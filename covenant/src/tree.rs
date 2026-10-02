@@ -31,9 +31,13 @@
 //!    confirmation. The lowest nodes carry RECLAIM.
 //! 7. No leaf script appears twice, so no node or leaf script is funded twice.
 //!    Each leaf's salt is `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`
-//!    ([`crate::leaf::leaf_salt`]): the owner's wallet picks its nonce fresh
-//!    for every leaf it asks for, the operator adds its own, and a batch with
-//!    an operator nonce twice is refused.
+//!    ([`crate::leaf::leaf_salt`]): the owner's wallet picks its nonce at
+//!    random for every leaf it asks for, the operator adds its own, and a
+//!    batch with an operator nonce twice is refused.
+//! 8. A key holds one leaf: a batch with an owner key on two leaves is
+//!    refused. Each leaf instance has its own key, and a key signs for one
+//!    leaf only, so no signature made for one leaf (a forfeit, a release)
+//!    can serve another.
 //!
 //! The tree gives the batch output the round pays, every node, and each leaf's
 //! [`LeafRecord`]. A leaf's unroll is built from its record
@@ -206,6 +210,8 @@ pub enum TreeError {
 	DuplicateLeaf { first: usize, second: usize },
 	#[error("leaves {first} and {second} have the same operator nonce")]
 	DuplicateOperatorNonce { first: usize, second: usize },
+	#[error("leaves {first} and {second} have the same owner key: a key holds one leaf")]
+	DuplicateOwner { first: usize, second: usize },
 	#[error("the batch would hold more than {max}", max = MAX_VALUE)]
 	ValueSum,
 	#[error("the tree would be {0} levels deep; a record holds {max}", max = MAX_LEVELS)]
@@ -281,9 +287,13 @@ impl Tree {
 		let mut tree_leaves: Vec<TreeLeaf> = Vec::with_capacity(n);
 		let mut seen = std::collections::HashMap::with_capacity(n);
 		let mut nonces = std::collections::HashMap::with_capacity(n);
+		let mut keys = std::collections::HashMap::with_capacity(n);
 		for (i, spec) in leaves.iter().enumerate() {
 			if let Some(first) = nonces.insert(spec.operator_nonce, i) {
 				return Err(TreeError::DuplicateOperatorNonce { first, second: i });
+			}
+			if let Some(first) = keys.insert(spec.owner, i) {
+				return Err(TreeError::DuplicateOwner { first, second: i });
 			}
 			if spec.template != Template::Vtxo1 {
 				return Err(TreeError::Template { leaf: i });

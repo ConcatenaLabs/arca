@@ -69,7 +69,7 @@ fn honest_round_passes_and_each_attack_names_its_check() {
 
 	// The honest round: one explicit atom, no token, into clock 0.
 	let honest = r.tx(vec![r.issuance(one, Value::Null)], vec![batch.clone(), t_at(&clock0, 1), fee(x, 1_000)]);
-	assert_eq!(check_round(&honest, &sched, &sweeps), Ok(()));
+	assert_eq!(check_round(&honest, &sched, &sweeps[0], &sweeps[1..]), Ok(()));
 	// Several batches in one round: one issuing input each; this batch's token is found.
 	let other = OutPoint::new(elements::Txid::from_byte_array(label32("second operator coin")), 0);
 	let mut second = r.issuance(one, Value::Null);
@@ -77,9 +77,9 @@ fn honest_round_passes_and_each_attack_names_its_check() {
 	let other_t = AssetId::new_issuance(other, ContractHash::from_byte_array(r.contract));
 	let two_batches = r.tx(vec![second, r.issuance(one, Value::Null)],
 		vec![batch.clone(), t_at(&clock0, 1), explicit(other_t, 1, op_true().script_pubkey()), fee(x, 1_000)]);
-	assert_eq!(check_round(&two_batches, &sched, &sweeps), Ok(()));
+	assert_eq!(check_round(&two_batches, &sched, &sweeps[0], &sweeps[1..]), Ok(()));
 
-	let check = |tx: &Transaction, s: &ClockSchedule, sw: &[Sweep]| check_round(tx, s, sw).unwrap_err();
+	let check = |tx: &Transaction, s: &ClockSchedule, sw: &[Sweep]| check_round(tx, s, &sw[0], &sw[1..]).unwrap_err();
 
 	// K1: two atoms, the second straight to R.
 	let k1 = r.tx(vec![r.issuance(Value::Explicit(2), Value::Null)], vec![batch.clone(), t_at(&clock0, 1), t_at(&r_spk, 1), fee(x, 1_000)]);
@@ -140,4 +140,19 @@ fn honest_round_passes_and_each_attack_names_its_check() {
 	let mut bad = sched.sweep(false, false);
 	bad.operator = xonly(&keypair("stranger"));
 	assert_eq!(check(&honest, &sched, &[bad]), RoundCheckFailure::SweepMismatch(0));
+
+	// Below the batch output every sweep waits the notice: one without it
+	// (an inner node, a lowest node, an entry) is refused at its position,
+	// while the batch output's may have none.
+	let none = sched.sweep(false, false);
+	let with = sched.sweep(true, false);
+	assert_eq!(check_round(&honest, &sched, &none, &[with, with, with]), Ok(()));
+	assert_eq!(check_round(&honest, &sched, &with, &[with]), Ok(()));
+	for i in 0..3 {
+		let mut below = [with, with, with];
+		below[i] = none;
+		let e = check(&honest, &sched, &[&[none][..], &below[..]].concat());
+		assert_eq!((e.check(), &e), (5, &RoundCheckFailure::NoNotice(i + 1)), "{}", e);
+	}
+	assert_eq!(check(&honest, &sched, &[none, none, none, none]), RoundCheckFailure::NoNotice(1));
 }

@@ -26,9 +26,32 @@
 //! with them. Nor is the salt: the record holds the owner's nonce and the
 //! operator's, and the salt is rebuilt from them
 //! (`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`,
-//! [`crate::leaf::leaf_salt`]). A wallet checks that the owner nonce is the one
-//! it picked for this leaf ([`LeafRecord::check_owner`]); validation against the
-//! round then shows that the leaf on-chain carries the salt built from it.
+//! [`crate::leaf::leaf_salt`]).
+//!
+//! # One key, one leaf
+//!
+//! A leaf's owner key signs for that leaf only. Every leaf instance, every
+//! receive included, has its own key, and the owner nonce is random, picked
+//! by the wallet for that leaf alone (never derived from a counter, which a
+//! restore would repeat). Where one key held two leaves, the operator could
+//! take one: a salt the owner had signed under, built into a new leaf, let
+//! an old forfeit pair spend it; one release filled two slots of a RECLAIM;
+//! two forfeits over one output merged. So the tree builder refuses a key on
+//! two leaves of a batch, a record whose lowest level names its own key in
+//! another slot is refused, and [`LeafRecord::validate`] takes the key and
+//! the nonce the wallet expects for the leaf and refuses a record not built
+//! from them.
+//!
+//! # What a wallet accepts
+//!
+//! [`LeafRecord::validate`] is the check a wallet runs before it accepts a
+//! leaf. Beyond the path and the five client checks it applies the wallet's
+//! own policy ([`WalletPolicy`]): its chain, the operator key it was told,
+//! the shortest notice `W` it accepts, how far after now the first expiry
+//! must lie, and the bounds on the exit delay. What it accepted names the
+//! round it was checked against ([`ValidLeaf::round_txid`]): after any
+//! rollback that disconnects that round, the wallet checks again whichever
+//! transaction now pays the batch output, and unrolls at once if that fails.
 //!
 //! # The binary form, version 2
 //!
@@ -90,7 +113,7 @@ use std::str::FromStr;
 
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Script, Transaction, TxOut};
+use elements::{AssetId, Script, Transaction, TxOut, Txid};
 
 use crate::checks::{check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
@@ -349,6 +372,18 @@ pub enum RecordError {
 	NotOwner,
 	#[error("the record's owner nonce is not the one the wallet picked for this leaf")]
 	OwnerNonce,
+	#[error("the lowest level names the record's own key in another slot: one key would hold two leaves")]
+	OwnKeyTwice,
+	#[error("the record is for another chain than the wallet's")]
+	WrongChain,
+	#[error("the record names another operator key than the one the wallet was told")]
+	WrongOperator,
+	#[error("a notice of {notice} units; the wallet accepts {min} at least")]
+	NoticeTooShort { notice: u16, min: u16 },
+	#[error("the first expiry {expiry} is earlier than {earliest}, the wallet's horizon after now")]
+	ExpiryTooSoon { expiry: u32, earliest: u64 },
+	#[error("an exit delay of {delay} units; the wallet accepts {min} to {max}")]
+	ExitDelay { delay: u16, min: u16, max: u16 },
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
 	#[error("not JSON: {0}")]
@@ -396,7 +431,8 @@ impl RecordError {
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
-			NotOwner | OwnerNonce => "owner",
+			NotOwner | OwnerNonce | OwnKeyTwice => "owner",
+			WrongChain | WrongOperator | NoticeTooShort { .. } | ExpiryTooSoon { .. } | ExitDelay { .. } => "policy",
 			Json(_) => "json",
 			Field(_) => "field",
 			Type(_) => "type",
@@ -437,10 +473,10 @@ impl LeafRecord {
 		leaf_salt(&self.owner_nonce, &self.operator_nonce)
 	}
 
-	/// The wallet's check that the record is for its key and for the nonce it
+	/// The check that the record is for the wallet's key and for the nonce it
 	/// picked for this leaf, so the salt holds its contribution. A wallet that
 	/// never repeats a nonce is then never given a leaf script it already
-	/// holds. It runs this as well as [`LeafRecord::validate`].
+	/// holds. [`LeafRecord::validate`] runs it.
 	pub fn check_owner(&self, owner: &XOnlyPublicKey, owner_nonce: &[u8; 32]) -> Result<(), RecordError> {
 		if self.owner != *owner {
 			return Err(RecordError::NotOwner);
@@ -491,6 +527,9 @@ impl LeafRecord {
 		shape(self.upper.len(), l.index, &l.siblings, l.reserve)?;
 		if l.owners.len() != l.siblings.len() {
 			return Err(RecordError::Owners { owners: l.owners.len(), siblings: l.siblings.len() });
+		}
+		if l.owners.contains(&self.owner) {
+			return Err(RecordError::OwnKeyTwice);
 		}
 		Ok(())
 	}
@@ -573,17 +612,31 @@ impl LeafRecord {
 		Ok(self.branch()?.leaf_id())
 	}
 
-	/// Checks the record against the round transaction that created its
-	/// batch: the round pays exactly one output equal to the batch output the
-	/// record rebuilds (asset, value and script), so the leaf is where the
-	/// record says; and the round passes the five client checks on the token
-	/// and its clock ([`check_round`]) for the record's schedule and every
-	/// sweep path above the leaf.
+	/// The check a wallet runs before it accepts a leaf of its own: the record
+	/// is for `owner` and the `owner_nonce` the wallet picked for this leaf
+	/// ([`LeafRecord::check_owner`]), within the wallet's `policy`, and it
+	/// matches the round transaction that created its batch. The round pays
+	/// exactly one output equal to the batch output the record rebuilds
+	/// (asset, value and script), so the leaf is where the record says, and
+	/// the round passes the five client checks on the token and its clock
+	/// ([`check_round`]) for the record's schedule and every sweep path above
+	/// the leaf.
 	///
-	/// This is the check a wallet runs before it accepts a leaf. Whether the
-	/// round is final (its block certified and its anchor buried) is for the
-	/// caller to establish.
-	pub fn validate(&self, round: &Transaction) -> Result<ValidLeaf, RecordError> {
+	/// Whether the round is final (its block certified and its anchor buried)
+	/// is for the caller to establish.
+	pub fn validate(&self, round: &Transaction, policy: &WalletPolicy, owner: &XOnlyPublicKey, owner_nonce: &[u8; 32])
+		-> Result<ValidLeaf, RecordError>
+	{
+		self.check_owner(owner, owner_nonce)?;
+		self.validate_round(round, policy)
+	}
+
+	/// [`LeafRecord::validate`] without the owner's key and nonce: for a leaf
+	/// the wallet does not own, such as the start of a coin it receives,
+	/// whose owner's nonce it cannot know. A wallet never accepts a leaf of its
+	/// own with this alone.
+	pub fn validate_round(&self, round: &Transaction, policy: &WalletPolicy) -> Result<ValidLeaf, RecordError> {
+		policy.check(self)?;
 		let branch = self.branch()?;
 		let out = branch.batch_output();
 		let found: Vec<usize> = round.output.iter().enumerate()
@@ -595,14 +648,15 @@ impl LeafRecord {
 			[i] => i as u32,
 			_ => return Err(RecordError::BatchOutputRepeated(found.len())),
 		};
-		check_round(round, &self.schedule, &branch.sweeps())?;
-		Ok(ValidLeaf { leaf_id: branch.leaf_id(), batch_vout, branch })
+		let sweeps = branch.sweeps();
+		check_round(round, &self.schedule, &sweeps[0], &sweeps[1..])?;
+		Ok(ValidLeaf { leaf_id: branch.leaf_id(), round_txid: round.txid(), batch_vout, branch })
 	}
 
 	/// Checks the path alone against one output: it must be the batch output
 	/// the record rebuilds. This does not check the token or the clock, which
-	/// only the round transaction shows; a wallet accepts a leaf only after
-	/// [`LeafRecord::validate`].
+	/// only the round transaction shows, nor the wallet's policy; a wallet
+	/// accepts a leaf only after [`LeafRecord::validate`].
 	pub fn validate_batch_output(&self, output: &TxOut) -> Result<Branch, RecordError> {
 		let branch = self.branch()?;
 		if ExplicitOutput::from_txout(output).as_ref() != Some(&branch.batch_output()) {
@@ -747,9 +801,87 @@ impl LeafRecord {
 #[derive(Debug, Clone)]
 pub struct ValidLeaf {
 	pub leaf_id: LeafId,
+	/// The round the leaf was checked against. Another transaction can pay
+	/// the same batch output after a rollback (it may spend the same issuing
+	/// coin); the wallet keeps this id and checks again when it changes.
+	pub round_txid: Txid,
 	/// The index of the batch output in the round.
 	pub batch_vout: u32,
 	pub branch: Branch,
+}
+
+/// What a wallet accepts in a leaf's record, beyond its being well formed and
+/// matching the chain: [`LeafRecord::validate`] refuses anything outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletPolicy {
+	/// The wallet's own chain.
+	pub chain: Chain,
+	/// The operator key the wallet was told (from the server's `info`, or its
+	/// configuration).
+	pub operator: XOnlyPublicKey,
+	/// The median time the wallet takes as now.
+	pub now: MedianTime,
+	/// The shortest notice `W` the wallet accepts.
+	pub min_notice: RelativeTime,
+	/// How long after `now` the first expiry `E_0` must lie, in seconds.
+	pub horizon: u32,
+	/// The bounds on the exit delay.
+	pub min_exit_delay: RelativeTime,
+	pub max_exit_delay: RelativeTime,
+}
+
+impl WalletPolicy {
+	/// The specification's notice and exit delay, 36 hours.
+	pub const SPEC_DELAY_SECONDS: u64 = 36 * 3600;
+	/// The default horizon: a round's batch expires 28 days after it is
+	/// created; one day of that is left for the round to become final and for
+	/// the participation to complete.
+	pub const DEFAULT_HORIZON: u32 = 27 * 86_400;
+	/// The longest exit delay accepted by default, 48 hours: the exit
+	/// deadline lies three days before the expiry, and the unroll and the exit
+	/// delay must fit in it.
+	pub const DEFAULT_MAX_EXIT_SECONDS: u64 = 48 * 3600;
+
+	/// The policy for a wallet on `chain` served by `operator`, at `now`,
+	/// with the specification's parameters: a notice of at least 36 hours, a
+	/// first expiry at least 27 days after now, and an exit delay of 36 to 48
+	/// hours.
+	pub fn new(chain: Chain, operator: XOnlyPublicKey, now: MedianTime) -> WalletPolicy {
+		let delay = RelativeTime::from_seconds_ceil(Self::SPEC_DELAY_SECONDS).expect("36 hours is a relative time");
+		WalletPolicy {
+			chain, operator, now,
+			min_notice: delay,
+			horizon: Self::DEFAULT_HORIZON,
+			min_exit_delay: delay,
+			max_exit_delay: RelativeTime::from_seconds_ceil(Self::DEFAULT_MAX_EXIT_SECONDS).expect("48 hours is a relative time"),
+		}
+	}
+
+	/// Refuses a record outside the policy.
+	pub fn check(&self, record: &LeafRecord) -> Result<(), RecordError> {
+		if record.chain != self.chain {
+			return Err(RecordError::WrongChain);
+		}
+		if record.schedule.operator != self.operator {
+			return Err(RecordError::WrongOperator);
+		}
+		let notice = record.schedule.notice.units();
+		if notice < self.min_notice.units() {
+			return Err(RecordError::NoticeTooShort { notice, min: self.min_notice.units() });
+		}
+		let expiry = record.schedule.expiries()[0].to_consensus_u32();
+		let earliest = self.now.to_consensus_u32() as u64 + self.horizon as u64;
+		if (expiry as u64) < earliest {
+			return Err(RecordError::ExpiryTooSoon { expiry, earliest });
+		}
+		let delay = record.exit_delay.units();
+		if delay < self.min_exit_delay.units() || delay > self.max_exit_delay.units() {
+			return Err(RecordError::ExitDelay {
+				delay, min: self.min_exit_delay.units(), max: self.max_exit_delay.units(),
+			});
+		}
+		Ok(())
+	}
 }
 
 /// A lowest node's RECLAIM: its owners, the release they sign, and the script.

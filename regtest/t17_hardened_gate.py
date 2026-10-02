@@ -75,8 +75,10 @@ class T17(Ark3, ArkBase, BitcoinTestFramework):
             self.mine_raw(tx, "today/MINED_" + name)
         # an empty signature with the malformed key: CSFS pushes false
         tap, u = self.node_for(leaf)
+        # (the mempool refuses the upgradable key type first)
         self.reject(self.gtx(u, tap, leaf, good, gate_witness(b"", merkle_path(levels, 2), bad33)),
-                    "today/neg_key33_empty_sig")
+                    "today/neg_key33_empty_sig",
+                    block="Script evaluated without error but finished with a false/empty top stack element")
         # an empty KEY in the member tree: CSFS fails with a pubkey-type error
         keysE = [k0, k1, empty, bad64]
         levelsE = merkle_levels(keysE)
@@ -141,8 +143,10 @@ class T17(Ark3, ArkBase, BitcoinTestFramework):
                     "hard/neg_t_altered_earlier")
         self.reject(self.gtx(u, tap, leaf, good, W(auth, 1, k1, tt=t + 1), locktime=t + 1),
                     "hard/neg_t_altered_later")
+        # the mempool refuses the non-minimal push first; in a block the
+        # authorisation, signed over the minimal bytes, fails
         self.reject(self.gtx(u, tap, leaf, good, W(auth, 1, k1, tt=t)[:1] + [sn(t) + b"\x00"] + W(auth, 1, k1)[2:],
-                             locktime=t), "hard/neg_t_nonminimal_encoding")
+                             locktime=t), "hard/neg_t_nonminimal_encoding", block="Invalid Schnorr signature")
         self.reject(self.gtx(u, tap, leaf, good, W(b"", 1, k1), locktime=t), "hard/neg_empty_signature")
         # ---- after t: the third party broadcasts with its own fee input
         self.send(self.gtx(u, tap, leaf, good, W(auth, 1, k1), locktime=t, external=True),

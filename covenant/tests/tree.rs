@@ -181,6 +181,12 @@ impl Fx {
 		round
 	}
 
+	/// The policy of a wallet on this chain, told this operator, at the
+	/// batch's creation.
+	fn policy(&self, b: &Batch) -> WalletPolicy {
+		WalletPolicy::new(Chain::new(self.genesis), xonly(&self.s), b.created)
+	}
+
 	fn verify(&self, what: &str, u: &UnrollTx) {
 		self.consensus.verify_tx(&u.prevouts, &u.tx)
 			.unwrap_or_else(|(i, e)| panic!("{}: input {} refused by the block rules: {}", what, i, e));
@@ -243,7 +249,8 @@ fn run_tree(fx: &Fx, n: usize, radix: usize, external: bool, totals: &mut Totals
 		let ctx = format!("{} / leaf {}", label, i);
 		let rec = b.tree.record(i);
 		assert_eq!(LeafRecord::from_bytes(&rec.to_bytes().unwrap()).unwrap(), rec, "{}", ctx);
-		let valid = rec.validate(&b.round).unwrap_or_else(|e| panic!("{}: {}", ctx, e));
+		let valid = rec.validate(&b.round, &fx.policy(&b), &xonly(&b.owners[i]), &b.tree.leaves()[i].spec.owner_nonce)
+			.unwrap_or_else(|e| panic!("{}: {}", ctx, e));
 		let branch = valid.branch;
 		let batch = OutPoint::new(round_txid, valid.batch_vout);
 		let owner = &b.owners[i];
@@ -396,6 +403,10 @@ fn the_builder_refuses() {
 	let mut owner_twice = leaves.clone();
 	owner_twice[1].owner_nonce = owner_twice[0].owner_nonce;
 	assert!(Tree::build(params.clone(), &owner_twice).is_ok());
+	// One key on two leaves: refused, whatever the nonces.
+	let mut key_twice = leaves.clone();
+	key_twice[2].owner = key_twice[0].owner;
+	assert_eq!(Tree::build(params.clone(), &key_twice).unwrap_err(), TreeError::DuplicateOwner { first: 0, second: 2 });
 	let mut huge = leaves.clone();
 	for l in &mut huge {
 		l.value = arca_covenant::record::MAX_VALUE / 2;
@@ -418,7 +429,7 @@ fn a_1024_leaf_batch_matches_the_specification_sizes() {
 	assert_eq!(b.tree.levels().iter().map(|l| l.len()).collect::<Vec<_>>(), vec![256, 64, 16, 4, 1]);
 	let records = b.tree.records();
 	for i in [0, 511, 1023] {
-		let v = records[i].validate(&b.round).unwrap();
+		let v = records[i].validate(&b.round, &fx.policy(&b), &xonly(&b.owners[i]), &b.tree.leaves()[i].spec.owner_nonce).unwrap();
 		let owner = &b.owners[i];
 		let auths: Vec<_> = v.branch.nodes.iter().map(|nd| {
 			nd.owner_auth(sig(owner, &nd.unroll_authorisation(b.created).digest), b.created, xonly(owner))
@@ -445,8 +456,8 @@ fn a_record_whose_salt_lacks_the_owner_nonce_is_refused() {
 	let owner = xonly(&b.owners[i]);
 	let picked = b.tree.leaves()[i].spec.owner_nonce;
 	let rec = b.tree.record(i);
-	rec.validate(&b.round).unwrap();
-	rec.check_owner(&owner, &picked).unwrap();
+	let policy = fx.policy(&b);
+	rec.validate(&b.round, &policy, &owner, &picked).unwrap();
 	assert_eq!(rec.salt(), arca_covenant::leaf::leaf_salt(&picked, &rec.operator_nonce));
 
 	// The record names another owner nonce: the salt it implies is not the
@@ -454,29 +465,30 @@ fn a_record_whose_salt_lacks_the_owner_nonce_is_refused() {
 	// the nonce the wallet picked.
 	let mut other = rec.clone();
 	other.owner_nonce = label32("not the wallet's nonce");
-	assert_eq!(other.validate(&b.round).unwrap_err().kind(), "batch_output");
-	assert_eq!(other.check_owner(&owner, &picked).unwrap_err().kind(), "owner");
+	assert_eq!(other.validate_round(&b.round, &policy).unwrap_err().kind(), "batch_output");
+	assert_eq!(other.validate(&b.round, &policy, &owner, &picked).unwrap_err().kind(), "owner");
 	let mut other_op = rec.clone();
 	other_op.operator_nonce = label32("not the operator's nonce");
-	assert_eq!(other_op.validate(&b.round).unwrap_err().kind(), "batch_output");
+	assert_eq!(other_op.validate(&b.round, &policy, &owner, &picked).unwrap_err().kind(), "batch_output");
 
 	// The operator builds the leaf from a nonce of its own choosing in place
-	// of the wallet's. If its record says so, the round validates it and the
-	// wallet's check refuses it; if the record names the wallet's nonce, the
-	// round refuses it.
+	// of the wallet's (say one the wallet signed under before). If its record
+	// says so, the round matches it and the wallet refuses the nonce; if the
+	// record names the wallet's nonce, the round refuses it.
 	let mut leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec).collect();
 	leaves[i].owner_nonce = label32("the operator's substitute");
 	let swapped = Tree::build(b.tree.params().clone(), &leaves).unwrap();
 	let round = fx.round(&swapped, issuer_of(label));
 	let honest = swapped.record(i);
-	honest.validate(&round).unwrap();
-	assert_eq!(honest.check_owner(&owner, &picked).unwrap_err().to_string(),
+	honest.validate_round(&round, &policy).unwrap();
+	assert_eq!(honest.validate(&round, &policy, &owner, &picked).unwrap_err().to_string(),
 		"the record's owner nonce is not the one the wallet picked for this leaf");
 	let mut lying = honest.clone();
 	lying.owner_nonce = picked;
-	assert_eq!(lying.validate(&round).unwrap_err().to_string(),
+	assert_eq!(lying.validate(&round, &policy, &owner, &picked).unwrap_err().to_string(),
 		"the round pays no output equal to the batch output the record rebuilds");
 	// And a record for another key.
-	assert_eq!(rec.check_owner(&xonly(&b.owners[0]), &picked).unwrap_err().to_string(), "the record is for another owner's key");
+	assert_eq!(rec.validate(&b.round, &policy, &xonly(&b.owners[0]), &picked).unwrap_err().to_string(),
+		"the record is for another owner's key");
 	println!("salt rule: wrong owner nonce, wrong operator nonce, substituted nonce stated as the wallet's: refused");
 }

@@ -134,7 +134,9 @@ consensus library from the checkout named by `SEQUENTIA_DIR`, and its agreement
 test runs the node named by `SEQUENTIAD_EXEC` (`consensus/README.md`). A unit test
 that builds a Sequentia transaction ends by verifying it there. A negative case
 that matters is also forced into a block on a regtest node (`generateblock`), not
-only refused by the mempool, because relay policy can hide a consensus flaw.
+only refused by the mempool, because relay policy can hide a consensus flaw, and
+the test asserts why the block refused it: start the node with `-par=1`, which
+checks scripts inline, or the block reports only `block-validation-failed`.
 
 Sequentia's transaction and block types come from `arca-sequentia-ext`, which
 re-exports the `rust-elements` SWK vendors with its `sequentia` feature (pinned

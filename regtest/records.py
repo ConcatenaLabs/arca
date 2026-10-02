@@ -20,7 +20,8 @@ k = ceil(n / r) nodes, the first n mod k of them holding n // k + 1 children
 and the rest n // k. Every node then holds 2 to r children; the one node with
 a single child is the batch output of a batch of one leaf. The radix is 3 to
 6 (at radix 2 an odd level would need a node of one child). Every node's
-script is built for its own child count. A node's value is
+script is built for its own child count. A key holds one leaf: a batch
+with an owner key on two leaves is refused. A node's value is
 the sum of its children's values plus its reserve. Its members are the
 operator and the owners of every leaf under it, in leaf order, padded to a
 power of two with the operator's key. The batch output's sweep has no notice;
@@ -198,6 +199,9 @@ class Batch:
         self.p, self.leaves = p, leaves
         S, r = p["operator"], p["radix"]
         assert 3 <= r <= 6
+        owners = [lf["owner"] for lf in leaves]
+        if len(set(owners)) != len(owners):
+            raise ValueError("a key holds one leaf: an owner key appears on two leaves")
         notice = SEQ_TIME | p["notice"]
         r_tap, _ = r_taptree(S, notice)
         self.r_spk = bytes(r_tap.scriptPubKey)

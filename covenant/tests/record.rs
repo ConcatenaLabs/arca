@@ -25,7 +25,36 @@ use serde_json::Value;
 
 use arca_covenant::record::{LeafRecord, Sibling};
 use arca_covenant::script::sha256;
-use arca_covenant::{ClockSchedule, MedianTime, MemberProof, RelativeTime};
+use arca_covenant::{Chain, ClockSchedule, MedianTime, MemberProof, RelativeTime, WalletPolicy};
+
+/// The time the vectors' batches are created: every first expiry lies 28
+/// days later.
+const CREATED: u32 = 1_791_000_000;
+
+/// The policy of a wallet on the vectors' chain, told the vectors' operator,
+/// at the batches' creation. One leaf of the vectors has twice the 36-hour
+/// exit delay, which this wallet accepts.
+fn vector_policy() -> WalletPolicy {
+	let v = vectors();
+	let chain = Chain::new(BlockHash::from_str(v["inputs"]["genesis_hash"].as_str().unwrap()).unwrap());
+	let operator = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&hexbytes(&v["inputs"]["operator"])).unwrap();
+	WalletPolicy {
+		max_exit_delay: RelativeTime::from_units(2 * RelativeTime::from_seconds_ceil(36 * 3600).unwrap().units()).unwrap(),
+		..WalletPolicy::new(chain, operator, MedianTime::from_consensus(CREATED).unwrap())
+	}
+}
+
+/// A wallet that believes whatever chain and operator `r` names and bounds
+/// nothing: what is left to refuse a mutation is the round alone.
+fn believing(r: &LeafRecord) -> WalletPolicy {
+	WalletPolicy {
+		min_notice: RelativeTime::from_units(1).unwrap(),
+		horizon: 0,
+		min_exit_delay: RelativeTime::from_units(1).unwrap(),
+		max_exit_delay: RelativeTime::from_units(u16::MAX).unwrap(),
+		..WalletPolicy::new(r.chain, r.operator(), MedianTime::from_consensus(CREATED).unwrap())
+	}
+}
 
 fn vectors() -> Value {
 	let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../regtest/vectors/records.json");
@@ -103,8 +132,13 @@ fn golden_vectors_regenerate() {
 			assert_eq!(rec.leaf_id().unwrap().to_string(), r["leaf_id"].as_str().unwrap(), "{}: leaf id", ctx);
 			assert_eq!(rec.schedule.clock0_script_pubkey().as_bytes().to_vec(), hexbytes(&b["clock0_script_pubkey"]));
 
-			// And the record validates against the round that funds it.
-			let ok = rec.validate(&round).unwrap_or_else(|e| panic!("{}: refused: {}", ctx, e));
+			// And the record validates against the round that funds it, for its
+			// owner and the nonce that owner picked.
+			let i = r["leaf"].as_u64().unwrap() as usize;
+			let nonce: [u8; 32] = hexbytes(&b["inputs"]["leaves"][i]["owner_nonce"]).try_into().unwrap();
+			let ok = rec.validate(&round, &vector_policy(), &rec.owner, &nonce)
+				.unwrap_or_else(|e| panic!("{}: refused: {}", ctx, e));
+			assert_eq!(ok.round_txid, round.txid());
 			assert_eq!(ok.batch_vout, b["round"]["batch_vout"].as_u64().unwrap() as u32);
 			assert_eq!(ok.leaf_id.to_string(), r["leaf_id"].as_str().unwrap());
 			records += 1;
@@ -297,9 +331,9 @@ fn every_single_field_mutation_is_refused() {
 			continue;
 		}
 		*n += 1;
-		rec.validate(round).unwrap();
+		rec.validate_round(round, &vector_policy()).unwrap();
 		for (field, mutant) in mutations(rec) {
-			let e = mutant.validate(round).err()
+			let e = mutant.validate_round(round, &believing(&mutant)).err()
 				.unwrap_or_else(|| panic!("{}: the mutation of {:?} VALIDATES", name, field));
 			tried += 1;
 			rows.entry(field).or_insert_with(|| format!("{} ({})", e, e.kind()));
@@ -331,7 +365,7 @@ fn every_one_byte_change_is_refused() {
 						*by_kind.entry(e.kind()).or_default() += 1;
 					},
 					Ok(m) => {
-						let e = m.validate(round).err().unwrap_or_else(|| {
+						let e = m.validate_round(round, &believing(&m)).err().unwrap_or_else(|| {
 							panic!("{}: byte {} ^ {:#04x} decodes and VALIDATES", name, i, mask)
 						});
 						validate_refused += 1;
@@ -349,38 +383,95 @@ fn every_one_byte_change_is_refused() {
 fn validation_needs_the_round() {
 	let (_, rec, round) = valid_records().remove(10);
 	let batch = rec.branch().unwrap().batch_output();
+	let policy = vector_policy();
+	let validate = |r: &LeafRecord, round: &Transaction| r.validate_round(round, &policy);
 
 	// The path alone matches the batch output, and a later expiry does not
 	// change the path: only the round shows the clock.
 	let mut later = rec.clone();
 	later.schedule = schedule_with(&rec.schedule, |e| e[0] = MedianTime::from_consensus(e[0].to_consensus_u32() + 1).unwrap());
 	assert!(later.validate_batch_output(&batch.txout()).is_ok());
-	assert_eq!(later.validate(&round).unwrap_err().to_string(),
+	assert_eq!(validate(&later, &round).unwrap_err().to_string(),
 		"check 5: the token is not paid to clock 0 rebuilt from the published schedule");
 
 	// The batch output paid twice, or not at all.
 	let mut twice = round.clone();
 	twice.output.push(batch.txout());
-	assert_eq!(rec.validate(&twice).unwrap_err().kind(), "batch_output");
+	assert_eq!(validate(&rec, &twice).unwrap_err().kind(), "batch_output");
 	let mut none = round.clone();
 	none.output[0].value = elements::confidential::Value::Explicit(batch.value - 1);
-	assert_eq!(rec.validate(&none).unwrap_err().kind(), "batch_output");
+	assert_eq!(validate(&rec, &none).unwrap_err().kind(), "batch_output");
 
 	// Each attack on the token that consensus accepts.
 	let mut two_atoms = round.clone();
 	two_atoms.input[0].asset_issuance.amount = elements::confidential::Value::Explicit(2);
-	assert_eq!(rec.validate(&two_atoms).unwrap_err().to_string(), "check 1: the token is issued as 2 atoms, not one");
+	assert_eq!(validate(&rec, &two_atoms).unwrap_err().to_string(), "check 1: the token is issued as 2 atoms, not one");
 	let mut token_at_r = round.clone();
 	token_at_r.output[1].script_pubkey = rec.schedule.r().script_pubkey();
-	assert_eq!(rec.validate(&token_at_r).unwrap_err().to_string(),
+	assert_eq!(validate(&rec, &token_at_r).unwrap_err().to_string(),
 		"check 4: the token is paid straight to R, released before any expiry");
 	let mut reissuable = round.clone();
 	reissuable.input[0].asset_issuance.inflation_keys = elements::confidential::Value::Explicit(1);
-	assert_eq!(rec.validate(&reissuable).unwrap_err().to_string(), "check 3: the issuance creates a reissuance token");
+	assert_eq!(validate(&rec, &reissuable).unwrap_err().to_string(), "check 3: the issuance creates a reissuance token");
 	let mut other_issuer = round.clone();
 	other_issuer.input[0].previous_output.txid = Txid::from_raw_hash(sha256d::Hash::hash(b"another"));
-	assert_eq!(rec.validate(&other_issuer).unwrap_err().to_string(), "check 1: no input of the round issues the token");
+	assert_eq!(validate(&rec, &other_issuer).unwrap_err().to_string(), "check 1: no input of the round issues the token");
 	let mut backwards = rec.clone();
 	backwards.schedule = schedule_with(&rec.schedule, |e| e.swap(0, 1));
-	assert_eq!(backwards.validate(&round).unwrap_err().to_string(), "check 5: the schedule runs backwards at step 1");
+	assert_eq!(validate(&backwards, &round).unwrap_err().to_string(), "check 5: the schedule runs backwards at step 1");
+}
+
+#[test]
+fn the_wallet_policy_and_the_owner_check_refuse() {
+	let v = vectors();
+	let b = &v["batches"][2];
+	let round = round_of(b);
+	let rec = LeafRecord::from_bytes(&hexbytes(&b["records"][5]["binary"])).unwrap();
+	let nonce: [u8; 32] = hexbytes(&b["inputs"]["leaves"][5]["owner_nonce"]).try_into().unwrap();
+	let policy = vector_policy();
+	rec.validate(&round, &policy, &rec.owner, &nonce).unwrap();
+	let refuse = |p: &WalletPolicy, r: &LeafRecord, owner: &elements::secp256k1_zkp::XOnlyPublicKey, nonce: &[u8; 32]| {
+		let e = r.validate(&round, p, owner, nonce).unwrap_err();
+		println!("{:<58} {} ({})", "", e, e.kind());
+		e
+	};
+
+	// The wallet's own chain and the operator it was told.
+	let other_chain = WalletPolicy { chain: Chain::new(BlockHash::from_byte_array(flip(rec.chain.genesis_bytes()))), ..policy };
+	assert_eq!(refuse(&other_chain, &rec, &rec.owner, &nonce).kind(), "policy");
+	let other_operator = WalletPolicy { operator: other_key("told"), ..policy };
+	assert_eq!(refuse(&other_operator, &rec, &rec.owner, &nonce).to_string(),
+		"the record names another operator key than the one the wallet was told");
+	// A notice shorter than the wallet accepts.
+	let longer = WalletPolicy { min_notice: RelativeTime::from_units(rec.schedule.notice.units() + 1).unwrap(), ..policy };
+	assert!(matches!(refuse(&longer, &rec, &rec.owner, &nonce), arca_covenant::RecordError::NoticeTooShort { .. }));
+	// A first expiry inside the wallet's horizon: a day later, it is too soon.
+	let later = WalletPolicy { now: MedianTime::from_consensus(CREATED + 86_400 + 1).unwrap(), ..policy };
+	assert!(matches!(refuse(&later, &rec, &rec.owner, &nonce), arca_covenant::RecordError::ExpiryTooSoon { .. }));
+	// An exit delay out of bounds.
+	let strict = WalletPolicy { max_exit_delay: RelativeTime::from_units(rec.exit_delay.units() - 1).unwrap(), ..policy };
+	assert!(matches!(refuse(&strict, &rec, &rec.owner, &nonce), arca_covenant::RecordError::ExitDelay { .. }));
+	let lax = WalletPolicy { min_exit_delay: RelativeTime::from_units(rec.exit_delay.units() + 1).unwrap(), ..policy };
+	assert!(matches!(refuse(&lax, &rec, &rec.owner, &nonce), arca_covenant::RecordError::ExitDelay { .. }));
+	// The default policy holds the specification's values.
+	let d = WalletPolicy::new(rec.chain, rec.operator(), MedianTime::from_consensus(CREATED).unwrap());
+	assert_eq!((d.min_notice.seconds(), d.horizon, d.min_exit_delay.seconds(), d.max_exit_delay.seconds()),
+		(254 * 512, 27 * 86_400, 254 * 512, 338 * 512));
+
+	// Another key, or a nonce the wallet did not pick.
+	assert_eq!(refuse(&policy, &rec, &other_key("me"), &nonce).to_string(), "the record is for another owner's key");
+	assert_eq!(refuse(&policy, &rec, &rec.owner, &flip(nonce)).to_string(),
+		"the record's owner nonce is not the one the wallet picked for this leaf");
+	// The lowest level naming the record's own key in another slot: one key
+	// on two leaves of a node, whose one release would fill both slots.
+	let mut twice = rec.clone();
+	twice.lowest.owners[0] = rec.owner;
+	assert_eq!(refuse(&policy, &twice, &rec.owner, &nonce).to_string(),
+		"the lowest level names the record's own key in another slot: one key would hold two leaves");
+	assert_eq!(LeafRecord::from_bytes(&{
+		let mut b = rec.to_bytes().unwrap();
+		let n = b.len();
+		b[n - 32 * rec.lowest.owners.len()..n - 32 * (rec.lowest.owners.len() - 1)].copy_from_slice(&rec.owner.serialize());
+		b
+	}).unwrap_err().kind(), "owner");
 }

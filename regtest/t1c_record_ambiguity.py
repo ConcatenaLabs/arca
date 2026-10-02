@@ -50,9 +50,15 @@ class T1c(ArkBase, BitcoinTestFramework):
                     stuck = Utxo(txid, 0, tx.vout[0])
                     t2 = self.mktx([stuck], [self.out(CHILD - 400, self.wallet_spk(), self.X_OUT), self.fee(400, self.X_OUT)])
                     self.setwit(t2, 0, [b"\x01"])
-                    self.reject(t2, tag + "/neg_spend_of_substituted_child")
+                    # the mempool refuses the non-standard input first
+                    self.reject(t2, tag + "/neg_spend_of_substituted_child",
+                                block="Witness program has incorrect length")
                 else:
-                    self.reject(tx, tag + "/neg_v0_33byte_program_substitution")
+                    # the mempool refuses the non-standard output first; the
+                    # block refuses the record that no longer matches
+                    self.reject(tx, tag + "/neg_v0_33byte_program_substitution",
+                                block="Script failed an OP_EQUALVERIFY operation" if form == "plain" else
+                                "Script evaluated without error but finished with a false/empty top stack element")
                     good = self.mktx([u], [self.out(CHILD, spk, self.X_OUT) for spk in spks] + [self.fee(RESERVE, self.X_OUT)])
                     self.setwit(good, 0, [bytes(lv["unroll"]), control_block(tap, "unroll")])
                     self.send(good, tag + "/unroll_reserve_fee", extra={"leaf_script_bytes": len(bytes(lv["unroll"]))})
