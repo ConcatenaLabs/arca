@@ -7,11 +7,19 @@
 //!
 //! 1. Leaves are laid left to right. Each sits behind its hash-locked entry,
 //!    whose value is the leaf's value plus the entry's reserve.
-//! 2. The entries are grouped `radix` at a time into lowest nodes, the lowest
-//!    nodes the same way into the level above, and so on until one node is
-//!    left: the batch output. Only the last node of a level may have fewer
-//!    than `radix` children, and each node's script is built for its own
-//!    child count. A batch of one leaf is one node with one child.
+//! 2. The entries are grouped into lowest nodes, the lowest nodes into the
+//!    level above, and so on until one node is left: the batch output. At
+//!    every level the children are spread as evenly as possible over the
+//!    fewest nodes that hold them: `n` children at radix `r` go to
+//!    `k = ⌈n / r⌉` nodes, the first `n mod k` of them holding `⌊n / k⌋ + 1`
+//!    children and the rest `⌊n / k⌋`. Every node therefore holds 2 to `r`
+//!    children, so owners in one batch pay about the same to exit; the one
+//!    node with a single child is the batch output of a batch of one leaf.
+//!    At radix 4, five leaves make lowest nodes of 3 and 2 under the batch
+//!    output; seventeen make lowest nodes of 4, 4, 3, 3 and 3, those make
+//!    nodes of 3 and 2, and those the batch output. Each node's script is
+//!    built for its own child count. The radix is 3 to 6: at radix 2 an odd
+//!    number of children on a level would need a node of one child.
 //! 3. Scripts are computed bottom-up, since a node pins its children's
 //!    scripts; `T` and `R` come first, since every sweep names them.
 //! 4. Every node holds its reserve on top of its children's values.
@@ -22,6 +30,10 @@
 //!    notice); every other node's and every entry's waits `W` from its own
 //!    confirmation. The lowest nodes carry RECLAIM.
 //! 7. No leaf script appears twice, so no node or leaf script is funded twice.
+//!    Each leaf's salt is `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`
+//!    ([`crate::leaf::leaf_salt`]): the owner's wallet picks its nonce fresh
+//!    for every leaf it asks for, the operator adds its own, and a batch with
+//!    an operator nonce twice is refused.
 //!
 //! The tree gives the batch output the round pays, every node, and each leaf's
 //! [`LeafRecord`]. A leaf's unroll is built from its record
@@ -34,12 +46,37 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn,
 
 use crate::clock::ClockSchedule;
 use crate::gate::{Members, MAX_OWNERS};
+use crate::leaf::leaf_salt;
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
 use crate::record::{LeafRecord, LowestLevel, Sibling, Template, UpperLevel, MAX_LEVELS, MAX_VALUE};
 use crate::script::{Child, ExplicitOutput};
 use crate::time::RelativeTime;
 use crate::{EntryPolicy, LeafPolicy, NodePolicy};
+
+/// The smallest radix the builder takes. At radix 2 a level with an odd
+/// number of children would need a node of one child.
+pub const MIN_RADIX: usize = 3;
+
+/// How `n` children are grouped into the nodes above them at radix `r`: the
+/// fewest nodes that hold them (`k = ⌈n / r⌉`), the first `n mod k` holding
+/// `⌊n / k⌋ + 1` children and the rest `⌊n / k⌋`. Each range is the children
+/// of one node, in order.
+pub fn spread(n: usize, r: usize) -> Vec<Range<usize>> {
+	if n == 0 || r == 0 {
+		return vec![];
+	}
+	let k = n.div_ceil(r);
+	let (q, rem) = (n / k, n % k);
+	let mut out = Vec::with_capacity(k);
+	let mut at = 0;
+	for j in 0..k {
+		let len = q + usize::from(j < rem);
+		out.push(at..at + len);
+		at += len;
+	}
+	out
+}
 
 /// How much each output in the tree holds back for the fee of the
 /// transaction that spends it.
@@ -66,7 +103,7 @@ pub struct TreeParams {
 	pub schedule: ClockSchedule,
 	/// Burn-only sweeps, for a batch its asset's issuer runs.
 	pub burn: bool,
-	/// The most children a node has: 2 to 6.
+	/// The most children a node has: [`MIN_RADIX`] to 6.
 	pub radix: usize,
 	pub reserve: ReserveRule,
 	/// The smallest leaf value the builder accepts. The specification sets it
@@ -82,11 +119,20 @@ pub struct LeafSpec {
 	/// The owner's key `A`.
 	pub owner: XOnlyPublicKey,
 	pub value: u64,
-	/// Unique to this leaf instance.
-	pub salt: [u8; 32],
+	/// The owner's contribution to the salt, fresh for every leaf it asks for.
+	pub owner_nonce: [u8; 32],
+	/// The operator's contribution to the salt, fresh for every leaf.
+	pub operator_nonce: [u8; 32],
 	pub exit_delay: RelativeTime,
 	/// The entry's unlock hash `h`.
 	pub unlock_hash: [u8; 32],
+}
+
+impl LeafSpec {
+	/// The leaf's salt: `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`.
+	pub fn salt(&self) -> [u8; 32] {
+		leaf_salt(&self.owner_nonce, &self.operator_nonce)
+	}
 }
 
 /// A leaf and the entry in front of it.
@@ -117,6 +163,9 @@ pub struct TreeNode {
 	pub reserve: u64,
 	/// The leaves under it.
 	pub leaves: Range<usize>,
+	/// Its children: their indices in the level below (the leaves' entries
+	/// for a lowest node).
+	pub children: Range<usize>,
 	members: Members,
 	program: [u8; 32],
 }
@@ -145,14 +194,18 @@ pub enum TreeError {
 	NoLeaves,
 	#[error("{0} leaves; a batch holds at most {max}", max = MAX_OWNERS)]
 	TooManyLeaves(usize),
-	#[error("a radix of {0}; it must be 2 to {max}", max = MAX_CHILDREN)]
+	#[error("a radix of {0}; it must be {min} to {max}", min = MIN_RADIX, max = MAX_CHILDREN)]
 	Radix(usize),
 	#[error("leaf {leaf} holds {value}, outside {min} to {max}", max = MAX_VALUE)]
 	LeafValue { leaf: usize, value: u64, min: u64 },
 	#[error("leaf {leaf} has a template this builder does not build")]
 	Template { leaf: usize },
+	/// Two leaves with one script. With distinct operator nonces this takes a
+	/// SHA256 collision; the check stays as a guard.
 	#[error("leaves {first} and {second} have the same script")]
 	DuplicateLeaf { first: usize, second: usize },
+	#[error("leaves {first} and {second} have the same operator nonce")]
+	DuplicateOperatorNonce { first: usize, second: usize },
 	#[error("the batch would hold more than {max}", max = MAX_VALUE)]
 	ValueSum,
 	#[error("the tree would be {0} levels deep; a record holds {max}", max = MAX_LEVELS)]
@@ -201,7 +254,7 @@ impl Tree {
 		if n > MAX_OWNERS {
 			return Err(TreeError::TooManyLeaves(n));
 		}
-		if !(2..=MAX_CHILDREN).contains(&params.radix) {
+		if !(MIN_RADIX..=MAX_CHILDREN).contains(&params.radix) {
 			return Err(TreeError::Radix(params.radix));
 		}
 		if let Some(i) = params.schedule.backwards_at() {
@@ -227,7 +280,11 @@ impl Tree {
 		let entry_sweep = params.schedule.sweep(true, params.burn);
 		let mut tree_leaves: Vec<TreeLeaf> = Vec::with_capacity(n);
 		let mut seen = std::collections::HashMap::with_capacity(n);
+		let mut nonces = std::collections::HashMap::with_capacity(n);
 		for (i, spec) in leaves.iter().enumerate() {
+			if let Some(first) = nonces.insert(spec.operator_nonce, i) {
+				return Err(TreeError::DuplicateOperatorNonce { first, second: i });
+			}
 			if spec.template != Template::Vtxo1 {
 				return Err(TreeError::Template { leaf: i });
 			}
@@ -235,7 +292,7 @@ impl Tree {
 				return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 			}
 			let leaf = LeafPolicy {
-				owner: spec.owner, operator, salt: spec.salt, chain: params.chain, exit_delay: spec.exit_delay,
+				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 			};
 			let program = leaf.program();
 			if let Some(first) = seen.insert(program, i) {
@@ -268,8 +325,10 @@ impl Tree {
 			let lowest = level == 0;
 			let is_root = level + 1 == depth;
 			let sweep = params.schedule.sweep(!is_root, params.burn);
-			let mut nodes = Vec::with_capacity(below.len().div_ceil(r));
-			for group in below.chunks(r) {
+			let groups = spread(below.len(), r);
+			let mut nodes = Vec::with_capacity(groups.len());
+			for range in groups {
+				let group = &below[range.clone()];
 				let children: Vec<Child> = group.iter().map(|(c, _)| *c).collect();
 				let leaf_range = group[0].1.start..group[group.len() - 1].1.end;
 				let owners: Vec<XOnlyPublicKey> = tree_leaves[leaf_range.clone()].iter().map(|l| l.spec.owner).collect();
@@ -286,7 +345,9 @@ impl Tree {
 					},
 				};
 				let value = policy.children().iter().try_fold(reserve, |acc, c| sum(acc, c.value))?;
-				nodes.push(TreeNode { program: taproot.program(), policy, value, reserve, leaves: leaf_range, members });
+				nodes.push(TreeNode {
+					program: taproot.program(), policy, value, reserve, leaves: leaf_range, children: range, members,
+				});
 			}
 			below = nodes.iter().map(|nd| (nd.child(), nd.leaves.clone())).collect();
 			levels.push(nodes);
@@ -341,12 +402,13 @@ impl Tree {
 	/// The nodes on leaf `leaf`'s path, from the batch output down, each with
 	/// the index of the child on the path.
 	pub fn path(&self, leaf: usize) -> Vec<(&TreeNode, usize)> {
-		let r = self.params.radix;
 		let mut out = Vec::with_capacity(self.levels.len());
 		let mut i = leaf;
 		for level in &self.levels {
-			out.push((&level[i / r], i % r));
-			i /= r;
+			let j = level.partition_point(|nd| nd.children.end <= i);
+			let node = &level[j];
+			out.push((node, i - node.children.start));
+			i = j;
 		}
 		out.reverse();
 		out
@@ -372,7 +434,8 @@ impl Tree {
 		LeafRecord {
 			template: l.spec.template,
 			owner: l.spec.owner,
-			salt: l.spec.salt,
+			owner_nonce: l.spec.owner_nonce,
+			operator_nonce: l.spec.operator_nonce,
 			exit_delay: l.spec.exit_delay,
 			asset: self.params.asset,
 			value: l.spec.value,

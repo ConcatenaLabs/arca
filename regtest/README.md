@@ -88,10 +88,11 @@ sample spend of every path:
 `vectors/records.json` holds the leaf record's vectors, written by
 `records.py`: the reference for the tree rules, the record's binary and JSON
 forms and the leaf id, which its docstring states in full. For each of seven
-batches (one leaf; five; sixteen; seventeen with burn-only sweeps; six at radix
-2; seven at radix 6 with no reserves; sixty-four) it holds the inputs, the batch
-output, a round transaction that issues the batch's token and funds it, and each
-exported leaf's position, leaf id and record in both forms. It also holds
+batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
+3; seven at radix 6 with no reserves; sixty-four) it holds the inputs, the
+shape of the tree (the child count of every node), the batch output, a round
+transaction that issues the batch's token and funds it, and each exported
+leaf's salt, position, leaf id and record in both forms. It also holds
 encodings a reader must refuse, each with the kind of reason.
 
 `vectors.py` writes both files from the suite's builders and the node framework's

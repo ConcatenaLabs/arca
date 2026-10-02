@@ -12,26 +12,35 @@ The tree
 --------
 A batch holds the leaves of one asset. Each leaf sits behind a hash-locked
 entry, whose value is the leaf's value plus the entry's reserve. The entries
-are laid left to right and grouped `radix` at a time into lowest nodes; the
-lowest nodes are grouped the same way into the level above, and so on until
-one node is left: the batch output. Only the last node of a level may have
-fewer than `radix` children, and every node's script is built for its own
-child count. A batch of one leaf is one node with one child. A node's value is
+are laid left to right and grouped into lowest nodes; the lowest nodes are
+grouped the same way into the level above, and so on until one node is left:
+the batch output. At every level the children are spread as evenly as
+possible over the fewest nodes that hold them: n children at radix r go to
+k = ceil(n / r) nodes, the first n mod k of them holding n // k + 1 children
+and the rest n // k. Every node then holds 2 to r children; the one node with
+a single child is the batch output of a batch of one leaf. The radix is 3 to
+6 (at radix 2 an odd level would need a node of one child). Every node's
+script is built for its own child count. A node's value is
 the sum of its children's values plus its reserve. Its members are the
 operator and the owners of every leaf under it, in leaf order, padded to a
 power of two with the operator's key. The batch output's sweep has no notice;
 every other node's and every entry's has the notice `W`. The lowest nodes
 (including a batch output whose children are entries) carry RECLAIM.
 
-The record, format version 1
+Each leaf's salt has a contribution from each side:
+SHA256("Arca/salt" || owner_nonce || operator_nonce). The record carries both
+nonces and not the salt, which is rebuilt from them.
+
+The record, format version 2
 ----------------------------
 All integers are little-endian. Asset ids and the genesis hash are in internal
 byte order.
 
-    u8    format version, 1
+    u8    format version, 2
     u8    template, 1 (vtxo)          u8  template version, 1
     [32]  owner key A                 the vtxo-1 parameters
-    [32]  salt
+    [32]  owner nonce
+    [32]  operator nonce
     u16   exit delay, 512-second units
     [32]  asset                       the leaf and its entry
     u64   value
@@ -74,10 +83,29 @@ from arklib3 import *                      # noqa: F401,F403
 from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxOutNonce, CTxOutValue,
                                      CAssetIssuance, uint256_from_str)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 TEMPLATES = {"vtxo": 1}                    # name -> template id
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 LEAF_ID_TAG = b"Arca/leaf-id"
+SALT_TAG = b"Arca/salt"
+
+
+def leaf_salt(owner_nonce, operator_nonce):
+    return sha256(SALT_TAG + owner_nonce + operator_nonce)
+
+
+def spread(n, r):
+    """The children of each node, as (start, end) ranges, when n children are
+    grouped at radix r: the fewest nodes, as evenly as possible, the larger
+    ones first."""
+    k = (n + r - 1) // r
+    q, rem = divmod(n, k)
+    out, at = [], 0
+    for j in range(k):
+        size = q + (1 if j < rem else 0)
+        out.append((at, at + size))
+        at += size
+    return out
 
 
 def tagged_hash(tag, msg):
@@ -163,11 +191,13 @@ class Batch:
 
     p: genesis (internal), asset (internal), operator (x-only), token
     (internal), notice (units), expiries, burn, radix, node_reserve,
-    entry_reserve. leaves: [{owner, salt, value, exit_delay, unlock_hash}]."""
+    entry_reserve. leaves: [{owner, owner_nonce, operator_nonce, value,
+    exit_delay, unlock_hash}]."""
 
     def __init__(self, p, leaves):
         self.p, self.leaves = p, leaves
         S, r = p["operator"], p["radix"]
+        assert 3 <= r <= 6
         notice = SEQ_TIME | p["notice"]
         r_tap, _ = r_taptree(S, notice)
         self.r_spk = bytes(r_tap.scriptPubKey)
@@ -181,7 +211,8 @@ class Batch:
         self.leaf_taps, self.entries = [], []
         level = []
         for i, lf in enumerate(leaves):
-            tap, _ = leaf3_taptree(lf["owner"], S, lf["salt"], ctag, SEQ_TIME | lf["exit_delay"], fold=True)
+            salt = leaf_salt(lf["owner_nonce"], lf["operator_nonce"])
+            tap, _ = leaf3_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], fold=True)
             self.leaf_taps.append(tap)
             etap, _ = entry_taptree(lf["unlock_hash"], p["asset"], lf["value"], bytes(tap.scriptPubKey)[2:],
                                     sweep(False))
@@ -191,11 +222,11 @@ class Batch:
         self.levels = []                   # lowest nodes first; the last holds the batch output alone
         lowest = True
         while True:
-            count = (len(level) + r - 1) // r
-            is_root = count == 1
+            groups = spread(len(level), r)
+            is_root = len(groups) == 1
             nodes = []
-            for j in range(count):
-                kids = level[j * r:(j + 1) * r]
+            for lo, hi in groups:
+                kids = level[lo:hi]
                 tuples = [(p["asset"], k["value"], k["prog"]) for k in kids]
                 owners = sum((k["owners"] for k in kids), [])
                 keys = [S] + [leaves[o]["owner"] for o in owners]
@@ -206,7 +237,7 @@ class Batch:
                     reclaim = reclaim_script(release_msg(p["genesis"], tuples), [leaves[o]["owner"] for o in owners], S)
                 tap, _ = node_taptree3(unroll, sweep(is_root), reclaim)
                 nodes.append({"tap": tap, "prog": bytes(tap.scriptPubKey)[2:], "kids": kids, "owners": owners,
-                              "first": kids[0]["first"], "mlevels": mlevels,
+                              "first": kids[0]["first"], "mlevels": mlevels, "lo": lo, "hi": hi,
                               "value": sum(k["value"] for k in kids) + p["node_reserve"]})
             self.levels.append(nodes)
             level, lowest = nodes, False
@@ -220,12 +251,13 @@ class Batch:
 
     def record(self, i):
         """Leaf i's record, as a dict of the format's fields."""
-        p, lf, r = self.p, self.leaves[i], self.p["radix"]
+        p, lf = self.p, self.leaves[i]
         levels = []
         idx = i
         for depth, nodes in enumerate(self.levels):
-            node = nodes[idx // r]
-            k = idx % r
+            j = next(j for j, nd in enumerate(nodes) if nd["lo"] <= idx < nd["hi"])
+            node = nodes[j]
+            k = idx - node["lo"]
             sib = [(c["value"], c["prog"]) for n, c in enumerate(node["kids"]) if n != k]
             level = {"children": len(node["kids"]), "index": k, "reserve": p["node_reserve"], "siblings": sib}
             if depth == 0:
@@ -235,11 +267,12 @@ class Batch:
                 level["member_index"] = m
                 level["member_path"] = [s for s, _ in mpath(node["mlevels"], m)]
             levels.append(level)
-            idx //= r
+            idx = j
         levels.reverse()                   # from the batch output down
         return {
             "template": ("vtxo", TEMPLATE_VTXO_VERSION),
-            "owner": lf["owner"], "salt": lf["salt"], "exit_delay": lf["exit_delay"],
+            "owner": lf["owner"], "owner_nonce": lf["owner_nonce"], "operator_nonce": lf["operator_nonce"],
+            "exit_delay": lf["exit_delay"],
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
             "entry_reserve": p["entry_reserve"],
             "genesis": p["genesis"], "operator": p["operator"], "token": p["token"], "notice": p["notice"],
@@ -255,7 +288,7 @@ class Batch:
 def encode(rec):
     name, ver = rec["template"]
     b = bytes([FORMAT_VERSION, TEMPLATES[name], ver])
-    b += rec["owner"] + rec["salt"] + le16(rec["exit_delay"])
+    b += rec["owner"] + rec["owner_nonce"] + rec["operator_nonce"] + le16(rec["exit_delay"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
     b += bytes([1 if rec["burn"] else 0])
@@ -286,7 +319,8 @@ def to_json(rec):
         path.append(o)
     return {
         "version": FORMAT_VERSION, "template": "%s-%d" % (name, ver),
-        "owner": rec["owner"].hex(), "salt": rec["salt"].hex(), "exit_delay_units": rec["exit_delay"],
+        "owner": rec["owner"].hex(), "owner_nonce": rec["owner_nonce"].hex(),
+        "operator_nonce": rec["operator_nonce"].hex(), "exit_delay_units": rec["exit_delay"],
         "asset": display(rec["asset"]), "value": str(rec["value"]), "unlock_hash": rec["unlock_hash"].hex(),
         "entry_reserve": str(rec["entry_reserve"]),
         "genesis_hash": display(rec["genesis"]), "operator": rec["operator"].hex(), "token": display(rec["token"]),
@@ -348,7 +382,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     for i in range(n):
         leaves.append({
             "owner": xonly("%s owner %d" % (name, i)),
-            "salt": label_hash("salt", "%s leaf %d" % (name, i)),
+            "owner_nonce": label_hash("owner nonce", "%s leaf %d" % (name, i)),
+            "operator_nonce": label_hash("operator nonce", "%s leaf %d" % (name, i)),
             "value": 10_000_000 + 1_000 * i,
             "exit_delay": odd_delay if (odd_delay and i == n - 1) else EXIT_DELAY,
             "unlock_hash": sha256(label_hash("preimage", "%s entry %d" % (name, i))),
@@ -370,12 +405,14 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     ArkBase.pad(tx)
 
     batch_prog = b.batch_spk()[2:]
+    lf_nonces = [(lf["owner_nonce"], lf["operator_nonce"]) for lf in leaves]
     records = []
     for i in (range(n) if export is None else export):
         rec = b.record(i)
         lprog = bytes(b.leaf_taps[i].scriptPubKey)[2:]
         records.append({
             "leaf": i,
+            "salt": leaf_salt(lf_nonces[i][0], lf_nonces[i][1]).hex(),
             "position": [lv["index"] for lv in rec["path"]],
             "leaf_program": lprog.hex(),
             "entry_program": bytes(b.entries[i]["tap"].scriptPubKey)[2:].hex(),
@@ -389,11 +426,13 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
             "radix": radix, "burn": burn, "node_reserve": node_reserve, "entry_reserve": entry_reserve,
             "token_issuer": {"txid": display(issuer_txid), "vout": 0, "contract_hash": bytes(32).hex()},
             "token": display(token), "notice_units": NOTICE, "expiries": p["expiries"],
-            "leaves": [{"owner": lf["owner"].hex(), "salt": lf["salt"].hex(), "value": lf["value"],
+            "leaves": [{"owner": lf["owner"].hex(), "owner_nonce": lf["owner_nonce"].hex(),
+                        "operator_nonce": lf["operator_nonce"].hex(), "value": lf["value"],
                         "exit_delay_units": lf["exit_delay"], "unlock_hash": lf["unlock_hash"].hex()}
                        for lf in leaves],
         },
         "levels": [len(lv) for lv in b.levels],
+        "children": [[nd["hi"] - nd["lo"] for nd in lv] for lv in b.levels],
         "batch_output": {"asset": display(ASSET), "value": b.root["value"],
                          "script_pubkey": b.batch_spk().hex()},
         "clock0_script_pubkey": b.clocks[0]["spk"].hex(),
@@ -406,8 +445,8 @@ def invalid_vectors(valid_binary, valid_json):
     """Encodings a decoder must refuse, each with the reason's kind."""
     v = bytes.fromhex(valid_binary)
     # Offsets of the fixed part (see the format above).
-    OWNER, EXIT, VALUE = 3, 67, 101
-    GEN = 3 + 32 + 32 + 2 + 32 + 8 + 32 + 8
+    OWNER, EXIT, VALUE = 3, 99, 133
+    GEN = 3 + 32 + 32 + 32 + 2 + 32 + 8 + 32 + 8
     NOTICE_AT = GEN + 96
     FLAGS = NOTICE_AT + 2
     EXP = FLAGS + 1
@@ -419,7 +458,8 @@ def invalid_vectors(valid_binary, valid_json):
         return v[:off] + b + v[off + len(b):]
 
     out = [
-        ("format version 2", v[:0] + b"\x02" + v[1:], "version"),
+        ("format version 1", v[:0] + b"\x01" + v[1:], "version"),
+        ("format version 3", v[:0] + b"\x03" + v[1:], "version"),
         ("template 2", put(1, b"\x02"), "template"),
         ("template vtxo, version 2", put(2, b"\x02"), "template_version"),
         ("a trailing byte", v + b"\x00", "trailing"),
@@ -451,13 +491,15 @@ def invalid_vectors(valid_binary, valid_json):
 
     jbad = [
         ("an unknown field", edit(lambda o: o.update({"extra": 1})), "field"),
-        ("a missing field", edit(lambda o: o.pop("salt")), "field"),
+        ("a missing field", edit(lambda o: o.pop("owner_nonce")), "field"),
+        ("the salt in place of the nonces", edit(lambda o: (o.pop("owner_nonce"), o.pop("operator_nonce"),
+                                                            o.update({"salt": "00" * 32}))), "field"),
         ("template vtxo-2", edit(lambda o: o.update({"template": "vtxo-2"})), "template_version"),
         ("template landing-1", edit(lambda o: o.update({"template": "landing-1"})), "template"),
-        ("format version 2", edit(lambda o: o.update({"version": 2})), "version"),
+        ("format version 1", edit(lambda o: o.update({"version": 1})), "version"),
         ("a value as a number", edit(lambda o: o.update({"value": int(j["value"])})), "type"),
         ("a value with a leading zero", edit(lambda o: o.update({"value": "0" + j["value"]})), "value"),
-        ("upper-case hex", edit(lambda o: o.update({"salt": j["salt"].upper()})), "hex"),
+        ("upper-case hex", edit(lambda o: o.update({"owner_nonce": j["owner_nonce"].upper()})), "hex"),
         ("a key one byte short", edit(lambda o: o.update({"owner": j["owner"][:-2]})), "hex"),
         ("a member path on the lowest level", edit(lambda o: o["path"][-1].update({"member_index": 1})), "field"),
         ("not JSON", "{", "json"),
@@ -471,7 +513,7 @@ def generate():
         batch_vector("five leaves", 5, 4),
         batch_vector("sixteen leaves", 16, 4, odd_delay=NOTICE * 2),
         batch_vector("seventeen leaves, issuer-operated", 17, 4, burn=True, node_reserve=3_100, entry_reserve=900),
-        batch_vector("six leaves at radix 2", 6, 2, expiries=(28,)),
+        batch_vector("ten leaves at radix 3", 10, 3, expiries=(28,)),
         batch_vector("seven leaves at radix 6", 7, 6, node_reserve=0, entry_reserve=0),
         batch_vector("sixty-four leaves", 64, 4, export=[0, 5, 21, 42, 63]),
     ]

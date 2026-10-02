@@ -25,7 +25,13 @@
 //!
 //! A pair is valid for every output that carries the leaf's script with the
 //! same asset and amount, so the salt is unique to each leaf instance and a
-//! leaf script is never funded twice.
+//! leaf script is never funded twice. The salt has a contribution from each
+//! side ([`leaf_salt`]): `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`.
+//! The owner's wallet picks its nonce fresh for every leaf it asks for, or
+//! publishes it in a receive request, and the operator adds its own. A wallet
+//! that never repeats a nonce is never given the same leaf script twice, and
+//! neither is an operator that never repeats its own. The script itself takes
+//! the salt as an opaque 32 bytes.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -41,6 +47,18 @@ use crate::Error;
 
 /// The most outputs a rebindable two-party spend commits to.
 pub const MAX_OUTPUTS: u8 = 4;
+
+/// The prefix of a leaf's salt.
+pub const SALT_TAG: &[u8; 9] = b"Arca/salt";
+
+/// A leaf's salt: `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`.
+pub fn leaf_salt(owner_nonce: &[u8; 32], operator_nonce: &[u8; 32]) -> [u8; 32] {
+	let mut b = Vec::with_capacity(SALT_TAG.len() + 64);
+	b.extend(SALT_TAG);
+	b.extend(owner_nonce);
+	b.extend(operator_nonce);
+	crate::script::sha256(&b)
+}
 
 /// The rebindable two-party script for the constant `k`, shared by the leaf
 /// and the checkpoint.

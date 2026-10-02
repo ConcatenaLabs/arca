@@ -69,7 +69,8 @@ fn the_builder_rebuilds_every_record_vector() {
 			template: Template::Vtxo1,
 			owner: key_of(&l["owner"]),
 			value: l["value"].as_u64().unwrap(),
-			salt: h32(&l["salt"]),
+			owner_nonce: h32(&l["owner_nonce"]),
+			operator_nonce: h32(&l["operator_nonce"]),
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 			unlock_hash: h32(&l["unlock_hash"]),
 		}).collect();
@@ -81,11 +82,18 @@ fn the_builder_rebuilds_every_record_vector() {
 		let widths: Vec<u64> = tree.levels().iter().map(|l| l.len() as u64).collect();
 		let expected: Vec<u64> = b["levels"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
 		assert_eq!(widths, expected, "{}: the tree's shape", name);
+		let counts: Vec<Vec<u64>> = tree.levels().iter()
+			.map(|l| l.iter().map(|nd| nd.policy.children().len() as u64).collect()).collect();
+		let expected: Vec<Vec<u64>> = b["children"].as_array().unwrap().iter()
+			.map(|l| l.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()).collect();
+		assert_eq!(counts, expected, "{}: the children of every node", name);
 		assert_eq!(tree.clock0_script_pubkey().as_bytes().to_vec(),
 			Vec::<u8>::from_hex(b["clock0_script_pubkey"].as_str().unwrap()).unwrap());
 		for r in b["records"].as_array().unwrap() {
 			let i = r["leaf"].as_u64().unwrap() as usize;
 			let rec = tree.record(i);
+			assert_eq!(hexstr(&rec.salt()), r["salt"].as_str().unwrap(), "{} / leaf {}: salt", name, i);
+			assert_eq!(rec.salt(), tree.leaves()[i].leaf.salt);
 			assert_eq!(hexstr(&rec.to_bytes().unwrap()), r["binary"].as_str().unwrap(), "{} / leaf {}: binary", name, i);
 			assert_eq!(rec.to_json_string().unwrap(), r["json"].as_str().unwrap(), "{} / leaf {}: JSON", name, i);
 			assert_eq!(rec.leaf_id().unwrap().to_string(), r["leaf_id"].as_str().unwrap(), "{} / leaf {}: id", name, i);
@@ -138,7 +146,7 @@ impl Fx {
 	fn batch(&self, n: usize, radix: usize, label: &str) -> Batch {
 		let created = MedianTime::from_consensus(1_791_000_000).unwrap();
 		let day = 86_400;
-		let issuer = OutPoint::new(Txid::from_raw_hash(sha256d::Hash::hash(format!("{} issuer", label).as_bytes())), 3);
+		let issuer = issuer_of(label);
 		let token = AssetId::new_issuance(issuer, ContractHash::from_byte_array([0; 32]));
 		let e = |d: u32| MedianTime::from_consensus(1_791_000_000 + d * day).unwrap();
 		let w = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
@@ -151,9 +159,18 @@ impl Fx {
 		let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
 		let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
 			template: Template::Vtxo1, owner: xonly(&owners[i]), value: 1_000_000 + 7 * i as u64,
-			salt: label32(&format!("{} salt {}", label, i)), exit_delay: w, unlock_hash: sha256(&preimages[i]),
+			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
+			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
+			exit_delay: w, unlock_hash: sha256(&preimages[i]),
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
+		let round = self.round(&tree, issuer);
+		Batch { tree, owners, preimages, round, created }
+	}
+
+	/// The round that funds `tree`, issuing its token from `issuer`.
+	fn round(&self, tree: &Tree, issuer: OutPoint) -> Transaction {
+		let token = tree.params().schedule.token;
 		let mut round = Spend::new(0).input(issuer, explicit(self.x, 10_000_000_000, op_true().script_pubkey()), 0xffff_ffff)
 			.outputs(vec![tree.batch_output().txout(), explicit(token, 1, tree.clock0_script_pubkey()), fee(self.x, 2_000)]).tx;
 		round.input[0].asset_issuance = AssetIssuance {
@@ -161,7 +178,7 @@ impl Fx {
 			amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,
 			denomination: 0,
 		};
-		Batch { tree, owners, preimages, round, created }
+		round
 	}
 
 	fn verify(&self, what: &str, u: &UnrollTx) {
@@ -172,6 +189,10 @@ impl Fx {
 	}
 }
 
+fn issuer_of(label: &str) -> OutPoint {
+	OutPoint::new(Txid::from_raw_hash(sha256d::Hash::hash(format!("{} issuer", label).as_bytes())), 3)
+}
+
 #[derive(Default, Debug)]
 struct Totals {
 	trees: usize,
@@ -180,6 +201,13 @@ struct Totals {
 	entry_txs: usize,
 	mutated: usize,
 	distinct_nodes: usize,
+	/// The widest spread, over the trees, of one leaf's exit (its nodes and
+	/// entry, reserve fees) between the leaves of one batch, in vbytes, with
+	/// the smallest node transaction of that batch beside it.
+	worst_exit_spread: (usize, usize, usize),
+	/// The widest spread of a leaf's share of a full exit, in nodes: each
+	/// node counted as one divided among the leaves under it.
+	worst_share_spread: (f64, usize),
 }
 
 fn fee_coin(fx: &Fx, label: &str) -> FeeSource {
@@ -197,6 +225,20 @@ fn run_tree(fx: &Fx, n: usize, radix: usize, external: bool, totals: &mut Totals
 	let b = fx.batch(n, radix, &label);
 	let round_txid = b.round.txid();
 	let mut nodes_seen = HashSet::new();
+
+	// No node of one child but the batch output of a batch of one leaf, every
+	// node 2 to `radix`, and the children of a level spread evenly.
+	for level in b.tree.levels() {
+		let counts: Vec<usize> = level.iter().map(|nd| nd.policy.children().len()).collect();
+		for c in &counts {
+			assert!(*c <= radix && (*c >= 2 || n == 1), "{}: a node of {} children: {:?}", label, c, counts);
+		}
+		assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{}: uneven {:?}", label, counts);
+		assert!(counts.windows(2).all(|w| w[0] >= w[1]), "{}: the larger nodes first {:?}", label, counts);
+	}
+	let mut solo: Vec<usize> = vec![];
+	let mut share: Vec<f64> = vec![];
+	let mut node_vsize = usize::MAX;
 	for i in 0..n {
 		let ctx = format!("{} / leaf {}", label, i);
 		let rec = b.tree.record(i);
@@ -242,6 +284,12 @@ fn run_tree(fx: &Fx, n: usize, radix: usize, external: bool, totals: &mut Totals
 		fx.verify(&format!("{}: entry, reserve fee", ctx), &e);
 		totals.entry_txs += 1;
 
+		// What this leaf's exit costs: alone, and as its share of a full exit.
+		assert_eq!(txs.len(), b.tree.levels().len(), "{}: every leaf sits at the same depth", ctx);
+		solo.push(txs.iter().map(|u| u.tx.vsize()).sum::<usize>() + e.tx.vsize());
+		share.push(b.tree.path(i).iter().map(|(nd, _)| 1.0 / nd.leaves.len() as f64).sum());
+		node_vsize = node_vsize.min(txs.iter().map(|u| u.tx.vsize()).min().unwrap());
+
 		// A fee coin the broadcaster attaches pays every fee instead.
 		if external {
 			let fees: Vec<FeeSource> = (0..branch.nodes.len()).map(|l| fee_coin(fx, &format!("{} fee {}", ctx, l))).collect();
@@ -261,6 +309,16 @@ fn run_tree(fx: &Fx, n: usize, radix: usize, external: bool, totals: &mut Totals
 		}
 		totals.branches += 1;
 	}
+	let spread = solo.iter().max().unwrap() - solo.iter().min().unwrap();
+	assert!(spread <= node_vsize, "{}: exits differ by {} vB, more than a node of {} vB", label, spread, node_vsize);
+	if spread > totals.worst_exit_spread.0 {
+		totals.worst_exit_spread = (spread, node_vsize, n);
+	}
+	let shares = share.iter().cloned().fold(f64::MIN, f64::max) - share.iter().cloned().fold(f64::MAX, f64::min);
+	assert!(shares < 1.0, "{}: shares of a full exit differ by {:.2} nodes", label, shares);
+	if shares > totals.worst_share_spread.0 {
+		totals.worst_share_spread = (shares, n);
+	}
 	totals.trees += 1;
 }
 
@@ -273,12 +331,12 @@ fn every_branch_of_every_tree_from_1_to_100_leaves() {
 	}
 	println!("radix 4, 1 to 100 leaves: {:?}", totals);
 	let mut other = Totals::default();
-	for radix in [2, 3, 5, 6] {
+	for radix in [3, 5, 6] {
 		for n in 1..=40 {
 			run_tree(&fx, n, radix, false, &mut other);
 		}
 	}
-	println!("radix 2, 3, 5 and 6, 1 to 40 leaves, reserve fees: {:?}", other);
+	println!("radix 3, 5 and 6, 1 to 40 leaves, reserve fees: {:?}", other);
 }
 
 #[test]
@@ -316,7 +374,7 @@ fn the_builder_refuses() {
 	let params = b.tree.params().clone();
 	let leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec).collect();
 	assert_eq!(Tree::build(params.clone(), &[]).unwrap_err(), TreeError::NoLeaves);
-	for radix in [0, 1, 7] {
+	for radix in [0, 1, 2, 7] {
 		assert_eq!(Tree::build(TreeParams { radix, ..params.clone() }, &leaves).unwrap_err(), TreeError::Radix(radix));
 	}
 	let mut small = leaves.clone();
@@ -325,9 +383,19 @@ fn the_builder_refuses() {
 	let mut zero = leaves.clone();
 	zero[2].value = 0;
 	assert!(matches!(Tree::build(TreeParams { min_leaf: 0, ..params.clone() }, &zero).unwrap_err(), TreeError::LeafValue { leaf: 2, .. }));
+	// A leaf twice: its operator nonce repeats, which the builder refuses
+	// before it looks at the script (the same script from different nonces
+	// would need a SHA256 collision).
 	let mut twice = leaves.clone();
 	twice[2] = twice[0];
-	assert_eq!(Tree::build(params.clone(), &twice).unwrap_err(), TreeError::DuplicateLeaf { first: 0, second: 2 });
+	assert_eq!(Tree::build(params.clone(), &twice).unwrap_err(), TreeError::DuplicateOperatorNonce { first: 0, second: 2 });
+	let mut nonce_twice = leaves.clone();
+	nonce_twice[1].operator_nonce = nonce_twice[0].operator_nonce;
+	assert_eq!(Tree::build(params.clone(), &nonce_twice).unwrap_err(), TreeError::DuplicateOperatorNonce { first: 0, second: 1 });
+	// The owner nonce may repeat across owners: the salts differ.
+	let mut owner_twice = leaves.clone();
+	owner_twice[1].owner_nonce = owner_twice[0].owner_nonce;
+	assert!(Tree::build(params.clone(), &owner_twice).is_ok());
 	let mut huge = leaves.clone();
 	for l in &mut huge {
 		l.value = arca_covenant::record::MAX_VALUE / 2;
@@ -366,4 +434,49 @@ fn a_1024_leaf_batch_matches_the_specification_sizes() {
 		println!("1,024 leaves, leaf {:>4}: member depths {:?}, unrolls {:?} vB, record {} bytes", i, depths, sizes,
 			records[i].to_bytes().unwrap().len());
 	}
+}
+
+#[test]
+fn a_record_whose_salt_lacks_the_owner_nonce_is_refused() {
+	let fx = Fx::new();
+	let label = "salt rule";
+	let b = fx.batch(5, 4, label);
+	let i = 2;
+	let owner = xonly(&b.owners[i]);
+	let picked = b.tree.leaves()[i].spec.owner_nonce;
+	let rec = b.tree.record(i);
+	rec.validate(&b.round).unwrap();
+	rec.check_owner(&owner, &picked).unwrap();
+	assert_eq!(rec.salt(), arca_covenant::leaf::leaf_salt(&picked, &rec.operator_nonce));
+
+	// The record names another owner nonce: the salt it implies is not the
+	// one on-chain, so the round pays no such batch output; and it is not
+	// the nonce the wallet picked.
+	let mut other = rec.clone();
+	other.owner_nonce = label32("not the wallet's nonce");
+	assert_eq!(other.validate(&b.round).unwrap_err().kind(), "batch_output");
+	assert_eq!(other.check_owner(&owner, &picked).unwrap_err().kind(), "owner");
+	let mut other_op = rec.clone();
+	other_op.operator_nonce = label32("not the operator's nonce");
+	assert_eq!(other_op.validate(&b.round).unwrap_err().kind(), "batch_output");
+
+	// The operator builds the leaf from a nonce of its own choosing in place
+	// of the wallet's. If its record says so, the round validates it and the
+	// wallet's check refuses it; if the record names the wallet's nonce, the
+	// round refuses it.
+	let mut leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec).collect();
+	leaves[i].owner_nonce = label32("the operator's substitute");
+	let swapped = Tree::build(b.tree.params().clone(), &leaves).unwrap();
+	let round = fx.round(&swapped, issuer_of(label));
+	let honest = swapped.record(i);
+	honest.validate(&round).unwrap();
+	assert_eq!(honest.check_owner(&owner, &picked).unwrap_err().to_string(),
+		"the record's owner nonce is not the one the wallet picked for this leaf");
+	let mut lying = honest.clone();
+	lying.owner_nonce = picked;
+	assert_eq!(lying.validate(&round).unwrap_err().to_string(),
+		"the round pays no output equal to the batch output the record rebuilds");
+	// And a record for another key.
+	assert_eq!(rec.check_owner(&xonly(&b.owners[0]), &picked).unwrap_err().to_string(), "the record is for another owner's key");
+	println!("salt rule: wrong owner nonce, wrong operator nonce, substituted nonce stated as the wallet's: refused");
 }
