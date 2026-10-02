@@ -69,7 +69,7 @@ pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
 pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
-pub use record::{Branch, BranchNode, LeafId, LeafRecord, RecordError, Template, ValidLeaf};
+pub use record::{Branch, BranchNode, LeafId, LeafRecord, RecordError, Template, ValidLeaf, WalletPolicy};
 pub use script::{Child, ExplicitOutput};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;

@@ -87,7 +87,7 @@ pub fn round_check(data: &[u8]) {
 	let schedule = ClockSchedule::new(token, key, RelativeTime::from_units(254).unwrap(),
 		vec![MedianTime::from_consensus(1_800_000_000).unwrap()]).unwrap();
 	let sweeps = [schedule.sweep(false, false), schedule.sweep(true, false)];
-	if let Err(e) = check_round(&tx, &schedule, &sweeps) {
+	if let Err(e) = check_round(&tx, &schedule, &sweeps[0], &sweeps[1..]) {
 		oracle_assert!((1..=5).contains(&e.check()));
 	}
 }

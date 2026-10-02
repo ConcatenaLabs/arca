@@ -118,13 +118,17 @@ class T16(Ark3, ArkBase, BitcoinTestFramework):
                     N + "committed_output_script_changed")
         evil = bytes([0x00, 0x21]) + bytes(recv.scriptPubKey)[2:] + b"\x01"
         self.reject(spend(leaf2, outputs=[self.out(V0, evil, self.X_OUT), committed[1]]),
-                    N + "committed_output_v0_33byte_program_substitution")
+                    N + "committed_output_v0_33byte_program_substitution",
+                    # the mempool refuses the non-standard output first
+                    block="Invalid Schnorr signature")
         self.reject(spend(leaf2, outputs=[committed[1], committed[0]]), N + "outputs_reordered")
         self.reject(spend(leaf2, m=1), N + "wrong_m_1_with_sigs_for_2")
         self.reject(spend(leaf2, m=3, outputs=committed + [self.out(100, self.wallet_spk(), self.X_OUT)]),
                     N + "wrong_m_3_with_sigs_for_2")
         self.reject(spend(leaf2, raw_m=b""), N + "m_empty")
-        self.reject(spend(leaf2, raw_m=b"\x00"), N + "m_zero_byte")
+        # the mempool refuses the non-minimal push first; in a block m = 0 is
+        # outside 1 to 4
+        self.reject(spend(leaf2, raw_m=b"\x00"), N + "m_zero_byte", block="Script failed an OP_VERIFY operation")
         self.reject(spend(leaf2, m=5), N + "m_above_M")
         self.reject(spend(leaf2, raw_m=b"\x02\x00"), N + "m_two_bytes_nonminimal")
         os_, oa = self.sigs(_os.urandom(32), outs)

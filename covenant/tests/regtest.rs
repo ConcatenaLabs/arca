@@ -91,7 +91,9 @@ fn op_true_spk() -> Script {
 impl Net {
 	fn start() -> Net {
 		let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("covenant-regtest-{}", std::process::id()));
-		let rt = Regtest::from_env(&dir, &[]);
+		// Scripts are checked inline, so a block refused for a script failure
+		// names it, and each negative case asserts why its block was refused.
+		let rt = Regtest::from_env(&dir, &["-par=1"]);
 		let c = rt.client();
 		let genesis = c.genesis_hash().unwrap();
 		let info: Value = c.call("getsidechaininfo", &[]).unwrap();
@@ -292,9 +294,22 @@ impl Net {
 			Err(e) => panic!("{}: {}", name, e),
 		};
 		assert_eq!(self.height(), h0);
+		let why = block_reason(&reason);
+		assert!(block.contains(&why), "{}: the block was refused with {:?}, not for the mempool's reason {:?}", name, block, why);
 		self.refused += 1;
 		self.rows.push(Row { name: name.into(), vsize: String::new(), mempool: send, block });
-		let _ = reason;
+	}
+
+	/// Accepted by the mempool and mined if this node's relay policy allows
+	/// it; otherwise refused by relay policy with `expect` and mined with
+	/// `generateblock`. Either way the block takes it.
+	fn pass_or_mine(&mut self, name: &str, tx: &Transaction, expect: &str) -> Txid {
+		let r = self.rt.client().test_mempool_accept(&[tx]).unwrap().remove(0);
+		if r.allowed {
+			self.pass(name, tx)
+		} else {
+			self.mine_policy_refused(name, tx, expect)
+		}
 	}
 
 	/// Refused by relay policy with `expect`, valid in a block: mined with
@@ -339,6 +354,16 @@ fn delay() -> RelativeTime {
 
 fn mt(t: u64) -> MedianTime {
 	MedianTime::from_consensus(t as u32).unwrap()
+}
+
+/// What a block refused by a node checking scripts inline reports for a
+/// transaction the mempool refused with `mempool`: the same script failure,
+/// or for a lock not yet reached `bad-txns-nonfinal`.
+fn block_reason(mempool: &str) -> String {
+	match mempool {
+		"non-final" | "non-BIP68-final" => "bad-txns-nonfinal".into(),
+		other => other.into(),
+	}
 }
 
 /// A transaction under assembly whose inputs are coins.
@@ -441,7 +466,8 @@ fn round(net: &mut Net, name: &str, issuer: Coin, batch: &Batch) -> RoundOut {
 	s.witness(0, op_true_witness());
 	// What a wallet runs before it accepts a leaf of this batch.
 	for i in [0, 5, 15] {
-		check_round(&s.tx, &batch.schedule, &batch.sweeps_above(i)).unwrap();
+		let sweeps = batch.sweeps_above(i);
+		check_round(&s.tx, &batch.schedule, &sweeps[0], &sweeps[1..]).unwrap();
 	}
 	let txid = net.pass(name, &s.tx);
 	net.purse.push(coin_of(txid, 2, &s.tx));
@@ -1014,16 +1040,17 @@ fn burn(net: &mut Net) {
 	let tx = burn_tx(net, &sched2, &[n0, n1], &at_r2,
 		vec![explicit(net.x, lv, burn_spk.clone()), t_back2.clone(), explicit(net.x, lv, op_true_spk())], &s_key);
 	net.refuse("burn/neg two lowest nodes sharing one burn output", &tx, "Script failed an OP_EQUALVERIFY operation");
-	// Each node burns at its own index, the token going back to R after them:
-	// valid, but two OP_RETURN outputs are not standard, so it relays only
-	// one node at a time; here a producer mines it.
+	// Each node burns at its own index, the token going back to R after them.
+	// A node relays several bare OP_RETURN burns in one transaction; one whose
+	// relay policy still counts each against the one-OP_RETURN limit refuses
+	// it (multi-op-return), and a producer mines it.
 	let tx = burn_tx(net, &sched2, &[n0, n1], &at_r2,
 		vec![explicit(net.x, lv, burn_spk.clone()), explicit(net.x, lv, burn_spk.clone()), t_back2], &s_key);
-	let bt2 = net.mine_policy_refused("burn/two lowest nodes burned in one transaction", &tx, "multi-op-return");
+	let bt2 = net.pass_or_mine("burn/two lowest nodes burned in one transaction", &tx, "multi-op-return");
 	for i in [0, 1] {
 		assert!(net.rpc("gettxout", json!([bt2.to_string(), i])).is_null());
 	}
-	// One node per transaction relays: the token, back at R, waits W again.
+	// The next node: the token, back at R, waits W again.
 	let at_r2 = coin_of(bt2, 2, &tx);
 	let n2 = (&b2.lowest[2], &lowest2[2], w);
 	let tx = burn_tx(net, &sched2, &[n2], &at_r2, vec![explicit(net.x, lv, burn_spk.clone()), explicit(sched2.token, 1, sched2.r().script_pubkey())], &s_key);
@@ -1098,18 +1125,20 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 	let round_txid = net.pass(&format!("{} / the round", label), &s.tx);
 	net.purse.push(coin_of(round_txid, 2, &s.tx));
 
-	// Every owner checks its record against the round as the chain has it.
+	// Every owner checks its record against the round as the chain has it,
+	// under its wallet's policy, for its key and the nonce it picked.
 	let round = net.rt.client().raw_transaction(&round_txid).unwrap();
+	let policy = WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp()));
 	let records: Vec<Vec<u8>> = tree.records().iter().map(|r| r.to_bytes().unwrap()).collect();
 	for (i, bytes) in records.iter().enumerate() {
 		let rec = LeafRecord::from_bytes(bytes).unwrap();
-		let ok = rec.validate(&round).unwrap_or_else(|e| panic!("{} / leaf {}: {}", label, i, e));
-		assert_eq!(ok.batch_vout, 0);
-		rec.check_owner(&xonly(&owners[i]), &leaves[i].owner_nonce).unwrap();
+		let ok = rec.validate(&round, &policy, &xonly(&owners[i]), &leaves[i].owner_nonce)
+			.unwrap_or_else(|e| panic!("{} / leaf {}: {}", label, i, e));
+		assert_eq!((ok.batch_vout, ok.round_txid), (0, round_txid));
 		// A record naming another owner nonce than the one in the leaf's salt.
 		let mut other = rec.clone();
 		other.owner_nonce = label32(&format!("{} not the owner nonce {}", label, i));
-		assert_eq!(other.validate(&round).unwrap_err().kind(), "batch_output");
+		assert_eq!(other.validate(&round, &policy, &xonly(&owners[i]), &other.owner_nonce).unwrap_err().kind(), "batch_output");
 	}
 	println!("{}: {} records validate against the confirmed round {}", label, n, round_txid);
 
@@ -1119,7 +1148,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 		let external = k == 1;
 		let shape = if external { ", fee coin" } else { "" };
 		let rec = LeafRecord::from_bytes(&records[i]).unwrap();
-		let branch = rec.validate(&round).unwrap().branch;
+		let branch = rec.validate(&round, &policy, &xonly(&owners[i]), &leaves[i].owner_nonce).unwrap().branch;
 		let owner = &owners[i];
 		let mut at = OutPoint::new(round_txid, 0);
 		for (level, node) in branch.nodes.iter().enumerate() {
@@ -1236,6 +1265,122 @@ fn built_trees(net: &mut Net) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 8. The review's probes B and F, turned around
+// ---------------------------------------------------------------------------
+
+/// A round that issues `sched`'s token from `issuer` and pays `batch` at 0
+/// and the token's atom to clock 0 at 1.
+fn plain_round(net: &mut Net, name: &str, issuer: &Coin, sched: &ClockSchedule, batch: &ExplicitOutput) -> (Txid, Transaction) {
+	let total = issuer.txout.value.explicit().unwrap();
+	let mut s = spend(0).coin(issuer, 0xffff_ffff).outputs(vec![
+		batch.txout(), explicit(sched.token, 1, sched.clock0_script_pubkey()),
+		explicit(net.x, total - batch.value - 2_000, op_true_spk()), fee(net.x, 2_000),
+	]);
+	s.tx.input[0].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
+		amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,
+		denomination: 0,
+	};
+	s.witness(0, op_true_witness());
+	let txid = net.pass(name, &s.tx);
+	net.purse.push(coin_of(txid, 2, &s.tx));
+	(txid, net.rt.client().raw_transaction(&txid).unwrap())
+}
+
+fn probes_turned_around(net: &mut Net) {
+	let day = 24 * H as u64;
+
+	// Probe B: one key on two leaves lets one release fill two RECLAIM slots.
+	// The builder refuses that batch; built by hand and funded, each record of
+	// the key that holds two leaves is refused by validation.
+	let s_key = keypair("probe B operator");
+	let a = keypair("probe B owner A, two leaves");
+	let (b, c) = (keypair("probe B owner B"), keypair("probe B owner C"));
+	let keys = [&a, &a, &b, &c];
+	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
+	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s_key), delay(),
+		vec![mt(net.now() + 28 * day), mt(net.now() + 56 * day)]).unwrap();
+	let specs: Vec<LeafSpec> = (0..4).map(|i| LeafSpec {
+		template: Template::Vtxo1, owner: xonly(keys[i]), value: LEAF,
+		owner_nonce: label32(&format!("probe B owner nonce {}", i)),
+		operator_nonce: label32(&format!("probe B operator nonce {}", i)),
+		exit_delay: delay(), unlock_hash: sha256(&label32(&format!("probe B preimage {}", i))),
+	}).collect();
+	let params = TreeParams {
+		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
+		reserve: ReserveRule::Fixed { node: NODE_RESERVE, entry: ENTRY_RESERVE }, min_leaf: 1,
+	};
+	assert_eq!(Tree::build(params.clone(), &specs).unwrap_err(), TreeError::DuplicateOwner { first: 0, second: 1 });
+	// By hand: the four entries under one node, gated to [S, A, A, B, C],
+	// whose RECLAIM names A twice.
+	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
+		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay() };
+		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
+			sweep: sched.sweep(true, false) };
+		(leaf, entry)
+	}).collect();
+	let children: Vec<Child> = entries.iter().map(|(_, e)| Child::new(net.x, LEAF + ENTRY_RESERVE, e.taproot().program())).collect();
+	let node = NodePolicy::new(children.clone(), xonly(&s_key), specs.iter().map(|sp| sp.owner).collect(),
+		sched.sweep(false, false), Some(net.chain)).unwrap();
+	let batch = ExplicitOutput::new(net.x, 4 * (LEAF + ENTRY_RESERVE) + NODE_RESERVE, node.script_pubkey());
+	let (round_txid, round) = plain_round(net, "probe B turned around / round with key A on leaves 0 and 1", &issuer, &sched, &batch);
+	let policy = WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp()));
+	for i in 0..4 {
+		let others: Vec<usize> = (0..4).filter(|j| *j != i).collect();
+		let rec = LeafRecord {
+			template: Template::Vtxo1, owner: specs[i].owner, owner_nonce: specs[i].owner_nonce,
+			operator_nonce: specs[i].operator_nonce, exit_delay: delay(), asset: net.x, value: LEAF,
+			unlock_hash: specs[i].unlock_hash, entry_reserve: ENTRY_RESERVE, chain: net.chain, schedule: sched.clone(),
+			burn: false, upper: vec![],
+			lowest: arca_covenant::record::LowestLevel {
+				index: i as u8, reserve: NODE_RESERVE,
+				siblings: others.iter().map(|j| arca_covenant::record::Sibling { value: children[*j].value, program: children[*j].program }).collect(),
+				owners: others.iter().map(|j| specs[*j].owner).collect(),
+			},
+		};
+		let r = rec.validate(&round, &policy, &specs[i].owner, &specs[i].owner_nonce);
+		if i < 2 {
+			let e = r.unwrap_err();
+			assert_eq!(e.kind(), "owner", "leaf {}: {}", i, e);
+			println!("probe B turned around: A's record of leaf {} against the confirmed round {}: refused, {}", i, round_txid, e);
+		} else {
+			r.unwrap_or_else(|e| panic!("probe B: leaf {} of another key: {}", i, e));
+		}
+	}
+
+	// Probe F: the operator builds a new leaf from a salt the owner signed
+	// under before, so the old forfeit pair would spend it. With the
+	// two-sided salt, the wallet's random nonce for the new leaf is not in
+	// that salt: a record that says so is refused, and one that names the
+	// wallet's nonce does not match the round.
+	let s_key = keypair("probe F operator");
+	let owner = keypair("probe F owner");
+	let old_nonce = label32("probe F nonce of an old leaf");
+	let old_op = label32("probe F operator nonce of an old leaf");
+	let fresh = label32("probe F the wallet's random nonce for the new leaf");
+	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
+	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s_key), delay(),
+		vec![mt(net.now() + 28 * day), mt(net.now() + 56 * day)]).unwrap();
+	let replayed = LeafSpec {
+		template: Template::Vtxo1, owner: xonly(&owner), value: LEAF, owner_nonce: old_nonce, operator_nonce: old_op,
+		exit_delay: delay(), unlock_hash: sha256(&label32("probe F new entry preimage")),
+	};
+	let tree = Tree::build(TreeParams { schedule: sched.clone(), ..params.clone() }, &[replayed]).unwrap();
+	let (_, round) = plain_round(net, "probe F turned around / round with a replayed salt", &issuer, &sched, &tree.batch_output());
+	let policy = WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp()));
+	let rec = tree.record(0);
+	assert_eq!(rec.salt(), arca_covenant::leaf::leaf_salt(&old_nonce, &old_op));
+	let e = rec.validate(&round, &policy, &xonly(&owner), &fresh).unwrap_err();
+	assert_eq!(e.to_string(), "the record's owner nonce is not the one the wallet picked for this leaf");
+	println!("probe F turned around: the record built from the old salt: refused, {}", e);
+	let mut lying = rec.clone();
+	lying.owner_nonce = fresh;
+	let e = lying.validate(&round, &policy, &xonly(&owner), &fresh).unwrap_err();
+	assert_eq!(e.kind(), "batch_output");
+	println!("probe F turned around: the same leaf, recorded with the wallet's nonce: refused, {}", e);
+}
+
 #[test]
 fn frozen_constructions_on_regtest() {
 	let mut net = Net::start();
@@ -1247,6 +1392,7 @@ fn frozen_constructions_on_regtest() {
 	entry_sweep(&mut net);
 	burn(&mut net);
 	built_trees(&mut net);
+	probes_turned_around(&mut net);
 	net.print();
 	assert!(net.refused >= 30, "only {} negative cases", net.refused);
 }

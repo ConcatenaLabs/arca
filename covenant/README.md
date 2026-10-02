@@ -55,8 +55,9 @@ tx.input[i].witness.script_witness = w;
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
 It names the leaf's template and version (`vtxo-1`), the owner's key, the two
-nonces the salt is built from, the exit delay, the asset and value, the entry in front of the leaf (its unlock
-hash and reserve), the batch's chain, token and clock schedule
+nonces the salt is built from, the exit delay, the asset and value, the entry in
+front of the leaf (its unlock hash and reserve), the batch's chain, token and
+clock schedule
 `(T, S, W, E_0 … E_K)` (`R` is rebuilt from `W` and `S`), whether its sweeps
 are burn-only, and the path from the batch output down to the leaf. Each level
 of the path holds the index of the child on the leaf's path, the node's reserve
@@ -65,30 +66,55 @@ node's member tree, and at the lowest node the other owners, whose keys that
 node's RECLAIM names.
 
 ```rust
-use arca_covenant::LeafRecord;
+use arca_covenant::{LeafRecord, WalletPolicy};
 
 let record = LeafRecord::from_bytes(&bytes)?;          // or LeafRecord::from_json_str(text)?
-let valid = record.validate(&round_tx)?;               // the batch output, then the five checks
+let policy = WalletPolicy::new(chain, operator, now);  // the wallet's chain, the operator it was told, now
+let valid = record.validate(&round_tx, &policy, &leaf_key, &leaf_nonce)?;
 let id = valid.leaf_id;                                // what the server keys the leaf by
+let round = valid.round_txid;                          // the round it was checked against
 let branch = valid.branch;                             // every output from the batch output down
-record.check_owner(&my_key, &my_nonce)?;               // the nonce this wallet picked for the leaf
 ```
 
-A leaf's salt has a contribution from each side:
-`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`. The owner's wallet picks
-`owner_nonce` fresh for every leaf it asks for (or publishes it in a receive
-request), and the operator adds its own. The record carries both nonces and
-rebuilds the salt from them, so a wallet checks with `check_owner` that the
-nonce in the record is the one it picked, and `validate` shows the leaf on-chain
-was built from it. A wallet that never repeats a nonce is never given the same
-leaf script twice, which is what keeps a rebindable signature pair to one coin.
+**One key, one leaf.** A leaf's owner key signs for that leaf only: every leaf
+instance, every receive included, has a key of its own. Where one key held two
+leaves, the operator could take one, by building a new leaf from a salt the owner
+had signed under, by one release filling two slots of a RECLAIM, or by merging
+two forfeits. The builder refuses a key on two leaves of a batch, and a record
+whose lowest level names its own key in another slot is refused.
 
-`validate` rebuilds every script on the path from the record, requires the
-round to pay exactly one output equal to the batch output it rebuilds (asset,
-value and script), so the leaf is where the record says, and runs the five
-client checks on the token and its clock. A wallet accepts a leaf only after
-that, and only once the round is final. `validate_batch_output` checks the path
-against one output and leaves out the clock, which only the round shows.
+**A salt from both sides.** A leaf's salt is
+`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`. The owner's wallet picks
+`owner_nonce` at random for every leaf it asks for (or publishes it in a receive
+request), never from a counter, which a restore would repeat; the operator adds
+its own. The record carries both nonces and rebuilds the salt from them.
+`validate` takes the key and the nonce the wallet expects for this leaf and
+refuses a record not built from them, so a wallet that never repeats a nonce is
+never given a leaf script it has signed for before.
+
+**The wallet's policy.** `validate` is the check a wallet runs before it accepts
+a leaf. It refuses a record outside the wallet's `WalletPolicy`: another chain,
+an operator key other than the one the wallet was told, a notice `W` below the
+wallet's minimum, a first expiry `E_0` sooner than the wallet's horizon after
+now, or an exit delay out of bounds. `WalletPolicy::new` takes the
+specification's parameters: `W` at least 36 hours, `E_0` at least 27 days after
+now (a batch expires 28 days after its round; the day between is for the round
+to become final), an exit delay of 36 to 48 hours. Then it rebuilds every script
+on the path, requires the round to pay exactly one output equal to the batch
+output it rebuilds (asset, value and script), so the leaf is where the record
+says, and runs the five client checks on the token and its clock, every sweep
+below the batch output carrying the notice. A wallet accepts a leaf only after
+that, and only once the round is final.
+
+`valid.round_txid` names the round the leaf was checked against. After a
+rollback that disconnects it, another transaction can pay the same batch output,
+even spending the same issuing coin, and may fail the checks: the wallet checks
+again whichever transaction now pays its batch output, and unrolls at once if
+that fails, `W` after the replacement being the time it has.
+`validate_round` is the same check without the owner's key and nonce, for a
+leaf the wallet does not own; `validate_batch_output` checks the path against
+one output and leaves out the clock, which only the round shows, and the
+policy.
 
 The leaf id is never an outpoint. It is the BIP340 tagged hash, tag
 `Arca/leaf-id`, of the batch output's witness program, the number of levels, the
@@ -157,7 +183,7 @@ depends on. The owner authorises each node with a signature over
 and supplies its own member proof.
 
 ```rust
-let branch = record.validate(&round)?.branch;
+let branch = record.validate(&round, &policy, &leaf_key, &leaf_nonce)?.branch;
 let auths: Vec<_> = branch.nodes.iter()
 	.map(|n| n.owner_auth(sign(&n.unroll_authorisation(t).digest), t, owner))
 	.collect();
@@ -219,15 +245,22 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   builder, every record checked against the confirmed round and three leaves in
   different subtrees unrolled from their records, unlocked and exited: every
   spend confirms, and every negative case is refused by the mempool and again
-  when forced into a block with `generateblock`.
+  when forced into a block with `generateblock`, the block for the same reason
+  (the node runs with `-par=1`, so a block refused by a script names the
+  failure). It also funds the review's attacks, turned around: a batch whose
+  key holds two leaves and a leaf built from a salt the owner signed under
+  before; validation refuses each owner's record against the confirmed round.
 
 The decoders and readers, the record's two among them, are fuzz targets in
 [fuzz/](../fuzz/README.md).
 
 ## Relay policy to plan around
 
-Two OP_RETURN outputs in one transaction are not standard (`multi-op-return`),
-so a burn-only sweep relays one node per transaction, and each one waits `W` at
-`R` for the token. A block producer can still mine several in one. A witness item
+The node's relay policy allows one data-carrying OP_RETURN output per
+transaction (`multi-op-return`), but a bare OP_RETURN, the burn-only sweep's
+output, carries no data and does not count, so one sweep can burn several nodes,
+each at its own index. A node whose policy still counts every OP_RETURN refuses
+that transaction; a block producer can mine it all the same. Every sweep returns
+the token to `R`, where it waits `W` again before the next. A witness item
 that is not minimally encoded (the sweep's `k`, say) is refused by the mempool and
 accepted in a block; it changes the witness, not what the spend does.

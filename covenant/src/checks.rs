@@ -14,8 +14,8 @@
 //!    `T` or an asset the wallet cannot see.
 //! 5. That output's script is clock 0 rebuilt from the published schedule;
 //!    every sweep path above the leaf names that `T`, `S` and `R` rebuilt from
-//!    `W` and `S`, and a notice that is `W` or, on the batch output, none; and
-//!    `E_0 ≤ E_1 ≤ … ≤ E_K`.
+//!    `W` and `S`; every one below the batch output waits the notice `W`, and
+//!    the batch output's waits `W` or nothing; and `E_0 ≤ E_1 ≤ … ≤ E_K`.
 //!
 //! The fifth matters most: the later clocks are hidden inside the first
 //! clock's taproot commitment, and nothing in the round transaction shows them.
@@ -52,6 +52,8 @@ pub enum RoundCheckFailure {
 	NotClockZero,
 	#[error("check 5: sweep path {0} does not name the schedule's token, operator, R and notice")]
 	SweepMismatch(usize),
+	#[error("check 5: sweep path {0} is below the batch output and has no notice")]
+	NoNotice(usize),
 	#[error("check 5: the schedule runs backwards at step {0}")]
 	ScheduleBackwards(usize),
 }
@@ -65,15 +67,19 @@ impl RoundCheckFailure {
 			NotExplicit => 2,
 			ReissuanceToken | Reissued(_) => 3,
 			TokenOutputs(_) | TokenOutputNotOneAtom | BlindedOutput(_) | TokenAtR => 4,
-			NotClockZero | SweepMismatch(_) | ScheduleBackwards(_) => 5,
+			NotClockZero | SweepMismatch(_) | NoNotice(_) | ScheduleBackwards(_) => 5,
 		}
 	}
 }
 
 /// Runs the five checks on `round` against the published `schedule` and the
-/// sweep paths of every output above the leaf (`sweeps`). Returns the first
-/// check that fails, in order.
-pub fn check_round(round: &Transaction, schedule: &ClockSchedule, sweeps: &[Sweep]) -> Result<(), RoundCheckFailure> {
+/// sweep paths of every output above the leaf: the batch output's
+/// (`batch_output`), then those of the outputs below it down to the leaf's
+/// entry (`below`). Returns the first check that fails, in order. A sweep path
+/// is named by its position: 0 for the batch output, then 1, 2, … for `below`.
+pub fn check_round(round: &Transaction, schedule: &ClockSchedule, batch_output: &Sweep, below: &[Sweep])
+	-> Result<(), RoundCheckFailure>
+{
 	let token = schedule.token;
 
 	// Checks 1 to 3: the input that issues T, and no other that reissues it.
@@ -130,10 +136,15 @@ pub fn check_round(round: &Transaction, schedule: &ClockSchedule, sweeps: &[Swee
 		return Err(RoundCheckFailure::NotClockZero);
 	}
 	let r_program = r.program();
-	for (i, s) in sweeps.iter().enumerate() {
-		let notice_ok = s.notice.is_none() || s.notice == Some(schedule.notice);
-		if s.token != token || s.r_program != r_program || s.operator != schedule.operator || !notice_ok {
+	for (i, s) in std::iter::once(batch_output).chain(below).enumerate() {
+		if s.token != token || s.r_program != r_program || s.operator != schedule.operator {
 			return Err(RoundCheckFailure::SweepMismatch(i));
+		}
+		match s.notice {
+			None if i == 0 => {},
+			None => return Err(RoundCheckFailure::NoNotice(i)),
+			Some(w) if w == schedule.notice => {},
+			Some(_) => return Err(RoundCheckFailure::SweepMismatch(i)),
 		}
 	}
 	Ok(())

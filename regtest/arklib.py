@@ -259,6 +259,15 @@ def leaf_taptree(a_x, s_x, delay, expiry):
 # Framework base
 # --------------------------------------------------------------------------
 
+def block_reason(mempool_reason):
+    """What a block refused by a node checking scripts inline (-par=1) reports
+    for a transaction the mempool refused with `mempool_reason`: the same
+    script failure, or bad-txns-nonfinal for a lock not yet reached."""
+    if mempool_reason in ("non-final", "non-BIP68-final"):
+        return "bad-txns-nonfinal"
+    return mempool_reason
+
+
 class ArkBase:
     """Mixin: use as `class T(ArkBase, BitcoinTestFramework)` and define
     set_test_params (calling self.ark_params()) and run_test in the subclass --
@@ -279,6 +288,9 @@ class ArkBase:
             "-con_any_asset_fees=1",
             "-maxtxfee=100.0",
             "-txindex=1",
+            # Scripts are checked inline, so a block refused for a script
+            # failure names it, and reject() asserts why the block refused.
+            "-par=1",
         ] + list(self.EXTRA)]
         self.R = {}          # results, dumped as JSON
 
@@ -465,9 +477,11 @@ class ArkBase:
         self.rec(label, m)
         return txid
 
-    def reject(self, tx, label, expect=None, consensus=True):
+    def reject(self, tx, label, expect=None, consensus=True, block=None):
         """Assert a tx is rejected; record both the testmempoolaccept reason and
-        the exact sendrawtransaction RPC error."""
+        the exact sendrawtransaction RPC error. The block must be refused for
+        the mempool's reason or, where the mempool refuses on a standardness
+        rule before the consensus failure the case is about, for `block`."""
         res = self.accept(tx)
         assert not res["allowed"], "%s unexpectedly ACCEPTED" % label
         reason = res.get("reject-reason", "")
@@ -490,6 +504,11 @@ class ArkBase:
             except JSONRPCException as e:
                 d["block-error"] = "%s (code %s)" % (e.error["message"], e.error["code"])
             assert self.node.getblockcount() == h0
+            # The block must be refused for the mempool's reason: a negative case
+            # refused for an unrelated reason would be a test that cannot fail.
+            why = block if block is not None else block_reason(reason)
+            assert why in d["block-error"], "%s: block refused with %r, not for the mempool's reason %r" % (
+                label, d["block-error"], why)
         self.log.info("REJECT %-42s %s | block: %s", label, rpc, d.get("block-error"))
         if expect is not None:
             assert expect in reason or expect in rpc, (label, reason, rpc)

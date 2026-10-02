@@ -22,9 +22,13 @@ too). The exit status is non-zero if any test fails.
 
 A test passes when every spend it expects to confirm is accepted by
 `testmempoolaccept`, broadcast and mined, and every negative case is refused by
-`sendrawtransaction` and again when forced into a block with `generateblock`.
-Relay policy can hide a consensus flaw, so no negative case rests on the mempool
-alone. A few spends that relay policy refuses but consensus accepts are mined on
+`sendrawtransaction` and again when forced into a block with `generateblock`,
+and the block is refused for the mempool's reason. Relay policy can hide a
+consensus flaw, so no negative case rests on the mempool alone, and a negative
+case refused for an unrelated reason would be a test that cannot fail. The node
+runs with `-par=1`, checking scripts inline, so a block refused for a script
+names the failure, as the mempool does; a lock not yet reached reads
+`bad-txns-nonfinal` in a block. A few spends that relay policy refuses but consensus accepts are mined on
 purpose with `generateblock`, to show what a block producer could do.
 
 Each test writes `regtest/out/results/<test>.json`: for every transaction its
