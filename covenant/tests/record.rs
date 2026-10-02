@@ -135,7 +135,7 @@ fn refusal_vectors() {
 	// different records, so it is refused.
 	let (_, rec, _) = valid_records().remove(20);
 	let text = rec.to_json_string().unwrap();
-	let twice = text.replacen("{\"asset\":", &format!("{{\"value\":\"1\",\"asset\":"), 1);
+	let twice = text.replacen("{\"asset\":", "{\"value\":\"1\",\"asset\":", 1);
 	assert_eq!(LeafRecord::from_json_str(&twice).unwrap_err().kind(), "json");
 	assert_eq!(LeafRecord::from_json_str(&format!("{} x", text)).unwrap_err().kind(), "json");
 	// Whitespace is read, and the canonical text has none.

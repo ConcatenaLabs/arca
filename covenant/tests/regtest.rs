@@ -16,7 +16,12 @@
 //! 3. `htlc-1`'s four paths, and the receiving direction;
 //! 4. the swap of two leaves in two assets in one transaction;
 //! 5. the hash-locked entry's sweep behind the token and the notice;
-//! 6. the burn-only sweep behind the token.
+//! 6. the burn-only sweep behind the token;
+//! 7. a 16-leaf and a 64-leaf batch built by the tree builder, with reserves
+//!    at four times the node's own relay floor: every leaf's record checked
+//!    against the confirmed round, and three leaves in different subtrees
+//!    unrolled from their records, unlocked and exited, one of them with fee
+//!    coins attached; their sizes are printed beside the prototype's.
 //!
 //! Locks are time based, as the specification requires: the exit delay, the
 //! forfeit's refund delay and the notice `W` are 36 hours, and median time is
@@ -25,6 +30,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -1027,6 +1033,201 @@ fn burn(net: &mut Net) {
 	net.pass("burn/a lowest node burned after its notice, behind the token", &tx);
 }
 
+// ---------------------------------------------------------------------------
+// 7. Batches built by the tree builder
+// ---------------------------------------------------------------------------
+
+/// What the prototype measured for the same transaction (T21 and T5; its exit
+/// claims paid a P2WPKH output, these pay a P2TR one).
+fn prototype_vsize(name: &str) -> &'static str {
+	let fee = name.contains("fee coin");
+	match (name.split(" / ").nth(1).unwrap_or(""), fee) {
+		(n, false) if n.starts_with("unroll, member depth 3") => "527",
+		(n, true) if n.starts_with("unroll, member depth 3") => "729",
+		(n, false) if n.starts_with("unroll, member depth 5") => "549",
+		(n, true) if n.starts_with("unroll, member depth 5") => "751",
+		(n, false) if n.starts_with("unroll, member depth 7") => "571",
+		(n, true) if n.starts_with("unroll, member depth 7") => "773",
+		(n, false) if n.starts_with("entry") => "234",
+		(n, false) if n.starts_with("exit") => "207 (P2WPKH out)",
+		(n, true) if n.starts_with("exit") => "342 (P2WPKH out)",
+		_ => "",
+	}
+}
+
+fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(String, usize, String)>) {
+	let label = format!("tree {}", n);
+	let s_key = keypair(&format!("{} operator", label));
+	let created = net.mtp() - 60;
+	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
+	let day = 24 * H as u64;
+	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s_key), delay(),
+		vec![mt(net.now() + 28 * day), mt(net.now() + 56 * day), mt(net.now() + 84 * day)]).unwrap();
+
+	// The reserve rule of the specification: four times the relay floor for
+	// each output's own spend, the floor read from the node (X is listed 1:1).
+	let info = net.rpc("getmempoolinfo", json!([]));
+	let floor_per_kvb = (info["minrelaytxfee"].as_f64().unwrap() * 1e8).round() as u64;
+	let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();
+	let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
+	let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
+		template: Template::Vtxo1, owner: xonly(&owners[i]), value: LEAF, salt: label32(&format!("{} salt {}", label, i)),
+		exit_delay: delay(), unlock_hash: sha256(&preimages[i]),
+	}).collect();
+	let params = TreeParams {
+		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
+		reserve: ReserveRule::FeeRate { floor_per_kvb, multiple: 4 }, min_leaf: 1_000 * floor_per_kvb / 1_000,
+	};
+	let tree = Tree::build(params, &leaves).unwrap();
+
+	// The round: the batch output at 0, the token's atom in clock 0 at 1.
+	let batch = tree.batch_output();
+	let total = issuer.txout.value.explicit().unwrap();
+	let mut s = spend(0).coin(&issuer, 0xffff_ffff).outputs(vec![
+		batch.txout(), explicit(sched.token, 1, tree.clock0_script_pubkey()),
+		explicit(net.x, total - batch.value - 2_000, op_true_spk()), fee(net.x, 2_000),
+	]);
+	s.tx.input[0].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
+		amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,
+		denomination: 0,
+	};
+	s.witness(0, op_true_witness());
+	let round_txid = net.pass(&format!("{} / the round", label), &s.tx);
+	net.purse.push(coin_of(round_txid, 2, &s.tx));
+
+	// Every owner checks its record against the round as the chain has it.
+	let round = net.rt.client().raw_transaction(&round_txid).unwrap();
+	let records: Vec<Vec<u8>> = tree.records().iter().map(|r| r.to_bytes().unwrap()).collect();
+	for (i, bytes) in records.iter().enumerate() {
+		let rec = LeafRecord::from_bytes(bytes).unwrap();
+		let ok = rec.validate(&round).unwrap_or_else(|e| panic!("{} / leaf {}: {}", label, i, e));
+		assert_eq!(ok.batch_vout, 0);
+	}
+	println!("{}: {} records validate against the confirmed round {}", label, n, round_txid);
+
+	// The unrolled nodes, by program: a later leaf starts below them.
+	let mut unrolled: HashMap<[u8; 32], Txid> = HashMap::new();
+	for (k, &i) in exits.iter().enumerate() {
+		let external = k == 1;
+		let shape = if external { ", fee coin" } else { "" };
+		let rec = LeafRecord::from_bytes(&records[i]).unwrap();
+		let branch = rec.validate(&round).unwrap().branch;
+		let owner = &owners[i];
+		let mut at = OutPoint::new(round_txid, 0);
+		for (level, node) in branch.nodes.iter().enumerate() {
+			let name = format!("{} / unroll, member depth {}, {} children, leaf {}{}", label, node.gate.depth,
+				node.children.len(), i, shape);
+			if let Some(txid) = unrolled.get(&node.program()) {
+				at = OutPoint::new(*txid, node.index as u32);
+				continue;
+			}
+			let auth = node.owner_auth(sig(owner, &node.unroll_authorisation(mt(created)).digest), mt(created), xonly(owner));
+			let fee_source = |net: &mut Net| if external {
+				let c = net.fee_coin();
+				FeeSource::Coin { outpoint: c.outpoint, coin: c.txout, fee: 4_000, change: op_true_spk() }
+			} else {
+				FeeSource::Reserve
+			};
+
+			// Before the real one, what must not unroll it, forced into a block.
+			if k == 0 && level == 0 {
+				let mut bad = node.unroll_tx(at, &auth, &FeeSource::Reserve).unwrap().tx;
+				let v = bad.output[1].value.explicit().unwrap();
+				bad.output[1].value = elements::confidential::Value::Explicit(v - 1);
+				let f = bad.output.len() - 1;
+				bad.output[f].value = elements::confidential::Value::Explicit(node.reserve + 1);
+				net.refuse(&format!("{} / neg a child one atom short", label), &bad, "Script failed an OP_EQUALVERIFY operation");
+				let stranger = keypair(&format!("{} stranger", label));
+				let forged = node.owner_auth(sig(&stranger, &node.unroll_authorisation(mt(created)).digest), mt(created), xonly(owner));
+				let tx = node.unroll_tx(at, &forged, &FeeSource::Reserve).unwrap().tx;
+				net.refuse(&format!("{} / neg a stranger's signature on the owner's proof", label), &tx, "Invalid Schnorr signature");
+				let later = mt(net.now() + 2 * day);
+				let early = node.owner_auth(sig(owner, &node.unroll_authorisation(later).digest), later, xonly(owner));
+				let tx = node.unroll_tx(at, &early, &FeeSource::Reserve).unwrap().tx;
+				net.refuse(&format!("{} / neg an authorisation used before its time", label), &tx, "non-final");
+			}
+			if k > 0 && level + 1 == branch.nodes.len() {
+				// The owner of the first leaf, a member of the batch output but not
+				// of this lowest node, offers its own proof.
+				let other = &owners[exits[0]];
+				let other_branch = LeafRecord::from_bytes(&records[exits[0]]).unwrap().branch().unwrap();
+				let theirs = other_branch.nodes.last().unwrap();
+				let a = arca_covenant::UnrollAuth {
+					signature: sig(other, &node.unroll_authorisation(mt(created)).digest), time: mt(created),
+					key: xonly(other), proof: theirs.proof.clone(),
+				};
+				let tx = node.unroll_tx(at, &a, &FeeSource::Reserve).unwrap().tx;
+				net.refuse(&format!("{} / neg a lowest node unrolled by an owner of another one", label), &tx,
+					"Script failed an OP_EQUALVERIFY operation");
+			}
+
+			let fs = fee_source(net);
+			let mut u = node.unroll_tx(at, &auth, &fs).unwrap();
+			if external {
+				u.tx.input[1].witness.script_witness = op_true_witness();
+			}
+			let txid = net.pass(&name, &u.tx);
+			sizes.push((name, net.rows.last().unwrap().vsize.parse().unwrap(), prototype_vsize(&format!("x / unroll, member depth {}{}", node.gate.depth, shape)).into()));
+			assert_eq!(u.tx.vsize().to_string(), net.rows.last().unwrap().vsize, "the size the builder reserves for");
+			unrolled.insert(node.program(), txid);
+			at = OutPoint::new(txid, node.index as u32);
+		}
+
+		// The entry, with the preimage.
+		let tx = branch.entry_tx(at, &label32("not the preimage"), &FeeSource::Reserve).unwrap().tx;
+		net.refuse(&format!("{} / neg entry {} with a wrong preimage", label, i), &tx, "Script failed an OP_EQUALVERIFY operation");
+		let fs = if external {
+			let c = net.fee_coin();
+			FeeSource::Coin { outpoint: c.outpoint, coin: c.txout, fee: 4_000, change: op_true_spk() }
+		} else {
+			FeeSource::Reserve
+		};
+		let mut u = branch.entry_tx(at, &preimages[i], &fs).unwrap();
+		if external {
+			u.tx.input[1].witness.script_witness = op_true_witness();
+		}
+		let name = format!("{} / entry {} into its leaf{}", label, i, shape);
+		let entry_txid = net.pass(&name, &u.tx);
+		sizes.push((name.clone(), net.rows.last().unwrap().vsize.parse().unwrap(), prototype_vsize(&format!("x / entry{}", shape)).into()));
+
+		// The exit, after the delay.
+		let leaf = branch.leaf;
+		let leaf_coin = Coin { outpoint: OutPoint::new(entry_txid, 0), txout: branch.leaf_output().txout() };
+		let exit = |net: &mut Net| {
+			let mut s = spend(0).coin(&leaf_coin, delay().to_sequence());
+			if external {
+				let c = net.fee_coin();
+				s = s.coin(&c, 0xffff_fffe).outputs(vec![explicit(net.x, LEAF, op_true_spk()),
+					explicit(net.policy, c.txout.value.explicit().unwrap() - 4_000, op_true_spk()), fee(net.policy, 4_000)]);
+				s.witness(1, op_true_witness());
+			} else {
+				s = s.outputs(vec![explicit(net.x, LEAF - FEE, op_true_spk()), fee(net.x, FEE)]);
+			}
+			let sg = s.sign(owner, 0, &leaf.exit_script(), net.genesis);
+			s.witness(0, leaf.exit_witness(&sg));
+			s.tx
+		};
+		let tx = exit(net);
+		net.refuse(&format!("{} / neg exit {} before the delay", label, i), &tx, "non-BIP68-final");
+		net.wait_csv(&entry_txid, delay());
+		let tx = exit(net);
+		let name = format!("{} / exit of leaf {}{}", label, i, shape);
+		net.pass(&name, &tx);
+		sizes.push((name, net.rows.last().unwrap().vsize.parse().unwrap(), prototype_vsize(&format!("x / exit{}", shape)).into()));
+	}
+}
+
+fn built_trees(net: &mut Net) {
+	let mut sizes = vec![];
+	built_tree(net, 16, [0, 6, 15], &mut sizes);
+	built_tree(net, 64, [0, 27, 63], &mut sizes);
+	println!("\n{:<70} {:>6}  prototype", "built by the tree builder", "vsize");
+	for (n, v, p) in &sizes {
+		println!("{:<70} {:>6}  {}", n, v, p);
+	}
+}
+
 #[test]
 fn frozen_constructions_on_regtest() {
 	let mut net = Net::start();
@@ -1037,6 +1238,7 @@ fn frozen_constructions_on_regtest() {
 	swap(&mut net);
 	entry_sweep(&mut net);
 	burn(&mut net);
+	built_trees(&mut net);
 	net.print();
 	assert!(net.refused >= 30, "only {} negative cases", net.refused);
 }
