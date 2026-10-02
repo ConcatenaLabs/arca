@@ -165,6 +165,13 @@ let txs = branch.unroll(batch_outpoint, &auths, &vec![FeeSource::Reserve; auths.
 let entry = branch.entry_tx(branch.entry_outpoint(&txs).unwrap(), &preimage, &FeeSource::Reserve)?;
 ```
 
+## Building
+
+The crate depends on `elements`, `thiserror` and, for the JSON form, `serde` and
+`serde_json`, so a wallet can take it alone. The Sequentia Wallet Kit does, for
+wasm as well, with the Rust it pins: the crate builds with the `rust-version`
+in its `Cargo.toml` and uses no newer standard-library API.
+
 ## Testing
 
 The tests verify through the node's own interpreter (`arca-consensus`), so they

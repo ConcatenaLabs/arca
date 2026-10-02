@@ -1,0 +1,26 @@
+name: covenant
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The Sequentia Wallet Kit depends on arca-covenant and builds it with the
+  # Rust it pins (1.85, its rust-toolchain.toml), natively and for wasm. The
+  # crate's rust-version says the same; this job keeps the two in step.
+  wallet-toolchain:
+    name: arca-covenant builds with the wallet kit's Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check, with and without the JSON form
+        run: |
+          cargo check --locked -p arca-covenant
+          cargo check --locked -p arca-covenant --no-default-features
