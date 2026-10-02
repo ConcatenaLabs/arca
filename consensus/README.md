@@ -50,8 +50,9 @@ with an explanation when `SEQUENTIA_DIR` is unset or the library is missing.
 
     cargo test -p arca-consensus
 
-The unit tests need only the library. `tests/node_agreement.rs` also runs a
-`sequentiad` on a fresh regtest chain, named by `SEQUENTIAD_EXEC`. It builds
+The unit tests need only the library. `tests/node_agreement.rs` also runs
+`sequentiad`, named by `SEQUENTIAD_EXEC`, on a fresh anchored regtest chain
+(`arca-sequentia-ext`'s regtest harness). It builds
 known-good and known-bad spends from the regtest prototype's scripts (the tree
 node's unroll, the rebindable two-party path through `OP_CHECKSIGFROMSTACK`, the
 hash-locked forfeit claim, the CLTV sweep, the CSV exit, and a Simplicity
@@ -60,6 +61,6 @@ relative lock) and asserts for each that the verifier, the node's
 same verdict, and that the verifier names the same script error as the node.
 `-- --nocapture` prints the table.
 
-The `consensus` workflow in `.github/workflows/` runs both against the newest node
-`master` commit whose build passed: it downloads that build's `sequentiad` and
+The `node` workflow (`.github/workflows/node.yml`) runs both against the newest
+node `master` commit whose build passed: it downloads that build's `sequentiad` and
 builds the consensus library from the same commit.

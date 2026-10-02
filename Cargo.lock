@@ -196,9 +196,9 @@ dependencies = [
 name = "arca-consensus"
 version = "0.1.0"
 dependencies = [
+ "arca-sequentia-ext",
  "cc",
  "elements",
- "minreq",
  "serde_json",
  "thiserror 2.0.18",
 ]

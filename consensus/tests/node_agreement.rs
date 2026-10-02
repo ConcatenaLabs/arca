@@ -10,9 +10,9 @@
 //! verdict never rests on relay policy alone. A spend expected to pass is
 //! mined.
 //!
-//! Needs `SEQUENTIAD_EXEC`. Run with `--nocapture` to see the table.
-
-mod common;
+//! The chain is anchored to a Bitcoin regtest parent, like every live
+//! Sequentia chain (`sequentia_ext::regtest`). Needs `SEQUENTIAD_EXEC`. Run
+//! with `--nocapture` to see the table.
 
 use std::str::FromStr;
 
@@ -32,7 +32,28 @@ use elements::{
 use serde_json::json;
 
 use arca_consensus::Verifier;
-use common::Node;
+use sequentia_ext::regtest::Regtest;
+use sequentia_ext::rpc::Error as RpcError;
+
+/// The anchored regtest chain, with JSON calls in the shape this test uses.
+struct Node(Regtest);
+
+impl Node {
+	fn start(name: &str) -> Node {
+		let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+			.join(format!("{}-{}", name, std::process::id()));
+		Node(Regtest::from_env(&dir, &[]))
+	}
+
+	fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+		self.0.client().call(method, params.as_array().unwrap())
+	}
+
+	fn rpc(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+		self.call(method, params.clone())
+			.unwrap_or_else(|e| panic!("{} {} failed: {}", method, params, e))
+	}
+}
 
 /// BIP341 nothing-up-my-sleeve point: every internal key, so no key path.
 const NUMS: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
@@ -213,7 +234,7 @@ struct Chain {
 
 impl Chain {
 	fn start() -> Chain {
-		let node = Node::start("node-agreement", &[]);
+		let node = Node::start("node-agreement");
 		let genesis = BlockHash::from_str(node.rpc("getblockhash", json!([0])).as_str().unwrap()).unwrap();
 		let asset = AssetId::from_str(
 			node.rpc("getsidechaininfo", json!([]))["pegged_asset"].as_str().unwrap()).unwrap();
@@ -335,9 +356,9 @@ impl Run {
 				"mined".to_string()
 			},
 			Err(e) => {
-				assert!(!expect_valid, "{}: valid spend not mined: {}", name, e.message);
+				assert!(!expect_valid, "{}: valid spend not mined: {}", name, e);
 				assert_eq!(self.chain.height(), h0);
-				format!("refused: {} (code {})", e.message, e.code)
+				format!("refused: {}", e)
 			},
 		};
 		self.outcomes.push(Outcome {

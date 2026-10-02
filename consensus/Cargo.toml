@@ -20,5 +20,5 @@ thiserror.workspace = true
 cc = "1.2"
 
 [dev-dependencies]
-minreq = "2.14"
+arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
 serde_json.workspace = true
