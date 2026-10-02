@@ -251,6 +251,10 @@ impl Ctx {
 				let f = self.forfeit();
 				(f.taproot(), BTreeMap::from([("claim", f.claim_script()), ("refund", f.refund_script())]))
 			},
+			"connector" => {
+				let c = ConnectorPolicy { operator: key(&self.output("connector")["params"]["operator"]) };
+				(c.taproot(), BTreeMap::from([("issue", c.script())]))
+			},
 			"checkpoint" => {
 				let c = self.checkpoint();
 				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("sweep", c.sweep_script())]))
@@ -273,7 +277,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 16);
+	assert_eq!(outputs.len(), 17);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -313,7 +317,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 28);
+	assert_eq!(spends.len(), 29);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -402,6 +406,10 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			("forfeit", "claim") => ctx.forfeit().claim_witness(&checksig("S"), &h32(&s["preimage"]),
 				s["connector_input"].as_u64().unwrap() as u32),
+			("connector", "issue") => {
+				let c = ConnectorPolicy { operator: key(&ctx.output("connector")["params"]["operator"]) };
+				c.witness(&checksig("S"))
+			},
 			("forfeit", "refund") => {
 				let owner = ctx.label_of(&ctx.forfeit().owner).to_string();
 				ctx.forfeit().refund_witness(&checksig(&owner))

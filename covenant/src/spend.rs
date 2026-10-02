@@ -69,6 +69,14 @@ pub enum SpendError {
 	Margin { margin: u64, value: u64 },
 	#[error(transparent)]
 	Policy(#[from] Error),
+	#[error("the round is not the transaction the new leaf was validated against")]
+	NotTheRound,
+	#[error("output {0} of the round is not the operator's connector output")]
+	Connector(u32),
+	#[error("the leaf given up and the round are under different operators")]
+	OtherOperator,
+	#[error(transparent)]
+	Offboard(#[from] crate::offboard::OffboardError),
 }
 
 pub(crate) fn explicit_txout(asset: AssetId, value: u64, script_pubkey: Script) -> TxOut {
@@ -309,6 +317,11 @@ impl KeySpend {
 		let coin_sequence = if inputs[0].2 == FINAL { FINAL } else { FEE_COIN_SEQUENCE };
 		let u = assemble(LockTime::ZERO, inputs, outputs, fee, coin_sequence)?;
 		Ok(KeySpend { tx: u.tx, prevouts: u.prevouts, script, tap })
+	}
+
+	/// A spend assembled elsewhere in the crate, input 0 by `script` of `tap`.
+	pub(crate) fn from_parts(tx: Transaction, prevouts: Vec<TxOut>, tap: TapOutput, script: Script) -> KeySpend {
+		KeySpend { tx, prevouts, script, tap }
 	}
 
 	/// The Elements taproot signature hash of input 0 (`SIGHASH_DEFAULT`):

@@ -21,6 +21,7 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `leaf` | The leaf (`vtxo-1`) | The rebindable collaborative path for 1 to 4 committed outputs, and the exit |
 | `entry` | The hash-locked entry | Unlock into the owner's leaf with the preimage; the sweep with notice |
 | `forfeit` | The forfeit output, bound to the leaf given up and to its round | The operator's claim with the preimage and the round's connector asset; the owner's refund after the delay |
+| `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
 | `offboard` | The offboard output a round pays | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
@@ -100,21 +101,42 @@ never given a leaf script it has signed for before.
 a leaf. It refuses a record outside the wallet's `WalletPolicy`: another chain,
 an operator key other than the one the wallet was told, a notice `W` below the
 wallet's minimum, a first expiry `E_0` sooner than the wallet's horizon after
-now, or an exit delay out of bounds. `WalletPolicy::new` takes the
+now, an exit delay out of bounds, a path deeper than `max_levels`, a node of one
+child anywhere but in a batch of one leaf, and a reserve on a node of the path
+or on the entry below `min_reserve`. Each bound keeps the leaf's exit what the
+builder would make it: a record of sixteen one-child levels with no reserves
+matches a round as well as an honest one does, and its exit costs sixteen node
+transactions paid from the owner's own coins. `WalletPolicy::new` takes the
 specification's parameters: `W` at least 36 hours, `E_0` at least 27 days after
 now (a batch expires 28 days after its round; the day between is for the round
-to become final), an exit delay of 36 to 48 hours. Then it rebuilds every script
-on the path, requires the round to pay exactly one output equal to the batch
-output it rebuilds (asset, value and script), so the leaf is where the record
-says, and runs the five client checks on the token and its clock, every sweep
-below the batch output carrying the notice. A wallet accepts a leaf only after
-that, and only once the round is final.
+to become final), an exit delay of 36 to 48 hours, at most five levels (1,024
+leaves at radix 4; a wallet sets the depth of the largest batch its operator
+advertises), and a reserve of at least one atom. `ReserveFloor::FeeRate` is the
+specification's reserve rule at the wallet's own floor, in the batch asset's
+atoms: each node and the entry must hold what `ReserveRule::FeeRate` gives them.
+Then it rebuilds every script on the path, requires the round to pay exactly one
+output equal to the batch output it rebuilds (asset, value and script), so the
+leaf is where the record says, and runs the five client checks on the token and
+its clock, every sweep below the batch output carrying the notice. A wallet
+accepts a leaf only after that, and only once the round is final.
+
+The 27-day horizon is for accepting a leaf from a round. A leaf the wallet
+already holds, and a coin it receives out of round, need only a first expiry
+past the exit deadline, three days after now: `policy.receipt()` is that policy.
+Under the acceptance horizon an honest leaf would be refused from the second day
+of its batch.
 
 `valid.round_txid` names the round the leaf was checked against. After a
-rollback that disconnects it, another transaction can pay the same batch output,
-even spending the same issuing coin, and may fail the checks: the wallet checks
-again whichever transaction now pays its batch output, and unrolls at once if
-that fails, `W` after the replacement being the time it has.
+rollback the operator broadcasts that round again unchanged, so it returns with
+the same txid. `record.recheck(&valid, &round, &policy)` checks the leaf against
+whatever transaction the chain now has paying its batch output, under the
+receipt policy: `Recheck::Same` when it is the round the leaf was accepted from,
+`Recheck::NewRound` when another transaction pays the same batch output. That
+one is a new round: every forfeit signed for the old round names a connector
+asset that can never be issued, so a leaf given up for it is still its owner's,
+and nothing signed for the old round carries over. An error means the leaf is
+not where the record says or no longer meets the policy; when its batch output is
+on-chain the wallet unrolls at once, `W` after any release being the time it has.
 `validate_round` is the same check without the owner's key and nonce, for a
 leaf the wallet does not own; `validate_batch_output` checks the path against
 one output and leaves out the clock, which only the round shows, and the
@@ -217,18 +239,40 @@ forfeit output is unique to its leaf and two forfeits of one participation can
 never share one. `M` is the asset that spending the round's connector output
 `(round_txid, c)` would issue (`connector_asset`): the owner computes it from
 the confirmed round, the operator issues one atom only when it needs to claim
-(`connector_issuance`) and reuses it for every claim of that round. After a
-rollback that replaces the round, `(round_txid, c)` does not exist, `M` can
-never be issued, no forfeit of that round can be claimed, and the owner takes
-the old coin back after the refund delay. The operator spends a round's
-connector output only to issue `M`.
+and reuses it for every claim of that round. If the round is not in the chain,
+`(round_txid, c)` does not exist, `M` can never be issued and no forfeit of that
+round can be claimed.
+
+The connector output has a script of its own (`ConnectorPolicy`): the
+operator's signature, then `OP_INSPECTINPUTISSUANCE` on its own input requiring
+a new issuance with a zero contract hash of exactly one explicit atom and no
+reissuance token. So nobody, the operator included, can spend it without issuing
+`M`, which would strand every claim of the round. The owner signs only a
+forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`), which
+takes `h` from the new leaf it validated and `M` from that round, and refuses a
+round other than the one the leaf was validated against, an output `c` that is
+not the operator's connector, and an old leaf under another operator.
+`Forfeit::new` takes `h` and `M` as given: it is how the server, which chose
+them, rebuilds the forfeit to verify the pair.
+
+After a rollback the operator broadcasts the identical round again: it has
+`nLockTime` 0 and spends only the operator's coins, so it returns with the same
+txid and its claims follow. A round with another txid that paid the same batch
+output would void every forfeit of the old one while its new leaves stayed good:
+each refreshed owner would keep the old coin and the new leaf. So a round with
+another txid is always a new round, with a new tree and new unlock hashes, whose
+participations run again, and a round that carries refreshes takes no input of a
+third party (a covenant fill, say), which could be spent elsewhere and force a
+replacement; fills go in their own round transactions.
 
 ```rust
-let m = connector_asset(round_txid, c);
-let f = Forfeit::new(old_leaf, (asset, value), old_leaf_id, h, m, refund_delay, margin)?;
+let valid = new_record.validate(&round, &policy, &new_key, &new_nonce)?;   // the new leaf, in this round
+let f = Forfeit::for_refresh(old_leaf, (asset, value), old_leaf_id, &valid, &round, c, refund_delay, margin)?;
 let digest = f.message().digest;                       // owner and operator each sign it
 f.verify(&pair)?;                                      // the server's check
 let forfeit_tx = f.tx(old_leaf_coin, &pair, &FeeSource::Reserve)?;
+let issue = ConnectorPolicy { operator }.issuance(connector_coin, (asset, value), m_to, &[], &FeeSource::Reserve)?;
+let issue = issue.finish(vec![sig_over(issue.sighash(genesis)?)]);           // the operator, when it must claim
 let claim = f.claim(forfeit_coin, (m_coin, m_txout), &outputs, m_back_to, &FeeSource::Reserve)?;
 let claim = claim.finish(ForfeitPolicy::claim_items(&sig_over(claim.sighash(genesis)?), &preimage, Forfeit::CONNECTOR_INPUT));
 ```
@@ -243,8 +287,17 @@ so once its exit delay has passed after the board confirmed, its owner can exit
 at any moment and an exit races any off-chain spend of it with nothing to wait
 for. A board leaf therefore takes no spend whose safety rests on an answer in
 time: its refresh into a round, or its offboard, is a forfeit the operator
-publishes and sees confirmed before it hands over the preimage, and it is not
-transferred out of round.
+publishes and sees final (its block certified and its anchor buried) before it
+hands over the preimage, and it is not transferred out of round. One block is not
+enough: a rollback that disconnects the forfeit lets the owner's exit take its
+place while the owner holds the preimage.
+
+**No off-chain spend of a leaf that is on-chain.** The board is one case of a
+general rule. Any Arca leaf on-chain past its exit delay, a batch leaf someone
+unrolled or a reassignment's output someone published, can be exited by its
+owner at once, so no off-chain spend of it is safe. The operator refuses to
+co-sign a spend of a leaf that is on-chain, and a receiver refuses a coin when
+any leaf or checkpoint in its lineage is on-chain (below).
 
 **The offboard.** A round pays an `OffboardPolicy` output, whose unlock moves
 it, with the preimage of `h`, to the owner's destination (any script, asset and
@@ -292,16 +345,27 @@ layout is in the `transfer` module's documentation.
 from the record and the round transactions alone: every batch leaf validates
 against its round under the receiver's policy, every preimage and authorisation
 is good and usable now, every pair verifies, no reassignment creates more than
-its checkpoints hold, the coin's output is the leaf the record names for the
-receiver's key and nonce, no coin is spent twice in the record, and the chain is
-at most five reassignments from a round. A coin from a reassignment is safe only
-until the earliest expiry among the batches it descends from (`expiry`), so a
-receiver sets its policy's horizon for that. The valid coin builds every
-transaction that brings it on-chain: the unroll and entry of each batch leaf,
-each `checkpoint_tx`, each `reassignment_tx`. Against the sender alone the
-receiver is safe: when the sender's leaf reaches the chain, it publishes the
-checkpoint and the reassignment within the leaf's exit delay. Against the sender
-and the operator together it is not, before a round: that is the trust the
+its checkpoints hold, every leaf in the lineage (whoever owns it) has an exit
+delay within the policy's bounds, the coin's output is the leaf the record names
+for the receiver's key and nonce, no coin is spent twice in the record, and the
+chain is at most five reassignments from a round. A receiver passes
+`policy.receipt()`: a coin from a reassignment is safe only until the earliest
+first expiry among the batches it descends from (`expiry`), and the receipt
+policy asks that every one of them lie past the exit deadline. The valid coin
+builds every transaction that brings it on-chain: the unroll and entry of each
+batch leaf, each `checkpoint_tx`, each `reassignment_tx`.
+
+The record cannot show what is on-chain. `coin.lineage()` lists every leaf and
+checkpoint the coin descends from, and `coin.check_lineage(on_chain)` refuses the
+coin if an index of the chain reports any of them on-chain; a wallet without such
+an index relies on the operator's refusal to co-sign a spend of an on-chain leaf.
+
+Against the sender alone the receiver is then safe: every leaf of the lineage is
+off-chain and has an exit delay of at least the policy's minimum, so when the
+sender's leaf reaches the chain, the receiver publishes the checkpoint and the
+reassignment within that delay. It answers at once: a rollback that disconnects
+its answer does not restart the delay of the leaf it answered. Against the sender
+and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.
 
 ## Building
@@ -336,9 +400,16 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
 - `tests/record.rs`: every leaf record in the regtest suite's record vectors
   (`regtest/vectors/records.json`) decodes from both forms, encodes back to the
   same bytes and the same JSON text, gives the same leaf id and validates
-  against the round transaction that funds its batch; the refusal vectors are
-  refused for the reason they name; every single-field mutation of a valid
-  record, and every one-byte change of its binary form, is refused.
+  against the round transaction that funds its batch, under a reserve floor
+  of the batch's own reserves (the batch with no reserves is refused under the
+  default floor); the refusal vectors are refused for the reason they name;
+  every single-field mutation of a valid record, and every one-byte change of
+  its binary form, is refused. The wallet's policy refuses each thing it
+  bounds: the chain, the operator, the notice, the horizon, the exit delay, the
+  depth, a node of one child, the node and entry reserves at a fixed floor and
+  at a fee-rate floor; and the receipt policy accepts a held leaf from the day
+  after its round until three days before its first expiry, where the
+  acceptance horizon refuses it from the second day.
 - `tests/tree.rs`: the builder rebuilds every batch and record in the record
   vectors byte for byte, the shape of every node included; for every leaf
   count from 1 to 100 at radix 4 (and 1 to 40 at radix 3, 5 and 6) no node
@@ -354,8 +425,9 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
 - `tests/transactions.rs`: every transaction in the regtest suite's
   off-chain vectors (`regtest/vectors/transactions.json`) is rebuilt here byte
   for byte, witnesses included, and re-signed with the test keys: the board and
-  its exit, the forfeit with the issuance of the connector asset, its claim and
-  refund, the offboard's unlock and reclaim, each with the margin as the fee and
+  its exit, the forfeit, the connector output and the operator's issuance of
+  the connector asset, the forfeit's claim and refund, the offboard's unlock and
+  reclaim, each with the margin as the fee and
   with a fee coin, and the three-hop chain's checkpoints and reassignments; every
   input verifies under the block rules and the mempool's checks. The board record
   decodes from both forms and its refusal vectors are refused; every coin record
@@ -367,8 +439,22 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   and verified; each kind of bad record refused (another key or nonce, a changed
   output, swapped pairs, a checkpoint worth more than its coin, a coin spent twice
   in the record, an authorisation by another key or not yet usable, a wrong
-  preimage, a missing round, the horizon, another operator, six hops); and every
-  one-byte change of the record refused.
+  preimage, a missing round, the horizon, batch leaves of another operator, six
+  hops); the receipt policy accepting the coin until three days before the
+  earliest first expiry in its lineage; a coin refused for a leaf up its lineage
+  whose exit delay is outside the bounds, too short or too long; the lineage
+  listing every leaf and checkpoint the coin descends from, and the coin refused
+  when any of them is on-chain; and every one-byte change of the record refused.
+- `tests/lineage.rs`: on an anchored regtest chain, what a receiver refuses and
+  what accepting it would have cost. A coin through a leaf of a 512-second exit
+  delay is refused; its owner alone brings that leaf on-chain and exits it, and
+  the checkpoint the receiver would hold is refused in a block. A leaf
+  transferred after it reached the chain and its delay passed validates under
+  the receipt policy, and the lineage check against the node's unspent outputs
+  refuses it; the sender exits at once and the receiver's checkpoint is refused.
+  A record of sixteen one-child levels with no reserves, paid by a confirmed
+  round, is refused for its depth and its one-child nodes, and a one-leaf batch
+  with no reserves for its reserve.
 - `tests/offchain.rs`: on an anchored regtest chain, a board and its refresh
   into a round (the forfeit published first, the connector asset issued, the
   claim, the new batch unrolled from its record, its entry unlocked with the
@@ -376,7 +462,10 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   connector serving two claims, two forfeits of one participation refused one
   output, the connector that cannot be issued after a rollback replaces the
   round and the owner's refund, and the offboard's unlock, its merge refused,
-  and its reclaim; every negative case refused by the mempool and in a block,
+  and its reclaim; the round's connector output spent with no issuance, issuing
+  two atoms, issuing with a reissuance token, issuing another asset under a
+  contract hash, or signed by another key, each refused, and its issuance of
+  `M` confirmed; every negative case refused by the mempool and in a block,
   for its reason. It also shows a board leaf exited at once while the operator
   holds its forfeit, which is why a board leaf takes no off-chain spend. Then the
   three-hop chain on chain: the last receiver validates it from its record and

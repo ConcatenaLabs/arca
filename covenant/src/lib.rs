@@ -13,8 +13,9 @@
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
-//!   checkpoint ([`checkpoint`]), `htlc-1` ([`htlc`]) and the offboard output
-//!   ([`offboard`]);
+//!   checkpoint ([`checkpoint`]), `htlc-1` ([`htlc`]), the offboard output
+//!   ([`offboard`]) and the round's connector output, which only the issuance
+//!   of the round's connector asset spends ([`forfeit::ConnectorPolicy`]);
 //! - the five checks a wallet runs on a round transaction and its published
 //!   clock schedule ([`checks`]);
 //! - the leaf record ([`record`]): what a holder keeps, its id, its binary
@@ -77,20 +78,23 @@ pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule};
 pub use entry::EntryPolicy;
-pub use forfeit::{connector_asset, connector_issuance, Forfeit, ForfeitPolicy};
+pub use forfeit::{connector_asset, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
 pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;
-pub use record::{Branch, BranchNode, LeafId, LeafRecord, RecordError, Template, ValidLeaf, WalletPolicy};
+pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
 pub use script::{Child, ExplicitOutput};
 pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};
-pub use transfer::{CoinRecord, NewLeaf, Transfer, TransferError, TransferInput, TransferPlan, ValidCoin, ValidInput, ValidOrigin};
+pub use transfer::{
+	CoinRecord, LineageKind, LineageOutput, NewLeaf, Transfer, TransferError, TransferInput, TransferPlan, ValidCoin, ValidInput,
+	ValidOrigin,
+};
 pub use tree::{LeafSpec, ReserveRule, Tree, TreeError, TreeParams};
 pub use unroll::{FeeSource, UnrollAuth, UnrollTx};
 

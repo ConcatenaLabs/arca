@@ -203,13 +203,20 @@ fn the_forfeit_its_claim_and_its_refund() {
 	assert_eq!(ff.policy.refund_script().as_bytes(), &bytes(&f["refund_script"])[..]);
 	println!("claim script {} bytes, refund script {} bytes", ff.policy.claim_script().len(), ff.policy.refund_script().len());
 
-	// The issuance of the connector asset.
+	// The connector output and the operator's issuance of the connector asset.
+	let connector = ConnectorPolicy { operator: key(&inp["operator"]) };
+	assert_eq!(connector.script().as_bytes(), &bytes(&f["connector_script"])[..]);
 	let iss = &f["issuance"];
 	let i0 = &iss["inputs"][0];
-	let u = connector_issuance(outpoint(&i0["outpoint"]), &out(&i0["spent"]).txout(), Script::from(bytes(&iss["to"])), &[],
+	let spent = out(&i0["spent"]);
+	assert_eq!(spent.script_pubkey, connector.script_pubkey());
+	assert_eq!(spent, out(&f["connector_output"]));
+	let ks = connector.issuance(outpoint(&i0["outpoint"]), (spent.asset, spent.value), Script::from(bytes(&iss["to"])), &[],
 		&FeeSource::Reserve).unwrap();
+	let u = fx.sign("the issuance of the connector asset", ks, "S", vec![], iss);
 	let issuance = fx.check("the issuance of the connector asset", u, iss);
 	assert_eq!(issuance.input[0].issuance_ids().0, m);
+	println!("connector script {} bytes; issuance {} vB", connector.script().len(), issuance.vsize());
 
 	let txs = f["transactions"].as_array().unwrap();
 	let leaf_coin = outpoint(&inp["leaf_outpoint"]);
