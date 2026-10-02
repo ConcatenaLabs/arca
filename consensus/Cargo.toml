@@ -1,0 +1,24 @@
+[package]
+name = "arca-consensus"
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "Script verification under Sequentia's consensus rules, for tests, through the node's own interpreter"
+publish = false
+build = "build.rs"
+links = "elementsconsensus"
+
+[lib]
+name = "arca_consensus"
+
+[dependencies]
+elements.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+minreq = "2.14"
+serde_json.workspace = true

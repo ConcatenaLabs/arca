@@ -129,6 +129,13 @@ CMake package config (`libboost-dev` on Debian and Ubuntu). On a machine without
 it, a directory holding a `lib/cmake/Boost-<version>/BoostConfig.cmake` that
 defines `Boost::headers`, named in `CMAKE_PREFIX_PATH`, is enough.
 
+`arca-consensus` is the verifier for Sequentia transactions: it links the node's
+consensus library from the checkout named by `SEQUENTIA_DIR`, and its agreement
+test runs the node named by `SEQUENTIAD_EXEC` (`consensus/README.md`). A unit test
+that builds a Sequentia transaction ends by verifying it there. A negative case
+that matters is also forced into a block on a regtest node (`generateblock`), not
+only refused by the mempool, because relay policy can hide a consensus flaw.
+
 CI runs on GitHub Actions (`.github/workflows/`). Check it after every merge.
 
 ## Rules from Sequentia that bind this code
