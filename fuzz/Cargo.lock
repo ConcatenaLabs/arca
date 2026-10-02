@@ -33,6 +33,8 @@ name = "arca-covenant"
 version = "0.1.0"
 dependencies = [
  "elements",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

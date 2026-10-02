@@ -15,6 +15,8 @@
 //!   ([`forfeit`]), the checkpoint ([`checkpoint`]) and `htlc-1` ([`htlc`]);
 //! - the five checks a wallet runs on a round transaction and its published
 //!   clock schedule ([`checks`]);
+//! - the leaf record ([`record`]): what a holder keeps, its id, its binary
+//!   and JSON forms ([`record_json`]), and its validation against the round;
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]).
@@ -41,6 +43,9 @@ pub mod htlc;
 pub mod leaf;
 pub mod message;
 pub mod node;
+pub mod record;
+#[cfg(feature = "json")]
+pub mod record_json;
 pub mod script;
 pub mod sign;
 pub mod sweep;
@@ -53,11 +58,12 @@ pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule};
 pub use entry::EntryPolicy;
 pub use forfeit::ForfeitPolicy;
-pub use gate::Members;
+pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
 pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
+pub use record::{Branch, BranchNode, LeafId, LeafRecord, RecordError, Template, ValidLeaf};
 pub use script::{Child, ExplicitOutput};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;

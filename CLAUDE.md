@@ -145,8 +145,11 @@ not Sequentia's. Tests that need a node start one with
 parent.
 
 `arca-covenant` (`covenant/`) builds every Arca script, its witnesses and the
-client's checks on a round, and is where new script code goes; Bark's MuSig2
-policies in `arca-lib` stay until a later package removes them.
+client's checks on a round, and holds the leaf record and its validation; it is
+where new script code goes. It depends on `elements`, `thiserror` and, for the
+record's JSON form, `serde` and `serde_json`, so a wallet can use it without
+`arca-lib`. Bark's MuSig2 policies in `arca-lib` stay until a later package
+removes them.
 
 `regtest/` is the independent reference for every Arca script: a Python suite
 on the node's functional test framework, and the golden vectors it exports
@@ -154,7 +157,9 @@ on the node's functional test framework, and the golden vectors it exports
 vector byte for byte. A script change starts there: change the builder in
 `regtest/arklib3.py`, run the suite, regenerate the vectors with
 `regtest/vectors.py`, and commit the result with the Rust change. CI fails when
-the vectors no longer regenerate byte for byte.
+the vectors no longer regenerate byte for byte. The leaf record's format is
+held the same way: `regtest/records.py` states it and writes
+`regtest/vectors/records.json`, and a change to the record changes both.
 
 CI runs on GitHub Actions (`.github/workflows/`). Check it after every merge.
 

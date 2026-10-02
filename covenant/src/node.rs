@@ -43,7 +43,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{Script, TxOut};
 
-use crate::gate::{Members, MAX_OWNERS};
+use crate::gate::{gate, GateCommitment, Members, MAX_OWNERS};
 use crate::message::{unroll_authorisation, Chain, CsfsMessage, UNROLL_TAG};
 use crate::script::{children_hash, BuilderExt, Child};
 use crate::sweep::Sweep;
@@ -120,17 +120,7 @@ impl NodePolicy {
 
 	/// The gated, timed UNROLL leaf.
 	pub fn unroll_script(&self) -> Script {
-		let mut b = self.members().gate(Builder::new());
-		for i in 0..self.children.len() {
-			b = b.output_record(i as i64);
-			if i > 0 {
-				b = b.push_opcode(OP_CAT);
-			}
-		}
-		b.ops(&[OP_SHA256, OP_DUP]).push_slice(&self.children_hash()).push_opcode(OP_EQUALVERIFY)
-			.ops(&[OP_SWAP, OP_CLTV, OP_CAT])
-			.push_slice(UNROLL_TAG).ops(&[OP_SWAP, OP_CAT, OP_SHA256, OP_FROMALTSTACK, OP_CHECKSIGFROMSTACK])
-			.into_script()
+		unroll_script(&self.members().commitment(), &self.children)
 	}
 
 	pub fn sweep_script(&self) -> Script {
@@ -145,30 +135,13 @@ impl NodePolicy {
 	/// The RECLAIM leaf, for a lowest node.
 	pub fn reclaim_script(&self) -> Option<Script> {
 		let release = self.release_message()?;
-		let n = self.owners.len();
-		let mut b = Builder::new().push_slice(&release.digest);
-		if n == 1 {
-			b = b.push_slice(&self.owners[0].serialize()).push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
-		} else {
-			b = b.ops(&[OP_DUP, OP_TOALTSTACK]).push_slice(&self.owners[0].serialize())
-				.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
-			for k in &self.owners[1..n - 1] {
-				b = b.ops(&[OP_FROMALTSTACK, OP_DUP, OP_TOALTSTACK]).push_slice(&k.serialize())
-					.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
-			}
-			b = b.push_opcode(OP_FROMALTSTACK).push_slice(&self.owners[n - 1].serialize())
-				.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
-		}
-		Some(b.push_slice(&self.operator.serialize()).push_opcode(OP_CHECKSIG).into_script())
+		Some(reclaim_script(&release.digest, &self.owners, &self.operator))
 	}
 
 	/// The node's output: `[UNROLL, SWEEP]`, or `[UNROLL, [SWEEP, RECLAIM]]`
 	/// for a lowest node.
 	pub fn taproot(&self) -> TapOutput {
-		match self.reclaim_script() {
-			None => TapOutput::new(vec![(1, self.unroll_script()), (1, self.sweep_script())]),
-			Some(rc) => TapOutput::new(vec![(1, self.unroll_script()), (2, self.sweep_script()), (2, rc)]),
-		}
+		node_taproot(self.unroll_script(), self.sweep_script(), self.reclaim_script())
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -212,5 +185,52 @@ impl NodePolicy {
 		let mut below = vec![operator_sig.as_ref().to_vec()];
 		below.extend(owner_sigs.iter().rev().map(|s| s.as_ref().to_vec()));
 		Ok(self.taproot().witness(&script, below))
+	}
+}
+
+/// The gated, timed UNROLL leaf of a node whose member tree is `gate_commitment`
+/// and whose children are `children`, at outputs `0..r-1`.
+pub fn unroll_script(gate_commitment: &GateCommitment, children: &[Child]) -> Script {
+	let mut b = gate(Builder::new(), gate_commitment);
+	for i in 0..children.len() {
+		b = b.output_record(i as i64);
+		if i > 0 {
+			b = b.push_opcode(OP_CAT);
+		}
+	}
+	b.ops(&[OP_SHA256, OP_DUP]).push_slice(&children_hash(children)).push_opcode(OP_EQUALVERIFY)
+		.ops(&[OP_SWAP, OP_CLTV, OP_CAT])
+		.push_slice(UNROLL_TAG).ops(&[OP_SWAP, OP_CAT, OP_SHA256, OP_FROMALTSTACK, OP_CHECKSIGFROMSTACK])
+		.into_script()
+}
+
+/// The RECLAIM leaf: every owner's signature over `release` (the digest of
+/// the release message), in owner order, then the operator's. Panics if
+/// `owners` is empty.
+pub fn reclaim_script(release: &[u8; 32], owners: &[XOnlyPublicKey], operator: &XOnlyPublicKey) -> Script {
+	let n = owners.len();
+	assert!(n > 0, "a reclaim needs an owner");
+	let mut b = Builder::new().push_slice(release);
+	if n == 1 {
+		b = b.push_slice(&owners[0].serialize()).push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
+	} else {
+		b = b.ops(&[OP_DUP, OP_TOALTSTACK]).push_slice(&owners[0].serialize())
+			.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
+		for k in &owners[1..n - 1] {
+			b = b.ops(&[OP_FROMALTSTACK, OP_DUP, OP_TOALTSTACK]).push_slice(&k.serialize())
+				.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
+		}
+		b = b.push_opcode(OP_FROMALTSTACK).push_slice(&owners[n - 1].serialize())
+			.push_opcode(OP_CHECKSIGFROMSTACKVERIFY);
+	}
+	b.push_slice(&operator.serialize()).push_opcode(OP_CHECKSIG).into_script()
+}
+
+/// A node's output: `[UNROLL, SWEEP]`, or `[UNROLL, [SWEEP, RECLAIM]]` for a
+/// lowest node.
+pub fn node_taproot(unroll: Script, sweep: Script, reclaim: Option<Script>) -> TapOutput {
+	match reclaim {
+		None => TapOutput::new(vec![(1, unroll), (1, sweep)]),
+		Some(rc) => TapOutput::new(vec![(1, unroll), (2, sweep), (2, rc)]),
 	}
 }

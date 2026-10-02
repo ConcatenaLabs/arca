@@ -210,6 +210,7 @@ dependencies = [
  "arca-consensus",
  "arca-sequentia-ext",
  "elements",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]
