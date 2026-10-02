@@ -28,7 +28,7 @@ jobs:
           echo "node build: run $(jq -r .databaseId <<<"$run"), commit $(jq -r .headSha <<<"$run")"
 
   node-tests:
-    name: verifier and node client against the node
+    name: verifier, node client and covenant scripts against the node
     needs: node-build
     runs-on: ubuntu-24.04
     env:
@@ -83,7 +83,7 @@ jobs:
       - name: Tests
         env:
           SEQUENTIA_DIR: ${{ github.workspace }}/sequentia
-        run: cargo test --locked -p arca-consensus -p arca-sequentia-ext -- --nocapture
+        run: cargo test --locked -p arca-consensus -p arca-sequentia-ext -p arca-covenant -- --nocapture
 
   regtest-suite:
     name: regtest suite and golden vectors against the node

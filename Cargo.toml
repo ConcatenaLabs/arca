@@ -19,6 +19,7 @@ members = [
   "wasm-testing",
   "consensus",
   "sequentia-ext",
+  "covenant",
 ]
 
 resolver = "2"

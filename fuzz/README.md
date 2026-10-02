@@ -99,6 +99,36 @@ Or combine it with other flags:
 ~/bark/fuzz$ ./fuzz.sh --use-corpus ~/../bark-qa -t 5000
 ```
 
+### The covenant targets
+
+`covenant_policy_decode`, `covenant_witness_parse` and `covenant_round_check`
+fuzz `arca-covenant`: the decoders of every policy and of the clock schedule
+(what decodes must re-encode to the same bytes and build its scripts), the
+readers of witnesses found on-chain, and the five client checks on an arbitrary
+round transaction. Their bodies are in `src/covenant.rs`.
+
+The same bodies also run under libFuzzer on a stable toolchain, without
+honggfuzz. The driver, `libfuzzer/covenant.rs`, picks a body by the first byte
+and treats any panic as a crash; with `ARCA_FUZZ_BODY` set to `policy`, `witness`
+or `round` it gives every input to that body whole. Build it with coverage
+instrumentation for the
+host target (so the flags do not reach build scripts), then run it:
+
+```bash
+RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
+  -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+  -Cllvm-args=-sanitizer-coverage-pc-table -Cllvm-args=-sanitizer-coverage-trace-compares" \
+  cargo build --manifest-path fuzz/Cargo.toml --release --features libfuzzer \
+  --bin covenant_libfuzzer --target x86_64-unknown-linux-gnu
+mkdir -p fuzz/corpus
+fuzz/target/x86_64-unknown-linux-gnu/release/covenant_libfuzzer fuzz/corpus -max_total_time=600 -max_len=4096
+```
+
+A seed corpus helps it reach deep paths quickly: encodings of real policies
+prefixed with `0x00`, witness stacks (each item as one length byte and the item)
+prefixed with `0x01`, and serialised transactions prefixed with `0x02`; the
+golden vectors (`regtest/vectors/arca.json`) hold all three.
+
 ## Debugging crashes
 
 When honggfuzz finds a crash, it saves the triggering input under

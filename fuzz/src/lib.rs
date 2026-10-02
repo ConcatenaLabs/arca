@@ -17,6 +17,8 @@
 //!   raised via [`oracle_assert!`]/[`oracle_assert_eq!`]/[`oracle_unreachable!`]
 //!   and [`harness::OracleResultExt::oracle`], are always re-raised as crashes.
 
+pub mod covenant;
+
 pub mod harness {
 	use std::cell::{Cell, RefCell};
 	use std::panic::{self, AssertUnwindSafe};

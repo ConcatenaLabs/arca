@@ -31,7 +31,7 @@ fn every_vector_spend_verifies() {
 	let standard = Verifier::standard(genesis);
 
 	let spends = v["spends"].as_array().unwrap();
-	assert!(spends.len() >= 27, "the vectors lost spends: {}", spends.len());
+	assert!(spends.len() >= 28, "the vectors lost spends: {}", spends.len());
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let tx: Transaction = deserialize(&hex(&s["tx"])).unwrap();

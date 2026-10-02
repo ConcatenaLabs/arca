@@ -166,7 +166,9 @@ def record_ops(i):
 def record(asset, value, spk):
     """Off-chain mirror of record_ops for an EXPLICIT output paying `spk`."""
     spk = bytes(spk)
-    if len(spk) >= 4 and (spk[0] == 0 or 0x51 <= spk[0] <= 0x60) and spk[1] == len(spk) - 2:
+    # A witness program as the node reads it (CScript::IsWitnessProgram): 4 to
+    # 42 bytes, a version opcode, then one push that fills the rest.
+    if 4 <= len(spk) <= 42 and (spk[0] == 0 or 0x51 <= spk[0] <= 0x60) and spk[1] == len(spk) - 2:
         ver, prog = (0 if spk[0] == 0 else spk[0] - 0x50), spk[2:]
     else:
         ver, prog = -1, sha256(spk)

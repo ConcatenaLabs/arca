@@ -250,6 +250,8 @@ def records():
         ("fee output (empty script)", X_ID, 500, b""),
         ("bare OP_RETURN", X_ID, 1_000_000, BURN_SPK),
         ("bare OP_TRUE", T_ID, 1, bytes([0x51])),
+        ("43 bytes shaped like a program, which the node does not read as one", X_ID, 7,
+         bytes([0x51, 41]) + label_hash("program", "long")[:32] + bytes(9)),
     ]
     return [{"name": n, "asset": hx(a), "value": v, "script_pubkey": hx(s), "record": hx(record(a, v, s))}
             for n, a, v, s in cases]
@@ -514,6 +516,11 @@ def generate():
     spends.append(rebind_spend("leaf/collab m=4", "leaf", "collab", ltap, CTAG, SALTS[i], leaf_spent, four, [S, A]))
     spends.append(rebind_spend("leaf/collab m=1, into the forfeit", "leaf", "collab", ltap, CTAG, SALTS[i],
                                leaf_spent, [(X_ID, LEAF_VALUE - 600, bytes(ftap.scriptPubKey))], [S, A]))
+    # A committed output whose script looks like a witness program but has 43
+    # bytes: the node reads it as SHA256(script) with version -1.
+    long_spk = bytes([0x51, 41]) + label_hash("program", "long")[:32] + bytes(9)
+    spends.append(rebind_spend("leaf/collab m=1, into a 43-byte script", "leaf", "collab", ltap, CTAG, SALTS[i],
+                               leaf_spent, [(X_ID, LEAF_VALUE - 600, long_spk)], [S, A]))
     spends.append(sweep_spend("checkpoint/sweep after the notice", "checkpoint", ctap, v_cp, bytes(ctap.scriptPubKey),
                               True, False))
 

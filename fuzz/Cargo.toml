@@ -12,6 +12,17 @@ name = "bark_fuzz"
 honggfuzz = { version = "0.5.55" , default-features = false }
 ark = { package = "arca-lib", path = "../lib", features = ["test-util"] }
 bitcoin = { version = "0.32", default-features = false, features = ["std"]}
+arca-covenant = { path = "../covenant" }
+libfuzzer-sys = { version = "0.4", optional = true }
+
+[features]
+# The covenant targets under libFuzzer, for machines without honggfuzz.
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[[bin]]
+name = "covenant_libfuzzer"
+path = "libfuzzer/covenant.rs"
+required-features = ["libfuzzer"]
 
 [profile.release]
 debug = 1
