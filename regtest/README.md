@@ -85,7 +85,16 @@ sample spend of every path:
   signed message and its digest, the test keys' signatures and the witness;
 - the injective record of several kinds of output.
 
-`vectors.py` writes the file from the suite's builders and the node framework's
+`vectors/records.json` holds the leaf record's vectors, written by
+`records.py`: the reference for the tree rules, the record's binary and JSON
+forms and the leaf id, which its docstring states in full. For each of seven
+batches (one leaf; five; sixteen; seventeen with burn-only sweeps; six at radix
+2; seven at radix 6 with no reserves; sixty-four) it holds the inputs, the batch
+output, a round transaction that issues the batch's token and funds it, and each
+exported leaf's position, leaf id and record in both forms. It also holds
+encodings a reader must refuse, each with the kind of reason.
+
+`vectors.py` writes both files from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
 signature uses zero auxiliary randomness, so the output is the same on every run:
 
@@ -96,11 +105,12 @@ The keys are test keys, `SHA256("Arca test vector key/" + label)` reduced modulo
 the group order; they hold nothing. `consensus/tests/vectors.rs` verifies every
 sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
-builders and compares them byte for byte.
+builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
+re-encodes and validates every record.
 
 ## In CI
 
 The `regtest-suite` job of [node.yml](../.github/workflows/node.yml) runs
-`vectors.py --check` and the whole suite against the newest node build, with the
+`vectors.py --check`, which regenerates both vector files, and the whole suite against the newest node build, with the
 functional test framework from the same node commit. The logs and result files
 are kept as the job's artifact.

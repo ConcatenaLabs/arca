@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Golden vectors for every frozen Arca script.
 
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py          # write vectors/arca.json
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check  # regenerate and compare
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py          # write vectors/arca.json and records.json
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check  # regenerate both and compare
 
 The scripts come from the suite's own builders (arklib.py, arklib3.py), the
 taproot outputs and signature hashes from the node's functional test
@@ -18,6 +18,10 @@ spends the output by one path, the outputs it spends, and for that path the
 signature hash or the signed message and its digest, the test keys'
 signatures and the full witness. Every sample transaction is a valid spend
 of its covenant input under the node's script rules.
+
+vectors/records.json holds the leaf record's vectors, which records.py
+generates: whole batches built by the tree rules, the round that funds each,
+and every exported leaf's record in both encodings with its leaf id.
 """
 import json
 import os
@@ -32,6 +36,7 @@ from test_framework.script import TaprootSignatureHash, LEAF_VERSION_TAPSCRIPT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "vectors", "arca.json")
+RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -591,22 +596,30 @@ def generate():
 
 
 def main():
-    text = json.dumps(generate(), indent=1) + "\n"
+    import records
+    files = [(OUT, json.dumps(generate(), indent=1) + "\n"),
+             (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
-        try:
-            with open(OUT) as f:
-                old = f.read()
-        except OSError:
-            old = None
-        if old != text:
+        stale = []
+        for path, text in files:
+            try:
+                with open(path) as f:
+                    old = f.read()
+            except OSError:
+                old = None
+            if old != text:
+                stale.append(os.path.relpath(path))
+            else:
+                print("%s regenerates byte for byte" % os.path.relpath(path))
+        if stale:
             sys.exit("%s does not match what vectors.py generates; run regtest/vectors.py and commit the result"
-                     % os.path.relpath(OUT))
-        print("%s regenerates byte for byte" % os.path.relpath(OUT))
+                     % ", ".join(stale))
         return
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w") as f:
-        f.write(text)
-    print("wrote %s" % os.path.relpath(OUT))
+    for path, text in files:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        print("wrote %s" % os.path.relpath(path))
 
 
 if __name__ == "__main__":

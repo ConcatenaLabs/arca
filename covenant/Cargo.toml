@@ -10,9 +10,16 @@ publish = false
 [lib]
 name = "arca_covenant"
 
+[features]
+default = [ "json" ]
+# The leaf record's JSON form (record_json).
+json = [ "dep:serde", "dep:serde_json" ]
+
 [dependencies]
 elements.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 arca-consensus = { path = "../consensus" }

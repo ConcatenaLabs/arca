@@ -101,16 +101,18 @@ Or combine it with other flags:
 
 ### The covenant targets
 
-`covenant_policy_decode`, `covenant_witness_parse` and `covenant_round_check`
-fuzz `arca-covenant`: the decoders of every policy and of the clock schedule
-(what decodes must re-encode to the same bytes and build its scripts), the
-readers of witnesses found on-chain, and the five client checks on an arbitrary
-round transaction. Their bodies are in `src/covenant.rs`.
+`covenant_policy_decode`, `covenant_witness_parse`, `covenant_round_check`,
+`covenant_record_decode` and `covenant_record_json` fuzz `arca-covenant`: the
+decoders of every policy and of the clock schedule (what decodes must re-encode
+to the same bytes and build its scripts), the readers of witnesses found
+on-chain, the five client checks on an arbitrary round transaction, and the leaf
+record's binary and JSON readers (what decodes must read the same from both
+forms and rebuild its path). Their bodies are in `src/covenant.rs`.
 
 The same bodies also run under libFuzzer on a stable toolchain, without
 honggfuzz. The driver, `libfuzzer/covenant.rs`, picks a body by the first byte
-and treats any panic as a crash; with `ARCA_FUZZ_BODY` set to `policy`, `witness`
-or `round` it gives every input to that body whole. Build it with coverage
+and treats any panic as a crash; with `ARCA_FUZZ_BODY` set to `policy`, `witness`,
+`round`, `record` or `record_json` it gives every input to that body whole. Build it with coverage
 instrumentation for the
 host target (so the flags do not reach build scripts), then run it:
 
@@ -126,8 +128,9 @@ fuzz/target/x86_64-unknown-linux-gnu/release/covenant_libfuzzer fuzz/corpus -max
 
 A seed corpus helps it reach deep paths quickly: encodings of real policies
 prefixed with `0x00`, witness stacks (each item as one length byte and the item)
-prefixed with `0x01`, and serialised transactions prefixed with `0x02`; the
-golden vectors (`regtest/vectors/arca.json`) hold all three.
+prefixed with `0x01`, serialised transactions prefixed with `0x02`, leaf records
+prefixed with `0x03` and their JSON texts with `0x04`; the golden vectors
+(`regtest/vectors/arca.json` and `records.json`) hold all five.
 
 ## Debugging crashes
 

@@ -24,6 +24,9 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
 
+`record` holds the leaf record, `record_json` its JSON form (the `json`
+feature, on by default), described below.
+
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
 authorisation, the release), `sign` the Elements taproot signature hash and BIP340
@@ -44,6 +47,49 @@ let msg = leaf.collab_message(asset, value, &outputs)?;   // what owner and oper
 let w = leaf.collab_witness(&sign_digest(&operator, &msg.digest, &aux), &sign_digest(&owner, &msg.digest, &aux), outputs.len() as u8);
 tx.input[i].witness.script_witness = w;
 ```
+
+## The leaf record
+
+A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
+the leaf against the chain and to take it on-chain alone, and nothing secret.
+It names the leaf's template and version (`vtxo-1`), the owner's key, the salt,
+the exit delay, the asset and value, the entry in front of the leaf (its unlock
+hash and reserve), the batch's chain, token and clock schedule
+`(T, S, W, E_0 … E_K)` (`R` is rebuilt from `W` and `S`), whether its sweeps
+are burn-only, and the path from the batch output down to the leaf. Each level
+of the path holds the index of the child on the leaf's path, the node's reserve
+and its other children; above the lowest node it holds the owner's proof in the
+node's member tree, and at the lowest node the other owners, whose keys that
+node's RECLAIM names.
+
+```rust
+use arca_covenant::LeafRecord;
+
+let record = LeafRecord::from_bytes(&bytes)?;          // or LeafRecord::from_json_str(text)?
+let valid = record.validate(&round_tx)?;               // the batch output, then the five checks
+let id = valid.leaf_id;                                // what the server keys the leaf by
+let branch = valid.branch;                             // every output from the batch output down
+```
+
+`validate` rebuilds every script on the path from the record, requires the
+round to pay exactly one output equal to the batch output it rebuilds (asset,
+value and script), so the leaf is where the record says, and runs the five
+client checks on the token and its clock. A wallet accepts a leaf only after
+that, and only once the round is final. `validate_batch_output` checks the path
+against one output and leaves out the clock, which only the round shows.
+
+The leaf id is never an outpoint. It is the BIP340 tagged hash, tag
+`Arca/leaf-id`, of the batch output's witness program, the number of levels, the
+index on the path at each level from the batch output down (one byte each), and
+the leaf's witness program.
+
+Both forms are versioned and canonical: a reader refuses an unknown format
+version, an unknown template or template version, and anything that does not
+encode back to the same record. The binary layout is in the `record` module's
+documentation. The JSON form has the same fields; its canonical text has its keys
+sorted and no whitespace, asset ids, the token and the genesis hash are in
+display order, and amounts are decimal strings. Its reader also refuses a
+repeated key, which two readers could otherwise resolve differently.
 
 ## Testing
 
@@ -67,13 +113,20 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   each attack that consensus accepts, naming the check.
 - `tests/encode.rs`: the encodings round-trip and refuse malformed bytes; the
   witness readers recover what the builders wrote.
+- `tests/record.rs`: every leaf record in the regtest suite's record vectors
+  (`regtest/vectors/records.json`) decodes from both forms, encodes back to the
+  same bytes and the same JSON text, gives the same leaf id and validates
+  against the round transaction that funds its batch; the refusal vectors are
+  refused for the reason they name; every single-field mutation of a valid
+  record, and every one-byte change of its binary form, is refused.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
   the burn-only sweep: every spend confirms, and every negative case is refused by
   the mempool and again when forced into a block with `generateblock`.
 
-The decoders and readers are fuzz targets in [fuzz/](../fuzz/README.md).
+The decoders and readers, the record's two among them, are fuzz targets in
+[fuzz/](../fuzz/README.md).
 
 ## Relay policy to plan around
 
