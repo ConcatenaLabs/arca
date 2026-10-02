@@ -102,17 +102,21 @@ Or combine it with other flags:
 ### The covenant targets
 
 `covenant_policy_decode`, `covenant_witness_parse`, `covenant_round_check`,
-`covenant_record_decode` and `covenant_record_json` fuzz `arca-covenant`: the
-decoders of every policy and of the clock schedule (what decodes must re-encode
-to the same bytes and build its scripts), the readers of witnesses found
-on-chain, the five client checks on an arbitrary round transaction, and the leaf
-record's binary and JSON readers (what decodes must read the same from both
-forms and rebuild its path). Their bodies are in `src/covenant.rs`.
+`covenant_record_decode`, `covenant_record_json`, `covenant_coin_record_decode`
+and `covenant_board_record` fuzz `arca-covenant`: the decoders of every policy
+and of the clock schedule (what decodes must re-encode to the same bytes and
+build its scripts), the readers of witnesses found on-chain, the five client
+checks on an arbitrary round transaction, the leaf record's binary and JSON
+readers (what decodes must read the same from both forms and rebuild its path),
+the coin record a receiver gets for an out-of-round transfer (what decodes must
+re-encode to the same bytes and go through validation without a panic), and the
+board record's two forms. Their bodies are in `src/covenant.rs`.
 
 The same bodies also run under libFuzzer on a stable toolchain, without
 honggfuzz. The driver, `libfuzzer/covenant.rs`, picks a body by the first byte
 and treats any panic as a crash; with `ARCA_FUZZ_BODY` set to `policy`, `witness`,
-`round`, `record` or `record_json` it gives every input to that body whole. Build it with coverage
+`round`, `record`, `record_json`, `coin` or `board` it gives every input to
+that body whole. Build it with coverage
 instrumentation for the
 host target (so the flags do not reach build scripts), then run it:
 
@@ -129,8 +133,10 @@ fuzz/target/x86_64-unknown-linux-gnu/release/covenant_libfuzzer fuzz/corpus -max
 A seed corpus helps it reach deep paths quickly: encodings of real policies
 prefixed with `0x00`, witness stacks (each item as one length byte and the item)
 prefixed with `0x01`, serialised transactions prefixed with `0x02`, leaf records
-prefixed with `0x03` and their JSON texts with `0x04`; the golden vectors
-(`regtest/vectors/arca.json` and `records.json`) hold all five.
+prefixed with `0x03` and their JSON texts with `0x04`, coin records prefixed with
+`0x05`, board records (either form) with `0x06`; the golden vectors
+(`regtest/vectors/arca.json`, `records.json` and `transactions.json`) hold all
+seven.
 
 ## Debugging crashes
 

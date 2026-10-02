@@ -5,15 +5,18 @@
 //! bodies are run bare under libFuzzer (`libfuzzer/covenant.rs`) and behind
 //! [`crate::harness::guard`] under honggfuzz (`src/bin/covenant_*.rs`).
 //! The oracles check that what decodes re-encodes to the same bytes, that
-//! every decoded policy builds its scripts, and that a decoded leaf record
-//! reads the same in both of its forms and rebuilds its path.
+//! every decoded policy builds its scripts, that a decoded leaf record or
+//! board record reads the same in both of its forms and rebuilds its path or
+//! leaf, and that a decoded coin record goes through validation without a
+//! panic.
 
 use arca_covenant::elements;
 use arca_covenant::encode::{Encoding, Policy};
 use arca_covenant::record::{LeafRecord, RecordError};
 use arca_covenant::script::sha256;
 use arca_covenant::witness::{find_preimage, ScriptPath, UnrollWitness};
-use arca_covenant::{check_round, ClockSchedule, MedianTime, RelativeTime};
+use arca_covenant::{check_round, BoardRecord, Chain, ClockSchedule, CoinRecord, MedianTime, RelativeTime, WalletPolicy};
+use elements::hashes::Hash;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 
 use crate::{oracle_assert, oracle_assert_eq, oracle_unreachable};
@@ -126,5 +129,40 @@ pub fn record_json(data: &[u8]) {
 	let Ok(text) = std::str::from_utf8(data) else { return };
 	if let Ok(r) = LeafRecord::from_json_str(text) {
 		record_oracles(&r);
+	}
+}
+
+/// A coin record (an out-of-round transfer's) in its binary form: decode,
+/// re-encode, and run validation, which must refuse without a panic.
+pub fn coin_record_decode(data: &[u8]) {
+	if let Ok(c) = CoinRecord::from_bytes(data) {
+		oracle_assert_eq!(c.to_bytes().expect("a decoded coin record encodes"), data.to_vec(),
+			"a decoded coin record re-encodes to its bytes");
+		let key = XOnlyPublicKey::from_slice(&[
+			0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+			0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+		]).unwrap();
+		let policy = WalletPolicy::new(Chain::new(elements::BlockHash::all_zeros()), key,
+			MedianTime::from_consensus(1_800_000_000).unwrap());
+		let _ = c.resolve(&[], &policy);
+		let _ = c.validate(&[], &policy, &key, &[0; 32]);
+	}
+}
+
+/// A board record, in its binary form and as JSON text: decode, re-encode,
+/// read the other form, rebuild its leaf.
+pub fn board_record(data: &[u8]) {
+	if let Ok(b) = BoardRecord::from_bytes(data) {
+		oracle_assert_eq!(b.to_bytes().unwrap(), data.to_vec(), "a decoded board record re-encodes to its bytes");
+		let text = b.to_json_string().expect("a decoded board record has a JSON form");
+		oracle_assert_eq!(BoardRecord::from_json_str(&text).expect("its JSON text decodes"), b);
+		let _ = b.leaf_id();
+		oracle_assert!(b.output().script_pubkey.is_v1_p2tr(), "a board pays a taproot leaf");
+	}
+	if let Ok(text) = std::str::from_utf8(data) {
+		if let Ok(b) = BoardRecord::from_json_str(text) {
+			let bytes = b.to_bytes().expect("a decoded board record encodes");
+			oracle_assert_eq!(BoardRecord::from_bytes(&bytes).expect("its bytes decode"), b);
+		}
 	}
 }
