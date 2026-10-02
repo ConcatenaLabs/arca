@@ -56,10 +56,19 @@ to a node binary, as [consensus/README.md](consensus/README.md) describes.
 
     cargo test -p arca-consensus -p arca-sequentia-ext
 
+[regtest/](regtest/README.md) is the regtest suite: Python tests that build every
+Arca script independently of the Rust code and spend it on a Sequentia regtest
+chain, with each negative case forced into a block. It exports the golden
+vectors (`regtest/vectors/arca.json`) that the Rust builders must reproduce byte
+for byte. It needs a node binary and a node source tree:
+
+    SEQUENTIAD_EXEC=/path/to/sequentiad SEQUENTIA_DIR=/path/to/Sequentia regtest/run
+
 Continuous integration on GitHub Actions runs on every pull request and on every
 push to `master`: [lib.yml](.github/workflows/lib.yml) builds `arca-lib` and runs
 its unit tests, and [node.yml](.github/workflows/node.yml) runs `arca-consensus`
-and `arca-sequentia-ext` against the newest node build.
+and `arca-sequentia-ext`, checks that the golden vectors regenerate, and runs the
+regtest suite, all against the newest node build.
 
 ## Security
 

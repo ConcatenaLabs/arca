@@ -144,6 +144,14 @@ not Sequentia's. Tests that need a node start one with
 `sequentia_ext::regtest::Regtest`, which anchors the chain to a Bitcoin regtest
 parent.
 
+`regtest/` is the independent reference for every Arca script: a Python suite
+on the node's functional test framework, and the golden vectors it exports
+(`regtest/README.md`). Rust code that builds an Arca script must reproduce the
+vector byte for byte. A script change starts there: change the builder in
+`regtest/arklib3.py`, run the suite, regenerate the vectors with
+`regtest/vectors.py`, and commit the result with the Rust change. CI fails when
+the vectors no longer regenerate byte for byte.
+
 CI runs on GitHub Actions (`.github/workflows/`). Check it after every merge.
 
 ## Rules from Sequentia that bind this code

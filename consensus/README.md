@@ -61,6 +61,11 @@ relative lock) and asserts for each that the verifier, the node's
 same verdict, and that the verifier names the same script error as the node.
 `-- --nocapture` prints the table.
 
-The `node` workflow (`.github/workflows/node.yml`) runs both against the newest
+`tests/vectors.rs` verifies every sample spend in the golden vectors
+(`regtest/vectors/arca.json`, see [regtest/README.md](../regtest/README.md)),
+every input, under the block rules and the mempool's script checks, and checks
+that a changed witness fails. It needs only the library.
+
+The `node` workflow (`.github/workflows/node.yml`) runs these tests against the newest
 node `master` commit whose build passed: it downloads that build's `sequentiad` and
 builds the consensus library from the same commit.
