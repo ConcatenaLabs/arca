@@ -17,6 +17,10 @@
 //!   clock schedule ([`checks`]);
 //! - the leaf record ([`record`]): what a holder keeps, its id, its binary
 //!   and JSON forms ([`record_json`]), and its validation against the round;
+//! - the tree builder ([`tree`]), which turns the leaves of one asset into a
+//!   batch and gives each owner its record, and the unroll ([`unroll`]): the
+//!   transactions from the batch output down to a leaf, with the reserve or a
+//!   fee coin paying;
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]).
@@ -51,6 +55,8 @@ pub mod sign;
 pub mod sweep;
 pub mod taptree;
 pub mod time;
+pub mod tree;
+pub mod unroll;
 pub mod witness;
 
 pub use checkpoint::CheckpointPolicy;
@@ -68,6 +74,8 @@ pub use script::{Child, ExplicitOutput};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};
+pub use tree::{LeafSpec, ReserveRule, Tree, TreeError, TreeParams};
+pub use unroll::{FeeSource, UnrollAuth, UnrollTx};
 
 /// Why a policy cannot be built or a spend cannot be made.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

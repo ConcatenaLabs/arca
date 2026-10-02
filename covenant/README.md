@@ -25,7 +25,9 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
-feature, on by default), described below.
+feature, on by default), `tree` the builder that turns the leaves of one asset
+into a batch, and `unroll` the transactions that take a leaf on-chain; all
+described below.
 
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
@@ -91,6 +93,59 @@ sorted and no whitespace, asset ids, the token and the genesis hash are in
 display order, and amounts are decimal strings. Its reader also refuses a
 repeated key, which two readers could otherwise resolve differently.
 
+## Building a tree
+
+`Tree::build` takes the leaves of one asset and the batch's parameters: the
+asset, the chain, the token and clock schedule (whose `S` is the operator's
+key), whether the sweeps are burn-only, the radix (2 to 6) and the reserve rule.
+It follows the specification's rules for building a tree: leaves left to right,
+each behind its hash-locked entry; entries grouped `radix` at a time into lowest
+nodes and nodes into the level above until one is left, only the last node of a
+level short and each built for its own child count; scripts bottom-up; the
+reserve at every node and every entry; member lists of the operator and the
+owners under the node, padded with the operator; RECLAIM on the lowest nodes; no
+leaf script twice. A batch of one leaf is one node with one child.
+
+```rust
+use arca_covenant::{LeafSpec, ReserveRule, Tree, TreeParams};
+
+let tree = Tree::build(TreeParams {
+	asset, chain, schedule, burn: false, radix: 4,
+	reserve: ReserveRule::FeeRate { floor_per_kvb, multiple: 4 },
+	min_leaf: floor_per_kvb,
+}, &leaves)?;
+let batch = tree.batch_output();                  // the round pays this
+let clock0 = tree.clock0_script_pubkey();         // and the token's atom here
+let records = tree.records();                     // one per leaf, for its owner
+```
+
+`ReserveRule::FeeRate` is the specification's rule: each output holds
+`multiple` times the relay floor for its own spend, sized from that
+transaction built with a full-length witness. `ReserveRule::Fixed` puts the same
+reserve on every node and on every entry.
+
+## Unrolling a leaf
+
+A leaf goes on-chain from its record alone. `Branch::unroll` builds the node
+transactions from the batch output down, each spending the child its parent
+created, and `Branch::entry_tx` the unlock of the entry into the leaf with the
+preimage. Each takes a `FeeSource`: the output's own reserve as the fee, or a
+coin of the broadcaster's in any accepted asset, attached as a second input,
+which pays the fee in its own asset while the reserve goes to an ordinary
+output. An attached coin changes every transaction's id, which no witness
+depends on. The owner authorises each node with a signature over
+`BranchNode::unroll_authorisation(t)`; another member signs the same message
+and supplies its own member proof.
+
+```rust
+let branch = record.validate(&round)?.branch;
+let auths: Vec<_> = branch.nodes.iter()
+	.map(|n| n.owner_auth(sign(&n.unroll_authorisation(t).digest), t, owner))
+	.collect();
+let txs = branch.unroll(batch_outpoint, &auths, &vec![FeeSource::Reserve; auths.len()])?;
+let entry = branch.entry_tx(branch.entry_outpoint(&txs).unwrap(), &preimage, &FeeSource::Reserve)?;
+```
+
 ## Testing
 
 The tests verify through the node's own interpreter (`arca-consensus`), so they
@@ -119,11 +174,22 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   against the round transaction that funds its batch; the refusal vectors are
   refused for the reason they name; every single-field mutation of a valid
   record, and every one-byte change of its binary form, is refused.
+- `tests/tree.rs`: the builder rebuilds every batch and record in the record
+  vectors byte for byte; for every leaf count from 1 to 100 at radix 4 (and 1
+  to 40 at radix 2, 3, 5 and 6) every leaf's record validates against the
+  round, every node transaction of every branch and every entry's unlock
+  verifies under the block rules and the mempool's checks, with the reserve as
+  the fee and with a fee coin attached, and a child changed by one atom makes
+  its node fail; the fee-rate reserves cover each spend; a 1,024-leaf batch's
+  node sizes match the specification's table.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
-  the burn-only sweep: every spend confirms, and every negative case is refused by
-  the mempool and again when forced into a block with `generateblock`.
+  the burn-only sweep; and a 16-leaf and a 64-leaf batch built by the tree
+  builder, every record checked against the confirmed round and three leaves in
+  different subtrees unrolled from their records, unlocked and exited: every
+  spend confirms, and every negative case is refused by the mempool and again
+  when forced into a block with `generateblock`.
 
 The decoders and readers, the record's two among them, are fuzz targets in
 [fuzz/](../fuzz/README.md).

@@ -145,8 +145,8 @@ not Sequentia's. Tests that need a node start one with
 parent.
 
 `arca-covenant` (`covenant/`) builds every Arca script, its witnesses and the
-client's checks on a round, and holds the leaf record and its validation; it is
-where new script code goes. It depends on `elements`, `thiserror` and, for the
+client's checks on a round, and holds the leaf record and its validation, the
+tree builder and the unroll; it is where new script code goes. It depends on `elements`, `thiserror` and, for the
 record's JSON form, `serde` and `serde_json`, so a wallet can use it without
 `arca-lib`. Bark's MuSig2 policies in `arca-lib` stay until a later package
 removes them.
