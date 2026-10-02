@@ -417,6 +417,8 @@ def generate():
                                                  "connector": {"round_txid": ROUND_TXID[::-1].hex(),
                                                                "vout": CONNECTOR_VOUT, "asset": hx(m_id)}},
                                      ftap, [("claim", 1), ("refund", 1)])
+    ctap_conn, _ = connector_taptree(S.x)
+    outputs["connector"] = output_json("connector", {"operator": hx(S.x)}, ctap_conn, [("issue", 0)])
     cp_sweep = sweep_token(T_ID, R_PROG, S.x, W)
     ctap, clv = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT, CTAG, cp_sweep)
     outputs["checkpoint"] = output_json("checkpoint", {
@@ -561,6 +563,20 @@ def generate():
     sp = Spend([("forfeit/refund", f_spent, DELAY)], [txout(LEAF_VALUE - 1200, bytes(taproot_construct(A.x).scriptPubKey)),
                                                       fee_out(600)])
     spends.append(checksig_spend("forfeit/refund", "forfeit", "refund", ftap, sp, 0, A))
+
+    # ---- spends: the connector -----------------------------------------
+    # The round's connector output (ROUND_TXID, CONNECTOR_VOUT) issues M:
+    # one explicit atom, no reissuance token, the connector's value the fee.
+    sp = Spend([("connector/issue", txout(5_000, ctap_conn.scriptPubKey), 0xffffffff)],
+               [txout(1, FEE_COIN_TAP.scriptPubKey, m_out), fee_out(5_000)])
+    sp.tx.vin[0].prevout = COutPoint(uint256_from_str(ROUND_TXID), CONNECTOR_VOUT)
+    iss = CAssetIssuance()
+    iss.assetBlindingNonce, iss.assetEntropy = 0, 0
+    iss.nAmount, iss.nInflationKeys, iss.denomination = CTxOutValue(1), CTxOutValue(), 0
+    sp.tx.vin[0].assetIssuance = iss
+    d = checksig_spend("connector/issue", "connector", "issue", ctap_conn, sp, 0, S)
+    d["issues"] = hx(m_id)
+    spends.append(d)
 
     # ---- spends: htlc-1 -----------------------------------------------
     h_spent = txout(LEAF_VALUE, htap.scriptPubKey)

@@ -59,8 +59,19 @@ hash. The claim's witness is <sig_S> <preimage> <k>, k the input holding M:
 input 1, whose whole value goes back to the operator after the claimed
 outputs. The issuance of M spends the connector output, issues one explicit
 atom with no reissuance token, pays it at output 0, and the connector's value
-pays the fee. The claim and the refund are ordinary signatures over the
-Elements taproot signature hash.
+pays the fee. The claim, the refund and the issuance are ordinary signatures
+over the Elements taproot signature hash.
+
+The connector output, (round_txid, c), has one leaf:
+
+    issue:   <S> OP_CHECKSIGVERIFY OP_PUSHCURRENTINPUTINDEX OP_INSPECTINPUTISSUANCE
+             <0^32> OP_EQUALVERIFY <0^32> OP_EQUALVERIFY
+             OP_1 OP_EQUALVERIFY <1, u64 LE> OP_EQUALVERIFY
+             OP_1 OP_EQUALVERIFY <0, u64 LE> OP_EQUAL
+
+so only the operator spends it, and only by issuing M on that input: a zero
+blinding nonce (a new issuance), a zero entropy (a zero contract hash), one
+explicit atom, no reissuance token. Its witness is <sig_S>.
 
 The offboard
 ------------
@@ -348,19 +359,30 @@ def board():
 # The forfeit
 # --------------------------------------------------------------------------
 
-def connector_issuance(round_txid, vout, coin_value, fee_value):
-    """The issuance of a round's connector asset."""
+CONNECTOR_TAP, CONNECTOR_SCRIPTS = connector_taptree(S.x)
+CONNECTOR_SPK = bytes(CONNECTOR_TAP.scriptPubKey)
+
+
+def connector_issuance(round_txid, vout, coin_value):
+    """The issuance of a round's connector asset: the connector output, held
+    at (round_txid, vout) by the connector script, issues one explicit atom
+    with no reissuance token, paid at output 0; its value pays the fee. The
+    operator signs it."""
     m = records.issued_asset(round_txid, vout)
     oj, op = {"txid": display(round_txid), "vout": vout}, COutPoint(uint256_from_str(round_txid), vout)
-    b = Built([((oj, op), (ASSET, coin_value, OP_TRUE_SPK), FINAL)],
+    b = Built([((oj, op), (ASSET, coin_value, CONNECTOR_SPK), FINAL)],
               [(m, 1, OP_TRUE_SPK), (ASSET, coin_value, b"")])
     iss = CAssetIssuance()
     iss.assetBlindingNonce, iss.assetEntropy = 0, 0
     iss.nAmount, iss.nInflationKeys, iss.denomination = CTxOutValue(1), CTxOutValue(), 0
     b.tx.vin[0].assetIssuance = iss
+    script = CONNECTOR_SCRIPTS["issue"]
+    sh = b.sighash(0, script)
+    sig = S.sign(sh)
+    b.witness(0, [sig, bytes(script), control_block(CONNECTOR_TAP, "issue")])
     d = b.json()
     d.update({"name": "the issuance of the connector asset", "asset": display(m), "fee": "reserve",
-              "to": OP_TRUE_SPK.hex()})
+              "to": OP_TRUE_SPK.hex(), "sighash": hx(sh), "signatures": {S.label: hx(sig)}})
     return m, d
 
 
@@ -374,7 +396,7 @@ def forfeit():
     preimage = label_hash("preimage", "forfeit")
     h = sha256(preimage)
     round_txid, c = label_hash("outpoint", "the round"), 2
-    m, issuance = connector_issuance(round_txid, c, 5_000, 5_000)
+    m, issuance = connector_issuance(round_txid, c, 5_000)
     ftap, fscripts = forfeit_taptree(h, A.x, S.x, SEQ_TIME | DELAY, leaf_id, m)
     fspk = bytes(ftap.scriptPubKey)
     fval = value - margin
@@ -414,6 +436,7 @@ def forfeit():
         "leaf_script_pubkey": lspk.hex(),
         "forfeit_output": out_json(ASSET, fval, fspk),
         "claim_script": hx(fscripts["claim"]), "refund_script": hx(fscripts["refund"]),
+        "connector_output": out_json(ASSET, 5_000, CONNECTOR_SPK), "connector_script": hx(CONNECTOR_SCRIPTS["issue"]),
         "issuance": issuance,
         "transactions": txs + [claim_r, claim_c, refund, refund_coin],
     }

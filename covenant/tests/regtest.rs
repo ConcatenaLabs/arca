@@ -298,7 +298,8 @@ fn forfeit(net: &mut Net) {
 	let a = keypair("forfeit owner");
 	let sched = ClockSchedule::new(asset("forfeit token"), xonly(&s_key), delay(), vec![mt(net.now() + 28 * 24 * H as u64)]).unwrap();
 	// The round's connector output, and the asset M spending it issues.
-	let connector = net.fund(vec![explicit(net.x, 5_000, op_true_spk())]).remove(0);
+	let conn_policy = ConnectorPolicy { operator: xonly(&s_key) };
+	let connector = net.fund(vec![conn_policy.output(net.x, 5_000).txout()]).remove(0);
 	let m = connector_asset(connector.outpoint.txid, connector.outpoint.vout);
 	let run = |net: &mut Net, label: &str| {
 		let old = net.leaf(&a, &s_key, &format!("forfeit old leaf {}", label));
@@ -333,8 +334,9 @@ fn forfeit(net: &mut Net) {
 	let ft = net.pass("forfeit/forfeit (the old leaf by its collaborative path)", &forfeit_tx(sig(&a, &msg.digest).as_ref().to_vec()));
 	let f_coin = Coin { outpoint: OutPoint::new(ft, 0), txout: f_out.txout() };
 	// The operator issues M by spending the round's connector output.
-	let mut iss = connector_issuance(connector.outpoint, &connector.txout, op_true_spk(), &[], &FeeSource::Reserve).unwrap();
-	iss.tx.input[0].witness.script_witness = op_true_witness();
+	let ks = conn_policy.issuance(connector.outpoint, (net.x, 5_000), op_true_spk(), &[], &FeeSource::Reserve).unwrap();
+	let sg = sig(&s_key, &ks.sighash(net.genesis).unwrap());
+	let iss = ks.finish(vec![sg.as_ref().to_vec()]);
 	let it = net.pass("forfeit/the issuance of the connector asset M", &iss.tx);
 	let m_coin = coin_of(it, 0, &iss.tx);
 	let claim = |net: &Net, pre: &[u8; 32], key: Option<&Keypair>| {

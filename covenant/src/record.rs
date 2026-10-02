@@ -48,10 +48,15 @@
 //! leaf. Beyond the path and the five client checks it applies the wallet's
 //! own policy ([`WalletPolicy`]): its chain, the operator key it was told,
 //! the shortest notice `W` it accepts, how far after now the first expiry
-//! must lie, and the bounds on the exit delay. What it accepted names the
-//! round it was checked against ([`ValidLeaf::round_txid`]): after any
-//! rollback that disconnects that round, the wallet checks again whichever
-//! transaction now pays the batch output, and unrolls at once if that fails.
+//! must lie, the bounds on the exit delay, the deepest path it accepts, no
+//! node of one child outside a batch of one leaf, and a floor on every
+//! reserve of the path. The first expiry must lie a batch lifetime ahead
+//! when a leaf is accepted from a round, and only past the exit deadline for
+//! a leaf the wallet holds or receives ([`WalletPolicy::receipt`]). What it
+//! accepted names the round it was checked against
+//! ([`ValidLeaf::round_txid`]): after a rollback the wallet checks the leaf
+//! again against whatever transaction now pays its batch output
+//! ([`LeafRecord::recheck`]), which is the same round returned or a new one.
 //!
 //! # The binary form, version 2
 //!
@@ -126,6 +131,7 @@ use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
 use crate::time::{MedianTime, RelativeTime};
+use crate::tree::fee_rate_reserve;
 use crate::{EntryPolicy, LeafPolicy};
 
 /// The record format this crate writes and reads.
@@ -384,6 +390,14 @@ pub enum RecordError {
 	ExpiryTooSoon { expiry: u32, earliest: u64 },
 	#[error("an exit delay of {delay} units; the wallet accepts {min} to {max}")]
 	ExitDelay { delay: u16, min: u16, max: u16 },
+	#[error("a path of {levels} levels; the wallet accepts {max} at most")]
+	TooManyLevels { levels: usize, max: usize },
+	#[error("level {level} is a node of one child; only a batch of one leaf has one")]
+	OneChild { level: usize },
+	#[error("level {level} holds a reserve of {reserve}; the wallet requires {min} at least")]
+	NodeReserve { level: usize, reserve: u64, min: u64 },
+	#[error("the entry holds a reserve of {reserve}; the wallet requires {min} at least")]
+	EntryReserve { reserve: u64, min: u64 },
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
 	#[error("not JSON: {0}")]
@@ -436,7 +450,8 @@ impl RecordError {
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
 			NotOwner | OwnerNonce | OwnKeyTwice => "owner",
-			WrongChain | WrongOperator | NoticeTooShort { .. } | ExpiryTooSoon { .. } | ExitDelay { .. } => "policy",
+			WrongChain | WrongOperator | NoticeTooShort { .. } | ExpiryTooSoon { .. } | ExitDelay { .. }
+			| TooManyLevels { .. } | OneChild { .. } | NodeReserve { .. } | EntryReserve { .. } => "policy",
 			Json(_) => "json",
 			Field(_) => "field",
 			Type(_) => "type",
@@ -658,6 +673,26 @@ impl LeafRecord {
 		Ok(ValidLeaf { leaf_id: branch.leaf_id(), round_txid: round.txid(), batch_vout, branch })
 	}
 
+	/// The wallet's look at a leaf it holds, after a rollback or at any time:
+	/// `round` is the transaction the chain now has paying the leaf's batch
+	/// output, and `held` what the wallet accepted. The record is checked
+	/// against `round` under `policy.receipt()`, so the first expiry need only
+	/// lie past the exit deadline.
+	///
+	/// An operator re-broadcasts a disconnected round unchanged, so the same
+	/// transaction returns ([`Recheck::Same`]) and every forfeit signed for it
+	/// can still be claimed. Another transaction paying the same batch output
+	/// is a new round ([`Recheck::NewRound`]): the forfeits signed for the old
+	/// one name a connector asset that can never be issued, so every leaf
+	/// given up for it is still its owner's, and nothing the wallet signed for
+	/// the old round carries over. An error means the leaf is not where the
+	/// record says, or no longer meets the policy; whether to unroll depends on
+	/// whether the batch output is on-chain at all.
+	pub fn recheck(&self, held: &ValidLeaf, round: &Transaction, policy: &WalletPolicy) -> Result<Recheck, RecordError> {
+		let valid = self.validate_round(round, &policy.receipt())?;
+		Ok(if valid.round_txid == held.round_txid { Recheck::Same(valid) } else { Recheck::NewRound(valid) })
+	}
+
 	/// Checks the path alone against one output: it must be the batch output
 	/// the record rebuilds. This does not check the token or the clock, which
 	/// only the round transaction shows, nor the wallet's policy; a wallet
@@ -815,8 +850,25 @@ pub struct ValidLeaf {
 	pub branch: Branch,
 }
 
+/// What [`LeafRecord::recheck`] finds.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum Recheck {
+	/// The round the leaf was accepted from pays its batch output.
+	Same(ValidLeaf),
+	/// Another transaction pays it: a new round.
+	NewRound(ValidLeaf),
+}
+
 /// What a wallet accepts in a leaf's record, beyond its being well formed and
 /// matching the chain: [`LeafRecord::validate`] refuses anything outside it.
+///
+/// Two moments use it. Accepting a leaf from a round ([`WalletPolicy::new`])
+/// asks that the first expiry lie a whole batch lifetime ahead, less the time
+/// for the round to become final. Every later look at a leaf the wallet
+/// holds, and the receipt of a coin out of round, asks only that the first
+/// expiry lie past the exit deadline ([`WalletPolicy::receipt`]): a leaf
+/// accepted from a round passes it for most of its batch's life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalletPolicy {
 	/// The wallet's own chain.
@@ -833,6 +885,27 @@ pub struct WalletPolicy {
 	/// The bounds on the exit delay.
 	pub min_exit_delay: RelativeTime,
 	pub max_exit_delay: RelativeTime,
+	/// The most levels a leaf's path may have: the depth of the largest batch
+	/// the operator advertises. Every level adds a node transaction to the
+	/// leaf's exit.
+	pub max_levels: usize,
+	/// The least each node on the path and the entry hold back for the fee of
+	/// the transaction that spends them.
+	pub min_reserve: ReserveFloor,
+}
+
+/// The least a reserve on a leaf's path holds, in the batch asset's atoms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReserveFloor {
+	/// Every node and the entry hold at least this many atoms. `Atoms(0)`
+	/// accepts any reserve.
+	Atoms(u64),
+	/// The specification's rule at the wallet's own floor, in the batch
+	/// asset's atoms per 1,000 vbytes: every node and the entry hold at least
+	/// what [`crate::ReserveRule::FeeRate`] gives them at that floor and
+	/// multiple. A wallet that sets the floor above the operator's refuses the
+	/// operator's honest batches.
+	FeeRate { floor_per_kvb: u64, multiple: u64 },
 }
 
 impl WalletPolicy {
@@ -842,15 +915,23 @@ impl WalletPolicy {
 	/// created; one day of that is left for the round to become final and for
 	/// the participation to complete.
 	pub const DEFAULT_HORIZON: u32 = 27 * 86_400;
+	/// The exit deadline, three days before the first expiry: a wallet still
+	/// holding a leaf then starts its exit, so the unroll, the exit delay and a
+	/// margin for an anchor rollback fit before the batch can be swept.
+	pub const EXIT_DEADLINE: u32 = 3 * 86_400;
 	/// The longest exit delay accepted by default, 48 hours: the exit
 	/// deadline lies three days before the expiry, and the unroll and the exit
 	/// delay must fit in it.
 	pub const DEFAULT_MAX_EXIT_SECONDS: u64 = 48 * 3600;
+	/// The default depth: the specification's largest batch, 1,024 leaves at
+	/// radix 4.
+	pub const DEFAULT_MAX_LEVELS: usize = 5;
 
 	/// The policy for a wallet on `chain` served by `operator`, at `now`,
-	/// with the specification's parameters: a notice of at least 36 hours, a
-	/// first expiry at least 27 days after now, and an exit delay of 36 to 48
-	/// hours.
+	/// accepting a leaf from a round, with the specification's parameters: a
+	/// notice of at least 36 hours, a first expiry at least 27 days after now,
+	/// an exit delay of 36 to 48 hours, at most five levels, and a reserve of
+	/// at least one atom on every node and on the entry.
 	pub fn new(chain: Chain, operator: XOnlyPublicKey, now: MedianTime) -> WalletPolicy {
 		let delay = RelativeTime::from_seconds_ceil(Self::SPEC_DELAY_SECONDS).expect("36 hours is a relative time");
 		WalletPolicy {
@@ -859,10 +940,33 @@ impl WalletPolicy {
 			horizon: Self::DEFAULT_HORIZON,
 			min_exit_delay: delay,
 			max_exit_delay: RelativeTime::from_seconds_ceil(Self::DEFAULT_MAX_EXIT_SECONDS).expect("48 hours is a relative time"),
+			max_levels: Self::DEFAULT_MAX_LEVELS,
+			min_reserve: ReserveFloor::Atoms(1),
 		}
 	}
 
-	/// Refuses a record outside the policy.
+	/// The same policy for a leaf or a coin the wallet already holds or
+	/// receives out of round, and for every re-check after a rollback: the
+	/// first expiry need only lie past the exit deadline, three days after
+	/// now ([`WalletPolicy::EXIT_DEADLINE`]). The acceptance horizon would
+	/// refuse an honest leaf from the second day of its batch.
+	pub fn receipt(self) -> WalletPolicy {
+		WalletPolicy { horizon: Self::EXIT_DEADLINE, ..self }
+	}
+
+	/// Whether `delay` is within the policy's bounds on the exit delay.
+	pub fn exit_delay_ok(&self, delay: RelativeTime) -> bool {
+		(self.min_exit_delay.units()..=self.max_exit_delay.units()).contains(&delay.units())
+	}
+
+	fn exit_delay_error(&self, delay: RelativeTime) -> RecordError {
+		RecordError::ExitDelay { delay: delay.units(), min: self.min_exit_delay.units(), max: self.max_exit_delay.units() }
+	}
+
+	/// Refuses a record outside the policy: its chain, operator, notice, first
+	/// expiry and exit delay; a path deeper than `max_levels`; a node of one
+	/// child anywhere but in a batch of one leaf; and a reserve below
+	/// `min_reserve` on any node of the path or on the entry.
 	pub fn check(&self, record: &LeafRecord) -> Result<(), RecordError> {
 		if record.chain != self.chain {
 			return Err(RecordError::WrongChain);
@@ -879,11 +983,45 @@ impl WalletPolicy {
 		if (expiry as u64) < earliest {
 			return Err(RecordError::ExpiryTooSoon { expiry, earliest });
 		}
-		let delay = record.exit_delay.units();
-		if delay < self.min_exit_delay.units() || delay > self.max_exit_delay.units() {
-			return Err(RecordError::ExitDelay {
-				delay, min: self.min_exit_delay.units(), max: self.max_exit_delay.units(),
-			});
+		if !self.exit_delay_ok(record.exit_delay) {
+			return Err(self.exit_delay_error(record.exit_delay));
+		}
+		let levels = record.levels();
+		if levels > self.max_levels {
+			return Err(RecordError::TooManyLevels { levels, max: self.max_levels });
+		}
+		// The builder gives every node 2 to r children; only a batch of one
+		// leaf is a single node of one child.
+		let children = record.upper.iter().map(|u| u.siblings.len() + 1)
+			.chain([record.lowest.siblings.len() + 1]);
+		if levels > 1 {
+			if let Some(level) = children.clone().position(|n| n == 1) {
+				return Err(RecordError::OneChild { level });
+			}
+		}
+		let reserves: Vec<u64> = record.upper.iter().map(|u| u.reserve).chain([record.lowest.reserve]).collect();
+		match self.min_reserve {
+			ReserveFloor::Atoms(min) => {
+				if let Some(level) = reserves.iter().position(|r| *r < min) {
+					return Err(RecordError::NodeReserve { level, reserve: reserves[level], min });
+				}
+				if record.entry_reserve < min {
+					return Err(RecordError::EntryReserve { reserve: record.entry_reserve, min });
+				}
+			},
+			ReserveFloor::FeeRate { floor_per_kvb, multiple } => {
+				let branch = record.branch()?;
+				for (level, node) in branch.nodes.iter().enumerate() {
+					let min = node.fee_rate_reserve(floor_per_kvb, multiple);
+					if node.reserve < min {
+						return Err(RecordError::NodeReserve { level, reserve: node.reserve, min });
+					}
+				}
+				let min = branch.entry_fee_rate_reserve(floor_per_kvb, multiple);
+				if record.entry_reserve < min {
+					return Err(RecordError::EntryReserve { reserve: record.entry_reserve, min });
+				}
+			},
 		}
 		Ok(())
 	}
@@ -968,6 +1106,18 @@ impl BranchNode {
 		unroll_authorisation(&self.children_hash(), t)
 	}
 
+	/// What [`crate::ReserveRule::FeeRate`] reserves on this node: `multiple`
+	/// times `floor_per_kvb` for its unroll with the reserve as the fee, the
+	/// witness at its full length, as the tree builder sizes it.
+	pub fn fee_rate_reserve(&self, floor_per_kvb: u64, multiple: u64) -> u64 {
+		let widest = MemberProof { index: 0, siblings: vec![[0; 32]; self.gate.depth] };
+		let mut below = vec![vec![0; 64], vec![0; 5]];
+		below.extend(widest.witness_items(&self.operator));
+		let w = self.taproot.witness(&self.unroll, below);
+		let outputs = self.children.iter().map(|c| c.output().txout()).collect();
+		fee_rate_reserve(floor_per_kvb, multiple, w, outputs, self.children[0].asset)
+	}
+
 	/// The full UNROLL witness for the owner's authorisation `sig` at `t`.
 	pub fn unroll_witness(&self, sig: &Signature, t: MedianTime, owner: &XOnlyPublicKey) -> Vec<Vec<u8>> {
 		self.member_unroll_witness(sig, t, owner, &self.proof)
@@ -1017,6 +1167,14 @@ impl Branch {
 	/// The leaf's output.
 	pub fn leaf_output(&self) -> ExplicitOutput {
 		ExplicitOutput::new(self.entry.asset, self.entry.value, self.leaf.script_pubkey())
+	}
+
+	/// What [`crate::ReserveRule::FeeRate`] reserves on the entry: `multiple`
+	/// times `floor_per_kvb` for its unlock into the leaf with the reserve as
+	/// the fee.
+	pub fn entry_fee_rate_reserve(&self, floor_per_kvb: u64, multiple: u64) -> u64 {
+		let w = self.entry_tap.witness(&self.entry.unlock_script(), vec![vec![0; 32]]);
+		fee_rate_reserve(floor_per_kvb, multiple, w, vec![self.leaf_output().txout()], self.entry.asset)
 	}
 
 	/// The sweep path of every output above the leaf: each node's, then the

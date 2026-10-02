@@ -12,7 +12,7 @@ from arklib import *                      # noqa: F401,F403
 from arklib import _csfs_2of2
 import os as _os
 from test_framework.messages import CAssetIssuance, CTxOutValue as _Val
-from test_framework.script import OP_INSPECTINPUTSCRIPTPUBKEY
+from test_framework.script import OP_INSPECTINPUTISSUANCE, OP_INSPECTINPUTSCRIPTPUBKEY
 
 TAG = b"ArcaRbd1"
 UTAG = b"Arca/unroll"
@@ -534,6 +534,22 @@ def forfeit_taptree(h, a_x, s_x, delay, leaf_id, connector):
     refund = exit_leaf(a_x, delay)
     tap = taproot_construct(NUMS, [("claim", claim), ("refund", refund)])
     return tap, {"claim": claim, "refund": refund}
+
+
+def connector_taptree(s_x):
+    """The round's connector output: one leaf, spent only by the operator and
+    only by issuing, on that input, one explicit atom of the asset it issues
+    with a zero contract hash (the round's connector asset M), with no
+    reissuance token. OP_INSPECTINPUTISSUANCE leaves, bottom to top: the
+    reissuance token amount and its prefix, the amount and its prefix, the
+    entropy, the blinding nonce. Witness: <sig_S>."""
+    issue = CScript([s_x, OP_CHECKSIGVERIFY, OP_PUSHCURRENTINPUTINDEX, OP_INSPECTINPUTISSUANCE,
+                     bytes(32), OP_EQUALVERIFY,              # blinding nonce: a new issuance
+                     bytes(32), OP_EQUALVERIFY,              # entropy: a zero contract hash
+                     OP_1, OP_EQUALVERIFY, (1).to_bytes(8, "little"), OP_EQUALVERIFY,   # one explicit atom
+                     OP_1, OP_EQUALVERIFY, bytes(8), OP_EQUAL])                         # no reissuance token
+    tap = taproot_construct(NUMS, [("issue", issue)])
+    return tap, {"issue": issue}
 
 
 def checkpoint_taptree(a_x, s_x, salt, ctag, sweep):

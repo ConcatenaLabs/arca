@@ -237,7 +237,7 @@ fn sum(a: u64, b: u64) -> Result<u64, TreeError> {
 
 /// `⌈vsize × floor_per_kvb / 1000⌉ × multiple` for a transaction with one input,
 /// whose witness is `witness`, and `outputs`, plus a fee output.
-fn fee_rate_reserve(floor_per_kvb: u64, multiple: u64, witness: Vec<Vec<u8>>, mut outputs: Vec<TxOut>, asset: AssetId) -> u64 {
+pub(crate) fn fee_rate_reserve(floor_per_kvb: u64, multiple: u64, witness: Vec<Vec<u8>>, mut outputs: Vec<TxOut>, asset: AssetId) -> u64 {
 	outputs.push(TxOut::new_fee(1, asset));
 	let mut tx = Transaction {
 		version: 2,

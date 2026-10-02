@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use arca_covenant::record::{LeafRecord, Sibling};
 use arca_covenant::script::sha256;
-use arca_covenant::{Chain, ClockSchedule, MedianTime, MemberProof, RelativeTime, WalletPolicy};
+use arca_covenant::{Chain, ClockSchedule, MedianTime, MemberProof, RecordError, RelativeTime, ReserveFloor, WalletPolicy};
 
 /// The time the vectors' batches are created: every first expiry lies 28
 /// days later.
@@ -52,6 +52,8 @@ fn believing(r: &LeafRecord) -> WalletPolicy {
 		horizon: 0,
 		min_exit_delay: RelativeTime::from_units(1).unwrap(),
 		max_exit_delay: RelativeTime::from_units(u16::MAX).unwrap(),
+		max_levels: arca_covenant::record::MAX_LEVELS,
+		min_reserve: ReserveFloor::Atoms(0),
 		..WalletPolicy::new(r.chain, r.operator(), MedianTime::from_consensus(CREATED).unwrap())
 	}
 }
@@ -133,10 +135,18 @@ fn golden_vectors_regenerate() {
 			assert_eq!(rec.schedule.clock0_script_pubkey().as_bytes().to_vec(), hexbytes(&b["clock0_script_pubkey"]));
 
 			// And the record validates against the round that funds it, for its
-			// owner and the nonce that owner picked.
+			// owner and the nonce that owner picked, under a wallet whose floor
+			// on the reserves is the batch's own. A batch with no reserves is
+			// refused under the default floor of one atom.
 			let i = r["leaf"].as_u64().unwrap() as usize;
 			let nonce: [u8; 32] = hexbytes(&b["inputs"]["leaves"][i]["owner_nonce"]).try_into().unwrap();
-			let ok = rec.validate(&round, &vector_policy(), &rec.owner, &nonce)
+			let floor = b["inputs"]["node_reserve"].as_u64().unwrap().min(b["inputs"]["entry_reserve"].as_u64().unwrap());
+			let policy = WalletPolicy { min_reserve: ReserveFloor::Atoms(floor), ..vector_policy() };
+			if floor == 0 {
+				let e = rec.validate(&round, &vector_policy(), &rec.owner, &nonce).unwrap_err();
+				assert!(matches!(e, RecordError::NodeReserve { reserve: 0, min: 1, .. }), "{}: {}", ctx, e);
+			}
+			let ok = rec.validate(&round, &policy, &rec.owner, &nonce)
 				.unwrap_or_else(|e| panic!("{}: refused: {}", ctx, e));
 			assert_eq!(ok.round_txid, round.txid());
 			assert_eq!(ok.batch_vout, b["round"]["batch_vout"].as_u64().unwrap() as u32);
@@ -331,7 +341,7 @@ fn every_single_field_mutation_is_refused() {
 			continue;
 		}
 		*n += 1;
-		rec.validate_round(round, &vector_policy()).unwrap();
+		rec.validate_round(round, &WalletPolicy { min_reserve: ReserveFloor::Atoms(0), ..vector_policy() }).unwrap();
 		for (field, mutant) in mutations(rec) {
 			let e = mutant.validate_round(round, &believing(&mutant)).err()
 				.unwrap_or_else(|| panic!("{}: the mutation of {:?} VALIDATES", name, field));
@@ -457,6 +467,49 @@ fn the_wallet_policy_and_the_owner_check_refuse() {
 	let d = WalletPolicy::new(rec.chain, rec.operator(), MedianTime::from_consensus(CREATED).unwrap());
 	assert_eq!((d.min_notice.seconds(), d.horizon, d.min_exit_delay.seconds(), d.max_exit_delay.seconds()),
 		(254 * 512, 27 * 86_400, 254 * 512, 338 * 512));
+	assert_eq!((d.max_levels, d.min_reserve), (5, ReserveFloor::Atoms(1)));
+
+	// A leaf the wallet holds, looked at again later: the receipt policy
+	// asks only for the exit deadline, so the leaf stays good from the day
+	// after its round until three days before its first expiry, where the
+	// acceptance horizon refuses it from the second day.
+	let e0 = rec.schedule.expiries()[0].to_consensus_u32();
+	assert_eq!(policy.receipt().horizon, 3 * 86_400);
+	for days in [1, 2, 10, 24] {
+		let at = WalletPolicy { now: MedianTime::from_consensus(CREATED + days * 86_400).unwrap(), ..policy };
+		rec.validate(&round, &at.receipt(), &rec.owner, &nonce)
+			.unwrap_or_else(|e| panic!("the receipt policy refuses the leaf {} days after its round: {}", days, e));
+		if days >= 2 {
+			assert!(matches!(refuse(&at, &rec, &rec.owner, &nonce), RecordError::ExpiryTooSoon { .. }));
+		}
+	}
+	let last = WalletPolicy { now: MedianTime::from_consensus(e0 - 3 * 86_400).unwrap(), ..policy };
+	rec.validate(&round, &last.receipt(), &rec.owner, &nonce).unwrap();
+	let past = WalletPolicy { now: MedianTime::from_consensus(e0 - 3 * 86_400 + 1).unwrap(), ..policy };
+	assert!(matches!(refuse(&past.receipt(), &rec, &rec.owner, &nonce), RecordError::ExpiryTooSoon { .. }));
+
+	// The tree's bounds: the depth, nodes of one child, and the reserves.
+	assert_eq!(rec.levels(), 2);
+	let shallow = WalletPolicy { max_levels: 1, ..policy };
+	assert!(matches!(refuse(&shallow, &rec, &rec.owner, &nonce), RecordError::TooManyLevels { levels: 2, max: 1 }));
+	let mut lone = rec.clone();
+	lone.lowest.siblings.clear();
+	lone.lowest.owners.clear();
+	assert!(matches!(refuse(&policy, &lone, &rec.owner, &nonce), RecordError::OneChild { level: 1 }));
+	let (node, entry) = (rec.upper[0].reserve, rec.entry_reserve);
+	assert_eq!((node, rec.lowest.reserve, entry), (2_500, 2_500, 1_000));
+	let floor = |f| WalletPolicy { min_reserve: f, ..policy };
+	rec.validate(&round, &floor(ReserveFloor::Atoms(entry)), &rec.owner, &nonce).unwrap();
+	assert!(matches!(refuse(&floor(ReserveFloor::Atoms(entry + 1)), &rec, &rec.owner, &nonce),
+		RecordError::EntryReserve { reserve: 1_000, min: 1_001 }));
+	assert!(matches!(refuse(&floor(ReserveFloor::Atoms(node + 1)), &rec, &rec.owner, &nonce),
+		RecordError::NodeReserve { level: 0, reserve: 2_500, min: 2_501 }));
+	// At a fee-rate floor, each output's own spend sets its reserve: these
+	// fixed reserves cover a floor of 100 atoms per 1,000 vbytes four times
+	// over, and not one of 2,000.
+	rec.validate(&round, &floor(ReserveFloor::FeeRate { floor_per_kvb: 100, multiple: 4 }), &rec.owner, &nonce).unwrap();
+	assert!(matches!(refuse(&floor(ReserveFloor::FeeRate { floor_per_kvb: 2_000, multiple: 4 }), &rec, &rec.owner, &nonce),
+		RecordError::NodeReserve { level: 0, reserve: 2_500, .. }));
 
 	// Another key, or a nonce the wallet did not pick.
 	assert_eq!(refuse(&policy, &rec, &other_key("me"), &nonce).to_string(), "the record is for another owner's key");

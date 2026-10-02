@@ -39,20 +39,34 @@
 //!
 //! A receiver accepts a coin only after [`CoinRecord::validate`]: every batch
 //! leaf in the record validates against the round that funds it, under the
-//! receiver's [`WalletPolicy`]; every preimage opens its entry and every
-//! authorisation is the leaf owner's, usable now; every pair verifies; no
-//! reassignment creates more of an asset than its checkpoints hold; the coin's
-//! output is the leaf its record names, for the receiver's key and the nonce it
-//! published; no coin is spent twice anywhere in the record; and the chain is
-//! no deeper than [`DEPTH_LIMIT`] reassignments. A coin from a reassignment is
-//! safe only until the earliest expiry among the batches it descends from
-//! ([`ValidCoin::expiry`]), since a sweep of any of them cuts its path.
+//! receiver's [`WalletPolicy`] (its receipt form, [`WalletPolicy::receipt`]);
+//! every preimage opens its entry and every authorisation is the leaf owner's,
+//! usable now; every pair verifies; no reassignment creates more of an asset
+//! than its checkpoints hold; every leaf a reassignment creates along the
+//! coin's lineage, whoever owns it, has an exit delay within the policy's
+//! bounds; the coin's output is the leaf its record names, for the receiver's
+//! key and the nonce it published; no coin is spent twice anywhere in the
+//! record; and the chain is no deeper than [`DEPTH_LIMIT`] reassignments. A
+//! coin from a reassignment is safe only until the earliest expiry among the
+//! batches it descends from ([`ValidCoin::expiry`]), since a sweep of any of
+//! them cuts its path; the receipt policy asks that each lie past the exit
+//! deadline.
+//!
+//! The record cannot show what is on-chain, and an Arca leaf that is on-chain
+//! is never spent off-chain: past its exit delay its owner can exit it at once.
+//! [`ValidCoin::lineage`] lists every leaf and checkpoint the coin descends
+//! from, and a receiver that can ask an index of the chain refuses the coin
+//! when any is on-chain ([`ValidCoin::check_lineage`]); one that cannot relies
+//! on the operator, which refuses to co-sign a spend of a leaf that is
+//! on-chain.
 //!
 //! What the receiver relies on is the trust the specification names
 //! "operator-confirmed": the sender and the operator could still sign another
-//! spend of an input. Against the sender alone the receiver is safe: it holds a
-//! co-signed spend of each coin, which needs no delay, and answers a stale exit
-//! by publishing the checkpoint and the reassignment within the exit delay.
+//! spend of an input. Against the sender alone the receiver is safe once those
+//! checks pass: it holds a co-signed spend of each coin, which needs no delay,
+//! every leaf it descends from is off-chain with an exit delay the receiver
+//! accepts, and it answers a stale exit at once by publishing the checkpoint
+//! and the reassignment within that delay.
 //!
 //! # The binary form, version 1
 //!
@@ -215,8 +229,6 @@ pub enum TransferError {
 	AuthSignature(usize),
 	#[error("the unroll authorisation for level {0} is not usable until later than now")]
 	AuthTime(usize),
-	#[error("the inputs of a reassignment name different operators or chains")]
-	Operator,
 	#[error("a checkpoint's value of {value} is not within the coin's {coin}")]
 	CheckpointValue { value: u64, coin: u64 },
 	#[error("input {input}: the {pair} pair does not verify: {error}")]
@@ -235,6 +247,10 @@ pub enum TransferError {
 	OwnerNonce,
 	#[error("the coin's exit delay is outside the wallet's bounds")]
 	ExitDelay,
+	#[error("a leaf {hops} reassignments up the coin's lineage has an exit delay of {delay} units; the wallet accepts {min} to {max}")]
+	LineageExitDelay { hops: usize, delay: u16, min: u16, max: u16 },
+	#[error("a {kind} in the coin's lineage is on-chain: its owner could spend it under the receiver")]
+	OnChain { kind: LineageKind, script: Script },
 	#[error("this is not an output of a reassignment")]
 	NotATransfer,
 	#[error("{given} checkpoints for a reassignment of {needed} inputs")]
@@ -252,12 +268,13 @@ impl TransferError {
 			DepthLimit { .. } => "depth",
 			RoundMissing => "round",
 			Preimage | Auths { .. } | AuthSignature(_) | AuthTime(_) => "unroll",
-			Operator => "operator",
 			CheckpointValue { .. } | Overspend(_) => "value",
 			Pair { .. } => "signature",
 			LeafMismatch | DuplicateOutput => "output",
 			DoubleSpend(_) => "double_spend",
 			NotOwner | OwnerNonce | ExitDelay => "owner",
+			LineageExitDelay { .. } => "policy",
+			OnChain { .. } => "on_chain",
 			NotATransfer | Checkpoints { .. } => "use",
 		}
 	}
@@ -306,7 +323,72 @@ pub struct ValidInput {
 	pub reassignment_pair: Pair,
 }
 
+/// What an output in a coin's lineage is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LineageKind {
+	/// A leaf: of a batch, or an output of a reassignment.
+	Leaf,
+	/// A checkpoint between a leaf and the reassignment that spends it.
+	Checkpoint,
+}
+
+impl std::fmt::Display for LineageKind {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		f.write_str(match self {
+			LineageKind::Leaf => "leaf",
+			LineageKind::Checkpoint => "checkpoint",
+		})
+	}
+}
+
+/// An output a coin descends from ([`ValidCoin::lineage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageOutput {
+	pub kind: LineageKind,
+	pub output: ExplicitOutput,
+}
+
 impl ValidCoin {
+	/// Every leaf and checkpoint the coin descends from, from the batches
+	/// down, in the order the record nests them; the coin's own leaf
+	/// ([`ValidCoin::output`]) is not among them.
+	///
+	/// None of them may be on-chain when the coin is received. A leaf on-chain
+	/// past its exit delay can be exited by its owner at once, and one on-chain
+	/// within it leaves the receiver only the rest of the delay to answer, so
+	/// an Arca leaf that is on-chain is never spent off-chain. A wallet that
+	/// can ask an index of the chain checks every script here with
+	/// [`ValidCoin::check_lineage`] and refuses the coin if any is on-chain;
+	/// one that cannot relies on the operator, which refuses to co-sign a
+	/// spend of a leaf that is on-chain.
+	pub fn lineage(&self) -> Vec<LineageOutput> {
+		let mut out = vec![];
+		self.lineage_into(&mut out);
+		out
+	}
+
+	fn lineage_into(&self, out: &mut Vec<LineageOutput>) {
+		if let ValidOrigin::Transfer { inputs, .. } = &self.origin {
+			for i in inputs {
+				i.coin.lineage_into(out);
+				out.push(LineageOutput { kind: LineageKind::Leaf, output: i.coin.output() });
+				out.push(LineageOutput { kind: LineageKind::Checkpoint, output: i.checkpoint_output() });
+			}
+		}
+	}
+
+	/// Refuses the coin if any script in its lineage is on-chain, as
+	/// `on_chain` reports it (an address index: has any transaction paid this
+	/// scriptPubKey).
+	pub fn check_lineage(&self, mut on_chain: impl FnMut(&Script) -> bool) -> Result<(), TransferError> {
+		for o in self.lineage() {
+			if on_chain(&o.output.script_pubkey) {
+				return Err(TransferError::OnChain { kind: o.kind, script: o.output.script_pubkey });
+			}
+		}
+		Ok(())
+	}
+
 	/// The checkpoint this coin moves into when transferred: its own salt,
 	/// the sweep of the batch it descends from.
 	pub fn checkpoint(&self) -> CheckpointPolicy {
@@ -454,7 +536,7 @@ impl CoinRecord {
 		if nonce != *owner_nonce {
 			return Err(TransferError::OwnerNonce);
 		}
-		if delay.units() < policy.min_exit_delay.units() || delay.units() > policy.max_exit_delay.units() {
+		if !policy.exit_delay_ok(delay) {
 			return Err(TransferError::ExitDelay);
 		}
 		let coin = self.resolve(rounds, policy)?;
@@ -535,11 +617,10 @@ impl CoinRecord {
 				let mut inputs = Vec::with_capacity(n);
 				let mut held: Vec<(AssetId, u64)> = vec![];
 				for (k, input) in t.inputs.iter().enumerate() {
+					// Every input resolves under the receiver's policy, so its
+					// leaf is the policy's operator's, on the policy's chain.
 					let coin = input.coin.resolve_in(rounds, policy, spent, depth + 1)?;
 					spent.add(coin.id)?;
-					if coin.leaf.operator != policy.operator || coin.leaf.chain != policy.chain {
-						return Err(TransferError::Operator);
-					}
 					if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 						return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 					}
@@ -564,6 +645,15 @@ impl CoinRecord {
 					if out > have {
 						return Err(TransferError::Overspend(asset));
 					}
+				}
+				// The new leaf is in the receiver's lineage whoever owns it: a
+				// short exit delay anywhere lets its owner exit before the
+				// receiver can answer.
+				if !policy.exit_delay_ok(t.leaf.exit_delay) {
+					return Err(TransferError::LineageExitDelay {
+						hops: depth, delay: t.leaf.exit_delay.units(), min: policy.min_exit_delay.units(),
+						max: policy.max_exit_delay.units(),
+					});
 				}
 				let first = &inputs[0].coin;
 				let leaf = t.leaf.policy(first.leaf.operator, first.leaf.chain);

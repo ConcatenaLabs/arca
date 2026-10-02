@@ -213,8 +213,21 @@ fn each_bad_record_is_refused() {
 	// The receiver's policy: a coin past its horizon, or another operator.
 	let later = WalletPolicy { now: MedianTime::from_consensus(CREATED + 2 * 86_400).unwrap(), ..*p };
 	assert_eq!(refuse("a coin whose earliest batch expires inside the horizon", rec, &later, &key, &nonce).kind(), "policy");
+	// Every leaf of the chain is the operator's: a wallet told another
+	// operator refuses the batch leaves the chain starts from.
 	let other = WalletPolicy { operator: xonly(&f.b.a), ..*p };
-	assert_eq!(refuse("a chain under another operator", rec, &other, &key, &nonce).kind(), "policy");
+	assert!(matches!(refuse("a chain whose batch leaves are another operator's", rec, &other, &key, &nonce),
+		TransferError::Record(RecordError::WrongOperator)));
+	// The receipt policy asks only for the exit deadline: the coin that the
+	// acceptance horizon refuses two days after its rounds is good until
+	// three days before the earliest first expiry in its lineage.
+	let coin = rec.validate(&f.rounds, &later.receipt(), &key, &nonce).unwrap();
+	let e0 = coin.expiry.to_consensus_u32();
+	let last = WalletPolicy { now: MedianTime::from_consensus(e0 - 3 * 86_400).unwrap(), ..*p };
+	rec.validate(&f.rounds, &last.receipt(), &key, &nonce).unwrap();
+	let past = WalletPolicy { now: MedianTime::from_consensus(e0 - 3 * 86_400 + 1).unwrap(), ..*p };
+	assert!(matches!(refuse("a coin past the exit deadline of its earliest batch", rec, &past.receipt(), &key, &nonce),
+		TransferError::Record(RecordError::ExpiryTooSoon { .. })));
 
 	// Deeper than the depth limit: D pays itself three more times.
 	let s = &f.b.s;
@@ -274,4 +287,81 @@ fn every_one_byte_change_of_a_record_is_refused() {
 	let mut long = bytes.clone();
 	long.push(0);
 	assert!(CoinRecord::from_bytes(&long).is_err());
+}
+
+/// One hop of `coin` (held under `prev`) to `to`, signed by `owner` and the
+/// operator, each step leaving the chain's margin.
+fn pay(prev: &CoinRecord, coin: &ValidCoin, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp256k1_zkp::Keypair,
+	to: NewLeaf, chain: Chain) -> CoinRecord
+{
+	let plan = TransferPlan {
+		inputs: vec![(coin.clone(), coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(coin.asset, coin.value - 2 * MARGIN, to.policy(xonly(s), chain).script_pubkey())],
+	};
+	let (cp, re) = (plan.checkpoint_message(0).unwrap().digest, plan.reassignment_message(0).unwrap().digest);
+	CoinRecord::Transfer(Box::new(Transfer {
+		inputs: vec![TransferInput { coin: prev.clone(), checkpoint_value: coin.value - MARGIN,
+			checkpoint: Pair { operator: sig(s, &cp), owner: sig(owner, &cp) },
+			reassignment: Pair { operator: sig(s, &re), owner: sig(owner, &re) } }],
+		outputs: plan.outputs.clone(), index: 0, leaf: to,
+	}))
+}
+
+#[test]
+fn every_leaf_of_the_lineage_meets_the_policy() {
+	let f = fx();
+	let p = &f.policy;
+	let s = &f.b.s;
+	let a_coin = f.hops.a_base.resolve(&f.rounds, p).unwrap();
+
+	// A pays B, whose leaf has an exit delay of one unit (512 s); B pays D,
+	// whose own leaf is within the policy. B alone could exit 512 s after
+	// its leaf reached the chain, before D could answer, so D refuses the
+	// coin for B's leaf.
+	let short = Party::new("short delay B", RelativeTime::from_units(1).unwrap());
+	let b = pay(&f.hops.a_base, &a_coin, &f.b.a, s, short.leaf, p.chain);
+	let b_coin = b.resolve(&f.rounds, &WalletPolicy { min_exit_delay: RelativeTime::from_units(1).unwrap(), ..*p }).unwrap();
+	let d = Party::new("short delay D", RelativeTime::from_seconds_ceil(36 * 3600).unwrap());
+	let d_rec = pay(&b, &b_coin, &short.key, s, d.leaf, p.chain);
+	let e = d_rec.validate(&f.rounds, p, &d.leaf.owner, &d.leaf.owner_nonce).unwrap_err();
+	println!("D receives a coin through a leaf of 512 s: {} ({})", e, e.kind());
+	assert!(matches!(e, TransferError::LineageExitDelay { hops: 1, delay: 1, .. }), "{}", e);
+	assert_eq!(e.kind(), "policy");
+	// B's leaf as the receiver's own is refused as before; a delay too long
+	// anywhere in the lineage is refused the same way.
+	assert!(matches!(b.validate(&f.rounds, p, &short.leaf.owner, &short.leaf.owner_nonce).unwrap_err(), TransferError::ExitDelay));
+	let long = Party::new("long delay B", RelativeTime::from_units(p.max_exit_delay.units() + 1).unwrap());
+	let b = pay(&f.hops.a_base, &a_coin, &f.b.a, s, long.leaf, p.chain);
+	let b_coin = b.resolve(&f.rounds, &WalletPolicy { max_exit_delay: long.leaf.exit_delay, ..*p }).unwrap();
+	let d_rec = pay(&b, &b_coin, &long.key, s, d.leaf, p.chain);
+	assert!(matches!(d_rec.validate(&f.rounds, p, &d.leaf.owner, &d.leaf.owner_nonce).unwrap_err(),
+		TransferError::LineageExitDelay { hops: 1, .. }));
+}
+
+#[test]
+fn the_lineage_lists_every_leaf_and_checkpoint() {
+	let f = fx();
+	let d = &f.hops.d;
+	let coin = f.hops.d_record.validate(&f.rounds, &f.policy, &d.leaf.owner, &d.leaf.owner_nonce).unwrap();
+	let lineage = coin.lineage();
+	// Hop 3 spends B's Y; hop 2 (the swap) spends B's X and C's Y; hop 1
+	// spends A's leaf: four leaves, each with its checkpoint.
+	let kinds: Vec<LineageKind> = lineage.iter().map(|o| o.kind).collect();
+	assert_eq!(kinds.iter().filter(|k| **k == LineageKind::Leaf).count(), 4);
+	assert_eq!(kinds.iter().filter(|k| **k == LineageKind::Checkpoint).count(), 4);
+	assert!(lineage.iter().all(|o| o.output.script_pubkey != coin.output().script_pubkey), "the coin's own leaf is not listed");
+	let a_leaf = f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap().output();
+	assert_eq!(lineage[0], LineageOutput { kind: LineageKind::Leaf, output: a_leaf.clone() }, "the batches first");
+	for o in &lineage {
+		println!("lineage {:<10} {} atoms of {}", o.kind, o.output.value, o.output.asset);
+	}
+	// Nothing on-chain: the coin is accepted. A's leaf on-chain: refused.
+	coin.check_lineage(|_| false).unwrap();
+	let e = coin.check_lineage(|spk| *spk == a_leaf.script_pubkey).unwrap_err();
+	println!("A's leaf on-chain: {} ({})", e, e.kind());
+	assert!(matches!(e, TransferError::OnChain { kind: LineageKind::Leaf, .. }));
+	let cp = lineage.iter().find(|o| o.kind == LineageKind::Checkpoint).unwrap().output.script_pubkey.clone();
+	assert!(matches!(coin.check_lineage(|spk| *spk == cp).unwrap_err(), TransferError::OnChain { kind: LineageKind::Checkpoint, .. }));
+	// A batch leaf received as it is has no lineage before it.
+	assert!(f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap().lineage().is_empty());
 }

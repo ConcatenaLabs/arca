@@ -108,9 +108,9 @@ impl Ctx {
 
 /// A round: it spends `issuer`, which issues the token when there is a tree,
 /// and pays the batch output and the token's atom to clock 0, then the
-/// connector output (an operator coin), then `extra`, change and the fee.
-/// Returns the transaction and the connector's index.
-fn round_tx(net: &Net, issuer: &Coin, tree: Option<&Tree>, extra: Vec<TxOut>) -> (Transaction, u32) {
+/// connector output under `s`'s connector script, then `extra`, change and
+/// the fee. Returns the transaction and the connector's index.
+fn round_tx(net: &Net, issuer: &Coin, tree: Option<&Tree>, extra: Vec<TxOut>, s: &Keypair) -> (Transaction, u32) {
 	let total = issuer.txout.value.explicit().unwrap();
 	let mut outs = vec![];
 	if let Some(t) = tree {
@@ -118,7 +118,7 @@ fn round_tx(net: &Net, issuer: &Coin, tree: Option<&Tree>, extra: Vec<TxOut>) ->
 		outs.push(explicit(t.params().schedule.token, 1, t.clock0_script_pubkey()));
 	}
 	let c = outs.len() as u32;
-	outs.push(explicit(net.x, 5_000, op_true_spk()));
+	outs.push(ConnectorPolicy { operator: xonly(s) }.output(net.x, 5_000).txout());
 	outs.extend(extra);
 	let spent: u64 = outs.iter().filter(|o| o.asset.explicit() == Some(net.x)).map(|o| o.value.explicit().unwrap()).sum();
 	outs.push(explicit(net.x, total - spent - 2_000, op_true_spk()));
@@ -160,13 +160,20 @@ fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (Lea
 	(leaf, coin, LeafId::compute(&p, &[], &p))
 }
 
-/// Issues the round's connector asset by spending its connector output.
-fn issue_connector(c: &mut Ctx, name: &str, round: &Transaction, round_txid: Txid, vout: u32) -> Coin {
+/// The operator's issuance of the round's connector asset, spending its
+/// connector output, signed by `s`.
+fn connector_issuance_tx(net: &Net, round: &Transaction, round_txid: Txid, vout: u32, s: &Keypair) -> Transaction {
 	let conn = coin_of(round_txid, vout, round);
-	let mut iss = connector_issuance(conn.outpoint, &conn.txout, op_true_spk(), &[], &FeeSource::Reserve).unwrap();
-	iss.tx.input[0].witness.script_witness = op_true_witness();
-	let it = c.pass(name, &iss.tx);
-	coin_of(it, 0, &iss.tx)
+	let (a, v) = (conn.txout.asset.explicit().unwrap(), conn.txout.value.explicit().unwrap());
+	let ks = ConnectorPolicy { operator: xonly(s) }.issuance(conn.outpoint, (a, v), op_true_spk(), &[], &FeeSource::Reserve).unwrap();
+	signed(net, ks, s, vec![]).tx
+}
+
+/// Issues the round's connector asset by spending its connector output.
+fn issue_connector(c: &mut Ctx, name: &str, round: &Transaction, round_txid: Txid, vout: u32, s: &Keypair) -> Coin {
+	let tx = connector_issuance_tx(&c.net, round, round_txid, vout, s);
+	let it = c.pass(name, &tx);
+	coin_of(it, 0, &tx)
 }
 
 /// The claim of `f` held at `f_coin`, with `m_coin` at input 1, its witness
@@ -224,7 +231,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		exit_delay: delay(), unlock_hash: sha256(&preimage_b),
 	};
 	let tree = c.tree(&sched, &[spec, spec_b]);
-	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![]);
+	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
 	let rt = c.pass("board/refresh: the round", &round);
 	c.net.purse.push(coin_of(rt, cv + 1, &round));
 	let round = c.net.rt.client().raw_transaction(&rt).unwrap();
@@ -236,7 +243,8 @@ fn board_and_refresh(c: &mut Ctx) {
 	// to this round. A board leaf is on-chain: the operator publishes the
 	// forfeit, and only once it is in a block does it release the preimage.
 	let margin = margin_for(280, c.floor_per_kvb, 4);
-	let f = Forfeit::new(rec.leaf(), (x, rec.value), rec.leaf_id(), sha256(&preimage), m, delay(), margin).unwrap();
+	let f = Forfeit::for_refresh(rec.leaf(), (x, rec.value), rec.leaf_id(), &new_valid, &round, cv, delay(), margin).unwrap();
+	assert_eq!((f.policy.unlock_hash, f.policy.connector), (sha256(&preimage), m), "h from the new leaf, M from the round");
 	let p = pair(&f, &a1, &s);
 	f.verify(&p).unwrap();
 	let bad = Pair { owner: sig(&a2, &f.message().digest), ..p };
@@ -251,7 +259,7 @@ fn board_and_refresh(c: &mut Ctx) {
 	let y_coin = c.net.fund(vec![explicit(c.net.y, 1, op_true_spk())]).remove(0);
 	let tx = claim_tx(&c.net, &f, f_coin, &y_coin, &s, &preimage, 1);
 	c.net.refuse("board/neg claim with another asset where M belongs", &tx, "Script failed an OP_EQUALVERIFY operation");
-	let m_coin = issue_connector(c, "board/refresh: the issuance of the connector asset M", &round, rt, cv);
+	let m_coin = issue_connector(c, "board/refresh: the issuance of the connector asset M", &round, rt, cv, &s);
 	let tx = claim_tx(&c.net, &f, f_coin, &m_coin, &s, &label32("not the preimage"), 1);
 	c.net.refuse("board/neg claim with M and a wrong preimage", &tx, "Script failed an OP_EQUALVERIFY operation");
 	let tx = claim_tx(&c.net, &f, f_coin, &m_coin, &s, &preimage, 0);
@@ -271,7 +279,8 @@ fn board_and_refresh(c: &mut Ctx) {
 	// 2. The same atom serves the second owner's claim, in another
 	// transaction: its old leaf is given up for the same round.
 	let (old_b, old_b_coin, old_b_id) = funded_leaf(&mut c.net, &keypair("refresh second owner, old leaf"), &s, "second owner old leaf");
-	let fb = Forfeit::new(old_b, (x, LEAF), old_b_id, sha256(&preimage_b), m, delay(), margin).unwrap();
+	let valid_b = tree.record(1).validate(&round, &c.policy(&s), &xonly(&second_owner), &spec_b.owner_nonce).unwrap();
+	let fb = Forfeit::for_refresh(old_b, (x, LEAF), old_b_id, &valid_b, &round, cv, delay(), margin).unwrap();
 	let pb = pair(&fb, &keypair("refresh second owner, old leaf"), &s);
 	let fc = c.net.fee_coin();
 	let mut u = fb.tx(old_b_coin.outpoint, &pb, &FeeSource::Coin {
@@ -328,6 +337,66 @@ fn board_and_refresh(c: &mut Ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// 2. The connector output: spent only by the issuance of M
+// ---------------------------------------------------------------------------
+
+/// The round's connector output spent every way but the issuance of exactly
+/// `M`: each is refused, by the mempool and in a block, for the script's
+/// reason. Then the issuance itself confirms.
+fn connector(c: &mut Ctx) {
+	let s = keypair("connector operator");
+	let x = c.net.x;
+	let policy = ConnectorPolicy { operator: xonly(&s) };
+	let issuer = c.net.fund(vec![explicit(x, 1_000_000_000, op_true_spk())]).remove(0);
+	let (round, cv) = round_tx(&c.net, &issuer, None, vec![], &s);
+	let rt = c.pass("connector/a round with its connector output", &round);
+	let round = c.net.rt.client().raw_transaction(&rt).unwrap();
+	let conn = coin_of(rt, cv, &round);
+	policy.check(&round, cv).unwrap();
+	assert_eq!(policy.check(&round, cv + 1).unwrap_err(), SpendError::Connector(cv + 1));
+	let m = connector_asset(rt, cv);
+	println!("connector: script {} bytes, round {} output {}, M {}", policy.script().len(), rt, cv, m);
+
+	// The issuance as the operator builds it, changed by `edit`, then signed by `key`.
+	let built = |c: &Ctx, key: &Keypair, edit: &dyn Fn(&mut Transaction)| {
+		let ks = policy.issuance(conn.outpoint, (x, 5_000), op_true_spk(), &[], &FeeSource::Reserve).unwrap();
+		let mut ks = ks;
+		edit(&mut ks.tx);
+		signed(&c.net, ks, key, vec![]).tx
+	};
+	let no_issuance = built(c, &s, &|tx| {
+		tx.input[0].asset_issuance = AssetIssuance::default();
+		tx.output.remove(0);
+	});
+	c.net.refuse("connector/neg spent with no issuance", &no_issuance, "Script failed an OP_EQUALVERIFY operation");
+	let two = built(c, &s, &|tx| {
+		tx.input[0].asset_issuance.amount = elements::confidential::Value::Explicit(2);
+		tx.output[0].value = elements::confidential::Value::Explicit(2);
+	});
+	c.net.refuse("connector/neg issuing two atoms of M", &two, "Script failed an OP_EQUALVERIFY operation");
+	let entropy = elements::AssetId::generate_asset_entropy(conn.outpoint, elements::ContractHash::from_byte_array([0; 32]));
+	let token = elements::AssetId::reissuance_token_from_entropy(entropy, false);
+	let reissuable = built(c, &s, &|tx| {
+		tx.input[0].asset_issuance.inflation_keys = elements::confidential::Value::Explicit(1);
+		tx.output.insert(1, explicit(token, 1, op_true_spk()));
+	});
+	c.net.refuse("connector/neg issuing M with a reissuance token", &reissuable,
+		"Script evaluated without error but finished with a false/empty top stack element");
+	let contract = label32("a contract hash");
+	let other = elements::AssetId::new_issuance(conn.outpoint, elements::ContractHash::from_byte_array(contract));
+	let other_asset = built(c, &s, &|tx| {
+		tx.input[0].asset_issuance.asset_entropy = contract;
+		tx.output[0].asset = elements::confidential::Asset::Explicit(other);
+	});
+	c.net.refuse("connector/neg issuing another asset (a contract hash)", &other_asset, "Script failed an OP_EQUALVERIFY operation");
+	let by_other = built(c, &keypair("not the operator"), &|_| {});
+	c.net.refuse("connector/neg the issuance signed by another key", &by_other, "Invalid Schnorr signature");
+	let tx = built(c, &s, &|_| {});
+	let it = c.pass("connector/the issuance of M, the connector's own spend", &tx);
+	assert_eq!(c.net.rt.client().raw_transaction(&it).unwrap().output[0].asset.explicit(), Some(m));
+}
+
+// ---------------------------------------------------------------------------
 // 3. Two forfeits of one participation, one forfeit output
 // ---------------------------------------------------------------------------
 
@@ -374,7 +443,7 @@ fn rollback(c: &mut Ctx) {
 		exit_delay: delay(), unlock_hash: sha256(&preimage),
 	};
 	let tree = c.tree(&sched, &[spec]);
-	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![]);
+	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
 	let rt = c.pass("rollback/round X, with its connector output", &round);
 	let m = connector_asset(rt, cv);
 	let f = Forfeit::new(old, (x, LEAF), old_id, sha256(&preimage), m, delay(), 1_500).unwrap();
@@ -399,10 +468,8 @@ fn rollback(c: &mut Ctx) {
 	println!("rollback: round X {} disconnected, round Y {} mined in its place", rt, yt);
 
 	// M cannot be issued: X's connector output does not exist.
-	let conn = coin_of(rt, cv, &round);
-	let mut iss = connector_issuance(conn.outpoint, &conn.txout, op_true_spk(), &[], &FeeSource::Reserve).unwrap();
-	iss.tx.input[0].witness.script_witness = op_true_witness();
-	c.net.refuse("rollback/neg the issuance of X's connector asset", &iss.tx, "bad-txns-inputs-missingorspent");
+	let iss = connector_issuance_tx(&c.net, &round, rt, cv, &s);
+	c.net.refuse("rollback/neg the issuance of X's connector asset", &iss, "bad-txns-inputs-missingorspent");
 	// The forfeit can still reach the chain (the old leaf is there), and no
 	// claim can follow it: there is no M, only some other asset.
 	let ft = c.pass("rollback/the forfeit, published after the rollback", &f.tx(old_coin.outpoint, &p, &FeeSource::Reserve).unwrap().tx);
@@ -439,7 +506,7 @@ fn offboard(c: &mut Ctx) {
 	let (oa, ob, oc, od) = (off("offboard a"), off("offboard b"), off("offboard c"), off("offboard d"));
 	let issuer = c.net.fund(vec![explicit(x, 1_000_000_000, op_true_spk())]).remove(0);
 	let (round, cv) = round_tx(&c.net, &issuer, None, vec![oa.output(reserve).txout(), ob.output(reserve).txout(),
-		oc.output(reserve).txout(), od.output(reserve).txout()]);
+		oc.output(reserve).txout(), od.output(reserve).txout()], &s);
 	let rt = c.pass("offboard/a round with four offboard outputs to one destination", &round);
 	let round = c.net.rt.client().raw_transaction(&rt).unwrap();
 	let at = |p: &OffboardPolicy| coin_of(rt, p.find(&round).unwrap(), &round);
@@ -447,9 +514,10 @@ fn offboard(c: &mut Ctx) {
 
 	// The owner gives up its old leaf against h_a, for this round.
 	let (old, old_coin, old_id) = funded_leaf(&mut c.net, &a, &s, "offboard old leaf");
-	let f = Forfeit::new(old, (x, LEAF), old_id, oa.unlock_hash, connector_asset(rt, cv), delay(), 1_500).unwrap();
+	let f = Forfeit::for_offboard(old, (x, LEAF), old_id, &oa, &round, cv, delay(), 1_500).unwrap();
+	assert_eq!(f.policy.connector, connector_asset(rt, cv));
 	let ft = c.pass("offboard/the forfeit against h_a", &f.tx(old_coin.outpoint, &pair(&f, &a, &s), &FeeSource::Reserve).unwrap().tx);
-	let m_coin = issue_connector(c, "offboard/the issuance of the connector asset M", &round, rt, cv);
+	let m_coin = issue_connector(c, "offboard/the issuance of the connector asset M", &round, rt, cv, &s);
 	let ct = c.pass("offboard/the operator's claim, publishing the preimage",
 		&claim_tx(&c.net, &f, OutPoint::new(ft, 0), &m_coin, &s, &label32("offboard a"), 1));
 	let pre_a = find_preimage(&c.net.witness_of(&ct, 0), &oa.unlock_hash).unwrap();
@@ -705,6 +773,7 @@ fn offchain_transactions_on_regtest() {
 	let floor_per_kvb = (info["minrelaytxfee"].as_f64().unwrap() * 1e8).round() as u64;
 	let mut c = Ctx { net, sizes: vec![], floor_per_kvb };
 	board_and_refresh(&mut c);
+	connector(&mut c);
 	no_merge(&mut c);
 	rollback(&mut c);
 	offboard(&mut c);
