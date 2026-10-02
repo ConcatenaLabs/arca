@@ -204,6 +204,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-covenant"
+version = "0.1.0"
+dependencies = [
+ "arca-consensus",
+ "arca-sequentia-ext",
+ "elements",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arca-json"
 version = "0.7.1"
 dependencies = [

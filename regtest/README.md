@@ -94,7 +94,9 @@ signature uses zero auxiliary randomness, so the output is the same on every run
 
 The keys are test keys, `SHA256("Arca test vector key/" + label)` reduced modulo
 the group order; they hold nothing. `consensus/tests/vectors.rs` verifies every
-sample spend, every input, with the node's own interpreter.
+sample spend, every input, with the node's own interpreter, and
+`covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
+builders and compares them byte for byte.
 
 ## In CI
 

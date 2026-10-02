@@ -144,6 +144,10 @@ not Sequentia's. Tests that need a node start one with
 `sequentia_ext::regtest::Regtest`, which anchors the chain to a Bitcoin regtest
 parent.
 
+`arca-covenant` (`covenant/`) builds every Arca script, its witnesses and the
+client's checks on a round, and is where new script code goes; Bark's MuSig2
+policies in `arca-lib` stay until a later package removes them.
+
 `regtest/` is the independent reference for every Arca script: a Python suite
 on the node's functional test framework, and the golden vectors it exports
 (`regtest/README.md`). Rust code that builds an Arca script must reproduce the

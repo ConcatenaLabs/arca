@@ -1,0 +1,20 @@
+[package]
+name = "arca-covenant"
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "Arca's covenant scripts on Sequentia: the tree, the clock, the leaf and the outputs around it, their witnesses and the client's checks"
+publish = false
+
+[lib]
+name = "arca_covenant"
+
+[dependencies]
+elements.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+arca-consensus = { path = "../consensus" }
+arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
+serde_json.workspace = true
