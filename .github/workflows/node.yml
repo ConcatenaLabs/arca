@@ -1,4 +1,4 @@
-name: consensus
+name: node
 
 on:
   push:
@@ -7,18 +7,18 @@ on:
   workflow_dispatch:
 
 jobs:
-  verifier:
-    name: arca-consensus against the node
+  node-tests:
+    name: verifier and node client against the node
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      # The verifier links the node's consensus library and its tests run the
-      # node itself, so both come from the same commit: the newest master
-      # commit of the node whose Build-dev workflow passed and published a
-      # Linux build.
+      # arca-consensus links the node's consensus library, and both crates'
+      # tests run the node itself, so library and binary come from the same
+      # commit: the newest node master commit whose Build-dev workflow passed
+      # and published a Linux build.
       - name: Find the node build
         id: node
         run: |
@@ -72,4 +72,4 @@ jobs:
       - name: Tests
         env:
           SEQUENTIA_DIR: ${{ github.workspace }}/sequentia
-        run: cargo test --locked -p arca-consensus -- --nocapture
+        run: cargo test --locked -p arca-consensus -p arca-sequentia-ext -- --nocapture

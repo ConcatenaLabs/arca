@@ -1,0 +1,26 @@
+[package]
+name = "arca-sequentia-ext"
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "Sequentia chain types and a JSON-RPC client for sequentiad"
+publish = false
+
+[lib]
+name = "sequentia_ext"
+
+[features]
+# A throwaway anchored regtest chain for tests (`regtest::Regtest`).
+regtest = []
+
+[dependencies]
+elements = { workspace = true, features = [ "serde" ] }
+base64 = "0.22"
+minreq = "2.14"
+serde = { workspace = true, features = [ "derive" ] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+arca-sequentia-ext = { path = ".", features = [ "regtest" ] }

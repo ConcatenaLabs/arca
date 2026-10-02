@@ -136,6 +136,14 @@ that builds a Sequentia transaction ends by verifying it there. A negative case
 that matters is also forced into a block on a regtest node (`generateblock`), not
 only refused by the mempool, because relay policy can hide a consensus flaw.
 
+Sequentia's transaction and block types come from `arca-sequentia-ext`, which
+re-exports the `rust-elements` SWK vendors with its `sequentia` feature (pinned
+once in the root `Cargo.toml`). Do not add another copy of that patch, and do not
+depend on upstream `elements` directly: its encoding of issuances and headers is
+not Sequentia's. Tests that need a node start one with
+`sequentia_ext::regtest::Regtest`, which anchors the chain to a Bitcoin regtest
+parent.
+
 CI runs on GitHub Actions (`.github/workflows/`). Check it after every merge.
 
 ## Rules from Sequentia that bind this code
