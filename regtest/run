@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Run Arca's regtest suite against a Sequentia node.
+
+    SEQUENTIAD_EXEC=/path/to/sequentiad SEQUENTIA_DIR=/path/to/Sequentia regtest/run
+
+SEQUENTIAD_EXEC names the node binary. SEQUENTIA_DIR names a Sequentia source
+tree, which provides the node's functional test framework; it need not be
+built. Every test starts its own node on a fresh `elementsregtest` chain.
+
+Options:
+    -j N          tests to run at once (default 4)
+    --out DIR     where logs, results and node data go (default regtest/out)
+    --keep        keep each test's node data even when the test passes
+    NAME ...      run only these tests (`t18` or `t18_token_sweep`)
+
+A test passes when every spend it expects to confirm confirms and every
+negative case is refused by the mempool and again when forced into a block
+with `generateblock`. The exit status is non-zero if any test fails.
+"""
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_INI = """\
+[environment]
+PACKAGE_NAME=Sequentia Core
+PACKAGE_BUGREPORT=https://github.com/ConcatenaLabs/Sequentia/issues
+SRCDIR={src}
+BUILDDIR={src}
+EXEEXT=
+RPCAUTH={src}/share/rpcauth/rpcauth.py
+
+[components]
+ENABLE_WALLET=true
+USE_SQLITE=true
+USE_BDB=true
+ENABLE_CLI=true
+ENABLE_BITCOIND=true
+"""
+
+
+def natural_key(name):
+    m = re.match(r"t(\d+)([a-z]*)_", name)
+    return (int(m.group(1)), m.group(2)) if m else (1 << 30, name)
+
+
+def discover():
+    names = [f[:-3] for f in os.listdir(HERE) if re.match(r"t\d+[a-z]*_.*\.py$", f)]
+    return sorted(names, key=natural_key)
+
+
+def select(all_names, wanted):
+    if not wanted:
+        return all_names
+    out = []
+    for w in wanted:
+        hits = [n for n in all_names if n == w or n.split("_", 1)[0] == w]
+        if not hits:
+            sys.exit("no test named %r; tests: %s" % (w, " ".join(all_names)))
+        out += [h for h in hits if h not in out]
+    return out
+
+
+def summarise(results_file):
+    """Count what a test recorded: confirmed spends, negatives refused in a
+    block, and spends mined on purpose to show what consensus accepts."""
+    try:
+        with open(results_file) as f:
+            r = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    c = {"confirmed": 0, "refused_in_block": 0, "mined_on_purpose": 0}
+    for v in r.values():
+        if not isinstance(v, dict):
+            continue
+        if v.get("confirmed"):
+            c["confirmed"] += 1
+        if v.get("rejected") and v.get("block-error"):
+            c["refused_in_block"] += 1
+        if v.get("confirmed_via_generateblock"):
+            c["mined_on_purpose"] += 1
+    return c
+
+
+def run_one(name, out, env, keep):
+    tmp = os.path.join(out, "tmp", name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    log = os.path.join(out, "logs", name + ".log")
+    cmd = [sys.executable, os.path.join(HERE, name + ".py"),
+           "--configfile=" + os.path.join(out, "config.ini"),
+           "--tmpdir=" + tmp,
+           "--cachedir=" + os.path.join(out, "tmp", "cache")]
+    if keep:
+        cmd.append("--nocleanup")
+    t0 = time.time()
+    with open(log, "w") as f:
+        rc = subprocess.call(cmd, cwd=HERE, env=env, stdout=f, stderr=subprocess.STDOUT)
+    return name, rc, time.time() - t0, log
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("-j", type=int, default=4)
+    ap.add_argument("--out", default=os.path.join(HERE, "out"))
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("tests", nargs="*")
+    a = ap.parse_args()
+
+    exe = os.environ.get("SEQUENTIAD_EXEC")
+    src = os.environ.get("SEQUENTIA_DIR")
+    if not exe or not os.access(exe, os.X_OK):
+        sys.exit("SEQUENTIAD_EXEC must name an executable sequentiad")
+    if not src or not os.path.isdir(os.path.join(src, "test", "functional", "test_framework")):
+        sys.exit("SEQUENTIA_DIR must name a Sequentia source tree with test/functional/test_framework")
+    src = os.path.abspath(src)
+
+    names = select(discover(), a.tests)
+    out = os.path.abspath(a.out)
+    results = os.path.join(out, "results")
+    for d in (out, os.path.join(out, "logs"), results, os.path.join(out, "tmp")):
+        os.makedirs(d, exist_ok=True)
+    with open(os.path.join(out, "config.ini"), "w") as f:
+        f.write(CONFIG_INI.format(src=src))
+
+    env = dict(os.environ)
+    env["BITCOIND"] = os.path.abspath(exe)
+    cli = os.path.join(os.path.dirname(os.path.abspath(exe)), "sequentia-cli")
+    env.setdefault("BITCOINCLI", cli)
+    env["ARCA_RESULTS"] = results
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    version = subprocess.run([exe, "-version"], capture_output=True, text=True).stdout.splitlines()
+    print("node: %s (%s)" % (os.path.abspath(exe), version[0] if version else "unknown version"))
+    print("framework: %s/test/functional" % src)
+    print("running %d tests, %d at a time; logs in %s" % (len(names), a.j, os.path.join(out, "logs")))
+
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.j)) as pool:
+        futs = [pool.submit(run_one, n, out, env, a.keep) for n in names]
+        for fut in concurrent.futures.as_completed(futs):
+            name, rc, secs, log = fut.result()
+            stem = name.split("_", 1)[0]
+            c = summarise(os.path.join(results, stem + ".json"))
+            detail = ", ".join("%s %d" % (k.replace("_", " "), v) for k, v in c.items() if v)
+            print("%-4s %-24s %6.1fs  %s" % ("PASS" if rc == 0 else "FAIL", name, secs, detail))
+            if rc != 0:
+                failed.append((name, log))
+
+    if failed:
+        for name, log in failed:
+            print("\n--- %s failed; the end of %s:" % (name, log))
+            with open(log) as f:
+                sys.stdout.write("".join(f.readlines()[-40:]))
+        print("\n%d of %d tests failed" % (len(failed), len(names)))
+        return 1
+    print("\nall %d tests passed" % len(names))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

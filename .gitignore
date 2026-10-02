@@ -30,3 +30,7 @@ contrib/agents/ci-debugging/
 .investigations/
 # CI devShell env payloads, generated per-pipeline by contrib/generate-ci-env.sh
 /contrib/ci-env/*.env
+
+# The regtest suite's logs, results and node data
+/regtest/out/
+/regtest/__pycache__/
