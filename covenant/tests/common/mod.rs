@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod chain;
 pub mod net;
 
 use elements::confidential::{Asset, Nonce, Value};

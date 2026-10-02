@@ -74,6 +74,35 @@ and the operator reclaims after a delay:
 
 The record is the tree's injective output record. The unlock pays the
 destination at output 0 and the rest of the output is the margin.
+
+The transfer
+------------
+Each input coin is spent by its collaborative path into a checkpoint output
+(collab: the coin owner's and S's rebindable pair; sweep: the sweep with notice
+of the batch the coin descends from, for a coin from a reassignment the first
+input's). The checkpoint's salt is SHA256("Arca/checkpoint" || the coin's leaf
+salt). The reassignment spends the checkpoints, in input order, into the
+committed outputs. Each pair signs the frozen rebindable message: the
+checkpoint pair on the coin's leaf over the checkpoint output, the
+reassignment pair on the checkpoint over the outputs.
+
+The coin record, format version 1:
+
+    u8    format version, 1
+    coin:
+      u8  0, a leaf of a batch: u16 length L and L bytes of its leaf record;
+          [32] the entry's preimage; u8 n and n x ([64] signature, u32 time),
+          the owner's unroll authorisation of each node from the batch output down
+      u8  1, an output of a reassignment: u8 input count, then per input the
+          coin (recursively), u64 the checkpoint's value, the checkpoint pair
+          and the reassignment pair ([64] operator, [64] owner each);
+          u8 output count, then per output [32] asset, u64 value, compact size
+          and scriptPubKey; u8 the coin's index; [32] owner key, [32] owner
+          nonce, [32] operator nonce, u16 exit delay units
+
+A coin from a reassignment has the leaf id of R || 0x01 || index || its leaf
+program, R the tagged hash "Arca/reassignment" of the input count, each input's
+coin id and checkpoint program, the output count and each output's record hash.
 """
 from arklib3 import *                      # noqa: F401,F403
 from test_framework.key import SECP256K1_ORDER
@@ -81,6 +110,8 @@ from test_framework.messages import CAssetIssuance, COutPoint, CTxIn, CTxOutValu
 from test_framework.script import TaprootSignatureHash
 
 import records
+import struct
+
 from records import (ASSET, GENESIS, OPERATOR, TEMPLATE_VTXO_VERSION, TEMPLATES, display, json_text, label_hash,
                      le16, le64, leaf_salt, tagged_hash, txout, LEAF_ID_TAG)
 
@@ -432,6 +463,198 @@ def offboard():
     }
 
 
+# --------------------------------------------------------------------------
+# The transfer
+# --------------------------------------------------------------------------
+
+CHECKPOINT_TAG = b"Arca/checkpoint"
+REASSIGNMENT_TAG = b"Arca/reassignment"
+Y_ASSET = label_hash("asset", "Y")
+CREATED = records.CREATED
+MARGIN = 1_200
+
+
+def checkpoint_salt(salt):
+    return sha256(CHECKPOINT_TAG + salt)
+
+
+def compact(n):
+    return bytes([n]) if n < 0xfd else b"\xfd" + le16(n)
+
+
+class Coin:
+    """A coin: its owner (Key), leaf salt, asset, value, leaf taproot, the
+    sweep its checkpoint takes, its id and its record's bytes (without the
+    format version)."""
+
+    def __init__(self, owner, salt, asset, value, tap, scripts, sweep, cid, record, delay=DELAY):
+        self.owner, self.salt, self.asset, self.value = owner, salt, asset, value
+        self.tap, self.scripts, self.sweep, self.id, self.record, self.delay = tap, scripts, sweep, cid, record, delay
+
+    def spk(self):
+        return bytes(self.tap.scriptPubKey)
+
+
+def path_nodes(b, i):
+    """The nodes on leaf i's path, from the batch output down."""
+    nodes, idx = [], i
+    for level in b.levels:
+        j = next(j for j, nd in enumerate(level) if nd["lo"] <= idx < nd["hi"])
+        nodes.append(level[j])
+        idx = j
+    return nodes[::-1]
+
+
+def chain_batch(label, asset, n, at, owner, value, issuer_label):
+    issuer = label_hash("outpoint", issuer_label)
+    token = records.issued_asset(issuer, 0)
+    p = {"genesis": GENESIS, "asset": asset, "operator": S.x, "token": token, "notice": records.NOTICE,
+         "expiries": [CREATED + 28 * records.DAY, CREATED + 56 * records.DAY], "burn": False, "radix": 4,
+         "node_reserve": 2_500, "entry_reserve": 1_000}
+    preimages = [label_hash("preimage", "%s %d" % (label, i)) for i in range(n)]
+    leaves = [{"owner": owner.x if i == at else Key("%s bystander %d" % (label, i)).x,
+               "owner_nonce": label_hash("owner nonce", "%s %d" % (label, i)),
+               "operator_nonce": label_hash("operator nonce", "%s %d" % (label, i)),
+               "value": value, "exit_delay": DELAY, "unlock_hash": sha256(preimages[i])} for i in range(n)]
+    b = records.Batch(p, leaves)
+    # The round: the issuing input, the batch output at 0, the token's atom at 1, the fee.
+    tx = Tx()
+    tx.nVersion, tx.nLockTime = 2, 0
+    vin = CTxIn(COutPoint(uint256_from_str(issuer), 0), nSequence=0xffffffff)
+    iss = CAssetIssuance()
+    iss.assetBlindingNonce, iss.assetEntropy = 0, 0
+    iss.nAmount, iss.nInflationKeys, iss.denomination = CTxOutValue(1), CTxOutValue(), 0
+    vin.assetIssuance = iss
+    tx.vin = [vin]
+    tx.vout = [txout(asset, b.root["value"], b.batch_spk()), txout(token, 1, b.clocks[0]["spk"]), txout(asset, 2_000, b"")]
+    ArkBase.pad(tx)
+    # The leaf at `at`: its record, with its entry's preimage and its owner's
+    # unroll authorisations for time CREATED.
+    rec = b.record(at)
+    rec_bytes = records.encode(rec)
+    auths = [owner.sign(unroll_auth3([(asset, k["value"], k["prog"]) for k in nd["kids"]], CREATED))
+             for nd in path_nodes(b, at)]
+    record = (b"\x00" + le16(len(rec_bytes)) + rec_bytes + preimages[at] + bytes([len(auths)])
+              + b"".join(a + struct.pack("<I", CREATED) for a in auths))
+    tap = b.leaf_taps[at]
+    lprog = bytes(tap.scriptPubKey)[2:]
+    cid = records.leaf_id(b.batch_spk()[2:], rec, lprog)
+    salt = leaf_salt(leaves[at]["owner_nonce"], leaves[at]["operator_nonce"])
+    sweep = sweep_token(token, b.r_spk[2:], S.x, SEQ_TIME | records.NOTICE)
+    _, scripts = leaf3_taptree(owner.x, S.x, salt, CTAG, SEQ_TIME | DELAY, fold=True)
+    return Coin(owner, salt, asset, value, tap, scripts, sweep, cid, record), tx
+
+
+def new_leaf(label):
+    k = Key("chain %s" % label)
+    on, opn = label_hash("owner nonce", "chain %s" % label), label_hash("operator nonce", "chain %s" % label)
+    tap, scripts, salt = leaf(k, on, opn)
+    return {"key": k, "owner_nonce": on, "operator_nonce": opn, "tap": tap, "scripts": scripts, "salt": salt}
+
+
+def hop(inputs, outputs, txs):
+    """A reassignment of `inputs` [(coin, outpoint, checkpoint value)] into
+    `outputs` [(asset, value, spk)]: the checkpoint transactions, the
+    reassignment, appended to `txs`; returns per input (cp value, cp pair, re
+    pair) and the reassignment's transaction."""
+    parts, cps, ins = [], [], []
+    for coin, at, v in inputs:
+        cp_salt = checkpoint_salt(coin.salt)
+        ctap, cscripts = checkpoint_taptree(coin.owner.x, S.x, cp_salt, CTAG, coin.sweep)
+        cspk = bytes(ctap.scriptPubKey)
+        cpd = rebind_msg3(CTAG, coin.salt, coin.asset, coin.value, [(coin.asset, v, cspk)], fold=True)
+        red = rebind_msg3(CTAG, cp_salt, coin.asset, v, outputs, fold=True)
+        cp_pair, re_pair = (S.sign(cpd), coin.owner.sign(cpd)), (S.sign(red), coin.owner.sign(red))
+        i, o = with_fee([(at, (coin.asset, coin.value, coin.spk()), FINAL)], [(coin.asset, v, cspk)], "reserve", FINAL)
+        b = Built(i, o)
+        b.witness(0, list(cp_pair) + [bytes([1]), bytes(coin.scripts["collab"]), control_block(coin.tap, "collab")])
+        d = b.json()
+        d["name"] = "checkpoint of %s" % coin.id.hex()
+        txs.append(d)
+        cps.append(coin_at(b.tx, 0))
+        ins.append((cps[-1], (coin.asset, v, cspk), FINAL))
+        parts.append((coin, v, cp_pair, re_pair, ctap, cscripts))
+    i, o = with_fee(ins, outputs, "reserve", FINAL)
+    b = Built(i, o)
+    for k, (coin, v, cp_pair, re_pair, ctap, cscripts) in enumerate(parts):
+        b.witness(k, list(re_pair) + [bytes([len(outputs)]), bytes(cscripts["collab"]), control_block(ctap, "collab")])
+    return parts, b
+
+
+def transfer_record(parts, outputs, index, nl):
+    r = b"\x01" + bytes([len(parts)])
+    for coin, v, cp_pair, re_pair, _, _ in parts:
+        r += coin.record + le64(v) + cp_pair[0] + cp_pair[1] + re_pair[0] + re_pair[1]
+    r += bytes([len(outputs)])
+    for a, v, spk in outputs:
+        r += a + le64(v) + compact(len(spk)) + spk
+    r += bytes([index]) + nl["key"].x + nl["owner_nonce"] + nl["operator_nonce"] + le16(DELAY)
+    return r
+
+
+def transfer_coin(parts, outputs, index, nl, asset, value):
+    msg = bytes([len(parts)])
+    for coin, _, _, _, ctap, _ in parts:
+        msg += coin.id + bytes(ctap.scriptPubKey)[2:]
+    msg += bytes([len(outputs)]) + b"".join(sha256(record(a, v, spk)) for a, v, spk in outputs)
+    lprog = bytes(nl["tap"].scriptPubKey)[2:]
+    cid = tagged_hash(LEAF_ID_TAG, tagged_hash(REASSIGNMENT_TAG, msg) + b"\x01" + bytes([index]) + lprog)
+    first = parts[0][0]
+    return Coin(nl["key"], nl["salt"], asset, value, nl["tap"], nl["scripts"], first.sweep, cid,
+                transfer_record(parts, outputs, index, nl))
+
+
+def transfer():
+    a, c = Key("chain A"), Key("chain C")
+    a_coin, round1 = chain_batch("chain batch 1", ASSET, 5, 2, a, 10_000_000, "chain batch 1 issuer")
+    c_coin, round2 = chain_batch("chain batch 2", Y_ASSET, 3, 1, c, 5_000_000, "chain batch 2 issuer")
+    bases = {a_coin.id.hex(): outpoint("chain A's leaf"), c_coin.id.hex(): outpoint("chain C's leaf")}
+    txs, records_out = [], {}
+
+    # Hop 1: A pays B 7,000,000 of X, change to a new leaf of A's.
+    b1, ach = new_leaf("B1"), new_leaf("A change")
+    cp1 = a_coin.value - MARGIN
+    out1 = [(ASSET, 7_000_000, bytes(b1["tap"].scriptPubKey)), (ASSET, cp1 - 7_000_000 - MARGIN, bytes(ach["tap"].scriptPubKey))]
+    parts1, re1 = hop([(a_coin, bases[a_coin.id.hex()], cp1)], out1, txs)
+    b1_coin = transfer_coin(parts1, out1, 0, b1, ASSET, 7_000_000)
+    ach_coin = transfer_coin(parts1, out1, 1, ach, ASSET, out1[1][1])
+    d = re1.json()
+    d["name"] = "reassignment creating %s" % b1_coin.id.hex()
+    txs.append(d)
+
+    # Hop 2: B gives X, C gives Y; B receives the Y, C the X.
+    b2, c2 = new_leaf("B2"), new_leaf("C2")
+    cp_b, cp_c = b1_coin.value - MARGIN, c_coin.value - MARGIN
+    out2 = [(Y_ASSET, cp_c, bytes(b2["tap"].scriptPubKey)), (ASSET, cp_b - MARGIN, bytes(c2["tap"].scriptPubKey))]
+    parts2, re2 = hop([(b1_coin, coin_at(re1.tx, 0), cp_b), (c_coin, bases[c_coin.id.hex()], cp_c)], out2, txs)
+    b2_coin = transfer_coin(parts2, out2, 0, b2, Y_ASSET, cp_c)
+    c2_coin = transfer_coin(parts2, out2, 1, c2, ASSET, cp_b - MARGIN)
+    d = re2.json()
+    d["name"] = "reassignment creating %s" % b2_coin.id.hex()
+    txs.append(d)
+
+    # Hop 3: B pays the Y on to D.
+    dl = new_leaf("D")
+    cp3 = b2_coin.value - MARGIN
+    out3 = [(Y_ASSET, cp3 - MARGIN, bytes(dl["tap"].scriptPubKey))]
+    parts3, re3 = hop([(b2_coin, coin_at(re2.tx, 0), cp3)], out3, txs)
+    d_coin = transfer_coin(parts3, out3, 0, dl, Y_ASSET, cp3 - MARGIN)
+    d = re3.json()
+    d["name"] = "reassignment creating %s" % d_coin.id.hex()
+    txs.append(d)
+
+    for name, coin in (("B1", b1_coin), ("A change", ach_coin), ("B2", b2_coin), ("C2", c2_coin), ("D", d_coin)):
+        records_out[name] = {"binary": (b"\x01" + coin.record).hex(), "id": coin.id.hex(), "owner": coin.owner.x.hex(),
+                             "owner_nonce": label_hash("owner nonce", "chain %s" % name).hex()}
+    return {
+        "inputs": {"now": CREATED, "y_asset": display(Y_ASSET),
+                   "rounds": [round1.serialize().hex(), round2.serialize().hex()],
+                   "bases": {k: v[0] for k, v in bases.items()}, "margin": MARGIN},
+        "records": records_out,
+        "transactions": txs,
+    }
+
+
 def generate():
     return {
         "about": "Golden vectors for Arca's off-chain transactions and the records that go with them. Generated by "
@@ -451,6 +674,7 @@ def generate():
         "board": board(),
         "forfeit": forfeit(),
         "offboard": offboard(),
+        "transfer": transfer(),
     }
 
 

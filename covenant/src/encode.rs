@@ -164,7 +164,7 @@ impl<'a> Reader<'a> {
 	}
 }
 
-fn write_compact_size(w: &mut Vec<u8>, n: u64) {
+pub(crate) fn write_compact_size(w: &mut Vec<u8>, n: u64) {
 	match n {
 		0..=0xfc => w.push(n as u8),
 		0xfd..=0xffff => { w.push(0xfd); w.extend((n as u16).to_le_bytes()); },

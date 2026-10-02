@@ -28,8 +28,9 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
-the board and its record, and `spend` the transactions that spend a leaf off
-the tree (forfeits, exits, the offboard's unlock and reclaim); all described
+the board and its record, `spend` the transactions that spend a leaf off the
+tree (forfeits, exits, the offboard's unlock and reclaim), and `transfer` the
+out-of-round transfer and the coin record a receiver validates; all described
 below.
 
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
@@ -256,6 +257,53 @@ must be longer than unrolling the old leaf, its exit delay, the forfeit's refund
 delay and a margin to broadcast the unlock together: a wallet starts its exit as
 soon as the preimage fails to arrive.
 
+## Out-of-round transfers
+
+A transfer is two linked transactions. Each input coin moves, by its
+collaborative path, into a checkpoint output, and the reassignment moves the
+checkpoints into the new leaves (1 to 4 committed outputs). For each input, its
+owner and the operator sign two pairs in advance: the checkpoint pair, over the
+checkpoint output, and the reassignment pair, over the outputs. A reassignment
+may take several coins of several owners in several assets, the in-tree swap:
+each owner signs the same output set. The checkpoint's salt is
+`SHA256("Arca/checkpoint" ‖ the coin's leaf salt)`, so neither step can be
+skipped or reordered, and the checkpoint sweeps with the notice of the batch the
+coin descends from.
+
+```rust
+let plan = TransferPlan { inputs: vec![(coin, checkpoint_value)], outputs };
+let cp = plan.checkpoint_message(0)?.digest;          // owner and operator sign both
+let re = plan.reassignment_message(0)?.digest;
+let record = CoinRecord::Transfer(Box::new(Transfer {
+	inputs: vec![TransferInput { coin: my_record, checkpoint_value, checkpoint: cp_pair, reassignment: re_pair }],
+	outputs: plan.outputs.clone(), index: 0, leaf: receiver_leaf,  // the receiver's key and nonce, the operator's nonce
+}));
+```
+
+A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
+the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
+and its owner's unroll authorisations, so anyone holding the record can bring it
+on-chain; for a coin a reassignment created, the reassignment's inputs (each a
+coin record, with its checkpoint's value and both pairs), its outputs, the
+coin's index and its leaf. The binary form is versioned and canonical, and the
+layout is in the `transfer` module's documentation.
+
+`CoinRecord::validate(rounds, policy, key, nonce)` is the receiver's check,
+from the record and the round transactions alone: every batch leaf validates
+against its round under the receiver's policy, every preimage and authorisation
+is good and usable now, every pair verifies, no reassignment creates more than
+its checkpoints hold, the coin's output is the leaf the record names for the
+receiver's key and nonce, no coin is spent twice in the record, and the chain is
+at most five reassignments from a round. A coin from a reassignment is safe only
+until the earliest expiry among the batches it descends from (`expiry`), so a
+receiver sets its policy's horizon for that. The valid coin builds every
+transaction that brings it on-chain: the unroll and entry of each batch leaf,
+each `checkpoint_tx`, each `reassignment_tx`. Against the sender alone the
+receiver is safe: when the sender's leaf reaches the chain, it publishes the
+checkpoint and the reassignment within the leaf's exit delay. Against the sender
+and the operator together it is not, before a round: that is the trust the
+specification calls operator-confirmed.
+
 ## Building
 
 The crate depends on `elements`, `thiserror` and, for the JSON form, `serde` and
@@ -308,9 +356,19 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   for byte, witnesses included, and re-signed with the test keys: the board and
   its exit, the forfeit with the issuance of the connector asset, its claim and
   refund, the offboard's unlock and reclaim, each with the margin as the fee and
-  with a fee coin; every input verifies under the block rules and the mempool's
-  checks. The board record decodes from both forms and its refusal vectors are
-  refused.
+  with a fee coin, and the three-hop chain's checkpoints and reassignments; every
+  input verifies under the block rules and the mempool's checks. The board record
+  decodes from both forms and its refusal vectors are refused; every coin record
+  in the chain decodes, encodes back, validates for its receiver and gives the
+  reference's coin id.
+- `tests/transfer.rs`: a chain three hops deep, one hop a two-asset swap,
+  received from the last receiver's record alone, validated against the two
+  rounds, and every transaction that brings it on-chain built from the record
+  and verified; each kind of bad record refused (another key or nonce, a changed
+  output, swapped pairs, a checkpoint worth more than its coin, a coin spent twice
+  in the record, an authorisation by another key or not yet usable, a wrong
+  preimage, a missing round, the horizon, another operator, six hops); and every
+  one-byte change of the record refused.
 - `tests/offchain.rs`: on an anchored regtest chain, a board and its refresh
   into a round (the forfeit published first, the connector asset issued, the
   claim, the new batch unrolled from its record, its entry unlocked with the
@@ -320,7 +378,13 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   round and the owner's refund, and the offboard's unlock, its merge refused,
   and its reclaim; every negative case refused by the mempool and in a block,
   for its reason. It also shows a board leaf exited at once while the operator
-  holds its forfeit, which is why a board leaf takes no off-chain spend.
+  holds its forfeit, which is why a board leaf takes no off-chain spend. Then the
+  three-hop chain on chain: the last receiver validates it from its record and
+  the confirmed rounds, brings it on-chain from the record, with fee coins
+  wherever the asset is not accepted for fees, and exits; a reassignment's pair
+  cannot skip the checkpoint, a checkpoint's pair cannot spend the checkpoint, a
+  swap cannot confirm with one input, and the first sender's exit fails once the
+  receiver has published the checkpoint.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
