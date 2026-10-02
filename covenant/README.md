@@ -20,14 +20,17 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `clock` | `R` and the clock chain from a published schedule `(T, S, W, E_0 … E_K)` | ROLL, RELEASE; `R` is `<W> CSV DROP <S> CHECKSIG` |
 | `leaf` | The leaf (`vtxo-1`) | The rebindable collaborative path for 1 to 4 committed outputs, and the exit |
 | `entry` | The hash-locked entry | Unlock into the owner's leaf with the preimage; the sweep with notice |
-| `forfeit` | The forfeit output | The operator's claim with the preimage; the owner's refund after the delay |
+| `forfeit` | The forfeit output, bound to the leaf given up and to its round | The operator's claim with the preimage and the round's connector asset; the owner's refund after the delay |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
+| `offboard` | The offboard output a round pays | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
-into a batch, and `unroll` the transactions that take a leaf on-chain; all
-described below.
+into a batch, `unroll` the transactions that take a leaf on-chain, `board`
+the board and its record, and `spend` the transactions that spend a leaf off
+the tree (forfeits, exits, the offboard's unlock and reclaim); all described
+below.
 
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
@@ -191,6 +194,68 @@ let txs = branch.unroll(batch_outpoint, &auths, &vec![FeeSource::Reserve; auths.
 let entry = branch.entry_tx(branch.entry_outpoint(&txs).unwrap(), &preimage, &FeeSource::Reserve)?;
 ```
 
+## Off-chain transactions
+
+Every spend outside the unroll has one shape (`spend`): input 0 spends an
+Arca output, outputs `0..m` are the ones its path pins or its signers committed
+to, and the rest is open for the fee. What the spent coins hold beyond those
+outputs is the margin, per asset. `FeeSource::Reserve` makes the margin the fee,
+in the coin's own asset; `FeeSource::Coin` attaches a coin of the broadcaster's
+in any accepted asset, which pays the fee, and the margin goes to its change. A
+rebindable spend (`collab_tx`, for a leaf or a checkpoint) is signed by owner
+and operator as a `Pair` over the outputs alone, before the coin is on-chain. A
+spend whose path ends in `<key> OP_CHECKSIG` (`KeySpend`: an exit, a forfeit's
+claim or refund, an offboard's reclaim) is signed once built.
+
+**The forfeit.** A refresh or an offboard gives up an old leaf against an
+unlock hash `h`. The owner and the operator sign the old leaf's move into the
+forfeit output in advance, leaving a margin for the fee. The forfeit's claim
+needs the preimage of `h`, the operator's signature, and an input holding the
+round's connector asset `M`; it names the id of the leaf given up, so every
+forfeit output is unique to its leaf and two forfeits of one participation can
+never share one. `M` is the asset that spending the round's connector output
+`(round_txid, c)` would issue (`connector_asset`): the owner computes it from
+the confirmed round, the operator issues one atom only when it needs to claim
+(`connector_issuance`) and reuses it for every claim of that round. After a
+rollback that replaces the round, `(round_txid, c)` does not exist, `M` can
+never be issued, no forfeit of that round can be claimed, and the owner takes
+the old coin back after the refund delay. The operator spends a round's
+connector output only to issue `M`.
+
+```rust
+let m = connector_asset(round_txid, c);
+let f = Forfeit::new(old_leaf, (asset, value), old_leaf_id, h, m, refund_delay, margin)?;
+let digest = f.message().digest;                       // owner and operator each sign it
+f.verify(&pair)?;                                      // the server's check
+let forfeit_tx = f.tx(old_leaf_coin, &pair, &FeeSource::Reserve)?;
+let claim = f.claim(forfeit_coin, (m_coin, m_txout), &outputs, m_back_to, &FeeSource::Reserve)?;
+let claim = claim.finish(ForfeitPolicy::claim_items(&sig_over(claim.sighash(genesis)?), &preimage, Forfeit::CONNECTOR_INPUT));
+```
+
+**The board.** The owner pays its own coins to a leaf (`BoardRecord::tx`), and
+keeps a `BoardRecord`: the leaf's key, the two nonces of its salt (one given by
+the operator), its exit delay, asset, value, chain and operator. The record has
+a binary and a JSON form like the leaf record's, and `validate` checks it
+against the board transaction. A board's leaf id is that of a batch with no
+levels whose batch output is the leaf. A board leaf is on-chain from the start,
+so once its exit delay has passed after the board confirmed, its owner can exit
+at any moment and an exit races any off-chain spend of it with nothing to wait
+for. A board leaf therefore takes no spend whose safety rests on an answer in
+time: its refresh into a round, or its offboard, is a forfeit the operator
+publishes and sees confirmed before it hands over the preimage, and it is not
+transferred out of round.
+
+**The offboard.** A round pays an `OffboardPolicy` output, whose unlock moves
+it, with the preimage of `h`, to the owner's destination (any script, asset and
+value explicit) at the unlocking input's own index, so that two offboards to
+one destination can never be paid by one output; anyone holding the preimage
+can broadcast it and choose how the fee is paid. The owner checks the round with
+`find` and forfeits its leaf against `h`; the operator's claim of that forfeit
+publishes the preimage. The operator reclaims the output after its delay, which
+must be longer than unrolling the old leaf, its exit delay, the forfeit's refund
+delay and a margin to broadcast the unlock together: a wallet starts its exit as
+soon as the preimage fails to arrive.
+
 ## Building
 
 The crate depends on `elements`, `thiserror` and, for the JSON form, `serde` and
@@ -238,6 +303,24 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   its node fail; the fee-rate reserves cover each spend; a 1,024-leaf batch's
   node sizes match the specification's table; a record whose salt is not built
   from the owner nonce it names, or from the wallet's nonce, is refused.
+- `tests/transactions.rs`: every transaction in the regtest suite's
+  off-chain vectors (`regtest/vectors/transactions.json`) is rebuilt here byte
+  for byte, witnesses included, and re-signed with the test keys: the board and
+  its exit, the forfeit with the issuance of the connector asset, its claim and
+  refund, the offboard's unlock and reclaim, each with the margin as the fee and
+  with a fee coin; every input verifies under the block rules and the mempool's
+  checks. The board record decodes from both forms and its refusal vectors are
+  refused.
+- `tests/offchain.rs`: on an anchored regtest chain, a board and its refresh
+  into a round (the forfeit published first, the connector asset issued, the
+  claim, the new batch unrolled from its record, its entry unlocked with the
+  preimage learned from the chain, the new leaf exited), one atom of the
+  connector serving two claims, two forfeits of one participation refused one
+  output, the connector that cannot be issued after a rollback replaces the
+  round and the owner's refund, and the offboard's unlock, its merge refused,
+  and its reclaim; every negative case refused by the mempool and in a block,
+  for its reason. It also shows a board leaf exited at once while the operator
+  holds its forfeit, which is why a board leaf takes no off-chain spend.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and

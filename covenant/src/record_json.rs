@@ -56,7 +56,7 @@ use crate::record::{
 use crate::script::asset_bytes;
 use crate::time::{MedianTime, RelativeTime};
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
 	let mut s = String::with_capacity(2 * b.len());
 	for x in b {
 		s.push_str(&format!("{:02x}", x));
@@ -64,7 +64,7 @@ fn hex(b: &[u8]) -> String {
 	s
 }
 
-fn display(b: [u8; 32]) -> String {
+pub(crate) fn display(b: [u8; 32]) -> String {
 	let mut r = b;
 	r.reverse();
 	hex(&r)
@@ -130,10 +130,7 @@ impl LeafRecord {
 	/// Reads the JSON text of a record. Refuses a repeated key and trailing
 	/// characters as well as everything [`LeafRecord::from_json`] refuses.
 	pub fn from_json_str(text: &str) -> Result<LeafRecord, RecordError> {
-		let mut de = serde_json::Deserializer::from_str(text);
-		let v = Strict::deserialize(&mut de).map_err(|e| RecordError::Json(e.to_string()))?;
-		de.end().map_err(|e| RecordError::Json(e.to_string()))?;
-		LeafRecord::from_json(&v.0)
+		LeafRecord::from_json(&strict(text)?)
 	}
 
 	/// Reads the JSON form.
@@ -204,7 +201,7 @@ impl LeafRecord {
 }
 
 /// `v` as an object with exactly the keys `keys`.
-fn object<'a>(v: &'a Value, ctx: &str, keys: &[&str]) -> Result<&'a Map<String, Value>, RecordError> {
+pub(crate) fn object<'a>(v: &'a Value, ctx: &str, keys: &[&str]) -> Result<&'a Map<String, Value>, RecordError> {
 	let m = v.as_object().ok_or_else(|| RecordError::Type(ctx.into()))?;
 	for k in keys {
 		if !m.contains_key(*k) {
@@ -217,33 +214,33 @@ fn object<'a>(v: &'a Value, ctx: &str, keys: &[&str]) -> Result<&'a Map<String, 
 	Ok(m)
 }
 
-fn int(m: &Map<String, Value>, k: &str, max: u64) -> Result<u64, RecordError> {
+pub(crate) fn int(m: &Map<String, Value>, k: &str, max: u64) -> Result<u64, RecordError> {
 	m[k].as_u64().filter(|v| *v <= max).ok_or_else(|| RecordError::Type(k.into()))
 }
 
-fn string<'a>(m: &'a Map<String, Value>, k: &str) -> Result<&'a str, RecordError> {
+pub(crate) fn string<'a>(m: &'a Map<String, Value>, k: &str) -> Result<&'a str, RecordError> {
 	m[k].as_str().ok_or_else(|| RecordError::Type(k.into()))
 }
 
-fn array<'a>(m: &'a Map<String, Value>, k: &str, max: usize) -> Result<&'a Vec<Value>, RecordError> {
+pub(crate) fn array<'a>(m: &'a Map<String, Value>, k: &str, max: usize) -> Result<&'a Vec<Value>, RecordError> {
 	m[k].as_array().filter(|a| a.len() <= max).ok_or_else(|| RecordError::Type(k.into()))
 }
 
-fn bytes32(m: &Map<String, Value>, k: &str) -> Result<[u8; 32], RecordError> {
+pub(crate) fn bytes32(m: &Map<String, Value>, k: &str) -> Result<[u8; 32], RecordError> {
 	hex32(string(m, k)?).ok_or_else(|| RecordError::Hex(k.into()))
 }
 
-fn display32(m: &Map<String, Value>, k: &str) -> Result<[u8; 32], RecordError> {
+pub(crate) fn display32(m: &Map<String, Value>, k: &str) -> Result<[u8; 32], RecordError> {
 	let mut b = bytes32(m, k)?;
 	b.reverse();
 	Ok(b)
 }
 
-fn key(m: &Map<String, Value>, k: &str) -> Result<XOnlyPublicKey, RecordError> {
+pub(crate) fn key(m: &Map<String, Value>, k: &str) -> Result<XOnlyPublicKey, RecordError> {
 	XOnlyPublicKey::from_slice(&bytes32(m, k)?).map_err(|_| RecordError::Key(k.into()))
 }
 
-fn units(m: &Map<String, Value>, k: &str) -> Result<RelativeTime, RecordError> {
+pub(crate) fn units(m: &Map<String, Value>, k: &str) -> Result<RelativeTime, RecordError> {
 	let u = int(m, k, u16::MAX as u64)?;
 	Ok(RelativeTime::from_units(u as u16).map_err(crate::encode::DecodeError::from)?)
 }
@@ -256,7 +253,7 @@ fn parse_amount(s: &str) -> Option<u64> {
 	s.parse().ok()
 }
 
-fn amount(m: &Map<String, Value>, k: &str) -> Result<u64, RecordError> {
+pub(crate) fn amount(m: &Map<String, Value>, k: &str) -> Result<u64, RecordError> {
 	parse_amount(string(m, k)?).ok_or_else(|| RecordError::Amount(k.into()))
 }
 
@@ -311,6 +308,14 @@ fn write_canonical(out: &mut String, v: &Value) {
 		},
 		other => out.push_str(&serde_json::to_string(other).expect("a scalar serialises")),
 	}
+}
+
+/// Reads JSON text with every object's keys distinct and nothing after it.
+pub(crate) fn strict(text: &str) -> Result<Value, RecordError> {
+	let mut de = serde_json::Deserializer::from_str(text);
+	let v = Strict::deserialize(&mut de).map_err(|e| RecordError::Json(e.to_string()))?;
+	de.end().map_err(|e| RecordError::Json(e.to_string()))?;
+	Ok(v.0)
 }
 
 /// A JSON value read with every object's keys distinct: two readers that keep

@@ -16,7 +16,7 @@ use elements::hashes::Hash;
 use elements::hex::{FromHex, ToHex};
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
-use elements::{AssetId, BlockHash, Script, Transaction, TxOut};
+use elements::{AssetId, BlockHash, Script, Transaction, TxOut, Txid};
 use serde_json::Value;
 
 use arca_consensus::Verifier;
@@ -165,11 +165,17 @@ impl Ctx {
 
 	fn forfeit(&self) -> ForfeitPolicy {
 		let p = &self.output("forfeit")["params"];
+		let round = Txid::from_str(p["connector"]["round_txid"].as_str().unwrap()).unwrap();
+		let vout = p["connector"]["vout"].as_u64().unwrap() as u32;
+		let connector = arca_covenant::connector_asset(round, vout);
+		assert_eq!(connector, AssetId::from_byte_array(h32(&p["connector"]["asset"])), "the connector asset from the round's outpoint");
 		ForfeitPolicy {
 			unlock_hash: h32(&p["unlock_hash"]),
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			refund_delay: rel(&p["refund_delay"]),
+			leaf_id: arca_covenant::LeafId(h32(&p["leaf_id"])),
+			connector,
 		}
 	}
 
@@ -394,7 +400,8 @@ fn every_spend_matches_its_vector_and_verifies() {
 					ctx.checkpoint().collab_witness(&ss, &sa, m as u8)
 				}
 			},
-			("forfeit", "claim") => ctx.forfeit().claim_witness(&checksig("S"), &h32(&s["preimage"])),
+			("forfeit", "claim") => ctx.forfeit().claim_witness(&checksig("S"), &h32(&s["preimage"]),
+				s["connector_input"].as_u64().unwrap() as u32),
 			("forfeit", "refund") => {
 				let owner = ctx.label_of(&ctx.forfeit().owner).to_string();
 				ctx.forfeit().refund_witness(&checksig(&owner))

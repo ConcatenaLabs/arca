@@ -5,7 +5,7 @@ mod common;
 
 use elements::hashes::Hash;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::BlockHash;
+use elements::{BlockHash, Script};
 
 use arca_covenant::encode::{DecodeError, Encoding, Policy};
 use arca_covenant::htlc::HtlcPath;
@@ -38,12 +38,19 @@ fn policies() -> Vec<Policy> {
 		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), sch.sweep(true, true), Some(chain())).unwrap()),
 		Policy::Node(NodePolicy::new(children[..1].to_vec(), s, (0..300).map(|_| a).collect(), sch.sweep(true, false), Some(chain())).unwrap()),
 		Policy::Entry(EntryPolicy { unlock_hash: label32("h"), asset: asset("X"), value: 77, leaf_program: leaf.program(), sweep: sch.sweep(true, false) }),
-		Policy::Forfeit(ForfeitPolicy { unlock_hash: label32("h"), owner: a, operator: s, refund_delay: sch.notice }),
+		Policy::Forfeit(ForfeitPolicy {
+			unlock_hash: label32("h"), owner: a, operator: s, refund_delay: sch.notice,
+			leaf_id: LeafId(label32("leaf id")), connector: asset("connector"),
+		}),
 		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: sch.sweep(true, false) }),
 		Policy::Htlc(HtlcPolicy {
 			owner: a, operator: s, direction: HtlcDirection::Receive, payment_hash: label32("p"),
 			timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),
 			salts: HtlcSalts { claim: label32("1"), claim_both: label32("2"), refund_both: label32("3") }, chain: chain(),
+		}),
+		Policy::Offboard(OffboardPolicy {
+			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
+			operator: s, reclaim_delay: sch.notice,
 		}),
 	]
 }
@@ -188,8 +195,11 @@ fn witness_readers() {
 
 	// The preimage a forfeit claim reveals.
 	let pre = label32("pre");
-	let forfeit = ForfeitPolicy { unlock_hash: sha256(&pre), owner: xonly(&a), operator: xonly(&s), refund_delay: sch.notice };
-	let w = forfeit.claim_witness(&sig(&s, &label32("any")), &pre);
+	let forfeit = ForfeitPolicy {
+		unlock_hash: sha256(&pre), owner: xonly(&a), operator: xonly(&s), refund_delay: sch.notice,
+		leaf_id: LeafId(label32("leaf given up")), connector: asset("M"),
+	};
+	let w = forfeit.claim_witness(&sig(&s, &label32("any")), &pre, 1);
 	assert_eq!(find_preimage(&w, &forfeit.unlock_hash), Some(pre));
 	assert_eq!(find_preimage(&w, &label32("other")), None);
 	let h = HtlcPolicy {
