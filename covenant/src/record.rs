@@ -305,7 +305,7 @@ pub(crate) fn hex32(s: &str) -> Option<[u8; 32]> {
 /// Lower-case hex, an even number of digits.
 pub(crate) fn hex_lower(s: &str) -> Option<Vec<u8>> {
 	let b = s.as_bytes();
-	if !b.len().is_multiple_of(2) {
+	if b.len() % 2 != 0 {
 		return None;
 	}
 	let digit = |c: u8| match c {

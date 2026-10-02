@@ -148,8 +148,10 @@ parent.
 client's checks on a round, and holds the leaf record and its validation, the
 tree builder and the unroll; it is where new script code goes. It depends on `elements`, `thiserror` and, for the
 record's JSON form, `serde` and `serde_json`, so a wallet can use it without
-`arca-lib`. Bark's MuSig2 policies in `arca-lib` stay until a later package
-removes them.
+`arca-lib`. The Sequentia Wallet Kit builds it with the Rust it pins, so the
+crate uses no standard-library API newer than its `rust-version` (1.85, in
+`covenant/Cargo.toml`), which the `covenant` workflow checks. Bark's MuSig2
+policies in `arca-lib` stay until a later package removes them.
 
 `regtest/` is the independent reference for every Arca script: a Python suite
 on the node's functional test framework, and the golden vectors it exports

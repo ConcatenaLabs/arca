@@ -90,7 +90,7 @@ impl UnrollWitness {
 	/// script of an UNROLL spend.
 	pub fn parse(items: &[Vec<u8>]) -> Result<UnrollWitness, WitnessError> {
 		let n = items.len();
-		if n < 3 || !(n - 3).is_multiple_of(2) {
+		if n < 3 || (n - 3) % 2 != 0 {
 			return Err(WitnessError::ItemCount(n));
 		}
 		let signature = Signature::from_slice(&items[0]).map_err(|_| WitnessError::Signature(0))?;

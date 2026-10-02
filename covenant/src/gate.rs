@@ -168,7 +168,7 @@ impl Members {
 		assert!(index < self.keys.len(), "member index out of range");
 		let mut path = Vec::with_capacity(self.depth());
 		for level in &self.levels[..self.levels.len() - 1] {
-			path.push(PathStep { sibling: level[index ^ 1], is_left: index.is_multiple_of(2) });
+			path.push(PathStep { sibling: level[index ^ 1], is_left: index % 2 == 0 });
 			index /= 2;
 		}
 		path

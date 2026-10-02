@@ -3,6 +3,9 @@ name = "arca-covenant"
 version = "0.1.0"
 license = "MIT"
 edition = "2021"
+# The Sequentia Wallet Kit builds this crate, for wasm as well, with the
+# toolchain it pins; CI checks the crate with this version.
+rust-version = "1.85"
 repository = "https://github.com/ConcatenaLabs/arca"
 description = "Arca's covenant scripts on Sequentia: the tree, the clock, the leaf and the outputs around it, their witnesses and the client's checks"
 publish = false

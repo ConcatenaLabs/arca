@@ -71,6 +71,9 @@ push to `master`: [lib.yml](.github/workflows/lib.yml) builds `arca-lib` and run
 its unit tests, and [node.yml](.github/workflows/node.yml) runs `arca-consensus`,
 `arca-sequentia-ext` and `arca-covenant`, checks that the golden vectors
 regenerate, and runs the regtest suite, all against the newest node build.
+[covenant.yml](.github/workflows/covenant.yml) checks that `arca-covenant`
+builds with the Rust version the Sequentia Wallet Kit pins, which is the
+`rust-version` in `covenant/Cargo.toml`.
 
 ## Security
 
