@@ -30,6 +30,7 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `server/` | `arca-server` | `server` | The operator's server (`captaind`) and the watcher (`watchmand`) |
 | `server-rpc/`, `server-log/`, `cln-rpc/` | `arca-server-rpc`, `arca-server-log`, `arca-cln-rpc` | `server_rpc`, `server_log`, `cln_rpc` | The gRPC protocol, structured log messages, the Core Lightning client |
 | `testing/` | `arca-testing` | `ark_testing` | The integration harness and its test suites |
+| `sequentia-ext/` | `arca-sequentia-ext` | `sequentia_ext` | Sequentia chain types (anchored block headers, issuances with a denomination, asset-tagged amounts), a JSON-RPC client for `sequentiad`, and a regtest harness ([sequentia-ext/README.md](sequentia-ext/README.md)) |
 | `consensus/` | `arca-consensus` | `arca_consensus` | Script verification under Sequentia's consensus rules for tests, through the node's own interpreter ([consensus/README.md](consensus/README.md)) |
 | `bip321/` | `bip321` | `bip321` | Payment URI parser |
 | `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
@@ -48,17 +49,17 @@ The [justfile](justfile) holds the remaining recipes (`just check`, `just unit`,
 `just int`). The integration tests drive real daemons and expect the environment
 that the Nix flake (`nix develop`) provides.
 
-`arca-consensus` links the Sequentia node's consensus library, and its tests run
-a `sequentiad` regtest node: set `SEQUENTIA_DIR` to a node checkout with that
-library built and `SEQUENTIAD_EXEC` to a node binary, as
-[consensus/README.md](consensus/README.md) describes.
+`arca-consensus` links the Sequentia node's consensus library, and its tests and
+those of `arca-sequentia-ext` run `sequentiad` on a regtest chain: set
+`SEQUENTIA_DIR` to a node checkout with that library built and `SEQUENTIAD_EXEC`
+to a node binary, as [consensus/README.md](consensus/README.md) describes.
 
-    cargo test -p arca-consensus
+    cargo test -p arca-consensus -p arca-sequentia-ext
 
 Continuous integration on GitHub Actions runs on every pull request and on every
 push to `master`: [lib.yml](.github/workflows/lib.yml) builds `arca-lib` and runs
-its unit tests, and [consensus.yml](.github/workflows/consensus.yml) runs
-`arca-consensus` against the newest node build.
+its unit tests, and [node.yml](.github/workflows/node.yml) runs `arca-consensus`
+and `arca-sequentia-ext` against the newest node build.
 
 ## Security
 

@@ -18,6 +18,7 @@ members = [
   "bip321",
   "wasm-testing",
   "consensus",
+  "sequentia-ext",
 ]
 
 resolver = "2"

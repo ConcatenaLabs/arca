@@ -300,6 +300,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-sequentia-ext"
+version = "0.1.0"
+dependencies = [
+ "arca-sequentia-ext",
+ "base64 0.22.1",
+ "elements",
+ "minreq",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arca-server"
 version = "0.7.1"
 dependencies = [
@@ -1621,6 +1634,7 @@ dependencies = [
  "bech32",
  "bitcoin",
  "secp256k1-zkp",
+ "serde",
  "serde_json",
 ]
 
@@ -4363,6 +4377,7 @@ dependencies = [
  "rand 0.8.6",
  "secp256k1 0.29.1",
  "secp256k1-zkp-sys",
+ "serde",
 ]
 
 [[package]]
