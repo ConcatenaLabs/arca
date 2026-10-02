@@ -86,6 +86,7 @@ fn golden_vectors_regenerate() {
 			assert_eq!(from_json, rec, "{}: the two forms differ", ctx);
 			assert_eq!(rec.to_json_string().unwrap(), text, "{}: JSON text", ctx);
 			assert_eq!(rec.chain.genesis_hash(), genesis);
+			assert_eq!(rec.salt().to_vec(), hexbytes(&r["salt"]), "{}: the salt from the two nonces", ctx);
 			assert_eq!(rec.schedule.token, token);
 			assert_eq!(rec.asset, asset);
 
@@ -172,7 +173,9 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 		m.push((name, x));
 	};
 	add("owner".into(), &|x| x.owner = other_key("owner"));
-	add("salt".into(), &|x| x.salt = flip(x.salt));
+	add("owner nonce".into(), &|x| x.owner_nonce = flip(x.owner_nonce));
+	add("operator nonce".into(), &|x| x.operator_nonce = flip(x.operator_nonce));
+	add("the two nonces swapped".into(), &|x| std::mem::swap(&mut x.owner_nonce, &mut x.operator_nonce));
 	add("exit delay".into(), &|x| x.exit_delay = RelativeTime::from_units(x.exit_delay.units() + 1).unwrap());
 	add("asset".into(), &|x| x.asset = AssetId::from_byte_array(flip(x.asset.into_inner().to_byte_array())));
 	add("value + 1".into(), &|x| x.value += 1);

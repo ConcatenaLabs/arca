@@ -23,18 +23,24 @@
 //! its member tree is rebuilt from them.
 //!
 //! `R` is not stored: it is rebuilt from `W` and `S`, so it cannot disagree
-//! with them.
+//! with them. Nor is the salt: the record holds the owner's nonce and the
+//! operator's, and the salt is rebuilt from them
+//! (`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`,
+//! [`crate::leaf::leaf_salt`]). A wallet checks that the owner nonce is the one
+//! it picked for this leaf ([`LeafRecord::check_owner`]); validation against the
+//! round then shows that the leaf on-chain carries the salt built from it.
 //!
-//! # The binary form, version 1
+//! # The binary form, version 2
 //!
 //! Integers are little-endian. Asset ids, the token and the genesis hash are in
 //! internal byte order.
 //!
 //! ```text
-//! u8    format version, 1
+//! u8    format version, 2
 //! u8    template, 1 (vtxo)            u8   template version, 1
 //! [32]  owner key A                   the vtxo-1 parameters
-//! [32]  salt
+//! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
+//! [32]  operator nonce
 //! u16   exit delay, 512-second units
 //! [32]  asset                         the leaf and its entry
 //! u64   value
@@ -90,6 +96,7 @@ use crate::checks::{check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Reader};
 use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
+use crate::leaf::leaf_salt;
 use crate::message::{unroll_authorisation, Chain, CsfsMessage};
 use crate::node::{node_taproot, reclaim_script, unroll_script, MAX_CHILDREN};
 use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
@@ -99,7 +106,7 @@ use crate::time::{MedianTime, RelativeTime};
 use crate::{EntryPolicy, LeafPolicy};
 
 /// The record format this crate writes and reads.
-pub const RECORD_VERSION: u8 = 1;
+pub const RECORD_VERSION: u8 = 2;
 
 /// The most levels a record's path has.
 pub const MAX_LEVELS: usize = 16;
@@ -226,8 +233,10 @@ pub struct LeafRecord {
 	pub template: Template,
 	/// The owner's key `A`.
 	pub owner: XOnlyPublicKey,
-	/// The leaf's salt, unique to this leaf instance.
-	pub salt: [u8; 32],
+	/// The owner's contribution to the leaf's salt.
+	pub owner_nonce: [u8; 32],
+	/// The operator's contribution to the leaf's salt.
+	pub operator_nonce: [u8; 32],
 	pub exit_delay: RelativeTime,
 	/// The batch's asset.
 	pub asset: AssetId,
@@ -336,6 +345,10 @@ pub enum RecordError {
 	MemberIndex { level: usize, index: u32, depth: usize },
 	#[error("level {level}: another child of the node carries the same script as the one on the leaf's path")]
 	DuplicateChild { level: usize },
+	#[error("the record is for another owner's key")]
+	NotOwner,
+	#[error("the record's owner nonce is not the one the wallet picked for this leaf")]
+	OwnerNonce,
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
 	#[error("not JSON: {0}")]
@@ -383,6 +396,7 @@ impl RecordError {
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
+			NotOwner | OwnerNonce => "owner",
 			Json(_) => "json",
 			Field(_) => "field",
 			Type(_) => "type",
@@ -416,6 +430,25 @@ impl LeafRecord {
 	/// The operator's key `S`.
 	pub fn operator(&self) -> XOnlyPublicKey {
 		self.schedule.operator
+	}
+
+	/// The leaf's salt, rebuilt from the two nonces.
+	pub fn salt(&self) -> [u8; 32] {
+		leaf_salt(&self.owner_nonce, &self.operator_nonce)
+	}
+
+	/// The wallet's check that the record is for its key and for the nonce it
+	/// picked for this leaf, so the salt holds its contribution. A wallet that
+	/// never repeats a nonce is then never given a leaf script it already
+	/// holds. It runs this as well as [`LeafRecord::validate`].
+	pub fn check_owner(&self, owner: &XOnlyPublicKey, owner_nonce: &[u8; 32]) -> Result<(), RecordError> {
+		if self.owner != *owner {
+			return Err(RecordError::NotOwner);
+		}
+		if self.owner_nonce != *owner_nonce {
+			return Err(RecordError::OwnerNonce);
+		}
+		Ok(())
 	}
 
 	/// Checks the record's shape: counts, indices and value bounds. Every
@@ -467,7 +500,7 @@ impl LeafRecord {
 		LeafPolicy {
 			owner: self.owner,
 			operator: self.schedule.operator,
-			salt: self.salt,
+			salt: self.salt(),
 			chain: self.chain,
 			exit_delay: self.exit_delay,
 		}
@@ -584,7 +617,8 @@ impl LeafRecord {
 		let mut w = Vec::with_capacity(256 + 160 * self.levels());
 		w.extend([RECORD_VERSION, self.template.id(), self.template.version()]);
 		w.extend(self.owner.serialize());
-		w.extend(self.salt);
+		w.extend(self.owner_nonce);
+		w.extend(self.operator_nonce);
 		w.extend(self.exit_delay.units().to_le_bytes());
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
@@ -634,7 +668,8 @@ impl LeafRecord {
 		let template_version = r.u8()?;
 		let template = Template::from_id(template_id, template_version)?;
 		let owner = r.key()?;
-		let salt = r.array32()?;
+		let owner_nonce = r.array32()?;
+		let operator_nonce = r.array32()?;
 		let exit_delay = r.relative_time()?;
 		let asset = r.asset()?;
 		let value = r.u64()?;
@@ -700,8 +735,8 @@ impl LeafRecord {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
 		}
 		let record = LeafRecord {
-			template, owner, salt, exit_delay, asset, value, unlock_hash, entry_reserve, chain, schedule,
-			burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
+			template, owner, owner_nonce, operator_nonce, exit_delay, asset, value, unlock_hash, entry_reserve, chain,
+			schedule, burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;
 		Ok(record)

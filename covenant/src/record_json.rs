@@ -3,9 +3,11 @@
 //! The fields are the binary form's ([`crate::record`]), named:
 //!
 //! ```text
-//! version            1
+//! version            2
 //! template           "vtxo-1"
-//! owner, salt        hex
+//! owner              hex
+//! owner_nonce        hex
+//! operator_nonce     hex
 //! exit_delay_units   512-second units
 //! asset              hex, display order
 //! value              decimal string
@@ -103,7 +105,8 @@ impl LeafRecord {
 		m.insert("version".into(), RECORD_VERSION.into());
 		m.insert("template".into(), Value::String(self.template.to_string()));
 		m.insert("owner".into(), Value::String(hex(&self.owner.serialize())));
-		m.insert("salt".into(), Value::String(hex(&self.salt)));
+		m.insert("owner_nonce".into(), Value::String(hex(&self.owner_nonce)));
+		m.insert("operator_nonce".into(), Value::String(hex(&self.operator_nonce)));
 		m.insert("exit_delay_units".into(), self.exit_delay.units().into());
 		m.insert("asset".into(), Value::String(display(asset_bytes(self.asset))));
 		m.insert("value".into(), Value::String(self.value.to_string()));
@@ -136,8 +139,8 @@ impl LeafRecord {
 	/// Reads the JSON form.
 	pub fn from_json(v: &Value) -> Result<LeafRecord, RecordError> {
 		let m = object(v, "record", &[
-			"version", "template", "owner", "salt", "exit_delay_units", "asset", "value", "unlock_hash",
-			"entry_reserve", "genesis_hash", "operator", "token", "notice_units", "burn", "expiries", "path",
+			"version", "template", "owner", "owner_nonce", "operator_nonce", "exit_delay_units", "asset", "value",
+			"unlock_hash", "entry_reserve", "genesis_hash", "operator", "token", "notice_units", "burn", "expiries", "path",
 		])?;
 		let version = int(m, "version", u64::MAX)?;
 		if version != RECORD_VERSION as u64 {
@@ -145,7 +148,8 @@ impl LeafRecord {
 		}
 		let template: Template = string(m, "template")?.parse()?;
 		let owner = key(m, "owner")?;
-		let salt = bytes32(m, "salt")?;
+		let owner_nonce = bytes32(m, "owner_nonce")?;
+		let operator_nonce = bytes32(m, "operator_nonce")?;
 		let exit_delay = units(m, "exit_delay_units")?;
 		let asset = AssetId::from_byte_array(display32(m, "asset")?);
 		let value = amount(m, "value")?;
@@ -190,7 +194,8 @@ impl LeafRecord {
 			owners.push(XOnlyPublicKey::from_slice(&b).map_err(|_| RecordError::Key(format!("{}.owners", ctx)))?);
 		}
 		let record = LeafRecord {
-			template, owner, salt, exit_delay, asset, value, unlock_hash, entry_reserve, chain, schedule, burn,
+			template, owner, owner_nonce, operator_nonce, exit_delay, asset, value, unlock_hash, entry_reserve, chain,
+			schedule, burn,
 			upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;

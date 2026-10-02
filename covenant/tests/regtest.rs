@@ -17,7 +17,7 @@
 //! 4. the swap of two leaves in two assets in one transaction;
 //! 5. the hash-locked entry's sweep behind the token and the notice;
 //! 6. the burn-only sweep behind the token;
-//! 7. a 16-leaf and a 64-leaf batch built by the tree builder, with reserves
+//! 7. a 17-leaf and a 64-leaf batch built by the tree builder, with reserves
 //!    at four times the node's own relay floor: every leaf's record checked
 //!    against the confirmed round, and three leaves in different subtrees
 //!    unrolled from their records, unlocked and exited, one of them with fee
@@ -1042,12 +1042,12 @@ fn burn(net: &mut Net) {
 fn prototype_vsize(name: &str) -> &'static str {
 	let fee = name.contains("fee coin");
 	match (name.split(" / ").nth(1).unwrap_or(""), fee) {
-		(n, false) if n.starts_with("unroll, member depth 3") => "527",
-		(n, true) if n.starts_with("unroll, member depth 3") => "729",
-		(n, false) if n.starts_with("unroll, member depth 5") => "549",
-		(n, true) if n.starts_with("unroll, member depth 5") => "751",
-		(n, false) if n.starts_with("unroll, member depth 7") => "571",
-		(n, true) if n.starts_with("unroll, member depth 7") => "773",
+		(n, false) if n.starts_with("unroll, member depth 3, 4 children") => "527",
+		(n, true) if n.starts_with("unroll, member depth 3, 4 children") => "729",
+		(n, false) if n.starts_with("unroll, member depth 5, 4 children") => "549",
+		(n, true) if n.starts_with("unroll, member depth 5, 4 children") => "751",
+		(n, false) if n.starts_with("unroll, member depth 7, 4 children") => "571",
+		(n, true) if n.starts_with("unroll, member depth 7, 4 children") => "773",
 		(n, false) if n.starts_with("entry") => "234",
 		(n, false) if n.starts_with("exit") => "207 (P2WPKH out)",
 		(n, true) if n.starts_with("exit") => "342 (P2WPKH out)",
@@ -1071,7 +1071,9 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 	let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();
 	let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
 	let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
-		template: Template::Vtxo1, owner: xonly(&owners[i]), value: LEAF, salt: label32(&format!("{} salt {}", label, i)),
+		template: Template::Vtxo1, owner: xonly(&owners[i]), value: LEAF,
+		owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
+		operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
 		exit_delay: delay(), unlock_hash: sha256(&preimages[i]),
 	}).collect();
 	let params = TreeParams {
@@ -1103,6 +1105,11 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 		let rec = LeafRecord::from_bytes(bytes).unwrap();
 		let ok = rec.validate(&round).unwrap_or_else(|e| panic!("{} / leaf {}: {}", label, i, e));
 		assert_eq!(ok.batch_vout, 0);
+		rec.check_owner(&xonly(&owners[i]), &leaves[i].owner_nonce).unwrap();
+		// A record naming another owner nonce than the one in the leaf's salt.
+		let mut other = rec.clone();
+		other.owner_nonce = label32(&format!("{} not the owner nonce {}", label, i));
+		assert_eq!(other.validate(&round).unwrap_err().kind(), "batch_output");
 	}
 	println!("{}: {} records validate against the confirmed round {}", label, n, round_txid);
 
@@ -1168,7 +1175,8 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 				u.tx.input[1].witness.script_witness = op_true_witness();
 			}
 			let txid = net.pass(&name, &u.tx);
-			sizes.push((name, net.rows.last().unwrap().vsize.parse().unwrap(), prototype_vsize(&format!("x / unroll, member depth {}{}", node.gate.depth, shape)).into()));
+			sizes.push((name, net.rows.last().unwrap().vsize.parse().unwrap(),
+				prototype_vsize(&format!("x / unroll, member depth {}, {} children{}", node.gate.depth, node.children.len(), shape)).into()));
 			assert_eq!(u.tx.vsize().to_string(), net.rows.last().unwrap().vsize, "the size the builder reserves for");
 			unrolled.insert(node.program(), txid);
 			at = OutPoint::new(txid, node.index as u32);
@@ -1220,7 +1228,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 
 fn built_trees(net: &mut Net) {
 	let mut sizes = vec![];
-	built_tree(net, 16, [0, 6, 15], &mut sizes);
+	built_tree(net, 17, [0, 6, 16], &mut sizes);
 	built_tree(net, 64, [0, 27, 63], &mut sizes);
 	println!("\n{:<70} {:>6}  prototype", "built by the tree builder", "vsize");
 	for (n, v, p) in &sizes {

@@ -54,8 +54,8 @@ tx.input[i].witness.script_witness = w;
 
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
-It names the leaf's template and version (`vtxo-1`), the owner's key, the salt,
-the exit delay, the asset and value, the entry in front of the leaf (its unlock
+It names the leaf's template and version (`vtxo-1`), the owner's key, the two
+nonces the salt is built from, the exit delay, the asset and value, the entry in front of the leaf (its unlock
 hash and reserve), the batch's chain, token and clock schedule
 `(T, S, W, E_0 … E_K)` (`R` is rebuilt from `W` and `S`), whether its sweeps
 are burn-only, and the path from the batch output down to the leaf. Each level
@@ -71,7 +71,17 @@ let record = LeafRecord::from_bytes(&bytes)?;          // or LeafRecord::from_js
 let valid = record.validate(&round_tx)?;               // the batch output, then the five checks
 let id = valid.leaf_id;                                // what the server keys the leaf by
 let branch = valid.branch;                             // every output from the batch output down
+record.check_owner(&my_key, &my_nonce)?;               // the nonce this wallet picked for the leaf
 ```
+
+A leaf's salt has a contribution from each side:
+`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`. The owner's wallet picks
+`owner_nonce` fresh for every leaf it asks for (or publishes it in a receive
+request), and the operator adds its own. The record carries both nonces and
+rebuilds the salt from them, so a wallet checks with `check_owner` that the
+nonce in the record is the one it picked, and `validate` shows the leaf on-chain
+was built from it. A wallet that never repeats a nonce is never given the same
+leaf script twice, which is what keeps a rebindable signature pair to one coin.
 
 `validate` rebuilds every script on the path from the record, requires the
 round to pay exactly one output equal to the batch output it rebuilds (asset,
@@ -97,14 +107,23 @@ repeated key, which two readers could otherwise resolve differently.
 
 `Tree::build` takes the leaves of one asset and the batch's parameters: the
 asset, the chain, the token and clock schedule (whose `S` is the operator's
-key), whether the sweeps are burn-only, the radix (2 to 6) and the reserve rule.
+key), whether the sweeps are burn-only, the radix (3 to 6) and the reserve rule.
 It follows the specification's rules for building a tree: leaves left to right,
-each behind its hash-locked entry; entries grouped `radix` at a time into lowest
-nodes and nodes into the level above until one is left, only the last node of a
-level short and each built for its own child count; scripts bottom-up; the
-reserve at every node and every entry; member lists of the operator and the
-owners under the node, padded with the operator; RECLAIM on the lowest nodes; no
-leaf script twice. A batch of one leaf is one node with one child.
+each behind its hash-locked entry; entries grouped into lowest nodes and nodes
+into the level above until one is left; scripts bottom-up; the reserve at every
+node and every entry; member lists of the operator and the owners under the
+node, padded with the operator; RECLAIM on the lowest nodes; no leaf script and
+no operator nonce twice.
+
+At every level the children are spread as evenly as possible over the fewest
+nodes that hold them: `n` children go to `k = ⌈n / r⌉` nodes, the first
+`n mod k` holding one child more than the rest. Every node then holds 2 to `r`
+children, so the owners in one batch pay about the same to exit; the only node
+with one child is a batch of one leaf. At radix 4, five leaves make lowest nodes
+of 3 and 2 under the batch output, and seventeen make lowest nodes of 4, 4, 3, 3
+and 3, then nodes of 3 and 2, then the batch output. Radix 2 is refused: an odd
+number of children on a level would need a node of one child. `tree::spread`
+gives the grouping.
 
 ```rust
 use arca_covenant::{LeafSpec, ReserveRule, Tree, TreeParams};
@@ -175,17 +194,21 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   refused for the reason they name; every single-field mutation of a valid
   record, and every one-byte change of its binary form, is refused.
 - `tests/tree.rs`: the builder rebuilds every batch and record in the record
-  vectors byte for byte; for every leaf count from 1 to 100 at radix 4 (and 1
-  to 40 at radix 2, 3, 5 and 6) every leaf's record validates against the
-  round, every node transaction of every branch and every entry's unlock
+  vectors byte for byte, the shape of every node included; for every leaf
+  count from 1 to 100 at radix 4 (and 1 to 40 at radix 3, 5 and 6) no node
+  but a one-leaf batch has one child, the nodes of a level differ by at most
+  one child, and one leaf's exit differs from another's by less than one node,
+  alone or as its share of a full exit; every leaf's record validates against
+  the round, every node transaction of every branch and every entry's unlock
   verifies under the block rules and the mempool's checks, with the reserve as
   the fee and with a fee coin attached, and a child changed by one atom makes
   its node fail; the fee-rate reserves cover each spend; a 1,024-leaf batch's
-  node sizes match the specification's table.
+  node sizes match the specification's table; a record whose salt is not built
+  from the owner nonce it names, or from the wallet's nonce, is refused.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
-  the burn-only sweep; and a 16-leaf and a 64-leaf batch built by the tree
+  the burn-only sweep; and a 17-leaf and a 64-leaf batch built by the tree
   builder, every record checked against the confirmed round and three leaves in
   different subtrees unrolled from their records, unlocked and exited: every
   spend confirms, and every negative case is refused by the mempool and again
