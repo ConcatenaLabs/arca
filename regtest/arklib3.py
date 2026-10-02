@@ -523,10 +523,14 @@ def entry_taptree(h, asset_id, value, leaf_prog, sweep):
     return tap, {"unlock": unlock, "sweep": sweep}
 
 
-def forfeit_taptree(h, a_x, s_x, delay):
-    """Forfeit output: claim = preimage of h and S's signature; refund = A
-    after the relative delay."""
-    claim = CScript(hash_gate(h) + [s_x, OP_CHECKSIG])
+def forfeit_taptree(h, a_x, s_x, delay, leaf_id, connector):
+    """Forfeit output, bound to the leaf it replaces and to its round:
+    claim = the leaf id (pushed and dropped), an input k holding the connector
+    asset M explicitly (k from the witness), the preimage of h and S's
+    signature; refund = A after the relative delay. Claim witness, bottom to
+    top: <sig_S> <preimage> <k>. `connector` is M's id in internal byte order."""
+    claim = CScript([leaf_id, OP_DROP, OP_INSPECTINPUTASSET, OP_1, OP_EQUALVERIFY, connector, OP_EQUALVERIFY]
+                    + hash_gate(h) + [s_x, OP_CHECKSIG])
     refund = exit_leaf(a_x, delay)
     tap = taproot_construct(NUMS, [("claim", claim), ("refund", refund)])
     return tap, {"claim": claim, "refund": refund}

@@ -12,7 +12,9 @@
 //!   rests at once released, and the chain of clocks built last one first;
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
-//!   ([`forfeit`]), the checkpoint ([`checkpoint`]) and `htlc-1` ([`htlc`]);
+//!   bound to the leaf it gives up and to its round ([`forfeit`]), the
+//!   checkpoint ([`checkpoint`]), `htlc-1` ([`htlc`]) and the offboard output
+//!   ([`offboard`]);
 //! - the five checks a wallet runs on a round transaction and its published
 //!   clock schedule ([`checks`]);
 //! - the leaf record ([`record`]): what a holder keeps, its id, its binary
@@ -21,6 +23,10 @@
 //!   batch and gives each owner its record, and the unroll ([`unroll`]): the
 //!   transactions from the batch output down to a leaf, with the reserve or a
 //!   fee coin paying;
+//! - the board and its record ([`board`]), and the transactions that spend a
+//!   leaf outside the unroll ([`spend`]): its exit, its forfeit with the claim
+//!   and the refund, the offboard's unlock and reclaim, the margin or a fee
+//!   coin paying;
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]).
@@ -36,6 +42,7 @@
 
 pub extern crate elements;
 
+pub mod board;
 pub mod checkpoint;
 pub mod checks;
 pub mod clock;
@@ -47,11 +54,13 @@ pub mod htlc;
 pub mod leaf;
 pub mod message;
 pub mod node;
+pub mod offboard;
 pub mod record;
 #[cfg(feature = "json")]
 pub mod record_json;
 pub mod script;
 pub mod sign;
+pub mod spend;
 pub mod sweep;
 pub mod taptree;
 pub mod time;
@@ -59,18 +68,21 @@ pub mod tree;
 pub mod unroll;
 pub mod witness;
 
+pub use board::{BoardRecord, ValidBoard};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule};
 pub use entry::EntryPolicy;
-pub use forfeit::ForfeitPolicy;
+pub use forfeit::{connector_asset, connector_issuance, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
 pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
+pub use offboard::OffboardPolicy;
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, RecordError, Template, ValidLeaf, WalletPolicy};
 pub use script::{Child, ExplicitOutput};
+pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};

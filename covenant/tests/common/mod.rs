@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod net;
+
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::{sha256d, Hash};
 use elements::secp256k1_zkp::schnorr::Signature;

@@ -353,7 +353,7 @@ fn raw_path(members: &[Vec<u8>], mut idx: usize) -> Vec<Vec<u8>> {
 	let mut level: Vec<[u8; 32]> = members.iter().map(|k| { let mut b = vec![0]; b.extend(k); sha256(&b) }).collect();
 	let mut steps = vec![];
 	while level.len() > 1 {
-		steps.push((level[idx ^ 1], idx.is_multiple_of(2)));
+		steps.push((level[idx ^ 1], idx % 2 == 0));
 		level = level.chunks(2).map(|p| { let mut b = vec![1]; b.extend(p[0]); b.extend(p[1]); sha256(&b) }).collect();
 		idx /= 2;
 	}
@@ -761,7 +761,11 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 
 	// The forfeit, made through the old leaf's collaborative path.
 	let old = f.leaf(&f.a, "old leaf");
-	let forfeit = ForfeitPolicy { unlock_hash: sha256(&preimage), owner: xonly(&f.a), operator: xonly(&f.s), refund_delay: f.delay };
+	let m = arca_covenant::connector_asset(elements::Txid::from_byte_array(label32("the round")), 2);
+	let forfeit = ForfeitPolicy {
+		unlock_hash: sha256(&preimage), owner: xonly(&f.a), operator: xonly(&f.s), refund_delay: f.delay,
+		leaf_id: LeafId(label32("the old leaf's id")), connector: m,
+	};
 	let old_coin = explicit(f.x, LEAF, old.script_pubkey());
 	let f_out = ExplicitOutput::new(f.x, LEAF - FEE, forfeit.script_pubkey());
 	let msg = old.collab_message(f.x, LEAF, std::slice::from_ref(&f_out)).unwrap();
@@ -775,18 +779,26 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 	book.pass("forfeit/the old leaf into the forfeit output", &forfeit_tx(sig(&f.a, &msg.digest).as_ref().to_vec()));
 	book.fail("forfeit/neg without the owner's signature", &forfeit_tx(vec![]), 0, "OP_CHECKSIGVERIFY");
 	let f_coin = f_out.txout();
-	let claim = |item: Vec<u8>, key: Option<&Keypair>| {
+	// The claim takes the connector asset M at input k (here 1).
+	let claim_with = |item: Vec<u8>, key: Option<&Keypair>, at_1: AssetId, k: i64| {
 		let mut s = Spend::new(0).fake_input("forfeit", f_coin.clone(), 0xffff_ffff)
-			.outputs(vec![explicit(f.x, LEAF - 2 * FEE, f.operator_spk()), fee(f.x, FEE)]);
+			.fake_input("connector atom", explicit(at_1, 1, op_true().script_pubkey()), 0xffff_ffff)
+			.outputs(vec![explicit(f.x, LEAF - 2 * FEE, f.operator_spk()), explicit(at_1, 1, f.operator_spk()), fee(f.x, FEE)]);
 		let sc = forfeit.claim_script();
 		let sg = key.map(|k| s.sign(k, 0, &sc, f.genesis).as_ref().to_vec()).unwrap_or_default();
-		s.witness(0, forfeit.taproot().witness(&sc, vec![sg, item]));
+		s.witness(0, forfeit.taproot().witness(&sc, vec![sg, item, arca_covenant::script::scriptnum(k)]));
+		s.witness(1, op_true_witness());
 		s
 	};
-	book.pass("forfeit/claim with the preimage and the operator's signature", &claim(preimage.to_vec(), Some(&f.s)));
+	let claim = |item: Vec<u8>, key: Option<&Keypair>| claim_with(item, key, m, 1);
+	book.pass("forfeit/claim with the preimage, M at input 1 and the operator's signature", &claim(preimage.to_vec(), Some(&f.s)));
 	book.fail("forfeit/neg claim with a wrong preimage", &claim(label32("wrong").to_vec(), Some(&f.s)), 0, EQUALVERIFY);
 	book.fail("forfeit/neg claim with the preimage but not the operator", &claim(preimage.to_vec(), Some(&f.stranger)), 0, BAD_SIG);
 	book.fail("forfeit/neg claim with the preimage and no signature", &claim(preimage.to_vec(), None), 0, FALSE);
+	book.fail("forfeit/neg claim with another asset where M belongs", &claim_with(preimage.to_vec(), Some(&f.s), f.y, 1), 0, EQUALVERIFY);
+	book.fail("forfeit/neg claim naming the forfeit itself as M's input", &claim_with(preimage.to_vec(), Some(&f.s), m, 0), 0, EQUALVERIFY);
+	book.fail("forfeit/neg claim naming an input that does not exist", &claim_with(preimage.to_vec(), Some(&f.s), m, 2), 0,
+		"Introspection index out of bounds");
 	let refund = |seq: u32| {
 		let mut s = Spend::new(0).fake_input("forfeit", f_coin.clone(), seq)
 			.outputs(vec![explicit(f.x, LEAF - 2 * FEE, f.operator_spk()), fee(f.x, FEE)]);

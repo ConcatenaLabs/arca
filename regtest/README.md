@@ -49,7 +49,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T3 | A full unroll of a 16-leaf tree with exits, fees from the in-tree reserve, and fees from an outside coin once the batch asset is delisted |
 | T3b | How many chained node transactions enter the mempool from one root |
 | T4 | A membership gate on the unroll: a signature from any key under the node, proven by a Merkle path |
-| T5 | The hash-locked entry and the forfeit: the operator takes the old leaf only by publishing the preimage that releases the new one; the abort path |
+| T5 | The hash-locked entry and the forfeit: the operator takes the old leaf only by publishing the preimage that releases the new one; the abort path. T5 runs the forfeit's claim without the leaf id and the connector asset; the claim as built is in the vectors and `covenant/tests/offchain.rs` |
 | T6 | A rebindable signature through `OP_CHECKSIGFROMSTACK`: one signature spends the leaf at any outpoint |
 | T7 | The burn-only sweep: the value can only be destroyed, at the input's own index |
 | T8 | A supervised asset in a tree under pause and targeted freeze; the forced single-owner landing |
@@ -81,7 +81,8 @@ sample spend of every path:
 
 - for each taproot output (the leaf, `R`, the clock steps, the hash-locked entry,
   the lowest, inner and batch nodes with the operator's sweep and with the
-  burn-only sweep, the forfeit output, the checkpoint output and `htlc-1` in both
+  burn-only sweep, the forfeit output (bound to the leaf it gives up and to its
+  round's connector asset), the checkpoint output and `htlc-1` in both
   directions): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
   times, children), each script leaf with its opcodes, depth, leaf hash and
   control block, the merkle root, the output key and the scriptPubKey;
@@ -99,19 +100,29 @@ transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds
 encodings a reader must refuse, each with the kind of reason.
 
-`vectors.py` writes both files from the suite's builders and the node framework's
+`vectors/transactions.json` holds the off-chain transactions' vectors, written
+by `offchain.py`, the reference for their shapes, which its docstring states in
+full: the board, its record in both forms with refusal vectors, and the exit of
+its leaf; the forfeit, the issuance of the round's connector asset, the claim
+and the refund; the offboard output, its unlock and its reclaim. Each
+transaction is given whole, witnesses included, with the outputs it spends and,
+for a signature, the signature hash and the test key's signature, once with the
+spent output's margin as the fee and once with a fee coin attached.
+
+`vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
 signature uses zero auxiliary randomness, so the output is the same on every run:
 
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py           # rewrite vectors/arca.json
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check   # fail if it would change
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py           # rewrite the files in vectors/
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check   # fail if any would change
 
 The keys are test keys, `SHA256("Arca test vector key/" + label)` reduced modulo
 the group order; they hold nothing. `consensus/tests/vectors.rs` verifies every
 sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
 builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
-re-encodes and validates every record.
+re-encodes and validates every record; `covenant/tests/transactions.rs` rebuilds
+every off-chain transaction byte for byte and verifies it.
 
 ## In CI
 

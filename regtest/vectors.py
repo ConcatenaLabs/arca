@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Golden vectors for every frozen Arca script.
 
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py          # write vectors/arca.json and records.json
-    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check  # regenerate both and compare
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py          # write every file in vectors/
+    SEQUENTIA_DIR=/path/to/Sequentia regtest/vectors.py --check  # regenerate them all and compare
 
 The scripts come from the suite's own builders (arklib.py, arklib3.py), the
 taproot outputs and signature hashes from the node's functional test
@@ -22,6 +22,11 @@ of its covenant input under the node's script rules.
 vectors/records.json holds the leaf record's vectors, which records.py
 generates: whole batches built by the tree rules, the round that funds each,
 and every exported leaf's record in both encodings with its leaf id.
+
+vectors/transactions.json holds the off-chain transactions' vectors, which
+offchain.py generates: the board and its record, the forfeit with the
+issuance of the connector asset, its claim and refund, and the offboard's
+unlock and reclaim, each transaction whole, witnesses included.
 """
 import json
 import os
@@ -37,6 +42,7 @@ from test_framework.script import TaprootSignatureHash, LEAF_VERSION_TAPSCRIPT
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "vectors", "arca.json")
 RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
+TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -103,6 +109,9 @@ SALT_CHANGE = label_hash("salt", "change leaf")
 SALT_HTLC = {k: label_hash("salt", "htlc " + k) for k in ("claim", "claim_both", "refund_both")}
 PREIMAGES = {i: label_hash("preimage", "entry%d" % i) for i in range(NLEAVES)}
 FORFEIT_PREIMAGE = label_hash("preimage", "forfeit")
+# The round the forfeit is given up for, and its connector output.
+ROUND_TXID = label_hash("outpoint", "the round")   # internal byte order
+CONNECTOR_VOUT = 2
 PAYMENT_PREIMAGE = label_hash("preimage", "payment")
 
 # --------------------------------------------------------------------------
@@ -396,9 +405,17 @@ def generate():
     outputs["batch_output_burn"] = node_vectors(b_root, "batch_output_burn", "batch output, issuer-operated")
 
     # ---- forfeit, checkpoint, htlc-1 ----------------------------------
-    ftap, flv = forfeit_taptree(sha256(FORFEIT_PREIMAGE), A.x, S.x, DELAY)
+    # The forfeit gives up the path leaf, whose id it carries, for the round
+    # whose connector asset M it requires at its claim.
+    import records as record_ref
+    leaf_id = record_ref.tagged_hash(record_ref.LEAF_ID_TAG, bytes(root["spk"])[2:] + bytes([3, i // 16, (i // 4) % 4, i % 4])
+                                  + bytes(ltap.scriptPubKey)[2:])
+    m_id = record_ref.issued_asset(ROUND_TXID, CONNECTOR_VOUT)
+    ftap, flv = forfeit_taptree(sha256(FORFEIT_PREIMAGE), A.x, S.x, DELAY, leaf_id, m_id)
     outputs["forfeit"] = output_json("forfeit", {"unlock_hash": hx(sha256(FORFEIT_PREIMAGE)), "owner": hx(A.x),
-                                                 "operator": hx(S.x), "refund_delay": DELAY},
+                                                 "operator": hx(S.x), "refund_delay": DELAY, "leaf_id": hx(leaf_id),
+                                                 "connector": {"round_txid": ROUND_TXID[::-1].hex(),
+                                                               "vout": CONNECTOR_VOUT, "asset": hx(m_id)}},
                                      ftap, [("claim", 1), ("refund", 1)])
     cp_sweep = sweep_token(T_ID, R_PROG, S.x, W)
     ctap, clv = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT, CTAG, cp_sweep)
@@ -531,9 +548,15 @@ def generate():
 
     # ---- spends: the forfeit ------------------------------------------
     f_spent = txout(LEAF_VALUE - 600, ftap.scriptPubKey)
-    sp = Spend([("forfeit/claim", f_spent, 0xffffffff)], [txout(LEAF_VALUE - 1200, OPERATOR_SPK), fee_out(600)])
-    d = checksig_spend("forfeit/claim", "forfeit", "claim", ftap, sp, 0, S, below_after=[FORFEIT_PREIMAGE])
+    # The connector atom is input 1 (k = 1) and goes back to the operator.
+    m_out = b"\x01" + m_id
+    sp = Spend([("forfeit/claim", f_spent, 0xffffffff),
+                ("forfeit/claim connector", txout(1, FEE_COIN_TAP.scriptPubKey, m_out), 0xffffffff)],
+               [txout(LEAF_VALUE - 1200, OPERATOR_SPK), txout(1, OPERATOR_SPK, m_out), fee_out(600)])
+    sp.witness(1, FEE_COIN_WITNESS)
+    d = checksig_spend("forfeit/claim", "forfeit", "claim", ftap, sp, 0, S, below_after=[FORFEIT_PREIMAGE, sn(1)])
     d["preimage"] = hx(FORFEIT_PREIMAGE)
+    d["connector_input"] = 1
     spends.append(d)
     sp = Spend([("forfeit/refund", f_spent, DELAY)], [txout(LEAF_VALUE - 1200, bytes(taproot_construct(A.x).scriptPubKey)),
                                                       fee_out(600)])
@@ -596,9 +619,11 @@ def generate():
 
 
 def main():
+    import offchain
     import records
     files = [(OUT, json.dumps(generate(), indent=1) + "\n"),
-             (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n")]
+             (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n"),
+             (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:

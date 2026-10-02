@@ -404,6 +404,10 @@ pub enum RecordError {
 	BatchOutputRepeated(usize),
 	#[error("the output is not the batch output the record rebuilds")]
 	BatchOutputMismatch,
+	#[error("the board transaction pays no output equal to the leaf the record rebuilds")]
+	BoardOutputMissing,
+	#[error("the board transaction pays the leaf the record rebuilds {0} times")]
+	BoardOutputRepeated(usize),
 	#[error(transparent)]
 	Round(#[from] RoundCheckFailure),
 }
@@ -439,6 +443,7 @@ impl RecordError {
 			Hex(_) => "hex",
 			Key(_) => "key",
 			BatchOutputMissing | BatchOutputRepeated(_) | BatchOutputMismatch => "batch_output",
+			BoardOutputMissing | BoardOutputRepeated(_) => "board_output",
 			Round(_) => "round",
 		}
 	}

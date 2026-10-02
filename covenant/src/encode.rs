@@ -17,9 +17,10 @@
 //! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
-//! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16) |
+//! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
 //! | [`CheckpointPolicy`] | `A`, `S`, salt, genesis hash (32 each), sweep |
 //! | [`HtlcPolicy`] | `A`, `S` (32 each), direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), three salts (32 each), genesis hash (32) |
+//! | [`OffboardPolicy`] | unlock hash (32), destination asset (32), value (u64), script length (compact size, at most 10,000), script, `S` (32), reclaim delay units (u16) |
 //! | [`Sweep`] | `T`, `R` program, `S` (32 each), flags (u8: bit 0 notice, bit 1 burn), and the notice units (u16) when bit 0 is set |
 //!
 //! Asset ids and the genesis hash are in internal byte order.
@@ -36,7 +37,9 @@ use crate::node::MAX_CHILDREN;
 use crate::script::{asset_bytes, Child};
 use crate::sweep::Sweep;
 use crate::time::{MedianTime, RelativeTime};
-use crate::{CheckpointPolicy, EntryPolicy, ForfeitPolicy, HtlcPolicy, LeafPolicy, NodePolicy};
+use crate::offboard::MAX_DESTINATION;
+use crate::script::ExplicitOutput;
+use crate::{CheckpointPolicy, EntryPolicy, ForfeitPolicy, HtlcPolicy, LeafPolicy, NodePolicy, OffboardPolicy};
 
 /// The encoding version this crate writes and reads.
 pub const VERSION: u8 = 0x01;
@@ -342,6 +345,8 @@ impl Encoding for ForfeitPolicy {
 		w.extend(self.owner.serialize());
 		w.extend(self.operator.serialize());
 		w.extend(self.refund_delay.units().to_le_bytes());
+		w.extend(self.leaf_id.0);
+		w.extend(asset_bytes(self.connector));
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<ForfeitPolicy, DecodeError> {
@@ -350,6 +355,8 @@ impl Encoding for ForfeitPolicy {
 			owner: r.key()?,
 			operator: r.key()?,
 			refund_delay: r.relative_time()?,
+			leaf_id: crate::record::LeafId(r.array32()?),
+			connector: r.asset()?,
 		})
 	}
 }
@@ -407,6 +414,36 @@ impl Encoding for HtlcPolicy {
 	}
 }
 
+impl Encoding for OffboardPolicy {
+	fn encode_to(&self, w: &mut Vec<u8>) {
+		w.extend(self.unlock_hash);
+		w.extend(asset_bytes(self.destination.asset));
+		w.extend(self.destination.value.to_le_bytes());
+		let spk = self.destination.script_pubkey.as_bytes();
+		write_compact_size(w, spk.len() as u64);
+		w.extend(spk);
+		w.extend(self.operator.serialize());
+		w.extend(self.reclaim_delay.units().to_le_bytes());
+	}
+
+	fn decode_from(r: &mut Reader) -> Result<OffboardPolicy, DecodeError> {
+		let unlock_hash = r.array32()?;
+		let asset = r.asset()?;
+		let value = r.u64()?;
+		let len = r.compact_size()?;
+		if len > MAX_DESTINATION as u64 {
+			return Err(DecodeError::Count(len));
+		}
+		let script = elements::Script::from(r.bytes(len as usize)?.to_vec());
+		Ok(OffboardPolicy {
+			unlock_hash,
+			destination: ExplicitOutput::new(asset, value, script),
+			operator: r.key()?,
+			reclaim_delay: r.relative_time()?,
+		})
+	}
+}
+
 /// Any of the output policies, tagged with its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
@@ -416,6 +453,7 @@ pub enum Policy {
 	Forfeit(ForfeitPolicy),
 	Checkpoint(CheckpointPolicy),
 	Htlc(HtlcPolicy),
+	Offboard(OffboardPolicy),
 }
 
 impl Policy {
@@ -428,6 +466,7 @@ impl Policy {
 			Policy::Forfeit(p) => p.script_pubkey(),
 			Policy::Checkpoint(p) => p.script_pubkey(),
 			Policy::Htlc(p) => p.script_pubkey(),
+			Policy::Offboard(p) => p.script_pubkey(),
 		}
 	}
 }
@@ -442,6 +481,7 @@ impl Encoding for Policy {
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
 			Policy::Checkpoint(p) => { w.push(5); p.encode_to(w) },
 			Policy::Htlc(p) => { w.push(6); p.encode_to(w) },
+			Policy::Offboard(p) => { w.push(7); p.encode_to(w) },
 		}
 	}
 
@@ -457,6 +497,7 @@ impl Encoding for Policy {
 			4 => Policy::Forfeit(ForfeitPolicy::decode_from(r)?),
 			5 => Policy::Checkpoint(CheckpointPolicy::decode_from(r)?),
 			6 => Policy::Htlc(HtlcPolicy::decode_from(r)?),
+			7 => Policy::Offboard(OffboardPolicy::decode_from(r)?),
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}

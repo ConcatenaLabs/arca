@@ -18,10 +18,9 @@
 //! transaction is built on the id of the one before it. The fee coin's own
 //! witness is the broadcaster's to add.
 
-use elements::confidential::{Asset, Nonce, Value};
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut, TxOutWitness};
+use elements::{LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut};
 
 use crate::gate::MemberProof;
 use crate::record::{Branch, BranchNode};
@@ -75,49 +74,17 @@ pub enum UnrollError {
 	FeeCoinNotExplicit,
 	#[error("the fee coin holds {value}, less than the fee of {fee}")]
 	FeeCoinTooSmall { value: u64, fee: u64 },
+	#[error("margins in {0} assets: one pays the fee, and the others need a fee coin's change to go to")]
+	SeveralMarginAssets(usize),
 }
 
-fn explicit(asset: elements::AssetId, value: u64, script_pubkey: Script) -> TxOut {
-	TxOut {
-		asset: Asset::Explicit(asset),
-		value: Value::Explicit(value),
-		nonce: Nonce::Null,
-		script_pubkey,
-		witness: TxOutWitness::default(),
-	}
-}
-
-/// Adds the fee to a transaction that spends `spent`, holding `reserve` of
+/// Adds the fee to a transaction that spends an output holding `reserve` of
 /// `asset` beyond what its pinned outputs take.
 fn pay_fee(tx: &mut Transaction, prevouts: &mut Vec<TxOut>, asset: elements::AssetId, reserve: u64, fee: &FeeSource, sequence: Sequence)
 	-> Result<(), UnrollError>
 {
-	match fee {
-		FeeSource::Reserve => {
-			if reserve > 0 {
-				tx.output.push(TxOut::new_fee(reserve, asset));
-			}
-		},
-		FeeSource::Coin { outpoint, coin, fee, change } => {
-			let (coin_asset, value) = match (coin.asset.explicit(), coin.value.explicit()) {
-				(Some(a), Some(v)) => (a, v),
-				_ => return Err(UnrollError::FeeCoinNotExplicit),
-			};
-			if value < *fee {
-				return Err(UnrollError::FeeCoinTooSmall { value, fee: *fee });
-			}
-			tx.input.push(TxIn { previous_output: *outpoint, sequence, ..Default::default() });
-			prevouts.push(coin.clone());
-			if reserve > 0 {
-				tx.output.push(explicit(asset, reserve, change.clone()));
-			}
-			if value > *fee {
-				tx.output.push(explicit(coin_asset, value - fee, change.clone()));
-			}
-			tx.output.push(TxOut::new_fee(*fee, coin_asset));
-		},
-	}
-	Ok(())
+	let margins: Vec<(elements::AssetId, u64)> = if reserve > 0 { vec![(asset, reserve)] } else { vec![] };
+	crate::spend::pay_fee(tx, prevouts, &margins, fee, sequence)
 }
 
 impl BranchNode {
