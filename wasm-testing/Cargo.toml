@@ -12,7 +12,7 @@ required-features = [ "bin" ]
 [features]
 
 bin = [
-	"dep:ark-testing",
+	"dep:arca-testing",
 	"tokio/process",
 	"tokio/signal",
 	"tokio/macros",
@@ -20,18 +20,18 @@ bin = [
 ]
 
 wasm = [
-	"bark-wallet/wasm-web",
-	"bark-wallet/indexed-db",
-	"bark-wallet/onchain-bdk",
-	"bark-server-rpc/tonic-web",
+	"arca-wallet/wasm-web",
+	"arca-wallet/indexed-db",
+	"arca-wallet/onchain-bdk",
+	"arca-server-rpc/tonic-web",
 	"dep:gloo-net",
 	"dep:wasm-bindgen-futures",
 ]
 
 [dependencies]
-ark-testing = { path = "../testing", optional = true }
-bark-wallet = { path = "../bark", default-features = false }
-bark-server-rpc = { path = "../server-rpc", default-features = false }
+arca-testing = { path = "../testing", optional = true }
+arca-wallet = { path = "../bark", default-features = false }
+arca-server-rpc = { path = "../server-rpc", default-features = false }
 
 anyhow = { workspace = true, optional = true }
 bitcoin.workspace = true

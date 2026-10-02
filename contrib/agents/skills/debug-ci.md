@@ -30,7 +30,7 @@ Artifacts save to `./contrib/agents/ci-debugging/<pipeline_id>-<job_name>/`:
   logs, configs, databases). `<test-dir>` is the job's test directory
   (`btc30`, `mempool`, `filestore`, `esplora`) and `<binary>` the test binary
   (`bark`, `barkd`, `exit`, `movement`, ...), matching the nextest failure
-  line `ark-testing::<binary> <module>::<test_name>`.
+  line `arca-testing::<binary> <module>::<test_name>`.
 
 ## Step 2: Check Out the CI Commit
 

@@ -67,7 +67,7 @@ changelogs, commit messages, and user-facing strings.
 
 ## Error Handling
 
-- `ark-lib`: Use `thiserror` - errors are part of the API
+- `arca-lib`: Use `thiserror` - errors are part of the API
 - `bark`/`captaind`: Use `anyhow` - propagate errors upstream
 - Use `thiserror` elsewhere when you need to handle errors differently
 - Avoid creating too many error types - be pragmatic

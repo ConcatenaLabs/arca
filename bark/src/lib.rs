@@ -481,7 +481,7 @@ const MAILBOX_KEY_INDEX: u32 = 1;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
 const MISSING_SERVER_TRANSPORT_HELP: &str =
-	"This build of bark-wallet does not include an Ark server transport backend. Enable feature `bark-wallet/native` or `bark-wallet/wasm-web` to use server-backed wallet functionality.";
+	"This build of arca-wallet does not include an Ark server transport backend. Enable feature `arca-wallet/native` or `arca-wallet/wasm-web` to use server-backed wallet functionality.";
 
 /// The timeout value to use for streaming subscribe requests to the Ark server
 const SUBSCRIBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -2593,7 +2593,7 @@ mod tests {
 	fn no_transport_connect_error_is_reworded_for_wallet_users() {
 		let err = wrap_server_connect_error(CreateEndpointError::NoTransportBackend.into());
 		assert!(err.to_string().contains(MISSING_SERVER_TRANSPORT_HELP));
-		assert!(err.to_string().contains("feature `bark-wallet/native` or `bark-wallet/wasm-web`"));
+		assert!(err.to_string().contains("feature `arca-wallet/native` or `arca-wallet/wasm-web`"));
 	}
 
 	fn ark_info_with_lifetime(vtxo_lifetime: u16, required_board_confirmations: usize) -> ArkInfo {

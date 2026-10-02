@@ -1,10 +1,13 @@
 [package]
-name = "bark-cli"
+name = "arca-cli"
 version = "0.7.1"
 edition = "2024"
 license = "MIT"
 description = "CLI for the bitcoin Ark protocol built by Second"
 authors = [ "Team Second <hello@second.tech>" ]
+
+[lib]
+name = "bark_cli"
 
 [[bin]]
 name = "bark"
@@ -18,22 +21,22 @@ path = "src/bin/barkd/main.rs"
 default = ["tls-native-roots", "barkd-swagger-ui"]
 
 # TLS certificate verification options (pick one)
-tls-native-roots = ["bark-wallet/tls-native-roots", "bark-server-rpc/tls-native-roots"]
+tls-native-roots = ["arca-wallet/tls-native-roots", "arca-server-rpc/tls-native-roots"]
 # Use this feature for cross-compilation. It uses rustls with bundled Mozilla
 # CA certificates instead of the system's native TLS and certificate store.
-tls-webpki-roots = ["bark-wallet/tls-webpki-roots", "bark-server-rpc/tls-webpki-roots"]
+tls-webpki-roots = ["arca-wallet/tls-webpki-roots", "arca-server-rpc/tls-webpki-roots"]
 # Compile SQLite from source instead of linking against the system library; useful for cross-compilation.
-sqlite-bundled = ["bark-wallet/sqlite-bundled"]
+sqlite-bundled = ["arca-wallet/sqlite-bundled"]
 
-barkd-swagger-ui = ["bark-rest/swagger-ui"]
+barkd-swagger-ui = ["arca-rest/swagger-ui"]
 
 [dependencies]
-ark-lib = { version = "0.7.1", path = "../lib" }
-bark-json = { version = "0.7.1", path = "../bark-json" }
-bark-wallet = { version = "0.7.1", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native", "bitcoind-rpc" ] }
-bark-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
-bark-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false, features = ["tonic-native", "socks5-proxy"] }
-bark-rest = { version = "0.7.1", path = "../bark-rest", default-features = false }
+arca-lib = { version = "0.7.1", path = "../lib" }
+arca-json = { version = "0.7.1", path = "../bark-json" }
+arca-wallet = { version = "0.7.1", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native", "bitcoind-rpc" ] }
+arca-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
+arca-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false, features = ["tonic-native", "socks5-proxy"] }
+arca-rest = { version = "0.7.1", path = "../bark-rest", default-features = false }
 
 anyhow.workspace = true
 bitcoin.workspace = true

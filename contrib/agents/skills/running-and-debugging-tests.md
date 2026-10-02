@@ -8,7 +8,7 @@ How to run, debug, and investigate test failures in this codebase.
 
 Integration tests require environment variables `CAPTAIND_EXEC` and `BARK_EXEC` to point to the built binaries. The `just int` command sets these automatically.
 
-Running `cargo test --package ark-testing` directly will fail because the test framework won't be able to find the executables.
+Running `cargo test --package arca-testing` directly will fail because the test framework won't be able to find the executables.
 
 ## Pre-Checks
 
@@ -36,7 +36,7 @@ Run a specific unit test:
 just unit test_name
 ```
 
-Unit tests run against all workspace crates except `ark-testing`.
+Unit tests run against all workspace crates except `arca-testing`.
 
 ## Integration Tests
 

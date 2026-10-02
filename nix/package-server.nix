@@ -119,7 +119,7 @@ let
 				'';
 				buildPhaseCargoCommand = ''
 					cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
-					cargo zigbuild --release --locked -p bark-server --target ${zigbuildTarget target} \
+					cargo zigbuild --release --locked -p arca-server --target ${zigbuildTarget target} \
 						--message-format json-render-diagnostics >"$cargoBuildLog"
 				'';
 			}

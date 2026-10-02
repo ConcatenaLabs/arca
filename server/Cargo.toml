@@ -1,9 +1,9 @@
 [package]
-name = "bark-server"
+name = "arca-server"
 version = "0.7.1"
 license = "MIT"
 authors = [ "Team Second <hello@second.tech>" ]
-repository = "https://gitlab.com/ark-bitcoin/bark"
+repository = "https://github.com/ConcatenaLabs/arca"
 description = "Server implementation of the bitcoin Ark protocol built by Second"
 edition = "2024"
 
@@ -18,12 +18,12 @@ path = "src/bin/captaind/main.rs"
 [dependencies]
 
 # OWN
-ark-lib = { path = "../lib" }
-bark-common = { path = "../bark-common" }
-bark-cln-rpc = { path = "../cln-rpc" }
-bark-server-log = { path = "../server-log" }
-bark-server-rpc = { path = "../server-rpc", features = ["server", "intman"] }
-bark-bitcoin-ext = { path = "../bitcoin-ext", features = ["rpc-async"] }
+arca-lib = { path = "../lib" }
+arca-common = { path = "../bark-common" }
+arca-cln-rpc = { path = "../cln-rpc" }
+arca-server-log = { path = "../server-log" }
+arca-server-rpc = { path = "../server-rpc", features = ["server", "intman"] }
+arca-bitcoin-ext = { path = "../bitcoin-ext", features = ["rpc-async"] }
 
 # EXPORTED
 bitcoin.workspace = true
@@ -90,11 +90,11 @@ json-subscriber.workspace = true
 
 # Optional: enables a tokio-console subscriber. Requires `--cfg tokio_unstable`
 # in RUSTFLAGS at build time. Build with:
-#   RUSTFLAGS="--cfg tokio_unstable" cargo build -p bark-server --features tokio-console
+#   RUSTFLAGS="--cfg tokio_unstable" cargo build -p arca-server --features tokio-console
 console-subscriber = { version = "0.5.0", optional = true }
 
 [features]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dev-dependencies]
-ark-lib = { path = "../lib", features = [ "test-util" ] }
+arca-lib = { path = "../lib", features = [ "test-util" ] }
