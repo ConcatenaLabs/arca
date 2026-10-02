@@ -1,0 +1,31 @@
+name: lib
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: arca-lib unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # bitcoinkernel (the library tests' consensus verifier) builds Bitcoin
+      # Core's kernel with CMake and needs the Boost headers and libclang.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libboost-dev clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked -p arca-lib
+
+      - name: Unit tests
+        run: cargo test --locked -p arca-lib --lib
