@@ -277,3 +277,54 @@ fn the_offboard_unlock_and_reclaim() {
 		}
 	}
 }
+
+#[test]
+fn the_transfer_chain() {
+	let v = vectors();
+	let fx = Fx::new(&v);
+	let t = &v["transfer"];
+	let rounds: Vec<Transaction> = t["inputs"]["rounds"].as_array().unwrap().iter().map(|r| deserialize(&bytes(r)).unwrap()).collect();
+	let now = MedianTime::from_consensus(t["inputs"]["now"].as_u64().unwrap() as u32).unwrap();
+	let policy = WalletPolicy::new(Chain::new(fx.genesis), key(&v["inputs"]["operator"]), now);
+
+	// Every receiver's record decodes, encodes back, and validates for it.
+	let mut d_coin = None;
+	for (name, r) in t["records"].as_object().unwrap() {
+		let b = bytes(&r["binary"]);
+		let rec = CoinRecord::from_bytes(&b).unwrap();
+		assert_eq!(rec.to_bytes().unwrap(), b, "{}: binary form", name);
+		let coin = rec.validate(&rounds, &policy, &key(&r["owner"]), &h32(&r["owner_nonce"]))
+			.unwrap_or_else(|e| panic!("{}: refused: {}", name, e));
+		assert_eq!(coin.id.to_string(), r["id"].as_str().unwrap(), "{}: coin id", name);
+		println!("{:<10} record {:>5} bytes, coin {}, {} hops, {} atoms", name, b.len(), coin.id, coin.hops, coin.value);
+		if name == "D" {
+			d_coin = Some(coin);
+		}
+	}
+
+	// From D's coin, every checkpoint and reassignment, rebuilt and compared.
+	let txs: std::collections::BTreeMap<String, &Value> = t["transactions"].as_array().unwrap().iter()
+		.map(|x| (x["name"].as_str().unwrap().to_string(), x)).collect();
+	fn walk(fx: &Fx, coin: &ValidCoin, bases: &Value, txs: &std::collections::BTreeMap<String, &Value>, n: &mut usize) -> OutPoint {
+		match &coin.origin {
+			ValidOrigin::Leaf { .. } => outpoint(&bases[coin.id.to_string()]),
+			ValidOrigin::Transfer { inputs, index, .. } => {
+				let mut cps = vec![];
+				for i in inputs {
+					let at = walk(fx, &i.coin, bases, txs, n);
+					let name = format!("checkpoint of {}", i.coin.id);
+					let cp = fx.check(&name, i.checkpoint_tx(at, &FeeSource::Reserve).unwrap(), txs[&name]);
+					cps.push(OutPoint::new(cp.txid(), 0));
+					*n += 1;
+				}
+				let name = format!("reassignment creating {}", coin.id);
+				let re = fx.check(&name, coin.reassignment_tx(&cps, &FeeSource::Reserve).unwrap(), txs[&name]);
+				*n += 1;
+				OutPoint::new(re.txid(), *index as u32)
+			},
+		}
+	}
+	let mut n = 0;
+	walk(&fx, d_coin.as_ref().unwrap(), &t["inputs"]["bases"], &txs, &mut n);
+	assert_eq!(n, txs.len(), "every transfer transaction in the vectors was rebuilt");
+}

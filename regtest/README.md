@@ -104,7 +104,10 @@ encodings a reader must refuse, each with the kind of reason.
 by `offchain.py`, the reference for their shapes, which its docstring states in
 full: the board, its record in both forms with refusal vectors, and the exit of
 its leaf; the forfeit, the issuance of the round's connector asset, the claim
-and the refund; the offboard output, its unlock and its reclaim. Each
+and the refund; the offboard output, its unlock and its reclaim; and a transfer
+chain three hops deep from two batches (one hop a swap of two owners' coins in
+two assets): the rounds, every checkpoint and reassignment, and every receiver's
+coin record with its id. Each
 transaction is given whole, witnesses included, with the outputs it spends and,
 for a signature, the signature hash and the test key's signature, once with the
 spent output's margin as the fee and once with a fee coin attached.

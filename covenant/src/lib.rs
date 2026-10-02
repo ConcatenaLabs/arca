@@ -23,6 +23,9 @@
 //!   batch and gives each owner its record, and the unroll ([`unroll`]): the
 //!   transactions from the batch output down to a leaf, with the reserve or a
 //!   fee coin paying;
+//! - the out-of-round transfer ([`transfer`]): the checkpoint and the
+//!   reassignment, for one or several coins and owners, and the coin record a
+//!   receiver validates back to the batches it came from;
 //! - the board and its record ([`board`]), and the transactions that spend a
 //!   leaf outside the unroll ([`spend`]): its exit, its forfeit with the claim
 //!   and the refund, the offboard's unlock and reclaim, the margin or a fee
@@ -64,6 +67,7 @@ pub mod spend;
 pub mod sweep;
 pub mod taptree;
 pub mod time;
+pub mod transfer;
 pub mod tree;
 pub mod unroll;
 pub mod witness;
@@ -86,6 +90,7 @@ pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
 pub use sweep::Sweep;
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};
+pub use transfer::{CoinRecord, NewLeaf, Transfer, TransferError, TransferInput, TransferPlan, ValidCoin, ValidInput, ValidOrigin};
 pub use tree::{LeafSpec, ReserveRule, Tree, TreeError, TreeParams};
 pub use unroll::{FeeSource, UnrollAuth, UnrollTx};
 

@@ -26,6 +26,14 @@
 //!    moves the output to the owner's destination; an output pinned at its own
 //!    index cannot be merged with another to one destination; the operator
 //!    reclaims an offboard whose preimage never came, after the delay.
+//! 6. An out-of-round chain three hops deep, one hop a swap of two owners'
+//!    coins in two assets: the last receiver validates it from its record and
+//!    the rounds alone, brings it on-chain from the record (unrolls, entries,
+//!    checkpoints and reassignments, outside fee coins wherever the asset is
+//!    not accepted for fees) and exits. A reassignment's pair cannot skip the
+//!    checkpoint, a checkpoint's pair cannot spend the checkpoint, a swap
+//!    cannot confirm without its other input, and the first sender's exit fails
+//!    once the receiver has published the checkpoint.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction's size
 //! beside the specification's, and every refusal.
@@ -40,10 +48,12 @@ use serde_json::json;
 use arca_covenant::script::sha256;
 use arca_covenant::sign::sign_digest;
 use arca_covenant::spend::{margin_for, FeeSource};
+use arca_covenant::spend::{collab_tx, UnrollTx};
 use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
 use arca_covenant::witness::find_preimage;
 use arca_covenant::*;
 
+use common::chain::*;
 use common::net::*;
 use common::*;
 
@@ -494,6 +504,200 @@ fn offboard(c: &mut Ctx) {
 	c.pass("offboard/the operator's reclaim after the delay", &rec(c, &s));
 }
 
+// ---------------------------------------------------------------------------
+// 6. A chain three hops deep, received and exited by the last receiver
+// ---------------------------------------------------------------------------
+
+/// A round for a batch in `tree`'s asset, which may differ from X: the
+/// issuer (X) issues the token; a coin of the batch asset funds the batch.
+fn asset_round(c: &mut Ctx, name: &str, issuer: &Coin, tree: &Tree) -> Transaction {
+	let x = c.net.x;
+	let a = tree.params().asset;
+	let batch = tree.batch_output();
+	let fund = c.net.fund(vec![explicit(a, batch.value + 1_000, op_true_spk())]).remove(0);
+	let total = issuer.txout.value.explicit().unwrap();
+	let mut s = spend(0).coin(issuer, 0xffff_ffff).coin(&fund, 0xffff_ffff).outputs(vec![
+		batch.txout(), explicit(tree.params().schedule.token, 1, tree.clock0_script_pubkey()),
+		explicit(x, 5_000, op_true_spk()), explicit(a, 1_000, op_true_spk()),
+		explicit(x, total - 5_000 - 2_000, op_true_spk()), fee(x, 2_000),
+	]);
+	s.tx.input[0].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
+		amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,
+		denomination: 0,
+	};
+	s.witness(0, op_true_witness());
+	s.witness(1, op_true_witness());
+	let txid = c.pass(name, &s.tx);
+	c.net.rt.client().raw_transaction(&txid).unwrap()
+}
+
+/// How a transaction moving value of `asset` pays its fee: from its margin
+/// when the node accepts the asset for fees, else with an outside coin.
+fn fee_for(c: &mut Ctx, asset: elements::AssetId) -> FeeSource {
+	if asset == c.net.x {
+		FeeSource::Reserve
+	} else {
+		let fc = c.net.fee_coin();
+		FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }
+	}
+}
+
+/// Completes the fee coin's witness, if one was attached at `at`.
+fn with_coin(mut u: UnrollTx, at: usize) -> Transaction {
+	if u.tx.input.len() > at {
+		u.tx.input[at].witness.script_witness = op_true_witness();
+	}
+	u.tx
+}
+
+/// Where [`bring`] stops to let a test act.
+enum Event<'a> {
+	/// An input coin is on-chain at the outpoint, before its checkpoint.
+	Coin(&'a ValidCoin, OutPoint),
+	/// The checkpoints of `coin`'s reassignment are on-chain, before it.
+	Checkpoints(&'a ValidCoin, &'a [OutPoint]),
+}
+
+/// Brings `coin` on-chain from its record, paying each fee as `fee_for`
+/// says; returns where it lands. `hook` sees each [`Event`].
+fn bring(c: &mut Ctx, coin: &ValidCoin, label: &str, hook: &mut dyn FnMut(&mut Ctx, Event)) -> OutPoint {
+	match &coin.origin {
+		ValidOrigin::Leaf { valid, preimage, auths } => {
+			let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
+			for (level, (node, auth)) in valid.branch.nodes.iter().zip(auths).enumerate() {
+				let fs = fee_for(c, coin.asset);
+				let u = node.unroll_tx(at, auth, &fs).unwrap();
+				let id = c.pass(&format!("chain/{}: unroll, level {}", label, level), &with_coin(u, 1));
+				at = OutPoint::new(id, node.index as u32);
+			}
+			let fs = fee_for(c, coin.asset);
+			let e = valid.branch.entry_tx(at, preimage, &fs).unwrap();
+			let id = c.pass(&format!("chain/{}: entry into the leaf", label), &with_coin(e, 1));
+			OutPoint::new(id, 0)
+		},
+		ValidOrigin::Transfer { inputs, index, outputs } => {
+			let mut cps = vec![];
+			for (k, i) in inputs.iter().enumerate() {
+				let at = bring(c, &i.coin, &format!("{}.{}", label, k), hook);
+				hook(c, Event::Coin(&i.coin, at));
+				let fs = fee_for(c, i.coin.asset);
+				let cp = i.checkpoint_tx(at, &fs).unwrap();
+				let id = c.pass(&format!("chain/{}: checkpoint of input {}", label, k), &with_coin(cp, 1));
+				cps.push(OutPoint::new(id, 0));
+			}
+			// The margin is in one asset when the signers left it so; the
+			// asset of the coin at `index` decides who pays.
+			let margin_assets: Vec<_> = inputs.iter().map(|i| i.coin.asset).filter(|a| {
+				let held: u64 = inputs.iter().filter(|i| i.coin.asset == *a).map(|i| i.checkpoint_value).sum();
+				let out: u64 = outputs.iter().filter(|o| o.asset == *a).map(|o| o.value).sum();
+				held > out
+			}).collect();
+			hook(c, Event::Checkpoints(coin, &cps));
+			let fs = if margin_assets.iter().all(|a| *a == c.net.x) { FeeSource::Reserve } else { fee_for(c, outputs[*index].asset) };
+			let re = coin.reassignment_tx(&cps, &fs).unwrap();
+			let n = inputs.len();
+			let id = c.pass(&format!("chain/{}: reassignment", label), &with_coin(re, n));
+			OutPoint::new(id, *index as u32)
+		},
+	}
+}
+
+fn transfer_chain(c: &mut Ctx) {
+	let s = keypair("chain operator");
+	let x = c.net.x;
+	let (i1, sched1) = c.schedule(&s);
+	let (i2, sched2) = c.schedule(&s);
+	let b = batches(c.net.chain, x, c.net.y, s, sched1, sched2, delay(),
+		ReserveRule::FeeRate { floor_per_kvb: c.floor_per_kvb, multiple: 4 });
+	let r1 = asset_round(c, "chain/round of batch 1, in X", &i1, &b.batch1);
+	let r2 = asset_round(c, "chain/round of batch 2, in Y (not accepted for fees)", &i2, &b.batch2);
+	let rounds = vec![r1, r2];
+	let policy = c.policy(&s);
+	let t = mt(c.net.mtp() - 60);
+	let h = hops(&b, &rounds, &policy, t, delay());
+
+	// D holds its record alone, as bytes from its mailbox, and the rounds as
+	// the chain has them.
+	let bytes = h.d_record.to_bytes().unwrap();
+	let rec = CoinRecord::from_bytes(&bytes).unwrap();
+	let coin = rec.validate(&rounds, &c.policy(&s), &h.d.leaf.owner, &h.d.leaf.owner_nonce).unwrap();
+	println!("chain: D validates a {}-byte record, {} hops, coin {} of {} atoms of Y", bytes.len(), coin.hops, coin.id, coin.value);
+
+	// Negative cases on the hop-1 input, once A's leaf is on-chain: the
+	// reassignment's pair on the leaf, skipping the checkpoint.
+	let hop1 = match &coin.origin { ValidOrigin::Transfer { inputs, .. } => inputs[0].coin.clone(), _ => unreachable!() };
+	let hop2 = match &hop1.origin { ValidOrigin::Transfer { inputs, outputs, .. } => (inputs.clone(), outputs.clone()), _ => unreachable!() };
+	let hop1_input = match &hop2.0[0].coin.origin { ValidOrigin::Transfer { inputs, outputs, .. } => (inputs[0].clone(), outputs.clone()), _ => unreachable!() };
+	let a_key = b.a;
+	let mut seen_a = false;
+	let mut stale: Option<Transaction> = None;
+	let mut seen_swap = false;
+	let swap_id = hop1.id;
+	let mut hook = |c: &mut Ctx, ev: Event| {
+		let (inner, at) = match ev {
+			Event::Coin(inner, at) => (inner, at),
+			Event::Checkpoints(made, cps) => {
+				if seen_swap || made.id != swap_id {
+					return;
+				}
+				seen_swap = true;
+				let (inputs, outputs) = match &made.origin { ValidOrigin::Transfer { inputs, outputs, .. } => (inputs, outputs), _ => unreachable!() };
+				// A checkpoint's own pair on the checkpoint output: an outside
+				// coin pays the fee, so the script is what refuses it.
+				let i = &inputs[0];
+				let fc = c.net.fee_coin();
+				let again = collab_tx(&i.checkpoint, cps[0], i.coin.asset, i.checkpoint_value, &[i.checkpoint_output()],
+					&i.checkpoint_pair, &FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }).unwrap();
+				c.net.refuse("chain/neg the checkpoint's pair on the checkpoint", &with_coin(again, 1), "Invalid Schnorr signature");
+				// The swap with B's input alone: its Y output has nothing to come from.
+				let alone = arca_covenant::transfer::reassignment_tx(&inputs[..1], outputs, &cps[..1], &FeeSource::Reserve);
+				assert!(alone.is_err(), "the builder refuses to make it");
+				let mut s = spend(0).coin(&Coin { outpoint: cps[0], txout: i.checkpoint_output().txout() }, 0xffff_ffff)
+					.outputs(outputs.iter().map(|o| o.txout()).collect());
+				s.witness(0, i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8));
+				c.net.refuse("chain/neg the swap with one of its two inputs", &s.tx, "bad-txns-in-ne-out");
+				return;
+			},
+		};
+		if seen_a || inner.id != hop1_input.0.coin.id {
+			return;
+		}
+		seen_a = true;
+		let (i, outs) = &hop1_input;
+		let skip = collab_tx(&i.coin.leaf, at, i.coin.asset, i.coin.value, outs, &i.reassignment_pair, &FeeSource::Reserve).unwrap();
+		c.net.refuse("chain/neg the reassignment's pair on the leaf, skipping the checkpoint", &skip.tx, "Invalid Schnorr signature");
+		// A, the sender, holds its leaf now; its exit waits the delay, and the
+		// receiver answers first with the checkpoint (below).
+		let ks = i.coin.leaf.exit_tx(at, i.coin.asset, i.coin.value,
+			&[ExplicitOutput::new(i.coin.asset, i.coin.value - 1_500, op_true_spk())], &FeeSource::Reserve).unwrap();
+		let ex = signed(&c.net, ks, &a_key, vec![]);
+		c.net.refuse("chain/neg the sender's exit before its delay", &ex.tx, "non-BIP68-final");
+		stale = Some(ex.tx);
+	};
+	let at = bring(c, &coin, "D", &mut hook);
+
+	// After the receiver published the checkpoint, the sender's exit has no
+	// coin to spend.
+	let stale = stale.expect("A's leaf came on-chain");
+	c.net.refuse("chain/neg the sender's exit after the receiver's checkpoint", &stale, "bad-txns-inputs-missingorspent");
+
+	// D exits after the delay, with an outside fee coin: Y pays no fees here.
+	let exit = |c: &mut Ctx| {
+		let fs = fee_for(c, coin.asset);
+		let ks = coin.leaf.exit_tx(at, coin.asset, coin.value, &[ExplicitOutput::new(coin.asset, coin.value, op_true_spk())], &fs).unwrap();
+		let mut u = signed(&c.net, ks, &h.d.key, vec![]);
+		u.tx.input[1].witness.script_witness = op_true_witness();
+		u.tx
+	};
+	let tx = exit(c);
+	c.net.refuse("chain/neg D's exit before the delay", &tx, "non-BIP68-final");
+	c.net.wait_csv(&at.txid, delay());
+	let tx = exit(c);
+	c.pass("chain/D's exit after the delay, a fee coin attached", &tx);
+	let _ = hop2;
+}
+
 #[test]
 fn offchain_transactions_on_regtest() {
 	let net = Net::start();
@@ -504,6 +708,7 @@ fn offchain_transactions_on_regtest() {
 	no_merge(&mut c);
 	rollback(&mut c);
 	offboard(&mut c);
+	transfer_chain(&mut c);
 	c.net.print();
 	println!("\n{:<96} specification", "transaction");
 	for (n, s) in &c.sizes {
