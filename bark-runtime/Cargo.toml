@@ -1,11 +1,14 @@
 [package]
-name = "bark-runtime"
+name = "arca-runtime"
 version = "0.7.1"
 license = "MIT"
 authors = [ "Team Second <hello@second.tech>" ]
-repository = "https://gitlab.com/ark-bitcoin/bark"
+repository = "https://github.com/ConcatenaLabs/arca"
 description = "Async runtime abstractions shared by the native and WASM builds of bark"
 edition = "2024"
+
+[lib]
+name = "bark_runtime"
 
 [dependencies]
 tokio = { workspace = true, features = [ "sync", "time", "rt", "macros" ] }

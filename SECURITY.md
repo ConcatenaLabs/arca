@@ -2,16 +2,14 @@
 
 ## Reporting a Vulnerability
 
-Please report any vulnerability or any bug that could potentially affect the
-security of users' funds by e-mail to [`security@second.tech`](mailto:security@second.tech).
+Report any vulnerability, or any bug that could affect the safety of users'
+funds, privately through GitHub's vulnerability reporting for this repository:
+the **Report a vulnerability** button under the repository's **Security** tab
+(<https://github.com/ConcatenaLabs/arca/security/advisories/new>).
 
-Please do not report security issues through public issue trackers or chat
-channels.
+Please do not report security issues through public issues, pull requests or
+chat channels.
 
-You may use the following PGP keys to encrypt your e-mail:
-
-- `8CC974D9CFD034DCEED213B02A57E0A610D7F19C` (Steven Roose)
-- `011E7F59B45397C4654D81298F44B2DD98E18528` (Erik De Smedt)
-
-Both keys can be found on the [keys.openpgp.org](https://keys.openpgp.org/)
-keyserver.
+This repository is a fork of Bark. A flaw that also exists in upstream Bark
+should be reported to its maintainers as well, as described in Bark's own
+`SECURITY.md` at <https://gitlab.com/ark-bitcoin/bark>.

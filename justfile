@@ -35,32 +35,26 @@ check-wasm-tests:
 		--target wasm32-unknown-unknown
 
 check-lib-arithmetic:
-	cargo clippy -p ark-lib --tests
+	cargo clippy -p arca-lib --tests
 
 check-fuzz:
 	cargo check --manifest-path fuzz/Cargo.toml
 
 check-release:
-	cargo check --release -p bark-cli -p bark-server
+	cargo check --release -p arca-cli -p arca-server
 
 check-bark-as-libs:
-	cargo check -p ark-lib
-	cargo check -p ark-lib --no-default-features
-	cargo check -p bark-bitcoin-ext
-	cargo check -p bark-bitcoin-ext --no-default-features
-	cargo check -p bark-wallet
-	cargo check -p bark-wallet -F native --no-default-features
-	cargo check -p bark-json
-	cargo check -p bark-json --no-default-features
-	cargo check -p bark-rest
-	cargo check -p bark-rest --no-default-features
-	cargo check -p bark-rest-client
-
-# Confirms bark-wallet is still consumable as a plain crates.io dependency.
-check-use-bark-as-dependency:
-	rm -rf barktest
-	cargo init barktest
-	cd barktest && cargo add bark-wallet && cargo update && cargo build
+	cargo check -p arca-lib
+	cargo check -p arca-lib --no-default-features
+	cargo check -p arca-bitcoin-ext
+	cargo check -p arca-bitcoin-ext --no-default-features
+	cargo check -p arca-wallet
+	cargo check -p arca-wallet -F native --no-default-features
+	cargo check -p arca-json
+	cargo check -p arca-json --no-default-features
+	cargo check -p arca-rest
+	cargo check -p arca-rest --no-default-features
+	cargo check -p arca-rest-client
 
 checks: prechecks check-lib-arithmetic check-wasm-tests check
 
@@ -76,11 +70,11 @@ build-ci:
 	cargo build --profile ci --workspace --bins --examples
 
 build-unit-tests-ci:
-	cargo nextest archive --cargo-profile ci --workspace --exclude ark-testing \
+	cargo nextest archive --cargo-profile ci --workspace --exclude arca-testing \
 		--archive-file {{CARGO_TARGET}}/ci/unit-tests.tar.zst --zstd-level 19
 
 build-integration-tests-ci:
-	cargo nextest archive --cargo-profile ci --package ark-testing \
+	cargo nextest archive --cargo-profile ci --package arca-testing \
 		--archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst --zstd-level 19
 
 build-bins:
@@ -119,15 +113,15 @@ build-msrv-lib:
 
 build-bark-wasm:
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
-		-p ark-lib --features wasm-web
+		-p arca-lib --features wasm-web
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
-		-p bark-bitcoin-ext --features wasm-web
+		-p arca-bitcoin-ext --features wasm-web
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
-		-p bark-server-rpc --features tonic-web
+		-p arca-server-rpc --features tonic-web
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
-		-p bark-wallet --features wasm-web
+		-p arca-wallet --features wasm-web
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
-		-p bark-wallet --features wasm-web,indexed-db
+		-p arca-wallet --features wasm-web,indexed-db
 
 build-lib-wasm-release:
 	cd lib/ && cargo build --release --target wasm32-unknown-unknown --lib --features wasm-web
@@ -137,7 +131,7 @@ docker-pull:
 
 test-unit TEST="":
 	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --workspace \
-		--exclude ark-testing {{TEST}}
+		--exclude arca-testing {{TEST}}
 alias unit := test-unit
 
 test-unit-prebuilt:
@@ -148,16 +142,16 @@ test-doc:
 
 test-unit-codecov TEST="":
 	cargo llvm-cov nextest --profile {{NEXTEST_PROFILE}} --workspace \
-		--exclude ark-testing --no-report {{TEST}}
+		--exclude arca-testing --no-report {{TEST}}
 
 test-integration TEST="": ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		-E 'not binary(tor)' {{TEST}}
 alias int := test-integration
 
 # run integration tests for bark and barkd test files only
 test-integration-bark: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		--test bark --test barkd
 alias int-bark := test-integration-bark
 
@@ -167,26 +161,26 @@ alias int-bark := test-integration-bark
 [doc("run the bark/barkd/bark-sdk integration tests double-driving every action step to check reentrancy")]
 test-integration-bark-int-action-reentrancy TEST="": ensure-build-bins docker-pull
 	BARK_DOUBLE_DRIVE_ACTIONS=1 \
-		cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		--test bark --test barkd --test bark-sdk {{TEST}}
 alias int-bark-int-action-reentrancy := test-integration-bark-int-action-reentrancy
 
 # Must not run under backward-compat mode (BARK_EXEC override has no effect
 # on tests linked against the current bark-wallet crate).
 test-integration-bark-sdk: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		--test bark-sdk
 alias int-bark-sdk := test-integration-bark-sdk
 
 # run tor integration tests
 test-integration-tor: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		--test tor
 alias int-tor := test-integration-tor
 
 # run integration tests for core and server test files only
 test-integration-core: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
 		--test core --test server
 alias int-core := test-integration-core
 
@@ -214,7 +208,7 @@ test-integration-codecov TEST="": docker-pull
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source <(cargo llvm-cov show-env --export-prefix)
-	cargo nextest run --profile {{NEXTEST_PROFILE}} --package ark-testing {{TEST}}
+	cargo nextest run --profile {{NEXTEST_PROFILE}} --package arca-testing {{TEST}}
 alias int-cov := test-integration-codecov
 
 test-integration-esplora TEST="": ensure-build-bins docker-pull
@@ -226,7 +220,7 @@ test-integration-esplora-codecov TEST="": docker-pull
 	set -euo pipefail
 	source <(cargo llvm-cov show-env --export-prefix)
 	CHAIN_SOURCE=esplora cargo nextest run --profile {{NEXTEST_PROFILE}} \
-		--package ark-testing {{TEST}}
+		--package arca-testing {{TEST}}
 
 test-integration-mempool TEST="": ensure-build-bins docker-pull
 	CHAIN_SOURCE=mempool just int "{{TEST}}"
@@ -237,7 +231,7 @@ test-integration-mempool-codecov TEST="": docker-pull
 	set -euo pipefail
 	source <(cargo llvm-cov show-env --export-prefix)
 	CHAIN_SOURCE=mempool cargo nextest run --profile {{NEXTEST_PROFILE}} \
-		--package ark-testing {{TEST}}
+		--package arca-testing {{TEST}}
 
 test-integration-all-codecov: docker-pull
 	just test-integration-codecov
@@ -295,19 +289,19 @@ rustdocs-internal:
 # cleans most of our crates, doesn't clean grpc gens, they are sometimes slow to build
 clean:
 	cargo clean \
-		-p ark-lib \
-		-p ark-testing \
-		-p bark-bitcoin-ext \
-		-p bark-cli \
-		-p bark-common \
-		-p bark-json \
-		-p bark-rest \
-		-p bark-rest-client \
-		-p bark-runtime \
-		-p bark-server \
-		-p bark-server-log \
-		-p bark-server-rpc \
-		-p bark-wallet \
+		-p arca-lib \
+		-p arca-testing \
+		-p arca-bitcoin-ext \
+		-p arca-cli \
+		-p arca-common \
+		-p arca-json \
+		-p arca-rest \
+		-p arca-rest-client \
+		-p arca-runtime \
+		-p arca-server \
+		-p arca-server-log \
+		-p arca-server-rpc \
+		-p arca-wallet \
 		-p bip321 \
 		-p wasm-testing
 
@@ -348,12 +342,12 @@ generate-bark-rest-client: dump-bark-rest-openapi-schema
 		-i {{BARK_OPENAPI_SCHEMA_PATH}} \
 		-g rust \
 		-o {{BARK_REST_CLIENT_DIR}} \
-		--package-name bark-rest-client \
+		--package-name arca-rest-client \
 		--artifact-version "$BARK_REST_VERSION" \
 		--additional-properties packageVersion="$BARK_REST_VERSION" \
 		--additional-properties reqwestDefaultFeatures="rustls"
-	cargo add --package bark-rest-client --path bark-json
-	cargo add --package bark-rest-client --path bark-rest --no-default-features
+	cargo add --package arca-rest-client --path bark-json
+	cargo add --package arca-rest-client --path bark-rest --no-default-features
 	rm {{BARK_REST_CLIENT_DIR}}/src/models/*.rs
 	cp bark-rest/helpers/models.rs {{BARK_REST_CLIENT_DIR}}/src/models/mod.rs
 
@@ -458,7 +452,7 @@ release-new-version NEW_VERSION: (bump-workspace-versions NEW_VERSION) generate-
 # `build-msrv-lib` is invoked separately from the Dockerfile because it needs
 # the .#msrv-lib nix shell rather than .#default.
 [doc("pre-run every CI recipe so the CI base image ships with a warm build cache")]
-ci-warmup: check build check-fuzz check-release check-bark-as-libs test-doc test-bark-wasm-indexed-db build-bark-wasm build-lib-wasm-release check-lib-arithmetic check-use-bark-as-dependency build-unit-tests-ci build-ci
+ci-warmup: check build check-fuzz check-release check-bark-as-libs test-doc test-bark-wasm-indexed-db build-bark-wasm build-lib-wasm-release check-lib-arithmetic build-unit-tests-ci build-ci
 
 cachix-push:
 	nix develop .#default  --profile /tmp/bark-shell-dev      -c true

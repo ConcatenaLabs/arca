@@ -1,8 +1,11 @@
 [package]
-name = "ark-testing"
+name = "arca-testing"
 version = "0.0.0"
 license = "MIT"
 edition = "2024"
+
+[lib]
+name = "ark_testing"
 
 [[bin]]
 name = "lock-holder"
@@ -32,17 +35,17 @@ path = "tests/core/mod.rs"
 slow_test = []
 
 [dependencies]
-ark-lib = { path = "../lib", features = ["test-util"] }
-bark-server = { path = "../server" }
-bark-server-log = { path = "../server-log" }
-bark-server-rpc = { path = "../server-rpc", features = ["server"] }
-bark-cln-rpc = { path = "../cln-rpc"}
-bark-json = { path = "../bark-json", features = ["onchain-bdk"] }
-bark-wallet = { path = "../bark", features = ["filestore", "sqlite", "socks5-proxy"] }
-bark-bitcoin-ext = { path = "../bitcoin-ext" }
+arca-lib = { path = "../lib", features = ["test-util"] }
+arca-server = { path = "../server" }
+arca-server-log = { path = "../server-log" }
+arca-server-rpc = { path = "../server-rpc", features = ["server"] }
+arca-cln-rpc = { path = "../cln-rpc"}
+arca-json = { path = "../bark-json", features = ["onchain-bdk"] }
+arca-wallet = { path = "../bark", features = ["filestore", "sqlite", "socks5-proxy"] }
+arca-bitcoin-ext = { path = "../bitcoin-ext" }
 bip321 = { path = "../bip321" }
-bark-rest = { path = "../bark-rest" }
-bark-rest-client = { path = "../bark-rest-client" }
+arca-rest = { path = "../bark-rest" }
+arca-rest-client = { path = "../bark-rest-client" }
 reqwest = { version = "^0.13", default-features = false }
 
 bitcoincore-rpc = "0.19.0"

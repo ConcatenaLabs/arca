@@ -1,111 +1,60 @@
-![bark: Ark on bitcoin](assets/bark-header-white.jpg)
+# Arca
 
-<div align="center">
-<h1>Bark: Ark on bitcoin</h1>
-<p>Fast, low-cost, self-custodial payments on bitcoin.</p>
-</div>
+Arca is an Ark protocol for [Sequentia](https://github.com/ConcatenaLabs/Sequentia),
+the Bitcoin sidechain for asset tokenization and disintermediated exchanges. An
+operator commits many users' balances to one on-chain output, a batch, whose
+covenant tree of introspection scripts pins every child output. Each user holds a
+leaf of that tree (a VTXO while off-chain), pays and receives off-chain with the
+operator's co-signature, and can always leave unilaterally by publishing the path
+from the batch to their leaf and claiming it after the exit delay. A batch carries
+one asset, and every asset issued on Sequentia can have batches of its own.
 
-<p align="center">
-  <br />
-  <a href="https://docs.second.tech">Docs</a> ·
-  <a href="https://gitlab.com/ark-bitcoin/bark/issues">Issues</a> ·
-  <a href="https://second.tech">Website</a> ·
-  <a href="https://blog.second.tech">Blog</a> ·
-  <a href="https://www.youtube.com/@2ndbtc">YouTube</a>
-</p>
+This repository is a fork of [Bark](https://gitlab.com/ark-bitcoin/bark), the Ark
+implementation by Second, taken at its `0.7.1` release with the full upstream
+history. Bark's tags (`bark-0.7.1`, `lib-0.7.1`, `server-0.7.1`) mark the fork
+point. Bark's MIT licence and its copyright notice are kept in [LICENSE](LICENSE).
 
-<div align="center">
+## Crates
 
-[![Release](https://img.shields.io/gitlab/pipeline-status/ark-bitcoin/bark?branch=master&gitlab_url=https%3A%2F%2Fgitlab.com)](https://gitlab.com/ark-bitcoin/bark/tags)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?logo=git)](CONTRIBUTING.md)
-[![Community](https://img.shields.io/badge/community-forum-blue?logo=discourse)](https://community.second.tech)
+The crates keep the directory and library names they have upstream, so code taken
+from Bark applies with few edits; only the package names carry the `arca-` prefix.
 
-</div>
+| Directory | Package | Library | What it holds |
+|---|---|---|---|
+| `lib/` | `arca-lib` | `ark` | Protocol primitives: the VTXO type and its encoding, policies and clauses, the transaction tree, arkoor, board, offboard, forfeits, attestations, fees |
+| `bitcoin-ext/` | `arca-bitcoin-ext` | `bitcoin_ext` | Height and delta types, fee and dust helpers, node RPC extension traits |
+| `bark/` | `arca-wallet` | `bark` | The client wallet library: rounds, arkoor, board and offboard, exits, Lightning, persistence |
+| `bark-cli/` | `arca-cli` | `bark_cli` | The `bark` command-line wallet and the `barkd` daemon |
+| `bark-json/`, `bark-rest/`, `bark-rest-client/` | `arca-json`, `arca-rest`, `arca-rest-client` | `bark_json`, `bark_rest`, `bark_rest_client` | JSON types, the daemon's REST server and its generated client |
+| `bark-common/`, `bark-runtime/` | `arca-common`, `arca-runtime` | `bark_common`, `bark_runtime` | Helpers shared by the wallet and the server; the async runtime abstraction |
+| `server/` | `arca-server` | `server` | The operator's server (`captaind`) and the watcher (`watchmand`) |
+| `server-rpc/`, `server-log/`, `cln-rpc/` | `arca-server-rpc`, `arca-server-log`, `arca-cln-rpc` | `server_rpc`, `server_log`, `cln_rpc` | The gRPC protocol, structured log messages, the Core Lightning client |
+| `testing/` | `arca-testing` | `ark_testing` | The integration harness and its test suites |
+| `bip321/` | `bip321` | `bip321` | Payment URI parser |
+| `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
 
-<br />
+## Building and testing
 
-Bark is an implementation of the Ark protocol on bitcoin, led by [Second](https://second.tech). The Ark protocol is a bitcoin layer 2 for making fast, low-cost, self-custodial payments at scale. Ark uses a client-server model to enable users to transact off-chain while still being able to "exit" their balances on-chain at any time.
+You need a stable Rust toolchain. The library's unit tests check every transaction
+they build for consensus validity through `bitcoinkernel`, which compiles Bitcoin
+Core's kernel with CMake and needs the Boost headers (Debian and Ubuntu:
+`apt install cmake libboost-dev`).
 
-The project consists of:
+    cargo build -p arca-lib
+    cargo test -p arca-lib --lib
 
-- The Ark wallet: **bark**
-- The Ark server: **captaind**
-- A set of libraries containing all protocol primitives
+The [justfile](justfile) holds the remaining recipes (`just check`, `just unit`,
+`just int`). The integration tests drive real daemons and expect the environment
+that the Nix flake (`nix develop`) provides.
 
-## Get started
+Continuous integration on GitHub Actions builds `arca-lib` and runs its unit tests
+on every pull request and on every push to `master`
+([.github/workflows/lib.yml](.github/workflows/lib.yml)).
 
-- [**Make your first Ark transactions**](https://docs.second.tech/getting-started/): Step-by-step guide to set up a CLI wallet, get sats from [our faucet](https://signet.2nd.dev), and buy some treats from [our test store](https://signet.2nd.dev/store).
-- [**Compile from source**](https://docs.second.tech/getting-started/optional/compile-from-source/)
-- [**Set up an Ark server**](https://docs.second.tech/run-ark-server/): For patient folks looking to do more in-depth testing!
+## Security
 
-## What if I don't speak Rust?
+See [SECURITY.md](SECURITY.md).
 
-No Rust, no problem!
+## Licence
 
-**barkd** is an Ark wallet that runs as a daemon and exposes a REST API over HTTP. It's well suited for power users and great for automation—think web shops, Telegram/Discord bots, and similar use cases. The [barkd-clients repository](https://gitlab.com/ark-bitcoin/barkd-clients) provides clients in TypeScript and C#.
-
-barkd serves plaintext HTTP and binds loopback by default. A bearer token holding full wallet access travels in every request, so exposing the port beyond loopback requires a reverse proxy that terminates TLS: barkd has no TLS of its own, and the token is readable by anyone on the path. `--no-auth` removes the token requirement entirely, and refuses to start on a non-loopback bind; `--dangerously-allow-remote-no-auth` is the flag that does both, disabling auth on a bind address anyone can reach.
-
-**uniffi-bindings** are the better choice if you're building a native desktop or mobile application. The bindings are available in the [bark-ffi repository](https://gitlab.com/ark-bitcoin/bark-ffi) and power the published Bark SDK packages.
-
-## Why Ark?
-
-As bitcoin adoption grows, on-chain fees spike during busy periods, making everyday transactions impractical. While Lightning has been revolutionary for bitcoin scaling, it's beginning to show its limitations-channel management and liquidity requirements create complexity for developers and users.
-
-Ark offers a complementary scaling solution that simplifies bitcoin self-custody:
-
-🏃‍♂️ **Smooth onboarding**: No channels to open, no on-chain setup required-create a wallet and start transacting  
-🤌 **Simplified UX**: Send and receive without managing channels, liquidity, or routing  
-🌐 **Universal payments**: Send Ark, Lightning, and on-chain payments from a single off-chain balance  
-🔌 **Easier integration**: Client-server architecture reduces complexity compared to P2P protocols  
-💸 **Lower costs**: Instant payments at a fraction of on-chain fees  
-🔒 **Self-custodial**: Users maintain full control of their funds at all times
-
-Perfect for users who want self-custody without the hassle, and developers who want to build bitcoin apps without the complexity.
-
-[Learn more about Ark's benefits →](https://second.tech)
-
-## How does Ark work?
-
-The Ark protocol enables multiple users to share control of a single bitcoin UTXO through a tree of pre-signed, off-chain transactions. This allows instant, off-chain payments while maintaining self-custody-users can always withdraw their bitcoin either cooperatively with the Ark server or unilaterally on-chain.
-
-For a detailed technical explanation, see our [protocol documentation](https://second.tech/docs/learn/intro).
-
-![An example of an Ark transaction tree from a refresh](assets/tx-tree-refresh.jpg)
-_A transaction tree showing how Ark enables multiple users to share control of a single UTXO through pre-signed transactions._
-
-## Minimum supported Rust version (MSRV)
-
-Most of our crates do not yet specify a MSRV, but we will commit to one once we make an official release.
-
-The `ark-lib` crate (and by extension the `bark-bitcoin-ext` crate) have a MSRV of v1.74.0.
-
-## Contributing
-
-Thinking of opening a pull request? See our [contribution guide](CONTRIBUTING.md) for dependencies, style guidelines, and code hygiene expectations.
-
-### Security
-
-Please report any vulnerability or any bug that could potentially affect the
-security of users' funds by e-mail to [`security@second.tech`](mailto:security@second.tech).
-
-You may use the following PGP keys to encrypt your e-mail:
-
-- `8CC974D9CFD034DCEED213B02A57E0A610D7F19C` (Steven Roose)
-- `011E7F59B45397C4654D81298F44B2DD98E18528` (Erik De Smedt)
-
-Both keys can be found on the [keys.openpgp.org](https://keys.openpgp.org/) keyserver.
-
-
-## Questions or issues
-
-If you run into any issues at all, let us know:
-
-- [Community forum](https://community.second.tech)
-- [Community chat](https://chat.second.tech)
-- [Issue tracker](https://gitlab.com/ark-bitcoin/bark/issues)
-
-## License
-
-Released under the **MIT** license-see the [LICENSE](LICENSE) file for details.
+MIT, see [LICENSE](LICENSE).

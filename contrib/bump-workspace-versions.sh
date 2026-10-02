@@ -30,18 +30,18 @@ lockstep="
 
 # Package names for the lockstep crates. Scopes the cross-crate dep sweep.
 packages="
-	bark-cli
-	bark-common
-	bark-json
-	bark-rest-client
-	bark-rest
-	bark-runtime
-	bark-wallet
-	bark-bitcoin-ext
-	ark-lib
-	bark-server-log
-	bark-server-rpc
-	bark-server
+	arca-cli
+	arca-common
+	arca-json
+	arca-rest-client
+	arca-rest
+	arca-runtime
+	arca-wallet
+	arca-bitcoin-ext
+	arca-lib
+	arca-server-log
+	arca-server-rpc
+	arca-server
 "
 
 lockstep_count=$(echo $lockstep | wc -w)

@@ -1,13 +1,16 @@
 [package]
-name = "bark-fuzz"
+name = "arca-fuzz"
 version = "0.0.1"
 publish = false
 edition = "2024"
 license = "MIT"
 
+[lib]
+name = "bark_fuzz"
+
 [dependencies]
 honggfuzz = { version = "0.5.55" , default-features = false }
-ark = { package = "ark-lib", path = "../lib", features = ["test-util"] }
+ark = { package = "arca-lib", path = "../lib", features = ["test-util"] }
 bitcoin = { version = "0.32", default-features = false, features = ["std"]}
 
 [profile.release]

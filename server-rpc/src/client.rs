@@ -73,7 +73,7 @@ pub const ACCESS_TOKEN_HEADER: &str = "ark-access-token";
 pub const USER_AGENT_HEADER: &str = "x-user-agent";
 /// Error text used when no Ark RPC transport backend was compiled into the binary.
 pub const NO_TRANSPORT_BACKEND_MESSAGE: &str =
-	"no Ark RPC transport backend compiled in this build; enable `bark-server-rpc/tonic-native` or `bark-server-rpc/tonic-web`";
+	"no Ark RPC transport backend compiled in this build; enable `arca-server-rpc/tonic-native` or `arca-server-rpc/tonic-web`";
 
 /// Default timeout to add on requests to the server
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -598,7 +598,7 @@ mod tests {
 	fn no_transport_backend_error_mentions_feature_selection() {
 		let err = CreateEndpointError::NoTransportBackend;
 		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
-		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
-		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+		assert!(err.to_string().contains("arca-server-rpc/tonic-native"));
+		assert!(err.to_string().contains("arca-server-rpc/tonic-web"));
 	}
 }

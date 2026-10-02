@@ -115,11 +115,106 @@ dependencies = [
 ]
 
 [[package]]
-name = "ark-lib"
+name = "arca-bitcoin-ext"
 version = "0.7.1"
 dependencies = [
  "async-trait",
- "bark-bitcoin-ext",
+ "base64 0.22.1",
+ "bdk_bitcoind_rpc",
+ "bdk_wallet",
+ "bitcoin",
+ "bitcoind-async-client",
+ "getrandom 0.2.17",
+ "jsonrpc 0.20.1",
+ "lazy_static",
+ "log",
+ "rand_core 0.6.4",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ureq",
+]
+
+[[package]]
+name = "arca-cli"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "arca-bitcoin-ext",
+ "arca-json",
+ "arca-lib",
+ "arca-rest",
+ "arca-server-rpc",
+ "arca-wallet",
+ "bip39",
+ "bitcoin",
+ "chrono",
+ "clap",
+ "dialoguer",
+ "env_logger",
+ "futures",
+ "home",
+ "lazy_static",
+ "lightning",
+ "lightning-invoice",
+ "lnurl-rs",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "arca-cln-rpc"
+version = "0.7.1+cln.26.06.7-hold"
+dependencies = [
+ "arca-lib",
+ "bitcoin",
+ "prost 0.14.3",
+ "tonic 0.14.6",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "arca-common"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "arca-json"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "arca-bitcoin-ext",
+ "arca-lib",
+ "arca-wallet",
+ "bitcoin",
+ "chrono",
+ "humantime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "utoipa",
+]
+
+[[package]]
+name = "arca-lib"
+version = "0.7.1"
+dependencies = [
+ "arca-bitcoin-ext",
+ "async-trait",
  "bitcoin",
  "bitcoinkernel",
  "chrono",
@@ -137,22 +232,189 @@ dependencies = [
 ]
 
 [[package]]
-name = "ark-testing"
+name = "arca-rest"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "arca-bitcoin-ext",
+ "arca-json",
+ "arca-lib",
+ "arca-wallet",
+ "axum",
+ "base64 0.22.1",
+ "bitcoin",
+ "chrono",
+ "futures",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "arca-rest-client"
+version = "0.7.1"
+dependencies = [
+ "arca-json",
+ "arca-rest",
+ "chrono",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "url",
+]
+
+[[package]]
+name = "arca-runtime"
+version = "0.7.1"
+dependencies = [
+ "futures",
+ "gloo-timers",
+ "tokio",
+ "tokio-util",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-time",
+]
+
+[[package]]
+name = "arca-server"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "arca-bitcoin-ext",
+ "arca-cln-rpc",
+ "arca-common",
+ "arca-lib",
+ "arca-server-log",
+ "arca-server-rpc",
+ "async-stream",
+ "async-trait",
+ "bb8",
+ "bb8-postgres",
+ "bdk_bitcoind_rpc",
+ "bdk_wallet",
+ "bip39",
+ "bitcoin",
+ "bitcoind-async-client",
+ "chrono",
+ "clap",
+ "config",
+ "console-subscriber",
+ "env_logger",
+ "futures",
+ "hickory-resolver",
+ "http",
+ "http-body",
+ "humantime",
+ "hyper",
+ "indexmap 2.14.0",
+ "ipnet",
+ "json-subscriber",
+ "lazy_static",
+ "lightning",
+ "lightning-invoice",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "pin-project",
+ "postgres-types",
+ "refinery",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tonic 0.14.6",
+ "tonic-health",
+ "tonic-tracing-opentelemetry",
+ "tonic-web",
+ "tower",
+ "tower-http 0.6.10",
+ "tracing",
+ "tracing-core",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "arca-server-log"
+version = "0.7.1"
+dependencies = [
+ "arca-bitcoin-ext",
+ "arca-lib",
+ "bdk_wallet",
+ "bitcoin",
+ "chrono",
+ "humantime",
+ "json-subscriber",
+ "opentelemetry",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-attributes",
+ "tracing-core",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "arca-server-rpc"
+version = "0.7.1"
+dependencies = [
+ "arca-lib",
+ "bitcoin",
+ "getrandom 0.2.17",
+ "http",
+ "hyper-socks2",
+ "hyper-util",
+ "log",
+ "prost 0.14.3",
+ "prost-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tonic-web-wasm-client",
+]
+
+[[package]]
+name = "arca-testing"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "ark-lib",
+ "arca-bitcoin-ext",
+ "arca-cln-rpc",
+ "arca-json",
+ "arca-lib",
+ "arca-rest",
+ "arca-rest-client",
+ "arca-server",
+ "arca-server-log",
+ "arca-server-rpc",
+ "arca-wallet",
  "async-trait",
  "axum",
- "bark-bitcoin-ext",
- "bark-cln-rpc",
- "bark-json",
- "bark-rest",
- "bark-rest-client",
- "bark-server",
- "bark-server-log",
- "bark-server-rpc",
- "bark-wallet",
  "bdk_bitcoind_rpc",
  "bdk_esplora",
  "bdk_wallet",
@@ -186,6 +448,60 @@ dependencies = [
  "tower-http 0.5.2",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "arca-wallet"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "arca-bitcoin-ext",
+ "arca-common",
+ "arca-lib",
+ "arca-runtime",
+ "arca-server-rpc",
+ "async-trait",
+ "bdk_bitcoind_rpc",
+ "bdk_core",
+ "bdk_esplora",
+ "bdk_wallet",
+ "bip321",
+ "bip39",
+ "bitcoin",
+ "bitcoind-async-client",
+ "chrono",
+ "config",
+ "console_log 1.0.0",
+ "esplora-client",
+ "futures",
+ "getrandom 0.4.2",
+ "http",
+ "indexed-db",
+ "js-sys",
+ "lazy_static",
+ "libc",
+ "lightning",
+ "lightning-invoice",
+ "lnurl-rs",
+ "log",
+ "parking_lot",
+ "rand 0.10.1",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic 0.14.6",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "zeromq",
 ]
 
 [[package]]
@@ -375,322 +691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bark-bitcoin-ext"
-version = "0.7.1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bdk_bitcoind_rpc",
- "bdk_wallet",
- "bitcoin",
- "bitcoind-async-client",
- "getrandom 0.2.17",
- "jsonrpc 0.20.1",
- "lazy_static",
- "log",
- "rand_core 0.6.4",
- "rmp-serde",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "ureq",
-]
-
-[[package]]
-name = "bark-cli"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "ark-lib",
- "bark-bitcoin-ext",
- "bark-json",
- "bark-rest",
- "bark-server-rpc",
- "bark-wallet",
- "bip39",
- "bitcoin",
- "chrono",
- "clap",
- "dialoguer",
- "env_logger",
- "futures",
- "home",
- "lazy_static",
- "lightning",
- "lightning-invoice",
- "lnurl-rs",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "toml",
- "tonic 0.14.6",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bark-cln-rpc"
-version = "0.7.1+cln.26.06.7-hold"
-dependencies = [
- "ark-lib",
- "bitcoin",
- "prost 0.14.3",
- "tonic 0.14.6",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "bark-common"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "serde",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "bark-json"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "ark-lib",
- "bark-bitcoin-ext",
- "bark-wallet",
- "bitcoin",
- "chrono",
- "humantime",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "utoipa",
-]
-
-[[package]]
-name = "bark-rest"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "ark-lib",
- "axum",
- "bark-bitcoin-ext",
- "bark-json",
- "bark-wallet",
- "base64 0.22.1",
- "bitcoin",
- "chrono",
- "futures",
- "log",
- "parking_lot",
- "serde",
- "serde_json",
- "subtle",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "utoipa",
- "utoipa-axum",
- "utoipa-swagger-ui",
-]
-
-[[package]]
-name = "bark-rest-client"
-version = "0.7.1"
-dependencies = [
- "bark-json",
- "bark-rest",
- "chrono",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "url",
-]
-
-[[package]]
-name = "bark-runtime"
-version = "0.7.1"
-dependencies = [
- "futures",
- "gloo-timers",
- "tokio",
- "tokio-util",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-time",
-]
-
-[[package]]
-name = "bark-server"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "ark-lib",
- "async-stream",
- "async-trait",
- "bark-bitcoin-ext",
- "bark-cln-rpc",
- "bark-common",
- "bark-server-log",
- "bark-server-rpc",
- "bb8",
- "bb8-postgres",
- "bdk_bitcoind_rpc",
- "bdk_wallet",
- "bip39",
- "bitcoin",
- "bitcoind-async-client",
- "chrono",
- "clap",
- "config",
- "console-subscriber",
- "env_logger",
- "futures",
- "hickory-resolver",
- "http",
- "http-body",
- "humantime",
- "hyper",
- "indexmap 2.14.0",
- "ipnet",
- "json-subscriber",
- "lazy_static",
- "lightning",
- "lightning-invoice",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "parking_lot",
- "pin-project",
- "postgres-types",
- "refinery",
- "rmp-serde",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror 2.0.18",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tokio-util",
- "toml",
- "tonic 0.14.6",
- "tonic-health",
- "tonic-tracing-opentelemetry",
- "tonic-web",
- "tower",
- "tower-http 0.6.10",
- "tracing",
- "tracing-core",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "bark-server-log"
-version = "0.7.1"
-dependencies = [
- "ark-lib",
- "bark-bitcoin-ext",
- "bdk_wallet",
- "bitcoin",
- "chrono",
- "humantime",
- "json-subscriber",
- "opentelemetry",
- "serde",
- "serde_json",
- "tracing",
- "tracing-attributes",
- "tracing-core",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bark-server-rpc"
-version = "0.7.1"
-dependencies = [
- "ark-lib",
- "bitcoin",
- "getrandom 0.2.17",
- "http",
- "hyper-socks2",
- "hyper-util",
- "log",
- "prost 0.14.3",
- "prost-types",
- "thiserror 2.0.18",
- "tokio",
- "tonic 0.14.6",
- "tonic-prost",
- "tonic-prost-build",
- "tonic-web-wasm-client",
-]
-
-[[package]]
-name = "bark-wallet"
-version = "0.7.1"
-dependencies = [
- "anyhow",
- "ark-lib",
- "async-trait",
- "bark-bitcoin-ext",
- "bark-common",
- "bark-runtime",
- "bark-server-rpc",
- "bdk_bitcoind_rpc",
- "bdk_core",
- "bdk_esplora",
- "bdk_wallet",
- "bip321",
- "bip39",
- "bitcoin",
- "bitcoind-async-client",
- "chrono",
- "config",
- "console_log 1.0.0",
- "esplora-client",
- "futures",
- "getrandom 0.4.2",
- "http",
- "indexed-db",
- "js-sys",
- "lazy_static",
- "libc",
- "lightning",
- "lightning-invoice",
- "lnurl-rs",
- "log",
- "parking_lot",
- "rand 0.10.1",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic 0.14.6",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "zeromq",
-]
-
-[[package]]
 name = "base58ck"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,7 +834,7 @@ dependencies = [
 name = "bip321"
 version = "0.4.0"
 dependencies = [
- "bark-bitcoin-ext",
+ "arca-bitcoin-ext",
  "bitcoin",
  "lightning",
  "lightning-invoice",
@@ -5908,9 +5908,9 @@ name = "wasm-testing"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "ark-testing",
- "bark-server-rpc",
- "bark-wallet",
+ "arca-server-rpc",
+ "arca-testing",
+ "arca-wallet",
  "bip39",
  "bitcoin",
  "console_log 0.2.2",

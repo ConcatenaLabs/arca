@@ -1,9 +1,9 @@
 [package]
-name = "bark-server-log"
-version = "0.7.1" # lock to bark-server version
+name = "arca-server-log"
+version = "0.7.1" # lock to arca-server version
 license = "MIT"
 authors = [ "Team Second <hello@second.tech>" ]
-repository = "https://gitlab.com/ark-bitcoin/bark"
+repository = "https://github.com/ConcatenaLabs/arca"
 description = "structured log message definitions for bark-server"
 edition = "2024"
 
@@ -12,8 +12,8 @@ name = "server_log"
 
 [dependencies]
 # OWN
-ark-lib = { path = "../lib" }
-bark-bitcoin-ext = { path = "../bitcoin-ext", default-features = false }
+arca-lib = { path = "../lib" }
+arca-bitcoin-ext = { path = "../bitcoin-ext", default-features = false }
 
 serde.workspace = true
 serde_json.workspace = true

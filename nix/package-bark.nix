@@ -179,7 +179,7 @@ let
 				# system libraries, which is required when cross-compiling.
 				buildPhaseCargoCommand = ''
 					cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
-					cargo zigbuild --release --locked -p bark-cli --no-default-features --features tls-webpki-roots,sqlite-bundled,barkd-swagger-ui --target ${zigbuildTarget target} --message-format json-render-diagnostics >"$cargoBuildLog"
+					cargo zigbuild --release --locked -p arca-cli --no-default-features --features tls-webpki-roots,sqlite-bundled,barkd-swagger-ui --target ${zigbuildTarget target} --message-format json-render-diagnostics >"$cargoBuildLog"
 				'';
 			}
 			// lib.optionalAttrs isDarwin {
