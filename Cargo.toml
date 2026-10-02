@@ -16,7 +16,8 @@ members = [
   "cln-rpc",
   "bark-rest-client",
   "bip321",
-  "wasm-testing"
+  "wasm-testing",
+  "consensus",
 ]
 
 resolver = "2"
@@ -51,6 +52,10 @@ lto = true
 # * EXPORTED (ECOSYSTEM)
 
 bitcoin = { version = "0.32.7", features = [ "serde", "rand", "rand-std" ] }
+# Sequentia's transaction and block encoding: rust-elements with the
+# `sequentia` feature (issuance denomination byte, Bitcoin anchor in the block
+# header), as vendored by SWK. One copy serves every Sequentia Rust project.
+elements = { git = "https://github.com/ConcatenaLabs/SWK", rev = "87a9f5e7f98356a2c00712884019079566aacfec", features = [ "sequentia" ] }
 lightning-invoice = { version = "0.34.0", features = [ "std", "serde" ] }
 lightning = { version = "0.2.0", default-features = false, features = [ "std" ] }
 lnurl-rs = { version = "0.10.0", features = [ "async", "async-https-rustls" ], default-features = false }

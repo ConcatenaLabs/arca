@@ -193,6 +193,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-consensus"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "elements",
+ "minreq",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arca-json"
 version = "0.7.1"
 dependencies = [
@@ -888,6 +899,12 @@ name = "bitcoin-io"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dee39a0ee5b4095224a0cfc6bf4cc1baf0f9624b96b367e53b66d974e51d953"
+
+[[package]]
+name = "bitcoin-private"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73290177011694f38ec25e165d0387ab7ea749a4b81cd4c80dae5988229f7a57"
 
 [[package]]
 name = "bitcoin-units"
@@ -1595,6 +1612,17 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "elements"
+version = "0.25.3"
+source = "git+https://github.com/ConcatenaLabs/SWK?rev=87a9f5e7f98356a2c00712884019079566aacfec#87a9f5e7f98356a2c00712884019079566aacfec"
+dependencies = [
+ "bech32",
+ "bitcoin",
+ "secp256k1-zkp",
+ "serde_json",
+]
 
 [[package]]
 name = "email_address"
@@ -4323,6 +4351,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dba61e98ffcb8aaa452eb2be632df2f54a48f72a8facf8d275ec63610c55b7d"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "secp256k1-zkp"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52a44aed3002b5ae975f8624c5df3a949cfbf00479e18778b6058fcd213b76e3"
+dependencies = [
+ "bitcoin-private",
+ "rand 0.8.6",
+ "secp256k1 0.29.1",
+ "secp256k1-zkp-sys",
+]
+
+[[package]]
+name = "secp256k1-zkp-sys"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f08b2d0b143a22e07f798ae4f0ab20d5590d7c68e0d090f2088a48a21d1654"
+dependencies = [
+ "cc",
+ "secp256k1-sys 0.10.1",
 ]
 
 [[package]]
