@@ -306,7 +306,7 @@ impl Store {
 		for (k, o) in p.outputs.iter().enumerate() {
 			let r = match &o.kind {
 				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, .. } => {
-					if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state <> 'lost'", &[&&owner_key[..]]).await?.is_some() {
+					if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state NOT IN ('lost', 'expired')", &[&&owner_key[..]]).await?.is_some() {
 						return Err(StoreError::KeyReused);
 					}
 					let nonce = draw_salted_nonce(&t, &p.id, owner_nonce).await?;
@@ -647,6 +647,7 @@ impl Store {
 			return Ok(false);
 		}
 		give_back(&t, id).await?;
+		free_keys(&t, id).await?;
 		t.commit().await?;
 		Ok(true)
 	}
@@ -705,14 +706,16 @@ impl Store {
 			&[&&id[..], &round_id, &attempt],
 		).await?;
 		give_back(&t, id).await?;
+		free_keys(&t, id).await?;
 		t.commit().await?;
 		Ok(true)
 	}
 
-	/// Whether `key` owns a leaf that is not lost.
+	/// Whether `key` owns a leaf that is neither lost nor expired (a leaf of a
+	/// participation that expired was never credited).
 	pub async fn key_owns_leaf(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
 		let conn = self.conn().await?;
-		Ok(conn.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state <> 'lost'", &[&&key[..]]).await?.is_some())
+		Ok(conn.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state NOT IN ('lost', 'expired')", &[&&key[..]]).await?.is_some())
 	}
 
 	/// The ids of the participations in `state`, oldest first.
@@ -751,6 +754,12 @@ async fn lock_in_round(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32], attem
 		return Err(StoreError::NotInRound(state.as_str()));
 	}
 	Ok(state)
+}
+
+/// The keys participation `id` wanted, free again: it is void or expired, and
+/// no leaf of it was ever credited.
+async fn free_keys(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result<u64, StoreError> {
+	Ok(t.execute("UPDATE participation_output SET active = false WHERE participation_id = $1 AND kind = 'leaf'", &[&&id[..]]).await?)
 }
 
 async fn give_back(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result<u64, StoreError> {

@@ -198,3 +198,98 @@ async fn participation_accepted_and_refused() {
 	assert!(VALUE - 900_000 >= fee + 500_000 * OFFBOARD_PPM / 1_000_000 + margin, "the fee covers the schedule");
 	assert_eq!(st["outputs"][1]["reclaim_delay_units"], 2 * 338 + 338);
 }
+
+/// Review R7c's F4 turned around. A participation wants a leaf only under a
+/// key it holds, proved by that key's signature over its key-proof digest:
+/// X naming Y's receive key, as a payment request publishes it, is refused
+/// with no proof and with a proof by another key, and a payer then pays Y's
+/// key. A key a participation wanted is free again once the participation
+/// never runs: Z's own participation, whose forfeit never comes, expires and
+/// Z's key is paid; V's, voided by the round because its coin passed its
+/// last round time, likewise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_runs() {
+	use arca_covenant::sign::sign_digest;
+	use arca_covenant::NewLeaf;
+	use common::client::{exit_delay, transfer_body};
+	use common::rounds::{advance_mtp, round_final};
+	let mut r = start().await;
+	let (s, chain, x) = (xonly(&r.s), r.chain, r.x);
+	// The operator's wallet funds the rounds.
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	const MARGIN: u64 = 2_000;
+	let fee = VALUE * REFRESH_PPM / 1_000_000;
+	let pay = |r: &Running, from: &Held, tx: &Transaction, to: &elements::secp256k1_zkp::Keypair| {
+		let v = from.record.resolve(std::slice::from_ref(tx), &r.policy()).unwrap();
+		let kept = v.value - MARGIN;
+		let leaf = NewLeaf { owner: xonly(to), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay() };
+		r.http.post("cosign_transfer", &transfer_body(&[(from, v, kept)], &[(x, kept - MARGIN, leaf)], s, chain))
+	};
+
+	// X wants a leaf under Y's key, which X does not hold.
+	let (xb, _) = credited_board(&mut r, &keypair("X")).await;
+	let y = keypair("Y receive");
+	let want_y = OutputRequest::Leaf { asset: x, value: VALUE - fee, template: arca_covenant::Template::Vtxo1, owner: xonly(&y),
+		owner_nonce: random32(), exit_delay: exit_delay() };
+	let (body, id) = participation_body(&[&xb], std::slice::from_ref(&want_y), &[(x, fee)], None, s, chain);
+	let a = r.http.post("submit_participation", &body);
+	println!("X's participation wanting Y's key, no key proof: {} {:?}", a.status, a.refusal());
+	refused(a, 400, "malformed");
+	let mut forged = body.clone();
+	let digest = server::participations::key_proof_digest(&id);
+	forged["outputs"][0]["leaf"]["key_proof"] = json!(hex(sign_digest(&keypair("X"), &digest, &random32()).as_ref()));
+	let a = r.http.post("submit_participation", &forged);
+	println!("X's participation wanting Y's key, proved by X's own key: {} {:?}", a.status, a.refusal());
+	refused(a, 422, "bad_attestation");
+	let (pb, ptx) = credited_board(&mut r, &keypair("payer")).await;
+	let t = pay(&r, &pb, &ptx, &y);
+	println!("a payer pays Y's key: {} {}", t.status, t.json.get("error").cloned().unwrap_or(json!("co-signed")));
+	assert_eq!(t.status, 200, "{}", t.json);
+
+	// Z's own participation: its key proved, its round run, its forfeit never
+	// handed over; a day after the round is final it expires, and Z's key is
+	// free again.
+	let (zb, _) = credited_board(&mut r, &keypair("Z")).await;
+	let z = keypair("Z, new leaf");
+	let (want_z, _) = want_leaf(&z, x, VALUE - fee);
+	let (body, zid) = participation_body(&[&zb], &[want_z], &[(x, fee)], None, s, chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (p2b, p2tx) = credited_board(&mut r, &keypair("payer 2")).await;
+	refused(pay(&r, &p2b, &p2tx, &z), 409, "key_reused");
+	advance_mtp(&r, 86_400 + 600).await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let st = r.http.post("participation_status", &json!({"participation_id": hex(&zid)})).ok();
+	assert_eq!(st["state"], "expired", "{}", st);
+	let t = pay(&r, &p2b, &p2tx, &z);
+	println!("Z's participation expired, its leaf never credited; a payer pays Z's key: {} {}", t.status,
+		t.json.get("error").cloned().unwrap_or(json!("co-signed")));
+	assert_eq!(t.status, 200, "{}", t.json);
+
+	// V's participation, its coin a board that passes its last round time
+	// before a round takes it: the round voids it, and V's key is free again.
+	let (vb, _) = credited_board(&mut r, &keypair("V")).await;
+	let v = keypair("V, new leaf");
+	let (want_v, _) = want_leaf(&v, x, VALUE - fee);
+	let (body, vid) = participation_body(&[&vb], &[want_v], &[(x, fee)], None, s, chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	advance_mtp(&r, 27 * 86_400 + 600).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "no round: V's participation can never run");
+	let st = r.http.post("participation_status", &json!({"participation_id": hex(&vid)})).ok();
+	assert_eq!(st["state"], "void", "{}", st);
+	let (p3b, p3tx) = credited_board(&mut r, &keypair("payer 3")).await;
+	let t = pay(&r, &p3b, &p3tx, &v);
+	println!("V's participation void; a payer pays V's key: {} {}", t.status, t.json.get("error").cloned().unwrap_or(json!("co-signed")));
+	assert_eq!(t.status, 200, "{}", t.json);
+}

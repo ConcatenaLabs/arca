@@ -29,7 +29,7 @@ use arca_covenant::{connector_asset, Chain, ClockSchedule, CoinRecord, ExplicitO
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::ForfeitRow;
-use super::client::{participation_id, Wanted};
+use super::client::{key_proof_digest, participation_id, Wanted};
 use super::pay::MARGIN_MULTIPLE;
 use super::wallet::{amount, sign, Wallet};
 use super::Error;
@@ -234,8 +234,17 @@ impl Wallet {
 			let key = self.keys.leaf(&r.owner_nonce)?;
 			inputs.push(json!({"leaf_id": r.leaf_id, "attestation": hex(sign(&key, &id).as_ref())}));
 		}
+		// Each leaf wanted under a key the wallet holds, and proves it holds.
+		let mut outputs = vec![];
+		for w in &wanted {
+			let Wanted::Leaf { owner_nonce, .. } = w;
+			let key = self.keys.leaf(owner_nonce)?;
+			let mut j = w.json();
+			j["leaf"]["key_proof"] = json!(hex(sign(&key, &key_proof_digest(&id)).as_ref()));
+			outputs.push(j);
+		}
 		let mut body = json!({
-			"inputs": inputs, "outputs": wanted.iter().map(Wanted::json).collect::<Vec<_>>(),
+			"inputs": inputs, "outputs": outputs,
 			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(),
 		});
 		if let Some(t) = not_before {

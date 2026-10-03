@@ -7,7 +7,8 @@
 //! hash `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key)`,
 //! `T = SHA256("Arca/auth")`. A transfer is authenticated by its owners'
 //! signatures over the transfer itself, a participation by each owner's
-//! attestation over the participation's id. There is no bearer token.
+//! attestation over the participation's id, and by each key it wants a leaf
+//! under, signing its key-proof digest. There is no bearer token.
 //!
 //! Every refusal the server makes comes back as [`Error::Server`], with its
 //! HTTP status, its stable code and its sentence; any other failure, a 5xx or
@@ -30,6 +31,23 @@ pub const AUTH_TAG: &[u8] = b"Arca/auth";
 
 /// The tag of a participation's id.
 pub const PARTICIPATION_TAG: &[u8] = b"Arca/participation";
+
+/// The tag of a key proof, the signature by a key a participation wants a
+/// leaf under.
+pub const KEY_PROOF_TAG: &[u8] = b"Arca/participation-key";
+
+/// The digest each key a participation wants a leaf under signs, to prove the
+/// participation holds it: `SHA256(T ‖ T ‖ id)`,
+/// `T = SHA256("Arca/participation-key")`. The server's
+/// (`server::participations::key_proof_digest`).
+pub fn key_proof_digest(id: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(KEY_PROOF_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(id);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
 
 /// The digest `key` signs to authenticate `call` with `challenge`.
 pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey) -> [u8; 32] {

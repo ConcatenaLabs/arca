@@ -25,7 +25,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql),
 [`schema/V6__signer_head.sql`](schema/V6__signer_head.sql),
 [`schema/V7__signer_messages.sql`](schema/V7__signer_messages.sql),
-[`schema/V8__stateless_challenges.sql`](schema/V8__stateless_challenges.sql)). `Store::connect` builds it
+[`schema/V8__stateless_challenges.sql`](schema/V8__stateless_challenges.sql),
+[`schema/V9__wanted_keys_freed.sql`](schema/V9__wanted_keys_freed.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -35,7 +36,8 @@ requests can race past them:
 - **Leaves, keyed by leaf id.** Every coin the server knows (a board, a leaf
   of a batch, an output of a transfer) is a row keyed by its leaf id, never by
   an outpoint, with its coin record, from which its lineage and every
-  transaction that brings it on-chain follow. A key owns one leaf.
+  transaction that brings it on-chain follow. A key owns one leaf; a leaf of
+  a participation that expired, never credited, owns none.
 - **Arca scripts.** Every leaf, board and checkpoint script the server has
   created or co-signed into appears once: a leaf script is never funded twice,
   across batches, boards and transfers alike. The operator's connector script,
@@ -271,8 +273,11 @@ each with an attestation (its owner key's BIP340 signature over the
 participation's id), the outputs it wants for them, the fee it pays in each
 asset, and optionally the earliest median time of a round it may run in, at
 most seven days ahead. An output wanted is a leaf (its template, `vtxo-1`, its
-owner key and nonce, its exit delay, asset and value) or an offboard (an asset,
-a value and the on-chain script to pay). The server accepts it only when:
+owner key and nonce, its exit delay, asset and value, and its key proof: the
+owner key's BIP340 signature over `SHA256(T ‖ T ‖ id)`,
+`T = SHA256("Arca/participation-key")`, so a participation wants a leaf only
+under a key it holds) or an offboard (an asset, a value and the on-chain
+script to pay). The server accepts it only when:
 
 - every coin given up passes the same check as a transfer's input: known,
   live, given up nowhere else, its record valid, every board it rests on
@@ -284,8 +289,9 @@ a value and the on-chain script to pay). The server accepts it only when:
   earliest round time asked for lies before the last time every coin is
   taken;
 - every leaf wanted is within the published bounds, under a key that owns no
-  leaf, that no other participation wants and that is not the operator's `S`
-  (`operator_key`); every offboard pays a served
+  leaf, that no other participation standing wants and that is not the
+  operator's `S` (`operator_key`), and its key proof verifies
+  (`bad_attestation`); every offboard pays a served
   asset within its bounds to a script that is not an Arca script;
 - per asset, the coins given up hold exactly what the outputs take plus the
   fee, and the fee covers the schedule.
@@ -1035,7 +1041,8 @@ on-chain is answered by its forfeit and the claim, and its exit is refused.
 forfeits have not come a day after its round was found final expires: its
 coin is live again and given up again in a new participation, its new leaf is
 expired, a good forfeit for it is refused and stores nothing, its new leaf's
-key cannot be wanted again, and a participation of the same round whose
+key is free again and wanted by the new participation, and a participation of
+the same round whose
 forfeits came is untouched. On batch leaves of a round whose first expiry is
 `E`: six days before `E` a refresh is charged for the day before the free
 window, and refused one atom short; four days before it is free and runs; a
@@ -1121,7 +1128,12 @@ asset; a fee one atom short of the schedule; a key wanted twice, wanted
 already, or owning a board; a template a round does not build; an exit
 delay, an asset, a leaf value or a round time outside the bounds; an offboard
 to an Arca script; an unknown coin, a board not yet final, a stray field, a
-coin given twice, and an unknown participation.
+coin given twice, and an unknown participation. A
+participation naming a key it does not hold (another holder's receive key)
+is refused, without a key proof (`malformed`) and with one by another key
+(`bad_attestation`), and a payer then pays that key; a key wanted by a
+participation that expired, or that a round voided because its board coin
+passed its last round time, is free again and paid.
 
 The user needs the right to create databases. A throwaway server in user
 space is enough:

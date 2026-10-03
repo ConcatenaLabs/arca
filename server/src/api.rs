@@ -379,6 +379,10 @@ pub struct WantedLeaf {
 	pub owner: String,
 	pub owner_nonce: String,
 	pub exit_delay_units: u16,
+	/// The owner key's BIP340 signature over the participation's key-proof
+	/// digest (`participations::key_proof_digest`): a participation wants a
+	/// leaf only under a key it holds.
+	pub key_proof: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -152,8 +152,9 @@ pub async fn resolve(store: &Store, policy: &WalletPolicy, id: &LeafId) -> Resul
 /// Checks the coin `id` given up by `holder` (a transfer, or a
 /// participation): see the [module documentation](self). A coin resting on a
 /// board is taken only while the board's service expiry lies more than
-/// `board_horizon` seconds ahead. A coin already spent by `holder` itself
-/// passes, the board's dates included, so a repeated request gets its answer.
+/// `board_horizon` seconds ahead, whoever holds it now: a round checks the
+/// coins its participations gave up against it. A coin already spent by
+/// `holder` itself passes the rest, so a repeated request gets its answer.
 pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], board_horizon: u32)
 	-> Result<Checked, CoinError>
 {
@@ -169,7 +170,7 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 	}
 	let Checked { record, coin, bases: found, board_expiry } = resolve(store, policy, id).await?;
 	if let Some(e) = board_expiry {
-		if !repeat && (policy.now.to_consensus_u32() as u64) + board_horizon as u64 >= e as u64 {
+		if (policy.now.to_consensus_u32() as u64) + board_horizon as u64 >= e as u64 {
 			return Err(CoinError::PastBoardDate { leaf: *id, expiry: e, horizon: board_horizon });
 		}
 	}

@@ -87,6 +87,22 @@ pub const MAX_DEFER: u32 = 7 * 86_400;
 /// The tag of a participation's id.
 pub const PARTICIPATION_TAG: &[u8] = b"Arca/participation";
 
+/// The tag of a key proof: the signature, by the key a leaf is wanted under,
+/// that the participation's author holds that key.
+pub const KEY_PROOF_TAG: &[u8] = b"Arca/participation-key";
+
+/// The digest each key a participation wants a leaf under signs:
+/// `SHA256(T ‖ T ‖ id)`, `T = SHA256("Arca/participation-key")`. The tag keeps
+/// it apart from the attestation over the id itself, which gives up a coin.
+pub fn key_proof_digest(id: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(KEY_PROOF_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(id);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// A coin given up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRequest {
@@ -120,6 +136,9 @@ impl OutputRequest {
 pub struct ParticipationRequest {
 	pub inputs: Vec<InputRequest>,
 	pub outputs: Vec<OutputRequest>,
+	/// For each output, in order, the proof of its key ([`key_proof_digest`],
+	/// signed by the key a leaf is wanted under); `None` for an offboard.
+	pub key_proofs: Vec<Option<Signature>>,
 	/// The fee paid, per asset, in that asset.
 	pub fees: Vec<(AssetId, u64)>,
 	/// The earliest median time of a round it may run in.
@@ -193,6 +212,9 @@ pub enum ParticipationError {
 	Coin(CoinError),
 	#[error("input {0}: the attestation is not the coin's owner's signature over the participation")]
 	BadAttestation(usize),
+	#[error("output {0}: the key proof is not the wanted key's signature over the participation: a participation wants a leaf only \
+		under a key it holds")]
+	BadKeyProof(usize),
 	#[error("output {0}: template {1} is not one a round builds")]
 	Template(usize, String),
 	#[error("an output is outside the operator's published bounds: {0}")]
@@ -231,7 +253,7 @@ impl ParticipationError {
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
-			BadAttestation(_) => "bad_attestation",
+			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
 			Template(..) => "template",
 			OutOfBounds(_) => "out_of_bounds",
 			KeyReused => "key_reused",
@@ -381,7 +403,12 @@ impl Participations {
 			}
 		}
 
-		// The outputs, within the published bounds.
+		// The outputs, within the published bounds, each leaf under a key the
+		// participation proves it holds.
+		if req.key_proofs.len() != m {
+			return Err(ParticipationError::Malformed(format!("{} key proofs for {} outputs", req.key_proofs.len(), m)));
+		}
+		let proof_digest = key_proof_digest(&id);
 		let mut keys = HashSet::new();
 		for (j, o) in req.outputs.iter().enumerate() {
 			p.check_value(o.asset(), o.value()).map_err(ParticipationError::OutOfBounds)?;
@@ -401,6 +428,10 @@ impl Participations {
 					}
 					if !keys.insert(*owner) {
 						return Err(ParticipationError::KeyReused);
+					}
+					match &req.key_proofs[j] {
+						Some(proof) if verify_digest(proof, &proof_digest, owner) => {},
+						_ => return Err(ParticipationError::BadKeyProof(j)),
 					}
 				},
 				OutputRequest::Offboard { script, .. } => {
