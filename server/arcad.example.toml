@@ -33,6 +33,12 @@ round_interval_seconds = 60
 # specification's 36 to 48 hours, [254, 338].
 # exit_delay_units = [254, 338]
 
+# Where the operator's metrics are served (GET /metrics, the text format
+# Prometheus reads): the watcher's fee pool, what is outstanding against it,
+# and the board forfeits it holds back. For the operator alone: a loopback
+# address. None are served when absent.
+# metrics_listen = "127.0.0.1:3536"
+
 # The assets a round's fee is paid in, in order of preference. A round pays in
 # the first of its own batches' assets the node accepts for fees, else in the
 # first of these it accepts, and never in any other. The served assets, in the

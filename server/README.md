@@ -433,7 +433,9 @@ node before expiry, with one atom of each `M` its owners' releases name.
 The watcher (`watcher`) is everything the operator does on the chain after a
 round. It follows the finality service: on each of its passes it answers
 stale exits and claims forfeits, and after each new block, or at least every
-`recovery_interval_seconds`, it does the rest. It never builds a second spend
+`recovery_interval_seconds`, it does the rest, always in the order of the
+deadlines: answers to stale exits (the exit delay), then claims (the refund
+delay), then new forfeits and the rest, which have none. It never builds a second spend
 of an outpoint while a spend of its own is in the nursery and not lost, so
 each step is taken once, and every transaction it publishes goes to the nursery,
 which broadcasts it again unchanged after a rollback of any depth. Each step
@@ -509,9 +511,23 @@ the signers committed to: paid whole, a large margin would be a fee the node
 refuses (`max-fee-exceeded`). Otherwise a coin of the wallet's pays, in the
 first asset of `fee_assets` the node accepts, and the margin goes to the
 wallet's change. No
-asset is assumed, the policy asset included. A coin that pays a fee is taken
-until its change is final, so an operator keeps several coins in each fee
-asset; a step the wallet cannot pay for waits, and is logged.
+asset is assumed, the policy asset included. The watcher spends the change of
+its own transactions the nursery still holds as pending, in a block or not,
+as long as fewer than twenty of its transactions waiting for a block lie
+under it; a round spends only final coins. A step the wallet cannot pay for
+waits, and is logged.
+
+A board forfeit in an asset the node does not accept for fees takes a wallet
+coin for its fee, and so does its claim. The watcher publishes one only while
+the fee pool (what it can pay fees with in the first accepted fee asset)
+covers, twice over, the claims of the forfeits already waiting and this
+forfeit with its claim; the rest are held back, and the pass logs that the
+pool cannot cover what is outstanding. The operator's metrics
+(`metrics_listen`, `GET /metrics` in the text format Prometheus reads) give
+the pool and what is outstanding per fee asset
+(`arca_watcher_fee_pool`, `arca_watcher_fee_outstanding`) and the board
+forfeits held back for block space or for the pool
+(`arca_watcher_forfeits_held`).
 
 ## The interface
 
@@ -610,7 +626,8 @@ fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
 behind (`[limits]`: the rate of nonces and challenges, a nonce's lifetime,
-how long a board may stay out of every block). The node must run with `-txindex` and `-validateanchor`.
+how long a board may stay out of every block), and where the operator's
+metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
 
 An asset served need not be accepted for fees by the node. A batch in such an
 asset carries a reserve of one atom on every node and every entry, on every
@@ -753,6 +770,15 @@ watcher passes once a block, and after each block the test checks every
 forfeit in a block whose claim is not: its refund must not be open (the tip's
 median time short of the refund delay past that of the block before the
 forfeit's), and its owner's refund is refused. Every forfeit is claimed.
+
+`tests/fee_pool.rs` turns R7's P5 around: eight boards of Y, which the node
+does not accept for fees, given up in one round, the wallet holding two coins
+of X, a parent block every ten blocks. The watcher publishes all eight
+forfeits in one pass, chaining each fee on the change of the one before, and
+claims them the next block; no refund. Then a pool too small for eight (fees
+at a thousand times the floor): two forfeits go out, six are held back, the
+log and the metrics say so, and once the wallet is paid more of X the rest
+go out and every one is claimed.
 
 `tests/funding.rs` gives the operator's wallet less of Y than a
 participation in Y wants: the round takes the participation in X, the one in

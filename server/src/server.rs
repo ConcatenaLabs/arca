@@ -81,6 +81,11 @@ pub struct Config {
 	/// absent.
 	#[serde(default)]
 	pub limits: LimitsSection,
+	/// Where the operator's metrics are served (`GET /metrics`, the text
+	/// format Prometheus reads), for the operator alone: a loopback address.
+	/// None are served when absent.
+	#[serde(default)]
+	pub metrics_listen: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -354,6 +359,8 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
+	/// Where the metrics are served, when they are.
+	pub metrics_addr: Option<SocketAddr>,
 	pub store: Store,
 	pub params: Arc<Params>,
 	pub finality: Arc<FinalityService>,
@@ -476,6 +483,22 @@ impl Server {
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
 			challenges: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
 		});
+		let mut metrics_addr = None;
+		if let Some(at) = &config.metrics_listen {
+			let w = watcher.clone();
+			let routes = axum::Router::new().route("/metrics", axum::routing::get(move || {
+				let w = w.clone();
+				async move { w.fee_status().metrics() }
+			}));
+			let listener = tokio::net::TcpListener::bind(at).await.map_err(err("metrics_listen"))?;
+			metrics_addr = Some(listener.local_addr().map_err(err("metrics_listen"))?);
+			log::info!("metrics on {}", metrics_addr.expect("set"));
+			tasks.push(tokio::spawn(async move {
+				if let Err(e) = axum::serve(listener, routes).await {
+					log::error!("the metrics listener stopped: {}", e);
+				}
+			}));
+		}
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
 		let addr = listener.local_addr().map_err(err("listen"))?;
 		let routes = router(app);
@@ -485,7 +508,7 @@ impl Server {
 			}
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher, tasks })
+		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher, tasks })
 	}
 
 	/// Stops every task.

@@ -93,6 +93,68 @@ impl Store {
 		Ok(true)
 	}
 
+	/// Records the outputs of `tx`, a transaction of the watcher's the nursery
+	/// holds, that pay the wallet: its change, spendable by the watcher's
+	/// next transaction before any block holds it. A block that holds the
+	/// transaction finds the coin there already.
+	pub async fn record_pending_outputs(&self, tx: &elements::Transaction) -> Result<(), StoreError> {
+		use elements::hashes::Hash;
+		let conn = self.conn().await?;
+		let txid = tx.txid().to_byte_array();
+		for (vout, o) in tx.output.iter().enumerate() {
+			let (asset, value) = match (o.asset.explicit(), o.value.explicit()) {
+				(Some(a), Some(v)) if v > 0 && o.nonce.is_null() => (a.into_inner().to_byte_array(), v),
+				_ => continue,
+			};
+			let value = i64::try_from(value).map_err(|_| StoreError::Corrupt(format!("value {}", value)))?;
+			conn.execute(
+				"INSERT INTO wallet_coin (txid, vout, asset, value, script_pubkey)
+				 SELECT $1, $2, $3, $4, k.script_pubkey FROM wallet_key k WHERE k.script_pubkey = $5
+				 ON CONFLICT (txid, vout) DO NOTHING",
+				&[&&txid[..], &(vout as i32), &&asset[..], &value, &o.script_pubkey.as_bytes()],
+			).await?;
+		}
+		Ok(())
+	}
+
+	/// The wallet's coins of `asset` that nothing spends whose transaction is
+	/// the watcher's and pending in the nursery (in no block yet, or in one
+	/// not final), each with how many of the watcher's transactions it rests
+	/// on, its own included, whether or not a block holds them.
+	pub async fn pending_change(&self, asset: &[u8; 32]) -> Result<Vec<(WalletCoin, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("{} JOIN watcher_tx w ON w.txid = c.txid JOIN nursery_tx n ON n.txid = c.txid
+				WHERE c.spent_by IS NULL AND c.asset = $1 AND n.state = 'pending'
+				ORDER BY c.value DESC", COIN_QUERY),
+			&[&&asset[..]],
+		).await?;
+		let mut out = vec![];
+		for r in &rows {
+			let c = coin(r)?;
+			let depth = conn.query_one(
+				"WITH RECURSIVE anc(txid, d) AS (
+				   SELECT $1::bytea, 0
+				   UNION
+				   SELECT wi.prev_txid, anc.d + 1 FROM anc
+				   JOIN watcher_input wi ON wi.txid = anc.txid
+				   JOIN nursery_tx n ON n.txid = wi.prev_txid AND n.state = 'pending'
+				   WHERE anc.d < 50 AND NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = wi.prev_txid))
+				 SELECT count(DISTINCT txid) FROM anc",
+				&[&&c.txid[..]],
+			).await?;
+			out.push((c, depth.get::<_, i64>(0) as u32));
+		}
+		Ok(out)
+	}
+
+	/// Forgets the coins `txid` made that no block holds: the transaction
+	/// can never confirm.
+	pub async fn forget_pending_outputs(&self, txid: &[u8; 32]) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.execute("DELETE FROM wallet_coin WHERE txid = $1 AND found_in IS NULL", &[&&txid[..]]).await?)
+	}
+
 	/// Frees the coins `txid` spent: the transaction will never confirm.
 	pub async fn release_wallet_coins(&self, txid: &[u8; 32]) -> Result<u64, StoreError> {
 		let conn = self.conn().await?;
