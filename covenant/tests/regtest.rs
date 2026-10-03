@@ -166,23 +166,41 @@ fn unlock(net: &Net, b: &Batch, i: usize, coin: &Coin, preimage: &[u8; 32], to: 
 	s.tx
 }
 
-/// Roll or release of clock `j`, paying the token to `to`, an operator fee
-/// coin paying the fee.
+/// Roll or release of clock `j`, built by `ClockSchedule::roll_tx` or
+/// `release_tx`, an operator fee coin paying the fee. A release's lock time
+/// is the clock's expiry; `lock` replaces it, for the negative cases.
 #[allow(clippy::too_many_arguments)]
 fn clock_move(net: &Net, s_key: &Keypair, sched: &ClockSchedule, j: usize, roll: bool, token: &Coin, fc: &Coin, lock: u32) -> Transaction {
-	let clocks = sched.clocks();
-	let c = &clocks[j];
-	let to = if roll { clocks[j + 1].output.script_pubkey() } else { sched.r().script_pubkey() };
-	let mut s = spend(lock).coin(token, 0xffff_fffe).coin(fc, 0xffff_fffe).outputs(vec![
-		explicit(sched.token, 1, to),
-		explicit(net.policy, fc.txout.value.explicit().unwrap() - 4_000, op_true_spk()),
-		fee(net.policy, 4_000),
-	]);
-	let script = if roll { c.roll.clone().unwrap() } else { c.release.clone() };
-	let sg = s.sign(s_key, 0, &script, net.genesis);
-	s.witness(0, c.output.witness(&script, Clock::witness_items(&sg)));
-	s.witness(1, op_true_witness());
-	s.tx
+	let fee = FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout.clone(), fee: 4_000, change: op_true_spk() };
+	let mut ks = if roll { sched.roll_tx(j, token.outpoint, &fee) } else { sched.release_tx(j, token.outpoint, &fee) }.unwrap();
+	if !roll {
+		ks.tx.lock_time = elements::LockTime::from_consensus(lock);
+	}
+	let sg = sig(s_key, &ks.sighash(net.genesis).unwrap());
+	let mut tx = ks.finish(Clock::witness_items(&sg)).tx;
+	tx.input[1].witness.script_witness = op_true_witness();
+	tx
+}
+
+/// One wave of a sweep built by `sweep_tx`: `swept` behind the token at `R`
+/// held at `token`, paying `to` with the swept outputs' margin as the fee, or
+/// (a burn-only sweep, `to` empty) an operator fee coin paying.
+fn built_sweep(net: &mut Net, s_key: &Keypair, sched: &ClockSchedule, swept: &[Sweepable], token: &Coin, to: &[ExplicitOutput]) -> Transaction {
+	let burn = swept[0].sweep.burn;
+	let fee = if burn {
+		let fc = net.fee_coin();
+		FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout.clone(), fee: 5_000, change: op_true_spk() }
+	} else {
+		FeeSource::Reserve
+	};
+	let sw = sweep_tx(sched, token.outpoint, swept, to, &fee).unwrap();
+	let sigs: Vec<_> = (0..sw.leaves.len()).map(|i| sig(s_key, &sw.sighash(i, net.genesis).unwrap())).collect();
+	let n = sw.leaves.len();
+	let mut tx = sw.finish(&sigs).unwrap().tx;
+	if burn {
+		tx.input[n].witness.script_witness = op_true_witness();
+	}
+	tx
 }
 
 fn r_sign(net: &Net, s_key: &Keypair, sched: &ClockSchedule, s: &mut Spend, idx: usize) {
@@ -575,9 +593,14 @@ fn entry_sweep(net: &mut Net) {
 	let mut at_r = coin_of(rl, 0, &tx);
 
 	let w = delay().to_sequence();
-	let sweep_entry = |net: &Net, i: usize, coin: &Coin, token: &Coin, with_token: bool| -> Transaction {
+	let sweep_entry = |net: &mut Net, i: usize, coin: &Coin, token: &Coin, with_token: bool| -> Transaction {
 		let e = &b.entries[i];
 		let value = coin.txout.value.explicit().unwrap();
+		if with_token {
+			// Built by the library.
+			let to = [ExplicitOutput::new(net.x, value - 3_000, op_true_spk())];
+			return built_sweep(net, &s_key, &sched, &[e.sweepable(coin.outpoint, value)], token, &to);
+		}
 		// Without the token, an ordinary coin of X stands at input 1.
 		let t_in = if with_token { token.clone() } else { net.purse.iter().find(|c| c.txout.asset.explicit() == Some(net.x)).unwrap().clone() };
 		let back = if with_token { explicit(sched.token, 1, sched.r().script_pubkey()) } else { explicit(net.x, t_in.txout.value.explicit().unwrap(), op_true_spk()) };
@@ -585,7 +608,7 @@ fn entry_sweep(net: &mut Net) {
 			.outputs(vec![explicit(net.x, value - 3_000, op_true_spk()), back, fee(net.x, 3_000)]);
 		let sg = s.sign(&s_key, 0, &e.sweep_script(), net.genesis);
 		s.witness(0, e.sweep_witness(&sg, 1));
-		if with_token { r_sign(net, &s_key, &sched, &mut s, 1); } else { s.witness(1, op_true_witness()); }
+		s.witness(1, op_true_witness());
 		s.tx
 	};
 	// The entries have been on-chain for days, but the token has not waited W at R.
@@ -685,7 +708,7 @@ fn burn(net: &mut Net) {
 	let v = b.value();
 	let t_back = explicit(sched.token, 1, sched.r().script_pubkey());
 	let batch_node = (&b.root, &r.batch, 0xffff_fffe);
-	let tx = burn_tx(net, &sched, &[batch_node], &at_r, vec![explicit(net.x, v, burn_spk.clone()), t_back.clone()], &s_key);
+	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v)], &at_r, &[]);
 	net.refuse("burn/neg the batch output burned at the release (no notice)", &tx, "non-BIP68-final");
 	net.wait_csv(&rl, delay());
 	net.wait_csv(&rl2, delay());
@@ -700,7 +723,7 @@ fn burn(net: &mut Net) {
 		let tx = burn_tx(net, &sched, &[batch_node], &at_r, outs, key);
 		net.refuse(name, &tx, expect);
 	}
-	let tx = burn_tx(net, &sched, &[batch_node], &at_r, vec![explicit(net.x, v, burn_spk.clone()), t_back.clone()], &s_key);
+	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v)], &at_r, &[]);
 	let bt = net.pass("burn/the batch output burned after the notice, behind the token", &tx);
 	let gone: Value = net.rpc("gettxout", json!([bt.to_string(), 0]));
 	assert!(gone.is_null(), "the OP_RETURN output never enters the UTXO set");
@@ -719,19 +742,20 @@ fn burn(net: &mut Net) {
 	// A node relays several bare OP_RETURN burns in one transaction; one whose
 	// relay policy still counts each against the one-OP_RETURN limit refuses
 	// it (multi-op-return), and a producer mines it.
-	let tx = burn_tx(net, &sched2, &[n0, n1], &at_r2,
-		vec![explicit(net.x, lv, burn_spk.clone()), explicit(net.x, lv, burn_spk.clone()), t_back2], &s_key);
+	let swept2 = [b2.lowest[0].sweepable(lowest2[0].outpoint, lv), b2.lowest[1].sweepable(lowest2[1].outpoint, lv)];
+	let tx = built_sweep(net, &s_key, &sched2, &swept2, &at_r2, &[]);
+	assert_eq!(tx.output[2], t_back2, "the token goes back to R after the burns");
 	let bt2 = net.pass_or_mine("burn/two lowest nodes burned in one transaction", &tx, "multi-op-return");
 	for i in [0, 1] {
 		assert!(net.rpc("gettxout", json!([bt2.to_string(), i])).is_null());
 	}
 	// The next node: the token, back at R, waits W again.
 	let at_r2 = coin_of(bt2, 2, &tx);
-	let n2 = (&b2.lowest[2], &lowest2[2], w);
-	let tx = burn_tx(net, &sched2, &[n2], &at_r2, vec![explicit(net.x, lv, burn_spk.clone()), explicit(sched2.token, 1, sched2.r().script_pubkey())], &s_key);
+	let n2 = [b2.lowest[2].sweepable(lowest2[2].outpoint, lv)];
+	let tx = built_sweep(net, &s_key, &sched2, &n2, &at_r2, &[]);
 	net.refuse("burn/neg the next node before the token has waited W again", &tx, "non-BIP68-final");
 	net.wait_csv(&bt2, delay());
-	let tx = burn_tx(net, &sched2, &[n2], &at_r2, vec![explicit(net.x, lv, burn_spk.clone()), explicit(sched2.token, 1, sched2.r().script_pubkey())], &s_key);
+	let tx = built_sweep(net, &s_key, &sched2, &n2, &at_r2, &[]);
 	net.pass("burn/a lowest node burned after its notice, behind the token", &tx);
 }
 

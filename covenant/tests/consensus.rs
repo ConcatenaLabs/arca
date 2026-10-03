@@ -14,12 +14,14 @@ use elements::hashes::Hash;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::{Keypair, XOnlyPublicKey};
 use elements::sighash::{Prevouts, SighashCache};
-use elements::{AssetId, BlockHash, SchnorrSighashType, Script, TxOut};
+use elements::{AssetId, BlockHash, OutPoint, SchnorrSighashType, Script, TxOut, Txid};
 
 use arca_consensus::Verifier;
 use arca_covenant::htlc::HtlcPath;
 use arca_covenant::message::rebind_message;
 use arca_covenant::script::{record, sha256};
+use arca_covenant::sign::sign_digest;
+use arca_covenant::spend::{FeeSource, SpendError, UnrollTx};
 use arca_covenant::*;
 
 use common::*;
@@ -998,6 +1000,131 @@ fn burn_cases(f: &F, book: &mut Book) {
 }
 
 // ---------------------------------------------------------------------------
+// The operator's builders: release, roll and the sweep
+// ---------------------------------------------------------------------------
+
+fn fake_outpoint(label: &str) -> OutPoint {
+	OutPoint::new(Txid::from_raw_hash(elements::hashes::sha256d::Hash::hash(label.as_bytes())), 0)
+}
+
+fn fee_coin_source(f: &F, label: &str, value: u64, fee: u64) -> FeeSource {
+	FeeSource::Coin { outpoint: fake_outpoint(label), coin: f.fee_coin(f.y, value), fee, change: op_true().script_pubkey() }
+}
+
+/// A built transaction as a `Spend`, with an attached fee coin's witness.
+fn spend_of(u: UnrollTx, fee_coin: Option<usize>) -> Spend {
+	let mut s = Spend { tx: u.tx, prevouts: u.prevouts };
+	if let Some(i) = fee_coin {
+		s.witness(i, op_true_witness());
+	}
+	s
+}
+
+fn builder_cases(f: &F, book: &mut Book) {
+	let clocks = f.schedule.clocks();
+	let token0 = fake_outpoint("token at clock 0");
+
+	// Release and roll, a fee coin of Y paying.
+	let release = f.schedule.release_tx(0, token0, &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
+	assert_eq!(release.tx.lock_time.to_consensus_u32(), clocks[0].expiry.to_consensus_u32(), "the release's lock time is E_0");
+	assert_eq!(release.tx.input[0].sequence.0, 0xffff_fffe, "the token's input is not final");
+	assert_eq!(release.tx.output[0], explicit(f.schedule.token, 1, f.schedule.r().script_pubkey()), "the token goes to R at output 0");
+	let sg = sign_digest(&f.s, &release.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.pass("builder/release of clock 0, a fee coin paying", &spend_of(release.clone().finish(Clock::witness_items(&sg)), Some(1)));
+	let bad = sign_digest(&f.stranger, &release.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.fail("builder/neg release signed by a stranger", &spend_of(release.clone().finish(Clock::witness_items(&bad)), Some(1)), 0, BAD_SIG);
+	let mut early = release.clone();
+	early.tx.lock_time = elements::LockTime::from_consensus(clocks[0].expiry.to_consensus_u32() - 1);
+	let sg = sign_digest(&f.s, &early.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.fail("builder/neg release with a lock time one second before E_0", &spend_of(early.finish(Clock::witness_items(&sg)), Some(1)), 0, LOCKTIME);
+	let roll = f.schedule.roll_tx(0, token0, &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
+	assert_eq!(roll.tx.output[0], explicit(f.schedule.token, 1, clocks[1].output.script_pubkey()));
+	let sg = sign_digest(&f.s, &roll.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.pass("builder/roll of clock 0 into clock 1", &spend_of(roll.clone().finish(Clock::witness_items(&sg)), Some(1)));
+	let mut stray = roll.clone();
+	stray.tx.output[0] = explicit(f.schedule.token, 1, clocks[2].output.script_pubkey());
+	let sg = sign_digest(&f.s, &stray.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.fail("builder/neg roll of clock 0 straight to clock 2", &spend_of(stray.finish(Clock::witness_items(&sg)), Some(1)), 0, FALSE);
+	let last = f.schedule.release_tx(2, fake_outpoint("token at clock 2"), &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
+	let sg = sign_digest(&f.s, &last.sighash(f.genesis).unwrap(), &[0; 32]);
+	book.pass("builder/release of the last clock", &spend_of(last.finish(Clock::witness_items(&sg)), Some(1)));
+	assert_eq!(f.schedule.roll_tx(2, token0, &fee_coin_source(f, "c", 9_000, 900)).unwrap_err(), SpendError::LastClock(2));
+	assert_eq!(f.schedule.release_tx(3, token0, &fee_coin_source(f, "c", 9_000, 900)).unwrap_err(), SpendError::ClockStep { step: 3, steps: 3 });
+	assert_eq!(f.schedule.release_tx(0, token0, &FeeSource::Reserve).unwrap_err(), SpendError::NeedsFeeCoin("the token"));
+	assert_eq!(f.schedule.place(&clocks[1].output.script_pubkey()), Some(TokenPlace::Clock(1)));
+	assert_eq!(f.schedule.place(&f.schedule.r().script_pubkey()), Some(TokenPlace::Released));
+	assert_eq!(f.schedule.place(&f.operator_spk()), None);
+
+	// One wave of a sweep: the batch output, a lowest node, an entry and a
+	// checkpoint, behind the token at R.
+	let os = owners(4);
+	let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
+	let children = children_of(f, &os, LEAF);
+	let value = 4 * LEAF + RESERVE;
+	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, false), None).unwrap();
+	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, false), Some(f.chain)).unwrap();
+	let entry = EntryPolicy { unlock_hash: label32("h"), asset: f.x, value: LEAF, leaf_program: f.leaf(&f.a, "salt").program(),
+		sweep: f.schedule.sweep(true, false) };
+	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp salt"), chain: f.chain,
+		sweep: f.schedule.sweep(true, false) };
+	let swept = vec![
+		batch.sweepable(fake_outpoint("batch"), value),
+		lowest.sweepable(fake_outpoint("lowest"), value),
+		entry.sweepable(fake_outpoint("entry"), LEAF + RESERVE),
+		cp.sweepable(fake_outpoint("checkpoint"), f.x, LEAF),
+	];
+	let total = 2 * value + LEAF + RESERVE + LEAF;
+	let at_r = fake_outpoint("token at R");
+	let to = vec![ExplicitOutput::new(f.x, total - FEE, f.operator_spk())];
+	let sw = sweep_tx(&f.schedule, at_r, &swept, &to, &FeeSource::Reserve).unwrap();
+	assert_eq!(sw.token_input(), 4);
+	assert_eq!(sw.tx.input[0].sequence.0, 0xffff_fffe, "the batch output carries no notice");
+	assert!(sw.tx.input[1..5].iter().all(|i| i.sequence.0 == f.w.to_sequence()), "every other input waits W");
+	assert_eq!(sw.tx.output[1], f.r_coin(), "the token goes back to R");
+	let sigs: Vec<_> = (0..5).map(|i| sign_digest(&f.s, &sw.sighash(i, f.genesis).unwrap(), &[0; 32])).collect();
+	book.pass("builder/sweep of the batch output, a lowest node, an entry and a checkpoint", &spend_of(sw.clone().finish(&sigs).unwrap(), None));
+	let mut one_bad = sigs.clone();
+	one_bad[2] = sign_digest(&f.stranger, &sw.sighash(2, f.genesis).unwrap(), &[0; 32]);
+	book.fail("builder/neg one swept input signed by a stranger", &spend_of(sw.clone().finish(&one_bad).unwrap(), None), 2, BAD_SIG);
+	let mut r_bad = sigs.clone();
+	r_bad[4] = sign_digest(&f.stranger, &sw.sighash(4, f.genesis).unwrap(), &[0; 32]);
+	book.fail("builder/neg the token at R signed by a stranger", &spend_of(sw.clone().finish(&r_bad).unwrap(), None), 4, BAD_SIG);
+	let mut late = sw.clone();
+	late.tx.input[1].sequence = elements::Sequence(f.w.to_sequence() - 1);
+	let sigs_late: Vec<_> = (0..5).map(|i| sign_digest(&f.s, &late.sighash(i, f.genesis).unwrap(), &[0; 32])).collect();
+	book.fail("builder/neg a lowest node one unit before its notice", &spend_of(late.finish(&sigs_late).unwrap(), None), 1, LOCKTIME);
+	assert!(matches!(sw.clone().finish(&sigs[..4]), Err(SpendError::SweepSignatures { given: 4, needed: 5 })));
+
+	// With a fee coin, the swept value goes whole to the operator.
+	let to_all = vec![ExplicitOutput::new(f.x, value, f.operator_spk())];
+	let sw = sweep_tx(&f.schedule, at_r, &swept[..1], &to_all, &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
+	let sigs: Vec<_> = (0..2).map(|i| sign_digest(&f.s, &sw.sighash(i, f.genesis).unwrap(), &[0; 32])).collect();
+	book.pass("builder/sweep of the batch output, a fee coin of another asset paying", &spend_of(sw.finish(&sigs).unwrap(), Some(2)));
+
+	// Burn-only: the builder pays each input whole to an OP_RETURN at its index.
+	let burn_lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, true), Some(f.chain)).unwrap();
+	let burn_batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, true), None).unwrap();
+	let burnt = vec![burn_batch.sweepable(fake_outpoint("burn batch"), value), burn_lowest.sweepable(fake_outpoint("burn lowest"), value)];
+	let sw = sweep_tx(&f.schedule, at_r, &burnt, &[], &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
+	assert_eq!(sw.tx.output[0], explicit(f.x, value, Script::from(vec![0x6a])));
+	assert_eq!(sw.tx.output[1], explicit(f.x, value, Script::from(vec![0x6a])));
+	let sigs: Vec<_> = (0..3).map(|i| sign_digest(&f.s, &sw.sighash(i, f.genesis).unwrap(), &[0; 32])).collect();
+	book.pass("builder/burn-only sweep of the batch output and a lowest node", &spend_of(sw.finish(&sigs).unwrap(), Some(3)));
+
+	// What the builder refuses.
+	let other = ClockSchedule::new(asset("T2"), xonly(&f.s), f.w, f.schedule.expiries().to_vec()).unwrap();
+	assert_eq!(sweep_tx(&other, at_r, &swept, &to, &FeeSource::Reserve).unwrap_err(), SpendError::OtherBatch(0));
+	assert_eq!(sweep_tx(&f.schedule, at_r, &[], &to, &FeeSource::Reserve).unwrap_err(), SpendError::NothingToSweep);
+	let mixed = vec![swept[0].clone(), burnt[1].clone()];
+	assert_eq!(sweep_tx(&f.schedule, at_r, &mixed, &to, &FeeSource::Reserve).unwrap_err(), SpendError::MixedBurn);
+	assert_eq!(sweep_tx(&f.schedule, at_r, &burnt, &to, &fee_coin_source(f, "c", 9_000, 900)).unwrap_err(), SpendError::BurnOutputs);
+	assert_eq!(sweep_tx(&f.schedule, at_r, &burnt, &[], &FeeSource::Reserve).unwrap_err(), SpendError::NeedsFeeCoin("a burn-only sweep"));
+	let mut wrong_tap = swept[1].clone();
+	wrong_tap.tap = batch.taproot();
+	assert_eq!(sweep_tx(&f.schedule, at_r, &[wrong_tap], &to, &FeeSource::Reserve).unwrap_err(), SpendError::NotSweepable(0));
+}
+
+// ---------------------------------------------------------------------------
 // htlc-1
 // ---------------------------------------------------------------------------
 
@@ -1097,6 +1224,7 @@ fn every_path_against_the_node_interpreter() {
 	checkpoint_swap_cases(&f, &mut book);
 	burn_cases(&f, &mut book);
 	htlc_cases(&f, &mut book);
+	builder_cases(&f, &mut book);
 	book.print();
 	assert!(book.refused >= 100, "only {} negative cases", book.refused);
 }

@@ -32,9 +32,10 @@ feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
 the board and its record, `spend` the transactions that spend a leaf off the
 tree (forfeits, exits, the offboard's unlock and reclaim), `release` the
-release an owner signs for the lowest node above a coin it gave up, and
-`transfer` the out-of-round transfer and the coin record a receiver validates;
-all described below.
+release an owner signs for the lowest node above a coin it gave up,
+`transfer` the out-of-round transfer and the coin record a receiver validates,
+and `clock` and `sweep` the operator's release or roll of the token and the
+sweep of an expired batch; all described below.
 
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
@@ -220,6 +221,40 @@ let auths: Vec<_> = branch.nodes.iter()
 	.collect();
 let txs = branch.unroll(batch_outpoint, &auths, &vec![FeeSource::Reserve; auths.len()])?;
 let entry = branch.entry_tx(branch.entry_outpoint(&txs).unwrap(), &preimage, &FeeSource::Reserve)?;
+```
+
+## Expiry: the release and the sweep
+
+The operator recovers an expired batch in two steps, each behind its
+signature `S`. The token rests at a clock until the clock's expiry `E`;
+`ClockSchedule::place` reads which clock, or `R`, from the script of the output
+holding it. `ClockSchedule::release_tx` moves it from clock `j` to `R` at
+output 0, with lock time `E_j` and a non-final input, so it confirms only once
+the chain's median time has passed `E_j`; `roll_tx` moves it to the next clock
+instead, extending the batch without touching the tree. The token holds one
+atom and nothing for a fee, so both take a fee coin.
+
+Once the token has waited `W` at `R`, `sweep_tx` builds one wave: the outputs
+it takes (`Sweepable`: the batch output, a node, an entry or a checkpoint,
+each with the taproot it was built as) by their sweep leaves at inputs
+`0..n`, the token at input `n`, which every sweep's `k` names, the outputs the
+operator pays, and the token back at `R` for the next wave. Each input carries
+its own notice as its sequence, so an output that went on-chain late is swept
+only `W` after its own confirmation. What the swept outputs hold beyond the
+outputs paid is the fee, in the batch asset, or a fee coin pays. A burn-only
+sweep pays every input whole to an `OP_RETURN` at its own index, and takes a
+fee coin. The operator signs each input's signature hash.
+
+```rust
+let fee = FeeSource::Coin { outpoint, coin, fee: atoms, change };
+let release = schedule.release_tx(0, token_at_clock0, &fee)?;   // at or after E_0
+let sig = sig_over(release.sighash(genesis)?);
+let release = release.finish(Clock::witness_items(&sig));
+let swept = [root.sweepable(batch_outpoint, batch_value)];      // after W at R
+let to = [ExplicitOutput::new(asset, batch_value - fee_atoms, operator_script)];
+let sw = sweep_tx(&schedule, token_at_r, &swept, &to, &FeeSource::Reserve)?;
+let sigs = (0..sw.leaves.len()).map(|i| Ok(sig_over(sw.sighash(i, genesis)?))).collect::<Result<Vec<_>, Error>>()?;
+let tx = sw.finish(&sigs)?;
 ```
 
 ## Off-chain transactions
@@ -486,8 +521,9 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   transaction with the witness built here must verify.
 - `tests/consensus.rs`: every path of every policy, spent by a transaction built
   here, verifies under the block rules and the mempool's script checks, and each
-  negative case is refused by the block rules with the node's error. `--nocapture`
-  prints the table.
+  negative case is refused by the block rules with the node's error; so are the
+  release, the roll and a sweep of every kind of output built by
+  `release_tx`, `roll_tx` and `sweep_tx`. `--nocapture` prints the table.
 - `tests/checks.rs`: the five client checks accept an honest round and refuse
   each attack that consensus accepts, naming the check.
 - `tests/encode.rs`: the encodings round-trip and refuse malformed bytes; the
@@ -641,7 +677,8 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
-  the burn-only sweep; and a 17-leaf and a 64-leaf batch built by the tree
+  the burn-only sweep, each clock move and sweep built by `release_tx`, `roll_tx`
+  and `sweep_tx`; and a 17-leaf and a 64-leaf batch built by the tree
   builder, every record checked against the confirmed round and three leaves in
   different subtrees unrolled from their records, unlocked and exited: every
   spend confirms, and every negative case is refused by the mempool and again

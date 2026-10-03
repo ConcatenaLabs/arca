@@ -16,14 +16,21 @@
 //! number of steps, last clock first, so it needs no state. The current expiry
 //! is the `E` of whichever clock holds `T`; a release starts the notice `W` at
 //! `R`, and every sweep spends `T` from `R`.
+//!
+//! The operator moves the token with [`ClockSchedule::release_tx`] at a
+//! clock's expiry, or [`ClockSchedule::roll_tx`] to extend the batch, and reads
+//! where it rests from the script of the output holding it
+//! ([`ClockSchedule::place`]). The token holds one atom and nothing for a fee,
+//! so a fee coin is attached to every move.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Script};
+use elements::{AssetId, LockTime, OutPoint, Script};
 
-use crate::script::{record, sha256, BuilderExt};
+use crate::script::{record, sha256, BuilderExt, ExplicitOutput};
+use crate::spend::{assemble, FeeSource, KeySpend, SpendError, FEE_COIN_SEQUENCE};
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
 use crate::time::{MedianTime, RelativeTime};
@@ -40,6 +47,15 @@ pub struct ClockSchedule {
 	pub operator: XOnlyPublicKey,
 	pub notice: RelativeTime,
 	expiries: Vec<MedianTime>,
+}
+
+/// Where a batch's token rests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenPlace {
+	/// At clock `step`: the batch expires at that clock's `E`.
+	Clock(usize),
+	/// At `R`: released, so every sweep of the batch spends it from here.
+	Released,
 }
 
 /// One clock output.
@@ -150,6 +166,51 @@ impl ClockSchedule {
 			notice: if with_notice { Some(self.notice) } else { None },
 			burn,
 		}
+	}
+
+	/// Where an output paying `script_pubkey` would hold the token: at one of
+	/// the clocks, at `R`, or at neither (`None`).
+	pub fn place(&self, script_pubkey: &Script) -> Option<TokenPlace> {
+		if *script_pubkey == self.r().script_pubkey() {
+			return Some(TokenPlace::Released);
+		}
+		self.clocks().iter().position(|c| c.output.script_pubkey() == *script_pubkey).map(TokenPlace::Clock)
+	}
+
+	/// The operator's release of clock `step`, which holds the token at
+	/// `token`: the token moves to `R` at output 0, where the notice `W`
+	/// begins. The lock time is the clock's expiry `E` and the token's input
+	/// non-final, as RELEASE's `OP_CHECKLOCKTIMEVERIFY` needs, so the release
+	/// confirms only once the chain's median time has passed `E`. `fee` must
+	/// be a fee coin. The operator signs [`KeySpend::sighash`] and finishes
+	/// it with [`Clock::witness_items`].
+	pub fn release_tx(&self, step: usize, token: OutPoint, fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		self.move_tx(step, token, false, fee)
+	}
+
+	/// The operator's roll of clock `step`, which holds the token at `token`,
+	/// into clock `step + 1`, at output 0: the batch's expiry moves to that
+	/// clock's `E`, and no script of the tree changes. `fee` must be a fee
+	/// coin. Signed and finished as [`ClockSchedule::release_tx`].
+	pub fn roll_tx(&self, step: usize, token: OutPoint, fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		self.move_tx(step, token, true, fee)
+	}
+
+	fn move_tx(&self, step: usize, token: OutPoint, roll: bool, fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		if matches!(fee, FeeSource::Reserve) {
+			return Err(SpendError::NeedsFeeCoin("the token"));
+		}
+		let clocks = self.clocks();
+		let c = clocks.get(step).ok_or(SpendError::ClockStep { step, steps: clocks.len() })?;
+		let (script, to, lock) = if roll {
+			let script = c.roll.clone().ok_or(SpendError::LastClock(step))?;
+			(script, clocks[step + 1].output.script_pubkey(), LockTime::ZERO)
+		} else {
+			(c.release.clone(), self.r().script_pubkey(), LockTime::from_consensus(c.expiry.to_consensus_u32()))
+		};
+		let spent = ExplicitOutput::new(self.token, 1, c.output.script_pubkey()).txout();
+		let u = assemble(lock, vec![(token, spent, FEE_COIN_SEQUENCE)], &[ExplicitOutput::new(self.token, 1, to)], fee, FEE_COIN_SEQUENCE)?;
+		Ok(KeySpend::from_parts(u.tx, u.prevouts, c.output.clone(), script))
 	}
 
 	/// `[<E> CLTV DROP] <S> CHECKSIGVERIFY <pin (T, 1, to_spk)>`.
