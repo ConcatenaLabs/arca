@@ -293,6 +293,14 @@ impl Store {
 		Ok(nonces)
 	}
 
+	/// Every leaf's salt and record, as kept: what the signer's record is
+	/// compacted against (`arcad <config> expired-salts`).
+	pub async fn leaf_salts(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT s.salt, l.record FROM leaf_salt s JOIN leaf l ON l.leaf_id = s.leaf_id ORDER BY s.salt", &[]).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "salt")?, r.get(1)))).collect()
+	}
+
 	/// Records `coins` together, or none of them: each takes its operator
 	/// nonce, each script is new to the server, each key owns no other leaf.
 	pub async fn insert_coins(&self, coins: &[NewCoin]) -> Result<(), StoreError> {

@@ -5,6 +5,7 @@
 //!
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file>
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record
+//!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. The genesis hash is in display
@@ -16,6 +17,14 @@
 //! its record and locks it while it runs. `--create-record` makes a new,
 //! empty record for this key and chain, once, and exits: a record is never
 //! made in passing, so one that is lost is never silently replaced.
+//!
+//! `--compact-into` writes a compacted copy of the record to a new file and
+//! exits (`server::signer::SpendRecord::compact`): every entry under a salt
+//! listed in the `--drop-salts` file (one hex salt a line, as
+//! `arcad <config> expired-salts` prints them) is dropped, every other entry
+//! carried over, and the new record goes on from the old one's latest entry.
+//! It locks the record, so it runs with the signer stopped; the operator then
+//! puts the new file in the record's place and starts the signer on it.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -44,6 +53,8 @@ struct Args {
 	socket: Option<PathBuf>,
 	record: PathBuf,
 	create_record: bool,
+	/// `--compact-into` and `--drop-salts`.
+	compact: Option<(PathBuf, PathBuf)>,
 }
 
 fn args() -> Result<Args, String> {
@@ -52,6 +63,8 @@ fn args() -> Result<Args, String> {
 	let mut socket = None;
 	let mut record = None;
 	let mut create_record = false;
+	let mut compact_into = None;
+	let mut drop_salts = None;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -61,10 +74,17 @@ fn args() -> Result<Args, String> {
 			"--socket" => socket = Some(PathBuf::from(value()?)),
 			"--record" => record = Some(PathBuf::from(value()?)),
 			"--create-record" => create_record = true,
+			"--compact-into" => compact_into = Some(PathBuf::from(value()?)),
+			"--drop-salts" => drop_salts = Some(PathBuf::from(value()?)),
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
-	if !create_record && socket.is_none() {
+	let compact = match (compact_into, drop_salts) {
+		(Some(i), Some(d)) => Some((i, d)),
+		(None, None) => None,
+		_ => return Err("--compact-into and --drop-salts go together".into()),
+	};
+	if !create_record && compact.is_none() && socket.is_none() {
 		return Err("--socket is required".into());
 	}
 	Ok(Args {
@@ -73,6 +93,7 @@ fn args() -> Result<Args, String> {
 		socket,
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
 		create_record,
+		compact,
 	})
 }
 
@@ -102,8 +123,10 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 		},
 		Request::Entries { after, limit } => {
 			let r = record.lock().unwrap_or_else(|e| e.into_inner());
-			let list = r.entries_after(after, limit.min(MAX_ENTRIES) as usize).iter().map(|e| e.to_wire()).collect();
-			Response { entries: Some(list), ..none }
+			match r.entries_after(after, limit.min(MAX_ENTRIES) as usize) {
+				Ok(list) => Response { entries: Some(list.iter().map(|e| e.to_wire()).collect()), ..none },
+				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
+			}
 		},
 		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known } => {
 			let parsed = (|| -> Result<_, String> {
@@ -229,6 +252,29 @@ async fn main() {
 			},
 		}
 	}
+	if let Some((into, drop_file)) = &args.compact {
+		let drop = match std::fs::read_to_string(drop_file).map_err(|e| format!("{}: {}", drop_file.display(), e)).and_then(|text| {
+			text.lines().map(str::trim).filter(|l| !l.is_empty()).map(unhex32).collect::<Result<std::collections::HashSet<_>, _>>()
+				.map_err(|e| format!("{}: {}", drop_file.display(), e))
+		}) {
+			Ok(d) => d,
+			Err(e) => {
+				eprintln!("arca-signer: {}", e);
+				std::process::exit(2);
+			},
+		};
+		match SpendRecord::compact(&args.record, into, &operator, &args.genesis, &drop) {
+			Ok((carried, dropped, (n, hash))) => {
+				eprintln!("arca-signer: compacted {} into {}: {} entries carried over, {} dropped; it goes on from entry {} ({})",
+					args.record.display(), into.display(), carried, dropped, n, hex(&hash));
+				std::process::exit(0);
+			},
+			Err(e) => {
+				eprintln!("arca-signer: compacting the record: {}", e);
+				std::process::exit(2);
+			},
+		}
+	}
 	let record = match SpendRecord::open(&args.record, &operator, &args.genesis) {
 		Ok((r, repaired)) => {
 			if let Some(note) = repaired {
@@ -256,8 +302,11 @@ async fn main() {
 		eprintln!("arca-signer: {}: {}", socket.display(), e);
 		std::process::exit(2);
 	}
-	eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}", hex(&operator.serialize()),
-		socket.display(), record.lock().unwrap_or_else(|e| e.into_inner()).len(), args.record.display());
+	{
+		let r = record.lock().unwrap_or_else(|e| e.into_inner());
+		eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}, its latest entry {}", hex(&operator.serialize()),
+			socket.display(), r.len(), args.record.display(), r.head().0);
+	}
 	loop {
 		let (stream, _) = match listener.accept().await {
 			Ok(s) => s,
