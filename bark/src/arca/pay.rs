@@ -336,9 +336,12 @@ impl Wallet {
 	}
 
 	/// Posts transfer request `id` and takes the answer: the inputs spent, the
-	/// wallet's own new coins validated and kept. A refusal puts the inputs
-	/// back; an unreachable server leaves the request to be posted again, the
-	/// same bytes, by `sync`.
+	/// wallet's own new coins validated and kept. Only a refusal (a 4xx with
+	/// one of the server's refusal codes) puts the inputs back; anything else,
+	/// a 5xx or a timeout after the server may have co-signed among them,
+	/// leaves the request standing, to be posted again, the same bytes, by
+	/// `sync`: the server answers a request repeated byte for byte as it did
+	/// the first time.
 	fn post_transfer(&mut self, id: i64, body: &Value, mine: &[String]) -> Result<Value, Error> {
 		match self.server.post("cosign_transfer", body) {
 			Ok(answer) => {
@@ -466,7 +469,10 @@ impl Wallet {
 
 	/// Reads the wallet's mailbox, and the mailbox of every key of a receive
 	/// request still waiting, and validates every coin in them. Each coin is
-	/// kept or refused with its reason; the cursor moves past both.
+	/// kept or refused with its reason; one refused for a passing reason
+	/// (what it rests on not on the chain now, the node or the server not
+	/// answering) is kept aside and checked again on every read until it is
+	/// kept or refused for good. The cursor moves past all of them.
 	pub fn mailbox(&mut self) -> Result<Value, Error> {
 		let mut keys = vec![self.keys.mailbox()?];
 		for n in self.store.nonces()? {
@@ -476,6 +482,24 @@ impl Wallet {
 		}
 		let mut accepted = vec![];
 		let mut refused = vec![];
+		let mut waiting = vec![];
+		for (leaf, bytes) in self.store.kept_for_retry()? {
+			match self.accept_coin(&bytes, &leaf, "mailbox") {
+				Ok(v) => {
+					self.store.drop_retry(&leaf)?;
+					accepted.push(v);
+				},
+				Err(e) if passing(&e) => {
+					self.store.keep_for_retry(&leaf, &bytes, &e.to_string())?;
+					waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+				},
+				Err(e) => {
+					self.store.drop_retry(&leaf)?;
+					self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
+					refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+				},
+			}
+		}
 		for key in keys {
 			let k = key.x_only_public_key().0.serialize();
 			loop {
@@ -488,9 +512,13 @@ impl Wallet {
 				for m in &msgs {
 					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
 					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
-					let r = unhex(m["record"].as_str().unwrap_or("")).and_then(|b| self.accept_coin(&b, &leaf, "mailbox"));
-					match r {
+					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
+					match self.accept_coin(&bytes, &leaf, "mailbox") {
 						Ok(v) => accepted.push(v),
+						Err(e) if passing(&e) => {
+							self.store.keep_for_retry(&leaf, &bytes, &e.to_string())?;
+							waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+						},
 						Err(e) => {
 							self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
 							refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
@@ -500,7 +528,7 @@ impl Wallet {
 				}
 			}
 		}
-		Ok(json!({"accepted": accepted, "refused": refused}))
+		Ok(json!({"accepted": accepted, "refused": refused, "waiting": waiting}))
 	}
 
 	// -----------------------------------------------------------------------
@@ -740,6 +768,13 @@ impl Wallet {
 		self.store.set_swap(id, "cancelled", None)?;
 		Ok(json!({"swap": id, "freed": freed}))
 	}
+}
+
+/// Whether a coin refused with `e` may be accepted later: what it rests on
+/// is not on the chain now, or the node, the server or the store did not
+/// answer.
+fn passing(e: &Error) -> bool {
+	matches!(e, Error::Missing(_) | Error::Node(_) | Error::Unreachable(_) | Error::Store(_) | Error::Io(_))
 }
 
 fn to_out_owner(o: &Out) -> String {

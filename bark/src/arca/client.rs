@@ -10,7 +10,9 @@
 //! attestation over the participation's id. There is no bearer token.
 //!
 //! Every refusal the server makes comes back as [`Error::Server`], with its
-//! HTTP status, its stable code and its sentence.
+//! HTTP status, its stable code and its sentence; any other failure, a 5xx or
+//! a timeout among them, is [`Error::Unreachable`], and leaves the request
+//! standing.
 
 use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::{Keypair, XOnlyPublicKey};
@@ -132,6 +134,20 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 		as the operator; use https://", base, host)))
 }
 
+/// The codes with which the server refuses a request outright, with a 4xx
+/// status: the request was not taken. A busy server's `rate_limited`, and
+/// `not_synced`, `signer_unavailable` and `internal` (5xx), are not among
+/// them: the request may be taken later, or may have been.
+pub const REFUSALS: &[&str] = &[
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
+	"double_spend", "fee", "forfeit_set", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction",
+	"key_reused", "leaf_set", "malformed", "margin", "merge", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
+	"not_in_round", "not_live", "not_participating", "on_chain", "open_reassignment", "operator_key", "out_of_bounds",
+	"release_early", "request_too_large", "round_not_final", "script_reused", "template", "unauthenticated", "unbalanced",
+	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator",
+	"wrong_round",
+];
+
 /// The server, at its base URL.
 #[derive(Debug, Clone)]
 pub struct ServerClient {
@@ -154,6 +170,13 @@ impl ServerClient {
 		&self.base
 	}
 
+	/// The server's answer to `call`. Only a 4xx carrying one of the
+	/// server's refusal codes ([`REFUSALS`]) is a refusal, [`Error::Server`]:
+	/// the request was not taken, and nothing it asked for was done. Anything
+	/// else (no answer, a timeout, a 5xx, a gateway's page, a code the wallet
+	/// does not know, a request to slow down) says nothing of what the server
+	/// did, and is [`Error::Unreachable`]: a request that changes something
+	/// stays standing, to be posted again byte for byte.
 	fn answer(call: &str, r: Result<minreq::Response, minreq::Error>) -> Result<Value, Error> {
 		let r = r.map_err(|e| Error::Unreachable(format!("{}: {}", call, e)))?;
 		let text = r.as_str().unwrap_or("");
@@ -163,7 +186,10 @@ impl ServerClient {
 		}
 		let code = json["error"]["code"].as_str().unwrap_or("").to_string();
 		let message = json["error"]["message"].as_str().map(|s| s.to_string()).unwrap_or_else(|| text.to_string());
-		Err(Error::Server { call: call.to_string(), status: r.status_code as i32, code, message })
+		if (400..500).contains(&r.status_code) && REFUSALS.contains(&code.as_str()) {
+			return Err(Error::Server { call: call.to_string(), status: r.status_code as i32, code, message });
+		}
+		Err(Error::Unreachable(format!("{}: the server answered {} {}: {}", call, r.status_code, code, message)))
 	}
 
 	pub fn get(&self, call: &str) -> Result<Value, Error> {
