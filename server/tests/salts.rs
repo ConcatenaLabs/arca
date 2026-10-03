@@ -1,6 +1,6 @@
-//! A leaf's salt is unique on a server, and the signer's record is kept per
-//! leaf (D44): nothing one holder sends changes what the operator will
-//! co-sign for another holder's leaf.
+//! A leaf's salt is unique on a server (D44), and the signer's one-spend
+//! rule is the salt's: its signature commits to the salt and not to the
+//! owner key, so it never gives two spend signatures under one salt.
 //!
 //! A transfer's sender chooses both nonces of a new leaf's salt, and the
 //! public `tree` call publishes every batch leaf's two nonces. So a holder
@@ -9,8 +9,12 @@
 //! a transfer output's, or one promised to a participation not yet in a
 //! round; a board and a transfer naming one are refused alike. A database
 //! that has forgotten a salt (restored from an older copy, or new) lets
-//! such a leaf through, and the signer, keyed per leaf, still signs the
-//! victim's own spend.
+//! such a leaf through; the first to spend under the salt then takes it, and
+//! the other holder is refused by the signer and can exit. And the case the
+//! rule guards: a holder that paid from its leaf, its database having
+//! forgotten the salt, makes a second leaf under it and pays again: the
+//! signer refuses that second spend, whose signature would also be valid on
+//! the first coin.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -146,12 +150,54 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	assert_eq!(fl.status, 200, "{}", fl.json);
 	assert_eq!(fl.json["state"], "released");
 
-	// A database that has forgotten W's salt (restored from an older copy,
-	// or a new one) lets the attacker's leaf under it through, and its spend
-	// as well; the signer keeps its record per leaf, so W still pays.
-	let (w_salt, w_on, w_op) = salt_from_tree(&r, &w.id);
 	let (pg, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
 	tokio::spawn(conn);
+	// R7c's case: the attacker pays a victim from its own leaf L1, its
+	// database then forgets L1's salt, and it makes a second leaf L2 of its
+	// own under that salt and pays itself from it. S's signature for L2's
+	// spend would be valid on L1 as well, taking the victim's payment back:
+	// the signer refuses it.
+	let (b4, b4_tx) = credited_board(&mut r, &keypair("attacker board 4"), x).await;
+	let b4v = b4.record.resolve(std::slice::from_ref(&b4_tx), &r.policy()).unwrap();
+	let k4 = b4v.value - MARGIN;
+	let a5 = keypair("attacker leaf L1");
+	let l1_leaf = NewLeaf { owner: xonly(&a5), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay() };
+	let (l1_on, l1_op) = (l1_leaf.owner_nonce, l1_leaf.creator_nonce);
+	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b4, b4v, k4)], &[(x, k4 - MARGIN, l1_leaf)], s, r.chain)).ok();
+	let rec = CoinRecord::from_bytes(&unhex(t["outputs"][0]["record"].as_str().unwrap())).unwrap();
+	let l1 = Held { key: a5, nonce: l1_on, id: t["outputs"][0]["leaf_id"].as_str().unwrap().parse().unwrap(), record: rec };
+	let l1v = l1.record.resolve(std::slice::from_ref(&b4_tx), &r.policy()).unwrap();
+	let l1_salt = l1v.leaf.salt;
+	let kl = l1v.value - MARGIN;
+	let (victim, _) = new_leaf(&keypair("victim R"));
+	let l1_value = l1v.value;
+	let t = r.http.post("cosign_transfer", &transfer_body(&[(&l1, l1v, kl)], &[(x, kl - MARGIN, victim)], s, r.chain));
+	println!("the attacker pays the victim from L1 (salt {}): {}", hex(&l1_salt), t.status);
+	assert_eq!(t.status, 200, "{}", t.json);
+	assert_eq!(pg.execute("DELETE FROM leaf_salt WHERE salt = $1", &[&&l1_salt[..]]).await.unwrap(), 1);
+	let (b5, b5_tx) = credited_board(&mut r, &keypair("attacker board 5"), x).await;
+	let b5v = b5.record.resolve(std::slice::from_ref(&b5_tx), &r.policy()).unwrap();
+	let k5 = b5v.value - MARGIN;
+	assert_eq!(k5 - MARGIN, l1_value, "L2 holds what L1 held: one message would spend either");
+	let a6 = keypair("attacker leaf L2");
+	let l2_leaf = NewLeaf { owner: xonly(&a6), owner_nonce: l1_on, creator_nonce: l1_op, exit_delay: exit_delay() };
+	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b5, b5v, k5)], &[(x, k5 - MARGIN, l2_leaf)], s, r.chain)).ok();
+	let rec = CoinRecord::from_bytes(&unhex(t["outputs"][0]["record"].as_str().unwrap())).unwrap();
+	let l2 = Held { key: a6, nonce: l1_on, id: t["outputs"][0]["leaf_id"].as_str().unwrap().parse().unwrap(), record: rec };
+	let l2v = l2.record.resolve(std::slice::from_ref(&b5_tx), &r.policy()).unwrap();
+	assert_eq!(l2v.leaf.salt, l1_salt);
+	println!("with L1's salt forgotten, the attacker's second leaf L2 under it is co-signed");
+	let (sink2, _) = new_leaf(&keypair("attacker sink 2"));
+	let t = r.http.post("cosign_transfer", &transfer_body(&[(&l2, l2v, kl)], &[(x, kl - MARGIN, sink2)], s, r.chain));
+	println!("the attacker pays itself from L2: {} {:?}", t.status, t.refusal());
+	assert_eq!(t.refusal().0, "double_spend", "the signer refuses a second spend under the salt: {}", t.json);
+	assert!(t.refusal().1.contains(&hex(&l1_salt)), "{}", t.json);
+
+	// A database that has forgotten W's salt (restored from an older copy,
+	// or a new one) lets the attacker's leaf under it through, and its spend
+	// as well; the signer's rule is the salt's, so W's own payment is then
+	// refused, and W can exit.
+	let (w_salt, w_on, w_op) = salt_from_tree(&r, &w.id);
 	assert_eq!(pg.execute("DELETE FROM leaf_salt WHERE salt = $1", &[&&w_salt[..]]).await.unwrap(), 1);
 	let (b3, b3_tx) = credited_board(&mut r, &keypair("attacker board 3"), x).await;
 	let b3v = b3.record.resolve(std::slice::from_ref(&b3_tx), &r.policy()).unwrap();
@@ -175,5 +221,6 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&w.new.held, wv, wk)], &[(x, wk - MARGIN, d_leaf)], s, r.chain));
 	println!("W pays D after the attacker spent a leaf under W's salt: {} {}", t.status,
 		t.json.get("error").cloned().unwrap_or(json!("co-signed")));
-	assert_eq!(t.status, 200, "{}", t.json);
+	assert_eq!(t.refusal().0, "double_spend", "{}", t.json);
+	assert!(t.refusal().1.contains(&hex(&w_salt)), "the signer names the salt: {}", t.json);
 }

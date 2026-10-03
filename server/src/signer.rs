@@ -36,33 +36,38 @@
 //! The signer, not the database, is the authority on what `S` has co-signed.
 //! Before it returns a rebindable signature it appends `(owner, salt, kind,
 //! digest)` to its record, a file it alone writes, and syncs it to disk
-//! ([`SpendRecord`]); it reads the whole record when it starts. The record is
-//! kept per leaf: a leaf is its owner's key together with its salt (a leaf's,
-//! a board's or a checkpoint's, whose owner is its coin's). For each leaf it
-//! then signs:
+//! ([`SpendRecord`]); it reads the whole record when it starts. Each entry
+//! names its leaf: its owner's key together with its salt (a leaf's, a
+//! board's or a checkpoint's, whose owner is its coin's). The rule, though, is
+//! kept per salt: `S`'s signature commits to the salt (`K` above) and not to
+//! the owner key, so a signature given for one leaf is valid on every coin of
+//! the same salt, asset and value. Under each salt it signs:
 //!
 //! - one **spend**: a message into anything but a forfeit output (a leaf
-//!   into its checkpoint, a checkpoint into its reassignment). A second spend
-//!   message for the leaf is refused (`already_signed`), whatever the
-//!   database says; the same message again is signed again, so a request
-//!   repeated after a signer outage completes;
+//!   into its checkpoint, a checkpoint into its reassignment). A spend
+//!   message is refused (`already_signed`) when any entry under the salt,
+//!   whatever its owner, carries another message, whatever the database
+//!   says; the same message again is signed again, so a request repeated
+//!   after a signer outage completes;
 //! - or any number of **forfeits**, one for each round's connector asset `M`:
 //!   a leaf given up in a round, and again forfeit-first in a later round
 //!   after the first could never return. A forfeit is a rebind request that
 //!   names the forfeit's parts (`forfeit`), from which the signer rebuilds
 //!   the forfeit output and checks it is the one output committed to; it is
-//!   refused once the leaf has a spend, and a second forfeit message for the
-//!   same `M` is refused. A spend is refused once the leaf has a forfeit.
+//!   refused once the salt has a spend, and a second forfeit message for the
+//!   same `M` under the salt is refused. A spend is refused once the salt
+//!   has a forfeit.
 //!
 //! Every rebind request names the leaf's owner key and carries the owner's
 //! own signature over the very message `S` is to sign (the checkpoint, the
 //! reassignment or the forfeit each needs both), and the signer checks it
 //! before it records anything: an entry under a key is always the holder of
-//! that key's doing. So nothing one holder sends changes what `S` will sign
-//! for another holder's leaf, even under a salt the two leaves share (the
-//! server refuses a second leaf under a salt it knows, but a database
-//! restored from an older copy, or a new one, has forgotten which salts it
-//! saw).
+//! that key's doing. The server refuses a second leaf under a salt it knows,
+//! so two leaves share a salt only where its database has forgotten one
+//! (restored from an older copy, or new). There the first leaf to spend
+//! under the salt takes it, and the other's holder is refused, and can still
+//! exit; a second signature under one salt, which would be valid on the first
+//! coin as well, is never given.
 //!
 //! So a database restored from an older copy, which no longer knows a
 //! transfer it co-signed, cannot have `S` co-sign a second spend of the same
@@ -263,7 +268,7 @@ pub enum Signed {
 	Forfeit([u8; 32]),
 }
 
-/// A leaf, as the record keys it: its owner's key and its salt.
+/// A leaf, as each entry of the record names it: its owner's key and its salt.
 pub type LeafKey = ([u8; 32], [u8; 32]);
 
 /// The first word of a record's first line.
@@ -370,7 +375,8 @@ pub struct SpendRecord {
 	size: u64,
 	header_hash: [u8; 32],
 	entries: Vec<Entry>,
-	by_leaf: std::collections::HashMap<LeafKey, Vec<usize>>,
+	/// The entries under each salt, whatever their owner.
+	by_salt: std::collections::HashMap<[u8; 32], Vec<usize>>,
 	/// Why the signer signs nothing more until it is started again.
 	refusing: Option<String>,
 }
@@ -447,7 +453,7 @@ impl SpendRecord {
 		}
 		let header_hash = chain_hash(&[0; 32], header);
 		let mut record = SpendRecord {
-			file, size: whole as u64, header_hash, entries: vec![], by_leaf: Default::default(), refusing: None,
+			file, size: whole as u64, header_hash, entries: vec![], by_salt: Default::default(), refusing: None,
 		};
 		for (k, line) in lines.enumerate() {
 			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), k + 2, what, line.chars().take(200).collect::<String>());
@@ -474,7 +480,7 @@ impl SpendRecord {
 	}
 
 	fn push(&mut self, e: Entry) {
-		self.by_leaf.entry((e.owner, e.salt)).or_default().push(self.entries.len());
+		self.by_salt.entry(e.salt).or_default().push(self.entries.len());
 		self.entries.push(e);
 	}
 
@@ -534,29 +540,34 @@ impl SpendRecord {
 
 	/// Whether `S` may sign `digest`, a message of `kind` for the leaf of
 	/// `owner` under `salt`: when it may, the message is in the record, on
-	/// disk, before this returns, and its entry is returned. Another leaf
-	/// under the same salt is another leaf: what was signed for it does not
-	/// count here.
+	/// disk, before this returns, and its entry is returned. The rule is the
+	/// salt's: `S`'s signature commits to the salt and not to the owner, so
+	/// what was signed for another leaf under the same salt counts here. A
+	/// spend is refused when any entry under the salt carries another
+	/// message; a forfeit when the salt has a spend, or a forfeit for the
+	/// same round with another message.
 	pub fn admit(&mut self, owner: &[u8; 32], salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<Entry, String> {
 		use std::io::Write;
 		if let Some(why) = &self.refusing {
 			return Err(why.clone());
 		}
-		let had: Vec<Entry> = self.by_leaf.get(&(*owner, *salt)).map(|v| v.iter().map(|i| self.entries[*i]).collect()).unwrap_or_default();
-		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
+		let had: Vec<Entry> = self.by_salt.get(salt).map(|v| v.iter().map(|i| self.entries[*i]).collect()).unwrap_or_default();
+		if let Some(e) = had.iter().find(|e| e.owner == *owner && e.kind == kind && e.digest == *digest) {
 			return Ok(*e);
 		}
 		for e in &had {
 			let clash = match (kind, e.kind) {
-				(Signed::Spend, _) | (Signed::Forfeit(_), Signed::Spend) => true,
-				(Signed::Forfeit(m), Signed::Forfeit(n)) => m == n,
+				(Signed::Spend, _) => e.digest != *digest,
+				(Signed::Forfeit(_), Signed::Spend) => true,
+				(Signed::Forfeit(m), Signed::Forfeit(n)) => m == n && e.digest != *digest,
 			};
 			if clash {
 				return Err(format!(
-					"{}: S has already co-signed {} {} for the leaf of {} under salt {} (entry {}); the signer co-signs one \
-					 spend of an output, or its forfeits, one for each round",
+					"{}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one \
+					 spend under a salt, or its forfeits, one for each round, since its signature commits to the salt and \
+					 not to the owner",
 					ALREADY_SIGNED, match e.kind { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(&e.digest),
-					hex(owner), hex(salt), e.n,
+					hex(salt), e.n, hex(&e.owner),
 				));
 			}
 		}

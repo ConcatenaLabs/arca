@@ -675,18 +675,24 @@ The signer is the one-spend authority. Before it returns a rebindable
 signature it appends the owner key, the salt, the kind and the message's
 digest to its record, an append-only file it alone writes, and syncs it to
 disk; it reads the record whole when it starts, and refuses to start on a line
-it cannot read. The record is kept per leaf: a leaf is its owner key together with
-its salt (a leaf's, a board's, a checkpoint's, whose owner is its coin's), so
-another leaf under the same salt is another leaf, and since every entry needs
-the named owner's signature, nothing one holder sends changes what `S` signs
-for another holder's leaf, even where the database has forgotten a salt. For
-each leaf it signs one spend, a message into anything but a forfeit output,
-or forfeits, one for each round's connector asset: a forfeit request names the forfeit's parts, and the signer
-rebuilds the forfeit output from them and checks it is the one output
-committed to. The same message again is signed again, so a request repeated
-after a signer outage completes; a second spend, a spend after a forfeit, a
-forfeit after a spend, and a second forfeit for one round are refused
-(`already_signed`), whatever the database holds. The server answers such a
+it cannot read. Each entry names its leaf: its owner key together with its
+salt (a leaf's, a board's, a checkpoint's, whose owner is its coin's), and
+needs that owner's own signature over the message, so an entry under a key is
+always its holder's doing. The rule is kept per salt: `S`'s signature commits
+to the salt and not to the owner key, so a signature given for one leaf is
+valid on every coin of the same salt, asset and value. Under each salt it
+signs one spend, a message into anything but a forfeit output, or forfeits,
+one for each round's connector asset: a forfeit request names the forfeit's
+parts, and the signer rebuilds the forfeit output from them and checks it is
+the one output committed to. The same message again is signed again, so a
+request repeated after a signer outage completes; a spend when any entry
+under the salt carries another message, a forfeit after a spend, and a second
+forfeit for one round are refused (`already_signed`), whatever the database
+holds. The server refuses a second leaf under a salt it has seen, so two
+leaves share a salt only where its database has forgotten one; there the
+first to spend takes the salt and the other's holder is refused, and can
+exit, while a second signature, which would also spend the first coin, is
+never given. The server answers such a
 refusal with `double_spend`, and logs that its database has lost a spend.
 
 The record cannot be lost, cut back, torn or shared without the signer
@@ -1034,9 +1040,9 @@ field, outputs out of range, an oversized line, a spend by the leaf's
 collaborative path or the owner's exit, an input out of range, spent outputs
 missing, and an input that spends no taproot output. Its record: a spend
 signed again when asked again and a second spend refused; another holder's
-leaf under the same salt spent once and refused a second time, each leaf on
-its own; an owner signature by another key, over another message or for
-another salt refused and not recorded; forfeits of one coin for two rounds
+leaf under the same salt refused another message once the first leaf spent
+under it, and signed the same message; an owner signature by another key,
+over another message or for another salt refused and not recorded; forfeits of one coin for two rounds
 signed and a second forfeit for one round refused; a spend after forfeits and
 a forfeit after a spend refused; forfeit parts that do not make the output
 refused and not recorded; the same refusals after a restart; a last line cut
@@ -1065,7 +1071,11 @@ participation not yet in a round are each refused with `salt`, naming it; the
 holders whose salts were named then pay and refresh as usual. With one salt
 deleted from the database, as one restored from an older copy would have
 forgotten it, the attacker's leaf under it is co-signed and spent, and its
-holder still pays: the signer keeps its record per leaf.
+holder's own payment is then refused by the signer (`double_spend`): the rule
+is the salt's. And the case it guards: an attacker pays from its leaf, its
+database forgets the leaf's salt, and it makes a second leaf of its own under
+that salt and pays from it: the signer refuses the second spend under the
+salt, which would have been a signature valid on the first coin too.
 
 `tests/restore.rs` restores the database from an older copy. A board pays B
 and the copy forgets it: the server does not start on it, naming the two
