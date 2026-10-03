@@ -6,7 +6,14 @@
 //! a coin a reassignment made, each coin it rests on, its checkpoint and the
 //! reassignment, all from the pairs in the record. Then, once the exit delay
 //! has run from the leaf's confirmation, the owner's claim to an on-chain
-//! address of the wallet.
+//! address of the wallet, one address for the exit however often it runs.
+//!
+//! The record says what the coin is; the chain says where its path is. Every
+//! run starts from the lowest output of the path that is unspent in a block
+//! or the mempool, matched by asset, value and script, never by transaction
+//! id: a round that returned under another id after a rollback, a step
+//! someone else published, or a board its owner converted is taken as the
+//! chain holds it, and only what is still missing is built and broadcast.
 //!
 //! Each transaction pays its fee from what it carries for it (a node's
 //! reserve, an entry's, a checkpoint's or reassignment's margin), in the
@@ -25,10 +32,23 @@ use serde_json::{json, Value};
 use arca_covenant::spend::{FeeSource, KeySpend};
 use arca_covenant::{CoinRecord, ExplicitOutput, UnrollTx, ValidCoin, ValidOrigin, WalletPolicy};
 
-use super::chain::{hex, unhex};
+use super::chain::hex;
 use super::keys::CHANGE;
 use super::wallet::{sign, Wallet};
 use super::Error;
+
+/// Where each output of a coin's path is now, from the chain's `locate`.
+struct Here {
+	outputs: Vec<TxOut>,
+	at: Vec<Option<OutPoint>>,
+}
+
+impl Here {
+	fn at(&self, o: &ExplicitOutput) -> Option<OutPoint> {
+		let o = o.txout();
+		self.outputs.iter().zip(&self.at).find(|(w, _)| **w == o).and_then(|(_, a)| *a)
+	}
+}
 
 /// Who pays the fees an output's own reserve cannot.
 struct Payer {
@@ -125,30 +145,66 @@ impl Wallet {
 		})
 	}
 
-	/// Every transaction that brings `coin` on-chain, in order, and where its
-	/// leaf then is.
-	fn bring(&self, coin: &ValidCoin, payer: &mut Payer, txs: &mut Vec<UnrollTx>) -> Result<OutPoint, Error> {
+	/// Every output on the way from the chain to `coin`'s leaf, the leaf's
+	/// own last: for a leaf of a batch, the batch output, each node's and the
+	/// entry's; for a board, the board output; for a coin a reassignment made,
+	/// those of each coin it spends, that coin's leaf and its checkpoint.
+	fn path_outputs(coin: &ValidCoin, out: &mut Vec<TxOut>) {
+		match &coin.origin {
+			ValidOrigin::Leaf { valid, .. } => {
+				out.extend(valid.branch.nodes.iter().map(|n| n.output().txout()));
+				out.push(valid.branch.entry_output().txout());
+			},
+			ValidOrigin::Board { record, .. } => out.push(record.output().txout()),
+			ValidOrigin::Transfer { inputs, .. } => {
+				for i in inputs {
+					Self::path_outputs(&i.coin, out);
+					out.push(i.checkpoint_output().txout());
+				}
+			},
+		}
+		out.push(coin.output().txout());
+	}
+
+	/// Every transaction still needed to bring `coin` on-chain, in order, and
+	/// where its leaf then is, starting from where the chain holds its path
+	/// now (`here`, from [`Self::path_outputs`] and the chain's `locate`):
+	/// the lowest output of the path that is unspent, so the plan follows
+	/// whichever round now pays the batch output, a board's conversion, and
+	/// every step someone else has already published.
+	fn bring(&self, coin: &ValidCoin, payer: &mut Payer, txs: &mut Vec<UnrollTx>, here: &Here) -> Result<OutPoint, Error> {
+		if let Some(at) = here.at(&coin.output()) {
+			return Ok(at);
+		}
 		match &coin.origin {
 			ValidOrigin::Leaf { valid, preimage, auths } => {
-				let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
-				for (node, auth) in valid.branch.nodes.iter().zip(auths) {
+				let b = &valid.branch;
+				let n = b.nodes.len();
+				let start = match here.at(&b.entry_output()) {
+					Some(at) => Some((n, at)),
+					None => (0..n).rev().find_map(|i| here.at(&b.nodes[i].output()).map(|at| (i, at))),
+				};
+				let (from, mut at) = start.ok_or_else(|| Error::Refused(format!("nothing of the path of leaf {} is unspent on the chain: \
+					no transaction in a block or the mempool pays its batch output, a node below it or its entry unspent", coin.id)))?;
+				for (node, auth) in b.nodes.iter().zip(auths).skip(from) {
 					let u = self.with_fee(payer, &|f| node.unroll_tx(at, auth, f).map_err(|e| Error::Refused(e.to_string())))?;
 					at = OutPoint::new(u.tx.txid(), node.index as u32);
 					txs.push(u);
 				}
-				let u = self.with_fee(payer, &|f| valid.branch.entry_tx(at, preimage, f).map_err(|e| Error::Refused(e.to_string())))?;
+				let u = self.with_fee(payer, &|f| b.entry_tx(at, preimage, f).map_err(|e| Error::Refused(e.to_string())))?;
 				let leaf = OutPoint::new(u.tx.txid(), 0);
 				txs.push(u);
 				Ok(leaf)
 			},
-			ValidOrigin::Board { valid, record } => {
+			ValidOrigin::Board { record, .. } => {
 				// The owner's conversion of its own board into the leaf.
+				let board = here.at(&record.output()).ok_or_else(|| Error::Refused(format!("the board of {} is spent, and not by its \
+					conversion into the coin's leaf", coin.id)))?;
 				let key = self.keys.leaf(&record.owner_nonce)?;
 				if key.x_only_public_key().0 != record.owner {
 					return Err(Error::Refused("a board in the record is not this wallet's to convert".into()));
 				}
 				let policy = record.policy();
-				let board = valid.outpoint();
 				let u = self.key_spend(payer, &key, &|f| policy.conversion(board, f).map_err(|e| Error::Refused(e.to_string())))?;
 				let leaf = OutPoint::new(u.tx.txid(), 0);
 				txs.push(u);
@@ -157,14 +213,26 @@ impl Wallet {
 			ValidOrigin::Transfer { inputs, index, .. } => {
 				let mut cps = vec![];
 				for i in inputs {
-					let u = if i.coin.board().is_some() {
-						self.with_fee(payer, &|f| i.board_checkpoint_tx(f).map_err(|e| Error::Refused(e.to_string())))?
-					} else {
-						let at = self.bring(&i.coin, payer, txs)?;
-						self.with_fee(payer, &|f| i.checkpoint_tx(at, f).map_err(|e| Error::Refused(e.to_string())))?
+					let cp = match here.at(&i.checkpoint_output()) {
+						Some(at) => at,
+						None => {
+							let u = match (i.coin.board(), here.at(&i.coin.output())) {
+								// A board not converted: its checkpoint spends the
+								// board output itself.
+								(Some((board, _)), None) if here.at(&board.output()).is_some() => {
+									self.with_fee(payer, &|f| i.board_checkpoint_tx(f).map_err(|e| Error::Refused(e.to_string())))?
+								},
+								_ => {
+									let at = self.bring(&i.coin, payer, txs, here)?;
+									self.with_fee(payer, &|f| i.checkpoint_tx(at, f).map_err(|e| Error::Refused(e.to_string())))?
+								},
+							};
+							let at = OutPoint::new(u.tx.txid(), 0);
+							txs.push(u);
+							at
+						},
 					};
-					cps.push(OutPoint::new(u.tx.txid(), 0));
-					txs.push(u);
+					cps.push(cp);
 				}
 				let u = self.with_fee(payer, &|f| coin.reassignment_tx(&cps, f).map_err(|e| Error::Refused(e.to_string())))?;
 				let leaf = OutPoint::new(u.tx.txid(), *index as u32);
@@ -175,8 +243,11 @@ impl Wallet {
 	}
 
 	/// Takes `leaf_id` on-chain from its record alone and claims it after the
-	/// exit delay. Each call goes as far as the chain allows now; call again
-	/// to go on. `fee_asset` pays whatever the coin's own reserves cannot.
+	/// exit delay. Each call goes as far as the chain allows now, building
+	/// what is still needed from where the chain holds the coin's path now;
+	/// call again to go on. `fee_asset` pays whatever the coin's own reserves
+	/// cannot, and is remembered for the exit's later steps. The claim goes to
+	/// one address of the wallet's, chosen when the exit starts.
 	pub fn exit(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
 		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered") {
@@ -185,38 +256,43 @@ impl Wallet {
 		let record = Self::record_of(&row)?;
 		let now = self.now()?;
 		// An exit asks nothing of the expiry: it is what a wallet does when
-		// time runs short.
+		// time runs short. The coin is the one the wallet accepted; where its
+		// path is now is the chain's.
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(now) };
-		let txs = self.base_txs(&record)?;
+		let txs = self.accepted_bases(&record)?;
 		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let key = self.keys.leaf(&row.owner_nonce)?;
-		let mut payer = Payer { asset: fee_asset, coin: None, change: None, used: vec![] };
-		let (plan, leaf_at): (Vec<Transaction>, OutPoint) = match self.store.exit(leaf_id)? {
-			Some((_, txs, _)) => {
-				let v: Value = serde_json::from_str(&txs).map_err(|e| Error::Store(e.to_string()))?;
-				let plan = v["txs"].as_array().cloned().unwrap_or_default().iter()
-					.map(|t| unhex(t.as_str().unwrap_or("")).and_then(|b| elements::encode::deserialize(&b).map_err(|e| Error::Store(e.to_string()))))
-					.collect::<Result<Vec<Transaction>, _>>()?;
-				let leaf_at = OutPoint::from_str(v["leaf"].as_str().unwrap_or("")).map_err(|e| Error::Store(e.to_string()))?;
-				(plan, leaf_at)
-			},
-			None => {
-				let mut built = vec![];
-				let leaf_at = self.bring(&coin, &mut payer, &mut built)?;
-				let plan: Vec<Transaction> = built.into_iter().map(|u| u.tx).collect();
-				let v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string()});
-				self.store.set_exit(leaf_id, "unrolling", &v.to_string(), None)?;
-				self.store.set_coin_state(leaf_id, "exiting", "its exit has started")?;
-				(plan, leaf_at)
-			},
+		let prior: Value = match self.store.exit(leaf_id)? {
+			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,
+			None => json!({}),
 		};
+		let fee_asset = match fee_asset {
+			Some(a) => Some(a),
+			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
+		};
+		// One claim address for the exit, however many times it is run.
+		let claim_index = match prior["claim_index"].as_u64() {
+			Some(i) => i as u32,
+			None => self.store.take_index(super::keys::RECEIVE)?,
+		};
+		let mut payer = Payer { asset: fee_asset, coin: None, change: None, used: vec![] };
+		let mut path = vec![];
+		Self::path_outputs(&coin, &mut path);
+		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
+		let mut built = vec![];
+		let leaf_at = self.bring(&coin, &mut payer, &mut built, &here)?;
+		let plan: Vec<Transaction> = built.into_iter().map(|u| u.tx).collect();
+		let record_exit = |state: &str, s: &Wallet| -> Result<(), Error> {
+			let v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
+				"fee_asset": fee_asset.map(|a| a.to_string()), "claim_index": claim_index});
+			s.store.set_exit(leaf_id, state, &v.to_string(), None)
+		};
+		record_exit("unrolling", self)?;
+		if row.state != "exiting" {
+			self.store.set_coin_state(leaf_id, "exiting", "its exit has started")?;
+		}
 		let mut steps = vec![];
 		for t in &plan {
-			let f = self.chain.finality(&t.txid())?;
-			if f.in_chain() || matches!(f, super::chain::Finality::NotInChain { in_mempool: true }) {
-				steps.push(json!({"txid": t.txid().to_string(), "vsize": t.vsize(), "already": f.word()}));
-				continue;
-			}
 			match self.chain.broadcast(t) {
 				Ok(txid) => steps.push(json!({"txid": txid.to_string(), "vsize": t.vsize(), "fee": txs_fee(t).iter()
 					.map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()})),
@@ -229,11 +305,10 @@ impl Wallet {
 		// The claim, once the leaf is in a block and its delay has run.
 		let leaf_f = self.chain.finality(&leaf_at.txid)?;
 		if !leaf_f.in_chain() {
-			self.store.set_exit(leaf_id, "unrolling", &self.store.exit(leaf_id)?.expect("set").1, None)?;
-			return Ok(json!({"leaf_id": leaf_id, "state": "unrolling", "broadcast": steps,
+			return Ok(json!({"leaf_id": leaf_id, "state": "unrolling", "broadcast": steps, "leaf": leaf_at.to_string(),
 				"next": "the leaf's transaction is not in a block yet; run exit again once it is"}));
 		}
-		let to = self.new_script(super::keys::RECEIVE)?;
+		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
 		let (asset, value) = (coin.asset, coin.value);
 		let leaf = coin.leaf;
 		let claim = self.key_spend(&mut payer, &key, &|f| {
@@ -265,14 +340,23 @@ impl Wallet {
 					"to": self.chain.address(&to)?}}))
 			},
 			Err(e) if e.to_string().contains("non-BIP68-final") => {
-				let txs = self.store.exit(leaf_id)?.expect("set").1;
-				self.store.set_exit(leaf_id, "waiting", &txs, None)?;
+				record_exit("waiting", self)?;
 				Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps,
 					"next": format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
 						leaf.exit_delay.seconds(), e)}))
 			},
 			Err(e) => Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "error": e.to_string()})),
 		}
+	}
+
+	/// Moves on every exit the wallet has started, with the fee asset each was
+	/// started with.
+	pub(crate) fn progress_exits(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for c in self.store.coins_in("exiting")? {
+			out.push(self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"leaf_id": c.leaf_id, "error": e.to_string()})));
+		}
+		Ok(out)
 	}
 
 	/// Everything the wallet does on its own: the re-check of every coin
@@ -283,7 +367,8 @@ impl Wallet {
 		let transfers = self.retry_transfers()?;
 		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let participations = self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		Ok(json!({"recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations}))
+		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		Ok(json!({"recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations, "exits": exits}))
 	}
 
 	/// The decoded coin record of `leaf_id`, for people.

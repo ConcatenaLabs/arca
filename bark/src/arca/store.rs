@@ -271,6 +271,13 @@ impl Store {
 		Ok(())
 	}
 
+	/// The txids of the rounds and boards a coin rests on.
+	pub fn set_coin_bases(&self, leaf_id: &str, bases: &[String]) -> Result<(), Error> {
+		self.conn.execute("UPDATE coin SET bases = ?2 WHERE leaf_id = ?1", params![leaf_id, serde_json::to_string(bases).expect("strings")])
+			.map_err(db)?;
+		Ok(())
+	}
+
 	pub fn set_coin_record(&self, leaf_id: &str, record: &[u8]) -> Result<(), Error> {
 		self.conn.execute("UPDATE coin SET record = ?2 WHERE leaf_id = ?1", params![leaf_id, record]).map_err(db)?;
 		Ok(())
