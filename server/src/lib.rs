@@ -5,12 +5,14 @@
 //! out-of-round transfers and delivers them to their receivers, and keeps its
 //! own on-chain wallet and transactions. Its state is in PostgreSQL
 //! ([`store`]); what it knows of the chain, and whether anything is final,
-//! comes from the finality service ([`chain::finality`]).
+//! comes from the finality service ([`chain::finality`]). Its on-chain wallet
+//! ([`wallet`]) is built on the Sequentia Wallet Kit.
 //!
 //! The scripts, records and their validation are `arca-covenant`'s; the server
 //! uses them and writes none of its own.
 
 pub mod chain;
 pub mod store;
+pub mod wallet;
 
 pub use store::{Store, StoreError};

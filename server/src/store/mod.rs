@@ -22,14 +22,17 @@ mod auth;
 mod chain;
 mod coins;
 mod mailbox;
+mod wallet;
 
 pub use auth::ChallengeError;
-pub use chain::{BlockRow, Scan};
+pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
+pub use wallet::{WalletCoin, WalletRefusal};
 
 /// The migrations, in order: `(version, SQL)`. The schema is squashed into the
-/// first; a later change to it is a new entry, never an edit of an old one.
+/// first; a change to a schema a server has run is a new entry, never an edit
+/// of an old one.
 const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../../schema/V1__arca.sql"))];
 
 /// An arbitrary key for the advisory lock that serialises migrations.

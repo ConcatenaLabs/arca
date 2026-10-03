@@ -289,14 +289,19 @@ CREATE TABLE auth_challenge (
 -- The on-chain wallet and the server's own transactions
 ------------------------------------------------------------------------------
 
--- The wallet's receiving scripts, by derivation index.
+-- The wallet's scripts it has handed out, by derivation chain (0 to receive,
+-- 1 for change) and index.
 CREATE TABLE wallet_key (
-	idx           INTEGER PRIMARY KEY CHECK (idx >= 0),
+	chain         SMALLINT NOT NULL CHECK (chain IN (0, 1)),
+	idx           INTEGER NOT NULL CHECK (idx >= 0),
 	script_pubkey BYTEA NOT NULL UNIQUE,
-	issued_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+	issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (chain, idx)
 );
 
--- The wallet's coins, per asset, all explicit. spent_by names the server's
+-- The wallet's coins, per asset, all explicit, as found in blocks of the
+-- active chain. found_in is the block that holds the coin's transaction, and
+-- empties when that block is disconnected; spent_by names the server's
 -- transaction that spends the coin once the wallet has built it.
 CREATE TABLE wallet_coin (
 	txid          BYTEA NOT NULL CHECK (length(txid) = 32),
@@ -304,6 +309,7 @@ CREATE TABLE wallet_coin (
 	asset         BYTEA NOT NULL CHECK (length(asset) = 32),
 	value         BIGINT NOT NULL CHECK (value > 0),
 	script_pubkey BYTEA NOT NULL REFERENCES wallet_key (script_pubkey),
+	found_in      BYTEA REFERENCES block ON DELETE SET NULL,
 	spent_by      BYTEA CHECK (spent_by IS NULL OR length(spent_by) = 32),
 	found_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 	PRIMARY KEY (txid, vout)

@@ -6,10 +6,11 @@
 //! follows the node's active chain into the database, scans each block for
 //! what the server watches, and is the one answer to "is this final".
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use elements::hashes::Hash;
-use elements::{BlockHash, Transaction, Txid};
+use elements::{AssetId, BlockHash, Transaction, Txid};
 use serde_json::{json, Value};
 
 use sequentia_ext::rpc::{Client, Error as RpcError};
@@ -91,6 +92,15 @@ pub trait ChainSource: Send + Sync + 'static {
 	fn broadcast(&self, tx: &Transaction) -> Result<Txid, ChainError>;
 	/// The chain's genesis block hash.
 	fn genesis(&self) -> Result<BlockHash, ChainError>;
+	/// The node's fee whitelist, now: each accepted fee asset and its rate, in
+	/// reference units per 10^8 atoms of the asset. An asset not listed is not
+	/// accepted for fees by this node.
+	fn fee_rates(&self) -> Result<BTreeMap<AssetId, u64>, ChainError>;
+	/// The node's relay floor, in reference units per 1,000 vbytes.
+	fn relay_floor_per_kvb(&self) -> Result<u64, ChainError>;
+	/// Whether the node would accept `tx` into its mempool now, and if not,
+	/// why; and its virtual size.
+	fn test_accept(&self, tx: &Transaction) -> Result<(bool, Option<String>, Option<u64>), ChainError>;
 }
 
 /// A `sequentiad` reached over JSON-RPC. It must run with `-txindex`, and with
@@ -186,6 +196,23 @@ impl ChainSource for NodeSource {
 
 	fn genesis(&self) -> Result<BlockHash, ChainError> {
 		Ok(self.client.genesis_hash()?)
+	}
+
+	fn fee_rates(&self) -> Result<BTreeMap<AssetId, u64>, ChainError> {
+		Ok(self.client.fee_exchange_rates()?)
+	}
+
+	fn relay_floor_per_kvb(&self) -> Result<u64, ChainError> {
+		// The node reports it in whole reference units per kvB, as a decimal.
+		let v: Value = self.client.call("getmempoolinfo", &[])?;
+		let units = v["minrelaytxfee"].as_f64().ok_or_else(|| ChainError::Answer("no minrelaytxfee".into()))?;
+		Ok((units * 100_000_000.0).round() as u64)
+	}
+
+	fn test_accept(&self, tx: &Transaction) -> Result<(bool, Option<String>, Option<u64>), ChainError> {
+		let r = self.client.test_mempool_accept(&[tx])?.into_iter().next()
+			.ok_or_else(|| ChainError::Answer("testmempoolaccept returned nothing".into()))?;
+		Ok((r.allowed, r.reject_reason, r.vsize))
 	}
 }
 

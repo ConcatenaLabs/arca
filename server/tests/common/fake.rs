@@ -32,6 +32,7 @@ struct Inner {
 	/// Whether blocks carry certificates at all.
 	committee: bool,
 	salt: u64,
+	rates: std::collections::BTreeMap<AssetId, u64>,
 }
 
 /// A transaction unique to `label`.
@@ -57,6 +58,7 @@ impl FakeChain {
 		let mut inner = Inner {
 			blocks: HashMap::new(), active: vec![], mempool: vec![],
 			anchor: AnchorStatus { validated: true, status: "ok".into() }, committee, salt: 0,
+			rates: Default::default(),
 		};
 		inner.push(None, 100, true, vec![]);
 		FakeChain { inner: Mutex::new(inner) }
@@ -94,6 +96,10 @@ impl FakeChain {
 
 	pub fn to_mempool(&self, tx: Transaction) {
 		self.inner.lock().unwrap().mempool.push(tx);
+	}
+
+	pub fn set_rate(&self, asset: AssetId, rate: u64) {
+		self.inner.lock().unwrap().rates.insert(asset, rate);
 	}
 
 	pub fn height(&self) -> u64 {
@@ -162,5 +168,17 @@ impl ChainSource for FakeChain {
 
 	fn genesis(&self) -> Result<BlockHash, ChainError> {
 		Ok(self.inner.lock().unwrap().active[0])
+	}
+
+	fn fee_rates(&self) -> Result<std::collections::BTreeMap<AssetId, u64>, ChainError> {
+		Ok(self.inner.lock().unwrap().rates.clone())
+	}
+
+	fn relay_floor_per_kvb(&self) -> Result<u64, ChainError> {
+		Ok(1_000)
+	}
+
+	fn test_accept(&self, _tx: &Transaction) -> Result<(bool, Option<String>, Option<u64>), ChainError> {
+		Ok((true, None, None))
 	}
 }
