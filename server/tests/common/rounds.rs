@@ -103,10 +103,13 @@ pub fn validate_new_leaf(r: &Running, id: &[u8; 32], output: usize, key: &Keypai
 	(valid, record, round)
 }
 
-/// The round's creation time, from a leaf's schedule: the time an owner signs
-/// its own unroll authorisations with.
+/// The time an owner signs its own unroll authorisations with: an hour
+/// before its round's creation, read from the leaf's schedule. An unroll is
+/// final only once the tip's median time is past the authorisation's time,
+/// and right after a round the median time may not yet be past the round's
+/// own; an earlier time is usable at once.
 pub fn created(record: &LeafRecord) -> MedianTime {
-	MedianTime::from_consensus(record.schedule.expiries()[0].to_consensus_u32() - 28 * 86_400).unwrap()
+	MedianTime::from_consensus(record.schedule.expiries()[0].to_consensus_u32() - 28 * 86_400 - 3_600).unwrap()
 }
 
 /// A transaction spending the server wallet's coin at `coin` (whose output is
