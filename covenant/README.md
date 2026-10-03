@@ -90,13 +90,16 @@ two forfeits. The builder refuses a key on two leaves of a batch, and a record
 whose lowest level names its own key in another slot is refused.
 
 **A salt from both sides.** A leaf's salt is
-`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`. The owner's wallet picks
+`SHA256("Arca/salt" ‖ owner_nonce ‖ creator_nonce)`. The owner's wallet picks
 `owner_nonce` at random for every leaf it asks for (or publishes it in a receive
-request), never from a counter, which a restore would repeat; the operator adds
-its own. The record carries both nonces and rebuilds the salt from them.
-`validate` takes the key and the nonce the wallet expects for this leaf and
-refuses a record not built from them, so a wallet that never repeats a nonce is
-never given a leaf script it has signed for before.
+request), never from a counter, which a restore would repeat; the leaf's creator
+adds the second nonce. For a leaf of a round, and for a board, the creator is
+the operator, and the leaf record and the board record call it the operator
+nonce. For a leaf a reassignment creates, the creator is the sender (below).
+The record carries both nonces and rebuilds the salt from them. `validate`
+takes the key and the nonce the wallet expects for this leaf and refuses a
+record not built from them, so a wallet that never repeats a nonce is never
+given a leaf script it has signed for before.
 
 **The wallet's policy.** `validate` is the check a wallet runs before it accepts
 a leaf. It refuses a record outside the wallet's `WalletPolicy`: another chain,
@@ -339,14 +342,46 @@ skipped or reordered, and the checkpoint sweeps with the notice of the batch the
 coin descends from.
 
 ```rust
+let receiver_leaf = NewLeaf { owner, owner_nonce, creator_nonce: random(), exit_delay };  // the request, and the sender's nonce
 let plan = TransferPlan { inputs: vec![(coin, checkpoint_value)], outputs };
+plan.admit(&mut seen)?;                               // the operator's rule, before it co-signs
 let cp = plan.checkpoint_message(0)?.digest;          // owner and operator sign both
 let re = plan.reassignment_message(0)?.digest;
 let record = CoinRecord::Transfer(Box::new(Transfer {
 	inputs: vec![TransferInput { coin: my_record, checkpoint_value, checkpoint: cp_pair, reassignment: re_pair }],
-	outputs: plan.outputs.clone(), index: 0, leaf: receiver_leaf,  // the receiver's key and nonce, the operator's nonce
+	outputs: plan.outputs.clone(), index: 0, leaf: receiver_leaf,
 }));
 ```
+
+**Every output a pair commits to carries something unique to the inputs it
+spends.** A pair names outputs, never inputs: two pairs whose committed outputs
+agree at every index both commit to (the same outputs, or one set the first
+outputs of the other) are satisfied by one transaction, which spends the coins
+of both, creates the outputs once, and leaves the value of one side to whoever
+broadcasts it. Each pair is sound on its own, so no signer can see it. So each
+kind of output carries what makes it unique: a forfeit output the id of the
+leaf it gives up, a checkpoint the salt of the coin it holds, and every output
+a reassignment creates something the sender draws fresh, for a leaf its
+creator nonce (an `htlc-1` output, its salts). The sender's wallet draws a
+fresh random nonce for every leaf it creates, the receiver's and its own
+change alike, never from a counter and never from the receive request; two
+payments to one receive request then create two leaves, where with the request
+alone they would commit to one output and one sender's coin would go to the
+broadcaster. The receiver checks its own key and nonce as for any leaf, and
+the leaf is rebuilt from both nonces.
+
+Two checks hold the rule where a sender breaks it. The operator co-signs a
+reassignment only after `TransferPlan::admit` against every reassignment it has
+co-signed (`SeenReassignments`, kept by the hash of output 0, which any two
+such reassignments share): it refuses one whose outputs agree with another's at
+every index both commit to, and admits the same reassignment again. And
+`CoinRecord::validate` refuses a record in which two coins share a salt: a leaf
+promised by two reassignments may exist on-chain only once, and a coin that
+rests on it twice could be brought on-chain only in part. `validate` cannot see
+the coins a wallet already holds, and two records at one leaf are one coin: a
+wallet refuses a coin whose salt (`coin.leaf.salt`) is that of a coin it holds.
+A second honest payment never meets that refusal, since its sender drew another
+creator nonce.
 
 A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
 the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
@@ -365,8 +400,9 @@ under the receiver's policy, every preimage and authorisation
 is good and usable now, every pair verifies, no reassignment creates more than
 its checkpoints hold, every leaf in the lineage (whoever owns it) has an exit
 delay within the policy's bounds, the coin's output is the leaf the record names
-for the receiver's key and nonce, no coin is spent twice in the record, and the
-chain is at most five reassignments from a round. A receiver passes
+for the receiver's key and nonce and the sender's creator nonce, no coin is
+spent twice in the record and no two share a salt, and the chain is at most
+five reassignments from a round. A receiver passes
 `policy.receipt()`: a coin from a reassignment is safe only until the earliest
 first expiry among the batches it descends from (`expiry`), and the receipt
 policy asks that every one of them lie past the exit deadline. The valid coin
@@ -457,15 +493,22 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   input verifies under the block rules and the mempool's checks. The board record
   decodes from both forms and its refusal vectors are refused; every coin record
   in the chain, and a coin paid out of round from the board, decodes, encodes
-  back, validates for its receiver and gives the reference's coin id.
+  back, validates for its receiver, gives the reference's coin id and carries
+  its sender's creator nonce; the coin resting on one leaf that two
+  reassignments promised is refused for the salt they share.
 - `tests/transfer.rs`: a chain three hops deep, one hop a two-asset swap,
   received from the last receiver's record alone, validated against the two
   rounds, and every transaction that brings it on-chain built from the record
   and verified; each kind of bad record refused (another key or nonce, a changed
   output, swapped pairs, a checkpoint worth more than its coin, a coin spent twice
-  in the record, an authorisation by another key or not yet usable, a wrong
-  preimage, a missing round, the horizon, batch leaves of another operator, six
-  hops); the receipt policy accepting the coin until three days before the
+  in the record, one leaf promised by two reassignments and both spent, a coin
+  paid back into the leaf it came from, an authorisation by another key or not
+  yet usable, a wrong preimage, a missing round, the horizon, batch leaves of
+  another operator, six hops); the operator's rule admitting the chain's three
+  reassignments and refusing another with the same outputs, with only the first
+  of them, or with one more after them, in either order, while admitting the
+  same reassignment again and one whose outputs part at output 1; the receipt
+  policy accepting the coin until three days before the
   earliest first expiry in its lineage; a coin refused for a leaf up its lineage
   whose exit delay is outside the bounds, too short or too long; the lineage
   listing every leaf and checkpoint the coin descends from, and the coin refused
@@ -506,6 +549,18 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   not balance; the pairs do not name the other input, so a third party funding
   that side would make it confirm), and the first sender's exit fails once the
   receiver has published the checkpoint.
+- `tests/merge.rs`: on an anchored regtest chain, two reassignments merged into
+  one transaction. Two senders pay one receive request, each drawing the
+  creator nonce of the leaf it creates: the operator admits both, the receiver
+  holds two leaves, and the transaction that spends both checkpoints into one
+  sender's outputs is refused (`Invalid Schnorr signature`, on the other
+  sender's input), by the mempool and in a block; each reassignment confirms on
+  its own. A sender that repeats another's creator nonce: the operator's rule
+  refuses its plan, for the same outputs and for one set the first outputs of
+  the other; the pairs made anyway merge, the leaf is created once and the
+  broadcaster takes a sender's whole checkpoint, in both shapes; a receiver
+  refuses the coin that rests on the one leaf twice, and after the merge only
+  one of its two checkpoints can be made.
 - `tests/rollback.rs`: on an anchored regtest chain, what each party holds after
   a rollback (`invalidateblock` standing in for an anchor rollback). A round
   broadcast again returns with its txid, the re-check finds the same round, `M`

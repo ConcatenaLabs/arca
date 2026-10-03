@@ -2,7 +2,9 @@
 //! one of them a swap of two owners' coins in two assets, received and
 //! validated from the last receiver's record alone; every transaction that
 //! brings the coin on-chain built from that record and verified under the
-//! block rules and the mempool's checks; and each kind of bad record refused.
+//! block rules and the mempool's checks; each kind of bad record refused; and
+//! the operator's rule that no two reassignments it co-signs can be satisfied
+//! by one transaction.
 
 mod common;
 
@@ -198,6 +200,42 @@ fn each_bad_record_is_refused() {
 	transfer_mut(&mut m).inputs[1] = first;
 	assert_eq!(refuse("one coin at both inputs of a swap", &m, p, &f.hops.b2.leaf.owner, &f.hops.b2.leaf.owner_nonce).kind(),
 		"double_spend");
+	// One leaf promised by two reassignments: A and a bystander of batch 1
+	// each pay one output, the same leaf (a sender repeating another's
+	// creator nonce), and its owner pays both coins on. One transaction can
+	// satisfy both reassignments and create the leaf once.
+	let s = &f.b.s;
+	let t = MedianTime::from_consensus(CREATED).unwrap();
+	let by = keypair("chain batch 1 bystander 0");
+	let by_base = base(&f.b.batch1, 0, &by, f.b.preimages1[0], t);
+	let by_coin = by_base.resolve(&f.rounds, p).unwrap();
+	let a_coin = f.hops.a_base.resolve(&f.rounds, p).unwrap();
+	assert_eq!((a_coin.asset, a_coin.value), (by_coin.asset, by_coin.value));
+	let twice = Party::new("promised twice", d.leaf.exit_delay);
+	let x1 = pay(&f.hops.a_base, &a_coin, &f.b.a, s, twice.leaf, p.chain);
+	let x2 = pay(&by_base, &by_coin, &by, s, twice.leaf, p.chain);
+	let (k1, k2) = (x1.resolve(&f.rounds, p).unwrap(), x2.resolve(&f.rounds, p).unwrap());
+	assert_eq!(k1.output(), k2.output());
+	let next = Party::new("after the promised leaf", d.leaf.exit_delay);
+	let plan = TransferPlan {
+		inputs: vec![(k1.clone(), k1.value - MARGIN), (k2.clone(), k2.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(k1.asset, k1.value + k2.value - 3 * MARGIN, next.leaf.policy(xonly(s), p.chain).script_pubkey())],
+	};
+	let m = CoinRecord::Transfer(Box::new(Transfer {
+		inputs: [&x1, &x2].iter().enumerate().map(|(i, r)| {
+			let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
+			TransferInput { coin: (*r).clone(), checkpoint_value: plan.inputs[i].1,
+				checkpoint: Pair { operator: sig(s, &cp), owner: sig(&twice.key, &cp) },
+				reassignment: Pair { operator: sig(s, &re), owner: sig(&twice.key, &re) } }
+		}).collect(),
+		outputs: plan.outputs.clone(), index: 0, leaf: next.leaf,
+	}));
+	let e = refuse("one leaf promised by two reassignments, both spent", &m, p, &next.leaf.owner, &next.leaf.owner_nonce);
+	assert!(matches!(e, TransferError::SaltTwice { .. }), "{}", e);
+	assert_eq!(e.kind(), "salt");
+	// The coin's own leaf made again from a salt up its lineage.
+	let m = pay(&f.hops.d_record, &coin_of(&f, rec), &d.key, s, d.leaf, p.chain);
+	assert!(matches!(refuse("a coin paid into the leaf it came from", &m, p, &key, &nonce), TransferError::SaltTwice { .. }));
 	// An unroll authorisation by another key, or not yet usable.
 	let mut m = f.hops.a_base.clone();
 	if let CoinRecord::Leaf { auths, .. } = &mut m {
@@ -253,6 +291,78 @@ fn each_bad_record_is_refused() {
 	assert_eq!(r.resolve(&f.rounds, p).unwrap().hops, 6);
 	assert_eq!(refuse("six reassignments from a round", &r, p, &owner.leaf.owner, &owner.leaf.owner_nonce).to_string(),
 		"6 reassignments since a round; a coin is refreshed into a round after 5");
+}
+
+fn coin_of(f: &Fx, rec: &CoinRecord) -> ValidCoin {
+	rec.resolve(&f.rounds, &f.policy).unwrap()
+}
+
+/// What the operator records of the reassignment that created `coin`.
+fn reassignment(coin: &ValidCoin) -> (Vec<(LeafId, u64)>, Vec<ExplicitOutput>) {
+	match &coin.origin {
+		ValidOrigin::Transfer { inputs, outputs, .. } =>
+			(inputs.iter().map(|i| (i.coin.id, i.checkpoint_value)).collect(), outputs.clone()),
+		_ => panic!("a reassignment's output"),
+	}
+}
+
+#[test]
+fn the_operator_cosigns_no_two_reassignments_one_transaction_could_satisfy() {
+	let f = fx();
+	let h = &f.hops;
+	// The chain's three reassignments, each seen once per output it creates:
+	// none refused, and an output's second sight is the same reassignment.
+	let mut seen = SeenReassignments::new();
+	for r in [&h.b1_record, &h.a_change_record, &h.b2_record, &h.c2_record, &h.d_record] {
+		let (ins, outs) = reassignment(&coin_of(&f, r));
+		seen.admit(&ins, &outs).unwrap();
+	}
+	assert_eq!(seen.len(), 3);
+
+	// Against hop 1's outputs [B1, A's change]: another reassignment with
+	// the same outputs, with only the first, with one more after them, all
+	// refused; the first alone, then the full set, refused in that order too.
+	let (ins1, outs1) = reassignment(&coin_of(&f, &h.b1_record));
+	let other = vec![(h.d_record.resolve(&f.rounds, &f.policy).unwrap().id, 1_000)];
+	let more = {
+		let mut o = outs1.clone();
+		o.push(ExplicitOutput::new(o[0].asset, 1, op_true().script_pubkey()));
+		o
+	};
+	for (name, outs) in [("the same outputs", outs1.clone()), ("its first output alone", outs1[..1].to_vec()),
+		("its outputs and one more", more)]
+	{
+		let e = seen.check(&other, &outs).unwrap_err();
+		println!("against hop 1 {:<28} {} ({})", name, e, e.kind());
+		assert!(matches!(e, TransferError::Mergeable));
+		assert!(arca_covenant::transfer::mergeable(&outs1, &outs));
+	}
+	let mut alone = SeenReassignments::new();
+	alone.admit(&other, &outs1[..1]).unwrap();
+	assert!(matches!(alone.admit(&ins1, &outs1).unwrap_err(), TransferError::Mergeable));
+	// The same first output and another second: no transaction satisfies
+	// both, since both commit to output 1; not refused.
+	let mut diverge = outs1.clone();
+	diverge[1].value -= 1;
+	assert!(!arca_covenant::transfer::mergeable(&outs1, &diverge));
+	seen.check(&other, &diverge).unwrap();
+	// The same reassignment again is not another one.
+	seen.check(&ins1, &outs1).unwrap();
+	// Its inputs with another checkpoint value is another reassignment.
+	let mut ins_other = ins1.clone();
+	ins_other[0].1 -= 1;
+	assert!(matches!(seen.check(&ins_other, &outs1).unwrap_err(), TransferError::Mergeable));
+	assert!(matches!(seen.check(&ins1, &[]).unwrap_err(), TransferError::Outputs(0)));
+
+	// The plan the sender builds is what the operator admits.
+	let plan = TransferPlan { inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: outs1.clone() };
+	assert!(matches!(plan.admit(&mut seen).unwrap_err(), TransferError::Mergeable));
+	let mut fresh = Party::new("B1", f.hops.b1.leaf.exit_delay).leaf;
+	fresh.creator_nonce = label32("another creator nonce");
+	let fresh_out = vec![ExplicitOutput::new(outs1[0].asset, outs1[0].value, fresh.policy(xonly(&f.b.s), f.policy.chain).script_pubkey())];
+	let plan = TransferPlan { inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: fresh_out };
+	plan.admit(&mut seen).unwrap();
+	println!("the same receiver, key and nonce, with another creator nonce: admitted");
 }
 
 #[test]

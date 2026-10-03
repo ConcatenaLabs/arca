@@ -32,8 +32,9 @@
 //! 7. No leaf script appears twice, so no node or leaf script is funded twice.
 //!    Each leaf's salt is `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`
 //!    ([`crate::leaf::leaf_salt`]): the owner's wallet picks its nonce at
-//!    random for every leaf it asks for, the operator adds its own, and a
-//!    batch with an operator nonce twice is refused.
+//!    random for every leaf it asks for, the operator, which creates the
+//!    round's leaves, adds its own, and a batch with an operator nonce twice
+//!    is refused.
 //! 8. A key holds one leaf: a batch with an owner key on two leaves is
 //!    refused. Each leaf instance has its own key, and a key signs for one
 //!    leaf only, so no signature made for one leaf (a forfeit, a release)

@@ -29,8 +29,9 @@ every other node's and every entry's has the notice `W`. The lowest nodes
 (including a batch output whose children are entries) carry RECLAIM.
 
 Each leaf's salt has a contribution from each side:
-SHA256("Arca/salt" || owner_nonce || operator_nonce). The record carries both
-nonces and not the salt, which is rebuilt from them.
+SHA256("Arca/salt" || owner_nonce || operator_nonce), the second nonce being
+that of the leaf's creator, here the operator, which builds the round. The
+record carries both nonces and not the salt, which is rebuilt from them.
 
 The record, format version 2
 ----------------------------

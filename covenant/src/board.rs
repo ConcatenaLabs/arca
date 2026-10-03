@@ -29,11 +29,11 @@
 //! exit delay. A board's refresh needs no forfeit on-chain first.
 //!
 //! The leaf's salt is built from the owner's nonce and one the operator gave
-//! it, as for every leaf ([`crate::leaf::leaf_salt`]), so the operator, which
-//! never repeats its nonce, can tell the board's scripts were never funded
-//! before. The operator credits the board once the transaction is final: its
-//! block certified and its anchor buried; the risk of a board reorged away is
-//! the operator's, which is why it waits.
+//! it, as for a leaf of a round ([`crate::leaf::leaf_salt`]), so the
+//! operator, which never repeats its nonce, can tell the board's scripts were
+//! never funded before. The operator credits the board once the transaction
+//! is final: its block certified and its anchor buried; the risk of a board
+//! reorged away is the operator's, which is why it waits.
 //!
 //! A converted board is an Arca leaf on-chain, and an Arca leaf on-chain is
 //! never spent off-chain again: past its delay its owner can exit at once.
