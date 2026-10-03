@@ -187,6 +187,7 @@ impl ForfeitError {
 			BadRelease(_) => "bad_signature",
 			WrongRound { .. } => "wrong_round",
 			Cosign(e) => e.code(),
+			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Store(_) | Internal(_) => "internal",
@@ -311,7 +312,7 @@ impl Forfeits {
 		// The operator's half of each forfeit.
 		let mut forfeits = Vec::with_capacity(built.len());
 		for (leaf, c, f, owner_sig) in &built {
-			let operator_sig = self.signer.rebind(&c.leaf.salt, c.asset, c.value, &[f.output()]).await?;
+			let operator_sig = self.signer.rebind_forfeit(&c.leaf.salt, c.asset, c.value, &f.policy, &f.output()).await?;
 			f.verify(&Pair { operator: operator_sig, owner: *owner_sig })
 				.map_err(|_| ForfeitError::Internal("the signer signed another message than the server built".into()))?;
 			forfeits.push(NewForfeit {

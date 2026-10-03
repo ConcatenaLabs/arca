@@ -75,6 +75,8 @@ pub enum ScriptKind {
 	Board,
 	/// A checkpoint between a leaf and the reassignment that spends it.
 	Checkpoint,
+	/// The operator's connector script, which every round pays.
+	Connector,
 }
 
 impl ScriptKind {
@@ -83,6 +85,7 @@ impl ScriptKind {
 			ScriptKind::Leaf => "leaf",
 			ScriptKind::Board => "board",
 			ScriptKind::Checkpoint => "checkpoint",
+			ScriptKind::Connector => "connector",
 		}
 	}
 }
@@ -307,6 +310,7 @@ impl Store {
 				"leaf" => ScriptKind::Leaf,
 				"board" => ScriptKind::Board,
 				"checkpoint" => ScriptKind::Checkpoint,
+				"connector" => ScriptKind::Connector,
 				other => return Err(StoreError::Corrupt(format!("script kind {}", other))),
 			};
 			Ok((kind, array32(r.get(1), "leaf id")?))

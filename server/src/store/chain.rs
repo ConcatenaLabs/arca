@@ -329,4 +329,47 @@ impl Store {
 		let rows = conn.query("SELECT kind, height, hash FROM chain_event ORDER BY seq", &[]).await?;
 		rows.iter().map(|r| Ok((r.get(0), r.get::<_, i64>(1) as u64, array32(r.get(2), "block hash")?))).collect()
 	}
+
+	/// Records the operator's connector script, which every round pays, so
+	/// the chain is watched for it from now on.
+	pub async fn watch_connector(&self, script_pubkey: &[u8]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute(
+			"INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'connector', $2) ON CONFLICT DO NOTHING",
+			&[&script_pubkey, &&[0u8; 32][..]],
+		).await?;
+		Ok(())
+	}
+
+	/// The transactions seen paying the connector script `script_pubkey`, in
+	/// a block or the mempool, that are not a round the database knows.
+	pub async fn unknown_rounds(&self, script_pubkey: &[u8]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT DISTINCT s.txid FROM script_sighting s
+			 WHERE s.script_pubkey = $1 AND NOT EXISTS (SELECT 1 FROM round r WHERE r.txid = s.txid)",
+			&[&script_pubkey],
+		).await?;
+		rows.iter().map(|r| array32(r.get(0), "txid")).collect()
+	}
+
+	/// Each board output seen spent by a transaction the nursery does not
+	/// hold: the board's record, its outpoint, the spender, and the
+	/// checkpoint script of the transfer of the board the operator co-signed,
+	/// if any. Such a spend is the owner's conversion, or the checkpoint of
+	/// that transfer; anything else is a spend the database does not know.
+	pub async fn board_spends_unbuilt(&self) -> Result<Vec<(Vec<u8>, [u8; 32], u32, [u8; 32], Option<Vec<u8>>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.record, b.txid, b.vout, w.spent_by,
+			        (SELECT a.script_pubkey FROM arca_script a
+			         JOIN transfer_input ti ON ti.leaf_id = a.leaf_id JOIN transfer t ON t.transfer_id = ti.transfer_id
+			         WHERE a.leaf_id = b.leaf_id AND a.kind = 'checkpoint' AND t.state = 'signed' LIMIT 1)
+			 FROM board b JOIN watched_outpoint w ON w.txid = b.txid AND w.vout = b.vout
+			 WHERE w.spent_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nursery_tx n WHERE n.txid = w.spent_by)",
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok((r.get(0), array32(r.get(1), "txid")?, r.get::<_, i32>(2) as u32, array32(r.get(3), "txid")?, r.get(4))))
+			.collect()
+	}
 }

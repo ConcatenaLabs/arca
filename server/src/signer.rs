@@ -22,11 +22,34 @@
 //!
 //! It signs nothing else: no digest handed to it, no unroll authorisation, no
 //! release, and no spend by a path that checks `S` with
-//! `OP_CHECKSIGFROMSTACK`, which only the rebindable message reaches. Whoever
-//! reaches the socket can have it sign a rebindable message for any salt,
-//! which is what co-signing is, and spend any output on the operator's own
-//! paths; the socket sits in a directory only the operator's user can enter,
-//! and the server checks every rule before it asks.
+//! `OP_CHECKSIGFROMSTACK`, which only the rebindable message reaches. The
+//! socket sits in a directory only the operator's user can enter, and the
+//! server checks every rule before it asks.
+//!
+//! # The one-spend record
+//!
+//! The signer, not the database, is the authority on what `S` has co-signed.
+//! Before it returns a rebindable signature it appends `(salt, kind, digest)`
+//! to its record, a file it alone writes, and syncs it to disk
+//! ([`SpendRecord`]); it reads the whole record when it starts. For each
+//! salt (a leaf's, a board's or a checkpoint's) it then signs:
+//!
+//! - one **spend**: a message into anything but a forfeit output (a leaf
+//!   into its checkpoint, a checkpoint into its reassignment). A second spend
+//!   message for the salt is refused (`already_signed`), whatever the
+//!   database says; the same message again is signed again, so a request
+//!   repeated after a signer outage completes;
+//! - or any number of **forfeits**, one for each round's connector asset `M`:
+//!   a leaf given up in a round, and again forfeit-first in a later round
+//!   after the first could never return. A forfeit is a rebind request that
+//!   names the forfeit's parts (`forfeit`), from which the signer rebuilds
+//!   the forfeit output and checks it is the one output committed to; it is
+//!   refused once the salt has a spend, and a second forfeit message for the
+//!   same `M` is refused. A spend is refused once the salt has a forfeit.
+//!
+//! So a database restored from an older copy, which no longer knows a
+//! transfer it co-signed, cannot have `S` co-sign a second spend of the same
+//! coin: the record outlives it.
 //!
 //! Amounts are decimal strings, asset ids in display order, everything else
 //! hex.
@@ -40,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use arca_covenant::ExplicitOutput;
+use arca_covenant::{ExplicitOutput, ForfeitPolicy, LeafId, RelativeTime};
 
 /// The longest request line the signer reads.
 pub const MAX_REQUEST: usize = 64 * 1024;
@@ -67,6 +90,40 @@ impl WireOutput {
 	}
 }
 
+/// The parts of a forfeit output, from which the signer rebuilds it: the
+/// owner's key, the unlock hash, the connector asset (display order), the
+/// refund delay in 512-second units and the id of the leaf given up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireForfeit {
+	pub owner: String,
+	pub unlock_hash: String,
+	pub connector: String,
+	pub refund_delay_units: u16,
+	pub leaf_id: String,
+}
+
+impl WireForfeit {
+	pub fn from_policy(p: &ForfeitPolicy) -> WireForfeit {
+		WireForfeit {
+			owner: hex(&p.owner.serialize()), unlock_hash: hex(&p.unlock_hash), connector: p.connector.to_string(),
+			refund_delay_units: p.refund_delay.units(), leaf_id: hex(&p.leaf_id.0),
+		}
+	}
+
+	/// The forfeit policy these parts name under `operator`.
+	pub fn to_policy(&self, operator: XOnlyPublicKey) -> Result<ForfeitPolicy, String> {
+		Ok(ForfeitPolicy {
+			unlock_hash: unhex32(&self.unlock_hash)?,
+			owner: XOnlyPublicKey::from_slice(&unhex(&self.owner)?).map_err(|e| format!("owner: {}", e))?,
+			operator,
+			refund_delay: RelativeTime::from_units(self.refund_delay_units).map_err(|e| format!("refund_delay_units: {}", e))?,
+			leaf_id: LeafId(unhex32(&self.leaf_id)?),
+			connector: self.connector.parse().map_err(|e| format!("connector: {}", e))?,
+		})
+	}
+}
+
 /// A request to the signer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -74,7 +131,12 @@ pub enum Request {
 	/// A struct variant, so a stray field is refused as for `rebind` (serde
 	/// lets a unit variant of a tagged enum through with any fields).
 	Pubkey {},
-	Rebind { salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput> },
+	/// A rebindable message; a forfeit's names its parts.
+	Rebind {
+		salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		forfeit: Option<WireForfeit>,
+	},
 	/// The transaction and each output its inputs spend, in Sequentia's
 	/// encoding as hex; the input signed; the leaf it spends by, as hex.
 	Spend { tx: String, prevouts: Vec<String>, input: u32, leaf: String },
@@ -106,7 +168,7 @@ pub fn check_spend(operator: &XOnlyPublicKey, tx: &elements::Transaction, prevou
 }
 
 /// The signer's answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +177,114 @@ pub struct Response {
 	pub signature: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
+	/// `already_signed` when the record holds another message for the salt.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub code: Option<String>,
+}
+
+/// The refusal code of a message the one-spend record does not admit.
+pub const ALREADY_SIGNED: &str = "already_signed";
+
+/// What a rebindable message the signer signed is, for its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Signed {
+	/// Into anything but a forfeit output: one per salt.
+	Spend,
+	/// Into a forfeit output for the round whose connector asset is this.
+	Forfeit([u8; 32]),
+}
+
+/// The signer's append-only record of every rebindable message it signed:
+/// see the [module documentation](self).
+///
+/// One line per message, `spend <salt> <digest>` or
+/// `forfeit <salt> <digest> <connector>`, hex, appended and synced to disk
+/// before the signature is returned. A last line cut short by a crash was
+/// never answered, and is dropped when the record is opened; any other line
+/// that does not read stops the signer from starting.
+pub struct SpendRecord {
+	file: std::fs::File,
+	by_salt: std::collections::HashMap<[u8; 32], Vec<(Signed, [u8; 32])>>,
+}
+
+impl SpendRecord {
+	/// Opens the record at `path`, creating it (mode 0600) when absent.
+	pub fn open(path: &Path) -> Result<SpendRecord, String> {
+		use std::io::{Read, Seek, Write};
+		use std::os::unix::fs::OpenOptionsExt;
+		let fail = |e: std::io::Error| format!("{}: {}", path.display(), e);
+		let created = !path.exists();
+		let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(path).map_err(fail)?;
+		if created {
+			if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+				std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)?;
+			}
+		}
+		let mut text = String::new();
+		file.seek(std::io::SeekFrom::Start(0)).map_err(fail)?;
+		file.read_to_string(&mut text).map_err(fail)?;
+		let whole = match text.rfind('\n') {
+			Some(i) => i + 1,
+			None => 0,
+		};
+		if whole < text.len() {
+			// A line cut short: never answered.
+			file.set_len(whole as u64).map_err(fail)?;
+			file.sync_all().map_err(fail)?;
+		}
+		let mut by_salt: std::collections::HashMap<[u8; 32], Vec<(Signed, [u8; 32])>> = Default::default();
+		for (n, line) in text[..whole].lines().enumerate() {
+			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), n + 1, what, line);
+			let f: Vec<&str> = line.split(' ').collect();
+			let (kind, salt, digest) = match f.as_slice() {
+				["spend", s, d] => (Signed::Spend, *s, *d),
+				["forfeit", s, d, m] => (Signed::Forfeit(unhex32(m).map_err(|e| bad(&e))?), *s, *d),
+				_ => return Err(bad("not a record line")),
+			};
+			by_salt.entry(unhex32(salt).map_err(|e| bad(&e))?).or_default().push((kind, unhex32(digest).map_err(|e| bad(&e))?));
+		}
+		let _ = file.flush();
+		Ok(SpendRecord { file, by_salt })
+	}
+
+	/// How many messages the record holds.
+	pub fn len(&self) -> usize {
+		self.by_salt.values().map(|v| v.len()).sum()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	/// Whether `S` may sign `digest`, a message of `kind` for `salt`: when it
+	/// may, the message is in the record, on disk, before this returns.
+	pub fn admit(&mut self, salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<(), String> {
+		use std::io::Write;
+		let had = self.by_salt.get(salt).map(|v| v.as_slice()).unwrap_or(&[]);
+		if had.iter().any(|(k, d)| *k == kind && d == digest) {
+			return Ok(());
+		}
+		for (k, d) in had {
+			let clash = match (kind, k) {
+				(Signed::Spend, _) | (Signed::Forfeit(_), Signed::Spend) => true,
+				(Signed::Forfeit(m), Signed::Forfeit(n)) => m == *n,
+			};
+			if clash {
+				return Err(format!(
+					"{}: S has already co-signed {} {} for salt {}; the signer co-signs one spend of an output, or its forfeits, one for each round",
+					ALREADY_SIGNED, match k { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(d), hex(salt),
+				));
+			}
+		}
+		let line = match kind {
+			Signed::Spend => format!("spend {} {}\n", hex(salt), hex(digest)),
+			Signed::Forfeit(m) => format!("forfeit {} {} {}\n", hex(salt), hex(digest), hex(&m)),
+		};
+		self.file.write_all(line.as_bytes()).and_then(|_| self.file.sync_data())
+			.map_err(|e| format!("the record could not be written, so nothing is signed: {}", e))?;
+		self.by_salt.entry(*salt).or_default().push((kind, *digest));
+		Ok(())
+	}
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -123,6 +293,9 @@ pub enum SignerError {
 	Unreachable { path: String, error: String },
 	#[error("the signer refused: {0}")]
 	Refused(String),
+	/// The one-spend record holds another message for the salt.
+	#[error("the signer refused: {0}")]
+	AlreadySigned(String),
 	#[error("the signer's answer is not understood: {0}")]
 	Answer(String),
 }
@@ -172,6 +345,9 @@ impl SignerClient {
 		reader.read_line(&mut answer).await.map_err(unreachable)?;
 		let r: Response = serde_json::from_str(&answer).map_err(|e| SignerError::Answer(format!("{}: {:?}", e, answer)))?;
 		if let Some(e) = r.error {
+			if r.code.as_deref() == Some(ALREADY_SIGNED) {
+				return Err(SignerError::AlreadySigned(e));
+			}
 			return Err(SignerError::Refused(e));
 		}
 		Ok(r)
@@ -189,9 +365,24 @@ impl SignerClient {
 	pub async fn rebind(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput])
 		-> Result<Signature, SignerError>
 	{
+		self.rebind_as(salt, asset_in, value_in, outputs, None).await
+	}
+
+	/// `S`'s signature over the rebindable message of the output with `salt`,
+	/// spending a coin of `value_in` of `asset_in` into `output`, the forfeit
+	/// output of `forfeit`: the signer records it as a forfeit for its round.
+	pub async fn rebind_forfeit(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, forfeit: &ForfeitPolicy, output: &ExplicitOutput)
+		-> Result<Signature, SignerError>
+	{
+		self.rebind_as(salt, asset_in, value_in, std::slice::from_ref(output), Some(WireForfeit::from_policy(forfeit))).await
+	}
+
+	async fn rebind_as(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>)
+		-> Result<Signature, SignerError>
+	{
 		let r = self.ask(&Request::Rebind {
 			salt: hex(salt), asset_in: asset_in.to_string(), value_in: value_in.to_string(),
-			outputs: outputs.iter().map(WireOutput::from_output).collect(),
+			outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit,
 		}).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
