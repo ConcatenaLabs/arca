@@ -29,7 +29,7 @@ use arca_covenant::{
 use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, rebuild, transfer_body, unhex, Answer, Held};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{created, credited_board, mtp, round_final, status, VALUE};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, status, VALUE};
 use common::running::{Running, MIN_LEAF};
 use server::participations::OutputRequest;
 use server::server::AssetSection;
@@ -115,19 +115,6 @@ fn complete(r: &Running, p: &Participant) -> ([u8; 32], Vec<(ValidLeaf, arca_cov
 	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&p.id), "forfeits": forfeits, "leaves": leaves})).ok();
 	assert_eq!(done["state"], "released", "{}: {}", p.label, done);
 	(unhex(done["preimage"].as_str().unwrap()).try_into().unwrap(), news)
-}
-
-/// Moves the chain's median time at least `seconds` on: the node's clock set
-/// ahead, then enough blocks for the median of the last eleven to follow.
-async fn advance_mtp(r: &Running, seconds: u32) {
-	let start = mtp(r).to_consensus_u32();
-	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-	let mock = now.max(start as u64) + seconds as u64 + 60;
-	let _: Value = r.rt.client().call("setmocktime", &[json!(mock)]).unwrap();
-	for _ in 0..12 {
-		r.produce().await;
-	}
-	assert!(mtp(r).to_consensus_u32() >= start + seconds, "the median time moved from {} to {}", start, mtp(r).to_consensus_u32());
 }
 
 fn send(r: &Running, what: &str, tx: &Transaction) -> Txid {

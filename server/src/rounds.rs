@@ -35,6 +35,20 @@
 //! forfeits) and every participation's move to issued are recorded in one
 //! database transaction, and the round goes to the nursery.
 //!
+//! A participation's coins are checked again when a round is built, under a
+//! horizon of one day before their first expiry ([`Params::round_policy`]): a
+//! participation accepted before its coins' exit deadline still runs if a
+//! round takes it by then, and one whose coin has passed it can never run and
+//! is voided, its coins given back.
+//!
+//! The owner of each participation in a round hands over its forfeits once
+//! the round is final, and has a day to ([`Params::FORFEIT_DEADLINE`]): a
+//! participation whose forfeits have not come a day after its round was found
+//! final expires. The coins it gave up are the owner's again (a coin under a
+//! forfeit signed for an earlier, lost round excepted), and its new leaves are
+//! never credited: their preimage never goes out, and the operator sweeps them
+//! with their batch at expiry.
+//!
 //! After a rollback the nursery broadcasts a round again unchanged; while it
 //! is out of the chain its new leaves are uncredited, and they are credited
 //! again once it is final again. A round that can never return (an input of
@@ -213,13 +227,23 @@ impl Rounds {
 	}
 
 	/// Whether every coin `p` gives up still passes the check it passed when
-	/// it was accepted.
+	/// it was accepted, under the round's horizon. A participation with a
+	/// coin past that horizon can never run: it is voided, its coins given
+	/// back.
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
-		let policy = self.params.participation_policy(now);
+		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
 			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id).await {
 				Ok(_) => {},
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
+				Err(coins::CoinError::InvalidCoin {
+					error: arca_covenant::TransferError::Record(arca_covenant::RecordError::ExpiryTooSoon { .. }), ..
+				}) => {
+					let voided = self.store.void_participation(&p.id).await?;
+					log::warn!("participation {} can never run: coin {} is past its last round time (voided: {})",
+						crate::signer::hex(&p.id), LeafId(i.leaf_id), voided);
+					return Ok(false);
+				},
 				Err(e) => {
 					log::warn!("participation {} waits: {}", crate::signer::hex(&p.id), e);
 					return Ok(false);
@@ -513,7 +537,8 @@ impl Rounds {
 	/// to the nursery goes to it; one the nursery found can never return is
 	/// retired; one the finality service calls final is marked final, and the
 	/// new leaves of its released participations are credited; one no longer
-	/// final goes back to broadcast, its leaves uncredited.
+	/// final goes back to broadcast, its leaves uncredited. Then every
+	/// participation whose forfeits are overdue expires.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
@@ -529,7 +554,21 @@ impl Rounds {
 			}
 			self.check_round(&r).await?;
 		}
+		self.expire().await?;
 		Ok(())
+	}
+
+	/// Expires every participation whose round was found final more than
+	/// [`Params::FORFEIT_DEADLINE`] ago and whose forfeits have not come.
+	/// Returns them.
+	pub async fn expire(&self) -> Result<Vec<[u8; 32]>, RoundError> {
+		let now = self.now().await?.to_consensus_u32();
+		let expired = self.store.expire_participations(now.saturating_sub(Params::FORFEIT_DEADLINE)).await?;
+		for id in &expired {
+			log::warn!("participation {} expired: its forfeits did not come within a day of its round being final; \
+				its coins are given back, its new leaves are never credited", crate::signer::hex(id));
+		}
+		Ok(expired)
 	}
 
 	/// Whether the nursery has found that the round can never return: a
@@ -579,7 +618,7 @@ impl Rounds {
 		let txid = Txid::from_byte_array(r.txid);
 		let fin = self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?;
 		match (r.state, fin.is_final()) {
-			(RoundState::Broadcast, true) if self.store.set_round_state(r.round_id, RoundState::Broadcast, RoundState::Final).await? => {
+			(RoundState::Broadcast, true) if self.store.mark_round_final(r.round_id, self.now().await?.to_consensus_u32()).await? => {
 				let credited = self.store.credit_round(r.round_id).await?;
 				log::info!("round {} ({}) is final; {} leaf/leaves credited", r.round_id, txid, credited);
 			},

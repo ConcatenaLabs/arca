@@ -14,7 +14,10 @@
 //!    forfeit-first: its release is retired, its forfeit for the new round is
 //!    taken and its preimage withheld; the one whose preimage had not runs as
 //!    before. The coins they gave up stay given up. No release is taken while
-//!    a round is not final.
+//!    a round is not final. The release, which named the lost round's
+//!    connector asset, is void on the chain as well: that asset can no longer
+//!    be issued, and the reclaim of the old node with the release and the new
+//!    round's connector asset is refused.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -25,11 +28,17 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{BlockHash, Transaction, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{CoinRecord, Forfeit, LeafId, RelativeTime, Release, ValidCoin, ValidLeaf};
+use arca_covenant::spend::FeeSource;
+use arca_covenant::{
+	connector_asset, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, RelativeTime, Release, TapOutput, ValidCoin,
+	ValidLeaf,
+};
 use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, transfer_body, unhex, want_leaf, Answer, Held};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{created, credited_board, round_final, round_state, spend_wallet_coin, start, status, validate_new_leaf, VALUE};
+use common::rounds::{
+	advance_mtp, created, credited_board, round_final, round_state, spend_wallet_coin, start, status, validate_new_leaf, VALUE,
+};
 use common::running::Running;
 use server::store::RoundState;
 
@@ -63,6 +72,11 @@ fn leaf_states(r: &Running, key: &Keypair) -> Vec<String> {
 	let mut states: Vec<String> = ld["leaves"].as_array().unwrap().iter().map(|l| l["state"].as_str().unwrap().to_string()).collect();
 	states.sort();
 	states
+}
+
+/// A coin anyone can spend through a tapscript of `OP_TRUE`.
+fn op_true_tap() -> TapOutput {
+	TapOutput::new(vec![(0, elements::Script::from(vec![0x51]))])
 }
 
 /// The block that holds `txid`.
@@ -113,7 +127,7 @@ async fn a_round_disconnected_returns_and_is_credited_again() {
 	refused(r.http.post("cosign_transfer", &pay), 422, "not_live");
 	// No release is taken while the round is not final.
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
-		"releases": [{"leaf_id": a_board.id.to_string(), "signature": hex(&[1; 64])}]})), 422, "round_not_final");
+		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "round_not_final");
 	// The same forfeit request again: the round is not final, nothing changes.
 	let rt = &r.rt;
 	r.wait("the server to broadcast the round again", || node::in_mempool(rt, &round_txid)).await;
@@ -142,6 +156,8 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	let (a0, b) = (keypair("A, board"), keypair("B"));
 	let (a0_board, a0_tx) = credited_board(&mut r, &a0, x).await;
 	let (b_board, b_tx) = credited_board(&mut r, &b, x).await;
+	let c = keypair("C");
+	let (c_board, c_tx) = credited_board(&mut r, &c, x).await;
 
 	// Round 0 gives A a batch leaf, the coin A refreshes below.
 	let a = keypair("A");
@@ -161,6 +177,8 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	let (a2, b2) = (keypair("A, new"), keypair("B, new"));
 	let (pa, a2_nonce) = participate(&r, &a_board, &a2);
 	let (pb, b2_nonce) = participate(&r, &b_board, &b2);
+	let c2 = keypair("C, new");
+	let (pc, c2_nonce) = participate(&r, &c_board, &c2);
 
 	// Round R: A completes its forfeit and holds R's preimage; B does not.
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
@@ -176,12 +194,21 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	let done = r.http.post("forfeit_leaves", &forfeit_body(&pa, a_board.id, forfeit_sig(&f_r, &a), auths_json(&a2_r, &a2, created(&a2_r_record)))).ok();
 	let r_preimage = done["preimage"].as_str().unwrap().to_string();
 	assert_eq!(status(&r, &pb)["state"], "issued");
+	// C completes in R as well.
+	let st_c = status(&r, &pc);
+	let (c2_r, c2_r_record, _) = validate_new_leaf(&r, &pc, 0, &c2, &c2_nonce);
+	let c_old = c_board.record.resolve(std::slice::from_ref(&c_tx), &r.policy()).unwrap();
+	let fc = forfeit_for(&c_old, &c2_r, &round_r, &st_c);
+	let done_c = r.http.post("forfeit_leaves", &forfeit_body(&pc, c_board.id, forfeit_sig(&fc, &c), auths_json(&c2_r, &c2, created(&c2_r_record)))).ok();
+	assert_eq!(done_c["state"], "released");
 	// A, holding R's preimage, releases the lowest node of its old leaf.
 	let lowest = a_valid0.branch.nodes.last().unwrap();
 	let c_r = st_r["round"]["connector_vout"].as_u64().unwrap() as u32;
-	let release = Release::for_refresh(&a_valid0, &a2_r, &round_r, c_r).unwrap().message().digest;
+	let a_release = Release::for_refresh(&a_valid0, &a2_r, &round_r, c_r).unwrap();
+	let m_r = a_release.connector;
+	let a_release_sig = arca_covenant::sign::sign_digest(&a, &a_release.message().digest, &common::client::random32());
 	let rel = r.http.post("release_leaves", &json!({"participation_id": hex(&pa), "releases": [{"leaf_id": a_board.id.to_string(),
-		"signature": hex(arca_covenant::sign::sign_digest(&a, &release, &common::client::random32()).as_ref())}]})).ok();
+		"connector_asset": m_r.to_string(), "signature": hex(a_release_sig.as_ref())}]})).ok();
 	assert_eq!(rel["released"].as_array().unwrap().len(), 1);
 	assert_eq!(r.server.store.releases(&lowest.children_hash()).await.unwrap().len(), 1);
 
@@ -222,7 +249,7 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 
 	// Round Y: new leaves under the same keys and owner nonces.
 	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
-	assert_eq!(built_y.participations, 2);
+	assert_eq!(built_y.participations, 3);
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &built_y.tx.txid()).await;
@@ -230,6 +257,51 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	assert_ne!(a2_y.leaf_id, a2_r.leaf_id);
 	assert_eq!(a2_r_record.validate_round(&round_y, &common::rounds::accept_policy(&r)).unwrap_err(),
 		arca_covenant::RecordError::BatchOutputMissing, "R's leaf is not in Y");
+	// On the chain, A's release for R is void. A's old node (round 0's batch
+	// output, its lowest node) is unspent; R's connector asset cannot be
+	// issued; with an atom of Y's, the release does not verify.
+	let lowest_at = elements::OutPoint::new(built0.tx.txid(), 0);
+	assert!(r.unspent(&lowest_at));
+	let op = xonly(&r.s);
+	let issue = |round: &Transaction, c: u32| -> Transaction {
+		let conn = elements::OutPoint::new(round.txid(), c);
+		let out = &round.output[c as usize];
+		let ks = ConnectorPolicy { operator: op }.issuance(conn, (out.asset.explicit().unwrap(), out.value.explicit().unwrap()),
+			op_true_tap().script_pubkey(), &[], &FeeSource::Reserve).unwrap();
+		let sg = arca_covenant::sign::sign_digest(&r.s, &ks.sighash(r.chain.genesis_hash()).unwrap(), &common::client::random32());
+		ks.finish(vec![sg.as_ref().to_vec()]).tx
+	};
+	let refused_by_node = |what: &str, tx: &Transaction, why: &str| {
+		let a = r.rt.client().test_mempool_accept(&[tx]).unwrap().remove(0);
+		let reason = a.reject_reason.unwrap_or_default();
+		assert!(!a.allowed && reason.contains(why), "{}: {:?}", what, reason);
+		println!("refused by the node, {}: {}", what, reason);
+	};
+	refused_by_node("the issuance of R's connector asset", &issue(&built.tx, c_r), "missing-inputs");
+	let cy = status(&r, &pa)["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let issue_y = issue(&built_y.tx, cy);
+	r.rt.client().send_raw_transaction(&issue_y).unwrap();
+	r.produce().await;
+	let m_y = connector_asset(built_y.tx.txid(), cy);
+	assert_ne!(m_y, m_r);
+	let atom = (elements::OutPoint::new(issue_y.txid(), 0), issue_y.output[0].clone());
+	let lowest0 = a_valid0.branch.nodes.last().unwrap();
+	let reclaim = |atoms: &[(elements::OutPoint, elements::TxOut)]| -> Transaction {
+		let ks = lowest0.reclaim_tx(lowest_at, atoms, &[ExplicitOutput::new(x, lowest0.value - 2_000, op_true_tap().script_pubkey())],
+			op_true_tap().script_pubkey(), &FeeSource::Reserve).unwrap();
+		let sg = arca_covenant::sign::sign_digest(&r.s, &ks.sighash(r.chain.genesis_hash()).unwrap(), &common::client::random32());
+		let mut u = ks.finish(arca_covenant::node::reclaim_items(&sg, &[(a_release_sig, 1)], 1).unwrap());
+		for i in 1..u.tx.input.len() {
+			u.tx.input[i].witness.script_witness = op_true_tap().witness(&elements::Script::from(vec![0x51]), vec![]);
+		}
+		u.tx
+	};
+	refused_by_node("the reclaim of A's old node with its release for R and Y's connector asset", &reclaim(&[atom]),
+		"Invalid Schnorr signature");
+	refused_by_node("the reclaim of A's old node with its release for R and no connector asset", &reclaim(&[]),
+		"Introspection index out of bounds");
+	assert!(r.unspent(&lowest_at), "A's old node is still A's");
+
 	// B, which never had R's preimage, completes as before.
 	let st_b = status(&r, &pb);
 	let (b2_y, b2_y_record, _) = validate_new_leaf(&r, &pb, 0, &b2, &b2_nonce);
@@ -253,6 +325,24 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	assert_eq!(leaf_states(&r, &a2), vec!["lost", "pending"]);
 	// No release before the preimage.
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
-		"releases": [{"leaf_id": a_board.id.to_string(), "signature": hex(&[1; 64])}]})), 422, "release_early");
+		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "release_early");
 	println!("A ran again forfeit-first: R's preimage {} is useless, Y's withheld", &r_preimage[..16]);
+
+	// C, which forfeited in R and runs again forfeit-first in Y, never hands
+	// over its forfeit for Y: a day after Y is final it expires. Its coin
+	// stays given up, since the operator holds a forfeit pair for it, signed
+	// for R, and co-signs no other off-chain spend of it. A, whose forfeit for
+	// Y came, does not expire.
+	assert_eq!(status(&r, &pc)["state"], "issued");
+	advance_mtp(&r, 86_400 + 600).await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(status(&r, &pc)["state"], "expired");
+	assert_eq!(status(&r, &pa)["state"], "issued");
+	assert_eq!(leaf_states(&r, &c), vec!["spent"], "C's coin, under a forfeit pair for R, is not given back");
+	assert_eq!(leaf_states(&r, &c2), vec!["expired", "lost"]);
+	let (d_leaf, _) = new_leaf(&keypair("D"));
+	let spend_c = transfer_body(&[(&c_board, c_old.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)], xonly(&r.s), r.chain);
+	refused(r.http.post("cosign_transfer", &spend_c), 409, "double_spend");
+	println!("C expired in Y; its coin stays given up under its forfeit for R");
 }

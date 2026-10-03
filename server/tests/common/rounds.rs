@@ -73,6 +73,19 @@ pub fn mtp(r: &Running) -> MedianTime {
 	MedianTime::from_consensus(r.rt.client().blockchain_info().unwrap().median_time as u32).unwrap()
 }
 
+/// Moves the chain's median time at least `seconds` on: the node's clock set
+/// ahead, then enough blocks for the median of the last eleven to follow.
+pub async fn advance_mtp(r: &Running, seconds: u32) {
+	let start = mtp(r).to_consensus_u32();
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	let mock = now.max(start as u64) + seconds as u64 + 60;
+	let _: Value = r.rt.client().call("setmocktime", &[json!(mock)]).unwrap();
+	for _ in 0..12 {
+		r.produce().await;
+	}
+	assert!(mtp(r).to_consensus_u32() >= start + seconds, "the median time moved from {} to {}", start, mtp(r).to_consensus_u32());
+}
+
 /// A wallet's acceptance policy at the chain's tip.
 pub fn accept_policy(r: &Running) -> WalletPolicy {
 	WalletPolicy::new(r.chain, xonly(&r.s), mtp(r))

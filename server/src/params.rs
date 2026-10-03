@@ -19,13 +19,15 @@ pub struct AssetParams {
 }
 
 /// What the operator charges, in the asset moved. Transfers inside the tree
-/// are free. A refresh, or an offboard, costs nothing for a coin whose batch
-/// expires within [`FeeSchedule::FREE_WINDOW`], and rises with the time left
-/// beyond it to `refresh_ppm` parts per million of the coin's value for a
-/// coin [`FeeSchedule::FULL_AFTER`] or more from that window; a coin from
-/// boards alone never expires and pays the whole of it. An offboard adds
-/// `offboard_ppm` of what it pays out, and the margin of the output the round
-/// pays, which the unlock spends as its fee.
+/// are free. A refresh, or an offboard, costs nothing in the free window, the
+/// two days before a coin's exit deadline: from [`FeeSchedule::FREE_FROM`]
+/// (five days) before its first expiry to three days before it, where the
+/// operator stops taking it ([`Params::participation_policy`]). Before the
+/// window the fee rises with the time left beyond it, to `refresh_ppm` parts
+/// per million of the coin's value for a coin [`FeeSchedule::FULL_AFTER`] or
+/// more from the window; a coin from boards alone never expires and pays the
+/// whole of it. An offboard adds `offboard_ppm` of what it pays out, and the
+/// margin of the output the round pays, which the unlock spends as its fee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FeeSchedule {
 	pub refresh_ppm: u64,
@@ -33,16 +35,17 @@ pub struct FeeSchedule {
 }
 
 impl FeeSchedule {
-	/// A refresh costs nothing in the last two days before a coin's expiry.
-	pub const FREE_WINDOW: u32 = 2 * 86_400;
+	/// A refresh costs nothing from five days before a coin's first expiry:
+	/// the two days before its exit deadline.
+	pub const FREE_FROM: u32 = 5 * 86_400;
 	/// The time left beyond the free window at which the whole refresh fee is
 	/// due: the rest of a 28-day batch.
-	pub const FULL_AFTER: u32 = 26 * 86_400;
+	pub const FULL_AFTER: u32 = 23 * 86_400;
 
 	/// The refresh fee for a coin of `value` whose earliest expiry is
 	/// `expiry`, at `now`.
 	pub fn refresh(&self, value: u64, expiry: MedianTime, now: MedianTime) -> u64 {
-		let left = expiry.to_consensus_u32().saturating_sub(now.to_consensus_u32()).saturating_sub(Self::FREE_WINDOW);
+		let left = expiry.to_consensus_u32().saturating_sub(now.to_consensus_u32()).saturating_sub(Self::FREE_FROM);
 		let charged = left.min(Self::FULL_AFTER) as u128;
 		let fee = (value as u128 * self.refresh_ppm as u128 * charged).div_ceil(Self::FULL_AFTER as u128 * 1_000_000);
 		fee.min(u64::MAX as u128) as u64
@@ -135,18 +138,38 @@ impl Params {
 		Ok(())
 	}
 
-	/// The policy a coin given up in a participation is checked under, at
-	/// `now`: [`Params::policy`], with the coin's first expiry at least
-	/// [`Params::PARTICIPATION_HORIZON`] after now, so that the coin can still
-	/// be refreshed inside the free window of the last two days, while the
-	/// round has time to become final and the forfeit to come in.
+	/// The policy a coin given up in a participation is checked under when
+	/// the participation is accepted, at `now`: [`Params::policy`], whose
+	/// horizon is the exit deadline. A participation accepts a coin only up to
+	/// its exit deadline, three days before its first expiry: past it the
+	/// owner should be exiting, and a refresh that stalled would leave no time
+	/// to.
 	pub fn participation_policy(&self, now: MedianTime) -> WalletPolicy {
 		WalletPolicy { horizon: Self::PARTICIPATION_HORIZON, ..self.policy(now) }
 	}
 
 	/// How long before its first expiry a coin may still be given up, in
-	/// seconds: one day.
-	pub const PARTICIPATION_HORIZON: u32 = 86_400;
+	/// seconds: the exit deadline, three days.
+	pub const PARTICIPATION_HORIZON: u32 = WalletPolicy::EXIT_DEADLINE;
+
+	/// The policy a pending participation's coins are checked under when a
+	/// round is built, at `now`: a coin accepted before its exit deadline
+	/// still runs if a round takes it up to [`Params::ROUND_HORIZON`] before
+	/// its first expiry. A participation with a coin past that can never run
+	/// and is voided, its coins given back.
+	pub fn round_policy(&self, now: MedianTime) -> WalletPolicy {
+		WalletPolicy { horizon: Self::ROUND_HORIZON, ..self.policy(now) }
+	}
+
+	/// How long before its first expiry a coin a participation gave up may
+	/// still go into a round, in seconds: one day.
+	pub const ROUND_HORIZON: u32 = 86_400;
+
+	/// How long after its round is final a participation's forfeits may come,
+	/// in seconds: one day. A participation whose forfeits have not come by
+	/// then expires: the coins it gave up are the owner's again, and its new
+	/// leaves, whose preimage never goes out, are swept with their batch.
+	pub const FORFEIT_DEADLINE: u32 = 86_400;
 
 	/// The policy the server checks records and coins under, at `now`: its
 	/// own chain and key, its exit-delay bounds, and the receipt horizon (a
@@ -158,5 +181,32 @@ impl Params {
 			min_reserve: ReserveFloor::Atoms(1),
 			..WalletPolicy::new(self.chain, self.operator, now).receipt()
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn t(s: u32) -> MedianTime {
+		MedianTime::from_consensus(s).unwrap()
+	}
+
+	#[test]
+	fn a_refresh_is_free_in_the_two_days_before_the_exit_deadline() {
+		const DAY: u32 = 86_400;
+		let f = FeeSchedule { refresh_ppm: 23_000, offboard_ppm: 0 };
+		let e = 1_800_000_000;
+		let value = 1_000_000;
+		// 23,000 ppm of a million atoms is 23,000 atoms for 23 days or more
+		// before the window: 1,000 atoms a day.
+		assert_eq!(f.refresh(value, t(e), t(e - 28 * DAY)), 23_000);
+		assert_eq!(f.refresh(value, t(e), t(e - 6 * DAY)), 1_000, "a day before the window");
+		assert_eq!(f.refresh(value, t(e), t(e - 5 * DAY - 1)), 1, "a second before the window, rounded up");
+		assert_eq!(f.refresh(value, t(e), t(e - 5 * DAY)), 0, "the window opens five days before the expiry");
+		assert_eq!(f.refresh(value, t(e), t(e - 4 * DAY)), 0);
+		assert_eq!(f.refresh(value, t(e), t(e - 3 * DAY)), 0, "free up to the exit deadline");
+		assert_eq!(FeeSchedule::FREE_FROM - Params::PARTICIPATION_HORIZON, 2 * DAY, "the window is two days");
+		const { assert!(Params::ROUND_HORIZON < Params::PARTICIPATION_HORIZON) };
 	}
 }

@@ -94,6 +94,7 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		LeafState::Spent => return Err(CoinError::Spent(*id)),
 		LeafState::Pending => return Err(CoinError::NotLive(*id, "pending")),
 		LeafState::Lost => return Err(CoinError::NotLive(*id, "lost")),
+		LeafState::Expired => return Err(CoinError::NotLive(*id, "expired")),
 	}
 	let record = CoinRecord::from_bytes(&row.record).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
 	let mut found = vec![];
