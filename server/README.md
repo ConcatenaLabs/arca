@@ -24,7 +24,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql),
 [`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql),
 [`schema/V6__signer_head.sql`](schema/V6__signer_head.sql),
-[`schema/V7__signer_messages.sql`](schema/V7__signer_messages.sql)). `Store::connect` builds it
+[`schema/V7__signer_messages.sql`](schema/V7__signer_messages.sql),
+[`schema/V8__stateless_challenges.sql`](schema/V8__stateless_challenges.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -67,7 +68,7 @@ requests can race past them:
   took for each, its offboard outputs and its connector output: what the
   server publishes and what it broadcasts again after a rollback.
 - **The chain as the server saw it**, participations and forfeits,
-  mailboxes, authentication challenges, the on-chain wallet's coins and the
+  mailboxes, the on-chain wallet's coins and the
   server's own transactions.
 - **Every node and entry of every batch**, by script, so the outputs a holder
   unrolls are seen, and **everything the watcher published**, with what it
@@ -610,7 +611,7 @@ canonical binary form. Every object refuses a field it does not know.
 |---|---|
 | `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
-| `POST challenge` | A challenge to authenticate with, good once, for a short while |
+| `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`), its transaction's finality and, once that is in a block, its dates (`exit_deadline`, `expiry`) |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
@@ -627,7 +628,11 @@ canonical binary form. Every object refuses a field it does not know.
 `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key)` with
 `T = SHA256("Arca/auth")`. The tag keeps it apart from everything else a leaf
 key signs, the genesis hash to one chain, the call to one request, the
-challenge to one use. There is no bearer token. `cosign_transfer` is
+challenge to a short while. A challenge is stored nowhere: it is the time it
+was issued, 12 random bytes, and a keyed check over both (HMAC-SHA256 under
+a key the server draws when it starts), taken within its lifetime
+(`challenge_ttl_seconds`, two minutes by default); one used again within it
+only repeats a read the same key made. There is no bearer token. `cosign_transfer` is
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
@@ -635,20 +640,26 @@ of its request, and `tree` is public. `forfeit_leaves` and `release_leaves`
 are authenticated by the owners' signatures over the forfeits and releases
 themselves.
 
-The two calls that write a row for anyone who asks, `operator_nonce` and
-`challenge`, are each handed out at a bounded rate, for the server as a whole
-and for each source (`[limits]`: five a second with bursts of fifty overall,
-and one a second with bursts of ten for each source, by default), so one
-caller asking as fast as it can leaves every other its share; a request past
-either is refused with 429 `rate_limited`. A source is an IPv4 address, or an
-IPv6 /64. A request from a trusted proxy (`trusted_proxies`, loopback by
-default, for a proxy on the same machine) is counted against the nearest
-address in its `X-Forwarded-For` that is not a trusted proxy; any other
-request against the address that connected, whatever header it carries. A nonce no board took within its
-lifetime (`nonce_ttl_seconds`), and a challenge once used or expired, is
-deleted, so what these calls hold in the database is bounded by the rate times
-the lifetime. A board naming a deleted nonce is refused (`nonce_unknown`): a
-wallet registers its board right after it takes the nonce.
+The one call that writes a row for anyone who asks, `operator_nonce`, is
+handed to each source at a bounded rate (`[limits]`: one a second with bursts
+of ten by default), so one caller asking as fast as it can leaves every other
+its share, and over every source together within a high bound (250 a second,
+bursts of 10,000), which bounds the rows nonces hold without a budget a few
+sources could use up; a request past either is refused with 429
+`rate_limited`. A `challenge` writes no row and is not limited. A source is
+an IPv4 address, or an IPv6 /48. A request from a trusted proxy
+(`trusted_proxies`, loopback by default, for a proxy on the same machine) is
+counted against the nearest address in its `X-Forwarded-For` that is not a
+trusted proxy; any other request against the address that connected,
+whatever header it carries. Each entry of the header is read on its own (an
+address, with or without a port), so one that does not read costs the others
+nothing; when the nearest entry that is not a trusted proxy does not read,
+the request is counted against the proxy, not against what a client wrote
+before it. A nonce no board took within its lifetime (`nonce_ttl_seconds`)
+is deleted, so what the call holds in the database is bounded by the overall
+rate times the lifetime. A board naming a deleted nonce is refused
+(`nonce_unknown`): a wallet registers its board right after it takes the
+nonce.
 
 ## The signer
 
@@ -734,8 +745,8 @@ with their smallest leaf, how often a round is built, the assets a round's
 fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
-behind (`[limits]`: the rate of nonces and challenges, overall and for each
-source, the proxies trusted to name a request's source, a nonce's lifetime,
+behind (`[limits]`: the rate of nonces, for each source and overall, the
+proxies trusted to name a request's source, a nonce's lifetime,
 how long a board may stay out of every block), and where the operator's
 metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
 
@@ -1082,13 +1093,15 @@ than read the whole of a long record against it.
 
 `tests/limits.rs` bounds what the calls anyone may make leave behind: junk
 boards whose transactions the node refuses leave no row and nothing in the
-nursery; nonces and challenges asked for a thousand times each are handed out
-within the rate and deleted once expired; a board the node took that never
-confirms is dropped. A stranger asking about a hundred times a second for
-each, through the proxy, leaves an honest wallet asking once a second every
-one of its twenty, and gets its own share and no more; a caller naming a new
-source in every request, from no trusted proxy, is counted as the address
-that connected.
+nursery; nonces asked for a thousand times are handed out within the rate and
+deleted once expired, and a thousand challenges are each handed out and leave
+no row; a board the node took that never confirms is dropped. A stranger
+asking about a hundred times a second for each, through the proxy, leaves an
+honest wallet asking once a second every one of its twenty, and gets its own
+share of nonces and no more; a caller naming a new source in every request,
+from no trusted proxy, is counted as the address that connected. Six sources
+each asking every 10 ms, each held to its own rate, leave an honest caller
+from a seventh every challenge and every nonce it asks for over 30 s.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

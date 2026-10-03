@@ -51,7 +51,8 @@ use crate::forfeits::{AuthsRequest, ForfeitError, ForfeitLeaves, ForfeitRequest,
 use crate::rounds::{RoundError, Rounds};
 use crate::participations::{self as part, ParticipationError, ParticipationRequest, Participations, Status};
 use crate::signer::{hex, parse_amount, unhex, unhex32};
-use crate::store::{ChallengeError, LeafKind, LeafState, Store, WantedKind};
+use crate::auth::ChallengeError;
+use crate::store::{LeafKind, LeafState, Store, WantedKind};
 
 /// What the HTTP handlers reach.
 pub struct App {
@@ -68,8 +69,9 @@ pub struct App {
 	pub challenge_ttl: Duration,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
-	/// Bounds the authentication challenges handed out.
-	pub challenges: Limiter,
+	/// The key of every challenge's check ([`crate::auth`]), drawn when the
+	/// server starts.
+	pub challenge_key: [u8; 32],
 	/// The addresses of the reverse proxies whose forwarded address names a
 	/// request's source.
 	pub trusted_proxies: Vec<IpAddr>,
@@ -112,23 +114,42 @@ impl App {
 	}
 }
 
+/// One entry of an `X-Forwarded-For`: an address, with or without a port
+/// (`203.0.113.5:4711`, `[2001:db8::1]:4711`); `None` for anything else
+/// (`unknown`, an obfuscated name).
+fn forwarded_entry(s: &str) -> Option<IpAddr> {
+	let s = s.trim();
+	s.parse::<IpAddr>().ok()
+		.or_else(|| s.parse::<SocketAddr>().ok().map(|a| a.ip()))
+		.or_else(|| s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).and_then(|a| a.parse::<IpAddr>().ok()))
+}
+
 /// Where a request from `peer` comes from, as the limits count it: `peer`,
 /// unless it is one of the `trusted` proxies, in which case the nearest
 /// address in its `X-Forwarded-For` that is not a trusted proxy (a proxy
 /// appends the address that connected to it; anything before that, a
-/// client may have written itself). A request that does not come from a
-/// trusted proxy names its own source, whatever header it carries; a header
-/// that does not read names none.
+/// client may have written itself). Each entry is read on its own, a port
+/// after an address allowed, so one that does not read costs nothing to the
+/// rest. But the walk stops at the first entry that is not a trusted proxy:
+/// when that one does not read, the source is unknown, and the request is
+/// counted against `peer` rather than against what a client wrote before it.
+/// A request that does not come from a trusted proxy names its own source,
+/// whatever header it carries.
 pub fn source_of(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAddr {
 	if !trusted.contains(&peer) {
 		return peer;
 	}
-	let forwarded: Vec<IpAddr> = headers.get_all("x-forwarded-for").iter()
-		.map(|v| v.to_str().ok())
-		.collect::<Option<Vec<&str>>>()
-		.and_then(|vs| vs.iter().flat_map(|v| v.split(',')).map(|a| a.trim().parse::<IpAddr>().ok()).collect::<Option<Vec<_>>>())
-		.unwrap_or_default();
-	forwarded.into_iter().rev().find(|a| !trusted.contains(a)).unwrap_or(peer)
+	let entries: Vec<Option<IpAddr>> = headers.get_all("x-forwarded-for").iter()
+		.flat_map(|v| v.to_str().ok().map(|v| v.split(',').map(forwarded_entry).collect::<Vec<_>>()).unwrap_or_else(|| vec![None]))
+		.collect();
+	for e in entries.into_iter().rev() {
+		match e {
+			Some(a) if trusted.contains(&a) => continue,
+			Some(a) => return a,
+			None => return peer,
+		}
+	}
+	peer
 }
 
 /// A token bucket: at most `burst` tokens, refilled at `per_second`.
@@ -158,28 +179,29 @@ impl Bucket {
 pub const MAX_SOURCES: usize = 65_536;
 
 /// Where a request comes from, as a [`Limiter`] counts it: an IPv4 address,
-/// or the /64 an IPv6 address is in (a host is handed a /64, so its
-/// addresses are one source).
+/// or the /48 an IPv6 address is in (a site is commonly handed a /48, so a
+/// caller holding one is one source, however many /64s it carves out).
 pub fn source_key(ip: IpAddr) -> IpAddr {
 	match ip {
 		IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
 			Some(v4) => IpAddr::V4(v4),
 			None => {
 				let s = v6.segments();
-				IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+				IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0))
 			},
 		},
 		v4 => v4,
 	}
 }
 
-/// Bounds one unauthenticated call that writes a row: a token bucket over
-/// every caller together (at most `burst` at once, refilled at
-/// `per_second`), and one for each source (`source_burst`, refilled at
+/// Bounds the one unauthenticated call that writes a row, the operator
+/// nonce: a token bucket for each source (`source_burst`, refilled at
 /// `source_per_second`), so that one caller cannot use up what every caller
-/// needs. Each row it lets through is deleted once expired
-/// (`Store::delete_expired`), so what the calls can hold in the database is
-/// bounded by the overall rate times the row's lifetime.
+/// needs, and one over every caller together (at most `burst` at once,
+/// refilled at `per_second`), set far above what honest callers ask: a high
+/// bound on the rows, each deleted once expired (`Store::delete_expired`), so
+/// what the call can hold in the database is at most the overall rate times
+/// the row's lifetime, without a budget a few sources could use up.
 #[derive(Debug)]
 pub struct Limiter {
 	per_second: f64,
@@ -232,7 +254,7 @@ impl Limiter {
 
 	fn refusal(&self, call: &str, source: IpAddr) -> Result<(), Refusal> {
 		self.take(source).map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
-			format!("{} is handed out at a bounded rate, overall and to each source; try again in {} ms", call,
+			format!("{} is handed out at a bounded rate to each source, within a high bound overall; try again in {} ms", call,
 				wait.as_millis().max(1))))
 	}
 }
@@ -366,17 +388,21 @@ fn amount(s: &str) -> Result<u64, Refusal> {
 	parse_amount(s).map_err(Refusal::malformed)
 }
 
-/// Checks a proof of `auth.key` for `call` and uses up its challenge.
+/// The server's clock, in seconds: what a challenge's time is.
+fn unix_now() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Checks a proof of `auth.key` for `call`: its challenge issued by this
+/// server within its lifetime, and the key's signature.
 async fn authenticate(app: &App, call: &str, a: &api::Auth) -> Result<XOnlyPublicKey, Refusal> {
 	let k = key(&a.key)?;
 	let challenge = unhex32(&a.challenge).map_err(Refusal::malformed)?;
 	let signature = sig(&a.signature)?;
 	let unauthenticated = |m: String| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated", m);
-	match app.store.use_challenge(&challenge).await? {
+	match auth::check_challenge(&app.challenge_key, &challenge, unix_now(), app.challenge_ttl.as_secs()) {
 		Ok(()) => {},
-		Err(ChallengeError::Unknown) => return Err(unauthenticated("the challenge was not issued by this server".into())),
-		Err(ChallengeError::Used) => return Err(unauthenticated("the challenge has already been used".into())),
-		Err(ChallengeError::Expired) => return Err(unauthenticated("the challenge has expired".into())),
+		Err(e @ ChallengeError::Unknown) | Err(e @ ChallengeError::Expired) => return Err(unauthenticated(e.to_string())),
 	}
 	if !auth::verify(&app.params.chain, call, &challenge, &k, &signature) {
 		return Err(unauthenticated(format!("the signature does not prove the key for {}", call)));
@@ -453,12 +479,11 @@ async fn operator_nonce(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectI
 	Ok(Json(api::NonceResponse { operator_nonce: hex(&n) }))
 }
 
-async fn challenge(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
-	body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChallengeResponse>, Refusal>
-{
+async fn challenge(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChallengeResponse>, Refusal> {
 	let _: api::Empty = parse(body, app.max_request)?;
-	app.challenges.refusal("a challenge", app.source(peer.ip(), &headers))?;
-	let c = app.store.issue_challenge(app.challenge_ttl).await?;
+	let mut random = [0u8; 12];
+	rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+	let c = auth::issue_challenge(&app.challenge_key, unix_now(), random);
 	Ok(Json(api::ChallengeResponse { challenge: hex(&c), expires_in_seconds: app.challenge_ttl.as_secs() }))
 }
 
@@ -781,6 +806,13 @@ mod tests {
 		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("198.51.100.9, ::1"), &trusted), ip("198.51.100.9"),
 			"a chain of trusted proxies is walked back");
 		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("not an address"), &trusted), ip("127.0.0.1"));
+		// An entry that does not read costs the others nothing; a port is read
+		// past; the nearest entry not a proxy unreadable names no source.
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("unknown, 203.0.113.5"), &trusted), ip("203.0.113.5"));
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("203.0.113.5:4711"), &trusted), ip("203.0.113.5"));
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("[2001:db8::7]:4711"), &trusted), ip("2001:db8::7"));
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("198.51.100.9, unknown"), &trusted), ip("127.0.0.1"),
+			"what a client wrote before an entry that does not read is not taken");
 	}
 
 	/// One source's bucket is its own: a caller that used up its own leaves
@@ -794,10 +826,11 @@ mod tests {
 		assert!(l.take(b).is_ok() && l.take(b).is_ok(), "b's is whole");
 		assert!(l.take(ip("192.0.2.1")).is_ok());
 		assert!(l.take(ip("192.0.2.2")).is_err(), "the overall burst of 5 is used up");
-		// The addresses of one IPv6 /64 are one source.
+		// The addresses of one IPv6 /48 are one source, its /64s included.
 		let l = Limiter::new(0, 10, 0, 1);
 		assert!(l.take(ip("2001:db8:1:2::1")).is_ok());
 		assert!(l.take(ip("2001:db8:1:2::ffff")).is_err());
-		assert!(l.take(ip("2001:db8:1:3::1")).is_ok());
+		assert!(l.take(ip("2001:db8:1:3::1")).is_err(), "another /64 of the same /48");
+		assert!(l.take(ip("2001:db8:2::1")).is_ok(), "another /48");
 	}
 }

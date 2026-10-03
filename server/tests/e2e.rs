@@ -209,13 +209,15 @@ async fn board_transfer_mailbox_and_rules() {
 	extra["unexpected"] = json!(1);
 	refused(r.http.post("cosign_transfer", &extra), 400, "malformed");
 
-	// Authentication: B's mailbox needs B's key, and a challenge once.
+	// Authentication: B's mailbox needs B's key, and a challenge this server
+	// issued; the same proof again within the challenge's lifetime only
+	// repeats B's own read.
 	let mut auth = r.http.auth("mailbox_read", &a, &r.chain);
 	auth["key"] = json!(hex(&xonly(&b).serialize()));
 	refused(r.http.post("mailbox_read", &json!({"auth": auth, "after": "0", "limit": 10})), 401, "unauthenticated");
 	let good = r.http.auth("mailbox_read", &b, &r.chain);
-	r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})).ok();
-	refused(r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})), 401, "unauthenticated");
+	let first = r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})).ok();
+	assert_eq!(r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})).ok(), first);
 	let mut other_call = r.http.auth("leaf_data", &b, &r.chain);
 	other_call["key"] = json!(hex(&xonly(&b).serialize()));
 	refused(r.http.post("mailbox_read", &json!({"auth": other_call, "after": "0", "limit": 10})), 401, "unauthenticated");
