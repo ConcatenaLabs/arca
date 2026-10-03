@@ -106,6 +106,13 @@ which case whoever broadcasts attaches a fee coin; the operator co-signs no
 transfer whose margins are below that, or above the multiple of it it
 publishes (`max_margin_multiple`).
 
+The operator's refresh fee is bounded by the wallet, not by what the server
+publishes: a fee above 10,000 millionths of a coin, or any fee for a coin in
+its free window (the two days before its exit deadline, five days before its
+first expiry), is refused before anything is signed, unless the user raises
+the bound for that one command (`participate --max-fee-ppm N`). Every fee is
+printed, coin by coin, before the wallet signs anything for the refresh.
+
 ### Commands
 
 | Command | Does |
@@ -120,7 +127,7 @@ publishes (`max_margin_multiple`).
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
-| `participate [--leaf L]… [--not-before T]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset |
+| `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
@@ -179,7 +186,8 @@ given to a participation that expires, or that the operator never runs; a coin
 in flight when the operator vanishes; a preimage withheld and a participation
 called void after its forfeit, the preimage then read from the operator's
 claim on the chain; and a round that can never return, whose coins come back,
-a forfeit of one of them published anyway and refunded after its delay.
+a forfeit of one of them published anyway and refunded after its delay; a
+refresh fee of half of every coin, and one inside a coin's free window.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

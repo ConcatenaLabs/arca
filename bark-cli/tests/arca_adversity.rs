@@ -567,3 +567,70 @@ async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded()
 	assert_eq!(coin_of(&c, &boards[1])["state"], "exited");
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
+
+// ---------------------------------------------------------------------------
+// The fee a refresh pays
+// ---------------------------------------------------------------------------
+
+/// The operator publishes a refresh fee of half of every coin: the wallet
+/// refuses it before it signs or submits anything, says what it would cost,
+/// and pays it only when the user raises the bound for that one command,
+/// printing the fee first. A coin in its free window pays nothing, whatever
+/// window the operator publishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F4");
+	let x = r.x;
+	let boards = boarded(&mut r, &c, &proxy.url.clone(), &[(x, 2_000_000), (x, 2_000_000)]).await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["fees"]["refresh_ppm"] = json!(500_000);
+		}
+		None
+	})));
+	let why = c.refused(&["participate", "--leaf", &boards[0]], "--max-fee-ppm");
+	println!("F4 a refresh fee of 500000 ppm published: REFUSED: {}", why);
+	assert!(why.contains("1000000") && why.contains("500000 ppm") && why.contains("10000 ppm"), "{}", why);
+	assert_eq!(proxy.count("/v1/submit_participation"), 0, "nothing was signed or submitted");
+	assert_eq!(coin_of(&c, &boards[0])["state"], "live");
+	// Raised for one command: printed before anything is signed, then paid.
+	let (ok, p, err) = c.run_full(&["participate", "--leaf", &boards[0], "--max-fee-ppm", "500000"]);
+	println!("F4 with the bound raised: stderr {:?}; {}", err.trim(), p);
+	assert!(ok, "{}", p);
+	assert!(err.contains(&format!("refresh fee for coin {}: 1000000 of asset {}", boards[0], x)), "the fee is printed: {}", err);
+	assert_eq!(p["fees"][0]["amount"], "1000000");
+	assert_eq!(p["wants"][0]["value"], "1000000");
+	proxy.rewrite(None);
+
+	// A batch leaf in its free window: the operator publishes a fee and no
+	// free window; the wallet pays nothing there.
+	c.ok(&["participate", "--leaf", &boards[1]]);
+	final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let leaf = s["participations"].as_array().unwrap().iter().find_map(|p| p["new_leaves"][0]["leaf_id"].as_str())
+		.unwrap_or_else(|| panic!("the refresh completes: {}", s)).to_string();
+	let CoinRecord::Leaf { record, .. } = record_of(&c, &leaf) else { panic!("a batch leaf") };
+	let e0 = record.schedule.expiries()[0].to_consensus_u32();
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, e0 - now - 4 * 86_400));
+	r.bury().await;
+	c.ok(&["sync"]);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live", "four days before its expiry the leaf is still live");
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["fees"]["refresh_ppm"] = json!(5_000);
+			v["fees"]["free_window_seconds"] = json!(0);
+		}
+		None
+	})));
+	let submitted = proxy.count("/v1/submit_participation");
+	let why = c.refused(&["participate", "--leaf", &leaf], "free window");
+	println!("F4 a fee inside the free window: REFUSED: {}", why);
+	assert_eq!(proxy.count("/v1/submit_participation"), submitted, "nothing was submitted");
+	proxy.rewrite(None);
+	let p = c.ok(&["participate", "--leaf", &leaf]);
+	assert_eq!(p["fees"], json!([]), "the honest schedule asks nothing in the free window: {}", p);
+	let _ = std::fs::remove_dir_all(&c.dir);
+}

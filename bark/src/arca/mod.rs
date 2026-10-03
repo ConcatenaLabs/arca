@@ -39,6 +39,7 @@ mod pay;
 mod round;
 mod wallet;
 
+pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};
 pub use wallet::{Config, Wallet};
 
 pub use arca_covenant;
