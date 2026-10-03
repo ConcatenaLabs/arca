@@ -542,6 +542,10 @@ impl Rounds {
 						hops: 0,
 						record: vec![],
 						state: LeafState::Pending,
+						// Promised to the participation when it took its
+						// operator nonce.
+						salt: arca_covenant::leaf::leaf_salt(&l.spec.owner_nonce, &l.spec.operator_nonce),
+						promised_to: Some(row.id),
 						// Taken when the participation was accepted.
 						operator_nonce: None,
 						scripts: vec![NewScript { script_pubkey: leaf_spk.to_bytes(), kind: ScriptKind::Leaf }],

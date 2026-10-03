@@ -2,10 +2,13 @@
 //!
 //! The schema is `schema/V1__arca.sql` and the migrations after it
 //! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`,
-//! `schema/V4__participation_waiting.sql`), built from nothing by [`Store::connect`] and
+//! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`), built
+//! from nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
-//! itself: a leaf script appears once ([`StoreError::ScriptReused`]), an
+//! itself: a leaf script appears once ([`StoreError::ScriptReused`]), a leaf
+//! salt is taken once, by one leaf or one leaf a participation wants
+//! ([`StoreError::SaltReused`]), an
 //! operator nonce is taken once ([`StoreError::NonceUsed`]), a key owns one leaf
 //! ([`StoreError::KeyReused`]), a leaf is given up once, by one transfer or by
 //! one participation at a time (a participation that never runs, or whose
@@ -59,6 +62,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(2, include_str!("../../schema/V2__watcher.sql")),
 	(3, include_str!("../../schema/V3__operator_scripts.sql")),
 	(4, include_str!("../../schema/V4__participation_waiting.sql")),
+	(5, include_str!("../../schema/V5__leaf_salt.sql")),
 ];
 
 /// An arbitrary key for the advisory lock that serialises migrations.
@@ -76,6 +80,10 @@ pub enum StoreError {
 	ScriptReused,
 	#[error("the key already owns a leaf: every leaf has a key of its own")]
 	KeyReused,
+	/// A leaf's salt the server has seen before, on a leaf or promised to
+	/// one: the salt, hex.
+	#[error("salt {0} is already known to the server: every leaf has a salt of its own")]
+	SaltReused(String),
 	#[error("the operator nonce was not issued by this server")]
 	NonceUnknown,
 	#[error("the operator nonce has already been used")]

@@ -19,6 +19,8 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 		hops: 0,
 		record: vec![n],
 		state: LeafState::Pending,
+		salt: [n; 32],
+		promised_to: None,
 		operator_nonce: Some(nonce),
 		scripts: vec![NewScript { script_pubkey: script, kind: ScriptKind::Board }],
 	}
@@ -27,11 +29,11 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 4);
+	assert_eq!(db.store.schema_version().await.unwrap(), 5);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 4);
+	assert_eq!(again.schema_version().await.unwrap(), 5);
 }
 
 #[tokio::test]
@@ -97,6 +99,41 @@ async fn script_and_key_are_unique() {
 	assert_eq!(row.value, 1_000);
 	assert_eq!(s.leaves_by_owner(&[1; 32]).await.unwrap(), vec![row]);
 	assert_eq!(s.arca_script(&[0x51, 0x20, 1, 1, 1]).await.unwrap(), Some((ScriptKind::Board, [1; 32])));
+}
+
+/// A leaf salt is taken once, whatever the leaf (D44): a second leaf under a
+/// salt the server knows is refused, and nothing of it is written.
+#[tokio::test]
+async fn salt_is_unique() {
+	let db = TestDb::new().await;
+	let s = &db.store;
+	s.insert_coins(&[coin(1, s.issue_nonce().await.unwrap())]).await.unwrap();
+	assert_eq!(s.known_salts(&[[1; 32], [2; 32]]).await.unwrap(), vec![[1; 32]]);
+
+	// Another leaf, its own key, script and id, under the first one's salt.
+	let mut c = coin(2, s.issue_nonce().await.unwrap());
+	c.salt = [1; 32];
+	let e = s.insert_coins(&[c]).await.unwrap_err();
+	assert!(matches!(&e, StoreError::SaltReused(h) if *h == "01".repeat(32)), "{:?}", e);
+	assert!(s.leaf(&[2; 32]).await.unwrap().is_none());
+	assert!(s.arca_script(&[0x51, 0x20, 2, 2, 2]).await.unwrap().is_none());
+
+	// A leaf of a batch may take only the salt promised to its own
+	// participation; a promise of another's is no use to it.
+	let mut c = coin(3, s.issue_nonce().await.unwrap());
+	c.salt = [1; 32];
+	c.promised_to = Some([9; 32]);
+	let e = s.insert_coins(&[c]).await.unwrap_err();
+	assert!(matches!(e, StoreError::SaltReused(_)), "{:?}", e);
+
+	// Two coins in one call under one salt: neither is written.
+	let a = coin(4, s.issue_nonce().await.unwrap());
+	let mut b = coin(5, s.issue_nonce().await.unwrap());
+	b.salt = a.salt;
+	let e = s.insert_coins(&[a, b]).await.unwrap_err();
+	assert!(matches!(e, StoreError::SaltReused(_)), "{:?}", e);
+	assert!(s.leaf(&[4; 32]).await.unwrap().is_none());
+	assert!(s.known_salts(&[[4; 32]]).await.unwrap().is_empty());
 }
 
 #[tokio::test]

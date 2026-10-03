@@ -173,17 +173,19 @@ async fn board_transfer_mailbox_and_rules() {
 	// A sender that repeats B's output for D, creator nonce and all: one
 	// transaction could satisfy both reassignments and hand one side's value
 	// to whoever broadcasts it. Refused for the same outputs, and for a set
-	// whose first outputs are B's.
+	// whose first outputs are B's: the repeated output's salt is D's leaf's,
+	// and a salt is unique on a server (the merge rule behind it refuses the
+	// same, `mergeable_at_once`).
 	let a2_valid = a2_record.resolve(&bases, &policy).unwrap();
 	let a2_coin = Held { key: a2, nonce: a2_nonce, id: a2_valid.id, record: a2_record.clone() };
 	let a2_kept = a2_valid.value - MARGIN;
 	let spend_a2 = |outs: Vec<(elements::AssetId, u64, arca_covenant::NewLeaf)>| transfer_body(&[(&a2_coin, a2_valid.clone(), a2_kept)], &outs, s, chain);
-	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf)])), 409, "merge");
+	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf)])), 409, "salt");
 	let (a3_leaf, _) = new_leaf(&keypair("A3"));
-	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf), (r.x, 1_000, a3_leaf)])), 409, "merge");
+	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf), (r.x, 1_000, a3_leaf)])), 409, "salt");
 	// The rule is kept in the database: a server started again still refuses.
 	r.restart_server().await;
-	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf)])), 409, "merge");
+	refused(r.http.post("cosign_transfer", &spend_a2(vec![(r.x, 300_000, d_leaf)])), 409, "salt");
 	// The same receive request paid again under a fresh creator nonce is a
 	// second leaf for D's key, which the server refuses: a key owns one leaf.
 	let mut again = d_leaf;
@@ -405,8 +407,13 @@ async fn mergeable_at_once() {
 			hs.into_iter().map(|h| h.join().unwrap()).collect()
 		})
 	});
+	// One is co-signed. The other is refused by the merge rule, which runs
+	// under a lock on the output set, when both passed the salt check before
+	// either was recorded; or for its salt, when the first was recorded
+	// before it got there. Which depends on timing alone.
 	let codes: Vec<(i32, String)> = answers.iter().map(|a| (a.status, a.refusal().0)).collect();
-	assert!(codes.contains(&(200, String::new())) && codes.contains(&(409, "merge".into())), "{:?}", codes);
+	assert!(codes.contains(&(200, String::new()))
+		&& (codes.contains(&(409, "merge".into())) || codes.contains(&(409, "salt".into()))), "{:?}", codes);
 	println!("two coins sent to one output set at once: {:?}", codes);
 }
 

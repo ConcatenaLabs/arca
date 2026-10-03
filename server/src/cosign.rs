@@ -148,6 +148,8 @@ pub enum CosignError {
 	OperatorKey,
 	#[error("an output's script is already known: a leaf script is never funded twice")]
 	ScriptReused,
+	#[error("an output's salt {0} is already known to the server: every leaf has a salt of its own, never one another leaf has had")]
+	SaltReused(String),
 	#[error("leaf {0} has an open out-of-round reassignment: no release is accepted for it")]
 	OpenReassignment(LeafId),
 	#[error("one transaction could satisfy this reassignment and one already co-signed, and give one side's value to whoever broadcast it: {0}")]
@@ -183,6 +185,7 @@ impl CosignError {
 			KeyReused => "key_reused",
 			OperatorKey => "operator_key",
 			ScriptReused => "script_reused",
+			SaltReused(_) => "salt",
 			OpenReassignment(_) => "open_reassignment",
 			Mergeable(_) => "merge",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
@@ -198,6 +201,7 @@ impl From<StoreError> for CosignError {
 		match e {
 			StoreError::KeyReused => CosignError::KeyReused,
 			StoreError::ScriptReused => CosignError::ScriptReused,
+			StoreError::SaltReused(h) => CosignError::SaltReused(h),
 			StoreError::Mergeable(m) => CosignError::Mergeable(m),
 			other => CosignError::Store(other),
 		}
@@ -317,6 +321,25 @@ impl Cosigner {
 			}
 			outputs.push(ExplicitOutput::new(o.asset, o.value, o.leaf.policy(s, chain).script_pubkey()));
 		}
+		// Each new leaf's salt is its own: never another output's, never one
+		// the server has seen on a leaf or promised to one (D44). The sender
+		// chooses both nonces of a new leaf's salt. A transfer recorded and
+		// not yet signed holds its outputs' salts itself, so the check
+		// against the server's is made only for a transfer not yet recorded.
+		let mut salts = Vec::with_capacity(m);
+		for o in &req.outputs {
+			let salt = o.leaf.salt();
+			if salts.contains(&salt) {
+				return Err(CosignError::SaltReused(crate::signer::hex(&salt)));
+			}
+			salts.push(salt);
+		}
+		let recorded = self.store.transfer(&transfer).await?.is_some();
+		if !recorded {
+			if let Some(known) = self.store.known_salts(&salts).await?.first() {
+				return Err(CosignError::SaltReused(crate::signer::hex(known)));
+			}
+		}
 
 		// The inputs, each checked.
 		let mut checked = Vec::with_capacity(n);
@@ -398,6 +421,8 @@ impl Cosigner {
 						hops: hops as u16,
 						record: vec![],
 						state: LeafState::Pending,
+						salt: o.leaf.salt(),
+						promised_to: None,
 						// The sender's creator nonce, not one the operator issued.
 						operator_nonce: None,
 						scripts: vec![NewScript { script_pubkey: out.script_pubkey.to_bytes(), kind: ScriptKind::Leaf }],
@@ -428,12 +453,14 @@ impl Cosigner {
 		// Now S signs, in its own process; each signature is checked against
 		// the message the server built.
 		let mut sigs = Vec::with_capacity(n);
-		for (k, c) in checked.iter().enumerate() {
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
-			let cp = self.signer.rebind(&c.coin.leaf.salt, c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await
-				.map_err(|e| lost_spend(e, &c.coin.id))?;
-			let re = self.signer.rebind(&plan.checkpoint(k).salt, c.coin.asset, plan.inputs[k].1, &outputs).await
-				.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let owner = c.coin.leaf.owner;
+			let cp = self.signer.rebind(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
+				std::slice::from_ref(&cp_out)).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let checkpoint = plan.checkpoint(k);
+			let re = self.signer.rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset, plan.inputs[k].1,
+				&outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
 			}

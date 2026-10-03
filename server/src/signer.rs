@@ -4,9 +4,9 @@
 //! a Unix socket, and answers three requests, one JSON object per line:
 //!
 //! - `{"op":"pubkey"}`: the x-only key `S`;
-//! - `{"op":"rebind","salt":…,"asset_in":…,"value_in":…,"outputs":[…]}`: `S`'s
-//!   signature over the rebindable message of a collaborative path, which the
-//!   signer builds itself from the parts, on its own chain:
+//! - `{"op":"rebind","owner":…,"owner_sig":…,"salt":…,"asset_in":…,"value_in":…,"outputs":[…]}`:
+//!   `S`'s signature over the rebindable message of a collaborative path,
+//!   which the signer builds itself from the parts, on its own chain:
 //!   `SHA256(K ‖ asset_in ‖ 0x01 ‖ 0x01 ‖ value_in ‖ m ‖ SHA256(record 0) ‖ …)`
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis) ‖ salt)`, for 1 to 4
 //!   committed outputs;
@@ -29,14 +29,16 @@
 //! # The one-spend record
 //!
 //! The signer, not the database, is the authority on what `S` has co-signed.
-//! Before it returns a rebindable signature it appends `(salt, kind, digest)`
-//! to its record, a file it alone writes, and syncs it to disk
-//! ([`SpendRecord`]); it reads the whole record when it starts. For each
-//! salt (a leaf's, a board's or a checkpoint's) it then signs:
+//! Before it returns a rebindable signature it appends `(owner, salt, kind,
+//! digest)` to its record, a file it alone writes, and syncs it to disk
+//! ([`SpendRecord`]); it reads the whole record when it starts. The record is
+//! kept per leaf: a leaf is its owner's key together with its salt (a leaf's,
+//! a board's or a checkpoint's, whose owner is its coin's). For each leaf it
+//! then signs:
 //!
 //! - one **spend**: a message into anything but a forfeit output (a leaf
 //!   into its checkpoint, a checkpoint into its reassignment). A second spend
-//!   message for the salt is refused (`already_signed`), whatever the
+//!   message for the leaf is refused (`already_signed`), whatever the
 //!   database says; the same message again is signed again, so a request
 //!   repeated after a signer outage completes;
 //! - or any number of **forfeits**, one for each round's connector asset `M`:
@@ -44,8 +46,18 @@
 //!   after the first could never return. A forfeit is a rebind request that
 //!   names the forfeit's parts (`forfeit`), from which the signer rebuilds
 //!   the forfeit output and checks it is the one output committed to; it is
-//!   refused once the salt has a spend, and a second forfeit message for the
-//!   same `M` is refused. A spend is refused once the salt has a forfeit.
+//!   refused once the leaf has a spend, and a second forfeit message for the
+//!   same `M` is refused. A spend is refused once the leaf has a forfeit.
+//!
+//! Every rebind request names the leaf's owner key and carries the owner's
+//! own signature over the very message `S` is to sign (the checkpoint, the
+//! reassignment or the forfeit each needs both), and the signer checks it
+//! before it records anything: an entry under a key is always the holder of
+//! that key's doing. So nothing one holder sends changes what `S` will sign
+//! for another holder's leaf, even under a salt the two leaves share (the
+//! server refuses a second leaf under a salt it knows, but a database
+//! restored from an older copy, or a new one, has forgotten which salts it
+//! saw).
 //!
 //! So a database restored from an older copy, which no longer knows a
 //! transfer it co-signed, cannot have `S` co-sign a second spend of the same
@@ -132,9 +144,11 @@ pub enum Request {
 	/// A struct variant, so a stray field is refused as for `rebind` (serde
 	/// lets a unit variant of a tagged enum through with any fields).
 	Pubkey {},
-	/// A rebindable message; a forfeit's names its parts.
+	/// A rebindable message for the leaf of `owner` (an x-only key) under
+	/// `salt`, with `owner_sig`, the owner's BIP340 signature over that same
+	/// message; a forfeit's names its parts.
 	Rebind {
-		salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput>,
+		owner: String, owner_sig: String, salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		forfeit: Option<WireForfeit>,
 	},
@@ -178,7 +192,7 @@ pub struct Response {
 	pub signature: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
-	/// `already_signed` when the record holds another message for the salt.
+	/// `already_signed` when the record holds another message for the leaf.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<String>,
 }
@@ -195,17 +209,20 @@ pub enum Signed {
 	Forfeit([u8; 32]),
 }
 
+/// A leaf, as the record keys it: its owner's key and its salt.
+pub type LeafKey = ([u8; 32], [u8; 32]);
+
 /// The signer's append-only record of every rebindable message it signed:
 /// see the [module documentation](self).
 ///
-/// One line per message, `spend <salt> <digest>` or
-/// `forfeit <salt> <digest> <connector>`, hex, appended and synced to disk
-/// before the signature is returned. A last line cut short by a crash was
-/// never answered, and is dropped when the record is opened; any other line
-/// that does not read stops the signer from starting.
+/// One line per message, `spend <owner> <salt> <digest>` or
+/// `forfeit <owner> <salt> <digest> <connector>`, hex, appended and synced to
+/// disk before the signature is returned. A last line cut short by a crash
+/// was never answered, and is dropped when the record is opened; any other
+/// line that does not read stops the signer from starting.
 pub struct SpendRecord {
 	file: std::fs::File,
-	by_salt: std::collections::HashMap<[u8; 32], Vec<(Signed, [u8; 32])>>,
+	by_leaf: std::collections::HashMap<LeafKey, Vec<(Signed, [u8; 32])>>,
 }
 
 impl SpendRecord {
@@ -233,35 +250,42 @@ impl SpendRecord {
 			file.set_len(whole as u64).map_err(fail)?;
 			file.sync_all().map_err(fail)?;
 		}
-		let mut by_salt: std::collections::HashMap<[u8; 32], Vec<(Signed, [u8; 32])>> = Default::default();
+		let mut by_leaf: std::collections::HashMap<LeafKey, Vec<(Signed, [u8; 32])>> = Default::default();
 		for (n, line) in text[..whole].lines().enumerate() {
 			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), n + 1, what, line);
 			let f: Vec<&str> = line.split(' ').collect();
-			let (kind, salt, digest) = match f.as_slice() {
-				["spend", s, d] => (Signed::Spend, *s, *d),
-				["forfeit", s, d, m] => (Signed::Forfeit(unhex32(m).map_err(|e| bad(&e))?), *s, *d),
+			let (kind, owner, salt, digest) = match f.as_slice() {
+				["spend", o, s, d] => (Signed::Spend, *o, *s, *d),
+				["forfeit", o, s, d, m] => (Signed::Forfeit(unhex32(m).map_err(|e| bad(&e))?), *o, *s, *d),
+				["spend", _, _] | ["forfeit", _, _, _] => return Err(bad(
+					"a line of a record kept by salt alone, which names no owner key: this signer keeps its record per leaf \
+					 and cannot read it")),
 				_ => return Err(bad("not a record line")),
 			};
-			by_salt.entry(unhex32(salt).map_err(|e| bad(&e))?).or_default().push((kind, unhex32(digest).map_err(|e| bad(&e))?));
+			let leaf = (unhex32(owner).map_err(|e| bad(&e))?, unhex32(salt).map_err(|e| bad(&e))?);
+			by_leaf.entry(leaf).or_default().push((kind, unhex32(digest).map_err(|e| bad(&e))?));
 		}
 		let _ = file.flush();
-		Ok(SpendRecord { file, by_salt })
+		Ok(SpendRecord { file, by_leaf })
 	}
 
 	/// How many messages the record holds.
 	pub fn len(&self) -> usize {
-		self.by_salt.values().map(|v| v.len()).sum()
+		self.by_leaf.values().map(|v| v.len()).sum()
 	}
 
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
 
-	/// Whether `S` may sign `digest`, a message of `kind` for `salt`: when it
-	/// may, the message is in the record, on disk, before this returns.
-	pub fn admit(&mut self, salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<(), String> {
+	/// Whether `S` may sign `digest`, a message of `kind` for the leaf of
+	/// `owner` under `salt`: when it may, the message is in the record, on
+	/// disk, before this returns. Another leaf under the same salt is
+	/// another leaf: what was signed for it does not count here.
+	pub fn admit(&mut self, owner: &[u8; 32], salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<(), String> {
 		use std::io::Write;
-		let had = self.by_salt.get(salt).map(|v| v.as_slice()).unwrap_or(&[]);
+		let leaf = (*owner, *salt);
+		let had = self.by_leaf.get(&leaf).map(|v| v.as_slice()).unwrap_or(&[]);
 		if had.iter().any(|(k, d)| *k == kind && d == digest) {
 			return Ok(());
 		}
@@ -272,18 +296,20 @@ impl SpendRecord {
 			};
 			if clash {
 				return Err(format!(
-					"{}: S has already co-signed {} {} for salt {}; the signer co-signs one spend of an output, or its forfeits, one for each round",
-					ALREADY_SIGNED, match k { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(d), hex(salt),
+					"{}: S has already co-signed {} {} for the leaf of {} under salt {}; the signer co-signs one spend of an \
+					 output, or its forfeits, one for each round",
+					ALREADY_SIGNED, match k { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(d),
+					hex(owner), hex(salt),
 				));
 			}
 		}
 		let line = match kind {
-			Signed::Spend => format!("spend {} {}\n", hex(salt), hex(digest)),
-			Signed::Forfeit(m) => format!("forfeit {} {} {}\n", hex(salt), hex(digest), hex(&m)),
+			Signed::Spend => format!("spend {} {} {}\n", hex(owner), hex(salt), hex(digest)),
+			Signed::Forfeit(m) => format!("forfeit {} {} {} {}\n", hex(owner), hex(salt), hex(digest), hex(&m)),
 		};
 		self.file.write_all(line.as_bytes()).and_then(|_| self.file.sync_data())
 			.map_err(|e| format!("the record could not be written, so nothing is signed: {}", e))?;
-		self.by_salt.entry(*salt).or_default().push((kind, *digest));
+		self.by_leaf.entry(leaf).or_default().push((kind, *digest));
 		Ok(())
 	}
 }
@@ -361,29 +387,33 @@ impl SignerClient {
 		XOnlyPublicKey::from_slice(&unhex(&k).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
 	}
 
-	/// `S`'s signature over the rebindable message of the output with `salt`,
-	/// spending a coin of `value_in` of `asset_in` into `outputs`.
-	pub async fn rebind(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput])
-		-> Result<Signature, SignerError>
+	/// `S`'s signature over the rebindable message of the leaf of `owner`
+	/// under `salt`, spending a coin of `value_in` of `asset_in` into
+	/// `outputs`; `owner_sig` is the owner's signature over that message.
+	pub async fn rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
+		outputs: &[ExplicitOutput]) -> Result<Signature, SignerError>
 	{
-		self.rebind_as(salt, asset_in, value_in, outputs, None).await
+		self.rebind_as(owner, owner_sig, salt, asset_in, value_in, outputs, None).await
 	}
 
-	/// `S`'s signature over the rebindable message of the output with `salt`,
-	/// spending a coin of `value_in` of `asset_in` into `output`, the forfeit
-	/// output of `forfeit`: the signer records it as a forfeit for its round.
-	pub async fn rebind_forfeit(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, forfeit: &ForfeitPolicy, output: &ExplicitOutput)
-		-> Result<Signature, SignerError>
+	/// `S`'s signature over the rebindable message of the leaf of `owner`
+	/// under `salt`, spending a coin of `value_in` of `asset_in` into
+	/// `output`, the forfeit output of `forfeit`: the signer records it as a
+	/// forfeit for its round. `owner_sig` is the owner's forfeit signature.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn rebind_forfeit(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
+		forfeit: &ForfeitPolicy, output: &ExplicitOutput) -> Result<Signature, SignerError>
 	{
-		self.rebind_as(salt, asset_in, value_in, std::slice::from_ref(output), Some(WireForfeit::from_policy(forfeit))).await
+		self.rebind_as(owner, owner_sig, salt, asset_in, value_in, std::slice::from_ref(output), Some(WireForfeit::from_policy(forfeit))).await
 	}
 
-	async fn rebind_as(&self, salt: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>)
-		-> Result<Signature, SignerError>
+	#[allow(clippy::too_many_arguments)]
+	async fn rebind_as(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
+		outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>) -> Result<Signature, SignerError>
 	{
 		let r = self.ask(&Request::Rebind {
-			salt: hex(salt), asset_in: asset_in.to_string(), value_in: value_in.to_string(),
-			outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit,
+			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
+			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit,
 		}).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))

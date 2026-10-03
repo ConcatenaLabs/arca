@@ -21,7 +21,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V1__arca.sql`](schema/V1__arca.sql) and the migrations after it
 ([`schema/V2__watcher.sql`](schema/V2__watcher.sql),
 [`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql),
-[`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql)). `Store::connect` builds it
+[`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql),
+[`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -43,6 +44,15 @@ requests can race past them:
   it is handed out and taken by one leaf at most. A nonce that was never
   issued, or was already taken, is refused. A leaf a reassignment creates
   takes its sender's creator nonce instead.
+- **Salts.** A leaf's salt is unique on a server. Every salt the server has
+  seen is kept for good: on a board, a leaf of a batch or an output of a
+  transfer, or promised to a leaf a participation wants (one for each
+  attempt, from the operator nonce drawn for it). A board or a transfer
+  whose new leaf would take a salt the server has seen is refused (`salt`),
+  and a participation's leaf is promised a salt no other leaf has. A
+  transfer's sender chooses both nonces of its new leaves' salts, and the
+  public tree shows every batch leaf's, so without this a holder could name
+  another holder's salt for a leaf of its own.
 - **Transfers and participations.** A leaf is given up as the input of one
   transfer, recorded before any signature leaves the server, or of one
   participation at a time, recorded when it is accepted. A participation that
@@ -146,9 +156,11 @@ its own, the exit delay, asset and value), pays its coins to the board output,
 and registers the record with the board transaction. The server refuses a
 record for another chain or another operator key, an exit delay out of
 bounds, an asset it does not serve, a value below its smallest leaf, a
-transaction that does not pay the board output exactly once, a nonce it never
-issued or already gave a leaf, a key that already owns a leaf or is the
-operator's own `S` (`operator_key`), a script it already knows, and another transaction for a board already registered. The
+transaction that does not pay the board output exactly once, a salt it has
+seen before (`salt`), a nonce it never issued or already gave a leaf, a key
+that already owns a leaf or is the operator's own `S` (`operator_key`), a
+script it already knows, and another transaction for a board already
+registered. The
 node must then take the board transaction: it is in a block or the mempool
 already, or `testmempoolaccept` allows it. One the node refuses (an input that
 does not exist, say) is refused with `not_accepted` and the node's reason, so
@@ -184,7 +196,10 @@ asset and a value. The server co-signs only when every rule holds:
 - the new coins are at most five reassignments from a round or a board;
 - each new leaf is within the published bounds: an asset served, a value
   within its bounds, an exit delay within the bounds, a key that owns no other
-  leaf and is not the operator's `S` (`operator_key`), a script never seen;
+  leaf and is not the operator's `S` (`operator_key`), a script never seen,
+  and a salt no other output of the transfer has and the server has never
+  seen on a leaf or promised to one (`salt`): the sender chooses both nonces
+  of a new leaf's salt;
 - no transaction could satisfy both it and a reassignment the server
   co-signed before: their committed outputs do not agree at every index both
   commit to (the same outputs, or one set the first outputs of the other).
@@ -586,7 +601,9 @@ refuses one others can), listens on a Unix socket of mode 0600, and answers
 three requests: its public key; `S`'s signature over the rebindable message of
 a collaborative path, which it builds itself from the parts (the salt, the
 coin's asset and value, one to four committed outputs, and for a forfeit the
-forfeit's own parts) on its own chain; and
+forfeit's own parts) on its own chain, for the leaf of an owner key the
+request names together with that owner's own signature over the same
+message, which the signer checks; and
 `S`'s signature over the spend of one input of a transaction by one tapscript
 leaf, whose signature hash it computes itself from the transaction and the
 outputs every input spends, on its own chain. It signs a spend only by a leaf
@@ -598,13 +615,17 @@ by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
 signature it gets back against the message or signature hash it built.
 
 The signer is the one-spend authority. Before it returns a rebindable
-signature it appends the salt, the kind and the message's digest to its
-record, an append-only file it alone writes, and syncs it to disk; it reads
-the record whole when it starts, and refuses to start on a line it cannot
-read (a last line cut short by a crash was never answered, and is dropped).
-For each salt (a leaf's, a board's, a checkpoint's) it signs one spend, a
-message into anything but a forfeit output, or forfeits, one for each round's
-connector asset: a forfeit request names the forfeit's parts, and the signer
+signature it appends the owner key, the salt, the kind and the message's
+digest to its record, an append-only file it alone writes, and syncs it to
+disk; it reads the record whole when it starts, and refuses to start on a line
+it cannot read (a last line cut short by a crash was never answered, and is
+dropped). The record is kept per leaf: a leaf is its owner key together with
+its salt (a leaf's, a board's, a checkpoint's, whose owner is its coin's), so
+another leaf under the same salt is another leaf, and since every entry needs
+the named owner's signature, nothing one holder sends changes what `S` signs
+for another holder's leaf, even where the database has forgotten a salt. For
+each leaf it signs one spend, a message into anything but a forfeit output,
+or forfeits, one for each round's connector asset: a forfeit request names the forfeit's parts, and the signer
 rebuilds the forfeit output from them and checks it is the one output
 committed to. The same message again is signed again, so a request repeated
 after a signer outage completes; a second spend, a spend after a forfeit, a
@@ -741,8 +762,9 @@ Each of the server's rules is exercised by a refusal, and each refusal is
 asserted by its code: a second spend, alone and eight at once; a leaf on the
 chain, by a board's conversion seen in the mempool and by a transfer's output
 its receiver published; a coin on a board a rollback uncredited; the depth
-limit; outputs outside the bounds; a key already owning a leaf; a mergeable
-reassignment, equal or prefix, alone, at once and after a restart; a bad
+limit; outputs outside the bounds; a key already owning a leaf; a repeated
+output, equal or prefix, alone and after a restart (`salt`), and two at once
+(`merge` or `salt`, as the race falls); a bad
 signature; an unknown leaf; a board not yet final; the request size bound; and
 authentication. A board rolled back, the node restarted with an empty mempool,
 is uncredited, broadcast again by the server and credited again; the signer
@@ -913,12 +935,25 @@ over the signature hash the library builds; it refuses a raw digest, a stray
 field, outputs out of range, an oversized line, a spend by the leaf's
 collaborative path or the owner's exit, an input out of range, spent outputs
 missing, and an input that spends no taproot output. Its record: a spend
-signed again when asked again and a second spend refused; forfeits of one
-coin for two rounds signed and a second forfeit for one round refused; a spend
-after forfeits and a forfeit after a spend refused; forfeit parts that do not
-make the output refused and not recorded; the same refusals after a restart;
-a last line cut short dropped, and a line that does not read refusing the
-start.
+signed again when asked again and a second spend refused; another holder's
+leaf under the same salt spent once and refused a second time, each leaf on
+its own; an owner signature by another key, over another message or for
+another salt refused and not recorded; forfeits of one coin for two rounds
+signed and a second forfeit for one round refused; a spend after forfeits and
+a forfeit after a spend refused; forfeit parts that do not make the output
+refused and not recorded; the same refusals after a restart; a last line cut
+short dropped, and a line that does not read, or one of a record kept by salt
+alone, refusing the start.
+
+`tests/salts.rs` names other leaves' salts. A transfer to a leaf of the
+attacker's under a batch leaf's salt read from the public tree, two new leaves
+of one transfer under one salt, a board under a transfer output's salt (its
+operator nonce unused), and a transfer to a leaf under the salt promised to a
+participation not yet in a round are each refused with `salt`, naming it; the
+holders whose salts were named then pay and refresh as usual. With one salt
+deleted from the database, as one restored from an older copy would have
+forgotten it, the attacker's leaf under it is co-signed and spent, and its
+holder still pays: the signer keeps its record per leaf.
 
 `tests/restore.rs` restores the database from an older copy. A board pays B,
 the copy forgets it, and the same board's spend to C is refused by the

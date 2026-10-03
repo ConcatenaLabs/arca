@@ -18,14 +18,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey};
+use elements::secp256k1_zkp::schnorr::Signature;
+use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use elements::BlockHash;
 use rand::RngCore;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use arca_covenant::message::rebind_message;
-use arca_covenant::sign::{script_spend_sighash, sign_digest};
+use arca_covenant::sign::{script_spend_sighash, sign_digest, verify_digest};
 use arca_covenant::Chain;
 use server::signer::{
 	check_spend, hex, parse_amount, unhex, unhex32, Request, Response, Signed, SpendRecord, ALREADY_SIGNED, MAX_REQUEST,
@@ -82,8 +83,10 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 	};
 	match req {
 		Request::Pubkey {} => Response { pubkey: Some(hex(&key.x_only_public_key().0.serialize())), ..none },
-		Request::Rebind { salt, asset_in, value_in, outputs, forfeit } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit } => {
 			let parsed = (|| -> Result<_, String> {
+				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
+				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
 				let salt = unhex32(&salt)?;
 				let asset_in = elements::AssetId::from_str(&asset_in).map_err(|e| format!("asset_in: {}", e))?;
 				let value_in = parse_amount(&value_in)?;
@@ -104,9 +107,9 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 						Signed::Forfeit(policy.connector.into_inner().to_byte_array())
 					},
 				};
-				Ok((salt, asset_in, value_in, outputs, kind))
+				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind))
 			})();
-			let (salt, asset_in, value_in, outputs, kind) = match parsed {
+			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind) = match parsed {
 				Ok(p) => p,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
@@ -114,18 +117,28 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 				Ok(m) => m,
 				Err(e) => return Response { error: Some(e.to_string()), ..none },
 			};
+			// The owner signed this very message: an entry under its key is
+			// its own doing, never another holder's.
+			if !verify_digest(&owner_sig, &message.digest, &owner) {
+				return Response {
+					error: Some(format!("the owner's signature over {} does not verify under the key {}: the signer records a message \
+						only under the key of the owner who signed it", hex(&message.digest), hex(&owner.serialize()))),
+					..none
+				};
+			}
 			// On disk before anything is signed.
-			let admitted = record.lock().unwrap_or_else(|e| e.into_inner()).admit(&salt, kind, &message.digest);
+			let admitted = record.lock().unwrap_or_else(|e| e.into_inner()).admit(&owner.serialize(), &salt, kind, &message.digest);
 			if let Err(e) = admitted {
-				eprintln!("arca-signer: refused rebind {} for salt {}: {}", hex(&message.digest), hex(&salt), e);
+				eprintln!("arca-signer: refused rebind {} for the leaf of {} under salt {}: {}", hex(&message.digest),
+					hex(&owner.serialize()), hex(&salt), e);
 				let code = e.starts_with(ALREADY_SIGNED).then(|| ALREADY_SIGNED.to_string());
 				return Response { error: Some(e), code, ..none };
 			}
 			let mut aux = [0u8; 32];
 			rand::rngs::OsRng.fill_bytes(&mut aux);
 			let sig = sign_digest(key, &message.digest, &aux);
-			eprintln!("arca-signer: signed rebind {} ({}) for salt {}", hex(&message.digest),
-				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&salt));
+			eprintln!("arca-signer: signed rebind {} ({}) for the leaf of {} under salt {}", hex(&message.digest),
+				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt));
 			Response { signature: Some(hex(sig.as_ref())), ..none }
 		},
 		Request::Spend { tx, prevouts, input, leaf } => {
