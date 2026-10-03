@@ -138,6 +138,10 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 /// status: the request was not taken. A busy server's `rate_limited`, and
 /// `not_synced`, `signer_unavailable` and `internal` (5xx), are not among
 /// them: the request may be taken later, or may have been.
+///
+/// They are the server's codes (`server::api::REFUSAL_CODES`) answered with a
+/// 4xx, but `rate_limited`: a request to slow down is sent again later. A
+/// test compares the two lists.
 pub const REFUSALS: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
 	"double_spend", "fee", "forfeit_set", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction",

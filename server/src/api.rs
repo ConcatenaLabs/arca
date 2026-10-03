@@ -22,6 +22,23 @@ pub struct ErrorDetail {
 	pub message: String,
 }
 
+/// Every code a refusal carries (`ErrorDetail::code`), each answered with
+/// the status `crate::http::status_of` gives it: a 4xx says the request was
+/// not taken, and nothing it asked for was done; a 5xx (`internal`,
+/// `signer_unavailable`, `not_synced`) and 429 (`rate_limited`) say nothing of
+/// what was done, and the request is sent again as it was. A test reads the
+/// codes out of the source and compares them with this list, and the wallet's
+/// own test compares it with the codes the wallet knows.
+pub const REFUSAL_CODES: &[&str] = &[
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
+	"double_spend", "fee", "forfeit_set", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record",
+	"invalid_transaction", "key_reused", "leaf_set", "malformed", "margin", "merge", "no_lowest_node", "nonce_unknown",
+	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
+	"operator_key", "out_of_bounds", "rate_limited", "release_early", "request_too_large", "round_not_final", "salt",
+	"script_reused", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
+	"unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator", "wrong_round",
+];
+
 /// `GET /v1/info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

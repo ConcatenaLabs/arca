@@ -233,7 +233,7 @@ impl IntoResponse for Refusal {
 }
 
 /// The status a refusal code is answered with.
-fn status_of(code: &str) -> StatusCode {
+pub fn status_of(code: &str) -> StatusCode {
 	match code {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
