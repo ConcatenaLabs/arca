@@ -268,6 +268,26 @@ a chain held in memory.
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
 
+`tests/e2e.rs` runs the server as an operator runs it: `arca-signer` in its own
+process holding the operator key, `Server::start` with its tasks and its HTTP
+listener, its wallet paid in an issued asset and never the policy asset. A
+minimal client (`tests/common/client.rs`), built on `arca-covenant` directly,
+drives it over HTTP as a wallet would: it boards, waits for the board to be
+credited, makes transfers with each owner's signatures, reads its mailbox with
+a signed challenge and validates every coin it receives as a receiver must.
+Each of the server's rules is exercised by a refusal, and each refusal is
+asserted by its code: a second spend, alone and eight at once; a leaf on the
+chain, by a board's conversion seen in the mempool and by a transfer's output
+its receiver published; a coin on a board a rollback uncredited; the depth
+limit; outputs outside the bounds; a key already owning a leaf; a mergeable
+reassignment, equal or prefix, alone, at once and after a restart; a bad
+signature; an unknown leaf; a board not yet final; the request size bound; and
+authentication. A board rolled back, the node restarted with an empty mempool,
+is uncredited, broadcast again by the server and credited again; the signer
+going away mid-transfer leaves the spend recorded and the same request
+completes once it returns; and the server, holding no policy asset, co-signs
+and broadcasts a transaction whose fee is in another asset.
+
 The user needs the right to create databases. A throwaway server in user
 space is enough:
 

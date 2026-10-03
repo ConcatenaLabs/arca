@@ -351,6 +351,7 @@ dependencies = [
  "log",
  "lwk_common",
  "lwk_signer",
+ "minreq",
  "rand 0.8.6",
  "serde",
  "serde_json",
