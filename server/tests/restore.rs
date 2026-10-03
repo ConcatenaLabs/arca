@@ -256,3 +256,41 @@ async fn a_forfeit_without_the_operators_half_is_completed_at_start() {
 	assert_eq!(r.signer_entries().await.len(), entries, "the signer's record did not grow");
 	println!("a forfeit without the operator's half: given it at start; the signer's record still {} entries", entries);
 }
+
+/// A copy taken before twelve messages were signed (six transfers, two each)
+/// is refused, naming the first ten entries it does not know and saying there
+/// may be more: the check stops there, rather than read the whole of a long
+/// record against a database far older than it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_far_older_than_the_record_is_named_by_its_first_entries() {
+	let mut r = Running::start().await;
+	let s = xonly(&r.s);
+	let x = r.x;
+	let mut coins = vec![];
+	for who in ["E", "F", "G"] {
+		let (held, tx) = credited_board(&mut r, &keypair(who), x).await;
+		coins.push((held, tx));
+	}
+	let copy = backup(&mut r).await;
+	let policy = r.policy();
+	for (k, (held, tx)) in coins.into_iter().enumerate() {
+		let mut held = held;
+		let bases = vec![tx];
+		for hop in 0..2 {
+			let valid = held.record.resolve(&bases, &policy).unwrap();
+			let key = keypair(&format!("hop {} {}", k, hop));
+			let (leaf, nonce) = new_leaf(&key);
+			let kept = valid.value - MARGIN;
+			let done = r.http.post("cosign_transfer", &transfer_body(&[(&held, valid, kept)], &[(x, kept - MARGIN, leaf)], s, r.chain)).ok();
+			let record = CoinRecord::from_bytes(&unhex(done["outputs"][0]["record"].as_str().unwrap())).unwrap();
+			held = common::client::Held { key, nonce, id: done["outputs"][0]["leaf_id"].as_str().unwrap().parse().unwrap(), record };
+		}
+	}
+	assert_eq!(r.signer_entries().await.len(), 12);
+	restore(&mut r, &copy).await;
+	let e = Server::start(&r.config).await.err().expect("no start on a copy older than twelve entries");
+	println!("start on a copy older than twelve entries: {}", e);
+	let e = e.to_string();
+	assert!(e.contains("entry 1,") && e.contains("entry 10,") && !e.contains("entry 11,"), "{}", e);
+	assert!(e.ends_with("; and maybe more"), "{}", e);
+}

@@ -466,15 +466,20 @@ async fn check_signer_entries(store: &Store, signer: &SignerClient) -> Result<()
 			unknown.push(format!("entry {}, the {} {} of the leaf of {} under salt {}", e.n,
 				match e.kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&e.digest), hex(&e.owner), hex(&e.salt)));
 		}
+		// Enough to refuse, and to name: a database far older than a long
+		// record is not read against all of it.
+		if unknown.len() >= 10 {
+			break;
+		}
 	}
 	if !unknown.is_empty() {
-		let more = unknown.len().saturating_sub(10);
+		let more = unknown.len() > 10 || after < signer.head().await.map_err(err("the signer"))?.0;
 		unknown.truncate(10);
 		return Err(StartError(format!(
 			"the signer's record holds what the database has no record of asking the signer for, so the database is older \
 			 than what the signer has signed (restored from an older copy, or a commit lost) and serving from it could co-sign \
 			 or build against what it forgot; restore the database to its latest state (see the server's README) before \
-			 starting: {}{}", unknown.join("; "), if more > 0 { format!("; and {} more", more) } else { String::new() })));
+			 starting: {}{}", unknown.join("; "), if more { "; and maybe more" } else { "" })));
 	}
 	if let Some((n, hash)) = last {
 		store.set_signer_head(n, &hash).await.map_err(err("the database"))?;
