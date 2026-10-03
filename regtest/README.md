@@ -63,7 +63,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T16 | The rebindable message bound to the spent coin's asset and amount and to the chain's genesis hash, with the folded 32-byte constant |
 | T17 | A gate that takes an unchecked key from the witness is spendable with a one-byte signature (mined); the hardened gate and the timed authorisation |
 | T18 | The token-gated sweep and its clock; the attacks consensus accepts and the client checks that catch them |
-| T19 | The reclaim of a lowest node by all its owners and the operator |
+| T19 | The reclaim of a lowest node by all its owners and the operator, each owner's release naming the connector asset `M` of the round of its new leaf, issued for real from a connector output: confirmed with an atom of `M` (and with an atom of each of two rounds), refused without it, with another round's `M`, with another asset, with three releases of four and with releases over the message that named no round |
 | T20 | The notice on the sweep token: no node of any age is swept earlier than the notice after the release |
 | T21 | Every frozen construction together in a 16-leaf tree in an asset that is not the policy asset |
 

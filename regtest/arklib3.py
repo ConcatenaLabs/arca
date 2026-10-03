@@ -272,17 +272,44 @@ def client_check_round(tx, T_hex, clock0_spk):
 # T19: reclaim
 # --------------------------------------------------------------------------
 
-def release_msg(genesis_internal, children):
-    return sha256(RTAG + genesis_internal + children_hash(children))
+def release_prefix(genesis_internal, children):
+    """The fixed part of a release: "Arca/release" || genesis_hash || H (76
+    bytes), the genesis hash in internal byte order. RECLAIM pushes it."""
+    return RTAG + genesis_internal + children_hash(children)
 
 
-def reclaim_leaf(rel, owners, s_x):
-    """Witness (bottom -> top): <sig_S> <sig_{n-1}> ... <sig_1> <sig_0>."""
-    s = [rel, OP_DUP, OP_TOALTSTACK, owners[0], OP_CHECKSIGFROMSTACKVERIFY]
-    for k in owners[1:-1]:
-        s += [OP_FROMALTSTACK, OP_DUP, OP_TOALTSTACK, k, OP_CHECKSIGFROMSTACKVERIFY]
-    s += [OP_FROMALTSTACK, owners[-1], OP_CHECKSIGFROMSTACKVERIFY, s_x, OP_CHECKSIG]
-    return CScript(s)
+def release_msg(genesis_internal, children, m):
+    """The release an owner signs: SHA256("Arca/release" || genesis_hash || H
+    || M), M the connector asset (internal byte order) of the round that made
+    the owner's new leaf."""
+    assert len(m) == 32
+    return sha256(release_prefix(genesis_internal, children) + m)
+
+
+def reclaim_leaf(prefix, owners, s_x):
+    """RECLAIM: each owner i's signature over SHA256(prefix || M_i), M_i the
+    asset of the input k_i names, read explicitly; then S's signature.
+    Witness (bottom -> top): <sig_S> <sig_{n-1}> <k_{n-1}> ... <sig_0> <k_0>.
+    One owner: the prefix is pushed in place, with no alt stack."""
+    read_m = [OP_INSPECTINPUTASSET, OP_1, OP_EQUALVERIFY]
+    if len(owners) == 1:
+        s = read_m + [prefix, OP_SWAP, OP_CAT, OP_SHA256, owners[0], OP_CHECKSIGFROMSTACKVERIFY]
+    else:
+        s = [prefix, OP_TOALTSTACK]
+        for k in owners[:-1]:
+            s += read_m + [OP_FROMALTSTACK, OP_DUP, OP_TOALTSTACK, OP_SWAP, OP_CAT, OP_SHA256,
+                           k, OP_CHECKSIGFROMSTACKVERIFY]
+        s += read_m + [OP_FROMALTSTACK, OP_SWAP, OP_CAT, OP_SHA256, owners[-1], OP_CHECKSIGFROMSTACKVERIFY]
+    return CScript(s + [s_x, OP_CHECKSIG])
+
+
+def reclaim_items(s_sig, owner_sigs, ks):
+    """The items below RECLAIM: owner_sigs and ks in owner order 0..n-1, so
+    owner 0's pair ends on top."""
+    below = [s_sig]
+    for sig, k in reversed(list(zip(owner_sigs, ks))):
+        below += [sig, sn(k)]
+    return below
 
 
 # --------------------------------------------------------------------------
@@ -606,3 +633,38 @@ def node_taptree3(unroll, sweep, reclaim=None):
         return tap, {"unroll": unroll, "sweep": sweep}
     tap = taproot_construct(NUMS, [("unroll", unroll), [("sweep", sweep), ("reclaim", reclaim)]])
     return tap, {"unroll": unroll, "sweep": sweep, "reclaim": reclaim}
+
+
+# --------------------------------------------------------------------------
+# A round's connector asset, issued for real (T19, T21)
+# --------------------------------------------------------------------------
+
+OP_TRUE_TAP = taproot_construct(NUMS, [("op_true", CScript([OP_1]))])
+OP_TRUE_SPK = bytes(OP_TRUE_TAP.scriptPubKey)
+OP_TRUE_WITNESS = [bytes(CScript([OP_1])), control_block(OP_TRUE_TAP, "op_true")]
+
+
+def _connector_atom(self, s_sec, label, asset=None, asset_out=None, value=5_000, fee=1_000):
+    """A round's connector asset M, issued as the operator issues it: a
+    transaction standing for the round pays the connector output, then the
+    operator spends that output by its one leaf, issuing one explicit atom of M
+    (a zero contract hash, no reissuance token) to an OP_1 tapscript anyone can
+    spend. Returns M (internal byte order), its asset prefix form, the atom's
+    utxo, and the stand-in round's txid and connector index."""
+    asset, asset_out = asset or self.X, asset_out or self.X_OUT
+    s_x = compute_xonly_pubkey(s_sec)[0]
+    ctap, clv = connector_taptree(s_x)
+    round_u = self.fund(ctap.scriptPubKey, value, asset)
+    tx = self.mktx([round_u], [self.out(1, OP_TRUE_SPK, b"\x01" + bytes(32)),
+                               self.out(value - fee, OP_TRUE_SPK, asset_out), self.fee(fee, asset_out)])
+    tx.vin[0].assetIssuance = self.issuing_input(round_u)
+    m_hex = self.issued_ids(tx)[0]
+    m_id = bytes.fromhex(m_hex)[::-1]
+    tx.vout[0].nAsset = CTxOutAsset(b"\x01" + m_id)
+    self.setwit(tx, 0, [self.sign(s_sec, tx, 0, clv["issue"]), bytes(clv["issue"]), control_block(ctap, "issue")])
+    txid = self.send(tx, label)
+    return {"M_id": m_id, "M_OUT": b"\x01" + m_id, "M_u": self.utxo_at(txid, 0), "round_txid": round_u.txid,
+            "round_vout": round_u.vout}
+
+
+Ark3.connector_atom = _connector_atom

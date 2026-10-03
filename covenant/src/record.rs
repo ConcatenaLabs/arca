@@ -125,8 +125,8 @@ use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Reader};
 use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
 use crate::leaf::leaf_salt;
-use crate::message::{unroll_authorisation, Chain, CsfsMessage};
-use crate::node::{node_taproot, reclaim_script, unroll_script, MAX_CHILDREN};
+use crate::message::{release_message, unroll_authorisation, Chain, CsfsMessage};
+use crate::node::{node_taproot, reclaim_script, reclaim_tx, unroll_script, MAX_CHILDREN};
 use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
@@ -607,12 +607,12 @@ impl LeafRecord {
 		let mut owners = l.owners.clone();
 		owners.insert(l.index as usize, self.owner);
 		let members = Members::new(operator, &owners);
-		let release = self.chain.release_message(&children_hash(&children));
-		let reclaim = reclaim_script(&release.digest, &owners, &operator);
+		let prefix = self.chain.release_prefix(&children_hash(&children));
+		let reclaim = reclaim_script(&prefix, &owners, &operator);
 		let node = BranchNode::new(
 			children, l.index as usize, l.reserve, operator, members.commitment(),
 			members.proof(1 + l.index as usize), self.schedule.sweep(level != 0, self.burn),
-			Some(Reclaim { owners, release, script: reclaim }),
+			Some(Reclaim { owners, prefix, script: reclaim }),
 		)?;
 		child = Child::new(self.asset, node.value, node.program());
 		nodes.push(node);
@@ -1043,12 +1043,22 @@ impl WalletPolicy {
 	}
 }
 
-/// A lowest node's RECLAIM: its owners, the release they sign, and the script.
+/// A lowest node's RECLAIM: its owners, in owner order, the fixed part of
+/// every release of it (`"Arca/release" ‖ genesis_hash ‖ H`), and the script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reclaim {
 	pub owners: Vec<XOnlyPublicKey>,
-	pub release: CsfsMessage,
+	pub prefix: Vec<u8>,
 	pub script: Script,
+}
+
+impl Reclaim {
+	/// The release an owner of this node signs, naming `connector`, the
+	/// connector asset of the round that made the owner's new leaf
+	/// ([`crate::release::Release`] builds it from the rounds themselves).
+	pub fn release_message(&self, connector: AssetId) -> CsfsMessage {
+		release_message(&self.prefix, connector)
+	}
 }
 
 /// A node on a leaf's path, rebuilt from the record.
@@ -1132,6 +1142,21 @@ impl BranchNode {
 		let w = self.taproot.witness(&self.unroll, below);
 		let outputs = self.children.iter().map(|c| c.output().txout()).collect();
 		fee_rate_reserve(floor_per_kvb, multiple, w, outputs, self.children[0].asset)
+	}
+
+	/// The operator's reclaim of this node, a lowest node, at `node`:
+	/// [`crate::node::reclaim_tx`] with its own value.
+	pub fn reclaim_tx(
+		&self,
+		node: elements::OutPoint,
+		connectors: &[(elements::OutPoint, TxOut)],
+		outputs: &[ExplicitOutput],
+		connector_to: Script,
+		fee: &crate::spend::FeeSource,
+	) -> Result<crate::spend::KeySpend, crate::spend::SpendError> {
+		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
+		let spent = self.output().txout();
+		reclaim_tx(self.taproot.clone(), r.script.clone(), (node, spent), connectors, outputs, connector_to, fee)
 	}
 
 	/// The full UNROLL witness for the owner's authorisation `sig` at `t`.

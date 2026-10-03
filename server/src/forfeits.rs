@@ -56,7 +56,9 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::{Transaction, Txid};
 
 use arca_covenant::sign::verify_digest;
-use arca_covenant::{connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, Pair, RelativeTime, WalletPolicy};
+use arca_covenant::{
+	connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, Pair, RelativeTime, Release, WalletPolicy,
+};
 
 use crate::coins::{self, CoinError};
 use crate::cosign::{CosignError, Cosigner};
@@ -341,8 +343,14 @@ impl Forfeits {
 			};
 			let branch = record.branch().map_err(|e| ForfeitError::Internal(e.to_string()))?;
 			let lowest = branch.nodes.last().ok_or(ForfeitError::NoLowestNode(r.leaf_id))?;
-			let reclaim = lowest.reclaim.as_ref().ok_or(ForfeitError::NoLowestNode(r.leaf_id))?;
-			if !verify_digest(&r.signature, &reclaim.release.digest, &record.owner) {
+			if lowest.reclaim.is_none() {
+				return Err(ForfeitError::NoLowestNode(r.leaf_id));
+			}
+			// The release names the connector asset of the participation's
+			// round, so it is void if that round leaves the chain.
+			let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
+			let release = Release { chain: self.params.chain, node_hash: lowest.children_hash(), owner: record.owner, connector: m };
+			if release.verify(&r.signature).is_err() {
 				return Err(ForfeitError::BadRelease(r.leaf_id));
 			}
 			self.store.insert_release(&r.leaf_id.0, id, &lowest.children_hash(), r.signature.as_ref()).await?;

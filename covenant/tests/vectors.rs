@@ -133,8 +133,8 @@ impl Ctx {
 		let padded: Vec<XOnlyPublicKey> = p["members_padded"].as_array().unwrap().iter().map(key).collect();
 		assert_eq!(m.keys(), &padded[..]);
 		assert_eq!(node.children_hash(), h32(&p["children_hash"]));
-		if let Some(rm) = node.release_message() {
-			assert_eq!(rm.digest, h32(&p["release_message"]));
+		if let Some(prefix) = node.release_prefix() {
+			assert_eq!(prefix, hex(&p["release_prefix"]));
 		}
 		node
 	}
@@ -383,16 +383,35 @@ fn every_spend_matches_its_vector_and_verifies() {
 			("entry", "unlock") => ctx.entry("entry", false).unlock_witness(&h32(&s["preimage"])),
 			(n, "reclaim") => {
 				let node = ctx.node(n, false);
-				let rm = node.release_message().unwrap();
-				assert_eq!(rm.preimage, hex(&s["release_message"]));
-				assert_eq!(rm.digest, h32(&s["release_digest"]));
-				let owner_sigs: Vec<Signature> = node.owners().iter().map(|o| {
+				assert_eq!(node.release_prefix().unwrap(), hex(&s["release_prefix"]));
+				// The transaction is the policy's reclaim: the node at input 0,
+				// one atom of each round's connector asset after it, each paid
+				// back after the operator's output, the rest the fee.
+				let connectors: Vec<(elements::OutPoint, TxOut)> = (1..tx.input.len())
+					.map(|i| (tx.input[i].previous_output, prevouts[i].clone())).collect();
+				let ks = node.reclaim_tx(tx.input[0].previous_output, value_in, &connectors,
+					&[ExplicitOutput::from_txout(&tx.output[0]).unwrap()], tx.output[1].script_pubkey.clone(), &FeeSource::Reserve)
+					.unwrap();
+				assert_eq!(ks.tx.txid(), tx.txid(), "{}: the policy's reclaim transaction", name);
+				let rels = s["releases"].as_array().unwrap();
+				assert_eq!(rels.len(), node.owners().len());
+				let releases: Vec<(Signature, u32)> = node.owners().iter().zip(rels).map(|(o, r)| {
 					let label = ctx.label_of(o);
-					let sig = sign_digest(ctx.kp(label), &rm.digest, &ZERO_AUX);
+					assert_eq!(r["owner"].as_str().unwrap(), label);
+					let m = asset(&r["connector_asset"]);
+					let release = Release { chain: ctx.chain, node_hash: node.children_hash(), owner: *o, connector: m };
+					let msg = release.message();
+					assert_eq!(msg, node.release_message(m).unwrap());
+					assert_eq!(msg.preimage, hex(&r["message"]), "{}: release message of {}", name, label);
+					assert_eq!(msg.digest, h32(&r["digest"]), "{}: release digest of {}", name, label);
+					let k = arca_covenant::node::connector_index(&prevouts, m).unwrap();
+					assert_eq!(k as u64, r["connector_input"].as_u64().unwrap(), "{}: index of {}'s M", name, label);
+					let sig = sign_digest(ctx.kp(label), &msg.digest, &ZERO_AUX);
 					assert_eq!(sig, expected_sigs[label], "{}: release signature by {}", name, label);
-					sig
+					release.verify(&sig).unwrap();
+					(sig, k)
 				}).collect();
-				node.reclaim_witness(&checksig("S"), &owner_sigs).unwrap()
+				node.reclaim_witness(&checksig("S"), &releases).unwrap()
 			},
 			(c, path) if c.starts_with("clock") => {
 				let j: usize = c[5..].parse().unwrap();

@@ -240,7 +240,7 @@ def build(burn=False):
             sweep = sweep_for(is_root, burn)
             reclaim = None
             if lowest:
-                reclaim = reclaim_leaf(release_msg(GENESIS, tuples), [OWNERS[o].x for o in owners], S.x)
+                reclaim = reclaim_leaf(release_prefix(GENESIS, tuples), [OWNERS[o].x for o in owners], S.x)
             tap, lv = node_taptree3(unroll, sweep, reclaim)
             nxt.append({"spk": bytes(tap.scriptPubKey), "value": sum(k["value"] for k in kids) + NODE_RESERVE,
                         "tap": tap, "lv": lv, "owners": owners, "children": kids, "tuples": tuples,
@@ -288,7 +288,7 @@ def node_vectors(n, label, kind):
     }
     if n["lowest"]:
         params["owners"] = [hx(OWNERS[o].x) for o in n["owners"]]
-        params["release_message"] = hx(release_msg(GENESIS, tuples))
+        params["release_prefix"] = hx(release_prefix(GENESIS, tuples))
     return output_json(kind, params, n["tap"], shape)
 
 
@@ -492,17 +492,33 @@ def generate():
     spends.append(sweep_spend("batch_output_burn/burn", "batch_output_burn", b_root["tap"], b_root["value"],
                               b_root["spk"], False, True))
 
-    # reclaim of the lowest node: every owner signs the release, the operator the transaction
-    rel = release_msg(GENESIS, n1["tuples"])
+    # reclaim of the lowest node: every owner signs a release naming the
+    # connector asset M of the round that made its new leaf, the operator
+    # the transaction. Owners 0 and 1 refreshed in the forfeit's round, whose
+    # M is input 1; owners 2 and 3 in another round, whose M is input 2. Each
+    # atom goes back to the operator.
+    import records as record_ref
+    m_rounds = [record_ref.issued_asset(ROUND_TXID, CONNECTOR_VOUT),
+                record_ref.issued_asset(label_hash("outpoint", "another round"), CONNECTOR_VOUT)]
+    ks = [1, 1, 2, 2]
+    prefix = release_prefix(GENESIS, n1["tuples"])
     owners = [OWNERS[o] for o in n1["owners"]]
-    osigs = [k.sign(rel) for k in owners]
-    sp = Spend([("lowest_node/reclaim", txout(n1["value"], n1["spk"]), 0xffffffff)],
-               [txout(n1["value"] - 2_000, OPERATOR_SPK), fee_out(2_000)])
+    rels = [release_msg(GENESIS, n1["tuples"], m_rounds[k - 1]) for k in ks]
+    osigs = [key.sign(rel) for key, rel in zip(owners, rels)]
+    m_ins = [("lowest_node/reclaim connector %d" % j, txout(1, FEE_COIN_TAP.scriptPubKey, b"\x01" + m), 0xffffffff)
+             for j, m in enumerate(m_rounds)]
+    sp = Spend([("lowest_node/reclaim", txout(n1["value"], n1["spk"]), 0xffffffff)] + m_ins,
+               [txout(n1["value"] - 2_000, OPERATOR_SPK)] + [txout(1, OPERATOR_SPK, b"\x01" + m) for m in m_rounds]
+               + [fee_out(2_000)])
+    for j in range(len(m_rounds)):
+        sp.witness(1 + j, FEE_COIN_WITNESS)
     d = checksig_spend("lowest_node/reclaim", "lowest_node", "reclaim", n1["tap"], sp, 0, S,
-                       below_after=list(reversed(osigs)))
-    d["release_message"] = hx(RTAG + GENESIS + children_hash(n1["tuples"]))
-    d["release_digest"] = hx(rel)
-    d["signatures"].update({k.label: hx(s) for k, s in zip(owners, osigs)})
+                       below_after=reclaim_items(b"", osigs, ks)[1:])
+    d["release_prefix"] = hx(prefix)
+    d["releases"] = [{"owner": key.label, "connector_input": k, "connector_asset": hx(m_rounds[k - 1]),
+                      "message": hx(prefix + m_rounds[k - 1]), "digest": hx(rel)}
+                     for key, k, rel in zip(owners, ks, rels)]
+    d["signatures"].update({key.label: hx(sg) for key, sg in zip(owners, osigs)})
     spends.append(d)
 
     # ---- spends: the clock --------------------------------------------
