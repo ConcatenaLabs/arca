@@ -141,6 +141,16 @@ impl Store {
 		Ok(n == 1)
 	}
 
+	/// The boards registered more than `seconds` ago, still pending and never
+	/// credited: their transaction has not been final once since.
+	pub async fn boards_never_credited(&self, seconds: u64) -> Result<Vec<BoardRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!(
+			"SELECT {} FROM board WHERE state = 'pending' AND credits = 0 AND created_at < now() - make_interval(secs => $1)
+			 ORDER BY created_at", BOARD_COLUMNS), &[&(seconds as f64)]).await?;
+		rows.iter().map(board_row).collect()
+	}
+
 	/// Marks a board lost: its transaction can no longer confirm.
 	pub async fn lose_board(&self, leaf_id: &[u8; 32]) -> Result<(), StoreError> {
 		let mut conn = self.conn().await?;

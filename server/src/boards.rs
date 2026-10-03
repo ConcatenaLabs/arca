@@ -5,9 +5,14 @@
 //! coins to the board output and registers the record with the transaction.
 //! The server checks the record under its own policy (its chain, its key, its
 //! exit-delay bounds, an asset it serves, a value within the bounds, the board
-//! output paid exactly once, an owner key other than `S`), takes the nonce, which it never hands out
-//! twice, records the board's scripts, which it never accepts twice, and
-//! takes the transaction into the nursery.
+//! output paid exactly once, an owner key other than `S`), and the nonce,
+//! which it must have handed out and never seen taken. Then the node must
+//! take the transaction: it is in a block or the mempool already, or the
+//! node's `testmempoolaccept` allows it. A transaction the node refuses (an
+//! input that does not exist, say) registers nothing, so no board nobody can
+//! pay sits in the database or the nursery. Only then does the server take
+//! the nonce, which it never hands out twice, record the board's scripts,
+//! which it never accepts twice, and take the transaction into the nursery.
 //!
 //! The board is credited, and its leaf becomes live, only once the finality
 //! service calls its transaction final: certified, and its anchor buried two
@@ -15,9 +20,12 @@
 //! back, which is why it waits. A rollback that takes a credited board out
 //! uncredits it at once; the nursery broadcasts it again, unchanged, and it is
 //! credited again when final again. A board whose transaction can no longer
-//! confirm is lost.
+//! confirm is lost, and so is one never credited whose transaction is in no
+//! block a set time after it was registered (`board_unconfirmed_seconds`):
+//! the nursery stops broadcasting it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use elements::encode::serialize;
 use elements::hashes::Hash;
@@ -40,6 +48,8 @@ pub enum BoardError {
 	OutOfBounds(String),
 	#[error("the board transaction is refused: {0}")]
 	Transaction(String),
+	#[error("the node does not take the board transaction: {0}")]
+	NotAccepted(String),
 	#[error("another board is registered for this leaf")]
 	Exists,
 	#[error("the board's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
@@ -65,6 +75,7 @@ impl BoardError {
 			},
 			BoardError::OutOfBounds(_) => "out_of_bounds",
 			BoardError::Transaction(_) => "invalid_transaction",
+			BoardError::NotAccepted(_) => "not_accepted",
 			BoardError::Exists => "board_exists",
 			BoardError::OperatorKey => "operator_key",
 			BoardError::NotSynced => "not_synced",
@@ -93,11 +104,17 @@ pub struct Boards {
 	finality: Arc<FinalityService>,
 	nursery: Arc<Nursery>,
 	params: Arc<Params>,
+	/// How long a board never credited may stay out of every block.
+	unconfirmed: Duration,
 }
 
 impl Boards {
-	pub fn new(store: Store, finality: Arc<FinalityService>, nursery: Arc<Nursery>, params: Arc<Params>) -> Arc<Boards> {
-		Arc::new(Boards { store, finality, nursery, params })
+	/// The boards, each dropped when never credited and out of every block
+	/// `unconfirmed` after it was registered.
+	pub fn new(store: Store, finality: Arc<FinalityService>, nursery: Arc<Nursery>, params: Arc<Params>, unconfirmed: Duration)
+		-> Arc<Boards>
+	{
+		Arc::new(Boards { store, finality, nursery, params, unconfirmed })
 	}
 
 	/// The median time of the tip the finality service follows.
@@ -125,6 +142,9 @@ impl Boards {
 			}
 			return Err(BoardError::Exists);
 		}
+		// The nonce, before anything is asked of the node.
+		self.store.check_nonce(&record.operator_nonce).await?;
+		self.accepted(tx).await?;
 		let board = record.policy();
 		let coin = NewCoin {
 			leaf_id: leaf_id.0,
@@ -147,6 +167,23 @@ impl Boards {
 		self.nursery.submit(tx, NurseryKind::Board, None).await.map_err(|e| BoardError::Internal(e.to_string()))?;
 		self.check(&leaf_id.0).await?;
 		self.status(&leaf_id).await?.ok_or(BoardError::Internal("a board vanished".into()))
+	}
+
+	/// Whether the node takes `tx`: it holds it already, in a block or its
+	/// mempool, or would take it into its mempool now.
+	async fn accepted(&self, tx: &Transaction) -> Result<(), BoardError> {
+		let txid = tx.txid();
+		let known = self.finality.call(move |c| c.transaction(&txid)).await.map_err(|e| BoardError::Internal(e.to_string()))?;
+		if known.is_some() {
+			return Ok(());
+		}
+		let probe = tx.clone();
+		let (allowed, reason, _) = self.finality.call(move |c| c.test_accept(&probe)).await
+			.map_err(|e| BoardError::Internal(e.to_string()))?;
+		if !allowed {
+			return Err(BoardError::NotAccepted(reason.unwrap_or_else(|| "no reason given".into())));
+		}
+		Ok(())
 	}
 
 	/// Where the board `leaf_id` stands.
@@ -193,12 +230,26 @@ impl Boards {
 		Ok(())
 	}
 
-	/// One pass over every board not lost.
+	/// One pass over every board not lost; then each board never credited
+	/// whose transaction is still in no block `unconfirmed` after it was
+	/// registered is dropped: marked lost, its transaction no longer
+	/// broadcast.
 	pub async fn pass(&self) -> Result<(), BoardError> {
 		let mut rows = self.store.boards_in(BoardState::Pending).await?;
 		rows.extend(self.store.boards_in(BoardState::Credited).await?);
 		for b in rows {
 			self.check_row(&b).await?;
+		}
+		for b in self.store.boards_never_credited(self.unconfirmed.as_secs()).await? {
+			let txid = Txid::from_byte_array(b.txid);
+			let fin = self.finality.status(&txid).await.map_err(|e| BoardError::Internal(e.to_string()))?;
+			if fin.in_chain() {
+				continue;
+			}
+			self.store.lose_board(&b.leaf_id).await?;
+			self.store.nursery_set_state(&b.txid, NurseryState::Lost).await?;
+			log::warn!("board {} dropped: its transaction {} is in no block {} s after it was registered",
+				LeafId(b.leaf_id), txid, self.unconfirmed.as_secs());
 		}
 		Ok(())
 	}

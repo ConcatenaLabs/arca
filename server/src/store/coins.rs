@@ -228,6 +228,30 @@ impl Store {
 		}
 	}
 
+	/// Whether `nonce` can be taken: issued, and not taken. Nothing is
+	/// changed; the nonce is taken with the coin that uses it.
+	pub async fn check_nonce(&self, nonce: &[u8; 32]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		match conn.query_opt("SELECT used_at IS NOT NULL FROM operator_nonce WHERE nonce = $1", &[&&nonce[..]]).await? {
+			None => Err(StoreError::NonceUnknown),
+			Some(r) if r.get::<_, bool>(0) => Err(StoreError::NonceUsed),
+			Some(_) => Ok(()),
+		}
+	}
+
+	/// Deletes every operator nonce handed out more than `nonce_ttl` ago and
+	/// never taken, and every authentication challenge used or expired.
+	/// Returns how many of each went.
+	pub async fn delete_expired(&self, nonce_ttl: std::time::Duration) -> Result<(u64, u64), StoreError> {
+		let conn = self.conn().await?;
+		let nonces = conn.execute(
+			"DELETE FROM operator_nonce WHERE used_at IS NULL AND issued_at < now() - make_interval(secs => $1)",
+			&[&nonce_ttl.as_secs_f64()],
+		).await?;
+		let challenges = conn.execute("DELETE FROM auth_challenge WHERE used_at IS NOT NULL OR expires_at <= now()", &[]).await?;
+		Ok((nonces, challenges))
+	}
+
 	/// Records `coins` together, or none of them: each takes its operator
 	/// nonce, each script is new to the server, each key owns no other leaf.
 	pub async fn insert_coins(&self, coins: &[NewCoin]) -> Result<(), StoreError> {

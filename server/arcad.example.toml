@@ -68,6 +68,25 @@ max_sweep_inputs = 50
 # chain.
 recovery_interval_seconds = 30
 
+[limits]
+# The calls anyone may make without proving a key are bounded in what they
+# leave behind. Operator nonces and authentication challenges are each handed
+# out at most this many per second, with bursts of up to issue_burst; a
+# request past that is refused with 429 rate_limited. The limit is the
+# server's as a whole, not per client.
+issue_per_second = 5
+issue_burst = 50
+# An operator nonce no board took within this time is deleted, and a board
+# naming it is then refused (nonce_unknown). A wallet registers its board
+# right after it takes the nonce.
+nonce_ttl_seconds = 3600
+# A board is registered only once the node takes its transaction. One never
+# credited whose transaction is still in no block this long after it was
+# registered is dropped: marked lost, and no longer broadcast.
+board_unconfirmed_seconds = 21600
+# How often expired nonces and used or expired challenges are deleted.
+cleanup_interval_seconds = 60
+
 [fees]
 # The most a refresh costs, in parts per million of the coin's value: due in
 # full for a coin 28 days or more from its first expiry, falling to nothing in

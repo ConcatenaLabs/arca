@@ -53,7 +53,7 @@ impl Stack {
 		let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
 		let rx = finality.subscribe();
 		let nursery = Nursery::new(db.store.clone(), finality.clone(), None, Duration::ZERO);
-		let boards = Boards::new(db.store.clone(), finality.clone(), nursery.clone(), params.clone());
+		let boards = Boards::new(db.store.clone(), finality.clone(), nursery.clone(), params.clone(), Duration::from_secs(6 * 3600));
 		let mut stack = Stack { db, rt, purse, x, y, s, chain, params, finality, nursery, boards, rx };
 		stack.follow().await;
 		stack

@@ -114,15 +114,22 @@ record for another chain or another operator key, an exit delay out of
 bounds, an asset it does not serve, a value below its smallest leaf, a
 transaction that does not pay the board output exactly once, a nonce it never
 issued or already gave a leaf, a key that already owns a leaf or is the
-operator's own `S` (`operator_key`), a script it already knows, and another transaction for a board already registered. A
-refused board leaves nothing behind.
+operator's own `S` (`operator_key`), a script it already knows, and another transaction for a board already registered. The
+node must then take the board transaction: it is in a block or the mempool
+already, or `testmempoolaccept` allows it. One the node refuses (an input that
+does not exist, say) is refused with `not_accepted` and the node's reason, so
+a board nobody can pay never reaches the database or the nursery. A refused
+board leaves nothing behind, its nonce included.
 
 A registered board goes into the nursery and is credited, its leaf becoming
 the owner's to spend off-chain, only once the finality service calls its
 transaction final. A rollback that takes a credited board out uncredits it at
 once; the nursery broadcasts the same transaction again and the board is
 credited again when final again. A board whose transaction can no longer
-confirm is lost.
+confirm is lost, and so is one never credited whose transaction is still in
+no block a set time after it was registered (`board_unconfirmed_seconds`, six
+hours by default): its transaction lost its parent, say. The nursery then
+stops broadcasting it.
 
 ## Out-of-round transfers
 
@@ -455,7 +462,7 @@ canonical binary form. Every object refuses a field it does not know.
 | Call | Does |
 |---|---|
 | `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window, a participation's exit deadline and forfeit deadline, the request limit |
-| `POST operator_nonce` | A fresh operator nonce, for a board |
+| `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
@@ -480,6 +487,15 @@ authenticated by the owners' signatures over the transfer itself, and
 of its request, and `tree` is public. `forfeit_leaves` and `release_leaves`
 are authenticated by the owners' signatures over the forfeits and releases
 themselves.
+
+The two calls that write a row for anyone who asks, `operator_nonce` and
+`challenge`, are each handed out at a bounded rate (`[limits]`: five a second
+with bursts of fifty, by default, for the server as a whole); a request past
+it is refused with 429 `rate_limited`. A nonce no board took within its
+lifetime (`nonce_ttl_seconds`), and a challenge once used or expired, is
+deleted, so what these calls hold in the database is bounded by the rate times
+the lifetime. A board naming a deleted nonce is refused (`nonce_unknown`): a
+wallet registers its board right after it takes the nonce.
 
 ## The signer
 
@@ -508,9 +524,11 @@ signature it gets back against the message or signature hash it built.
 address, the database, the signer's socket, the wallet's mnemonic file, the
 node's RPC, the finality rule, the exit-delay bounds, the assets served
 with their smallest leaf, how often a round is built, the assets a round's
-fee is paid in, the fee schedule, and the watcher (`[watcher]`: whether it
+fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
-recovery work runs). The node must run with `-txindex` and `-validateanchor`.
+recovery work runs), and the limits on what the unauthenticated calls leave
+behind (`[limits]`: the rate of nonces and challenges, a nonce's lifetime,
+how long a board may stay out of every block). The node must run with `-txindex` and `-validateanchor`.
 
 An asset served need not be accepted for fees by the node. A batch in such an
 asset carries a reserve of one atom on every node and every entry, on every
