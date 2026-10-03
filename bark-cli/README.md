@@ -11,7 +11,12 @@ The command-line wallets of this workspace:
 ## The `arca` wallet
 
 `arca` keeps its state in one directory (`--datadir`, `ARCA_DATADIR`, by
-default `~/.arca`): the BIP39 `mnemonic` (mode 0600), and `arca.sqlite`, the
+default `~/.arca`, mode 0700): the BIP39 `mnemonic`, the store `arca.sqlite`,
+and, when the node is reached with a password, `node_password`, each readable
+by its owner alone (mode 0600). The node's password is never a command-line
+argument, which other users of the machine can read: `create` takes it from
+the environment variable `ARCA_NODE_PASSWORD` or from a file
+(`--node-password-file`), once, and keeps it in `node_password`, never in the
 store. The wallet library is `bark::arca` (`bark/src/arca/`, the `arca` feature
 of `arca-wallet`), built on `arca-covenant` for every script, record and check.
 
@@ -45,10 +50,18 @@ one mnemonic serves both:
   `c1`…`c4` are the first four 31-bit chunks of `SHA256("Arca/key" ‖
   owner_nonce)` and the owner nonce is 32 random bytes drawn for that leaf
   alone. The nonce goes into the leaf's record, so a record names its own key;
-- the mailbox key is `m/6'/account'/0'`;
+- the mailbox key is the key that same derivation gives for the fixed nonce
+  `SHA256("Arca/mailbox")`, so any wallet on the kit derives it from the
+  mnemonic with the kit's own leaf derivation. It signs only the tagged
+  authentication of a call, and no coin is ever accepted for its nonce;
 - on-chain keys are `m/84'/1'/0'/<chain>/<index>` (`0'` instead of `1'` on the
   main chain), unblinded P2WPKH: the same key is a Bitcoin and a Sequentia
-  address.
+  address. The wallet looks at each chain of them up to 20 unused scripts past
+  the last one holding a coin, so a wallet restored from the mnemonic finds
+  its on-chain coins gap by gap, and it never hands out an index it found in
+  use. Each index is taken in one statement of the store, so two processes on
+  one directory never hand out the same address; each exit claims to one
+  address, however often it is run.
 
 The store keeps every owner nonce the wallet has ever drawn, with its key,
 written before the key is handed out or signs anything, and never deleted. It
@@ -137,10 +150,10 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 
 | Command | Does |
 |---|---|
-| `create --server URL --node-url URL [--node-user U --node-password P \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
+| `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
-| `balance` | Per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
+| `balance` | One row per holding, BTC first and always, 0 included, then each Sequentia asset the wallet holds anything of; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
 | `coins`, `record LEAF` | Every coin held or once held; one coin's record |
 | `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final |
 | `boards` | Where each board stands, by the server and by the chain |
@@ -150,7 +163,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
-| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
+| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
 | `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -228,7 +241,11 @@ and holding it there, with the reason shown:
   fees, refused before any forfeit, and the same tree accepted where the node
   does not accept the asset, the fee coin its exit needs stated;
 - an acceptance of a swap cancelled, after which the maker's completion is
-  refused.
+  refused;
+- the files a fresh wallet writes, readable by their owner alone, the node's
+  password in none of the store's, and its balance of one row, 0 BTC; and a
+  wallet restored from the mnemonic that finds on-chain coins past the first
+  20 unused addresses.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

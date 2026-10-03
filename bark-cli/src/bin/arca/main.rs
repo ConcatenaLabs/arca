@@ -47,8 +47,13 @@ enum Cmd {
 		node_url: String,
 		#[arg(long)]
 		node_user: Option<String>,
+		/// A file holding the node's RPC password, read once; the password is
+		/// also taken from the environment variable ARCA_NODE_PASSWORD. It is
+		/// never a command-line argument, which other users of the machine
+		/// can read, and the wallet keeps it in a file of its directory only
+		/// its owner can read.
 		#[arg(long)]
-		node_password: Option<String>,
+		node_password_file: Option<PathBuf>,
 		/// The node's cookie file, instead of a user and password.
 		#[arg(long)]
 		node_cookie: Option<String>,
@@ -202,17 +207,48 @@ fn bitcoin_balance(datadir: &Path) -> Value {
 	}
 }
 
+/// One row per holding: BTC first, always, 0 included, as every Sequentia
+/// wallet shows it; then each Sequentia asset the wallet holds anything of,
+/// on-chain or in Arca, with nothing set apart. An asset with nothing in it
+/// has no row.
+fn rows(b: &Value) -> Value {
+	let btc: u64 = b["bitcoin"].as_object().map(|o| o.iter()
+		.filter(|(k, _)| k.ends_with("_sat"))
+		.filter_map(|(_, v)| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+		.sum()).unwrap_or(0);
+	let mut rows = vec![json!({"asset": "BTC", "total": btc.to_string(), "unit": "sat"})];
+	let mut per: std::collections::BTreeMap<String, u128> = std::collections::BTreeMap::new();
+	for (a, states) in b["arca"].as_object().into_iter().flatten() {
+		for (_, v) in states.as_object().into_iter().flatten() {
+			*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+		}
+	}
+	for (a, v) in b["sequentia_onchain"].as_object().into_iter().flatten() {
+		*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+	}
+	for (a, total) in per {
+		if total > 0 {
+			rows.push(json!({"asset": a, "total": total.to_string(), "unit": "atom"}));
+		}
+	}
+	Value::Array(rows)
+}
+
 fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	let datadir = PathBuf::from(&cli.datadir);
 	if let Cmd::Bitcoin { args } = &cli.command {
 		return bitcoin(&datadir, args);
 	}
-	if let Cmd::Create { server, node_url, node_user, node_password, node_cookie, mnemonic, account, exit_delay_units,
+	if let Cmd::Create { server, node_url, node_user, node_password_file, node_cookie, mnemonic, account, exit_delay_units,
 		min_exit_delay_units, max_exit_delay_units } = cli.command
 	{
 		let mut cfg = Config::spec_delays(&server, &node_url);
 		cfg.node_user = node_user;
-		cfg.node_password = node_password;
+		cfg.node_password = match node_password_file {
+			Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?
+				.trim_end_matches(['\r', '\n']).to_string()),
+			None => std::env::var("ARCA_NODE_PASSWORD").ok(),
+		};
 		cfg.node_cookie = node_cookie;
 		cfg.account = account;
 		if let Some(d) = exit_delay_units {
@@ -258,6 +294,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Balance => {
 			let mut b = w.balance()?;
 			b["bitcoin"] = bitcoin_balance(&datadir);
+			b["rows"] = rows(&b);
 			Ok(b)
 		},
 		Cmd::Coins => w.coins(),

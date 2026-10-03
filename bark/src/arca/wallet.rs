@@ -22,7 +22,27 @@ use super::{random32, Error};
 pub const MNEMONIC_FILE: &str = "mnemonic";
 /// The database.
 pub const DB_FILE: &str = "arca.sqlite";
-/// How many unused on-chain scripts past the last handed out the wallet looks at.
+/// The file beside the database that holds the node's RPC password, when the
+/// node is reached with one: readable by its owner alone, and never in the
+/// database.
+pub const NODE_PASSWORD_FILE: &str = "node_password";
+
+/// Writes `contents` to `path`, readable and writable by its owner alone.
+fn write_private(path: &Path, contents: &str) -> Result<(), Error> {
+	std::fs::write(path, contents).map_err(|e| Error::Io(format!("{}: {}", path.display(), e)))?;
+	set_private(path)
+}
+
+/// Makes `path` readable and writable by its owner alone.
+fn set_private(path: &Path) -> Result<(), Error> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::Io(format!("{}: {}", path.display(), e)))?;
+	}
+	Ok(())
+}
+/// How many unused on-chain scripts past the last one in use the wallet looks at.
 const GAP: u32 = 20;
 
 /// How the wallet reaches its node and its server, and what it asks for and
@@ -206,18 +226,16 @@ impl Wallet {
 		if !(cfg.min_exit_delay_units..=cfg.max_exit_delay_units).contains(&cfg.exit_delay_units) {
 			return Err(Error::Refused("the exit delay asked for is outside the bounds the wallet accepts".into()));
 		}
-		let path = datadir.join(MNEMONIC_FILE);
-		std::fs::write(&path, mnemonic.to_string()).map_err(|e| Error::Io(format!("{}: {}", path.display(), e)))?;
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::PermissionsExt;
-			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::Io(e.to_string()))?;
+		write_private(&datadir.join(MNEMONIC_FILE), &mnemonic.to_string())?;
+		if let Some(p) = &cfg.node_password {
+			write_private(&datadir.join(NODE_PASSWORD_FILE), p)?;
 		}
 		let store = Store::open(&datadir.join(DB_FILE))?;
+		set_private(&datadir.join(DB_FILE))?;
 		let tip = chain.tip()?;
 		let meta = [
 			("server", cfg.server.clone()), ("node_url", cfg.node_url.clone()),
-			("node_user", cfg.node_user.clone().unwrap_or_default()), ("node_password", cfg.node_password.clone().unwrap_or_default()),
+			("node_user", cfg.node_user.clone().unwrap_or_default()),
 			("node_cookie", cfg.node_cookie.clone().unwrap_or_default()),
 			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
 			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
@@ -238,11 +256,24 @@ impl Wallet {
 			return Err(Error::Refused(format!("{} holds no wallet; create one first", datadir.display())));
 		}
 		let store = Store::open(&db)?;
+		set_private(&db)?;
 		let get = |k: &str| -> Result<String, Error> { store.meta(k)?.ok_or_else(|| Error::Store(format!("{} is not set", k))) };
 		let opt = |k: &str| -> Result<Option<String>, Error> { Ok(store.meta(k)?.filter(|v| !v.is_empty())) };
+		// The node's password, from its own file; a store that still holds it
+		// gives it up to that file.
+		let password_file = datadir.join(NODE_PASSWORD_FILE);
+		if let Some(p) = opt("node_password")? {
+			write_private(&password_file, &p)?;
+			store.set_meta("node_password", "")?;
+		}
+		let node_password = match std::fs::read_to_string(&password_file) {
+			Ok(p) => Some(p.trim_end_matches(['\r', '\n']).to_string()),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+			Err(e) => return Err(Error::Io(format!("{}: {}", password_file.display(), e))),
+		};
 		let cfg = Config {
 			server: get("server")?, node_url: get("node_url")?,
-			node_user: opt("node_user")?, node_password: opt("node_password")?, node_cookie: opt("node_cookie")?,
+			node_user: opt("node_user")?, node_password, node_cookie: opt("node_cookie")?,
 			account: parse("account", &get("account")?)?,
 			exit_delay_units: parse("exit delay", &get("exit_delay_units")?)?,
 			min_exit_delay_units: parse("exit delay", &get("min_exit_delay_units")?)?,
@@ -763,30 +794,35 @@ impl Wallet {
 		Ok(json!({"address": self.chain.address(&s)?, "script_pubkey": hex(s.as_bytes())}))
 	}
 
-	/// Every on-chain script the wallet watches, with its key.
-	fn onchain_keys(&self) -> Result<Vec<(Script, Keypair)>, Error> {
+	/// The wallet's unspent on-chain coins (spends in the mempool excluded),
+	/// each with its key and height. The scripts it looks at run to a gap of
+	/// [`GAP`] unused ones past the last index in use, whether the store
+	/// handed that index out or the chain shows it used, as after a restore;
+	/// an index found in use is never handed out again.
+	pub(crate) fn onchain_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
 		let mut out = vec![];
 		for chain in [RECEIVE, CHANGE] {
-			for i in 0..self.store.indices(chain)? + GAP {
-				let k = self.keys.onchain(chain, i)?;
-				out.push((p2wpkh(&k), k));
-			}
-		}
-		Ok(out)
-	}
-
-	/// The wallet's unspent on-chain coins (spends in the mempool excluded),
-	/// each with its key and height.
-	pub(crate) fn onchain_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
-		let keys = self.onchain_keys()?;
-		let scripts: Vec<Script> = keys.iter().map(|(s, _)| s.clone()).collect();
-		let mut out = vec![];
-		for (op, o, h) in self.chain.coins_at(&scripts)? {
-			if !self.chain.unspent(&op)? {
-				continue;
-			}
-			if let Some((_, k)) = keys.iter().find(|(s, _)| *s == o.script_pubkey) {
-				out.push((op, o, *k, h));
+			let mut from = 0u32;
+			let mut end = self.store.indices(chain)? + GAP;
+			while from < end {
+				let window: Vec<(u32, Script, Keypair)> = (from..end).map(|i| {
+					let k = self.keys.onchain(chain, i)?;
+					Ok((i, p2wpkh(&k), k))
+				}).collect::<Result<_, Error>>()?;
+				let scripts: Vec<Script> = window.iter().map(|(_, s, _)| s.clone()).collect();
+				let mut last_used = None;
+				for (op, o, h) in self.chain.coins_at(&scripts)? {
+					let Some((i, _, k)) = window.iter().find(|(_, s, _)| *s == o.script_pubkey) else { continue };
+					last_used = last_used.max(Some(*i));
+					if self.chain.unspent(&op)? {
+						out.push((op, o, *k, h));
+					}
+				}
+				from = end;
+				if let Some(i) = last_used {
+					self.store.bump_index(chain, i + 1)?;
+					end = end.max(i + 1 + GAP);
+				}
 			}
 		}
 		Ok(out)

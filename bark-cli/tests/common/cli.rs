@@ -22,7 +22,8 @@ impl Arca {
 	/// wrote to its standard error.
 	pub fn run_full(&self, args: &[&str]) -> (bool, Value, String) {
 		let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca"))
-			.arg("--datadir").arg(&self.dir).args(args).output().expect("run arca"));
+			.arg("--datadir").arg(&self.dir).args(args)
+			.env("ARCA_NODE_PASSWORD", "arca").output().expect("run arca"));
 		let json: Value = serde_json::from_slice(&out.stdout)
 			.unwrap_or_else(|e| panic!("{} {:?}: not JSON ({}): {}\n{}", self.name, args, e, String::from_utf8_lossy(&out.stdout),
 				String::from_utf8_lossy(&out.stderr)));
@@ -32,7 +33,8 @@ impl Arca {
 	/// Runs `arca` with `args`: whether it succeeded, and its JSON.
 	pub fn run(&self, args: &[&str]) -> (bool, Value) {
 		let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca"))
-			.arg("--datadir").arg(&self.dir).args(args).output().expect("run arca"));
+			.arg("--datadir").arg(&self.dir).args(args)
+			.env("ARCA_NODE_PASSWORD", "arca").output().expect("run arca"));
 		let json: Value = serde_json::from_slice(&out.stdout)
 			.unwrap_or_else(|e| panic!("{} {:?}: not JSON ({}): {}\n{}", self.name, args, e, String::from_utf8_lossy(&out.stdout),
 				String::from_utf8_lossy(&out.stderr)));

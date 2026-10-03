@@ -9,10 +9,15 @@
 //!   the leaf's salt and its record, so a record names its own key and a
 //!   restore needs no index scan. A key never comes from a counter, which a
 //!   restore would repeat.
-//! - **The mailbox key**, `m/6'/account'/0'`: three steps, which no leaf key
-//!   (six steps) can take. The wallet names it in every receive request and
-//!   reads its mailbox with it, so one challenge collects every coin paid to
-//!   the wallet.
+//! - **The mailbox key**: the key the kit's own leaf derivation gives for the
+//!   fixed nonce [`MAILBOX_NONCE`], `SHA256("Arca/mailbox")`, at
+//!   `m/6'/account'/c1'/c2'/c3'/c4'`. Any wallet on the kit derives it from
+//!   the mnemonic with the kit's `leaf_key`, as it derives a leaf's key from
+//!   its record. The wallet names it in every receive request and reads its
+//!   mailbox with it, so one challenge collects every coin paid to the
+//!   wallet. It signs only the tagged authentication digest of a call, never
+//!   a leaf's message, and no coin is accepted for its nonce, which the
+//!   wallet never draws.
 //! - **On-chain keys**, `m/84'/coin'/0'/<chain>/<index>` (`coin` is 0 on the
 //!   main chain and 1 elsewhere), each an unblinded P2WPKH script: the same
 //!   key is a Bitcoin address and a Sequentia address, as on every Sequentia
@@ -31,6 +36,15 @@ pub const ARK_PURPOSE: u32 = 6;
 
 /// The tag that begins the hash a leaf key's path is read from.
 pub const KEY_TAG: &[u8] = b"Arca/key";
+
+/// The tag whose hash is the mailbox key's nonce.
+pub const MAILBOX_TAG: &[u8] = b"Arca/mailbox";
+
+/// The nonce of the mailbox key: `SHA256("Arca/mailbox")`, the same for
+/// every wallet, so the key follows from the mnemonic and the account alone.
+pub fn mailbox_nonce() -> [u8; 32] {
+	sha256::Hash::hash(MAILBOX_TAG).to_byte_array()
+}
 
 /// The on-chain chains: scripts handed out to be paid, and change.
 pub const RECEIVE: u32 = 0;
@@ -95,9 +109,9 @@ impl Keys {
 		Ok(self.leaf(owner_nonce)?.x_only_public_key().0)
 	}
 
-	/// The mailbox key, `m/6'/account'/0'`.
+	/// The mailbox key: the leaf key of [`mailbox_nonce`].
 	pub fn mailbox(&self) -> Result<Keypair, Error> {
-		self.keypair_at(&DerivationPath::from(vec![hardened(ARK_PURPOSE)?, hardened(self.account)?, hardened(0)?]))
+		self.leaf(&mailbox_nonce())
 	}
 
 	/// The on-chain key at `m/84'/coin'/0'/chain/index`.
@@ -154,8 +168,21 @@ mod tests {
 		// Another nonce, another key; another account, another key.
 		assert_ne!(keys.leaf_xonly(&[1; 32]).unwrap(), keys.leaf_xonly(&[2; 32]).unwrap());
 		assert_ne!(Keys::new(MNEMONIC, 1, 1).unwrap().leaf_xonly(&[1; 32]).unwrap(), keys.leaf_xonly(&[1; 32]).unwrap());
-		// The mailbox key is none of the leaf keys.
+		// The mailbox key is none of the leaf keys a drawn nonce gives.
 		assert_ne!(keys.mailbox().unwrap().x_only_public_key().0, keys.leaf_xonly(&[0; 32]).unwrap());
+	}
+
+	#[test]
+	fn the_mailbox_key_is_the_kits_leaf_key_of_its_nonce() {
+		use lwk_common::Signer as _;
+		let keys = Keys::new(MNEMONIC, 0, 1).unwrap();
+		let signer = SwSigner::new(MNEMONIC, false).unwrap();
+		let nonce: [u8; 32] = sha256::Hash::hash(b"Arca/mailbox").to_byte_array();
+		let path = leaf_key_path(0, &nonce).unwrap();
+		let kit = signer.derive_xpub(&path).unwrap().public_key.x_only_public_key().0;
+		assert_eq!(keys.mailbox().unwrap().x_only_public_key().0.serialize(), kit.serialize());
+		assert_eq!(path.to_string().matches('/').count(), 5, "six hardened steps, as every Arca key of the kit: {}", path);
+		assert_ne!(Keys::new(MNEMONIC, 1, 1).unwrap().mailbox().unwrap().x_only_public_key().0, kit, "per account");
 	}
 
 	#[test]
