@@ -1,12 +1,19 @@
 //! `arcad`: the Arca operator's server.
 //!
 //!     arcad <config.toml>
+//!     arcad <config.toml> address
 //!
 //! The configuration is `server::server::Config`; `server/arcad.example.toml`
 //! shows every setting. The operator key lives in `arca-signer`, which must be
 //! running first.
+//!
+//! With `address`, it hands out a receive address of the operator's on-chain
+//! wallet, records it in the database and prints it as JSON
+//! (`{"address", "script_pubkey", "index"}`), then exits: what the operator
+//! pays to fund the wallet. It needs the database, the mnemonic file and the
+//! node, not the signer, and may run beside the server.
 
-use server::server::{Config, Server};
+use server::server::{receive_address, Config, Server};
 
 #[tokio::main]
 async fn main() {
@@ -14,7 +21,7 @@ async fn main() {
 	let path = match std::env::args().nth(1) {
 		Some(p) => p,
 		None => {
-			eprintln!("usage: arcad <config.toml>");
+			eprintln!("usage: arcad <config.toml> [address]");
 			std::process::exit(2);
 		},
 	};
@@ -32,6 +39,24 @@ async fn main() {
 			std::process::exit(2);
 		},
 	};
+	match std::env::args().nth(2).as_deref() {
+		None => {},
+		Some("address") => match receive_address(&config).await {
+			Ok((index, script, address)) => {
+				let hex: String = script.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+				println!("{}", serde_json::json!({"address": address, "script_pubkey": hex, "index": index}));
+				return;
+			},
+			Err(e) => {
+				eprintln!("arcad: {}", e);
+				std::process::exit(1);
+			},
+		},
+		Some(other) => {
+			eprintln!("arcad: unknown command {:?}; usage: arcad <config.toml> [address]", other);
+			std::process::exit(2);
+		},
+	}
 	let server = match Server::start(&config).await {
 		Ok(s) => s,
 		Err(e) => {

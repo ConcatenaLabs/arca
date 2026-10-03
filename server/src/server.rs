@@ -303,6 +303,39 @@ fn err<E: std::fmt::Display>(what: &str) -> impl Fn(E) -> StartError + '_ {
 	move |e| StartError(format!("{}: {}", what, e))
 }
 
+/// The node's RPC client, as the configuration names it.
+fn node_client(config: &Config) -> Result<Client, StartError> {
+	let auth = match (&config.node.cookie_file, &config.node.rpc_user, &config.node.rpc_password) {
+		(Some(c), _, _) => Auth::CookieFile(c.clone()),
+		(None, Some(u), Some(p)) => Auth::UserPass(u.clone(), p.clone()),
+		_ => return Err(StartError("the node needs cookie_file, or rpc_user and rpc_password".into())),
+	};
+	Ok(Client::new(config.node.rpc_url.clone(), auth))
+}
+
+/// A receive address of the operator's on-chain wallet, handed out and
+/// recorded in the database ([`Wallet::hand_out_receive_script`]): what the
+/// operator pays to fund the wallet. Its index, its script, and its address
+/// as the node writes it (unblinded). It needs the database, the mnemonic
+/// file and the node, and neither the signer nor a running server, so
+/// `arcad <config> address` may run beside the server or before its first
+/// start. The server follows the chain from where it first started, so a
+/// coin is found only in a block it connects after the address was handed
+/// out and after that first start.
+pub async fn receive_address(config: &Config) -> Result<(u32, elements::Script, String), StartError> {
+	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file)
+		.map_err(err("wallet_mnemonic_file"))?.trim().to_string();
+	let (index, script) = Wallet::hand_out_receive_script(&store, &mnemonic).await.map_err(err("the wallet"))?;
+	let client = node_client(config)?;
+	let hex: String = script.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+	let decoded = tokio::task::spawn_blocking(move || client.call::<serde_json::Value>("decodescript", &[serde_json::json!(hex)]))
+		.await.map_err(err("the node"))?.map_err(err("the node"))?;
+	let address = decoded["address"].as_str().or_else(|| decoded["segwit"]["address"].as_str())
+		.ok_or_else(|| StartError(format!("the node gave no address for the wallet's script: {}", decoded)))?;
+	Ok((index, script, address.to_string()))
+}
+
 /// Deletes, every `every`, the operator nonces no board took within
 /// `nonce_ttl` and the challenges used or expired.
 fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandle<()> {
@@ -382,12 +415,7 @@ impl Server {
 	/// HTTP listener.
 	pub async fn start(config: &Config) -> Result<Server, StartError> {
 		let store = Store::connect(&config.database).await.map_err(err("the database"))?;
-		let auth = match (&config.node.cookie_file, &config.node.rpc_user, &config.node.rpc_password) {
-			(Some(c), _, _) => Auth::CookieFile(c.clone()),
-			(None, Some(u), Some(p)) => Auth::UserPass(u.clone(), p.clone()),
-			_ => return Err(StartError("the node needs cookie_file, or rpc_user and rpc_password".into())),
-		};
-		let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(Client::new(config.node.rpc_url.clone(), auth)));
+		let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(node_client(config)?));
 		let certification = match config.finality.certification.as_str() {
 			"required" => Certification::Required,
 			"none" => Certification::NotOnThisChain,
