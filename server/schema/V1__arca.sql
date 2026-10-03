@@ -77,16 +77,18 @@ CREATE TABLE script_sighting (
 	PRIMARY KEY (script_pubkey, txid, vout)
 );
 
--- Outputs whose spending the server must notice (a board output), and the
--- first transaction seen spending each. Like a sighting, a spend once seen is
--- kept.
+-- Outputs whose spending the server must notice: a board output, or an input
+-- of a transaction the nursery keeps broadcasting. watched_for is the leaf or
+-- the transaction that relies on it. spent_by is the transaction seen
+-- spending it: the first seen in the mempool, replaced by the one a block
+-- holds. Like a sighting, a spend once seen is kept.
 CREATE TABLE watched_outpoint (
-	txid     BYTEA NOT NULL CHECK (length(txid) = 32),
-	vout     INTEGER NOT NULL CHECK (vout >= 0),
-	kind     TEXT NOT NULL,
-	leaf_id  BYTEA NOT NULL,
-	spent_by BYTEA,
-	spent_at TIMESTAMPTZ,
+	txid        BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout        INTEGER NOT NULL CHECK (vout >= 0),
+	kind        TEXT NOT NULL CHECK (kind IN ('board', 'nursery')),
+	watched_for BYTEA NOT NULL CHECK (length(watched_for) = 32),
+	spent_by    BYTEA CHECK (spent_by IS NULL OR length(spent_by) = 32),
+	spent_at    TIMESTAMPTZ,
 	PRIMARY KEY (txid, vout)
 );
 
