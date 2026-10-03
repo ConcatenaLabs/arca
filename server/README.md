@@ -484,6 +484,21 @@ going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
 
+`tests/round_e2e.rs` runs rounds as wallets meet them. Eight participants in
+two assets, one giving up coins of both for leaves of both and one leaving half
+on-chain, share one round; each validates its leaves from the published trees,
+hands over its forfeits and gets its preimage, every new leaf is live, and the
+offboard's output is unlocked to its owner's script with the preimage alone.
+Then a leaf is unrolled from its published tree and exited by its owner alone:
+each node by the owner's own unroll authorisation with its reserve as the fee,
+the entry with the preimage, the exit after the exit delay; no signature of the
+operator's is made. Once that leaf is on the chain the server refuses to co-sign
+a spend of it, and the exit is refused before the delay and when signed by the
+operator's key. These run on a proof-of-stake chain, which takes no block its
+committee did not make (`generateblock` is refused there), so a refused spend
+is refused by the mempool; the covenant's own suite forces each into a block on
+a chain that can.
+
 `tests/rounds.rs` turns participations in two assets, X listed for fees and
 Y not, into one round: a batch and a token per asset, an offboard, the
 connector, nLockTime 0, the operator's coins only, the fee in X, the wallet
