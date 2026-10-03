@@ -6,8 +6,11 @@
 //! round holding the participation is final, the wallet rebuilds each new
 //! leaf from the published tree, validates it against the round transaction
 //! with the five checks on its sweep token and clock and every bound of its
-//! policy, and only then signs the forfeit of each coin it gave up, built from
-//! that validated leaf and round, and its unroll authorisations. The server
+//! policy, and requires the status to show exactly the leaves it asked for,
+//! in order, all under the participation's one unlock hash, and exactly the
+//! coins it gave up. Only then does it sign the forfeit of each coin it gave
+//! up, built from the validated leaf of the coin's own asset and its round,
+//! and its unroll authorisations. The server
 //! answers with the preimage that opens the new leaves; the wallet checks it
 //! against their unlock hash, keeps them, and releases the lowest node of each
 //! old batch leaf.
@@ -223,7 +226,17 @@ impl Wallet {
 	}
 
 	/// The forfeit swap of an issued participation, once its round is final.
+	///
+	/// Nothing is signed until the status shows exactly the leaves the wallet
+	/// asked for, in the order it asked for them, each rebuilt from the
+	/// published tree and validated against the round, every one under the
+	/// participation's one unlock hash, and the coins given up are exactly
+	/// the participation's. Each coin's forfeit and release is then built
+	/// against the new leaf of the coin's own asset.
 	fn complete(&mut self, pid: &str, st: &Value, given: &[String], wanted: &Value) -> Result<Value, Error> {
+		if st["participation_id"].as_str() != Some(pid) {
+			return Err(Error::Refused(format!("the server answers for participation {}, not {}", st["participation_id"], pid)));
+		}
 		let round_txid = Txid::from_str(st["round"]["txid"].as_str().unwrap_or("")).map_err(|e| Error::Parse(e.to_string()))?;
 		let finality = self.chain.finality(&round_txid)?;
 		if !finality.is_final() {
@@ -236,12 +249,29 @@ impl Wallet {
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
 		let accept = self.accept_policy(now);
+		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
+			.map_err(|_| Error::Refused("the status names no unlock hash for the participation".into()))?;
+		// The coins given up: exactly the participation's, each once.
+		let inputs = st["inputs"].as_array().cloned().unwrap_or_default();
+		if inputs.len() != given.len() || given.iter().any(|l| inputs.iter().filter(|i| i["leaf_id"].as_str() == Some(l.as_str())).count() != 1) {
+			return Err(Error::Refused(format!("the status names {} coin(s) given up; the participation gives up exactly {}",
+				inputs.len(), given.len())));
+		}
 		// Each new leaf, rebuilt from the published tree and validated
-		// against the round before anything is signed for it.
+		// against the round before anything is signed for it: the leaves the
+		// wallet asked for, all of them, in order, and nothing else.
 		let mut news: Vec<(ValidLeaf, LeafRecord, [u8; 32])> = vec![];
 		let wanted = wanted.as_array().cloned().unwrap_or_default();
-		for (j, o) in st["outputs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-			let w = wanted.get(j).ok_or_else(|| Error::Refused("the server reports more outputs than the wallet asked for".into()))?;
+		let outputs = st["outputs"].as_array().cloned().unwrap_or_default();
+		if outputs.len() != wanted.len() {
+			return Err(Error::Refused(format!("the status shows {} new leaf/leaves and the wallet asked for {}: it signs nothing \
+				until every leaf it asked for is shown and checked", outputs.len(), wanted.len())));
+		}
+		for (j, (o, w)) in outputs.iter().zip(&wanted).enumerate() {
+			if o["kind"].as_str() != Some("leaf") || o["asset"] != w["asset"] || o["value"] != w["value"] {
+				return Err(Error::Refused(format!("the status's output {} is {} {} of {}; the wallet asked for a leaf of {} of {}", j,
+					o["kind"], o["value"], o["asset"], w["value"], w["asset"])));
+			}
 			let nonce = unhex32(w["nonce"].as_str().unwrap_or(""))?;
 			let tree = self.server.post("tree", &json!({"txid": round_txid.to_string(), "vout": o["batch_vout"]}))?;
 			if tree["round_txid"].as_str() != Some(&round_txid.to_string()) {
@@ -263,6 +293,12 @@ impl Wallet {
 			if Some(valid.leaf_id.to_string().as_str()) != o["leaf_id"].as_str() {
 				return Err(Error::Refused("the server names the new leaf by another id than its record gives".into()));
 			}
+			// One unlock hash opens every new leaf of the participation: a
+			// forfeit can be claimed only by releasing all of them.
+			if record.unlock_hash != unlock_hash {
+				return Err(Error::Refused(format!("the new leaf in asset {} is locked to another unlock hash than the participation's \
+					{}: a forfeit is claimable only by releasing every leaf the wallet asked for", record.asset, hex(&unlock_hash))));
+			}
 			news.push((valid, record, nonce));
 		}
 		if news.is_empty() {
@@ -279,11 +315,15 @@ impl Wallet {
 		let c = st["round"]["connector_vout"].as_u64().ok_or_else(|| Error::Parse("no connector_vout".into()))? as u32;
 		let mut forfeits = vec![];
 		let mut releases = vec![];
-		for (k, l) in given.iter().enumerate() {
+		for l in given {
 			let row = self.store.coin(l)?.ok_or_else(|| Error::Store(format!("coin {} is gone", l)))?;
 			let (record, a) = self.held(&row)?;
 			let old = &a.valid;
-			let margin = amount(&st["inputs"][k]["margin"], "a forfeit's margin")?;
+			let input = inputs.iter().find(|i| i["leaf_id"].as_str() == Some(l.as_str())).expect("checked above");
+			let margin = amount(&input["margin"], "a forfeit's margin")?;
+			// The new leaf of the coin's own asset.
+			let new = &news.iter().find(|(_, r, _)| r.asset == old.asset)
+				.ok_or_else(|| Error::Refused(format!("the participation has no new leaf in the asset of coin {}", l)))?.0;
 			// The margin is the fee of a forfeit someone broadcasts: a few
 			// times the floor, or one atom where the node does not take the
 			// asset for fees. More is value handed to the broadcaster.
@@ -294,7 +334,7 @@ impl Wallet {
 			if margin > ceiling {
 				return Err(Error::Refused(format!("the forfeit of {} would leave {} atoms uncommitted; the wallet leaves at most {}", l, margin, ceiling)));
 			}
-			let f = Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, &news[0].0, &round, c, refund, margin)
+			let f = Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, refund, margin)
 				.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
 			let key = self.keys.leaf(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
@@ -303,7 +343,7 @@ impl Wallet {
 			// round leaves the chain.
 			if let (CoinRecord::Leaf { .. }, arca_covenant::ValidOrigin::Leaf { valid, .. }) = (&record, &old.origin) {
 				if valid.branch.nodes.last().is_some_and(|n| n.reclaim.is_some()) {
-					let rel = Release::for_refresh(valid, &news[0].0, &round, c)
+					let rel = Release::for_refresh(valid, new, &round, c)
 						.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
