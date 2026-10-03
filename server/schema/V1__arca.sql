@@ -238,33 +238,88 @@ CREATE TABLE connector_output (
 	issuance_txid   BYTEA CHECK (length(issuance_txid) = 32)
 );
 
--- A participation: leaves given up and leaves wanted, under one unlock hash.
+-- pending: accepted, waiting for a round;
+-- issued: its leaves are in a round (round_id), whose forfeits it owes;
+-- released: its forfeits are in and its preimage handed over;
+-- void: it will not run (its round was never built, or cannot be).
+CREATE TYPE participation_state AS ENUM ('pending', 'issued', 'released', 'void');
+
+-- A participation: the coins an owner gives up and the leaves (or on-chain
+-- outputs) it wants for them, submitted once and run in a round without the
+-- owner online. Its id is the hash of the request, which the owner of every
+-- coin given up signed. The unlock hash is the current attempt's: chosen when
+-- the participation is accepted, and again whenever a round it was in can
+-- never return.
 CREATE TABLE participation (
-	participation_id BYTEA PRIMARY KEY CHECK (length(participation_id) = 32),
-	unlock_hash      BYTEA NOT NULL UNIQUE CHECK (length(unlock_hash) = 32),
-	preimage         BYTEA NOT NULL CHECK (length(preimage) = 32),
-	round_id         BIGINT REFERENCES round,
-	state            TEXT NOT NULL CHECK (state IN ('pending', 'issued', 'forfeited', 'released')),
-	created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+	participation_id   BYTEA PRIMARY KEY CHECK (length(participation_id) = 32),
+	unlock_hash        BYTEA NOT NULL UNIQUE CHECK (length(unlock_hash) = 32),
+	preimage           BYTEA NOT NULL CHECK (length(preimage) = 32),
+	attempt            INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+	round_id           BIGINT REFERENCES round,
+	state              participation_state NOT NULL DEFAULT 'pending',
+	-- Set when a round it was released in can never return: its next
+	-- preimage goes out only once its forfeit is published and claimed.
+	forfeit_first      BOOLEAN NOT NULL DEFAULT false,
+	-- The earliest median time of a round it may run in.
+	not_before         BIGINT,
+	-- The delay after which each owner may take a forfeit back.
+	refund_delay_units INTEGER NOT NULL CHECK (refund_delay_units > 0),
+	created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+	CHECK ((state IN ('issued', 'released')) = (round_id IS NOT NULL))
 );
 
+-- Each coin given up. A coin is given up once, ever: the unique key holds it,
+-- and the coin's row is marked spent by the participation in the same
+-- transaction.
 CREATE TABLE participation_input (
 	participation_id BYTEA NOT NULL REFERENCES participation,
-	leaf_id          BYTEA NOT NULL REFERENCES leaf,
-	PRIMARY KEY (participation_id, leaf_id)
-);
-
-CREATE TABLE participation_output (
-	participation_id BYTEA NOT NULL REFERENCES participation,
 	idx              SMALLINT NOT NULL CHECK (idx >= 0),
+	leaf_id          BYTEA NOT NULL UNIQUE REFERENCES leaf,
 	asset            BYTEA NOT NULL CHECK (length(asset) = 32),
 	value            BIGINT NOT NULL CHECK (value > 0),
-	template         TEXT NOT NULL,
-	owner_key        BYTEA NOT NULL CHECK (length(owner_key) = 32),
-	owner_nonce      BYTEA NOT NULL CHECK (length(owner_nonce) = 32),
-	exit_delay_units INTEGER NOT NULL,
-	leaf_id          BYTEA REFERENCES leaf,
+	-- What the forfeit leaves uncommitted for its own fee.
+	margin           BIGINT NOT NULL CHECK (margin > 0),
+	-- The owner's signature over the participation's id.
+	attestation      BYTEA NOT NULL CHECK (length(attestation) = 64),
 	PRIMARY KEY (participation_id, idx)
+);
+
+-- Each output wanted: a leaf, or an offboard's on-chain output.
+CREATE TABLE participation_output (
+	participation_id    BYTEA NOT NULL REFERENCES participation,
+	idx                 SMALLINT NOT NULL CHECK (idx >= 0),
+	kind                TEXT NOT NULL CHECK (kind IN ('leaf', 'offboard')),
+	asset               BYTEA NOT NULL CHECK (length(asset) = 32),
+	value               BIGINT NOT NULL CHECK (value > 0),
+	-- A leaf: its template, its owner's key and nonce, its exit delay, and
+	-- the operator nonce of the current attempt.
+	template            TEXT,
+	owner_key           BYTEA CHECK (owner_key IS NULL OR length(owner_key) = 32),
+	owner_nonce         BYTEA CHECK (owner_nonce IS NULL OR length(owner_nonce) = 32),
+	exit_delay_units    INTEGER,
+	operator_nonce      BYTEA REFERENCES operator_nonce,
+	-- The leaf the current attempt's round made of it.
+	leaf_id             BYTEA REFERENCES leaf,
+	-- An offboard: the destination script, the margin the round's output
+	-- holds for its unlock, and the operator's reclaim delay.
+	script              BYTEA,
+	margin              BIGINT CHECK (margin IS NULL OR margin >= 0),
+	reclaim_delay_units INTEGER,
+	PRIMARY KEY (participation_id, idx),
+	CHECK ((kind = 'leaf') = (owner_key IS NOT NULL AND owner_nonce IS NOT NULL AND template IS NOT NULL
+		AND exit_delay_units IS NOT NULL AND operator_nonce IS NOT NULL)),
+	CHECK ((kind = 'offboard') = (script IS NOT NULL AND margin IS NOT NULL AND reclaim_delay_units IS NOT NULL))
+);
+-- A key is wanted for one leaf, ever: one key, one leaf.
+CREATE UNIQUE INDEX participation_output_owner_key ON participation_output (owner_key) WHERE kind = 'leaf';
+
+-- The fee a participation pays, per asset, in that asset.
+CREATE TABLE participation_fee (
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	asset            BYTEA NOT NULL CHECK (length(asset) = 32),
+	amount           BIGINT NOT NULL CHECK (amount >= 0),
+	PRIMARY KEY (participation_id, asset)
 );
 
 -- A forfeit of a leaf for a round: the owner's and the operator's signatures

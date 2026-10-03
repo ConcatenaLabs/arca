@@ -20,7 +20,8 @@ use crate::chain::{Certification, ChainSource, FinalityConfig, FinalityService, 
 use crate::cosign::Cosigner;
 use crate::http::{router, App};
 use crate::nursery::Nursery;
-use crate::params::{AssetParams, Params};
+use crate::params::{AssetParams, FeeSchedule, Params};
+use crate::participations::Participations;
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
 use crate::wallet::{SpendFrom, Wallet, WalletConfig};
@@ -56,6 +57,28 @@ pub struct Config {
 	pub exit_delay_units: Option<(u16, u16)>,
 	/// The assets served.
 	pub assets: Vec<AssetSection>,
+	/// The assets a round's fee is paid in, in order of preference (display
+	/// order ids); the served assets, in the order listed, when absent. A
+	/// round pays in the first of its own batches' assets the node accepts
+	/// for fees, else in the first of these it accepts.
+	#[serde(default)]
+	pub fee_assets: Option<Vec<String>>,
+	/// What the operator charges for a refresh and an offboard; nothing when
+	/// absent.
+	#[serde(default)]
+	pub fees: FeesSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeesSection {
+	/// The most a refresh costs, in parts per million of the coin's value.
+	#[serde(default)]
+	pub refresh_ppm: u64,
+	/// What an offboard costs, in parts per million of what it pays out, on
+	/// top of the margin of its output.
+	#[serde(default)]
+	pub offboard_ppm: u64,
 }
 
 fn default_fee_multiple() -> u64 {
@@ -146,6 +169,7 @@ pub struct Server {
 	pub boards: Arc<Boards>,
 	pub wallet: Arc<Wallet>,
 	pub cosigner: Arc<Cosigner>,
+	pub participations: Arc<Participations>,
 	tasks: Vec<JoinHandle<()>>,
 }
 
@@ -179,14 +203,22 @@ impl Server {
 		let operator = signer.pubkey().await.map_err(err("the signer"))?;
 
 		let mut assets = BTreeMap::new();
+		let mut order = vec![];
 		for a in &config.assets {
 			let id = AssetId::from_str(&a.asset).map_err(err("assets.asset"))?;
 			assets.insert(id, AssetParams { min_leaf: parse_amount(&a.min_leaf).map_err(err("assets.min_leaf"))? });
+			order.push(id);
 		}
 		let mut params = Params::new(Chain::new(genesis), operator, assets);
+		params.fee_assets = match &config.fee_assets {
+			Some(list) => list.iter().map(|a| AssetId::from_str(a)).collect::<Result<_, _>>().map_err(err("fee_assets"))?,
+			None => order,
+		};
+		params.fees = FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm };
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
+			params.set_delays();
 		}
 		let params = Arc::new(params);
 
@@ -198,6 +230,7 @@ impl Server {
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone());
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer);
+		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
 
 		// The first pass before anything is answered, so the chain is known.
 		finality.sync().await.map_err(err("the first pass over the chain"))?;
@@ -206,7 +239,7 @@ impl Server {
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
-			certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
+			participations: participations.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 		});
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
@@ -218,7 +251,7 @@ impl Server {
 			}
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, tasks })
+		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, tasks })
 	}
 
 	/// Stops every task.
@@ -232,5 +265,18 @@ impl Server {
 impl Drop for Server {
 	fn drop(&mut self) {
 		self.stop();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Config;
+
+	/// The example configuration names every setting, and parses.
+	#[test]
+	fn example_config_parses() {
+		let c: Config = toml::from_str(include_str!("../arcad.example.toml")).expect("the example parses");
+		assert_eq!(c.assets.len(), 1);
+		assert_eq!(c.fees.refresh_ppm, 0);
 	}
 }

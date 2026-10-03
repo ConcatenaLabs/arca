@@ -76,6 +76,16 @@ pub struct FeesInfo {
 	/// What the operator charges for an out-of-round transfer, in the asset
 	/// moved.
 	pub transfer: String,
+	/// The refresh fee, in parts per million of a coin's value, for a coin
+	/// whose expiry is `full_after_seconds` or more beyond the free window; it
+	/// falls in proportion to the time left beyond the window, to nothing
+	/// within it. A coin from boards alone pays the whole of it.
+	pub refresh_ppm: u64,
+	pub free_window_seconds: u32,
+	pub full_after_seconds: u32,
+	/// The offboard fee, in parts per million of what it pays out, on top of
+	/// the margin the round's output holds for its unlock.
+	pub offboard_ppm: u64,
 }
 
 /// `POST /v1/operator_nonce`: a fresh operator nonce for one leaf the
@@ -249,4 +259,139 @@ pub struct LeafEntry {
 	/// The coin record, binary form; empty while a transfer's output waits
 	/// for its signatures.
 	pub record: String,
+}
+
+/// `POST /v1/submit_participation`: the coins given up, each with its
+/// owner's attestation, the outputs wanted, the fee per asset, and the
+/// earliest median time of a round it may run in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitParticipation {
+	pub inputs: Vec<ParticipationInput>,
+	pub outputs: Vec<WantedOutput>,
+	pub fees: Vec<FeeAmount>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub not_before: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationInput {
+	pub leaf_id: String,
+	/// The coin's owner key's signature over the participation's id.
+	pub attestation: String,
+}
+
+/// An output wanted: `{"leaf": …}` or `{"offboard": …}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WantedOutput {
+	Leaf(WantedLeaf),
+	Offboard(WantedOffboard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WantedLeaf {
+	pub asset: String,
+	pub value: String,
+	/// `vtxo-1`.
+	pub template: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub exit_delay_units: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WantedOffboard {
+	pub asset: String,
+	pub value: String,
+	/// The destination's scriptPubKey.
+	pub script: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeeAmount {
+	pub asset: String,
+	pub amount: String,
+}
+
+/// `POST /v1/participation_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationStatusRequest {
+	pub participation_id: String,
+}
+
+/// A participation: `pending` until a round takes it, `issued` once it is in
+/// a round, `released` once its forfeits are in and its preimage handed over,
+/// `void` if it will not run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationStatus {
+	pub participation_id: String,
+	pub state: String,
+	/// How often a round it was in could not return and it ran again.
+	pub attempt: u32,
+	pub unlock_hash: String,
+	/// Set after a round it was released in could not return: the next
+	/// preimage goes out only once its forfeit is published and claimed.
+	pub forfeit_first: bool,
+	/// The refund delay every forfeit of it carries.
+	pub refund_delay_units: u16,
+	/// Its round, once issued.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round: Option<RoundRef>,
+	pub inputs: Vec<ParticipationInputStatus>,
+	pub outputs: Vec<ParticipationOutputStatus>,
+	pub fees: Vec<FeeAmount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundRef {
+	pub txid: String,
+	/// The round's connector output, whose asset every forfeit of the round names.
+	pub connector_vout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationInputStatus {
+	pub leaf_id: String,
+	pub asset: String,
+	pub value: String,
+	/// What the forfeit of this coin leaves uncommitted for its own fee.
+	pub margin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationOutputStatus {
+	/// `leaf` or `offboard`.
+	pub kind: String,
+	pub asset: String,
+	pub value: String,
+	/// A leaf: the operator nonce of its salt, and once in a round its id, its
+	/// batch output's index in the round and its index among that batch's
+	/// leaves.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub operator_nonce: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub batch_vout: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_index: Option<u32>,
+	/// An offboard: what the round's output holds beyond the destination for
+	/// its unlock, the operator's reclaim delay, and once in a round the
+	/// output's index.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub margin: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reclaim_delay_units: Option<u16>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub offboard_vout: Option<u32>,
 }

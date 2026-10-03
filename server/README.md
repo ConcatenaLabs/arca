@@ -3,8 +3,9 @@
 The Arca operator's server on Sequentia. It holds the operator's side of Arca:
 it hands out the second nonce of the salt of every leaf it creates, registers
 boards and credits them once final, co-signs out-of-round transfers and delivers them to
-their receivers' mailboxes, re-serves a key's leaves, and keeps its own
-on-chain wallet and the transactions it relies on broadcast. Its state is in
+their receivers' mailboxes, takes participations in rounds, re-serves a key's
+leaves, and keeps its own on-chain wallet and the transactions it relies on
+broadcast. Its state is in
 PostgreSQL; what is final comes from one finality service; the operator key
 lives in a separate signer process. Wallets speak JSON over HTTP to `arcad`.
 
@@ -35,8 +36,9 @@ requests can race past them:
   it is handed out and taken by one leaf at most. A nonce that was never
   issued, or was already taken, is refused. A leaf a reassignment creates
   takes its sender's creator nonce instead.
-- **Transfers.** A leaf is the input of one transfer at most, recorded before
-  any signature leaves the server.
+- **Transfers and participations.** A leaf is given up once: as the input of
+  one transfer, recorded before any signature leaves the server, or of one
+  participation, recorded when it is accepted.
 - **Reassignments.** Every reassignment the server co-signed, kept by the hash
   of its output 0's record with its inputs and outputs: the merge rule below
   reads them, so it survives a restart.
@@ -85,8 +87,8 @@ certificates.
 
 The operator publishes its chain (the genesis hash), its key `S`, the bounds on
 every leaf's exit delay (36 to 48 hours by default), the assets it serves with
-the smallest leaf it takes in each, and the depth limit (5 reassignments from
-a round or a board). Every record and coin the server checks is checked under
+the smallest leaf it takes in each, the depth limit (5 reassignments from
+a round or a board) and its fee schedule. Every record and coin the server checks is checked under
 these, with the receipt horizon a receiver uses: a coin's first expiry past
 the exit deadline.
 
@@ -154,6 +156,58 @@ The same record of spends answers the round's question, before it accepts an
 owner's release of a leaf's lowest node, whether the leaf has an open
 out-of-round reassignment (`Cosigner::check_release`).
 
+## Participations
+
+An owner takes part in a round with one request, and is never asked for
+anything while the round runs: the participation names the coins it gives up,
+each with an attestation (its owner key's BIP340 signature over the
+participation's id), the outputs it wants for them, the fee it pays in each
+asset, and optionally the earliest median time of a round it may run in, at
+most seven days ahead. An output wanted is a leaf (its template, `vtxo-1`, its
+owner key and nonce, its exit delay, asset and value) or an offboard (an asset,
+a value and the on-chain script to pay). The server accepts it only when:
+
+- every coin given up passes the same check as a transfer's input: known,
+  live, given up nowhere else, its record valid, every board it rests on
+  credited and unspent, nothing of its lineage on the chain; and its
+  attestation verifies;
+- every leaf wanted is within the published bounds, under a key that owns no
+  leaf and that no other participation wants; every offboard pays a served
+  asset within its bounds to a script that is not an Arca script;
+- per asset, the coins given up hold exactly what the outputs take plus the
+  fee, and the fee covers the schedule.
+
+It then chooses the participation's unlock hash and keeps its preimage,
+draws an operator nonce of its own for every leaf wanted (taken at once, so
+never handed out again), prices each forfeit's margin and each offboard
+output's margin from the node's floor in that asset, and records everything in
+one database transaction, the coins given up becoming spent by the
+participation. The same request again is the same participation and gets its
+status.
+
+The participation's id is
+`SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body)`, `T = SHA256("Arca/participation")`,
+where the body is the request without its attestations: the leaf ids given up,
+each output (kind, asset, value, then a leaf's template id and version, owner
+key, owner nonce and exit delay, or an offboard's script), each fee and the
+earliest round time (the layout is in `participations.rs`). The tag keeps the
+attestation apart from everything else a leaf key signs, the genesis hash and
+`S` to one chain and one operator.
+
+The fee schedule is published by `info`. Transfers are free. A refresh, or an
+offboard, costs nothing for a coin whose batch expires within two days, and
+rises with the time left beyond that to `refresh_ppm` parts per million of the
+coin's value for a coin 26 days or more beyond it; a coin from boards alone
+never expires and pays the whole of it. An offboard adds `offboard_ppm` of what
+it pays out and the margin its on-chain output holds for its unlock.
+
+Each forfeit carries the refund delay the server publishes with the
+participation (the longest exit delay), and leaves uncommitted the margin the
+server priced: four times the node's floor for the forfeit transaction, in the
+coin's asset, or one atom when the node does not accept that asset for fees.
+An offboard's output may be reclaimed by the operator after a delay longer than
+unrolling the coin given up, its exit delay, the refund delay and a margin.
+
 ## The interface
 
 JSON over HTTP, every call under `/v1/`, so the server sits behind one
@@ -173,6 +227,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
+| `POST submit_participation` | Accepts a participation in a round |
+| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`), its unlock hash, its forfeits' refund delay and margins, and its outputs |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
 | `POST leaf_data` | The leaves a key owns, with their records |
 
@@ -182,7 +238,10 @@ canonical binary form. Every object refuses a field it does not know.
 `T = SHA256("Arca/auth")`. The tag keeps it apart from everything else a leaf
 key signs, the genesis hash to one chain, the call to one request, the
 challenge to one use. There is no bearer token. `cosign_transfer` is
-authenticated by the owners' signatures over the transfer itself.
+authenticated by the owners' signatures over the transfer itself, and
+`submit_participation` by each owner's attestation over the participation;
+`participation_status` needs only the participation's id, which is a hash
+of its request.
 
 ## The signer
 
@@ -202,8 +261,9 @@ The server checks each signature it gets back against the message it built.
 
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
 address, the database, the signer's socket, the wallet's mnemonic file, the
-node's RPC, the finality rule, the exit-delay bounds, and the assets served
-with their smallest leaf. The node must run with `-txindex` and
+node's RPC, the finality rule, the exit-delay bounds, the assets served
+with their smallest leaf, the assets a round's fee is paid in, and the fee
+schedule. The node must run with `-txindex` and
 `-validateanchor`.
 
 ## The on-chain wallet
@@ -287,6 +347,16 @@ is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
+
+`tests/participations.rs` takes a participation over HTTP (its status, the
+same request again) and refuses, each by its code: a coin given up already,
+in a participation and in a transfer; an attestation by another key or for
+another participation; amounts one atom off either way and a fee in another
+asset; a fee one atom short of the schedule; a key wanted twice, wanted
+already, or owning a board; a template a round does not build; an exit
+delay, an asset, a leaf value or a round time outside the bounds; an offboard
+to an Arca script; an unknown coin, a board not yet final, a stray field, a
+coin given twice, and an unknown participation.
 
 The user needs the right to create databases. A throwaway server in user
 space is enough:
