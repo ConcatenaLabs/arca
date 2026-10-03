@@ -29,11 +29,11 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 5);
+	assert_eq!(db.store.schema_version().await.unwrap(), 6);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 5);
+	assert_eq!(again.schema_version().await.unwrap(), 6);
 }
 
 #[tokio::test]

@@ -38,6 +38,12 @@ impl SignerProcess {
 		std::fs::write(&file, key.secret_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>()).unwrap();
 		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 		let socket = dir.join("signer.sock");
+		// A new operator key's record, made once, on purpose.
+		let made = Command::new(signer_exe())
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(),
+				"--record", dir.join("signer.record").to_str().unwrap(), "--create-record"])
+			.output().unwrap();
+		assert!(made.status.success(), "the signer's record: {}", String::from_utf8_lossy(&made.stderr));
 		let child = Command::new(signer_exe())
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
 				"--record", dir.join("signer.record").to_str().unwrap()])

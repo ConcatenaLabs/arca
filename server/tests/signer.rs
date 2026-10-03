@@ -227,7 +227,8 @@ async fn the_signers_record() {
 	// The record outlives the process: after a restart, the same refusals.
 	let lines = std::fs::read_to_string(p.record()).unwrap();
 	println!("the record, {} line(s):\n{}", lines.lines().count(), lines.trim_end());
-	assert_eq!(lines.lines().count(), 5, "a spend each of A's and B's leaves under salt 1, two forfeits of salt 2, a spend of salt 3");
+	assert_eq!(lines.lines().count(), 1 + 5,
+		"the header, a spend each of A's and B's leaves under salt 1, two forfeits of salt 2, a spend of salt 3");
 	p.restart(&s, genesis);
 	refused_twice(spend(&a, [1; 32], out(9_000, 2)).await.unwrap_err());
 	refused_twice(spend(&b, [1; 32], out(9_000, 1)).await.unwrap_err());
@@ -238,14 +239,14 @@ async fn the_signers_record() {
 	// A last line cut short by a crash was never answered: it is dropped.
 	p.kill();
 	let mut f = std::fs::OpenOptions::new().append(true).open(p.record()).unwrap();
-	std::io::Write::write_all(&mut f, b"spend 0404").unwrap();
+	std::io::Write::write_all(&mut f, b"6 spend 0404").unwrap();
 	drop(f);
 	p.restart(&s, genesis);
 	spend(&a, [4; 32], out(9_000, 4)).await.unwrap();
 	let lines = std::fs::read_to_string(p.record()).unwrap();
-	assert_eq!(lines.lines().count(), 6, "the cut line dropped, the new one whole: {}", lines);
-	// Any other line that does not read stops the signer from starting, a
-	// line of a record kept by salt alone among them.
+	assert_eq!(lines.lines().count(), 1 + 6, "the cut line dropped, the new one whole: {}", lines);
+	// Any other line that does not read stops the signer from starting, and
+	// so does a record kept by salt alone, which has no header.
 	let start = |p: &SignerProcess| Command::new(env!("CARGO_BIN_EXE_arca-signer"))
 		.args(["--key-file", p.dir.join("operator.key").to_str().unwrap(), "--genesis", &genesis.to_string(),
 			"--socket", p.socket.to_str().unwrap(), "--record", p.record().to_str().unwrap()])
@@ -259,10 +260,217 @@ async fn the_signers_record() {
 	let out = start(&p);
 	assert_eq!(out.status.code(), Some(2));
 	let msg = String::from_utf8_lossy(&out.stderr);
-	assert!(msg.contains("kept by salt alone"), "{}", msg);
+	assert!(msg.contains("by salt alone"), "{}", msg);
 	println!("a record kept by salt alone: {}", msg.trim());
 }
 
 fn hex32(s: &elements::secp256k1_zkp::schnorr::Signature) -> String {
 	s.as_ref()[..8].iter().map(|b| format!("{:02x}", b)).collect::<String>() + "…"
+}
+
+/// A rebind request line for `owner`'s leaf under `salt`, spending 10,000 of
+/// `asset` into one output of 9,000 to a script ending in `b`, naming
+/// `known` as the latest entry the database knows.
+fn rebind_line(owner: &Keypair, genesis: BlockHash, salt: [u8; 32], asset: AssetId, b: u8, known: Option<(u64, [u8; 32])>) -> String {
+	use server::signer::{hex, WireOutput};
+	let o = ExplicitOutput::new(asset, 9_000, Script::from(vec![0x51, b]));
+	let sig = owner_sig(owner, genesis, &salt, asset, 10_000, std::slice::from_ref(&o));
+	let mut r = serde_json::json!({
+		"op": "rebind", "owner": hex(&xonly(owner).serialize()), "owner_sig": hex(sig.as_ref()), "salt": hex(&salt),
+		"asset_in": asset.to_string(), "value_in": "10000", "outputs": [WireOutput::from_output(&o)],
+	});
+	if let Some((entry, hash)) = known {
+		r["known"] = serde_json::json!({"entry": entry, "hash": hex(&hash)});
+	}
+	r.to_string()
+}
+
+/// The answer to a rebind request: the entry recorded, or the refusal's
+/// code and sentence.
+async fn ask(socket: &std::path::Path, line: &str) -> Result<(u64, [u8; 32]), (String, String)> {
+	let v: serde_json::Value = serde_json::from_str(&raw(socket, line).await).unwrap();
+	match v["error"].as_str() {
+		Some(e) => Err((v["code"].as_str().unwrap_or("").to_string(), e.to_string())),
+		None => {
+			assert!(v["signature"].is_string(), "{}", v);
+			let h: [u8; 32] = server::signer::unhex32(v["entry"]["hash"].as_str().unwrap_or("")).unwrap_or([0; 32]);
+			Ok((v["entry"]["entry"].as_u64().unwrap_or(0), h))
+		},
+	}
+}
+
+/// A signer run by hand: its process, its socket, and its log.
+struct Run {
+	child: std::process::Child,
+	socket: std::path::PathBuf,
+	log: std::path::PathBuf,
+}
+
+impl Run {
+	/// Starts `arca-signer` on `record` through `prefix` (a shell prefix that
+	/// ends in an `exec`, so the signer keeps the shell's pid), its log to a
+	/// file beside the socket. Waits for
+	/// its socket, or for it to exit; `None` when it exited.
+	fn start(dir: &std::path::Path, name: &str, genesis: BlockHash, record: &std::path::Path, prefix: &str) -> Result<Run, String> {
+		let socket = dir.join(format!("{}.sock", name));
+		let log = dir.join(format!("{}.log", name));
+		let _ = std::fs::remove_file(&socket);
+		let cmd = format!("{}{} --key-file {} --genesis {} --socket {} --record {} 2> {}", prefix, env!("CARGO_BIN_EXE_arca-signer"),
+			dir.join("operator.key").display(), genesis, socket.display(), record.display(), log.display());
+		let mut child = Command::new("bash").args(["-c", &cmd]).spawn().unwrap();
+		let start = std::time::Instant::now();
+		loop {
+			if socket.exists() {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+				return Ok(Run { child, socket, log });
+			}
+			if let Some(st) = child.try_wait().unwrap() {
+				return Err(format!("exit {:?}: {}", st.code(), std::fs::read_to_string(&log).unwrap_or_default().trim()));
+			}
+			assert!(start.elapsed() < std::time::Duration::from_secs(20), "the signer neither served nor exited");
+			std::thread::sleep(std::time::Duration::from_millis(50));
+		}
+	}
+
+	fn log(&self) -> String {
+		std::fs::read_to_string(&self.log).unwrap_or_default()
+	}
+
+	fn stop(self) -> String {
+		self.log()
+	}
+}
+
+impl Drop for Run {
+	fn drop(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+	}
+}
+
+/// The signer's record cannot be lost, cut back, torn or shared without the
+/// signer noticing: a missing record is never replaced by an empty one (one
+/// is made on purpose, once); a record cut back at a line boundary, or
+/// another record, is caught by the entry the database knows, and the signer
+/// then signs nothing; a write that fails is undone at once, and a line cut
+/// short by a crash is removed at start with a log line; an edited line, or
+/// a record of another key, stops the start; two signers never write one
+/// record.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_cannot_be_lost_cut_torn_or_shared() {
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let (a, b) = (keypair("owner"), keypair("another holder"));
+
+	// Lost: no record, no start; one is made on purpose, once.
+	let e = Run::start(&dir, "lost", genesis, &record, "exec ").err().expect("no start without a record");
+	println!("(a) no record: {}", e);
+	assert!(e.contains("exit Some(2)") && e.contains("there is no record here"), "{}", e);
+	assert!(!record.exists(), "nothing was made in passing");
+	let made = common::signer::create_record(&key, genesis, &record);
+	assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+	println!("(a) --create-record: {}", String::from_utf8_lossy(&made.stderr).trim());
+	let again = common::signer::create_record(&key, genesis, &record);
+	assert_eq!(again.status.code(), Some(2));
+	println!("(a) --create-record again: {}", String::from_utf8_lossy(&again.stderr).trim());
+	assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
+
+	// Entries 1 and 2, the database told each.
+	let run = Run::start(&dir, "one", genesis, &record, "exec ").unwrap();
+	let e1 = ask(&run.socket, &rebind_line(&a, genesis, [1; 32], asset, 1, None)).await.unwrap();
+	assert_eq!(e1.0, 1);
+	let at_one = std::fs::read(&record).unwrap();
+	let e2 = ask(&run.socket, &rebind_line(&a, genesis, [2; 32], asset, 1, Some(e1))).await.unwrap();
+	assert_eq!(e2.0, 2);
+	println!("entries 1 and 2 recorded; the database knows entry 2");
+
+	// Shared: a second signer on the same record does not start.
+	let e = Run::start(&dir, "two", genesis, &record, "exec ").err().expect("a second signer on one record does not start");
+	println!("(d) a second signer on the same record: {}", e);
+	assert!(e.contains("exit Some(2)") && e.contains("held by another signer"), "{}", e);
+	run.stop();
+
+	// Cut back: the record as it was after entry 1. The signer starts (it
+	// cannot know), but the first request naming entry 2 is refused, and
+	// from then on it signs nothing: not the second spend of the leaf under
+	// salt 2 it would otherwise sign again, nor anything else.
+	std::fs::write(dir.join("whole.record"), std::fs::read(&record).unwrap()).unwrap();
+	std::fs::write(&record, &at_one).unwrap();
+	let run = Run::start(&dir, "cut", genesis, &record, "exec ").unwrap();
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [2; 32], asset, 2, Some(e2))).await.unwrap_err();
+	println!("(b) the record cut back to entry 1, the database knowing entry 2: {} {}", e.0, e.1);
+	assert_eq!(e.0, "record_behind", "{}", e.1);
+	let e = ask(&run.socket, &rebind_line(&b, genesis, [9; 32], asset, 1, None)).await.unwrap_err();
+	println!("(b) then anything else: {} {}", e.0, e.1);
+	assert_eq!(e.0, "record_behind");
+	run.stop();
+	std::fs::write(&record, std::fs::read(dir.join("whole.record")).unwrap()).unwrap();
+
+	// Another record: a copy taken after entry 1 and written on by another
+	// signer has another entry 2.
+	let copy = dir.join("copy.record");
+	std::fs::write(&copy, &at_one).unwrap();
+	let other = Run::start(&dir, "copy", genesis, &copy, "exec ").unwrap();
+	let c2 = ask(&other.socket, &rebind_line(&b, genesis, [7; 32], asset, 1, Some(e1))).await.unwrap();
+	assert_eq!(c2.0, 2);
+	let e = ask(&other.socket, &rebind_line(&b, genesis, [8; 32], asset, 1, Some(e2))).await.unwrap_err();
+	println!("(d) a copy written by another signer, asked with the database's entry 2: {} {}", e.0, e.1);
+	assert_eq!(e.0, "record_differs", "{}", e.1);
+	other.stop();
+
+	// A write that fails (the disk full: a file size limit just past the
+	// record) is undone at once; with room again the next entry is whole.
+	let size = std::fs::metadata(&record).unwrap().len();
+	let limited = Run::start(&dir, "full", genesis, &record, &format!("trap '' XFSZ; exec prlimit --fsize={}:unlimited ", size + 100))
+		.unwrap();
+	let pid = limited.child.id().to_string();
+	let e = ask(&limited.socket, &rebind_line(&a, genesis, [3; 32], asset, 1, Some(e2))).await.unwrap_err();
+	println!("(c) a write past the limit: {}", e.1);
+	assert!(e.1.contains("could not be written") && e.1.contains("removed"), "{}", e.1);
+	let bytes = std::fs::read(&record).unwrap();
+	assert_eq!(bytes.len() as u64, size, "the line cut short is gone at once");
+	assert!(bytes.ends_with(b"\n"));
+	let raised = Command::new("prlimit").args(["--pid", &pid, "--fsize=unlimited:unlimited"]).status().unwrap();
+	assert!(raised.success());
+	let e3 = ask(&limited.socket, &rebind_line(&a, genesis, [3; 32], asset, 1, Some(e2))).await.unwrap();
+	assert_eq!(e3.0, 3, "the next entry follows entry 2");
+	limited.stop();
+	let run = Run::start(&dir, "after", genesis, &record, "exec ").unwrap();
+	println!("(c) room again: entry 3 written whole, and the signer starts on the record: {}", run.log().trim());
+	run.stop();
+
+	// A line cut short by a crash is removed at start, which says so, and
+	// the next entry follows the last whole one.
+	let mut f = std::fs::OpenOptions::new().append(true).open(&record).unwrap();
+	std::io::Write::write_all(&mut f, format!("4 spend {}", "05".repeat(20)).as_bytes()).unwrap();
+	drop(f);
+	let run = Run::start(&dir, "crash", genesis, &record, "exec ").unwrap();
+	let log = run.log();
+	println!("(c) a line cut short by a crash, at start: {}", log.lines().next().unwrap_or(""));
+	assert!(log.contains("cut short") && log.contains("removed"), "{}", log);
+	let e4 = ask(&run.socket, &rebind_line(&a, genesis, [4; 32], asset, 1, Some(e3))).await.unwrap();
+	assert_eq!(e4.0, 4);
+	run.stop();
+
+	// An edited line stops the start: its running hash no longer follows.
+	let text = std::fs::read_to_string(&record).unwrap();
+	let edited = text.replacen(&"02".repeat(32), &"0a".repeat(32), 1);
+	assert_ne!(edited, text);
+	std::fs::write(&record, edited).unwrap();
+	let e = Run::start(&dir, "edited", genesis, &record, "exec ").err().expect("no start on an edited record");
+	println!("(b) an edited line: {}", e);
+	assert!(e.contains("running hash does not follow"), "{}", e);
+	std::fs::write(&record, text).unwrap();
+
+	// A record of another key does not start under this one.
+	let other_key = keypair("another operator");
+	std::fs::write(&key, other_key.secret_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>()).unwrap();
+	let e = Run::start(&dir, "key", genesis, &record, "exec ").err().expect("no start on another key's record");
+	println!("a record of another key: {}", e);
+	assert!(e.contains("another operator key"), "{}", e);
+	std::fs::remove_dir_all(&dir).unwrap();
 }

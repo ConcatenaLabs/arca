@@ -39,11 +39,22 @@ pub fn key_file(dir: &std::path::Path, key: &Keypair, mode: u32) -> PathBuf {
 	path
 }
 
+/// Makes a new record at `record` for the key in `key_file`, as an operator
+/// does once for a new key: the signer's output.
+pub fn create_record(key_file: &std::path::Path, genesis: BlockHash, record: &std::path::Path) -> std::process::Output {
+	Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+		.args(["--key-file", key_file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
+			"--create-record"])
+		.output().unwrap()
+}
+
 impl SignerProcess {
 	pub fn start(key: &Keypair, genesis: BlockHash) -> SignerProcess {
 		let dir = signer_dir();
 		let file = key_file(&dir, key, 0o600);
 		let socket = dir.join("signer.sock");
+		let made = create_record(&file, genesis, &dir.join("signer.record"));
+		assert!(made.status.success(), "the signer's record: {}", String::from_utf8_lossy(&made.stderr));
 		let child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
 				"--record", dir.join("signer.record").to_str().unwrap()])

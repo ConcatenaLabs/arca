@@ -2,8 +2,8 @@
 //!
 //! The schema is `schema/V1__arca.sql` and the migrations after it
 //! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`,
-//! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`), built
-//! from nothing by [`Store::connect`] and
+//! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
+//! `schema/V6__signer_head.sql`), built from nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), a leaf
@@ -63,6 +63,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(3, include_str!("../../schema/V3__operator_scripts.sql")),
 	(4, include_str!("../../schema/V4__participation_waiting.sql")),
 	(5, include_str!("../../schema/V5__leaf_salt.sql")),
+	(6, include_str!("../../schema/V6__signer_head.sql")),
 ];
 
 /// An arbitrary key for the advisory lock that serialises migrations.
@@ -171,6 +172,31 @@ impl Store {
 			}
 		}
 		tx.commit().await?;
+		Ok(())
+	}
+
+	/// The latest entry of the signer's record the server was given: its
+	/// number and running hash; `None` before the first.
+	pub async fn signer_head(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let row = conn.query_opt("SELECT entry, hash FROM signer_head", &[]).await?;
+		row.map(|r| {
+			let n: i64 = r.get(0);
+			Ok((u64::try_from(n).map_err(|_| StoreError::Corrupt(format!("entry {}", n)))?, array32(r.get(1), "hash")?))
+		}).transpose()
+	}
+
+	/// Remembers entry `entry` of the signer's record, with its running
+	/// hash, when it is later than the one remembered.
+	pub async fn set_signer_head(&self, entry: u64, hash: &[u8; 32]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		let n = i64::try_from(entry).map_err(|_| StoreError::Corrupt(format!("entry {}", entry)))?;
+		conn.execute(
+			"INSERT INTO signer_head (one, entry, hash) VALUES (true, $1, $2)
+			 ON CONFLICT (one) DO UPDATE SET entry = EXCLUDED.entry, hash = EXCLUDED.hash, updated_at = now()
+			 WHERE signer_head.entry < EXCLUDED.entry",
+			&[&n, &&hash[..]],
+		).await?;
 		Ok(())
 	}
 
