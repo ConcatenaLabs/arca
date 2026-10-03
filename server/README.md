@@ -1046,7 +1046,9 @@ taken mid-round, the round final and the forfeit not yet handed over, does
 not start either, naming the forfeit; the latest state starts. A round
 built after the copy makes the server refuse to start on it, naming the
 round. A forfeit whose operator's half was never stored is given it at
-start, and the signer's record does not grow.
+start, and the signer's record does not grow. A copy older than twelve
+entries is refused naming the first ten, the check stopping there rather
+than read the whole of a long record against it.
 
 `tests/limits.rs` bounds what the calls anyone may make leave behind: junk
 boards whose transactions the node refuses leave no row and nothing in the
