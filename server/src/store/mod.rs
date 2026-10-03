@@ -26,6 +26,7 @@ mod coins;
 mod mailbox;
 mod nursery;
 mod participations;
+mod rounds;
 mod transfers;
 mod wallet;
 
@@ -37,6 +38,9 @@ pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
 	NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, WantedKind,
+};
+pub use rounds::{
+	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, Placement, RoundRow, RoundState, StoredReserve,
 };
 pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};

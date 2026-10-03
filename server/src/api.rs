@@ -395,3 +395,71 @@ pub struct ParticipationOutputStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub offboard_vout: Option<u32>,
 }
+
+/// `POST /v1/tree`: the published tree of the batch paid by output `vout` of
+/// the round `txid`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeRequest {
+	pub txid: String,
+	pub vout: u32,
+}
+
+/// A batch as the operator publishes it: everything the tree builder takes,
+/// so anyone rebuilds every script of the tree, and where the round put it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedTree {
+	pub round_txid: String,
+	pub batch_vout: u32,
+	/// The output holding the batch's sweep token, at its first clock.
+	pub token_vout: u32,
+	/// The round's connector output.
+	pub connector_vout: u32,
+	pub asset: String,
+	pub genesis_hash: String,
+	/// The clock schedule `(T, S, W, E_0 … E_K)`, in arca-covenant's
+	/// canonical encoding.
+	pub schedule: String,
+	pub burn: bool,
+	pub radix: u32,
+	pub reserve: TreeReserve,
+	pub min_leaf: String,
+	/// Every leaf, in the tree's order.
+	pub leaves: Vec<TreeLeaf>,
+}
+
+/// The tree's reserve rule: `{"fee_rate": …}` or `{"fixed": …}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TreeReserve {
+	FeeRate(FeeRateReserve),
+	Fixed(FixedReserve),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeeRateReserve {
+	/// The floor per 1,000 vbytes, in the batch asset's atoms.
+	pub floor_per_kvb: String,
+	pub multiple: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedReserve {
+	pub node: String,
+	pub entry: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeLeaf {
+	pub template: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub operator_nonce: String,
+	pub exit_delay_units: u16,
+	pub value: String,
+	pub unlock_hash: String,
+}

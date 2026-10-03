@@ -59,7 +59,7 @@ async fn participation_accepted_and_refused() {
 	let a = keypair("A");
 	let (a_coin, _) = credited_board(&mut r, &a).await;
 	let b = keypair("B");
-	let (b_coin, _) = credited_board(&mut r, &b).await;
+	let (b_coin, b_tx) = credited_board(&mut r, &b).await;
 
 	// A board never expires, so its refresh pays the whole fee.
 	let fee = VALUE * REFRESH_PPM / 1_000_000;
@@ -177,6 +177,12 @@ async fn participation_accepted_and_refused() {
 	let (w, _) = want_leaf(&b2, x, 2 * VALUE - 2 * fee);
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin, &b_coin], &[w], &[(x, 2 * fee)], None, s, chain).0), 400, "malformed");
 	refused(r.http.post("participation_status", &json!({"participation_id": hex(&[9; 32])})), 404, "unknown_participation");
+
+	// A transfer paying a key a participation wants: the key is promised.
+	let b_valid = b_coin.record.resolve(std::slice::from_ref(&b_tx), &r.policy()).unwrap();
+	let promised = arca_covenant::NewLeaf { owner: xonly(&a2), owner_nonce: random32(), creator_nonce: random32(), exit_delay: common::client::exit_delay() };
+	let body = common::client::transfer_body(&[(&b_coin, b_valid, VALUE - 2_000)], &[(x, VALUE - 4_000, promised)], s, chain);
+	refused(r.http.post("cosign_transfer", &body), 409, "key_reused");
 
 	// B, honestly, half to a new leaf and half offboard to an address of its
 	// own: the offboard pays its percentage and its output's margin.

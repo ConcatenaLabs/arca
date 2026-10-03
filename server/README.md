@@ -42,9 +42,12 @@ requests can race past them:
 - **Reassignments.** Every reassignment the server co-signed, kept by the hash
   of its output 0's record with its inputs and outputs: the merge rule below
   reads them, so it survives a restart.
-- **The chain as the server saw it**, rounds and their connector outputs,
-  participations and forfeits, mailboxes, authentication challenges, the
-  on-chain wallet's coins and the server's own transactions.
+- **Rounds**, each kept whole with its batches, every leaf the tree builder
+  took for each, its offboard outputs and its connector output: what the
+  server publishes and what it broadcasts again after a rollback.
+- **The chain as the server saw it**, participations and forfeits,
+  mailboxes, authentication challenges, the on-chain wallet's coins and the
+  server's own transactions.
 
 Back up the database: it holds what the chain does not, such as which leaves
 were spent off-chain and the records receivers collect from their mailboxes.
@@ -208,6 +211,53 @@ coin's asset, or one atom when the node does not accept that asset for fees.
 An offboard's output may be reclaimed by the operator after a delay longer than
 unrolling the coin given up, its exit delay, the refund delay and a margin.
 
+## Rounds
+
+At each round (every `round_interval_seconds` while participations wait) the
+runner gathers the pending participations whose earliest round time has
+come, checks each coin they give up again, and builds one tree per asset with
+`arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
+the lowest nodes, each leaf behind its participation's hash-locked entry, the
+reserve at four times the node's floor in the batch asset (one atom where the
+node does not accept the asset for fees, so whoever unrolls attaches a fee
+coin). A batch holds at most 1,024 leaves; a participation runs whole in one
+round, its leaves in several assets included. Each batch has its own sweep
+token, one explicit atom with no reissuance token, issued by one of the
+operator's coins, and a clock schedule of three steps, 28, 56 and 84 days
+after the round's median time, with a notice of 36 hours.
+
+The round transaction pays each batch output followed by its token's atom at
+the batch's first clock, then every offboard output, then the connector
+output, then change per asset and the one fee output. It spends the
+operator's coins only: a round that carries forfeits takes no input of a
+third party, which could be spent elsewhere and keep the round from
+returning after a rollback. Its lock time is 0 and every input final, and it
+is kept byte for byte, so the nursery broadcasts it again unchanged and it
+returns with its txid, every forfeit signed for it still good. Its fee is
+paid in one asset: the first of its own batches' assets, in the order of
+`fee_assets`, that the node accepts for fees now, else the first asset of
+`fee_assets` it accepts; never another, and never one the node refuses.
+
+Before it records anything the runner checks its work as a wallet would:
+every leaf's record validates against the transaction under the acceptance
+policy (the five checks on the token and its clock among them), the connector
+output is the operator's, each offboard output is paid once, the lock time is
+0, and the node would accept the transaction now. Then the round, its
+batches, each leaf (a pending coin until its owner hands over its forfeits)
+and every participation's move to `issued` are recorded in one database
+transaction, and the round goes to the nursery. A participation one of whose
+keys has come to own a leaf meanwhile cannot run; it is voided and the coins
+it gave up are live again, since nothing was signed for them.
+
+Every batch is published by `tree`: the round, the batch output, its token's
+output and the round's connector output, the asset, the schedule in
+`arca-covenant`'s canonical encoding, burn-only or not, the radix, the
+reserve rule and the smallest leaf, and every leaf as the builder took it
+(template, owner key and nonce, operator nonce, exit delay, value, unlock
+hash). From that alone a wallet, an explorer or any mirror rebuilds every
+script of the tree with `Tree::build` and checks the leaf it cares about
+against the round transaction with `LeafRecord::validate`.
+
 ## The interface
 
 JSON over HTTP, every call under `/v1/`, so the server sits behind one
@@ -228,7 +278,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
 | `POST submit_participation` | Accepts a participation in a round |
-| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`), its unlock hash, its forfeits' refund delay and margins, and its outputs |
+| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it |
+| `POST tree` | The published tree of a batch, by its round's txid and output |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
 | `POST leaf_data` | The leaves a key owns, with their records |
 
@@ -241,7 +292,7 @@ challenge to one use. There is no bearer token. `cosign_transfer` is
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
-of its request.
+of its request, and `tree` is public.
 
 ## The signer
 
@@ -262,8 +313,8 @@ The server checks each signature it gets back against the message it built.
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
 address, the database, the signer's socket, the wallet's mnemonic file, the
 node's RPC, the finality rule, the exit-delay bounds, the assets served
-with their smallest leaf, the assets a round's fee is paid in, and the fee
-schedule. The node must run with `-txindex` and
+with their smallest leaf, how often a round is built, the assets a round's
+fee is paid in, and the fee schedule. The node must run with `-txindex` and
 `-validateanchor`.
 
 ## The on-chain wallet
@@ -293,7 +344,13 @@ signer signs every input.
 - **Round-shaped transactions** carry the round's connector output, whose only
   spend is the issuance of the round's connector asset
   (`arca_covenant::ConnectorPolicy`), right after the outputs they pay, then
-  change per asset, then the one fee output.
+  change per asset, then the one fee output. A round transaction also issues
+  each batch's sweep token from one of the wallet's coins per batch, those
+  coins first among its inputs; each token's id follows from that coin's
+  outpoint and a zero contract hash. The token is issued with denomination 8,
+  which is what the kit's PSET signs an issuance as, and the wallet sets the
+  PSET's output index of an issuing input back to the outpoint's own (the kit
+  keeps the issuance flag in it).
 
 ## The nursery
 
@@ -347,6 +404,15 @@ is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
+
+`tests/rounds.rs` turns participations in two assets, X listed for fees and
+Y not, into one round: a batch and a token per asset, an offboard, the
+connector, nLockTime 0, the operator's coins only, the fee in X, the wallet
+holding no policy asset. Once the round is final, each owner validates its
+new leaf from the published tree alone, and a published tree with a leaf's
+value or unlock hash, the last expiry, the clock's order or the reserve rule
+changed is refused. It also builds rounds of 1, 4 and 16 leaves and prints
+their sizes.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

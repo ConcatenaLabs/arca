@@ -293,6 +293,36 @@ impl Store {
 		read_participation(&*conn, id).await
 	}
 
+	/// Voids the pending participation `id`, which no round has taken: the
+	/// coins it gave up are live again, since nothing was signed for them.
+	/// Returns whether it was pending and never in a round.
+	pub async fn void_participation(&self, id: &[u8; 32]) -> Result<bool, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let n = t.execute(
+			"UPDATE participation SET state = 'void', updated_at = now()
+			 WHERE participation_id = $1 AND state = 'pending' AND attempt = 0",
+			&[&&id[..]],
+		).await?;
+		if n != 1 {
+			return Ok(false);
+		}
+		t.execute(
+			"UPDATE leaf SET state = 'live', spent_by = NULL, updated_at = now()
+			 WHERE spent_by = $1 AND state = 'spent'
+			   AND leaf_id IN (SELECT leaf_id FROM participation_input WHERE participation_id = $1)",
+			&[&&id[..]],
+		).await?;
+		t.commit().await?;
+		Ok(true)
+	}
+
+	/// Whether `key` owns a leaf that is not lost.
+	pub async fn key_owns_leaf(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state <> 'lost'", &[&&key[..]]).await?.is_some())
+	}
+
 	/// The ids of the participations in `state`, oldest first.
 	pub async fn participations_in(&self, state: ParticipationState) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;

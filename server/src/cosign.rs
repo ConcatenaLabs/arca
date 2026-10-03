@@ -112,6 +112,8 @@ pub enum CosignError {
 	DoubleSpend(LeafId),
 	#[error("leaf {0} rests on a board that is not credited: its transaction is not final")]
 	BoardNotFinal(LeafId),
+	#[error("leaf {0} rests on a leaf of a round that is not final")]
+	RoundNotFinal(LeafId),
 	#[error("leaf {leaf}: {what} is on-chain, so its owner could take it under the receiver; the server co-signs no off-chain spend of it")]
 	OnChain { leaf: LeafId, what: String },
 	#[error("the new coins would be {hops} reassignments from a round or a board; the limit is {limit}: refresh in a round first")]
@@ -152,6 +154,7 @@ impl CosignError {
 			NotLive(..) => "not_live",
 			DoubleSpend(_) => "double_spend",
 			BoardNotFinal(_) => "board_not_final",
+			RoundNotFinal(_) => "round_not_final",
 			OnChain { .. } => "on_chain",
 			DepthLimit { .. } => "depth_limit",
 			OutOfBounds(_) => "out_of_bounds",
@@ -187,6 +190,7 @@ impl From<CoinError> for CosignError {
 			CoinError::NotLive(id, state) => CosignError::NotLive(id, state),
 			CoinError::Spent(id) => CosignError::DoubleSpend(id),
 			CoinError::BoardNotFinal(id) => CosignError::BoardNotFinal(id),
+			CoinError::RoundNotFinal(id) => CosignError::RoundNotFinal(id),
 			CoinError::OnChain { leaf, what } => CosignError::OnChain { leaf, what },
 			CoinError::InvalidCoin { leaf, error } => CosignError::InvalidCoin { leaf, error },
 			CoinError::Store(e) => e.into(),
@@ -247,7 +251,7 @@ impl Cosigner {
 	/// server's policy, its boards credited and unspent, nothing of its
 	/// lineage on-chain ([`crate::coins::check`]).
 	async fn check_input(&self, id: &LeafId, transfer: &[u8; 32], now: MedianTime) -> Result<Checked, CosignError> {
-		Ok(coins::check(&self.store, &self.params, id, transfer, now).await?)
+		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer).await?)
 	}
 
 	/// Co-signs `req`: see the [module documentation](self).

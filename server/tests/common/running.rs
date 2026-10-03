@@ -63,6 +63,8 @@ impl Running {
 			fee_multiple: 2,
 			max_request_bytes: 64 * 1024,
 			challenge_ttl_seconds: 120,
+			// The tests build each round by hand.
+			round_interval_seconds: 0,
 			node: NodeConfig {
 				rpc_url: format!("http://127.0.0.1:{}/", rt.node.rpc_port()),
 				cookie_file: None, rpc_user: Some("arca".into()), rpc_password: Some("arca".into()),
@@ -130,11 +132,25 @@ impl Running {
 	/// A board of `value` of X for `owner`, paid and registered over HTTP;
 	/// its transaction, and the answer.
 	pub fn board(&mut self, owner: &Keypair, value: u64) -> (arca_covenant::BoardRecord, Transaction, Value) {
+		self.board_in(owner, self.x, value)
+	}
+
+	/// [`Running::board`] in `asset`.
+	pub fn board_in(&mut self, owner: &Keypair, asset: AssetId, value: u64) -> (arca_covenant::BoardRecord, Transaction, Value) {
 		let nonce = self.http.operator_nonce();
-		let record = super::client::board_record(owner, nonce, self.x, value, self.chain, self.s.x_only_public_key().0);
-		let coin = self.purse.take_coin(self.x);
-		let tx = super::client::board_tx(&record, &coin, 2_000, node::op_true());
-		self.purse.put((OutPoint::new(tx.txid(), 1), tx.output[1].clone()));
+		let record = super::client::board_record(owner, nonce, asset, value, self.chain, self.s.x_only_public_key().0);
+		// The fee in X, which the node accepts: a board in another asset
+		// takes an X coin as well.
+		let mut coins = vec![self.purse.take_coin(asset)];
+		if asset != self.x {
+			coins.push(self.purse.take_coin(self.x));
+		}
+		let tx = record.tx(&coins, self.x, 2_000, &node::op_true()).unwrap().tx;
+		for (j, o) in tx.output.iter().enumerate().skip(1) {
+			if !o.is_fee() {
+				self.purse.put((OutPoint::new(tx.txid(), j as u32), o.clone()));
+			}
+		}
 		self.rt.client().send_raw_transaction(&tx).unwrap();
 		let answer = self.http.register_board(&record, &tx).ok();
 		(record, tx, answer)
@@ -142,8 +158,14 @@ impl Running {
 
 	/// Pays the server's wallet `amount` of X.
 	pub async fn fund_wallet(&mut self, amount: u64) {
+		let x = self.x;
+		self.fund_wallet_in(x, amount).await;
+	}
+
+	/// Pays the server's wallet `amount` of `asset`, in one coin.
+	pub async fn fund_wallet_in(&mut self, asset: AssetId, amount: u64) -> Transaction {
 		let to = self.server.wallet.receive_script().await.unwrap();
-		tokio::task::block_in_place(|| self.purse.pay(&self.rt, vec![explicit_txout(AssetAmount::new(self.x, amount), to)]));
+		tokio::task::block_in_place(|| self.purse.pay(&self.rt, vec![explicit_txout(AssetAmount::new(asset, amount), to)]))
 	}
 
 	/// Whether the node holds `txid`'s output `vout` unspent.

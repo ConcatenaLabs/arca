@@ -240,3 +240,48 @@ pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(A
 	}
 	(body, id)
 }
+
+// ---------------------------------------------------------------------------
+// Published trees
+// ---------------------------------------------------------------------------
+
+use arca_covenant::encode::Encoding;
+use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
+use arca_covenant::ClockSchedule;
+
+/// The tree a published batch describes, rebuilt by the wallet from the
+/// published parts alone with `arca-covenant`'s builder.
+pub fn rebuild(t: &Value) -> Tree {
+	try_rebuild(t).unwrap()
+}
+
+/// [`rebuild`], or why the builder refuses the parts.
+pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
+	let s = |k: &str| t[k].as_str().unwrap_or_else(|| panic!("{} in {}", k, t)).to_string();
+	let num = |v: &Value| v.as_str().unwrap().parse::<u64>().unwrap();
+	let reserve = if let Some(r) = t["reserve"].get("fee_rate") {
+		ReserveRule::FeeRate { floor_per_kvb: num(&r["floor_per_kvb"]), multiple: num(&r["multiple"]) }
+	} else {
+		let r = &t["reserve"]["fixed"];
+		ReserveRule::Fixed { node: num(&r["node"]), entry: num(&r["entry"]) }
+	};
+	let params = TreeParams {
+		asset: s("asset").parse().unwrap(),
+		chain: Chain::new(s("genesis_hash").parse().unwrap()),
+		schedule: ClockSchedule::decode(&unhex(&s("schedule"))).map_err(|e| e.to_string())?,
+		burn: t["burn"].as_bool().unwrap(),
+		radix: t["radix"].as_u64().unwrap() as usize,
+		reserve,
+		min_leaf: num(&t["min_leaf"]),
+	};
+	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
+		template: l["template"].as_str().unwrap().parse().unwrap(),
+		owner: XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap())).unwrap(),
+		value: num(&l["value"]),
+		owner_nonce: unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
+		operator_nonce: unhex(l["operator_nonce"].as_str().unwrap()).try_into().unwrap(),
+		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
+	}).collect();
+	Tree::build(params, &leaves).map_err(|e| e.to_string())
+}
