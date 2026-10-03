@@ -11,7 +11,7 @@ use elements::{AssetId, OutPoint, Script};
 use serde_json::{json, Value};
 
 use arca_covenant::spend::{margin_for, FeeSource};
-use arca_covenant::{CoinRecord, ExplicitOutput, NewLeaf, Pair, RelativeTime, TransferPlan, ValidCoin, ValidInput};
+use arca_covenant::{CoinRecord, ExplicitOutput, NewLeaf, Pair, RelativeTime, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::CoinRow;
@@ -200,10 +200,16 @@ impl Wallet {
 		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay() })
 	}
 
-	/// The live coins of `asset`, largest first, each resolved.
+	/// The live coins of `asset`, largest first, each resolved; a coin past
+	/// its exit deadline is not paid on (the operator takes it only into a
+	/// refresh).
 	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
+		let now = self.now()?.to_consensus_u32() as u64;
 		for row in self.store.coins_in("live")?.into_iter().filter(|c| c.asset == asset.to_string()) {
+			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
+				continue;
+			}
 			let (_, a) = self.held(&row)?;
 			if !a.all_final() {
 				continue;
@@ -498,6 +504,15 @@ impl Wallet {
 			return Err(Error::Refused(format!("the coin's salt is that of coin {} the wallet has held: its old pairs would spend it", c.leaf_id)));
 		}
 		a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).map_err(|e| Error::Refused(e.to_string()))?;
+		// A coin resting on a board carries the board's dates: past its exit
+		// deadline the operator co-signs no spend of it.
+		let board_expiry = self.board_expiry(&record, &a.bases)?;
+		if let Some(e) = board_expiry {
+			if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64 {
+				return Err(Error::Refused(format!("the coin rests on a board whose exit deadline has passed (its service ends at median time \
+					{}): the operator co-signs no spend of it, and takes it only into a refresh", e)));
+			}
+		}
 		let lineage: BTreeSet<Script> = a.valid.lineage().into_iter().map(|o| o.output.script_pubkey).collect();
 		let seen = self.chain.scripts_seen(&lineage, a.lowest_height())?;
 		a.valid.check_lineage(|s| seen.contains(s)).map_err(|e| Error::Refused(e.to_string()))?;
@@ -523,8 +538,19 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
-		Ok(json!({"leaf_id": id, "kind": kind_of(&record), "asset": a.valid.asset.to_string(), "value": a.valid.value.to_string(),
-			"hops": a.valid.hops, "state": state, "note": note, "from": source}))
+		let mut out = json!({"leaf_id": id, "kind": kind_of(&record), "asset": a.valid.asset.to_string(), "value": a.valid.value.to_string(),
+			"hops": a.valid.hops, "state": state, "note": note, "from": source});
+		if super::wallet::rests_on_board(&record) {
+			out["board"] = match board_expiry {
+				Some(e) => json!({"exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE), "expiry": e,
+					"note": "the coin rests on a board, which carries the dates of a batch made when it confirmed: pay it on or refresh it \
+					before its exit deadline; after it the operator takes it only into a refresh, until a day before its expiry, and from \
+					the expiry it may bring the coin on the chain"}),
+				None => json!({"note": "the coin rests on a board not yet in a block: it carries the dates of a batch made when the board \
+					confirms, shown once it does"}),
+			};
+		}
+		Ok(out)
 	}
 
 	/// Reads the wallet's mailbox, and the mailbox of every key of a receive

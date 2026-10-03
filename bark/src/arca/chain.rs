@@ -144,6 +144,13 @@ impl ChainSource {
 		}
 	}
 
+	/// The median time of the active chain's block at `height`.
+	pub fn median_time_at(&self, height: u64) -> Result<Option<u32>, Error> {
+		let Some(hash) = self.block_hash(height)? else { return Ok(None) };
+		let v: Value = self.client.call("getblockheader", &[json!(hash.to_string()), json!(true)]).map_err(node)?;
+		Ok(v["mediantime"].as_u64().map(|t| t.min(u32::MAX as u64) as u32))
+	}
+
 	/// Whether `txid` is in a block of the active chain, and whether it is in
 	/// the mempool: a cheap look, without the finality of the block.
 	pub fn whereabouts(&self, txid: &Txid) -> Result<(bool, bool), Error> {

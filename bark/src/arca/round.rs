@@ -157,11 +157,19 @@ impl Wallet {
 		let mut ids = vec![];
 		let mut coins = vec![];
 		for r in &rows {
-			let (_, a) = self.held(r)?;
+			let (record, a) = self.held(r)?;
 			if !a.all_final() {
 				return Err(Error::Refused(format!("coin {} is not final: {}", r.leaf_id, a.waiting())));
 			}
-			let (value, expiry) = (a.valid.value, a.valid.expiry.to_consensus_u32());
+			// A coin resting on a board counts from the board's dates, and is
+			// taken into a refresh until a day before the board's expiry.
+			let (value, expiry) = (a.valid.value, self.service_expiry(&record, &a)?);
+			if let Some(b) = self.board_expiry(&record, &a.bases)? {
+				if now.to_consensus_u32() as u64 + super::wallet::BOARD_REFRESH_UNTIL as u64 >= b as u64 {
+					return Err(Error::Refused(format!("coin {} rests on a board whose service ends at median time {}: the operator takes \
+						it into a refresh only until a day before; exit it", r.leaf_id, b)));
+				}
+			}
 			let fee = refresh_fee(&info["fees"], value, expiry, now.to_consensus_u32());
 			let free = in_free_window(expiry, now.to_consensus_u32());
 			let bound = max_fee_ppm.unwrap_or(if free { 0 } else { DEFAULT_MAX_FEE_PPM });
@@ -888,7 +896,7 @@ mod tests {
 		assert!(!in_free_window(e, e - deadline - FREE_WINDOW - 1));
 		assert!(in_free_window(e, e - deadline - FREE_WINDOW));
 		assert!(in_free_window(e, e - deadline));
-		// A board never expires.
+		// A coin with no expiry known yet: a board in no block.
 		assert!(!in_free_window(u32::MAX, e));
 	}
 

@@ -183,7 +183,18 @@ board leaves nothing behind, its nonce included.
 
 A registered board goes into the nursery and is credited, its leaf becoming
 the owner's to spend off-chain, only once the finality service calls its
-transaction final. A rollback that takes a credited board out uncredits it at
+transaction final.
+
+A board, and every coin resting on it, carries the dates of a batch made
+when the board confirmed: its service expiry is 28 days after the median
+time of the block that holds its transaction, and its exit deadline three
+days before that (`board_status`, `info.boards`). Up to the exit deadline the
+server co-signs spends of a coin resting on the board; after it, it takes the
+coin only into a refresh, up to a day before the expiry. Past its expiry a
+coin resting on the board is the owner's to take on-chain, and the operator
+may bring its lineage on the chain to collect a coin of it that was given up
+(see the watcher). A rollback that moves the board's transaction to another
+block moves its dates with it. A rollback that takes a credited board out uncredits it at
 once; the nursery broadcasts the same transaction again and the board is
 credited again when final again. A board whose transaction can no longer
 confirm is lost, and so is one never credited whose transaction is still in
@@ -202,6 +213,8 @@ asset and a value. The server co-signs only when every rule holds:
 - each input is live (a board once credited) and spent by nothing else: a
   second spend of a leaf is refused, which is the whole of the double-spend
   protection before a round;
+- each input resting on a board is before the board's exit deadline
+  (`invalid_coin` after it: the coin is taken only into a refresh);
 - nothing of the coin's lineage, its own leaf included, has been seen paid on
   the chain, in a block or in the mempool, and every board it rests on is
   credited and unspent: an Arca leaf on the chain past its exit delay can be
@@ -264,8 +277,11 @@ a value and the on-chain script to pay). The server accepts it only when:
   live, given up nowhere else, its record valid, every board it rests on
   credited and unspent, nothing of its lineage on the chain, and its first
   expiry at least three days ahead: a coin is taken only up to its exit
-  deadline. Its attestation verifies, and an earliest round time asked for
-  lies before every coin's exit deadline;
+  deadline. A coin resting on a board is taken past the board's exit
+  deadline, until a day before the board's expiry: after the deadline a
+  refresh is the one way it is taken. Its attestation verifies, and an
+  earliest round time asked for lies before the last time every coin is
+  taken;
 - every leaf wanted is within the published bounds, under a key that owns no
   leaf, that no other participation wants and that is not the operator's `S`
   (`operator_key`); every offboard pays a served
@@ -295,7 +311,8 @@ offboard, costs nothing in the free window, the two days before a coin's exit
 deadline (from five days before its first expiry to three days before it, when
 the server stops taking it), and rises with the time left beyond the window to
 `refresh_ppm` parts per million of the coin's value for a coin 23 days or more
-beyond it; a coin from boards alone never expires and pays the whole of it. An
+beyond it; a coin resting on a board counts from the board's service expiry
+when that comes first (see Boards). An
 offboard adds `offboard_ppm` of what it pays out and the margin its on-chain
 output holds for its unlock.
 
@@ -491,9 +508,9 @@ one, nor for a reclaim before an owner under it has released.
   checkpoint it spends is on the chain. A board given up and then converted
   is the same case: its leaf appears. The answer confirms within the leaf's
   exit delay, after which its owner's exit finds the leaf spent.
-- **Boards given up in a round.** A board never expires, so once the round it
-  was given up for is final the watcher publishes its forfeit from the board
-  output itself, and claims it. Every forfeit's refund clock starts when it
+- **Boards given up in a round.** No batch sweeps a board, so once the round
+  it was given up for is final the watcher publishes its forfeit from the
+  board output itself, and claims it. Every forfeit's refund clock starts when it
   confirms, and a round may give up thousands of boards, so the watcher
   publishes them no faster than it can claim them: a new one goes out only
   while the watcher's own transactions waiting for a block stay within
@@ -501,11 +518,20 @@ one, nor for a reclaim before an owner under it has released.
   its claim can follow within its refund delay at `block_interval_seconds`
   apart. The rest wait for the next pass, and each pass says how many wait.
   The round's atom of its connector asset is issued with its first board
-  forfeit, so it is held by the time the forfeits confirm. A coin of a transfer given up in a final round
-  whose lineage rests on boards alone never expires either: the watcher
-  publishes each board's checkpoint from the board output, and the answers to
-  stale exits carry it through each reassignment to the coin's forfeit. A coin
-  resting on a batch leaf is left to that batch's sweep.
+  forfeit, so it is held by the time the forfeits confirm. A coin of a
+  transfer given up in a final round whose lineage rests on boards alone is
+  swept by no batch either: the watcher publishes each board's checkpoint
+  from the board output, and the answers to stale exits carry it through
+  each reassignment to the coin's forfeit. That lineage is shared: each
+  reassignment on it made other coins too (a sender's change, say), which
+  land on the chain with it, and so do the coins those were spent into. So
+  the watcher publishes it at once only when none of them is a coin another
+  holder may still hold off-chain (live, pending, or given up with no
+  forfeit the operator can claim); otherwise it waits until the latest
+  service expiry among those coins, a date each of their holders was shown.
+  Before then only an exit puts the lineage on the chain, and the answers to
+  stale exits take it on. A coin resting on a batch leaf is left to that
+  batch's sweep.
 - **Claims.** The forfeits the watcher published that are in a block are
   claimed, every one of a round in one transaction (up to `max_claim_inputs`,
   200 by default), each with the preimage of its unlock hash, against one
@@ -582,11 +608,11 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
-| `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
+| `POST board_status` | A board's state (`pending`, `credited`, `lost`), its transaction's finality and, once that is in a block, its dates (`exit_deadline`, `expiry`) |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, and while it is pending why the last round did not take it (`waiting`) |
@@ -955,8 +981,12 @@ every owner refreshed and released, in two rounds, comes back before it
 expires: one unroll of the batch output, a reclaim of each lowest node with an
 atom of the connector asset its releases name; nothing is unrolled while two
 owners have yet to release. A coin paid out of round from a board and then
-refreshed by its receiver comes back: the board's checkpoint, the
-reassignment, the coin's forfeit and its claim. And an anchor-driven
+refreshed by its receiver waits while the sender's change rests live on the
+same lineage: the board shows its dates, and the watcher publishes nothing.
+Past the board's exit deadline the change is refused in a transfer
+(`invalid_coin`) and taken into a refresh; with no live coin left on the
+lineage the watcher publishes, before the board's expiry, the board's
+checkpoint, the reassignment and both forfeits, and claims them. And an anchor-driven
 reorganisation: the parent
 chain orphans the block a round and the watcher's answer to a stale exit are
 anchored to and every block above; the node disconnects them all, the server

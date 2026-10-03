@@ -60,7 +60,7 @@ use arca_covenant::sign::verify_digest;
 use arca_covenant::transfer::SeenReassignments;
 use arca_covenant::transfer::{transfer_id, Transfer, TransferInput, MAX_INPUTS};
 use arca_covenant::spend::{margin_for, FeeSource};
-use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan, ValidInput};
+use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan, ValidInput, WalletPolicy};
 use elements::OutPoint;
 
 use crate::chain::FinalityService;
@@ -155,6 +155,11 @@ pub enum CosignError {
 	OpenReassignment(LeafId),
 	#[error("one transaction could satisfy this reassignment and one already co-signed, and give one side's value to whoever broadcast it: {0}")]
 	Mergeable(String),
+	/// A coin resting on a board past its exit deadline: the operator takes
+	/// it only into a refresh.
+	#[error("leaf {leaf} rests on a board whose exit deadline has passed (its service ends at median time {expiry}): the operator \
+		takes it only into a refresh")]
+	PastBoardDate { leaf: LeafId, expiry: u32 },
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error("the server has not followed the chain yet")]
@@ -182,7 +187,7 @@ impl CosignError {
 			Value(_) => "value",
 			Margin(_) => "margin",
 			BadSignature { .. } => "bad_signature",
-			InvalidCoin { .. } => "invalid_coin",
+			InvalidCoin { .. } | PastBoardDate { .. } => "invalid_coin",
 			KeyReused => "key_reused",
 			OperatorKey => "operator_key",
 			ScriptReused => "script_reused",
@@ -219,6 +224,7 @@ impl From<CoinError> for CosignError {
 			CoinError::RoundNotFinal(id) => CosignError::RoundNotFinal(id),
 			CoinError::OnChain { leaf, what } => CosignError::OnChain { leaf, what },
 			CoinError::InvalidCoin { leaf, error } => CosignError::InvalidCoin { leaf, error },
+			CoinError::PastBoardDate { leaf, expiry, .. } => CosignError::PastBoardDate { leaf, expiry },
 			CoinError::Store(e) => e.into(),
 			CoinError::Internal(m) => CosignError::Internal(m),
 		}
@@ -274,10 +280,11 @@ impl Cosigner {
 	}
 
 	/// Checks a coin given up: known, live, its record valid under the
-	/// server's policy, its boards credited and unspent, nothing of its
-	/// lineage on-chain ([`crate::coins::check`]).
+	/// server's policy, its boards credited and unspent and their exit
+	/// deadline not past, nothing of its lineage on-chain
+	/// ([`crate::coins::check`]).
 	async fn check_input(&self, id: &LeafId, transfer: &[u8; 32], now: MedianTime) -> Result<Checked, CosignError> {
-		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer).await?)
+		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, WalletPolicy::EXIT_DEADLINE).await?)
 	}
 
 	/// Co-signs `req`: see the [module documentation](self).

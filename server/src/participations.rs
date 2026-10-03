@@ -229,7 +229,7 @@ impl ParticipationError {
 			Coin(CoinError::BoardNotFinal(_)) => "board_not_final",
 			Coin(CoinError::RoundNotFinal(_)) => "round_not_final",
 			Coin(CoinError::OnChain { .. }) => "on_chain",
-			Coin(CoinError::InvalidCoin { .. }) => "invalid_coin",
+			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) => "bad_attestation",
 			Template(..) => "template",
@@ -415,24 +415,34 @@ impl Participations {
 			}
 		}
 
-		// The coins given up, each checked, each attested by its owner.
+		// The coins given up, each checked, each attested by its owner. A coin
+		// resting on a board is taken past its exit deadline, into a refresh,
+		// up to a day before the board's service expiry.
 		let mut coins = Vec::with_capacity(n);
+		let mut expiries = Vec::with_capacity(n);
+		let mut last_times = Vec::with_capacity(n);
 		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
-			let c = coins::check(&self.store, &policy, &i.leaf_id, &id).await?;
+			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, Params::ROUND_HORIZON).await?;
 			if !verify_digest(&i.attestation, &id, &c.coin.leaf.owner) {
 				return Err(ParticipationError::BadAttestation(k));
 			}
+			let mut last = c.coin.expiry.to_consensus_u32().saturating_sub(Params::PARTICIPATION_HORIZON);
+			if let Some(b) = c.board_expiry {
+				last = last.min(b.saturating_sub(Params::ROUND_HORIZON));
+			}
+			expiries.push(c.expiry());
+			last_times.push(last);
 			coins.push(c.coin);
 		}
-		// A coin is taken only up to its exit deadline, and so is a round
+		// A coin is taken only up to its exit deadline (a coin resting on a
+		// board, up to a day before the board's expiry), and so is a round
 		// asked for later.
 		if let Some(t) = req.not_before {
-			for (c, i) in coins.iter().zip(&req.inputs) {
-				let deadline = c.expiry.to_consensus_u32().saturating_sub(Params::PARTICIPATION_HORIZON);
-				if t.to_consensus_u32() > deadline {
+			for (last, i) in last_times.iter().zip(&req.inputs) {
+				if t.to_consensus_u32() > *last {
 					return Err(ParticipationError::OutOfBounds(format!(
-						"the earliest round time {} lies past coin {}'s exit deadline {}", t.to_consensus_u32(), i.leaf_id, deadline)));
+						"the earliest round time {} lies past the last time coin {} is taken, {}", t.to_consensus_u32(), i.leaf_id, last)));
 				}
 			}
 		}
@@ -462,9 +472,9 @@ impl Participations {
 		let refund_delay = p.refund_delay;
 		let mut margins = Vec::with_capacity(n);
 		let mut due: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for c in &coins {
+		for (c, expiry) in coins.iter().zip(&expiries) {
 			margins.push(forfeit_margin(c, refund_delay, self.floor(c.asset).await?));
-			*due.entry(c.asset).or_default() += p.fees.refresh(c.value, c.expiry, now);
+			*due.entry(c.asset).or_default() += p.fees.refresh(c.value, *expiry, now);
 		}
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {

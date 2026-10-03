@@ -92,7 +92,8 @@ the keys, but which coins were spent off-chain is in the store and the server.
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
   Its key and nonce must be ones the wallet drew and is waiting on (a receive
   request is single use); no leaf or checkpoint of its lineage may be on the
-  chain; every board it rests on must be unspent. After that, the re-check
+  chain; every board it rests on must be unspent, and before its exit
+  deadline. After that, the re-check
   watches every coin the wallet holds, handed over or not: when a leaf or
   checkpoint it descends from, its own leaf, or a board it rests on spent
   shows on the chain (a sender converting the board it paid from, or exiting
@@ -135,6 +136,21 @@ the keys, but which coins were spent off-chain is in the store and the server.
   wallet the preimage and its new leaves. A forfeit never published whose
   round can never return is void, and the coin is live again.
 
+- **A board's dates.** A board, and every coin resting on it, carries the
+  dates of a batch made when the board confirmed: its service expiry is 28
+  days after the median time of the block that holds the board, and its exit
+  deadline three days before that. `coins` shows every coin's `expiry` and
+  `exit_deadline`, and whether it rests on a board; the wallet says so when it
+  receives such a coin. Up to the exit deadline the operator co-signs spends
+  of it; after it the wallet pays nothing with it, and the operator takes it
+  only into a refresh, until a day before the expiry. From the expiry the
+  operator may bring the board's lineage on the chain to collect a coin of it
+  given up in a refresh; a coin of the wallet's on that lineage then goes on
+  the chain, and the wallet exits it. A refresh before the deadline avoids
+  that, with the free window as for a batch leaf. The wallet reads the dates
+  from the chain, refuses a server that serves boards for less than 28 days,
+  and moves them with the board's block after a rollback.
+
 ### Fees
 
 Fees are paid in the asset being moved unless another is named
@@ -169,7 +185,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
 | `balance` | One row per holding, BTC first and always, 0 included, then each Sequentia asset the wallet holds anything of; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
-| `coins`, `record LEAF` | Every coin held or once held; one coin's record |
+| `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board; one coin's record |
 | `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
@@ -259,6 +275,12 @@ and holding it there, with the reason shown:
   anything is signed;
 - a sender converting the board it paid from, answered at once by the
   receiver;
+- a receiver's refresh of two coins paid from a board, which leaves the
+  sender's change on the same lineage live off chain (nothing of the lineage
+  published, the sender's wallet untouched), every coin showing the board's
+  dates and the receiver told so; after the board's expiry the operator
+  brings the lineage on the chain and claims both forfeits, and the sender's
+  change, on the chain with it, goes into its exit;
 - a server named `https://` whose certificate no root vouches for, refused by
   TLS itself, and a plain-HTTP server on another host, refused before anything
   is sent;

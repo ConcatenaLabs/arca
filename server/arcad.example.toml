@@ -116,7 +116,9 @@ cleanup_interval_seconds = 60
 # the free window, the two days before its exit deadline (five to three days
 # before the expiry). The server takes no coin past its exit deadline, and a
 # participation's forfeits are due within a day of its round being final. A
-# coin from boards alone pays the whole of it.
+# coin resting on a board counts from the board's service expiry, 28 days
+# after the median time of the block that confirms the board, when that
+# comes first.
 refresh_ppm = 0
 # What an offboard costs, in parts per million of what it pays out, on top of
 # the margin its on-chain output holds for its unlock.

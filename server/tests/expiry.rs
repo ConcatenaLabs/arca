@@ -196,8 +196,8 @@ async fn the_refresh_window_and_the_exit_deadline() {
 	let x = r.x;
 	let fees = FeeSchedule { refresh_ppm: 23_000, offboard_ppm: 0 };
 
-	// Three batch leaves of one round, from boards: A, B and C. A coin from
-	// boards alone pays the whole fee.
+	// Three batch leaves of one round, from boards: A, B and C. A board just
+	// confirmed has its whole service ahead of it and pays the whole fee.
 	let full = fees.refresh(VALUE, arca_covenant::transfer::NEVER, mtp(&r));
 	assert_eq!(full, 23_000);
 	let cv = VALUE - full;

@@ -54,6 +54,7 @@ pub struct Info {
 	pub templates: TemplatesInfo,
 	pub fees: FeesInfo,
 	pub participations: ParticipationsInfo,
+	pub boards: BoardsInfo,
 	/// The largest request body the server reads.
 	pub max_request_bytes: u64,
 }
@@ -70,6 +71,22 @@ pub struct ParticipationsInfo {
 	/// being found final, one day; otherwise it expires, its coins are the
 	/// owner's again and its new leaves never are.
 	pub forfeit_deadline_seconds: u32,
+}
+
+/// The dates a board, and every coin resting on it, carries: those of a batch
+/// made when the board confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoardsInfo {
+	/// A board's service expiry lies this long after the median time of the
+	/// block that confirms it: 28 days, a batch's lifetime.
+	pub lifetime_seconds: u32,
+	/// Its exit deadline lies this long before the expiry, three days: up to
+	/// it the operator co-signs spends of a coin resting on the board; after
+	/// it, it takes the coin only into a refresh.
+	pub exit_deadline_seconds: u32,
+	/// A refresh takes the coin until this long before the expiry, one day.
+	pub refresh_until_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +128,8 @@ pub struct FeesInfo {
 	/// The refresh fee, in parts per million of a coin's value, for a coin
 	/// whose expiry is `full_after_seconds` or more beyond the free window; it
 	/// falls in proportion to the time left beyond the window, to nothing
-	/// within it. A coin from boards alone pays the whole of it.
+	/// within it. A coin resting on a board counts from the board's service
+	/// expiry when that comes first.
 	pub refresh_ppm: u64,
 	/// A refresh is free for a coin whose first expiry is at most this far
 	/// ahead, five days: the window is the two days before the exit deadline.
@@ -191,8 +209,10 @@ pub struct BoardStatusRequest {
 	pub leaf_id: String,
 }
 
-/// A board's state: `pending`, `credited` or `lost`, and its transaction's
-/// finality: `not_in_chain`, `unsettled`, `settled` or `final`.
+/// A board's state: `pending`, `credited` or `lost`, its transaction's
+/// finality: `not_in_chain`, `unsettled`, `settled` or `final`, and, once its
+/// transaction is in a block, its dates (median times): the exit deadline and
+/// the service expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoardStatus {
@@ -201,6 +221,10 @@ pub struct BoardStatus {
 	pub vout: u32,
 	pub state: String,
 	pub finality: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub exit_deadline: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expiry: Option<u32>,
 }
 
 /// `POST /v1/cosign_transfer`.
