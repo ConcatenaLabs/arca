@@ -379,7 +379,11 @@ stale exits and claims forfeits, and after each new block, or at least every
 `recovery_interval_seconds`, it does the rest. It never builds a second spend
 of an outpoint while a spend of its own is in the nursery and not lost, so
 each step is taken once, and every transaction it publishes goes to the nursery,
-which broadcasts it again unchanged after a rollback of any depth.
+which broadcasts it again unchanged after a rollback of any depth. Each step
+reads only what may still need it: an output a final transaction of the
+watcher's spends is not looked at again until a rollback takes that
+transaction out, a batch is not looked at for its expiry before its first
+one, nor for a reclaim before an owner under it has released.
 
 - **Stale exits.** A coin the server holds as given up, by a participation
   whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on

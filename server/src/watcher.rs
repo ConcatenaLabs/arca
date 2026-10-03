@@ -498,7 +498,7 @@ impl Watcher {
 	async fn answer_stale_exits(&self) -> Result<(), WatcherError> {
 		for (kind, leaf_id, txid, vout) in self.store.spent_coin_sightings().await? {
 			let op = OutPoint::new(txid_of(&txid), vout);
-			if self.unspent(op).await?.is_none() || self.spending(&op).await? {
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 				continue;
 			}
 			let r = match kind {
@@ -644,7 +644,11 @@ impl Watcher {
 	/// Publishes the forfeit of every credited board given up in a round
 	/// that is final, from the board output.
 	async fn recover_boards(&self, _now: MedianTime) -> Result<(), WatcherError> {
-		for b in self.store.boards_in(BoardState::Credited).await? {
+		for id in self.store.boards_to_recover().await? {
+			let b = match self.store.board(&id).await? {
+				Some(b) if b.state == BoardState::Credited => b,
+				_ => continue,
+			};
 			let leaf = match self.store.leaf(&b.leaf_id).await? {
 				Some(l) if l.state == LeafState::Spent => l,
 				_ => continue,
@@ -663,7 +667,7 @@ impl Watcher {
 				continue;
 			}
 			let op = OutPoint::new(txid_of(&b.txid), b.vout);
-			if self.unspent(op).await?.is_none() || self.spending(&op).await? {
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 				continue;
 			}
 			let r = async {
@@ -691,7 +695,18 @@ impl Watcher {
 	/// reassignment, then the coin's forfeit) and claiming the forfeit. A coin
 	/// resting on a batch leaf is left to that batch's sweep.
 	async fn recover_board_transfers(&self, now: MedianTime) -> Result<(), WatcherError> {
-		for leaf_id in self.store.forfeited_transfer_coins().await? {
+		/// Whether every base of the coin is a board.
+		fn boards_alone(r: &CoinRecord) -> bool {
+			match r {
+				CoinRecord::Board(_) => true,
+				CoinRecord::Leaf { .. } => false,
+				CoinRecord::Transfer(t) => t.inputs.iter().all(|i| boards_alone(&i.coin)),
+			}
+		}
+		for (leaf_id, record) in self.store.forfeited_transfer_coins().await? {
+			if !CoinRecord::from_bytes(&record).is_ok_and(|r| boards_alone(&r)) {
+				continue;
+			}
 			let f = match self.live_forfeit(&leaf_id).await? {
 				Some(f) => f,
 				None => continue,
@@ -892,23 +907,22 @@ impl Watcher {
 	/// forfeit-first participation's are claimed only once all its
 	/// forfeits are final, since the claim reveals the preimage.
 	async fn claim_forfeits(&self) -> Result<(), WatcherError> {
-		let log = self.store.watcher_log().await?;
-		for w in log.iter().filter(|w| w.kind == "forfeit" && w.state != NurseryState::Lost) {
-			let leaf_id: [u8; 32] = match w.subject.clone().try_into() {
+		for (txid, subject) in self.store.unclaimed_forfeits().await? {
+			let leaf_id: [u8; 32] = match subject.try_into() {
 				Ok(l) => l,
 				Err(_) => continue,
 			};
-			let op = OutPoint::new(txid_of(&w.txid), 0);
-			if self.unspent(op).await?.is_none() || self.spending(&op).await? {
+			let op = OutPoint::new(txid_of(&txid), 0);
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 				continue;
 			}
-			let r = self.claim(&leaf_id, op, &log).await;
+			let r = self.claim(&leaf_id, op).await;
 			Self::item(&format!("the claim of coin {}'s forfeit", hex(&leaf_id)), r)?;
 		}
 		Ok(())
 	}
 
-	async fn claim(&self, leaf_id: &[u8; 32], op: OutPoint, log: &[crate::store::WatcherTxRow]) -> Result<(), WatcherError> {
+	async fn claim(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<(), WatcherError> {
 		let f = match self.live_forfeit(leaf_id).await? {
 			Some(f) => f,
 			None => return Ok(()),
@@ -918,7 +932,7 @@ impl Watcher {
 		if p.forfeit_first && p.state == ParticipationState::Issued {
 			// Every forfeit of it final before the preimage goes out.
 			for i in &p.inputs {
-				let done = log.iter().any(|w| w.kind == "forfeit" && w.subject == i.leaf_id && w.state == NurseryState::Final);
+				let done = self.store.watcher_txs("forfeit", &i.leaf_id).await?.iter().any(|w| w.state == NurseryState::Final);
 				if !done {
 					return Ok(());
 				}
@@ -968,7 +982,7 @@ impl Watcher {
 	/// reclaims every one whose participation expired or was voided once its
 	/// delay has passed.
 	async fn offboards(&self) -> Result<(), WatcherError> {
-		for o in self.store.offboards_in(RoundState::Final).await? {
+		for o in self.store.offboards_pending().await? {
 			let r = self.offboard(&o).await;
 			Self::item(&format!("the offboard at output {} of round {}", o.vout, o.round_id), r)?;
 		}
@@ -980,7 +994,7 @@ impl Watcher {
 			.ok_or_else(|| WatcherError::Build("an offboard of no participation".into()))?;
 		let round = self.store.round(o.round_id).await?.ok_or_else(|| WatcherError::Build("an offboard of no round".into()))?;
 		let op = OutPoint::new(txid_of(&round.txid), o.vout);
-		if self.unspent(op).await?.is_none() || self.spending(&op).await? {
+		if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 			return Ok(());
 		}
 		let wanted = p.outputs.get(o.output_idx as usize).ok_or_else(|| WatcherError::Build("no such offboard output".into()))?;
@@ -1074,6 +1088,11 @@ impl Watcher {
 
 	async fn expire(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
 		let schedule = ClockSchedule::decode(&b.schedule).map_err(build("the schedule"))?;
+		// Nothing moves the token before the first expiry: every clock's is
+		// at least that.
+		if now.to_consensus_u32() < schedule.expiries()[0].to_consensus_u32() {
+			return Ok(());
+		}
 		let (at, spk) = self.token(round, b, schedule.token).await?;
 		let place = match schedule.place(&spk) {
 			Some(p) => p,
@@ -1196,8 +1215,12 @@ impl Watcher {
 	/// released it, and with `reclaim_early` unrolls toward them through
 	/// nodes all of whose owners have.
 	async fn reclaims(&self, now: MedianTime) -> Result<(), WatcherError> {
-		for round in self.store.rounds_in(RoundState::Final).await? {
-			for b in self.store.batches(round.round_id).await? {
+		for (round_id, vout) in self.store.batches_with_releases().await? {
+			let round = match self.store.round(round_id).await? {
+				Some(r) if r.state == RoundState::Final => r,
+				_ => continue,
+			};
+			for b in self.store.batches(round_id).await?.into_iter().filter(|b| b.vout == vout) {
 				let r = self.reclaim_batch(&round, &b, now).await;
 				Self::item(&format!("the reclaim of the batch at output {} of round {}", b.vout, round.round_id), r)?;
 			}
@@ -1243,7 +1266,7 @@ impl Watcher {
 					candidates.push(OutPoint::new(txid_of(&round.txid), b.vout));
 				}
 				for op in candidates {
-					if self.unspent(op).await?.is_none() || self.spending(&op).await? {
+					if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 						continue;
 					}
 					if level == 0 {
