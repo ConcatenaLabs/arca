@@ -26,6 +26,18 @@ indexed-db = ["dep:indexed-db", "dep:web-sys", "dep:serde-wasm-bindgen"]
 
 rand = ["bitcoin/rand", "bip39/rand"]
 
+# The Arca wallet on Sequentia (`bark::arca`): its chain source over the
+# node's RPC, its SQLite store, its keys from the mnemonic as the Sequentia
+# Wallet Kit derives them, and its client of the Arca server over HTTP.
+arca = [
+	"sqlite",
+	"dep:arca-covenant",
+	"dep:arca-sequentia-ext",
+	"dep:elements",
+	"dep:lwk_signer",
+	"dep:minreq",
+]
+
 # TLS implementations
 tls-native-roots = ["arca-server-rpc/tls-native-roots"]
 tls-webpki-roots = ["arca-server-rpc/tls-webpki-roots"]
@@ -60,6 +72,11 @@ arca-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", default-feature
 ]}
 arca-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false }
 bip321 = { version = "0.4.0", path = "../bip321"  }
+arca-covenant = { path = "../covenant", optional = true }
+arca-sequentia-ext = { path = "../sequentia-ext", optional = true }
+elements = { workspace = true, optional = true }
+lwk_signer = { workspace = true, optional = true }
+minreq = { version = "2.14", optional = true }
 
 # EXPORTED
 bitcoin.workspace = true
@@ -127,6 +144,8 @@ tokio = { workspace = true, features = ["fs"] }
 [dev-dependencies]
 arca-lib = { path = "../lib", features = [ "test-util" ] }
 bdk_wallet = { workspace = true, features = ["test-utils"] }
+# The kit's signer trait, to check the Arca leaf keys against the kit's own derivation.
+lwk_common.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

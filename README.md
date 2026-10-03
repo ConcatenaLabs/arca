@@ -23,8 +23,8 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 |---|---|---|---|
 | `lib/` | `arca-lib` | `ark` | Protocol primitives: the VTXO type and its encoding, policies and clauses, the transaction tree, arkoor, board, offboard, forfeits, attestations, fees |
 | `bitcoin-ext/` | `arca-bitcoin-ext` | `bitcoin_ext` | Height and delta types, fee and dust helpers, node RPC extension traits |
-| `bark/` | `arca-wallet` | `bark` | The client wallet library: rounds, arkoor, board and offboard, exits, Lightning, persistence |
-| `bark-cli/` | `arca-cli` | `bark_cli` | The `bark` command-line wallet and the `barkd` daemon |
+| `bark/` | `arca-wallet` | `bark` | The client wallet library: Bark's wallet for Bitcoin arks (rounds, arkoor, board and offboard, exits, Lightning, persistence), and the Arca wallet on Sequentia (`bark::arca`, the `arca` feature): its chain source, its SQLite store, its keys, its client of the Arca server, and every operation of the `arca` command line |
+| `bark-cli/` | `arca-cli` | `bark_cli` | The `arca` command-line wallet, dual-chain: Arca coins on Sequentia, and Bitcoin arks through Bark's `bark` wallet and `barkd` daemon ([bark-cli/README.md](bark-cli/README.md)) |
 | `bark-json/`, `bark-rest/`, `bark-rest-client/` | `arca-json`, `arca-rest`, `arca-rest-client` | `bark_json`, `bark_rest`, `bark_rest_client` | JSON types, the daemon's REST server and its generated client |
 | `bark-common/`, `bark-runtime/` | `arca-common`, `arca-runtime` | `bark_common`, `bark_runtime` | Helpers shared by the wallet and the server; the async runtime abstraction |
 | `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL, the finality service, the on-chain wallet on the Sequentia Wallet Kit, the nursery, boards, transfer co-signing, rounds with their participations and published trees, and the JSON interface (`arcad`), and the signer holding the operator key (`arca-signer`) ([server/README.md](server/README.md)) |
@@ -44,6 +44,9 @@ Core's kernel with CMake and needs the Boost headers (Debian and Ubuntu:
 
     cargo build -p arca-lib
     cargo test -p arca-lib --lib
+
+The wallet crates (`arca-wallet`, `arca-cli`) compile Bark's gRPC protocol and
+also need `protoc` (`apt install protobuf-compiler`).
 
 The [justfile](justfile) holds the remaining recipes (`just check`, `just unit`).
 
@@ -74,6 +77,9 @@ regenerate, and runs the regtest suite, all against the newest node build.
 [server.yml](.github/workflows/server.yml) runs the server's tests, the
 end-to-end ones with the signer process and the minimal client included,
 against a PostgreSQL service and the newest node build.
+[client.yml](.github/workflows/client.yml) runs the `arca` wallet's
+scenarios against a whole server, the same PostgreSQL service and the newest
+node build.
 [covenant.yml](.github/workflows/covenant.yml) checks that `arca-covenant`
 builds with the Rust version the Sequentia Wallet Kit pins, which is the
 `rust-version` in `covenant/Cargo.toml`.
