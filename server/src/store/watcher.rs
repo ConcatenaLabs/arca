@@ -242,13 +242,14 @@ impl Store {
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get::<_, i32>(1) as u32))).collect()
 	}
 
-	/// Every forfeit stored for `leaf_id`, for any round.
+	/// Every forfeit stored whole (the operator's half in) for `leaf_id`,
+	/// for any round.
 	pub async fn forfeits_of(&self, leaf_id: &[u8; 32]) -> Result<Vec<ForfeitRow>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
 			"SELECT leaf_id, owner_sig, operator_sig, refund_delay_units, margin, unlock_hash, connector_asset, round_id,
 			        participation_id, attempt
-			 FROM forfeit WHERE leaf_id = $1 ORDER BY created_at",
+			 FROM forfeit WHERE leaf_id = $1 AND operator_sig IS NOT NULL ORDER BY created_at",
 			&[&&leaf_id[..]],
 		).await?;
 		rows.iter().map(|r| {

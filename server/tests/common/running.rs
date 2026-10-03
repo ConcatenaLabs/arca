@@ -103,6 +103,19 @@ impl Running {
 		self.http = Http { base: format!("http://{}", self.server.addr) };
 	}
 
+	/// Every entry of the signer's record.
+	pub async fn signer_entries(&self) -> Vec<server::signer::Entry> {
+		let client = server::signer::SignerClient::new(&self.signer.socket);
+		let mut all = vec![];
+		loop {
+			let page = client.entries(all.len() as u64).await.unwrap();
+			if page.is_empty() {
+				return all;
+			}
+			all.extend(page);
+		}
+	}
+
 	/// Waits until `f` holds, polling.
 	pub async fn wait<F: FnMut() -> bool>(&self, what: &str, mut f: F) {
 		let start = Instant::now();

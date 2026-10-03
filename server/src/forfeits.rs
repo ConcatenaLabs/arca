@@ -22,13 +22,17 @@
 //! inside any later transfer. The record must validate against the round as a
 //! receiver checks a coin.
 //!
-//! The operator's half of each forfeit is signed by the signer, over the
-//! message the server built, and checked. It is never returned: it leaves the
-//! server only inside a forfeit the operator publishes, so an owner never
-//! holds a forfeit it could publish itself. Then, in one database transaction,
-//! the forfeits are stored, the new leaves' records filled in, the
-//! participation released and its new leaves credited, and only then is the
-//! preimage returned. The coins given up have been spent by the participation
+//! The forfeits are recorded first, each with its owner's half, together
+//! with the new leaves' records and the messages the signer is to sign, so
+//! a forfeit the signer may have signed is never one the database has not
+//! heard of. The operator's half of each forfeit is then signed by the
+//! signer, over the message the server built, checked and stored. It is
+//! never returned: it leaves the server only inside a forfeit the operator
+//! publishes, so an owner never holds a forfeit it could publish itself.
+//! Then, in one database transaction, the participation is released and its
+//! new leaves credited, and only then is the preimage returned. A forfeit
+//! left without the operator's half (the server stopped before the answer
+//! was stored) is completed later ([`Forfeits::fill_unsigned`]). The coins given up have been spent by the participation
 //! since it was accepted. A participation run again forfeit-first, after a
 //! round it was released in could not return, has its forfeits stored and its
 //! preimage withheld: it goes out only once the forfeit is published and
@@ -79,7 +83,7 @@ use crate::coins::{self, CoinError};
 use crate::cosign::{CosignError, Cosigner};
 use crate::params::Params;
 use crate::signer::{hex, SignerClient, SignerError};
-use crate::store::{NewForfeit, ParticipationState, RoundState, Store, StoreError};
+use crate::store::{NewForfeit, ParticipationState, RoundState, SignerMessage, Store, StoreError};
 
 /// One coin's forfeit: its owner's signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,22 +313,36 @@ impl Forfeits {
 			records.push((leaf.0, coin.to_bytes().map_err(|e| ForfeitError::Internal(e.to_string()))?));
 		}
 
-		// The operator's half of each forfeit.
-		let mut forfeits = Vec::with_capacity(built.len());
-		for (leaf, c, f, owner_sig) in &built {
+		// Recorded before the signer is asked: each forfeit with its owner's
+		// half, the new leaves' records, and the messages S is to sign. A
+		// forfeit the signer may have signed is never one the database has
+		// not heard of, whatever becomes of this request or of the server.
+		let mut forfeits: Vec<NewForfeit> = built.iter().map(|(leaf, _, f, owner_sig)| NewForfeit {
+			leaf_id: leaf.0,
+			owner_sig: *owner_sig.as_ref(),
+			operator_sig: [0; 64],
+			refund_delay_units: p.refund_delay_units,
+			margin: f.margin,
+			unlock_hash: p.unlock_hash,
+			connector_asset: m.into_inner().to_byte_array(),
+		}).collect();
+		let messages: Vec<SignerMessage> = built.iter().map(|(_, c, f, _)| SignerMessage {
+			owner: c.leaf.owner.serialize(), salt: c.leaf.salt, digest: f.message().digest, forfeit: true,
+		}).collect();
+		match self.store.begin_forfeits(&id, p.attempt, round_id, &forfeits, &records, &messages).await {
+			Ok(()) => {},
+			Err(StoreError::NotInRound(state)) => return Err(ForfeitError::NotInRound(state)),
+			Err(e) => return Err(e.into()),
+		}
+
+		// The operator's half of each forfeit, stored as it comes.
+		for ((leaf, c, f, owner_sig), stored) in built.iter().zip(forfeits.iter_mut()) {
 			let operator_sig = self.signer.rebind_forfeit(&c.leaf.owner, owner_sig, &c.leaf.salt, c.asset, c.value, &f.policy,
 				&f.output()).await?;
 			f.verify(&Pair { operator: operator_sig, owner: *owner_sig })
 				.map_err(|_| ForfeitError::Internal("the signer signed another message than the server built".into()))?;
-			forfeits.push(NewForfeit {
-				leaf_id: leaf.0,
-				owner_sig: *owner_sig.as_ref(),
-				operator_sig: *operator_sig.as_ref(),
-				refund_delay_units: p.refund_delay_units,
-				margin: f.margin,
-				unlock_hash: p.unlock_hash,
-				connector_asset: m.into_inner().to_byte_array(),
-			});
+			self.store.set_forfeit_operator_sig(&leaf.0, round_id, operator_sig.as_ref()).await?;
+			stored.operator_sig = *operator_sig.as_ref();
 		}
 
 		// Recorded, then the preimage. A participation that expired meanwhile
@@ -346,6 +364,56 @@ impl Forfeits {
 			preimage: released.then_some(p.preimage),
 			forfeit_first: p.forfeit_first,
 		})
+	}
+
+	/// Fills in the operator's half of every forfeit recorded without it
+	/// ([`Store::unsigned_forfeits`]): one whose request ended before the
+	/// signer's answer was stored (the server stopped, the signer went away),
+	/// or a database restored to a point between a forfeit being recorded and
+	/// signed. The signer signs again a message it signed before, adding
+	/// nothing to its record. A forfeit is its owner's signed consent to give
+	/// its coin up for its new leaf, and the claim that takes it reveals the
+	/// preimage that opens that leaf, so completing it takes nothing from
+	/// anyone. One the signer refuses (its record holds a spend of the coin)
+	/// stays without, and is logged. Returns how many were filled in.
+	pub async fn fill_unsigned(&self) -> Result<usize, ForfeitError> {
+		let mut filled = 0;
+		for row in self.store.unsigned_forfeits().await? {
+			let f = &row.forfeit;
+			let leaf = LeafId(f.leaf_id);
+			let built = async {
+				let now = self.now().await?;
+				let policy = WalletPolicy { horizon: 0, ..self.params.policy(now) };
+				let checked = coins::resolve(&self.store, &policy, &leaf).await?;
+				let c = checked.coin;
+				let refund = RelativeTime::from_units(f.refund_delay_units).map_err(|e| ForfeitError::Internal(e.to_string()))?;
+				let forfeit = Forfeit::new(c.leaf, (c.asset, c.value), c.id, f.unlock_hash, AssetId::from_byte_array(f.connector_asset),
+					refund, f.margin).map_err(|e| ForfeitError::Internal(e.to_string()))?;
+				let owner_sig = Signature::from_slice(&f.owner_sig).map_err(|e| ForfeitError::Internal(e.to_string()))?;
+				Ok::<_, ForfeitError>((c, forfeit, owner_sig))
+			}.await;
+			let (c, forfeit, owner_sig) = match built {
+				Ok(b) => b,
+				Err(e) => {
+					log::error!("the forfeit of coin {} for round {} lacks the operator's half and cannot be rebuilt: {}", leaf, row.round_id, e);
+					continue;
+				},
+			};
+			match self.signer.rebind_forfeit(&c.leaf.owner, &owner_sig, &c.leaf.salt, c.asset, c.value, &forfeit.policy, &forfeit.output()).await {
+				Ok(operator_sig) => {
+					forfeit.verify(&Pair { operator: operator_sig, owner: owner_sig })
+						.map_err(|_| ForfeitError::Internal("the signer signed another message than the server built".into()))?;
+					self.store.set_forfeit_operator_sig(&f.leaf_id, row.round_id, operator_sig.as_ref()).await?;
+					log::info!("the forfeit of coin {} for round {}: the operator's half filled in", leaf, row.round_id);
+					filled += 1;
+				},
+				Err(SignerError::AlreadySigned(e)) => {
+					log::error!("the forfeit of coin {} for round {} stays without the operator's half: {}", leaf, row.round_id, e);
+				},
+				Err(e) => return Err(e.into()),
+			}
+		}
+		Ok(filled)
 	}
 
 	/// Takes owners' releases of the lowest nodes of coins given up in the

@@ -36,8 +36,9 @@
 //!   whose answer would need a coin of the operator's for every fee, or
 //!   whose margin would be a fee the node refuses, is not co-signed.
 //!
-//! Then the transfer is recorded, inputs spent, before `S` signs anything
-//! (the signer runs in its own process: [`crate::signer`]). The signer keeps
+//! Then the transfer is recorded, inputs spent, with the messages `S` is to
+//! sign, before `S` signs anything (the signer runs in its own process:
+//! [`crate::signer`]). The signer keeps
 //! its own record and co-signs one spend of each output whatever the
 //! database says, so a database restored from an older copy cannot co-sign a
 //! second spend: the signer refuses it, and so does the server
@@ -68,7 +69,7 @@ use crate::fees;
 use crate::params::Params;
 use crate::signer::{SignerClient, SignerError};
 use crate::store::{
-	LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, Store,
+	LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, SignerMessage, Store,
 	StoreError,
 };
 
@@ -442,7 +443,17 @@ impl Cosigner {
 					}
 					plan.admit(&mut known).map_err(|e| e.to_string())
 				};
-				self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs).await.map_err(|e| match e {
+				// What the signer is to sign for it, recorded with it: the
+				// database never holds a transfer the signer signed for and
+				// forgets it ([`crate::server`] checks at start).
+				let signer_messages: Vec<SignerMessage> = checked.iter().enumerate().flat_map(|(k, c)| {
+					let cp = plan.checkpoint(k);
+					[
+						SignerMessage { owner: c.coin.leaf.owner.serialize(), salt: c.coin.leaf.salt, digest: messages[k].0, forfeit: false },
+						SignerMessage { owner: cp.owner.serialize(), salt: cp.salt, digest: messages[k].1, forfeit: false },
+					]
+				}).collect();
+				self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs, &signer_messages).await.map_err(|e| match e {
 					StoreError::LeafSpent(id) => CosignError::DoubleSpend(id.parse().unwrap_or(req.inputs[0].leaf_id)),
 					StoreError::LeafNotLive(id, state) => CosignError::NotLive(id.parse().unwrap_or(req.inputs[0].leaf_id), state),
 					other => other.into(),
