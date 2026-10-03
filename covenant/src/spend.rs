@@ -17,8 +17,10 @@
 //!
 //! The value of the spent coins that the pinned or committed outputs do not
 //! take is the margin, counted per asset. With [`FeeSource::Reserve`] the
-//! margin is the fee, which needs it to be in one asset. With
-//! [`FeeSource::Coin`] the broadcaster attaches a coin in any asset a
+//! margin is the fee, which needs it to be in one asset; with
+//! [`FeeSource::Split`] part of it is, and the rest goes to the broadcaster's
+//! change, after the committed outputs. With [`FeeSource::Coin`] the
+//! broadcaster attaches a coin in any asset a
 //! producer accepts, which pays the fee in its own asset, and every margin
 //! goes to the broadcaster's change: a transaction with fee outputs in two
 //! assets is refused. Value no signature commits to belongs to whoever
@@ -154,6 +156,17 @@ pub(crate) fn pay_fee(
 		FeeSource::Reserve => match margins {
 			[] => {},
 			[(asset, value)] => tx.output.push(TxOut::new_fee(*value, *asset)),
+			_ => return Err(UnrollError::SeveralMarginAssets(margins.len())),
+		},
+		FeeSource::Split { fee, change } => match margins {
+			[(asset, value)] if *fee >= 1 && fee <= value => {
+				if value > fee {
+					tx.output.push(explicit_txout(*asset, value - fee, change.clone()));
+				}
+				tx.output.push(TxOut::new_fee(*fee, *asset));
+			},
+			[] => return Err(UnrollError::SplitFee { fee: *fee, margin: 0 }),
+			[(_, value)] => return Err(UnrollError::SplitFee { fee: *fee, margin: *value }),
 			_ => return Err(UnrollError::SeveralMarginAssets(margins.len())),
 		},
 		FeeSource::Coin { outpoint, coin, fee, change } => {

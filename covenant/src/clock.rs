@@ -197,7 +197,7 @@ impl ClockSchedule {
 	}
 
 	fn move_tx(&self, step: usize, token: OutPoint, roll: bool, fee: &FeeSource) -> Result<KeySpend, SpendError> {
-		if matches!(fee, FeeSource::Reserve) {
+		if !matches!(fee, FeeSource::Coin { .. }) {
 			return Err(SpendError::NeedsFeeCoin("the token"));
 		}
 		let clocks = self.clocks();

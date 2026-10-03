@@ -6,7 +6,8 @@
 //! record, builds every one of these transactions:
 //!
 //! - with the output's own reserve as the fee ([`FeeSource::Reserve`]): one
-//!   fee output in the batch asset;
+//!   fee output in the batch asset; or part of it as the fee and the rest to
+//!   the broadcaster's change ([`FeeSource::Split`]);
 //! - or with a coin of the broadcaster's attached as a second input
 //!   ([`FeeSource::Coin`]), in any asset a producer accepts: the coin pays the
 //!   fee in its own asset, and the reserve goes to an ordinary output, since a
@@ -39,6 +40,13 @@ pub enum FeeSource {
 		outpoint: OutPoint,
 		/// The coin: an explicit asset and value.
 		coin: TxOut,
+		fee: u64,
+		change: Script,
+	},
+	/// The spent output's reserve, or the margin its signers left, in one
+	/// asset, pays `fee` of itself, and the rest goes to `change`: a margin
+	/// larger than the fee the transaction needs is not given away whole.
+	Split {
 		fee: u64,
 		change: Script,
 	},
@@ -76,6 +84,8 @@ pub enum UnrollError {
 	FeeCoinTooSmall { value: u64, fee: u64 },
 	#[error("margins in {0} assets: one pays the fee, and the others need a fee coin's change to go to")]
 	SeveralMarginAssets(usize),
+	#[error("a fee of {fee} out of a margin of {margin}: the fee is at least one atom and at most the margin")]
+	SplitFee { fee: u64, margin: u64 },
 }
 
 /// Adds the fee to a transaction that spends an output holding `reserve` of
