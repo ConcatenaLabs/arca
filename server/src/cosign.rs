@@ -3,9 +3,9 @@
 //! A sender gives up one or more coins the server knows, by leaf id, each
 //! with the value its checkpoint keeps and the owner's two signatures (over
 //! the checkpoint and over the reassignment), for one to four new leaves,
-//! each named by its owner's key and nonce, an operator nonce the server
-//! issued, an exit delay, an asset and a value. The server co-signs only when
-//! every rule holds:
+//! each named by its owner's key and nonce, a creator nonce the sender drew
+//! fresh for it, an exit delay, an asset and a value. The server co-signs
+//! only when every rule holds:
 //!
 //! - each input is a coin the server knows, live (a board is live only once
 //!   credited, that is final), spent by nothing else: a second spend of a leaf
@@ -18,9 +18,13 @@
 //! - the new coins are at most [`Params::depth_limit`] reassignments from a
 //!   round or a board;
 //! - each new leaf is within the published bounds: an asset served, a value
-//!   within that asset's bounds, an exit delay within the bounds, an operator
-//!   nonce the server issued and never gave another leaf, a key that owns no
-//!   other leaf, a script never seen;
+//!   within that asset's bounds, an exit delay within the bounds, a key that
+//!   owns no other leaf, a script never seen;
+//! - no transaction could satisfy both this reassignment and one the server
+//!   co-signed before: their committed outputs do not agree at every index
+//!   both commit to (`arca_covenant::TransferPlan::admit`, run against every
+//!   reassignment recorded with the same output 0, under a lock on it), since
+//!   such a transaction would hand one side's value to whoever broadcast it;
 //! - every checkpoint keeps between one atom and the whole coin, the outputs
 //!   take no more of any asset than the checkpoints keep, and every owner
 //!   signature verifies.
@@ -39,14 +43,19 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Transaction};
 
+use arca_covenant::script::sha256;
 use arca_covenant::sign::verify_digest;
+use arca_covenant::transfer::SeenReassignments;
 use arca_covenant::transfer::{transfer_id, Transfer, TransferInput, MAX_INPUTS};
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan, ValidCoin};
 
 use crate::chain::FinalityService;
 use crate::params::Params;
 use crate::signer::{SignerClient, SignerError};
-use crate::store::{BoardState, LeafKind, LeafState, NewCoin, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, Store, StoreError};
+use crate::store::{
+	BoardState, LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, Store,
+	StoreError,
+};
 
 /// One coin given up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,16 +123,14 @@ pub enum CosignError {
 	BadSignature { input: usize, which: &'static str },
 	#[error("leaf {leaf}'s coin does not check out: {error}")]
 	InvalidCoin { leaf: LeafId, error: TransferError },
-	#[error("the operator nonce of an output was not issued by this server")]
-	NonceUnknown,
-	#[error("the operator nonce of an output has already been used")]
-	NonceUsed,
 	#[error("an output's key already owns a leaf: every leaf has a key of its own")]
 	KeyReused,
 	#[error("an output's script is already known: a leaf script is never funded twice")]
 	ScriptReused,
 	#[error("leaf {0} has an open out-of-round reassignment: no release is accepted for it")]
 	OpenReassignment(LeafId),
+	#[error("one transaction could satisfy this reassignment and one already co-signed, and give one side's value to whoever broadcast it: {0}")]
+	Mergeable(String),
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error("the server has not followed the chain yet")]
@@ -150,11 +157,10 @@ impl CosignError {
 			Value(_) => "value",
 			BadSignature { .. } => "bad_signature",
 			InvalidCoin { .. } => "invalid_coin",
-			NonceUnknown => "nonce_unknown",
-			NonceUsed => "nonce_used",
 			KeyReused => "key_reused",
 			ScriptReused => "script_reused",
 			OpenReassignment(_) => "open_reassignment",
+			Mergeable(_) => "merge",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Store(_) | Internal(_) => "internal",
@@ -165,10 +171,9 @@ impl CosignError {
 impl From<StoreError> for CosignError {
 	fn from(e: StoreError) -> CosignError {
 		match e {
-			StoreError::NonceUnknown => CosignError::NonceUnknown,
-			StoreError::NonceUsed => CosignError::NonceUsed,
 			StoreError::KeyReused => CosignError::KeyReused,
 			StoreError::ScriptReused => CosignError::ScriptReused,
+			StoreError::Mergeable(m) => CosignError::Mergeable(m),
 			other => CosignError::Store(other),
 		}
 	}
@@ -196,7 +201,7 @@ impl TransferRequest {
 			e.input(&o.value.to_le_bytes());
 			e.input(&o.leaf.owner.serialize());
 			e.input(&o.leaf.owner_nonce);
-			e.input(&o.leaf.operator_nonce);
+			e.input(&o.leaf.creator_nonce);
 			e.input(&o.leaf.exit_delay.units().to_le_bytes());
 			e.input(&o.mailbox.unwrap_or(o.leaf.owner).serialize());
 		}
@@ -413,12 +418,26 @@ impl Cosigner {
 						hops: hops as u16,
 						record: vec![],
 						state: LeafState::Pending,
-						operator_nonce: Some(o.leaf.operator_nonce),
+						// The sender's creator nonce, not one the operator issued.
+						operator_nonce: None,
 						scripts: vec![NewScript { script_pubkey: out.script_pubkey.to_bytes(), kind: ScriptKind::Leaf }],
 					},
 					mailbox_key: o.mailbox.unwrap_or(o.leaf.owner).serialize(),
 				}).collect();
-				self.store.record_transfer(&transfer, &ins, &outs).await.map_err(|e| match e {
+				let spent: Vec<(LeafId, u64)> = plan.inputs.iter().map(|(c, v)| (c.id, *v)).collect();
+				let reassignment = NewReassignment {
+					first_output: sha256(&outputs[0].record()),
+					inputs: encode_inputs(&spent),
+					outputs: encode_outputs(&outputs),
+				};
+				let admit = |seen: &[(Vec<u8>, Vec<u8>)]| -> Result<(), String> {
+					let mut known = SeenReassignments::new();
+					for (i, o) in seen {
+						known.admit(&decode_inputs(i)?, &decode_outputs(o)?).map_err(|e| e.to_string())?;
+					}
+					plan.admit(&mut known).map_err(|e| e.to_string())
+				};
+				self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs).await.map_err(|e| match e {
 					StoreError::LeafSpent(id) => CosignError::DoubleSpend(id.parse().unwrap_or(req.inputs[0].leaf_id)),
 					StoreError::LeafNotLive(id, state) => CosignError::NotLive(id.parse().unwrap_or(req.inputs[0].leaf_id), state),
 					other => other.into(),
@@ -512,4 +531,63 @@ fn sig_bytes(s: &Signature) -> [u8; 64] {
 
 fn sig_from(b: &[u8; 64]) -> Result<Signature, CosignError> {
 	Signature::from_slice(b).map_err(|e| CosignError::Internal(e.to_string()))
+}
+
+/// A reassignment's inputs, as the store keeps them: each coin's id and its
+/// checkpoint's value.
+fn encode_inputs(inputs: &[(LeafId, u64)]) -> Vec<u8> {
+	let mut w = vec![inputs.len() as u8];
+	for (id, v) in inputs {
+		w.extend(id.0);
+		w.extend(v.to_le_bytes());
+	}
+	w
+}
+
+fn decode_inputs(b: &[u8]) -> Result<Vec<(LeafId, u64)>, String> {
+	let bad = || "a stored reassignment's inputs do not decode".to_string();
+	let n = *b.first().ok_or_else(bad)? as usize;
+	if b.len() != 1 + n * 40 {
+		return Err(bad());
+	}
+	Ok((0..n).map(|i| {
+		let at = 1 + i * 40;
+		(LeafId(b[at..at + 32].try_into().expect("32")), u64::from_le_bytes(b[at + 32..at + 40].try_into().expect("8")))
+	}).collect())
+}
+
+/// A reassignment's committed outputs, as the store keeps them.
+fn encode_outputs(outputs: &[ExplicitOutput]) -> Vec<u8> {
+	let mut w = vec![outputs.len() as u8];
+	for o in outputs {
+		w.extend(o.asset.into_inner().to_byte_array());
+		w.extend(o.value.to_le_bytes());
+		let spk = o.script_pubkey.as_bytes();
+		w.extend((spk.len() as u16).to_le_bytes());
+		w.extend(spk);
+	}
+	w
+}
+
+fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
+	let bad = || "a stored reassignment's outputs do not decode".to_string();
+	let mut at = 1;
+	let n = *b.first().ok_or_else(bad)? as usize;
+	let mut out = Vec::with_capacity(n);
+	for _ in 0..n {
+		let take = |at: &mut usize, len: usize| -> Result<&[u8], String> {
+			let s = b.get(*at..*at + len).ok_or_else(bad)?;
+			*at += len;
+			Ok(s)
+		};
+		let asset = AssetId::from_byte_array(take(&mut at, 32)?.try_into().expect("32"));
+		let value = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8"));
+		let len = u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2")) as usize;
+		let spk = elements::Script::from(take(&mut at, len)?.to_vec());
+		out.push(ExplicitOutput::new(asset, value, spk));
+	}
+	if at != b.len() {
+		return Err(bad());
+	}
+	Ok(out)
 }

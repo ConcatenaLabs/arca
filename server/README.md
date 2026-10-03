@@ -1,8 +1,8 @@
 # arca-server
 
 The Arca operator's server on Sequentia. It holds the operator's side of Arca:
-it hands out the operator's half of every leaf's salt, registers boards and
-credits them once final, co-signs out-of-round transfers and delivers them to
+it hands out the second nonce of the salt of every leaf it creates, registers
+boards and credits them once final, co-signs out-of-round transfers and delivers them to
 their receivers' mailboxes, re-serves a key's leaves, and keeps its own
 on-chain wallet and the transactions it relies on broadcast. Its state is in
 PostgreSQL; what is final comes from one finality service; the operator key
@@ -29,11 +29,17 @@ requests can race past them:
 - **Arca scripts.** Every leaf, board and checkpoint script the server has
   created or co-signed into appears once: a leaf script is never funded twice,
   across batches, boards and transfers alike.
-- **Operator nonces.** The operator's half of every leaf's salt is 32 random
-  bytes, recorded as issued before it is handed out and taken by one leaf at
-  most. A nonce that was never issued, or was already taken, is refused.
+- **Operator nonces.** A leaf's salt is built from two nonces, its owner's and
+  its creator's. For a leaf the operator creates (a board, a leaf of a round)
+  the creator's is the operator's: 32 random bytes, recorded as issued before
+  it is handed out and taken by one leaf at most. A nonce that was never
+  issued, or was already taken, is refused. A leaf a reassignment creates
+  takes its sender's creator nonce instead.
 - **Transfers.** A leaf is the input of one transfer at most, recorded before
   any signature leaves the server.
+- **Reassignments.** Every reassignment the server co-signed, kept by the hash
+  of its output 0's record with its inputs and outputs: the merge rule below
+  reads them, so it survives a restart.
 - **The chain as the server saw it**, rounds and their connector outputs,
   participations and forfeits, mailboxes, authentication challenges, the
   on-chain wallet's coins and the server's own transactions.
@@ -109,8 +115,8 @@ confirm is lost.
 A sender gives up coins the server knows, by leaf id, each with the value its
 checkpoint keeps and its owner's signatures over the checkpoint and the
 reassignment, for one to four new leaves, each named by its receiver's key and
-nonce, an operator nonce from the server, an exit delay, an asset and a value.
-The server co-signs only when every rule holds:
+nonce, a creator nonce the sender draws fresh for that leaf, an exit delay, an
+asset and a value. The server co-signs only when every rule holds:
 
 - each input is live (a board once credited) and spent by nothing else: a
   second spend of a leaf is refused, which is the whole of the double-spend
@@ -122,9 +128,16 @@ The server co-signs only when every rule holds:
   it, a converted board included;
 - the new coins are at most five reassignments from a round or a board;
 - each new leaf is within the published bounds: an asset served, a value
-  within its bounds, an exit delay within the bounds, an operator nonce the
-  server issued and never gave another leaf, a key that owns no other leaf, a
-  script never seen;
+  within its bounds, an exit delay within the bounds, a key that owns no other
+  leaf, a script never seen;
+- no transaction could satisfy both it and a reassignment the server
+  co-signed before: their committed outputs do not agree at every index both
+  commit to (the same outputs, or one set the first outputs of the other).
+  Such a transaction would spend both sides' checkpoints, create the outputs
+  once and give one side's value to whoever broadcast it. The rule is
+  `arca-covenant`'s (`TransferPlan::admit`), run against every reassignment
+  recorded with the same output 0, under a lock on that output, so two
+  requests racing cannot both pass;
 - every checkpoint keeps between one atom and the whole coin, the outputs take
   no more of any asset than the checkpoints keep, and each owner signature
   verifies.
@@ -155,7 +168,7 @@ canonical binary form. Every object refuses a field it does not know.
 | Call | Does |
 |---|---|
 | `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule, the request limit |
-| `POST operator_nonce` | A fresh operator nonce for one new leaf |
+| `POST operator_nonce` | A fresh operator nonce, for a board |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |

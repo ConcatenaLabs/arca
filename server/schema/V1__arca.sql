@@ -96,9 +96,11 @@ CREATE TABLE watched_outpoint (
 -- Nonces, leaves, boards
 ------------------------------------------------------------------------------
 
--- The operator's contribution to a leaf's salt. Each is random, handed out
--- once, and taken by at most one leaf: the server never repeats an operator
--- nonce, so no leaf script it signs for can match one it signed for before.
+-- The second nonce of the salt of a leaf the operator creates (a board, a
+-- leaf of a round). Each is random, handed out once, and taken by at most one
+-- leaf: the server never repeats an operator nonce, so no leaf script it signs
+-- for can match one it signed for before. A leaf a reassignment creates takes
+-- its sender's creator nonce instead.
 CREATE TABLE operator_nonce (
 	nonce     BYTEA PRIMARY KEY CHECK (length(nonce) = 32),
 	issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -187,6 +189,20 @@ CREATE TABLE transfer_input (
 	reassignment_operator_sig BYTEA CHECK (length(reassignment_operator_sig) = 64),
 	PRIMARY KEY (transfer_id, idx)
 );
+
+-- Each reassignment the operator co-signed, as the rule that keeps any two
+-- from being merged into one transaction needs it: the hash of its output 0's
+-- record (every mergeable pair agrees at output 0), the coins it spends with
+-- their checkpoints' values, and its committed outputs, each encoded by the
+-- server. The rule is arca-covenant's (TransferPlan::admit); this table makes
+-- what it has seen durable.
+CREATE TABLE reassignment (
+	transfer_id  BYTEA PRIMARY KEY REFERENCES transfer,
+	first_output BYTEA NOT NULL CHECK (length(first_output) = 32),
+	inputs       BYTEA NOT NULL,
+	outputs      BYTEA NOT NULL
+);
+CREATE INDEX reassignment_by_first_output ON reassignment (first_output);
 
 -- Each committed output of a transfer: a new leaf, delivered to a mailbox.
 CREATE TABLE transfer_output (

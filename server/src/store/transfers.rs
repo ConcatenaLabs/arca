@@ -26,6 +26,15 @@ pub struct NewTransferInput {
 	pub checkpoint_script: Vec<u8>,
 }
 
+/// A reassignment as the merge rule keeps it: the hash of its output 0's
+/// record, and its inputs and outputs, encoded by the caller.
+#[derive(Debug, Clone)]
+pub struct NewReassignment {
+	pub first_output: [u8; 32],
+	pub inputs: Vec<u8>,
+	pub outputs: Vec<u8>,
+}
+
 /// One output of a transfer to record: its coin (pending, its record empty
 /// until signed) and the mailbox it goes to.
 #[derive(Debug, Clone)]
@@ -84,13 +93,27 @@ impl Store {
 	}
 
 	/// Records a transfer before it is signed: see the [module
-	/// documentation](self). Refuses an input that is not live or is spent
-	/// already, a nonce not issued or taken, a key or script already known.
-	pub async fn record_transfer(&self, transfer_id: &[u8; 32], inputs: &[NewTransferInput], outputs: &[NewTransferOutput])
-		-> Result<(), StoreError>
+	/// documentation](self). First `admit` is given every reassignment
+	/// already recorded with the same output 0 (`(inputs, outputs)` as
+	/// encoded), under a lock on that output, and refuses the transfer when
+	/// one transaction could satisfy it and one of them. Then refuses an input
+	/// that is not live or is spent already, a nonce not issued or taken, a
+	/// key or script already known.
+	pub async fn record_transfer<F>(&self, transfer_id: &[u8; 32], reassignment: &NewReassignment, admit: F,
+		inputs: &[NewTransferInput], outputs: &[NewTransferOutput]) -> Result<(), StoreError>
+	where
+		F: FnOnce(&[(Vec<u8>, Vec<u8>)]) -> Result<(), String>,
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		// One reassignment at a time per output 0: two that could be merged
+		// always agree there.
+		let lock = i64::from_le_bytes(reassignment.first_output[..8].try_into().expect("8 bytes"));
+		t.execute("SELECT pg_advisory_xact_lock($1)", &[&lock]).await?;
+		let seen = t.query("SELECT inputs, outputs FROM reassignment WHERE first_output = $1",
+			&[&&reassignment.first_output[..]]).await?;
+		let seen: Vec<(Vec<u8>, Vec<u8>)> = seen.iter().map(|r| (r.get(0), r.get(1))).collect();
+		admit(&seen).map_err(StoreError::Mergeable)?;
 		for i in inputs {
 			let r = t.query_opt(
 				"SELECT leaf_id, kind::text, asset, value, owner_key, script_pubkey, hops, record, state::text, spent_by
@@ -138,6 +161,8 @@ impl Store {
 			t.execute("INSERT INTO transfer_output (transfer_id, idx, leaf_id, mailbox_key) VALUES ($1, $2, $3, $4)",
 				&[&&transfer_id[..], &(k as i16), &&o.coin.leaf_id[..], &&o.mailbox_key[..]]).await?;
 		}
+		t.execute("INSERT INTO reassignment (transfer_id, first_output, inputs, outputs) VALUES ($1, $2, $3, $4)",
+			&[&&transfer_id[..], &&reassignment.first_output[..], &reassignment.inputs, &reassignment.outputs]).await?;
 		t.commit().await?;
 		Ok(())
 	}

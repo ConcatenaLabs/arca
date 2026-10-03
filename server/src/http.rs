@@ -86,7 +86,7 @@ fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"double_spend" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" => StatusCode::CONFLICT,
+		"double_spend" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"signer_unavailable" | "not_synced" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
@@ -262,7 +262,7 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 			leaf: NewLeaf {
 				owner: key(&o.owner)?,
 				owner_nonce: unhex32(&o.owner_nonce).map_err(Refusal::malformed)?,
-				operator_nonce: unhex32(&o.operator_nonce).map_err(Refusal::malformed)?,
+				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 			},

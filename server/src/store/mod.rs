@@ -33,7 +33,7 @@ pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
-pub use transfers::{NewTransferInput, NewTransferOutput, TransferRow};
+pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
 
 /// The migrations, in order: `(version, SQL)`. The schema is squashed into the
@@ -68,6 +68,9 @@ pub enum StoreError {
 	LeafSpent(String),
 	#[error("leaf {0} is {1}, not live")]
 	LeafNotLive(String, &'static str),
+	/// The merge rule refused a reassignment.
+	#[error("{0}")]
+	Mergeable(String),
 }
 
 impl StoreError {

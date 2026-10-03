@@ -89,7 +89,7 @@ pub struct NewScript {
 	pub kind: ScriptKind,
 }
 
-/// A coin to record: the leaf, the operator nonce its salt took, and every
+/// A coin to record: the leaf, the operator nonce its salt took if any, and every
 /// Arca script it brings (its own leaf script first).
 #[derive(Debug, Clone)]
 pub struct NewCoin {
@@ -104,9 +104,11 @@ pub struct NewCoin {
 	/// The coin record, binary form.
 	pub record: Vec<u8>,
 	pub state: LeafState,
-	/// The operator nonce in the leaf's salt; `None` only for a leaf whose
-	/// nonce the server has already taken (a batch leaf the round runner
-	/// records after building the tree).
+	/// The operator nonce in the leaf's salt, for a leaf the operator
+	/// created (a board); `None` for a leaf a reassignment created, whose
+	/// salt takes its sender's creator nonce, and for a leaf whose nonce the
+	/// server has already taken (a batch leaf the round runner records after
+	/// building the tree).
 	pub operator_nonce: Option<[u8; 32]>,
 	/// Every Arca script the coin brings, its own included.
 	pub scripts: Vec<NewScript>,

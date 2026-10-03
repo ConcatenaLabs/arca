@@ -78,7 +78,8 @@ pub struct FeesInfo {
 	pub transfer: String,
 }
 
-/// `POST /v1/operator_nonce`: a fresh operator nonce for one new leaf.
+/// `POST /v1/operator_nonce`: a fresh operator nonce for one leaf the
+/// operator creates, a board's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NonceResponse {
@@ -163,8 +164,9 @@ pub struct TransferOutput {
 	/// The new leaf's owner key and nonce, as its receiver published them.
 	pub owner: String,
 	pub owner_nonce: String,
-	/// A nonce from `operator_nonce`.
-	pub operator_nonce: String,
+	/// The second nonce of the new leaf's salt: the sender draws it, fresh
+	/// and at random, for every leaf it creates.
+	pub creator_nonce: String,
 	pub exit_delay_units: u16,
 	/// The mailbox the new coin goes to; the owner key when absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
