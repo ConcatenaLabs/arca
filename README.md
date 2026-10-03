@@ -27,6 +27,7 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `bark-cli/` | `arca-cli` | `bark_cli` | The `bark` command-line wallet and the `barkd` daemon |
 | `bark-json/`, `bark-rest/`, `bark-rest-client/` | `arca-json`, `arca-rest`, `arca-rest-client` | `bark_json`, `bark_rest`, `bark_rest_client` | JSON types, the daemon's REST server and its generated client |
 | `bark-common/`, `bark-runtime/` | `arca-common`, `arca-runtime` | `bark_common`, `bark_runtime` | Helpers shared by the wallet and the server; the async runtime abstraction |
+| `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL ([server/README.md](server/README.md)) |
 | `server-rpc/` | `arca-server-rpc` | `server_rpc` | The gRPC protocol of Bark's server, which the Bark wallet speaks |
 | `sequentia-ext/` | `arca-sequentia-ext` | `sequentia_ext` | Sequentia chain types (anchored block headers, issuances with a denomination, asset-tagged amounts), a JSON-RPC client for `sequentiad`, and a regtest harness ([sequentia-ext/README.md](sequentia-ext/README.md)) |
 | `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf, the entry, the forfeit, the checkpoint and `htlc-1`, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the board, the forfeit and its connector asset, the offboard, and the transactions that spend a leaf off the tree ([covenant/README.md](covenant/README.md)) |
@@ -54,6 +55,9 @@ to a node binary, as [consensus/README.md](consensus/README.md) describes.
 
     cargo test -p arca-consensus -p arca-sequentia-ext -p arca-covenant
 
+The server's tests also need a PostgreSQL server, named by `ARCA_TEST_POSTGRES`
+([server/README.md](server/README.md)).
+
 [regtest/](regtest/README.md) is the regtest suite: Python tests that build every
 Arca script independently of the Rust code and spend it on a Sequentia regtest
 chain, with each negative case forced into a block. It exports the golden
@@ -67,6 +71,8 @@ push to `master`: [lib.yml](.github/workflows/lib.yml) builds `arca-lib` and run
 its unit tests, and [node.yml](.github/workflows/node.yml) runs `arca-consensus`,
 `arca-sequentia-ext` and `arca-covenant`, checks that the golden vectors
 regenerate, and runs the regtest suite, all against the newest node build.
+[server.yml](.github/workflows/server.yml) runs the server's tests against a
+PostgreSQL service.
 [covenant.yml](.github/workflows/covenant.yml) checks that `arca-covenant`
 builds with the Rust version the Sequentia Wallet Kit pins, which is the
 `rust-version` in `covenant/Cargo.toml`.

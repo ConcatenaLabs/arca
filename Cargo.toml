@@ -15,6 +15,7 @@ members = [
   "consensus",
   "sequentia-ext",
   "covenant",
+  "server",
 ]
 
 resolver = "2"

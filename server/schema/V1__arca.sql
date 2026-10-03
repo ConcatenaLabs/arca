@@ -1,0 +1,346 @@
+-- The Arca server's schema, in one piece.
+--
+-- Conventions: every hash, key, asset id and txid is BYTEA in internal byte
+-- order (the reverse of what RPCs print); every amount is a pair of an asset
+-- and a BIGINT of that asset's atoms, never a bare number; leaves are keyed by
+-- their leaf id, never by an outpoint; transactions are stored in Sequentia's
+-- encoding.
+
+------------------------------------------------------------------------------
+-- The chain, as the finality service sees it
+------------------------------------------------------------------------------
+
+-- The active chain the finality service has followed: one row per height. A
+-- block leaves this table when it is disconnected.
+CREATE TABLE block (
+	hash          BYTEA PRIMARY KEY CHECK (length(hash) = 32),
+	height        BIGINT NOT NULL UNIQUE CHECK (height >= 0),
+	prev_hash     BYTEA NOT NULL CHECK (length(prev_hash) = 32),
+	-- The Bitcoin block the header commits to.
+	anchor_height BIGINT NOT NULL,
+	anchor_hash   BYTEA NOT NULL CHECK (length(anchor_hash) = 32),
+	median_time   BIGINT NOT NULL,
+	-- Whether the committee certified the block, as the node reports it.
+	certified     BOOLEAN NOT NULL,
+	connected_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Every connection and disconnection, in order: the record of what the server
+-- saw of the chain, rollbacks included.
+CREATE TABLE chain_event (
+	seq    BIGSERIAL PRIMARY KEY,
+	kind   TEXT NOT NULL CHECK (kind IN ('connected', 'disconnected')),
+	height BIGINT NOT NULL,
+	hash   BYTEA NOT NULL,
+	at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Transactions something in the server relies on, and why.
+CREATE TABLE watched_tx (
+	txid     BYTEA PRIMARY KEY CHECK (length(txid) = 32),
+	kind     TEXT NOT NULL,
+	added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Which active-chain block holds a watched transaction. The row goes with the
+-- block when it is disconnected.
+CREATE TABLE tx_block (
+	txid       BYTEA NOT NULL REFERENCES watched_tx ON DELETE CASCADE,
+	block_hash BYTEA NOT NULL REFERENCES block ON DELETE CASCADE,
+	PRIMARY KEY (txid, block_hash)
+);
+
+------------------------------------------------------------------------------
+-- Arca scripts and their sightings
+------------------------------------------------------------------------------
+
+-- Every Arca output script the server has created, accepted or co-signed
+-- into: leaves, boards, checkpoints. A script is funded at most once, so it
+-- has one row; the primary key is the server's guarantee of uniqueness across
+-- batches, boards and transfers.
+CREATE TABLE arca_script (
+	script_pubkey BYTEA PRIMARY KEY,
+	kind          TEXT NOT NULL CHECK (kind IN ('leaf', 'board', 'checkpoint')),
+	leaf_id       BYTEA NOT NULL CHECK (length(leaf_id) = 32),
+	added_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- A transaction output paying an Arca script, seen in the mempool or in a
+-- block. A sighting is never removed: once an output of a leaf has been seen,
+-- the server co-signs no off-chain spend of that leaf, rollback or not.
+CREATE TABLE script_sighting (
+	script_pubkey BYTEA NOT NULL REFERENCES arca_script,
+	txid          BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout          INTEGER NOT NULL CHECK (vout >= 0),
+	seen_in       TEXT NOT NULL CHECK (seen_in IN ('mempool', 'block')),
+	seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (script_pubkey, txid, vout)
+);
+
+-- Outputs whose spending the server must notice (a board output), and the
+-- first transaction seen spending each. Like a sighting, a spend once seen is
+-- kept.
+CREATE TABLE watched_outpoint (
+	txid     BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout     INTEGER NOT NULL CHECK (vout >= 0),
+	kind     TEXT NOT NULL,
+	leaf_id  BYTEA NOT NULL,
+	spent_by BYTEA,
+	spent_at TIMESTAMPTZ,
+	PRIMARY KEY (txid, vout)
+);
+
+------------------------------------------------------------------------------
+-- Nonces, leaves, boards
+------------------------------------------------------------------------------
+
+-- The operator's contribution to a leaf's salt. Each is random, handed out
+-- once, and taken by at most one leaf: the server never repeats an operator
+-- nonce, so no leaf script it signs for can match one it signed for before.
+CREATE TABLE operator_nonce (
+	nonce     BYTEA PRIMARY KEY CHECK (length(nonce) = 32),
+	issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	used_at   TIMESTAMPTZ,
+	used_by   BYTEA CHECK (used_by IS NULL OR length(used_by) = 32),
+	CHECK ((used_at IS NULL) = (used_by IS NULL))
+);
+
+CREATE TYPE leaf_kind AS ENUM ('board', 'batch', 'transfer');
+
+-- pending: known, not yet the owner's to spend (a board not yet final, a
+--   transfer's output whose signatures are not yet made);
+-- live: the owner's to spend off-chain;
+-- spent: spent off-chain, by the transfer or participation in spent_by;
+-- lost: can no longer be spent off-chain (its board never returned).
+CREATE TYPE leaf_state AS ENUM ('pending', 'live', 'spent', 'lost');
+
+-- Every coin the server knows, keyed by leaf id: a board, a leaf of a batch,
+-- or an output of a transfer, with its coin record (binary form), from which
+-- its whole lineage and every transaction that brings it on-chain follow.
+CREATE TABLE leaf (
+	leaf_id       BYTEA PRIMARY KEY CHECK (length(leaf_id) = 32),
+	kind          leaf_kind NOT NULL,
+	asset         BYTEA NOT NULL CHECK (length(asset) = 32),
+	value         BIGINT NOT NULL CHECK (value > 0),
+	-- One key, one leaf.
+	owner_key     BYTEA NOT NULL UNIQUE CHECK (length(owner_key) = 32),
+	script_pubkey BYTEA NOT NULL UNIQUE REFERENCES arca_script,
+	-- Reassignments since a round or a board.
+	hops          SMALLINT NOT NULL CHECK (hops >= 0),
+	record        BYTEA NOT NULL,
+	state         leaf_state NOT NULL,
+	spent_by      BYTEA,
+	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+	CHECK ((state = 'spent') = (spent_by IS NOT NULL))
+);
+
+-- pending: registered, its transaction not final;
+-- credited: final, the leaf is live;
+-- lost: its transaction cannot return to the chain.
+CREATE TYPE board_state AS ENUM ('pending', 'credited', 'lost');
+
+-- Boards: the owner's own coins brought in. The transaction is kept, whole, so
+-- the server can broadcast it again after a rollback.
+CREATE TABLE board (
+	leaf_id      BYTEA PRIMARY KEY REFERENCES leaf,
+	record       BYTEA NOT NULL,
+	txid         BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout         INTEGER NOT NULL CHECK (vout >= 0),
+	tx           BYTEA NOT NULL,
+	state        board_state NOT NULL,
+	-- How often the board was credited and uncredited: a rollback that
+	-- disconnects a credited board uncredits it.
+	credits      INTEGER NOT NULL DEFAULT 0,
+	uncredits    INTEGER NOT NULL DEFAULT 0,
+	credited_at  TIMESTAMPTZ,
+	created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+	UNIQUE (txid, vout)
+);
+
+------------------------------------------------------------------------------
+-- Out-of-round transfers
+------------------------------------------------------------------------------
+
+-- A transfer the server co-signed: its id is the reassignment's hash, the
+-- request hash makes a repeated request return the same answer.
+CREATE TABLE transfer (
+	transfer_id  BYTEA PRIMARY KEY CHECK (length(transfer_id) = 32),
+	request_hash BYTEA NOT NULL UNIQUE CHECK (length(request_hash) = 32),
+	state        TEXT NOT NULL CHECK (state IN ('recorded', 'signed')),
+	created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Each input of a transfer. A leaf is the input of at most one transfer: the
+-- unique key is the double-spend guard, and it is written before any
+-- signature leaves the server.
+CREATE TABLE transfer_input (
+	transfer_id               BYTEA NOT NULL REFERENCES transfer,
+	idx                       SMALLINT NOT NULL CHECK (idx >= 0),
+	leaf_id                   BYTEA NOT NULL UNIQUE REFERENCES leaf,
+	checkpoint_value          BIGINT NOT NULL CHECK (checkpoint_value > 0),
+	checkpoint_owner_sig      BYTEA NOT NULL CHECK (length(checkpoint_owner_sig) = 64),
+	reassignment_owner_sig    BYTEA NOT NULL CHECK (length(reassignment_owner_sig) = 64),
+	checkpoint_operator_sig   BYTEA CHECK (length(checkpoint_operator_sig) = 64),
+	reassignment_operator_sig BYTEA CHECK (length(reassignment_operator_sig) = 64),
+	PRIMARY KEY (transfer_id, idx)
+);
+
+-- Each committed output of a transfer: a new leaf, delivered to a mailbox.
+CREATE TABLE transfer_output (
+	transfer_id BYTEA NOT NULL REFERENCES transfer,
+	idx         SMALLINT NOT NULL CHECK (idx >= 0),
+	leaf_id     BYTEA NOT NULL UNIQUE REFERENCES leaf,
+	mailbox_key BYTEA NOT NULL CHECK (length(mailbox_key) = 32),
+	PRIMARY KEY (transfer_id, idx)
+);
+
+------------------------------------------------------------------------------
+-- Rounds
+------------------------------------------------------------------------------
+
+-- A round transaction the operator built and signed. It is kept whole, with
+-- nLockTime 0, and broadcast again unchanged after a rollback.
+CREATE TABLE round (
+	round_id   BIGSERIAL PRIMARY KEY,
+	txid       BYTEA NOT NULL UNIQUE CHECK (length(txid) = 32),
+	tx         BYTEA NOT NULL,
+	state      TEXT NOT NULL CHECK (state IN ('built', 'broadcast', 'final', 'lost')),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The round's connector output, which only the issuance of the round's
+-- connector asset spends, and that asset once issued.
+CREATE TABLE connector_output (
+	round_id        BIGINT PRIMARY KEY REFERENCES round,
+	vout            INTEGER NOT NULL CHECK (vout >= 0),
+	asset           BYTEA NOT NULL CHECK (length(asset) = 32),
+	value           BIGINT NOT NULL CHECK (value > 0),
+	connector_asset BYTEA NOT NULL CHECK (length(connector_asset) = 32),
+	issuance_txid   BYTEA CHECK (length(issuance_txid) = 32)
+);
+
+-- A participation: leaves given up and leaves wanted, under one unlock hash.
+CREATE TABLE participation (
+	participation_id BYTEA PRIMARY KEY CHECK (length(participation_id) = 32),
+	unlock_hash      BYTEA NOT NULL UNIQUE CHECK (length(unlock_hash) = 32),
+	preimage         BYTEA NOT NULL CHECK (length(preimage) = 32),
+	round_id         BIGINT REFERENCES round,
+	state            TEXT NOT NULL CHECK (state IN ('pending', 'issued', 'forfeited', 'released')),
+	created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE participation_input (
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	leaf_id          BYTEA NOT NULL REFERENCES leaf,
+	PRIMARY KEY (participation_id, leaf_id)
+);
+
+CREATE TABLE participation_output (
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	idx              SMALLINT NOT NULL CHECK (idx >= 0),
+	asset            BYTEA NOT NULL CHECK (length(asset) = 32),
+	value            BIGINT NOT NULL CHECK (value > 0),
+	template         TEXT NOT NULL,
+	owner_key        BYTEA NOT NULL CHECK (length(owner_key) = 32),
+	owner_nonce      BYTEA NOT NULL CHECK (length(owner_nonce) = 32),
+	exit_delay_units INTEGER NOT NULL,
+	leaf_id          BYTEA REFERENCES leaf,
+	PRIMARY KEY (participation_id, idx)
+);
+
+-- A forfeit of a leaf for a round: the owner's and the operator's signatures
+-- over the leaf's move into the forfeit output.
+CREATE TABLE forfeit (
+	leaf_id            BYTEA NOT NULL REFERENCES leaf,
+	round_id           BIGINT NOT NULL REFERENCES round,
+	participation_id   BYTEA NOT NULL REFERENCES participation,
+	owner_sig          BYTEA NOT NULL CHECK (length(owner_sig) = 64),
+	operator_sig       BYTEA NOT NULL CHECK (length(operator_sig) = 64),
+	refund_delay_units INTEGER NOT NULL,
+	margin             BIGINT NOT NULL CHECK (margin >= 0),
+	PRIMARY KEY (leaf_id, round_id)
+);
+
+------------------------------------------------------------------------------
+-- Mailboxes and authentication
+------------------------------------------------------------------------------
+
+-- Messages for receivers who may be offline, read by cursor.
+CREATE TABLE mailbox_message (
+	cursor      BIGSERIAL PRIMARY KEY,
+	mailbox_key BYTEA NOT NULL CHECK (length(mailbox_key) = 32),
+	kind        TEXT NOT NULL CHECK (kind IN ('coin')),
+	leaf_id     BYTEA REFERENCES leaf,
+	payload     BYTEA NOT NULL,
+	created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX mailbox_message_by_key ON mailbox_message (mailbox_key, cursor);
+
+-- Challenges a client signs with a leaf key to authenticate: each is used once.
+CREATE TABLE auth_challenge (
+	challenge  BYTEA PRIMARY KEY CHECK (length(challenge) = 32),
+	issued_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+	expires_at TIMESTAMPTZ NOT NULL,
+	used_at    TIMESTAMPTZ
+);
+
+------------------------------------------------------------------------------
+-- The on-chain wallet and the server's own transactions
+------------------------------------------------------------------------------
+
+-- The wallet's receiving scripts, by derivation index.
+CREATE TABLE wallet_key (
+	idx           INTEGER PRIMARY KEY CHECK (idx >= 0),
+	script_pubkey BYTEA NOT NULL UNIQUE,
+	issued_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The wallet's coins, per asset, all explicit. spent_by names the server's
+-- transaction that spends the coin once the wallet has built it.
+CREATE TABLE wallet_coin (
+	txid          BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout          INTEGER NOT NULL CHECK (vout >= 0),
+	asset         BYTEA NOT NULL CHECK (length(asset) = 32),
+	value         BIGINT NOT NULL CHECK (value > 0),
+	script_pubkey BYTEA NOT NULL REFERENCES wallet_key (script_pubkey),
+	spent_by      BYTEA CHECK (spent_by IS NULL OR length(spent_by) = 32),
+	found_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (txid, vout)
+);
+CREATE INDEX wallet_coin_by_asset ON wallet_coin (asset) WHERE spent_by IS NULL;
+
+-- Outputs paid to the wallet that it refused to take as coins (a blinded
+-- output: the server is transparent at its boundary).
+CREATE TABLE wallet_refused (
+	txid          BYTEA NOT NULL CHECK (length(txid) = 32),
+	vout          INTEGER NOT NULL CHECK (vout >= 0),
+	script_pubkey BYTEA NOT NULL,
+	reason        TEXT NOT NULL,
+	seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (txid, vout)
+);
+
+-- pending: to be kept broadcast until final;
+-- final: certified and its anchor buried;
+-- lost: it can no longer confirm (an input is spent elsewhere).
+CREATE TYPE nursery_state AS ENUM ('pending', 'final', 'lost');
+
+-- Transactions the server keeps broadcasting until they are final: its own
+-- (rounds, wallet transactions) and those it relies on (boards). Each is kept
+-- byte for byte, and only ever broadcast again unchanged.
+CREATE TABLE nursery_tx (
+	txid              BYTEA PRIMARY KEY CHECK (length(txid) = 32),
+	tx                BYTEA NOT NULL,
+	kind              TEXT NOT NULL CHECK (kind IN ('board', 'wallet', 'round')),
+	-- The fee asset and amount a server-built transaction names; NULL for a
+	-- transaction the server did not build.
+	fee_asset         BYTEA CHECK (fee_asset IS NULL OR length(fee_asset) = 32),
+	fee               BIGINT CHECK (fee IS NULL OR fee >= 0),
+	state             nursery_state NOT NULL DEFAULT 'pending',
+	broadcasts        INTEGER NOT NULL DEFAULT 0,
+	last_broadcast_at TIMESTAMPTZ,
+	last_result       TEXT,
+	created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+	CHECK ((fee_asset IS NULL) = (fee IS NULL))
+);

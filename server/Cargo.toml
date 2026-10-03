@@ -1,0 +1,30 @@
+[package]
+name = "arca-server"
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "The Arca operator's server on Sequentia: durable state, finality, the on-chain wallet, boards and transfer co-signing"
+publish = false
+
+[lib]
+name = "server"
+
+[dependencies]
+arca-covenant = { path = "../covenant" }
+arca-sequentia-ext = { path = "../sequentia-ext" }
+elements.workspace = true
+
+thiserror.workspace = true
+log.workspace = true
+serde = { workspace = true, features = [ "derive" ] }
+serde_json.workspace = true
+rand = "0.8"
+
+tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "sync", "time" ] }
+tokio-postgres = "0.7"
+bb8 = "0.9"
+bb8-postgres = "0.9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "sync", "time" ] }
