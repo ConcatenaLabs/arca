@@ -35,6 +35,14 @@
 //! forfeits) and every participation's move to issued are recorded in one
 //! database transaction, and the round goes to the nursery.
 //!
+//! After a rollback the nursery broadcasts a round again unchanged; while it
+//! is out of the chain its new leaves are uncredited, and they are credited
+//! again once it is final again. A round that can never return (an input of
+//! it spent by another transaction that is final) is retired: its new leaves
+//! are lost, and its participations run again in a later round under new
+//! unlock hashes and operator nonces, forfeit-first where their preimage had
+//! gone out, the releases given for it retired.
+//!
 //! Each batch is published ([`Rounds::tree`]): its round, its output, its
 //! token's output, the round's connector output, its asset, schedule, radix,
 //! reserve rule and smallest leaf, and every leaf as the builder took it, so
@@ -66,7 +74,7 @@ use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{
 	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRound, NewScript, ParticipationRow,
-	ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, WantedKind,
+	NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, WantedKind,
 };
 use crate::wallet::{Wallet, WalletError};
 
@@ -502,9 +510,10 @@ impl Rounds {
 	}
 
 	/// One pass over every round not lost: a round recorded but never handed
-	/// to the nursery goes to it; a round the finality service calls final is
-	/// marked final, and the new leaves of its released participations are
-	/// credited; one no longer final goes back to broadcast.
+	/// to the nursery goes to it; one the nursery found can never return is
+	/// retired; one the finality service calls final is marked final, and the
+	/// new leaves of its released participations are credited; one no longer
+	/// final goes back to broadcast, its leaves uncredited.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
@@ -514,7 +523,53 @@ impl Rounds {
 		let mut rows = self.store.rounds_in(RoundState::Broadcast).await?;
 		rows.extend(self.store.rounds_in(RoundState::Final).await?);
 		for r in rows {
+			if self.nursery_lost(&r).await? {
+				self.retire(&r).await?;
+				continue;
+			}
 			self.check_round(&r).await?;
+		}
+		Ok(())
+	}
+
+	/// Whether the nursery has found that the round can never return: a
+	/// final transaction of another txid spent one of its inputs.
+	async fn nursery_lost(&self, r: &RoundRow) -> Result<bool, RoundError> {
+		Ok(self.store.nursery_get(&r.txid).await?.is_some_and(|n| n.state == NurseryState::Lost))
+	}
+
+	/// Retires a round that can never return: its unspent new leaves are
+	/// lost, and its participations run again in a later round under new
+	/// unlock hashes, forfeit-first where their preimage had gone out.
+	async fn retire(&self, r: &RoundRow) -> Result<(), RoundError> {
+		let again = self.store.retire_round(r.round_id).await?;
+		log::warn!("round {} ({}) can never return: retired; {} participation(s) run again, {} of them forfeit-first",
+			r.round_id, Txid::from_byte_array(r.txid), again.len(), again.iter().filter(|(_, f)| *f).count());
+		Ok(())
+	}
+
+	/// A round that was final and no longer is: back to broadcast, its live
+	/// new leaves uncredited until it is final again.
+	async fn unfinal(&self, round_id: i64, txid: &Txid) -> Result<(), RoundError> {
+		if self.store.set_round_state(round_id, RoundState::Final, RoundState::Broadcast).await? {
+			let n = self.store.uncredit_round(round_id).await?;
+			log::warn!("round {} ({}) is no longer final: {} leaf/leaves uncredited", round_id, txid, n);
+		}
+		Ok(())
+	}
+
+	/// Handles a change to the chain: a disconnection that takes a round out
+	/// uncredits its leaves at once (the nursery broadcasts it again).
+	pub async fn on_chain_event(&self, event: &ChainEvent) -> Result<(), RoundError> {
+		if let ChainEvent::Disconnected { watched, .. } = event {
+			for (txid, kind) in watched {
+				if kind != NurseryKind::Round.as_str() {
+					continue;
+				}
+				if let Some(r) = self.store.round_by_txid(&txid.to_byte_array()).await? {
+					self.unfinal(r.round_id, txid).await?;
+				}
+			}
 		}
 		Ok(())
 	}
@@ -528,9 +583,7 @@ impl Rounds {
 				let credited = self.store.credit_round(r.round_id).await?;
 				log::info!("round {} ({}) is final; {} leaf/leaves credited", r.round_id, txid, credited);
 			},
-			(RoundState::Final, false) if self.store.set_round_state(r.round_id, RoundState::Final, RoundState::Broadcast).await? => {
-				log::warn!("round {} ({}) is no longer final: {:?}", r.round_id, txid, fin);
-			},
+			(RoundState::Final, false) => self.unfinal(r.round_id, &txid).await?,
 			_ => {},
 		}
 		Ok(())
@@ -584,7 +637,8 @@ impl Rounds {
 			loop {
 				let r = tokio::select! {
 					e = rx.recv() => match e {
-						Ok(ChainEvent::Synced { .. }) | Ok(ChainEvent::Disconnected { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => me.pass().await,
+						Ok(ChainEvent::Synced { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => me.pass().await,
+						Ok(e @ ChainEvent::Disconnected { .. }) => me.on_chain_event(&e).await,
 						Ok(_) => Ok(()),
 						Err(broadcast::error::RecvError::Closed) => return,
 					},

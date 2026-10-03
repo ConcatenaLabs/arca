@@ -126,8 +126,7 @@ CREATE TABLE leaf (
 	kind          leaf_kind NOT NULL,
 	asset         BYTEA NOT NULL CHECK (length(asset) = 32),
 	value         BIGINT NOT NULL CHECK (value > 0),
-	-- One key, one leaf.
-	owner_key     BYTEA NOT NULL UNIQUE CHECK (length(owner_key) = 32),
+	owner_key     BYTEA NOT NULL CHECK (length(owner_key) = 32),
 	script_pubkey BYTEA NOT NULL UNIQUE REFERENCES arca_script,
 	-- Reassignments since a round or a board.
 	hops          SMALLINT NOT NULL CHECK (hops >= 0),
@@ -138,6 +137,10 @@ CREATE TABLE leaf (
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	CHECK ((state = 'spent') = (spent_by IS NOT NULL))
 );
+-- One key, one leaf: a key owns one leaf that is not lost. A participation
+-- that runs again after its round could never return asks for its leaves
+-- under the same keys; the leaves of the lost round are lost.
+CREATE UNIQUE INDEX leaf_owner_key_key ON leaf (owner_key) WHERE state <> 'lost';
 
 -- pending: registered, its transaction not final;
 -- credited: final, the leaf is live;
@@ -281,6 +284,20 @@ CREATE TABLE participation (
 	CHECK ((state IN ('issued', 'released')) = (round_id IS NOT NULL))
 );
 
+-- The earlier attempts of a participation: each round it was in that could
+-- never return, with the unlock hash and preimage it had then and whether that
+-- preimage went out.
+CREATE TABLE participation_attempt (
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	attempt          INTEGER NOT NULL CHECK (attempt >= 0),
+	round_id         BIGINT NOT NULL REFERENCES round,
+	unlock_hash      BYTEA NOT NULL CHECK (length(unlock_hash) = 32),
+	preimage         BYTEA NOT NULL CHECK (length(preimage) = 32),
+	released         BOOLEAN NOT NULL,
+	retired_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (participation_id, attempt)
+);
+
 -- Each coin given up. A coin is given up once, ever: the unique key holds it,
 -- and the coin's row is marked spent by the participation in the same
 -- transaction.
@@ -421,13 +438,17 @@ CREATE TABLE forfeit (
 -- An owner's release of the lowest node of a coin it gave up: its signature,
 -- with the coin's key, over SHA256("Arca/release" ‖ genesis_hash ‖ H), H the
 -- node's children hash. Taken only after the participation's preimage went
--- out, and never for a coin with an open out-of-round reassignment. Once every
--- owner under a lowest node has released it, the operator may reclaim it.
+-- out, while its round is final, and never for a coin with an open
+-- out-of-round reassignment. Once every owner under a lowest node has released
+-- it, the operator may reclaim it.
 CREATE TABLE node_release (
 	leaf_id          BYTEA PRIMARY KEY REFERENCES leaf,
 	participation_id BYTEA NOT NULL REFERENCES participation,
 	node_hash        BYTEA NOT NULL CHECK (length(node_hash) = 32),
 	signature        BYTEA NOT NULL CHECK (length(signature) = 64),
+	-- Set when the round the participation was released in can never
+	-- return: a release given for that round is never used.
+	retired          BOOLEAN NOT NULL DEFAULT false,
 	created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX node_release_by_node ON node_release (node_hash);

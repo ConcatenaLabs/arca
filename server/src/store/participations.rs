@@ -416,14 +416,99 @@ impl Store {
 	}
 
 	/// The releases recorded for the lowest node whose children hash is
-	/// `node_hash`: each leaf's id and its owner's signature.
+	/// `node_hash`, but those retired with a lost round: each leaf's id and
+	/// its owner's signature.
 	pub async fn releases(&self, node_hash: &[u8; 32]) -> Result<Vec<([u8; 32], [u8; 64])>, StoreError> {
 		let conn = self.conn().await?;
-		let rows = conn.query("SELECT leaf_id, signature FROM node_release WHERE node_hash = $1 ORDER BY leaf_id", &[&&node_hash[..]]).await?;
+		let rows = conn.query("SELECT leaf_id, signature FROM node_release WHERE node_hash = $1 AND NOT retired ORDER BY leaf_id",
+			&[&&node_hash[..]]).await?;
 		rows.iter().map(|r| {
 			let sig: Vec<u8> = r.get(1);
 			Ok((array32(r.get(0), "leaf id")?, sig.try_into().map_err(|_| StoreError::Corrupt("signature".into()))?))
 		}).collect()
+	}
+
+	/// Uncredits the live new leaves of the round `round_id`, which is no
+	/// longer final: each goes back to pending until the round is final
+	/// again. A leaf already spent stays spent; what rests on it is refused
+	/// while its round is not final. Returns how many.
+	pub async fn uncredit_round(&self, round_id: i64) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.execute(
+			"UPDATE leaf SET state = 'pending', updated_at = now()
+			 WHERE state = 'live' AND leaf_id IN (SELECT leaf_id FROM batch_leaf WHERE round_id = $1)",
+			&[&round_id],
+		).await?)
+	}
+
+	/// Retires the round `round_id`, which can never return, whole or not at
+	/// all: the round is lost, its new leaves not yet spent are lost, and every
+	/// participation it ran runs again in a later round, under a new unlock
+	/// hash, with a new operator nonce for each leaf it wants (its keys and
+	/// owner nonces as before), the attempt it leaves recorded, and any
+	/// release of the coins it gave up retired. A participation whose
+	/// preimage had gone out runs again forfeit-first.
+	/// The coins those participations gave up stay given up. Returns the
+	/// participations that run again, and which of them forfeit-first.
+	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<([u8; 32], bool)>, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let n = t.execute(
+			"UPDATE round SET state = 'lost', updated_at = now() WHERE round_id = $1 AND state <> 'lost'",
+			&[&round_id],
+		).await?;
+		if n != 1 {
+			return Ok(vec![]);
+		}
+		t.execute(
+			"UPDATE leaf SET state = 'lost', updated_at = now()
+			 WHERE state IN ('pending', 'live') AND leaf_id IN (SELECT leaf_id FROM batch_leaf WHERE round_id = $1)",
+			&[&round_id],
+		).await?;
+		let rows = t.query(
+			"SELECT participation_id, attempt, unlock_hash, preimage, state::text, forfeit_first FROM participation
+			 WHERE round_id = $1 AND state IN ('issued', 'released') FOR UPDATE",
+			&[&round_id],
+		).await?;
+		let mut again = Vec::with_capacity(rows.len());
+		for r in rows {
+			let id = array32(r.get(0), "participation id")?;
+			let attempt: i32 = r.get(1);
+			let unlock_hash: Vec<u8> = r.get(2);
+			let preimage: Vec<u8> = r.get(3);
+			let released = r.get::<_, &str>(4) == "released";
+			let forfeit_first = r.get::<_, bool>(5) || released;
+			t.execute(
+				"INSERT INTO participation_attempt (participation_id, attempt, round_id, unlock_hash, preimage, released)
+				 VALUES ($1, $2, $3, $4, $5, $6)",
+				&[&&id[..], &attempt, &round_id, &unlock_hash, &preimage, &released],
+			).await?;
+			let mut new_preimage = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut new_preimage);
+			let new_hash = arca_covenant::script::sha256(&new_preimage);
+			t.execute(
+				"UPDATE participation SET state = 'pending', round_id = NULL, attempt = attempt + 1, unlock_hash = $2,
+				 preimage = $3, forfeit_first = $4, updated_at = now() WHERE participation_id = $1",
+				&[&&id[..], &&new_hash[..], &&new_preimage[..], &forfeit_first],
+			).await?;
+			let outputs = t.query(
+				"SELECT idx FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx", &[&&id[..]],
+			).await?;
+			for o in outputs {
+				let idx: i16 = o.get(0);
+				let nonce = draw_nonce(&t, &id).await?;
+				t.execute(
+					"UPDATE participation_output SET operator_nonce = $3, leaf_id = NULL WHERE participation_id = $1 AND idx = $2",
+					&[&&id[..], &idx, &&nonce[..]],
+				).await?;
+			}
+			t.execute("UPDATE participation_output SET leaf_id = NULL WHERE participation_id = $1", &[&&id[..]]).await?;
+			// Releases given on the strength of this round are never used.
+			t.execute("UPDATE node_release SET retired = true WHERE participation_id = $1", &[&&id[..]]).await?;
+			again.push((id, forfeit_first));
+		}
+		t.commit().await?;
+		Ok(again)
 	}
 
 	/// Voids the pending participation `id`, which no round has taken: the

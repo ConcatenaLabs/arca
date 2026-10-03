@@ -108,3 +108,40 @@ pub fn validate_new_leaf(r: &Running, id: &[u8; 32], output: usize, key: &Keypai
 pub fn created(record: &LeafRecord) -> MedianTime {
 	MedianTime::from_consensus(record.schedule.expiries()[0].to_consensus_u32() - 28 * 86_400).unwrap()
 }
+
+/// A transaction spending the server wallet's coin at `coin` (whose output is
+/// `txout`) into `outputs` and a fee of `fee` in the coin's asset, signed
+/// outside the server with the wallet's mnemonic: the operator's coin spent
+/// elsewhere, as when another tool uses the same wallet.
+pub fn spend_wallet_coin(coin: elements::OutPoint, txout: &elements::TxOut, outputs: Vec<elements::TxOut>, fee: u64) -> Transaction {
+	use elements::bitcoin::bip32::DerivationPath;
+	use elements::pset::PartiallySignedTransaction;
+	use lwk_common::Signer as _;
+	use std::str::FromStr;
+	let signer = lwk_signer::SwSigner::new(super::keys::MNEMONIC, false).unwrap();
+	let secp = elements::bitcoin::secp256k1::Secp256k1::new();
+	// Find the key: the wallet's scripts are m/84'/1'/0'/<chain>/<index>.
+	let (path, pk) = (0..2).flat_map(|c| (0..200).map(move |i| (c, i))).find_map(|(c, i)| {
+		let path = DerivationPath::from_str(&format!("m/84h/1h/0h/{}/{}", c, i)).unwrap();
+		let pk = elements::bitcoin::PublicKey::new(signer.derive_xprv(&path).unwrap().private_key.public_key(&secp));
+		(elements::Script::new_v0_wpkh(&elements::WPubkeyHash::hash(&pk.to_bytes())) == txout.script_pubkey).then_some((path, pk))
+	}).expect("a key of the wallet's");
+	let asset = txout.asset.explicit().unwrap();
+	let value = txout.value.explicit().unwrap();
+	let spent: u64 = outputs.iter().map(|o| o.value.explicit().unwrap()).sum();
+	let mut output = outputs;
+	output.push(sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(asset, value - spent - fee), super::node::op_true()));
+	output.push(sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(asset, fee)));
+	let mut tx = Transaction {
+		version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: coin, sequence: elements::Sequence::MAX, ..Default::default() }],
+		output,
+	};
+	let mut pset = PartiallySignedTransaction::from_tx(tx.clone());
+	pset.inputs_mut()[0].witness_utxo = Some(txout.clone());
+	pset.inputs_mut()[0].bip32_derivation.insert(pk, (signer.fingerprint(), path));
+	assert_eq!(signer.sign(&mut pset).unwrap(), 1);
+	let sig = pset.inputs()[0].partial_sigs.get(&pk).unwrap().clone();
+	tx.input[0].witness.script_witness = vec![sig, pk.to_bytes()];
+	tx
+}
