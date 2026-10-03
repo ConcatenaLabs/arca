@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS swap (
 	created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mailbox (key BLOB PRIMARY KEY, cursor INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mailbox_retry (leaf_id TEXT PRIMARY KEY, record BLOB NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS exit (leaf_id TEXT PRIMARY KEY, state TEXT NOT NULL, txs TEXT NOT NULL, claim TEXT);
 CREATE TABLE IF NOT EXISTS forfeit (
 	leaf_id TEXT NOT NULL,
@@ -475,6 +476,26 @@ impl Store {
 	pub fn set_cursor(&self, key: &[u8; 32], cursor: i64) -> Result<(), Error> {
 		self.conn.execute("INSERT INTO mailbox (key, cursor) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET cursor = ?2",
 			params![&key[..], cursor]).map_err(db)?;
+		Ok(())
+	}
+
+	/// A coin from the mailbox refused for a passing reason, kept to be
+	/// checked again.
+	pub fn keep_for_retry(&self, leaf_id: &str, record: &[u8], reason: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO mailbox_retry (leaf_id, record, reason, at) VALUES (?1, ?2, ?3, ?4)
+			ON CONFLICT(leaf_id) DO UPDATE SET reason = ?3, at = ?4", params![leaf_id, record, reason, now()]).map_err(db)?;
+		Ok(())
+	}
+
+	/// `(leaf_id, record)` of every coin kept for another check.
+	pub fn kept_for_retry(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, record FROM mailbox_retry ORDER BY at").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	pub fn drop_retry(&self, leaf_id: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM mailbox_retry WHERE leaf_id = ?1", params![leaf_id]).map_err(db)?;
 		Ok(())
 	}
 

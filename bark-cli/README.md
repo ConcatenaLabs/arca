@@ -29,7 +29,12 @@ It needs:
 Every command prints JSON. A refusal prints
 `{"error": {"kind", "message"}}` (with the server's `code` and `status` when
 the server refused) and exits with status 1. Every refusal is also recorded,
-and `arca refusals` lists them.
+and `arca refusals` lists them. The server has refused only when it answers a
+4xx with one of its refusal codes; any other failure (no answer, a timeout, a
+5xx, a proxy's error page) says nothing of what it did, so the wallet reports
+it as `unreachable` and keeps whatever it asked for standing: a payment stays
+in flight and `sync` posts the same request again, which the server answers as
+it did the first time.
 
 ### Keys
 
@@ -136,7 +141,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
-| `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
+| `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
@@ -189,19 +194,27 @@ answer of the server or hold a call unanswered, and with transactions the test
 builds itself as the operator or as a sender. Each case is one way an operator
 lies, stalls or vanishes, or a sender goes back on a payment, and each ends
 with the wallet refusing before it signs anything, or taking its coin on-chain
-and holding it there, with the reason shown: a refresh whose status hides a new
-leaf or names another unlock hash; a round rolled back and replaced by one
-that fails check 1, which the wallet's re-check exits from at once; a coin
-given to a participation that expires, or that the operator never runs; a coin
-in flight when the operator vanishes; a preimage withheld and a participation
-called void after its forfeit, the preimage then read from the operator's
-claim on the chain; and a round that can never return, whose coins come back,
-a forfeit of one of them published anyway and refunded after its delay; a
-refresh fee of half of every coin, and one inside a coin's free window; and a
-sender converting the board it paid from, answered at once by the receiver;
-a server named `https://` whose certificate no root vouches for, refused by
-TLS itself, and a plain-HTTP server on another host, refused before anything
-is sent.
+and holding it there, with the reason shown:
+
+- a refresh whose status hides a new leaf, or names another unlock hash;
+- a round rolled back and replaced by one that fails check 1, which the
+  wallet's re-check exits from at once;
+- a coin given to a participation that expires, or that the operator never
+  runs;
+- a coin in flight when the operator vanishes;
+- a preimage withheld and a participation called void after its forfeit, the
+  preimage then read from the operator's claim on the chain;
+- a round that can never return, whose coins come back, a forfeit of one of
+  them published anyway and refunded after its delay;
+- a refresh fee of half of every coin, and one inside a coin's free window;
+- a sender converting the board it paid from, answered at once by the
+  receiver;
+- a server named `https://` whose certificate no root vouches for, refused by
+  TLS itself, and a plain-HTTP server on another host, refused before anything
+  is sent;
+- a payment whose answer comes back as a gateway's 502, posted again;
+- a coin received while its board is rolled out of the chain, taken once the
+  board returns.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

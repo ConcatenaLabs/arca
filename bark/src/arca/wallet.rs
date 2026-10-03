@@ -336,7 +336,7 @@ impl Wallet {
 					txs.push(t);
 				},
 				(None, Some(t)) => txs.push(t),
-				(None, None) => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
+				(None, None) => return Err(Error::Missing(format!("no transaction on the chain pays the batch or board output {} it rests on",
 					hex(o.script_pubkey.as_bytes())))),
 			}
 		}
@@ -357,7 +357,7 @@ impl Wallet {
 				Some(t) => txs.push(t),
 				None => match self.chain_payer(&o)? {
 					Some(t) => txs.push(t),
-					None => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
+					None => return Err(Error::Missing(format!("no transaction on the chain pays the batch or board output {} it rests on",
 						hex(o.script_pubkey.as_bytes())))),
 				},
 			}
@@ -571,7 +571,7 @@ impl Wallet {
 	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy) -> Result<Checked, Error> {
 		let txs = match self.base_txs(record) {
 			Ok(t) => t,
-			Err(e @ (Error::Refused(_) | Error::Parse(_))) => return Ok(Checked::Holds("pending", format!("re-check: {}", e))),
+			Err(e @ (Error::Refused(_) | Error::Missing(_) | Error::Parse(_))) => return Ok(Checked::Holds("pending", format!("re-check: {}", e))),
 			Err(e) => return Err(e),
 		};
 		let mut bases = vec![];

@@ -56,6 +56,10 @@ pub enum Error {
 	Server { call: String, status: i32, code: String, message: String },
 	#[error("cannot reach the server: {0}")]
 	Unreachable(String),
+	/// What a coin rests on is not on the chain the node holds now, as during
+	/// a rollback: it may be again.
+	#[error("not on the chain now: {0}")]
+	Missing(String),
 	#[error("the node: {0}")]
 	Node(String),
 	#[error("the store: {0}")]
@@ -75,6 +79,7 @@ impl Error {
 			Error::Refused(_) => "refused",
 			Error::Server { .. } => "server_refused",
 			Error::Unreachable(_) => "unreachable",
+			Error::Missing(_) => "missing",
 			Error::Node(_) => "node",
 			Error::Store(_) => "store",
 			Error::Keys(_) => "keys",

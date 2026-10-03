@@ -800,3 +800,83 @@ async fn the_server_is_reached_over_tls_and_plain_http_only_on_this_machine() {
 		let _ = std::fs::remove_dir_all(Arca::new(d).dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// An answer lost, a coin not yet backed
+// ---------------------------------------------------------------------------
+
+/// The server co-signs a payment and the answer comes back as a gateway's
+/// 502. That is no refusal: the coin stays in flight, `sync` posts the same
+/// bytes again, and the server's same answer spends the coin and keeps the
+/// change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("F9A");
+	let b = Arca::new("F9B");
+	let boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/cosign_transfer" && status == 200 {
+			*v = json!({"error": {"code": "bad_gateway", "message": "upstream timed out"}});
+			return Some(502);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("F9 A's send answered 502 after the server co-signed: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!(v["error"]["kind"], "unreachable", "a 502 is not a refusal: {}", v);
+	proxy.rewrite(None);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "sending", "the coin is still in flight, not live");
+	let m = b.ok(&["mailbox"]);
+	assert_eq!(m["accepted"][0]["value"], "600000", "the receiver has its coin: {}", m);
+	let s = a.ok(&["sync"]);
+	println!("F9 A's sync: transfers {}", s["transfers"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string(), "the request posted again gets the server's answer: {}", s);
+	let calls: Vec<Value> = proxy.calls().into_iter().filter(|(p, ..)| p == "/v1/cosign_transfer").map(|(_, q, ..)| q).collect();
+	assert_eq!(calls.len(), 2);
+	assert_eq!(calls[0], calls[1], "the same request, byte for byte");
+	assert_eq!(coin_of(&a, &boards[0])["state"], "spent");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A coin paid to the wallet while the board it rests on is rolled out of
+/// the chain is refused for a passing reason, kept, and accepted once the
+/// board is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mailbox_coin_refused_during_a_rollback_is_taken_once_its_board_returns() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("F10A");
+	let b = Arca::new("F10B");
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let CoinRecord::Board(rec) = record_of(&a, &boards[0]) else { panic!("a board") };
+	let board_txid = find_unspent(&r, &rec.output().txout()).txid.to_string();
+	let block = block_of(&r, &board_txid);
+	rpc(&r, "invalidateblock", &[json!(block)]);
+	let m = b.ok(&["mailbox"]);
+	println!("F10 B's mailbox during the rollback: {}", m);
+	assert_eq!(m["refused"], json!([]), "{}", m);
+	assert!(m["waiting"][0]["reason"].as_str().unwrap().contains("no transaction on the chain pays"), "{}", m);
+	rpc(&r, "reconsiderblock", &[json!(block)]);
+	r.produce().await;
+	r.bury().await;
+	let m = b.ok(&["mailbox"]);
+	println!("F10 B's mailbox once the board is back: {}", m);
+	assert_eq!(m["accepted"][0]["value"], "600000", "{}", m);
+	assert_eq!(b.ok(&["mailbox"])["waiting"], json!([]));
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
