@@ -81,6 +81,24 @@ pub enum SpendError {
 	OtherBoard,
 	#[error("the coin has no lowest node of its own to release")]
 	NoLowestNode,
+	#[error("{0} holds nothing for a fee: attach a fee coin")]
+	NeedsFeeCoin(&'static str),
+	#[error("the schedule has no clock {step}; it has {steps}")]
+	ClockStep { step: usize, steps: usize },
+	#[error("clock {0} is the last: it has no roll")]
+	LastClock(usize),
+	#[error("a sweep takes at least one output")]
+	NothingToSweep,
+	#[error("swept output {0} carries no sweep behind this schedule's token, R and operator")]
+	OtherBatch(usize),
+	#[error("swept output {0} is not an output of the taproot given for it, or that taproot has no such sweep leaf")]
+	NotSweepable(usize),
+	#[error("a sweep takes burn-only outputs or others, never both")]
+	MixedBurn,
+	#[error("a burn-only sweep pays nothing but the burns, which it builds itself")]
+	BurnOutputs,
+	#[error("{given} signatures for a sweep of {needed} inputs")]
+	SweepSignatures { given: usize, needed: usize },
 }
 
 pub(crate) fn explicit_txout(asset: AssetId, value: u64, script_pubkey: Script) -> TxOut {

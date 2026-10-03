@@ -11,7 +11,9 @@
 //!   with the release each owner signs for it, bound to the round of its new
 //!   leaf ([`release`]);
 //! - the expiry clock ([`clock`]): ROLL, RELEASE, the script `R` the token
-//!   rests at once released, and the chain of clocks built last one first;
+//!   rests at once released, the chain of clocks built last one first, and the
+//!   operator's release and roll of the token; and the sweep transaction
+//!   ([`sweep::sweep_tx`]) that takes a batch's outputs behind the token;
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
@@ -80,7 +82,7 @@ pub mod witness;
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
-pub use clock::{Clock, ClockSchedule};
+pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
 pub use forfeit::{connector_asset, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
@@ -93,7 +95,7 @@ pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, R
 pub use release::Release;
 pub use script::{Child, ExplicitOutput};
 pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
-pub use sweep::Sweep;
+pub use sweep::{sweep_tx, Sweep, SweepTx, Sweepable};
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};
 pub use transfer::{
