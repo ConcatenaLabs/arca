@@ -56,6 +56,13 @@ pub struct TreeOutput {
 	pub vout: u32,
 }
 
+/// The outpoint `t.v` is spent by a transaction of the watcher's the nursery
+/// calls final: nothing more to do for it until a rollback takes that out.
+fn spent_final(t: &str, v: &str) -> String {
+	format!("EXISTS (SELECT 1 FROM watcher_input wi JOIN nursery_tx wn ON wn.txid = wi.txid
+		WHERE wi.prev_txid = {} AND wi.prev_vout = {} AND wn.state = 'final')", t, v)
+}
+
 /// A transaction the watcher publishes, with what it is and acts for.
 #[derive(Debug, Clone)]
 pub struct NewWatcherTx {
@@ -190,16 +197,18 @@ impl Store {
 
 	/// Every output seen paying the leaf or the checkpoint of a coin the
 	/// server holds as spent off-chain (given up in a transfer or a
-	/// participation): what a stale exit, or an answer to one, puts on the
-	/// chain. `(kind, the coin's leaf id, txid, vout)`, oldest first.
+	/// participation), but those a final transaction of the watcher's
+	/// spends: what a stale exit, or an answer to one, puts on the chain and
+	/// may still need answering. `(kind, the coin's leaf id, txid, vout)`,
+	/// oldest first.
 	pub async fn spent_coin_sightings(&self) -> Result<Vec<(ScriptKind, [u8; 32], [u8; 32], u32)>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT a.kind, a.leaf_id, s.txid, s.vout FROM script_sighting s
+			&format!("SELECT a.kind, a.leaf_id, s.txid, s.vout FROM script_sighting s
 			 JOIN arca_script a ON a.script_pubkey = s.script_pubkey
 			 JOIN leaf l ON l.leaf_id = a.leaf_id
-			 WHERE a.kind IN ('leaf', 'checkpoint') AND l.state = 'spent'
-			 ORDER BY s.seen_at, s.txid, s.vout",
+			 WHERE a.kind IN ('leaf', 'checkpoint') AND l.state = 'spent' AND NOT {}
+			 ORDER BY s.seen_at, s.txid, s.vout", spent_final("s.txid", "s.vout")),
 			&[],
 		).await?;
 		rows.iter().map(|r| {
@@ -277,14 +286,83 @@ impl Store {
 	}
 
 	/// Every coin a transfer made that is given up in a participation and
-	/// has a forfeit stored.
-	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+	/// has a forfeit stored, but those whose claim is final: with its record.
+	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT DISTINCT l.leaf_id FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
-			 WHERE l.kind = 'transfer' AND l.state = 'spent' ORDER BY l.leaf_id",
+			"SELECT DISTINCT l.leaf_id, l.record FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
+			 WHERE l.kind = 'transfer' AND l.state = 'spent'
+			   AND NOT EXISTS (SELECT 1 FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
+			                   WHERE w.kind = 'claim' AND w.subject = l.leaf_id AND n.state = 'final')
+			 ORDER BY l.leaf_id",
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, r.get(1)))).collect()
+	}
+
+	/// The forfeits the watcher published, not lost, whose output no final
+	/// transaction of the watcher's spends: what may still be claimed.
+	/// `(txid, the coin's leaf id)`, oldest first.
+	pub async fn unclaimed_forfeits(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("SELECT w.txid, w.subject FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
+			 WHERE w.kind = 'forfeit' AND n.state <> 'lost' AND NOT {}
+			 ORDER BY w.created_at, w.txid", spent_final("w.txid", "0")),
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get(1)))).collect()
+	}
+
+	/// The credited boards whose coin is given up with a forfeit stored and
+	/// whose board output no final transaction of the watcher's spends: the
+	/// boards the operator may still have to recover. Their leaf ids.
+	pub async fn boards_to_recover(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("SELECT b.leaf_id FROM board b JOIN leaf l ON l.leaf_id = b.leaf_id
+			 WHERE b.state = 'credited' AND l.state = 'spent'
+			   AND EXISTS (SELECT 1 FROM forfeit f WHERE f.leaf_id = b.leaf_id) AND NOT {}
+			 ORDER BY b.created_at, b.leaf_id", spent_final("b.txid", "b.vout")),
 			&[],
 		).await?;
 		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
+	}
+
+	/// The batches, `(round id, output)`, whose leaves include one whose
+	/// owner released its lowest node, for a round not lost: those a reclaim
+	/// may be due in.
+	pub async fn batches_with_releases(&self) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT DISTINCT bl.round_id, bl.vout FROM node_release nr JOIN batch_leaf bl ON bl.leaf_id = nr.leaf_id
+			 JOIN round r ON r.round_id = bl.round_id
+			 WHERE NOT nr.retired AND r.state = 'final' ORDER BY bl.round_id, bl.vout",
+			&[],
+		).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// The offboard outputs of final rounds whose participation is released,
+	/// expired or void and that no final transaction of the watcher's
+	/// spends: those that may still be unlocked or reclaimed.
+	pub async fn offboards_pending(&self) -> Result<Vec<super::rounds::OffboardRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("SELECT o.round_id, o.vout, o.participation_id, o.output_idx, o.attempt, o.value
+			 FROM round_offboard o JOIN round r ON r.round_id = o.round_id
+			 JOIN participation p ON p.participation_id = o.participation_id
+			 WHERE r.state = 'final' AND p.state IN ('released', 'expired', 'void') AND NOT {}
+			 ORDER BY o.round_id, o.vout", spent_final("r.txid", "o.vout")),
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok(super::rounds::OffboardRow {
+			round_id: r.get(0),
+			vout: r.get::<_, i32>(1) as u32,
+			participation_id: array32(r.get(2), "participation id")?,
+			output_idx: r.get::<_, i16>(3) as u16,
+			attempt: r.get::<_, i32>(4) as u32,
+			value: r.get::<_, i64>(5) as u64,
+		})).collect()
 	}
 }
