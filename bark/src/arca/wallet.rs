@@ -506,7 +506,9 @@ impl Wallet {
 	/// Checks every coin the wallet can spend, or is waiting on, against the
 	/// chain as it is now: a coin whose round or board is not final (a
 	/// rollback took it out, or it has not got there yet) is not spendable,
-	/// and one whose bases are final again is. Each base is read from the
+	/// and one whose bases are final again is. A board held as lost whose
+	/// transaction the chain holds and the server reports credited is checked
+	/// with them. Each base is read from the
 	/// chain first: when another transaction now pays a batch output the
 	/// wallet's coin rests on, the checks run on that one, and a coin that
 	/// fails them on a base the chain holds goes into its exit at once. Run on
@@ -524,8 +526,9 @@ impl Wallet {
 		let policy = self.receipt_policy(now);
 		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
 		let mut changes = vec![];
+		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		for c in self.store.coins()? {
-			if !matches!(c.state.as_str(), "pending" | "live") {
+			if !matches!(c.state.as_str(), "pending" | "live") && !revived.contains(&c.leaf_id) {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
@@ -874,6 +877,13 @@ impl Wallet {
 	/// another is named). The server registers it first; only then is it
 	/// broadcast, so a refused board spends nothing. The coin is spendable once
 	/// the board transaction is final.
+	///
+	/// Only a refusal (a 4xx with one of the server's refusal codes) marks the
+	/// board lost. Any other failure (no answer, a timeout, a 5xx, a gateway's
+	/// page) says nothing of what the server did, and a server that took the
+	/// board broadcasts it itself: the coin stays pending with its
+	/// transaction, and `sync` posts the same registration again until the
+	/// server answers it ([`Self::retry_boards`]).
 	pub fn board(&mut self, asset: AssetId, value: u64, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let fee_asset = fee_asset.unwrap_or(asset);
 		self.fee_for(fee_asset, 1)?;
@@ -937,26 +947,97 @@ impl Wallet {
 			note: "board registered; waiting for its transaction to be final".into(), expiry: u32::MAX,
 			bases: vec![tx.txid().to_string()], spent_by: None,
 		};
+		let body = json!({
+			"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?),
+			"tx": hex(&elements::encode::serialize(&tx)),
+		});
 		self.store.atomically(|s| {
 			s.put_tx(&tx.txid().to_string(), &elements::encode::serialize(&tx), "base")?;
 			s.put_coin(&row)?;
-			s.use_nonce(&owner_nonce, &leaf_id)
+			s.use_nonce(&owner_nonce, &leaf_id)?;
+			s.put_board_request(&leaf_id, &body.to_string())
 		})?;
-		let reg = self.server.post("register_board", &json!({
-			"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?),
-			"tx": hex(&elements::encode::serialize(&tx)),
-		}));
-		if let Err(e) = reg {
-			self.store.set_coin_state(&leaf_id, "lost", &format!("the server refused the board, which was never broadcast: {}", e))?;
-			self.store.refused(&format!("board {}", leaf_id), &e.to_string())?;
-			return Err(e);
-		}
-		self.chain.broadcast(&tx)?;
+		let state = self.post_board(&leaf_id, &body, &tx)?;
 		Ok(json!({
 			"leaf_id": leaf_id, "txid": tx.txid().to_string(), "vsize": tx.vsize(), "asset": asset.to_string(),
 			"value": value.to_string(), "fee": {"asset": fee_asset.to_string(), "amount": fee.to_string()},
-			"state": "pending",
+			"state": state,
 		}))
+	}
+
+	/// Posts the registration of board `leaf_id` and takes the answer: the
+	/// board transaction broadcast once the server holds the board, the coin
+	/// lost only on a refusal. Anything else leaves the registration
+	/// standing, the coin pending with its transaction, to be posted again
+	/// byte for byte: the server answers a board it already holds with its
+	/// status. Returns the coin's state.
+	fn post_board(&mut self, leaf_id: &str, body: &Value, tx: &Transaction) -> Result<&'static str, Error> {
+		match self.server.post("register_board", body) {
+			Ok(status) => {
+				self.store.set_board_request(leaf_id, "done", &status.to_string())?;
+				if status["state"].as_str() == Some("lost") {
+					let why = "the server holds the board as lost: its transaction can no longer confirm, or stayed out of every block";
+					self.store.set_coin_state(leaf_id, "lost", why)?;
+					return Ok("lost");
+				}
+				self.chain.broadcast(tx)?;
+				Ok("pending")
+			},
+			Err(e @ Error::Server { .. }) => {
+				self.store.atomically(|s| {
+					s.set_coin_state(leaf_id, "lost", &format!("the server refused the board, which was never broadcast: {}", e))?;
+					s.set_board_request(leaf_id, "refused", &e.to_string())?;
+					s.refused(&format!("board {}", leaf_id), &e.to_string())
+				})?;
+				Err(e)
+			},
+			Err(e) => {
+				let seen = match &e {
+					Error::Unreachable(m) => m.clone(),
+					e => e.to_string(),
+				};
+				let why = format!("registering: the server's answer was not seen ({}); the server may hold the board and broadcast it, \
+					so the coin is kept with its transaction, and sync posts the same registration again", seen);
+				self.store.set_coin_state(leaf_id, "pending", &why)?;
+				Err(Error::Unreachable(format!("{}; board {} is kept pending with its transaction, and sync posts the same registration \
+					again", seen, leaf_id)))
+			},
+		}
+	}
+
+	/// Posts again every board registration the server has not answered.
+	pub(crate) fn retry_boards(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for (leaf_id, body) in self.store.board_requests_in("requested")? {
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			let raw = super::chain::unhex(body["tx"].as_str().unwrap_or(""))?;
+			let tx: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+			out.push(match self.post_board(&leaf_id, &body, &tx) {
+				Ok(state) => json!({"board": leaf_id, "registered": true, "state": state}),
+				Err(e) => json!({"board": leaf_id, "error": e.to_string()}),
+			});
+		}
+		Ok(out)
+	}
+
+	/// Every board the wallet holds as lost whose transaction the chain holds
+	/// all the same, followed again when the server reports it credited: the
+	/// coin is then the re-check's like any other. The server credits a board
+	/// it took, whatever answer the wallet saw.
+	fn lost_boards_credited(&self) -> Result<Vec<CoinRow>, Error> {
+		let mut out = vec![];
+		for c in self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "board") {
+			let Some(Ok(txid)) = c.bases.first().map(|t| Txid::from_str(t)) else { continue };
+			let (in_chain, in_mempool) = self.chain.whereabouts(&txid)?;
+			if !in_chain && !in_mempool {
+				continue;
+			}
+			match self.server.post("board_status", &json!({"leaf_id": c.leaf_id})) {
+				Ok(st) if st["state"].as_str() == Some("credited") && st["txid"].as_str() == Some(&txid.to_string()) => out.push(c),
+				_ => {},
+			}
+		}
+		Ok(out)
 	}
 
 	/// Where each board the wallet holds stands, by the server and by the

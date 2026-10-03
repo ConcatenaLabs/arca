@@ -18,7 +18,8 @@
 //!   forfeit's output on the chain, read a preimage from its claim, or take
 //!   the refund, whatever the server says;
 //! - the transactions its coins rest on (rounds, boards), its participations
-//!   with the new leaves it validated for them, its transfer requests, its
+//!   with the new leaves it validated for them, its board registrations and
+//!   transfer requests, each kept until the server answers it, its
 //!   swaps, its mailbox cursor, its exits, the refusals it made, and its
 //!   on-chain derivation indices.
 //!
@@ -70,6 +71,13 @@ CREATE TABLE IF NOT EXISTS transfer (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	body TEXT NOT NULL,
 	inputs TEXT NOT NULL,
+	state TEXT NOT NULL,
+	answer TEXT,
+	created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS board_request (
+	leaf_id TEXT PRIMARY KEY,
+	body TEXT NOT NULL,
 	state TEXT NOT NULL,
 	answer TEXT,
 	created_at INTEGER NOT NULL
@@ -459,6 +467,30 @@ impl Store {
 
 	pub fn set_transfer(&self, id: i64, state: &str, answer: &str) -> Result<(), Error> {
 		self.conn.execute("UPDATE transfer SET state = ?2, answer = ?3 WHERE id = ?1", params![id, state, answer]).map_err(db)?;
+		Ok(())
+	}
+
+	// --- board registrations ---
+
+	/// Records the registration of board `leaf_id`, before it is posted.
+	pub fn put_board_request(&self, leaf_id: &str, body: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO board_request (leaf_id, body, state, created_at) VALUES (?1, ?2, 'requested', ?3)",
+			params![leaf_id, body, now()]).map_err(db)?;
+		Ok(())
+	}
+
+	/// `(leaf_id, body)` of every board registration in `state`
+	/// (`requested`: posted, no answer yet; `done`; `refused`).
+	pub fn board_requests_in(&self, state: &str) -> Result<Vec<(String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, body FROM board_request WHERE state = ?1 ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map(params![state], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	pub fn set_board_request(&self, leaf_id: &str, state: &str, answer: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE board_request SET state = ?2, answer = ?3 WHERE leaf_id = ?1", params![leaf_id, state, answer])
+			.map_err(db)?;
 		Ok(())
 	}
 
