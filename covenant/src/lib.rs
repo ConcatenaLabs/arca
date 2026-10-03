@@ -93,8 +93,8 @@ pub use sweep::Sweep;
 pub use taptree::TapOutput;
 pub use time::{MedianTime, RelativeTime};
 pub use transfer::{
-	CoinRecord, LineageKind, LineageOutput, NewLeaf, Transfer, TransferError, TransferInput, TransferPlan, ValidCoin, ValidInput,
-	ValidOrigin,
+	CoinRecord, LineageKind, LineageOutput, NewLeaf, SeenReassignments, Transfer, TransferError, TransferInput, TransferPlan,
+	ValidCoin, ValidInput, ValidOrigin,
 };
 pub use tree::{LeafSpec, ReserveRule, Tree, TreeError, TreeParams};
 pub use unroll::{FeeSource, UnrollAuth, UnrollTx};

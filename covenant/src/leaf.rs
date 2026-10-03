@@ -25,13 +25,17 @@
 //!
 //! A pair is valid for every output that carries the leaf's script with the
 //! same asset and amount, so the salt is unique to each leaf instance and a
-//! leaf script is never funded twice. The salt has a contribution from each
-//! side ([`leaf_salt`]): `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`.
-//! The owner's wallet picks its nonce fresh for every leaf it asks for, or
-//! publishes it in a receive request, and the operator adds its own. A wallet
-//! that never repeats a nonce is never given the same leaf script twice, and
-//! neither is an operator that never repeats its own. The script itself takes
-//! the salt as an opaque 32 bytes.
+//! leaf script is never funded twice. The salt has two contributions
+//! ([`leaf_salt`]): `SHA256("Arca/salt" ‖ owner_nonce ‖ creator_nonce)`. The
+//! owner's wallet picks its nonce fresh for every leaf it asks for, or
+//! publishes it in a receive request; the leaf's creator adds the second. In
+//! a round, and for a board, the creator is the operator. In a reassignment
+//! it is the sender, whose wallet draws a fresh random nonce for every leaf it
+//! creates, so that two reassignments paying one receive request still create
+//! two different leaves and never commit to the same output
+//! ([`crate::transfer`]). A wallet that never repeats a nonce is never given
+//! the same leaf script twice, and neither is a creator that never repeats its
+//! own. The script itself takes the salt as an opaque 32 bytes.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -51,12 +55,14 @@ pub const MAX_OUTPUTS: u8 = 4;
 /// The prefix of a leaf's salt.
 pub const SALT_TAG: &[u8; 9] = b"Arca/salt";
 
-/// A leaf's salt: `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`.
-pub fn leaf_salt(owner_nonce: &[u8; 32], operator_nonce: &[u8; 32]) -> [u8; 32] {
+/// A leaf's salt: `SHA256("Arca/salt" ‖ owner_nonce ‖ creator_nonce)`. The
+/// creator's nonce is the operator's for a leaf of a round or a board, and the
+/// sender's for a leaf a reassignment creates.
+pub fn leaf_salt(owner_nonce: &[u8; 32], creator_nonce: &[u8; 32]) -> [u8; 32] {
 	let mut b = Vec::with_capacity(SALT_TAG.len() + 64);
 	b.extend(SALT_TAG);
 	b.extend(owner_nonce);
-	b.extend(operator_nonce);
+	b.extend(creator_nonce);
 	crate::script::sha256(&b)
 }
 

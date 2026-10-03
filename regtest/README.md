@@ -112,7 +112,10 @@ of its connector asset, the claim and the refund; the offboard output, its unloc
 chain three hops deep from two batches (one hop a swap of two owners' coins in
 two assets) and a coin paid out of round from the board: the rounds and the
 board, every checkpoint and reassignment, and every receiver's coin record with
-its id. Each
+its id and the creator nonce its sender drew for its leaf. It also holds a coin
+record a receiver must refuse, resting on one leaf that two reassignments
+promised (the second sender repeating the first's creator nonce), and the same
+coin with the second sender's own creator nonce, which it accepts. Each
 transaction is given whole, witnesses included, with the outputs it spends and,
 for a signature, the signature hash and the test key's signature, once with the
 spent output's margin as the fee and once with a fee coin attached.
