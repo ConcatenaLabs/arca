@@ -185,6 +185,18 @@ impl Store {
 		rows.iter().map(watcher_row).collect()
 	}
 
+	/// The transactions of the watcher's the nursery holds as pending that no
+	/// block of the active chain holds: those waiting for a block.
+	pub async fn watcher_unconfirmed(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT n.tx FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
+			 WHERE n.state = 'pending' AND NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = n.txid)",
+			&[],
+		).await?;
+		Ok(rows.iter().map(|r| r.get(0)).collect())
+	}
+
 	/// Every transaction the watcher has published, oldest first.
 	pub async fn watcher_log(&self) -> Result<Vec<WatcherTxRow>, StoreError> {
 		let conn = self.conn().await?;

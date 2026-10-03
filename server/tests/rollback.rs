@@ -419,9 +419,10 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	}
 	assert!(released, "A's participation is released");
 	let kinds: Vec<&str> = log.iter().filter(|w| w.subject == a_old_id).map(|w| w.kind.as_str()).collect();
-	assert_eq!(kinds, vec!["entry", "forfeit", "claim"], "A's old coin brought on-chain, forfeited, claimed");
+	assert_eq!(kinds, vec!["entry", "forfeit"], "A's old coin brought on-chain and forfeited");
+	assert!(common::flow::claim_of(&log, &a_old_id).is_some(), "and its forfeit claimed");
 	assert!(!r.unspent(&lowest_at), "the watcher unrolled A's old node, by A's own authorisation");
-	let claim = log.iter().find(|w| w.kind == "claim" && w.subject == a_old_id).unwrap();
+	let claim = common::flow::claim_of(&log, &a_old_id).unwrap();
 	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
 	let y_preimage = arca_covenant::witness::find_preimage(&ctx.input[0].witness.script_witness,
 		&unhex(status(&r, &pa)["unlock_hash"].as_str().unwrap()).try_into().unwrap()).expect("the claim reveals Y's preimage");

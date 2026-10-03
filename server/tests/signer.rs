@@ -19,8 +19,10 @@ use server::signer::{SignerClient, SignerError};
 
 async fn raw(socket: &std::path::Path, line: &str) -> String {
 	let mut s = UnixStream::connect(socket).await.unwrap();
-	s.write_all(line.as_bytes()).await.unwrap();
-	s.write_all(b"\n").await.unwrap();
+	// A line over the limit is answered, and the socket closed, before the
+	// signer has read it all: the rest cannot be written.
+	let _ = s.write_all(line.as_bytes()).await;
+	let _ = s.write_all(b"\n").await;
 	let mut r = BufReader::new(s);
 	let mut out = String::new();
 	r.read_line(&mut out).await.unwrap();
@@ -62,7 +64,7 @@ async fn the_signer_process() {
 			"00".repeat(32), asset, vec![format!(r#"{{"asset":"{}","value":"1","script":"51"}}"#, asset); 5].join(","))),
 		("an unknown field", format!(r#"{{"op":"pubkey","digest":"{}"}}"#, "00".repeat(32))),
 		("a value with a sign", format!(r#"{{"op":"rebind","salt":"{}","asset_in":"{}","value_in":"-1","outputs":[{{"asset":"{}","value":"1","script":"51"}}]}}"#, "00".repeat(32), asset, asset)),
-		("a line over the limit", format!(r#"{{"op":"pubkey","x":"{}"}}"#, "a".repeat(70_000))),
+		("a line over the limit", format!(r#"{{"op":"pubkey","x":"{}"}}"#, "a".repeat(1_100_000))),
 	] {
 		let answer = raw(&p.socket, &line).await;
 		let v: serde_json::Value = serde_json::from_str(&answer).unwrap();

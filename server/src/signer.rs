@@ -65,8 +65,9 @@ use tokio::net::UnixStream;
 
 use arca_covenant::{ExplicitOutput, ForfeitPolicy, LeafId, RelativeTime};
 
-/// The longest request line the signer reads.
-pub const MAX_REQUEST: usize = 64 * 1024;
+/// The longest request line the signer reads: a claim of 200 forfeits, its
+/// spent outputs with it, fits several times over.
+pub const MAX_REQUEST: usize = 1024 * 1024;
 
 /// An output a rebindable signature commits to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

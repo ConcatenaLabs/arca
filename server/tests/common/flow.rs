@@ -148,13 +148,40 @@ pub async fn drive<F: FnMut(&[WatcherTxRow]) -> bool>(r: &Running, what: &str, r
 		log(r).await.iter().map(|w| (w.kind.clone(), w.state)).collect::<Vec<_>>());
 }
 
-/// Whether the watcher's transaction of `kind` for `subject` is final.
+/// The watcher's claim, in `log`, of the forfeit it published for the coin
+/// `leaf`: a claim acts for its round, and takes each forfeit as an input.
+pub fn claim_of<'a>(log: &'a [WatcherTxRow], leaf: &[u8]) -> Option<&'a WatcherTxRow> {
+	let forfeits: Vec<[u8; 32]> = log.iter().filter(|w| w.kind == "forfeit" && w.subject == leaf).map(|w| w.txid).collect();
+	log.iter().filter(|w| w.kind == "claim").find(|w| {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		tx.input.iter().any(|i| i.previous_output.vout == 0 && forfeits.contains(&i.previous_output.txid.to_byte_array()))
+	})
+}
+
+/// How many of the forfeits in `log` its claims take.
+pub fn claimed(log: &[WatcherTxRow]) -> usize {
+	let forfeits: std::collections::HashSet<[u8; 32]> = log.iter().filter(|w| w.kind == "forfeit").map(|w| w.txid).collect();
+	log.iter().filter(|w| w.kind == "claim").map(|w| {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		tx.input.iter().filter(|i| i.previous_output.vout == 0 && forfeits.contains(&i.previous_output.txid.to_byte_array())).count()
+	}).sum()
+}
+
+/// Whether the watcher's transaction of `kind` for `subject` is final; for
+/// a claim, the claim of the coin `subject`'s forfeit.
 pub fn final_of(log: &[WatcherTxRow], kind: &str, subject: &[u8]) -> bool {
+	if kind == "claim" {
+		return claim_of(log, subject).is_some_and(|w| w.state == NurseryState::Final);
+	}
 	log.iter().any(|w| w.kind == kind && w.subject == subject && w.state == NurseryState::Final)
 }
 
-/// Whether the watcher has published one of `kind` for `subject`.
+/// Whether the watcher has published one of `kind` for `subject`; for a
+/// claim, the claim of the coin `subject`'s forfeit.
 pub fn has(log: &[WatcherTxRow], kind: &str, subject: &[u8]) -> bool {
+	if kind == "claim" {
+		return claim_of(log, subject).is_some();
+	}
 	log.iter().any(|w| w.kind == kind && w.subject == subject)
 }
 

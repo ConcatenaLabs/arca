@@ -67,6 +67,15 @@ max_sweep_inputs = 50
 # runs when no block arrives; stale exits are answered on every pass over the
 # chain.
 recovery_interval_seconds = 30
+# The most forfeits one claim takes: every forfeit of a round in a block is
+# claimed in one transaction, against one atom of its connector asset.
+max_claim_inputs = 200
+# How many vbytes of the watcher's own transactions may wait for a block
+# before it publishes no new forfeit of a board, and the chain's block
+# interval: forfeits go out no faster than they can be claimed within their
+# refund delay.
+block_share_vbytes = 45000
+block_interval_seconds = 60
 
 [limits]
 # The calls anyone may make without proving a key are bounded in what they
