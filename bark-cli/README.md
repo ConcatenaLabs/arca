@@ -72,7 +72,10 @@ the keys, but which coins were spent off-chain is in the store and the server.
   is spendable only while everything it rests on is final. The wallet asks again
   every time, never remembers: on every start it re-checks every coin against
   the chain, so a rollback un-credits the coins it took out, and credits them
-  again when their round or board returns.
+  again when their round or board returns. It reads each round and board from
+  the chain, not from what it stored: when another transaction now pays a
+  batch output a coin rests on, the checks run again on that one, and a coin
+  that fails them on a transaction the chain holds goes into its exit at once.
 
 ### Fees
 
@@ -102,9 +105,9 @@ publishes (`max_margin_multiple`).
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
 | `participate [--leaf L]… [--not-before T]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset |
-| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, and moves every participation on: once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset |
-| `recheck` | Re-checks every coin against the chain as it is now, and reports what changed and whether the tip it last saw was reorganised away |
-| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to the wallet's on-chain address. Each run goes as far as the chain allows; run it again to go on |
+| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), and moves every exit on |
+| `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, and reports what changed and whether the tip it last saw was reorganised away |
+| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
 | `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up and its coins freed |
@@ -153,7 +156,8 @@ builds itself as the operator or as a sender. Each case is one way an operator
 lies, stalls or vanishes, or a sender goes back on a payment, and each ends
 with the wallet refusing before it signs anything, or taking its coin on-chain
 and holding it there, with the reason shown: a refresh whose status hides a new
-leaf or names another unlock hash.
+leaf or names another unlock hash; a round rolled back and replaced by one
+that fails check 1, which the wallet's re-check exits from at once.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

@@ -10,7 +10,7 @@ use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, XOnlyPublicKey};
 use elements::{AssetId, OutPoint, Script, Transaction, TxOut, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, Recheck, RelativeTime, Template, ValidCoin, ValidOrigin, WalletPolicy};
+use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, RelativeTime, Template, ValidCoin, WalletPolicy};
 
 use super::chain::{hex, ChainSource, Finality};
 use super::client::ServerClient;
@@ -113,6 +113,14 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 		},
 	}
 	Ok(())
+}
+
+/// What the re-check finds of one coin.
+enum Checked {
+	/// It holds, in this state, with this note.
+	Holds(&'static str, String),
+	/// A base the chain holds fails the wallet's checks, for this reason.
+	Fails(String),
 }
 
 /// A coin the wallet has checked against the chain.
@@ -296,8 +304,13 @@ impl Wallet {
 	// Coins against the chain
 	// -----------------------------------------------------------------------
 
-	/// The transactions `record` rests on: from the store when the wallet has
-	/// seen them, else found on the chain by the output they pay.
+	/// The transactions `record` rests on, as the chain holds them now: for
+	/// each batch or board output, the one the wallet stored when that one is
+	/// in the active chain or the mempool, else whichever transaction of the
+	/// active chain pays the output (another round paying the same batch
+	/// output after a rollback, say), and only when none does, the one the
+	/// wallet stored, which is then out of the chain. What the wallet stored
+	/// is never taken over what the chain holds.
 	pub(crate) fn base_txs(&self, record: &CoinRecord) -> Result<Vec<Transaction>, Error> {
 		let mut outs = vec![];
 		base_outputs(record, &mut outs)?;
@@ -306,29 +319,62 @@ impl Wallet {
 			if txs.iter().any(|t| t.output.contains(&o)) {
 				continue;
 			}
-			if let Some(t) = self.known_base(&o)? {
-				txs.push(t);
-				continue;
+			let stored = self.known_base(&o)?;
+			if let Some(t) = &stored {
+				let (in_chain, in_mempool) = self.chain.whereabouts(&t.txid())?;
+				if in_chain || in_mempool {
+					txs.push(t.clone());
+					continue;
+				}
 			}
-			let found = self.chain.coins_at(std::slice::from_ref(&o.script_pubkey))?.into_iter()
-				.find(|(_, out, _)| *out == o).map(|(op, _, _)| op.txid);
-			let tx = match found {
-				Some(txid) => self.chain.transaction(&txid)?,
-				None => {
-					let from: u64 = self.store.meta("birthday")?.and_then(|b| b.parse().ok()).unwrap_or(0);
-					self.chain.find_payment(&o, from.saturating_sub(1000))?.map(|(t, _)| t)
-				},
-			};
-			match tx {
-				Some(t) => {
+			match (self.chain_payer(&o)?, stored) {
+				(Some(t), _) => {
 					self.store.put_tx(&t.txid().to_string(), &elements::encode::serialize(&t), "base")?;
 					txs.push(t);
 				},
-				None => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
+				(None, Some(t)) => txs.push(t),
+				(None, None) => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
 					hex(o.script_pubkey.as_bytes())))),
 			}
 		}
 		Ok(txs)
+	}
+
+	/// The transactions `record` rests on as the wallet accepted it: from the
+	/// store when it has them, else as the chain holds them.
+	pub(crate) fn accepted_bases(&self, record: &CoinRecord) -> Result<Vec<Transaction>, Error> {
+		let mut outs = vec![];
+		base_outputs(record, &mut outs)?;
+		let mut txs: Vec<Transaction> = vec![];
+		for o in outs {
+			if txs.iter().any(|t| t.output.contains(&o)) {
+				continue;
+			}
+			match self.known_base(&o)? {
+				Some(t) => txs.push(t),
+				None => match self.chain_payer(&o)? {
+					Some(t) => txs.push(t),
+					None => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
+						hex(o.script_pubkey.as_bytes())))),
+				},
+			}
+		}
+		Ok(txs)
+	}
+
+	/// The transaction of the active chain that pays `o`: found in the set of
+	/// unspent outputs, else by reading the blocks from before the wallet's
+	/// birthday.
+	fn chain_payer(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
+		let found = self.chain.coins_at(std::slice::from_ref(&o.script_pubkey))?.into_iter()
+			.find(|(_, out, _)| out == o).map(|(op, _, _)| op.txid);
+		match found {
+			Some(txid) => self.chain.transaction(&txid),
+			None => {
+				let from: u64 = self.store.meta("birthday")?.and_then(|b| b.parse().ok()).unwrap_or(0);
+				Ok(self.chain.find_payment(o, from.saturating_sub(1000))?.map(|(t, _)| t))
+			},
+		}
 	}
 
 	fn known_base(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
@@ -399,9 +445,12 @@ impl Wallet {
 	/// Checks every coin the wallet can spend, or is waiting on, against the
 	/// chain as it is now: a coin whose round or board is not final (a
 	/// rollback took it out, or it has not got there yet) is not spendable,
-	/// and one whose bases are final again is. Run on start and after any
-	/// reorganisation. Returns what changed, and whether the tip the wallet
-	/// last saw has been reorganised away.
+	/// and one whose bases are final again is. Each base is read from the
+	/// chain first: when another transaction now pays a batch output the
+	/// wallet's coin rests on, the checks run on that one, and a coin that
+	/// fails them on a base the chain holds goes into its exit at once. Run on
+	/// start and after any reorganisation. Returns what changed, and whether
+	/// the tip the wallet last saw has been reorganised away.
 	pub fn recheck(&mut self) -> Result<Value, Error> {
 		let tip = self.chain.tip()?;
 		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
@@ -418,37 +467,17 @@ impl Wallet {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
-			let (state, note) = match self.assess(&record, &policy, None) {
-				Err(e) => ("pending", format!("re-check: {}", e)),
-				Ok(a) => {
-					let mut extra = String::new();
-					if let (CoinRecord::Leaf { record: lr, .. }, ValidOrigin::Leaf { valid, .. }) = (&record, &a.valid.origin) {
-						// The round the leaf was accepted from, or another
-						// transaction now paying its batch output.
-						let round = a.bases.iter().find(|(t, _)| t.txid() == valid.round_txid).cloned();
-						if let Some((round, finality)) = round {
-							if !finality.in_chain() {
-								let out = valid.branch.batch_output().txout();
-								if let Some((other, _)) = self.chain.find_payment(&out, a.lowest_height().saturating_sub(10))? {
-									if let Ok(Recheck::NewRound(_)) = lr.recheck(valid, &other, &policy) {
-										extra = format!("; another transaction, {}, now pays its batch output: a new round, \
-											so nothing signed for {} carries over", other.txid(), round.txid());
-									}
-								}
-							} else if let Err(e) = lr.recheck(valid, &round, &policy) {
-								extra = format!("; re-check: {}", e);
-							}
-						}
-					}
-					if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
-						("pending", format!("{}{}", e, extra))
-					} else if a.all_final() && extra.is_empty() {
-						("live", String::new())
-					} else if a.all_final() {
-						("pending", extra.trim_start_matches("; ").to_string())
-					} else {
-						("pending", format!("waiting: {}{}", a.waiting(), extra))
-					}
+			let (state, note) = match self.recheck_one(&c, &record, &policy)? {
+				Checked::Holds(state, note) => (state, note),
+				Checked::Fails(why) => {
+					// A base the chain holds fails the wallet's checks: the coin
+					// is brought on-chain from its record now, before anyone
+					// can use what the failing base lets them.
+					let why = format!("{}: the wallet takes it on-chain", why);
+					self.store.set_coin_state(&c.leaf_id, "exiting", &why)?;
+					let exit = self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"error": e.to_string()}));
+					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "exiting", "why": why, "exit": exit}));
+					continue;
 				},
 			};
 			if state != c.state || note != c.note {
@@ -461,6 +490,50 @@ impl Wallet {
 		self.store.set_meta("tip_height", &tip.height.to_string())?;
 		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
 		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes}))
+	}
+
+	/// One coin against the chain: where it stands, or why a base the chain
+	/// holds fails the wallet's checks.
+	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy) -> Result<Checked, Error> {
+		let txs = match self.base_txs(record) {
+			Ok(t) => t,
+			Err(e @ (Error::Refused(_) | Error::Parse(_))) => return Ok(Checked::Holds("pending", format!("re-check: {}", e))),
+			Err(e) => return Err(e),
+		};
+		let mut bases = vec![];
+		for t in &txs {
+			bases.push((t.clone(), self.chain.finality(&t.txid())?));
+		}
+		let waiting = bases.iter().filter(|(_, f)| !f.is_final())
+			.map(|(t, f)| format!("{} is {}", t.txid(), f.word())).collect::<Vec<_>>().join("; ");
+		// The bases that are not the ones the wallet stored for the coin.
+		let replaced: Vec<String> = txs.iter().map(|t| t.txid().to_string()).filter(|t| !c.bases.contains(t)).collect();
+		let valid = match record.resolve(&txs, policy) {
+			Ok(v) => v,
+			Err(e) if bases.iter().all(|(_, f)| f.in_chain()) => {
+				return Ok(Checked::Fails(if replaced.is_empty() {
+					format!("re-check: {}", e)
+				} else {
+					format!("re-check: {}, which now pays an output the coin rests on in place of what the wallet accepted, \
+						fails the wallet's checks: {}", replaced.join(", "), e)
+				}));
+			},
+			Err(e) => return Ok(Checked::Holds("pending", format!("waiting: {}; re-check: {}", waiting, e))),
+		};
+		let extra = if replaced.is_empty() { String::new() } else {
+			// The wallet holds the coin on what the chain holds from now on.
+			self.store.set_coin_bases(&c.leaf_id, &txs.iter().map(|t| t.txid().to_string()).collect::<Vec<_>>())?;
+			format!("; {} now pays an output it rests on, in place of what the wallet accepted, and passes every check: \
+				nothing the wallet signed for the other round carries over", replaced.join(", "))
+		};
+		let a = Assessed { valid, bases };
+		Ok(if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
+			Checked::Holds("pending", format!("{}{}", e, extra))
+		} else if a.all_final() {
+			Checked::Holds("live", extra.trim_start_matches("; ").to_string())
+		} else {
+			Checked::Holds("pending", format!("waiting: {}{}", waiting, extra))
+		})
 	}
 
 	// -----------------------------------------------------------------------

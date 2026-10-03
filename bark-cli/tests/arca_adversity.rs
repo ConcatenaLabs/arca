@@ -162,3 +162,129 @@ async fn a_status_that_hides_a_new_leaf_is_refused_before_any_forfeit() {
 	}
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
+
+// ---------------------------------------------------------------------------
+// After a rollback: the round the chain holds
+// ---------------------------------------------------------------------------
+
+fn rpc(r: &Running, method: &str, params: &[Value]) -> Value {
+	r.rt.client().call(method, params).unwrap_or_else(|e| panic!("{} {:?}: {}", method, params, e))
+}
+
+fn block_of(r: &Running, txid: &str) -> String {
+	rpc(r, "getrawtransaction", &[json!(txid), json!(true)])["blockhash"].as_str().unwrap().to_string()
+}
+
+fn confirmations(r: &Running, txid: &elements::Txid) -> i64 {
+	rpc(r, "getrawtransaction", &[json!(txid.to_string()), json!(true)])["confirmations"].as_i64().unwrap_or(0)
+}
+
+/// Signs every input of `tx` the operator's on-chain wallet owns.
+fn operator_signs(r: &Running, tx: &mut Transaction) {
+	use elements::hashes::Hash;
+	for i in 0..tx.input.len() {
+		let op = tx.input[i].previous_output;
+		let prev = r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone();
+		let signed = (0..2u8).flat_map(|chain| (0..64u32).map(move |index| (chain, index))).any(|(chain, index)| {
+			let coin = server::store::WalletCoin {
+				txid: op.txid.to_byte_array(), vout: op.vout, asset: prev.asset.explicit().unwrap().into_inner().to_byte_array(),
+				value: prev.value.explicit().unwrap(), script_pubkey: prev.script_pubkey.to_bytes(), chain, index,
+				in_chain: true, spent_by: None,
+			};
+			r.server.wallet.sign_input(tx, i, &coin).is_ok()
+		});
+		assert!(signed, "input {} of the operator's transaction is the operator's", i);
+	}
+}
+
+/// The operator rolls back a final round and confirms in its place a
+/// transaction that pays the same batch output and issues the sweep token
+/// twice, one atom at `R` (what check 1 answers). The wallet's re-check
+/// reads the batch output's payer from the chain, finds that it fails check 1
+/// and takes the coin on-chain at once, from the replacement; it claims the
+/// leaf after its exit delay, and the operator's sweep of the batch output
+/// finds nothing to take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_round_that_fails_a_check_puts_the_coin_into_exit_at_once() {
+	use arca_covenant::{ExplicitOutput, FeeSource, Sweepable};
+	use elements::{OutPoint, TxOut};
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let c = Arca::new("F2");
+	boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	c.ok(&["participate"]);
+	let r1 = final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let leaf = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&c, &leaf)["state"], "live");
+	let CoinRecord::Leaf { record, .. } = record_of(&c, &leaf) else { panic!("a batch leaf") };
+	let token = record.schedule.token;
+	let r_script = record.schedule.r().script_pubkey();
+
+	// The operator: the round's block rolled back, the mempool emptied, and
+	// R1 re-signed with the token issued as two atoms, one paid to R.
+	r.server.stop();
+	let block = block_of(&r, &r1.txid().to_string());
+	rpc(&r, "invalidateblock", &[json!(block)]);
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let mut r2 = r1.clone();
+	let k = r2.input.iter().position(|i| i.has_issuance() && i.issuance_ids().0 == token).unwrap();
+	r2.input[k].asset_issuance.amount = elements::confidential::Value::Explicit(2);
+	let fee_at = r2.output.iter().position(|o| o.is_fee()).unwrap();
+	r2.output.insert(fee_at, TxOut {
+		asset: elements::confidential::Asset::Explicit(token), value: elements::confidential::Value::Explicit(1),
+		nonce: elements::confidential::Nonce::Null, script_pubkey: r_script.clone(), witness: Default::default(),
+	});
+	operator_signs(&r, &mut r2);
+	let r2id = r.rt.client().send_raw_transaction(&r2).expect("the replacement relays");
+	r.produce().await;
+	r.bury().await;
+	println!("F2 replacement {} issues 2 atoms of the token, one at R; confirmations {}", r2id, confirmations(&r, &r2id));
+
+	// The wallet's re-check: the coin goes into its exit at once, from R2.
+	let rc = c.ok(&["recheck"]);
+	let ch = rc["changes"].as_array().unwrap().iter().find(|ch| ch["leaf_id"] == leaf.as_str())
+		.unwrap_or_else(|| panic!("the re-check changes the coin: {}", rc)).clone();
+	println!("F2 the wallet's re-check: {}", ch);
+	assert_eq!(ch["to"], "exiting", "{}", ch);
+	let why = ch["why"].as_str().unwrap();
+	assert!(why.contains(&r2id.to_string()) && why.contains("check 1"), "the reason names the replacement and the check: {}", why);
+	let steps = ch["exit"]["broadcast"].as_array().unwrap_or_else(|| panic!("the exit ran: {}", ch)).clone();
+	assert!(!steps.is_empty(), "{}", ch);
+	let first = elements::Txid::from_str(steps[0]["txid"].as_str().unwrap()).unwrap();
+	let first = r.rt.client().raw_transaction(&first).unwrap();
+	assert_eq!(first.input[0].previous_output.txid, r2id, "the unroll starts from the round the chain holds");
+	r.produce().await;
+	let e = c.ok(&["exit", &leaf]);
+	assert_eq!(e["state"], "waiting", "the claim waits out the exit delay: {}", e);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let e = c.ok(&["exit", &leaf]);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	r.produce().await;
+	let claim = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+	let ctx = r.rt.client().raw_transaction(&claim).unwrap();
+	assert!(confirmations(&r, &claim) >= 1);
+	assert_eq!(ctx.output[0].asset.explicit(), Some(x));
+	println!("F2 the wallet's claim {} pays {} of X to its own address, confirmed", claim, ctx.output[0].value.explicit().unwrap());
+	assert_eq!(coin_of(&c, &leaf)["state"], "exited");
+
+	// The operator's sweep of the batch output, once the notice has run.
+	let branch = record.branch().unwrap();
+	let batch = branch.batch_output();
+	let bvout = r2.output.iter().position(|o| ExplicitOutput::from_txout(o).as_ref() == Some(&batch)).unwrap() as u32;
+	let tvout = r2.output.iter().position(|o| o.asset.explicit() == Some(token) && o.script_pubkey == r_script).unwrap() as u32;
+	let node0 = &branch.nodes[0];
+	let swept = Sweepable::new(OutPoint::new(r2id, bvout), (batch.asset, batch.value), node0.taproot().clone(), node0.sweep);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, record.schedule.notice.seconds() as u32));
+	let st = arca_covenant::sweep_tx(&record.schedule, OutPoint::new(r2id, tvout), &[swept],
+		&[ExplicitOutput::new(batch.asset, batch.value - 3_000, Script::from(vec![0x54]))], &FeeSource::Reserve).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let s_key = common::running::keypair("operator");
+	let sigs: Vec<_> = (0..st.leaves.len()).map(|i| arca_covenant::sign::sign_digest(&s_key, &st.sighash(i, genesis).unwrap(), &[0; 32])).collect();
+	let sweep = st.finish(&sigs).unwrap().tx;
+	let refused = r.rt.client().send_raw_transaction(&sweep).expect_err("the batch output is the wallet's unroll's");
+	println!("F2 the operator's sweep of the batch output: REFUSED: {}", refused);
+	assert!(refused.to_string().contains("missingorspent"), "{}", refused);
+	let _ = std::fs::remove_dir_all(&c.dir);
+}

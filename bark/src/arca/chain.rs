@@ -144,6 +144,15 @@ impl ChainSource {
 		}
 	}
 
+	/// Whether `txid` is in a block of the active chain, and whether it is in
+	/// the mempool: a cheap look, without the finality of the block.
+	pub fn whereabouts(&self, txid: &Txid) -> Result<(bool, bool), Error> {
+		if self.tx_block(txid)?.is_some() {
+			return Ok((true, false));
+		}
+		Ok((false, self.in_mempool(txid)?))
+	}
+
 	fn in_mempool(&self, txid: &Txid) -> Result<bool, Error> {
 		match self.client.call::<Value>("getmempoolentry", &[json!(txid.to_string())]) {
 			Ok(_) => Ok(true),
@@ -279,6 +288,42 @@ impl ChainSource {
 			out.push((OutPoint::new(txid, vout), o.clone(), u["height"].as_u64().unwrap_or(0)));
 		}
 		Ok(out)
+	}
+
+	/// Where each of `outputs` is now: an output equal to it (asset, value and
+	/// script) that is unspent in the active chain's set of unspent outputs or
+	/// made by a transaction in the mempool, and spent by nothing in the
+	/// mempool; `None` where there is none. Outputs are found by script, so
+	/// one paying the script another amount is not taken for it.
+	pub fn locate(&self, outputs: &[TxOut]) -> Result<Vec<Option<OutPoint>>, Error> {
+		let mut found: Vec<Option<OutPoint>> = vec![None; outputs.len()];
+		if outputs.is_empty() {
+			return Ok(found);
+		}
+		let mut scripts: Vec<Script> = outputs.iter().map(|o| o.script_pubkey.clone()).collect();
+		scripts.sort();
+		scripts.dedup();
+		for (op, o, _) in self.coins_at(&scripts)? {
+			if let Some(i) = outputs.iter().enumerate().position(|(i, w)| *w == o && found[i].is_none()) {
+				if self.unspent(&op)? {
+					found[i] = Some(op);
+				}
+			}
+		}
+		let ids: Vec<String> = self.client.call("getrawmempool", &[]).map_err(node)?;
+		for id in ids {
+			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
+			let Some(tx) = self.transaction(&txid)? else { continue };
+			for (j, o) in tx.output.iter().enumerate() {
+				if let Some(i) = outputs.iter().enumerate().position(|(i, w)| w == o && found[i].is_none()) {
+					let op = OutPoint::new(txid, j as u32);
+					if self.unspent(&op)? {
+						found[i] = Some(op);
+					}
+				}
+			}
+		}
+		Ok(found)
 	}
 
 	/// Which of `scripts` an output of the active chain from `from_height` up,
