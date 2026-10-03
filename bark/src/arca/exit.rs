@@ -237,8 +237,10 @@ impl Wallet {
 		let (asset, value) = (coin.asset, coin.value);
 		let leaf = coin.leaf;
 		let claim = self.key_spend(&mut payer, &key, &|f| {
+			// The leaf's own value pays the claim's fee unless a fee coin
+			// does; the wallet never splits its own claim.
 			let out = match f {
-				FeeSource::Reserve => {
+				FeeSource::Reserve | FeeSource::Split { .. } => {
 					let fee = self.fee_for(asset, 220)?;
 					if fee >= value {
 						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
