@@ -79,7 +79,7 @@ This script will return `0.0.1` for all cases.
 
 ## prechecks.sh
 #### Parameters:
-1. "rust_no_spaces_for_indent", "rust_no_whitespace_on_empty_lines" or "unused_server_logs"
+1. "rust_no_spaces_for_indent" or "rust_no_whitespace_on_empty_lines"
 
 #### rust_no_spaces_for_indent:
 We don't allow any line that starts with a whitespace.
@@ -87,8 +87,6 @@ Exit code 2 if whitespace is found.
 #### rust_no_whitespace_on_empty_lines:
 We don't allow empty lines to contain whitespace.
 Exit code 2 if an empty line with whitespace is found.
-#### unused_server_logs:
-Check if there are structure log messages in server-logs that are not used.
 
 ## ci-run-test.sh
 #### Parameters:

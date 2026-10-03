@@ -1,15 +1,12 @@
 # Find the target directory
 CARGO_TARGET := `cargo metadata --format-version 1 --no-deps | jq -r '.target_directory'`
 JUSTFILE_DIR := justfile_directory()
-export CAPTAIND_EXEC := env("CAPTAIND_EXEC", CARGO_TARGET / "debug" / "captaind")
-export WATCHMAND_EXEC := env("WATCHMAND_EXEC", CARGO_TARGET / "debug" / "watchmand")
 export BARK_EXEC := env("BARK_EXEC", CARGO_TARGET / "debug" / "bark")
 export BARKD_EXEC := env("BARKD_EXEC", CARGO_TARGET / "debug" / "barkd")
 export BITCOIND_SNAPSHOT_DIR := JUSTFILE_DIR / "test" / "_bitcoind_snapshot"
 
 NEXTEST_PROFILE := env("NEXTEST_PROFILE", "default")
 
-SERVER_SQL_SCHEMA_PATH := "server/schema.sql"
 BARK_SQL_SCHEMA_PATH := "bark/schema.sql"
 BARK_OPENAPI_SCHEMA_PATH := "bark-rest/openapi.json"
 BARK_REST_CLIENT_DIR := "bark-rest-client"
@@ -21,18 +18,10 @@ precheck CHECK:
 prechecks:
 	just precheck rust_no_spaces_for_indent
 	just precheck rust_no_whitespace_on_empty_lines
-	just precheck unused_server_logs
-	just precheck conflicting_migration_scripts
 
 check:
 	cargo version
 	cargo check --all --tests --examples
-
-check-wasm-tests:
-	ARK_CONTROL_URL="" ARK_ESPLORA_URL="" ARK_SERVER_URL="" \
-		cargo check -p wasm-testing --tests \
-		--no-default-features --features wasm \
-		--target wasm32-unknown-unknown
 
 check-lib-arithmetic:
 	cargo clippy -p arca-lib --tests
@@ -56,7 +45,7 @@ check-bark-as-libs:
 	cargo check -p arca-rest --no-default-features
 	cargo check -p arca-rest-client
 
-checks: prechecks check-lib-arithmetic check-wasm-tests check
+checks: prechecks check-lib-arithmetic check
 
 check-commits:
 	bash contrib/check-commits.sh
@@ -70,27 +59,14 @@ build-ci:
 	cargo build --profile ci --workspace --bins --examples
 
 build-unit-tests-ci:
-	cargo nextest archive --cargo-profile ci --workspace --exclude arca-testing \
+	cargo nextest archive --cargo-profile ci --workspace \
 		--archive-file {{CARGO_TARGET}}/ci/unit-tests.tar.zst --zstd-level 19
-
-build-integration-tests-ci:
-	cargo nextest archive --cargo-profile ci --package arca-testing \
-		--archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst --zstd-level 19
 
 build-bins:
 	cargo build --workspace --bins
 
 build-examples:
 	cargo build --workspace --examples
-
-ensure-build-bins:
-	#!/usr/bin/env bash
-	set -euo pipefail
-	if [ -z "${ASSUME_BUILT:-}" ]; then
-		just build-bins
-	else
-		echo "ASSUME_BUILT is set, skipping build"
-	fi
 
 ensure-build-examples:
 	#!/usr/bin/env bash
@@ -108,9 +84,6 @@ build-codecov:
 	cargo llvm-cov clean --workspace
 	cargo build --workspace
 
-build-msrv-lib:
-	cd testing/msrv-lib && cargo build
-
 build-bark-wasm:
 	cargo build --target wasm32-unknown-unknown --lib --no-default-features \
 		-p arca-lib --features wasm-web
@@ -126,12 +99,8 @@ build-bark-wasm:
 build-lib-wasm-release:
 	cd lib/ && cargo build --release --target wasm32-unknown-unknown --lib --features wasm-web
 
-docker-pull:
-	if [ -n "${LIGHTNINGD_DOCKER_IMAGE-""}" ]; then docker image inspect "$LIGHTNINGD_DOCKER_IMAGE" > /dev/null 2>&1 && echo "Image already exists locally." || (echo "Image not found locally. Pulling..." && docker pull "$LIGHTNINGD_DOCKER_IMAGE"); fi
-
 test-unit TEST="":
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --workspace \
-		--exclude arca-testing {{TEST}}
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --workspace {{TEST}}
 alias unit := test-unit
 
 test-unit-prebuilt:
@@ -141,111 +110,12 @@ test-doc:
 	cargo test --doc
 
 test-unit-codecov TEST="":
-	cargo llvm-cov nextest --profile {{NEXTEST_PROFILE}} --workspace \
-		--exclude arca-testing --no-report {{TEST}}
-
-test-integration TEST="": ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		-E 'not binary(tor)' {{TEST}}
-alias int := test-integration
-
-# run integration tests for bark and barkd test files only
-test-integration-bark: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		--test bark --test barkd
-alias int-bark := test-integration-bark
-
-# Run the integration tests that drive wallet actions (bark, barkd, bark-sdk)
-# double-driving every action step (BARK_DOUBLE_DRIVE_ACTIONS) to check
-# reentrancy.
-[doc("run the bark/barkd/bark-sdk integration tests double-driving every action step to check reentrancy")]
-test-integration-bark-int-action-reentrancy TEST="": ensure-build-bins docker-pull
-	BARK_DOUBLE_DRIVE_ACTIONS=1 \
-		cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		--test bark --test barkd --test bark-sdk {{TEST}}
-alias int-bark-int-action-reentrancy := test-integration-bark-int-action-reentrancy
-
-# Must not run under backward-compat mode (BARK_EXEC override has no effect
-# on tests linked against the current bark-wallet crate).
-test-integration-bark-sdk: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		--test bark-sdk
-alias int-bark-sdk := test-integration-bark-sdk
-
-# run tor integration tests
-test-integration-tor: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		--test tor
-alias int-tor := test-integration-tor
-
-# run integration tests for core and server test files only
-test-integration-core: ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package arca-testing \
-		--test core --test server
-alias int-core := test-integration-core
-
-test-integration-prebuilt TEST="": docker-pull
-	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst {{TEST}}
-
-test-integration-bark-prebuilt: docker-pull
-	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
-		-E 'binary(bark) + binary(barkd)'
-
-test-integration-bark-sdk-prebuilt: docker-pull
-	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
-		-E 'binary(=bark-sdk)'
-
-test-integration-core-prebuilt: docker-pull
-	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
-		-E 'binary(core) + binary(server)'
-
-test-integration-bark-int-prebuilt: docker-pull
-	RUST_MIN_STACK=33554432 \
-	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
-		-E 'binary(bark) + binary(barkd) + binary(=bark-sdk)'
-
-test-integration-codecov TEST="": docker-pull
-	#!/usr/bin/env bash
-	set -euo pipefail
-	source <(cargo llvm-cov show-env --export-prefix)
-	cargo nextest run --profile {{NEXTEST_PROFILE}} --package arca-testing {{TEST}}
-alias int-cov := test-integration-codecov
-
-test-integration-esplora TEST="": ensure-build-bins docker-pull
-	CHAIN_SOURCE=esplora just int "{{TEST}}"
-alias int-esplora := test-integration-esplora
-
-test-integration-esplora-codecov TEST="": docker-pull
-	#!/usr/bin/env bash
-	set -euo pipefail
-	source <(cargo llvm-cov show-env --export-prefix)
-	CHAIN_SOURCE=esplora cargo nextest run --profile {{NEXTEST_PROFILE}} \
-		--package arca-testing {{TEST}}
-
-test-integration-mempool TEST="": ensure-build-bins docker-pull
-	CHAIN_SOURCE=mempool just int "{{TEST}}"
-alias int-mempool := test-integration-mempool
-
-test-integration-mempool-codecov TEST="": docker-pull
-	#!/usr/bin/env bash
-	set -euo pipefail
-	source <(cargo llvm-cov show-env --export-prefix)
-	CHAIN_SOURCE=mempool cargo nextest run --profile {{NEXTEST_PROFILE}} \
-		--package arca-testing {{TEST}}
-
-test-integration-all-codecov: docker-pull
-	just test-integration-codecov
-	just test-integration-mempool-codecov
-alias int-all-cov := test-integration-all-codecov
+	cargo llvm-cov nextest --profile {{NEXTEST_PROFILE}} --workspace --no-report {{TEST}}
 
 test-all-codecov:
 	just test-unit-codecov
-	just test-integration-all-codecov
-test: test-unit test-integration test-integration-esplora test-integration-mempool
 
-test-wasm TEST="": ensure-build-bins docker-pull
-	CHAIN_SOURCE=esplora cargo run -p wasm-testing --bin wasm-test-suite --features=bin -- "{{TEST}}"
-alias wasm := test-wasm
+test: test-unit
 
 test-wasm-unit:
 	wasm-pack test --headless --firefox bark-runtime --lib
@@ -290,7 +160,6 @@ rustdocs-internal:
 clean:
 	cargo clean \
 		-p arca-lib \
-		-p arca-testing \
 		-p arca-bitcoin-ext \
 		-p arca-cli \
 		-p arca-common \
@@ -299,27 +168,13 @@ clean:
 		-p arca-rest-client \
 		-p arca-runtime \
 		-p arca-server \
-		-p arca-server-log \
 		-p arca-server-rpc \
 		-p arca-wallet \
-		-p bip321 \
-		-p wasm-testing
+		-p bip321
 
 # run a single clippy lint
 clippy LINT:
 	cargo clippy -- -A clippy::all -W clippy::{{LINT}}
-
-
-dump-server-sql-schema: ensure-build-examples
-	{{EXAMPLES_DIR}}/dump-server-postgres-schema > {{SERVER_SQL_SCHEMA_PATH}}
-	# Use sed to remove lines that are hard to reproduce across different systems
-	sed '/^-- Dumped by .*$/d' {{SERVER_SQL_SCHEMA_PATH}} \
-		| sed '/^-- Dumped from .*$/d' \
-		| sed '/^\\restrict.*$/d' \
-		| sed '/^\\unrestrict.*$/d' > {{SERVER_SQL_SCHEMA_PATH}}.tmp \
-			&& mv {{SERVER_SQL_SCHEMA_PATH}}.tmp {{SERVER_SQL_SCHEMA_PATH}}
-	echo "bark-server SQL schema written to {{SERVER_SQL_SCHEMA_PATH}}"
-	chmod 644 bark/schema.sql
 
 dump-bark-sql-schema: ensure-build-examples
 	{{EXAMPLES_DIR}}/dump-sqlite-schema > {{BARK_SQL_SCHEMA_PATH}}
