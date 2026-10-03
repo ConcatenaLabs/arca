@@ -3,7 +3,8 @@
 //! The schema is `schema/V1__arca.sql` and the migrations after it
 //! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`,
 //! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
-//! `schema/V6__signer_head.sql`), built from nothing by [`Store::connect`] and
+//! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`), built from
+//! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), a leaf
@@ -64,7 +65,30 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(4, include_str!("../../schema/V4__participation_waiting.sql")),
 	(5, include_str!("../../schema/V5__leaf_salt.sql")),
 	(6, include_str!("../../schema/V6__signer_head.sql")),
+	(7, include_str!("../../schema/V7__signer_messages.sql")),
 ];
+
+/// A rebindable message the server asks the signer to sign, recorded before
+/// it asks: the leaf it is for (its owner key and salt), its digest, and
+/// whether it is a forfeit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignerMessage {
+	pub owner: [u8; 32],
+	pub salt: [u8; 32],
+	pub digest: [u8; 32],
+	pub forfeit: bool,
+}
+
+/// Records `messages` inside `t`; one recorded before is left as it is.
+pub(crate) async fn insert_messages(t: &tokio_postgres::Transaction<'_>, messages: &[SignerMessage]) -> Result<(), StoreError> {
+	for m in messages {
+		t.execute(
+			"INSERT INTO signer_message (owner, salt, digest, kind) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+			&[&&m.owner[..], &&m.salt[..], &&m.digest[..], &if m.forfeit { "forfeit" } else { "spend" }],
+		).await?;
+	}
+	Ok(())
+}
 
 /// An arbitrary key for the advisory lock that serialises migrations.
 const MIGRATION_LOCK: i64 = 0x4172_6361_5363_6865;
@@ -198,6 +222,20 @@ impl Store {
 			&[&n, &&hash[..]],
 		).await?;
 		Ok(())
+	}
+
+	/// Which of `messages` (the leaf's owner key, its salt, the digest) the
+	/// server never recorded asking the signer for: their indices.
+	pub async fn unknown_messages(&self, messages: &[([u8; 32], [u8; 32], [u8; 32])]) -> Result<Vec<usize>, StoreError> {
+		let conn = self.conn().await?;
+		let stmt = conn.prepare("SELECT 1 FROM signer_message WHERE owner = $1 AND salt = $2 AND digest = $3").await?;
+		let mut unknown = vec![];
+		for (i, (o, s, d)) in messages.iter().enumerate() {
+			if conn.query_opt(&stmt, &[&&o[..], &&s[..], &&d[..]]).await?.is_none() {
+				unknown.push(i);
+			}
+		}
+		Ok(unknown)
 	}
 
 	/// The schema version the database is at.

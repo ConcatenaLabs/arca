@@ -98,9 +98,11 @@ impl Store {
 	/// encoded), under a lock on that output, and refuses the transfer when
 	/// one transaction could satisfy it and one of them. Then refuses an input
 	/// that is not live or is spent already, a nonce not issued or taken, a
-	/// key or script already known.
+	/// key or script already known. `messages`, the ones the signer is to
+	/// sign for it, are recorded with it.
+	#[allow(clippy::too_many_arguments)]
 	pub async fn record_transfer<F>(&self, transfer_id: &[u8; 32], reassignment: &NewReassignment, admit: F,
-		inputs: &[NewTransferInput], outputs: &[NewTransferOutput]) -> Result<(), StoreError>
+		inputs: &[NewTransferInput], outputs: &[NewTransferOutput], messages: &[super::SignerMessage]) -> Result<(), StoreError>
 	where
 		F: FnOnce(&[(Vec<u8>, Vec<u8>)]) -> Result<(), String>,
 	{
@@ -163,6 +165,7 @@ impl Store {
 		}
 		t.execute("INSERT INTO reassignment (transfer_id, first_output, inputs, outputs) VALUES ($1, $2, $3, $4)",
 			&[&&transfer_id[..], &&reassignment.first_output[..], &reassignment.inputs, &reassignment.outputs]).await?;
+		super::insert_messages(&t, messages).await?;
 		t.commit().await?;
 		Ok(())
 	}

@@ -346,35 +346,97 @@ impl Store {
 		read_participation(&*conn, id).await
 	}
 
+	/// Begins the forfeit step of participation `id` at `attempt`, in the
+	/// round `round_id`, whole or not at all, before the signer is asked for
+	/// anything: records each forfeit with its owner's half and without the
+	/// operator's (a forfeit already recorded stays as it was), fills in each
+	/// new leaf's coin record (a record already there stays; a batch leaf's
+	/// record is served only once its preimage went out), and records
+	/// `messages`, the forfeits' messages the signer is to sign. Refused with
+	/// [`StoreError::NotInRound`] once the participation is neither issued nor
+	/// released.
+	pub async fn begin_forfeits(&self, id: &[u8; 32], attempt: u32, round_id: i64, forfeits: &[NewForfeit],
+		records: &[([u8; 32], Vec<u8>)], messages: &[super::SignerMessage]) -> Result<(), StoreError>
+	{
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		lock_in_round(&t, id, attempt, round_id).await?;
+		for f in forfeits {
+			t.execute(
+				"INSERT INTO forfeit (leaf_id, round_id, participation_id, attempt, owner_sig, operator_sig, refund_delay_units,
+				 margin, unlock_hash, connector_asset)
+				 VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+				&[&&f.leaf_id[..], &round_id, &&id[..], &(attempt as i32), &&f.owner_sig[..],
+					&(f.refund_delay_units as i32), &i64_of(f.margin)?, &&f.unlock_hash[..], &&f.connector_asset[..]],
+			).await?;
+		}
+		for (leaf, record) in records {
+			t.execute("UPDATE leaf SET record = $2, updated_at = now() WHERE leaf_id = $1 AND kind = 'batch' AND record = ''::bytea",
+				&[&&leaf[..], record]).await?;
+		}
+		super::insert_messages(&t, messages).await?;
+		t.commit().await?;
+		Ok(())
+	}
+
+	/// The operator's half of the forfeit of `leaf_id` for the round
+	/// `round_id`, filled in where it is missing.
+	pub async fn set_forfeit_operator_sig(&self, leaf_id: &[u8; 32], round_id: i64, sig: &[u8; 64]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("UPDATE forfeit SET operator_sig = $3 WHERE leaf_id = $1 AND round_id = $2 AND operator_sig IS NULL",
+			&[&&leaf_id[..], &round_id, &&sig[..]]).await?;
+		Ok(())
+	}
+
+	/// Every forfeit recorded without the operator's half: the signer was
+	/// asked for it and the answer never stored (the server stopped, the
+	/// signer went away), or not asked yet.
+	pub async fn unsigned_forfeits(&self) -> Result<Vec<ForfeitRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT leaf_id, owner_sig, refund_delay_units, margin, unlock_hash, connector_asset, round_id, participation_id, attempt
+			 FROM forfeit WHERE operator_sig IS NULL ORDER BY created_at, leaf_id",
+			&[],
+		).await?;
+		rows.iter().map(|r| {
+			let a: Vec<u8> = r.get(1);
+			Ok(ForfeitRow {
+				forfeit: NewForfeit {
+					leaf_id: array32(r.get(0), "leaf id")?,
+					owner_sig: a.try_into().map_err(|_| StoreError::Corrupt("signature".into()))?,
+					operator_sig: [0; 64],
+					refund_delay_units: r.get::<_, i32>(2) as u16,
+					margin: r.get::<_, i64>(3) as u64,
+					unlock_hash: array32(r.get(4), "unlock hash")?,
+					connector_asset: array32(r.get(5), "connector asset")?,
+				},
+				round_id: r.get(6),
+				participation_id: array32(r.get(7), "participation id")?,
+				attempt: r.get::<_, i32>(8) as u32,
+			})
+		}).collect()
+	}
+
 	/// Completes the forfeit step of participation `id` at `attempt`, in the
-	/// round `round_id`, whole or not at all: records each forfeit (a forfeit
-	/// already recorded stays as it was), fills in each new leaf's coin record
-	/// (a record already there stays), and, when `release`, moves the
-	/// participation from issued to released and credits its new leaves if
-	/// the round is final. Returns whether the participation is released.
+	/// round `round_id`, whole or not at all: records each forfeit whole (the
+	/// operator's half filled in where [`Store::begin_forfeits`] left it
+	/// out; a whole forfeit already recorded stays as it was), fills in each
+	/// new leaf's coin record (a record already there stays), and, when
+	/// `release`, moves the participation from issued to released and credits
+	/// its new leaves if the round is final. Returns whether the
+	/// participation is released.
 	pub async fn complete_participation(&self, id: &[u8; 32], attempt: u32, round_id: i64, forfeits: &[NewForfeit],
 		records: &[([u8; 32], Vec<u8>)], release: bool) -> Result<bool, StoreError>
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
-		let row = t.query_opt(
-			"SELECT state::text FROM participation WHERE participation_id = $1 AND attempt = $2 AND round_id = $3 FOR UPDATE",
-			&[&&id[..], &(attempt as i32), &round_id],
-		).await?;
-		let state = match row {
-			Some(r) => ParticipationState::parse(r.get(0))?,
-			None => return Err(StoreError::Corrupt(format!("participation {} is not in round {} at attempt {}", hex(id), round_id, attempt))),
-		};
-		// It expired meanwhile: its coins are the owner's again, and nothing
-		// is taken for it.
-		if !matches!(state, ParticipationState::Issued | ParticipationState::Released) {
-			return Err(StoreError::NotInRound(state.as_str()));
-		}
+		let state = lock_in_round(&t, id, attempt, round_id).await?;
 		for f in forfeits {
 			t.execute(
 				"INSERT INTO forfeit (leaf_id, round_id, participation_id, attempt, owner_sig, operator_sig, refund_delay_units,
 				 margin, unlock_hash, connector_asset)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				 ON CONFLICT (leaf_id, round_id) DO UPDATE SET operator_sig = EXCLUDED.operator_sig WHERE forfeit.operator_sig IS NULL",
 				&[&&f.leaf_id[..], &round_id, &&id[..], &(attempt as i32), &&f.owner_sig[..], &&f.operator_sig[..],
 					&(f.refund_delay_units as i32), &i64_of(f.margin)?, &&f.unlock_hash[..], &&f.connector_asset[..]],
 			).await?;
@@ -403,7 +465,7 @@ impl Store {
 		let rows = conn.query(
 			"SELECT leaf_id, owner_sig, operator_sig, refund_delay_units, margin, unlock_hash, connector_asset, round_id,
 			        participation_id, attempt
-			 FROM forfeit WHERE participation_id = $1 AND round_id = $2 ORDER BY leaf_id",
+			 FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NOT NULL ORDER BY leaf_id",
 			&[&&id[..], &round_id],
 		).await?;
 		rows.iter().map(|r| {
@@ -670,6 +732,27 @@ impl Store {
 /// and its input inactive, so it can be given up again. A coin with a forfeit
 /// signed for an earlier round that could not return stays given up: the
 /// operator co-signs no other off-chain spend of it.
+/// Locks participation `id` inside `t`, at `attempt` in the round
+/// `round_id`, and returns its state: issued or released, or
+/// [`StoreError::NotInRound`] when it expired meanwhile (its coins are the
+/// owner's again, and nothing is taken for it).
+async fn lock_in_round(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32], attempt: u32, round_id: i64)
+	-> Result<ParticipationState, StoreError>
+{
+	let row = t.query_opt(
+		"SELECT state::text FROM participation WHERE participation_id = $1 AND attempt = $2 AND round_id = $3 FOR UPDATE",
+		&[&&id[..], &(attempt as i32), &round_id],
+	).await?;
+	let state = match row {
+		Some(r) => ParticipationState::parse(r.get(0))?,
+		None => return Err(StoreError::Corrupt(format!("participation {} is not in round {} at attempt {}", hex(id), round_id, attempt))),
+	};
+	if !matches!(state, ParticipationState::Issued | ParticipationState::Released) {
+		return Err(StoreError::NotInRound(state.as_str()));
+	}
+	Ok(state)
+}
+
 async fn give_back(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result<u64, StoreError> {
 	let free = "SELECT leaf_id FROM participation_input i WHERE i.participation_id = $1 AND i.active
 		AND NOT EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = $1 AND f.leaf_id = i.leaf_id)";

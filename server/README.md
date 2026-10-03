@@ -23,7 +23,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql),
 [`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql),
 [`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql),
-[`schema/V6__signer_head.sql`](schema/V6__signer_head.sql)). `Store::connect` builds it
+[`schema/V6__signer_head.sql`](schema/V6__signer_head.sql),
+[`schema/V7__signer_messages.sql`](schema/V7__signer_messages.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -100,6 +101,14 @@ to an older state:
   given, so a record cut back or replaced by an older copy signs nothing
   (`record_behind`) and the server does not start against it. A record that
   is lost cannot be replaced by a new one: the operator stops co-signing.
+- The server records every message it asks the signer to sign before it
+  asks, in the same transaction as what the signature is for (a transfer,
+  a forfeit), and refuses to start on a database that does not know an
+  entry of the signer's record after the latest it was given: such a
+  database is older than what the signer has signed (a copy taken before a
+  transfer, or mid-round before the forfeits came, which nothing on the
+  chain shows yet). It names each entry: its number, the spend or forfeit,
+  the leaf's owner key and salt.
 - The server refuses to start on a database that does not know what the
   chain shows of the operator's: a transaction paying the operator's
   connector script that is no round it knows (a round it built and forgot,
@@ -403,12 +412,19 @@ only when:
   record (its record, the preimage, the authorisations) validates against the
   round as a receiver checks a coin.
 
-The signer then signs the operator's half of each forfeit, which the server
-checks and keeps: it is never returned to anyone, and leaves the server only
-inside a forfeit the operator publishes. An owner therefore never holds a
-forfeit it could publish itself. In one database transaction the forfeits are stored, each new leaf's
-coin record filled in, the participation released and its new leaves
-credited; only then does the preimage go back. The same request again gets
+The forfeits are then recorded with their owners' halves, each new leaf's
+coin record filled in, together with the messages the signer is to sign, in
+one database transaction: a forfeit the signer may have signed is never one
+the database has not heard of. The signer then signs the operator's half of
+each forfeit, which the server checks and stores: it is never returned to
+anyone, and leaves the server only inside a forfeit the operator publishes.
+An owner therefore never holds a forfeit it could publish itself. Then, in
+one database transaction, the participation is released and its new leaves
+credited; only then does the preimage go back. A forfeit left without the
+operator's half (the server stopped before the signer's answer was stored)
+is given it at start and every minute after; the signer signs again what it
+signed, and a forfeit is its owner's consent, so completing it takes
+nothing from anyone. The same request again gets
 the same preimage. A participation that runs again forfeit-first, after a
 round it was released in could not return, has its forfeits stored and its
 preimage withheld: that preimage goes out only by the claim of the forfeit,
@@ -1001,12 +1017,16 @@ deleted from the database, as one restored from an older copy would have
 forgotten it, the attacker's leaf under it is co-signed and spent, and its
 holder still pays: the signer keeps its record per leaf.
 
-`tests/restore.rs` restores the database from an older copy. A board pays B,
-the copy forgets it, and the same board's spend to C is refused by the
-signer's record (`double_spend`, `already_signed`); B's coin validates and its
-checkpoint and reassignment are taken by the node, after which the server
-refuses to start, naming the board's spend it has no record of. A round built
-after the copy makes the server refuse to start on it, naming the round.
+`tests/restore.rs` restores the database from an older copy. A board pays B
+and the copy forgets it: the server does not start on it, naming the two
+entries of the signer's record the payment made; B's coin validates and its
+checkpoint and reassignment are taken by the node, and behind the record's
+check the chain's refuses the start too, naming the board's spend. A copy
+taken mid-round, the round final and the forfeit not yet handed over, does
+not start either, naming the forfeit; the latest state starts. A round
+built after the copy makes the server refuse to start on it, naming the
+round. A forfeit whose operator's half was never stored is given it at
+start, and the signer's record does not grow.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

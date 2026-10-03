@@ -415,6 +415,47 @@ async fn check_signer_record(store: &Store, signer: &SignerClient) -> Result<(),
 	}
 }
 
+/// Refuses to start when the signer's record holds an entry, after the
+/// latest one the database was given, that the database never recorded
+/// asking for: the database is older than what the signer has signed
+/// (restored from an older copy, or a commit lost), and serving from it
+/// could co-sign or build against what it forgot (a forfeit it would never
+/// claim, a spend it would co-sign again). Names each such entry. Every
+/// message the server asks for is recorded before it asks, with what the
+/// signature is for, so a database restored to its latest commit always
+/// knows them. Otherwise the database is told the record's latest entry.
+async fn check_signer_entries(store: &Store, signer: &SignerClient) -> Result<(), StartError> {
+	use crate::signer::{hex, Signed};
+	let mut after = store.signer_head().await.map_err(err("the database"))?.map(|h| h.0).unwrap_or(0);
+	let mut unknown = vec![];
+	let mut last = None;
+	loop {
+		let page = signer.entries(after).await.map_err(err("the signer"))?;
+		let Some(end) = page.last() else { break };
+		after = end.n;
+		last = Some((end.n, end.hash));
+		let keys: Vec<([u8; 32], [u8; 32], [u8; 32])> = page.iter().map(|e| (e.owner, e.salt, e.digest)).collect();
+		for i in store.unknown_messages(&keys).await.map_err(err("the database"))? {
+			let e = &page[i];
+			unknown.push(format!("entry {}, the {} {} of the leaf of {} under salt {}", e.n,
+				match e.kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&e.digest), hex(&e.owner), hex(&e.salt)));
+		}
+	}
+	if !unknown.is_empty() {
+		let more = unknown.len().saturating_sub(10);
+		unknown.truncate(10);
+		return Err(StartError(format!(
+			"the signer's record holds what the database has no record of asking the signer for, so the database is older \
+			 than what the signer has signed (restored from an older copy, or a commit lost) and serving from it could co-sign \
+			 or build against what it forgot; restore the database to its latest state (see the server's README) before \
+			 starting: {}{}", unknown.join("; "), if more > 0 { format!("; and {} more", more) } else { String::new() })));
+	}
+	if let Some((n, hash)) = last {
+		store.set_signer_head(n, &hash).await.map_err(err("the database"))?;
+	}
+	Ok(())
+}
+
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
@@ -459,6 +500,7 @@ impl Server {
 		let signer = SignerClient::new(&config.signer_socket).with_store(store.clone());
 		let operator = signer.pubkey().await.map_err(err("the signer"))?;
 		check_signer_record(&store, &signer).await?;
+		check_signer_entries(&store, &signer).await?;
 
 		let mut assets = BTreeMap::new();
 		let mut order = vec![];
@@ -521,6 +563,13 @@ impl Server {
 				 older copy, or a commit lost) and serving from it could co-sign or build against what it forgot; restore the \
 				 database to its latest state (see the server's README) before starting: {}", unknown.join("; "))));
 		}
+		// A forfeit recorded and never given the operator's half is completed
+		// now, and every minute after (the signer may come back later).
+		match forfeits.fill_unsigned().await {
+			Ok(0) => {},
+			Ok(n) => log::info!("{} forfeit(s) given the operator's half at start", n),
+			Err(e) => log::warn!("forfeits without the operator's half: {}", e),
+		}
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
 		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval)];
@@ -530,6 +579,19 @@ impl Server {
 		tasks.push(finality.spawn());
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
+		tasks.push({
+			let forfeits = forfeits.clone();
+			tokio::spawn(async move {
+				loop {
+					tokio::time::sleep(Duration::from_secs(60)).await;
+					match forfeits.fill_unsigned().await {
+						Ok(0) => {},
+						Ok(n) => log::info!("{} forfeit(s) given the operator's half", n),
+						Err(e) => log::warn!("forfeits without the operator's half: {}", e),
+					}
+				}
+			})
+		});
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
