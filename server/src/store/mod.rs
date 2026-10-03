@@ -19,6 +19,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
 
 mod auth;
+mod boards;
 mod chain;
 mod coins;
 mod mailbox;
@@ -26,6 +27,7 @@ mod nursery;
 mod wallet;
 
 pub use auth::ChallengeError;
+pub use boards::{BoardRow, BoardState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;

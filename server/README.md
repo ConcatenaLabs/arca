@@ -71,6 +71,35 @@ node that does not validate its anchors, since that node has no notion of
 finality, and refuses to leave certification out on a chain whose node reports
 certificates.
 
+## Published parameters
+
+The operator publishes its chain (the genesis hash), its key `S`, the bounds on
+every leaf's exit delay (36 to 48 hours by default), the assets it serves with
+the smallest leaf it takes in each, and the depth limit (5 reassignments from
+a round or a board). Every record and coin the server checks is checked under
+these, with the receipt horizon a receiver uses: a coin's first expiry past
+the exit deadline.
+
+## Boards
+
+An owner brings its own coins in with a board (`board-1`). It asks the server
+for an operator nonce, builds its board record with it (its key, a nonce of
+its own, the exit delay, asset and value), pays its coins to the board output,
+and registers the record with the board transaction. The server refuses a
+record for another chain or another operator key, an exit delay out of
+bounds, an asset it does not serve, a value below its smallest leaf, a
+transaction that does not pay the board output exactly once, a nonce it never
+issued or already gave a leaf, a key that already owns a leaf, a script it
+already knows, and another transaction for a board already registered. A
+refused board leaves nothing behind.
+
+A registered board goes into the nursery and is credited, its leaf becoming
+the owner's to spend off-chain, only once the finality service calls its
+transaction final. A rollback that takes a credited board out uncredits it at
+once; the nursery broadcasts the same transaction again and the board is
+credited again when final again. A board whose transaction can no longer
+confirm is lost.
+
 ## The on-chain wallet
 
 The operator's wallet is built on the Sequentia Wallet Kit: its keys come from
