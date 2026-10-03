@@ -537,14 +537,17 @@ pub struct ReleaseLeaves {
 	pub releases: Vec<ReleaseSignature>,
 }
 
-/// One coin's release: the connector asset `M` of the participation's round
-/// (display order), which the release names, and the signature over
-/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`.
+/// One coin's release: the signature over
+/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset of
+/// the participation's round, and, if the wallet names it, that `M` (display
+/// order). A named `M` that is not the round's is refused (`wrong_round`); an
+/// unnamed one is the round's, and the signature is checked over it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseSignature {
 	pub leaf_id: String,
-	pub connector_asset: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub connector_asset: Option<String>,
 	pub signature: String,
 }
 

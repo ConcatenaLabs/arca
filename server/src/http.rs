@@ -488,7 +488,8 @@ async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	let id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
 	let mut releases = Vec::with_capacity(req.releases.len());
 	for r in &req.releases {
-		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, connector: asset(&r.connector_asset)?, signature: sig(&r.signature)? });
+		let connector = r.connector_asset.as_deref().map(asset).transpose()?;
+		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, connector, signature: sig(&r.signature)? });
 	}
 	let done = app.forfeits.release_leaves(&id, &releases).await?;
 	Ok(Json(api::Released { participation_id: hex(&id), released: done.iter().map(|l| l.to_string()).collect() }))

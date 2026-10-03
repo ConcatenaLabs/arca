@@ -43,13 +43,14 @@
 //! refused (`not_in_round`), even one that was in flight when it expired.
 //!
 //! `release_leaves` takes an owner's release of the lowest node of a coin it
-//! gave up: the connector asset `M` of the participation's round, which the
-//! release names, and the owner's signature with the coin's key over
-//! `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)` ([`arca_covenant::Release`]).
-//! RECLAIM needs an atom of `M` among its inputs, and `M` exists only while
-//! that round is in the chain, so a release is void with its round. A release
-//! naming another `M` is refused (`wrong_round`), as is one over another
-//! message (`bad_signature`). It is also refused for a coin with an open
+//! gave up: the owner's signature with the coin's key over
+//! `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset of
+//! the participation's round ([`arca_covenant::Release`]), which the request
+//! may name. RECLAIM needs an atom of `M` among its inputs, and `M` exists only
+//! while that round is in the chain, so a release is void with its round. A
+//! release naming another `M` is refused (`wrong_round`), as is one whose
+//! signature is over another message (`bad_signature`): the server checks it
+//! over the round's own `M` whether the request names it or not. It is also refused for a coin with an open
 //! out-of-round reassignment, whatever else holds
 //! ([`crate::cosign::Cosigner::check_release`]: the release key is the key the
 //! coin was built with, so its sender and the operator could otherwise void
@@ -111,12 +112,12 @@ pub struct Forfeited {
 	pub forfeit_first: bool,
 }
 
-/// One coin's release: the connector asset of the round it names, and the
-/// owner's signature.
+/// One coin's release: the owner's signature, and the connector asset of the
+/// round it names when the wallet names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRequest {
 	pub leaf_id: LeafId,
-	pub connector: AssetId,
+	pub connector: Option<AssetId>,
 	pub signature: Signature,
 }
 
@@ -371,8 +372,8 @@ impl Forfeits {
 			// The release names the connector asset of the participation's
 			// round, so it is void if that round leaves the chain.
 			let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
-			if r.connector != m {
-				return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named: r.connector, round: m });
+			if let Some(named) = r.connector.filter(|n| *n != m) {
+				return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named, round: m });
 			}
 			let release = Release { chain: self.params.chain, node_hash: lowest.children_hash(), owner: record.owner, connector: m };
 			if release.verify(&r.signature).is_err() {

@@ -345,13 +345,15 @@ flight when it ran, is refused (`not_in_round`) and stores nothing. A round
 that stops being final and becomes final again starts the day again.
 
 `release_leaves` then takes the owner's release of the lowest node of each
-coin it gave up: the connector asset `M` of the participation's round, and
-the owner's signature, with the coin's own key, over
+coin it gave up: the owner's signature, with the coin's own key, over
 `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `H` the node's children hash
-(`arca_covenant::Release`). RECLAIM needs an atom of `M` among its inputs, and
-`M` exists only while that round is in the chain, so a release is void with
-its round. A release naming another `M` is refused (`wrong_round`), and one
-over another message (`bad_signature`). It is also refused for a coin with an
+and `M` the connector asset of the participation's round
+(`arca_covenant::Release`), and, if the wallet names it, that `M`
+(`connector_asset`). RECLAIM needs an atom of `M` among its inputs, and `M`
+exists only while that round is in the chain, so a release is void with its
+round. A release naming another `M` is refused (`wrong_round`), and one whose
+signature is over another message (`bad_signature`): the server checks every
+release over its round's own `M`, named or not. It is also refused for a coin with an
 open out-of-round reassignment, whatever else holds; for a coin not given up
 in the participation named; before the participation's preimage went out;
 while its round is not final; and for a board or a coin a reassignment made,
