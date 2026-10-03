@@ -98,6 +98,12 @@ refresh_ppm = 0
 # What an offboard costs, in parts per million of what it pays out, on top of
 # the margin its on-chain output holds for its unlock.
 offboard_ppm = 0
+# The most margin a co-signed transfer may leave for its checkpoint's and its
+# reassignment's fees, as a multiple of the least it must leave: four times
+# the node's floor in an asset the node accepts for fees, one atom in one it
+# does not. The watcher pays from a margin only the fee its transaction needs
+# and returns the rest to the operator's wallet.
+max_margin_multiple = 25
 
 # Each asset served, with the smallest leaf taken, in the asset's atoms. An
 # asset served need not be one the node accepts for fees: a batch in such an

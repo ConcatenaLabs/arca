@@ -27,6 +27,12 @@ fn refused(a: common::client::Answer, status: i32, code: &str) {
 	println!("refused {} {}: {}", status, code, m);
 }
 
+/// The cases here pay part of a coin with no change, leaving margins far
+/// above the default cap; the bounds themselves are `tests/margins.rs`'s.
+fn wide_margins(c: &mut server::server::Config, _: elements::AssetId) {
+	c.fees.max_margin_multiple = Some(1_000_000);
+}
+
 /// A credited board for `owner`, held as a coin.
 async fn credited_board(r: &mut Running, owner: &elements::secp256k1_zkp::Keypair) -> (Held, Transaction) {
 	let (record, tx, _) = r.board(owner, VALUE);
@@ -40,7 +46,7 @@ async fn credited_board(r: &mut Running, owner: &elements::secp256k1_zkp::Keypai
 
 #[tokio::test(flavor = "multi_thread")]
 async fn board_transfer_mailbox_and_rules() {
-	let mut r = Running::start().await;
+	let mut r = Running::start_with(wide_margins).await;
 	let s = xonly(&r.s);
 
 	// info
@@ -229,7 +235,7 @@ async fn depth_limit_five() {
 		let next = keypair(&format!("hop {}", hop));
 		let (leaf, nonce) = new_leaf(&next);
 		let kept = value - MARGIN;
-		let body = transfer_body(&[(&held, coin, kept)], &[(r.x, kept, leaf)], s, r.chain);
+		let body = transfer_body(&[(&held, coin, kept)], &[(r.x, kept - MARGIN, leaf)], s, r.chain);
 		let a = r.http.post("cosign_transfer", &body);
 		if hop == 6 {
 			refused(a, 422, "depth_limit");
@@ -241,7 +247,7 @@ async fn depth_limit_five() {
 		assert_eq!(valid.hops, hop);
 		println!("hop {}: co-signed, {} reassignments from the board", hop, valid.hops);
 		held = Held { key: next, nonce, id: valid.id, record };
-		value = kept;
+		value = kept - MARGIN;
 	}
 }
 
@@ -379,7 +385,7 @@ async fn two_spends_at_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mergeable_at_once() {
-	let mut r = Running::start().await;
+	let mut r = Running::start_with(wide_margins).await;
 	let s = xonly(&r.s);
 	// Two coins of two owners, each sent at once to the same output set.
 	let (k1, t1) = credited_board(&mut r, &keypair("M1")).await;

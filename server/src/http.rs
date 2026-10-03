@@ -296,6 +296,8 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			free_window_seconds: FeeSchedule::FREE_FROM,
 			full_after_seconds: FeeSchedule::FULL_AFTER,
 			offboard_ppm: p.fees.offboard_ppm,
+			margin_multiple: crate::fees::MULTIPLE,
+			max_margin_multiple: p.max_margin_multiple,
 		},
 		participations: api::ParticipationsInfo {
 			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,

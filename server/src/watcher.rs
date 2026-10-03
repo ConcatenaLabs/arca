@@ -51,9 +51,10 @@
 //!    watcher.
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
-//! signers left, when the node accepts that asset for fees now; otherwise by a
-//! coin of the wallet's in the first asset of the operator's `fee_assets` the
-//! node accepts. No asset is assumed, the policy asset included. Every
+//! signers left, when the node accepts that asset for fees now (the fee the
+//! transaction needs, the rest of a large margin back to the wallet);
+//! otherwise by a coin of the wallet's in the first asset of the operator's
+//! `fee_assets` the node accepts. No asset is assumed, the policy asset included. Every
 //! transaction goes to the nursery, which broadcasts it again unchanged after
 //! a rollback, however deep: an anchor-driven reorganisation that takes out a
 //! round and the watcher's answers puts them back in the order they were
@@ -157,7 +158,7 @@ fn sized(mut tx: Transaction, wallet_inputs: &[usize]) -> u64 {
 fn fee_input(tx: &Transaction, fee: &FeeSource) -> Option<usize> {
 	match fee {
 		FeeSource::Coin { outpoint, .. } => tx.input.iter().position(|i| i.previous_output == *outpoint),
-		FeeSource::Reserve => None,
+		FeeSource::Reserve | FeeSource::Split { .. } => None,
 	}
 }
 
@@ -419,7 +420,10 @@ impl Watcher {
 	/// Builds a spend whose outputs its signers committed to: the margin they
 	/// left pays the fee when the node accepts its asset now and the margin
 	/// covers the node's floor; otherwise a wallet coin pays, the margin
-	/// going to the wallet's change. `make` is as for [`Watcher::payout`].
+	/// going to the wallet's change. A margin of more than twice the fee the
+	/// wallet pays for the transaction pays that fee, and the rest goes to
+	/// the wallet: paid whole, a large margin would be a fee the node refuses
+	/// (`max-fee-exceeded`). `make` is as for [`Watcher::payout`].
 	async fn margin_or_coin<T, F>(&self, asset: AssetId, margin: u64, mut make: F) -> Result<(T, Option<WalletCoin>, Option<AssetAmount>), WatcherError>
 	where
 		F: FnMut(&FeeSource) -> Result<(T, Transaction), String>,
@@ -427,6 +431,15 @@ impl Watcher {
 		if let Some(floor) = self.accepted(asset).await? {
 			let (made, dummy) = make(&FeeSource::Reserve).map_err(WatcherError::Build)?;
 			if margin >= fees::atoms_for(floor, dummy.vsize() as u64, 1) {
+				let to = self.to_wallet().await?;
+				// Sized with the change output it would have.
+				if let Ok((_, sized)) = make(&FeeSource::Split { fee: 1, change: to.clone() }) {
+					let fee = self.wallet.fee_in(asset, sized.vsize() as u64).await?;
+					if margin > fee.saturating_mul(2) {
+						let (made, _) = make(&FeeSource::Split { fee, change: to }).map_err(WatcherError::Build)?;
+						return Ok((made, None, Some(AssetAmount::new(asset, fee))));
+					}
+				}
 				return Ok((made, None, Some(AssetAmount::new(asset, margin))));
 			}
 		}

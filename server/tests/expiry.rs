@@ -168,7 +168,7 @@ async fn a_participation_whose_forfeits_never_come_expires() {
 async fn start_charging() -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection { asset: y.to_string(), min_leaf: MIN_LEAF.to_string() });
-		c.fees = FeesSection { refresh_ppm: 23_000, offboard_ppm: 0 };
+		c.fees = FeesSection { refresh_ppm: 23_000, ..Default::default() };
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;

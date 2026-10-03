@@ -103,6 +103,12 @@ pub struct FeesInfo {
 	/// The offboard fee, in parts per million of what it pays out, on top of
 	/// the margin the round's output holds for its unlock.
 	pub offboard_ppm: u64,
+	/// The least margin a transfer's checkpoint and reassignment leave for
+	/// their fee, as a multiple of the node's floor in an asset it accepts
+	/// for fees (one atom in one it does not), and the most, as a multiple of
+	/// that least.
+	pub margin_multiple: u64,
+	pub max_margin_multiple: u64,
 }
 
 /// `POST /v1/operator_nonce`: a fresh operator nonce for one leaf the

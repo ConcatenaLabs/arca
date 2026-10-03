@@ -186,6 +186,11 @@ pub struct FeesSection {
 	/// top of the margin of its output.
 	#[serde(default)]
 	pub offboard_ppm: u64,
+	/// The most margin a co-signed transfer may leave for a fee, as a
+	/// multiple of the least (four times the node's floor in an asset it
+	/// accepts for fees, one atom in one it does not); 25 when absent.
+	#[serde(default)]
+	pub max_margin_multiple: Option<u64>,
 }
 
 fn default_fee_multiple() -> u64 {
@@ -383,6 +388,12 @@ impl Server {
 			None => order,
 		};
 		params.fees = FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm };
+		if let Some(m) = config.fees.max_margin_multiple {
+			if m < 1 {
+				return Err(StartError("fees.max_margin_multiple is at least 1".into()));
+			}
+			params.max_margin_multiple = m;
+		}
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
