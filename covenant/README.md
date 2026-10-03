@@ -281,7 +281,13 @@ never share one. `M` is the asset that spending the round's connector output
 the confirmed round, the operator issues one atom only when it needs to claim
 and reuses it for every claim of that round. If the round is not in the chain,
 `(round_txid, c)` does not exist, `M` can never be issued and no forfeit of that
-round can be claimed.
+round can be claimed. The claim reads input `k`'s asset and nothing else of it,
+so several claims can name one `k`: `batch_claim_tx` claims every forfeit of a
+round in one transaction, the forfeits at inputs `0..n` and one atom of `M` at
+input `n`, which goes back to the operator. The operator signs each claim input
+over the whole transaction, so no signature serves another input or another
+claim, and a forfeit of another round cannot join: its claim finds this round's
+`M` at `k`, not its own.
 
 The connector output has a script of its own (`ConnectorPolicy`): the
 operator's signature, then `OP_INSPECTINPUTISSUANCE` on its own input requiring

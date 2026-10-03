@@ -84,7 +84,7 @@ pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
-pub use forfeit::{connector_asset, ConnectorPolicy, Forfeit, ForfeitPolicy};
+pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
 pub use leaf::LeafPolicy;

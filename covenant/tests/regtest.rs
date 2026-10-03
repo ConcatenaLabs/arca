@@ -409,6 +409,81 @@ fn forfeit(net: &mut Net) {
 	let _ = refund;
 }
 
+/// Three forfeits of one round claimed in one transaction against one atom of
+/// its connector asset; each negative forced into a block.
+fn claim_batch(net: &mut Net) {
+	let s_key = keypair("batch operator");
+	let conn_policy = ConnectorPolicy { operator: xonly(&s_key) };
+	let connectors = net.fund(vec![conn_policy.output(net.x, 5_000).txout(), conn_policy.output(net.x, 5_000).txout()]);
+	let m = connector_asset(connectors[0].outpoint.txid, connectors[0].outpoint.vout);
+	let m2 = connector_asset(connectors[1].outpoint.txid, connectors[1].outpoint.vout);
+	let make = |net: &Net, i: usize, conn: elements::AssetId| {
+		let owner = keypair(&format!("batch owner {}", i));
+		let leaf = net.leaf(&owner, &s_key, &format!("batch old leaf {}", i));
+		let pre = label32(&format!("batch preimage {}", i));
+		(Forfeit::new(leaf, (net.x, LEAF), LeafId(label32(&format!("batch leaf id {}", i))), sha256(&pre), conn, delay(), FEE).unwrap(), pre)
+	};
+	let fs: Vec<(Forfeit, [u8; 32])> = (0..3).map(|i| make(net, i, m)).collect();
+	let (other, other_pre) = make(net, 3, m2);
+	let mut outs: Vec<TxOut> = fs.iter().map(|(f, _)| f.output().txout()).collect();
+	outs.push(other.output().txout());
+	let coins = net.fund(outs);
+	// The operator issues one atom of M.
+	let ks = conn_policy.issuance(connectors[0].outpoint, (net.x, 5_000), op_true_spk(), &[], &FeeSource::Reserve).unwrap();
+	let sg = sig(&s_key, &ks.sighash(net.genesis).unwrap());
+	let iss = ks.finish(vec![sg.as_ref().to_vec()]);
+	let it = net.pass("claim batch/the issuance of one atom of M", &iss.tx);
+	let atom = coin_of(it, 0, &iss.tx);
+	assert_eq!(atom.txout.asset.explicit(), Some(m));
+
+	let set: Vec<(&Forfeit, OutPoint)> = fs.iter().zip(&coins).map(|((f, _), c)| (f, c.outpoint)).collect();
+	let to = vec![ExplicitOutput::new(net.x, 3 * (LEAF - FEE) - FEE, op_true_spk())];
+	let c = batch_claim_tx(&set, (atom.outpoint, atom.txout.clone()), &to, op_true_spk(), &FeeSource::Reserve).unwrap();
+	let preimages: Vec<[u8; 32]> = fs.iter().map(|(_, p)| *p).collect();
+	let genesis = net.genesis;
+	let sigs = |c: &ClaimTx| -> Vec<elements::secp256k1_zkp::schnorr::Signature> {
+		(0..c.leaves.len()).map(|i| sig(&s_key, &c.sighash(i, genesis).unwrap())).collect()
+	};
+	let done = |c: &ClaimTx, s: Vec<elements::secp256k1_zkp::schnorr::Signature>, p: &[[u8; 32]]| -> Transaction {
+		let k = c.connector_input() as usize;
+		let mut tx = c.clone().finish(&s, p).unwrap().tx;
+		tx.input[k].witness.script_witness = op_true_witness();
+		tx
+	};
+	let mut wrong = preimages.clone();
+	wrong[1] = label32("not the preimage");
+	net.refuse("claim batch/neg a wrong preimage on the second claim", &done(&c, sigs(&c), &wrong), "Script failed an OP_EQUALVERIFY operation");
+	let mut swapped = sigs(&c);
+	swapped.swap(0, 1);
+	net.refuse("claim batch/neg two claims' signatures swapped", &done(&c, swapped, &preimages), "Invalid Schnorr signature");
+	let mut tx = done(&c, sigs(&c), &preimages);
+	let n = tx.input[2].witness.script_witness.len();
+	tx.input[2].witness.script_witness[n - 3] = arca_covenant::script::scriptnum(0);
+	net.refuse("claim batch/neg a claim naming a forfeit input as M's", &tx, "Script failed an OP_EQUALVERIFY operation");
+	// Another round's forfeit beside this round's, with this round's atom.
+	let mixed = vec![set[0], (&other, coins[3].outpoint)];
+	assert_eq!(batch_claim_tx(&mixed, (atom.outpoint, atom.txout.clone()), &to, op_true_spk(), &FeeSource::Reserve).unwrap_err(),
+		arca_covenant::spend::SpendError::OtherConnector(1));
+	let mut s = spend(0).coin(&coins[0], 0xffff_ffff).coin(&coins[3], 0xffff_ffff).coin(&atom, 0xffff_ffff).outputs(vec![
+		explicit(net.x, 2 * (LEAF - FEE) - FEE, op_true_spk()), explicit(m, 1, op_true_spk()), fee(net.x, FEE)]);
+	let (f0, f3) = (&fs[0].0.policy, &other.policy);
+	let s0 = s.sign(&s_key, 0, &f0.claim_script(), net.genesis);
+	let s3 = s.sign(&s_key, 1, &f3.claim_script(), net.genesis);
+	s.witness(0, f0.taproot().witness(&f0.claim_script(), ForfeitPolicy::claim_items(&s0, &fs[0].1, 2)));
+	s.witness(1, f3.taproot().witness(&f3.claim_script(), ForfeitPolicy::claim_items(&s3, &other_pre, 2)));
+	s.witness(2, op_true_witness());
+	net.refuse("claim batch/neg another round's forfeit claimed with this round's atom", &s.tx, "Script failed an OP_EQUALVERIFY operation");
+
+	let tx = done(&c, sigs(&c), &preimages);
+	let ct = net.pass("claim batch/three forfeits of one round, one atom of M", &tx);
+	println!("claim batch: {} forfeits in {} vB", c.leaves.len(), tx.vsize());
+	// Each owner learns its own preimage from the claim, and the atom is back.
+	for (i, (f, p)) in fs.iter().enumerate() {
+		assert_eq!(find_preimage(&net.witness_of(&ct, i), &f.policy.unlock_hash), Some(*p), "owner {} learns its preimage", i);
+	}
+	assert_eq!(tx.output[1], explicit(m, 1, op_true_spk()), "the atom goes back for the next claim");
+}
+
 fn unlock_entry(net: &Net, e: &EntryPolicy, coin: &Coin, preimage: &[u8; 32], to: Script, value: u64) -> Transaction {
 	let mut s = spend(0).coin(coin, 0xffff_ffff)
 		.outputs(vec![explicit(net.x, value, to), fee(net.x, LEAF + ENTRY_RESERVE - value)]);
@@ -1086,6 +1161,7 @@ fn frozen_constructions_on_regtest() {
 	checkpoint_chain(&mut net, false);
 	checkpoint_chain(&mut net, true);
 	forfeit(&mut net);
+	claim_batch(&mut net);
 	htlc(&mut net);
 	swap(&mut net);
 	entry_sweep(&mut net);
