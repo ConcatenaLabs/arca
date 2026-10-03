@@ -691,8 +691,12 @@ signature it gets back against the message or signature hash it built.
 The signer is the one-spend authority. Before it returns a rebindable
 signature it appends the owner key, the salt, the kind and the message's
 digest to its record, an append-only file it alone writes, and syncs it to
-disk; it reads the record whole when it starts, and refuses to start on a line
-it cannot read. Each entry names its leaf: its owner key together with its
+disk; it reads the record line by line when it starts, checking every line,
+and refuses to start on a line it cannot read. It keeps at hand only what a
+lookup needs, the first bytes of each entry's salt and where its line
+starts, and reads the entries under a salt back from the file when a request
+names it: a record of four million entries opens in about ten seconds in
+under 70 MB. Each entry names its leaf: its owner key together with its
 salt (a leaf's, a board's, a checkpoint's, whose owner is its coin's), and
 needs that owner's own signature over the message, so an entry under a key is
 always its holder's doing. The rule is kept per salt: `S`'s signature commits
@@ -738,6 +742,21 @@ noticing:
   on the same file does not start; a copy written by another signer is
   another record, caught by the entry the database knows.
 
+The record grows with every message signed, and protects nothing once the
+coins its entries are for can no longer be spent off-chain. It can be
+compacted, with the signer stopped: `arcad <config> expired-salts` lists the
+salts of every leaf whose coin rests on batches alone, all past their last
+expiry, and of their checkpoints (a board never expires, so a coin resting on
+one is never listed), and `arca-signer --compact-into <new file>
+--drop-salts <list>` writes a new record without the entries under those
+salts. The new record's first line names the old record's latest entry and
+running hash, from which its own entries go on, so the entry the server's
+database knows is still the record's; it carries every other entry's line
+over verbatim, with a hash over them in that first line, which the signer
+checks at start. A database that knows an entry compacted away is older than
+the compaction (`record_differs`). The operator then puts the new file in the
+record's place and starts the signer on it.
+
 ## Running
 
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
@@ -746,6 +765,9 @@ noticing:
         --record /var/lib/arca/signer.record
     arcad /etc/arca/arcad.toml
     arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
+    arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
+        --compact-into /var/lib/arca/signer.record.new --drop-salts expired.salts   # with the signer stopped
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`).
@@ -1073,13 +1095,25 @@ database's later entry (`record_behind`), and everything after it; a copy
 another signer wrote refusing the database's entry (`record_differs`); a write
 past a file size limit undone at once and the next entry whole once there is
 room; a line cut short by a crash removed at start, which says so; an edited
-line, and a record of another key, refusing the start.
+line, and a record of another key, refusing the start. Its compaction: no
+compaction while a signer holds the record, nor over a file that is there;
+the entries under the salts listed dropped, the rest carried over verbatim,
+the new record going on from the old one's latest entry; the signer on it
+refusing another message under a salt carried over, signing the same message
+again as its entry, taking a dropped salt afresh, accepting the database's
+knowledge of a carried entry and refusing that of one compacted away
+(`record_differs`), listing its entries; a carried line changed refusing the
+start; and a compacted record compacted again.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next
 payment is answered `signer_unavailable` (`record_behind`) and the server does
 not start, naming both entries; with the whole record back the server starts
-and the payment, sent again byte for byte, is co-signed.
+and the payment, sent again byte for byte, is co-signed. And a batch leaf paid
+on out of round, past its batch's last expiry: `expired_salts` lists its salt,
+the salt of the coin it paid and both checkpoints', never a board's; the
+record compacted with that list, the server starts on it, its database's
+entry the compacted record's latest.
 
 `tests/salts.rs` names other leaves' salts. A transfer to a leaf of the
 attacker's under a batch leaf's salt read from the public tree, two new leaves

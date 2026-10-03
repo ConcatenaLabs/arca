@@ -36,7 +36,7 @@
 //! The signer, not the database, is the authority on what `S` has co-signed.
 //! Before it returns a rebindable signature it appends `(owner, salt, kind,
 //! digest)` to its record, a file it alone writes, and syncs it to disk
-//! ([`SpendRecord`]); it reads the whole record when it starts. Each entry
+//! ([`SpendRecord`]); it reads the record line by line when it starts. Each entry
 //! names its leaf: its owner's key together with its salt (a leaf's, a
 //! board's or a checkpoint's, whose owner is its coin's). The rule, though, is
 //! kept per salt: `S`'s signature commits to the salt (`K` above) and not to
@@ -86,6 +86,7 @@
 
 use std::path::{Path, PathBuf};
 
+use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
@@ -343,6 +344,109 @@ impl Entry {
 	}
 }
 
+/// The format of a record compacted from another
+/// ([`SpendRecord::compact`]): its first line also names the record it was
+/// compacted from, by that record's latest entry and running hash, and how
+/// many of its entries it carries over, with a hash over their lines.
+pub const RECORD_VERSION_COMPACTED: u32 = 2;
+/// The tag of the hash over a compacted record's carried lines.
+pub const RECORD_CARRIED_TAG: &[u8] = b"Arca/signer-record-carried";
+
+/// How many entries apart the record remembers where a line starts, to read
+/// entries back from the file.
+const MARK_EVERY: u64 = 1024;
+/// How many of the latest entries' running hashes the record keeps at hand:
+/// the entry the database knows, which every request names, is nearly always
+/// one of them.
+const RECENT: usize = 4096;
+
+/// One entry as the record keeps it at hand: the first eight bytes of its
+/// salt, and where its line starts in the file. Everything else is read back
+/// from the line when a request needs it: the entries under a salt are few,
+/// so a lookup reads one or two lines, and keeping only this lets a record of
+/// millions of entries open in a few tens of megabytes. Two salts sharing
+/// their first eight bytes (salts are hashes) only make a lookup read one
+/// more line, which its full salt then sets apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Kept {
+	salt: u64,
+	at: u64,
+}
+
+fn salt_key(salt: &[u8; 32]) -> u64 {
+	u64::from_le_bytes(salt[..8].try_into().expect("8 bytes"))
+}
+
+/// Whether `b` is 64 lower-case hex digits.
+fn is_hex32(b: &[u8]) -> bool {
+	b.len() == 64 && b.iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// One entry line, checked as the record is opened without decoding more
+/// than it needs: its fields, its number and salt, and its running hash,
+/// which must follow `prev` over the line's text as written. Returns the
+/// entry's number, salt and running hash.
+fn check_line(line: &[u8], prev: Option<&[u8; 32]>) -> Result<(u64, [u8; 32], [u8; 32]), String> {
+	let f: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+	let ok = match f.as_slice() {
+		[n, kind, rest @ ..] => {
+			n.iter().all(u8::is_ascii_digit) && !n.is_empty()
+				&& ((*kind == b"spend" && rest.len() == 4) || (*kind == b"forfeit" && rest.len() == 5))
+				&& rest.iter().all(|x| is_hex32(x))
+		},
+		_ => false,
+	};
+	if !ok {
+		return Err("not a record line".into());
+	}
+	let n: u64 = std::str::from_utf8(f[0]).ok().and_then(|n| n.parse().ok()).ok_or("not a record line")?;
+	let salt = unhex32(std::str::from_utf8(f[3]).expect("hex"))?;
+	let hash = unhex32(std::str::from_utf8(f[f.len() - 1]).expect("hex"))?;
+	if let Some(prev) = prev {
+		let text = &line[..line.len() - 65];
+		let mut e = sha256::Hash::engine();
+		e.input(RECORD_TAG);
+		e.input(prev);
+		e.input(text);
+		if sha256::Hash::from_engine(e).to_byte_array() != hash {
+			return Err("its running hash does not follow from the lines before it: the record has been changed".into());
+		}
+	}
+	Ok((n, salt, hash))
+}
+
+/// One entry line, its running hash included.
+fn parse_entry(line: &str) -> Result<Entry, String> {
+	let f: Vec<&str> = line.split(' ').collect();
+	let n: u64 = f.first().and_then(|n| n.parse().ok()).ok_or("not a record line")?;
+	let (kind, owner, salt, digest, hash) = match f.as_slice() {
+		[_, "spend", o, s, d, h] => (Signed::Spend, *o, *s, *d, *h),
+		[_, "forfeit", o, s, d, m, h] => (Signed::Forfeit(unhex32(m)?), *o, *s, *d, *h),
+		_ => return Err("not a record line".into()),
+	};
+	Ok(Entry { n, kind, owner: unhex32(owner)?, salt: unhex32(salt)?, digest: unhex32(digest)?, hash: unhex32(hash)? })
+}
+
+/// Reads the line that starts at `at` in `file`, without its newline.
+fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
+	use std::os::unix::fs::FileExt;
+	let mut buf = vec![0u8; 512];
+	let mut got = 0;
+	loop {
+		let n = file.read_at(&mut buf[got..], at + got as u64).map_err(|e| e.to_string())?;
+		if n == 0 {
+			return Err(format!("no whole line at offset {}", at));
+		}
+		got += n;
+		if let Some(end) = buf[..got].iter().position(|b| *b == b'\n') {
+			return String::from_utf8(buf[..end].to_vec()).map_err(|e| e.to_string());
+		}
+		if got == buf.len() {
+			buf.resize(buf.len() * 2, 0);
+		}
+	}
+}
+
 /// The signer's append-only record of every rebindable message it signed:
 /// see the [module documentation](self).
 ///
@@ -353,6 +457,21 @@ impl Entry {
 /// each ending with the running hash ([`chain_hash`]) over the header and
 /// every line before it, appended and synced to disk before the signature is
 /// returned.
+///
+/// The record is read line by line when it is opened, every line checked,
+/// and kept at hand only as far as a lookup needs: for each entry, the first
+/// eight bytes of its salt and where its line starts, sorted; with where
+/// every 1,024th line starts, and the running hashes of the latest 4,096
+/// entries. The entries under a salt, and anything a request repeated or the
+/// database's start check asks, are read back from the file.
+///
+/// A record can be compacted into a new one ([`SpendRecord::compact`]),
+/// dropping the entries under salts the server no longer serves (leaves
+/// whose batches have expired): the new record's first line,
+/// `arca-signer-record 2 <S> <genesis> <n> <hash> <carried> <carried hash>`,
+/// names the old record's latest entry and running hash, from which its own
+/// entries go on, and how many lines it carries over from it, verbatim, with
+/// a hash over them (`SHA256("Arca/signer-record-carried" ‖ lines)`).
 ///
 /// The record is never made in passing: [`SpendRecord::create`] makes a new
 /// one, once, and [`SpendRecord::open`] refuses a path where there is none,
@@ -373,10 +492,23 @@ pub struct SpendRecord {
 	file: std::fs::File,
 	/// The file's length, every line in it whole.
 	size: u64,
-	header_hash: [u8; 32],
-	entries: Vec<Entry>,
-	/// The entries under each salt, whatever their owner.
-	by_salt: std::collections::HashMap<[u8; 32], Vec<usize>>,
+	/// Where the first entry line starts.
+	first: u64,
+	/// The entry the record's own entries follow, and its running hash: 0
+	/// and the header's hash, or for a compacted record the latest of the
+	/// record it was compacted from.
+	base: (u64, [u8; 32]),
+	head: (u64, [u8; 32]),
+	/// How many entries the record holds.
+	count: u64,
+	/// Every entry read when the record was opened, by salt.
+	kept: Vec<Kept>,
+	/// Every entry added since, by salt.
+	added: std::collections::HashMap<u64, Vec<u64>>,
+	/// `(entry, offset)` of every [`MARK_EVERY`]th entry line, from the first.
+	marks: Vec<(u64, u64)>,
+	/// `(entry, running hash)` of the latest entries.
+	recent: std::collections::VecDeque<(u64, [u8; 32])>,
 	/// Why the signer signs nothing more until it is started again.
 	refusing: Option<String>,
 }
@@ -386,17 +518,31 @@ impl SpendRecord {
 	/// chain of `genesis`, and syncs it and its directory: an act of its own,
 	/// for a new operator key. It never replaces a record already there.
 	pub fn create(path: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash) -> Result<(), String> {
+		Self::write_new(path, &format!("{}\n", record_header(operator, genesis)), |_| Ok(()))
+	}
+
+	/// Writes a new file at `path` (mode 0600, refused where one is) with
+	/// `header` and whatever `rest` writes, and syncs it and its directory.
+	fn write_new(path: &Path, header: &str, rest: impl FnOnce(&mut std::io::BufWriter<&std::fs::File>) -> Result<(), String>)
+		-> Result<(), String>
+	{
 		use std::io::Write;
 		use std::os::unix::fs::OpenOptionsExt;
 		let fail = |e: std::io::Error| format!("{}: {}", path.display(), e);
-		let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+		let file = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
 			Ok(f) => f,
 			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
 				return Err(format!("{}: a record is there already; a record is made once, and never replaced", path.display()));
 			},
 			Err(e) => return Err(fail(e)),
 		};
-		file.write_all(format!("{}\n", record_header(operator, genesis)).as_bytes()).and_then(|_| file.sync_all()).map_err(fail)?;
+		{
+			let mut w = std::io::BufWriter::new(&file);
+			w.write_all(header.as_bytes()).map_err(fail)?;
+			rest(&mut w)?;
+			w.flush().map_err(fail)?;
+		}
+		file.sync_all().map_err(fail)?;
 		if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
 			std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)?;
 		}
@@ -404,10 +550,10 @@ impl SpendRecord {
 	}
 
 	/// Opens the record at `path`, kept for `operator` on the chain of
-	/// `genesis`, and locks it for this process. Returns it, and a note when
-	/// a last line cut short was removed.
+	/// `genesis`, and locks it for this process, reading it line by line.
+	/// Returns it, and a note when a last line cut short was removed.
 	pub fn open(path: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash) -> Result<(SpendRecord, Option<String>), String> {
-		use std::io::{Read, Seek};
+		use std::io::{BufRead, Seek};
 		let fail = |e: std::io::Error| format!("{}: {}", path.display(), e);
 		let mut file = match std::fs::OpenOptions::new().read(true).append(true).open(path) {
 			Ok(f) => f,
@@ -423,86 +569,229 @@ impl SpendRecord {
 				"{}: the record is held by another signer that is running; two signers never write one record", path.display())),
 			Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
 		}
-		let mut text = String::new();
 		file.seek(std::io::SeekFrom::Start(0)).map_err(fail)?;
-		file.read_to_string(&mut text).map_err(fail)?;
-		let whole = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
-		let mut repaired = None;
-		if whole < text.len() {
-			// A line cut short, by a write that failed or a crash: never
-			// answered, and never to be followed by another.
-			let cut = &text[whole..];
-			repaired = Some(format!("the record's last line was cut short, by a write that failed or a crash, and was never \
-				answered: removed ({} bytes: {:?})", cut.len(), cut.chars().take(80).collect::<String>()));
-			file.set_len(whole as u64).map_err(fail)?;
-			file.sync_all().map_err(fail)?;
+		let mut reader = std::io::BufReader::with_capacity(1 << 20, file.try_clone().map_err(fail)?);
+		let mut line: Vec<u8> = Vec::with_capacity(512);
+		let read = |reader: &mut std::io::BufReader<std::fs::File>, line: &mut Vec<u8>| -> Result<usize, String> {
+			line.clear();
+			reader.read_until(b'\n', line).map_err(fail)
+		};
+		let got = read(&mut reader, &mut line)?;
+		if got == 0 || !line.ends_with(b"\n") {
+			return Err(format!("{}: the record has no header line", path.display()));
 		}
-		let mut lines = text[..whole].lines();
-		let header = lines.next().ok_or_else(|| format!("{}: the record has no header line", path.display()))?;
+		let header = std::str::from_utf8(&line[..got - 1]).map_err(|e| format!("{}: the header: {}", path.display(), e))?.to_string();
 		let f: Vec<&str> = header.split(' ').collect();
 		if f.first() != Some(&RECORD_MAGIC) {
 			return Err(format!("{}: the first line is not a record's header ({:?}): a record kept without one, by salt \
 				alone, cannot be read by this signer", path.display(), header.chars().take(80).collect::<String>()));
 		}
-		if f.get(1) != Some(&RECORD_VERSION.to_string().as_str()) {
-			return Err(format!("{}: the record is of format {:?}; this signer reads format {}", path.display(), f.get(1), RECORD_VERSION));
-		}
-		if header != record_header(operator, genesis) {
+		let ours = record_header(operator, genesis);
+		let ours: Vec<&str> = ours.split(' ').collect();
+		let (base, carried) = match f.get(1).and_then(|v| v.parse::<u32>().ok()) {
+			Some(RECORD_VERSION) => (None, None),
+			Some(RECORD_VERSION_COMPACTED) if f.len() == 8 => {
+				let n: u64 = f[4].parse().map_err(|_| format!("{}: the header's latest entry {:?}", path.display(), f[4]))?;
+				let carried: u64 = f[6].parse().map_err(|_| format!("{}: the header's carried count {:?}", path.display(), f[6]))?;
+				(Some((n, unhex32(f[5]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)),
+					Some((carried, unhex32(f[7]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)))
+			},
+			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {} and {}", path.display(), f.get(1),
+				RECORD_VERSION, RECORD_VERSION_COMPACTED)),
+		};
+		if f.get(2..4) != ours.get(2..4) || (base.is_none() && f.len() != 4) {
 			return Err(format!("{}: the record is kept for another operator key or another chain ({:?}); this signer holds \
 				{} on {}", path.display(), header, hex(&operator.serialize()), genesis));
 		}
-		let header_hash = chain_hash(&[0; 32], header);
+		let base = base.unwrap_or((0, chain_hash(&[0; 32], &header)));
+		let first = got as u64;
+		// About 300 bytes a line: room for every entry at once.
+		let lines = file.metadata().map(|m| m.len()).unwrap_or(0) / 280 + 16;
 		let mut record = SpendRecord {
-			file, size: whole as u64, header_hash, entries: vec![], by_salt: Default::default(), refusing: None,
+			file, size: first, first, base, head: base, count: 0, kept: Vec::with_capacity(lines as usize), added: Default::default(),
+			marks: vec![], recent: Default::default(), refusing: None,
 		};
-		for (k, line) in lines.enumerate() {
-			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), k + 2, what, line.chars().take(200).collect::<String>());
-			let f: Vec<&str> = line.split(' ').collect();
-			let n: u64 = f.first().and_then(|n| n.parse().ok()).ok_or_else(|| bad("not a record line"))?;
-			let (kind, owner, salt, digest, hash) = match f.as_slice() {
-				[_, "spend", o, s, d, h] => (Signed::Spend, *o, *s, *d, *h),
-				[_, "forfeit", o, s, d, m, h] => (Signed::Forfeit(unhex32(m).map_err(|e| bad(&e))?), *o, *s, *d, *h),
-				_ => return Err(bad("not a record line")),
-			};
-			let e = Entry {
-				n, kind, owner: unhex32(owner).map_err(|e| bad(&e))?, salt: unhex32(salt).map_err(|e| bad(&e))?,
-				digest: unhex32(digest).map_err(|e| bad(&e))?, hash: unhex32(hash).map_err(|e| bad(&e))?,
-			};
-			if n != record.entries.len() as u64 + 1 {
-				return Err(bad(&format!("entry {} where entry {} follows", n, record.entries.len() + 1)));
+		let mut at = first;
+		let mut k = 1u64;
+		// The carried lines of a compacted record: whole, numbered upwards to
+		// the entry it was compacted at, their hash the header's.
+		if let Some((carried, want)) = carried {
+			let mut e = sha256::Hash::engine();
+			e.input(RECORD_CARRIED_TAG);
+			let mut last = 0u64;
+			for _ in 0..carried {
+				k += 1;
+				let got = read(&mut reader, &mut line)?;
+				let text = std::str::from_utf8(&line[..got.saturating_sub(1)]).unwrap_or("");
+				let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), k, what, text.chars().take(200).collect::<String>());
+				if got == 0 || !line.ends_with(b"\n") {
+					return Err(bad("a carried line is missing or cut short: the record has been changed"));
+				}
+				e.input(&line[..got]);
+				let (n, salt, hash) = check_line(&line[..got - 1], None).map_err(|w| bad(&w))?;
+				if n <= last || n > base.0 {
+					return Err(bad("a carried entry out of order"));
+				}
+				last = n;
+				record.keep(n, &salt, hash, at, false);
+				at += got as u64;
 			}
-			if chain_hash(&record.head().1, &e.text()) != e.hash {
-				return Err(bad("its running hash does not follow from the lines before it: the record has been changed"));
+			if sha256::Hash::from_engine(e).to_byte_array() != want {
+				return Err(format!("{}: the carried lines do not hash to the header's: the record has been changed", path.display()));
 			}
-			record.push(e);
 		}
+		let mut repaired = None;
+		loop {
+			k += 1;
+			let got = read(&mut reader, &mut line)?;
+			if got == 0 {
+				break;
+			}
+			if !line.ends_with(b"\n") {
+				// A line cut short, by a write that failed or a crash: never
+				// answered, and never to be followed by another.
+				let cut = String::from_utf8_lossy(&line[..got]).to_string();
+				repaired = Some(format!("the record's last line was cut short, by a write that failed or a crash, and was never \
+					answered: removed ({} bytes: {:?})", got, cut.chars().take(80).collect::<String>()));
+				record.file.set_len(at).map_err(fail)?;
+				record.file.sync_all().map_err(fail)?;
+				break;
+			}
+			let body = &line[..got - 1];
+			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), k, what,
+				String::from_utf8_lossy(body).chars().take(200).collect::<String>());
+			let (n, salt, hash) = check_line(body, Some(&record.head.1)).map_err(|w| bad(&w))?;
+			if n != record.head.0 + 1 {
+				return Err(bad(&format!("entry {} where entry {} follows", n, record.head.0 + 1)));
+			}
+			record.head = (n, hash);
+			record.keep(n, &salt, hash, at, false);
+			at += got as u64;
+		}
+		record.size = at;
+		record.kept.sort_unstable();
+		record.kept.shrink_to_fit();
 		Ok((record, repaired))
 	}
 
-	fn push(&mut self, e: Entry) {
-		self.by_salt.entry(e.salt).or_default().push(self.entries.len());
-		self.entries.push(e);
+	/// Keeps entry `n` under `salt`, its running hash `hash` and its line at
+	/// `at`, at hand: in the sorted entries read at opening, or among those
+	/// `added` since.
+	fn keep(&mut self, n: u64, salt: &[u8; 32], hash: [u8; 32], at: u64, added: bool) {
+		if added {
+			self.added.entry(salt_key(salt)).or_default().push(at);
+		} else {
+			self.kept.push(Kept { salt: salt_key(salt), at });
+		}
+		if self.count % MARK_EVERY == 0 {
+			self.marks.push((n, at));
+		}
+		self.count += 1;
+		self.recent.push_back((n, hash));
+		if self.recent.len() > RECENT {
+			self.recent.pop_front();
+		}
+	}
+
+	/// Every entry under `salt`, read back from the file.
+	fn under(&self, salt: &[u8; 32]) -> Result<Vec<Entry>, String> {
+		let key = salt_key(salt);
+		let from = self.kept.partition_point(|k| k.salt < key);
+		let mut at: Vec<u64> = self.kept[from..].iter().take_while(|k| k.salt == key).map(|k| k.at).collect();
+		at.extend(self.added.get(&key).into_iter().flatten());
+		let mut out = vec![];
+		for a in at {
+			let e = self.entry_at(a)?;
+			if e.salt == *salt {
+				out.push(e);
+			}
+		}
+		Ok(out)
+	}
+
+	/// The entry whose line starts at `at`.
+	fn entry_at(&self, at: u64) -> Result<Entry, String> {
+		parse_entry(&line_at(&self.file, at)?)
+	}
+
+	/// Calls `f` with each entry line from `from` on (its text, its entry and
+	/// where it starts) until `f` says stop.
+	fn each_from(&self, from: u64, mut f: impl FnMut(&str, Entry, u64) -> Result<bool, String>) -> Result<(), String> {
+		use std::io::{BufRead, Seek};
+		let mut file = self.file.try_clone().map_err(|e| e.to_string())?;
+		file.seek(std::io::SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+		let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+		let mut line = String::with_capacity(512);
+		let mut at = from;
+		while at < self.size {
+			line.clear();
+			let got = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+			if got == 0 {
+				break;
+			}
+			let text = line.trim_end_matches('\n');
+			if !f(text, parse_entry(text)?, at)? {
+				break;
+			}
+			at += got as u64;
+		}
+		Ok(())
 	}
 
 	/// How many messages the record holds.
 	pub fn len(&self) -> usize {
-		self.entries.len()
+		self.count as usize
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.entries.is_empty()
+		self.count == 0
 	}
 
 	/// The latest entry's number and running hash: 0 and the header's hash
-	/// for a record that holds none.
+	/// for a record that holds none, and for a compacted record that has
+	/// added none, the latest of the record it was compacted from.
 	pub fn head(&self) -> (u64, [u8; 32]) {
-		self.entries.last().map(|e| (e.n, e.hash)).unwrap_or((0, self.header_hash))
+		self.head
 	}
 
-	/// The entries after entry `after`, at most `limit` of them.
-	pub fn entries_after(&self, after: u64, limit: usize) -> &[Entry] {
-		let from = (after as usize).min(self.entries.len());
-		&self.entries[from..(from + limit).min(self.entries.len())]
+	/// The entries after entry `after`, at most `limit` of them, read back
+	/// from the file.
+	pub fn entries_after(&self, after: u64, limit: usize) -> Result<Vec<Entry>, String> {
+		let mut out = vec![];
+		if limit == 0 || after >= self.head.0 {
+			return Ok(out);
+		}
+		let i = self.marks.partition_point(|(n, _)| *n <= after);
+		let from = if i == 0 { self.first } else { self.marks[i - 1].1 };
+		self.each_from(from, |_, e, _| {
+			if e.n > after {
+				out.push(e);
+			}
+			Ok(out.len() < limit)
+		})?;
+		Ok(out)
+	}
+
+	/// The running hash of entry `n`, when the record holds it.
+	fn hash_of(&self, n: u64) -> Result<Option<[u8; 32]>, String> {
+		if n == self.base.0 {
+			return Ok(Some(self.base.1));
+		}
+		if let Ok(i) = self.recent.binary_search_by_key(&n, |(m, _)| *m) {
+			return Ok(Some(self.recent[i].1));
+		}
+		let i = self.marks.partition_point(|(m, _)| *m <= n);
+		if i == 0 {
+			return Ok(None);
+		}
+		let mut found = None;
+		self.each_from(self.marks[i - 1].1, |_, e, _| {
+			if e.n == n {
+				found = Some(e.hash);
+			}
+			Ok(e.n < n)
+		})?;
+		Ok(found)
 	}
 
 	/// Why the signer signs nothing more, if it does not.
@@ -521,16 +810,22 @@ impl SpendRecord {
 		if n == 0 {
 			return Ok(());
 		}
-		let held = self.entries.len() as u64;
+		let held = self.head.0;
 		if n > held {
 			self.refusing = Some(format!(
 				"{}: the database knows entry {} of the signer's record, and the record ends at entry {}: it has been cut \
 				 back or replaced by an older copy; nothing is signed until the signer runs on its whole record", RECORD_BEHIND, n, held));
-		} else if self.entries[n as usize - 1].hash != *hash {
-			self.refusing = Some(format!(
-				"{}: entry {} of the signer's record is not the one the database knows (its running hash is {}, the database's \
-				 {}): this is another record, or one two signers wrote; nothing is signed", RECORD_DIFFERS, n,
-				hex(&self.entries[n as usize - 1].hash), hex(hash)));
+		} else {
+			match self.hash_of(n) {
+				Ok(Some(h)) if h == *hash => {},
+				Ok(Some(h)) => self.refusing = Some(format!(
+					"{}: entry {} of the signer's record is not the one the database knows (its running hash is {}, the database's \
+					 {}): this is another record, or one two signers wrote; nothing is signed", RECORD_DIFFERS, n, hex(&h), hex(hash))),
+				Ok(None) => self.refusing = Some(format!(
+					"{}: the database knows entry {} of the signer's record, which this record does not hold: compacted away, \
+					 so the database is older than the compaction, or this is another record; nothing is signed", RECORD_DIFFERS, n)),
+				Err(e) => return Err(format!("the record could not be read: {}", e)),
+			}
 		}
 		match &self.refusing {
 			Some(why) => Err(why.clone()),
@@ -542,7 +837,8 @@ impl SpendRecord {
 	/// `owner` under `salt`: when it may, the message is in the record, on
 	/// disk, before this returns, and its entry is returned. The rule is the
 	/// salt's: `S`'s signature commits to the salt and not to the owner, so
-	/// what was signed for another leaf under the same salt counts here. A
+	/// what was signed for another leaf under the same salt counts here. The
+	/// same message again under the salt is the entry already recorded; a
 	/// spend is refused when any entry under the salt carries another
 	/// message; a forfeit when the salt has a spend, or a forfeit for the
 	/// same round with another message.
@@ -551,8 +847,8 @@ impl SpendRecord {
 		if let Some(why) = &self.refusing {
 			return Err(why.clone());
 		}
-		let had: Vec<Entry> = self.by_salt.get(salt).map(|v| v.iter().map(|i| self.entries[*i]).collect()).unwrap_or_default();
-		if let Some(e) = had.iter().find(|e| e.owner == *owner && e.kind == kind && e.digest == *digest) {
+		let had = self.under(salt).map_err(|e| format!("the record could not be read: {}", e))?;
+		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
 			return Ok(*e);
 		}
 		for e in &had {
@@ -571,7 +867,7 @@ impl SpendRecord {
 				));
 			}
 		}
-		let (n, prev) = self.head();
+		let (n, prev) = self.head;
 		let mut e = Entry { n: n + 1, kind, owner: *owner, salt: *salt, digest: *digest, hash: [0; 32] };
 		e.hash = chain_hash(&prev, &e.text());
 		let line = format!("{} {}\n", e.text(), hex(&e.hash));
@@ -587,9 +883,57 @@ impl SpendRecord {
 				},
 			};
 		}
+		let at = self.size;
 		self.size += line.len() as u64;
-		self.push(e);
+		self.head = (e.n, e.hash);
+		self.keep(e.n, &e.salt, e.hash, at, true);
 		Ok(e)
+	}
+
+	/// Compacts the record at `from` (kept for `operator` on the chain of
+	/// `genesis`, and locked while this runs, so its signer is stopped) into a
+	/// new record at `into`, dropping every entry under a salt of `drop`: the
+	/// salts of leaves whose batches have expired, which the server no longer
+	/// serves (`arcad <config> expired-salts`). The new record's first line
+	/// names the old record's latest entry and running hash, from which its
+	/// own entries go on, so the server's database, which knows that entry,
+	/// knows the new record; it carries every other entry's line over
+	/// verbatim. Returns how many entries it carried and dropped, and the
+	/// entry the new record goes on from.
+	pub fn compact(from: &Path, into: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash,
+		drop: &std::collections::HashSet<[u8; 32]>) -> Result<(u64, u64, (u64, [u8; 32])), String>
+	{
+		use std::io::Write;
+		let (old, repaired) = Self::open(from, operator, genesis)?;
+		if let Some(note) = repaired {
+			return Err(format!("{}: {}; open it with the signer first", from.display(), note));
+		}
+		let (mut carried, mut dropped) = (0u64, 0u64);
+		let mut e = sha256::Hash::engine();
+		e.input(RECORD_CARRIED_TAG);
+		old.each_from(old.first, |text, entry, _| {
+			if drop.contains(&entry.salt) {
+				dropped += 1;
+			} else {
+				carried += 1;
+				e.input(text.as_bytes());
+				e.input(b"\n");
+			}
+			Ok(true)
+		})?;
+		let carried_hash = sha256::Hash::from_engine(e).to_byte_array();
+		let base = old.head();
+		let header = format!("{} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_COMPACTED, hex(&operator.serialize()), genesis,
+			base.0, hex(&base.1), carried, hex(&carried_hash));
+		Self::write_new(into, &header, |w| {
+			old.each_from(old.first, |text, entry, _| {
+				if !drop.contains(&entry.salt) {
+					w.write_all(text.as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| format!("{}: {}", into.display(), e))?;
+				}
+				Ok(true)
+			})
+		})?;
+		Ok((carried, dropped, base))
 	}
 }
 

@@ -341,6 +341,36 @@ fn node_client(config: &Config) -> Result<Client, StartError> {
 	Ok(Client::new(config.node.rpc_url.clone(), auth))
 }
 
+/// The salts the signer's record no longer needs: each leaf whose coin rests
+/// on batches alone, every one of them past its last expiry at the tip the
+/// database followed, and its checkpoint's. A batch past its last expiry is
+/// swept, and the server serves none of its coins; a coin resting on a board
+/// is never dropped. What `arca-signer --compact-into` drops; `arcad
+/// <config> expired-salts` prints them, one hex salt a line. It needs the
+/// database alone.
+pub async fn expired_salts(config: &Config) -> Result<Vec<[u8; 32]>, StartError> {
+	use arca_covenant::CoinRecord;
+	fn last_expiry(r: &CoinRecord) -> Option<u32> {
+		match r {
+			CoinRecord::Board(_) => None,
+			CoinRecord::Leaf { record, .. } => Some(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX)),
+			CoinRecord::Transfer(t) => t.inputs.iter().map(|i| last_expiry(&i.coin)).try_fold(0u32, |m, e| e.map(|e| m.max(e))),
+		}
+	}
+	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let now = store.tip_block().await.map_err(err("the database"))?
+		.ok_or_else(|| StartError("the database has followed no block yet".into()))?.median_time;
+	let mut out = vec![];
+	for (salt, record) in store.leaf_salts().await.map_err(err("the database"))? {
+		let Ok(record) = CoinRecord::from_bytes(&record) else { continue };
+		if last_expiry(&record).is_some_and(|e| (e as u64) < now) {
+			out.push(salt);
+			out.push(arca_covenant::transfer::checkpoint_salt(&salt));
+		}
+	}
+	Ok(out)
+}
+
 /// A receive address of the operator's on-chain wallet, handed out and
 /// recorded in the database ([`Wallet::hand_out_receive_script`]): what the
 /// operator pays to fund the wallet. Its index, its script, and its address

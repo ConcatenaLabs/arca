@@ -242,8 +242,8 @@ async fn the_signers_record() {
 	// The record outlives the process: after a restart, the same refusals.
 	let lines = std::fs::read_to_string(p.record()).unwrap();
 	println!("the record, {} line(s):\n{}", lines.lines().count(), lines.trim_end());
-	assert_eq!(lines.lines().count(), 1 + 5,
-		"the header, the one message under salt 1 signed for A's and for B's leaf, two forfeits of salt 2, a spend of salt 3");
+	assert_eq!(lines.lines().count(), 1 + 4,
+		"the header, the one message under salt 1, two forfeits of salt 2, a spend of salt 3");
 	p.restart(&s, genesis);
 	refused_twice(spend(&a, [1; 32], out(9_000, 2)).await.unwrap_err());
 	refused_twice(spend(&b, [1; 32], out(9_000, 2)).await.unwrap_err());
@@ -260,7 +260,7 @@ async fn the_signers_record() {
 	p.restart(&s, genesis);
 	spend(&a, [4; 32], out(9_000, 4)).await.unwrap();
 	let lines = std::fs::read_to_string(p.record()).unwrap();
-	assert_eq!(lines.lines().count(), 1 + 6, "the cut line dropped, the new one whole: {}", lines);
+	assert_eq!(lines.lines().count(), 1 + 5, "the cut line dropped, the new one whole: {}", lines);
 	// Any other line that does not read stops the signer from starting, and
 	// so does a record kept by salt alone, which has no header.
 	let start = |p: &SignerProcess| Command::new(env!("CARGO_BIN_EXE_arca-signer"))
@@ -489,4 +489,110 @@ async fn the_record_cannot_be_lost_cut_torn_or_shared() {
 	println!("a record of another key: {}", e);
 	assert!(e.contains("another operator key"), "{}", e);
 	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The record compacted into a new one: the entries under the salts the
+/// server lists as expired dropped, every other carried over verbatim, the
+/// new record going on from the old one's latest entry, so the entry the
+/// database knows is still the record's. The signer starts on it and keeps
+/// the rule for every salt carried over; a dropped salt is free again; the
+/// carried lines are checked against the header's hash; and a compaction
+/// never runs while a signer holds the record, nor over a file that is there.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_is_compacted_and_goes_on_from_its_latest_entry() {
+	use server::signer::hex;
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let a = keypair("owner");
+	assert!(common::signer::create_record(&key, genesis, &record).status.success());
+
+	// Seven entries, under salts 1 to 7, the database told each.
+	let run = Run::start(&dir, "first", genesis, &record, "exec ").unwrap();
+	let mut known = None;
+	let mut entries = vec![];
+	for k in 1..=7u8 {
+		let e = ask(&run.socket, &rebind_line(&a, genesis, [k; 32], asset, 1, known)).await.unwrap();
+		assert_eq!(e.0, k as u64);
+		entries.push(e);
+		known = Some(e);
+	}
+	let compact = |into: &std::path::Path, drop: &std::path::Path| Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+		.args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
+			"--compact-into", into.to_str().unwrap(), "--drop-salts", drop.to_str().unwrap()])
+		.output().unwrap();
+	let drop = dir.join("expired.salts");
+	std::fs::write(&drop, format!("{}\n{}\n{}\n{}\n", hex(&[1; 32]), hex(&[2; 32]), hex(&[3; 32]), hex(&[9; 32]))).unwrap();
+	let new = dir.join("signer.record.new");
+	let out = compact(&new, &drop);
+	assert_eq!(out.status.code(), Some(2), "no compaction while a signer holds the record");
+	println!("compacting while the signer runs: {}", String::from_utf8_lossy(&out.stderr).trim());
+	assert!(!new.exists());
+	run.stop();
+
+	let out = compact(&new, &drop);
+	let said = String::from_utf8_lossy(&out.stderr).to_string();
+	println!("compacted: {}", said.trim());
+	assert!(out.status.success(), "{}", said);
+	assert!(said.contains("4 entries carried over, 3 dropped; it goes on from entry 7"), "{}", said);
+	assert_eq!(compact(&new, &drop).status.code(), Some(2), "never over a file that is there");
+	let text = std::fs::read_to_string(&new).unwrap();
+	let header: Vec<&str> = text.lines().next().unwrap().split(' ').collect();
+	assert_eq!(header[..2], ["arca-signer-record", "2"]);
+	assert_eq!((header[4], header[5], header[6]), ("7", hex(&entries[6].1).as_str(), "4"));
+	let old = std::fs::read_to_string(&record).unwrap();
+	for (k, line) in text.lines().skip(1).enumerate() {
+		assert_eq!(line, old.lines().nth(4 + k).unwrap(), "carried over verbatim");
+	}
+	assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o777, 0o600);
+	std::fs::rename(&new, &record).unwrap();
+
+	// The signer on the compacted record: the database's entry 7 is its
+	// own; the rule holds for every salt carried over, and a dropped one is
+	// free again.
+	let run = Run::start(&dir, "compacted", genesis, &record, "exec ").unwrap();
+	assert!(run.log().contains("4 message(s) in the record") && run.log().contains("its latest entry 7"), "{}", run.log());
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [4; 32], asset, 2, known)).await.unwrap_err();
+	println!("salt 4, carried over, another message: {:?}", e);
+	assert_eq!(e.0, "already_signed");
+	assert_eq!(ask(&run.socket, &rebind_line(&a, genesis, [4; 32], asset, 1, known)).await.unwrap(), entries[3],
+		"the same message again: its entry, read back from the file");
+	let e8 = ask(&run.socket, &rebind_line(&a, genesis, [1; 32], asset, 2, known)).await.unwrap();
+	println!("salt 1, dropped, another message: signed as entry {}", e8.0);
+	assert_eq!(e8.0, 8);
+	ask(&run.socket, &rebind_line(&a, genesis, [5; 32], asset, 1, Some(entries[4]))).await
+		.expect("the database knowing a carried entry");
+	let listed: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"entries","after":0,"limit":100}"#).await).unwrap();
+	let ns: Vec<u64> = listed["entries"].as_array().unwrap().iter().map(|e| e["entry"].as_u64().unwrap()).collect();
+	assert_eq!(ns, vec![4, 5, 6, 7, 8]);
+	let listed: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"entries","after":6,"limit":100}"#).await).unwrap();
+	assert_eq!(listed["entries"].as_array().unwrap().len(), 2);
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [6; 32], asset, 1, Some(entries[1]))).await.unwrap_err();
+	println!("the database knowing entry 2, compacted away: {:?}", e);
+	assert_eq!(e.0, "record_differs");
+	assert!(e.1.contains("compacted away"), "{}", e.1);
+	run.stop();
+
+	// Started again, it reads the carried lines and the new one; a carried
+	// line changed stops the start.
+	let run = Run::start(&dir, "again", genesis, &record, "exec ").unwrap();
+	assert!(run.log().contains("5 message(s) in the record") && run.log().contains("its latest entry 8"), "{}", run.log());
+	run.stop();
+	let whole = std::fs::read_to_string(&record).unwrap();
+	std::fs::write(&record, whole.replacen(&hex(&[5; 32]), &hex(&[0x55; 32]), 1)).unwrap();
+	let e = Run::start(&dir, "edited", genesis, &record, "exec ").err().expect("an edited carried line stops the start");
+	println!("a carried line changed: {}", e);
+	assert!(e.contains("do not hash to the header"), "{}", e);
+	std::fs::write(&record, &whole).unwrap();
+
+	// A compacted record compacted again goes on from its own latest entry.
+	std::fs::write(&drop, format!("{}\n", hex(&[4; 32]))).unwrap();
+	let out = compact(&new, &drop);
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	assert!(String::from_utf8_lossy(&out.stderr).contains("4 entries carried over, 1 dropped; it goes on from entry 8"),
+		"{}", String::from_utf8_lossy(&out.stderr));
+	let _ = std::fs::remove_dir_all(&dir);
 }
