@@ -632,8 +632,12 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   releases is refused with the replacement's `M` and with none, and an owner
   takes its old leaf alone. A reclaim already confirmed goes with its round: the
   round's block disconnected and the round replaced, the reclaim cannot return,
-  the node is unspent again and an owner exits its old leaf. Every negative case
-  is refused by the mempool and in a block, for its reason.
+  the node is unspent again and an owner exits its old leaf. A release for an
+  offboard (`Release::for_offboard`) names the round that pays the offboard,
+  refuses another operator's offboard, a round that does not pay it and an
+  output that is not the connector, and the one-owner node is reclaimed with
+  that round's `M` and not another's. Every negative case is refused by the
+  mempool and in a block, for its reason.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
