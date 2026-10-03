@@ -314,6 +314,43 @@ impl Regtest {
 		}
 	}
 
+	/// Reorganises the parent chain from `height`: the parent block at that
+	/// height and every block above it are invalidated, and the parent mines
+	/// a longer branch in their place. Every Sequentia block anchored to one
+	/// of the orphaned blocks is then invalid: the node's anchor watcher finds
+	/// it, disconnects it and every block above it, and returns their
+	/// transactions to the mempool, as on the live chain when Bitcoin
+	/// reorganises. Waits until the node's tip is anchored in the parent's
+	/// new chain, and returns the orphaned parent blocks, lowest first.
+	pub fn orphan_parent_from(&self, height: u64) -> Result<Vec<BlockHash>, String> {
+		let parent = self.parent.client();
+		let tip = parent.block_count().map_err(|e| e.to_string())?;
+		if height == 0 || height > tip {
+			return Err(format!("parent height {} is not between 1 and the tip, {}", height, tip));
+		}
+		let orphaned = (height..=tip).map(|h| parent.block_hash(h)).collect::<Result<Vec<_>, _>>()
+			.map_err(|e| e.to_string())?;
+		let _: serde_json::Value = parent.call("invalidateblock", &[serde_json::json!(orphaned[0].to_string())])
+			.map_err(|e| e.to_string())?;
+		// Another output script, so no block of the new branch can be one
+		// of the invalidated blocks again.
+		parent.generate_to_descriptor(tip - height + 2, "raw(52)").map_err(|e| e.to_string())?;
+		let start = Instant::now();
+		loop {
+			let t = self.client().best_block_hash().map_err(|e| e.to_string())?;
+			let anchor = crate::BlockHeaderExt::bitcoin_anchor(&self.client().block_header(&t).map_err(|e| e.to_string())?);
+			let at: serde_json::Value = parent.call("getblockheader", &[serde_json::json!(anchor.block_hash.to_string())])
+				.map_err(|e| e.to_string())?;
+			if at["confirmations"].as_i64().unwrap_or(-1) >= 0 {
+				return Ok(orphaned);
+			}
+			if start.elapsed() > Duration::from_secs(60) {
+				return Err(format!("the tip is still anchored to an orphaned parent block {} after 60 s", anchor.block_hash));
+			}
+			std::thread::sleep(Duration::from_millis(250));
+		}
+	}
+
 	/// The Sequentia node's client.
 	pub fn client(&self) -> &Client {
 		&self.node.client

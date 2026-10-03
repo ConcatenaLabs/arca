@@ -209,3 +209,60 @@ fn regtest_pos_chain() {
 	assert!(!mempool.contains(&waiting.to_string()), "the mempool kept {}", waiting);
 	assert_eq!(chain.client().send_raw_transaction(&tx2).unwrap(), waiting);
 }
+
+/// An anchor-driven reorganisation: the parent chain orphans the block a
+/// Sequentia block is anchored to, and the node disconnects that block and
+/// every block above it, certified or not, returns their transactions to the
+/// mempool, and builds on the parent's new chain.
+#[test]
+fn regtest_pos_anchor_reorg() {
+	let chain = Regtest::start_pos(
+		std::path::Path::new(&std::env::var_os("SEQUENTIAD_EXEC").expect("SEQUENTIAD_EXEC")),
+		&workdir("sequentia-ext-anchor-reorg"), &[],
+	).unwrap();
+	chain.produce_block().unwrap();
+	let genesis = chain.client().genesis_hash().unwrap();
+	let block = chain.client().block(&genesis).unwrap();
+	let (txid, vout, out) = block.txdata.iter().flat_map(|tx| {
+		tx.output.iter().enumerate().map(move |(i, o)| (tx.txid(), i as u32, o.clone()))
+	}).find(|(_, _, o)| o.script_pubkey.as_bytes() == [0x51]).unwrap();
+	let amount = out.asset_amount().unwrap();
+
+	// A parent block of its own for the block that will hold the spend.
+	chain.mine_parent(1).unwrap();
+	let anchored = chain.anchor_to_parent_tip().unwrap();
+	let a = chain.client().block_header(anchored.last().unwrap()).unwrap().bitcoin_anchor();
+	let tx = Transaction {
+		version: 2, lock_time: LockTime::ZERO,
+		input: vec![TxIn { previous_output: OutPoint::new(txid, vout), ..Default::default() }],
+		output: vec![
+			explicit_txout(AssetAmount::new(amount.asset, amount.amount - 10_000), Script::from(vec![0x51])),
+			fee_txout(AssetAmount::new(amount.asset, 10_000)),
+		],
+	};
+	let spent = chain.client().send_raw_transaction(&tx).unwrap();
+	let holder = chain.produce_block().unwrap();
+	let h_holder = chain.client().block_header(&holder).unwrap();
+	assert_eq!(h_holder.bitcoin_anchor().height, a.height, "the block holding the spend is anchored to the parent's tip");
+	// Buried two parent blocks, so it was final before the reorganisation.
+	chain.mine_parent(2).unwrap();
+	chain.anchor_to_parent_tip().unwrap();
+	let height = chain.client().block_count().unwrap();
+	let v: Json = chain.client().call("getrawtransaction", &[json!(spent.to_string()), json!(true)]).unwrap();
+	assert_eq!(v["blockhash"], json!(holder.to_string()));
+
+	let orphaned = chain.orphan_parent_from(a.height as u64).unwrap();
+	assert_eq!(orphaned[0], a.block_hash);
+	let after = chain.client().block_count().unwrap();
+	let mempool: Vec<String> = chain.client().call("getrawmempool", &[]).unwrap();
+	println!("parent blocks {}..{} orphaned; Sequentia tip {} -> {}; the spend back in the mempool: {}",
+		a.height, a.height as usize + orphaned.len() - 1, height, after, mempool.contains(&spent.to_string()));
+	assert!(after < h_holder.height as u64, "the block anchored to the orphaned parent block was disconnected");
+	assert!(mempool.contains(&spent.to_string()), "the spend returned to the mempool");
+	let h = chain.produce_block().unwrap();
+	assert_ne!(h, holder);
+	assert!(chain.client().block(&h).unwrap().txdata.iter().any(|t| t.txid() == spent), "the spend confirms again");
+	let header = chain.client().block_header(&h).unwrap();
+	let at: Json = chain.parent.client().call("getblockheader", &[json!(header.bitcoin_anchor().block_hash.to_string())]).unwrap();
+	assert!(at["confirmations"].as_i64().unwrap() >= 0, "the new block is anchored in the parent's new chain");
+}
