@@ -23,6 +23,9 @@
 //!    the round replaced: the issuance of `M` and the reclaim go with it and
 //!    cannot return, the node is unspent again, and an owner exits its old
 //!    leaf alone.
+//! 4. A release given for an offboard ([`Release::for_offboard`]) names the
+//!    round that pays the offboard; the one-owner node is reclaimed with that
+//!    round's `M`, and not with another round's.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction.
 
@@ -317,5 +320,54 @@ fn a_confirmed_reclaim_goes_with_its_round() {
 	c.net.wait_csv(&at.txid, delay());
 	let et = c.net.pass("undone/owner 2's exit of its old leaf", &exit_tx(&c.net, &b0.valid[2].branch.leaf, at, x_asset, LEAF, &b0.owners[2]));
 	println!("RESULT the reclaim went with round X; owner 2 exited {} atoms of its old leaf", paid(&c.net, &et));
+	c.net.print();
+}
+
+// ---------------------------------------------------------------------------
+// 4. A release for an offboard names the round that pays it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_offboards_release_names_the_round_that_pays_it() {
+	let mut c = Arca::start();
+	let x = c.net.x;
+	let s = keypair("offboard release operator");
+	let b = old_batch(&mut c, &s, "O0", 1);
+	let dest = ExplicitOutput::new(x, LEAF - 3_000, elements::Script::from({
+		let mut v = vec![0x00, 0x14];
+		v.extend(&label32("O0 owner's on-chain address")[..20]);
+		v
+	}));
+	let off = OffboardPolicy {
+		unlock_hash: sha256(&label32("O0 offboard")), destination: dest, operator: xonly(&s),
+		reclaim_delay: RelativeTime::from_seconds_ceil(5 * DAY).unwrap(),
+	};
+	// The round that pays the offboard, in the place of a batch output.
+	let (issuer, sched) = c.schedule(&s);
+	let (round, cv) = round_tx(&c.net, &issuer, &[], &off.output(1_000), &sched);
+	c.net.pass("O0: the round paying the offboard", &round);
+
+	let r = Release::for_offboard(&b.valid[0], &off, &round, cv).unwrap();
+	assert_eq!(r.connector, connector_asset(round.txid(), cv));
+	assert_eq!((r.owner, r.node_hash), (xonly(&b.owners[0]), b.valid[0].branch.nodes[0].children_hash()));
+	// Refused: an offboard under another operator, a round that does not pay
+	// the offboard, an output that is not the connector.
+	let other = OffboardPolicy { operator: xonly(&keypair("another operator")), ..off.clone() };
+	assert_eq!(Release::for_offboard(&b.valid[0], &other, &round, cv).unwrap_err(), SpendError::OtherOperator);
+	let not_paying = OffboardPolicy { unlock_hash: sha256(&label32("another offboard")), ..off.clone() };
+	assert!(matches!(Release::for_offboard(&b.valid[0], &not_paying, &round, cv).unwrap_err(), SpendError::Offboard(_)));
+	assert_eq!(Release::for_offboard(&b.valid[0], &off, &round, 1).unwrap_err(), SpendError::Connector(1));
+
+	// The owner's release, and the reclaim of its one-owner node with an atom
+	// of that round's M; with an atom of another round's M it is refused.
+	let sg = sig(&b.owners[0], &r.message().digest);
+	r.verify(&sg).unwrap();
+	let atom = issue_m(&mut c, "O0: the issuance of the offboard round's M", &round, cv, &s);
+	let (other_round, ocv, _) = new_round(&mut c, &s, "O1", &[keypair("O1 new key")]);
+	let other_atom = issue_m(&mut c, "O1: the issuance of another round's M", &other_round, ocv, &s);
+	let rel = with_index(&[(r, sg)], &[&other_atom]);
+	c.net.refuse("O0/neg the reclaim with another round's M", &reclaim(&c, &b, &[&other_atom], &rel, &s), "Invalid Schnorr signature");
+	let rel = with_index(&[(r, sg)], &[&atom]);
+	c.net.pass("O0/the reclaim of a one-owner node with the offboard round's M", &reclaim(&c, &b, &[&atom], &rel, &s));
 	c.net.print();
 }
