@@ -62,8 +62,13 @@ the keys, but which coins were spent off-chain is in the store and the server.
   validated against the round transaction under the wallet's policy before the
   wallet signs anything for it: the five checks on the sweep token and its
   clock, the batch output paid exactly once, the notice, a first expiry at
-  least 27 days ahead, the exit delay within the wallet's bounds, the depth, the
-  reserves. Only once the round is final, and only when the operator's status
+  least 27 days ahead, the exit delay within the wallet's bounds, the depth,
+  and reserves on every node and on the entry of at least four times the
+  node's relay floor in the leaf's asset, so the leaf pays its own way out.
+  Where the node does not accept the asset for fees, one atom is the rule (the
+  operator's own), and the wallet says, when it gives up a coin for such a
+  leaf and again when it takes the leaf, that every exit of it needs a fee coin
+  in an accepted asset. Only once the round is final, and only when the operator's status
   shows exactly the leaves the wallet asked for, in order, each validated, all
   under the participation's one unlock hash, and exactly the coins it gave up.
   The forfeit of each coin given up is built from the validated leaf of the
@@ -135,7 +140,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `create --server URL --node-url URL [--node-user U --node-password P \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
-| `balance` | Per asset: Arca coins by state, on-chain coins, and the Bitcoin side |
+| `balance` | Per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
 | `coins`, `record LEAF` | Every coin held or once held; one coin's record |
 | `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final |
 | `boards` | Where each board stands, by the server and by the chain |
@@ -148,7 +153,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
-| `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up and its coins freed |
+| `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
 | `refusals` | Every refusal the wallet made, with its reason |
 | `bitcoin [--] ARGS…` | Runs Bark's `bark` with `--datadir <datadir>/bitcoin` and the arguments given: the wallet's Bitcoin side. Put `--` before an argument `arca` would read itself, such as `--help` |
 
@@ -156,6 +161,10 @@ A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 (held for a swap), `sending` (in a transfer the server has not answered),
 `given` (in a participation, no forfeit signed), `forfeited` (a forfeit of it
 signed, the preimage not in hand), `spent`, `exiting`, `exited` and `lost`.
+`coins` and `balance` show a live coin that rests on a reassignment, one
+received out of round and not yet refreshed into a round, as
+`operator-confirmed`: it relies on the operator and its sender not colluding,
+which a round removes.
 
 ### An example
 
@@ -214,7 +223,12 @@ and holding it there, with the reason shown:
   is sent;
 - a payment whose answer comes back as a gateway's 502, posted again;
 - a coin received while its board is rolled out of the chain, taken once the
-  board returns.
+  board returns;
+- a tree whose reserves are one atom in an asset the wallet's node accepts for
+  fees, refused before any forfeit, and the same tree accepted where the node
+  does not accept the asset, the fee coin its exit needs stated;
+- an acceptance of a swap cancelled, after which the maker's completion is
+  refused.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

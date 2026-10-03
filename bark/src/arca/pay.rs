@@ -752,21 +752,73 @@ impl Wallet {
 	}
 
 	/// Cancels a swap the wallet offered or accepted and has not seen
-	/// completed: its coins are spendable again.
+	/// completed. An offer has nothing of the wallet's signed in it: its coins
+	/// are spendable again. An acceptance has: the maker holds the wallet's
+	/// signatures over the swap and can complete it while the wallet's coins
+	/// in it are unspent, so the wallet spends them, through the server, to a
+	/// fresh leaf of its own, after which the acceptance can never complete.
+	/// If that cannot be done now, the answer says the acceptance still
+	/// stands, and the coins stay held for the swap.
 	pub fn swap_cancel(&mut self, id: &str) -> Result<Value, Error> {
-		let (_, _, _, state) = self.store.swap(id)?.ok_or_else(|| Error::Refused(format!("no swap {}", id)))?;
+		let (role, _, _, state) = self.store.swap(id)?.ok_or_else(|| Error::Refused(format!("no swap {}", id)))?;
 		if state == "done" {
 			return Err(Error::Refused(format!("swap {} is done", id)));
 		}
+		let held: Vec<CoinRow> = self.store.coins_in("offered")?.into_iter().filter(|c| c.note == format!("swap {}", id)).collect();
+		if role == "taker" && state == "accepted" && !held.is_empty() {
+			let ids: Vec<String> = held.iter().map(|c| c.leaf_id.clone()).collect();
+			return match self.respend_to_self(held) {
+				Ok(answer) => {
+					self.store.set_swap(id, "cancelled", None)?;
+					Ok(json!({"swap": id, "cancelled": true, "respent": ids, "transfer": answer,
+						"note": "the coins signed into the acceptance moved to a fresh leaf of the wallet's own: the acceptance can never complete"}))
+				},
+				Err(Error::Server { code, message, .. }) if code == "double_spend" => {
+					Ok(json!({"swap": id, "cancelled": false, "error": message,
+						"note": "the coins signed into the acceptance are already spent, most likely by the maker completing the swap: \
+						read the mailbox for what the swap pays the wallet"}))
+				},
+				Err(e) => {
+					for l in &ids {
+						if self.store.coin(l)?.is_some_and(|c| c.state == "live") {
+							self.store.set_coin_state(l, "offered", &format!("swap {}", id))?;
+						}
+					}
+					Ok(json!({"swap": id, "cancelled": false, "acceptance_stands": true, "error": e.to_string(),
+						"note": "the acceptance still stands: the maker can complete it while the coins signed into it are unspent; run \
+						swap cancel again, or exit the coins"}))
+				},
+			};
+		}
 		let mut freed = vec![];
-		for c in self.store.coins_in("offered")? {
-			if c.note == format!("swap {}", id) {
-				self.store.set_coin_state(&c.leaf_id, "live", "")?;
-				freed.push(c.leaf_id);
-			}
+		for c in held {
+			self.store.set_coin_state(&c.leaf_id, "live", "")?;
+			freed.push(c.leaf_id);
 		}
 		self.store.set_swap(id, "cancelled", None)?;
-		Ok(json!({"swap": id, "freed": freed}))
+		Ok(json!({"swap": id, "cancelled": true, "freed": freed}))
+	}
+
+	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's
+	/// own, through the server, with the margins a transfer leaves.
+	fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
+		let asset = AssetId::from_str(&rows[0].asset).map_err(|e| Error::Store(e.to_string()))?;
+		let floor = self.chain.floor_per_kvb(asset)?;
+		let mut inputs = vec![];
+		for row in rows {
+			let (_, a) = self.held(&row)?;
+			let m = self.checkpoint_margin(&a.valid, floor)?;
+			inputs.push(In { checkpoint_value: a.valid.value - m.min(a.valid.value - 1), row, coin: a.valid });
+		}
+		let leaf = self.own_leaf("cancel")?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox };
+		let all: Vec<&ValidCoin> = inputs.iter().map(|i| &i.coin).collect();
+		let margin = self.reassignment_margin(&all, &[probe.explicit(self)], floor)?;
+		let kept: u64 = inputs.iter().map(|i| i.checkpoint_value).sum();
+		let value = kept.checked_sub(margin).filter(|v| *v > 0)
+			.ok_or_else(|| Error::Refused("the coins do not cover the margins of a transfer to the wallet itself".into()))?;
+		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox }], &[])
 	}
 }
 
