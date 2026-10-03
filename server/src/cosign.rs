@@ -19,7 +19,7 @@
 //!   round or a board;
 //! - each new leaf is within the published bounds: an asset served, a value
 //!   within that asset's bounds, an exit delay within the bounds, a key that
-//!   owns no other leaf, a script never seen;
+//!   owns no other leaf and is not the operator's `S`, a script never seen;
 //! - no transaction could satisfy both this reassignment and one the server
 //!   co-signed before: their committed outputs do not agree at every index
 //!   both commit to (`arca_covenant::TransferPlan::admit`, run against every
@@ -128,6 +128,8 @@ pub enum CosignError {
 	InvalidCoin { leaf: LeafId, error: TransferError },
 	#[error("an output's key already owns a leaf: every leaf has a key of its own")]
 	KeyReused,
+	#[error("an output's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
+	OperatorKey,
 	#[error("an output's script is already known: a leaf script is never funded twice")]
 	ScriptReused,
 	#[error("leaf {0} has an open out-of-round reassignment: no release is accepted for it")]
@@ -162,6 +164,7 @@ impl CosignError {
 			BadSignature { .. } => "bad_signature",
 			InvalidCoin { .. } => "invalid_coin",
 			KeyReused => "key_reused",
+			OperatorKey => "operator_key",
 			ScriptReused => "script_reused",
 			OpenReassignment(_) => "open_reassignment",
 			Mergeable(_) => "merge",
@@ -288,6 +291,9 @@ impl Cosigner {
 				)));
 			}
 			self.params.check_value(o.asset, o.value).map_err(CosignError::OutOfBounds)?;
+			if o.leaf.owner == s {
+				return Err(CosignError::OperatorKey);
+			}
 			if !keys.insert(o.leaf.owner) {
 				return Err(CosignError::KeyReused);
 			}

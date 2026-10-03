@@ -113,8 +113,8 @@ and registers the record with the board transaction. The server refuses a
 record for another chain or another operator key, an exit delay out of
 bounds, an asset it does not serve, a value below its smallest leaf, a
 transaction that does not pay the board output exactly once, a nonce it never
-issued or already gave a leaf, a key that already owns a leaf, a script it
-already knows, and another transaction for a board already registered. A
+issued or already gave a leaf, a key that already owns a leaf or is the
+operator's own `S` (`operator_key`), a script it already knows, and another transaction for a board already registered. A
 refused board leaves nothing behind.
 
 A registered board goes into the nursery and is credited, its leaf becoming
@@ -143,7 +143,7 @@ asset and a value. The server co-signs only when every rule holds:
 - the new coins are at most five reassignments from a round or a board;
 - each new leaf is within the published bounds: an asset served, a value
   within its bounds, an exit delay within the bounds, a key that owns no other
-  leaf, a script never seen;
+  leaf and is not the operator's `S` (`operator_key`), a script never seen;
 - no transaction could satisfy both it and a reassignment the server
   co-signed before: their committed outputs do not agree at every index both
   commit to (the same outputs, or one set the first outputs of the other).
@@ -186,7 +186,8 @@ a value and the on-chain script to pay). The server accepts it only when:
   deadline. Its attestation verifies, and an earliest round time asked for
   lies before every coin's exit deadline;
 - every leaf wanted is within the published bounds, under a key that owns no
-  leaf and that no other participation wants; every offboard pays a served
+  leaf, that no other participation wants and that is not the operator's `S`
+  (`operator_key`); every offboard pays a served
   asset within its bounds to a script that is not an Arca script;
 - per asset, the coins given up hold exactly what the outputs take plus the
   fee, and the fee covers the schedule.
