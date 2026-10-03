@@ -189,7 +189,7 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "log",
- "minreq",
+ "minreq 2.14.1",
  "serde",
  "serde_json",
  "tokio",
@@ -337,7 +337,7 @@ dependencies = [
  "arca-sequentia-ext",
  "base64 0.22.1",
  "elements",
- "minreq",
+ "minreq 2.14.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -357,7 +357,7 @@ dependencies = [
  "log",
  "lwk_common",
  "lwk_signer",
- "minreq",
+ "minreq 2.14.1",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -427,11 +427,12 @@ dependencies = [
  "log",
  "lwk_common",
  "lwk_signer",
- "minreq",
+ "minreq 3.0.0",
  "parking_lot",
  "rand 0.10.1",
  "rmp-serde",
  "rusqlite",
+ "rustls",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -2471,7 +2472,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3662a38d341d77efecb73caf01420cfa5aa63c0253fd7bc05289ef9f6616e1bf"
 dependencies = [
  "base64 0.13.1",
- "minreq",
+ "minreq 2.14.1",
  "serde",
  "serde_json",
 ]
@@ -2779,6 +2780,17 @@ checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "minreq"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "659579df697b372ef9e36f02fcbb41f6d6f157dcec7db9c9618fa0f23cf0fc20"
+dependencies = [
+ "rustls",
+ "rustls-webpki",
+ "webpki-roots",
 ]
 
 [[package]]

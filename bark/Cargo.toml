@@ -28,7 +28,7 @@ rand = ["bitcoin/rand", "bip39/rand"]
 
 # The Arca wallet on Sequentia (`bark::arca`): its chain source over the
 # node's RPC, its SQLite store, its keys from the mnemonic as the Sequentia
-# Wallet Kit derives them, and its client of the Arca server over HTTP.
+# Wallet Kit derives them, and its client of the Arca server over HTTPS.
 arca = [
 	"sqlite",
 	"dep:arca-covenant",
@@ -36,6 +36,7 @@ arca = [
 	"dep:elements",
 	"dep:lwk_signer",
 	"dep:minreq",
+	"dep:rustls",
 ]
 
 # TLS implementations
@@ -76,7 +77,10 @@ arca-covenant = { path = "../covenant", optional = true }
 arca-sequentia-ext = { path = "../sequentia-ext", optional = true }
 elements = { workspace = true, optional = true }
 lwk_signer = { workspace = true, optional = true }
-minreq = { version = "2.14", optional = true }
+minreq = { version = "3", optional = true, features = ["https-rustls"] }
+# The TLS of the Arca client: the workspace builds rustls with two crypto
+# providers, so the client installs one before its first request.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
 # EXPORTED
 bitcoin.workspace = true

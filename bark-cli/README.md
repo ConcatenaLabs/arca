@@ -17,7 +17,10 @@ of `arca-wallet`), built on `arca-covenant` for every script, record and check.
 
 It needs:
 
-- an Arca server (`arcad`), reached over HTTP at its base URL;
+- an Arca server (`arcad`), reached over HTTPS at its base URL. Plain
+  `http://` is refused except to this machine (a loopback address or
+  `localhost`, as for a server behind a local TLS proxy): across a network,
+  anyone on the path could answer as the operator;
 - a `sequentiad` it can call over JSON-RPC, running with `-txindex` and
   `-validateanchor`. The wallet reads the chain only from this node, and
   refuses one that does not validate its anchors: without that the node has no
@@ -124,7 +127,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 
 | Command | Does |
 |---|---|
-| `create --server URL --node-url URL [--node-user U --node-password P \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
+| `create --server URL --node-url URL [--node-user U --node-password P \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
 | `balance` | Per asset: Arca coins by state, on-chain coins, and the Bitcoin side |
@@ -195,7 +198,10 @@ called void after its forfeit, the preimage then read from the operator's
 claim on the chain; and a round that can never return, whose coins come back,
 a forfeit of one of them published anyway and refunded after its delay; a
 refresh fee of half of every coin, and one inside a coin's free window; and a
-sender converting the board it paid from, answered at once by the receiver.
+sender converting the board it paid from, answered at once by the receiver;
+a server named `https://` whose certificate no root vouches for, refused by
+TLS itself, and a plain-HTTP server on another host, refused before anything
+is sent.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

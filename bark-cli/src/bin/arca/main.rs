@@ -227,6 +227,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		let w = Wallet::create(&datadir, mnemonic.as_deref(), cfg)?;
 		let mut info = w.info()?;
 		info["mnemonic_file"] = json!(w.mnemonic_path().display().to_string());
+		let check = format!("compare the operator key {} with the one the operator publishes through a channel you trust: the wallet \
+			has pinned it, and refuses any server that names another", info["operator"].as_str().unwrap_or(""));
+		eprintln!("arca: {}", check);
+		info["operator_key_check"] = json!(check);
 		return Ok(info);
 	}
 	let mut w = Wallet::open(&datadir)?;
