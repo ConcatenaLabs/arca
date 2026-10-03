@@ -152,6 +152,16 @@ impl Ctx {
 		leaf
 	}
 
+	fn board(&self) -> BoardPolicy {
+		let p = &self.output("board")["params"];
+		let leaf = LeafPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
+			exit_delay: rel(&p["exit_delay"]),
+		};
+		assert_eq!(leaf.program(), h32(&p["leaf_program"]));
+		BoardPolicy { leaf, asset: AssetId::from_byte_array(h32(&p["asset"])), value: p["value"].as_u64().unwrap() }
+	}
+
 	fn entry(&self, name: &str, burn: bool) -> EntryPolicy {
 		let p = &self.output(name)["params"];
 		EntryPolicy {
@@ -251,6 +261,10 @@ impl Ctx {
 				let f = self.forfeit();
 				(f.taproot(), BTreeMap::from([("claim", f.claim_script()), ("refund", f.refund_script())]))
 			},
+			"board" => {
+				let b = self.board();
+				(b.taproot(), BTreeMap::from([("collab", b.leaf.collab_script()), ("convert", b.convert_script())]))
+			},
 			"connector" => {
 				let c = ConnectorPolicy { operator: key(&self.output("connector")["params"]["operator"]) };
 				(c.taproot(), BTreeMap::from([("issue", c.script())]))
@@ -277,7 +291,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 17);
+	assert_eq!(outputs.len(), 18);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -317,7 +331,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 29);
+	assert_eq!(spends.len(), 31);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -406,6 +420,17 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			("forfeit", "claim") => ctx.forfeit().claim_witness(&checksig("S"), &h32(&s["preimage"]),
 				s["connector_input"].as_u64().unwrap() as u32),
+			("board", "convert") => {
+				let b = ctx.board();
+				b.convert_witness(&checksig(ctx.label_of(&b.leaf.owner)))
+			},
+			("board", "collab") => {
+				let b = ctx.board();
+				let owner = ctx.label_of(&b.leaf.owner).to_string();
+				let outs = committed(s["m"].as_u64().unwrap() as usize);
+				let msg = b.leaf.collab_message(asset_in, value_in, &outs).unwrap();
+				b.witness(&Pair { operator: csfs(&msg, "S"), owner: csfs(&msg, &owner) }, outs.len() as u8)
+			},
 			("connector", "issue") => {
 				let c = ConnectorPolicy { operator: key(&ctx.output("connector")["params"]["operator"]) };
 				c.witness(&checksig("S"))

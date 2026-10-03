@@ -76,9 +76,9 @@
 //!
 //! A round that cannot return leaves every owner who gave up a leaf for it a
 //! forfeit no claim can answer, signed by both and ending in the owner's
-//! refund. So a participation run again after it is forfeit-first, as a
-//! board's is: the operator publishes the forfeit for the new round and sees
-//! it final before it hands over the preimage. With the preimage released
+//! refund. So a participation run again after it is forfeit-first: the
+//! operator publishes the forfeit for the new round and sees it final before
+//! it hands over the preimage. With the preimage released
 //! first, the owner publishes the old forfeit instead, refunds it, and keeps
 //! the new leaf too. For the same reason the operator co-signs no other
 //! off-chain spend of a leaf given up for a lost round.
@@ -101,6 +101,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::{XOnlyPublicKey, ZERO_TWEAK};
 use elements::{AssetId, AssetIssuance, ContractHash, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut, Txid};
 
+use crate::board::BoardPolicy;
 use crate::entry::hash_gate;
 use crate::leaf::{exit_script, LeafPolicy};
 use crate::message::CsfsMessage;
@@ -376,6 +377,16 @@ impl Forfeit {
 	/// The forfeit transaction, spending the old leaf at `leaf_coin`.
 	pub fn tx(&self, leaf_coin: OutPoint, pair: &Pair, fee: &FeeSource) -> Result<UnrollTx, SpendError> {
 		collab_tx(&self.leaf, leaf_coin, self.asset, self.value, &[self.output()], pair, fee)
+	}
+
+	/// The forfeit transaction for a board not converted: the board output
+	/// at `board_coin`, by its collaborative path, which is the leaf's own, so
+	/// the same pair signs it ([`crate::board`]).
+	pub fn board_tx(&self, board: &BoardPolicy, board_coin: OutPoint, pair: &Pair, fee: &FeeSource) -> Result<UnrollTx, SpendError> {
+		if board.leaf != self.leaf || board.asset != self.asset || board.value != self.value {
+			return Err(SpendError::OtherBoard);
+		}
+		collab_tx(board, board_coin, self.asset, self.value, &[self.output()], pair, fee)
 	}
 
 	/// The operator's claim of the forfeit output at `forfeit_coin` into

@@ -32,14 +32,16 @@
 //! A [`CoinRecord`] is what the holder of a coin keeps: for a leaf of a batch,
 //! its [`LeafRecord`] with the preimage of its entry and its owner's unroll
 //! authorisations for every node on its path, so that anyone holding the record
-//! can bring it on-chain; for a coin a reassignment created, the reassignment's
+//! can bring it on-chain; for a board, its [`BoardRecord`] (the board is
+//! on-chain already); for a coin a reassignment created, the reassignment's
 //! inputs (each a coin record in turn, with its checkpoint's value and both
 //! pairs), the committed outputs, the coin's index among them, and the coin's
 //! leaf: its owner's key, the two nonces of its salt and its exit delay.
 //!
 //! A receiver accepts a coin only after [`CoinRecord::validate`]: every batch
-//! leaf in the record validates against the round that funds it, under the
-//! receiver's [`WalletPolicy`] (its receipt form, [`WalletPolicy::receipt`]);
+//! leaf in the record validates against the round that funds it, and every
+//! board against its board transaction, under the receiver's [`WalletPolicy`]
+//! (its receipt form, [`WalletPolicy::receipt`]);
 //! every preimage opens its entry and every authorisation is the leaf owner's,
 //! usable now; every pair verifies; no reassignment creates more of an asset
 //! than its checkpoints hold; every leaf a reassignment creates along the
@@ -58,7 +60,18 @@
 //! from, and a receiver that can ask an index of the chain refuses the coin
 //! when any is on-chain ([`ValidCoin::check_lineage`]); one that cannot relies
 //! on the operator, which refuses to co-sign a spend of a leaf that is
-//! on-chain.
+//! on-chain. A board is on-chain from the start and must still be there,
+//! unspent: [`ValidCoin::boards`] lists them and [`ValidCoin::check_boards`]
+//! refuses the coin when one is spent.
+//!
+//! # A coin from a board
+//!
+//! A board has no batch and no expiry. Its leaf is the coin; a checkpoint of
+//! it carries a sweep whose token no issuance can create
+//! ([`board_sweep`]), so only the checkpoint's collaborative path spends it.
+//! Every pair over the coin spends it as the board output or as the leaf a
+//! conversion made of it ([`crate::board`]):
+//! [`ValidInput::board_checkpoint_tx`] spends the board output itself.
 //!
 //! What the receiver relies on is the trust the specification names
 //! "operator-confirmed": the sender and the operator could still sign another
@@ -78,6 +91,8 @@
 //!         [32] the preimage of its entry's unlock hash
 //!         u8   n, the levels of its path, then n × ([64] signature, u32 time):
 //!              its owner's unroll authorisation for each node, from the batch output down
+//!   u8  2, a board:
+//!         u16  length L, then L bytes: its BoardRecord, binary form
 //!   u8  1, an output of a reassignment:
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
@@ -102,7 +117,9 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxOut};
 
+use crate::board::{BoardPolicy, BoardRecord, ValidBoard};
 use crate::checkpoint::CheckpointPolicy;
+use crate::clock::ClockSchedule;
 use crate::encode::{write_compact_size, DecodeError, Reader};
 use crate::leaf::{leaf_salt, LeafPolicy, MAX_OUTPUTS};
 use crate::message::{Chain, CsfsMessage};
@@ -128,6 +145,23 @@ pub const DEPTH_LIMIT: usize = 5;
 pub const CHECKPOINT_SALT_TAG: &[u8; 15] = b"Arca/checkpoint";
 /// The tag of a reassignment's hash, from which its outputs' ids follow.
 pub const REASSIGNMENT_TAG: &[u8] = b"Arca/reassignment";
+
+/// The tag whose hash is the sweep token of a coin from a board: an asset id
+/// no issuance creates, so a sweep that needs it can never be taken.
+pub const BOARD_TOKEN_TAG: &[u8] = b"Arca/board-token";
+
+/// The expiry of a coin that descends from boards alone: a board never
+/// expires.
+pub const NEVER: MedianTime = MedianTime::MAX;
+
+/// The sweep a checkpoint of a coin from a board carries: the frozen sweep
+/// with notice, for a token no issuance creates (`SHA256(BOARD_TOKEN_TAG)`)
+/// and `R` under the operator with the leaf's exit delay as its notice. Only
+/// the checkpoint's collaborative path can spend it.
+pub fn board_sweep(operator: XOnlyPublicKey, notice: RelativeTime) -> Sweep {
+	let token = AssetId::from_byte_array(sha256(BOARD_TOKEN_TAG));
+	ClockSchedule::new_unchecked(token, operator, notice, vec![NEVER]).expect("one step").sweep(true, false)
+}
 
 /// The salt of the checkpoint of a coin whose leaf salt is `leaf_salt`.
 pub fn checkpoint_salt(leaf_salt: &[u8; 32]) -> [u8; 32] {
@@ -171,6 +205,8 @@ pub enum CoinRecord {
 	},
 	/// An output of a reassignment.
 	Transfer(Box<Transfer>),
+	/// A board, on-chain.
+	Board(BoardRecord),
 }
 
 /// A reassignment, and the coin's place in it.
@@ -219,8 +255,10 @@ pub enum TransferError {
 	Outputs(usize),
 	#[error("index {index} is past the reassignment's {count} outputs")]
 	Index { index: usize, count: usize },
-	#[error("no round given pays the batch output of a leaf in the record")]
+	#[error("no transaction given pays the batch output or the board output of a base in the record")]
 	RoundMissing,
+	#[error("the board at {0} is spent")]
+	BoardSpent(OutPoint),
 	#[error("a leaf's preimage does not open its entry")]
 	Preimage,
 	#[error("{given} unroll authorisations for a path of {needed} nodes")]
@@ -253,6 +291,8 @@ pub enum TransferError {
 	OnChain { kind: LineageKind, script: Script },
 	#[error("this is not an output of a reassignment")]
 	NotATransfer,
+	#[error("this coin is not a board")]
+	NotABoard,
 	#[error("{given} checkpoints for a reassignment of {needed} inputs")]
 	Checkpoints { given: usize, needed: usize },
 }
@@ -274,8 +314,8 @@ impl TransferError {
 			DoubleSpend(_) => "double_spend",
 			NotOwner | OwnerNonce | ExitDelay => "owner",
 			LineageExitDelay { .. } => "policy",
-			OnChain { .. } => "on_chain",
-			NotATransfer | Checkpoints { .. } => "use",
+			OnChain { .. } | BoardSpent(_) => "on_chain",
+			NotATransfer | NotABoard | Checkpoints { .. } => "use",
 		}
 	}
 }
@@ -311,6 +351,8 @@ pub enum ValidOrigin {
 	},
 	/// An output of a reassignment.
 	Transfer { inputs: Vec<ValidInput>, outputs: Vec<ExplicitOutput>, index: usize },
+	/// A board, checked against its board transaction.
+	Board { valid: ValidBoard, record: BoardRecord },
 }
 
 /// One checked input of a reassignment.
@@ -377,6 +419,34 @@ impl ValidCoin {
 		}
 	}
 
+	/// Every board the coin descends from, its own included: each must still
+	/// be unspent when the coin is received, since a board spent by its
+	/// conversion or by a forfeit no longer backs the coin.
+	pub fn boards(&self) -> Vec<OutPoint> {
+		match &self.origin {
+			ValidOrigin::Board { valid, .. } => vec![valid.outpoint()],
+			ValidOrigin::Transfer { inputs, .. } => inputs.iter().flat_map(|i| i.coin.boards()).collect(),
+			ValidOrigin::Leaf { .. } => vec![],
+		}
+	}
+
+	/// Refuses the coin if any board it descends from is spent, as `unspent`
+	/// reports it (the chain's set of unspent outputs).
+	pub fn check_boards(&self, mut unspent: impl FnMut(&OutPoint) -> bool) -> Result<(), TransferError> {
+		match self.boards().into_iter().find(|b| !unspent(b)) {
+			Some(b) => Err(TransferError::BoardSpent(b)),
+			None => Ok(()),
+		}
+	}
+
+	/// The board output and where it is, for a coin that is a board.
+	pub fn board(&self) -> Option<(BoardPolicy, OutPoint)> {
+		match &self.origin {
+			ValidOrigin::Board { valid, record } => Some((record.policy(), valid.outpoint())),
+			_ => None,
+		}
+	}
+
 	/// Refuses the coin if any script in its lineage is on-chain, as
 	/// `on_chain` reports it (an address index: has any transaction paid this
 	/// scriptPubKey).
@@ -410,7 +480,7 @@ impl ValidCoin {
 	pub fn reassignment_tx(&self, checkpoints: &[OutPoint], fee: &FeeSource) -> Result<UnrollTx, TransferError> {
 		let (inputs, outputs) = match &self.origin {
 			ValidOrigin::Transfer { inputs, outputs, .. } => (inputs, outputs),
-			ValidOrigin::Leaf { .. } => return Err(TransferError::NotATransfer),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return Err(TransferError::NotATransfer),
 		};
 		reassignment_tx(inputs, outputs, checkpoints, fee)
 	}
@@ -422,10 +492,17 @@ impl ValidInput {
 		ExplicitOutput::new(self.coin.asset, self.checkpoint_value, self.checkpoint.script_pubkey())
 	}
 
-	/// The checkpoint transaction, spending the coin at `coin`.
+	/// The checkpoint transaction, spending the coin's leaf at `coin`.
 	pub fn checkpoint_tx(&self, coin: OutPoint, fee: &FeeSource) -> Result<UnrollTx, TransferError> {
 		Ok(collab_tx(&self.coin.leaf, coin, self.coin.asset, self.coin.value, &[self.checkpoint_output()],
 			&self.checkpoint_pair, fee)?)
+	}
+
+	/// The checkpoint transaction of a coin that is a board, spending the
+	/// board output itself with the same pair.
+	pub fn board_checkpoint_tx(&self, fee: &FeeSource) -> Result<UnrollTx, TransferError> {
+		let (board, at) = self.coin.board().ok_or(TransferError::NotABoard)?;
+		Ok(collab_tx(&board, at, self.coin.asset, self.coin.value, &[self.checkpoint_output()], &self.checkpoint_pair, fee)?)
 	}
 }
 
@@ -529,6 +606,7 @@ impl CoinRecord {
 		let (key, nonce, delay) = match self {
 			CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce, record.exit_delay),
 			CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce, t.leaf.exit_delay),
+			CoinRecord::Board(b) => (b.owner, b.owner_nonce, b.exit_delay),
 		};
 		if key != *owner {
 			return Err(TransferError::NotOwner);
@@ -592,6 +670,18 @@ impl CoinRecord {
 					id, leaf, asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
 					expiry: record.schedule.expiries()[0], hops: 0,
 					origin: ValidOrigin::Leaf { valid, preimage: *preimage, auths: unroll },
+				})
+			},
+			CoinRecord::Board(record) => {
+				let out = record.output();
+				let tx = rounds.iter()
+					.find(|r| r.output.iter().any(|o| ExplicitOutput::from_txout(o).as_ref() == Some(&out)))
+					.ok_or(TransferError::RoundMissing)?;
+				let valid = record.validate(tx, policy)?;
+				Ok(ValidCoin {
+					id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
+					sweep: board_sweep(record.operator, record.exit_delay), expiry: NEVER, hops: 0,
+					origin: ValidOrigin::Board { valid, record: *record },
 				})
 			},
 			CoinRecord::Transfer(t) => {
@@ -702,6 +792,12 @@ impl CoinRecord {
 					w.extend(t.to_consensus_u32().to_le_bytes());
 				}
 			},
+			CoinRecord::Board(record) => {
+				w.push(2);
+				let b = record.to_bytes()?;
+				w.extend((b.len() as u16).to_le_bytes());
+				w.extend(b);
+			},
 			CoinRecord::Transfer(t) => {
 				if t.inputs.is_empty() || t.inputs.len() > MAX_INPUTS {
 					return Err(TransferError::Inputs(t.inputs.len()));
@@ -808,6 +904,10 @@ impl CoinRecord {
 				}
 				let leaf = NewLeaf { owner: r.key()?, owner_nonce: r.array32()?, operator_nonce: r.array32()?, exit_delay: r.relative_time()? };
 				Ok(CoinRecord::Transfer(Box::new(Transfer { inputs, outputs, index, leaf })))
+			},
+			2 => {
+				let len = r.u16()? as usize;
+				Ok(CoinRecord::Board(BoardRecord::from_bytes(r.bytes(len)?)?))
 			},
 			t => Err(TransferError::Tag(t)),
 		}

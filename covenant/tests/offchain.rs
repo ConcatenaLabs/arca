@@ -10,13 +10,16 @@
 //! `generateblock`, the block for the same reason (the node checks scripts
 //! inline, `-par=1`).
 //!
-//! 1. A board, its record checked against the board transaction, and its
-//!    refresh into a round: the forfeit of the board leaf is published first,
-//!    the operator issues the round's connector asset and claims, the owner
-//!    learns the preimage from the chain, unrolls the new batch and exits.
-//!    Then why a board leaf takes no off-chain spend: once its delay has
-//!    passed, its owner exits at once and the forfeit the operator holds is
-//!    void.
+//! 1. A board (`board-1`), its record checked against the board transaction
+//!    under the wallet's policy, and its refresh into a round, the preimage
+//!    handed over on the forfeit pair alone. The conversion signed by the
+//!    operator, unsigned, one atom short, or into another script is refused;
+//!    the owner's own conversion confirms, its exit waits the leaf's delay, and
+//!    the operator answers with the forfeit on the converted leaf, so the exit
+//!    has nothing left. The operator issues the round's connector asset and
+//!    claims; the owner learns the preimage from the chain, unrolls the new
+//!    batch and exits. A second board never converted: the operator publishes
+//!    the forfeit straight from the board output and claims.
 //!    One atom of the connector asset serves two claims of one round.
 //! 2. The round's connector output, spent any way but by the issuance of
 //!    exactly `M`: with no issuance, two atoms, a reissuance token, another
@@ -200,24 +203,26 @@ fn board_and_refresh(c: &mut Ctx) {
 	let a2 = keypair("board owner, the new leaf's key");
 	let x = c.net.x;
 	let rec = BoardRecord {
-		template: Template::Vtxo1, owner: xonly(&a1), owner_nonce: label32("board owner nonce"),
+		template: Template::Board1, owner: xonly(&a1), owner_nonce: label32("board owner nonce"),
 		operator_nonce: label32("board operator nonce"), exit_delay: delay(), asset: x, value: 20_000_000,
 		chain: c.net.chain, operator: xonly(&s),
 	};
+	let bp = rec.policy();
 	// The owner's wallet coin pays the board, with change, the fee in X.
 	let wallet = c.net.fund(vec![explicit(x, 30_000_000, op_true_spk())]).remove(0);
 	let mut b = rec.tx(&[(wallet.outpoint, wallet.txout.clone())], x, 1_500, &op_true_spk()).unwrap();
 	b.tx.input[0].witness.script_witness = op_true_witness();
 	let bt = c.pass("board/the board transaction", &b.tx);
 	let on_chain = c.net.rt.client().raw_transaction(&bt).unwrap();
-	let valid = BoardRecord::from_bytes(&rec.to_bytes().unwrap()).unwrap().validate(&on_chain).unwrap();
+	let policy = c.policy(&s);
+	let valid = BoardRecord::from_bytes(&rec.to_bytes().unwrap()).unwrap().validate(&on_chain, &policy).unwrap();
 	assert_eq!((valid.vout, valid.leaf_id), (0, rec.leaf_id()));
 	rec.check_owner(&xonly(&a1), &rec.owner_nonce).unwrap();
 	let mut other = rec;
 	other.owner_nonce = label32("not the board's nonce");
-	assert_eq!(other.validate(&on_chain).unwrap_err().kind(), "board_output");
+	assert_eq!(other.validate(&on_chain, &policy).unwrap_err().kind(), "board_output");
 	println!("board: the record validates against board {} (leaf id {}); one with another owner nonce is refused", bt, valid.leaf_id);
-	let board_coin = coin_of(bt, 0, &on_chain);
+	let board_coin = valid.outpoint();
 
 	// A round that refreshes it: the owner's new leaf, under a new key and a
 	// fresh nonce, behind an entry locked to h; the connector output.
@@ -240,12 +245,14 @@ fn board_and_refresh(c: &mut Ctx) {
 	c.net.purse.push(coin_of(rt, cv + 1, &round));
 	let round = c.net.rt.client().raw_transaction(&rt).unwrap();
 	let new_rec = tree.record(0);
-	let new_valid = new_rec.validate(&round, &c.policy(&s), &xonly(&a2), &spec.owner_nonce).unwrap();
+	let new_valid = new_rec.validate(&round, &policy, &xonly(&a2), &spec.owner_nonce).unwrap();
 	let m = connector_asset(rt, cv);
 
-	// The owner signs the forfeit of the board leaf, bound to that leaf and
-	// to this round. A board leaf is on-chain: the operator publishes the
-	// forfeit, and only once it is in a block does it release the preimage.
+	// The owner signs the forfeit of the board's leaf, bound to that leaf and
+	// to this round, and the operator hands over the preimage at once: the
+	// one pair spends the board output and the leaf a conversion makes, and
+	// the owner alone gets out only by converting, which gives the operator
+	// the leaf's whole exit delay to answer.
 	let margin = margin_for(280, c.floor_per_kvb, 4);
 	let f = Forfeit::for_refresh(rec.leaf(), (x, rec.value), rec.leaf_id(), &new_valid, &round, cv, delay(), margin).unwrap();
 	assert_eq!((f.policy.unlock_hash, f.policy.connector), (sha256(&preimage), m), "h from the new leaf, M from the round");
@@ -253,11 +260,53 @@ fn board_and_refresh(c: &mut Ctx) {
 	f.verify(&p).unwrap();
 	let bad = Pair { owner: sig(&a2, &f.message().digest), ..p };
 	assert_eq!(f.verify(&bad).unwrap_err().to_string(), "the owner's signature does not verify");
-	let u = f.tx(board_coin.outpoint, &bad, &FeeSource::Reserve).unwrap();
+
+	// The owner's conversion: only its own signature, only into its leaf.
+	let fee_coin = |c: &mut Ctx| {
+		let fc = c.net.fee_coin();
+		FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }
+	};
+	let convert = |c: &mut Ctx, key: Option<&Keypair>, edit: &dyn Fn(&mut Transaction)| {
+		let fs = fee_coin(c);
+		let mut ks = bp.conversion(board_coin, &fs).unwrap();
+		edit(&mut ks.tx);
+		let below = match key {
+			Some(k) => vec![sign_digest(k, &ks.sighash(c.net.genesis).unwrap(), &ZERO_AUX).as_ref().to_vec()],
+			None => vec![vec![]],
+		};
+		let mut u = ks.finish(below);
+		u.tx.input[1].witness.script_witness = op_true_witness();
+		u.tx
+	};
+	let tx = convert(c, Some(&s), &|_| {});
+	c.net.refuse("board/neg the conversion signed by the operator", &tx, "Invalid Schnorr signature");
+	let tx = convert(c, None, &|_| {});
+	c.net.refuse("board/neg the conversion with no signature", &tx, "Script failed an OP_CHECKSIGVERIFY operation");
+	let tx = convert(c, Some(&a1), &|tx| {
+		let v = tx.output[0].value.explicit().unwrap();
+		tx.output[0].value = elements::confidential::Value::Explicit(v - 1);
+		tx.output.insert(1, explicit(x, 1, op_true_spk()));
+	});
+	c.net.refuse("board/neg the conversion one atom short", &tx, "Script failed an OP_EQUALVERIFY operation");
+	let tx = convert(c, Some(&a1), &|tx| tx.output[0].script_pubkey = op_true_spk());
+	c.net.refuse("board/neg the conversion into another script", &tx,
+		"Script evaluated without error but finished with a false/empty top stack element");
+	let tx = convert(c, Some(&a1), &|_| {});
+	let ct = c.pass("board/the owner's conversion into its leaf, a fee coin attached", &tx);
+	let leaf_coin = OutPoint::new(ct, 0);
+
+	// The owner's exit waits the leaf's delay; the operator answers within it
+	// with the forfeit it holds, on the leaf, and the exit has nothing left.
+	let ks = rec.leaf().exit_tx(leaf_coin, x, rec.value, &[ExplicitOutput::new(x, rec.value - 1_500, op_true_spk())],
+		&FeeSource::Reserve).unwrap();
+	let ex = signed(&c.net, ks, &a1, vec![]);
+	c.net.refuse("board/neg the converted leaf's exit at once", &ex.tx, "non-BIP68-final");
+	let u = f.tx(leaf_coin, &bad, &FeeSource::Reserve).unwrap();
 	c.net.refuse("board/neg the forfeit signed by the new leaf's key", &u.tx, "Invalid Schnorr signature");
-	let u = f.tx(board_coin.outpoint, &p, &FeeSource::Reserve).unwrap();
-	let ft = c.pass("board/refresh: the forfeit of the board leaf, published first", &u.tx);
+	let ft = c.pass("board/refresh: the forfeit, on the converted leaf", &f.tx(leaf_coin, &p, &FeeSource::Reserve).unwrap().tx);
 	let f_coin = OutPoint::new(ft, 0);
+	c.net.wait_csv(&ct, delay());
+	c.net.refuse("board/neg the converted leaf's exit after its delay", &ex.tx, "bad-txns-inputs-missingorspent");
 
 	// The operator issues M and claims; negatives first.
 	let y_coin = c.net.fund(vec![explicit(c.net.y, 1, op_true_spk())]).remove(0);
@@ -280,10 +329,10 @@ fn board_and_refresh(c: &mut Ctx) {
 	let m_coin = coin_of(ct, 1, &tx);
 	assert_eq!(m_coin.txout.asset.explicit(), Some(m));
 
-	// 2. The same atom serves the second owner's claim, in another
+	// The same atom serves the second owner's claim, in another
 	// transaction: its old leaf is given up for the same round.
 	let (old_b, old_b_coin, old_b_id) = funded_leaf(&mut c.net, &keypair("refresh second owner, old leaf"), &s, "second owner old leaf");
-	let valid_b = tree.record(1).validate(&round, &c.policy(&s), &xonly(&second_owner), &spec_b.owner_nonce).unwrap();
+	let valid_b = tree.record(1).validate(&round, &policy, &xonly(&second_owner), &spec_b.owner_nonce).unwrap();
 	let fb = Forfeit::for_refresh(old_b, (x, LEAF), old_b_id, &valid_b, &round, cv, delay(), margin).unwrap();
 	let pb = pair(&fb, &keypair("refresh second owner, old leaf"), &s);
 	let fc = c.net.fee_coin();
@@ -317,10 +366,9 @@ fn board_and_refresh(c: &mut Ctx) {
 	c.net.wait_csv(&et, delay());
 	c.pass("board/refresh: the new leaf's exit after the delay", &exit(c));
 
-	// Why a board leaf takes no off-chain spend. A second board, its delay
-	// passed: the owner has signed a forfeit for a refresh and holds the
-	// preimage, and exits the board leaf at once. The exit confirms with
-	// nothing to wait for, and the forfeit the operator holds is void.
+	// A second board, refreshed the same way and never converted: the
+	// operator takes its value when it chooses, by publishing the forfeit
+	// straight from the board output with the same kind of pair, and claims.
 	let a3 = keypair("board owner, a second board");
 	let rec3 = BoardRecord { owner: xonly(&a3), owner_nonce: label32("second board nonce"),
 		operator_nonce: label32("second board operator nonce"), value: 15_000_000, ..rec };
@@ -329,15 +377,25 @@ fn board_and_refresh(c: &mut Ctx) {
 	b.tx.input[0].witness.script_witness = op_true_witness();
 	let bt3 = c.pass("board/a second board", &b.tx);
 	c.net.wait_csv(&bt3, delay());
-	let f3 = Forfeit::new(rec3.leaf(), (x, rec3.value), rec3.leaf_id(), sha256(&label32("second board preimage")), m,
-		delay(), margin).unwrap();
+	let (issuer, sched) = c.schedule(&s);
+	let preimage3 = label32("second board preimage");
+	let spec3 = LeafSpec {
+		template: Template::Vtxo1, owner: xonly(&keypair("second board, new leaf")), value: 14_990_000,
+		owner_nonce: label32("second board new nonce"), operator_nonce: label32("second board new operator nonce"),
+		exit_delay: delay(), unlock_hash: sha256(&preimage3),
+	};
+	let tree3 = c.tree(&sched, &[spec3]);
+	let (round3, cv3) = round_tx(&c.net, &issuer, Some(&tree3), vec![], &s);
+	let rt3 = c.pass("board/a second board's refresh: the round", &round3);
+	let round3 = c.net.rt.client().raw_transaction(&rt3).unwrap();
+	let valid3 = tree3.record(0).validate(&round3, &policy, &spec3.owner, &spec3.owner_nonce).unwrap();
+	let f3 = Forfeit::for_refresh(rec3.leaf(), (x, rec3.value), rec3.leaf_id(), &valid3, &round3, cv3, delay(), margin).unwrap();
 	let p3 = pair(&f3, &a3, &s);
-	let ks = rec3.leaf().exit_tx(OutPoint::new(bt3, 0), x, rec3.value,
-		&[ExplicitOutput::new(x, rec3.value - 1_500, op_true_spk())], &FeeSource::Reserve).unwrap();
-	let ex = signed(&c.net, ks, &a3, vec![]);
-	c.pass("board/flaw: the owner's exit of a board leaf whose delay has passed, at once", &ex.tx);
-	let late = f3.tx(OutPoint::new(bt3, 0), &p3, &FeeSource::Reserve).unwrap();
-	c.net.refuse("board/flaw: the forfeit the operator held, now void", &late.tx, "bad-txns-inputs-missingorspent");
+	assert_eq!(f3.board_tx(&rec.policy(), OutPoint::new(bt3, 0), &p3, &FeeSource::Reserve).unwrap_err(), SpendError::OtherBoard);
+	let ft3 = c.pass("board/the forfeit straight from the board output, its delay long past",
+		&f3.board_tx(&rec3.policy(), OutPoint::new(bt3, 0), &p3, &FeeSource::Reserve).unwrap().tx);
+	let m3 = issue_connector(c, "board/the second board's round: the issuance of M", &round3, rt3, cv3, &s);
+	c.pass("board/the claim of the second board's forfeit", &claim_tx(&c.net, &f3, OutPoint::new(ft3, 0), &m3, &s, &preimage3, 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +670,7 @@ fn bring(c: &mut Ctx, coin: &ValidCoin, label: &str, hook: &mut dyn FnMut(&mut C
 			let id = c.pass(&format!("chain/{}: reassignment", label), &with_coin(re, n));
 			OutPoint::new(id, *index as u32)
 		},
+		ValidOrigin::Board { .. } => unreachable!("the chain has no board"),
 	}
 }
 

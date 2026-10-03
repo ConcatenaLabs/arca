@@ -82,8 +82,10 @@ sample spend of every path:
 - for each taproot output (the leaf, `R`, the clock steps, the hash-locked entry,
   the lowest, inner and batch nodes with the operator's sweep and with the
   burn-only sweep, the forfeit output (bound to the leaf it gives up and to its
-  round's connector asset), the round's connector output (spent only by the
-  operator's issuance of that asset), the checkpoint output and `htlc-1` in both
+  round's connector output), the round's connector output (spent only by the
+  operator's issuance of that asset), the board output (`board-1`: the leaf's
+  collaborative path and the owner's conversion), the checkpoint output and
+  `htlc-1` in both
   directions): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
   times, children), each script leaf with its opcodes, depth, leaf hash and
   control block, the merkle root, the output key and the scriptPubKey;
@@ -103,12 +105,14 @@ encodings a reader must refuse, each with the kind of reason.
 
 `vectors/transactions.json` holds the off-chain transactions' vectors, written
 by `offchain.py`, the reference for their shapes, which its docstring states in
-full: the board, its record in both forms with refusal vectors, and the exit of
-its leaf; the forfeit, the round's connector output and the operator's issuance
+full: the board, its record in both forms with refusal vectors, the owner's
+conversion, the exit of the converted leaf, and one pair spending the board
+output and the converted leaf alike; the forfeit, the round's connector output and the operator's issuance
 of its connector asset, the claim and the refund; the offboard output, its unlock and its reclaim; and a transfer
 chain three hops deep from two batches (one hop a swap of two owners' coins in
-two assets): the rounds, every checkpoint and reassignment, and every receiver's
-coin record with its id. Each
+two assets) and a coin paid out of round from the board: the rounds and the
+board, every checkpoint and reassignment, and every receiver's coin record with
+its id. Each
 transaction is given whole, witnesses included, with the outputs it spends and,
 for a signature, the signature hash and the test key's signature, once with the
 spent output's margin as the fee and once with a fee coin attached.

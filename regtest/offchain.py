@@ -22,13 +22,24 @@ that script's witness.
 
 The board
 ---------
-The owner pays its own coins to a vtxo-1 leaf whose salt is
-SHA256("Arca/salt" || owner_nonce || operator_nonce). The board transaction
-puts the leaf at output 0, then each asset's change, less the fee in the fee
-asset, then the fee. The board record, format version 1:
+The owner pays its own coins to a board-1 output: a taproot output of two
+leaves, the collaborative path of the vtxo-1 leaf it converts into (the very
+script that leaf carries, so one pair spends the coin in either form) and the
+conversion:
 
-    u8    format version, 1
-    u8    template, 1 (vtxo)          u8  template version, 1
+    convert:  <A> OP_CHECKSIGVERIFY
+              OP_0 OP_INSPECTOUTPUTASSET OP_1 OP_EQUALVERIFY <asset> OP_EQUALVERIFY
+              OP_0 OP_INSPECTOUTPUTVALUE OP_1 OP_EQUALVERIFY <value_le8> OP_EQUALVERIFY
+              OP_0 OP_INSPECTOUTPUTSCRIPTPUBKEY OP_1 OP_EQUALVERIFY <leaf program> OP_EQUAL
+
+The leaf's salt is SHA256("Arca/salt" || owner_nonce || operator_nonce), and
+the board holds the leaf's value; the owner's conversion pays its fee with a
+coin attached. The board transaction puts the board output at output 0, then
+each asset's change, less the fee in the fee asset, then the fee. The board
+record, format version 2:
+
+    u8    format version, 2
+    u8    template, 2 (board)         u8  template version, 1
     [32]  owner key A
     [32]  owner nonce
     [32]  operator nonce
@@ -39,8 +50,8 @@ asset, then the fee. The board record, format version 1:
     [32]  operator key S
 
 Its JSON form has the leaf record's field names and conventions. Its leaf id
-is the leaf id of a batch with no levels whose batch output is the leaf:
-tagged hash "Arca/leaf-id" of leaf program || 0x00 || leaf program.
+is the leaf id of a batch with no levels whose batch output is the board
+output: tagged hash "Arca/leaf-id" of board program || 0x00 || leaf program.
 
 The forfeit
 -----------
@@ -111,6 +122,11 @@ The coin record, format version 1:
           and scriptPubKey; u8 the coin's index; [32] owner key, [32] owner
           nonce, [32] operator nonce, u16 exit delay units
 
+A board as a coin is tag 2: u16 length L and L bytes of its board record. Its
+checkpoint carries the sweep with notice for the token SHA256("Arca/board-token"),
+which no issuance creates, and R under S with the leaf's exit delay as notice;
+its checkpoint transaction spends the board output by its collaborative path.
+
 A coin from a reassignment has the leaf id of R || 0x01 || index || its leaf
 program, R the tagged hash "Arca/reassignment" of the input count, each input's
 coin id and checkpoint program, the output count and each output's record hash.
@@ -123,10 +139,10 @@ from test_framework.script import TaprootSignatureHash
 import records
 import struct
 
-from records import (ASSET, GENESIS, OPERATOR, TEMPLATE_VTXO_VERSION, TEMPLATES, display, json_text, label_hash,
+from records import (ASSET, GENESIS, OPERATOR, TEMPLATE_BOARD_VERSION, TEMPLATES, display, json_text, label_hash,
                      le16, le64, leaf_salt, tagged_hash, txout, LEAF_ID_TAG)
 
-BOARD_FORMAT_VERSION = 1
+BOARD_FORMAT_VERSION = 2
 CTAG = chain_tag(GENESIS)
 H = 3600
 DELAY = (36 * H + 511) // 512              # exit and forfeit-refund delay, 512-second units
@@ -299,31 +315,56 @@ def board_json(rec):
             "genesis_hash": display(rec["genesis"]), "operator": rec["operator"].hex()}
 
 
-def board():
+def board_parts():
+    """The board every vector here uses: its record, its leaf and board
+    taproots, and the board transaction."""
     value = 25_000_000
-    rec = {"template": ("vtxo", TEMPLATE_VTXO_VERSION), "owner": A.x,
+    rec = {"template": ("board", TEMPLATE_BOARD_VERSION), "owner": A.x,
            "owner_nonce": label_hash("owner nonce", "board"), "operator_nonce": label_hash("operator nonce", "board"),
            "exit_delay": DELAY, "asset": ASSET, "value": value, "genesis": GENESIS, "operator": S.x}
-    tap, scripts, salt = leaf(A, rec["owner_nonce"], rec["operator_nonce"])
-    spk = bytes(tap.scriptPubKey)
-    prog = spk[2:]
+    ltap, lscripts, salt = leaf(A, rec["owner_nonce"], rec["operator_nonce"])
+    lspk = bytes(ltap.scriptPubKey)
+    btap, bscripts = board_taptree(A.x, S.x, salt, CTAG, ASSET, value, lspk[2:])
+    bspk = bytes(btap.scriptPubKey)
     coins = [(outpoint("board coin 0"), (ASSET, 20_000_000, OP_TRUE_SPK)),
              (outpoint("board coin 1"), (ASSET, 9_000_000, OP_TRUE_SPK))]
     fee = 1_200
-    b = Built([(c, s, FINAL) for c, s in coins],
-              [(ASSET, value, spk), (ASSET, 29_000_000 - value - fee, OP_TRUE_SPK), (ASSET, fee, b"")])
-    board_tx = b.json()
-    board_tx.update({"fee_asset": display(ASSET), "fee": fee, "change": hx(OP_TRUE_SPK), "leaf_vout": 0})
+    b = Built([(c, s_, FINAL) for c, s_ in coins],
+              [(ASSET, value, bspk), (ASSET, 29_000_000 - value - fee, OP_TRUE_SPK), (ASSET, fee, b"")])
+    return {"rec": rec, "value": value, "salt": salt, "ltap": ltap, "lscripts": lscripts, "lspk": lspk,
+            "btap": btap, "bscripts": bscripts, "bspk": bspk, "built": b, "fee": fee,
+            "leaf_id": tagged_hash(LEAF_ID_TAG, bspk[2:] + b"\x00" + lspk[2:])}
 
-    # The owner's exit of the board leaf, the margin paying the fee.
-    leaf_coin = coin_at(b.tx, 0)
-    exit_tx = key_spend("the board leaf's exit claim", tap, "exit", scripts["exit"], leaf_coin,
-                        (ASSET, value, spk), SEQ_TIME | DELAY, [(ASSET, value - 1_500, OWNER_SPK)], "reserve", A)
+
+def board():
+    bp = board_parts()
+    rec, value, b = bp["rec"], bp["value"], bp["built"]
+    btap, bscripts, bspk, ltap, lscripts, lspk = bp["btap"], bp["bscripts"], bp["bspk"], bp["ltap"], bp["lscripts"], bp["lspk"]
+    board_tx = b.json()
+    board_tx.update({"fee_asset": display(ASSET), "fee": bp["fee"], "change": hx(OP_TRUE_SPK), "board_vout": 0})
+    board_coin = coin_at(b.tx, 0)
+
+    # The owner's conversion: its signature, the leaf at output 0, a fee coin
+    # paying the fee. Then the leaf's exit after its delay.
+    conversion = key_spend("the owner's conversion", btap, "convert", bscripts["convert"], board_coin,
+                           (ASSET, value, bspk), FINAL, [(ASSET, value, lspk)], fee_coin("conversion fee coin"), A)
+    leaf_coin = coin_at(Tx.from_hex(conversion["tx"]), 0)
+    exit_tx = key_spend("the converted leaf's exit claim", ltap, "exit", lscripts["exit"], leaf_coin,
+                        (ASSET, value, lspk), SEQ_TIME | DELAY, [(ASSET, value - 1_500, OWNER_SPK)], "reserve", A)
+    # One pair over the leaf's message spends the board output and, the same
+    # pair, the leaf a conversion made.
+    to_operator = [(ASSET, value - 1_000, OPERATOR_SPK)]
+    by_pair = [collab_spend("the board output spent by a pair over its leaf", btap, bscripts["collab"], bp["salt"],
+                            board_coin, (ASSET, value, bspk), to_operator, [S, A], "reserve"),
+               collab_spend("the converted leaf spent by the same pair", ltap, lscripts["collab"], bp["salt"],
+                            leaf_coin, (ASSET, value, lspk), to_operator, [S, A], "reserve")]
+    assert by_pair[0]["message_digest"] == by_pair[1]["message_digest"]
 
     binary = board_record(rec)
     bad = [
-        ("format version 2", bytes([2]) + binary[1:], "version"),
-        ("template 2", binary[:1] + b"\x02" + binary[2:], "template"),
+        ("format version 1", bytes([1]) + binary[1:], "version"),
+        ("template 1 (vtxo)", binary[:1] + b"\x01" + binary[2:], "template"),
+        ("template version 2", binary[:2] + b"\x02" + binary[3:], "template_version"),
         ("a trailing byte", binary + b"\x00", "trailing"),
         ("the last byte missing", binary[:-1], "end"),
         ("a value of zero", binary[:133] + le64(0) + binary[141:], "value"),
@@ -342,14 +383,17 @@ def board():
         ("the salt in place of the nonces", edit(lambda o: (o.pop("owner_nonce"), o.update({"salt": "00" * 32}))),
          "field"),
         ("a value as a number", edit(lambda o: o.update({"value": value})), "type"),
-        ("format version 2", edit(lambda o: o.update({"version": 2})), "version"),
+        ("format version 1", edit(lambda o: o.update({"version": 1})), "version"),
+        ("the vtxo template", edit(lambda o: o.update({"template": "vtxo-1"})), "template"),
     ]
     return {
-        "record": {"binary": binary.hex(), "json": json_text(j), "salt": salt.hex(), "leaf_program": prog.hex(),
-                   "leaf_id": tagged_hash(LEAF_ID_TAG, prog + b"\x00" + prog).hex(),
-                   "script_pubkey": spk.hex()},
+        "record": {"binary": binary.hex(), "json": json_text(j), "salt": bp["salt"].hex(), "leaf_program": lspk[2:].hex(),
+                   "leaf_id": bp["leaf_id"].hex(), "leaf_script_pubkey": lspk.hex(), "script_pubkey": bspk.hex(),
+                   "convert_script": hx(bscripts["convert"]), "collab_script": hx(bscripts["collab"])},
         "board_tx": board_tx,
+        "conversion_tx": conversion,
         "exit_tx": exit_tx,
+        "by_pair": by_pair,
         "invalid_binary": [{"name": n, "binary": x.hex(), "kind": k} for n, x, k in bad],
         "invalid_json": [{"name": n, "json": x, "kind": k} for n, x, k in bad_json],
     }
@@ -491,6 +535,7 @@ def offboard():
 # --------------------------------------------------------------------------
 
 CHECKPOINT_TAG = b"Arca/checkpoint"
+BOARD_TOKEN_TAG = b"Arca/board-token"
 REASSIGNMENT_TAG = b"Arca/reassignment"
 Y_ASSET = label_hash("asset", "Y")
 CREATED = records.CREATED
@@ -666,12 +711,31 @@ def transfer():
     d["name"] = "reassignment creating %s" % d_coin.id.hex()
     txs.append(d)
 
-    for name, coin in (("B1", b1_coin), ("A change", ach_coin), ("B2", b2_coin), ("C2", c2_coin), ("D", d_coin)):
+    # Hop 4: the board's owner pays E out of round, from the board output.
+    bp = board_parts()
+    rec_bytes = board_record(bp["rec"])
+    board_token = sha256(BOARD_TOKEN_TAG)
+    r_tap, _ = r_taptree(S.x, SEQ_TIME | DELAY)
+    board_sweep = sweep_token(board_token, bytes(r_tap.scriptPubKey)[2:], S.x, SEQ_TIME | DELAY)
+    board_coin = Coin(A, bp["salt"], ASSET, bp["value"], bp["btap"], bp["bscripts"], board_sweep, bp["leaf_id"],
+                      b"\x02" + le16(len(rec_bytes)) + rec_bytes)
+    el = new_leaf("E")
+    cp4 = board_coin.value - MARGIN
+    out4 = [(ASSET, cp4 - MARGIN, bytes(el["tap"].scriptPubKey))]
+    parts4, re4 = hop([(board_coin, coin_at(bp["built"].tx, 0), cp4)], out4, txs)
+    e_coin = transfer_coin(parts4, out4, 0, el, ASSET, cp4 - MARGIN)
+    d = re4.json()
+    d["name"] = "reassignment creating %s" % e_coin.id.hex()
+    txs.append(d)
+
+    for name, coin in (("B1", b1_coin), ("A change", ach_coin), ("B2", b2_coin), ("C2", c2_coin), ("D", d_coin),
+                       ("E", e_coin)):
         records_out[name] = {"binary": (b"\x01" + coin.record).hex(), "id": coin.id.hex(), "owner": coin.owner.x.hex(),
                              "owner_nonce": label_hash("owner nonce", "chain %s" % name).hex()}
     return {
         "inputs": {"now": CREATED, "y_asset": display(Y_ASSET),
                    "rounds": [round1.serialize().hex(), round2.serialize().hex()],
+                   "boards": [bp["built"].tx.serialize().hex()],
                    "bases": {k: v[0] for k, v in bases.items()}, "margin": MARGIN},
         "records": records_out,
         "transactions": txs,

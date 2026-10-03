@@ -26,11 +26,12 @@
 //!   fee coin paying;
 //! - the out-of-round transfer ([`transfer`]): the checkpoint and the
 //!   reassignment, for one or several coins and owners, and the coin record a
-//!   receiver validates back to the batches it came from;
-//! - the board and its record ([`board`]), and the transactions that spend a
-//!   leaf outside the unroll ([`spend`]): its exit, its forfeit with the claim
-//!   and the refund, the offboard's unlock and reclaim, the margin or a fee
-//!   coin paying;
+//!   receiver validates back to the batches and boards it came from;
+//! - the board (`board-1`: the leaf's collaborative path and the owner's
+//!   conversion into the leaf) and its record ([`board`]), and the
+//!   transactions that spend a leaf outside the unroll ([`spend`]): its exit,
+//!   its forfeit with the claim and the refund, the offboard's unlock and
+//!   reclaim, the margin or a fee coin paying;
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]).
@@ -73,7 +74,7 @@ pub mod tree;
 pub mod unroll;
 pub mod witness;
 
-pub use board::{BoardRecord, ValidBoard};
+pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule};

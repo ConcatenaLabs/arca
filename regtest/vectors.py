@@ -107,6 +107,7 @@ SALT_CHECKPOINT = label_hash("salt", "checkpoint")
 SALT_RECV = label_hash("salt", "receiver leaf")
 SALT_CHANGE = label_hash("salt", "change leaf")
 SALT_HTLC = {k: label_hash("salt", "htlc " + k) for k in ("claim", "claim_both", "refund_both")}
+SALT_BOARD = label_hash("salt", "board")
 PREIMAGES = {i: label_hash("preimage", "entry%d" % i) for i in range(NLEAVES)}
 FORFEIT_PREIMAGE = label_hash("preimage", "forfeit")
 # The round the forfeit is given up for, and its connector output.
@@ -417,6 +418,12 @@ def generate():
                                                  "connector": {"round_txid": ROUND_TXID[::-1].hex(),
                                                                "vout": CONNECTOR_VOUT, "asset": hx(m_id)}},
                                      ftap, [("claim", 1), ("refund", 1)])
+    board_leaf, _ = leaf_tap(0, key=A, salt=SALT_BOARD)
+    board_leaf_spk = bytes(board_leaf.scriptPubKey)
+    btap, _ = board_taptree(A.x, S.x, SALT_BOARD, CTAG, X_ID, LEAF_VALUE, board_leaf_spk[2:])
+    outputs["board"] = output_json("board-1", {
+        "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_BOARD), "chain_tag": hx(CTAG), "exit_delay": DELAY,
+        "asset": hx(X_ID), "value": LEAF_VALUE, "leaf_program": hx(board_leaf_spk[2:])}, btap, [("collab", 1), ("convert", 1)])
     ctap_conn, _ = connector_taptree(S.x)
     outputs["connector"] = output_json("connector", {"operator": hx(S.x)}, ctap_conn, [("issue", 0)])
     cp_sweep = sweep_token(T_ID, R_PROG, S.x, W)
@@ -578,6 +585,17 @@ def generate():
     d["issues"] = hx(m_id)
     spends.append(d)
 
+    # ---- spends: the board -----------------------------------------------
+    # The owner's conversion into the leaf, a fee coin at input 1; and the
+    # board output spent by a pair over the leaf's message.
+    sp = Spend([("board/convert", txout(LEAF_VALUE, btap.scriptPubKey), 0xffffffff),
+                ("board/convert fee coin", txout(5_000, FEE_COIN_TAP.scriptPubKey), 0xffffffff)],
+               [txout(LEAF_VALUE, board_leaf_spk), fee_out(5_000)])
+    sp.witness(1, FEE_COIN_WITNESS)
+    spends.append(checksig_spend("board/convert", "board", "convert", btap, sp, 0, A))
+    spends.append(rebind_spend("board/collab m=1", "board", "collab", btap, CTAG, SALT_BOARD,
+                               txout(LEAF_VALUE, btap.scriptPubKey), [(X_ID, LEAF_VALUE - 600, OPERATOR_SPK)], [S, A]))
+
     # ---- spends: htlc-1 -----------------------------------------------
     h_spent = txout(LEAF_VALUE, htap.scriptPubKey)
     h_out = [(X_ID, LEAF_VALUE - 500, OPERATOR_SPK)]
@@ -621,7 +639,7 @@ def generate():
             "node_reserve": NODE_RESERVE, "path_leaf": PATH_LEAF,
             "salts": dict([("leaf%d" % j, hx(SALTS[j])) for j in range(NLEAVES)]
                           + [("checkpoint", hx(SALT_CHECKPOINT)), ("receiver leaf", hx(SALT_RECV)),
-                             ("change leaf", hx(SALT_CHANGE))]
+                             ("change leaf", hx(SALT_CHANGE)), ("board", hx(SALT_BOARD))]
                           + [("htlc " + k, hx(v)) for k, v in SALT_HTLC.items()]),
             "preimages": dict([("entry%d" % j, hx(PREIMAGES[j])) for j in range(NLEAVES)]
                               + [("forfeit", hx(FORFEIT_PREIMAGE)), ("payment", hx(PAYMENT_PREIMAGE))]),

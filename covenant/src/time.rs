@@ -39,6 +39,9 @@ pub enum TimeError {
 pub struct MedianTime(u32);
 
 impl MedianTime {
+	/// The latest median time there is.
+	pub const MAX: MedianTime = MedianTime(u32::MAX);
+
 	/// A median time; a value below the lock-time threshold is a height and is
 	/// refused.
 	pub fn from_consensus(t: u32) -> Result<MedianTime, TimeError> {
