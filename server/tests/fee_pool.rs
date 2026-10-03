@@ -62,6 +62,7 @@ async fn eight_boards_of_y(r: &mut Running, d: RelativeTime) -> Vec<(elements::s
 		let held = Held { key: *key, nonce: rec.owner_nonce, id: rec.leaf_id(), record: CoinRecord::Board(*rec) };
 		let new_key = keypair(&format!("new leaf of Y {}", i));
 		let nonce = random32();
+		common::client::hold_key(&new_key);
 		let w = OutputRequest::Leaf { asset: y, value: VALUE, template: Template::Vtxo1, owner: xonly(&new_key), owner_nonce: nonce, exit_delay: d };
 		let (body, id) = participation_body(&[&held], &[w], &[], None, s, r.chain);
 		assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");

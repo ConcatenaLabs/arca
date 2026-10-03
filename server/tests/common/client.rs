@@ -197,9 +197,27 @@ pub fn txid(s: &str) -> Txid {
 
 use server::participations::{participation_id, OutputRequest};
 
+/// The keys the tests' wallets want leaves under, by their x-only key, so
+/// that [`participation_body`] can prove each one, as a wallet does.
+static WANTED_KEYS: std::sync::Mutex<Vec<Keypair>> = std::sync::Mutex::new(Vec::new());
+
+/// Holds `key` as one the tests' wallets want leaves under.
+pub fn hold_key(key: &Keypair) {
+	let mut k = WANTED_KEYS.lock().unwrap();
+	if !k.iter().any(|h| h.x_only_public_key().0 == key.x_only_public_key().0) {
+		k.push(*key);
+	}
+}
+
+fn held_key(owner: &XOnlyPublicKey) -> Option<Keypair> {
+	WANTED_KEYS.lock().unwrap().iter().find(|k| k.x_only_public_key().0 == *owner).copied()
+}
+
 /// A leaf a participation wants for `key`: a fresh owner nonce of the
-/// wallet's, the specification's exit delay.
+/// wallet's, the specification's exit delay. The key is held, so the
+/// participation proves it.
 pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [u8; 32]) {
+	hold_key(key);
 	let nonce = random32();
 	(OutputRequest::Leaf {
 		asset, value, template: arca_covenant::Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
@@ -220,7 +238,8 @@ pub fn output_json(o: &OutputRequest) -> Value {
 }
 
 /// A participation's request body and its id: `coins` given up, each
-/// attested by its owner's key, for `outputs`, paying `fees`.
+/// attested by its owner's key, for `outputs`, each leaf's key proved when
+/// the tests hold it ([`hold_key`]), paying `fees`.
 pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(AssetId, u64)], not_before: Option<u32>,
 	operator: XOnlyPublicKey, chain: Chain) -> (Value, [u8; 32])
 {
@@ -230,9 +249,19 @@ pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(A
 	let inputs: Vec<Value> = coins.iter().map(|h| json!({
 		"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref()),
 	})).collect();
+	let proof = server::participations::key_proof_digest(&id);
+	let outputs: Vec<Value> = outputs.iter().map(|o| {
+		let mut j = output_json(o);
+		if let OutputRequest::Leaf { owner, .. } = o {
+			if let Some(k) = held_key(owner) {
+				j["leaf"]["key_proof"] = json!(hex(sign_digest(&k, &proof, &random32()).as_ref()));
+			}
+		}
+		j
+	}).collect();
 	let mut body = json!({
 		"inputs": inputs,
-		"outputs": outputs.iter().map(output_json).collect::<Vec<_>>(),
+		"outputs": outputs,
 		"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(),
 	});
 	if let Some(t) = not_before {

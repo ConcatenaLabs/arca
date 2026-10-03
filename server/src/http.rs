@@ -601,7 +601,12 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 		inputs.push(part::InputRequest { leaf_id: leaf_id(&i.leaf_id)?, attestation: sig(&i.attestation)? });
 	}
 	let mut outputs = Vec::with_capacity(req.outputs.len());
+	let mut key_proofs = Vec::with_capacity(req.outputs.len());
 	for o in &req.outputs {
+		key_proofs.push(match o {
+			api::WantedOutput::Leaf(l) => Some(sig(&l.key_proof)?),
+			api::WantedOutput::Offboard(_) => None,
+		});
 		outputs.push(match o {
 			api::WantedOutput::Leaf(l) => part::OutputRequest::Leaf {
 				asset: asset(&l.asset)?,
@@ -625,7 +630,7 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	}
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
-	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, fees, not_before }).await?;
+	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before }).await?;
 	Ok(Json(participation_status(&status)))
 }
 

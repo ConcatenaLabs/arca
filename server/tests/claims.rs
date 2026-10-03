@@ -124,6 +124,7 @@ async fn claims_keep_up(n: usize) {
 		let held: Vec<Held> = group.iter().map(|(k, rec, _)| Held { key: *k, nonce: rec.owner_nonce, id: rec.leaf_id(), record: CoinRecord::Board(*rec) }).collect();
 		let new_key = keypair(&format!("new leaf {} of {}", j, n));
 		let nonce = random32();
+		common::client::hold_key(&new_key);
 		let w = OutputRequest::Leaf { asset: x, value: VALUE * group.len() as u64, template: Template::Vtxo1, owner: xonly(&new_key),
 			owner_nonce: nonce, exit_delay: one };
 		let refs: Vec<&Held> = held.iter().collect();

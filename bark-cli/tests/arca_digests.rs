@@ -1,5 +1,6 @@
-//! The wallet's copies of the server's digests, the call authentication and
-//! the participation id, agree with the server's own for the same parts.
+//! The wallet's copies of the server's digests, the call authentication, the
+//! participation id and its key proof, agree with the server's own for the
+//! same parts.
 
 use std::str::FromStr;
 
@@ -8,7 +9,7 @@ use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey};
 use elements::{AssetId, BlockHash};
 
 use arca_covenant::{Chain, LeafId, MedianTime, RelativeTime, Template};
-use bark::arca::client::{auth_digest, participation_id, Wanted};
+use bark::arca::client::{auth_digest, key_proof_digest, participation_id, Wanted};
 use server::participations::OutputRequest;
 
 fn key(label: &str) -> Keypair {
@@ -55,5 +56,7 @@ fn the_wallets_digests_are_the_servers() {
 		let theirs = server::participations::participation_id(&chain, &s, &ids, &[OutputRequest::Leaf { asset: a, value: 5_000,
 			template: Template::Vtxo1, owner: k, owner_nonce: [3; 32], exit_delay: d }], &fees, nb);
 		assert_eq!(mine, theirs);
+		assert_eq!(key_proof_digest(&mine), server::participations::key_proof_digest(&theirs));
+		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");
 	}
 }

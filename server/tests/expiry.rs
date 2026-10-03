@@ -5,8 +5,9 @@
 //! 1. A participation whose forfeits have not come a day after its round was
 //!    found final expires: its coin is live again and is given up again in a
 //!    new participation, its new leaf is expired and never credited, its
-//!    forfeit is refused, and its new leaf's key cannot be wanted again. A
-//!    participation of the same round whose forfeits came is untouched.
+//!    forfeit is refused, and its new leaf's key is free again: the new
+//!    participation wants a leaf under it. A participation of the same round
+//!    whose forfeits came is untouched.
 //! 2. The refresh window and the exit deadline, on batch leaves of a round
 //!    whose first expiry is `E`: at `E` less six days a refresh is charged for
 //!    the day before the window; at `E` less four days it is free and runs, and
@@ -147,12 +148,10 @@ async fn a_participation_whose_forfeits_never_come_expires() {
 		other => panic!("an expired participation completed: {:?}", other.map(|_| ())),
 	}
 	assert_eq!(status(&r, &pa)["state"], "expired");
-	// A's new leaf keeps its key: no leaf may be wanted under it again.
-	let (ans, _, _) = submit(&r, &a_board, &a2, VALUE, 0, None);
-	refused(ans, 409, "key_reused");
-	// A's board is given up again, in a new participation.
-	let a3 = keypair("A, third");
-	let (ans, pa3, _) = submit(&r, &a_board, &a3, VALUE, 0, None);
+	// A's new leaf was never credited: its key is free again, and A's board,
+	// given back by the expiry, is given up again in a new participation that
+	// wants a leaf under that same key.
+	let (ans, pa3, _) = submit(&r, &a_board, &a2, VALUE, 0, None);
 	assert_eq!(ans.ok()["state"], "pending");
 	assert_ne!(pa3, pa);
 	assert_eq!(leaf_states(&r, &a), vec!["spent"]);
