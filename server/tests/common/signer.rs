@@ -45,7 +45,8 @@ impl SignerProcess {
 		let file = key_file(&dir, key, 0o600);
 		let socket = dir.join("signer.sock");
 		let child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap()])
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
+				"--record", dir.join("signer.record").to_str().unwrap()])
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();
@@ -54,6 +55,11 @@ impl SignerProcess {
 			std::thread::sleep(Duration::from_millis(50));
 		}
 		SignerProcess { child, dir, socket }
+	}
+
+	/// The signer's one-spend record.
+	pub fn record(&self) -> PathBuf {
+		self.dir.join("signer.record")
 	}
 
 	pub fn pid(&self) -> u32 {
@@ -73,7 +79,8 @@ impl SignerProcess {
 		let file = self.dir.join("operator.key");
 		let _ = key;
 		self.child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap()])
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
+				"--record", self.record().to_str().unwrap()])
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();

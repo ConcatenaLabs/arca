@@ -1,7 +1,7 @@
 //! The server's durable state, in PostgreSQL.
 //!
 //! The schema is `schema/V1__arca.sql` and the migrations after it
-//! (`schema/V2__watcher.sql`), built from nothing by [`Store::connect`] and
+//! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`), built from nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), an
@@ -56,6 +56,7 @@ pub use watcher::{NewTreeScript, NewWatcherTx, TreeOutput, TreeScriptKind, Watch
 const MIGRATIONS: &[(i32, &str)] = &[
 	(1, include_str!("../../schema/V1__arca.sql")),
 	(2, include_str!("../../schema/V2__watcher.sql")),
+	(3, include_str!("../../schema/V3__operator_scripts.sql")),
 ];
 
 /// An arbitrary key for the advisory lock that serialises migrations.

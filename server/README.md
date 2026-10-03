@@ -19,7 +19,8 @@ script of its own.
 
 The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V1__arca.sql`](schema/V1__arca.sql) and the migrations after it
-([`schema/V2__watcher.sql`](schema/V2__watcher.sql)). `Store::connect` builds it
+([`schema/V2__watcher.sql`](schema/V2__watcher.sql),
+[`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -32,7 +33,9 @@ requests can race past them:
   transaction that brings it on-chain follow. A key owns one leaf.
 - **Arca scripts.** Every leaf, board and checkpoint script the server has
   created or co-signed into appears once: a leaf script is never funded twice,
-  across batches, boards and transfers alike.
+  across batches, boards and transfers alike. The operator's connector script,
+  which every round pays, is recorded beside them, so the chain is watched for
+  it.
 - **Operator nonces.** A leaf's salt is built from two nonces, its owner's and
   its creator's. For a leaf the operator creates (a board, a leaf of a round)
   the creator's is the operator's: 32 random bytes, recorded as issued before
@@ -57,8 +60,38 @@ requests can race past them:
   unrolls are seen, and **everything the watcher published**, with what it
   acts for and the outpoints it spends.
 
-Back up the database: it holds what the chain does not, such as which leaves
-were spent off-chain and the records receivers collect from their mailboxes.
+### Keeping the database
+
+The database holds what the chain does not: which leaves were spent off-chain,
+the rounds the server built with their preimages, the records receivers
+collect from their mailboxes. It must never lose a commit, and never go back
+to an older state:
+
+- Run PostgreSQL with its durability settings on (`fsync`,
+  `synchronous_commit` and `full_page_writes`, the defaults), and keep every
+  commit off the machine as it happens: a synchronous standby
+  (`synchronous_standby_names`, with `synchronous_commit = on` or
+  `remote_apply`), or continuous WAL archiving (`archive_mode`,
+  `archive_command`) with base backups. A nightly dump alone loses whatever
+  came after it.
+- A restore is to the latest commit: promote the standby, or recover the base
+  backup with every archived WAL segment to the end. Never restore to an
+  earlier point, and never start the server on a copy taken earlier.
+- The signer's record (`arca-signer --record`) is never restored with the
+  database or from any older copy; it lives on its own durable storage and
+  only grows. It is what keeps `S` from co-signing a second spend of a coin
+  whatever the database says, so a database that has lost a transfer gets a
+  refusal (`double_spend`) where it would co-sign the second spend. A record
+  lost or rolled back opens that hole again, so the signer is not run without
+  its record whole.
+- The server refuses to start on a database that does not know what the
+  chain shows of the operator's: a transaction paying the operator's
+  connector script that is no round it knows (a round it built and forgot,
+  whose batches it would never release or sweep and whose participations
+  would run again), or a board spent by its collaborative path by a
+  transaction it neither built nor co-signed. It names each one. A database
+  that fails this check is older than the chain; restore it to its latest
+  commit rather than start it.
 
 ## Finality
 
@@ -504,7 +537,8 @@ never holds it. It loads the key from a file only its owner can read (it
 refuses one others can), listens on a Unix socket of mode 0600, and answers
 three requests: its public key; `S`'s signature over the rebindable message of
 a collaborative path, which it builds itself from the parts (the salt, the
-coin's asset and value, one to four committed outputs) on its own chain; and
+coin's asset and value, one to four committed outputs, and for a forfeit the
+forfeit's own parts) on its own chain; and
 `S`'s signature over the spend of one input of a transaction by one tapscript
 leaf, whose signature hash it computes itself from the transaction and the
 outputs every input spends, on its own chain. It signs a spend only by a leaf
@@ -515,9 +549,25 @@ no digest it is handed, no unroll authorisation and no release, and nothing
 by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
 signature it gets back against the message or signature hash it built.
 
+The signer is the one-spend authority. Before it returns a rebindable
+signature it appends the salt, the kind and the message's digest to its
+record, an append-only file it alone writes, and syncs it to disk; it reads
+the record whole when it starts, and refuses to start on a line it cannot
+read (a last line cut short by a crash was never answered, and is dropped).
+For each salt (a leaf's, a board's, a checkpoint's) it signs one spend, a
+message into anything but a forfeit output, or forfeits, one for each round's
+connector asset: a forfeit request names the forfeit's parts, and the signer
+rebuilds the forfeit output from them and checks it is the one output
+committed to. The same message again is signed again, so a request repeated
+after a signer outage completes; a second spend, a spend after a forfeit, a
+forfeit after a spend, and a second forfeit for one round are refused
+(`already_signed`), whatever the database holds. The server answers such a
+refusal with `double_spend`, and logs that its database has lost a spend.
+
 ## Running
 
-    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
+        --record /var/lib/arca/signer.record
     arcad /etc/arca/arcad.toml
 
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
@@ -752,7 +802,20 @@ rebindable message, and the spend of a clock's release whose signature verifies
 over the signature hash the library builds; it refuses a raw digest, a stray
 field, outputs out of range, an oversized line, a spend by the leaf's
 collaborative path or the owner's exit, an input out of range, spent outputs
-missing, and an input that spends no taproot output.
+missing, and an input that spends no taproot output. Its record: a spend
+signed again when asked again and a second spend refused; forfeits of one
+coin for two rounds signed and a second forfeit for one round refused; a spend
+after forfeits and a forfeit after a spend refused; forfeit parts that do not
+make the output refused and not recorded; the same refusals after a restart;
+a last line cut short dropped, and a line that does not read refusing the
+start.
+
+`tests/restore.rs` restores the database from an older copy. A board pays B,
+the copy forgets it, and the same board's spend to C is refused by the
+signer's record (`double_spend`, `already_signed`); B's coin validates and its
+checkpoint and reassignment are taken by the node, after which the server
+refuses to start, naming the board's spend it has no record of. A round built
+after the copy makes the server refuse to start on it, naming the round.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

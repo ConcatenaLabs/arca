@@ -12,7 +12,7 @@ use elements::AssetId;
 use serde::Deserialize;
 use tokio::task::JoinHandle;
 
-use arca_covenant::{Chain, RelativeTime};
+use arca_covenant::{BoardRecord, Chain, ConnectorPolicy, RelativeTime};
 use sequentia_ext::rpc::{Auth, Client};
 
 use crate::boards::Boards;
@@ -285,6 +285,44 @@ fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandl
 	})
 }
 
+/// What the chain shows of the operator's that the database does not know:
+/// a transaction paying the operator's connector script that is no round of
+/// the database's, and a board output spent by its collaborative path, which
+/// needs `S`, by a transaction the server neither built nor co-signed (the
+/// checkpoint of the board's transfer). Each is named.
+async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>, operator: elements::secp256k1_zkp::XOnlyPublicKey)
+	-> Result<Vec<String>, StartError>
+{
+	use elements::hashes::Hash;
+	let mut found = vec![];
+	let connector = ConnectorPolicy { operator }.script_pubkey();
+	for t in store.unknown_rounds(connector.as_bytes()).await.map_err(err("the database"))? {
+		found.push(format!("transaction {} pays the operator's connector script and is no round the database knows",
+			elements::Txid::from_byte_array(t)));
+	}
+	for (record, txid, vout, by, checkpoint) in store.board_spends_unbuilt().await.map_err(err("the database"))? {
+		let record = BoardRecord::from_bytes(&record).map_err(err("a board's record"))?;
+		let by = elements::Txid::from_byte_array(by);
+		let spender = match finality.call(move |c| c.transaction(&by)).await.map_err(err("the node"))? {
+			Some(t) => t,
+			None => continue,
+		};
+		let at = elements::OutPoint::new(elements::Txid::from_byte_array(txid), vout);
+		let script = spender.input.iter().find(|i| i.previous_output == at)
+			.and_then(|i| i.witness.script_witness.iter().rev().nth(1).cloned());
+		// The owner's conversion is its own; any other path needs S, and the
+		// server co-signed it only as the checkpoint of the board's transfer.
+		if script.as_deref() == Some(record.policy().convert_script().as_bytes())
+			|| checkpoint.is_some_and(|c| spender.output.iter().any(|o| o.script_pubkey.as_bytes() == c.as_slice()))
+		{
+			continue;
+		}
+		found.push(format!("transaction {} spends board {} by its collaborative path, which the database has no record of co-signing",
+			by, record.leaf_id()));
+	}
+	Ok(found)
+}
+
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
@@ -371,8 +409,19 @@ impl Server {
 				recovery_interval: Duration::from_secs(config.watcher.recovery_interval_seconds.max(1)),
 			});
 
-		// The first pass before anything is answered, so the chain is known.
+		// The first pass before anything is answered, so the chain is known,
+		// watching for the operator's connector script, which every round
+		// pays; then nothing is served from a database that does not know
+		// what the chain shows of the operator's.
+		store.watch_connector(ConnectorPolicy { operator }.script_pubkey().as_bytes()).await.map_err(err("the database"))?;
 		finality.sync().await.map_err(err("the first pass over the chain"))?;
+		let unknown = unknown_to_the_database(&store, &finality, operator).await?;
+		if !unknown.is_empty() {
+			return Err(StartError(format!(
+				"the chain shows what the database does not know, so the database is older than the chain (restored from an \
+				 older copy, or a commit lost) and serving from it could co-sign or build against what it forgot; restore the \
+				 database to its latest state (see the server's README) before starting: {}", unknown.join("; "))));
+		}
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
 		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval)];

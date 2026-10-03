@@ -504,7 +504,7 @@ impl Watcher {
 			let r = match kind {
 				ScriptKind::Leaf => self.answer_leaf(&leaf_id, op).await,
 				ScriptKind::Checkpoint => self.publish_reassignment(&leaf_id).await,
-				ScriptKind::Board => Ok(()),
+				ScriptKind::Board | ScriptKind::Connector => Ok(()),
 			};
 			Self::item(&format!("the {:?} of coin {} at {}", kind, hex(&leaf_id), op), r)?;
 		}

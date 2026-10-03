@@ -30,7 +30,11 @@
 //!   signature verifies.
 //!
 //! Then the transfer is recorded, inputs spent, before `S` signs anything
-//! (the signer runs in its own process: [`crate::signer`]). Each new coin's
+//! (the signer runs in its own process: [`crate::signer`]). The signer keeps
+//! its own record and co-signs one spend of each output whatever the
+//! database says, so a database restored from an older copy cannot co-sign a
+//! second spend: the signer refuses it, and so does the server
+//! (`double_spend`). Each new coin's
 //! record is checked by the server as a receiver would check it, stored, and
 //! posted to the receiver's mailbox. A request repeated byte for byte gets the
 //! same answer.
@@ -168,6 +172,7 @@ impl CosignError {
 			ScriptReused => "script_reused",
 			OpenReassignment(_) => "open_reassignment",
 			Mergeable(_) => "merge",
+			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Store(_) | Internal(_) => "internal",
@@ -410,8 +415,10 @@ impl Cosigner {
 		let mut sigs = Vec::with_capacity(n);
 		for (k, c) in checked.iter().enumerate() {
 			let cp_out = plan.checkpoint_output(k);
-			let cp = self.signer.rebind(&c.coin.leaf.salt, c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await?;
-			let re = self.signer.rebind(&plan.checkpoint(k).salt, c.coin.asset, plan.inputs[k].1, &outputs).await?;
+			let cp = self.signer.rebind(&c.coin.leaf.salt, c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await
+				.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let re = self.signer.rebind(&plan.checkpoint(k).salt, c.coin.asset, plan.inputs[k].1, &outputs).await
+				.map_err(|e| lost_spend(e, &c.coin.id))?;
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
 			}
@@ -481,6 +488,17 @@ impl Cosigner {
 	pub fn finality(&self) -> &Arc<FinalityService> {
 		&self.finality
 	}
+}
+
+/// The signer's refusal, logged loudly when its record holds another spend
+/// of the coin: the database let through a second spend, so it has lost one
+/// the signer co-signed.
+fn lost_spend(e: SignerError, leaf: &LeafId) -> CosignError {
+	if let SignerError::AlreadySigned(m) = &e {
+		log::error!("the signer refused a second spend of leaf {} that the database allowed: the database has lost a spend \
+			the signer co-signed ({})", leaf, m);
+	}
+	CosignError::Signer(e)
 }
 
 fn sig_bytes(s: &Signature) -> [u8; 64] {

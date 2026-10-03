@@ -39,7 +39,8 @@ impl SignerProcess {
 		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 		let socket = dir.join("signer.sock");
 		let child = Command::new(signer_exe())
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap()])
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
+				"--record", dir.join("signer.record").to_str().unwrap()])
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();
