@@ -466,7 +466,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
-| `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records |
+| `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records; a round's leaf is served with an empty record until its participation's preimage went out |
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
