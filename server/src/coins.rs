@@ -9,12 +9,18 @@
 //! own leaf included, may have been seen paid on the chain, in a block or in
 //! the mempool: an Arca leaf on the chain past its exit delay can be exited by
 //! its owner at once, so the server takes no off-chain spend of it.
+//!
+//! A coin resting on a board is taken only within the board's dates
+//! ([`Params::BOARD_LIFETIME`]): the board's service expiry, 28 days after the
+//! median time of the block that confirms it, less a horizon the caller
+//! names (the exit deadline for a transfer, a day for a refresh).
 
 use elements::hashes::Hash;
 use elements::Transaction;
 
 use arca_covenant::{CoinRecord, LeafId, TransferError, ValidCoin, WalletPolicy};
 
+use crate::params::Params;
 use crate::store::{BoardState, LeafState, RoundState, Store, StoreError};
 
 /// A coin given up, checked.
@@ -24,6 +30,20 @@ pub struct Checked {
 	pub coin: ValidCoin,
 	/// The transactions its bases came from: each board's.
 	pub bases: Vec<Transaction>,
+	/// The earliest service expiry of the boards it rests on (median time),
+	/// of those confirmed; `None` for a coin resting on no board.
+	pub board_expiry: Option<u32>,
+}
+
+impl Checked {
+	/// When the coin expires as the operator serves it: its first expiry, or
+	/// the service expiry of a board it rests on, whichever comes first.
+	pub fn expiry(&self) -> arca_covenant::MedianTime {
+		match self.board_expiry.and_then(|e| arca_covenant::MedianTime::from_consensus(e).ok()) {
+			Some(b) if b < self.coin.expiry => b,
+			_ => self.coin.expiry,
+		}
+	}
 }
 
 /// Why a coin cannot be given up.
@@ -44,6 +64,11 @@ pub enum CoinError {
 	OnChain { leaf: LeafId, what: String },
 	#[error("leaf {leaf}'s coin does not check out: {error}")]
 	InvalidCoin { leaf: LeafId, error: TransferError },
+	/// It rests on a board whose service ends at `expiry`, less than
+	/// `horizon` seconds ahead.
+	#[error("leaf {leaf} rests on a board whose service ends at median time {expiry}: it is taken here only until {horizon} s before \
+		that (a transfer up to its exit deadline, a refresh up to a day before)")]
+	PastBoardDate { leaf: LeafId, expiry: u32, horizon: u32 },
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
@@ -83,6 +108,31 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 	Ok(())
 }
 
+/// The earliest service expiry of the boards `record` rests on, each the
+/// median time of the block of the followed chain that holds it plus
+/// [`Params::BOARD_LIFETIME`]; boards in no block are passed over (a coin on
+/// one is not live). `None` when it rests on no board in a block.
+pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u32>, CoinError> {
+	let mut boards = vec![];
+	fn collect(r: &CoinRecord, out: &mut Vec<[u8; 32]>) {
+		match r {
+			CoinRecord::Board(b) => out.push(b.leaf_id().0),
+			CoinRecord::Leaf { .. } => {},
+			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out)),
+		}
+	}
+	collect(record, &mut boards);
+	let mut earliest: Option<u32> = None;
+	for b in boards {
+		let Some(row) = store.board(&b).await? else { continue };
+		if let Some(block) = store.tx_location(&row.txid).await? {
+			let e = Params::board_expiry(block.median_time.min(u32::MAX as u64) as u32);
+			earliest = Some(earliest.map_or(e, |x| x.min(e)));
+		}
+	}
+	Ok(earliest)
+}
+
 /// The coin `id`, resolved from its record under `policy`, with nothing
 /// checked of its state or of the chain: what a step already taken for it
 /// is verified again against.
@@ -95,23 +145,34 @@ pub async fn resolve(store: &Store, policy: &WalletPolicy, id: &LeafId) -> Resul
 	if coin.id != *id {
 		return Err(CoinError::Internal(format!("the record of leaf {} gives the id {}", id, coin.id)));
 	}
-	Ok(Checked { record, coin, bases: found })
+	let board_expiry = board_expiry(store, &record).await?;
+	Ok(Checked { record, coin, bases: found, board_expiry })
 }
 
 /// Checks the coin `id` given up by `holder` (a transfer, or a
-/// participation): see the [module documentation](self). A coin already
-/// spent by `holder` itself passes, so a repeated request gets its answer.
-pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32]) -> Result<Checked, CoinError> {
+/// participation): see the [module documentation](self). A coin resting on a
+/// board is taken only while the board's service expiry lies more than
+/// `board_horizon` seconds ahead. A coin already spent by `holder` itself
+/// passes, the board's dates included, so a repeated request gets its answer.
+pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], board_horizon: u32)
+	-> Result<Checked, CoinError>
+{
 	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;
+	let repeat = row.state == LeafState::Spent && row.spent_by.as_deref() == Some(&holder[..]);
 	match row.state {
 		LeafState::Live => {},
-		LeafState::Spent if row.spent_by.as_deref() == Some(&holder[..]) => {},
+		LeafState::Spent if repeat => {},
 		LeafState::Spent => return Err(CoinError::Spent(*id)),
 		LeafState::Pending => return Err(CoinError::NotLive(*id, "pending")),
 		LeafState::Lost => return Err(CoinError::NotLive(*id, "lost")),
 		LeafState::Expired => return Err(CoinError::NotLive(*id, "expired")),
 	}
-	let Checked { record, coin, bases: found } = resolve(store, policy, id).await?;
+	let Checked { record, coin, bases: found, board_expiry } = resolve(store, policy, id).await?;
+	if let Some(e) = board_expiry {
+		if !repeat && (policy.now.to_consensus_u32() as u64) + board_horizon as u64 >= e as u64 {
+			return Err(CoinError::PastBoardDate { leaf: *id, expiry: e, horizon: board_horizon });
+		}
+	}
 	// Its own leaf and every leaf and checkpoint it descends from.
 	let mut scripts = vec![coin.output().script_pubkey.to_bytes()];
 	scripts.extend(coin.lineage().iter().map(|o| o.output.script_pubkey.to_bytes()));
@@ -136,5 +197,5 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 			});
 		}
 	}
-	Ok(Checked { record, coin, bases: found })
+	Ok(Checked { record, coin, bases: found, board_expiry })
 }

@@ -399,6 +399,8 @@ fn board_status(s: &BoardStatus) -> api::BoardStatus {
 			crate::store::BoardState::Lost => "lost",
 		}.into(),
 		finality: finality_name(&s.finality),
+		exit_deadline: s.expiry.map(|e| e.saturating_sub(arca_covenant::WalletPolicy::EXIT_DEADLINE)),
+		expiry: s.expiry,
 	}
 }
 
@@ -432,6 +434,11 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		participations: api::ParticipationsInfo {
 			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,
 			forfeit_deadline_seconds: Params::FORFEIT_DEADLINE,
+		},
+		boards: api::BoardsInfo {
+			lifetime_seconds: Params::BOARD_LIFETIME,
+			exit_deadline_seconds: arca_covenant::WalletPolicy::EXIT_DEADLINE,
+			refresh_until_seconds: Params::ROUND_HORIZON,
 		},
 		max_request_bytes: app.max_request as u64,
 	})

@@ -210,6 +210,13 @@ impl Store {
 		Ok(rows.iter().map(|r| r.get(0)).collect())
 	}
 
+	/// The transfer that made the coin `leaf_id`, when a transfer did.
+	pub async fn made_by_transfer(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT transfer_id FROM transfer_output WHERE leaf_id = $1", &[&&leaf_id[..]]).await?;
+		r.map(|r| array32(r.get(0), "transfer id")).transpose()
+	}
+
 	/// Whether `leaf_id` is the input of a transfer: an open out-of-round
 	/// reassignment, until a round takes the coins it made.
 	pub async fn spent_by_transfer(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {

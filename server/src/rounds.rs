@@ -236,12 +236,12 @@ impl Rounds {
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
 		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
-			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id).await {
+			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, Params::ROUND_HORIZON).await {
 				Ok(_) => {},
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
 				Err(coins::CoinError::InvalidCoin {
 					error: arca_covenant::TransferError::Record(arca_covenant::RecordError::ExpiryTooSoon { .. }), ..
-				}) => {
+				}) | Err(coins::CoinError::PastBoardDate { .. }) => {
 					let voided = self.store.void_participation(&p.id).await?;
 					log::warn!("participation {} can never run: coin {} is past its last round time (voided: {})",
 						crate::signer::hex(&p.id), LeafId(i.leaf_id), voided);

@@ -100,6 +100,10 @@ pub struct BoardStatus {
 	pub vout: u32,
 	pub state: BoardState,
 	pub finality: Finality,
+	/// The board's service expiry, [`Params::BOARD_LIFETIME`] after the
+	/// median time of the block that holds its transaction; `None` while it
+	/// is in no block of the followed chain.
+	pub expiry: Option<u32>,
 }
 
 /// See the [module documentation](self).
@@ -203,7 +207,8 @@ impl Boards {
 		};
 		let txid = Txid::from_byte_array(b.txid);
 		let finality = self.finality.status(&txid).await.map_err(|e| BoardError::Internal(e.to_string()))?;
-		Ok(Some(BoardStatus { leaf_id: *leaf_id, txid, vout: b.vout, state: b.state, finality }))
+		let expiry = self.store.tx_location(&b.txid).await?.map(|block| Params::board_expiry(block.median_time.min(u32::MAX as u64) as u32));
+		Ok(Some(BoardStatus { leaf_id: *leaf_id, txid, vout: b.vout, state: b.state, finality, expiry }))
 	}
 
 	/// Credits the board if final, uncredits it if it no longer is, marks it

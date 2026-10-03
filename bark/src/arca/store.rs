@@ -127,8 +127,11 @@ pub struct CoinRow {
 	/// hand), `spent`, `exiting`, `exited` or `lost`.
 	pub state: String,
 	pub note: String,
-	/// The earliest first expiry of the batches it rests on (median time);
-	/// `u32::MAX` for a coin from boards alone.
+	/// When the coin expires as the operator serves it (median time): the
+	/// earliest first expiry of the batches it rests on, or the service
+	/// expiry of a board it rests on (28 days after the median time of the
+	/// block that confirms the board), whichever comes first; `u32::MAX`
+	/// while a coin from boards alone has none of its boards in a block.
 	pub expiry: u32,
 	/// The txids of the rounds and boards it rests on.
 	pub bases: Vec<String>,
@@ -351,6 +354,11 @@ impl Store {
 
 	pub fn set_coin_spent(&self, leaf_id: &str, by: &str) -> Result<(), Error> {
 		self.conn.execute("UPDATE coin SET state = 'spent', spent_by = ?2, note = '' WHERE leaf_id = ?1", params![leaf_id, by]).map_err(db)?;
+		Ok(())
+	}
+
+	pub fn set_coin_expiry(&self, leaf_id: &str, expiry: u32) -> Result<(), Error> {
+		self.conn.execute("UPDATE coin SET expiry = ?2 WHERE leaf_id = ?1", params![leaf_id, expiry as i64]).map_err(db)?;
 		Ok(())
 	}
 

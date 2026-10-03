@@ -61,7 +61,8 @@ async fn participation_accepted_and_refused() {
 	let b = keypair("B");
 	let (b_coin, b_tx) = credited_board(&mut r, &b).await;
 
-	// A board never expires, so its refresh pays the whole fee.
+	// A board just confirmed has its whole service ahead of it (28 days), so
+	// its refresh pays the whole fee.
 	let fee = VALUE * REFRESH_PPM / 1_000_000;
 	let a2 = keypair("A, new leaf");
 	let (want_a2, _) = want_leaf(&a2, x, VALUE - fee);

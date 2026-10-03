@@ -1433,6 +1433,118 @@ async fn a_final_refund_orphaned_with_its_anchor_gives_way_to_the_claim_and_the_
 }
 
 // ---------------------------------------------------------------------------
+// A board's dates
+// ---------------------------------------------------------------------------
+
+/// Review R7c's F3 turned around. A boards and pays B twice out of round,
+/// keeping change that rests on two reassignments from its board. B
+/// refreshes both coins, its round final and its forfeits handed over. A's
+/// change is still live off chain: the watcher publishes nothing of the
+/// shared lineage, and A's wallet finds nothing of it on the chain. Every
+/// coin shows the board's dates, and B's wallet said so when it received
+/// its coins. After the board's expiry the operator brings the lineage on the
+/// chain and collects B's forfeited coins; A's change, on the chain with it,
+/// is A's to exit, on a date both of them knew.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receivers_refresh_leaves_the_senders_change_live_until_the_boards_expiry() {
+	use elements::hashes::Hash;
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("F3A");
+	let b = Arca::new("F3B");
+	let board = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await.remove(0);
+	b.ok(&create_args(&url, &r.node_url()));
+	let mut received = vec![];
+	for v in ["300000", "100000"] {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		a.ok(&["send", &req, "--amount", v, "--asset", &x.to_string()]);
+		let m = b.ok(&["mailbox"]);
+		let got = m["accepted"][0].clone();
+		println!("F3 B receives {}: {}", v, got);
+		received.push(got);
+	}
+	let change_id = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["state"] == "live" && c["kind"] == "transfer")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).expect("A's change");
+	// B refreshes everything it holds: the two coins from A.
+	b.ok(&["participate"]);
+	final_round(&r).await;
+	let s = b.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	let given: Vec<String> = received.iter().map(|g| g["leaf_id"].as_str().unwrap().to_string()).collect();
+	for _ in 0..4 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	r.server.watcher.pass().await.unwrap();
+	let log = r.server.store.watcher_log().await.unwrap();
+	println!("F3 the watcher's log after B's refresh: {:?}", log.iter().map(|w| (&w.kind, &w.detail)).collect::<Vec<_>>());
+	assert!(!log.iter().any(|w| w.kind == "checkpoint" || w.kind == "reassignment"), "nothing of the shared lineage is published");
+	let (ok, v, stderr) = a.run_full(&["sync"]);
+	assert!(ok, "{}", v);
+	println!("F3 A's sync after B's refresh: recheck {} exits {}", v["recheck"], v["exits"]);
+	assert!(!stderr.contains("exiting") && v["recheck"]["changes"] == json!([]), "A's coin is not touched: {} {}", stderr, v);
+	assert_eq!(coin_of(&a, &change_id)["state"], "live", "A's change is still live off chain");
+
+	// The board's dates: those of a batch made when it confirmed.
+	let CoinRecord::Board(rec) = record_of(&a, &board) else { panic!("a board") };
+	let board_txid = elements::Txid::from_byte_array(r.server.store.board(&rec.leaf_id().0).await.unwrap().unwrap().txid);
+	let confirmed = rpc(&r, "getblockheader", &[json!(block_of(&r, &board_txid.to_string()))])["mediantime"].as_u64().unwrap() as u32;
+	let expiry = confirmed + 28 * 86_400;
+	for got in &received {
+		assert!(got["board"]["note"].as_str().unwrap_or("").contains("rests on a board"), "the wallet said so: {}", got);
+		assert_eq!(got["board"]["expiry"], json!(expiry));
+		assert_eq!(got["board"]["exit_deadline"], json!(expiry - 3 * 86_400));
+	}
+	let change = coin_of(&a, &change_id);
+	println!("F3 A's change: {}", change);
+	assert_eq!(change["rests_on_board"], true);
+	assert_eq!(change["expiry"], json!(expiry), "the change carries the board's dates");
+	assert_eq!(change["exit_deadline"], json!(expiry - 3 * 86_400));
+
+	// The board's expiry passes: the operator collects B's forfeited coins,
+	// bringing the lineage on the chain, and A's change with it.
+	let now = rpc(&r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, expiry - now + 3_600));
+	r.bury().await;
+	r.synced().await;
+	// Each of B's coins forfeited on the chain, and that forfeit claimed.
+	let claimed = |r: &Running| {
+		let log = tokio::runtime::Handle::current().block_on(r.server.store.watcher_log()).unwrap();
+		let claims: Vec<Transaction> = log.iter().filter(|w| w.kind == "claim").map(|w| elements::encode::deserialize(&w.tx).unwrap()).collect();
+		given.iter().all(|l| log.iter().filter(|w| w.kind == "forfeit" && w.subject == l.parse::<LeafId>().unwrap().0.to_vec())
+			.any(|f| claims.iter().any(|c| c.input.iter().any(|i| i.previous_output.txid.to_byte_array() == f.txid))))
+	};
+	for _ in 0..12 {
+		if tokio::task::block_in_place(|| claimed(&r)) {
+			break;
+		}
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	let log = r.server.store.watcher_log().await.unwrap();
+	for w in &log {
+		println!("F3 watcher: {} {}", w.kind, w.detail);
+	}
+	assert!(tokio::task::block_in_place(|| claimed(&r)), "the operator claimed B's two forfeited coins");
+	let first = log.iter().find(|w| w.kind == "checkpoint").expect("the board's checkpoint");
+	let at = rpc(&r, "getblockheader", &[json!(block_of(&r, &elements::Txid::from_byte_array(first.txid).to_string()))])["mediantime"]
+		.as_u64().unwrap() as u32;
+	println!("F3 the lineage reached the chain in a block of median time {}; the board's expiry {}", at, expiry);
+	assert!(at >= expiry, "not before the board's expiry");
+	let s = a.ok(&["sync"]);
+	println!("F3 A's sync once the lineage is on the chain: recheck {}", s["recheck"]);
+	assert_eq!(coin_of(&a, &change_id)["state"], "exiting", "A's change is on the chain, A's to exit: {}", coin_of(&a, &change_id));
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Margins: the operator's, within the wallet's bound
 // ---------------------------------------------------------------------------
 

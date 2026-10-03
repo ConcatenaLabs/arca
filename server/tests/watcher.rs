@@ -22,9 +22,14 @@
 //!    authorisation, each lowest node reclaimed with an atom of each round's
 //!    connector asset.
 //! 6. A coin paid out of round from a board and then refreshed by its
-//!    receiver rests on that board alone and never expires: the watcher
-//!    publishes the board's checkpoint, the reassignment and the coin's
-//!    forfeit, and claims it.
+//!    receiver rests on that board alone, which no batch sweeps: the board
+//!    carries the dates of a batch made when it confirmed (`board_status`).
+//!    While the sender's change rests live on the same lineage the watcher
+//!    publishes nothing of it. Past the board's exit deadline the change is
+//!    refused in a transfer and taken into a refresh; with no live coin left
+//!    on the lineage the watcher publishes the board's checkpoint, the
+//!    reassignment and both forfeits at once, before the board's expiry, and
+//!    claims them.
 //! 5. An anchor-driven reorganisation: the parent orphans the block a round
 //!    and the watcher's answer to a stale exit are anchored to; the node
 //!    disconnects them, the nursery broadcasts them again unchanged, and they
@@ -469,45 +474,91 @@ async fn an_anchor_driven_reorganisation_takes_out_a_round_and_the_answers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refreshed_coin_paid_from_a_board_comes_back() {
+async fn a_refreshed_coin_paid_from_a_board_waits_for_the_change_and_then_comes_back() {
 	let mut r = start().await;
 	let (x, s) = (r.x, xonly(&r.s));
 	let a = keypair("W6 A");
 	let ca = board_coin(&mut r, &a).await;
 	let (b, a2) = (keypair("W6 B"), keypair("W6 A, change"));
 	let (b_leaf, b_nonce) = new_leaf(&b);
-	let (a2_leaf, _) = new_leaf(&a2);
+	let (a2_leaf, a2_nonce) = new_leaf(&a2);
 	let kept = VALUE - 2_000;
-	let outputs = vec![(x, 600_000, b_leaf), (x, kept - 600_000 - 2_000, a2_leaf)];
+	let change = kept - 600_000 - 2_000;
+	let outputs = vec![(x, 600_000, b_leaf), (x, change, a2_leaf)];
 	let done = r.http.post("cosign_transfer", &transfer_body(&[(&ca.held, ca.valid(&r), kept)], &outputs, s, r.chain)).ok();
 	let transfer: Vec<u8> = unhex(done["transfer_id"].as_str().unwrap());
 	let (_, b_id, b_record) = r.http.mailbox(&b, &r.chain, 0)[0].clone();
 	let cb = Coin { held: common::client::Held { key: b, nonce: b_nonce, id: b_id, record: b_record }, bases: ca.bases.clone() };
-	println!("A paid B 600000 of X from its board; B's coin rests on that board alone and never expires");
+	let (_, a2_id, a2_record) = r.http.mailbox(&a2, &r.chain, 0)[0].clone();
+	let ca2 = Coin { held: common::client::Held { key: a2, nonce: a2_nonce, id: a2_id, record: a2_record }, bases: ca.bases.clone() };
+	println!("A paid B 600000 of X from its board and kept {} as change; both coins rest on A's board", change);
 
 	// B refreshes its coin into a round: the operator now holds B's forfeit,
-	// and funded B's new leaf.
+	// and funded B's new leaf. A's change still rests on the lineage, live:
+	// the watcher publishes none of it, whatever B did.
 	let b2 = keypair("W6 B, round");
 	let got = refresh(&mut r, &[(&cb, &b2)]).await;
 	println!("B's coin refreshed into round {}", got[0].round.txid());
-
-	// The watcher brings B's old coin on-chain and claims its forfeit: the
-	// board's checkpoint, the reassignment, the forfeit, the claim.
-	let before = x_balance(&r).await;
 	let bid = b_id.0.to_vec();
-	drive(&r, "B's old coin, resting on A's board", 10, |l| has(l, "claim", &bid)).await;
+	for _ in 0..4 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	let l = log(&r).await;
+	assert!(!has(&l, "checkpoint", &ca.held.id.0) && !has(&l, "reassignment", &transfer) && !has(&l, "forfeit", &bid),
+		"nothing of the lineage is published while A's change rests on it: {:?}", l.iter().map(|w| (&w.kind, &w.detail)).collect::<Vec<_>>());
+	println!("after four passes and four blocks the watcher has published nothing of the lineage: A's change is live on it");
+	let ld = r.http.post("leaf_data", &serde_json::json!({"auth": r.http.auth("leaf_data", &b2, &r.chain)})).ok();
+	assert_eq!(ld["leaves"][0]["state"], "live", "B's new leaf is live");
+
+	// The board's dates: those of a batch made when it confirmed.
+	let board_tx = ca.bases[0].txid();
+	let block: serde_json::Value = r.rt.client().call("getrawtransaction", &[serde_json::json!(board_tx.to_string()), serde_json::json!(true)]).unwrap();
+	let header: serde_json::Value = r.rt.client().call("getblockheader", &[block["blockhash"].clone()]).unwrap();
+	let confirmed = header["mediantime"].as_u64().unwrap() as u32;
+	let st = r.http.board_status(&ca.held.id).ok();
+	println!("A's board: {}", st);
+	assert_eq!(st["expiry"].as_u64(), Some((confirmed + 28 * 86_400) as u64), "28 days after the median time of its block");
+	assert_eq!(st["exit_deadline"].as_u64(), Some((confirmed + 25 * 86_400) as u64), "three days before");
+	let info = r.http.get("info").ok();
+	assert_eq!(info["boards"], serde_json::json!({"lifetime_seconds": 2_419_200, "exit_deadline_seconds": 259_200, "refresh_until_seconds": 86_400}));
+	let expiry = confirmed + 28 * 86_400;
+
+	// Past the board's exit deadline: A's change is no longer co-signed into
+	// a transfer, and is taken into a refresh.
+	let now = common::rounds::mtp(&r).to_consensus_u32();
+	advance_mtp(&r, expiry - 3 * 86_400 + HOUR - now).await;
+	r.synced().await;
+	let now = common::rounds::mtp(&r).to_consensus_u32();
+	assert!(now > expiry - 3 * 86_400 && now < expiry - 86_400, "between the exit deadline and the last refresh time: {}", now);
+	let (a3_leaf, _) = new_leaf(&keypair("W6 A, change again"));
+	let refused = r.http.post("cosign_transfer", &transfer_body(&[(&ca2.held, ca2.valid(&r), change - 2_000)],
+		&[(x, change - 4_000, a3_leaf)], s, r.chain));
+	println!("A's transfer of its change past the board's exit deadline: {} {:?}", refused.status, refused.refusal());
+	assert_eq!(refused.refusal().0, "invalid_coin");
+	assert!(refused.refusal().1.contains("exit deadline has passed"), "{:?}", refused.refusal());
+	let a4 = keypair("W6 A, round");
+	let got_a = refresh(&mut r, &[(&ca2, &a4)]).await;
+	println!("A's change refreshed past the exit deadline into round {}", got_a[0].round.txid());
+
+	// No coin another holder may hold rests on the lineage any more: the
+	// watcher brings it on-chain at once, before the board's expiry, and
+	// claims both forfeits.
+	let before = x_balance(&r).await;
+	let a2id = a2_id.0.to_vec();
+	drive(&r, "the lineage of A's board, both coins on it given up", 12, |l| has(l, "claim", &bid) && has(l, "claim", &a2id)).await;
 	settle(&r).await;
+	assert!(common::rounds::mtp(&r).to_consensus_u32() < expiry, "before the board's expiry");
 	let l = log(&r).await;
 	assert!(final_of(&l, "checkpoint", &ca.held.id.0), "A's board checkpointed from the board output");
-	assert!(final_of(&l, "reassignment", &transfer), "the reassignment published, B's old leaf on the chain");
+	assert!(final_of(&l, "reassignment", &transfer), "the reassignment published");
 	assert!(final_of(&l, "forfeit", &bid) && final_of(&l, "claim", &bid), "B's forfeit published and claimed");
+	assert!(final_of(&l, "forfeit", &a2id) && final_of(&l, "claim", &a2id), "A's forfeit published and claimed");
 	let cp = l.iter().find(|w| w.kind == "checkpoint").unwrap();
 	let cptx: Transaction = elements::encode::deserialize(&cp.tx).unwrap();
 	assert_eq!(cptx.input[0].previous_output, ca.valid(&r).board().unwrap().1, "the checkpoint spends the board output itself");
 	let after = x_balance(&r).await;
-	println!("the wallet holds {} more of X: B's 600000 back, less the fees", after as i64 - before as i64);
-	assert!(after > before + 590_000);
-	// B's new leaf is untouched and live.
-	let ld = r.http.post("leaf_data", &serde_json::json!({"auth": r.http.auth("leaf_data", &b2, &r.chain)})).ok();
-	assert_eq!(ld["leaves"][0]["state"], "live");
+	println!("the wallet holds {} more of X: both coins back, less the fees", after as i64 - before as i64);
+	assert!(after > before + 590_000 + change - 20_000);
 }

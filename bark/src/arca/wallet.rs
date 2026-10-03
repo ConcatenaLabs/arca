@@ -150,6 +150,29 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 	Ok(())
 }
 
+/// How long the operator serves a board, and every coin resting on it, from
+/// the median time of the block that confirms the board: a batch's lifetime,
+/// 28 days, so a board carries the dates a batch made then would have
+/// (`info.boards`). Its exit deadline is three days before
+/// ([`WalletPolicy::EXIT_DEADLINE`]): up to it the operator co-signs spends
+/// of a coin resting on the board; after it, it takes the coin only into a
+/// refresh, up to [`BOARD_REFRESH_UNTIL`] before the expiry; from the expiry
+/// it may bring the coin's lineage on the chain.
+pub const BOARD_LIFETIME: u32 = 28 * 86_400;
+
+/// How long before a board's service expiry a coin resting on it is still
+/// taken into a refresh: a day.
+pub const BOARD_REFRESH_UNTIL: u32 = 86_400;
+
+/// Whether `record`'s lineage holds a board.
+pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
+	match record {
+		CoinRecord::Board(_) => true,
+		CoinRecord::Leaf { .. } => false,
+		CoinRecord::Transfer(t) => t.inputs.iter().any(|i| rests_on_board(&i.coin)),
+	}
+}
+
 /// What the re-check finds of one coin.
 enum Checked {
 	/// It holds, in this state, with this note.
@@ -341,6 +364,12 @@ impl Wallet {
 	/// created: the same chain and the same operator key.
 	pub(crate) fn server_info(&self) -> Result<Value, Error> {
 		let info = self.server.info()?;
+		if let Some(l) = info["boards"]["lifetime_seconds"].as_u64() {
+			if l < BOARD_LIFETIME as u64 {
+				return Err(Error::Refused(format!("the server serves a board for {} s from its confirmation; this wallet counts on {} s, \
+					and would show dates the operator does not keep", l, BOARD_LIFETIME)));
+			}
+		}
 		if info["genesis_hash"].as_str() != Some(&self.genesis.genesis_hash().to_string()) {
 			return Err(Error::Refused(format!("the server now serves the chain of genesis {}; this wallet is on {}",
 				info["genesis_hash"], self.genesis.genesis_hash())));
@@ -472,6 +501,38 @@ impl Wallet {
 		Ok(Assessed { valid, bases })
 	}
 
+	/// The earliest service expiry of the boards `record` rests on, each
+	/// [`BOARD_LIFETIME`] after the median time of the block of the active
+	/// chain that holds it (`bases`, as [`Self::assess`] finds them); `None`
+	/// when no board it rests on is in a block.
+	pub(crate) fn board_expiry(&self, record: &CoinRecord, bases: &[(Transaction, Finality)]) -> Result<Option<u32>, Error> {
+		fn boards(r: &CoinRecord, out: &mut Vec<TxOut>) {
+			match r {
+				CoinRecord::Board(b) => out.push(b.output().txout()),
+				CoinRecord::Leaf { .. } => {},
+				CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| boards(&i.coin, out)),
+			}
+		}
+		let mut outs = vec![];
+		boards(record, &mut outs);
+		let mut earliest: Option<u32> = None;
+		for o in outs {
+			let Some(h) = bases.iter().find(|(t, _)| t.output.contains(&o)).and_then(|(_, f)| f.height()) else { continue };
+			if let Some(m) = self.chain.median_time_at(h)? {
+				let e = m.saturating_add(BOARD_LIFETIME);
+				earliest = Some(earliest.map_or(e, |x| x.min(e)));
+			}
+		}
+		Ok(earliest)
+	}
+
+	/// When a coin expires as the operator serves it: its first expiry, or
+	/// the service expiry of a board it rests on, whichever comes first.
+	pub(crate) fn service_expiry(&self, record: &CoinRecord, a: &Assessed) -> Result<u32, Error> {
+		let e = a.valid.expiry.to_consensus_u32();
+		Ok(self.board_expiry(record, &a.bases)?.map_or(e, |b| b.min(e)))
+	}
+
 	/// The store's row for a coin the wallet accepts.
 	pub(crate) fn row(&self, record: &CoinRecord, a: &Assessed, state: &str, note: &str) -> Result<CoinRow, Error> {
 		let (_, nonce) = owner_of(record);
@@ -482,7 +543,7 @@ impl Wallet {
 		Ok(CoinRow {
 			leaf_id: a.valid.id.to_string(), owner_nonce: nonce, kind: kind_of(record).into(),
 			asset: a.valid.asset.to_string(), value: a.valid.value, record: bytes, salt: a.valid.leaf.salt,
-			state: state.into(), note: note.into(), expiry: a.valid.expiry.to_consensus_u32(),
+			state: state.into(), note: note.into(), expiry: self.service_expiry(record, a)?,
 			bases: a.bases.iter().map(|(t, _)| t.txid().to_string()).collect(), spent_by: None,
 		})
 	}
@@ -667,6 +728,11 @@ impl Wallet {
 			}
 		}
 		let a = Assessed { valid, bases };
+		// The coin's dates, from where the chain holds its boards now.
+		let expiry = self.service_expiry(record, &a)?;
+		if expiry != c.expiry {
+			self.store.set_coin_expiry(&c.leaf_id, expiry)?;
+		}
 		Ok(if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
 			Checked::Holds("pending", format!("{}{}", e, extra))
 		} else if a.all_final() {
@@ -722,10 +788,17 @@ impl Wallet {
 		if c.kind == "transfer" && c.state == "live" { "operator-confirmed" } else { &c.state }
 	}
 
+	/// A coin for people: its dates (median times) are its expiry and its
+	/// exit deadline, three days before; a coin resting on a board carries
+	/// the board's ([`BOARD_LIFETIME`]).
 	fn coin_json(c: &CoinRow) -> Value {
+		let on_board = Self::record_of(c).map(|r| rests_on_board(&r)).unwrap_or(false);
+		let (expiry, deadline) = if c.expiry == u32::MAX { (Value::Null, Value::Null) } else {
+			(json!(c.expiry), json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)))
+		};
 		json!({
 			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
-			"standing": Self::standing(c), "note": c.note, "expiry": if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry) },
+			"standing": Self::standing(c), "note": c.note, "expiry": expiry, "exit_deadline": deadline, "rests_on_board": on_board,
 			"spent_by": c.spent_by,
 		})
 	}

@@ -16,15 +16,19 @@
 //!    the leaf's owner can no longer exit it. A board given up and then
 //!    converted is the same case: its leaf appears.
 //! 2. **Boards given up in a round.** Once the round is final, the forfeit of
-//!    a board is published from the board output: a board never expires, so
+//!    a board is published from the board output: no batch sweeps a board, so
 //!    this is how its value comes back to the operator. Every forfeit's
 //!    refund clock starts when it confirms, so these go out no faster than
 //!    they can be claimed: a new one is published only while the watcher's
 //!    own transactions waiting for a block stay within `block_share_vbytes`,
-//!    and only if its claim can follow within its refund delay. A coin of a transfer
-//!    given up in a round whose lineage rests on boards alone never expires
-//!    either: the watcher publishes each board's checkpoint, and 1 carries it
-//!    through each reassignment to the coin's forfeit.
+//!    and only if its claim can follow within its refund delay. A coin of a
+//!    transfer given up in a round whose lineage rests on boards alone is
+//!    swept by no batch either: the watcher publishes each board's
+//!    checkpoint, and 1 carries it through each reassignment to the coin's
+//!    forfeit. That lineage is shared with every coin its reassignments
+//!    made, so it is published at once only when none of those is a coin
+//!    another holder may still hold; otherwise not before the latest board
+//!    service expiry among them ([`Params::BOARD_LIFETIME`]).
 //! 3. **Forfeit-first.** A participation run again after a round it was in
 //!    could not return has its forfeits stored and its preimage withheld. The
 //!    watcher brings each coin it gave up onto the chain from the coin's own
@@ -939,11 +943,20 @@ impl Watcher {
 	}
 
 	/// Brings onto the chain every coin of a transfer given up in a round
-	/// that is final, whose lineage rests on boards alone: it never expires,
-	/// so the operator gets its value back only by publishing the lineage
+	/// that is final, whose lineage rests on boards alone: no batch sweeps
+	/// it, so the operator gets its value back only by publishing the lineage
 	/// (each board's checkpoint; the answers to stale exits publish each
 	/// reassignment, then the coin's forfeit) and claiming the forfeit. A coin
 	/// resting on a batch leaf is left to that batch's sweep.
+	///
+	/// The lineage is shared: the reassignments it publishes make other coins
+	/// too, which land on the chain with it, and so do the coins those were
+	/// spent into, carried on by the answers to stale exits. So the lineage
+	/// is published at once only when none of them is a coin another holder
+	/// may still hold off-chain ([`Self::shared_until`]); otherwise not
+	/// before the latest service expiry among those coins, a date each of
+	/// their holders knew ([`Params::BOARD_LIFETIME`]). Before then only an
+	/// exit puts it on the chain, and the answers to stale exits take it on.
 	async fn recover_board_transfers(&self, now: MedianTime) -> Result<(), WatcherError> {
 		/// Whether every base of the coin is a board.
 		fn boards_alone(r: &CoinRecord) -> bool {
@@ -974,11 +987,97 @@ impl Watcher {
 				if coin.expiry != arca_covenant::transfer::NEVER {
 					return Ok(());
 				}
+				if let Some(until) = self.shared_until(&leaf_id).await? {
+					if now.to_consensus_u32() < until {
+						log::info!("watcher: the lineage of coin {} waits until median time {}: another holder's coin rests on it",
+							hex(&leaf_id), until);
+						return Ok(());
+					}
+				}
 				self.bring_on_chain(&coin, now).await
 			}.await;
 			Self::item(&format!("the coin {} resting on boards", hex(&leaf_id)), r)?;
 		}
 		Ok(())
+	}
+
+	/// Whether publishing the lineage of the forfeited coin `leaf` would put
+	/// on the chain a coin another holder may still hold off-chain, and if
+	/// so the latest service expiry among such coins (`u32::MAX` when one of
+	/// them has none known). The lineage publishes the transfer that made
+	/// the coin, and for each of its inputs the transfers that made that
+	/// input, down to the boards; every coin those transfers make lands on
+	/// the chain. A coin spent by another transfer passes it on (counted as
+	/// published, its own coins with it); one live or pending, or given up
+	/// in a participation that holds no forfeit of it the operator can
+	/// claim, is a coin someone may still hold. A coin under such a forfeit
+	/// is the operator's.
+	async fn shared_until(&self, leaf: &[u8; 32]) -> Result<Option<u32>, WatcherError> {
+		let mut path: HashSet<[u8; 32]> = HashSet::new();
+		let mut path_coins: HashSet<[u8; 32]> = HashSet::new();
+		let mut todo = vec![*leaf];
+		while let Some(c) = todo.pop() {
+			if !path_coins.insert(c) {
+				continue;
+			}
+			if let Some(t) = self.store.made_by_transfer(&c).await? {
+				if path.insert(t) {
+					let row = self.store.transfer(&t).await?
+						.ok_or_else(|| WatcherError::Build(format!("transfer {} is not known", hex(&t))))?;
+					todo.extend(row.inputs.iter().map(|i| i.0));
+				}
+			}
+		}
+		let mut transfers: Vec<[u8; 32]> = path.iter().copied().collect();
+		let mut seen: HashSet<[u8; 32]> = path.clone();
+		let mut until: Option<u32> = None;
+		while let Some(t) = transfers.pop() {
+			let row = self.store.transfer(&t).await?.ok_or_else(|| WatcherError::Build(format!("transfer {} is not known", hex(&t))))?;
+			for (out, _) in row.outputs {
+				if path_coins.contains(&out) {
+					continue;
+				}
+				let Some(l) = self.store.leaf(&out).await? else { continue };
+				let held = match l.state {
+					LeafState::Live | LeafState::Pending => true,
+					LeafState::Lost | LeafState::Expired => false,
+					LeafState::Spent => match self.store.spent_by_transfer(&out).await? {
+						Some(next) => {
+							if seen.insert(next) {
+								transfers.push(next);
+							}
+							false
+						},
+						None => self.live_forfeit(&out).await?.is_none(),
+					},
+				};
+				if held {
+					let record = CoinRecord::from_bytes(&l.record).map_err(build("a coin record"))?;
+					let date = Self::service_expiry(&self.store, &record).await?.unwrap_or(u32::MAX);
+					until = Some(until.map_or(date, |u| u.max(date)));
+				}
+			}
+		}
+		Ok(until)
+	}
+
+	/// When the coin of `record` expires as the operator serves it: the
+	/// earliest first expiry of the batches it rests on, or service expiry
+	/// of the boards ([`coins::board_expiry`]); `None` when none is known.
+	async fn service_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u32>, WatcherError> {
+		fn batches(r: &CoinRecord, out: &mut Vec<u32>) {
+			match r {
+				CoinRecord::Leaf { record, .. } => out.extend(record.schedule.expiries().first().map(|e| e.to_consensus_u32())),
+				CoinRecord::Board(_) => {},
+				CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| batches(&i.coin, out)),
+			}
+		}
+		let mut dates = vec![];
+		batches(record, &mut dates);
+		if let Some(b) = coins::board_expiry(store, record).await.map_err(|e| WatcherError::Build(e.to_string()))? {
+			dates.push(b);
+		}
+		Ok(dates.into_iter().min())
 	}
 
 	// -----------------------------------------------------------------------

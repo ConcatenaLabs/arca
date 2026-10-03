@@ -25,8 +25,9 @@ pub struct AssetParams {
 /// operator stops taking it ([`Params::participation_policy`]). Before the
 /// window the fee rises with the time left beyond it, to `refresh_ppm` parts
 /// per million of the coin's value for a coin [`FeeSchedule::FULL_AFTER`] or
-/// more from the window; a coin from boards alone never expires and pays the
-/// whole of it. An offboard adds `offboard_ppm` of what it pays out, and the
+/// more from the window. A coin resting on a board takes the board's service
+/// expiry for its first expiry, when that comes first ([`Params::BOARD_LIFETIME`]).
+/// An offboard adds `offboard_ppm` of what it pays out, and the
 /// margin of the output the round pays, which the unlock spends as its fee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FeeSchedule {
@@ -173,6 +174,24 @@ impl Params {
 	/// still go into a round, in seconds: one day.
 	pub const ROUND_HORIZON: u32 = 86_400;
 
+	/// How long the operator serves a board, and every coin resting on it, in
+	/// seconds from the median time of the block that confirms the board: a
+	/// batch's lifetime, 28 days, so that a board carries the dates a batch
+	/// made then would have. Its exit deadline is [`WalletPolicy::EXIT_DEADLINE`]
+	/// before its expiry. Up to the exit deadline the server co-signs spends of
+	/// a coin resting on the board; after it, it takes the coin only into a
+	/// refresh, up to [`Params::ROUND_HORIZON`] before the expiry. The watcher
+	/// publishes the lineage of a forfeited coin resting on boards before the
+	/// expiry only when no coin another holder may still hold rests on it,
+	/// or to answer an exit.
+	pub const BOARD_LIFETIME: u32 = 28 * 86_400;
+
+	/// The service expiry of a board confirmed in a block of median time
+	/// `confirmed`.
+	pub fn board_expiry(confirmed: u32) -> u32 {
+		confirmed.saturating_add(Self::BOARD_LIFETIME)
+	}
+
 	/// How long after its round is final a participation's forfeits may come,
 	/// in seconds: one day. A participation whose forfeits have not come by
 	/// then expires: the coins it gave up are the owner's again, and its new
@@ -216,5 +235,12 @@ mod tests {
 		assert_eq!(f.refresh(value, t(e), t(e - 3 * DAY)), 0, "free up to the exit deadline");
 		assert_eq!(FeeSchedule::FREE_FROM - Params::PARTICIPATION_HORIZON, 2 * DAY, "the window is two days");
 		const { assert!(Params::ROUND_HORIZON < Params::PARTICIPATION_HORIZON) };
+	}
+
+	#[test]
+	fn a_board_carries_the_dates_of_a_batch_made_when_it_confirmed() {
+		assert_eq!(Params::BOARD_LIFETIME, crate::rounds::RoundConfig::default().lifetime, "a batch's lifetime");
+		assert_eq!(Params::board_expiry(1_800_000_000), 1_800_000_000 + 28 * 86_400);
+		assert_eq!(Params::board_expiry(u32::MAX - 1), u32::MAX);
 	}
 }

@@ -183,7 +183,7 @@ impl ForfeitError {
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::BoardNotFinal(_)) => "board_not_final",
 			Coin(CoinError::RoundNotFinal(_)) => "round_not_final",
-			Coin(CoinError::InvalidCoin { .. }) => "invalid_coin",
+			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(_) => "internal",
 			NotParticipating(_) => "not_participating",
 			ReleaseEarly => "release_early",
@@ -274,7 +274,7 @@ impl Forfeits {
 			let checked = if p.state == ParticipationState::Released {
 				coins::resolve(&self.store, &policy, &leaf).await?
 			} else {
-				coins::check(&self.store, &policy, &leaf, &id).await?
+				coins::check(&self.store, &policy, &leaf, &id, 0).await?
 			};
 			let c = &checked.coin;
 			let f = Forfeit::new(c.leaf, (c.asset, c.value), c.id, p.unlock_hash, m, refund, i.margin)
