@@ -621,8 +621,25 @@ impl Wallet {
 	/// whose round can never return, is void, and its coin is the wallet's
 	/// again. A refund in the mempool, or a claim in a block not yet final,
 	/// decides nothing: the other may still take the output.
+	///
+	/// A forfeit decided by a final spend is followed still, until the new
+	/// leaves' batch has expired: Sequentia reorganises whenever its Bitcoin
+	/// anchor does, with no depth limit, so a rollback can take a final
+	/// refund or claim out, and the operator's claim can then confirm in
+	/// place of the wallet's refund. When the spend that decided a forfeit is
+	/// no longer final, the forfeit is undecided again and the chain decides
+	/// it again ([`Self::recheck_decided`]).
 	pub(crate) fn watch_forfeits(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
+		for state in DECIDED {
+			for f in self.store.forfeits_in(state)? {
+				match self.recheck_decided(&f) {
+					Ok(Some(v)) => out.push(v),
+					Ok(None) => {},
+					Err(e) => out.push(json!({"leaf_id": f.leaf_id, "round": f.round, "error": e.to_string()})),
+				}
+			}
+		}
 		let mut followed = vec![];
 		for state in FOLLOWED {
 			followed.extend(self.store.forfeits_in(state)?);
@@ -635,6 +652,51 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// Whether the new leaves of participation `pid` have expired: the
+	/// median time is past the last expiry of every batch they are in, after
+	/// which no preimage opens anything. A participation with no new leaves
+	/// recorded has not.
+	fn new_leaves_expired(&self, pid: &str) -> Result<bool, Error> {
+		let Some(news) = self.store.participation_news(pid)? else { return Ok(false) };
+		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+		let mut last = 0u32;
+		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
+			last = last.max(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX));
+		}
+		Ok(last != 0 && self.now()?.to_consensus_u32() > last)
+	}
+
+	/// A forfeit decided by a final spend of its output (`refunded`, or
+	/// `claimed` with the claim's txid recorded), looked at again until the
+	/// new leaves' batch has expired: when that spend is no longer final (a
+	/// rollback took its block out, however deep, or left it uncertified or
+	/// its anchor unburied), the forfeit goes back to undecided (`refunding`,
+	/// `claiming`) and the coin of a refund back under its forfeit, so the
+	/// chain decides again: a claim that confirms in the refund's place
+	/// publishes the preimage, which completes the new leaves.
+	pub(crate) fn recheck_decided(&mut self, f: &ForfeitRow) -> Result<Option<Value>, Error> {
+		let Ok(spend) = Txid::from_str(&f.note) else { return Ok(None) };
+		if self.new_leaves_expired(&f.participation)? {
+			return Ok(None);
+		}
+		let finality = self.chain.finality(&spend)?;
+		if finality.is_final() {
+			return Ok(None);
+		}
+		let (what, back) = if f.state == "refunded" { ("refund", "refunding") } else { ("claim", "claiming") };
+		let why = format!("the {} {} that decided its forfeit is {} now: a rollback took it out of the final chain, and the wallet \
+			follows the forfeit's output until a spend of it is final again", what, spend, finality.word());
+		self.store.atomically(|s| {
+			s.set_forfeit_state(&f.leaf_id, &f.round, back, &spend.to_string())?;
+			if f.state == "refunded" && s.coin(&f.leaf_id)?.is_some_and(|c| c.state == "exited") {
+				s.set_coin_state(&f.leaf_id, "forfeited", &why)?;
+			}
+			Ok(())
+		})?;
+		Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": back, "was": f.state, "note": why})))
 	}
 
 	/// [`Self::watch_forfeits`] for one forfeit, its outcome for people.
@@ -672,6 +734,9 @@ impl Wallet {
 					// whatever becomes of the claim: the new leaves are kept.
 					let state = if finality.is_final() { "claimed" } else { "claiming" };
 					let kept = self.finish(&f.participation, pre, state)?;
+					// The claim is what decided this forfeit: followed while its
+					// new leaves' batch lives.
+					self.store.set_forfeit_state(&f.leaf_id, &f.round, state, &spent_by.to_string())?;
 					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": state, "claim": spent_by.to_string(),
 						"finality": finality.word(),
 						"note": "the operator claimed the forfeit on the chain, which publishes the preimage: the new leaves are the wallet's",
@@ -790,6 +855,12 @@ impl Wallet {
 /// refund, not yet final), `claiming` (spent by the operator's claim, not yet
 /// final; the preimage is in hand).
 pub(crate) const FOLLOWED: [&str; 3] = ["signed", "refunding", "claiming"];
+
+/// The states of a forfeit decided by a final spend of its output, which the
+/// wallet still looks at until its new leaves' batch has expired: `refunded`
+/// (the wallet's refund final), `claimed` (the operator's claim final). A
+/// rollback that leaves that spend not final makes it undecided again.
+pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 
 #[cfg(test)]
 mod tests {

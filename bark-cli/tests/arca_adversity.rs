@@ -1337,6 +1337,101 @@ async fn a_refund_decides_the_coin_only_once_it_is_final() {
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// Review R7c's probe P3a turned around. The wallet's refund is final
+/// (`refunded`, the coin `exited`); then the Bitcoin parent block the
+/// refund's block is anchored to is orphaned, with every parent block above
+/// it, and the node disconnects every Sequentia block anchored to them: a
+/// rollback deeper than finality, which the chain must follow. The
+/// operator's claim, carrying the preimage, confirms in the refund's place.
+/// The wallet still follows the forfeit it had decided: the refund no longer
+/// final makes it undecided again, the claim decides it, and the wallet
+/// reads the preimage from the claim and holds its new leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_refund_orphaned_with_its_anchor_gives_way_to_the_claim_and_the_new_leaf() {
+	use arca_covenant::spend::FeeSource;
+	use arca_covenant::ExplicitOutput;
+	use elements::OutPoint;
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F2");
+	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
+	let (units, cvout, margin, unlock) = stored_status(&r, &pid);
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	assert_eq!(f["state"], "refunding", "{}", f);
+	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
+	r.produce().await;
+	let refund_block = block_of(&r, &refund.to_string());
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	println!("F2 the refund final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
+	assert_eq!(f["state"], "refunded", "{}", f);
+	assert_eq!(coin_of(&c, &board)["state"], "exited");
+	// Still followed, and nothing changes while the refund is final.
+	let s = c.ok(&["sync"]);
+	assert!(!s["forfeits"].as_array().unwrap().iter().any(|f| f["leaf_id"] == board.as_str()), "{}", s);
+	assert_eq!(coin_of(&c, &board)["state"], "exited");
+
+	// The operator's claim, built as the watcher builds it.
+	let CoinRecord::Board(rec) = record_of(&c, &board) else { panic!("a board") };
+	let board_txid = r.server.store.board(&rec.leaf_id().0).await.unwrap().map(|b| b.txid).expect("the board is registered");
+	let board_tx = r.rt.client().raw_transaction(&elements::hashes::Hash::from_byte_array(board_txid)).unwrap();
+	let mtp = rpc(&r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	let old = CoinRecord::Board(rec).resolve(std::slice::from_ref(&board_tx), &arca_covenant::WalletPolicy {
+		min_exit_delay: RelativeTime::from_units(1).unwrap(), horizon: 0,
+		..arca_covenant::WalletPolicy::new(rec.chain, rec.operator, arca_covenant::MedianTime::from_consensus(mtp).unwrap())
+	}).unwrap();
+	let round_txid = r.server.store.round(r.server.store.participation(&unhex(&pid).try_into().unwrap()).await.unwrap().unwrap()
+		.round_id.unwrap()).await.unwrap().unwrap().txid;
+	let m = connector_asset(elements::hashes::Hash::from_byte_array(round_txid), cvout);
+	let forfeit = Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, m, RelativeTime::from_units(units).unwrap(), margin).unwrap();
+	let fo = forfeit.output();
+	let atx = r.rt.client().raw_transaction(&atom_txid).unwrap();
+	let av = atx.output.iter().position(|o| o.asset.explicit() == Some(m)).unwrap() as u32;
+	let m_out = atx.output[av as usize].clone();
+	let ct = arca_covenant::batch_claim_tx(&[(&forfeit, OutPoint::new(forfeit_txid, 0))], (OutPoint::new(atom_txid, av), m_out.clone()),
+		&[ExplicitOutput::new(fo.asset, fo.value - 40_000, common::node::op_true())], m_out.script_pubkey.clone(), &FeeSource::Reserve).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &ct.sighash(0, genesis).unwrap(), &[0; 32]);
+	let mut claim = ct.finish(&[sig], &[preimage]).unwrap().tx;
+	operator_signs_input(&r, &mut claim, 1);
+
+	// Deeper than final, driven by the anchor.
+	let hash: elements::BlockHash = refund_block.parse().unwrap();
+	let anchor = sequentia_ext::BlockHeaderExt::bitcoin_anchor(&r.rt.client().block_header(&hash).unwrap()).height as u64;
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(anchor)).unwrap();
+	println!("F2 the refund's block {} is anchored to parent height {}; {} parent blocks orphaned; the refund's confirmations now {}",
+		refund_block, anchor, orphaned.len(), confirmations(&r, &refund));
+	assert!(confirmations(&r, &refund) < 1, "the rollback took the refund out of the chain");
+	if in_mempool(&r, &refund) {
+		// Back in the mempool: the operator's claim, paying more, replaces it.
+		println!("F2 the refund is back in the mempool");
+	}
+	r.rt.client().send_raw_transaction(&claim).expect("the claim takes the forfeit's output");
+	r.produce().await;
+	assert!(confirmations(&r, &claim.txid()) >= 1, "the claim confirms");
+	assert!(confirmations(&r, &refund) < 1, "the refund is not in the chain");
+	let s = c.ok(&["sync"]);
+	println!("F2 the wallet's sync after the claim took the place of its final refund: forfeits {}", s["forfeits"]);
+	let forfeits = s["forfeits"].as_array().unwrap();
+	assert!(forfeits.iter().any(|f| f["leaf_id"] == board.as_str() && f["was"] == "refunded" && f["state"] == "refunding"),
+		"the forfeit is undecided again: {}", s["forfeits"]);
+	let f = forfeits.iter().find(|f| f["leaf_id"] == board.as_str() && f["claim"].is_string()).cloned()
+		.unwrap_or_else(|| panic!("the claim decides the forfeit again: {}", s["forfeits"]));
+	assert_eq!(f["claim"], claim.txid().to_string());
+	let leaf = f["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	println!("F2 the claim final: forfeits {}", s["forfeits"]);
+	c.ok(&["sync"]);
+	println!("F2 RESULT: the coin given up is {} ({}); the new leaf {} is {}", coin_of(&c, &board)["state"], coin_of(&c, &board)["note"],
+		leaf, coin_of(&c, &leaf)["state"]);
+	assert_eq!(coin_of(&c, &board)["state"], "spent", "the coin given up is the operator's: {}", coin_of(&c, &board));
+	assert_eq!(coin_of(&c, &leaf)["state"], "live", "the new leaf is the wallet's: {}", coin_of(&c, &leaf));
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 // ---------------------------------------------------------------------------
 // Margins: the operator's, within the wallet's bound
 // ---------------------------------------------------------------------------

@@ -156,7 +156,11 @@ pub struct ForfeitRow {
 	/// `claimed` (that claim final), `refunding` (the wallet's refund spends
 	/// its output, not yet final), `refunded` (that refund final: the coin is
 	/// the wallet's on the chain) or `void` (its round can never return).
+	/// `claimed` and `refunded` go back to `claiming` and `refunding` when a
+	/// rollback leaves the spend that decided them not final.
 	pub state: String,
+	/// For a forfeit whose output is spent, the txid of the spend: the refund,
+	/// or the claim that published the preimage.
 	pub note: String,
 }
 
