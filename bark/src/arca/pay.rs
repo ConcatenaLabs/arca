@@ -22,6 +22,15 @@ use super::{random32, Error};
 /// specification's cover for a fourfold rise in the fee floor.
 pub const MARGIN_MULTIPLE: u64 = 4;
 
+/// A script of a leaf's size, to size an output whose leaf is not known yet:
+/// every leaf pays a taproot output, and the operator prices a margin from
+/// the transaction's real size.
+fn leaf_probe() -> Script {
+	let mut b = vec![0x51, 0x20];
+	b.extend([0u8; 32]);
+	Script::from(b)
+}
+
 const REQUEST_PREFIX: &str = "arca:";
 const OFFER_PREFIX: &str = "arca-offer:";
 const ACCEPT_PREFIX: &str = "arca-accept:";
@@ -162,7 +171,9 @@ impl Wallet {
 	/// The checkpoint margin of `coin`, and the vsize of a reassignment of
 	/// `inputs` into `outputs`, each at the node's floor in the asset now.
 	fn checkpoint_margin(&self, coin: &ValidCoin, floor: Option<u64>) -> Result<u64, Error> {
-		let Some(f) = floor else { return Ok(0) };
+		// One atom in an asset the node does not accept for fees: the least
+		// the operator co-signs.
+		let Some(f) = floor else { return Ok(1) };
 		let vi = ValidInput {
 			coin: coin.clone(), checkpoint: coin.checkpoint(), checkpoint_value: coin.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
@@ -172,7 +183,7 @@ impl Wallet {
 	}
 
 	fn reassignment_margin(&self, inputs: &[&ValidCoin], outputs: &[ExplicitOutput], floor: Option<u64>) -> Result<u64, Error> {
-		let Some(f) = floor else { return Ok(0) };
+		let Some(f) = floor else { return Ok(1) };
 		let vis: Vec<ValidInput> = inputs.iter().map(|c| ValidInput {
 			coin: (*c).clone(), checkpoint: c.checkpoint(), checkpoint_value: c.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
@@ -203,7 +214,7 @@ impl Wallet {
 			chosen.push(In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), ..c });
 			let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
 			// Size the reassignment with a change output, which it may need.
-			let change_probe = ExplicitOutput::new(asset, 1, Script::new());
+			let change_probe = ExplicitOutput::new(asset, 1, leaf_probe());
 			let mut outs = others.to_vec();
 			outs.push(change_probe);
 			// Inputs another owner adds (a swap's other side) are sized as
@@ -517,7 +528,7 @@ impl Wallet {
 		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox };
 		// The taker's leaf of `give`, and its change, are not known yet: size
 		// with probes of the same shape.
-		let probe = |a: AssetId| ExplicitOutput::new(a, 1, Script::new());
+		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
 		let others = vec![wanted.explicit(self), probe(give_asset), probe(want_asset)];
 		let (inputs, margin, change) = self.choose(give_asset, give, &others, true, min_give, 1)?;
 		let mut outs = vec![wanted];
@@ -606,7 +617,7 @@ impl Wallet {
 		let mut outs = maker_outs.clone();
 		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
-		others.push(ExplicitOutput::new(want_asset, 1, Script::new()));
+		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		let (mine, _, change) = self.choose(want_asset, want, &others, false, min_want, 0)?;
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf("change")?, mailbox });

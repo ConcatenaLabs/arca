@@ -79,8 +79,10 @@ asset for fees, the wallet says so and does nothing; it never falls back to
 another asset. Fee rates are the node's floor in the fee asset's own atoms,
 read when the transaction is built. The transactions a transfer signs in
 advance (the checkpoint, the reassignment) leave a margin of four times the
-floor in the asset moved, or none where the node does not accept it, in which
-case whoever broadcasts attaches a fee coin.
+floor in the asset moved, or one atom where the node does not accept it, in
+which case whoever broadcasts attaches a fee coin; the operator co-signs no
+transfer whose margins are below that, or above the multiple of it it
+publishes (`max_margin_multiple`).
 
 ### Commands
 

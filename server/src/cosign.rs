@@ -27,7 +27,14 @@
 //!   such a transaction would hand one side's value to whoever broadcast it;
 //! - every checkpoint keeps between one atom and the whole coin, the outputs
 //!   take no more of any asset than the checkpoints keep, and every owner
-//!   signature verifies.
+//!   signature verifies;
+//! - the margins are bounded: each checkpoint leaves, and the reassignment
+//!   leaves in at least one asset, the least margin that pays its fee (four
+//!   times the node's floor for the transaction, in an asset the node
+//!   accepts for fees now; one atom in one it does not), and no margin is
+//!   more than [`Params::max_margin_multiple`] times its least. A transfer
+//!   whose answer would need a coin of the operator's for every fee, or
+//!   whose margin would be a fee the node refuses, is not co-signed.
 //!
 //! Then the transfer is recorded, inputs spent, before `S` signs anything
 //! (the signer runs in its own process: [`crate::signer`]). The signer keeps
@@ -51,10 +58,13 @@ use arca_covenant::script::sha256;
 use arca_covenant::sign::verify_digest;
 use arca_covenant::transfer::SeenReassignments;
 use arca_covenant::transfer::{transfer_id, Transfer, TransferInput, MAX_INPUTS};
-use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan};
+use arca_covenant::spend::{margin_for, FeeSource};
+use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan, ValidInput};
+use elements::OutPoint;
 
 use crate::chain::FinalityService;
 use crate::coins::{self, Checked, CoinError};
+use crate::fees;
 use crate::params::Params;
 use crate::signer::{SignerClient, SignerError};
 use crate::store::{
@@ -126,6 +136,8 @@ pub enum CosignError {
 	OutOfBounds(String),
 	#[error("the values do not add up: {0}")]
 	Value(String),
+	#[error("a margin is outside the bounds: {0}")]
+	Margin(String),
 	#[error("input {input}: the owner's {which} signature does not verify")]
 	BadSignature { input: usize, which: &'static str },
 	#[error("leaf {leaf}'s coin does not check out: {error}")]
@@ -165,6 +177,7 @@ impl CosignError {
 			DepthLimit { .. } => "depth_limit",
 			OutOfBounds(_) => "out_of_bounds",
 			Value(_) => "value",
+			Margin(_) => "margin",
 			BadSignature { .. } => "bad_signature",
 			InvalidCoin { .. } => "invalid_coin",
 			KeyReused => "key_reused",
@@ -335,6 +348,8 @@ impl Cosigner {
 			}
 		}
 
+		self.check_margins(req, &checked, &outputs).await?;
+
 		// The owners' signatures.
 		let plan = TransferPlan {
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
@@ -454,6 +469,78 @@ impl Cosigner {
 		log::info!("co-signed transfer {} of {} input(s) into {} new leaf/leaves",
 			crate::signer::hex(&transfer), n, m);
 		self.answer(&transfer).await
+	}
+
+	/// The least margin of a transaction of `vsize` vbytes in `asset`: four
+	/// times the node's floor when it accepts the asset for fees now, one
+	/// atom when it does not.
+	async fn least_margin(&self, asset: AssetId, vsize: usize) -> Result<u64, CosignError> {
+		match fees::floor_per_kvb(&self.finality, asset).await.map_err(|e| CosignError::Internal(e.to_string()))? {
+			Some(f) => Ok(margin_for(vsize, f, fees::MULTIPLE).max(1)),
+			None => Ok(1),
+		}
+	}
+
+	/// Each checkpoint's margin, and the reassignment's, within the bounds:
+	/// see the [module documentation](self). Each transaction is sized as a
+	/// wallet sizes it: the checkpoint keeping the whole coin, and the
+	/// reassignment with every input and output in the first input's asset
+	/// (an explicit output's size does not depend on its asset or value).
+	async fn check_margins(&self, req: &TransferRequest, checked: &[Checked], outputs: &[ExplicitOutput]) -> Result<(), CosignError> {
+		let cap = self.params.max_margin_multiple;
+		fn internal<E: std::fmt::Display>(e: E) -> CosignError {
+			CosignError::Internal(e.to_string())
+		}
+		let dummy = Signature::from_slice(&[1; 64]).expect("64 bytes");
+		let pair = Pair { operator: dummy, owner: dummy };
+		let first = checked[0].coin.asset;
+		let mut sized = Vec::with_capacity(checked.len());
+		for (k, (i, c)) in req.inputs.iter().zip(checked).enumerate() {
+			let vi = ValidInput {
+				coin: c.coin.clone(), checkpoint: c.coin.checkpoint(), checkpoint_value: c.coin.value,
+				checkpoint_pair: pair, reassignment_pair: pair,
+			};
+			let vsize = vi.checkpoint_tx(OutPoint::default(), &FeeSource::Reserve).map_err(internal)?.tx.vsize();
+			let least = self.least_margin(c.coin.asset, vsize).await?;
+			let margin = c.coin.value - i.checkpoint_value;
+			if margin < least || margin > least.saturating_mul(cap) {
+				return Err(CosignError::Margin(format!(
+					"input {}'s checkpoint leaves {} of asset {} for its fee; the operator takes {} to {}",
+					k, margin, c.coin.asset, least, least.saturating_mul(cap))));
+			}
+			let mut same = vi;
+			same.coin.asset = first;
+			sized.push(same);
+		}
+		let small: Vec<ExplicitOutput> = outputs.iter().map(|o| ExplicitOutput::new(first, 1, o.script_pubkey.clone())).collect();
+		let cps: Vec<OutPoint> = (0..sized.len()).map(|i| OutPoint::new(elements::Txid::all_zeros(), i as u32)).collect();
+		let vsize = arca_covenant::transfer::reassignment_tx(&sized, &small, &cps, &FeeSource::Reserve).map_err(internal)?.tx.vsize();
+		let mut margins: BTreeMap<AssetId, u64> = BTreeMap::new();
+		for (i, c) in req.inputs.iter().zip(checked) {
+			*margins.entry(c.coin.asset).or_default() += i.checkpoint_value;
+		}
+		for o in outputs {
+			let m = margins.entry(o.asset).or_default();
+			*m = m.saturating_sub(o.value);
+		}
+		let mut pays = None;
+		let mut least_any = vec![];
+		for (a, m) in &margins {
+			let least = self.least_margin(*a, vsize).await?;
+			least_any.push(format!("{} of asset {}", least, a));
+			if *m > least.saturating_mul(cap) {
+				return Err(CosignError::Margin(format!(
+					"the reassignment leaves {} of asset {} for its fee; the operator takes at most {}", m, a, least.saturating_mul(cap))));
+			}
+			if *m >= least {
+				pays.get_or_insert(*a);
+			}
+		}
+		if pays.is_none() {
+			return Err(CosignError::Margin(format!(
+				"the reassignment leaves no margin that pays its fee: at least {}", least_any.join(", or "))));
+		}
+		Ok(())
 	}
 
 	/// The stored answer to the transfer `transfer`.

@@ -195,7 +195,14 @@ asset and a value. The server co-signs only when every rule holds:
   requests racing cannot both pass;
 - every checkpoint keeps between one atom and the whole coin, the outputs take
   no more of any asset than the checkpoints keep, and each owner signature
-  verifies.
+  verifies;
+- the margins are bounded (`margin`): each checkpoint, and the reassignment in
+  at least one asset, leaves the least margin that pays its fee, four times
+  the node's floor for the transaction in an asset the node accepts for fees
+  now, or one atom in one it does not; and no margin is more than
+  `max_margin_multiple` (25 by default) times its least. A margin of nothing
+  would make every answer a coin of the operator's, and a margin far above
+  the fee a fee the node refuses. Both bounds are published (`info`).
 
 The transfer is then recorded, inputs spent, before the operator key signs
 anything, so the server never signs a spend it has not durably recorded and
@@ -484,8 +491,12 @@ one, nor for a reclaim before an owner under it has released.
 
 A fee is paid from the value a transaction takes, or from the margin its
 signers left, when the node accepts that asset for fees now and it covers the
-node's floor; otherwise a coin of the wallet's pays, in the first asset of
-`fee_assets` the node accepts, and the margin goes to the wallet's change. No
+node's floor. A margin of more than twice the fee the wallet pays for the
+transaction pays that fee and the rest goes to the wallet, after the outputs
+the signers committed to: paid whole, a large margin would be a fee the node
+refuses (`max-fee-exceeded`). Otherwise a coin of the wallet's pays, in the
+first asset of `fee_assets` the node accepts, and the margin goes to the
+wallet's change. No
 asset is assumed, the policy asset included. A coin that pays a fee is taken
 until its change is final, so an operator keeps several coins in each fee
 asset; a step the wallet cannot pay for waits, and is logged.
@@ -503,7 +514,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window, a participation's exit deadline and forfeit deadline, the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`), a participation's exit deadline and forfeit deadline, the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
@@ -714,6 +725,14 @@ new leaf from the published tree alone, and a published tree with a leaf's
 value or unlock hash, the last expiry, the clock's order or the reserve rule
 changed is refused. It also builds rounds of 1, 4 and 16 leaves and prints
 their sizes.
+
+`tests/margins.rs` refuses transfers whose margins are out of bounds: no
+checkpoint margin, no reassignment margin, and either past the cap, in X;
+none of either in Y, where one atom each is co-signed. Then R7's P9 with the
+cap raised: a board paid out of round with nearly the whole coin left as the
+reassignment's margin, then converted; the watcher's checkpoint and
+reassignment each pay the fee they need and return the rest to the
+operator's wallet, and a block takes the reassignment.
 
 `tests/funding.rs` gives the operator's wallet less of Y than a
 participation in Y wants: the round takes the participation in X, the one in

@@ -87,7 +87,14 @@ pub struct Params {
 	/// output nobody unlocked: longer than unrolling the leaf given up, its
 	/// exit delay, the forfeit's refund delay and a margin to unlock.
 	pub offboard_reclaim_delay: RelativeTime,
+	/// The most margin a co-signed transfer may leave, as a multiple of the
+	/// least: four times the node's floor in an asset it accepts for fees,
+	/// one atom in one it does not.
+	pub max_margin_multiple: u64,
 }
+
+/// The default cap on a transfer's margins, as a multiple of the least.
+pub const MAX_MARGIN_MULTIPLE: u64 = 25;
 
 impl Params {
 	/// The specification's parameters: an exit delay of 36 to 48 hours and a
@@ -106,6 +113,7 @@ impl Params {
 			fees: FeeSchedule::default(),
 			refund_delay: spec.max_exit_delay,
 			offboard_reclaim_delay: spec.max_exit_delay,
+			max_margin_multiple: MAX_MARGIN_MULTIPLE,
 		};
 		p.set_delays();
 		p
