@@ -229,6 +229,13 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	let rel = r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)).ok();
 	assert_eq!(rel["released"], json!([a2_valid.leaf_id.to_string()]));
 	assert_eq!(r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)).ok(), rel, "a release again changes nothing");
+	// A release that does not name its M is checked over the round's own.
+	let unnamed = json!({"participation_id": hex(&pa3), "releases": [{"leaf_id": a2_valid.leaf_id.to_string(),
+		"signature": hex(sign_digest(&a2, &release, &random32()).as_ref())}]});
+	assert_eq!(r.http.post("release_leaves", &unnamed).ok(), rel, "taken over the round's own M");
+	let unnamed_old = json!({"participation_id": hex(&pa3), "releases": [{"leaf_id": a2_valid.leaf_id.to_string(),
+		"signature": hex(sign_digest(&a2, &sha256(&a2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap().prefix), &random32()).as_ref())}]});
+	refused(r.http.post("release_leaves", &unnamed_old), 422, "bad_signature");
 	let node_hash = a2_valid.branch.nodes.last().unwrap().children_hash();
 	assert_eq!(r.server.store.releases(&node_hash).await.unwrap().len(), 1);
 	println!("A released the lowest node of its old leaf {}", a2_valid.leaf_id);
