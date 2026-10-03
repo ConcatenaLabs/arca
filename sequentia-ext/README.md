@@ -51,11 +51,26 @@ coins to a bare `OP_TRUE` output, and Simplicity is active from genesis. Both
 nodes stop, and their data is deleted, when the value is dropped.
 `Regtest::from_env` takes the binary from `SEQUENTIAD_EXEC`.
 
+`Regtest::start_pos` (or `pos_from_env`) runs the same chain under proof of
+stake, as the live chains run: a committee of three test stakers certifies
+every block, `produce_block` builds one from the mempool, and the node takes
+its anchor from the parent's tip as soon as it sees it. Such a chain takes no
+block from `generateblock`, so everything reaches a block through the mempool;
+the node runs with `-acceptnonstdtxn` so the genesis block's free coins, at a
+bare `OP_TRUE`, can be spent. `mine_parent` mines parent blocks and
+`anchor_to_parent_tip` produces blocks until the tip is anchored to the
+parent's tip, which is how a test buries an anchor. `Daemon::restart` stops a
+node and starts it again on its data; with `-persistmempool=0` it comes back
+with an empty mempool.
+
 ## Testing
 
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-sequentia-ext
 
-`tests/regtest.rs` runs against the regtest harness: it reads the chain's
+`tests/regtest.rs` runs against the regtest harness. `regtest_pos_chain`
+checks the proof-of-stake chain: certified blocks, an anchor following the
+parent, the free coins spent through the mempool, and a restart that empties
+the mempool and keeps the chain. `regtest_node_client` reads the chain's
 genesis hash and fee whitelist, has the node build a transaction with an asset
 issuance of denomination 2 (`createrawtransaction`, `rawissueasset`), decodes it
 and re-encodes it byte for byte, signs and broadcasts it, and decodes the block

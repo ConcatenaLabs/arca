@@ -7,8 +7,33 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The newest node master commit whose Build-dev workflow passed and
+  # published a Linux build, as the node workflow finds it.
+  node-build:
+    name: find the node build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      run: ${{ steps.node.outputs.run }}
+      sha: ${{ steps.node.outputs.sha }}
+    steps:
+      - name: Find the node build
+        id: node
+        run: |
+          run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&per_page=50" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | sort_by(.created_at) | last
+              | {databaseId: .id, headSha: .head_sha}')
+          if [ -z "$run" ] || [ "$(jq -r .databaseId <<<"$run")" = null ]; then
+            echo "no successful node build on master"; exit 1
+          fi
+          echo "run=$(jq -r .databaseId <<<"$run")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(jq -r .headSha <<<"$run")" >> "$GITHUB_OUTPUT"
+          echo "node build: run $(jq -r .databaseId <<<"$run"), commit $(jq -r .headSha <<<"$run")"
+
   server-tests:
-    name: the operator's server against PostgreSQL
+    name: the operator's server against PostgreSQL and the node
+    needs: node-build
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -26,8 +51,17 @@ jobs:
           --health-retries 10
     env:
       ARCA_TEST_POSTGRES: postgres://arca:arca@127.0.0.1:5432/postgres
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download sequentiad
+        run: |
+          gh run download ${{ needs.node-build.outputs.run }} -R ConcatenaLabs/Sequentia \
+            -n sequentia-dev-x86_64-pc-linux-gnu -D "$RUNNER_TEMP/node"
+          tar -xf "$RUNNER_TEMP/node/sequentia-dev-linux.tar" -C "$RUNNER_TEMP/node"
+          echo "SEQUENTIAD_EXEC=$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" -version | head -1
 
       - uses: dtolnay/rust-toolchain@stable
 
