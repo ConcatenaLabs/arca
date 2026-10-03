@@ -247,10 +247,29 @@ impl Store {
 		row.as_ref().map(leaf_row).transpose()
 	}
 
-	/// The coins owned by `key` (one at most: a key owns one leaf).
+	/// The coins owned by `key` (one that is not lost at most: a key owns one
+	/// leaf), as their owner may see them. A batch leaf's record holds its
+	/// participation's preimage, so it is served empty until that preimage
+	/// went out: the participation released at the leaf's attempt, then or
+	/// at an earlier attempt that a round it was in could never return
+	/// retired. A forfeit-first participation's preimage goes out only by
+	/// the claim of its forfeit.
 	pub async fn leaves_by_owner(&self, key: &[u8; 32]) -> Result<Vec<LeafRow>, StoreError> {
 		let conn = self.conn().await?;
-		let rows = conn.query(&format!("SELECT {} FROM leaf WHERE owner_key = $1", LEAF_COLUMNS), &[&&key[..]]).await?;
+		let rows = conn.query(
+			"SELECT l.leaf_id, l.kind::text, l.asset, l.value, l.owner_key, l.script_pubkey, l.hops,
+			        CASE WHEN l.kind = 'batch' AND NOT EXISTS (
+			            SELECT 1 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
+			            WHERE b.leaf_id = l.leaf_id AND p.attempt = b.attempt AND p.state = 'released'
+			            UNION ALL
+			            SELECT 1 FROM batch_leaf b JOIN participation_attempt a
+			              ON a.participation_id = b.participation_id AND a.attempt = b.attempt
+			            WHERE b.leaf_id = l.leaf_id AND a.released)
+			        THEN ''::bytea ELSE l.record END,
+			        l.state::text, l.spent_by
+			 FROM leaf l WHERE l.owner_key = $1",
+			&[&&key[..]],
+		).await?;
 		rows.iter().map(leaf_row).collect()
 	}
 

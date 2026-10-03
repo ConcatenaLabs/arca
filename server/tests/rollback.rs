@@ -74,6 +74,22 @@ fn leaf_states(r: &Running, key: &Keypair) -> Vec<String> {
 	states
 }
 
+/// The preimage each leaf record `leaf_data` serves `key` carries, by the
+/// leaf's state: `None` for a record served empty or holding no preimage.
+fn served_preimages(r: &Running, key: &Keypair) -> Vec<(String, Option<[u8; 32]>)> {
+	let ld = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", key, &r.chain)})).ok();
+	ld["leaves"].as_array().unwrap().iter().map(|l| {
+		let bytes = unhex(l["record"].as_str().unwrap());
+		let preimage = if bytes.is_empty() { None } else {
+			match arca_covenant::CoinRecord::from_bytes(&bytes).unwrap() {
+				arca_covenant::CoinRecord::Leaf { preimage, .. } => Some(preimage),
+				_ => None,
+			}
+		};
+		(l["state"].as_str().unwrap().to_string(), preimage)
+	}).collect()
+}
+
 /// A coin anyone can spend through a tapscript of `OP_TRUE`.
 fn op_true_tap() -> TapOutput {
 	TapOutput::new(vec![(0, elements::Script::from(vec![0x51]))])
@@ -323,6 +339,15 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	assert_eq!(r.http.post("forfeit_leaves", &body).ok(), done_a, "the same again");
 	assert_eq!(r.server.store.forfeits(&pa, built_y.round_id).await.unwrap().len(), 1, "the forfeit for Y is held");
 	assert_eq!(leaf_states(&r, &a2), vec!["lost", "pending"]);
+	// No answer carries Y's preimage while it is withheld: `leaf_data` serves
+	// A's pending leaf of Y with an empty record.
+	let y_hash: [u8; 32] = unhex(st_a["unlock_hash"].as_str().unwrap()).try_into().unwrap();
+	for (state, pre) in served_preimages(&r, &a2) {
+		assert!(pre.is_none_or(|p| arca_covenant::script::sha256(&p) != y_hash), "leaf_data serves Y's withheld preimage ({} leaf)", state);
+		if state == "pending" {
+			assert!(pre.is_none(), "the pending leaf's record is served empty");
+		}
+	}
 	// No release before the preimage.
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
 		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "release_early");
@@ -404,5 +429,7 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	assert_eq!((again["state"].as_str(), again["preimage"].as_str()), (Some("released"), Some(hex(&y_preimage).as_str())),
 		"the server hands over the preimage the claim revealed");
 	assert_eq!(leaf_states(&r, &a2), vec!["live", "lost"], "A's leaf of Y is live");
+	let live: Vec<Option<[u8; 32]>> = served_preimages(&r, &a2).into_iter().filter(|(s, _)| s == "live").map(|(_, p)| p).collect();
+	assert_eq!(live, vec![Some(y_preimage)], "once released, leaf_data serves the leaf's record whole");
 	println!("A's run completed forfeit-first: the claim {} revealed Y's preimage, A's new leaf is live", Txid::from_byte_array(claim.txid));
 }
