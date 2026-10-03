@@ -135,10 +135,11 @@ fn owner_sig(owner: &Keypair, genesis: BlockHash, salt: &[u8; 32], asset: AssetI
 	sign_digest(owner, &m.digest, &[0; 32])
 }
 
-/// The one-spend record: one spend per leaf (its owner key and its salt), or
-/// forfeits one per round, kept on disk across restarts, whatever asks; an
-/// entry is always the owner's doing, and another leaf under the same salt
-/// is another leaf.
+/// The one-spend record: one spend under a salt, or forfeits one per round,
+/// kept on disk across restarts, whatever asks; an entry names its leaf (its
+/// owner key and its salt) and is always the owner's doing, but the rule is
+/// the salt's, since `S`'s signature commits to the salt and not to the
+/// owner: another leaf under the same salt is refused another message.
 #[tokio::test]
 async fn the_signers_record() {
 	use arca_covenant::{ForfeitPolicy, LeafId, RelativeTime};
@@ -165,13 +166,18 @@ async fn the_signers_record() {
 	println!("A's leaf under salt 1: a second spend: {}", e);
 	refused_twice(e);
 
-	// B's leaf under the same salt is another leaf: what A's holder did
-	// changes nothing for it, and the other way round (D44).
-	spend(&b, [1; 32], out(9_000, 2)).await.unwrap();
-	println!("B's leaf under salt 1 (A's salt): its first spend is signed");
+	// B's leaf under the same salt: S's signature for A's spend is valid on
+	// B's coin too, so a spend of B's into another message would be a second
+	// signature under the salt, valid on A's coin as well: refused. The same
+	// message, B's own signature over it, is no second spend.
+	let e = spend(&b, [1; 32], out(9_000, 2)).await.unwrap_err();
+	println!("B's leaf under salt 1 (A's salt), another message: {}", e);
+	refused_twice(e);
+	spend(&b, [1; 32], out(9_000, 1)).await.unwrap();
+	println!("B's leaf under salt 1, the message A's spend was signed for: signed, no second spend");
 	refused_twice(spend(&b, [1; 32], out(9_000, 3)).await.unwrap_err());
 	refused_twice(spend(&a, [1; 32], out(9_000, 3)).await.unwrap_err());
-	println!("B's second spend and A's second spend: each refused, each for its own leaf");
+	println!("any other message under salt 1, by either owner: refused");
 
 	// An owner signature that is not the named key's over this message:
 	// refused, and nothing recorded under that key.
@@ -213,6 +219,15 @@ async fn the_signers_record() {
 	let e = spend(&a, [2; 32], out(9_000, 1)).await.unwrap_err();
 	println!("salt 2: a spend after its forfeits: {}", e);
 	refused_twice(e);
+	// Another owner's forfeit under salt 2 for a round already forfeited
+	// there, and its spend: refused, the rule being the salt's.
+	let fb = ForfeitPolicy { owner: xonly(&b), ..forfeit(7, 3) };
+	let ob = fout(&fb);
+	let sig = owner_sig(&b, genesis, &[2; 32], asset, 10_000, &[ob.clone()]);
+	let e = client.rebind_forfeit(&xonly(&b), &sig, &[2; 32], asset, 10_000, &fb, &ob).await.unwrap_err();
+	println!("salt 2: B's forfeit for the round A's forfeit was signed for: {}", e);
+	refused_twice(e);
+	refused_twice(spend(&b, [2; 32], out(9_000, 1)).await.unwrap_err());
 	// A spend's leaf takes no forfeit.
 	let f3 = forfeit(9, 1);
 	let e = give([1; 32], f3, fout(&f3)).await.unwrap_err();
@@ -228,10 +243,11 @@ async fn the_signers_record() {
 	let lines = std::fs::read_to_string(p.record()).unwrap();
 	println!("the record, {} line(s):\n{}", lines.lines().count(), lines.trim_end());
 	assert_eq!(lines.lines().count(), 1 + 5,
-		"the header, a spend each of A's and B's leaves under salt 1, two forfeits of salt 2, a spend of salt 3");
+		"the header, the one message under salt 1 signed for A's and for B's leaf, two forfeits of salt 2, a spend of salt 3");
 	p.restart(&s, genesis);
 	refused_twice(spend(&a, [1; 32], out(9_000, 2)).await.unwrap_err());
-	refused_twice(spend(&b, [1; 32], out(9_000, 1)).await.unwrap_err());
+	refused_twice(spend(&b, [1; 32], out(9_000, 2)).await.unwrap_err());
+	spend(&b, [1; 32], out(9_000, 1)).await.unwrap();
 	refused_twice(give([2; 32], f1b, fout(&f1b)).await.unwrap_err());
 	spend(&a, [1; 32], out(9_000, 1)).await.unwrap();
 	println!("after a restart: the same second spends and second forfeit refused; the first spend signed again");
