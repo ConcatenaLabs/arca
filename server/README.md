@@ -694,7 +694,13 @@ final is marked final (and stays watched, since a rollback can take it out
 again), one not in the chain is broadcast again, and one whose input a final
 transaction of another txid has spent, whatever first watched that input, is
 marked lost, freeing the wallet coins it held: it can no longer confirm, and
-what depends on it learns so.
+what depends on it learns so. So is a transaction of the watcher's the node
+refuses for a missing input whose own transaction is in no block of the
+followed chain, not in the mempool, and not one the nursery holds as pending:
+a claim whose atom's issuance an anchor-driven reorganisation took out and
+another spend of the connector replaced, say. Nothing final ever spends an
+outpoint that does not exist, so the first rule never catches it; once it is
+lost the watcher does its work again.
 
 ## Testing
 
@@ -770,6 +776,13 @@ watcher passes once a block, and after each block the test checks every
 forfeit in a block whose claim is not: its refund must not be open (the tip's
 median time short of the refund delay past that of the block before the
 forfeit's), and its owner's refund is refused. Every forfeit is claimed.
+
+`tests/orphan.rs` runs R7's F9: a deep anchor-driven reorganisation (eight
+Sequentia blocks) takes out a board's forfeit, the round's atom issuance and
+the claim on that atom, and another issuance of the same connector output
+takes the first one's place; the forfeit returns, the claim is refused for
+its missing input and marked lost, and the watcher claims the forfeit again
+with the new atom.
 
 `tests/fee_pool.rs` turns R7's P5 around: eight boards of Y, which the node
 does not accept for fees, given up in one round, the wallet holding two coins

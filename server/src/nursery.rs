@@ -19,8 +19,15 @@
 //!   is marked final. One not in the chain is broadcast again, at most every
 //!   `rebroadcast_interval`. One whose input a final transaction of another
 //!   txid has spent can never confirm: it is marked lost, and its wallet
-//!   coins, if the wallet built it, are freed. A final transaction stays
-//!   watched: a rollback can take it out again, and then it is pending.
+//!   coins, if the wallet built it, are freed. So can a transaction of the
+//!   watcher's the node refuses for a missing input whose transaction is in
+//!   no block and not the mempool, and is not one the nursery holds as
+//!   pending, which could bring it back (a claim whose atom's issuance an
+//!   anchor-driven reorganisation took out and another spend replaced, say):
+//!   no final transaction ever spends that input, so the first rule never
+//!   catches it. It is marked lost the same way, and the watcher does its work
+//!   again. A final transaction stays watched: a rollback can take it out
+//!   again, and then it is pending.
 //!
 //! The nursery decides nothing about finality itself; it asks the finality
 //! service.
@@ -74,6 +81,9 @@ pub enum NurseryEvent {
 	Unfinal { txid: Txid },
 	/// `txid` can no longer confirm: `by`, final, spent one of its inputs.
 	Lost { txid: Txid, kind: String, by: Txid },
+	/// `txid`, the watcher's, can no longer confirm: its input `missing` is
+	/// of a transaction no block, no mempool and nothing in the nursery holds.
+	Orphaned { txid: Txid, missing: elements::OutPoint },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -206,6 +216,18 @@ impl Nursery {
 				let _ = self.events.send(NurseryEvent::Lost { txid, kind: row.kind.clone(), by });
 				continue;
 			}
+			if row.kind == NurseryKind::Watcher.as_str() {
+				if let Some(missing) = self.orphaned(&row).await? {
+					self.store.nursery_set_state(&row.txid, NurseryState::Lost).await?;
+					log::warn!("nursery: {} ({}) is lost: its input {} is of a transaction in no block, not in the mempool, and none \
+						the nursery could bring back; its work is done again", txid, row.kind, missing);
+					if let Some(w) = &self.wallet {
+						w.release(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
+					}
+					let _ = self.events.send(NurseryEvent::Orphaned { txid, missing });
+					continue;
+				}
+			}
 			let due = match self.last.lock().await.get(&txid) {
 				Some(at) => at.elapsed() >= self.rebroadcast_interval,
 				None => true,
@@ -215,6 +237,48 @@ impl Nursery {
 			}
 		}
 		Ok(())
+	}
+
+	/// An input of `row`'s, which the node last refused for a missing input,
+	/// whose transaction is in no block and not in the mempool, and is not
+	/// one the nursery holds as pending: it will not come back.
+	async fn orphaned(&self, row: &NurseryRow) -> Result<Option<elements::OutPoint>, NurseryError> {
+		// `sendrawtransaction` says "Missing inputs"; the mempool's own checks
+		// say `missing-inputs` or `bad-txns-inputs-missingorspent`.
+		let refused = row.last_result.as_deref().is_some_and(|r| r.to_ascii_lowercase().contains("missing"));
+		if !refused {
+			return Ok(None);
+		}
+		let tx: Transaction = deserialize(&row.tx).map_err(|e| NurseryError::Decode(e.to_string()))?;
+		let mut pool: Option<std::collections::HashSet<Txid>> = None;
+		for i in &tx.input {
+			let op = i.previous_output;
+			let call = |e: crate::chain::ChainError| NurseryError::Finality(e.to_string());
+			// There, unspent, in the chain or the mempool.
+			if self.finality.call(move |c| c.unspent(&op, true)).await.map_err(call)?.is_some() {
+				continue;
+			}
+			let parent = op.txid;
+			// Its transaction in a block of the chain the server follows (the
+			// output spent there, by something that may not stay), or in the
+			// mempool, or one the nursery may yet bring back.
+			if let Some(b) = self.finality.call(move |c| c.tx_block(&parent)).await.map_err(call)? {
+				if self.store.block_by_hash(&b.to_byte_array()).await?.is_some() {
+					continue;
+				}
+			}
+			if pool.is_none() {
+				pool = Some(self.finality.call(|c| c.mempool()).await.map_err(call)?.into_iter().collect());
+			}
+			if pool.as_ref().is_some_and(|p| p.contains(&parent)) {
+				continue;
+			}
+			if self.store.nursery_get(&parent.to_byte_array()).await?.is_some_and(|p| p.state != NurseryState::Lost) {
+				continue;
+			}
+			return Ok(Some(op));
+		}
+		Ok(None)
 	}
 
 	/// A final transaction of another txid spending one of `row`'s inputs:
