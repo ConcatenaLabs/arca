@@ -33,4 +33,5 @@ axum = { version = "0.8", default-features = false, features = [ "http1", "json"
 
 [dev-dependencies]
 arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
+minreq = "2.14"
 tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "sync", "time" ] }
