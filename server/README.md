@@ -231,7 +231,11 @@ asset and a value. The server co-signs only when every rule holds:
   now, or one atom in one it does not; and no margin is more than
   `max_margin_multiple` (25 by default) times its least. A margin of nothing
   would make every answer a coin of the operator's, and a margin far above
-  the fee a fee the node refuses. Both bounds are published (`info`).
+  the fee a fee the node refuses. Both bounds are published (`info`), with the
+  node's floor in every asset served now (`fees.floors`, read from the node at
+  most every five seconds; `null` for an asset it does not accept), so a
+  wallet prices its margins as the operator bounds them, whatever its own
+  node makes of the asset.
 
 The transfer is then recorded, inputs spent, before the operator key signs
 anything, so the server never signs a spend it has not durably recorded and
@@ -578,7 +582,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`), a participation's exit deadline and forfeit deadline, the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
@@ -862,7 +866,8 @@ none of either in Y, where one atom each is co-signed. Then R7's P9 with the
 cap raised: a board paid out of round with nearly the whole coin left as the
 reassignment's margin, then converted; the watcher's checkpoint and
 reassignment each pay the fee they need and return the rest to the
-operator's wallet, and a block takes the reassignment.
+operator's wallet, and a block takes the reassignment. `info` publishes the
+node's floor in X, and `null` in Y.
 
 `tests/claims.rs` refreshes 16, 200 and 2,000 boards in one round (2,000 is
 ignored by default; `-- --ignored` runs it) on a chain of one-minute blocks of

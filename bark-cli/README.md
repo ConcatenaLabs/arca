@@ -136,11 +136,17 @@ Fees are paid in the asset being moved unless another is named
 asset for fees, the wallet says so and does nothing; it never falls back to
 another asset. Fee rates are the node's floor in the fee asset's own atoms,
 read when the transaction is built. The transactions a transfer signs in
-advance (the checkpoint, the reassignment) leave a margin of four times the
-floor in the asset moved, or one atom where the node does not accept it, in
-which case whoever broadcasts attaches a fee coin; the operator co-signs no
-transfer whose margins are below that, or above the multiple of it it
-publishes (`max_margin_multiple`).
+advance (the checkpoint, the reassignment) leave a margin in the asset moved,
+which the operator bounds: at least four times its own node's floor, or one
+atom where its node does not accept the asset (whoever broadcasts then
+attaches a fee coin), and at most the multiple of that it publishes
+(`max_margin_multiple`). Nodes value an asset each for itself, so the wallet
+prices these margins from the floors the operator publishes (`info`), never
+from its own node's: it leaves twice the operator's least, within the
+operator's most, as room for the operator's floor to rise before it
+co-signs. And it stays within its own bound: margins above 10,000 millionths
+of the coins they come out of are refused before anything is signed, whatever
+floor the operator publishes.
 
 The operator's refresh fee is bounded by the wallet, not by what the server
 publishes: a fee above 10,000 millionths of a coin, or any fee for a coin in
@@ -237,6 +243,11 @@ and holding it there, with the reason shown:
   the claim and holds its new leaf, and the coin given up is spent; and a
   refund that confirms, which decides the coin only once it is final;
 - a refresh fee of half of every coin, and one inside a coin's free window;
+- wallets whose own nodes value an asset 10% or 25% above or 10% below the
+  operator's, do not accept it, or accept one the operator's node does not,
+  each sending with the margins the operator publishes; and an operator
+  floor that would take margins above the wallet's bound, refused before
+  anything is signed;
 - a sender converting the board it paid from, answered at once by the
   receiver;
 - a server named `https://` whose certificate no root vouches for, refused by

@@ -629,6 +629,7 @@ impl Server {
 				config.limits.source_burst),
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
+			floors: tokio::sync::Mutex::new(None),
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {
