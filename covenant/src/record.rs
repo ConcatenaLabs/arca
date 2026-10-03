@@ -24,8 +24,8 @@
 //!
 //! `R` is not stored: it is rebuilt from `W` and `S`, so it cannot disagree
 //! with them. Nor is the salt: the record holds the owner's nonce and the
-//! operator's, and the salt is rebuilt from them
-//! (`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`,
+//! operator's, the creator of a round's leaves, and the salt is rebuilt from
+//! them (`SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`,
 //! [`crate::leaf::leaf_salt`]).
 //!
 //! # One key, one leaf

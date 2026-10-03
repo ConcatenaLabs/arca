@@ -341,10 +341,28 @@ fn the_transfer_chain() {
 		let coin = rec.validate(&rounds, &policy, &key(&r["owner"]), &h32(&r["owner_nonce"]))
 			.unwrap_or_else(|e| panic!("{}: refused: {}", name, e));
 		assert_eq!(coin.id.to_string(), r["id"].as_str().unwrap(), "{}: coin id", name);
+		// The second nonce of the coin's salt is its sender's.
+		match &rec {
+			CoinRecord::Transfer(t) => assert_eq!(t.leaf.creator_nonce, h32(&r["creator_nonce"]), "{}: creator nonce", name),
+			_ => panic!("{}: a reassignment's output", name),
+		}
 		println!("{:<10} record {:>5} bytes, coin {}, {} hops, {} atoms", name, b.len(), coin.id, coin.hops, coin.value);
 		if name == "D" || name == "E" {
 			ends.insert(name.clone(), coin);
 		}
+	}
+
+	// Each refused record decodes, encodes back, and is refused for the
+	// reason it names.
+	for x in t["refused_records"].as_array().unwrap() {
+		let name = x["name"].as_str().unwrap();
+		let b = bytes(&x["binary"]);
+		let rec = CoinRecord::from_bytes(&b).unwrap();
+		assert_eq!(rec.to_bytes().unwrap(), b, "{}: binary form", name);
+		let e = rec.validate(&rounds, &policy, &key(&x["owner"]), &h32(&x["owner_nonce"]))
+			.err().unwrap_or_else(|| panic!("{}: ACCEPTED", name));
+		assert_eq!(e.kind(), x["kind"].as_str().unwrap(), "{}: {}", name, e);
+		println!("refused: {}: {} ({})", name, e, e.kind());
 	}
 
 	// From D's coin, every checkpoint and reassignment, rebuilt and compared.

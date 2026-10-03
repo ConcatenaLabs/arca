@@ -8,10 +8,10 @@
 //!   received, C gives its Y leaf; B receives the Y, C the X.
 //! - Hop 3: B pays the Y on to D.
 //!
-//! Every new leaf has its own key and its owner's nonce. Each signer leaves a
-//! margin of 1,200 atoms in the coin's asset at each step, except that the
-//! swap commits all of C's checkpointed Y, so the reassignment's margin is in
-//! X alone.
+//! Every new leaf has its own key, its owner's nonce and a creator nonce of
+//! its sender's. Each signer leaves a margin of 1,200 atoms in the coin's
+//! asset at each step, except that the swap commits all of C's checkpointed Y,
+//! so the reassignment's margin is in X alone.
 
 use elements::secp256k1_zkp::Keypair;
 use elements::{AssetId, Transaction};
@@ -24,7 +24,8 @@ use super::*;
 
 pub const MARGIN: u64 = 1_200;
 
-/// A party to the chain: its key and the nonce it published for the leaf.
+/// A party to the chain: its key, and the leaf it is paid into: the key and
+/// nonce it published, and the creator nonce its sender drew.
 #[derive(Clone)]
 pub struct Party {
 	pub key: Keypair,
@@ -37,7 +38,7 @@ impl Party {
 		Party {
 			leaf: NewLeaf {
 				owner: xonly(&key), owner_nonce: label32(&format!("chain {} owner nonce", label)),
-				operator_nonce: label32(&format!("chain {} operator nonce", label)), exit_delay: delay,
+				creator_nonce: label32(&format!("chain {} creator nonce", label)), exit_delay: delay,
 			},
 			key,
 		}

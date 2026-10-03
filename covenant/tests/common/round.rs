@@ -197,12 +197,13 @@ pub fn one_hop(prev: &CoinRecord, coin: &ValidCoin, owner: &Keypair, s: &Keypair
 	}))
 }
 
-/// A receiver: its key and the leaf it publishes, with delay `d`.
+/// A receiver: its key and the leaf it is paid into, with delay `d`: the key
+/// and owner nonce it publishes, and the creator nonce the sender draws.
 pub fn party(label: &str, d: RelativeTime) -> (Keypair, NewLeaf) {
 	let k = keypair(&format!("party {} key", label));
 	let leaf = NewLeaf {
 		owner: xonly(&k), owner_nonce: label32(&format!("party {} owner nonce", label)),
-		operator_nonce: label32(&format!("party {} operator nonce", label)), exit_delay: d,
+		creator_nonce: label32(&format!("party {} creator nonce", label)), exit_delay: d,
 	};
 	(k, leaf)
 }

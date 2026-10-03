@@ -108,6 +108,17 @@ committed outputs. Each pair signs the frozen rebindable message: the
 checkpoint pair on the coin's leaf over the checkpoint output, the
 reassignment pair on the checkpoint over the outputs.
 
+A leaf a reassignment creates has the salt SHA256("Arca/salt" || owner_nonce
+|| creator_nonce): the owner's nonce, as the receiver publishes it, and the
+creator's, which the sender draws fresh for every leaf it creates. A pair
+names outputs, never inputs, so two reassignments whose committed outputs
+agree at every index both commit to (one set the first outputs of the other)
+are satisfied by one transaction that creates the outputs once; the sender's
+nonce keeps every reassignment's outputs its own. The operator co-signs no
+reassignment whose outputs agree so with those of one it co-signed before
+(mergeable() states the test), and a receiver refuses a record in which two
+coins share a salt.
+
 The coin record, format version 1:
 
     u8    format version, 1
@@ -120,7 +131,7 @@ The coin record, format version 1:
           and the reassignment pair ([64] operator, [64] owner each);
           u8 output count, then per output [32] asset, u64 value, compact size
           and scriptPubKey; u8 the coin's index; [32] owner key, [32] owner
-          nonce, [32] operator nonce, u16 exit delay units
+          nonce, [32] creator nonce (the sender's), u16 exit delay units
 
 A board as a coin is tag 2: u16 length L and L bytes of its board record. Its
 checkpoint carries the sweep with notice for the token SHA256("Arca/board-token"),
@@ -614,10 +625,22 @@ def chain_batch(label, asset, n, at, owner, value, issuer_label):
 
 
 def new_leaf(label):
+    """The leaf a reassignment creates for party `label`: its key and owner
+    nonce, as the party publishes them, and the creator nonce its sender
+    draws for it."""
     k = Key("chain %s" % label)
-    on, opn = label_hash("owner nonce", "chain %s" % label), label_hash("operator nonce", "chain %s" % label)
-    tap, scripts, salt = leaf(k, on, opn)
-    return {"key": k, "owner_nonce": on, "operator_nonce": opn, "tap": tap, "scripts": scripts, "salt": salt}
+    on, cn = label_hash("owner nonce", "chain %s" % label), label_hash("creator nonce", "chain %s" % label)
+    tap, scripts, salt = leaf(k, on, cn)
+    return {"key": k, "owner_nonce": on, "creator_nonce": cn, "tap": tap, "scripts": scripts, "salt": salt}
+
+
+def mergeable(a, b):
+    """Whether one transaction satisfies a pair over outputs `a` and a pair
+    over outputs `b` [(asset, value, spk)]: both commit to the outputs at
+    indices 0..m, so they fit one transaction when they agree at every index
+    both commit to."""
+    n = min(len(a), len(b))
+    return n > 0 and a[:n] == b[:n]
 
 
 def hop(inputs, outputs, txs):
@@ -656,7 +679,7 @@ def transfer_record(parts, outputs, index, nl):
     r += bytes([len(outputs)])
     for a, v, spk in outputs:
         r += a + le64(v) + compact(len(spk)) + spk
-    r += bytes([index]) + nl["key"].x + nl["owner_nonce"] + nl["operator_nonce"] + le16(DELAY)
+    r += bytes([index]) + nl["key"].x + nl["owner_nonce"] + nl["creator_nonce"] + le16(DELAY)
     return r
 
 
@@ -728,16 +751,58 @@ def transfer():
     d["name"] = "reassignment creating %s" % e_coin.id.hex()
     txs.append(d)
 
+    # The operator's rule holds over the chain: no two of its reassignments
+    # can be satisfied by one transaction.
+    sets = [out1, out2, out3, out4]
+    assert not any(mergeable(sets[i], sets[j]) for i in range(len(sets)) for j in range(i))
+
     for name, coin in (("B1", b1_coin), ("A change", ach_coin), ("B2", b2_coin), ("C2", c2_coin), ("D", d_coin),
                        ("E", e_coin)):
         records_out[name] = {"binary": (b"\x01" + coin.record).hex(), "id": coin.id.hex(), "owner": coin.owner.x.hex(),
-                             "owner_nonce": label_hash("owner nonce", "chain %s" % name).hex()}
+                             "owner_nonce": label_hash("owner nonce", "chain %s" % name).hex(),
+                             "creator_nonce": label_hash("creator nonce", "chain %s" % name).hex()}
+
+    # Refused: a coin resting on one leaf twice. A's leaf and the board each
+    # pay one output, the same leaf P (P's sender repeating the creator nonce
+    # of the other's), so the two reassignments are mergeable and P may exist
+    # on-chain once; P's owner pays both coins on to F.
+    scratch = []
+    pl = new_leaf("promised twice")
+    out_p = [(ASSET, 7_000_000, bytes(pl["tap"].scriptPubKey))]
+    assert mergeable(out_p, out_p)
+    parts_pa, _ = hop([(a_coin, bases[a_coin.id.hex()], a_coin.value - MARGIN)], out_p, scratch)
+    parts_pb, _ = hop([(board_coin, coin_at(bp["built"].tx, 0), board_coin.value - MARGIN)], out_p, scratch)
+    p1 = transfer_coin(parts_pa, out_p, 0, pl, ASSET, 7_000_000)
+    p2 = transfer_coin(parts_pb, out_p, 0, pl, ASSET, 7_000_000)
+    assert p1.salt == p2.salt and p1.id != p2.id
+    fl = new_leaf("F")
+    cpf = 7_000_000 - MARGIN
+    out_f = [(ASSET, 2 * cpf - MARGIN, bytes(fl["tap"].scriptPubKey))]
+    parts_f, _ = hop([(p1, outpoint("P, first"), cpf), (p2, outpoint("P, second"), cpf)], out_f, scratch)
+    f_coin = transfer_coin(parts_f, out_f, 0, fl, ASSET, out_f[0][1])
+    refusals = [{"name": "a coin resting on one leaf promised by two reassignments", "kind": "salt",
+                 "binary": (b"\x01" + f_coin.record).hex(), "owner": fl["key"].x.hex(),
+                 "owner_nonce": fl["owner_nonce"].hex()}]
+    # Accepted: the same, but the second sender drew a creator nonce of its
+    # own, so P's two coins are two leaves.
+    pl2 = dict(pl)
+    pl2["creator_nonce"] = label_hash("creator nonce", "chain promised twice, second sender")
+    pl2["tap"], pl2["scripts"], pl2["salt"] = leaf(pl["key"], pl["owner_nonce"], pl2["creator_nonce"])
+    out_p2 = [(ASSET, 7_000_000, bytes(pl2["tap"].scriptPubKey))]
+    assert not mergeable(out_p, out_p2)
+    parts_pb2, _ = hop([(board_coin, coin_at(bp["built"].tx, 0), board_coin.value - MARGIN)], out_p2, scratch)
+    p2b = transfer_coin(parts_pb2, out_p2, 0, pl2, ASSET, 7_000_000)
+    parts_f2, _ = hop([(p1, outpoint("P, first"), cpf), (p2b, outpoint("P, second"), cpf)], out_f, scratch)
+    f2_coin = transfer_coin(parts_f2, out_f, 0, fl, ASSET, out_f[0][1])
+    records_out["F"] = {"binary": (b"\x01" + f2_coin.record).hex(), "id": f2_coin.id.hex(), "owner": fl["key"].x.hex(),
+                        "owner_nonce": fl["owner_nonce"].hex(), "creator_nonce": fl["creator_nonce"].hex()}
     return {
         "inputs": {"now": CREATED, "y_asset": display(Y_ASSET),
                    "rounds": [round1.serialize().hex(), round2.serialize().hex()],
                    "boards": [bp["built"].tx.serialize().hex()],
                    "bases": {k: v[0] for k, v in bases.items()}, "margin": MARGIN},
         "records": records_out,
+        "refused_records": refusals,
         "transactions": txs,
     }
 

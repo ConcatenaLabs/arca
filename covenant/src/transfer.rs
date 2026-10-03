@@ -16,6 +16,40 @@
 //! each is certain its coin moves only into a transaction that creates every
 //! output it signed for; no signature names the other inputs.
 //!
+//! # Outputs unique to the reassignment
+//!
+//! Because no pair names an input, two reassignments whose committed outputs
+//! agree at every index both commit to (the same outputs, or one set the
+//! first outputs of the other) are satisfied by one transaction: it spends
+//! the checkpoints of both, creates the outputs once, and the value of one
+//! reassignment's inputs goes to whoever broadcasts it. Each pair is sound
+//! on its own, so no signer can see this. Two payments to one receive
+//! request, with no change, would commit to exactly one output set if the
+//! receiver's leaf were built from the request alone.
+//!
+//! So every output a pair commits to carries something unique to the inputs
+//! it spends. A leaf's salt is built from two nonces
+//! ([`crate::leaf::leaf_salt`]): its owner's, and its creator's. For a leaf a
+//! reassignment creates, the creator is the sender: its wallet draws a fresh
+//! random nonce for every leaf it creates, the receiver's and its own change
+//! alike ([`NewLeaf::creator_nonce`]), so two reassignments never commit to
+//! the same output. The receiver checks its own key and nonce, as for any
+//! leaf; the record carries the creator nonce, and the leaf is rebuilt from
+//! both.
+//!
+//! Two more checks hold the rule where a sender breaks it. The operator
+//! co-signs a reassignment only if its outputs cannot be merged with those of
+//! any other reassignment it has co-signed ([`TransferPlan::admit`],
+//! [`SeenReassignments`]). And [`CoinRecord::validate`] refuses a record in
+//! which two coins share a salt: one leaf promised by two reassignments may
+//! exist on-chain only once. The record cannot show the coins a wallet holds
+//! or has held, so the wallet keeps every salt it has held a coin under and
+//! refuses a coin at one of them: two records at one leaf are one coin, and
+//! a leaf rebuilt at a salt its owner has signed under is spent by the
+//! owner's old pairs, at the same asset and value. The sender chooses the
+//! creator nonce, so it could rebuild such a leaf; a second honest payment,
+//! under another creator nonce, never meets the refusal.
+//!
 //! # The checkpoint's salt
 //!
 //! A checkpoint's collaborative path is the leaf's script under another salt,
@@ -36,7 +70,10 @@
 //! on-chain already); for a coin a reassignment created, the reassignment's
 //! inputs (each a coin record in turn, with its checkpoint's value and both
 //! pairs), the committed outputs, the coin's index among them, and the coin's
-//! leaf: its owner's key, the two nonces of its salt and its exit delay.
+//! leaf: its owner's key, the two nonces of its salt (the owner's and the
+//! sender's) and its exit delay. The second nonce of a leaf's salt is always
+//! its creator's: the operator's in a leaf record (a round) and a board
+//! record, the sender's in a coin a reassignment created.
 //!
 //! A receiver accepts a coin only after [`CoinRecord::validate`]: every batch
 //! leaf in the record validates against the round that funds it, and every
@@ -47,8 +84,9 @@
 //! than its checkpoints hold; every leaf a reassignment creates along the
 //! coin's lineage, whoever owns it, has an exit delay within the policy's
 //! bounds; the coin's output is the leaf its record names, for the receiver's
-//! key and the nonce it published; no coin is spent twice anywhere in the
-//! record; and the chain is no deeper than [`DEPTH_LIMIT`] reassignments. A
+//! key and the nonce it published, and the sender's creator nonce; no coin is
+//! spent twice anywhere in the record, and no two coins in it share a salt;
+//! and the chain is no deeper than [`DEPTH_LIMIT`] reassignments. A
 //! coin from a reassignment is safe only until the earliest expiry among the
 //! batches it descends from ([`ValidCoin::expiry`]), since a sweep of any of
 //! them cuts its path; the receipt policy asks that each lie past the exit
@@ -101,7 +139,7 @@
 //!         u8   output count m, 1 to 4, then per output:
 //!                [32] asset, u64 value, compact size and the scriptPubKey (at most 10,000 bytes)
 //!         u8   the coin's index, below m
-//!         [32] owner key, [32] owner nonce, [32] operator nonce, u16 exit delay units
+//!         [32] owner key, [32] owner nonce, [32] creator nonce (the sender's), u16 exit delay units
 //! ```
 //!
 //! Reassignments nest at most [`MAX_HOPS`] deep along any path of the record.
@@ -111,7 +149,8 @@
 //! The id of a coin a reassignment created is the leaf id, tag `Arca/leaf-id`,
 //! of `R ‖ 0x01 ‖ index ‖ the leaf's program`, where `R` is the BIP340 tagged
 //! hash, tag `Arca/reassignment`, of the input count, each input's coin id and
-//! checkpoint program, the output count and each output's record hash.
+//! checkpoint program, the output count and each output's record hash
+//! ([`reassignment_hash`]).
 
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
@@ -171,12 +210,17 @@ pub fn checkpoint_salt(leaf_salt: &[u8; 32]) -> [u8; 32] {
 }
 
 /// A new leaf a reassignment creates: its owner's key and nonce, as the
-/// receiver publishes them, the operator's nonce, and the exit delay.
+/// receiver publishes them, the creator nonce the sender draws for it, and
+/// the exit delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NewLeaf {
 	pub owner: XOnlyPublicKey,
 	pub owner_nonce: [u8; 32],
-	pub operator_nonce: [u8; 32],
+	/// The second nonce of the leaf's salt, the creator's: the sender's
+	/// wallet draws it at random for every leaf a reassignment creates, never
+	/// from a counter or from the receive request, so that two reassignments
+	/// never commit to the same output (see the [module documentation](self)).
+	pub creator_nonce: [u8; 32],
 	pub exit_delay: RelativeTime,
 }
 
@@ -184,9 +228,13 @@ impl NewLeaf {
 	/// The leaf, for `operator` on `chain`.
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
-			owner: self.owner, operator, salt: leaf_salt(&self.owner_nonce, &self.operator_nonce), chain,
-			exit_delay: self.exit_delay,
+			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay,
 		}
+	}
+
+	/// The leaf's salt: `SHA256("Arca/salt" ‖ owner_nonce ‖ creator_nonce)`.
+	pub fn salt(&self) -> [u8; 32] {
+		leaf_salt(&self.owner_nonce, &self.creator_nonce)
 	}
 }
 
@@ -279,6 +327,10 @@ pub enum TransferError {
 	DuplicateOutput,
 	#[error("coin {0} is spent twice in the record")]
 	DoubleSpend(LeafId),
+	#[error("coins {first} and {second} in the record share a salt: one leaf promised twice exists on-chain at most once")]
+	SaltTwice { first: LeafId, second: LeafId },
+	#[error("the outputs agree, at every index both commit to, with those of another reassignment: one transaction would satisfy both")]
+	Mergeable,
 	#[error("the coin is for another owner's key")]
 	NotOwner,
 	#[error("the coin's owner nonce is not the one the wallet published")]
@@ -312,6 +364,8 @@ impl TransferError {
 			Pair { .. } => "signature",
 			LeafMismatch | DuplicateOutput => "output",
 			DoubleSpend(_) => "double_spend",
+			SaltTwice { .. } => "salt",
+			Mergeable => "merge",
 			NotOwner | OwnerNonce | ExitDelay => "owner",
 			LineageExitDelay { .. } => "policy",
 			OnChain { .. } | BoardSpent(_) => "on_chain",
@@ -523,9 +577,17 @@ pub fn reassignment_tx(inputs: &[ValidInput], outputs: &[ExplicitOutput], checkp
 	Ok(u)
 }
 
-/// The reassignment hash and the id of its output `index`, whose leaf
-/// program is `program`.
+/// The id of output `index` of the reassignment of `inputs` (each a coin's
+/// id and its checkpoint's program) into `outputs`, whose leaf program is
+/// `program`.
 pub fn transfer_id(inputs: &[(LeafId, [u8; 32])], outputs: &[ExplicitOutput], index: u8, program: &[u8; 32]) -> LeafId {
+	LeafId::compute(&reassignment_hash(inputs, outputs), &[index], program)
+}
+
+/// The reassignment's hash, `R`: the BIP340 tagged hash, tag
+/// `Arca/reassignment`, of the input count, each input's coin id and
+/// checkpoint program, the output count and each output's record hash.
+pub fn reassignment_hash(inputs: &[(LeafId, [u8; 32])], outputs: &[ExplicitOutput]) -> [u8; 32] {
 	let tag = sha256(REASSIGNMENT_TAG);
 	let mut b = Vec::with_capacity(64 + 1 + 64 * inputs.len() + 1 + 32 * outputs.len());
 	b.extend(tag);
@@ -539,7 +601,86 @@ pub fn transfer_id(inputs: &[(LeafId, [u8; 32])], outputs: &[ExplicitOutput], in
 	for o in outputs {
 		b.extend(sha256(&o.record()));
 	}
-	LeafId::compute(&sha256(&b), &[index], program)
+	sha256(&b)
+}
+
+/// Whether one transaction can satisfy a pair over `a` and a pair over `b`:
+/// every rebindable pair commits to the outputs at indices `0..m`, so two
+/// pairs fit one transaction when their outputs agree at every index both
+/// commit to, that is when one set is the first outputs of the other.
+pub fn mergeable(a: &[ExplicitOutput], b: &[ExplicitOutput]) -> bool {
+	let n = a.len().min(b.len());
+	n > 0 && a[..n] == b[..n]
+}
+
+/// The reassignments an operator has co-signed, as the rule that keeps any
+/// two from being merged needs them ([`TransferPlan::admit`]).
+///
+/// A transaction that satisfies two reassignments' pairs spends the
+/// checkpoints of both and creates the outputs once; what one of them was to
+/// pay goes to whoever broadcasts it. Two such reassignments always agree at
+/// output 0, so they are kept by the hash of output 0's record. A wallet that
+/// draws the creator nonce of every leaf it creates never meets this rule;
+/// it holds where a wallet does not.
+#[derive(Debug, Clone, Default)]
+pub struct SeenReassignments {
+	by_first: std::collections::HashMap<[u8; 32], Vec<SeenReassignment>>,
+	count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SeenReassignment {
+	/// The coins spent, each with its checkpoint's value.
+	inputs: Vec<(LeafId, u64)>,
+	outputs: Vec<ExplicitOutput>,
+}
+
+impl SeenReassignments {
+	pub fn new() -> SeenReassignments {
+		SeenReassignments::default()
+	}
+
+	/// The number of reassignments recorded.
+	pub fn len(&self) -> usize {
+		self.count
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.count == 0
+	}
+
+	/// Refuses the reassignment of `inputs` (each coin's id and its
+	/// checkpoint's value) into `outputs` when a transaction could satisfy
+	/// both it and one recorded here. The same reassignment again (the same
+	/// coins, checkpoint values and outputs) is not refused: its checkpoints
+	/// are the same outputs, each spent once.
+	pub fn check(&self, inputs: &[(LeafId, u64)], outputs: &[ExplicitOutput]) -> Result<(), TransferError> {
+		let first = match outputs.first() {
+			Some(o) => sha256(&o.record()),
+			None => return Err(TransferError::Outputs(0)),
+		};
+		for seen in self.by_first.get(&first).into_iter().flatten() {
+			if seen.inputs == inputs && seen.outputs == outputs {
+				continue;
+			}
+			if mergeable(&seen.outputs, outputs) {
+				return Err(TransferError::Mergeable);
+			}
+		}
+		Ok(())
+	}
+
+	/// [`SeenReassignments::check`], then records the reassignment.
+	pub fn admit(&mut self, inputs: &[(LeafId, u64)], outputs: &[ExplicitOutput]) -> Result<(), TransferError> {
+		self.check(inputs, outputs)?;
+		let first = sha256(&outputs[0].record());
+		let list = self.by_first.entry(first).or_default();
+		if !list.iter().any(|s| s.inputs == inputs && s.outputs == outputs) {
+			list.push(SeenReassignment { inputs: inputs.to_vec(), outputs: outputs.to_vec() });
+			self.count += 1;
+		}
+		Ok(())
+	}
 }
 
 /// A transfer being made: what each input's owner and the operator sign.
@@ -576,22 +717,45 @@ impl TransferPlan {
 		let (coin, v) = &self.inputs[i];
 		Ok(self.checkpoint(i).message(coin.asset, *v, &self.outputs)?)
 	}
+
+	/// The operator's rule before it co-signs: refuses the plan when one
+	/// transaction could satisfy both its pairs and those of a reassignment in
+	/// `seen` (its outputs agree with the other's at every index both commit
+	/// to), and otherwise records it in `seen`. See the
+	/// [module documentation](self).
+	pub fn admit(&self, seen: &mut SeenReassignments) -> Result<(), TransferError> {
+		let m = self.outputs.len();
+		if m == 0 || m > MAX_OUTPUTS as usize {
+			return Err(TransferError::Outputs(m));
+		}
+		let inputs: Vec<(LeafId, u64)> = self.inputs.iter().map(|(c, v)| (c.id, *v)).collect();
+		seen.admit(&inputs, &self.outputs)
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
-/// The ids every coin in a record's lineage spends, to refuse one spent twice.
-struct Spent(Vec<LeafId>);
+/// Every coin a record's lineage spends, by its id and its leaf's salt: to
+/// refuse one spent twice, and one leaf promised by two reassignments.
+struct Spent(Vec<(LeafId, [u8; 32])>);
 
 impl Spent {
-	fn add(&mut self, id: LeafId) -> Result<(), TransferError> {
-		if self.0.contains(&id) {
-			return Err(TransferError::DoubleSpend(id));
+	fn add(&mut self, coin: &ValidCoin) -> Result<(), TransferError> {
+		if self.0.iter().any(|(id, _)| *id == coin.id) {
+			return Err(TransferError::DoubleSpend(coin.id));
 		}
-		self.0.push(id);
+		self.check_salt(coin)?;
+		self.0.push((coin.id, coin.leaf.salt));
 		Ok(())
+	}
+
+	fn check_salt(&self, coin: &ValidCoin) -> Result<(), TransferError> {
+		match self.0.iter().find(|(_, salt)| *salt == coin.leaf.salt) {
+			Some((first, _)) => Err(TransferError::SaltTwice { first: *first, second: coin.id }),
+			None => Ok(()),
+		}
 	}
 }
 
@@ -631,6 +795,7 @@ impl CoinRecord {
 	pub fn resolve(&self, rounds: &[Transaction], policy: &WalletPolicy) -> Result<ValidCoin, TransferError> {
 		let mut spent = Spent(vec![]);
 		let coin = self.resolve_in(rounds, policy, &mut spent, 0)?;
+		spent.check_salt(&coin)?;
 		Ok(coin)
 	}
 
@@ -710,7 +875,7 @@ impl CoinRecord {
 					// Every input resolves under the receiver's policy, so its
 					// leaf is the policy's operator's, on the policy's chain.
 					let coin = input.coin.resolve_in(rounds, policy, spent, depth + 1)?;
-					spent.add(coin.id)?;
+					spent.add(&coin)?;
 					if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 						return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 					}
@@ -828,7 +993,7 @@ impl CoinRecord {
 				w.push(t.index);
 				w.extend(t.leaf.owner.serialize());
 				w.extend(t.leaf.owner_nonce);
-				w.extend(t.leaf.operator_nonce);
+				w.extend(t.leaf.creator_nonce);
 				w.extend(t.leaf.exit_delay.units().to_le_bytes());
 			},
 		}
@@ -902,7 +1067,7 @@ impl CoinRecord {
 				if index as usize >= m {
 					return Err(TransferError::Index { index: index as usize, count: m });
 				}
-				let leaf = NewLeaf { owner: r.key()?, owner_nonce: r.array32()?, operator_nonce: r.array32()?, exit_delay: r.relative_time()? };
+				let leaf = NewLeaf { owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()? };
 				Ok(CoinRecord::Transfer(Box::new(Transfer { inputs, outputs, index, leaf })))
 			},
 			2 => {
