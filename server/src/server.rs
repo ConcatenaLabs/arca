@@ -18,7 +18,7 @@ use sequentia_ext::rpc::{Auth, Client};
 use crate::boards::Boards;
 use crate::chain::{Certification, ChainSource, FinalityConfig, FinalityService, NodeSource};
 use crate::cosign::Cosigner;
-use crate::http::{router, App};
+use crate::http::{router, App, Limiter};
 use crate::nursery::Nursery;
 use crate::params::{AssetParams, FeeSchedule, Params};
 use crate::participations::Participations;
@@ -77,6 +77,63 @@ pub struct Config {
 	/// How the watcher works; the defaults when absent.
 	#[serde(default)]
 	pub watcher: WatcherSection,
+	/// What the unauthenticated calls may leave behind; the defaults when
+	/// absent.
+	#[serde(default)]
+	pub limits: LimitsSection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+	/// Operator nonces handed out per second at most, and the same for
+	/// authentication challenges, each counted on its own.
+	#[serde(default = "default_issue_per_second")]
+	pub issue_per_second: u32,
+	/// How many of either may be handed out at once before the rate holds.
+	#[serde(default = "default_issue_burst")]
+	pub issue_burst: u32,
+	/// How long an operator nonce is good for: one no board took in that
+	/// time is deleted, and a board naming it is refused.
+	#[serde(default = "default_nonce_ttl")]
+	pub nonce_ttl_seconds: u64,
+	/// How long a board never credited may stay out of every block after it
+	/// was registered before it is dropped.
+	#[serde(default = "default_board_unconfirmed")]
+	pub board_unconfirmed_seconds: u64,
+	/// How often expired nonces and challenges are deleted.
+	#[serde(default = "default_cleanup_interval")]
+	pub cleanup_interval_seconds: u64,
+}
+
+impl Default for LimitsSection {
+	fn default() -> LimitsSection {
+		LimitsSection {
+			issue_per_second: default_issue_per_second(), issue_burst: default_issue_burst(),
+			nonce_ttl_seconds: default_nonce_ttl(), board_unconfirmed_seconds: default_board_unconfirmed(),
+			cleanup_interval_seconds: default_cleanup_interval(),
+		}
+	}
+}
+
+fn default_issue_per_second() -> u32 {
+	5
+}
+
+fn default_issue_burst() -> u32 {
+	50
+}
+
+fn default_nonce_ttl() -> u64 {
+	3600
+}
+
+fn default_board_unconfirmed() -> u64 {
+	6 * 3600
+}
+
+fn default_cleanup_interval() -> u64 {
+	60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,6 +270,21 @@ fn err<E: std::fmt::Display>(what: &str) -> impl Fn(E) -> StartError + '_ {
 	move |e| StartError(format!("{}: {}", what, e))
 }
 
+/// Deletes, every `every`, the operator nonces no board took within
+/// `nonce_ttl` and the challenges used or expired.
+fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		loop {
+			match store.delete_expired(nonce_ttl).await {
+				Ok((0, 0)) => {},
+				Ok((n, c)) => log::info!("deleted {} expired operator nonce(s) and {} used or expired challenge(s)", n, c),
+				Err(e) => log::warn!("deleting expired nonces and challenges: {}", e),
+			}
+			tokio::time::sleep(every).await;
+		}
+	})
+}
+
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
@@ -286,7 +358,8 @@ impl Server {
 			WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Final })
 			.map_err(err("the wallet"))?);
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
-		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone());
+		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),
+			Duration::from_secs(config.limits.board_unconfirmed_seconds));
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
@@ -307,11 +380,15 @@ impl Server {
 			tasks.push(watcher.spawn());
 		}
 		tasks.push(finality.spawn());
+		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
+			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
 			participations: participations.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
+			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
+			challenges: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
 		});
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
 		let addr = listener.local_addr().map_err(err("listen"))?;
@@ -351,5 +428,7 @@ mod tests {
 		assert_eq!(c.fees.refresh_ppm, 0);
 		assert!(c.watcher.reclaim_early);
 		assert_eq!(c.watcher.max_sweep_inputs, 50);
+		assert_eq!(c.limits.issue_per_second, 5);
+		assert_eq!(c.limits.nonce_ttl_seconds, 3600);
 	}
 }

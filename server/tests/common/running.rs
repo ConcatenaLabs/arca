@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use arca_covenant::{Chain, MedianTime, WalletPolicy};
 use sequentia_ext::regtest::Regtest;
 use sequentia_ext::{explicit_txout, AssetAmount};
-use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server, WatcherSection};
+use server::server::{AssetSection, Config, FinalitySection, LimitsSection, NodeConfig, Server, WatcherSection};
 
 use super::client::Http;
 use super::db::TestDb;
@@ -79,6 +79,9 @@ impl Running {
 			// The tests before the watcher's drive every step by hand; a test
 			// of the watcher turns it on, or calls its pass.
 			watcher: WatcherSection { enabled: false, ..Default::default() },
+			// The tests ask for nonces and challenges faster than a wallet
+			// does; the test of the limits sets them itself.
+			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },
 		};
 		tune(&mut config, y);
 		let server = Server::start(&config).await.unwrap();

@@ -11,7 +11,7 @@ use elements::{AssetId, Transaction, Txid};
 
 use sequentia_ext::regtest::Regtest;
 use sequentia_ext::{explicit_txout, AssetAmount};
-use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server, WatcherSection};
+use server::server::{AssetSection, Config, FinalitySection, LimitsSection, NodeConfig, Server, WatcherSection};
 use server::store::RoundState;
 
 use super::db::TestDb;
@@ -82,6 +82,9 @@ impl Running {
 			// own on-chain work would change the coins they hold; the
 			// watcher has tests of its own in the server.
 			watcher: WatcherSection { enabled: false, ..Default::default() },
+			// The scenarios ask for nonces and challenges faster than one
+			// wallet does.
+			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },
 		};
 		let server = Server::start(&config).await.unwrap();
 		let mut r = Running { server, config, rt, purse, x, y, signer, db };

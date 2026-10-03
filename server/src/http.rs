@@ -9,8 +9,8 @@
 //! | Call | Method | Authenticated |
 //! |---|---|---|
 //! | `info` | GET | no |
-//! | `operator_nonce` | POST | no |
-//! | `challenge` | POST | no |
+//! | `operator_nonce` | POST | no: issued at a bounded rate ([`Limiter`]) |
+//! | `challenge` | POST | no: issued at a bounded rate ([`Limiter`]) |
 //! | `register_board`, `board_status` | POST | no |
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
@@ -64,6 +64,49 @@ pub struct App {
 	pub anchor_depth: u32,
 	pub max_request: usize,
 	pub challenge_ttl: Duration,
+	/// Bounds the operator nonces handed out.
+	pub nonces: Limiter,
+	/// Bounds the authentication challenges handed out.
+	pub challenges: Limiter,
+}
+
+/// A token bucket over one unauthenticated call that writes a row: at most
+/// `burst` at once, refilled at `per_second`. Each row it lets through is
+/// deleted once expired (`Store::delete_expired`), so what the calls can
+/// hold in the database is bounded by the rate times the row's lifetime.
+#[derive(Debug)]
+pub struct Limiter {
+	per_second: f64,
+	burst: f64,
+	state: std::sync::Mutex<(f64, std::time::Instant)>,
+}
+
+impl Limiter {
+	pub fn new(per_second: u32, burst: u32) -> Limiter {
+		let burst = f64::from(burst.max(1));
+		Limiter { per_second: f64::from(per_second), burst, state: std::sync::Mutex::new((burst, std::time::Instant::now())) }
+	}
+
+	/// Takes one token, or says how long until one is there.
+	pub fn take(&self) -> Result<(), Duration> {
+		let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		let now = std::time::Instant::now();
+		s.0 = (s.0 + now.duration_since(s.1).as_secs_f64() * self.per_second).min(self.burst);
+		s.1 = now;
+		if s.0 >= 1.0 {
+			s.0 -= 1.0;
+			return Ok(());
+		}
+		if self.per_second <= 0.0 {
+			return Err(Duration::from_secs(60));
+		}
+		Err(Duration::from_secs_f64((1.0 - s.0) / self.per_second))
+	}
+
+	fn refusal(&self, call: &str) -> Result<(), Refusal> {
+		self.take().map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
+			format!("{} is handed out at a bounded rate; try again in {} ms", call, wait.as_millis().max(1))))
+	}
 }
 
 /// A refusal, as the client sees it.
@@ -100,6 +143,7 @@ fn status_of(code: &str) -> StatusCode {
 		"unknown_participation" | "unknown_batch" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
 		"signer_unavailable" | "not_synced" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -263,12 +307,14 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 
 async fn operator_nonce(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::NonceResponse>, Refusal> {
 	let _: api::Empty = parse(body, app.max_request)?;
+	app.nonces.refusal("an operator nonce")?;
 	let n = app.store.issue_nonce().await?;
 	Ok(Json(api::NonceResponse { operator_nonce: hex(&n) }))
 }
 
 async fn challenge(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChallengeResponse>, Refusal> {
 	let _: api::Empty = parse(body, app.max_request)?;
+	app.challenges.refusal("a challenge")?;
 	let c = app.store.issue_challenge(app.challenge_ttl).await?;
 	Ok(Json(api::ChallengeResponse { challenge: hex(&c), expires_in_seconds: app.challenge_ttl.as_secs() }))
 }
