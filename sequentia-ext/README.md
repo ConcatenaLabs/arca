@@ -59,9 +59,14 @@ block from `generateblock`, so everything reaches a block through the mempool;
 the node runs with `-acceptnonstdtxn` so the genesis block's free coins, at a
 bare `OP_TRUE`, can be spent. `mine_parent` mines parent blocks and
 `anchor_to_parent_tip` produces blocks until the tip is anchored to the
-parent's tip, which is how a test buries an anchor. `Daemon::restart` stops a
-node and starts it again on its data; with `-persistmempool=0` it comes back
-with an empty mempool.
+parent's tip, which is how a test buries an anchor. `orphan_parent_from`
+reorganises the parent chain from a height (the parent invalidates that block
+and mines a longer branch in its place) and waits until the Sequentia node,
+which validates its anchors, has disconnected every block anchored to an
+orphaned parent block: an anchor-driven reorganisation, as the live chain
+follows Bitcoin, with the disconnected transactions back in the mempool.
+`Daemon::restart` stops a node and starts it again on its data; with
+`-persistmempool=0` it comes back with an empty mempool.
 
 ## Testing
 
@@ -70,7 +75,11 @@ with an empty mempool.
 `tests/regtest.rs` runs against the regtest harness. `regtest_pos_chain`
 checks the proof-of-stake chain: certified blocks, an anchor following the
 parent, the free coins spent through the mempool, and a restart that empties
-the mempool and keeps the chain. `regtest_node_client` reads the chain's
+the mempool and keeps the chain. `regtest_pos_anchor_reorg` orphans the parent
+block a certified, buried block is anchored to: the node drops that block and
+every one above it, the spend it held returns to the mempool, and the next
+block confirms it again, anchored in the parent's new chain.
+`regtest_node_client` reads the chain's
 genesis hash and fee whitelist, has the node build a transaction with an asset
 issuance of denomination 2 (`createrawtransaction`, `rawissueasset`), decodes it
 and re-encodes it byte for byte, signs and broadcasts it, and decodes the block
