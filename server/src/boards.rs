@@ -5,7 +5,7 @@
 //! coins to the board output and registers the record with the transaction.
 //! The server checks the record under its own policy (its chain, its key, its
 //! exit-delay bounds, an asset it serves, a value within the bounds, the board
-//! output paid exactly once), takes the nonce, which it never hands out
+//! output paid exactly once, an owner key other than `S`), takes the nonce, which it never hands out
 //! twice, records the board's scripts, which it never accepts twice, and
 //! takes the transaction into the nursery.
 //!
@@ -42,6 +42,8 @@ pub enum BoardError {
 	Transaction(String),
 	#[error("another board is registered for this leaf")]
 	Exists,
+	#[error("the board's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
+	OperatorKey,
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	#[error(transparent)]
@@ -64,6 +66,7 @@ impl BoardError {
 			BoardError::OutOfBounds(_) => "out_of_bounds",
 			BoardError::Transaction(_) => "invalid_transaction",
 			BoardError::Exists => "board_exists",
+			BoardError::OperatorKey => "operator_key",
 			BoardError::NotSynced => "not_synced",
 			BoardError::Store(StoreError::NonceUnknown) => "nonce_unknown",
 			BoardError::Store(StoreError::NonceUsed) => "nonce_used",
@@ -109,6 +112,9 @@ impl Boards {
 	pub async fn register(&self, record: &BoardRecord, tx: &Transaction) -> Result<BoardStatus, BoardError> {
 		let policy = self.params.policy(self.now().await?);
 		record.check()?;
+		if record.owner == self.params.operator {
+			return Err(BoardError::OperatorKey);
+		}
 		self.params.check_value(record.asset, record.value).map_err(BoardError::OutOfBounds)?;
 		let valid = record.validate(tx, &policy)?;
 		let leaf_id = valid.leaf_id;

@@ -18,8 +18,8 @@
 //!   lies before every coin's exit deadline;
 //! - every leaf wanted is a template the round builds (`vtxo-1`), within the
 //!   published bounds (an asset served, a value within its bounds, an exit
-//!   delay within the bounds), under a key that owns no leaf and is wanted by
-//!   no other participation; every offboard pays a served asset within its
+//!   delay within the bounds), under a key that owns no leaf, is wanted by no
+//!   other participation and is not the operator's `S`; every offboard pays a served asset within its
 //!   bounds to a script that is not an Arca script the server knows;
 //! - per asset, the coins given up hold exactly what the outputs take plus
 //!   the fee, and the fee covers the published schedule
@@ -196,6 +196,8 @@ pub enum ParticipationError {
 	OutOfBounds(String),
 	#[error("an output's key already owns a leaf or is wanted by another participation: every leaf has a key of its own")]
 	KeyReused,
+	#[error("output {0}: the leaf's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
+	OperatorKey(usize),
 	#[error("an offboard pays a script the server knows as an Arca script: a leaf script is never funded twice")]
 	ScriptReused,
 	#[error("the amounts do not balance: {0}")]
@@ -230,6 +232,7 @@ impl ParticipationError {
 			Template(..) => "template",
 			OutOfBounds(_) => "out_of_bounds",
 			KeyReused => "key_reused",
+			OperatorKey(_) => "operator_key",
 			ScriptReused => "script_reused",
 			Unbalanced(_) => "unbalanced",
 			Fee(_) => "fee",
@@ -389,6 +392,9 @@ impl Participations {
 							"an exit delay of {} units; the operator takes {} to {}", exit_delay.units(),
 							p.min_exit_delay.units(), p.max_exit_delay.units(),
 						)));
+					}
+					if *owner == p.operator {
+						return Err(ParticipationError::OperatorKey(j));
 					}
 					if !keys.insert(*owner) {
 						return Err(ParticipationError::KeyReused);
