@@ -143,9 +143,11 @@ pub struct ForfeitRow {
 	/// The height the wallet reads the chain from for it.
 	pub from_height: u64,
 	/// `signed` (its preimage not in hand), `settled` (the preimage in hand:
-	/// the coin was exchanged for the new leaves), `claimed` (the operator
-	/// claimed it on the chain, publishing the preimage), `refunded` (the
-	/// wallet took the refund) or `void` (its round can never return).
+	/// the coin was exchanged for the new leaves), `claiming` (the operator's
+	/// claim spends its output, publishing the preimage, not yet final),
+	/// `claimed` (that claim final), `refunding` (the wallet's refund spends
+	/// its output, not yet final), `refunded` (that refund final: the coin is
+	/// the wallet's on the chain) or `void` (its round can never return).
 	pub state: String,
 	pub note: String,
 }

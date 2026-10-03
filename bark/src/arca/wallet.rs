@@ -690,7 +690,7 @@ impl Wallet {
 			self.store.atomically(|s| {
 				for l in &given {
 					for f in s.forfeits_of(l)? {
-						if f.round == r && matches!(f.state.as_str(), "settled" | "claimed") {
+						if f.round == r && matches!(f.state.as_str(), "settled" | "claimed" | "claiming") {
 							s.set_forfeit_state(l, &r, "signed", &why)?;
 						}
 					}

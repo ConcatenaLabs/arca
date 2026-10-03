@@ -335,7 +335,8 @@ impl Wallet {
 			if !matches!(c.state.as_str(), "given" | "forfeited") {
 				continue;
 			}
-			let open: Vec<String> = self.store.forfeits_of(l)?.into_iter().filter(|f| f.state == "signed").map(|f| f.round).collect();
+			let open: Vec<String> = self.store.forfeits_of(l)?.into_iter().filter(|f| FOLLOWED.contains(&f.state.as_str()))
+				.map(|f| f.round).collect();
 			if open.is_empty() {
 				back.push(l.clone());
 			} else {
@@ -610,16 +611,23 @@ impl Wallet {
 			.map_err(|e| Error::Refused(e.to_string()))
 	}
 
-	/// Follows on the chain every forfeit the wallet signed whose preimage it
-	/// does not hold, whatever the server says of it: a claim of the
-	/// forfeit's output publishes the preimage, which completes the new
-	/// leaves; an output left unclaimed until the refund delay has run since
-	/// it confirmed is the wallet's to refund; a forfeit never published,
+	/// Follows on the chain every forfeit the wallet signed whose output's
+	/// fate is not yet decided, whatever the server says of it, until a spend
+	/// of that output is final: a claim of the output publishes the preimage,
+	/// which completes the new leaves at once, whatever the wallet broadcast
+	/// itself; an output left unclaimed until the refund delay has run since
+	/// it confirmed is the wallet's to refund, and the coin is the wallet's
+	/// on the chain once that refund is final; a forfeit never published,
 	/// whose round can never return, is void, and its coin is the wallet's
-	/// again.
+	/// again. A refund in the mempool, or a claim in a block not yet final,
+	/// decides nothing: the other may still take the output.
 	pub(crate) fn watch_forfeits(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		for f in self.store.forfeits_in("signed")? {
+		let mut followed = vec![];
+		for state in FOLLOWED {
+			followed.extend(self.store.forfeits_in(state)?);
+		}
+		for f in followed {
 			match self.watch_forfeit(&f) {
 				Ok(Some(v)) => out.push(v),
 				Ok(None) => {},
@@ -642,40 +650,63 @@ impl Wallet {
 		let row = self.store.coin(&f.leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", f.leaf_id)))?;
 		let forfeit = self.forfeit_of(&row, f)?;
 		let out = forfeit.output().txout();
-		// Published and unspent: the refund, once its delay has run.
+		// Published and unspent: the refund, once its delay has run (again,
+		// when a refund the wallet sent left the mempool or a block).
 		if let Some(at) = self.chain.locate(std::slice::from_ref(&out))?[0] {
 			return self.refund_forfeit(f, &forfeit, at, &row).map(Some);
 		}
 		// Published and spent: by a claim, which publishes the preimage, or by
-		// the wallet's own refund.
+		// the wallet's own refund. Only a final spend decides the coin.
 		if let Some((ftx, h)) = self.chain.find_payment(&out, f.from_height)? {
 			let vout = ftx.output.iter().position(|o| *o == out).expect("pays it") as u32;
 			let at = OutPoint::new(ftx.txid(), vout);
 			if let Some((spender, _)) = self.chain.spender(&at, h)? {
+				let spent_by = spender.txid();
+				let finality = self.chain.finality(&spent_by)?;
 				let unlock = unhex32(&f.unlock_hash)?;
 				let preimage = spender.input.iter().filter(|i| i.previous_output == at).flat_map(|i| i.witness.script_witness.iter())
 					.find(|w| w.len() == 32 && sha256::Hash::hash(w).to_byte_array() == unlock)
 					.map(|w| <[u8; 32]>::try_from(w.as_slice()).expect("32 bytes"));
 				if let Some(pre) = preimage {
-					let kept = self.finish(&f.participation, pre, "claimed")?;
-					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "claimed", "claim": spender.txid().to_string(),
+					// The preimage is the wallet's from the moment it is seen,
+					// whatever becomes of the claim: the new leaves are kept.
+					let state = if finality.is_final() { "claimed" } else { "claiming" };
+					let kept = self.finish(&f.participation, pre, state)?;
+					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": state, "claim": spent_by.to_string(),
+						"finality": finality.word(),
 						"note": "the operator claimed the forfeit on the chain, which publishes the preimage: the new leaves are the wallet's",
 						"new_leaves": kept})));
 				}
+				if finality.is_final() {
+					self.store.atomically(|s| {
+						s.set_forfeit_state(&f.leaf_id, &f.round, "refunded", &spent_by.to_string())?;
+						s.set_coin_state(&f.leaf_id, "exited", &format!("its forfeit's output refunded by {}, final", spent_by))
+					})?;
+					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "refunded", "refund": spent_by.to_string()})));
+				}
+				let why = format!("its forfeit's output is spent by the refund {}, which is {}: the wallet follows the output until a \
+					spend of it is final, the refund or the operator's claim", spent_by, finality.word());
 				self.store.atomically(|s| {
-					s.set_forfeit_state(&f.leaf_id, &f.round, "refunded", &spender.txid().to_string())?;
-					s.set_coin_state(&f.leaf_id, "exited", &format!("its forfeit's output refunded by {}", spender.txid()))
+					s.set_forfeit_state(&f.leaf_id, &f.round, "refunding", &spent_by.to_string())?;
+					if s.coin(&f.leaf_id)?.is_some_and(|c| c.state != "spent") {
+						s.set_coin_state(&f.leaf_id, "forfeited", &why)?;
+					}
+					Ok(())
 				})?;
-				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "refunded", "refund": spender.txid().to_string()})));
+				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "refunding", "refund": spent_by.to_string(),
+					"finality": finality.word(), "note": why})));
 			}
 		}
 		// Never published: void once its round can never return.
+		if f.state != "signed" {
+			return Ok(None);
+		}
 		if let Some(raw) = self.store.tx(&f.round)? {
 			let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
 			if self.chain.gone(&round)? {
 				let why = format!("round {} can never return, so its forfeit can never be claimed: the coin is the wallet's again", f.round);
 				self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
-				let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| x.state == "signed");
+				let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| FOLLOWED.contains(&x.state.as_str()));
 				if !open && matches!(row.state.as_str(), "forfeited" | "spent") {
 					self.store.set_coin_state(&f.leaf_id, "live", &why)?;
 				}
@@ -724,12 +755,20 @@ impl Wallet {
 		let mut v = base;
 		match built.and_then(|u| self.chain.broadcast(&u.tx).map(|txid| (txid, u))) {
 			Ok((txid, u)) => {
+				// Sent, which decides nothing: the operator's claim may still
+				// take the output. The wallet follows it until a spend is final.
+				let why = format!("its forfeit's refund {} is sent: the wallet follows the forfeit's output until a spend of it is \
+					final, the refund or the operator's claim", txid);
 				self.store.atomically(|s| {
-					s.set_forfeit_state(&f.leaf_id, &f.round, "refunded", &txid.to_string())?;
-					s.set_coin_state(&f.leaf_id, "exited", &format!("its forfeit's output refunded by {}", txid))
+					s.set_forfeit_state(&f.leaf_id, &f.round, "refunding", &txid.to_string())?;
+					if s.coin(&f.leaf_id)?.is_some_and(|c| c.state != "spent") {
+						s.set_coin_state(&f.leaf_id, "forfeited", &why)?;
+					}
+					Ok(())
 				})?;
-				v["state"] = json!("refunded");
+				v["state"] = json!("refunding");
 				v["refund"] = json!({"txid": txid.to_string(), "vsize": u.tx.vsize(), "pays": u.tx.output[0].value.explicit().map(|x| x.to_string())});
+				v["note"] = json!(why);
 			},
 			Err(e) if e.to_string().contains("non-BIP68-final") => {
 				v["state"] = json!("published");
@@ -744,6 +783,13 @@ impl Wallet {
 		Ok(v)
 	}
 }
+
+/// The states of a forfeit whose output's fate is not decided yet, which the
+/// wallet follows on the chain: `signed` (its preimage not in hand, the
+/// output unpublished or unspent), `refunding` (spent by the wallet's
+/// refund, not yet final), `claiming` (spent by the operator's claim, not yet
+/// final; the preimage is in hand).
+pub(crate) const FOLLOWED: [&str; 3] = ["signed", "refunding", "claiming"];
 
 #[cfg(test)]
 mod tests {
