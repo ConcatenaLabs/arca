@@ -146,3 +146,66 @@ fn regtest_node_client() {
 		other => panic!("rebroadcast of a mined transaction: {:?}", other),
 	}
 }
+
+/// The proof-of-stake chain: every block the committee produces is certified,
+/// its anchor follows the parent's tip, a block produced takes the mempool,
+/// and a restart without the mempool keeps the chain and empties the mempool.
+#[test]
+fn regtest_pos_chain() {
+	let mut chain = Regtest::start_pos(
+		std::path::Path::new(&std::env::var_os("SEQUENTIAD_EXEC").expect("SEQUENTIAD_EXEC")),
+		&workdir("sequentia-ext-pos"), &[],
+	).unwrap();
+	let h1 = chain.produce_block().unwrap();
+	// No block without the committee.
+	let e = chain.client().generate_to_descriptor(1, OP_TRUE_DESCRIPTOR).unwrap_err();
+	assert!(e.to_string().contains("bad-posvrf"), "{}", e);
+	println!("a block without the committee: {}", e);
+	let header: Json = chain.client().call("getblockheader", &[json!(h1.to_string())]).unwrap();
+	assert_eq!(header["height"], 1);
+	assert_eq!(header["poscertified"], true);
+	let a1 = header["anchorheight"].as_u64().unwrap();
+
+	chain.mine_parent(2).unwrap();
+	let made = chain.anchor_to_parent_tip().unwrap();
+	let tip = chain.client().block_header(made.last().unwrap()).unwrap();
+	assert_eq!(tip.bitcoin_anchor().height as u64, a1 + 2);
+	println!("block 1 anchored at {}; tip anchored at {} after {} block(s)", a1, a1 + 2, made.len());
+
+	// The genesis block's free coins, at a bare OP_TRUE, move through the
+	// mempool into the next block.
+	let genesis = chain.client().genesis_hash().unwrap();
+	let block = chain.client().block(&genesis).unwrap();
+	let (txid, vout, out) = block.txdata.iter().flat_map(|tx| {
+		tx.output.iter().enumerate().map(move |(i, o)| (tx.txid(), i as u32, o.clone()))
+	}).find(|(_, _, o)| o.script_pubkey.as_bytes() == [0x51]).unwrap();
+	let amount = out.asset_amount().unwrap();
+	let tx = Transaction {
+		version: 2, lock_time: LockTime::ZERO,
+		input: vec![TxIn { previous_output: OutPoint::new(txid, vout), ..Default::default() }],
+		output: vec![
+			explicit_txout(AssetAmount::new(amount.asset, amount.amount - 10_000), Script::from(vec![0x51])),
+			fee_txout(AssetAmount::new(amount.asset, 10_000)),
+		],
+	};
+	let spent = chain.client().send_raw_transaction(&tx).unwrap();
+	let h = chain.produce_block().unwrap();
+	assert!(chain.client().block(&h).unwrap().txdata.iter().any(|t| t.txid() == spent));
+
+	// A transaction left in the mempool is gone after a restart without it.
+	let tx2 = Transaction {
+		version: 2, lock_time: LockTime::ZERO,
+		input: vec![TxIn { previous_output: OutPoint::new(spent, 0), ..Default::default() }],
+		output: vec![
+			explicit_txout(AssetAmount::new(amount.asset, amount.amount - 20_000), Script::from(vec![0x51])),
+			fee_txout(AssetAmount::new(amount.asset, 10_000)),
+		],
+	};
+	let waiting = chain.client().send_raw_transaction(&tx2).unwrap();
+	let height = chain.client().block_count().unwrap();
+	chain.node.restart(&["-persistmempool=0"]).unwrap();
+	assert_eq!(chain.client().block_count().unwrap(), height);
+	let mempool: Vec<String> = chain.client().call("getrawmempool", &[]).unwrap();
+	assert!(!mempool.contains(&waiting.to_string()), "the mempool kept {}", waiting);
+	assert_eq!(chain.client().send_raw_transaction(&tx2).unwrap(), waiting);
+}
