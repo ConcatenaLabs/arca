@@ -16,6 +16,28 @@ fn key(label: &str) -> Keypair {
 	Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(s.as_byte_array()).unwrap())
 }
 
+/// The wallet knows every code the server refuses a request with: a 4xx
+/// with a code it does not know would be taken for an answer that says
+/// nothing, and the request sent again, where the server said it will not
+/// take it. It knows no code the server never answers with, and it takes
+/// none of those that say nothing of what was done (a 5xx, or a request to
+/// slow down) for a refusal.
+#[test]
+fn the_wallet_knows_every_refusal_the_server_answers_with() {
+	use bark::arca::client::REFUSALS;
+	use server::api::REFUSAL_CODES;
+	for code in REFUSAL_CODES {
+		let status = server::http::status_of(code).as_u16();
+		let refusal = (400..500).contains(&status) && *code != "rate_limited";
+		assert_eq!(REFUSALS.contains(code), refusal, "the server answers {} with {}; the wallet's REFUSALS {} it", code, status,
+			if refusal { "lacks" } else { "has" });
+	}
+	for code in REFUSALS {
+		assert!(REFUSAL_CODES.contains(code), "the wallet knows {}, which the server never answers with", code);
+	}
+	println!("the wallet takes {} of the server's {} codes for refusals", REFUSALS.len(), REFUSAL_CODES.len());
+}
+
 #[test]
 fn the_wallets_digests_are_the_servers() {
 	let chain = Chain::new(BlockHash::from_str("3ce8ab6c8f9836c0cebca304f3cbed3e824e6c53f4cacd2822f6f8441eed1a3e").unwrap());

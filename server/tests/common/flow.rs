@@ -185,8 +185,26 @@ pub fn has(log: &[WatcherTxRow], kind: &str, subject: &[u8]) -> bool {
 	log.iter().any(|w| w.kind == kind && w.subject == subject)
 }
 
-/// Produces and buries blocks until the watcher's transactions are final.
+/// Waits until every transaction in the nursery has gone to the node at least
+/// once. The watcher logs a transaction before it broadcasts it, so one its
+/// own task logged a moment ago may not have reached the mempool yet, and a
+/// block made now would leave it out.
+pub async fn broadcast_all(r: &Running) {
+	let start = std::time::Instant::now();
+	loop {
+		let pending = r.server.store.nursery_in(NurseryState::Pending).await.unwrap();
+		if pending.iter().all(|n| n.broadcasts > 0) {
+			return;
+		}
+		assert!(start.elapsed() < Duration::from_secs(30), "a transaction in the nursery was never broadcast");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+}
+
+/// Produces and buries blocks until the watcher's transactions are final,
+/// each of them broadcast first ([`broadcast_all`]).
 pub async fn settle(r: &Running) {
+	broadcast_all(r).await;
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;

@@ -958,7 +958,15 @@ anchored to and every block above; the node disconnects them all, the server
 no longer calls the round final, the round and the answers wait in the
 mempool and the nursery as pending, and they return with the same txids and
 are final again, nothing built a second time; the owner's exit is still
-refused.
+refused. A test waits before it makes a block for every transaction in the
+nursery to have gone to the node once: the watcher logs a transaction before
+it broadcasts it, so its own task's answer may be in the log a moment before
+it is in the mempool.
+
+`tests/refusal_codes.rs` reads every refusal code out of the server's source
+(each `code()` of its refusals, each refusal the HTTP layer makes itself) and
+compares them with `api::REFUSAL_CODES`, both ways; a code is answered with a
+4xx exactly when the request was not taken.
 
 `tests/offboard.rs` runs offboards. In X, which the node accepts for fees, and
 in Y, which it does not: nothing is unlocked before the owner's forfeit; then

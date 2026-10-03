@@ -248,7 +248,9 @@ and holding it there, with the reason shown:
   20 unused addresses.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
-participation id against the server's own.
+participation id against the server's own, and its list of refusal codes
+against the server's: the wallet takes every code the server answers with a
+4xx for a refusal (but `rate_limited`, a request to slow down), and no other.
 
 They need `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` (as for the server's tests:
 [server/README.md](../server/README.md)) and the signer binary, built beside
