@@ -5,6 +5,7 @@
 
 pub mod chain;
 pub mod net;
+pub mod round;
 
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::{sha256d, Hash};

@@ -17,23 +17,27 @@
 //!    Then why a board leaf takes no off-chain spend: once its delay has
 //!    passed, its owner exits at once and the forfeit the operator holds is
 //!    void.
-//! 2. One atom of the connector asset serves two claims of one round.
+//!    One atom of the connector asset serves two claims of one round.
+//! 2. The round's connector output, spent any way but by the issuance of
+//!    exactly `M`: with no issuance, two atoms, a reissuance token, another
+//!    asset under a contract hash, or another key's signature. Each is
+//!    refused; the issuance confirms.
 //! 3. Two forfeits of one participation cannot share one forfeit output, with
 //!    distinct keys and with the same key.
-//! 4. After a rollback that replaces the round, the connector asset cannot be
-//!    issued, no claim confirms, and the owner refunds after the delay.
-//! 5. The offboard: the operator's claim publishes the preimage, a third party
+//! 4. The offboard: the operator's claim publishes the preimage, a third party
 //!    moves the output to the owner's destination; an output pinned at its own
 //!    index cannot be merged with another to one destination; the operator
 //!    reclaims an offboard whose preimage never came, after the delay.
-//! 6. An out-of-round chain three hops deep, one hop a swap of two owners'
+//! 5. An out-of-round chain three hops deep, one hop a swap of two owners'
 //!    coins in two assets: the last receiver validates it from its record and
 //!    the rounds alone, brings it on-chain from the record (unrolls, entries,
 //!    checkpoints and reassignments, outside fee coins wherever the asset is
 //!    not accepted for fees) and exits. A reassignment's pair cannot skip the
-//!    checkpoint, a checkpoint's pair cannot spend the checkpoint, a swap
-//!    cannot confirm without its other input, and the first sender's exit fails
-//!    once the receiver has published the checkpoint.
+//!    checkpoint, a checkpoint's pair cannot spend the checkpoint, the swap's
+//!    outputs cannot be paid from one input's value alone, and the first
+//!    sender's exit fails once the receiver has published the checkpoint.
+//!
+//! Rollbacks are in `rollback.rs`.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction's size
 //! beside the specification's, and every refusal.
@@ -427,67 +431,7 @@ fn no_merge(c: &mut Ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. A rollback that replaces the round
-// ---------------------------------------------------------------------------
-
-fn rollback(c: &mut Ctx) {
-	let s = keypair("rollback operator");
-	let a = keypair("rollback owner, old leaf");
-	let x = c.net.x;
-	let (old, old_coin, old_id) = funded_leaf(&mut c.net, &a, &s, "rollback old leaf");
-	let (issuer, sched) = c.schedule(&s);
-	let preimage = label32("rollback preimage");
-	let spec = LeafSpec {
-		template: Template::Vtxo1, owner: xonly(&keypair("rollback owner, new leaf")), value: LEAF - 2_000,
-		owner_nonce: label32("rollback new nonce"), operator_nonce: label32("rollback operator nonce"),
-		exit_delay: delay(), unlock_hash: sha256(&preimage),
-	};
-	let tree = c.tree(&sched, &[spec]);
-	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
-	let rt = c.pass("rollback/round X, with its connector output", &round);
-	let m = connector_asset(rt, cv);
-	let f = Forfeit::new(old, (x, LEAF), old_id, sha256(&preimage), m, delay(), 1_500).unwrap();
-	let p = pair(&f, &a, &s);
-
-	// X's block is disconnected (a stand-in for an anchor-driven rollback),
-	// and round Y, spending the same coins, is mined instead.
-	let info = c.net.rpc("getrawtransaction", json!([rt.to_string(), true]));
-	let block = info["blockhash"].as_str().unwrap().to_string();
-	c.net.rpc("invalidateblock", json!([block]));
-	let mut y = round.clone();
-	let n = y.output.len();
-	let v = y.output[n - 2].value.explicit().unwrap();
-	y.output[n - 2].value = elements::confidential::Value::Explicit(v - 1);
-	y.output[n - 1].value = elements::confidential::Value::Explicit(2_001);
-	let yt = y.txid();
-	c.net.mock += 60;
-	c.net.set_mock(c.net.mock);
-	c.net.rt.client().generate_block("raw(51)", &[&y]).unwrap();
-	assert!(c.net.rt.client().confirmations(&yt).unwrap() >= 1);
-	assert_ne!(yt, rt);
-	println!("rollback: round X {} disconnected, round Y {} mined in its place", rt, yt);
-
-	// M cannot be issued: X's connector output does not exist.
-	let iss = connector_issuance_tx(&c.net, &round, rt, cv, &s);
-	c.net.refuse("rollback/neg the issuance of X's connector asset", &iss, "bad-txns-inputs-missingorspent");
-	// The forfeit can still reach the chain (the old leaf is there), and no
-	// claim can follow it: there is no M, only some other asset.
-	let ft = c.pass("rollback/the forfeit, published after the rollback", &f.tx(old_coin.outpoint, &p, &FeeSource::Reserve).unwrap().tx);
-	let other = c.net.fund(vec![explicit(c.net.y, 1, op_true_spk())]).remove(0);
-	let tx = claim_tx(&c.net, &f, OutPoint::new(ft, 0), &other, &s, &preimage, 1);
-	c.net.refuse("rollback/neg the claim, with another asset where M belongs", &tx, "Script failed an OP_EQUALVERIFY operation");
-	let refund = |c: &Ctx| {
-		let ks = f.refund(OutPoint::new(ft, 0), &[ExplicitOutput::new(x, f.output().value - 1_500, op_true_spk())],
-			&FeeSource::Reserve).unwrap();
-		signed(&c.net, ks, &a, vec![]).tx
-	};
-	c.net.refuse("rollback/neg the owner's refund before the delay", &refund(c), "non-BIP68-final");
-	c.net.wait_csv(&ft, delay());
-	c.pass("rollback/the owner's refund after the delay", &refund(c));
-}
-
-// ---------------------------------------------------------------------------
-// 5. The offboard
+// 4. The offboard
 // ---------------------------------------------------------------------------
 
 fn offboard(c: &mut Ctx) {
@@ -573,7 +517,7 @@ fn offboard(c: &mut Ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. A chain three hops deep, received and exited by the last receiver
+// 5. A chain three hops deep, received and exited by the last receiver
 // ---------------------------------------------------------------------------
 
 /// A round for a batch in `tree`'s asset, which may differ from X: the
@@ -718,13 +662,17 @@ fn transfer_chain(c: &mut Ctx) {
 				let again = collab_tx(&i.checkpoint, cps[0], i.coin.asset, i.checkpoint_value, &[i.checkpoint_output()],
 					&i.checkpoint_pair, &FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }).unwrap();
 				c.net.refuse("chain/neg the checkpoint's pair on the checkpoint", &with_coin(again, 1), "Invalid Schnorr signature");
-				// The swap with B's input alone: its Y output has nothing to come from.
+				// The swap's outputs from B's input alone, nothing paying C's
+				// side: refused because the values do not balance, not by a
+				// script. B's pair signs the outputs, never the other input, so
+				// a third party who funds C's side makes the same swap confirm
+				// with one leaf (the specification's limit 2).
 				let alone = arca_covenant::transfer::reassignment_tx(&inputs[..1], outputs, &cps[..1], &FeeSource::Reserve);
 				assert!(alone.is_err(), "the builder refuses to make it");
 				let mut s = spend(0).coin(&Coin { outpoint: cps[0], txout: i.checkpoint_output().txout() }, 0xffff_ffff)
 					.outputs(outputs.iter().map(|o| o.txout()).collect());
 				s.witness(0, i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8));
-				c.net.refuse("chain/neg the swap with one of its two inputs", &s.tx, "bad-txns-in-ne-out");
+				c.net.refuse("chain/neg the swap's outputs from B's input alone, unfunded", &s.tx, "bad-txns-in-ne-out");
 				return;
 			},
 		};
@@ -775,7 +723,6 @@ fn offchain_transactions_on_regtest() {
 	board_and_refresh(&mut c);
 	connector(&mut c);
 	no_merge(&mut c);
-	rollback(&mut c);
 	offboard(&mut c);
 	transfer_chain(&mut c);
 	c.net.print();

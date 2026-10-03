@@ -263,7 +263,12 @@ each refreshed owner would keep the old coin and the new leaf. So a round with
 another txid is always a new round, with a new tree and new unlock hashes, whose
 participations run again, and a round that carries refreshes takes no input of a
 third party (a covenant fill, say), which could be spent elsewhere and force a
-replacement; fills go in their own round transactions.
+replacement; fills go in their own round transactions. A round that cannot
+return leaves each owner who gave up a leaf for it a forfeit that no claim can
+answer and that ends in the owner's refund, so a participation run again after
+it is forfeit-first, as a board's is: the operator publishes the forfeit for
+the new round and sees it final before it hands over the preimage, and it
+co-signs no other off-chain spend of a leaf given up for the lost round.
 
 ```rust
 let valid = new_record.validate(&round, &policy, &new_key, &new_nonce)?;   // the new leaf, in this round
@@ -460,9 +465,7 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   claim, the new batch unrolled from its record, its entry unlocked with the
   preimage learned from the chain, the new leaf exited), one atom of the
   connector serving two claims, two forfeits of one participation refused one
-  output, the connector that cannot be issued after a rollback replaces the
-  round and the owner's refund, and the offboard's unlock, its merge refused,
-  and its reclaim; the round's connector output spent with no issuance, issuing
+  output, and the offboard's unlock, its merge refused, and its reclaim; the round's connector output spent with no issuance, issuing
   two atoms, issuing with a reissuance token, issuing another asset under a
   contract hash, or signed by another key, each refused, and its issuance of
   `M` confirmed; every negative case refused by the mempool and in a block,
@@ -471,9 +474,27 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   three-hop chain on chain: the last receiver validates it from its record and
   the confirmed rounds, brings it on-chain from the record, with fee coins
   wherever the asset is not accepted for fees, and exits; a reassignment's pair
-  cannot skip the checkpoint, a checkpoint's pair cannot spend the checkpoint, a
-  swap cannot confirm with one input, and the first sender's exit fails once the
+  cannot skip the checkpoint, a checkpoint's pair cannot spend the checkpoint,
+  the swap's outputs cannot be paid from one input's value alone (the values do
+  not balance; the pairs do not name the other input, so a third party funding
+  that side would make it confirm), and the first sender's exit fails once the
   receiver has published the checkpoint.
+- `tests/rollback.rs`: on an anchored regtest chain, what each party holds after
+  a rollback (`invalidateblock` standing in for an anchor rollback). A round
+  broadcast again returns with its txid, the re-check finds the same round, `M`
+  is issued and the forfeit claimed: the operator ends with the old coin, the
+  owner with the new leaf. A replacement with another txid paying the same batch
+  output is a new round to the re-check, and the wallet will not carry its
+  forfeit over; `M` of the old round cannot be issued and the new round's does
+  not satisfy the claim, so the owner ends with the old coin and the new leaf.
+  A round whose third party's input is spent elsewhere cannot return; the new
+  round has a new tree and new unlock hashes: re-run forfeit-first, the old
+  forfeit has no coin left and the operator claims; re-run with the preimage
+  first, the owner publishes the old forfeit, refunds it and keeps the new leaf.
+  A forfeit disconnected late in its refund delay restarts it. A receiver's
+  checkpoint disconnected while the replacing chain runs past the sender's exit
+  delay: the leaf's delay does not restart, and a producer mines the sender's
+  exit.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
