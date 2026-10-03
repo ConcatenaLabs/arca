@@ -146,10 +146,6 @@ pub(super) fn leaf_row(r: &tokio_postgres::Row) -> Result<LeafRow, StoreError> {
 	})
 }
 
-fn hex(b: &[u8]) -> String {
-	b.iter().map(|x| format!("{:02x}", x)).collect()
-}
-
 /// Takes an operator nonce for `leaf_id` inside `tx`: it must have been issued
 /// and never taken.
 pub(super) async fn take_nonce(tx: &tokio_postgres::Transaction<'_>, nonce: &[u8; 32], leaf_id: &[u8; 32])
@@ -194,7 +190,7 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 	).await;
 	match r {
 		Ok(_) => Ok(()),
-		Err(e) if StoreError::is_unique(&e, "leaf_pkey") => Err(StoreError::LeafExists(hex(&coin.leaf_id))),
+		Err(e) if StoreError::is_unique(&e, "leaf_pkey") => Err(StoreError::LeafExists(super::hex(&coin.leaf_id))),
 		Err(e) if StoreError::is_unique(&e, "leaf_owner_key_key") => Err(StoreError::KeyReused),
 		Err(e) if StoreError::is_unique(&e, "leaf_script_pubkey_key") => Err(StoreError::ScriptReused),
 		Err(e) => Err(e.into()),

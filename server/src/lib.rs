@@ -12,10 +12,16 @@
 //! The scripts, records and their validation are `arca-covenant`'s; the server
 //! uses them and writes none of its own.
 
+pub mod api;
+pub mod auth;
 pub mod boards;
 pub mod chain;
+pub mod cosign;
+pub mod http;
 pub mod nursery;
 pub mod params;
+pub mod server;
+pub mod signer;
 pub mod store;
 pub mod wallet;
 
