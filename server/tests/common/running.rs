@@ -38,6 +38,12 @@ pub struct Running {
 
 impl Running {
 	pub async fn start() -> Running {
+		Running::start_with(|_, _| {}).await
+	}
+
+	/// [`Running::start`], with the server's configuration changed by `tune`
+	/// first. `tune` is given the configuration and asset Y.
+	pub async fn start_with<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {
 		let db = TestDb::new().await;
 		let rt = tokio::task::block_in_place(node::start);
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
@@ -49,7 +55,7 @@ impl Running {
 		let signer = tokio::task::block_in_place(|| SignerProcess::start(&s, genesis));
 		let mnemonic = signer.dir.join("wallet.mnemonic");
 		std::fs::write(&mnemonic, MNEMONIC).unwrap();
-		let config = Config {
+		let mut config = Config {
 			listen: "127.0.0.1:0".into(),
 			database: db.url.clone(),
 			signer_socket: signer.socket.clone(),
@@ -64,7 +70,10 @@ impl Running {
 			finality: FinalitySection { poll_interval_ms: 200, ..Default::default() },
 			exit_delay_units: None,
 			assets: vec![AssetSection { asset: x.to_string(), min_leaf: MIN_LEAF.to_string() }],
+			fee_assets: None,
+			fees: Default::default(),
 		};
+		tune(&mut config, y);
 		let server = Server::start(&config).await.unwrap();
 		let http = Http { base: format!("http://{}", server.addr) };
 		Running { server, config, http, rt, purse, x, y, s, chain: Chain::new(genesis), signer, db }

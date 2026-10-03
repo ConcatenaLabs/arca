@@ -13,6 +13,8 @@
 //! | `challenge` | POST | no |
 //! | `register_board`, `board_status` | POST | no |
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
+//! | `submit_participation` | POST | by each owner's attestation over the participation |
+//! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
 
 use std::str::FromStr;
@@ -32,16 +34,17 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Transaction};
 use serde::de::DeserializeOwned;
 
-use arca_covenant::{BoardRecord, LeafId, NewLeaf, RelativeTime};
+use arca_covenant::{BoardRecord, LeafId, MedianTime, NewLeaf, RelativeTime};
 
 use crate::api;
 use crate::auth;
 use crate::boards::{BoardError, BoardStatus, Boards};
 use crate::chain::{Certification, Finality};
 use crate::cosign::{CosignError, Cosigner, InputRequest, OutputRequest, TransferRequest};
-use crate::params::Params;
+use crate::params::{FeeSchedule, Params};
+use crate::participations::{self as part, ParticipationError, ParticipationRequest, Participations, Status};
 use crate::signer::{hex, parse_amount, unhex, unhex32};
-use crate::store::{ChallengeError, LeafKind, LeafState, Store};
+use crate::store::{ChallengeError, LeafKind, LeafState, Store, WantedKind};
 
 /// What the HTTP handlers reach.
 pub struct App {
@@ -49,6 +52,7 @@ pub struct App {
 	pub params: Arc<Params>,
 	pub boards: Arc<Boards>,
 	pub cosigner: Arc<Cosigner>,
+	pub participations: Arc<Participations>,
 	pub certification: Certification,
 	pub anchor_depth: u32,
 	pub max_request: usize,
@@ -86,7 +90,8 @@ fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"double_spend" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" | "merge" => StatusCode::CONFLICT,
+		"unknown_participation" => StatusCode::NOT_FOUND,
+		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"signer_unavailable" | "not_synced" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
@@ -109,6 +114,16 @@ impl From<CosignError> for Refusal {
 		let code = e.code();
 		if code == "internal" {
 			log::error!("cosign_transfer: {}", e);
+		}
+		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+impl From<ParticipationError> for Refusal {
+	fn from(e: ParticipationError) -> Refusal {
+		let code = e.code();
+		if code == "internal" {
+			log::error!("participation: {}", e);
 		}
 		Refusal::new(status_of(code), code, e.to_string())
 	}
@@ -207,7 +222,13 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			anchor_depth: app.anchor_depth,
 		},
 		templates: api::TemplatesInfo { version: 1, list: vec!["vtxo-1".into(), "board-1".into()] },
-		fees: api::FeesInfo { transfer: "0".into() },
+		fees: api::FeesInfo {
+			transfer: "0".into(),
+			refresh_ppm: p.fees.refresh_ppm,
+			free_window_seconds: FeeSchedule::FREE_WINDOW,
+			full_after_seconds: FeeSchedule::FULL_AFTER,
+			offboard_ppm: p.fees.offboard_ppm,
+		},
 		max_request_bytes: app.max_request as u64,
 	})
 }
@@ -282,6 +303,97 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 	}))
 }
 
+fn participation_status(s: &Status) -> api::ParticipationStatus {
+	let r = &s.row;
+	api::ParticipationStatus {
+		participation_id: hex(&r.id),
+		state: r.state.as_str().into(),
+		attempt: r.attempt,
+		unlock_hash: hex(&r.unlock_hash),
+		forfeit_first: r.forfeit_first,
+		refund_delay_units: r.refund_delay_units,
+		round: s.round.as_ref().map(|rr| api::RoundRef { txid: rr.txid.to_string(), connector_vout: rr.connector_vout }),
+		inputs: r.inputs.iter().map(|i| api::ParticipationInputStatus {
+			leaf_id: hex(&i.leaf_id),
+			asset: AssetId::from_byte_array(i.asset).to_string(),
+			value: i.value.to_string(),
+			margin: i.margin.to_string(),
+		}).collect(),
+		outputs: r.outputs.iter().zip(&s.placed).map(|(o, at)| {
+			let mut out = api::ParticipationOutputStatus {
+				kind: String::new(),
+				asset: AssetId::from_byte_array(o.asset).to_string(),
+				value: o.value.to_string(),
+				operator_nonce: None,
+				leaf_id: at.leaf_id.map(|l| l.to_string()),
+				batch_vout: at.batch_vout,
+				leaf_index: at.leaf_index,
+				margin: None,
+				reclaim_delay_units: None,
+				offboard_vout: at.offboard_vout,
+			};
+			match &o.kind {
+				WantedKind::Leaf { operator_nonce, .. } => {
+					out.kind = "leaf".into();
+					out.operator_nonce = Some(hex(operator_nonce));
+				},
+				WantedKind::Offboard { margin, reclaim_delay_units, .. } => {
+					out.kind = "offboard".into();
+					out.margin = Some(margin.to_string());
+					out.reclaim_delay_units = Some(*reclaim_delay_units);
+				},
+			}
+			out
+		}).collect(),
+		fees: r.fees.iter().map(|(a, v)| api::FeeAmount { asset: AssetId::from_byte_array(*a).to_string(), amount: v.to_string() }).collect(),
+	}
+}
+
+async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::ParticipationStatus>, Refusal>
+{
+	let req: api::SubmitParticipation = parse(body, app.max_request)?;
+	let mut inputs = Vec::with_capacity(req.inputs.len());
+	for i in &req.inputs {
+		inputs.push(part::InputRequest { leaf_id: leaf_id(&i.leaf_id)?, attestation: sig(&i.attestation)? });
+	}
+	let mut outputs = Vec::with_capacity(req.outputs.len());
+	for o in &req.outputs {
+		outputs.push(match o {
+			api::WantedOutput::Leaf(l) => part::OutputRequest::Leaf {
+				asset: asset(&l.asset)?,
+				value: amount(&l.value)?,
+				template: l.template.parse().map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "template",
+					format!("template {:?}: {}", l.template, e)))?,
+				owner: key(&l.owner)?,
+				owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
+				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
+			},
+			api::WantedOutput::Offboard(b) => part::OutputRequest::Offboard {
+				asset: asset(&b.asset)?,
+				value: amount(&b.value)?,
+				script: elements::Script::from(unhex(&b.script).map_err(Refusal::malformed)?),
+			},
+		});
+	}
+	let mut fees = Vec::with_capacity(req.fees.len());
+	for f in &req.fees {
+		fees.push((asset(&f.asset)?, amount(&f.amount)?));
+	}
+	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
+		.transpose()?;
+	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, fees, not_before }).await?;
+	Ok(Json(participation_status(&status)))
+}
+
+async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::ParticipationStatus>, Refusal>
+{
+	let req: api::ParticipationStatusRequest = parse(body, app.max_request)?;
+	let id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
+	Ok(Json(participation_status(&app.participations.status(&id).await?)))
+}
+
 /// The most messages one read returns.
 pub const MAILBOX_PAGE: u32 = 100;
 
@@ -338,6 +450,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/register_board", post(register_board))
 		.route("/v1/board_status", post(board_status_call))
 		.route("/v1/cosign_transfer", post(cosign_transfer))
+		.route("/v1/submit_participation", post(submit_participation))
+		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
 		.layer(DefaultBodyLimit::max(limit))

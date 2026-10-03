@@ -5,7 +5,8 @@
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), an
 //! operator nonce is taken once ([`StoreError::NonceUsed`]), a key owns one leaf
-//! ([`StoreError::KeyReused`]), a leaf is the input of one transfer. Each
+//! ([`StoreError::KeyReused`]), a leaf is given up once, by one transfer or one
+//! participation. Each
 //! operation that changes more than one row runs in one transaction, so it
 //! happens whole or not at all.
 //!
@@ -24,6 +25,7 @@ mod chain;
 mod coins;
 mod mailbox;
 mod nursery;
+mod participations;
 mod transfers;
 mod wallet;
 
@@ -33,6 +35,9 @@ pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
+pub use participations::{
+	NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, WantedKind,
+};
 pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
 
@@ -71,6 +76,8 @@ pub enum StoreError {
 	/// The merge rule refused a reassignment.
 	#[error("{0}")]
 	Mergeable(String),
+	#[error("a participation with this id is already recorded")]
+	ParticipationExists,
 }
 
 impl StoreError {

@@ -190,3 +190,53 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 pub fn txid(s: &str) -> Txid {
 	Txid::from_str(s).unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Participations
+// ---------------------------------------------------------------------------
+
+use server::participations::{participation_id, OutputRequest};
+
+/// A leaf a participation wants for `key`: a fresh owner nonce of the
+/// wallet's, the specification's exit delay.
+pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [u8; 32]) {
+	let nonce = random32();
+	(OutputRequest::Leaf {
+		asset, value, template: arca_covenant::Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
+	}, nonce)
+}
+
+/// The JSON of one output wanted.
+pub fn output_json(o: &OutputRequest) -> Value {
+	match o {
+		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => json!({"leaf": {
+			"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
+			"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
+		}}),
+		OutputRequest::Offboard { asset, value, script } => json!({"offboard": {
+			"asset": asset.to_string(), "value": value.to_string(), "script": hex(script.as_bytes()),
+		}}),
+	}
+}
+
+/// A participation's request body and its id: `coins` given up, each
+/// attested by its owner's key, for `outputs`, paying `fees`.
+pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(AssetId, u64)], not_before: Option<u32>,
+	operator: XOnlyPublicKey, chain: Chain) -> (Value, [u8; 32])
+{
+	let ids: Vec<LeafId> = coins.iter().map(|h| h.id).collect();
+	let nb = not_before.map(|t| arca_covenant::MedianTime::from_consensus(t).unwrap());
+	let id = participation_id(&chain, &operator, &ids, outputs, fees, nb);
+	let inputs: Vec<Value> = coins.iter().map(|h| json!({
+		"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref()),
+	})).collect();
+	let mut body = json!({
+		"inputs": inputs,
+		"outputs": outputs.iter().map(output_json).collect::<Vec<_>>(),
+		"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(),
+	});
+	if let Some(t) = not_before {
+		body["not_before"] = json!(t);
+	}
+	(body, id)
+}

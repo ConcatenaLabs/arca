@@ -47,13 +47,14 @@ use arca_covenant::script::sha256;
 use arca_covenant::sign::verify_digest;
 use arca_covenant::transfer::SeenReassignments;
 use arca_covenant::transfer::{transfer_id, Transfer, TransferInput, MAX_INPUTS};
-use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan, ValidCoin};
+use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferError, TransferPlan};
 
 use crate::chain::FinalityService;
+use crate::coins::{self, Checked, CoinError};
 use crate::params::Params;
 use crate::signer::{SignerClient, SignerError};
 use crate::store::{
-	BoardState, LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, Store,
+	LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, Store,
 	StoreError,
 };
 
@@ -179,6 +180,21 @@ impl From<StoreError> for CosignError {
 	}
 }
 
+impl From<CoinError> for CosignError {
+	fn from(e: CoinError) -> CosignError {
+		match e {
+			CoinError::UnknownLeaf(id) => CosignError::UnknownLeaf(id),
+			CoinError::NotLive(id, state) => CosignError::NotLive(id, state),
+			CoinError::Spent(id) => CosignError::DoubleSpend(id),
+			CoinError::BoardNotFinal(id) => CosignError::BoardNotFinal(id),
+			CoinError::OnChain { leaf, what } => CosignError::OnChain { leaf, what },
+			CoinError::InvalidCoin { leaf, error } => CosignError::InvalidCoin { leaf, error },
+			CoinError::Store(e) => e.into(),
+			CoinError::Internal(m) => CosignError::Internal(m),
+		}
+	}
+}
+
 /// The tag of a transfer request's hash, which is the transfer's id.
 pub const REQUEST_TAG: &[u8] = b"Arca/transfer-request";
 
@@ -209,13 +225,6 @@ impl TransferRequest {
 	}
 }
 
-/// A coin given up, checked.
-struct Checked {
-	record: CoinRecord,
-	coin: ValidCoin,
-	bases: Vec<Transaction>,
-}
-
 /// See the [module documentation](self).
 pub struct Cosigner {
 	store: Store,
@@ -234,70 +243,11 @@ impl Cosigner {
 		MedianTime::from_consensus(tip.median_time as u32).map_err(|e| CosignError::Internal(e.to_string()))
 	}
 
-	/// The transactions a coin record's bases came from: each board's, as
-	/// registered. A leaf of a batch rests on its round.
-	async fn bases(&self, record: &CoinRecord, out: &mut Vec<Transaction>) -> Result<(), CosignError> {
-		match record {
-			CoinRecord::Board(b) => {
-				let row = self.store.board(&b.leaf_id().0).await?
-					.ok_or_else(|| CosignError::Internal(format!("board {} of a known coin is not registered", b.leaf_id())))?;
-				let tx: Transaction = elements::encode::deserialize(&row.tx).map_err(|e| CosignError::Internal(e.to_string()))?;
-				out.push(tx);
-			},
-			CoinRecord::Transfer(t) => {
-				for i in &t.inputs {
-					Box::pin(self.bases(&i.coin, out)).await?;
-				}
-			},
-			CoinRecord::Leaf { .. } => {},
-		}
-		Ok(())
-	}
-
 	/// Checks a coin given up: known, live, its record valid under the
 	/// server's policy, its boards credited and unspent, nothing of its
-	/// lineage on-chain.
+	/// lineage on-chain ([`crate::coins::check`]).
 	async fn check_input(&self, id: &LeafId, transfer: &[u8; 32], now: MedianTime) -> Result<Checked, CosignError> {
-		let row = self.store.leaf(&id.0).await?.ok_or(CosignError::UnknownLeaf(*id))?;
-		match row.state {
-			LeafState::Live => {},
-			LeafState::Spent if row.spent_by.as_deref() == Some(&transfer[..]) => {},
-			LeafState::Spent => return Err(CosignError::DoubleSpend(*id)),
-			LeafState::Pending => return Err(CosignError::NotLive(*id, "pending")),
-			LeafState::Lost => return Err(CosignError::NotLive(*id, "lost")),
-		}
-		let record = CoinRecord::from_bytes(&row.record).map_err(|error| CosignError::InvalidCoin { leaf: *id, error })?;
-		let mut bases = vec![];
-		self.bases(&record, &mut bases).await?;
-		let coin = record.resolve(&bases, &self.params.policy(now)).map_err(|error| CosignError::InvalidCoin { leaf: *id, error })?;
-		if coin.id != *id {
-			return Err(CosignError::Internal(format!("the record of leaf {} gives the id {}", id, coin.id)));
-		}
-		// Its own leaf and every leaf and checkpoint it descends from.
-		let mut scripts = vec![coin.output().script_pubkey.to_bytes()];
-		scripts.extend(coin.lineage().iter().map(|o| o.output.script_pubkey.to_bytes()));
-		let seen = self.store.sighted(&scripts).await?;
-		if seen.contains(&scripts[0]) {
-			return Err(CosignError::OnChain { leaf: *id, what: "its own leaf".into() });
-		}
-		coin.check_lineage(|s| seen.contains(&s.to_bytes()))
-			.map_err(|e| CosignError::OnChain { leaf: *id, what: e.to_string() })?;
-		// Every board it rests on: credited, and its output unspent.
-		for b in coin.boards() {
-			let txid = b.txid.to_byte_array();
-			let board = self.store.boards_by_txid(&txid).await?.into_iter().find(|r| r.vout == b.vout)
-				.ok_or_else(|| CosignError::Internal(format!("board output {} is not registered", b)))?;
-			if board.state != BoardState::Credited {
-				return Err(CosignError::BoardNotFinal(*id));
-			}
-			if let Some(by) = self.store.outpoint_spender(&txid, b.vout).await? {
-				return Err(CosignError::OnChain {
-					leaf: *id,
-					what: format!("the board output {} is spent by {}", b, elements::Txid::from_byte_array(by)),
-				});
-			}
-		}
-		Ok(Checked { record, coin, bases })
+		Ok(coins::check(&self.store, &self.params, id, transfer, now).await?)
 	}
 
 	/// Co-signs `req`: see the [module documentation](self).

@@ -29,6 +29,12 @@ challenge_ttl_seconds = 120
 # specification's 36 to 48 hours, [254, 338].
 # exit_delay_units = [254, 338]
 
+# The assets a round's fee is paid in, in order of preference. A round pays in
+# the first of its own batches' assets the node accepts for fees, else in the
+# first of these it accepts, and never in any other. The served assets, in the
+# order listed below, when absent.
+# fee_assets = ["<asset id>"]
+
 [node]
 # sequentiad, with -txindex and -validateanchor.
 rpc_url = "http://127.0.0.1:18884/"
@@ -42,6 +48,15 @@ anchor_depth = 2
 certification = "required"
 poll_interval_ms = 1000
 # start_height = 0
+
+[fees]
+# The most a refresh costs, in parts per million of the coin's value: due in
+# full for a coin 28 days or more from its expiry, falling to nothing in the
+# last two days. A coin from boards alone pays the whole of it.
+refresh_ppm = 0
+# What an offboard costs, in parts per million of what it pays out, on top of
+# the margin its on-chain output holds for its unlock.
+offboard_ppm = 0
 
 # Each asset served, with the smallest leaf taken, in the asset's atoms.
 [[assets]]
