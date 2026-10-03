@@ -158,23 +158,31 @@ pub const LEAF_ID_TAG: &[u8] = b"Arca/leaf-id";
 pub enum Template {
 	/// `vtxo-1`, the ordinary holding ([`LeafPolicy`]).
 	Vtxo1,
+	/// `board-1`, a board: the owner's coins on-chain, which a cooperative
+	/// spend takes as they are and the owner alone takes only by converting
+	/// them into a `vtxo-1` leaf ([`crate::board::BoardPolicy`]). A board
+	/// record names it; a leaf record never does.
+	Board1,
 }
 
 impl Template {
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
+	/// The template id of `board`.
+	pub const BOARD: u8 = 2;
 
 	/// Its id in the binary form.
 	pub fn id(self) -> u8 {
 		match self {
 			Template::Vtxo1 => Template::VTXO,
+			Template::Board1 => Template::BOARD,
 		}
 	}
 
 	/// Its version.
 	pub fn version(self) -> u8 {
 		match self {
-			Template::Vtxo1 => 1,
+			Template::Vtxo1 | Template::Board1 => 1,
 		}
 	}
 
@@ -182,6 +190,7 @@ impl Template {
 	pub fn name(self) -> &'static str {
 		match self {
 			Template::Vtxo1 => "vtxo",
+			Template::Board1 => "board",
 		}
 	}
 
@@ -189,7 +198,9 @@ impl Template {
 	pub fn from_id(id: u8, version: u8) -> Result<Template, RecordError> {
 		match (id, version) {
 			(Template::VTXO, 1) => Ok(Template::Vtxo1),
+			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
+			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -212,13 +223,15 @@ impl FromStr for Template {
 		if !canonical {
 			return Err(RecordError::Template(s.into()));
 		}
-		match name {
-			"vtxo" => match version.parse::<u64>() {
-				Ok(1) => Ok(Template::Vtxo1),
-				Ok(v) => Err(RecordError::TemplateVersion { template: name.into(), version: v }),
-				Err(_) => Err(RecordError::TemplateVersion { template: name.into(), version: u64::MAX }),
-			},
-			_ => Err(RecordError::Template(s.into())),
+		let known = match name {
+			"vtxo" => Template::Vtxo1,
+			"board" => Template::Board1,
+			_ => return Err(RecordError::Template(s.into())),
+		};
+		match version.parse::<u64>() {
+			Ok(1) => Ok(known),
+			Ok(v) => Err(RecordError::TemplateVersion { template: name.into(), version: v }),
+			Err(_) => Err(RecordError::TemplateVersion { template: name.into(), version: u64::MAX }),
 		}
 	}
 }
@@ -510,6 +523,9 @@ impl LeafRecord {
 	/// Checks the record's shape: counts, indices and value bounds. Every
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
+		if self.template != Template::Vtxo1 {
+			return Err(RecordError::Template(self.template.to_string()));
+		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
 		}

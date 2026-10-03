@@ -536,6 +536,17 @@ def forfeit_taptree(h, a_x, s_x, delay, leaf_id, connector):
     return tap, {"claim": claim, "refund": refund}
 
 
+def board_taptree(a_x, s_x, salt, ctag, asset_id, value, leaf_prog):
+    """board-1: collab = the leaf's own collaborative path, the very script
+    the leaf carries, so one pair spends the coin as the board or as the leaf;
+    convert = A's signature, then output 0 = (asset, value, the leaf).
+    Witness for convert: <sig_A>."""
+    collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
+    convert = CScript([a_x, OP_CHECKSIGVERIFY] + unroll_body([(asset_id, value, leaf_prog)]))
+    tap = taproot_construct(NUMS, [("collab", collab), ("convert", convert)])
+    return tap, {"collab": collab, "convert": convert}
+
+
 def connector_taptree(s_x):
     """The round's connector output: one leaf, spent only by the operator and
     only by issuing, on that input, one explicit atom of the asset it issues

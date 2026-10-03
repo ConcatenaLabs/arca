@@ -85,8 +85,9 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
                                      CAssetIssuance, uint256_from_str)
 
 FORMAT_VERSION = 2
-TEMPLATES = {"vtxo": 1}                    # name -> template id
+TEMPLATES = {"vtxo": 1, "board": 2}        # name -> template id; a leaf record names vtxo, a board record board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
+TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
 LEAF_ID_TAG = b"Arca/leaf-id"
 SALT_TAG = b"Arca/salt"
 

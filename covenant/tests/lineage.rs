@@ -19,6 +19,12 @@
 //!    chain refuses it; the sender exits in the next block.
 //! 3. Sixteen levels of one child each with no reserves, paid by a confirmed
 //!    round: refused for its depth, its one-child nodes and its reserves.
+//! 4. A board paid out of round: the receiver validates the coin against the
+//!    board transaction, finds the board unspent, and brings the coin on-chain
+//!    from the board output itself. A board converted after a payment: the
+//!    receipt check now refuses the coin (the board spent, the leaf on-chain),
+//!    and the receiver holding it answers with the checkpoint on the leaf, so
+//!    the sender's exit has nothing left.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction.
 
@@ -192,5 +198,86 @@ fn a_degenerate_layout_is_refused() {
 	println!("e4: a one-leaf batch with no reserves: {} ({})", e, e.kind());
 	assert!(matches!(e, RecordError::NodeReserve { level: 0, reserve: 0, min: 1 }));
 	alone.validate(&round, &blind, &xonly(&a), &owner_nonce).unwrap();
+	c.net.print();
+}
+
+// ---------------------------------------------------------------------------
+// 4. A board paid out of round
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_board_is_paid_out_of_round() {
+	let mut c = Arca::start();
+	let x = c.net.x;
+	let s = keypair("lineage board operator");
+	let a = keypair("lineage board owner");
+	let policy = c.policy(&s);
+	let board = |c: &mut Arca, label: &str| {
+		let rec = BoardRecord {
+			template: Template::Board1, owner: xonly(&a), owner_nonce: label32(&format!("{} nonce", label)),
+			operator_nonce: label32(&format!("{} operator nonce", label)), exit_delay: delay(), asset: x, value: LEAF,
+			chain: c.net.chain, operator: xonly(&s),
+		};
+		let coin = c.net.fund(vec![rec.output().txout()]).remove(0);
+		(rec, c.net.rt.client().raw_transaction(&coin.outpoint.txid).unwrap())
+	};
+
+	// A pays B from a board. B receives the record and the board
+	// transaction, and finds the board unspent and nothing of the lineage
+	// on-chain.
+	let (rec, board_tx) = board(&mut c, "lineage board 1");
+	let a_base = CoinRecord::Board(rec);
+	let a_coin = a_base.resolve(std::slice::from_ref(&board_tx), &policy).unwrap();
+	let (b, b_leaf) = party("lineage board B", delay());
+	let b_record = one_hop(&a_base, &a_coin, &a, &s, b_leaf, c.net.chain);
+	let bytes = b_record.to_bytes().unwrap();
+	assert_eq!(CoinRecord::from_bytes(&bytes).unwrap(), b_record);
+	let b_coin = b_record.validate(std::slice::from_ref(&board_tx), &policy.receipt(), &b_leaf.owner, &b_leaf.owner_nonce).unwrap();
+	assert_eq!(b_coin.boards(), vec![OutPoint::new(board_tx.txid(), 0)]);
+	b_coin.check_boards(|at| c.unspent(at)).unwrap();
+	b_coin.check_lineage(|spk| c.on_chain(spk)).unwrap();
+	assert_eq!(b_record.validate(&[], &policy.receipt(), &b_leaf.owner, &b_leaf.owner_nonce).unwrap_err().kind(), "round");
+	println!("board: B receives a {}-byte record from a board, coin {} of {} atoms", bytes.len(), b_coin.id, b_coin.value);
+
+	// B brings its coin on-chain from the board output itself, and exits.
+	let cp = inputs(&b_coin)[0].board_checkpoint_tx(&FeeSource::Reserve).unwrap();
+	let cpt = c.net.pass("board/B's checkpoint, straight from the board output", &cp.tx);
+	let re = b_coin.reassignment_tx(&[OutPoint::new(cpt, 0)], &FeeSource::Reserve).unwrap();
+	let ret = c.net.pass("board/the reassignment creating B's leaf", &re.tx);
+	let at = OutPoint::new(ret, 0);
+	let ex = exit_tx(&c.net, &b_coin.leaf, at, x, b_coin.value, &b);
+	c.net.refuse("board/neg B's exit at once", &ex, "non-BIP68-final");
+	c.net.wait_csv(&ret, delay());
+	c.net.pass("board/B's exit after the delay", &ex);
+
+	// A pays C from a second board, then converts it, starting its exit.
+	// C's look at the chain now finds the board spent and the leaf on-chain,
+	// so nobody would take this coin from here on; C, which holds it already,
+	// answers with the checkpoint on the converted leaf, and A's exit has
+	// nothing left.
+	let (rec2, board2_tx) = board(&mut c, "lineage board 2");
+	let a2_base = CoinRecord::Board(rec2);
+	let a2_coin = a2_base.resolve(std::slice::from_ref(&board2_tx), &policy).unwrap();
+	let (_cr, c_leaf) = party("lineage board C", delay());
+	let c_coin = one_hop(&a2_base, &a2_coin, &a, &s, c_leaf, c.net.chain)
+		.validate(std::slice::from_ref(&board2_tx), &policy.receipt(), &c_leaf.owner, &c_leaf.owner_nonce).unwrap();
+	let fc = c.net.fee_coin();
+	let ks = rec2.policy().conversion(OutPoint::new(board2_tx.txid(), 0),
+		&FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }).unwrap();
+	let mut conv = signed(&c.net, ks, &a, vec![]);
+	conv.tx.input[1].witness.script_witness = op_true_witness();
+	let ct = c.net.pass("board/A converts its second board", &conv.tx);
+	let e = c_coin.check_boards(|at| c.unspent(at)).unwrap_err();
+	println!("board: after the conversion, a receipt is refused: {} ({})", e, e.kind());
+	assert!(matches!(e, TransferError::BoardSpent(_)));
+	assert!(matches!(c_coin.check_lineage(|spk| c.on_chain(spk)).unwrap_err(), TransferError::OnChain { kind: LineageKind::Leaf, .. }));
+	let leaf_at = OutPoint::new(ct, 0);
+	let a_exit = exit_tx(&c.net, &rec2.leaf(), leaf_at, x, LEAF, &a);
+	c.net.refuse("board/neg A's exit at once", &a_exit, "non-BIP68-final");
+	let cp = inputs(&c_coin)[0].checkpoint_tx(leaf_at, &FeeSource::Reserve).unwrap();
+	let cpt = c.net.pass("board/C's checkpoint, on the converted leaf", &cp.tx);
+	c.net.pass("board/the reassignment creating C's leaf", &c_coin.reassignment_tx(&[OutPoint::new(cpt, 0)], &FeeSource::Reserve).unwrap().tx);
+	c.net.wait_csv(&ct, delay());
+	c.net.refuse("board/neg A's exit after the delay", &a_exit, "bad-txns-inputs-missingorspent");
 	c.net.print();
 }

@@ -1,39 +1,55 @@
-//! The board: an owner's own coins paid to a leaf.
+//! The board: an owner's own coins brought into Arca (`board-1`).
 //!
-//! The owner pays its coins to an output carrying the standard leaf script
-//! (`vtxo-1`). No tree is involved, so no operator signature is needed. The
-//! leaf's salt is built from the owner's nonce and one the operator gave it,
-//! as for every leaf ([`crate::leaf::leaf_salt`]), so the operator, which
-//! never repeats its nonce, can tell the board's script was never funded
-//! before. The operator credits the board once the transaction is certified
-//! and its anchor is buried; the risk of a board reorged away is the
-//! operator's, which is why it waits.
+//! The owner pays its coins to a board output. No tree is involved, so no
+//! operator signature is needed. The board output carries two script leaves:
+//!
+//! ```text
+//! collab:   the leaf's collaborative path: the owner's and the operator's
+//!           rebindable signatures, exactly as on the leaf the board converts into
+//! convert:  <A> OP_CHECKSIGVERIFY
+//!           OP_0 OP_INSPECTOUTPUTASSET OP_1 OP_EQUALVERIFY <asset> OP_EQUALVERIFY
+//!           OP_0 OP_INSPECTOUTPUTVALUE OP_1 OP_EQUALVERIFY <value_le8> OP_EQUALVERIFY
+//!           OP_0 OP_INSPECTOUTPUTSCRIPTPUBKEY OP_1 OP_EQUALVERIFY <leaf program> OP_EQUAL
+//! ```
+//!
+//! The owner alone can take the board only by converting it, with its
+//! signature, into the standard leaf (`vtxo-1`) of the same value at output 0;
+//! the leaf's exit delay then runs from the conversion. So every unilateral
+//! exit of a board gives the full notice of a leaf, and nobody but the owner
+//! can start it. The board holds exactly the leaf's value, and the conversion
+//! pays its fee with a coin attached, in any accepted asset.
+//!
+//! Because the collaborative leaf is the leaf's own script and the board holds
+//! the leaf's value, every pair the owner and the operator sign over the
+//! leaf (a forfeit, a checkpoint) spends the coin in either form: the board
+//! output as it is, or the leaf after a conversion. Off-chain spends of a
+//! board are signed in advance, as for any leaf: the operator holding a
+//! board's forfeit publishes it from the board output whenever it wants the
+//! value, and answers a conversion by publishing it on the leaf within the
+//! exit delay. A board's refresh needs no forfeit on-chain first.
+//!
+//! The leaf's salt is built from the owner's nonce and one the operator gave
+//! it, as for every leaf ([`crate::leaf::leaf_salt`]), so the operator, which
+//! never repeats its nonce, can tell the board's scripts were never funded
+//! before. The operator credits the board once the transaction is final: its
+//! block certified and its anchor buried; the risk of a board reorged away is
+//! the operator's, which is why it waits.
+//!
+//! A converted board is an Arca leaf on-chain, and an Arca leaf on-chain is
+//! never spent off-chain again: past its delay its owner can exit at once.
 //!
 //! [`BoardRecord`] is what the owner keeps and what the operator registers:
 //! the leaf's parameters, its asset and value, the chain and the operator.
 //! [`BoardRecord::tx`] builds the funding transaction from the owner's coins,
-//! whose signatures are the owner's wallet's, and
-//! [`BoardRecord::validate`] checks the record against it.
+//! whose signatures are the owner's wallet's, [`BoardRecord::validate`] checks
+//! the record against it under a wallet's policy, and [`BoardPolicy`] builds
+//! the board output and its conversion.
 //!
-//! # A board leaf is on-chain from the start
-//!
-//! A leaf's exit delay runs from the confirmation of the output it spends. A
-//! leaf in a batch reaches the chain only when someone unrolls it, so the
-//! operator and any watcher have the whole delay to answer a stale exit with
-//! the checkpoint or forfeit it holds. A board leaf confirms with the board:
-//! once its delay has passed after that, the owner can exit at any moment,
-//! and an exit races any off-chain spend of the same leaf with nothing to
-//! wait for. So a board leaf takes no spend whose safety rests on an answer
-//! in time. Its refresh into a round is a forfeit that is broadcast and
-//! final before the operator hands over the preimage, and an offboard of it
-//! the same; it is not transferred out of round with a checkpoint, because
-//! the sender could exit it under the receiver.
-//!
-//! # The binary form, version 1
+//! # The binary form, version 2
 //!
 //! ```text
-//! u8    format version, 1
-//! u8    template, 1 (vtxo)            u8   template version, 1
+//! u8    format version, 2
+//! u8    template, 2 (board)           u8   template version, 1
 //! [32]  owner key A
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -45,27 +61,119 @@
 //! ```
 //!
 //! The leaf id of a board is the leaf id of a batch of no levels whose batch
-//! output is the leaf: the BIP340 tagged hash, tag `Arca/leaf-id`, of
-//! `leaf program (32) ‖ 0x00 ‖ leaf program (32)`. A leaf of a batch always
+//! output is the board output: the BIP340 tagged hash, tag `Arca/leaf-id`, of
+//! `board program (32) ‖ 0x00 ‖ leaf program (32)`. A leaf of a batch always
 //! has at least one level, so the two never meet.
 
+use elements::opcodes::all::*;
+use elements::script::Builder;
+use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxIn, TxOut};
+use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, Txid};
 
 use crate::encode::{DecodeError, Reader};
 use crate::leaf::{leaf_salt, LeafPolicy};
-use crate::message::Chain;
-use crate::record::{LeafId, RecordError, Template, MAX_VALUE};
+use crate::message::{Chain, CsfsMessage};
+use crate::record::{LeafId, RecordError, Template, WalletPolicy, MAX_VALUE};
 use crate::script::{asset_bytes, ExplicitOutput};
-use crate::spend::{explicit_txout, margins, SpendError, UnrollTx, FINAL};
+use crate::spend::{assemble, explicit_txout, margins, FeeSource, KeySpend, Rebindable, SpendError, UnrollTx, FINAL};
+use crate::taptree::TapOutput;
 use crate::time::RelativeTime;
+use crate::Error;
 
 /// The board record format this crate writes and reads.
-pub const BOARD_RECORD_VERSION: u8 = 1;
+pub const BOARD_RECORD_VERSION: u8 = 2;
+
+/// A board output's policy: the leaf it converts into, and its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BoardPolicy {
+	/// The standard leaf the board converts into.
+	pub leaf: LeafPolicy,
+	pub asset: AssetId,
+	/// The board's value, which the leaf holds after a conversion.
+	pub value: u64,
+}
+
+impl BoardPolicy {
+	/// The conversion: the owner's signature, then output 0 pinned to the
+	/// leaf, holding the board's asset and value.
+	pub fn convert_script(&self) -> Script {
+		Builder::new().push_slice(&self.leaf.owner.serialize()).push_opcode(OP_CHECKSIGVERIFY)
+			.push_int(0).push_opcode(OP_INSPECTOUTPUTASSET).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&asset_bytes(self.asset)).push_opcode(OP_EQUALVERIFY)
+			.push_int(0).push_opcode(OP_INSPECTOUTPUTVALUE).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&self.value.to_le_bytes()).push_opcode(OP_EQUALVERIFY)
+			.push_int(0).push_opcode(OP_INSPECTOUTPUTSCRIPTPUBKEY).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&self.leaf.program()).push_opcode(OP_EQUAL)
+			.into_script()
+	}
+
+	/// `[collab, convert]`, both at depth 1; `collab` is the leaf's own.
+	pub fn taproot(&self) -> TapOutput {
+		TapOutput::new(vec![(1, self.leaf.collab_script()), (1, self.convert_script())])
+	}
+
+	pub fn script_pubkey(&self) -> Script {
+		self.taproot().script_pubkey()
+	}
+
+	pub fn program(&self) -> [u8; 32] {
+		self.taproot().program()
+	}
+
+	/// The board output.
+	pub fn output(&self) -> ExplicitOutput {
+		ExplicitOutput::new(self.asset, self.value, self.script_pubkey())
+	}
+
+	/// The leaf a conversion creates.
+	pub fn leaf_output(&self) -> ExplicitOutput {
+		ExplicitOutput::new(self.asset, self.value, self.leaf.script_pubkey())
+	}
+
+	/// The owner's conversion of the board at `board`: the leaf at output 0,
+	/// the fee paid as `fee` says (the board holds no margin, so a coin of the
+	/// owner's in any accepted asset pays it). The owner signs
+	/// [`KeySpend::sighash`] and finishes it with `[signature]`.
+	pub fn conversion(&self, board: OutPoint, fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		let u = assemble(LockTime::ZERO, vec![(board, self.output().txout(), FINAL)], &[self.leaf_output()], fee, FINAL)?;
+		Ok(KeySpend::from_parts(u.tx, u.prevouts, self.taproot(), self.convert_script()))
+	}
+
+	/// The full conversion witness: the owner's signature.
+	pub fn convert_witness(&self, owner_sig: &Signature) -> Vec<Vec<u8>> {
+		self.taproot().witness(&self.convert_script(), vec![owner_sig.as_ref().to_vec()])
+	}
+}
+
+/// The board output's collaborative path is the leaf's: one pair spends the
+/// coin as a board or as the leaf it converts into.
+impl Rebindable for BoardPolicy {
+	fn owner(&self) -> XOnlyPublicKey {
+		self.leaf.owner
+	}
+
+	fn operator(&self) -> XOnlyPublicKey {
+		self.leaf.operator
+	}
+
+	fn tap(&self) -> TapOutput {
+		self.taproot()
+	}
+
+	fn collab(&self) -> Script {
+		self.leaf.collab_script()
+	}
+
+	fn message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		self.leaf.message(asset_in, value_in, outputs)
+	}
+}
 
 /// What the owner of a board keeps. See the [module documentation](self).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BoardRecord {
+	/// Always [`Template::Board1`].
 	pub template: Template,
 	/// The owner's key `A`.
 	pub owner: XOnlyPublicKey,
@@ -73,6 +181,7 @@ pub struct BoardRecord {
 	pub owner_nonce: [u8; 32],
 	/// The operator's contribution to the leaf's salt.
 	pub operator_nonce: [u8; 32],
+	/// The exit delay of the leaf the board converts into.
 	pub exit_delay: RelativeTime,
 	pub asset: AssetId,
 	pub value: u64,
@@ -85,8 +194,17 @@ pub struct BoardRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidBoard {
 	pub leaf_id: LeafId,
-	/// The index of the leaf in the board transaction.
+	/// The board transaction.
+	pub txid: Txid,
+	/// The index of the board output in it.
 	pub vout: u32,
+}
+
+impl ValidBoard {
+	/// Where the board output is.
+	pub fn outpoint(&self) -> OutPoint {
+		OutPoint::new(self.txid, self.vout)
+	}
 }
 
 impl BoardRecord {
@@ -95,26 +213,33 @@ impl BoardRecord {
 		leaf_salt(&self.owner_nonce, &self.operator_nonce)
 	}
 
-	/// The leaf's policy.
+	/// The leaf the board converts into.
 	pub fn leaf(&self) -> LeafPolicy {
 		LeafPolicy {
 			owner: self.owner, operator: self.operator, salt: self.salt(), chain: self.chain, exit_delay: self.exit_delay,
 		}
 	}
 
-	/// The leaf output the board pays.
+	/// The board output's policy.
+	pub fn policy(&self) -> BoardPolicy {
+		BoardPolicy { leaf: self.leaf(), asset: self.asset, value: self.value }
+	}
+
+	/// The board output the board transaction pays.
 	pub fn output(&self) -> ExplicitOutput {
-		ExplicitOutput::new(self.asset, self.value, self.leaf().script_pubkey())
+		self.policy().output()
 	}
 
 	/// The board's leaf id.
 	pub fn leaf_id(&self) -> LeafId {
-		let program = self.leaf().program();
-		LeafId::compute(&program, &[], &program)
+		LeafId::compute(&self.policy().program(), &[], &self.leaf().program())
 	}
 
-	/// The value bounds: 1 to [`MAX_VALUE`].
+	/// The template and the value bounds: `board-1`, 1 to [`MAX_VALUE`].
 	pub fn check(&self) -> Result<(), RecordError> {
+		if self.template != Template::Board1 {
+			return Err(RecordError::Template(self.template.to_string()));
+		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
 		}
@@ -134,10 +259,11 @@ impl BoardRecord {
 	}
 
 	/// The board transaction: `coins`, the owner's own outputs (any assets,
-	/// explicit), pay the leaf at output 0; what is left of each asset goes
-	/// to `change`, less `fee` of `fee_asset`, which goes to the fee output.
-	/// The fee defaults to the board's own asset in a wallet, never to a
-	/// privileged one. The inputs' witnesses are the owner's wallet's to add.
+	/// explicit), pay the board output at output 0; what is left of each
+	/// asset goes to `change`, less `fee` of `fee_asset`, which goes to the
+	/// fee output. The fee defaults to the board's own asset in a wallet,
+	/// never to a privileged one. The inputs' witnesses are the owner's
+	/// wallet's to add.
 	pub fn tx(&self, coins: &[(OutPoint, TxOut)], fee_asset: AssetId, fee: u64, change: &Script) -> Result<UnrollTx, SpendError> {
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(SpendError::Value(self.value));
@@ -173,12 +299,25 @@ impl BoardRecord {
 		Ok(UnrollTx { tx, prevouts: coins.iter().map(|(_, o)| o.clone()).collect() })
 	}
 
-	/// Checks the record against the board transaction: it pays exactly one
-	/// output equal to the leaf the record rebuilds (asset, value and script).
-	/// Whether the board is final (its block certified and its anchor
-	/// buried) is for the caller to establish.
-	pub fn validate(&self, board: &Transaction) -> Result<ValidBoard, RecordError> {
+	/// Checks the record against the board transaction under `policy`: the
+	/// chain and operator are the wallet's, the leaf's exit delay is within
+	/// its bounds, and the transaction pays exactly one output equal to the
+	/// board output the record rebuilds (asset, value and script). Whether
+	/// the board is final (its block certified and its anchor buried) is for
+	/// the caller to establish.
+	pub fn validate(&self, board: &Transaction, policy: &WalletPolicy) -> Result<ValidBoard, RecordError> {
 		self.check()?;
+		if self.chain != policy.chain {
+			return Err(RecordError::WrongChain);
+		}
+		if self.operator != policy.operator {
+			return Err(RecordError::WrongOperator);
+		}
+		if !policy.exit_delay_ok(self.exit_delay) {
+			return Err(RecordError::ExitDelay {
+				delay: self.exit_delay.units(), min: policy.min_exit_delay.units(), max: policy.max_exit_delay.units(),
+			});
+		}
 		let out = self.output();
 		let found: Vec<u32> = board.output.iter().enumerate()
 			.filter(|(_, o)| ExplicitOutput::from_txout(o).as_ref() == Some(&out))
@@ -186,7 +325,7 @@ impl BoardRecord {
 			.collect();
 		match found[..] {
 			[] => Err(RecordError::BoardOutputMissing),
-			[vout] => Ok(ValidBoard { leaf_id: self.leaf_id(), vout }),
+			[vout] => Ok(ValidBoard { leaf_id: self.leaf_id(), txid: board.txid(), vout }),
 			_ => Err(RecordError::BoardOutputRepeated(found.len())),
 		}
 	}

@@ -77,6 +77,8 @@ pub enum SpendError {
 	OtherOperator,
 	#[error(transparent)]
 	Offboard(#[from] crate::offboard::OffboardError),
+	#[error("the board is not the coin the forfeit gives up")]
+	OtherBoard,
 }
 
 pub(crate) fn explicit_txout(asset: AssetId, value: u64, script_pubkey: Script) -> TxOut {

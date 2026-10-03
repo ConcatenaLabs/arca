@@ -94,6 +94,7 @@ fn bring(coin: &ValidCoin, out: &mut Vec<(String, UnrollTx)>) -> OutPoint {
 			out.push((format!("reassignment creating coin {}", coin.id), re));
 			at
 		},
+		ValidOrigin::Board { .. } => unreachable!("the chain has no board"),
 	}
 }
 

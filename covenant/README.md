@@ -24,6 +24,7 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
+| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
@@ -266,8 +267,8 @@ third party (a covenant fill, say), which could be spent elsewhere and force a
 replacement; fills go in their own round transactions. A round that cannot
 return leaves each owner who gave up a leaf for it a forfeit that no claim can
 answer and that ends in the owner's refund, so a participation run again after
-it is forfeit-first, as a board's is: the operator publishes the forfeit for
-the new round and sees it final before it hands over the preimage, and it
+it is forfeit-first: the operator publishes the forfeit for the new round and
+sees it final before it hands over the preimage, and it
 co-signs no other off-chain spend of a leaf given up for the lost round.
 
 ```rust
@@ -282,25 +283,34 @@ let claim = f.claim(forfeit_coin, (m_coin, m_txout), &outputs, m_back_to, &FeeSo
 let claim = claim.finish(ForfeitPolicy::claim_items(&sig_over(claim.sighash(genesis)?), &preimage, Forfeit::CONNECTOR_INPUT));
 ```
 
-**The board.** The owner pays its own coins to a leaf (`BoardRecord::tx`), and
-keeps a `BoardRecord`: the leaf's key, the two nonces of its salt (one given by
-the operator), its exit delay, asset, value, chain and operator. The record has
-a binary and a JSON form like the leaf record's, and `validate` checks it
-against the board transaction. A board's leaf id is that of a batch with no
-levels whose batch output is the leaf. A board leaf is on-chain from the start,
-so once its exit delay has passed after the board confirmed, its owner can exit
-at any moment and an exit races any off-chain spend of it with nothing to wait
-for. A board leaf therefore takes no spend whose safety rests on an answer in
-time: its refresh into a round, or its offboard, is a forfeit the operator
-publishes and sees final (its block certified and its anchor buried) before it
-hands over the preimage, and it is not transferred out of round. One block is not
-enough: a rollback that disconnects the forfeit lets the owner's exit take its
-place while the owner holds the preimage.
+**The board.** The owner brings its own coins into Arca with a board
+(`board-1`): it pays them to a board output (`BoardRecord::tx`) and keeps a
+`BoardRecord`: the key, the two nonces of the salt (one given by the operator)
+and the exit delay of the leaf the board converts into, its asset, value, chain
+and operator. The board output has two script leaves: the leaf's own
+collaborative path, and the conversion, which needs the owner's signature and
+pays the standard leaf of the board's whole value at output 0
+(`BoardPolicy::conversion`; its fee comes from a coin attached, in any accepted
+asset). The owner alone takes a board only by converting it, and the leaf's
+exit delay then runs from the conversion, so every unilateral exit gives the
+full notice and nobody else can start it. Because the board's collaborative
+leaf is the leaf's own and the board holds the leaf's value, one pair over the
+leaf spends the coin in either form: a board's forfeit, or a checkpoint of it,
+is signed in advance as for any leaf. The operator hands over a refreshed
+board's preimage on the pair alone, publishes the forfeit from the board output
+(`Forfeit::board_tx`) whenever it wants the value, and answers a conversion by
+publishing it on the leaf within the delay. A board may also be paid out of
+round. The record has a binary and a JSON form like the leaf record's, and
+`validate` checks it against the board transaction under the wallet's policy
+(chain, operator, exit delay). A board's leaf id is that of a batch with no
+levels whose batch output is the board output. The board's own conversion costs
+370 vB with a fee coin; the operator credits a board once its transaction is
+final.
 
-**No off-chain spend of a leaf that is on-chain.** The board is one case of a
-general rule. Any Arca leaf on-chain past its exit delay, a batch leaf someone
-unrolled or a reassignment's output someone published, can be exited by its
-owner at once, so no off-chain spend of it is safe. The operator refuses to
+**No off-chain spend of a leaf that is on-chain.** Any Arca leaf on-chain past
+its exit delay, a batch leaf someone unrolled, a reassignment's output someone
+published or a board someone converted, can be exited by its owner at once, so
+no off-chain spend of it is safe. The operator refuses to
 co-sign a spend of a leaf that is on-chain, and a receiver refuses a coin when
 any leaf or checkpoint in its lineage is on-chain (below).
 
@@ -341,14 +351,17 @@ let record = CoinRecord::Transfer(Box::new(Transfer {
 A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
 the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
 and its owner's unroll authorisations, so anyone holding the record can bring it
-on-chain; for a coin a reassignment created, the reassignment's inputs (each a
+on-chain; for a board, its board record (the board is on-chain already, and a
+checkpoint of it spends the board output itself, `board_checkpoint_tx`); for a
+coin a reassignment created, the reassignment's inputs (each a
 coin record, with its checkpoint's value and both pairs), its outputs, the
 coin's index and its leaf. The binary form is versioned and canonical, and the
 layout is in the `transfer` module's documentation.
 
 `CoinRecord::validate(rounds, policy, key, nonce)` is the receiver's check,
-from the record and the round transactions alone: every batch leaf validates
-against its round under the receiver's policy, every preimage and authorisation
+from the record and the transactions its bases came from alone: every batch leaf
+validates against its round, and every board against its board transaction,
+under the receiver's policy, every preimage and authorisation
 is good and usable now, every pair verifies, no reassignment creates more than
 its checkpoints hold, every leaf in the lineage (whoever owns it) has an exit
 delay within the policy's bounds, the coin's output is the leaf the record names
@@ -364,6 +377,12 @@ The record cannot show what is on-chain. `coin.lineage()` lists every leaf and
 checkpoint the coin descends from, and `coin.check_lineage(on_chain)` refuses the
 coin if an index of the chain reports any of them on-chain; a wallet without such
 an index relies on the operator's refusal to co-sign a spend of an on-chain leaf.
+A board must instead still be there: `coin.boards()` lists the boards the coin
+rests on, and `coin.check_boards(unspent)` refuses it when one is spent, by its
+conversion or by a forfeit. A board has no batch and no expiry: a coin from
+boards alone never expires (`expiry` is `MedianTime::MAX`), and a checkpoint of a
+board's leaf carries the frozen sweep for a token no issuance creates
+(`board_sweep`), so only its collaborative path spends it.
 
 Against the sender alone the receiver is then safe: every leaf of the lineage is
 off-chain and has an exit delay of at least the policy's minimum, so when the
@@ -429,15 +448,16 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   from the owner nonce it names, or from the wallet's nonce, is refused.
 - `tests/transactions.rs`: every transaction in the regtest suite's
   off-chain vectors (`regtest/vectors/transactions.json`) is rebuilt here byte
-  for byte, witnesses included, and re-signed with the test keys: the board and
-  its exit, the forfeit, the connector output and the operator's issuance of
+  for byte, witnesses included, and re-signed with the test keys: the board, the
+  owner's conversion and the converted leaf's exit, one pair spending the board
+  output and the converted leaf alike, the forfeit, the connector output and the operator's issuance of
   the connector asset, the forfeit's claim and refund, the offboard's unlock and
   reclaim, each with the margin as the fee and
   with a fee coin, and the three-hop chain's checkpoints and reassignments; every
   input verifies under the block rules and the mempool's checks. The board record
   decodes from both forms and its refusal vectors are refused; every coin record
-  in the chain decodes, encodes back, validates for its receiver and gives the
-  reference's coin id.
+  in the chain, and a coin paid out of round from the board, decodes, encodes
+  back, validates for its receiver and gives the reference's coin id.
 - `tests/transfer.rs`: a chain three hops deep, one hop a two-asset swap,
   received from the last receiver's record alone, validated against the two
   rounds, and every transaction that brings it on-chain built from the record
@@ -459,19 +479,26 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   refuses it; the sender exits at once and the receiver's checkpoint is refused.
   A record of sixteen one-child levels with no reserves, paid by a confirmed
   round, is refused for its depth and its one-child nodes, and a one-leaf batch
-  with no reserves for its reserve.
+  with no reserves for its reserve. A board paid out of round: the receiver
+  validates the coin against the board transaction, finds the board unspent and
+  brings the coin on-chain from the board output itself; a board converted after
+  a payment makes the receipt check refuse the coin, and the receiver holding it
+  answers with the checkpoint on the converted leaf.
 - `tests/offchain.rs`: on an anchored regtest chain, a board and its refresh
-  into a round (the forfeit published first, the connector asset issued, the
-  claim, the new batch unrolled from its record, its entry unlocked with the
-  preimage learned from the chain, the new leaf exited), one atom of the
+  into a round: the preimage handed over on the forfeit pair alone; the
+  conversion signed by the operator, unsigned, one atom short or into another
+  script refused, the owner's own conversion confirmed, its exit refused before
+  the delay and, once the operator has answered with the forfeit on the
+  converted leaf, after it; the connector asset issued, the claim, the new batch
+  unrolled from its record, its entry unlocked with the preimage learned from
+  the chain, the new leaf exited; a second board never converted, its forfeit
+  published straight from the board output and claimed; one atom of the
   connector serving two claims, two forfeits of one participation refused one
   output, and the offboard's unlock, its merge refused, and its reclaim; the round's connector output spent with no issuance, issuing
   two atoms, issuing with a reissuance token, issuing another asset under a
   contract hash, or signed by another key, each refused, and its issuance of
   `M` confirmed; every negative case refused by the mempool and in a block,
-  for its reason. It also shows a board leaf exited at once while the operator
-  holds its forfeit, which is why a board leaf takes no off-chain spend. Then the
-  three-hop chain on chain: the last receiver validates it from its record and
+  for its reason. Then the three-hop chain on chain: the last receiver validates it from its record and
   the confirmed rounds, brings it on-chain from the record, with fee coins
   wherever the asset is not accepted for fees, and exits; a reassignment's pair
   cannot skip the checkpoint, a checkpoint's pair cannot spend the checkpoint,
@@ -494,7 +521,9 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   A forfeit disconnected late in its refund delay restarts it. A receiver's
   checkpoint disconnected while the replacing chain runs past the sender's exit
   delay: the leaf's delay does not restart, and a producer mines the sender's
-  exit.
+  exit. A board's forfeit seen in one block and disconnected: the owner has no
+  exit from the board itself, its conversion starts the leaf's delay, and the
+  same pair's forfeit takes the converted leaf.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and

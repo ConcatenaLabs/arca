@@ -27,6 +27,9 @@
 //! 5. A receiver's checkpoint disconnected, the replacing chain running past
 //!    the sender's exit delay: the leaf's delay does not restart and a producer
 //!    mines the sender's exit.
+//! 6. A board's forfeit seen in one block, then disconnected: the owner has no
+//!    exit from the board itself; its conversion starts the leaf's delay, and
+//!    the same pair's forfeit takes the converted leaf.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction.
 
@@ -342,5 +345,52 @@ fn a_rolled_back_checkpoint_does_not_restart_the_leafs_delay() {
 	c.net.refuse("d3/neg B's checkpoint after A's exit", &cp.tx, "bad-txns-inputs-missingorspent");
 	println!("d3: RESULT {} blocks without the checkpoint ran past A's delay; a producer mined A's exit. \
 		The leaf's delay did not restart; only the answer was undone", blocks);
+	c.net.print();
+}
+
+// ---------------------------------------------------------------------------
+// 6. A board's forfeit disconnected after one block
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_boards_forfeit_rolled_back_still_wins() {
+	let mut c = Arca::start();
+	let x = c.net.x;
+	let s = keypair("d4 operator");
+	let a = keypair("d4 board owner");
+	let rec = BoardRecord {
+		template: Template::Board1, owner: xonly(&a), owner_nonce: label32("d4 board nonce"),
+		operator_nonce: label32("d4 board operator nonce"), exit_delay: delay(), asset: x, value: LEAF,
+		chain: c.net.chain, operator: xonly(&s),
+	};
+	let board = rec.policy();
+	let coin = c.net.fund(vec![rec.output().txout()]).remove(0);
+	c.net.wait_csv(&coin.outpoint.txid, delay());
+	// The board's forfeit, for some round: the operator publishes it from the
+	// board output, sees it in one block, and hands over the preimage.
+	let f = Forfeit::new(rec.leaf(), (x, LEAF), rec.leaf_id(), sha256(&label32("d4 h")), connector_asset(OutPoint::default().txid, 2),
+		delay(), 1_500).unwrap();
+	let pair = forfeit_pair(&f, &a, &s);
+	let ftx = f.board_tx(&board, coin.outpoint, &pair, &FeeSource::Reserve).unwrap().tx;
+	let fc = c.net.fee_coin();
+	let ft = c.net.pass("d4/the board's forfeit, one block", &ftx);
+	c.roll_back(&ft);
+	// The owner has no exit from the board itself: it converts, and a
+	// producer mines the conversion in place of the forfeit.
+	let ks = board.conversion(coin.outpoint, &FeeSource::Coin { outpoint: fc.outpoint, coin: fc.txout, fee: 4_000, change: op_true_spk() }).unwrap();
+	let mut conv = signed(&c.net, ks, &a, vec![]);
+	conv.tx.input[1].witness.script_witness = op_true_witness();
+	let r = c.net.rt.client().test_mempool_accept(&[&conv.tx]).unwrap().remove(0);
+	assert_eq!((r.allowed, r.reject_reason.as_deref()), (false, Some("txn-mempool-conflict")), "the forfeit waits in the mempool");
+	c.mine_with(&[&conv.tx]);
+	let leaf_at = OutPoint::new(conv.tx.txid(), 0);
+	// The conversion starts the leaf's delay: the owner's exit waits, and the
+	// operator publishes the same pair's forfeit on the leaf.
+	let ex = exit_tx(&c.net, &rec.leaf(), leaf_at, x, LEAF, &a);
+	c.net.refuse("d4/neg the owner's exit right after the conversion", &ex, "non-BIP68-final");
+	c.net.pass("d4/the forfeit again, on the converted leaf", &f.tx(leaf_at, &pair, &FeeSource::Reserve).unwrap().tx);
+	c.net.wait_csv(&leaf_at.txid, delay());
+	c.net.refuse("d4/neg the owner's exit after the delay", &ex, "bad-txns-inputs-missingorspent");
+	println!("d4: RESULT the rollback of the board's forfeit gave the owner no exit: the forfeit took the converted leaf");
 	c.net.print();
 }

@@ -142,24 +142,59 @@ fn the_board_and_its_record() {
 	assert_eq!(rec.to_json_string().unwrap(), b["record"]["json"].as_str().unwrap());
 	assert_eq!(rec.salt().to_vec(), bytes(&b["record"]["salt"]));
 	assert_eq!(rec.leaf().program().to_vec(), bytes(&b["record"]["leaf_program"]));
+	assert_eq!(rec.leaf().script_pubkey().as_bytes(), &bytes(&b["record"]["leaf_script_pubkey"])[..]);
 	assert_eq!(rec.output().script_pubkey.as_bytes(), &bytes(&b["record"]["script_pubkey"])[..]);
+	let policy = rec.policy();
+	assert_eq!(policy.convert_script().as_bytes(), &bytes(&b["record"]["convert_script"])[..]);
+	assert_eq!(policy.leaf.collab_script().as_bytes(), &bytes(&b["record"]["collab_script"])[..]);
 	assert_eq!(rec.leaf_id().to_string(), b["record"]["leaf_id"].as_str().unwrap());
 	assert_eq!(rec.operator, key(&v["inputs"]["operator"]));
+	println!("board-1: convert script {} bytes, collab script {} bytes (the leaf's own)",
+		policy.convert_script().len(), policy.leaf.collab_script().len());
 
-	// The board transaction from the owner's coins, and the record against it.
+	// The board transaction from the owner's coins, and the record against it
+	// under a wallet's policy.
 	let t = &b["board_tx"];
 	let coins: Vec<(OutPoint, TxOut)> = t["inputs"].as_array().unwrap().iter()
 		.map(|i| (outpoint(&i["outpoint"]), out(&i["spent"]).txout())).collect();
 	let u = rec.tx(&coins, asset_of(&t["fee_asset"]), t["fee"].as_u64().unwrap(), &Script::from(bytes(&t["change"]))).unwrap();
 	let board = fx.check("the board transaction", u, t);
-	assert_eq!(rec.validate(&board).unwrap().vout, 0);
+	let wallet = WalletPolicy::new(Chain::new(fx.genesis), rec.operator, MedianTime::from_consensus(1_791_000_000).unwrap());
+	let valid = rec.validate(&board, &wallet).unwrap();
+	assert_eq!((valid.vout, valid.txid), (t["board_vout"].as_u64().unwrap() as u32, board.txid()));
+	let other = WalletPolicy { operator: rec.owner, ..wallet };
+	assert_eq!(rec.validate(&board, &other).unwrap_err(), RecordError::WrongOperator);
+	let strict = WalletPolicy { min_exit_delay: RelativeTime::from_units(rec.exit_delay.units() + 1).unwrap(), ..wallet };
+	assert_eq!(rec.validate(&board, &strict).unwrap_err().kind(), "policy");
 
-	// The owner's exit of the board leaf.
+	// The owner's conversion, signed, a fee coin attached; then the
+	// converted leaf's exit.
+	let c = &b["conversion_tx"];
+	let ks = policy.conversion(valid.outpoint(), &fee_of(&c["fee"])).unwrap();
+	let u = fx.sign("the owner's conversion", ks, "A", vec![], c);
+	let conversion = fx.check("the owner's conversion", u, c);
+	println!("board-1: the owner's conversion {} vB", conversion.vsize());
 	let e = &b["exit_tx"];
-	let i0 = &e["inputs"][0];
-	let ks = rec.leaf().exit_tx(outpoint(&i0["outpoint"]), rec.asset, rec.value, &chosen(e), &fee_of(&e["fee"])).unwrap();
-	let u = fx.sign("the board leaf's exit claim", ks, "A", vec![], e);
-	fx.check("the board leaf's exit claim", u, e);
+	let ks = rec.leaf().exit_tx(OutPoint::new(conversion.txid(), 0), rec.asset, rec.value, &chosen(e), &fee_of(&e["fee"])).unwrap();
+	let u = fx.sign("the converted leaf's exit claim", ks, "A", vec![], e);
+	fx.check("the converted leaf's exit claim", u, e);
+
+	// One pair over the leaf's message spends the board output, and the leaf
+	// the conversion made.
+	let pairs = b["by_pair"].as_array().unwrap();
+	let outs = chosen(&pairs[0]);
+	let d = rec.leaf().collab_message(rec.asset, rec.value, &outs).unwrap().digest;
+	let pair = Pair { operator: sign_digest(&vector_key("S"), &d, &ZERO_AUX), owner: sign_digest(&vector_key("A"), &d, &ZERO_AUX) };
+	for (x, at, by_board) in [(&pairs[0], valid.outpoint(), true), (&pairs[1], OutPoint::new(conversion.txid(), 0), false)] {
+		assert_eq!(d.to_vec(), bytes(&x["message_digest"]));
+		let name = x["name"].as_str().unwrap();
+		let u = if by_board {
+			collab_tx(&policy, at, rec.asset, rec.value, &outs, &pair, &fee_of(&x["fee"])).unwrap()
+		} else {
+			collab_tx(&rec.leaf(), at, rec.asset, rec.value, &outs, &pair, &fee_of(&x["fee"])).unwrap()
+		};
+		fx.check(name, u, x);
+	}
 
 	for x in b["invalid_binary"].as_array().unwrap() {
 		let err = BoardRecord::from_bytes(&bytes(&x["binary"])).err()
@@ -290,12 +325,15 @@ fn the_transfer_chain() {
 	let v = vectors();
 	let fx = Fx::new(&v);
 	let t = &v["transfer"];
-	let rounds: Vec<Transaction> = t["inputs"]["rounds"].as_array().unwrap().iter().map(|r| deserialize(&bytes(r)).unwrap()).collect();
+	// The transactions the records' bases came from: two rounds and a board.
+	let rounds: Vec<Transaction> = ["rounds", "boards"].iter()
+		.flat_map(|k| t["inputs"][k].as_array().unwrap().iter())
+		.map(|r| deserialize(&bytes(r)).unwrap()).collect();
 	let now = MedianTime::from_consensus(t["inputs"]["now"].as_u64().unwrap() as u32).unwrap();
 	let policy = WalletPolicy::new(Chain::new(fx.genesis), key(&v["inputs"]["operator"]), now);
 
 	// Every receiver's record decodes, encodes back, and validates for it.
-	let mut d_coin = None;
+	let mut ends = std::collections::BTreeMap::new();
 	for (name, r) in t["records"].as_object().unwrap() {
 		let b = bytes(&r["binary"]);
 		let rec = CoinRecord::from_bytes(&b).unwrap();
@@ -304,8 +342,8 @@ fn the_transfer_chain() {
 			.unwrap_or_else(|e| panic!("{}: refused: {}", name, e));
 		assert_eq!(coin.id.to_string(), r["id"].as_str().unwrap(), "{}: coin id", name);
 		println!("{:<10} record {:>5} bytes, coin {}, {} hops, {} atoms", name, b.len(), coin.id, coin.hops, coin.value);
-		if name == "D" {
-			d_coin = Some(coin);
+		if name == "D" || name == "E" {
+			ends.insert(name.clone(), coin);
 		}
 	}
 
@@ -315,12 +353,19 @@ fn the_transfer_chain() {
 	fn walk(fx: &Fx, coin: &ValidCoin, bases: &Value, txs: &std::collections::BTreeMap<String, &Value>, n: &mut usize) -> OutPoint {
 		match &coin.origin {
 			ValidOrigin::Leaf { .. } => outpoint(&bases[coin.id.to_string()]),
+			ValidOrigin::Board { valid, .. } => valid.outpoint(),
 			ValidOrigin::Transfer { inputs, index, .. } => {
 				let mut cps = vec![];
 				for i in inputs {
 					let at = walk(fx, &i.coin, bases, txs, n);
 					let name = format!("checkpoint of {}", i.coin.id);
-					let cp = fx.check(&name, i.checkpoint_tx(at, &FeeSource::Reserve).unwrap(), txs[&name]);
+					// A board's checkpoint spends the board output itself.
+					let u = if i.coin.board().is_some() {
+						i.board_checkpoint_tx(&FeeSource::Reserve).unwrap()
+					} else {
+						i.checkpoint_tx(at, &FeeSource::Reserve).unwrap()
+					};
+					let cp = fx.check(&name, u, txs[&name]);
 					cps.push(OutPoint::new(cp.txid(), 0));
 					*n += 1;
 				}
@@ -332,6 +377,14 @@ fn the_transfer_chain() {
 		}
 	}
 	let mut n = 0;
-	walk(&fx, d_coin.as_ref().unwrap(), &t["inputs"]["bases"], &txs, &mut n);
+	for coin in ends.values() {
+		walk(&fx, coin, &t["inputs"]["bases"], &txs, &mut n);
+	}
+	// E's coin rests on the board: its lineage holds the board's leaf and its
+	// checkpoint, and the board must still be unspent.
+	let e = &ends["E"];
+	assert_eq!(e.boards(), vec![OutPoint::new(rounds[2].txid(), 0)]);
+	assert_eq!(e.lineage().len(), 2);
+	assert_eq!(e.expiry, MedianTime::MAX, "a coin from a board alone never expires");
 	assert_eq!(n, txs.len(), "every transfer transaction in the vectors was rebuilt");
 }

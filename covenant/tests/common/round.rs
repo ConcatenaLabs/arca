@@ -65,6 +65,11 @@ impl Arca {
 		!r["unspents"].as_array().unwrap().is_empty()
 	}
 
+	/// Whether `at` is an unspent output on-chain.
+	pub fn unspent(&self, at: &OutPoint) -> bool {
+		!self.net.rpc("gettxout", json!([at.txid.to_string(), at.vout])).is_null()
+	}
+
 	/// The block that holds `txid`.
 	pub fn block_of(&self, txid: &Txid) -> String {
 		let info = self.net.rpc("getrawtransaction", json!([txid.to_string(), true]));
