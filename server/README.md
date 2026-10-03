@@ -37,13 +37,54 @@ requests can race past them:
 Back up the database: it holds what the chain does not, such as which leaves
 were spent off-chain and the records receivers collect from their mailboxes.
 
+## Finality
+
+The server never counts confirmations. One component, the finality service
+(`chain::finality`), follows the node's active chain block by block into the
+database and gives the one answer to "is this final" for any transaction
+something in the server relies on:
+
+| State | Meaning |
+|---|---|
+| not in the chain | not in a block of the active chain (perhaps in the mempool) |
+| unsettled | in a block the committee has not certified |
+| settled | in a certified block, its anchor buried fewer Bitcoin blocks than the rule |
+| final | certified, and its anchor buried `anchor_depth` Bitcoin blocks (2) |
+
+A block counts as certified when the node reports the committee's certificate
+for it or for any block above it. The anchor's burial is the anchor height of
+the tip less the anchor height of the block, as SeqLN counts it, so many
+Sequentia blocks on one Bitcoin block bury nothing. Nothing becomes final
+while the node reports its tip's anchor as anything but `ok`.
+
+Sequentia reorganises whenever its Bitcoin anchor does, with no depth limit,
+so the service disconnects, tip first, every block the node no longer holds,
+however deep and whether or not it was final, and publishes each change: a
+disconnection names every watched transaction the block held, so whatever
+relied on one is checked again. A rollback that happens while the server is
+stopped is found on its first pass. The service also records, for good, every
+output it sees paying an Arca script the server knows and every spend of an
+outpoint it watches, in blocks and in the mempool.
+
+The node must run with `-txindex` and `-validateanchor`. The service refuses a
+node that does not validate its anchors, since that node has no notion of
+finality, and refuses to leave certification out on a chain whose node reports
+certificates.
+
 ## Testing
 
 The tests run against a real PostgreSQL server. `ARCA_TEST_POSTGRES` names it,
 with a database to connect to for administration; each test creates a database
-of its own there, builds the schema in it and drops it at the end.
+of its own there, builds the schema in it and drops it at the end. The tests
+that need a chain run `sequentiad` (named by `SEQUENTIAD_EXEC`) on an anchored
+proof-of-stake regtest chain (`sequentia_ext::regtest::Regtest::start_pos`),
+where a committee certifies every block; the cases a live chain will not
+produce on demand (a block without its certificate, a certificate arriving
+late, a stale anchor, a rollback below where the service started) run against
+a chain held in memory.
 
-    ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres cargo test -p arca-server
+    ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
+    SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
 
 The user needs the right to create databases. A throwaway server in user
 space is enough:

@@ -19,10 +19,12 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
 
 mod auth;
+mod chain;
 mod coins;
 mod mailbox;
 
 pub use auth::ChallengeError;
+pub use chain::{BlockRow, Scan};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 
