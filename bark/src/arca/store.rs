@@ -12,9 +12,15 @@
 //!   follow), its state and its salt. A salt is unique: the wallet refuses a
 //!   coin at a salt it has held a coin under, since its old pairs would spend
 //!   it;
-//! - the transactions its coins rest on (rounds, boards), its participations,
-//!   its transfer requests, its swaps, its mailbox cursor, its exits, the
-//!   refusals it made, and its on-chain derivation indices.
+//! - **every forfeit it signs**, written before the signature leaves the
+//!   wallet: the coin, the round and connector output it is bound to, the
+//!   unlock hash, the refund delay and the margin, so the wallet can find the
+//!   forfeit's output on the chain, read a preimage from its claim, or take
+//!   the refund, whatever the server says;
+//! - the transactions its coins rest on (rounds, boards), its participations
+//!   with the new leaves it validated for them, its transfer requests, its
+//!   swaps, its mailbox cursor, its exits, the refusals it made, and its
+//!   on-chain derivation indices.
 //!
 //! The mnemonic is not here; it is the `mnemonic` file beside the database.
 
@@ -78,6 +84,20 @@ CREATE TABLE IF NOT EXISTS swap (
 );
 CREATE TABLE IF NOT EXISTS mailbox (key BLOB PRIMARY KEY, cursor INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS exit (leaf_id TEXT PRIMARY KEY, state TEXT NOT NULL, txs TEXT NOT NULL, claim TEXT);
+CREATE TABLE IF NOT EXISTS forfeit (
+	leaf_id TEXT NOT NULL,
+	participation TEXT NOT NULL,
+	round TEXT NOT NULL,
+	connector_vout INTEGER NOT NULL,
+	unlock_hash TEXT NOT NULL,
+	refund_units INTEGER NOT NULL,
+	margin INTEGER NOT NULL,
+	from_height INTEGER NOT NULL,
+	state TEXT NOT NULL,
+	note TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY (leaf_id, round)
+);
 CREATE TABLE IF NOT EXISTS refusal (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, what TEXT NOT NULL, reason TEXT NOT NULL);
 ";
 
@@ -93,8 +113,9 @@ pub struct CoinRow {
 	/// The coin record, binary form.
 	pub record: Vec<u8>,
 	pub salt: [u8; 32],
-	/// `pending`, `live`, `offered`, `sending`, `given`, `spent`, `exiting`,
-	/// `exited` or `lost`.
+	/// `pending`, `live`, `offered`, `sending`, `given` (in a participation,
+	/// no forfeit signed), `forfeited` (a forfeit signed, its preimage not in
+	/// hand), `spent`, `exiting`, `exited` or `lost`.
 	pub state: String,
 	pub note: String,
 	/// The earliest first expiry of the batches it rests on (median time);
@@ -103,6 +124,29 @@ pub struct CoinRow {
 	/// The txids of the rounds and boards it rests on.
 	pub bases: Vec<String>,
 	pub spent_by: Option<String>,
+}
+
+/// A forfeit the wallet signed, as the store holds it.
+#[derive(Debug, Clone)]
+pub struct ForfeitRow {
+	/// The coin given up.
+	pub leaf_id: String,
+	pub participation: String,
+	/// The round it is bound to, and that round's connector output: the
+	/// forfeit can be claimed only while that round is in the chain.
+	pub round: String,
+	pub connector_vout: u32,
+	pub unlock_hash: String,
+	pub refund_units: u16,
+	pub margin: u64,
+	/// The height the wallet reads the chain from for it.
+	pub from_height: u64,
+	/// `signed` (its preimage not in hand), `settled` (the preimage in hand:
+	/// the coin was exchanged for the new leaves), `claimed` (the operator
+	/// claimed it on the chain, publishing the preimage), `refunded` (the
+	/// wallet took the refund) or `void` (its round can never return).
+	pub state: String,
+	pub note: String,
 }
 
 /// A nonce as the store holds it.
@@ -137,7 +181,19 @@ impl Store {
 		let conn = Connection::open(path).map_err(db)?;
 		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;").map_err(db)?;
 		conn.execute_batch(SCHEMA).map_err(db)?;
-		Ok(Store { conn })
+		let store = Store { conn };
+		store.add_column("participation", "news", "TEXT")?;
+		Ok(store)
+	}
+
+	/// Adds `column` to `table` in a store made before it existed.
+	fn add_column(&self, table: &str, column: &str, kind: &str) -> Result<(), Error> {
+		let has: bool = self.conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{}') WHERE name = ?1", table)).map_err(db)?
+			.exists(params![column]).map_err(db)?;
+		if !has {
+			self.conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, kind)).map_err(db)?;
+		}
+		Ok(())
 	}
 
 	// --- meta ---
@@ -314,6 +370,60 @@ impl Store {
 	pub fn set_participation(&self, id: &str, state: &str, preimage: Option<&str>, round: Option<&str>) -> Result<(), Error> {
 		self.conn.execute("UPDATE participation SET state = ?2, preimage = COALESCE(?3, preimage), round = COALESCE(?4, round) WHERE id = ?1",
 			params![id, state, preimage, round]).map_err(db)?;
+		Ok(())
+	}
+
+	/// The new leaves validated for participation `id`, with their nonces
+	/// and the authorisations signed for them, before its forfeits went out.
+	pub fn set_participation_news(&self, id: &str, news: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE participation SET news = ?2 WHERE id = ?1", params![id, news]).map_err(db)?;
+		Ok(())
+	}
+
+	pub fn participation_news(&self, id: &str) -> Result<Option<String>, Error> {
+		Ok(self.conn.query_row("SELECT news FROM participation WHERE id = ?1", params![id], |r| r.get::<_, Option<String>>(0))
+			.optional().map_err(db)?.flatten())
+	}
+
+	// --- forfeits ---
+
+	/// Records a forfeit about to be signed. One coin has one forfeit per
+	/// round.
+	pub fn put_forfeit(&self, f: &ForfeitRow) -> Result<(), Error> {
+		self.conn.execute("INSERT OR IGNORE INTO forfeit (leaf_id, participation, round, connector_vout, unlock_hash, refund_units, margin,
+			from_height, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'signed', ?9)",
+			params![f.leaf_id, f.participation, f.round, f.connector_vout, f.unlock_hash, f.refund_units, f.margin as i64, f.from_height as i64, now()])
+			.map_err(db)?;
+		Ok(())
+	}
+
+	fn forfeit_row(r: &rusqlite::Row) -> rusqlite::Result<ForfeitRow> {
+		Ok(ForfeitRow {
+			leaf_id: r.get(0)?, participation: r.get(1)?, round: r.get(2)?, connector_vout: r.get(3)?, unlock_hash: r.get(4)?,
+			refund_units: r.get(5)?, margin: r.get::<_, i64>(6)? as u64, from_height: r.get::<_, i64>(7)? as u64, state: r.get(8)?,
+			note: r.get(9)?,
+		})
+	}
+
+	/// Every forfeit signed for coin `leaf_id`.
+	pub fn forfeits_of(&self, leaf_id: &str) -> Result<Vec<ForfeitRow>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, participation, round, connector_vout, unlock_hash, refund_units, margin, from_height,
+			state, note FROM forfeit WHERE leaf_id = ?1 ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map(params![leaf_id], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// Every forfeit in `state`.
+	pub fn forfeits_in(&self, state: &str) -> Result<Vec<ForfeitRow>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, participation, round, connector_vout, unlock_hash, refund_units, margin, from_height,
+			state, note FROM forfeit WHERE state = ?1 ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map(params![state], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	pub fn set_forfeit_state(&self, leaf_id: &str, round: &str, state: &str, note: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE forfeit SET state = ?3, note = ?4 WHERE leaf_id = ?1 AND round = ?2", params![leaf_id, round, state, note])
+			.map_err(db)?;
 		Ok(())
 	}
 
