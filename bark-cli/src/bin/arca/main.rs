@@ -120,6 +120,11 @@ enum Cmd {
 		/// The earliest median time of a round it may run in.
 		#[arg(long)]
 		not_before: Option<u32>,
+		/// The most the operator's refresh fee may take of a coin, in
+		/// millionths, for this command: by default 10,000, and nothing in a
+		/// coin's free window.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
 	},
 	/// Re-checks every coin against the chain, retries what the server never
 	/// answered, reads the mailbox and moves every participation on.
@@ -258,7 +263,15 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
-		Cmd::Participate { leaves, not_before } => w.participate(&leaves, not_before),
+		Cmd::Participate { leaves, not_before, max_fee_ppm } => {
+			// The fee is shown before anything is signed.
+			let quote = w.refresh_quote(&leaves, max_fee_ppm)?;
+			for c in quote.coins() {
+				eprintln!("arca: refresh fee for coin {}: {} of asset {} ({} ppm of its {}; the wallet's bound {} ppm)", c["leaf_id"].as_str().unwrap_or(""),
+					c["fee"].as_str().unwrap_or(""), c["asset"].as_str().unwrap_or(""), c["ppm"], c["value"].as_str().unwrap_or(""), c["bound_ppm"]);
+			}
+			w.participate(quote, not_before)
+		},
 		Cmd::Sync => w.sync(),
 		Cmd::Recheck => w.recheck(),
 		Cmd::Exit { leaf_id, fee_asset } => w.exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),

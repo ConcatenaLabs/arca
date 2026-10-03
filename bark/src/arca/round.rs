@@ -45,6 +45,49 @@ pub fn refresh_fee(fees: &Value, value: u64, expiry: u32, now: u32) -> u64 {
 	((value as u128 * ppm * charged).div_ceil(full as u128 * 1_000_000)).min(u64::MAX as u128) as u64
 }
 
+/// The most a refresh may cost, in millionths of a coin's value, unless the
+/// user raises it for one command.
+pub const DEFAULT_MAX_FEE_PPM: u64 = 10_000;
+
+/// A refresh is free in the two days before a coin's exit deadline, three
+/// days before its first expiry: the wallet pays nothing there unless the
+/// user raises the bound for one command, whatever window the server
+/// publishes.
+pub const FREE_WINDOW: u32 = 2 * 86_400;
+
+/// Whether a coin whose first expiry is `expiry` is in its free window at
+/// `now`.
+pub fn in_free_window(expiry: u32, now: u32) -> bool {
+	(expiry as u64).saturating_sub(now as u64) <= (WalletPolicy::EXIT_DEADLINE + FREE_WINDOW) as u64
+}
+
+/// Whether `fee` is at most `ppm` millionths of `value`.
+pub fn fee_within(fee: u64, value: u64, ppm: u64) -> bool {
+	(fee as u128) * 1_000_000 <= (value as u128) * (ppm as u128)
+}
+
+fn ppm_of(fee: u64, value: u64) -> u64 {
+	((fee as u128 * 1_000_000).div_ceil(value.max(1) as u128)).min(u64::MAX as u128) as u64
+}
+
+/// A refresh as [`Wallet::refresh_quote`] prices it: the coins it gives up
+/// and what each costs, checked against the wallet's bound.
+pub struct RefreshQuote {
+	info: Value,
+	rows: Vec<super::store::CoinRow>,
+	ids: Vec<arca_covenant::LeafId>,
+	per: BTreeMap<AssetId, (u64, u64)>,
+	coins: Vec<Value>,
+}
+
+impl RefreshQuote {
+	/// Each coin given up, its fee, that fee in millionths of the coin, and
+	/// the bound it was checked against.
+	pub fn coins(&self) -> &[Value] {
+		&self.coins
+	}
+}
+
 /// The tree a published batch describes, rebuilt by the wallet from the
 /// published parts alone.
 pub fn rebuild(t: &Value) -> Result<Tree, Error> {
@@ -81,10 +124,14 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 }
 
 impl Wallet {
-	/// Gives up `leaf_ids` (every live coin when empty) for one new leaf per
-	/// asset in a round, paying the operator's schedule in each coin's own
-	/// asset. Not before median time `not_before`, when given.
-	pub fn participate(&mut self, leaf_ids: &[String], not_before: Option<u32>) -> Result<Value, Error> {
+	/// What a refresh of `leaf_ids` (every live coin when empty) costs, coin by
+	/// coin, by the schedule the server's `info` publishes, checked against
+	/// the wallet's bound before anything is signed: a fee above
+	/// `max_fee_ppm` of a coin (by default [`DEFAULT_MAX_FEE_PPM`]), or any fee
+	/// for a coin in the free window (the [`FREE_WINDOW`] before its exit
+	/// deadline) unless `max_fee_ppm` is given, is refused. The quote is what
+	/// [`Wallet::participate`] submits.
+	pub fn refresh_quote(&self, leaf_ids: &[String], max_fee_ppm: Option<u64>) -> Result<RefreshQuote, Error> {
 		let info = self.server_info()?;
 		let now = self.now()?;
 		let rows: Vec<_> = if leaf_ids.is_empty() {
@@ -103,22 +150,51 @@ impl Wallet {
 		}
 		let mut per: BTreeMap<AssetId, (u64, u64)> = BTreeMap::new();
 		let mut ids = vec![];
+		let mut coins = vec![];
 		for r in &rows {
 			let (_, a) = self.held(r)?;
 			if !a.all_final() {
 				return Err(Error::Refused(format!("coin {} is not final: {}", r.leaf_id, a.waiting())));
 			}
-			let fee = refresh_fee(&info["fees"], a.valid.value, a.valid.expiry.to_consensus_u32(), now.to_consensus_u32());
+			let (value, expiry) = (a.valid.value, a.valid.expiry.to_consensus_u32());
+			let fee = refresh_fee(&info["fees"], value, expiry, now.to_consensus_u32());
+			let free = in_free_window(expiry, now.to_consensus_u32());
+			let bound = max_fee_ppm.unwrap_or(if free { 0 } else { DEFAULT_MAX_FEE_PPM });
+			if !fee_within(fee, value, bound) {
+				return Err(Error::Refused(format!("the operator asks a refresh fee of {} of asset {} for coin {}: {} ppm of its {}{}; \
+					the wallet pays at most {} ppm{} unless the bound is raised for this command (--max-fee-ppm)",
+					fee, a.valid.asset, r.leaf_id, ppm_of(fee, value), value,
+					if free { ", inside its free window (the two days before its exit deadline), where a refresh is free" } else { "" },
+					bound, if max_fee_ppm.is_none() && !free { ", and nothing in a coin's free window," } else { "" })));
+			}
 			let e = per.entry(a.valid.asset).or_default();
-			e.0 += a.valid.value;
-			e.1 += fee;
+			e.0 = e.0.checked_add(value).ok_or_else(|| Error::Refused("the coins' values overflow".into()))?;
+			e.1 = e.1.checked_add(fee).ok_or_else(|| Error::Refused("the fees overflow".into()))?;
 			ids.push(a.valid.id);
+			coins.push(json!({"leaf_id": r.leaf_id, "asset": a.valid.asset.to_string(), "value": value.to_string(), "fee": fee.to_string(),
+				"ppm": ppm_of(fee, value), "free_window": free, "bound_ppm": bound}));
 		}
+		for (asset, (total, fee)) in &per {
+			let value = total.checked_sub(*fee).ok_or_else(|| Error::Refused(format!("the refresh fee of {} in asset {} is more than the \
+				coins hold, {}", fee, asset, total)))?;
+			let min = Self::min_leaf(&info, *asset)?;
+			if value < min {
+				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
+			}
+		}
+		Ok(RefreshQuote { info, rows, ids, per, coins })
+	}
+
+	/// Gives up the coins of `quote` for one new leaf per asset in a round,
+	/// paying the fees it states in each coin's own asset. Not before median
+	/// time `not_before`, when given.
+	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
+		let RefreshQuote { info, rows, ids, per, coins } = quote;
 		let mut wanted = vec![];
 		let mut nonces = vec![];
 		let mut fees = vec![];
 		for (asset, (total, fee)) in &per {
-			let value = total - fee;
+			let value = total.checked_sub(*fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
 			let min = Self::min_leaf(&info, *asset)?;
 			if value < min {
 				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
@@ -157,7 +233,7 @@ impl Wallet {
 		})?;
 		let answer = self.submit(&pid, &body, &given)?;
 		Ok(json!({"participation": pid, "state": answer["state"], "gives": given, "wants": nonces,
-			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()}))
+			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(), "quote": coins}))
 	}
 
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
@@ -641,5 +717,45 @@ impl Wallet {
 			},
 		}
 		Ok(v)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_fee_is_bounded_in_millionths_of_its_coin() {
+		assert!(fee_within(20_000, 2_000_000, DEFAULT_MAX_FEE_PPM));
+		assert!(!fee_within(20_001, 2_000_000, DEFAULT_MAX_FEE_PPM));
+		assert!(!fee_within(1_000_000, 2_000_000, DEFAULT_MAX_FEE_PPM));
+		assert!(fee_within(1_000_000, 2_000_000, 500_000));
+		// Nothing at all in the free window, unless raised.
+		assert!(fee_within(0, 2_000_000, 0));
+		assert!(!fee_within(1, 2_000_000, 0));
+		// No overflow at the extremes.
+		assert!(fee_within(u64::MAX, u64::MAX, 1_000_000));
+		assert!(!fee_within(u64::MAX, 1, u64::MAX / 2));
+		assert_eq!(ppm_of(1_000_000, 2_000_000), 500_000);
+	}
+
+	#[test]
+	fn the_free_window_is_the_two_days_before_the_exit_deadline() {
+		let e = 2_000_000_000u32;
+		let deadline = WalletPolicy::EXIT_DEADLINE;
+		assert!(!in_free_window(e, e - deadline - FREE_WINDOW - 1));
+		assert!(in_free_window(e, e - deadline - FREE_WINDOW));
+		assert!(in_free_window(e, e - deadline));
+		// A board never expires.
+		assert!(!in_free_window(u32::MAX, e));
+	}
+
+	#[test]
+	fn a_published_fee_above_the_coin_is_capped_not_wrapped() {
+		let fees = json!({"refresh_ppm": u64::MAX, "free_window_seconds": 0, "full_after_seconds": 1});
+		let fee = refresh_fee(&fees, 2_000_000, u32::MAX, 0);
+		assert!(fee > 2_000_000);
+		assert!(!fee_within(fee, 2_000_000, DEFAULT_MAX_FEE_PPM));
+		assert!(2_000_000u64.checked_sub(fee).is_none());
 	}
 }
