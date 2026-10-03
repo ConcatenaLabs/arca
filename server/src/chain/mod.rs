@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use elements::hashes::Hash;
-use elements::{AssetId, BlockHash, Transaction, Txid};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, Txid};
 use serde_json::{json, Value};
 
 use sequentia_ext::rpc::{Client, Error as RpcError};
@@ -101,6 +101,11 @@ pub trait ChainSource: Send + Sync + 'static {
 	/// Whether the node would accept `tx` into its mempool now, and if not,
 	/// why; and its virtual size.
 	fn test_accept(&self, tx: &Transaction) -> Result<(bool, Option<String>, Option<u64>), ChainError>;
+	/// Whether `outpoint` is an unspent output of the active chain, or, with
+	/// `mempool`, of the mempool and spent by nothing in it: its
+	/// confirmations (0 in the mempool), or `None` when it is spent or does
+	/// not exist.
+	fn unspent(&self, outpoint: &OutPoint, mempool: bool) -> Result<Option<u64>, ChainError>;
 }
 
 /// A `sequentiad` reached over JSON-RPC. It must run with `-txindex`, and with
@@ -213,6 +218,14 @@ impl ChainSource for NodeSource {
 		let r = self.client.test_mempool_accept(&[tx])?.into_iter().next()
 			.ok_or_else(|| ChainError::Answer("testmempoolaccept returned nothing".into()))?;
 		Ok((r.allowed, r.reject_reason, r.vsize))
+	}
+
+	fn unspent(&self, outpoint: &OutPoint, mempool: bool) -> Result<Option<u64>, ChainError> {
+		let v: Value = self.client.call("gettxout", &[json!(outpoint.txid.to_string()), json!(outpoint.vout), json!(mempool)])?;
+		if v.is_null() {
+			return Ok(None);
+		}
+		Ok(Some(v["confirmations"].as_u64().ok_or_else(|| ChainError::Answer("gettxout gave no confirmations".into()))?))
 	}
 }
 

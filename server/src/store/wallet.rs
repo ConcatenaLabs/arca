@@ -107,4 +107,11 @@ impl Store {
 			txid: array32(r.get(0), "txid")?, vout: r.get::<_, i32>(1) as u32, reason: r.get(2),
 		})).collect()
 	}
+
+	/// Every round's connector asset.
+	pub async fn connector_assets(&self) -> Result<std::collections::HashSet<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT connector_asset FROM connector_output", &[]).await?;
+		rows.iter().map(|r| super::array32(r.get(0), "connector asset")).collect()
+	}
 }

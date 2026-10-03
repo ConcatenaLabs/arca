@@ -87,8 +87,8 @@ use crate::fees;
 use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{
-	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRound, NewScript, ParticipationRow,
-	NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, WantedKind,
+	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRound, NewScript, NewTreeScript, ParticipationRow,
+	NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, TreeScriptKind, WantedKind,
 };
 use crate::wallet::{Wallet, WalletError};
 
@@ -451,6 +451,22 @@ impl Rounds {
 					},
 				});
 			}
+			// Every node and entry, so their outputs are seen once unrolled.
+			let mut scripts = vec![];
+			for (level, nodes) in tree.levels().iter().enumerate() {
+				for (k, nd) in nodes.iter().enumerate() {
+					scripts.push(NewTreeScript {
+						script_pubkey: nd.output().script_pubkey.to_bytes(), kind: TreeScriptKind::Node,
+						level: level as i16, idx: k as u32, value: nd.value,
+					});
+				}
+			}
+			for (k, l) in tree.leaves().iter().enumerate() {
+				scripts.push(NewTreeScript {
+					script_pubkey: l.entry.script_pubkey().to_bytes(), kind: TreeScriptKind::Entry,
+					level: -1, idx: k as u32, value: l.entry_value,
+				});
+			}
 			let tp = tree.params();
 			new_batches.push(NewBatch {
 				batch: BatchRow {
@@ -471,6 +487,7 @@ impl Rounds {
 					min_leaf: tp.min_leaf,
 				},
 				leaves: new_leaves,
+				scripts,
 			});
 		}
 		if let Err(e) = (ConnectorPolicy { operator: s }).check(&tx, c) {

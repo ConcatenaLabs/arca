@@ -1,7 +1,8 @@
 //! The server's durable state, in PostgreSQL.
 //!
-//! One schema, `schema/V1__arca.sql`, built from nothing by [`Store::connect`]
-//! (the migrations it holds are applied in order, once, under a lock). Every
+//! The schema is `schema/V1__arca.sql` and the migrations after it
+//! (`schema/V2__watcher.sql`), built from nothing by [`Store::connect`] and
+//! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), an
 //! operator nonce is taken once ([`StoreError::NonceUsed`]), a key owns one leaf
@@ -30,6 +31,7 @@ mod participations;
 mod rounds;
 mod transfers;
 mod wallet;
+mod watcher;
 
 pub use auth::ChallengeError;
 pub use boards::{BoardRow, BoardState};
@@ -42,15 +44,19 @@ pub use participations::{
 	WantedKind,
 };
 pub use rounds::{
-	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, Placement, RoundRow, RoundState, StoredReserve,
+	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, OffboardRow, Placement, RoundRow, RoundState, StoredReserve,
 };
 pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
+pub use watcher::{NewTreeScript, NewWatcherTx, TreeOutput, TreeScriptKind, WatcherTxRow};
 
 /// The migrations, in order: `(version, SQL)`. The schema is squashed into the
 /// first; a change to a schema a server has run is a new entry, never an edit
 /// of an old one.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../../schema/V1__arca.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+	(1, include_str!("../../schema/V1__arca.sql")),
+	(2, include_str!("../../schema/V2__watcher.sql")),
+];
 
 /// An arbitrary key for the advisory lock that serialises migrations.
 const MIGRATION_LOCK: i64 = 0x4172_6361_5363_6865;

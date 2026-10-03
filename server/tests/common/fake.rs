@@ -178,6 +178,26 @@ impl ChainSource for FakeChain {
 		Ok(1_000)
 	}
 
+	fn unspent(&self, outpoint: &OutPoint, mempool: bool) -> Result<Option<u64>, ChainError> {
+		let i = self.inner.lock().unwrap();
+		let tip = i.active.len() as u64;
+		let mut found = None;
+		for (h, hash) in i.active.iter().enumerate() {
+			for tx in &i.blocks[hash].txs {
+				if tx.txid() == outpoint.txid && (outpoint.vout as usize) < tx.output.len() {
+					found = Some(tip - h as u64);
+				}
+			}
+		}
+		if mempool && found.is_none() && i.mempool.iter().any(|t| t.txid() == outpoint.txid && (outpoint.vout as usize) < t.output.len()) {
+			found = Some(0);
+		}
+		let spent = i.active.iter().flat_map(|h| i.blocks[h].txs.iter())
+			.chain(i.mempool.iter().filter(|_| mempool))
+			.any(|t| t.input.iter().any(|x| x.previous_output == *outpoint));
+		Ok(if spent { None } else { found })
+	}
+
 	fn test_accept(&self, _tx: &Transaction) -> Result<(bool, Option<String>, Option<u64>), ChainError> {
 		Ok((true, None, None))
 	}

@@ -26,6 +26,16 @@
 //! round transaction ([`Wallet::build_round`]) also issues each batch's sweep
 //! token, one explicit atom with no reissuance token, from one of the
 //! wallet's own coins per batch.
+//!
+//! The watcher builds transactions the wallet did not build (a forfeit, a
+//! claim, a release, a sweep), and a coin of the wallet may pay their fee
+//! ([`Wallet::with_fee_coin`]) or hold a round's connector asset. The wallet
+//! signs its own input of such a transaction itself
+//! ([`Wallet::sign_input`]), with the key the kit derives, over the
+//! transaction's segwit v0 signature hash as rust-elements computes it from the
+//! transaction itself: the kit's PSET signer re-encodes an input's issuance
+//! (its index and denomination) before it signs, which would sign another
+//! transaction than one that issues a connector asset.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -41,6 +51,7 @@ use lwk_common::Signer as _;
 use lwk_signer::SwSigner;
 use tokio::sync::Mutex;
 
+use arca_covenant::spend::FeeSource;
 use arca_covenant::{ConnectorPolicy, ExplicitOutput};
 use sequentia_ext::{explicit_txout, fee_txout, AssetAmount};
 
@@ -77,6 +88,12 @@ pub enum WalletError {
 	TooFewCoins { need: usize, have: usize },
 	#[error("the round's outputs: {0}")]
 	Round(String),
+	#[error("the transaction a fee coin pays for: {0}")]
+	Build(String),
+	#[error("no asset of {0} is both accepted for fees by the node now and held by the wallet in a coin that covers the fee")]
+	NoFeeCoin(String),
+	#[error("input {0} does not spend the coin it is signed for")]
+	WrongInput(usize),
 }
 
 /// How spendable a coin must be.
@@ -257,9 +274,12 @@ impl Wallet {
 	{
 		self.fee_for(fee_asset, 1).await?;
 		let _one = self.building.lock().await;
+		// A connector asset's atom is the watcher's, for its claims and
+		// reclaims: it never issues a token.
+		let connectors = self.store.connector_assets().await?;
 		let mut coins = vec![];
 		for c in self.store.wallet_coins(None).await? {
-			if self.spendable(&c).await? {
+			if !connectors.contains(&c.asset) && self.spendable(&c).await? {
 				coins.push(c);
 			}
 		}
@@ -476,6 +496,114 @@ impl Wallet {
 				.ok_or(WalletError::Signing { signed, inputs: coins.len() })?;
 			tx.input[i].witness.script_witness = vec![sig, pk.to_bytes()];
 		}
+		Ok(())
+	}
+
+	/// The fee for `vsize` vbytes in `asset`'s own atoms, now: the node's
+	/// relay floor at its rate for `asset`, times the wallet's multiple.
+	/// Refuses an asset the node does not accept for fees now.
+	pub async fn fee_in(&self, asset: AssetId, vsize: u64) -> Result<u64, WalletError> {
+		self.fee_for(asset, vsize).await
+	}
+
+	/// Builds, with `build`, a transaction whose fee a coin of the wallet's
+	/// pays: the first asset of `assets` the node accepts for fees now in
+	/// which the wallet holds a spendable coin of at least twice the fee
+	/// (its largest), with the change to a new change script. `build` is
+	/// given the fee source and returns what it built, its txid and the
+	/// virtual size it will have once signed; the fee is sized again from
+	/// that size until it covers it. The coin is marked spent by that txid
+	/// before this returns; a transaction never broadcast must have it
+	/// released ([`Wallet::release`]). Returns what `build` made, the coin
+	/// and the fee.
+	pub async fn with_fee_coin<T, F>(&self, assets: &[AssetId], mut build: F) -> Result<(T, WalletCoin, AssetAmount), WalletError>
+	where
+		F: FnMut(&FeeSource) -> Result<(T, Txid, u64), String>,
+	{
+		let _one = self.building.lock().await;
+		for asset in assets {
+			let mut fee = match self.fee_for(*asset, 400).await {
+				Ok(f) => f,
+				Err(WalletError::FeeAssetNotAccepted(_)) => continue,
+				Err(e) => return Err(e),
+			};
+			let mut coins = vec![];
+			for c in self.store.wallet_coins(Some(&asset.into_inner().to_byte_array())).await? {
+				if self.spendable(&c).await? {
+					coins.push(c);
+				}
+			}
+			coins.sort_by(|a, b| b.value.cmp(&a.value).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
+			let coin = match coins.into_iter().next() {
+				Some(c) => c,
+				None => continue,
+			};
+			let change = self.new_script(CHANGE).await?;
+			for _ in 0..5 {
+				if coin.value < fee.saturating_mul(2) {
+					break;
+				}
+				let source = FeeSource::Coin {
+					outpoint: OutPoint::new(Txid::from_byte_array(coin.txid), coin.vout),
+					coin: explicit_txout(AssetAmount::new(*asset, coin.value), Script::from(coin.script_pubkey.clone())),
+					fee,
+					change: change.clone(),
+				};
+				let (made, txid, vsize) = build(&source).map_err(WalletError::Build)?;
+				let need = self.fee_for(*asset, vsize).await?;
+				if need <= fee {
+					if !self.store.spend_wallet_coins(&[(coin.txid, coin.vout)], &txid.to_byte_array()).await? {
+						return Err(WalletError::Raced);
+					}
+					return Ok((made, coin, AssetAmount::new(*asset, fee)));
+				}
+				fee = need;
+			}
+		}
+		Err(WalletError::NoFeeCoin(assets.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")))
+	}
+
+	/// The wallet's coins of `asset` in a block of the active chain and not
+	/// spent, final or not: where the watcher finds a round's connector atom.
+	pub async fn coins_in_chain(&self, asset: AssetId) -> Result<Vec<WalletCoin>, WalletError> {
+		Ok(self.store.wallet_coins(Some(&asset.into_inner().to_byte_array())).await?
+			.into_iter().filter(|c| c.in_chain && c.spent_by.is_none()).collect())
+	}
+
+	/// Marks `coins` spent by `txid`, the watcher's transaction that spends
+	/// them; refuses a coin another transaction took.
+	pub async fn take(&self, coins: &[&WalletCoin], txid: &Txid) -> Result<(), WalletError> {
+		let _one = self.building.lock().await;
+		let ids: Vec<([u8; 32], u32)> = coins.iter().map(|c| (c.txid, c.vout)).collect();
+		if !self.store.spend_wallet_coins(&ids, &txid.to_byte_array()).await? {
+			return Err(WalletError::Raced);
+		}
+		Ok(())
+	}
+
+	/// Signs input `index` of `tx`, which spends the wallet's `coin`, a
+	/// P2WPKH output: see the [module documentation](self). The signature
+	/// commits to every input and output, so it is made once nothing else
+	/// will change but the other inputs' witnesses.
+	pub fn sign_input(&self, tx: &mut Transaction, index: usize, coin: &WalletCoin) -> Result<(), WalletError> {
+		use elements::bitcoin::secp256k1::{Message, Secp256k1};
+		use elements::sighash::SighashCache;
+		let input = tx.input.get(index).ok_or(WalletError::WrongInput(index))?;
+		if input.previous_output != OutPoint::new(Txid::from_byte_array(coin.txid), coin.vout) {
+			return Err(WalletError::WrongInput(index));
+		}
+		let pk = self.public_key(coin.chain, coin.index)?;
+		if Self::script(&pk).as_bytes() != coin.script_pubkey.as_slice() {
+			return Err(WalletError::Keys(format!("coin {}:{} is not at the key the wallet derives for it", Txid::from_byte_array(coin.txid), coin.vout)));
+		}
+		let xprv = self.signer.derive_xprv(&Self::path(coin.chain, coin.index)).map_err(|e| WalletError::Keys(e.to_string()))?;
+		let code = Script::new_p2pkh(&elements::PubkeyHash::hash(&pk.to_bytes()));
+		let sighash = SighashCache::new(&*tx).segwitv0_sighash(index, &code, confidential::Value::Explicit(coin.value),
+			elements::EcdsaSighashType::All);
+		let sig = Secp256k1::new().sign_ecdsa_low_r(&Message::from_digest(sighash.to_byte_array()), &xprv.private_key);
+		let mut der = sig.serialize_der().to_vec();
+		der.push(elements::EcdsaSighashType::All as u8);
+		tx.input[index].witness.script_witness = vec![der, pk.to_bytes()];
 		Ok(())
 	}
 
