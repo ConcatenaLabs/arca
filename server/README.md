@@ -4,8 +4,10 @@ The Arca operator's server on Sequentia. It holds the operator's side of Arca:
 it hands out the second nonce of the salt of every leaf it creates, registers
 boards and credits them once final, co-signs out-of-round transfers and delivers them to
 their receivers' mailboxes, takes participations in rounds, re-serves a key's
-leaves, and keeps its own on-chain wallet and the transactions it relies on
-broadcast. Its state is in
+leaves, keeps its own on-chain wallet and the transactions it relies on
+broadcast, and watches the chain to act for the operator there: it answers a
+stale exit, claims forfeits, releases and sweeps expired batches, reclaims
+emptied nodes and settles offboards. Its state is in
 PostgreSQL; what is final comes from one finality service; the operator key
 lives in a separate signer process. Wallets speak JSON over HTTP to `arcad`.
 
@@ -16,9 +18,10 @@ script of its own.
 ## State
 
 The server keeps everything in one PostgreSQL database, whose schema is
-[`schema/V1__arca.sql`](schema/V1__arca.sql). `Store::connect` builds it from
-nothing on an empty database and brings an older one up to date: the schema is
-a list of numbered migrations, applied in order, each once, under a lock.
+[`schema/V1__arca.sql`](schema/V1__arca.sql) and the migrations after it
+([`schema/V2__watcher.sql`](schema/V2__watcher.sql)). `Store::connect` builds it
+from nothing on an empty database and brings an older one up to date: the
+migrations are applied in order, each once, under a lock.
 
 What the database holds, and the rules it enforces itself so that no two
 requests can race past them:
@@ -50,6 +53,9 @@ requests can race past them:
 - **The chain as the server saw it**, participations and forfeits,
   mailboxes, authentication challenges, the on-chain wallet's coins and the
   server's own transactions.
+- **Every node and entry of every batch**, by script, so the outputs a holder
+  unrolls are seen, and **everything the watcher published**, with what it
+  acts for and the outpoints it spends.
 
 Back up the database: it holds what the chain does not, such as which leaves
 were spent off-chain and the records receivers collect from their mailboxes.
@@ -81,7 +87,8 @@ disconnection names every watched transaction the block held, so whatever
 relied on one is checked again. A rollback that happens while the server is
 stopped is found on its first pass. The service also records, for good, every
 output it sees paying an Arca script the server knows and every spend of an
-outpoint it watches, in blocks and in the mempool.
+outpoint it watches, in blocks and in the mempool, and every output paying a
+node or an entry of a batch the server built.
 
 The node must run with `-txindex` and `-validateanchor`. The service refuses a
 node that does not validate its anchors, since that node has no notion of
@@ -292,8 +299,8 @@ so the operator co-signs no other off-chain spend of them, and any release of
 their lowest nodes given for the lost round is retired: it names the lost
 round's connector asset, which can never be issued, so no reclaim can use it.
 
-The nursery does not yet call a round lost when its input's own transaction
-is reorganised away and never returns: such a round stays broadcast, its
+The nursery does not call a round lost when its input's own transaction is
+reorganised away and never returns: such a round stays broadcast, its
 participations issued and its leaves uncredited.
 
 ## The forfeit swap
@@ -328,7 +335,10 @@ credited; only then does the preimage go back. The same request again gets
 the same preimage. A participation that runs again forfeit-first, after a
 round it was released in could not return, has its forfeits stored and its
 preimage withheld: that preimage goes out only by the claim of the forfeit,
-once published, which reveals it on the chain.
+once published, which reveals it on the chain. The watcher publishes it (see
+below), and releases the participation once the claims are final; the same
+request again then returns the preimage, whatever the chain has seen of the
+coins given up meanwhile.
 
 A new leaf is live, and can be paid on out of round, once its participation
 is released and its round final; a coin resting on a leaf of a round that is
@@ -360,6 +370,67 @@ while its round is not final; and for a board or a coin a reassignment made,
 which have no lowest node. Each release is kept with its round and `M`. Once
 every owner under a lowest node has released it, the operator may reclaim the
 node before expiry, with one atom of each `M` its owners' releases name.
+
+## The watcher
+
+The watcher (`watcher`) is everything the operator does on the chain after a
+round. It follows the finality service: on each of its passes it answers
+stale exits and claims forfeits, and after each new block, or at least every
+`recovery_interval_seconds`, it does the rest. It never builds a second spend
+of an outpoint while a spend of its own is in the nursery and not lost, so
+each step is taken once, and every transaction it publishes goes to the nursery,
+which broadcasts it again unchanged after a rollback of any depth.
+
+- **Stale exits.** A coin the server holds as given up, by a participation
+  whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on
+  the chain unspent, in a block or the mempool, is answered at once: by its
+  forfeit, or by its checkpoint; and a reassignment is published once every
+  checkpoint it spends is on the chain. A board given up and then converted
+  is the same case: its leaf appears. The answer confirms within the leaf's
+  exit delay, after which its owner's exit finds the leaf spent.
+- **Boards given up in a round.** A board never expires, so once the round it
+  was given up for is final the watcher publishes its forfeit from the board
+  output itself, and claims it.
+- **Claims.** Each forfeit the watcher published is claimed with the preimage
+  of its unlock hash and an atom of its round's connector asset `M`. The
+  watcher issues that atom from the round's connector output when it holds
+  none, to the wallet, and every claim pays it back to the wallet for the
+  next; claims of one round therefore follow one another, a block apart.
+- **Forfeit-first.** A participation run again after a round that could not
+  return has its forfeits stored and its preimage withheld. The watcher brings
+  each coin it gave up onto the chain from the coin's own record (each node of a
+  batch leaf's path by its owner's unroll authorisation, then its entry with
+  its preimage; the checkpoint of any board in its lineage), so the answer to
+  stale exits publishes its forfeit; it claims the forfeits, which reveals the
+  preimage, only once all of them are final, and releases the participation
+  once the claims are final.
+- **Offboards.** A released participation's offboard output is unlocked to its
+  destination with the preimage, which its owner already holds, so the owner
+  need do nothing more. One whose participation expired or was voided, its
+  preimage never out, is reclaimed by the operator once its reclaim delay has
+  passed since it confirmed. An offboard whose preimage went out is never
+  reclaimed. A stale exit of the coin it gave up is answered as any other.
+- **Expiry.** At the expiry of the clock that holds a batch's token, the
+  release moves the token to `R`. Once it has waited the notice there, each
+  sweep takes every output of the batch still unspent whose own notice has
+  passed (the batch output, a node or an entry someone unrolled, a checkpoint
+  of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
+  the token to `R`. A leaf on the chain is its owner's and is never swept.
+  The server builds no burn-only batch and sweeps none.
+- **Reclaim.** A lowest node every owner of which has released it is
+  reclaimed with an atom of each connector asset the releases name. With
+  `reclaim_early`, a node all of whose lowest nodes are released is unrolled
+  first, by a released owner's authorisation, until the lowest nodes are on
+  the chain, so a fully refreshed batch comes back before it expires; the
+  watcher never unrolls a node with an owner who has not released.
+
+A fee is paid from the value a transaction takes, or from the margin its
+signers left, when the node accepts that asset for fees now and it covers the
+node's floor; otherwise a coin of the wallet's pays, in the first asset of
+`fee_assets` the node accepts, and the margin goes to the wallet's change. No
+asset is assumed, the policy asset included. A coin that pays a fee is taken
+until its change is final, so an operator keeps several coins in each fee
+asset; a step the wallet cannot pay for waits, and is logged.
 
 ## The interface
 
@@ -405,12 +476,19 @@ themselves.
 
 The operator key `S` lives in `arca-signer`, a process of its own; the server
 never holds it. It loads the key from a file only its owner can read (it
-refuses one others can), listens on a Unix socket of mode 0600, and answers two
-requests: its public key, and `S`'s signature over the rebindable message of a
-collaborative path, which it builds itself from the parts (the salt, the coin's
-asset and value, one to four committed outputs) on its own chain. It signs no
-digest it is handed, no transaction, no unroll authorisation and no release.
-The server checks each signature it gets back against the message it built.
+refuses one others can), listens on a Unix socket of mode 0600, and answers
+three requests: its public key; `S`'s signature over the rebindable message of
+a collaborative path, which it builds itself from the parts (the salt, the
+coin's asset and value, one to four committed outputs) on its own chain; and
+`S`'s signature over the spend of one input of a transaction by one tapscript
+leaf, whose signature hash it computes itself from the transaction and the
+outputs every input spends, on its own chain. It signs a spend only by a leaf
+that names `S` with `OP_CHECKSIG` or `OP_CHECKSIGVERIFY` (the operator's own
+paths: a clock's release, `R`, a sweep, a reclaim, a forfeit's claim, the
+connector's issuance, an offboard's reclaim) and of a taproot output. It signs
+no digest it is handed, no unroll authorisation and no release, and nothing
+by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
+signature it gets back against the message or signature hash it built.
 
 ## Running
 
@@ -421,8 +499,9 @@ The server checks each signature it gets back against the message it built.
 address, the database, the signer's socket, the wallet's mnemonic file, the
 node's RPC, the finality rule, the exit-delay bounds, the assets served
 with their smallest leaf, how often a round is built, the assets a round's
-fee is paid in, and the fee schedule. The node must run with `-txindex` and
-`-validateanchor`.
+fee is paid in, the fee schedule, and the watcher (`[watcher]`: whether it
+acts on its own, early reclaims, the most outputs a sweep takes, how often its
+recovery work runs). The node must run with `-txindex` and `-validateanchor`.
 
 An asset served need not be accepted for fees by the node. A batch in such an
 asset carries a reserve of one atom on every node and every entry, on every
@@ -455,6 +534,12 @@ signer signs every input.
   wallet never pays in another asset instead, and assumes none, the policy
   asset included. A wallet holding no policy asset at all builds and pays in
   whatever accepted asset it holds.
+- **Coins for the watcher.** The watcher's transactions spend Arca outputs,
+  and a coin of the wallet may pay their fee (`Wallet::with_fee_coin`) or hold
+  a round's connector asset. The wallet signs its own input of such a
+  transaction itself, with the key the kit derives, over the segwit v0
+  signature hash rust-elements computes from the transaction. A connector
+  asset's atom never issues a round's sweep token.
 - **Round-shaped transactions** carry the round's connector output, whose only
   spend is the issuance of the round's connector asset
   (`arca_covenant::ConnectorPolicy`), right after the outputs they pay, then
@@ -470,8 +555,8 @@ signer signs every input.
 
 The nursery keeps every transaction the server relies on broadcast until the
 finality service calls it final: the server's own (a round, a wallet
-transaction, each with its fee asset named) and those it relies on without
-having built them (a board). A transaction enters byte for byte and is only
+transaction, the watcher's, each with its fee asset named) and those it relies
+on without having built them (a board). A transaction enters byte for byte and is only
 ever broadcast again as those bytes: the nursery never builds a replacement,
 so a round returns with its txid and every forfeit signed for it still holds,
 and a board returns as its owner signed it.
@@ -481,8 +566,9 @@ back to pending and is broadcast again at once, oldest first, so a parent
 precedes its child. On each pass a transaction the finality service calls
 final is marked final (and stays watched, since a rollback can take it out
 again), one not in the chain is broadcast again, and one whose input a final
-transaction of another txid has spent is marked lost, freeing the wallet coins
-it held: it can no longer confirm, and what depends on it learns so.
+transaction of another txid has spent, whatever first watched that input, is
+marked lost, freeing the wallet coins it held: it can no longer confirm, and
+what depends on it learns so.
 
 ## Testing
 
@@ -573,7 +659,50 @@ the release and the new round's connector asset, or with none, so the node
 stays its owner's. The other completes as before, and the coins both gave up
 stay given up. A third, also released in the lost round, never hands over its
 forfeit for the new round: a day after that round is final it expires, and its
-coin, under a forfeit pair for the lost round, stays given up.
+coin, under a forfeit pair for the lost round, stays given up. Last, the
+watcher completes the forfeit-first run: it unrolls the old coin's node by its
+owner's authorisation and unlocks its entry, from the server's own record of
+the coin, publishes the forfeit for the new round, claims it once final, which
+reveals the new preimage on the chain, and releases the participation once the
+claim is final; its new leaf is live, and the same forfeit request returns the
+preimage the claim revealed.
+
+`tests/watcher.rs` drives the watcher a pass at a time, a block between
+passes, except where it runs on its own as the server's task. Refreshed boards
+come back to the operator: each forfeit from the board output, one atom of the
+round's connector asset, a claim for each; the board's owner can no longer
+convert it. A refreshed batch leaf that its owner unrolls and unlocks again (a
+stale exit) is answered by its forfeit and claimed, the claim revealing the
+preimage of the owner's new leaf; the owner's exit is refused before its delay
+and, after it, because the leaf is spent. A board paid out of round and then
+converted by its sender is answered, by the watcher's own task while the
+conversion is still in the mempool, with the checkpoint and the reassignment;
+the sender's exit is refused and the receiver exits the leaf the watcher put
+on the chain. A batch of five leaves, part of it unrolled by its owners, is not
+released before its expiry, is released at it, is not swept during the notice,
+and is then swept in one transaction of exactly what is left of it (a lowest
+node and an entry), while the leaf an owner put on the chain exits. A batch
+every owner refreshed and released, in two rounds, comes back before it
+expires: one unroll of the batch output, a reclaim of each lowest node with an
+atom of the connector asset its releases name; nothing is unrolled while two
+owners have yet to release. And an anchor-driven reorganisation: the parent
+chain orphans the block a round and the watcher's answer to a stale exit are
+anchored to and every block above; the node disconnects them all, the server
+no longer calls the round final, the round and the answers wait in the
+mempool and the nursery as pending, and they return with the same txids and
+are final again, nothing built a second time; the owner's exit is still
+refused.
+
+`tests/offboard.rs` runs offboards. In X, which the node accepts for fees, and
+in Y, which it does not: nothing is unlocked before the owner's forfeit; then
+the watcher unlocks each output to its destination, the margin paying in X and
+a coin of X paying for Y, and the boards given up come back, Y's forfeit and
+claim paid by coins of X. An offboard whose owner never hands over its forfeit
+expires with its participation: the coin is the owner's again, the output is
+neither unlocked nor reclaimed early, a reclaim signed before the delay is
+refused by the node, and after the delay the watcher reclaims it. An owner who
+offboards a batch leaf, is paid on-chain and then brings the leaf back
+on-chain is answered by its forfeit and the claim, and its exit is refused.
 
 `tests/expiry.rs` moves the chain's median time on. A participation whose
 forfeits have not come a day after its round was found final expires: its
@@ -587,6 +716,13 @@ round time asked for past the exit deadline is refused; past the exit
 deadline a coin is refused; and a participation accepted before the deadline
 whose coin passes one day before `E` with no round taking it is voided by the
 next round, its coin live again.
+
+`tests/signer.rs` runs `arca-signer` as its own process: its key, a
+rebindable message, and the spend of a clock's release whose signature verifies
+over the signature hash the library builds; it refuses a raw digest, a stray
+field, outputs out of range, an oversized line, a spend by the leaf's
+collaborative path or the owner's exit, an input out of range, spent outputs
+missing, and an input that spends no taproot output.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

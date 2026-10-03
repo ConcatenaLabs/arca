@@ -16,7 +16,7 @@ pub enum NurseryState {
 }
 
 impl NurseryState {
-	fn as_str(self) -> &'static str {
+	pub(crate) fn as_str(self) -> &'static str {
 		match self {
 			NurseryState::Pending => "pending",
 			NurseryState::Final => "final",
@@ -24,7 +24,7 @@ impl NurseryState {
 		}
 	}
 
-	fn parse(s: &str) -> Result<NurseryState, StoreError> {
+	pub(crate) fn parse(s: &str) -> Result<NurseryState, StoreError> {
 		Ok(match s {
 			"pending" => NurseryState::Pending,
 			"final" => NurseryState::Final,

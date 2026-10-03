@@ -48,6 +48,9 @@ pub enum NurseryKind {
 	Wallet,
 	/// A round transaction.
 	Round,
+	/// A transaction the watcher built: an answer to a stale exit, a claim,
+	/// a release, a sweep, a reclaim, an offboard's unlock or reclaim.
+	Watcher,
 }
 
 impl NurseryKind {
@@ -56,6 +59,7 @@ impl NurseryKind {
 			NurseryKind::Board => "board",
 			NurseryKind::Wallet => "wallet",
 			NurseryKind::Round => "round",
+			NurseryKind::Watcher => "watcher",
 		}
 	}
 }
@@ -118,6 +122,16 @@ impl Nursery {
 		self.store.nursery_insert(&txid.to_byte_array(), &serialize(tx), kind.as_str(), fee, &inputs).await?;
 		self.finality.watch(txid, kind.as_str()).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
 		let row = self.store.nursery_get(&txid.to_byte_array()).await?.expect("just stored");
+		self.broadcast(&row).await
+	}
+
+	/// Takes a transaction of the watcher's into the nursery with its log
+	/// entry, whole ([`Store::insert_watcher_tx`]), and broadcasts it.
+	pub async fn submit_watcher(&self, w: &crate::store::NewWatcherTx) -> Result<String, NurseryError> {
+		self.store.insert_watcher_tx(w).await?;
+		let txid = Txid::from_byte_array(w.txid);
+		self.finality.watch(txid, NurseryKind::Watcher.as_str()).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
+		let row = self.store.nursery_get(&w.txid).await?.expect("just stored");
 		self.broadcast(&row).await
 	}
 
@@ -184,7 +198,7 @@ impl Nursery {
 			if let Some(by) = self.final_conflict(&row).await? {
 				self.store.nursery_set_state(&row.txid, NurseryState::Lost).await?;
 				log::warn!("nursery: {} ({}) is lost: {} spent its input and is final", txid, row.kind, by);
-				if row.kind == NurseryKind::Wallet.as_str() || row.kind == NurseryKind::Round.as_str() {
+				if row.kind != NurseryKind::Board.as_str() {
 					if let Some(w) = &self.wallet {
 						w.release(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
 					}
@@ -203,9 +217,21 @@ impl Nursery {
 		Ok(())
 	}
 
-	/// A final transaction of another txid spending one of `row`'s inputs.
+	/// A final transaction of another txid spending one of `row`'s inputs:
+	/// any spend the finality service recorded of an outpoint it spends,
+	/// whatever watched that outpoint first (a board output the watcher's
+	/// forfeit spends is watched for its board).
 	async fn final_conflict(&self, row: &NurseryRow) -> Result<Option<Txid>, NurseryError> {
-		for by in self.store.conflicting_spends(&row.txid).await? {
+		let tx: Transaction = deserialize(&row.tx).map_err(|e| NurseryError::Decode(e.to_string()))?;
+		let mut spenders = self.store.conflicting_spends(&row.txid).await?;
+		for i in &tx.input {
+			if let Some(by) = self.store.outpoint_spender(&i.previous_output.txid.to_byte_array(), i.previous_output.vout).await? {
+				if by != row.txid && !spenders.contains(&by) {
+					spenders.push(by);
+				}
+			}
+		}
+		for by in spenders {
 			let by = Txid::from_byte_array(by);
 			let s = self.finality.status(&by).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
 			if s.is_final() {

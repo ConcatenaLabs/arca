@@ -83,6 +83,21 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 	Ok(())
 }
 
+/// The coin `id`, resolved from its record under `policy`, with nothing
+/// checked of its state or of the chain: what a step already taken for it
+/// is verified again against.
+pub async fn resolve(store: &Store, policy: &WalletPolicy, id: &LeafId) -> Result<Checked, CoinError> {
+	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;
+	let record = CoinRecord::from_bytes(&row.record).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
+	let mut found = vec![];
+	bases(store, &record, &mut found).await?;
+	let coin = record.resolve(&found, policy).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
+	if coin.id != *id {
+		return Err(CoinError::Internal(format!("the record of leaf {} gives the id {}", id, coin.id)));
+	}
+	Ok(Checked { record, coin, bases: found })
+}
+
 /// Checks the coin `id` given up by `holder` (a transfer, or a
 /// participation): see the [module documentation](self). A coin already
 /// spent by `holder` itself passes, so a repeated request gets its answer.
@@ -96,13 +111,7 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		LeafState::Lost => return Err(CoinError::NotLive(*id, "lost")),
 		LeafState::Expired => return Err(CoinError::NotLive(*id, "expired")),
 	}
-	let record = CoinRecord::from_bytes(&row.record).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
-	let mut found = vec![];
-	bases(store, &record, &mut found).await?;
-	let coin = record.resolve(&found, policy).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
-	if coin.id != *id {
-		return Err(CoinError::Internal(format!("the record of leaf {} gives the id {}", id, coin.id)));
-	}
+	let Checked { record, coin, bases: found } = resolve(store, policy, id).await?;
 	// Its own leaf and every leaf and checkpoint it descends from.
 	let mut scripts = vec![coin.output().script_pubkey.to_bytes()];
 	scripts.extend(coin.lineage().iter().map(|o| o.output.script_pubkey.to_bytes()));

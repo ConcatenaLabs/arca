@@ -84,8 +84,9 @@ fn i64_of(v: u64) -> i64 {
 	i64::try_from(v).expect("a chain height or time fits in i64")
 }
 
-/// Records what `scan` found inside `tx`: sightings of Arca scripts and spends
-/// of watched outpoints, `seen_in` the mempool or a block.
+/// Records what `scan` found inside `tx`: sightings of Arca scripts and of
+/// the nodes and entries of every batch, and spends of watched outpoints,
+/// `seen_in` the mempool or a block.
 async fn record_scan(tx: &tokio_postgres::Transaction<'_>, scan: &Scan, seen_in: &str) -> Result<(), StoreError> {
 	let txids: Vec<Vec<u8>> = scan.outputs.iter().map(|o| o.txid.to_vec()).collect();
 	let vouts: Vec<i32> = scan.outputs.iter().map(|o| o.vout as i32).collect();
@@ -94,6 +95,14 @@ async fn record_scan(tx: &tokio_postgres::Transaction<'_>, scan: &Scan, seen_in:
 		"INSERT INTO script_sighting (script_pubkey, txid, vout, seen_in)
 		 SELECT o.s, o.t, o.v, $4 FROM unnest($1::bytea[], $2::bytea[], $3::int4[]) AS o(s, t, v)
 		 JOIN arca_script a ON a.script_pubkey = o.s
+		 ON CONFLICT (script_pubkey, txid, vout) DO UPDATE SET seen_in = 'block'
+		 WHERE EXCLUDED.seen_in = 'block'",
+		&[&scripts, &txids, &vouts, &seen_in],
+	).await?;
+	tx.execute(
+		"INSERT INTO tree_sighting (script_pubkey, txid, vout, seen_in)
+		 SELECT o.s, o.t, o.v, $4 FROM unnest($1::bytea[], $2::bytea[], $3::int4[]) AS o(s, t, v)
+		 JOIN tree_script a ON a.script_pubkey = o.s
 		 ON CONFLICT (script_pubkey, txid, vout) DO UPDATE SET seen_in = 'block'
 		 WHERE EXCLUDED.seen_in = 'block'",
 		&[&scripts, &txids, &vouts, &seen_in],

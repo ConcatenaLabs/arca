@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use arca_covenant::{Chain, MedianTime, WalletPolicy};
 use sequentia_ext::regtest::Regtest;
 use sequentia_ext::{explicit_txout, AssetAmount};
-use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server};
+use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server, WatcherSection};
 
 use super::client::Http;
 use super::db::TestDb;
@@ -44,6 +44,8 @@ impl Running {
 	/// [`Running::start`], with the server's configuration changed by `tune`
 	/// first. `tune` is given the configuration and asset Y.
 	pub async fn start_with<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {
+		// The server's log, at the level RUST_LOG names.
+		let _ = env_logger::builder().is_test(true).try_init();
 		let db = TestDb::new().await;
 		let rt = tokio::task::block_in_place(node::start);
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
@@ -74,6 +76,9 @@ impl Running {
 			assets: vec![AssetSection { asset: x.to_string(), min_leaf: MIN_LEAF.to_string() }],
 			fee_assets: None,
 			fees: Default::default(),
+			// The tests before the watcher's drive every step by hand; a test
+			// of the watcher turns it on, or calls its pass.
+			watcher: WatcherSection { enabled: false, ..Default::default() },
 		};
 		tune(&mut config, y);
 		let server = Server::start(&config).await.unwrap();

@@ -97,11 +97,13 @@ pub struct BatchRow {
 	pub min_leaf: u64,
 }
 
-/// A batch to record, with its leaves in tree order.
+/// A batch to record, with its leaves in tree order and the scripts of its
+/// nodes and entries.
 #[derive(Debug, Clone)]
 pub struct NewBatch {
 	pub batch: BatchRow,
 	pub leaves: Vec<NewBatchLeaf>,
+	pub scripts: Vec<super::NewTreeScript>,
 }
 
 /// A leaf of a batch, as stored.
@@ -122,6 +124,18 @@ pub struct BatchLeafRow {
 	pub value: u64,
 	pub unlock_hash: [u8; 32],
 	pub record: Vec<u8>,
+}
+
+/// An offboard output of a round, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffboardRow {
+	pub round_id: i64,
+	pub vout: u32,
+	pub participation_id: [u8; 32],
+	pub output_idx: u16,
+	pub attempt: u32,
+	/// The output's value: the destination's and the margin for its unlock.
+	pub value: u64,
 }
 
 /// An offboard output a round pays.
@@ -276,6 +290,13 @@ impl Store {
 					&&x.issuer.0[..], &(x.issuer.1 as i32), &x.schedule, &x.burn, &(x.radix as i16), &kind, &i64_of(a)?,
 					&i64_of(bb)?, &i64_of(x.min_leaf)?],
 			).await?;
+			for sc in &b.scripts {
+				t.execute(
+					"INSERT INTO tree_script (script_pubkey, round_id, batch_vout, kind, level, idx, value)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+					&[&sc.script_pubkey, &round_id, &(x.vout as i32), &sc.kind.as_str(), &sc.level, &(sc.idx as i32), &i64_of(sc.value)?],
+				).await?;
+			}
 			for l in &b.leaves {
 				insert_coin(&t, &l.coin).await?;
 				t.execute(
@@ -415,5 +436,23 @@ impl Store {
 			p.offboards.push((r.get::<_, i16>(0) as u16, r.get::<_, i32>(1) as u32));
 		}
 		Ok(p)
+	}
+
+	/// Every offboard output of the rounds in `state`.
+	pub async fn offboards_in(&self, state: RoundState) -> Result<Vec<OffboardRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT o.round_id, o.vout, o.participation_id, o.output_idx, o.attempt, o.value
+			 FROM round_offboard o JOIN round r ON r.round_id = o.round_id WHERE r.state = $1 ORDER BY o.round_id, o.vout",
+			&[&state.as_str()],
+		).await?;
+		rows.iter().map(|r| Ok(OffboardRow {
+			round_id: r.get(0),
+			vout: r.get::<_, i32>(1) as u32,
+			participation_id: array32(r.get(2), "participation id")?,
+			output_idx: r.get::<_, i16>(3) as u16,
+			attempt: r.get::<_, i32>(4) as u32,
+			value: r.get::<_, i64>(5) as u64,
+		})).collect()
 	}
 }

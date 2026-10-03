@@ -30,5 +30,6 @@ pub mod server;
 pub mod signer;
 pub mod store;
 pub mod wallet;
+pub mod watcher;
 
 pub use store::{Store, StoreError};

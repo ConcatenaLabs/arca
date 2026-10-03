@@ -27,6 +27,7 @@ use crate::rounds::{RoundConfig, Rounds};
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
 use crate::wallet::{SpendFrom, Wallet, WalletConfig};
+use crate::watcher::{Watcher, WatcherConfig};
 
 /// The server's configuration, as `arcad` reads it from a TOML file.
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +74,49 @@ pub struct Config {
 	/// absent.
 	#[serde(default)]
 	pub fees: FeesSection,
+	/// How the watcher works; the defaults when absent.
+	#[serde(default)]
+	pub watcher: WatcherSection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherSection {
+	/// Whether the watcher acts on its own, following the chain. Off, it acts
+	/// only when `Watcher::pass` is called.
+	#[serde(default = "default_true")]
+	pub enabled: bool,
+	/// Unroll a node all of whose owners have released their lowest nodes,
+	/// and reclaim those, before the batch expires.
+	#[serde(default = "default_true")]
+	pub reclaim_early: bool,
+	/// The most outputs one sweep takes.
+	#[serde(default = "default_sweep_inputs")]
+	pub max_sweep_inputs: usize,
+	/// How often the recovery work runs when no block arrives, in seconds.
+	#[serde(default = "default_recovery_interval")]
+	pub recovery_interval_seconds: u64,
+}
+
+impl Default for WatcherSection {
+	fn default() -> WatcherSection {
+		WatcherSection {
+			enabled: true, reclaim_early: default_true(), max_sweep_inputs: default_sweep_inputs(),
+			recovery_interval_seconds: default_recovery_interval(),
+		}
+	}
+}
+
+fn default_true() -> bool {
+	true
+}
+
+fn default_sweep_inputs() -> usize {
+	WatcherConfig::default().max_sweep_inputs
+}
+
+fn default_recovery_interval() -> u64 {
+	WatcherConfig::default().recovery_interval.as_secs()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -182,13 +226,15 @@ pub struct Server {
 	pub participations: Arc<Participations>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
+	pub watcher: Arc<Watcher>,
 	tasks: Vec<JoinHandle<()>>,
 }
 
 impl Server {
 	/// Starts every component from `config`: the store, the finality service
 	/// following the node, the signer's key, the wallet, the nursery, the
-	/// boards, the co-signer, their tasks, and the HTTP listener.
+	/// boards, the co-signer, the rounds, the watcher, their tasks, and the
+	/// HTTP listener.
 	pub async fn start(config: &Config) -> Result<Server, StartError> {
 		let store = Store::connect(&config.database).await.map_err(err("the database"))?;
 		let auth = match (&config.node.cookie_file, &config.node.rpc_user, &config.node.rpc_password) {
@@ -244,13 +290,22 @@ impl Server {
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
-		let forfeits = Forfeits::new(store.clone(), params.clone(), signer, cosigner.clone());
+		let forfeits = Forfeits::new(store.clone(), params.clone(), signer.clone(), cosigner.clone());
+		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
+			rounds.clone(), WatcherConfig {
+				reclaim_early: config.watcher.reclaim_early,
+				max_sweep_inputs: config.watcher.max_sweep_inputs.max(1),
+				recovery_interval: Duration::from_secs(config.watcher.recovery_interval_seconds.max(1)),
+			});
 
 		// The first pass before anything is answered, so the chain is known.
 		finality.sync().await.map_err(err("the first pass over the chain"))?;
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
 		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval)];
+		if config.watcher.enabled {
+			tasks.push(watcher.spawn());
+		}
 		tasks.push(finality.spawn());
 
 		let app = Arc::new(App {
@@ -267,7 +322,7 @@ impl Server {
 			}
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, tasks })
+		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher, tasks })
 	}
 
 	/// Stops every task.
@@ -294,5 +349,7 @@ mod tests {
 		let c: Config = toml::from_str(include_str!("../arcad.example.toml")).expect("the example parses");
 		assert_eq!(c.assets.len(), 1);
 		assert_eq!(c.fees.refresh_ppm, 0);
+		assert!(c.watcher.reclaim_early);
+		assert_eq!(c.watcher.max_sweep_inputs, 50);
 	}
 }
