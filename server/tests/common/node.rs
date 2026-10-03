@@ -84,6 +84,16 @@ impl Purse {
 		Purse { policy, coins: vec![(OutPoint::new(txid, 0), tx.output[0].clone())] }
 	}
 
+	/// A purse coin of `asset`, given away: the caller spends it.
+	pub fn take_coin(&mut self, asset: AssetId) -> (OutPoint, TxOut) {
+		self.take(asset)
+	}
+
+	/// Puts a coin at a bare `OP_TRUE` back in the purse.
+	pub fn put(&mut self, coin: (OutPoint, TxOut)) {
+		self.coins.push(coin);
+	}
+
 	fn take(&mut self, asset: AssetId) -> (OutPoint, TxOut) {
 		let i = self.coins.iter().position(|(_, o)| o.explicit_asset() == Some(asset)).expect("a purse coin of the asset");
 		self.coins.remove(i)

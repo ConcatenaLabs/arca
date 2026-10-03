@@ -2,7 +2,9 @@
 
 #![allow(dead_code)]
 
+pub mod client;
 pub mod db;
 pub mod fake;
 pub mod keys;
 pub mod node;
+pub mod stack;
