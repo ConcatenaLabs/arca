@@ -186,11 +186,31 @@ impl Wallet {
 		DerivationPath::from_str(&format!("m/84h/1h/0h/{}/{}", chain, index)).expect("a valid path")
 	}
 
-	/// The public key at `chain`/`index`.
-	fn public_key(&self, chain: u8, index: u32) -> Result<elements::bitcoin::PublicKey, WalletError> {
-		let xprv = self.signer.derive_xprv(&Self::path(chain, index)).map_err(|e| WalletError::Keys(e.to_string()))?;
+	/// The public key of `signer` at `chain`/`index`.
+	fn key_of(signer: &SwSigner, chain: u8, index: u32) -> Result<elements::bitcoin::PublicKey, WalletError> {
+		let xprv = signer.derive_xprv(&Self::path(chain, index)).map_err(|e| WalletError::Keys(e.to_string()))?;
 		let secp = elements::bitcoin::secp256k1::Secp256k1::new();
 		Ok(elements::bitcoin::PublicKey::new(xprv.private_key.public_key(&secp)))
+	}
+
+	/// The public key at `chain`/`index`.
+	fn public_key(&self, chain: u8, index: u32) -> Result<elements::bitcoin::PublicKey, WalletError> {
+		Self::key_of(&self.signer, chain, index)
+	}
+
+	/// A new receive script of the wallet whose mnemonic is `mnemonic`,
+	/// recorded in `store` as [`Wallet::receive_script`] records one, with
+	/// its index: what an operator pays to fund the wallet. It needs only the
+	/// database, so it may be taken while the server runs or before it
+	/// starts; a script handed out by both at once is the same script, and
+	/// either way every output paying it in a block the finality service
+	/// connects after it was recorded is a coin of the wallet's.
+	pub async fn hand_out_receive_script(store: &Store, mnemonic: &str) -> Result<(u32, Script), WalletError> {
+		let signer = SwSigner::new(mnemonic, false).map_err(|e| WalletError::Keys(e.to_string()))?;
+		let index = store.next_wallet_index(RECEIVE).await?;
+		let script = Self::script(&Self::key_of(&signer, RECEIVE, index)?);
+		store.add_wallet_key(RECEIVE, index, script.as_bytes()).await?;
+		Ok((index, script))
 	}
 
 	fn script(pk: &elements::bitcoin::PublicKey) -> Script {

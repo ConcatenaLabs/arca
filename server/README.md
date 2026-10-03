@@ -617,6 +617,10 @@ refusal with `double_spend`, and logs that its database has lost a spend.
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
         --record /var/lib/arca/signer.record
     arcad /etc/arca/arcad.toml
+    arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
+
+`arcad` stops its tasks and exits on SIGINT, so a service manager is set to
+send it that signal (systemd's `KillSignal=SIGINT`).
 
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
 address, the database, the signer's socket, the wallet's mnemonic file, the
@@ -644,6 +648,15 @@ a BIP39 mnemonic through the kit's software signer, at
 chain 1 for change), each an unblinded P2WPKH script, and the kit's PSET
 signer signs every input.
 
+- **Funding.** `arcad <config> address` hands out a receive address of the
+  wallet (chain 0, the next index), records it in the database and prints it
+  with its script and index as JSON, then exits. It needs the database, the
+  mnemonic file and the node, not the signer, and runs beside the server.
+  The server follows the chain from the block it first started at, so an
+  operator starts the server once, then hands out an address and pays it: an
+  output paying it in any block the server connects after that is a coin.
+  The wallet knows the scripts it handed out, and no others: a coin paid to a
+  key of the mnemonic it never handed out is not found.
 - **Coins per asset, explicit only.** The wallet finds its coins as the
   finality service connects blocks: each explicit output paying one of its
   scripts is a coin of that asset. An output paying it that hides its asset or
@@ -736,6 +749,11 @@ is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
+
+`tests/address.rs` runs `arcad <config> address` beside a running server:
+each run hands out the next index, the address is the node's for the script
+printed, the server's own next script is another, a coin paid to it is the
+wallet's and spendable once final, and the index goes on after a restart.
 
 `tests/round_e2e.rs` runs rounds as wallets meet them. Eight participants in
 two assets, one giving up coins of both for leaves of both and one leaving half
