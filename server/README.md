@@ -258,6 +258,34 @@ hash). From that alone a wallet, an explorer or any mirror rebuilds every
 script of the tree with `Tree::build` and checks the leaf it cares about
 against the round transaction with `LeafRecord::validate`.
 
+### Rollbacks
+
+A round the chain loses goes back to the nursery's care. When a rollback
+disconnects it, its new leaves are uncredited at once: a leaf whose round is
+not final is not live, and no coin resting on one is co-signed. The nursery
+broadcasts the round again byte for byte, so it returns with its txid, every
+forfeit signed for it still good, and its leaves are credited again once it is
+final again.
+
+A round that can never return (the nursery finds an input of it spent by
+another transaction that is final) is retired, in one database transaction:
+the round is lost, its new leaves not yet spent are lost, and every
+participation it ran runs again in a later round, under a new unlock hash and
+with a new operator nonce for each leaf it wants (its keys and owner nonces as
+before, so its owner's wallet recognises the new leaves), the attempt it
+leaves recorded. A round with another txid is always a new round with new
+hashes: nothing signed for the old one carries over. A participation whose
+preimage had gone out runs again forfeit-first: its forfeit for the new round
+is taken, and its new preimage goes out only through the claim of that
+forfeit, once published. The coins those participations gave up stay given up,
+so the operator co-signs no other off-chain spend of them, and any release of
+their lowest nodes given on the strength of the lost round is retired and never
+used.
+
+The nursery does not yet call a round lost when its input's own transaction
+is reorganised away and never returns: such a round stays broadcast, its
+participations issued and its leaves uncredited.
+
 ## The forfeit swap
 
 Once its round is final, an owner validates each new leaf from the published
@@ -300,9 +328,9 @@ not final is not co-signed (`round_not_final`).
 coin it gave up: its signature, with the coin's own key, over the node's
 release message. It is refused for a coin with an open out-of-round
 reassignment, whatever else holds; for a coin not given up in the
-participation named; before the participation's preimage went out; for a
-board or a coin a reassignment made, which have no lowest node; and for a
-signature by another key. Once every owner under a lowest node has released
+participation named; before the participation's preimage went out; while its
+round is not final; for a board or a coin a reassignment made, which have no
+lowest node; and for a signature by another key. Once every owner under a lowest node has released
 it, the operator may reclaim the node before expiry.
 
 ## The interface
@@ -476,6 +504,18 @@ another key, a forfeit set that is not exact (none, another coin, one twice,
 one more), no authorisations, authorisations by another key or not yet usable,
 a release before the preimage, by another key, of a board, of a coin not in the
 participation, and of a coin with an open reassignment.
+
+`tests/rollback.rs` disconnects a final round: its new leaf is uncredited at
+once and a transfer of it refused, a release refused, the round broadcast
+again by the server to a node restarted with an empty mempool, final again
+with its txid, the leaf credited again and paid on. Then a round that can never
+return, the operator's coin it spent taken by another transaction that becomes
+final: the round is retired, its leaves lost, and its two participations run
+again in a new round under new unlock hashes and operator nonces. The one whose
+preimage had gone out (giving up a leaf whose lowest node its owner had
+released) runs forfeit-first: its release is retired, its old forfeit does not
+verify for the new round, its new forfeit is taken and its preimage withheld.
+The other completes as before, and the coins both gave up stay given up.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

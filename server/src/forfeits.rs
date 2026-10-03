@@ -43,9 +43,10 @@
 //! else holds ([`crate::cosign::Cosigner::check_release`]: the release key is
 //! the key the coin was built with, so its sender and the operator could
 //! otherwise void the receiver's chain); for a coin not given up in the
-//! participation named; before the participation's preimage went out; and
-//! for a coin that has no lowest node (a board, or a coin a reassignment
-//! made).
+//! participation named; before the participation's preimage went out; while
+//! the participation's round is not final; and for a coin that has no lowest
+//! node (a board, or a coin a reassignment made). When a round can never
+//! return, the releases given for it are retired and never used.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -324,6 +325,13 @@ impl Forfeits {
 			}
 			if p.state != ParticipationState::Released {
 				return Err(ForfeitError::ReleaseEarly);
+			}
+			// Its round must be final: a release given on the strength of a
+			// round that may not stay is not taken.
+			let round = self.store.round(p.round_id.unwrap_or_default()).await?
+				.ok_or_else(|| ForfeitError::Internal("a released participation without its round".into()))?;
+			if round.state != RoundState::Final {
+				return Err(ForfeitError::RoundNotFinal(Txid::from_byte_array(round.txid)));
 			}
 			let row = self.store.leaf(&r.leaf_id.0).await?.ok_or_else(|| ForfeitError::Internal("a coin given up vanished".into()))?;
 			let record = match CoinRecord::from_bytes(&row.record) {
