@@ -21,7 +21,7 @@ use arca_covenant::htlc::HtlcPath;
 use arca_covenant::message::rebind_message;
 use arca_covenant::script::{record, sha256};
 use arca_covenant::sign::sign_digest;
-use arca_covenant::spend::{FeeSource, SpendError, UnrollTx};
+use arca_covenant::spend::{FeeSource, SpendError, UnrollError, UnrollTx};
 use arca_covenant::*;
 
 use common::*;
@@ -1110,6 +1110,30 @@ fn builder_cases(f: &F, book: &mut Book) {
 	assert_eq!(sw.tx.output[1], explicit(f.x, value, Script::from(vec![0x6a])));
 	let sigs: Vec<_> = (0..3).map(|i| sign_digest(&f.s, &sw.sighash(i, f.genesis).unwrap(), &[0; 32])).collect();
 	book.pass("builder/burn-only sweep of the batch output and a lowest node", &spend_of(sw.finish(&sigs).unwrap(), Some(3)));
+
+	// A margin larger than the fee: the fee is paid from it and the rest goes
+	// to the broadcaster's change, after the outputs the signers committed
+	// to, which the collaborative path still verifies.
+	let old = f.leaf(&f.a, "split old leaf");
+	let m = arca_covenant::connector_asset(elements::Txid::from_byte_array(label32("split round")), 2);
+	let margin = 40_000;
+	let ff = Forfeit::new(old, (f.x, LEAF), LeafId(label32("split leaf id")), label32("split h"), m, f.delay, margin).unwrap();
+	let pair = Pair { operator: sig(&f.s, &ff.message().digest), owner: sig(&f.a, &ff.message().digest) };
+	let split = FeeSource::Split { fee: FEE, change: f.operator_spk() };
+	let u = ff.tx(fake_outpoint("split old leaf"), &pair, &split).unwrap();
+	assert_eq!(u.tx.output.len(), 3);
+	assert_eq!(u.tx.output[0], ff.output().txout(), "the committed output first");
+	assert_eq!(u.tx.output[1], explicit(f.x, margin - FEE, f.operator_spk()), "the rest of the margin to the change");
+	assert_eq!(u.tx.output[2], fee(f.x, FEE), "then the fee");
+	book.pass("builder/forfeit whose margin pays the fee and the rest to change", &spend_of(u, None));
+	let whole = ff.tx(fake_outpoint("split old leaf"), &pair, &FeeSource::Split { fee: margin, change: f.operator_spk() }).unwrap();
+	assert_eq!(whole.tx.output, vec![ff.output().txout(), fee(f.x, margin)], "a fee of the whole margin leaves no change");
+	book.pass("builder/forfeit split with the whole margin as the fee", &spend_of(whole, None));
+	for bad in [0, margin + 1] {
+		assert_eq!(ff.tx(fake_outpoint("split old leaf"), &pair, &FeeSource::Split { fee: bad, change: f.operator_spk() }).unwrap_err(),
+			SpendError::Fee(UnrollError::SplitFee { fee: bad, margin }));
+	}
+	assert_eq!(f.schedule.release_tx(0, token0, &split).unwrap_err(), SpendError::NeedsFeeCoin("the token"));
 
 	// What the builder refuses.
 	let other = ClockSchedule::new(asset("T2"), xonly(&f.s), f.w, f.schedule.expiries().to_vec()).unwrap();

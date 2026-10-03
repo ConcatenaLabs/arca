@@ -248,7 +248,7 @@ pub fn sweep_tx(
 		if !outputs.is_empty() {
 			return Err(SpendError::BurnOutputs);
 		}
-		if matches!(fee, FeeSource::Reserve) {
+		if !matches!(fee, FeeSource::Coin { .. }) {
 			return Err(SpendError::NeedsFeeCoin("a burn-only sweep"));
 		}
 		swept.iter().map(|s| ExplicitOutput::new(s.asset, s.value, burn_script())).collect()
