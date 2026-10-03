@@ -71,6 +71,35 @@ node that does not validate its anchors, since that node has no notion of
 finality, and refuses to leave certification out on a chain whose node reports
 certificates.
 
+## The on-chain wallet
+
+The operator's wallet is built on the Sequentia Wallet Kit: its keys come from
+a BIP39 mnemonic through the kit's software signer, at
+`m/84'/1'/0'/<chain>/<index>` (chain 0 for scripts handed out to be paid,
+chain 1 for change), each an unblinded P2WPKH script, and the kit's PSET
+signer signs every input.
+
+- **Coins per asset, explicit only.** The wallet finds its coins as the
+  finality service connects blocks: each explicit output paying one of its
+  scripts is a coin of that asset. An output paying it that hides its asset or
+  value, or carries a nonce, is refused and recorded as refused: the server is
+  transparent at its boundary. A coin whose block is disconnected is out of
+  the chain until its transaction returns.
+- **Final coins only**, by default: the wallet spends a coin once the finality
+  service says its transaction is final.
+- **A named fee asset, no fallback.** Every transaction is built by hand and
+  names its fee asset. The fee is in that asset's own atoms, priced from the
+  node's relay floor and the node's exchange rate for the asset at the moment
+  of building, times a configured multiple. An asset the node does not accept
+  for fees now is refused, and so is one the wallet holds too little of; the
+  wallet never pays in another asset instead, and assumes none, the policy
+  asset included. A wallet holding no policy asset at all builds and pays in
+  whatever accepted asset it holds.
+- **Round-shaped transactions** carry the round's connector output, whose only
+  spend is the issuance of the round's connector asset
+  (`arca_covenant::ConnectorPolicy`), right after the outputs they pay, then
+  change per asset, then the one fee output.
+
 ## Testing
 
 The tests run against a real PostgreSQL server. `ARCA_TEST_POSTGRES` names it,

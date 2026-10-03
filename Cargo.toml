@@ -54,6 +54,11 @@ bitcoin = { version = "0.32.7", features = [ "serde", "rand", "rand-std" ] }
 # `sequentia` feature (issuance denomination byte, Bitcoin anchor in the block
 # header), as vendored by SWK. One copy serves every Sequentia Rust project.
 elements = { git = "https://github.com/ConcatenaLabs/SWK", rev = "87a9f5e7f98356a2c00712884019079566aacfec", features = [ "sequentia" ] }
+# The Sequentia Wallet Kit's keys and signer, for the operator's on-chain
+# wallet. The kit names its own crates and `elements` by version; the patches
+# at the end of this file point them at the kit and at the `elements` above.
+lwk_signer = { git = "https://github.com/ConcatenaLabs/SWK", rev = "6f432d9584dff5e4b1226d4b32657c52f3d8457b", default-features = false }
+lwk_common = { git = "https://github.com/ConcatenaLabs/SWK", rev = "6f432d9584dff5e4b1226d4b32657c52f3d8457b", default-features = false }
 lightning-invoice = { version = "0.34.0", features = [ "std", "serde" ] }
 lightning = { version = "0.2.0", default-features = false, features = [ "std" ] }
 lnurl-rs = { version = "0.10.0", features = [ "async", "async-https-rustls" ], default-features = false }
@@ -127,3 +132,10 @@ tracing-core = { version = "0.1.35" }
 tracing-opentelemetry = "0.31.0"
 tracing-subscriber = { version = "0.3.22", features = [ "std", "registry", "ansi", "fmt", "json", "env-filter" ] }
 tracing-attributes = "0.1.31"
+
+# The kit's crates depend on one another, and on `elements`, by version. As a
+# git dependency the kit's own patches do not apply, so these do: the kit's
+# common crate from the kit, and the one Sequentia `elements` for everything.
+[patch.crates-io]
+elements = { git = "https://github.com/ConcatenaLabs/SWK", rev = "87a9f5e7f98356a2c00712884019079566aacfec" }
+lwk_common = { git = "https://github.com/ConcatenaLabs/SWK", rev = "6f432d9584dff5e4b1226d4b32657c52f3d8457b" }

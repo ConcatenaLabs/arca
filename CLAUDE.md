@@ -142,7 +142,10 @@ Sequentia's transaction and block types come from `arca-sequentia-ext`, which
 re-exports the `rust-elements` SWK vendors with its `sequentia` feature (pinned
 once in the root `Cargo.toml`). Do not add another copy of that patch, and do not
 depend on upstream `elements` directly: its encoding of issuances and headers is
-not Sequentia's. Tests that need a node start one with
+not Sequentia's. The server also uses the kit's own crates (`lwk_signer`,
+`lwk_common`), which name `elements` and each other by version; the root
+`Cargo.toml`'s `[patch.crates-io]` points those names at the same revisions,
+so the whole workspace has one `elements`. Move a pin in both places at once. Tests that need a node start one with
 `sequentia_ext::regtest::Regtest`, which anchors the chain to a Bitcoin regtest
 parent.
 
