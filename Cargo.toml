@@ -9,17 +9,13 @@ members = [
   "bark-cli",
   "bark-json",
   "bark-rest",
-  "server",
-  "server-log",
   "server-rpc",
-  "testing",
-  "cln-rpc",
   "bark-rest-client",
   "bip321",
-  "wasm-testing",
   "consensus",
   "sequentia-ext",
   "covenant",
+  "server",
 ]
 
 resolver = "2"

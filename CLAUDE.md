@@ -155,6 +155,14 @@ crate uses no standard-library API newer than its `rust-version` (1.85, in
 `covenant/Cargo.toml`), which the `covenant` workflow checks. Bark's MuSig2
 policies in `arca-lib` stay until a later package removes them.
 
+`arca-server` (`server/`) is the operator's server on Sequentia. It uses
+`arca-covenant` for every script, record and check, and writes none of its own:
+when a rule it must enforce needs something the library does not expose, the
+accessor goes into `arca-covenant` with a test, in its own pull request. Its
+state is in PostgreSQL, so its tests need a PostgreSQL server named by
+`ARCA_TEST_POSTGRES`, where each test makes a database of its own
+(`server/README.md`).
+
 `regtest/` is the independent reference for every Arca script: a Python suite
 on the node's functional test framework, and the golden vectors it exports
 (`regtest/README.md`). Rust code that builds an Arca script must reproduce the
