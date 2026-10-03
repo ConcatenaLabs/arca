@@ -1,7 +1,7 @@
 # Arca
 
 Arca is an Ark protocol for [Sequentia](https://github.com/ConcatenaLabs/Sequentia),
-the Bitcoin sidechain for asset tokenization and disintermediated exchanges. An
+a Bitcoin sidechain for asset tokenization and disintermediated exchanges. An
 operator commits many users' balances to one on-chain output, a batch, whose
 covenant tree of introspection scripts pins every child output. Each user holds a
 leaf of that tree (a VTXO while off-chain), pays and receives off-chain with the
