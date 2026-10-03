@@ -137,9 +137,9 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	refused(r.http.post("forfeit_leaves", &forfeit_body(&pa, &[(a_board.id, forfeit_sig(&f, &a))], &[auths_json(&a2_valid, &b2, t)])), 422, "invalid_leaf");
 	let later = MedianTime::from_consensus(t.to_consensus_u32() + 30 * 86_400).unwrap();
 	refused(r.http.post("forfeit_leaves", &forfeit_body(&pa, &[(a_board.id, forfeit_sig(&f, &a))], &[auths_json(&a2_valid, &a2, later)])), 422, "invalid_leaf");
-	// A release before the preimage.
+	// A release before the preimage (refused before its M is looked at).
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
-		"releases": [{"leaf_id": a_board.id.to_string(), "signature": hex(&[1; 64])}]})), 422, "release_early");
+		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "release_early");
 	// None of these changed anything.
 	assert_eq!(status(&r, &pa)["state"], "issued");
 
@@ -171,7 +171,7 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	// A board has no lowest node to release.
 	let rel = sign_digest(&a, &[0; 32], &random32());
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
-		"releases": [{"leaf_id": a_board.id.to_string(), "signature": hex(rel.as_ref())}]})), 422, "no_lowest_node");
+		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(rel.as_ref())}]})), 422, "no_lowest_node");
 
 	// B completes too, and pays its new leaf on out of round to C, which
 	// validates it against the round.
@@ -204,15 +204,28 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	let a2_old = coin_of(&r, &a2_held, std::slice::from_ref(&round));
 	let f3 = forfeit_for(&a2_old, &a3_valid, &round2, &st3, 0);
 	// The release of A's old batch leaf, signed with that leaf's key.
+	// It names the connector asset M of round 2, which made A's new leaf.
 	let c2 = st3["round"]["connector_vout"].as_u64().unwrap() as u32;
-	let release = Release::for_refresh(&a2_valid, &a3_valid, &round2, c2).unwrap().message().digest;
-	let rel_body = |key: &Keypair, leaf: LeafId| json!({"participation_id": hex(&pa3),
-		"releases": [{"leaf_id": leaf.to_string(), "signature": hex(sign_digest(key, &release, &random32()).as_ref())}]});
+	let a_release = Release::for_refresh(&a2_valid, &a3_valid, &round2, c2).unwrap();
+	let m2 = a_release.connector;
+	assert_eq!(m2, connector_asset(round2.txid(), c2));
+	let release = a_release.message().digest;
+	let rel_body_m = |key: &Keypair, leaf: LeafId, m: elements::AssetId, digest: &[u8; 32]| json!({"participation_id": hex(&pa3),
+		"releases": [{"leaf_id": leaf.to_string(), "connector_asset": m.to_string(),
+			"signature": hex(sign_digest(key, digest, &random32()).as_ref())}]});
+	let rel_body = |key: &Keypair, leaf: LeafId| rel_body_m(key, leaf, m2, &release);
 	refused(r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)), 422, "release_early");
 	let done3 = r.http.post("forfeit_leaves", &forfeit_body(&pa3, &[(a2_valid.leaf_id, forfeit_sig(&f3, &a2))],
 		&[auths_json(&a3_valid, &a3, created(&a3_record))])).ok();
 	assert_eq!(done3["state"], "released");
 	refused(r.http.post("release_leaves", &rel_body(&a3, a2_valid.leaf_id)), 422, "bad_signature");
+	// A release naming another round's M (round 1's, which made A's old
+	// leaf), signed for it; and one over the message that named no round.
+	let c1_round = status(&r, &pa)["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let m1 = connector_asset(round.txid(), c1_round);
+	let lowest = a2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap();
+	refused(r.http.post("release_leaves", &rel_body_m(&a2, a2_valid.leaf_id, m1, &lowest.release_message(m1).digest)), 422, "wrong_round");
+	refused(r.http.post("release_leaves", &rel_body_m(&a2, a2_valid.leaf_id, m2, &sha256(&lowest.prefix))), 422, "bad_signature");
 	let rel = r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)).ok();
 	assert_eq!(rel["released"], json!([a2_valid.leaf_id.to_string()]));
 	assert_eq!(r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)).ok(), rel, "a release again changes nothing");
@@ -223,8 +236,9 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	// reassignment to C: refused whatever participation is named.
 	refused(r.http.post("release_leaves", &rel_body(&a2, b_board.id)), 422, "not_participating");
 	let c1 = stb["round"]["connector_vout"].as_u64().unwrap() as u32;
-	let b_rel = b2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap()
-		.release_message(connector_asset(round.txid(), c1)).digest;
+	let mb = connector_asset(round.txid(), c1);
+	let b_rel = b2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap().release_message(mb).digest;
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pb),
-		"releases": [{"leaf_id": b2_valid.leaf_id.to_string(), "signature": hex(sign_digest(&b2, &b_rel, &random32()).as_ref())}]})), 422, "open_reassignment");
+		"releases": [{"leaf_id": b2_valid.leaf_id.to_string(), "connector_asset": mb.to_string(),
+			"signature": hex(sign_digest(&b2, &b_rel, &random32()).as_ref())}]})), 422, "open_reassignment");
 }

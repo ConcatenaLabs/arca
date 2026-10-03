@@ -44,6 +44,9 @@ pub struct RoundRow {
 	pub fee_asset: [u8; 32],
 	pub fee: u64,
 	pub created_mtp: u32,
+	/// The tip's median time when the round was last found final; `None`
+	/// while it is not final.
+	pub final_mtp: Option<u32>,
 	/// The connector output: its index, asset, value and the connector asset.
 	pub connector_vout: u32,
 	pub connector_asset: [u8; 32],
@@ -164,7 +167,7 @@ fn u64_of(v: i64, what: &str) -> Result<u64, StoreError> {
 	u64::try_from(v).map_err(|_| StoreError::Corrupt(format!("{} {}", what, v)))
 }
 
-const ROUND_COLUMNS: &str = "r.round_id, r.txid, r.tx, r.state, r.fee_asset, r.fee, r.created_mtp, c.vout, c.connector_asset";
+const ROUND_COLUMNS: &str = "r.round_id, r.txid, r.tx, r.state, r.fee_asset, r.fee, r.created_mtp, c.vout, c.connector_asset, r.final_mtp";
 
 fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 	Ok(RoundRow {
@@ -177,6 +180,7 @@ fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 		created_mtp: r.get::<_, i64>(6) as u32,
 		connector_vout: r.get::<_, i32>(7) as u32,
 		connector_asset: array32(r.get(8), "connector asset")?,
+		final_mtp: r.get::<_, Option<i64>>(9).map(|t| t as u32),
 	})
 }
 
@@ -330,12 +334,24 @@ impl Store {
 	}
 
 	/// Moves the round `round_id` from `from` to `to`; returns whether it was
-	/// in `from`.
+	/// in `from`. A round leaving final forgets when it was found final.
 	pub async fn set_round_state(&self, round_id: i64, from: RoundState, to: RoundState) -> Result<bool, StoreError> {
 		let conn = self.conn().await?;
 		let n = conn.execute(
-			"UPDATE round SET state = $3, updated_at = now() WHERE round_id = $1 AND state = $2",
+			"UPDATE round SET state = $3, final_mtp = CASE WHEN $3 = 'final' THEN final_mtp END, updated_at = now()
+			 WHERE round_id = $1 AND state = $2",
 			&[&round_id, &from.as_str(), &to.as_str()],
+		).await?;
+		Ok(n == 1)
+	}
+
+	/// Moves the round `round_id` from broadcast to final, found so at the
+	/// tip's median time `mtp`; returns whether it was broadcast.
+	pub async fn mark_round_final(&self, round_id: i64, mtp: u32) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let n = conn.execute(
+			"UPDATE round SET state = 'final', final_mtp = $2, updated_at = now() WHERE round_id = $1 AND state = 'broadcast'",
+			&[&round_id, &(mtp as i64)],
 		).await?;
 		Ok(n == 1)
 	}

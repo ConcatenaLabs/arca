@@ -115,8 +115,11 @@ CREATE TYPE leaf_kind AS ENUM ('board', 'batch', 'transfer');
 --   transfer's output whose signatures are not yet made);
 -- live: the owner's to spend off-chain;
 -- spent: spent off-chain, by the transfer or participation in spent_by;
--- lost: can no longer be spent off-chain (its board never returned).
-CREATE TYPE leaf_state AS ENUM ('pending', 'live', 'spent', 'lost');
+-- lost: can no longer be spent off-chain (its board or round never returned);
+-- expired: a new leaf of a participation whose forfeits never came: it is
+--   never the owner's (its preimage never goes out), and the operator sweeps
+--   it with its batch.
+CREATE TYPE leaf_state AS ENUM ('pending', 'live', 'spent', 'lost', 'expired');
 
 -- Every coin the server knows, keyed by leaf id: a board, a leaf of a batch,
 -- or an output of a transfer, with its coin record (binary form), from which
@@ -238,6 +241,9 @@ CREATE TABLE round (
 	fee         BIGINT NOT NULL CHECK (fee > 0),
 	-- The median time the round's clock schedules count from.
 	created_mtp BIGINT NOT NULL,
+	-- The tip's median time when the round was last found final; null while
+	-- it is not. A participation's forfeits are due within a day of it.
+	final_mtp   BIGINT,
 	created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -256,8 +262,10 @@ CREATE TABLE connector_output (
 -- pending: accepted, waiting for a round;
 -- issued: its leaves are in a round (round_id), whose forfeits it owes;
 -- released: its forfeits are in and its preimage handed over;
--- void: it will not run (its round was never built, or cannot be).
-CREATE TYPE participation_state AS ENUM ('pending', 'issued', 'released', 'void');
+-- void: it will not run (its round was never built, or cannot be);
+-- expired: its round was final and its forfeits had not come a day later:
+--   the coins it gave up are the owner's again, its new leaves never are.
+CREATE TYPE participation_state AS ENUM ('pending', 'issued', 'released', 'void', 'expired');
 
 -- A participation: the coins an owner gives up and the leaves (or on-chain
 -- outputs) it wants for them, submitted once and run in a round without the
@@ -281,7 +289,7 @@ CREATE TABLE participation (
 	refund_delay_units INTEGER NOT NULL CHECK (refund_delay_units > 0),
 	created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-	CHECK ((state IN ('issued', 'released')) = (round_id IS NOT NULL))
+	CHECK ((state IN ('issued', 'released', 'expired')) = (round_id IS NOT NULL))
 );
 
 -- The earlier attempts of a participation: each round it was in that could
@@ -298,13 +306,17 @@ CREATE TABLE participation_attempt (
 	PRIMARY KEY (participation_id, attempt)
 );
 
--- Each coin given up. A coin is given up once, ever: the unique key holds it,
--- and the coin's row is marked spent by the participation in the same
--- transaction.
+-- Each coin given up. A coin is given up by one participation at a time: the
+-- unique index holds it, and the coin's row is marked spent by the
+-- participation in the same transaction. A participation that never ran
+-- (void) or whose forfeits never came (expired) gives back each coin no
+-- forfeit was signed for: the coin is live again and its input inactive, so
+-- it can be given up again.
 CREATE TABLE participation_input (
 	participation_id BYTEA NOT NULL REFERENCES participation,
 	idx              SMALLINT NOT NULL CHECK (idx >= 0),
-	leaf_id          BYTEA NOT NULL UNIQUE REFERENCES leaf,
+	leaf_id          BYTEA NOT NULL REFERENCES leaf,
+	active           BOOLEAN NOT NULL DEFAULT true,
 	asset            BYTEA NOT NULL CHECK (length(asset) = 32),
 	value            BIGINT NOT NULL CHECK (value > 0),
 	-- What the forfeit leaves uncommitted for its own fee.
@@ -313,6 +325,7 @@ CREATE TABLE participation_input (
 	attestation      BYTEA NOT NULL CHECK (length(attestation) = 64),
 	PRIMARY KEY (participation_id, idx)
 );
+CREATE UNIQUE INDEX participation_input_leaf_id_key ON participation_input (leaf_id) WHERE active;
 
 -- Each output wanted: a leaf, or an offboard's on-chain output.
 CREATE TABLE participation_output (
@@ -435,21 +448,26 @@ CREATE TABLE forfeit (
 	PRIMARY KEY (leaf_id, round_id)
 );
 
--- An owner's release of the lowest node of a coin it gave up: its signature,
--- with the coin's key, over SHA256("Arca/release" ‖ genesis_hash ‖ H), H the
--- node's children hash. Taken only after the participation's preimage went
--- out, while its round is final, and never for a coin with an open
--- out-of-round reassignment. Once every owner under a lowest node has released
--- it, the operator may reclaim it.
+-- An owner's release of the lowest node of a coin it gave up, for the round of
+-- one of the participation's attempts: its signature, with the coin's key,
+-- over SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M), H the node's children
+-- hash and M that round's connector asset. RECLAIM needs an atom of M among
+-- its inputs, so the release is void unless that round is in the chain. Taken
+-- only after the participation's preimage went out, while its round is final,
+-- and never for a coin with an open out-of-round reassignment. Once every
+-- owner under a lowest node has released it, the operator may reclaim it.
 CREATE TABLE node_release (
-	leaf_id          BYTEA PRIMARY KEY REFERENCES leaf,
+	leaf_id          BYTEA NOT NULL REFERENCES leaf,
+	round_id         BIGINT NOT NULL REFERENCES round,
 	participation_id BYTEA NOT NULL REFERENCES participation,
 	node_hash        BYTEA NOT NULL CHECK (length(node_hash) = 32),
+	connector_asset  BYTEA NOT NULL CHECK (length(connector_asset) = 32),
 	signature        BYTEA NOT NULL CHECK (length(signature) = 64),
-	-- Set when the round the participation was released in can never
-	-- return: a release given for that round is never used.
+	-- Set when the round can never return: its M can never be issued, and
+	-- the release is never used.
 	retired          BOOLEAN NOT NULL DEFAULT false,
-	created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+	created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (leaf_id, round_id)
 );
 CREATE INDEX node_release_by_node ON node_release (node_hash);
 

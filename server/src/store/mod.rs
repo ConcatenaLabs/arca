@@ -5,8 +5,9 @@
 //! rule that two requests could otherwise race past is held by the database
 //! itself: a leaf script appears once ([`StoreError::ScriptReused`]), an
 //! operator nonce is taken once ([`StoreError::NonceUsed`]), a key owns one leaf
-//! ([`StoreError::KeyReused`]), a leaf is given up once, by one transfer or one
-//! participation. Each
+//! ([`StoreError::KeyReused`]), a leaf is given up once, by one transfer or by
+//! one participation at a time (a participation that never runs, or whose
+//! forfeits never come, gives back the coins no forfeit was signed for). Each
 //! operation that changes more than one row runs in one transaction, so it
 //! happens whole or not at all.
 //!
@@ -37,7 +38,8 @@ pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
-	ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, WantedKind,
+	ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, ReleaseRow,
+	WantedKind,
 };
 pub use rounds::{
 	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, Placement, RoundRow, RoundState, StoredReserve,
@@ -82,6 +84,9 @@ pub enum StoreError {
 	Mergeable(String),
 	#[error("a participation with this id is already recorded")]
 	ParticipationExists,
+	/// The participation is no longer in its round's forfeit step.
+	#[error("the participation is {0}")]
+	NotInRound(&'static str),
 }
 
 impl StoreError {

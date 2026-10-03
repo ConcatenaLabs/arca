@@ -55,14 +55,20 @@ poll_interval_ms = 1000
 
 [fees]
 # The most a refresh costs, in parts per million of the coin's value: due in
-# full for a coin 28 days or more from its expiry, falling to nothing in the
-# last two days. A coin from boards alone pays the whole of it.
+# full for a coin 28 days or more from its first expiry, falling to nothing in
+# the free window, the two days before its exit deadline (five to three days
+# before the expiry). The server takes no coin past its exit deadline, and a
+# participation's forfeits are due within a day of its round being final. A
+# coin from boards alone pays the whole of it.
 refresh_ppm = 0
 # What an offboard costs, in parts per million of what it pays out, on top of
 # the margin its on-chain output holds for its unlock.
 offboard_ppm = 0
 
-# Each asset served, with the smallest leaf taken, in the asset's atoms.
+# Each asset served, with the smallest leaf taken, in the asset's atoms. An
+# asset served need not be one the node accepts for fees: a batch in such an
+# asset carries a reserve of one atom on every node and every entry, and
+# whoever unrolls it attaches a fee coin in an accepted asset.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"

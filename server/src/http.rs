@@ -249,9 +249,13 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		fees: api::FeesInfo {
 			transfer: "0".into(),
 			refresh_ppm: p.fees.refresh_ppm,
-			free_window_seconds: FeeSchedule::FREE_WINDOW,
+			free_window_seconds: FeeSchedule::FREE_FROM,
 			full_after_seconds: FeeSchedule::FULL_AFTER,
 			offboard_ppm: p.fees.offboard_ppm,
+		},
+		participations: api::ParticipationsInfo {
+			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,
+			forfeit_deadline_seconds: Params::FORFEIT_DEADLINE,
 		},
 		max_request_bytes: app.max_request as u64,
 	})
@@ -484,7 +488,7 @@ async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	let id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
 	let mut releases = Vec::with_capacity(req.releases.len());
 	for r in &req.releases {
-		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, signature: sig(&r.signature)? });
+		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, connector: asset(&r.connector_asset)?, signature: sig(&r.signature)? });
 	}
 	let done = app.forfeits.release_leaves(&id, &releases).await?;
 	Ok(Json(api::Released { participation_id: hex(&id), released: done.iter().map(|l| l.to_string()).collect() }))
@@ -528,6 +532,7 @@ async fn leaf_data(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejecti
 				LeafState::Live => "live",
 				LeafState::Spent => "spent",
 				LeafState::Lost => "lost",
+				LeafState::Expired => "expired",
 			}.into(),
 			asset: AssetId::from_byte_array(r.asset).to_string(),
 			value: r.value.to_string(),

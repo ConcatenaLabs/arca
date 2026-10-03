@@ -12,7 +12,10 @@
 //!
 //! - every coin given up passes the check of [`crate::coins`]: known, live,
 //!   held by nothing else, its record valid, its boards credited and unspent,
-//!   nothing of its lineage on-chain; and its attestation verifies;
+//!   nothing of its lineage on-chain, and its first expiry still past its exit
+//!   deadline, three days ahead ([`Params::participation_policy`]); its
+//!   attestation verifies; and the earliest round time asked for, if any,
+//!   lies before every coin's exit deadline;
 //! - every leaf wanted is a template the round builds (`vtxo-1`), within the
 //!   published bounds (an asset served, a value within its bounds, an exit
 //!   delay within the bounds), under a key that owns no leaf and is wanted by
@@ -412,6 +415,17 @@ impl Participations {
 				return Err(ParticipationError::BadAttestation(k));
 			}
 			coins.push(c.coin);
+		}
+		// A coin is taken only up to its exit deadline, and so is a round
+		// asked for later.
+		if let Some(t) = req.not_before {
+			for (c, i) in coins.iter().zip(&req.inputs) {
+				let deadline = c.expiry.to_consensus_u32().saturating_sub(Params::PARTICIPATION_HORIZON);
+				if t.to_consensus_u32() > deadline {
+					return Err(ParticipationError::OutOfBounds(format!(
+						"the earliest round time {} lies past coin {}'s exit deadline {}", t.to_consensus_u32(), i.leaf_id, deadline)));
+				}
+			}
 		}
 
 		// The amounts, per asset: in = out + fee, exactly.

@@ -37,23 +37,35 @@
 //! The step is idempotent: the same request again, for a released
 //! participation, verifies again and returns the same preimage.
 //!
+//! The forfeits are due within a day of the round being found final
+//! ([`crate::params::Params::FORFEIT_DEADLINE`]): after that the
+//! participation expires ([`crate::rounds`]), and a forfeit step for it is
+//! refused (`not_in_round`), even one that was in flight when it expired.
+//!
 //! `release_leaves` takes an owner's release of the lowest node of a coin it
-//! gave up: its signature with the coin's key over the node's release message.
-//! It is refused for a coin with an open out-of-round reassignment, whatever
-//! else holds ([`crate::cosign::Cosigner::check_release`]: the release key is
-//! the key the coin was built with, so its sender and the operator could
-//! otherwise void the receiver's chain); for a coin not given up in the
-//! participation named; before the participation's preimage went out; while
-//! the participation's round is not final; and for a coin that has no lowest
-//! node (a board, or a coin a reassignment made). When a round can never
-//! return, the releases given for it are retired and never used.
+//! gave up: the connector asset `M` of the participation's round, which the
+//! release names, and the owner's signature with the coin's key over
+//! `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)` ([`arca_covenant::Release`]).
+//! RECLAIM needs an atom of `M` among its inputs, and `M` exists only while
+//! that round is in the chain, so a release is void with its round. A release
+//! naming another `M` is refused (`wrong_round`), as is one over another
+//! message (`bad_signature`). It is also refused for a coin with an open
+//! out-of-round reassignment, whatever else holds
+//! ([`crate::cosign::Cosigner::check_release`]: the release key is the key the
+//! coin was built with, so its sender and the operator could otherwise void
+//! the receiver's chain); for a coin not given up in the participation named;
+//! before the participation's preimage went out; while the participation's
+//! round is not final; and for a coin that has no lowest node (a board, or a
+//! coin a reassignment made). Each release is stored with its round and `M`.
+//! When a round can never return, the releases given for it are retired:
+//! their `M` can never be issued.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use elements::hashes::Hash;
 use elements::secp256k1_zkp::schnorr::Signature;
-use elements::{Transaction, Txid};
+use elements::{AssetId, Transaction, Txid};
 
 use arca_covenant::sign::verify_digest;
 use arca_covenant::{
@@ -99,10 +111,12 @@ pub struct Forfeited {
 	pub forfeit_first: bool,
 }
 
-/// One coin's release.
+/// One coin's release: the connector asset of the round it names, and the
+/// owner's signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRequest {
 	pub leaf_id: LeafId,
+	pub connector: AssetId,
 	pub signature: Signature,
 }
 
@@ -133,6 +147,8 @@ pub enum ForfeitError {
 	NoLowestNode(LeafId),
 	#[error("coin {0}'s release is not its owner's signature over its lowest node's release message")]
 	BadRelease(LeafId),
+	#[error("coin {leaf}'s release names the connector asset {named}; the participation's round's is {round}")]
+	WrongRound { leaf: LeafId, named: AssetId, round: AssetId },
 	#[error(transparent)]
 	Cosign(CosignError),
 	#[error("the signer: {0}")]
@@ -166,6 +182,7 @@ impl ForfeitError {
 			ReleaseEarly => "release_early",
 			NoLowestNode(_) => "no_lowest_node",
 			BadRelease(_) => "bad_signature",
+			WrongRound { .. } => "wrong_round",
 			Cosign(e) => e.code(),
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
@@ -297,9 +314,14 @@ impl Forfeits {
 			});
 		}
 
-		// Recorded, then the preimage.
+		// Recorded, then the preimage. A participation that expired meanwhile
+		// takes nothing.
 		let release = !p.forfeit_first;
-		let released = self.store.complete_participation(&id, p.attempt, round_id, &forfeits, &records, release).await?;
+		let released = match self.store.complete_participation(&id, p.attempt, round_id, &forfeits, &records, release).await {
+			Ok(r) => r,
+			Err(StoreError::NotInRound(state)) => return Err(ForfeitError::NotInRound(state)),
+			Err(e) => return Err(e.into()),
+		};
 		if released {
 			log::info!("participation {} released: {} forfeit(s) in, preimage handed over", hex(&id), forfeits.len());
 		} else {
@@ -349,11 +371,15 @@ impl Forfeits {
 			// The release names the connector asset of the participation's
 			// round, so it is void if that round leaves the chain.
 			let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
+			if r.connector != m {
+				return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named: r.connector, round: m });
+			}
 			let release = Release { chain: self.params.chain, node_hash: lowest.children_hash(), owner: record.owner, connector: m };
 			if release.verify(&r.signature).is_err() {
 				return Err(ForfeitError::BadRelease(r.leaf_id));
 			}
-			self.store.insert_release(&r.leaf_id.0, id, &lowest.children_hash(), r.signature.as_ref()).await?;
+			self.store.insert_release(&r.leaf_id.0, id, round.round_id, &lowest.children_hash(), &m.into_inner().to_byte_array(),
+				r.signature.as_ref()).await?;
 			done.push(r.leaf_id);
 		}
 		Ok(done)

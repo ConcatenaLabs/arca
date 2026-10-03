@@ -36,9 +36,11 @@ requests can race past them:
   it is handed out and taken by one leaf at most. A nonce that was never
   issued, or was already taken, is refused. A leaf a reassignment creates
   takes its sender's creator nonce instead.
-- **Transfers and participations.** A leaf is given up once: as the input of
-  one transfer, recorded before any signature leaves the server, or of one
-  participation, recorded when it is accepted.
+- **Transfers and participations.** A leaf is given up as the input of one
+  transfer, recorded before any signature leaves the server, or of one
+  participation at a time, recorded when it is accepted. A participation that
+  never runs, or whose forfeits never come, gives back each coin for which no
+  forfeit was signed; that coin can then be given up again.
 - **Reassignments.** Every reassignment the server co-signed, kept by the hash
   of its output 0's record with its inputs and outputs: the merge rule below
   reads them, so it survives a restart.
@@ -172,8 +174,10 @@ a value and the on-chain script to pay). The server accepts it only when:
 
 - every coin given up passes the same check as a transfer's input: known,
   live, given up nowhere else, its record valid, every board it rests on
-  credited and unspent, nothing of its lineage on the chain; and its
-  attestation verifies;
+  credited and unspent, nothing of its lineage on the chain, and its first
+  expiry at least three days ahead: a coin is taken only up to its exit
+  deadline. Its attestation verifies, and an earliest round time asked for
+  lies before every coin's exit deadline;
 - every leaf wanted is within the published bounds, under a key that owns no
   leaf and that no other participation wants; every offboard pays a served
   asset within its bounds to a script that is not an Arca script;
@@ -198,11 +202,13 @@ attestation apart from everything else a leaf key signs, the genesis hash and
 `S` to one chain and one operator.
 
 The fee schedule is published by `info`. Transfers are free. A refresh, or an
-offboard, costs nothing for a coin whose batch expires within two days, and
-rises with the time left beyond that to `refresh_ppm` parts per million of the
-coin's value for a coin 26 days or more beyond it; a coin from boards alone
-never expires and pays the whole of it. An offboard adds `offboard_ppm` of what
-it pays out and the margin its on-chain output holds for its unlock.
+offboard, costs nothing in the free window, the two days before a coin's exit
+deadline (from five days before its first expiry to three days before it, when
+the server stops taking it), and rises with the time left beyond the window to
+`refresh_ppm` parts per million of the coin's value for a coin 23 days or more
+beyond it; a coin from boards alone never expires and pays the whole of it. An
+offboard adds `offboard_ppm` of what it pays out and the margin its on-chain
+output holds for its unlock.
 
 Each forfeit carries the refund delay the server publishes with the
 participation (the longest exit delay), and leaves uncommitted the margin the
@@ -218,9 +224,13 @@ runner gathers the pending participations whose earliest round time has
 come, checks each coin they give up again, and builds one tree per asset with
 `arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
 the lowest nodes, each leaf behind its participation's hash-locked entry, the
-reserve at four times the node's floor in the batch asset (one atom where the
-node does not accept the asset for fees, so whoever unrolls attaches a fee
-coin). A batch holds at most 1,024 leaves; a participation runs whole in one
+reserve at four times the node's floor in the batch asset. A batch in an asset
+the node does not accept for fees carries a reserve of one atom on every node
+and every entry, so whoever unrolls it attaches a fee coin in an asset that is
+accepted. A coin is checked again under a horizon of one day before its first
+expiry: a participation accepted before its exit deadline still runs if a
+round takes it by then, and one with a coin past that can never run and is
+voided, its coins given back. A batch holds at most 1,024 leaves; a participation runs whole in one
 round, its leaves in several assets included. Each batch has its own sweep
 token, one explicit atom with no reissuance token, issued by one of the
 operator's coins, and a clock schedule of three steps, 28, 56 and 84 days
@@ -247,7 +257,7 @@ batches, each leaf (a pending coin until its owner hands over its forfeits)
 and every participation's move to `issued` are recorded in one database
 transaction, and the round goes to the nursery. A participation one of whose
 keys has come to own a leaf meanwhile cannot run; it is voided and the coins
-it gave up are live again, since nothing was signed for them.
+it gave up are given back.
 
 Every batch is published by `tree`: the round, the batch output, its token's
 output and the round's connector output, the asset, the schedule in
@@ -279,8 +289,8 @@ preimage had gone out runs again forfeit-first: its forfeit for the new round
 is taken, and its new preimage goes out only through the claim of that
 forfeit, once published. The coins those participations gave up stay given up,
 so the operator co-signs no other off-chain spend of them, and any release of
-their lowest nodes given on the strength of the lost round is retired and never
-used.
+their lowest nodes given for the lost round is retired: it names the lost
+round's connector asset, which can never be issued, so no reclaim can use it.
 
 The nursery does not yet call a round lost when its input's own transaction
 is reorganised away and never returns: such a round stays broadcast, its
@@ -324,14 +334,30 @@ A new leaf is live, and can be paid on out of round, once its participation
 is released and its round final; a coin resting on a leaf of a round that is
 not final is not co-signed (`round_not_final`).
 
+The forfeits are due within a day of the round being found final. A
+participation whose forfeits have not come by then expires: its new leaves
+are never credited (their preimage never goes out, and the operator sweeps
+them with their batch at expiry), and each coin it gave up for which no
+forfeit was signed is given back, live again and free to be given up again. A
+coin under a forfeit signed for an earlier round that could not return stays
+given up. A forfeit step that reaches the server after the expiry, even one in
+flight when it ran, is refused (`not_in_round`) and stores nothing. A round
+that stops being final and becomes final again starts the day again.
+
 `release_leaves` then takes the owner's release of the lowest node of each
-coin it gave up: its signature, with the coin's own key, over the node's
-release message. It is refused for a coin with an open out-of-round
-reassignment, whatever else holds; for a coin not given up in the
-participation named; before the participation's preimage went out; while its
-round is not final; for a board or a coin a reassignment made, which have no
-lowest node; and for a signature by another key. Once every owner under a lowest node has released
-it, the operator may reclaim the node before expiry.
+coin it gave up: the connector asset `M` of the participation's round, and
+the owner's signature, with the coin's own key, over
+`SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `H` the node's children hash
+(`arca_covenant::Release`). RECLAIM needs an atom of `M` among its inputs, and
+`M` exists only while that round is in the chain, so a release is void with
+its round. A release naming another `M` is refused (`wrong_round`), and one
+over another message (`bad_signature`). It is also refused for a coin with an
+open out-of-round reassignment, whatever else holds; for a coin not given up
+in the participation named; before the participation's preimage went out;
+while its round is not final; and for a board or a coin a reassignment made,
+which have no lowest node. Each release is kept with its round and `M`. Once
+every owner under a lowest node has released it, the operator may reclaim the
+node before expiry, with one atom of each `M` its owners' releases name.
 
 ## The interface
 
@@ -346,19 +372,19 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule, the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window, a participation's exit deadline and forfeit deadline, the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board |
 | `POST challenge` | A challenge to authenticate with, good once, for a short while |
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
 | `POST submit_participation` | Accepts a participation in a round |
-| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it |
+| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it |
 | `POST tree` | The published tree of a batch, by its round's txid and output |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
-| `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up |
+| `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
-| `POST leaf_data` | The leaves a key owns, with their records |
+| `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records |
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
@@ -395,6 +421,13 @@ node's RPC, the finality rule, the exit-delay bounds, the assets served
 with their smallest leaf, how often a round is built, the assets a round's
 fee is paid in, and the fee schedule. The node must run with `-txindex` and
 `-validateanchor`.
+
+An asset served need not be accepted for fees by the node. A batch in such an
+asset carries a reserve of one atom on every node and every entry, on every
+operator's server alike: nobody can pay a fee in it, so whoever unrolls the
+batch attaches a fee coin in an accepted asset. A batch in an accepted asset
+reserves four times the node's floor for each node's unroll. A round's own fee
+is always paid in an accepted asset (`fee_assets`).
 
 ## The on-chain wallet
 
@@ -512,13 +545,15 @@ their sizes.
 the round final, the new leaf validated from the published tree, the forfeit
 and the preimage that opens the new leaf's entry, the new leaf live and paid on
 out of round, then a second refresh of that batch leaf and the release of its
-lowest node. Each refusal is asserted by its code: forfeits before the round
-and before it is final, for the wrong unlock hash, the wrong connector (another
-output, another round), another coin, another margin, another refund delay or
-another key, a forfeit set that is not exact (none, another coin, one twice,
-one more), no authorisations, authorisations by another key or not yet usable,
-a release before the preimage, by another key, of a board, of a coin not in the
-participation, and of a coin with an open reassignment.
+lowest node, naming the second round's connector asset. Each refusal is
+asserted by its code: forfeits before the round and before it is final, for
+the wrong unlock hash, the wrong connector (another output, another round),
+another coin, another margin, another refund delay or another key, a forfeit
+set that is not exact (none, another coin, one twice, one more), no
+authorisations, authorisations by another key or not yet usable, a release
+before the preimage, by another key, naming another round's connector asset
+(`wrong_round`), over the message that named no round, of a board, of a coin
+not in the participation, and of a coin with an open reassignment.
 
 `tests/rollback.rs` disconnects a final round: its new leaf is uncredited at
 once and a transfer of it refused, a release refused, the round broadcast
@@ -530,7 +565,26 @@ again in a new round under new unlock hashes and operator nonces. The one whose
 preimage had gone out (giving up a leaf whose lowest node its owner had
 released) runs forfeit-first: its release is retired, its old forfeit does not
 verify for the new round, its new forfeit is taken and its preimage withheld.
-The other completes as before, and the coins both gave up stay given up.
+The release is void on the chain as well: the lost round's connector asset
+cannot be issued, and the node refuses the reclaim of the released node with
+the release and the new round's connector asset, or with none, so the node
+stays its owner's. The other completes as before, and the coins both gave up
+stay given up. A third, also released in the lost round, never hands over its
+forfeit for the new round: a day after that round is final it expires, and its
+coin, under a forfeit pair for the lost round, stays given up.
+
+`tests/expiry.rs` moves the chain's median time on. A participation whose
+forfeits have not come a day after its round was found final expires: its
+coin is live again and given up again in a new participation, its new leaf is
+expired, a good forfeit for it is refused and stores nothing, its new leaf's
+key cannot be wanted again, and a participation of the same round whose
+forfeits came is untouched. On batch leaves of a round whose first expiry is
+`E`: six days before `E` a refresh is charged for the day before the free
+window, and refused one atom short; four days before it is free and runs; a
+round time asked for past the exit deadline is refused; past the exit
+deadline a coin is refused; and a participation accepted before the deadline
+whose coin passes one day before `E` with no round taking it is voided by the
+next round, its coin live again.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

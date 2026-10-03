@@ -38,6 +38,9 @@ pub enum LeafState {
 	Live,
 	Spent,
 	Lost,
+	/// A new leaf of a participation whose forfeits never came: never the
+	/// owner's; the operator sweeps it with its batch.
+	Expired,
 }
 
 impl LeafState {
@@ -47,6 +50,7 @@ impl LeafState {
 			LeafState::Live => "live",
 			LeafState::Spent => "spent",
 			LeafState::Lost => "lost",
+			LeafState::Expired => "expired",
 		}
 	}
 
@@ -56,6 +60,7 @@ impl LeafState {
 			"live" => LeafState::Live,
 			"spent" => LeafState::Spent,
 			"lost" => LeafState::Lost,
+			"expired" => LeafState::Expired,
 			other => return Err(StoreError::Corrupt(format!("leaf state {}", other))),
 		})
 	}

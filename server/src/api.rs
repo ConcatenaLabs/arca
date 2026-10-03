@@ -36,8 +36,23 @@ pub struct Info {
 	pub finality: FinalityInfo,
 	pub templates: TemplatesInfo,
 	pub fees: FeesInfo,
+	pub participations: ParticipationsInfo,
 	/// The largest request body the server reads.
 	pub max_request_bytes: u64,
+}
+
+/// The times a participation keeps to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipationsInfo {
+	/// A coin is given up only while its first expiry lies at least this far
+	/// ahead, and a later round time asked for must lie before that point:
+	/// the exit deadline, three days.
+	pub exit_deadline_seconds: u32,
+	/// A participation's forfeits must come within this long of its round
+	/// being found final, one day; otherwise it expires, its coins are the
+	/// owner's again and its new leaves never are.
+	pub forfeit_deadline_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +96,8 @@ pub struct FeesInfo {
 	/// falls in proportion to the time left beyond the window, to nothing
 	/// within it. A coin from boards alone pays the whole of it.
 	pub refresh_ppm: u64,
+	/// A refresh is free for a coin whose first expiry is at most this far
+	/// ahead, five days: the window is the two days before the exit deadline.
 	pub free_window_seconds: u32,
 	pub full_after_seconds: u32,
 	/// The offboard fee, in parts per million of what it pays out, on top of
@@ -327,7 +344,8 @@ pub struct ParticipationStatusRequest {
 
 /// A participation: `pending` until a round takes it, `issued` once it is in
 /// a round, `released` once its forfeits are in and its preimage handed over,
-/// `void` if it will not run.
+/// `void` if it will not run, `expired` if its forfeits did not come within a
+/// day of its round being final (its coins are the owner's again).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipationStatus {
@@ -516,7 +534,18 @@ pub struct Forfeited {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseLeaves {
 	pub participation_id: String,
-	pub releases: Vec<ForfeitSignature>,
+	pub releases: Vec<ReleaseSignature>,
+}
+
+/// One coin's release: the connector asset `M` of the participation's round
+/// (display order), which the release names, and the signature over
+/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseSignature {
+	pub leaf_id: String,
+	pub connector_asset: String,
+	pub signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
