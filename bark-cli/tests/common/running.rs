@@ -83,7 +83,9 @@ impl Running {
 			watcher: WatcherSection::default(),
 			// The scenarios ask for nonces and challenges faster than one
 			// wallet does.
-			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },
+			limits: LimitsSection {
+				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000, ..Default::default()
+			},
 			metrics_listen: None,
 		};
 		let server = Server::start(&config).await.unwrap();

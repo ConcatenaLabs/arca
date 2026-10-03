@@ -86,7 +86,9 @@ impl Running {
 			watcher: WatcherSection { enabled: false, ..Default::default() },
 			// The tests ask for nonces and challenges faster than a wallet
 			// does; the test of the limits sets them itself.
-			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },
+			limits: LimitsSection {
+				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000, ..Default::default()
+			},
 			metrics_listen: None,
 		};
 		tune(&mut config, y);
