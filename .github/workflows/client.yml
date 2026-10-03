@@ -75,7 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: The wallet's unit tests
-        run: cargo test --locked -p arca-wallet --features arca --lib arca::
+        run: cargo test --locked -p arca-wallet --features arca --lib "arca::"
 
       # The scenarios run the operator's signer as its own process, as the
       # server's own tests do.
