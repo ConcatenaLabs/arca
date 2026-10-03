@@ -1149,6 +1149,68 @@ fn builder_cases(f: &F, book: &mut Book) {
 }
 
 // ---------------------------------------------------------------------------
+// Claims in one transaction
+// ---------------------------------------------------------------------------
+
+/// Three forfeits of one round claimed in one transaction against one atom
+/// of its connector asset, every claim naming that atom's input.
+fn claim_batch_cases(f: &F, book: &mut Book) {
+	let m = arca_covenant::connector_asset(elements::Txid::from_byte_array(label32("batch round")), 2);
+	let m2 = arca_covenant::connector_asset(elements::Txid::from_byte_array(label32("another round")), 2);
+	let make = |i: usize, conn: AssetId| {
+		let owner = keypair(&format!("batch owner {}", i));
+		let leaf = f.leaf(&owner, &format!("batch old leaf {}", i));
+		let pre = label32(&format!("batch preimage {}", i));
+		(Forfeit::new(leaf, (f.x, LEAF), LeafId(label32(&format!("batch leaf id {}", i))), sha256(&pre), conn, f.delay, FEE).unwrap(), pre)
+	};
+	let fs: Vec<(Forfeit, [u8; 32])> = (0..3).map(|i| make(i, m)).collect();
+	let ops: Vec<OutPoint> = (0..3).map(|i| fake_outpoint(&format!("batch forfeit {}", i))).collect();
+	let atom = (fake_outpoint("batch atom"), explicit(m, 1, op_true().script_pubkey()));
+	let set: Vec<(&Forfeit, OutPoint)> = fs.iter().zip(&ops).map(|((f, _), op)| (f, *op)).collect();
+	let to = vec![ExplicitOutput::new(f.x, 3 * (LEAF - FEE) - FEE, f.operator_spk())];
+	let c = batch_claim_tx(&set, atom.clone(), &to, f.operator_spk(), &FeeSource::Reserve).unwrap();
+	assert_eq!(c.connector_input(), 3);
+	assert_eq!(c.tx.output[1], explicit(m, 1, f.operator_spk()), "the atom goes back");
+	let preimages: Vec<[u8; 32]> = fs.iter().map(|(_, p)| *p).collect();
+	let sigs = |c: &ClaimTx, key: &Keypair| -> Vec<Signature> { (0..3).map(|i| sign_digest(key, &c.sighash(i, f.genesis).unwrap(), &[0; 32])).collect() };
+	let finish = |c: &ClaimTx, s: Vec<Signature>, p: &[[u8; 32]]| {
+		let mut sp = spend_of(c.clone().finish(&s, p).unwrap(), None);
+		sp.witness(3, op_true_witness());
+		sp
+	};
+	book.pass("claim batch/three forfeits of one round, one atom of M at input 3", &finish(&c, sigs(&c, &f.s), &preimages));
+	let mut wrong = preimages.clone();
+	wrong[1] = label32("not the preimage");
+	book.fail("claim batch/neg a wrong preimage on the second claim", &finish(&c, sigs(&c, &f.s), &wrong), 1, EQUALVERIFY);
+	let mut swapped = sigs(&c, &f.s);
+	swapped.swap(0, 1);
+	book.fail("claim batch/neg the first claim's signature on the second input", &finish(&c, swapped, &preimages), 0, BAD_SIG);
+	let mut sp = finish(&c, sigs(&c, &f.s), &preimages);
+	let n = sp.tx.input[2].witness.script_witness.len();
+	sp.tx.input[2].witness.script_witness[n - 3] = arca_covenant::script::scriptnum(0);
+	book.fail("claim batch/neg a claim naming a forfeit input as M's", &sp, 2, EQUALVERIFY);
+	// A forfeit of another round, with this round's atom: refused by the
+	// builder, and by the script when built by hand.
+	let (other, other_pre) = make(3, m2);
+	let mixed: Vec<(&Forfeit, OutPoint)> = vec![(&fs[0].0, ops[0]), (&other, fake_outpoint("other forfeit"))];
+	assert_eq!(batch_claim_tx(&mixed, atom.clone(), &to, f.operator_spk(), &FeeSource::Reserve).unwrap_err(), SpendError::OtherConnector(1));
+	let mut by_hand = c.clone();
+	by_hand.tx.input[1].previous_output = fake_outpoint("other forfeit");
+	by_hand.prevouts[1] = other.output().txout();
+	let mut s2 = Spend::new(0).fake_input("f0", by_hand.prevouts[0].clone(), 0xffff_ffff).fake_input("other", other.output().txout(), 0xffff_ffff)
+		.fake_input("atom", atom.1.clone(), 0xffff_ffff).outputs(vec![explicit(f.x, 2 * (LEAF - FEE) - FEE, f.operator_spk()),
+			explicit(m, 1, f.operator_spk()), fee(f.x, FEE)]);
+	let s0 = s2.sign(&f.s, 0, &fs[0].0.policy.claim_script(), f.genesis);
+	let s1 = s2.sign(&f.s, 1, &other.policy.claim_script(), f.genesis);
+	s2.witness(0, fs[0].0.policy.taproot().witness(&fs[0].0.policy.claim_script(), ForfeitPolicy::claim_items(&s0, &fs[0].1, 2)));
+	s2.witness(1, other.policy.taproot().witness(&other.policy.claim_script(), ForfeitPolicy::claim_items(&s1, &other_pre, 2)));
+	s2.witness(2, op_true_witness());
+	book.fail("claim batch/neg a forfeit of another round claimed with this round's atom", &s2, 1, EQUALVERIFY);
+	assert!(matches!(c.clone().finish(&sigs(&c, &f.s)[..2], &preimages), Err(SpendError::ClaimItems { sigs: 2, preimages: 3, forfeits: 3 })));
+	assert_eq!(batch_claim_tx(&[], atom, &to, f.operator_spk(), &FeeSource::Reserve).unwrap_err(), SpendError::NothingToClaim);
+}
+
+// ---------------------------------------------------------------------------
 // htlc-1
 // ---------------------------------------------------------------------------
 
@@ -1249,6 +1311,7 @@ fn every_path_against_the_node_interpreter() {
 	burn_cases(&f, &mut book);
 	htlc_cases(&f, &mut book);
 	builder_cases(&f, &mut book);
+	claim_batch_cases(&f, &mut book);
 	book.print();
 	assert!(book.refused >= 100, "only {} negative cases", book.refused);
 }

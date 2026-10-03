@@ -92,6 +92,18 @@
 //! preimage ([`Forfeit::claim`]); the owner's refund waits the delay
 //! ([`Forfeit::refund`]). Each is signed once built, since an ordinary
 //! signature commits to the transaction.
+//!
+//! # Claims in one transaction
+//!
+//! The claim reads input `k`'s asset and nothing else of it, so several
+//! claims can name the same `k`: one transaction claims every forfeit of a
+//! round at once, against one atom of its `M` ([`batch_claim_tx`]). The forfeits
+//! are its first inputs and the atom the one after them, which every claim
+//! names; the atom goes back to the operator for the next claim. The
+//! operator signs each claim input over the whole transaction
+//! (`SIGHASH_DEFAULT`), so no signature serves another input, another
+//! claim or another transaction. A forfeit of another round cannot join: its
+//! claim checks for its own round's `M` at `k`, and finds this round's.
 
 use elements::confidential::Value;
 use elements::hashes::Hash;
@@ -108,8 +120,9 @@ use crate::message::CsfsMessage;
 use crate::offboard::OffboardPolicy;
 use crate::record::{LeafId, ValidLeaf};
 use crate::script::{asset_bytes, scriptnum, ExplicitOutput};
+use crate::sign::script_spend_sighash;
 use crate::spend::{
-	check_margin, collab_tx, margins, pay_fee, FeeSource, KeySpend, Pair, Rebindable, SpendError, UnrollTx, FINAL,
+	assemble, check_margin, collab_tx, margins, pay_fee, FeeSource, KeySpend, Pair, Rebindable, SpendError, UnrollTx, FINAL,
 };
 use crate::taptree::TapOutput;
 use crate::time::RelativeTime;
@@ -424,4 +437,88 @@ impl Forfeit {
 			vec![(forfeit_coin, self.output().txout(), Sequence(self.policy.refund_delay.to_sequence()))], outputs, fee,
 		)
 	}
+}
+
+/// A claim of several forfeits of one round in one transaction, built and
+/// waiting for the operator's signature on each forfeit input: see the
+/// [module documentation](self).
+#[derive(Debug, Clone)]
+pub struct ClaimTx {
+	pub tx: Transaction,
+	/// The outputs the inputs spend, in input order.
+	pub prevouts: Vec<TxOut>,
+	/// The claim script each forfeit input spends by, in input order.
+	pub leaves: Vec<Script>,
+	taps: Vec<TapOutput>,
+}
+
+impl ClaimTx {
+	/// The input that holds the connector asset, which every claim's `k`
+	/// names: the one after the forfeits.
+	pub fn connector_input(&self) -> u32 {
+		self.leaves.len() as u32
+	}
+
+	/// The Elements taproot signature hash of forfeit input `input`, which
+	/// the operator signs.
+	pub fn sighash(&self, input: usize, genesis_hash: elements::BlockHash) -> Result<[u8; 32], crate::Error> {
+		let leaf = self.leaves.get(input).ok_or(crate::Error::InputIndex(input))?;
+		script_spend_sighash(&self.tx, input, &self.prevouts, leaf, genesis_hash)
+	}
+
+	/// Puts on each forfeit input the operator's signature and the preimage
+	/// of that forfeit's unlock hash, in input order. The connector atom's
+	/// witness, and a fee coin's, are the operator's wallet's to add.
+	pub fn finish(mut self, sigs: &[Signature], preimages: &[[u8; 32]]) -> Result<UnrollTx, SpendError> {
+		let n = self.leaves.len();
+		if sigs.len() != n || preimages.len() != n {
+			return Err(SpendError::ClaimItems { sigs: sigs.len(), preimages: preimages.len(), forfeits: n });
+		}
+		let k = self.connector_input();
+		for i in 0..n {
+			self.tx.input[i].witness.script_witness =
+				self.taps[i].witness(&self.leaves[i], ForfeitPolicy::claim_items(&sigs[i], &preimages[i], k));
+		}
+		Ok(UnrollTx { tx: self.tx, prevouts: self.prevouts })
+	}
+}
+
+/// The operator's claim of every forfeit of `forfeits`, each with the
+/// outpoint of its forfeit output, at inputs `0..n`, with the connector
+/// asset's coin `connector` at input `n`, whose whole value goes back to
+/// `connector_to`; then `outputs`, and what the forfeits hold beyond them
+/// pays the fee as `fee` says. Refuses an empty set, forfeits of more than
+/// one operator, and a forfeit whose round's connector asset is not the
+/// coin's.
+pub fn batch_claim_tx(
+	forfeits: &[(&Forfeit, OutPoint)],
+	connector: (OutPoint, TxOut),
+	outputs: &[ExplicitOutput],
+	connector_to: Script,
+	fee: &FeeSource,
+) -> Result<ClaimTx, SpendError> {
+	let first = forfeits.first().ok_or(SpendError::NothingToClaim)?;
+	let (m, held) = match (connector.1.asset.explicit(), connector.1.value.explicit()) {
+		(Some(a), Some(v)) => (a, v),
+		_ => return Err(SpendError::NotExplicit),
+	};
+	for (i, (f, _)) in forfeits.iter().enumerate() {
+		if f.policy.connector != m {
+			return Err(SpendError::OtherConnector(i));
+		}
+		if f.policy.operator != first.0.policy.operator {
+			return Err(SpendError::OtherOperator);
+		}
+	}
+	let mut inputs: Vec<(OutPoint, TxOut, Sequence)> = forfeits.iter().map(|(f, op)| (*op, f.output().txout(), FINAL)).collect();
+	inputs.push((connector.0, connector.1, FINAL));
+	let mut all = outputs.to_vec();
+	all.push(ExplicitOutput::new(m, held, connector_to));
+	let u = assemble(LockTime::ZERO, inputs, &all, fee, FINAL)?;
+	Ok(ClaimTx {
+		tx: u.tx,
+		prevouts: u.prevouts,
+		leaves: forfeits.iter().map(|(f, _)| f.policy.claim_script()).collect(),
+		taps: forfeits.iter().map(|(f, _)| f.policy.taproot()).collect(),
+	})
 }

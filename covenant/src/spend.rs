@@ -101,6 +101,12 @@ pub enum SpendError {
 	BurnOutputs,
 	#[error("{given} signatures for a sweep of {needed} inputs")]
 	SweepSignatures { given: usize, needed: usize },
+	#[error("a claim takes at least one forfeit")]
+	NothingToClaim,
+	#[error("forfeit {0} is of another round: its connector asset is not the coin's")]
+	OtherConnector(usize),
+	#[error("{sigs} signatures and {preimages} preimages for a claim of {forfeits} forfeits")]
+	ClaimItems { sigs: usize, preimages: usize, forfeits: usize },
 }
 
 pub(crate) fn explicit_txout(asset: AssetId, value: u64, script_pubkey: Script) -> TxOut {
