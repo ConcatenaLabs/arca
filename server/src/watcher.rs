@@ -16,7 +16,10 @@
 //!    converted is the same case: its leaf appears.
 //! 2. **Boards given up in a round.** Once the round is final, the forfeit of
 //!    a board is published from the board output: a board never expires, so
-//!    this is how its value comes back to the operator.
+//!    this is how its value comes back to the operator. A coin of a transfer
+//!    given up in a round whose lineage rests on boards alone never expires
+//!    either: the watcher publishes each board's checkpoint, and 1 carries it
+//!    through each reassignment to the coin's forfeit.
 //! 3. **Forfeit-first.** A participation run again after a round it was in
 //!    could not return has its forfeits stored and its preimage withheld. The
 //!    watcher brings each coin it gave up onto the chain from the coin's own
@@ -222,6 +225,7 @@ impl Watcher {
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
 		self.recover_boards(now).await?;
+		self.recover_board_transfers(now).await?;
 		self.forfeit_first(now).await?;
 		self.claim_forfeits().await?;
 		self.answer_stale_exits().await?;
@@ -676,6 +680,38 @@ impl Watcher {
 					format!("the forfeit of board {}, given up in round {}", hex(&b.leaf_id), f.round_id)).await
 			}.await;
 			Self::item(&format!("the board {}", hex(&b.leaf_id)), r)?;
+		}
+		Ok(())
+	}
+
+	/// Brings onto the chain every coin of a transfer given up in a round
+	/// that is final, whose lineage rests on boards alone: it never expires,
+	/// so the operator gets its value back only by publishing the lineage
+	/// (each board's checkpoint; the answers to stale exits publish each
+	/// reassignment, then the coin's forfeit) and claiming the forfeit. A coin
+	/// resting on a batch leaf is left to that batch's sweep.
+	async fn recover_board_transfers(&self, now: MedianTime) -> Result<(), WatcherError> {
+		for leaf_id in self.store.forfeited_transfer_coins().await? {
+			let f = match self.live_forfeit(&leaf_id).await? {
+				Some(f) => f,
+				None => continue,
+			};
+			let p = match self.store.participation(&f.participation_id).await? {
+				Some(p) => p,
+				None => continue,
+			};
+			let round_final = self.store.round(f.round_id).await?.is_some_and(|r| r.state == RoundState::Final);
+			if p.state != ParticipationState::Released || !round_final {
+				continue;
+			}
+			let r = async {
+				let coin = self.coin(&leaf_id).await?;
+				if coin.expiry != arca_covenant::transfer::NEVER {
+					return Ok(());
+				}
+				self.bring_on_chain(&coin, now).await
+			}.await;
+			Self::item(&format!("the coin {} resting on boards", hex(&leaf_id)), r)?;
 		}
 		Ok(())
 	}
