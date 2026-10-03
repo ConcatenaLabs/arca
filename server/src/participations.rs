@@ -27,7 +27,10 @@
 //!
 //! It then chooses the participation's unlock hash, draws its own operator
 //! nonce for every leaf wanted (taken by this participation at once, so never
-//! handed out again), takes each leaf's owner nonce as given, prices each
+//! handed out again), takes each leaf's owner nonce as given, promises the
+//! participation the salt the two make (drawing again in the unlikely case
+//! the server has seen it: a salt is unique on a server, so no transfer can
+//! take it before the round makes the leaf), prices each
 //! forfeit's margin, and records it all, the coins given up becoming spent by
 //! the participation, in one database transaction. A participation submitted
 //! again byte for byte is the same participation and gets its status.

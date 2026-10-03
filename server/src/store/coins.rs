@@ -112,6 +112,13 @@ pub struct NewCoin {
 	/// The coin record, binary form.
 	pub record: Vec<u8>,
 	pub state: LeafState,
+	/// The leaf's salt: no other leaf the server knows, or has promised to a
+	/// participation, has it.
+	pub salt: [u8; 32],
+	/// The participation that was promised the salt, for a leaf of a batch:
+	/// the leaf takes that promise. `None` for any other leaf, whose salt
+	/// must be new to the server.
+	pub promised_to: Option<[u8; 32]>,
 	/// The operator nonce in the leaf's salt, for a leaf the operator
 	/// created (a board); `None` for a leaf a reassignment created, whose
 	/// salt takes its sender's creator nonce, and for a leaf whose nonce the
@@ -171,9 +178,40 @@ pub(super) async fn take_nonce(tx: &tokio_postgres::Transaction<'_>, nonce: &[u8
 	Ok(())
 }
 
-/// Inserts `coin` inside `tx`: takes its nonce, records its scripts, writes
-/// the leaf. A key wanted by a participation is refused for any coin but
-/// the batch leaf that participation's round makes.
+/// Records inside `tx` that `participation` wants a leaf under `salt`:
+/// false, and nothing recorded, when the salt is already known.
+pub(super) async fn promise_salt(tx: &tokio_postgres::Transaction<'_>, salt: &[u8; 32], participation: &[u8; 32])
+	-> Result<bool, StoreError>
+{
+	let n = tx.execute("INSERT INTO leaf_salt (salt, participation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+		&[&&salt[..], &&participation[..]]).await?;
+	Ok(n == 1)
+}
+
+/// Records inside `tx` that `coin` takes its salt: a salt new to the server,
+/// or, for a leaf of a batch, the one promised to its participation.
+async fn take_salt(tx: &tokio_postgres::Transaction<'_>, coin: &NewCoin) -> Result<(), StoreError> {
+	if let Some(p) = &coin.promised_to {
+		let n = tx.execute(
+			"UPDATE leaf_salt SET leaf_id = $2 WHERE salt = $1 AND participation_id = $3 AND leaf_id IS NULL",
+			&[&&coin.salt[..], &&coin.leaf_id[..], &&p[..]],
+		).await?;
+		if n == 1 {
+			return Ok(());
+		}
+	}
+	let r = tx.execute("INSERT INTO leaf_salt (salt, leaf_id) VALUES ($1, $2)", &[&&coin.salt[..], &&coin.leaf_id[..]]).await;
+	match r {
+		Ok(_) => Ok(()),
+		Err(e) if StoreError::is_unique(&e, "leaf_salt_pkey") => Err(StoreError::SaltReused(super::hex(&coin.salt))),
+		Err(e) if StoreError::is_unique(&e, "leaf_salt_leaf_id") => Err(StoreError::LeafExists(super::hex(&coin.leaf_id))),
+		Err(e) => Err(e.into()),
+	}
+}
+
+/// Inserts `coin` inside `tx`: takes its nonce and its salt, records its
+/// scripts, writes the leaf. A key wanted by a participation is refused for
+/// any coin but the batch leaf that participation's round makes.
 pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &NewCoin) -> Result<(), StoreError> {
 	if let Some(nonce) = &coin.operator_nonce {
 		take_nonce(tx, nonce, &coin.leaf_id).await?;
@@ -206,7 +244,7 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 		],
 	).await;
 	match r {
-		Ok(_) => Ok(()),
+		Ok(_) => take_salt(tx, coin).await,
 		Err(e) if StoreError::is_unique(&e, "leaf_pkey") => Err(StoreError::LeafExists(super::hex(&coin.leaf_id))),
 		Err(e) if StoreError::is_unique(&e, "leaf_owner_key_key") => Err(StoreError::KeyReused),
 		Err(e) if StoreError::is_unique(&e, "leaf_script_pubkey_key") => Err(StoreError::ScriptReused),
@@ -298,6 +336,14 @@ impl Store {
 			&[&&key[..]],
 		).await?;
 		rows.iter().map(leaf_row).collect()
+	}
+
+	/// Which of `salts` the server has seen, on a leaf or promised to one.
+	pub async fn known_salts(&self, salts: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let list: Vec<Vec<u8>> = salts.iter().map(|s| s.to_vec()).collect();
+		let rows = conn.query("SELECT salt FROM leaf_salt WHERE salt = ANY($1)", &[&list]).await?;
+		rows.into_iter().map(|r| array32(r.get(0), "salt")).collect()
 	}
 
 	/// Whether the server knows `script_pubkey` as an Arca script, and for

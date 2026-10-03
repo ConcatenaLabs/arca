@@ -144,6 +144,20 @@ fn i64_of(v: u64) -> Result<i64, StoreError> {
 	i64::try_from(v).map_err(|_| StoreError::Corrupt(format!("amount {}", v)))
 }
 
+/// A fresh operator nonce for a leaf `by` wants under `owner_nonce`,
+/// recorded as issued and taken by `by` at once, whose salt with
+/// `owner_nonce` is new to the server and now promised to `by`.
+pub(super) async fn draw_salted_nonce(t: &tokio_postgres::Transaction<'_>, by: &[u8; 32], owner_nonce: &[u8; 32])
+	-> Result<[u8; 32], StoreError>
+{
+	loop {
+		let nonce = draw_nonce(t, by).await?;
+		if super::coins::promise_salt(t, &arca_covenant::leaf::leaf_salt(owner_nonce, &nonce), by).await? {
+			return Ok(nonce);
+		}
+	}
+}
+
 /// A fresh operator nonce, recorded as issued and taken by `by` at once.
 pub(super) async fn draw_nonce(t: &tokio_postgres::Transaction<'_>, by: &[u8; 32]) -> Result<[u8; 32], StoreError> {
 	loop {
@@ -295,7 +309,7 @@ impl Store {
 					if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state <> 'lost'", &[&&owner_key[..]]).await?.is_some() {
 						return Err(StoreError::KeyReused);
 					}
-					let nonce = draw_nonce(&t, &p.id).await?;
+					let nonce = draw_salted_nonce(&t, &p.id, owner_nonce).await?;
 					t.execute(
 						"INSERT INTO participation_output
 						 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce)
@@ -525,11 +539,13 @@ impl Store {
 				&[&&id[..], &&new_hash[..], &&new_preimage[..], &forfeit_first],
 			).await?;
 			let outputs = t.query(
-				"SELECT idx FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx", &[&&id[..]],
+				"SELECT idx, owner_nonce FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx",
+				&[&&id[..]],
 			).await?;
 			for o in outputs {
 				let idx: i16 = o.get(0);
-				let nonce = draw_nonce(&t, &id).await?;
+				let owner_nonce = array32(o.get(1), "owner nonce")?;
+				let nonce = draw_salted_nonce(&t, &id, &owner_nonce).await?;
 				t.execute(
 					"UPDATE participation_output SET operator_nonce = $3, leaf_id = NULL WHERE participation_id = $1 AND idx = $2",
 					&[&&id[..], &idx, &&nonce[..]],

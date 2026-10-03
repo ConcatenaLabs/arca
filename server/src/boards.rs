@@ -5,8 +5,9 @@
 //! coins to the board output and registers the record with the transaction.
 //! The server checks the record under its own policy (its chain, its key, its
 //! exit-delay bounds, an asset it serves, a value within the bounds, the board
-//! output paid exactly once, an owner key other than `S`), and the nonce,
-//! which it must have handed out and never seen taken. Then the node must
+//! output paid exactly once, an owner key other than `S`), the leaf's salt,
+//! which it must never have seen on a leaf or promised to one, and the
+//! nonce, which it must have handed out and never seen taken. Then the node must
 //! take the transaction: it is in a block or the mempool already, or the
 //! node's `testmempoolaccept` allows it. A transaction the node refuses (an
 //! input that does not exist, say) registers nothing, so no board nobody can
@@ -54,6 +55,8 @@ pub enum BoardError {
 	Exists,
 	#[error("the board's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
 	OperatorKey,
+	#[error("the board's salt {0} is already known to the server: every leaf has a salt of its own")]
+	SaltReused(String),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	#[error(transparent)]
@@ -78,6 +81,7 @@ impl BoardError {
 			BoardError::NotAccepted(_) => "not_accepted",
 			BoardError::Exists => "board_exists",
 			BoardError::OperatorKey => "operator_key",
+			BoardError::SaltReused(_) | BoardError::Store(StoreError::SaltReused(_)) => "salt",
 			BoardError::NotSynced => "not_synced",
 			BoardError::Store(StoreError::NonceUnknown) => "nonce_unknown",
 			BoardError::Store(StoreError::NonceUsed) => "nonce_used",
@@ -142,7 +146,10 @@ impl Boards {
 			}
 			return Err(BoardError::Exists);
 		}
-		// The nonce, before anything is asked of the node.
+		// The salt, then the nonce, before anything is asked of the node.
+		if let Some(known) = self.store.known_salts(&[record.salt()]).await?.first() {
+			return Err(BoardError::SaltReused(crate::signer::hex(known)));
+		}
 		self.store.check_nonce(&record.operator_nonce).await?;
 		self.accepted(tx).await?;
 		let board = record.policy();
@@ -156,6 +163,8 @@ impl Boards {
 			hops: 0,
 			record: CoinRecord::Board(*record).to_bytes().map_err(|e| BoardError::Internal(e.to_string()))?,
 			state: LeafState::Pending,
+			salt: record.salt(),
+			promised_to: None,
 			operator_nonce: Some(record.operator_nonce),
 			scripts: vec![
 				NewScript { script_pubkey: board.script_pubkey().to_bytes(), kind: ScriptKind::Board },
