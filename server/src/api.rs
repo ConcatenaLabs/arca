@@ -365,6 +365,10 @@ pub struct ParticipationStatus {
 	pub inputs: Vec<ParticipationInputStatus>,
 	pub outputs: Vec<ParticipationOutputStatus>,
 	pub fees: Vec<FeeAmount>,
+	/// While pending: why the last round that could have taken it did not
+	/// (the operator's wallet could not fund its outputs, say).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub waiting: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

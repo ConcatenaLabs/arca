@@ -132,6 +132,8 @@ pub struct ParticipationRow {
 	pub inputs: Vec<ParticipationInput>,
 	pub outputs: Vec<ParticipationOutput>,
 	pub fees: Vec<([u8; 32], u64)>,
+	/// Why a round that could have taken it did not, while it is pending.
+	pub waiting: Option<String>,
 }
 
 fn u64_of(v: i64, what: &str) -> Result<u64, StoreError> {
@@ -163,7 +165,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 {
 	let r = c.query_opt(
 		"SELECT participation_id, unlock_hash, preimage, attempt, round_id, state::text, forfeit_first, not_before,
-		        refund_delay_units
+		        refund_delay_units, waiting
 		 FROM participation WHERE participation_id = $1",
 		&[&&id[..]],
 	).await?;
@@ -187,6 +189,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 		inputs: vec![],
 		outputs: vec![],
 		fees: vec![],
+		waiting: r.get(9),
 	};
 	for r in c.query(
 		"SELECT leaf_id, asset, value, margin, attestation FROM participation_input WHERE participation_id = $1 ORDER BY idx",
@@ -546,6 +549,15 @@ impl Store {
 	/// Voids the pending participation `id`, which will not run: each coin it
 	/// gave up for which no forfeit was ever signed is given back
 	/// ([`give_back`]). Returns whether it was pending.
+	/// Says why the pending participation `id` waits, or that it does not
+	/// (`None`).
+	pub async fn set_waiting(&self, id: &[u8; 32], why: Option<&str>) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("UPDATE participation SET waiting = $2 WHERE participation_id = $1 AND waiting IS DISTINCT FROM $2",
+			&[&&id[..], &why]).await?;
+		Ok(())
+	}
+
 	pub async fn void_participation(&self, id: &[u8; 32]) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;

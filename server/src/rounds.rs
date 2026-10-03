@@ -1,8 +1,11 @@
 //! The round: what turns pending participations into batches on-chain.
 //!
 //! At each round the runner gathers the pending participations whose
-//! earliest round time has come, checks their coins again, and builds one
-//! tree per asset with `arca-covenant`'s builder ([`Tree::build`]): balanced
+//! earliest round time has come, checks their coins again, takes those the
+//! operator's wallet can fund in each asset (what the round pays for them,
+//! batch outputs with their reserves and offboard outputs, then its own fee
+//! and connector; one that does not fit waits, saying why, and delays no
+//! other), and builds one tree per asset with `arca-covenant`'s builder ([`Tree::build`]): balanced
 //! at radix 4, every node gated, RECLAIM on the lowest nodes, each leaf
 //! behind its participation's hash-locked entry, the reserve at four times the
 //! node's floor in the batch asset (one atom where the node does not accept
@@ -246,6 +249,8 @@ impl Rounds {
 				},
 				Err(e) => {
 					log::warn!("participation {} waits: {}", crate::signer::hex(&p.id), e);
+					self.store.set_waiting(&p.id, Some(&format!("coin {} does not pass the check a round makes now: {}", LeafId(i.leaf_id), e)))
+						.await?;
 					return Ok(false);
 				},
 			}
@@ -258,8 +263,6 @@ impl Rounds {
 	pub async fn run_round(&self) -> Result<Option<Built>, RoundError> {
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
-		let p = self.params.clone();
-		let s = p.operator;
 
 		// The participations, whole, within the batch size.
 		let mut chosen: Vec<ParticipationRow> = vec![];
@@ -303,9 +306,129 @@ impl Rounds {
 			}
 			chosen.push(row);
 		}
-		if chosen.is_empty() {
-			return Ok(None);
+		// What the wallet can fund: a participation whose outputs do not fit
+		// waits, saying why, and delays no other.
+		let mut chosen = self.fundable(chosen, now).await?;
+		loop {
+			if chosen.is_empty() {
+				return Ok(None);
+			}
+			match self.build_from(&chosen, now).await {
+				// Short of an asset once the round's own fee and connector are
+				// counted: the last participation wanting that asset waits.
+				Err(RoundError::Wallet(WalletError::Insufficient { asset, need, have })) => {
+					let a = asset.into_inner().to_byte_array();
+					let i = match chosen.iter().rposition(|r| r.outputs.iter().any(|o| o.asset == a)) {
+						Some(i) => i,
+						None => return Err(RoundError::Wallet(WalletError::Insufficient { asset, need, have })),
+					};
+					let row = chosen.remove(i);
+					self.wait(&row, asset, need, have).await?;
+				},
+				other => return other,
+			}
 		}
+	}
+
+	/// Records why `row` waits: a round with it would pay `need` of `asset`,
+	/// and the wallet can spend `have`.
+	async fn wait(&self, row: &ParticipationRow, asset: AssetId, need: u64, have: u64) -> Result<(), RoundError> {
+		let why = format!("the operator's wallet cannot fund it in a round now: the round would pay {} of asset {}, and the wallet \
+			can spend {} of it; it runs once the wallet can", need, asset, have);
+		if row.waiting.as_deref() != Some(why.as_str()) {
+			log::warn!("participation {} waits: {}", crate::signer::hex(&row.id), why);
+		}
+		self.store.set_waiting(&row.id, Some(&why)).await?;
+		Ok(())
+	}
+
+	/// What a round with `rows` pays of each asset on their behalf: each
+	/// batch output, its leaves and its reserves as the builder makes them,
+	/// and each offboard output.
+	async fn pays(&self, rows: &[&ParticipationRow], now: MedianTime) -> Result<BTreeMap<AssetId, u64>, RoundError> {
+		let mut leaves: BTreeMap<AssetId, Vec<LeafSpec>> = BTreeMap::new();
+		let mut pays: BTreeMap<AssetId, u64> = BTreeMap::new();
+		for row in rows {
+			for o in &row.outputs {
+				let asset = AssetId::from_byte_array(o.asset);
+				match &o.kind {
+					WantedKind::Leaf { .. } => leaves.entry(asset).or_default().push(Self::spec(row, o)?),
+					WantedKind::Offboard { margin, .. } => *pays.entry(asset).or_default() += o.value + margin,
+				}
+			}
+		}
+		let expiries = self.expiries(now)?;
+		for (asset, specs) in leaves {
+			let reserve = match self.floor(asset).await? {
+				Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
+				None => ReserveRule::Fixed { node: 1, entry: 1 },
+			};
+			// The token's id changes no value: any asset stands in for it.
+			let schedule = ClockSchedule::new(AssetId::from_byte_array([0xee; 32]), self.params.operator, self.config.notice, expiries.clone())
+				.map_err(|e| RoundError::Internal(e.to_string()))?;
+			let params = TreeParams {
+				asset, chain: self.params.chain, schedule, burn: false, radix: self.config.radix, reserve,
+				min_leaf: self.params.assets.get(&asset).map(|a| a.min_leaf).unwrap_or(1),
+			};
+			let tree = Tree::build(params, &specs).map_err(|e| RoundError::Internal(format!("the tree of asset {}: {}", asset, e)))?;
+			*pays.entry(asset).or_default() += tree.batch_output().value;
+		}
+		Ok(pays)
+	}
+
+	/// The participations of `chosen` the wallet can fund now, in order: per
+	/// asset, what a round with them pays must fit in what the wallet can
+	/// spend of that asset. One that does not fit waits, saying why, and the
+	/// ones after it are taken if they fit.
+	async fn fundable(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
+		let balance = self.wallet.balance().await?;
+		let have = |a: &AssetId| balance.get(a).copied().unwrap_or(0);
+		let all: Vec<&ParticipationRow> = chosen.iter().collect();
+		let whole = self.pays(&all, now).await?;
+		if whole.iter().all(|(a, v)| *v <= have(a)) {
+			return Ok(chosen);
+		}
+		let mut taken: Vec<ParticipationRow> = vec![];
+		for row in chosen {
+			let mut with: Vec<&ParticipationRow> = taken.iter().collect();
+			with.push(&row);
+			let pays = self.pays(&with, now).await?;
+			let mine: Vec<AssetId> = row.outputs.iter().map(|o| AssetId::from_byte_array(o.asset)).collect();
+			match pays.iter().find(|(a, v)| mine.contains(a) && **v > have(a)) {
+				Some((a, v)) => self.wait(&row, *a, *v, have(a)).await?,
+				None => taken.push(row),
+			}
+		}
+		Ok(taken)
+	}
+
+	/// The leaf `o` of `row` wants, as the tree builder takes it.
+	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
+		match &o.kind {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce } => Ok(LeafSpec {
+				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
+				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
+				value: o.value,
+				owner_nonce: *owner_nonce,
+				operator_nonce: *operator_nonce,
+				exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
+				unlock_hash: row.unlock_hash,
+			}),
+			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
+		}
+	}
+
+	/// The expiries of a round built at `now`.
+	fn expiries(&self, now: MedianTime) -> Result<Vec<MedianTime>, RoundError> {
+		(1..=self.config.steps as u32)
+			.map(|k| MedianTime::from_consensus(now.to_consensus_u32() + k * self.config.lifetime))
+			.collect::<Result<_, _>>().map_err(|e| RoundError::Internal(e.to_string()))
+	}
+
+	/// Builds, checks, records and broadcasts the round of `chosen`.
+	async fn build_from(&self, chosen: &[ParticipationRow], now: MedianTime) -> Result<Option<Built>, RoundError> {
+		let p = self.params.clone();
+		let s = p.operator;
 
 		// The leaves per asset, and the offboards.
 		let mut groups: BTreeMap<AssetId, Vec<Planned>> = BTreeMap::new();
@@ -314,17 +437,8 @@ impl Rounds {
 			for (j, o) in row.outputs.iter().enumerate() {
 				let asset = AssetId::from_byte_array(o.asset);
 				match &o.kind {
-					WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce } => {
-						let spec = LeafSpec {
-							template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
-							owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key)
-								.map_err(|e| RoundError::Internal(e.to_string()))?,
-							value: o.value,
-							owner_nonce: *owner_nonce,
-							operator_nonce: *operator_nonce,
-							exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
-							unlock_hash: row.unlock_hash,
-						};
+					WantedKind::Leaf { .. } => {
+						let spec = Self::spec(row, o)?;
 						groups.entry(asset).or_default().push(Planned { participation: k, output: j as u16, spec });
 					},
 					WantedKind::Offboard { script, margin, reclaim_delay_units } => {
@@ -358,9 +472,7 @@ impl Rounds {
 		let connector = AssetAmount::new(fee_asset, fees::atoms_for(fee_floor, issuance_vsize(s, fee_asset), fees::MULTIPLE).max(1));
 
 		// The schedule's times and each batch's reserve rule.
-		let expiries: Vec<MedianTime> = (1..=self.config.steps as u32)
-			.map(|k| MedianTime::from_consensus(now.to_consensus_u32() + k * self.config.lifetime))
-			.collect::<Result<_, _>>().map_err(|e| RoundError::Internal(e.to_string()))?;
+		let expiries = self.expiries(now)?;
 		let reserves: BTreeMap<AssetId, ReserveRule> = groups.keys().map(|a| (*a, match floors[a] {
 			Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
 			None => ReserveRule::Fixed { node: 1, entry: 1 },
@@ -537,6 +649,9 @@ impl Rounds {
 		let batches: Vec<(AssetId, u32, usize)> = groups.iter().enumerate().map(|(i, (a, l))| (*a, 2 * i as u32, l.len())).collect();
 		log::info!("round {} ({}): {} batch(es), {} offboard(s), {} participation(s), {} vB, fee {} of {}: {}",
 			round_id, txid, batches.len(), offboards.len(), chosen.len(), tx.vsize(), built.fee.amount, fee_asset, broadcast);
+		for row in chosen {
+			self.store.set_waiting(&row.id, None).await?;
+		}
 		Ok(Some(Built {
 			round_id, tx, batches, offboards: offboards.len(), participations: chosen.len(), connector_vout: c, broadcast,
 		}))

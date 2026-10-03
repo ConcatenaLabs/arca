@@ -20,7 +20,8 @@ script of its own.
 The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V1__arca.sql`](schema/V1__arca.sql) and the migrations after it
 ([`schema/V2__watcher.sql`](schema/V2__watcher.sql),
-[`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql)). `Store::connect` builds it
+[`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql),
+[`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -279,7 +280,15 @@ accepted. A coin is checked again under a horizon of one day before its first
 expiry: a participation accepted before its exit deadline still runs if a
 round takes it by then, and one with a coin past that can never run and is
 voided, its coins given back. A batch holds at most 1,024 leaves; a participation runs whole in one
-round, its leaves in several assets included. Each batch has its own sweep
+round, its leaves in several assets included. The participations are taken
+against what the operator's wallet can spend of each asset now: per asset,
+what the round pays on their behalf (each batch output, leaves and reserves
+as the builder makes it, and each offboard output) must fit, and the round's
+own fee and connector after it. A participation that does not fit waits,
+in order, and the ones after it still run if they fit: one asset the
+operator is short of delays no participation in another. A participation
+that waits says why in its status (`waiting`), and runs once the wallet can
+fund it. Each batch has its own sweep
 token, one explicit atom with no reissuance token, issued by one of the
 operator's coins, and a clock schedule of three steps, 28, 56 and 84 days
 after the round's median time, with a notice of 36 hours.
@@ -501,7 +510,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
 | `POST submit_participation` | Accepts a participation in a round |
-| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it |
+| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, and while it is pending why the last round did not take it (`waiting`) |
 | `POST tree` | The published tree of a batch, by its round's txid and output |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
@@ -705,6 +714,11 @@ new leaf from the published tree alone, and a published tree with a leaf's
 value or unlock hash, the last expiry, the clock's order or the reserve rule
 changed is refused. It also builds rounds of 1, 4 and 16 leaves and prints
 their sizes.
+
+`tests/funding.rs` gives the operator's wallet less of Y than a
+participation in Y wants: the round takes the participation in X, the one in
+Y waits and says why, and the next round takes it once the wallet is paid
+more Y.
 
 `tests/forfeits.rs` runs a refresh end to end: a board, its participation,
 the round final, the new leaf validated from the published tree, the forfeit
