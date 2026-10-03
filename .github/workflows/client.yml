@@ -83,4 +83,4 @@ jobs:
         run: cargo build --locked -p arca-server --bin arca-signer
 
       - name: Scenarios
-        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_digests -- --nocapture
+        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_digests -- --nocapture

@@ -78,10 +78,9 @@ impl Running {
 			],
 			fee_assets: None,
 			fees: Default::default(),
-			// The scenarios take every step a wallet takes, and the server's
-			// own on-chain work would change the coins they hold; the
-			// watcher has tests of its own in the server.
-			watcher: WatcherSection { enabled: false, ..Default::default() },
+			// The watcher acts on the chain for the operator, as it does on a
+			// server in use: the wallet must hold its coins with it on.
+			watcher: WatcherSection::default(),
 			// The scenarios ask for nonces and challenges faster than one
 			// wallet does.
 			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },

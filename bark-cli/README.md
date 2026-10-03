@@ -55,9 +55,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   wallet signs anything for it: the five checks on the sweep token and its
   clock, the batch output paid exactly once, the notice, a first expiry at
   least 27 days ahead, the exit delay within the wallet's bounds, the depth, the
-  reserves. Only once the round is final. The forfeit of each coin given up is
-  built from that validated leaf and round, and its refund delay must end
-  before the new leaves' exit deadline.
+  reserves. Only once the round is final, and only when the operator's status
+  shows exactly the leaves the wallet asked for, in order, each validated, all
+  under the participation's one unlock hash, and exactly the coins it gave up.
+  The forfeit of each coin given up is built from the validated leaf of the
+  coin's own asset and its round, and its refund delay must end before the new
+  leaves' exit deadline.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -125,8 +128,8 @@ A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 ## Testing
 
 `tests/arca_scenarios.rs` runs `arca` as a user runs it against a whole Arca
-server (`arca-signer` in its own process, `Server::start` with its tasks and
-its HTTP listener) on an anchored proof-of-stake regtest chain, its wallet
+server (`arca-signer` in its own process, `Server::start` with its tasks, its
+watcher and its HTTP listener) on an anchored proof-of-stake regtest chain, its wallet
 paid in an issued asset and never the policy asset. Two wallets are created
 and board, a board is credited once final; one pays the other out of round,
 the receiver validates the coin from its mailbox; a wallet refreshes through a
@@ -140,8 +143,18 @@ leaf's value, the last expiry, a clock running backwards): the wallet refuses
 each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
-refusal is asserted by its reason. `tests/arca_digests.rs` checks the wallet's
-call authentication and participation id against the server's own.
+refusal is asserted by its reason.
+
+`tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
+answer of the server or hold a call unanswered, and with transactions the test
+builds itself as the operator or as a sender. Each case is one way an operator
+lies, stalls or vanishes, or a sender goes back on a payment, and each ends
+with the wallet refusing before it signs anything, or taking its coin on-chain
+and holding it there, with the reason shown: a refresh whose status hides a new
+leaf or names another unlock hash.
+
+`tests/arca_digests.rs` checks the wallet's call authentication and
+participation id against the server's own.
 
 They need `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` (as for the server's tests:
 [server/README.md](../server/README.md)) and the signer binary, built beside
@@ -150,5 +163,5 @@ needs `protoc` (`apt install protobuf-compiler`).
 
     cargo build -p arca-server --bin arca-signer
     ARCA_TEST_POSTGRES=postgres://arca@127.0.0.1:55432/postgres \
-    SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-cli --test arca_scenarios -- --nocapture
+    SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-cli --test arca_scenarios --test arca_adversity -- --nocapture
     cargo test -p arca-wallet --features arca --lib arca::
