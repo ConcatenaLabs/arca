@@ -27,7 +27,7 @@ use arca_covenant::sign::sign_digest;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::{ExplicitOutput, Forfeit, OffboardPolicy, RelativeTime, ValidOrigin};
 use common::client::{forfeit_sig, hex, participation_body, random32, unhex};
-use common::flow::{drive, exit_tx, final_of, has, log, of_kind, refresh, settle, txid, verdict, Coin};
+use common::flow::{claim_of, drive, exit_tx, final_of, has, log, of_kind, refresh, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
 use common::rounds::{advance_mtp, credited_board, round_final, start, status, VALUE};
 use common::running::Running;
@@ -157,7 +157,9 @@ async fn offboards_in_either_asset_are_unlocked_by_the_watcher() {
 	}
 	// The Y board came back too: its forfeit and claim paid by coins of X.
 	for kind in ["forfeit", "claim"] {
-		let w = l.iter().find(|w| w.kind == kind && w.subject == cy.held.id.0.to_vec()).unwrap();
+		let w = if kind == "claim" { claim_of(&l, &cy.held.id.0).unwrap() } else {
+			l.iter().find(|w| w.kind == kind && w.subject == cy.held.id.0.to_vec()).unwrap()
+		};
 		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
 		let fee_asset = tx.output.iter().find(|o| o.is_fee()).and_then(|o| o.asset.explicit()).unwrap();
 		println!("Y board's {} {} ({} vB): fee in {}", kind, txid(w), tx.vsize(), if fee_asset == x { "X" } else { "Y" });

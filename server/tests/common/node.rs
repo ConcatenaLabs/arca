@@ -12,10 +12,17 @@ use sequentia_ext::{explicit_txout, fee_txout, AssetAmount, TxOutExt};
 
 /// A fresh chain under its own directory: tests in one binary run in parallel.
 pub fn start() -> Regtest {
+	start_with(&[])
+}
+
+/// [`start`], the node given `extra` arguments as well.
+pub fn start_with(extra: &[&str]) -> Regtest {
 	static N: AtomicUsize = AtomicUsize::new(0);
 	let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 		.join(format!("server-regtest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
-	Regtest::pos_from_env(&dir, &["-par=1"])
+	let mut args = vec!["-par=1"];
+	args.extend_from_slice(extra);
+	Regtest::pos_from_env(&dir, &args)
 }
 
 /// A bare `OP_TRUE`: anyone spends it with an empty witness, through the

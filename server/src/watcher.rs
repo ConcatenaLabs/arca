@@ -16,7 +16,11 @@
 //!    converted is the same case: its leaf appears.
 //! 2. **Boards given up in a round.** Once the round is final, the forfeit of
 //!    a board is published from the board output: a board never expires, so
-//!    this is how its value comes back to the operator. A coin of a transfer
+//!    this is how its value comes back to the operator. Every forfeit's
+//!    refund clock starts when it confirms, so these go out no faster than
+//!    they can be claimed: a new one is published only while the watcher's
+//!    own transactions waiting for a block stay within `block_share_vbytes`,
+//!    and only if its claim can follow within its refund delay. A coin of a transfer
 //!    given up in a round whose lineage rests on boards alone never expires
 //!    either: the watcher publishes each board's checkpoint, and 1 carries it
 //!    through each reassignment to the coin's forfeit.
@@ -28,10 +32,13 @@
 //!    lineage), so 1 publishes the forfeit; once every forfeit is final, the
 //!    claims reveal the preimage, and once the claims are final the
 //!    participation is released.
-//! 4. **Claims.** Each forfeit the watcher published is claimed with the
-//!    preimage of its unlock hash and an atom of its round's connector asset
-//!    `M`, issued from the round's connector output when no atom is held,
-//!    and paid back to the wallet by every claim for the next.
+//! 4. **Claims.** The forfeits the watcher published that are in a block are
+//!    claimed, every one of a round in one transaction (up to
+//!    `max_claim_inputs`), each with the preimage of its unlock hash, against
+//!    one atom of the round's connector asset `M`, which every claim names
+//!    and which goes back to the wallet for the next. The atom is issued
+//!    from the round's connector output when the first board forfeit of the
+//!    round is published, so it is held by the time the forfeits confirm.
 //! 5. **Offboards.** A released participation's offboard output is unlocked
 //!    to its destination with the preimage, which the owner already holds. One
 //!    whose participation expired or was voided (its preimage never went out)
@@ -71,13 +78,12 @@ use elements::{AssetId, OutPoint, Script, Transaction, Txid};
 use tokio::sync::{broadcast, Mutex};
 
 use arca_covenant::encode::Encoding;
-use arca_covenant::forfeit::ForfeitPolicy;
 use arca_covenant::node::{connector_index, reclaim_items};
 use arca_covenant::sign::{script_spend_sighash, verify_digest};
 use arca_covenant::spend::{FeeSource, KeySpend};
 use arca_covenant::tree::Tree;
 use arca_covenant::{
-	connector_asset, sweep_tx, Clock, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, MedianTime,
+	connector_asset, sweep_tx, ClaimTx, Clock, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, MedianTime,
 	OffboardPolicy, Pair, RelativeTime, Sweepable, TokenPlace, ValidCoin, ValidOrigin, WalletPolicy,
 };
 use sequentia_ext::AssetAmount;
@@ -107,12 +113,38 @@ pub struct WatcherConfig {
 	/// reclaims) run when no block arrives; stale exits are answered on every
 	/// pass of the finality service.
 	pub recovery_interval: Duration,
+	/// The most forfeits one claim takes.
+	pub max_claim_inputs: usize,
+	/// How many vbytes of the watcher's own transactions may wait for a
+	/// block before it publishes no new forfeit of a board: the share of a
+	/// block it takes, so every forfeit it publishes is claimed a block or two
+	/// after it confirms.
+	pub block_share_vbytes: u64,
+	/// The chain's block interval, to tell whether a forfeit published now
+	/// can be claimed within its refund delay.
+	pub block_interval: Duration,
 }
 
 impl Default for WatcherConfig {
 	fn default() -> WatcherConfig {
-		WatcherConfig { reclaim_early: true, max_sweep_inputs: 50, recovery_interval: Duration::from_secs(30) }
+		WatcherConfig {
+			reclaim_early: true, max_sweep_inputs: 50, recovery_interval: Duration::from_secs(30),
+			max_claim_inputs: 200, block_share_vbytes: 45_000, block_interval: Duration::from_secs(60),
+		}
 	}
+}
+
+/// What one more forfeit adds to its round's claim, in vbytes: a claim input
+/// with its witness (the operator's signature, the preimage, `k`, the claim
+/// script and its control block), measured at about 130 (`tests/claims.rs`).
+pub const CLAIM_INPUT_VSIZE: u64 = 140;
+
+/// A forfeit the watcher published, in a block, ready to be claimed.
+struct Claimable {
+	round_id: i64,
+	forfeit: Forfeit,
+	at: OutPoint,
+	preimage: [u8; 32],
 }
 
 /// Why the watcher could not act.
@@ -417,6 +449,45 @@ impl Watcher {
 		Ok(Payout { made, fee_coin: Some(coin), fee })
 	}
 
+	/// [`Watcher::payout`] for what a spend takes in several assets
+	/// (`held`): each asset's value goes to the wallet, the fee from the
+	/// first of them the node accepts for fees now whose value covers it
+	/// twice over; otherwise a wallet coin pays.
+	async fn payout_all<T, F>(&self, held: &BTreeMap<AssetId, u64>, wallet_inputs: &[usize], mut make: F) -> Result<Payout<T>, WatcherError>
+	where
+		F: FnMut(&[ExplicitOutput], &FeeSource) -> Result<(T, Transaction), String>,
+	{
+		let to = self.to_wallet().await?;
+		let outs = |less: Option<(AssetId, u64)>| -> Vec<ExplicitOutput> {
+			held.iter().map(|(a, v)| {
+				let fee = less.filter(|(b, _)| b == a).map(|(_, f)| f).unwrap_or(0);
+				ExplicitOutput::new(*a, v - fee, to.clone())
+			}).collect()
+		};
+		for (asset, value) in held {
+			if self.accepted(*asset).await?.is_none() {
+				continue;
+			}
+			let (_, dummy) = make(&outs(None), &FeeSource::Reserve).map_err(WatcherError::Build)?;
+			// The fee output is not there yet: allow for it.
+			let fee = self.wallet.fee_in(*asset, sized(dummy, wallet_inputs) + 50).await?;
+			if *value > fee.saturating_mul(2) {
+				let (made, _) = make(&outs(Some((*asset, fee))), &FeeSource::Reserve).map_err(WatcherError::Build)?;
+				return Ok(Payout { made, fee_coin: None, fee: AssetAmount::new(*asset, fee) });
+			}
+		}
+		let first = *held.keys().next().ok_or_else(|| WatcherError::Build("nothing to pay out".into()))?;
+		let all = outs(None);
+		let (made, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets(first), |src| {
+			let (made, dummy) = make(&all, src)?;
+			let mut w = wallet_inputs.to_vec();
+			w.extend(fee_input(&dummy, src));
+			let txid = dummy.txid();
+			Ok((made, txid, sized(dummy, &w)))
+		}).await?;
+		Ok(Payout { made, fee_coin: Some(coin), fee })
+	}
+
 	/// Builds a spend whose outputs its signers committed to: the margin they
 	/// left pays the fee when the node accepts its asset now and the margin
 	/// covers the node's floor; otherwise a wallet coin pays, the margin
@@ -654,9 +725,36 @@ impl Watcher {
 	// 2. Boards given up in a round
 	// -----------------------------------------------------------------------
 
+	/// The vbytes of the watcher's own transactions the nursery holds that
+	/// no block holds yet.
+	async fn waiting_vbytes(&self) -> Result<u64, WatcherError> {
+		let mut v = 0;
+		for tx in self.store.watcher_unconfirmed().await? {
+			let t: Transaction = deserialize(&tx).map_err(build("a watcher transaction"))?;
+			v += t.vsize() as u64;
+		}
+		Ok(v)
+	}
+
+	/// Whether a forfeit published now, with `waiting` vbytes of the
+	/// watcher's ahead of it, is claimed before its refund opens: it
+	/// confirms once those are in blocks, and its claim a block or two
+	/// after, each block about `block_interval` apart, while its refund
+	/// opens `refund_delay` after the block that holds it.
+	fn claimed_in_time(&self, waiting: u64, refund_delay_units: u16) -> bool {
+		let share = self.config.block_share_vbytes.max(1);
+		let blocks = waiting.div_ceil(share) + 2;
+		let needed = blocks.saturating_mul(self.config.block_interval.as_secs());
+		needed < u64::from(refund_delay_units) * 512
+	}
+
 	/// Publishes the forfeit of every credited board given up in a round
-	/// that is final, from the board output.
+	/// that is final, from the board output, no faster than the forfeits can
+	/// be claimed: see the [module documentation](self).
 	async fn recover_boards(&self, _now: MedianTime) -> Result<(), WatcherError> {
+		let mut waiting = self.waiting_vbytes().await?;
+		let mut held_back = 0usize;
+		let mut atoms: HashSet<i64> = HashSet::new();
 		for id in self.store.boards_to_recover().await? {
 			let b = match self.store.board(&id).await? {
 				Some(b) if b.state == BoardState::Credited => b,
@@ -683,6 +781,11 @@ impl Watcher {
 			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
 				continue;
 			}
+			// Paced: within the block share, and claimable in time.
+			if waiting >= self.config.block_share_vbytes || !self.claimed_in_time(waiting, f.forfeit.refund_delay_units) {
+				held_back += 1;
+				continue;
+			}
 			let r = async {
 				let coin = self.coin(&b.leaf_id).await?;
 				let (board, _) = coin.board().ok_or_else(|| WatcherError::Build("a board's coin is not a board".into()))?;
@@ -692,11 +795,24 @@ impl Watcher {
 					let t = u.tx.clone();
 					Ok((u, t))
 				}).await?;
+				let vsize = u.tx.vsize() as u64;
 				let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
-				self.publish(Ready { tx: u.tx, wallet, fee }, "forfeit", b.leaf_id.to_vec(),
-					format!("the forfeit of board {}, given up in round {}", hex(&b.leaf_id), f.round_id)).await
+				let done = self.publish(Ready { tx: u.tx, wallet, fee }, "forfeit", b.leaf_id.to_vec(),
+					format!("the forfeit of board {}, given up in round {}", hex(&b.leaf_id), f.round_id)).await?;
+				Ok::<_, WatcherError>(done.map(|_| vsize))
 			}.await;
-			Self::item(&format!("the board {}", hex(&b.leaf_id)), r)?;
+			if let Some(Some(vsize)) = Self::item(&format!("the board {}", hex(&b.leaf_id)), r)? {
+				waiting += vsize + CLAIM_INPUT_VSIZE;
+				// The round's atom of `M`, so the claim need not wait for it.
+				if atoms.insert(f.round_id) {
+					let r = self.connector_atom(f.round_id).await;
+					Self::item(&format!("the connector atom of round {}", f.round_id), r)?;
+				}
+			}
+		}
+		if held_back > 0 {
+			log::info!("watcher: {} board forfeit(s) wait for block space: {} vB of the watcher's wait for a block (share {})",
+				held_back, waiting, self.config.block_share_vbytes);
 		}
 		Ok(())
 	}
@@ -763,7 +879,7 @@ impl Watcher {
 			}
 			let mut claimed = 0;
 			for i in &p.inputs {
-				if self.store.watcher_txs("claim", &i.leaf_id).await?.iter().any(|w| w.state == NurseryState::Final) {
+				if self.claimed_final(&i.leaf_id).await? {
 					claimed += 1;
 					continue;
 				}
@@ -915,30 +1031,55 @@ impl Watcher {
 		Ok(None)
 	}
 
-	/// Claims every forfeit the watcher published whose output is unspent,
-	/// with the preimage and an atom of its round's connector asset. A
-	/// forfeit-first participation's are claimed only once all its
+	/// Whether a forfeit the watcher published of the coin `leaf_id` is
+	/// claimed by a transaction of the watcher's that is final.
+	async fn claimed_final(&self, leaf_id: &[u8; 32]) -> Result<bool, WatcherError> {
+		for f in self.store.watcher_txs("forfeit", leaf_id).await? {
+			if self.store.watcher_spend(&f.txid, 0).await?.is_some_and(|w| w.kind == "claim" && w.state == NurseryState::Final) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// Claims the forfeits the watcher published that are in a block and
+	/// unspent: every one of a round in one transaction, up to
+	/// `max_claim_inputs`, against one atom of the round's connector asset.
+	/// A forfeit-first participation's are claimed only once all its
 	/// forfeits are final, since the claim reveals the preimage.
 	async fn claim_forfeits(&self) -> Result<(), WatcherError> {
+		let mut by_round: BTreeMap<i64, Vec<Claimable>> = BTreeMap::new();
 		for (txid, subject) in self.store.unclaimed_forfeits().await? {
 			let leaf_id: [u8; 32] = match subject.try_into() {
 				Ok(l) => l,
 				Err(_) => continue,
 			};
 			let op = OutPoint::new(txid_of(&txid), 0);
-			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
+			if self.spending(&op).await? || !self.confirmed(op).await? {
 				continue;
 			}
-			let r = self.claim(&leaf_id, op).await;
-			Self::item(&format!("the claim of coin {}'s forfeit", hex(&leaf_id)), r)?;
+			let r = self.claimable(&leaf_id, op).await;
+			if let Some(Some(c)) = Self::item(&format!("the claim of coin {}'s forfeit", hex(&leaf_id)), r)? {
+				by_round.entry(c.round_id).or_default().push(c);
+			}
+		}
+		for (round_id, list) in by_round {
+			let n = list.len().min(self.config.max_claim_inputs.max(1));
+			let r = self.claim(round_id, &list[..n]).await;
+			Self::item(&format!("the claim of {} forfeit(s) of round {}", n, round_id), r)?;
+			if list.len() > n {
+				log::info!("watcher: {} more forfeit(s) of round {} wait for the next claim", list.len() - n, round_id);
+			}
 		}
 		Ok(())
 	}
 
-	async fn claim(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<(), WatcherError> {
+	/// The forfeit of `leaf_id` at `op`, if it is the coin's live forfeit and
+	/// may be claimed now.
+	async fn claimable(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<Option<Claimable>, WatcherError> {
 		let f = match self.live_forfeit(leaf_id).await? {
 			Some(f) => f,
-			None => return Ok(()),
+			None => return Ok(None),
 		};
 		let p = self.store.participation(&f.participation_id).await?
 			.ok_or_else(|| WatcherError::Build("a forfeit of no participation".into()))?;
@@ -947,7 +1088,7 @@ impl Watcher {
 			for i in &p.inputs {
 				let done = self.store.watcher_txs("forfeit", &i.leaf_id).await?.iter().any(|w| w.state == NurseryState::Final);
 				if !done {
-					return Ok(());
+					return Ok(None);
 				}
 			}
 		}
@@ -961,7 +1102,14 @@ impl Watcher {
 		}
 		let preimage = self.store.attempt_preimage(&f.participation_id, f.attempt).await?
 			.ok_or_else(|| WatcherError::Build("no preimage for the forfeit's attempt".into()))?;
-		let atom = match self.connector_atom(f.round_id).await? {
+		Ok(Some(Claimable { round_id: f.round_id, forfeit, at: op, preimage }))
+	}
+
+	/// Claims `list`, forfeits of the round `round_id`, in one transaction
+	/// against one atom of its connector asset, paying what they hold to the
+	/// wallet less the fee.
+	async fn claim(&self, round_id: i64, list: &[Claimable]) -> Result<(), WatcherError> {
+		let atom = match self.connector_atom(round_id).await? {
 			Some(a) => a,
 			None => return Ok(()),
 		};
@@ -969,21 +1117,36 @@ impl Watcher {
 		let m_out = sequentia_ext::explicit_txout(AssetAmount::new(AssetId::from_byte_array(atom.asset), atom.value),
 			Script::from(atom.script_pubkey.clone()));
 		let back = self.to_wallet().await?;
-		let pay = self.payout(held.asset, held.value, &[Forfeit::CONNECTOR_INPUT as usize], |outs, fee| {
-			let ks = forfeit.claim(op, (m_op, m_out.clone()), outs, back.clone(), fee).map_err(|e| e.to_string())?;
-			let t = ks.clone().finish(ForfeitPolicy::claim_items(&dummy_sig(), &preimage, Forfeit::CONNECTOR_INPUT)).tx;
-			Ok((ks, t))
+		let set: Vec<(&Forfeit, OutPoint)> = list.iter().map(|c| (&c.forfeit, c.at)).collect();
+		let preimages: Vec<[u8; 32]> = list.iter().map(|c| c.preimage).collect();
+		let mut held: BTreeMap<AssetId, u64> = BTreeMap::new();
+		for c in list {
+			let o = c.forfeit.output();
+			*held.entry(o.asset).or_default() += o.value;
+		}
+		let n = list.len();
+		let dummies = vec![dummy_sig(); n];
+		let pay = self.payout_all(&held, &[n], |outs, fee| {
+			let ct = arca_covenant::batch_claim_tx(&set, (m_op, m_out.clone()), outs, back.clone(), fee).map_err(|e| e.to_string())?;
+			let t = ct.clone().finish(&dummies, &preimages).map_err(|e| e.to_string())?.tx;
+			Ok((ct, t))
 		}).await?;
-		let ks: KeySpend = pay.made;
-		let txid = ks.tx.txid();
+		let ct: ClaimTx = pay.made;
+		let txid = ct.tx.txid();
 		self.wallet.take(&[&atom], &txid).await?;
-		let sig = self.operator_sig(&ks.tx, &ks.prevouts, 0, &ks.script).await?;
-		let n = ks.tx.input.len();
-		let u = ks.finish(ForfeitPolicy::claim_items(&sig, &preimage, Forfeit::CONNECTOR_INPUT));
-		let mut wallet = vec![(Forfeit::CONNECTOR_INPUT as usize, atom)];
-		wallet.extend(pay.fee_coin.map(|c| (n - 1, c)));
-		self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "claim", leaf_id.to_vec(),
-			format!("the claim of coin {}'s forfeit for round {}, revealing its preimage", hex(leaf_id), f.round_id)).await?;
+		let mut sigs = Vec::with_capacity(n);
+		for i in 0..n {
+			sigs.push(self.operator_sig(&ct.tx, &ct.prevouts, i, &ct.leaves[i]).await?);
+		}
+		let k = ct.connector_input() as usize;
+		let tx = ct.finish(&sigs, &preimages).map_err(build("the claim"))?.tx;
+		// What it acts for is the round, by its connector asset, as for the
+		// atom's issuance; each forfeit it claims is an input of it.
+		let subject = AssetId::from_byte_array(atom.asset).into_inner().to_byte_array().to_vec();
+		let mut wallet = vec![(k, atom)];
+		wallet.extend(pay.fee_coin.map(|c| (tx.input.len() - 1, c)));
+		self.publish(Ready { tx, wallet, fee: Some(pay.fee) }, "claim", subject,
+			format!("the claim of {} forfeit(s) of round {}, revealing their preimages", n, round_id)).await?;
 		Ok(())
 	}
 

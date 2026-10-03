@@ -44,10 +44,15 @@ impl Running {
 	/// [`Running::start`], with the server's configuration changed by `tune`
 	/// first. `tune` is given the configuration and asset Y.
 	pub async fn start_with<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {
+		Running::start_on(&[], tune).await
+	}
+
+	/// [`Running::start_with`] on a node given `node_args` as well.
+	pub async fn start_on<F: FnOnce(&mut Config, AssetId)>(node_args: &[&str], tune: F) -> Running {
 		// The server's log, at the level RUST_LOG names.
 		let _ = env_logger::builder().is_test(true).try_init();
 		let db = TestDb::new().await;
-		let rt = tokio::task::block_in_place(node::start);
+		let rt = tokio::task::block_in_place(|| node::start_with(node_args));
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
 		let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));
 		let y = tokio::task::block_in_place(|| purse.issue(&rt, "asset Y", 100_000_000_000));

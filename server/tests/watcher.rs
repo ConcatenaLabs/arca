@@ -47,7 +47,7 @@ use arca_covenant::spend::FeeSource;
 use arca_covenant::witness::find_preimage;
 use arca_covenant::ValidOrigin;
 use common::client::{new_leaf, random32, transfer_body, unhex};
-use common::flow::{drive, exit_tx, final_of, has, log, of_kind, refresh, settle, txid, verdict, Coin};
+use common::flow::{claim_of, claimed, drive, exit_tx, final_of, has, log, of_kind, refresh, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
 use common::node;
 use common::rounds::{advance_mtp, credited_board, start, VALUE};
@@ -185,7 +185,7 @@ async fn a_stale_exit_is_answered_and_refreshed_boards_come_back() {
 	let ftx: Transaction = elements::encode::deserialize(&forfeit.tx).unwrap();
 	assert_eq!(ftx.input[0].previous_output, leaf_at, "the forfeit spends A's leaf where A put it");
 	assert!(final_of(&l, "forfeit", &id1) && final_of(&l, "claim", &id1), "the forfeit and its claim are final");
-	let claim = l.iter().find(|w| w.kind == "claim" && w.subject == id1).unwrap();
+	let claim = claim_of(&l, &id1).unwrap();
 	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
 	let h = arca_covenant::script::sha256(&second[0].preimage);
 	assert_eq!(find_preimage(&ctx.input[0].witness.script_witness, &h), Some(second[0].preimage),
@@ -287,7 +287,7 @@ async fn an_expired_batch_is_released_then_swept() {
 	};
 	println!("a batch of five leaves (lowest nodes of 3 and 2), expiring at {}", e0);
 	// The boards given up come back first; then nothing more to do.
-	drive(&r, "the five boards", 12, |l| l.iter().filter(|w| w.kind == "claim").count() == 5).await;
+	drive(&r, "the five boards", 12, |l| claimed(l) == 5).await;
 	settle(&r).await;
 
 	// U0 unrolls the batch output and U3 its lowest node and its entry: an
@@ -350,7 +350,7 @@ async fn a_batch_every_owner_released_comes_back_before_it_expires() {
 	let pairs: Vec<(&Coin, &Keypair)> = boards.iter().zip(&keys).collect();
 	let first = refresh(&mut r, &pairs).await;
 	let round1 = first[0].round.clone();
-	drive(&r, "the five boards", 12, |l| l.iter().filter(|w| w.kind == "claim").count() == 5).await;
+	drive(&r, "the five boards", 12, |l| claimed(l) == 5).await;
 	settle(&r).await;
 
 	// Owners 0, 1, 2 refresh in round 2 and release; owners 3 and 4 in round 3.
@@ -400,7 +400,7 @@ async fn an_anchor_driven_reorganisation_takes_out_a_round_and_the_answers() {
 	let cb = board_coin(&mut r, &keypair("W5 B, board")).await;
 	let (a1, b1) = (keypair("W5 A, round 1"), keypair("W5 B, round 1"));
 	let first = refresh(&mut r, &[(&ca, &a1), (&cb, &b1)]).await;
-	drive(&r, "the two boards", 8, |l| l.iter().filter(|w| w.kind == "claim").count() == 2).await;
+	drive(&r, "the two boards", 8, |l| claimed(l) == 2).await;
 	settle(&r).await;
 
 	// A parent block of their own for what follows: round 2, A's stale
@@ -418,7 +418,7 @@ async fn an_anchor_driven_reorganisation_takes_out_a_round_and_the_answers() {
 	// What the watcher published after round 2: the forfeit, round 2's
 	// connector asset, the claim.
 	let m2 = arca_covenant::connector_asset(round2, second[0].connector_vout).into_inner().to_byte_array().to_vec();
-	let answers: Vec<(String, Txid)> = log(&r).await.iter().filter(|w| w.subject == id1 || (w.kind == "issue" && w.subject == m2))
+	let answers: Vec<(String, Txid)> = log(&r).await.iter().filter(|w| w.subject == id1 || ((w.kind == "issue" || w.kind == "claim") && w.subject == m2))
 		.map(|w| (w.kind.clone(), txid(w))).collect();
 	assert_eq!(answers.len(), 3, "{:?}", answers);
 	assert!(log(&r).await.iter().all(|w| w.state == server::store::NurseryState::Final));
@@ -460,7 +460,8 @@ async fn an_anchor_driven_reorganisation_takes_out_a_round_and_the_answers() {
 		assert_eq!(row.state, server::store::NurseryState::Final, "{} {} is final again, with the same txid", kind, t);
 		assert!(r.rt.client().confirmations(t).unwrap() >= 1);
 	}
-	assert_eq!(l.iter().filter(|w| w.subject == id1).count(), 2, "nothing built again: one forfeit and one claim");
+	assert_eq!((l.iter().filter(|w| w.subject == id1).count(), l.iter().filter(|w| w.kind == "claim" && w.subject == m2).count()), (1, 1),
+		"nothing built again: one forfeit and one claim");
 	advance_mtp(&r, 37 * HOUR).await;
 	let e = verdict(&r, &exit_tx(&r, &first[0].new_valid.branch.leaf, leaf_at, x, VALUE, &a1)).unwrap_err();
 	println!("A's exit after the reorganisation and its delay: refused, {}", e);

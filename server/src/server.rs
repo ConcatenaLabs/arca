@@ -153,13 +153,24 @@ pub struct WatcherSection {
 	/// How often the recovery work runs when no block arrives, in seconds.
 	#[serde(default = "default_recovery_interval")]
 	pub recovery_interval_seconds: u64,
+	/// The most forfeits one claim takes.
+	#[serde(default = "default_claim_inputs")]
+	pub max_claim_inputs: usize,
+	/// How many vbytes of the watcher's own transactions may wait for a
+	/// block before it publishes no new forfeit of a board.
+	#[serde(default = "default_block_share")]
+	pub block_share_vbytes: u64,
+	/// The chain's block interval, in seconds.
+	#[serde(default = "default_block_interval")]
+	pub block_interval_seconds: u64,
 }
 
 impl Default for WatcherSection {
 	fn default() -> WatcherSection {
 		WatcherSection {
 			enabled: true, reclaim_early: default_true(), max_sweep_inputs: default_sweep_inputs(),
-			recovery_interval_seconds: default_recovery_interval(),
+			recovery_interval_seconds: default_recovery_interval(), max_claim_inputs: default_claim_inputs(),
+			block_share_vbytes: default_block_share(), block_interval_seconds: default_block_interval(),
 		}
 	}
 }
@@ -174,6 +185,18 @@ fn default_sweep_inputs() -> usize {
 
 fn default_recovery_interval() -> u64 {
 	WatcherConfig::default().recovery_interval.as_secs()
+}
+
+fn default_claim_inputs() -> usize {
+	WatcherConfig::default().max_claim_inputs
+}
+
+fn default_block_share() -> u64 {
+	WatcherConfig::default().block_share_vbytes
+}
+
+fn default_block_interval() -> u64 {
+	WatcherConfig::default().block_interval.as_secs()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -418,6 +441,9 @@ impl Server {
 				reclaim_early: config.watcher.reclaim_early,
 				max_sweep_inputs: config.watcher.max_sweep_inputs.max(1),
 				recovery_interval: Duration::from_secs(config.watcher.recovery_interval_seconds.max(1)),
+				max_claim_inputs: config.watcher.max_claim_inputs.max(1),
+				block_share_vbytes: config.watcher.block_share_vbytes.max(1),
+				block_interval: Duration::from_secs(config.watcher.block_interval_seconds.max(1)),
 			});
 
 		// The first pass before anything is answered, so the chain is known,

@@ -451,16 +451,28 @@ one, nor for a reclaim before an owner under it has released.
   exit delay, after which its owner's exit finds the leaf spent.
 - **Boards given up in a round.** A board never expires, so once the round it
   was given up for is final the watcher publishes its forfeit from the board
-  output itself, and claims it. A coin of a transfer given up in a final round
+  output itself, and claims it. Every forfeit's refund clock starts when it
+  confirms, and a round may give up thousands of boards, so the watcher
+  publishes them no faster than it can claim them: a new one goes out only
+  while the watcher's own transactions waiting for a block stay within
+  `block_share_vbytes` (45,000 by default, about half a block), and only if
+  its claim can follow within its refund delay at `block_interval_seconds`
+  apart. The rest wait for the next pass, and each pass says how many wait.
+  The round's atom of its connector asset is issued with its first board
+  forfeit, so it is held by the time the forfeits confirm. A coin of a transfer given up in a final round
   whose lineage rests on boards alone never expires either: the watcher
   publishes each board's checkpoint from the board output, and the answers to
   stale exits carry it through each reassignment to the coin's forfeit. A coin
   resting on a batch leaf is left to that batch's sweep.
-- **Claims.** Each forfeit the watcher published is claimed with the preimage
-  of its unlock hash and an atom of its round's connector asset `M`. The
+- **Claims.** The forfeits the watcher published that are in a block are
+  claimed, every one of a round in one transaction (up to `max_claim_inputs`,
+  200 by default), each with the preimage of its unlock hash, against one
+  atom of the round's connector asset `M` that every claim in it names. The
   watcher issues that atom from the round's connector output when it holds
   none, to the wallet, and every claim pays it back to the wallet for the
-  next; claims of one round therefore follow one another, a block apart.
+  next. A claim acts for its round (its log entry names `M`) and takes each
+  forfeit as an input; it pays what the forfeits hold to the wallet, less the
+  fee in the first of their assets the node accepts, or a wallet coin pays.
 - **Forfeit-first.** A participation run again after a round that could not
   return has its forfeits stored and its preimage withheld. The watcher brings
   each coin it gave up onto the chain from the coin's own record (each node of a
@@ -733,6 +745,14 @@ cap raised: a board paid out of round with nearly the whole coin left as the
 reassignment's margin, then converted; the watcher's checkpoint and
 reassignment each pay the fee they need and return the rest to the
 operator's wallet, and a block takes the reassignment.
+
+`tests/claims.rs` refreshes 16, 200 and 2,000 boards in one round (2,000 is
+ignored by default; `-- --ignored` runs it) on a chain of one-minute blocks of
+400,000 weight units, the refund delay at its shortest (one unit, 512 s). The
+watcher passes once a block, and after each block the test checks every
+forfeit in a block whose claim is not: its refund must not be open (the tip's
+median time short of the refund delay past that of the block before the
+forfeit's), and its owner's refund is refused. Every forfeit is claimed.
 
 `tests/funding.rs` gives the operator's wallet less of Y than a
 participation in Y wants: the round takes the participation in X, the one in
