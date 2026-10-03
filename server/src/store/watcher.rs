@@ -275,4 +275,16 @@ impl Store {
 		).await?;
 		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
 	}
+
+	/// Every coin a transfer made that is given up in a participation and
+	/// has a forfeit stored.
+	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT DISTINCT l.leaf_id FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
+			 WHERE l.kind = 'transfer' AND l.state = 'spent' ORDER BY l.leaf_id",
+			&[],
+		).await?;
+		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
+	}
 }

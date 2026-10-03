@@ -21,6 +21,10 @@
 //!    back before it expires: the batch output unrolled by an owner's
 //!    authorisation, each lowest node reclaimed with an atom of each round's
 //!    connector asset.
+//! 6. A coin paid out of round from a board and then refreshed by its
+//!    receiver rests on that board alone and never expires: the watcher
+//!    publishes the board's checkpoint, the reassignment and the coin's
+//!    forfeit, and claims it.
 //! 5. An anchor-driven reorganisation: the parent orphans the block a round
 //!    and the watcher's answer to a stale exit are anchored to; the node
 //!    disconnects them, the nursery broadcasts them again unchanged, and they
@@ -461,4 +465,48 @@ async fn an_anchor_driven_reorganisation_takes_out_a_round_and_the_answers() {
 	let e = verdict(&r, &exit_tx(&r, &first[0].new_valid.branch.leaf, leaf_at, x, VALUE, &a1)).unwrap_err();
 	println!("A's exit after the reorganisation and its delay: refused, {}", e);
 	assert!(e.contains("missingorspent") || e.contains("missing-inputs"), "{}", e);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refreshed_coin_paid_from_a_board_comes_back() {
+	let mut r = start().await;
+	let (x, s) = (r.x, xonly(&r.s));
+	let a = keypair("W6 A");
+	let ca = board_coin(&mut r, &a).await;
+	let (b, a2) = (keypair("W6 B"), keypair("W6 A, change"));
+	let (b_leaf, b_nonce) = new_leaf(&b);
+	let (a2_leaf, _) = new_leaf(&a2);
+	let kept = VALUE - 2_000;
+	let outputs = vec![(x, 600_000, b_leaf), (x, kept - 600_000 - 2_000, a2_leaf)];
+	let done = r.http.post("cosign_transfer", &transfer_body(&[(&ca.held, ca.valid(&r), kept)], &outputs, s, r.chain)).ok();
+	let transfer: Vec<u8> = unhex(done["transfer_id"].as_str().unwrap());
+	let (_, b_id, b_record) = r.http.mailbox(&b, &r.chain, 0)[0].clone();
+	let cb = Coin { held: common::client::Held { key: b, nonce: b_nonce, id: b_id, record: b_record }, bases: ca.bases.clone() };
+	println!("A paid B 600000 of X from its board; B's coin rests on that board alone and never expires");
+
+	// B refreshes its coin into a round: the operator now holds B's forfeit,
+	// and funded B's new leaf.
+	let b2 = keypair("W6 B, round");
+	let got = refresh(&mut r, &[(&cb, &b2)]).await;
+	println!("B's coin refreshed into round {}", got[0].round.txid());
+
+	// The watcher brings B's old coin on-chain and claims its forfeit: the
+	// board's checkpoint, the reassignment, the forfeit, the claim.
+	let before = x_balance(&r).await;
+	let bid = b_id.0.to_vec();
+	drive(&r, "B's old coin, resting on A's board", 10, |l| has(l, "claim", &bid)).await;
+	settle(&r).await;
+	let l = log(&r).await;
+	assert!(final_of(&l, "checkpoint", &ca.held.id.0), "A's board checkpointed from the board output");
+	assert!(final_of(&l, "reassignment", &transfer), "the reassignment published, B's old leaf on the chain");
+	assert!(final_of(&l, "forfeit", &bid) && final_of(&l, "claim", &bid), "B's forfeit published and claimed");
+	let cp = l.iter().find(|w| w.kind == "checkpoint").unwrap();
+	let cptx: Transaction = elements::encode::deserialize(&cp.tx).unwrap();
+	assert_eq!(cptx.input[0].previous_output, ca.valid(&r).board().unwrap().1, "the checkpoint spends the board output itself");
+	let after = x_balance(&r).await;
+	println!("the wallet holds {} more of X: B's 600000 back, less the fees", after as i64 - before as i64);
+	assert!(after > before + 590_000);
+	// B's new leaf is untouched and live.
+	let ld = r.http.post("leaf_data", &serde_json::json!({"auth": r.http.auth("leaf_data", &b2, &r.chain)})).ok();
+	assert_eq!(ld["leaves"][0]["state"], "live");
 }

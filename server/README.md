@@ -390,7 +390,11 @@ which broadcasts it again unchanged after a rollback of any depth.
   exit delay, after which its owner's exit finds the leaf spent.
 - **Boards given up in a round.** A board never expires, so once the round it
   was given up for is final the watcher publishes its forfeit from the board
-  output itself, and claims it.
+  output itself, and claims it. A coin of a transfer given up in a final round
+  whose lineage rests on boards alone never expires either: the watcher
+  publishes each board's checkpoint from the board output, and the answers to
+  stale exits carry it through each reassignment to the coin's forfeit. A coin
+  resting on a batch leaf is left to that batch's sweep.
 - **Claims.** Each forfeit the watcher published is claimed with the preimage
   of its unlock hash and an atom of its round's connector asset `M`. The
   watcher issues that atom from the round's connector output when it holds
@@ -685,7 +689,10 @@ node and an entry), while the leaf an owner put on the chain exits. A batch
 every owner refreshed and released, in two rounds, comes back before it
 expires: one unroll of the batch output, a reclaim of each lowest node with an
 atom of the connector asset its releases name; nothing is unrolled while two
-owners have yet to release. And an anchor-driven reorganisation: the parent
+owners have yet to release. A coin paid out of round from a board and then
+refreshed by its receiver comes back: the board's checkpoint, the
+reassignment, the coin's forfeit and its claim. And an anchor-driven
+reorganisation: the parent
 chain orphans the block a round and the watcher's answer to a stale exit are
 anchored to and every block above; the node disconnects them all, the server
 no longer calls the round final, the round and the answers wait in the
