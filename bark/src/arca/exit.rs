@@ -473,19 +473,20 @@ impl Wallet {
 	}
 
 	/// Everything the wallet does on its own: the re-check of every coin
-	/// against the chain, transfer requests the server never answered, the
-	/// mailbox, every participation as far as it can go, every forfeit it
-	/// signed without the preimage in hand, followed on the chain, and every
-	/// exit it started.
+	/// against the chain, board registrations and transfer requests the
+	/// server never answered, the mailbox, every participation as far as it
+	/// can go, every forfeit it signed without the preimage in hand, followed
+	/// on the chain, and every exit it started.
 	pub fn sync(&mut self) -> Result<Value, Error> {
+		let boards = self.retry_boards()?;
 		let recheck = self.recheck()?;
 		let transfers = self.retry_transfers()?;
 		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let participations = self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		Ok(json!({"recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations, "forfeits": forfeits,
-			"exits": exits}))
+		Ok(json!({"boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations,
+			"forfeits": forfeits, "exits": exits}))
 	}
 
 	/// The decoded coin record of `leaf_id`, for people.

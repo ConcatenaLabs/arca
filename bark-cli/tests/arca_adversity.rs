@@ -876,6 +876,108 @@ async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() 
 	}
 }
 
+/// The server registers a board, and broadcasts it itself, but the answer
+/// comes back as a gateway's 502. That is no refusal: the coin stays pending
+/// with its transaction, `sync` posts the same registration again, and the
+/// coin is live once the board is final.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_whose_answer_is_lost_stays_pending_and_is_registered_again() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let x = r.x;
+	let a = Arca::new("F1A");
+	a.ok(&create_args(&proxy.url, &r.node_url()));
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	let onchain = |w: &Arca| w.ok(&["balance"])["sequentia_onchain"][x.to_string()].as_str().unwrap_or("0").parse::<u64>().unwrap();
+	let before = onchain(&a);
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/register_board" && status == 200 {
+			*v = json!({"error": {"code": "bad_gateway", "message": "upstream timed out"}});
+			return Some(502);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["board", &x.to_string(), "2000000"]);
+	println!("F1 board, answered 502 after the server registered it: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!(v["error"]["kind"], "unreachable", "a 502 is not a refusal: {}", v);
+	proxy.rewrite(None);
+	let coins = a.ok(&["coins"]);
+	let leaf = coins[0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coins[0]["state"], "pending", "the board is not lost: {}", coins);
+	assert!(v["error"]["message"].as_str().unwrap().contains("kept pending with its transaction"), "{}", v);
+	let id: LeafId = leaf.parse().unwrap();
+	let row = r.server.store.board(&id.0).await.unwrap().expect("the server took the board");
+	println!("F1 the server's board: {:?}", row.state);
+	let s = a.ok(&["sync"]);
+	println!("F1 sync: boards {}", s["boards"]);
+	assert_eq!(s["boards"][0]["registered"], true, "{}", s);
+	let calls: Vec<Value> = proxy.calls().into_iter().filter(|(p, ..)| p == "/v1/register_board").map(|(_, q, ..)| q).collect();
+	assert_eq!(calls.len(), 2);
+	assert_eq!(calls[0], calls[1], "the same registration, byte for byte");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the board", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	assert_eq!(coin_of(&a, &leaf)["state"], "live", "the board is the wallet's: {}", coin_of(&a, &leaf));
+	assert_eq!(a.ok(&["balance"])["arca"][x.to_string()]["live"], "2000000");
+	assert!(before - onchain(&a) >= 2_000_000);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// A board answered with a refusal although the server took it (a proxy's
+/// own 4xx, or a wallet that once took every failure for a refusal): the
+/// wallet holds it as lost, then follows it again once the server reports it
+/// credited and its transaction is in the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_held_as_lost_is_followed_again_once_the_server_credits_it() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let x = r.x;
+	let a = Arca::new("F1bA");
+	a.ok(&create_args(&proxy.url, &r.node_url()));
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/register_board" && status == 200 {
+			*v = json!({"error": {"code": "not_accepted", "message": "a refusal the server never made"}});
+			return Some(422);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["board", &x.to_string(), "1500000"]);
+	println!("F1b a board answered with a refusal after the server registered it: ok={} {}", ok, v);
+	assert!(!ok);
+	proxy.rewrite(None);
+	let second = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["value"] == "1500000").cloned().unwrap();
+	let second_leaf = second["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(second["state"], "lost", "{}", second);
+	let id: LeafId = second_leaf.parse().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	// The server's own record, not a command of the wallet's: each command
+	// re-checks the wallet's coins when it starts.
+	r.wait("the server to credit the board", || {
+		tokio::runtime::Handle::current().block_on(async {
+			r.server.boards.pass().await.ok();
+			r.server.store.board(&id.0).await.unwrap().map(|b| format!("{:?}", b.state)) == Some("Credited".into())
+		})
+	}).await;
+	let re = a.ok(&["recheck"]);
+	println!("F1b recheck: {}", re);
+	assert!(re["changes"].as_array().unwrap().iter().any(|c| c["leaf_id"] == second_leaf && c["from"] == "lost" && c["to"] == "live"), "{}", re);
+	assert_eq!(coin_of(&a, &second_leaf)["state"], "live");
+	assert_eq!(a.ok(&["balance"])["arca"][x.to_string()]["live"], "1500000");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
 /// A coin paid to the wallet while the board it rests on is rolled out of
 /// the chain is refused for a passing reason, kept, and accepted once the
 /// board is back.

@@ -110,7 +110,9 @@ the keys, but which coins were spent off-chain is in the store and the server.
   batch output a coin rests on, the checks run again on that one, and a coin
   that fails them on a transaction the chain holds goes into its exit at once.
   A coin resting on a round that can never return (a coin the round spends is
-  spent by another transaction that is final) is `lost`.
+  spent by another transaction that is final) is `lost`. A board held as
+  `lost` whose transaction the chain holds is followed again once the server
+  reports it credited.
 - **A coin handed over stays the wallet's until the chain says otherwise.** A
   coin given to a participation, or sent in a transfer the server has not
   answered, can be exited at any time; exiting it withdraws the wallet from the
@@ -164,13 +166,13 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
 | `balance` | One row per holding, BTC first and always, 0 included, then each Sequentia asset the wallet holds anything of; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
 | `coins`, `record LEAF` | Every coin held or once held; one coin's record |
-| `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final |
+| `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
-| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
+| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
@@ -254,6 +256,9 @@ and holding it there, with the reason shown:
   TLS itself, and a plain-HTTP server on another host, refused before anything
   is sent;
 - a payment whose answer comes back as a gateway's 502, posted again;
+- a board whose registration is answered with a 502 after the server took
+  it, kept pending and registered again, and one answered with a refusal the
+  server never made, followed again once the server reports it credited;
 - a coin received while its board is rolled out of the chain, taken once the
   board returns;
 - a tree whose reserves are one atom in an asset the wallet's node accepts for
