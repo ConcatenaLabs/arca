@@ -14,6 +14,10 @@ name = "bark"
 path = "src/bin/bark/main.rs"
 
 [[bin]]
+name = "arca"
+path = "src/bin/arca/main.rs"
+
+[[bin]]
 name = "barkd"
 path = "src/bin/barkd/main.rs"
 
@@ -33,7 +37,7 @@ barkd-swagger-ui = ["arca-rest/swagger-ui"]
 [dependencies]
 arca-lib = { version = "0.7.1", path = "../lib" }
 arca-json = { version = "0.7.1", path = "../bark-json" }
-arca-wallet = { version = "0.7.1", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native", "bitcoind-rpc" ] }
+arca-wallet = { version = "0.7.1", path = "../bark", default-features = false, features = [ "onchain-bdk", "sqlite", "filestore", "socks5-proxy", "rand", "native", "bitcoind-rpc", "arca" ] }
 arca-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", features = ["rpc-socks5-proxy"] }
 arca-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false, features = ["tonic-native", "socks5-proxy"] }
 arca-rest = { version = "0.7.1", path = "../bark-rest", default-features = false }
@@ -62,3 +66,14 @@ tokio-util.workspace = true
 dialoguer = "0.12"
 home = "=0.5.9"
 
+
+# The scenario tests run the `arca` binary against a whole Arca server on an
+# anchored proof-of-stake regtest chain (`tests/arca_scenarios.rs`).
+[dev-dependencies]
+arca-server = { path = "../server" }
+arca-covenant = { path = "../covenant" }
+arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
+elements.workspace = true
+tokio-postgres = "0.7"
+minreq = "2.14"
+tokio = { workspace = true, features = [ "time" ] }

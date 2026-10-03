@@ -1,0 +1,288 @@
+//! `arca`: the Arca wallet on the command line.
+//!
+//! A dual-chain wallet. Its Sequentia side holds Arca coins (leaves of
+//! covenant-tree batches, boards, coins paid out of round) against an Arca
+//! server, with the node as its chain source; every coin is validated before it
+//! is kept. Its Bitcoin side is Bark's own wallet for Bitcoin arks, run by
+//! `arca bitcoin …` in the same data directory.
+//!
+//! Every command prints JSON. A refusal prints `{"error": {"kind", "message"}}`
+//! with its reason and exits with status 1.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
+
+use bark::arca::elements::AssetId;
+use bark::arca::{Config, Wallet};
+use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
+
+fn default_datadir() -> String {
+	home::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".arca").display().to_string()
+}
+
+#[derive(Parser)]
+#[command(name = "arca", about = "The Arca wallet: Arca coins on Sequentia, and Bitcoin arks through Bark")]
+struct Cli {
+	/// The wallet's directory: its mnemonic and its database.
+	#[arg(long, env = "ARCA_DATADIR", global = true, default_value_t = default_datadir())]
+	datadir: String,
+
+	#[command(subcommand)]
+	command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+	/// Creates a wallet: a new mnemonic (or the one given), the node's chain,
+	/// and the server's operator key, pinned.
+	Create {
+		/// The Arca server's base URL.
+		#[arg(long)]
+		server: String,
+		/// The node's JSON-RPC URL. The node must run with -txindex and
+		/// -validateanchor.
+		#[arg(long)]
+		node_url: String,
+		#[arg(long)]
+		node_user: Option<String>,
+		#[arg(long)]
+		node_password: Option<String>,
+		/// The node's cookie file, instead of a user and password.
+		#[arg(long)]
+		node_cookie: Option<String>,
+		/// Restore from this mnemonic instead of drawing a new one.
+		#[arg(long)]
+		mnemonic: Option<String>,
+		/// The account of the leaf keys, m/6'/account'/….
+		#[arg(long, default_value_t = 0)]
+		account: u32,
+		/// The exit delay to ask for on the wallet's own leaves, in 512-second
+		/// units (default 36 hours).
+		#[arg(long)]
+		exit_delay_units: Option<u16>,
+		/// The shortest exit delay the wallet accepts on any leaf, its lineage
+		/// included (default 36 hours).
+		#[arg(long)]
+		min_exit_delay_units: Option<u16>,
+		/// The longest (default 48 hours).
+		#[arg(long)]
+		max_exit_delay_units: Option<u16>,
+	},
+	/// The wallet, its chain, its operator and what the server publishes.
+	Info,
+	/// A new on-chain Sequentia address of the wallet's.
+	Address,
+	/// What the wallet holds, per asset: Arca coins by state, on-chain coins,
+	/// and the Bitcoin side.
+	Balance,
+	/// Every coin the wallet holds or held.
+	Coins,
+	/// One coin's record.
+	Record { leaf_id: String },
+	/// Boards `amount` of `asset` from the wallet's on-chain coins.
+	Board {
+		asset: String,
+		amount: u64,
+		/// The asset to pay the board transaction's fee in; the boarded asset
+		/// unless named.
+		#[arg(long)]
+		fee_asset: Option<String>,
+	},
+	/// Where each board stands.
+	Boards,
+	/// A single-use receive request: a fresh key and owner nonce, and the
+	/// wallet's mailbox.
+	Receive {
+		#[arg(long)]
+		asset: Option<String>,
+		#[arg(long)]
+		amount: Option<u64>,
+	},
+	/// Pays a receive request out of round.
+	Send {
+		request: String,
+		#[arg(long)]
+		amount: Option<u64>,
+		/// The asset to send, when the request does not name it.
+		#[arg(long)]
+		asset: Option<String>,
+	},
+	/// Reads the mailbox and validates every coin in it.
+	Mailbox,
+	/// Takes part in the next round with the coins named (every live coin
+	/// when none is), for one new leaf per asset.
+	#[command(alias = "refresh")]
+	Participate {
+		#[arg(long = "leaf")]
+		leaves: Vec<String>,
+		/// The earliest median time of a round it may run in.
+		#[arg(long)]
+		not_before: Option<u32>,
+	},
+	/// Re-checks every coin against the chain, retries what the server never
+	/// answered, reads the mailbox and moves every participation on.
+	Sync,
+	/// Re-checks every coin against the chain as it is now.
+	Recheck,
+	/// Takes a coin on-chain from its record alone and claims it after its
+	/// exit delay. Run again to go on.
+	Exit {
+		leaf_id: String,
+		/// The asset to pay fees in where the coin's own reserves cannot.
+		#[arg(long)]
+		fee_asset: Option<String>,
+	},
+	/// An in-tree swap of two assets with another wallet.
+	#[command(subcommand)]
+	Swap(SwapCmd),
+	/// Every refusal the wallet made, with its reason.
+	Refusals,
+	/// The Bitcoin side: Bark's wallet for Bitcoin arks, in `<datadir>/bitcoin`.
+	/// Everything after `bitcoin` goes to Bark.
+	Bitcoin {
+		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+		args: Vec<String>,
+	},
+}
+
+#[derive(Subcommand)]
+enum SwapCmd {
+	/// Offers `give` of one asset for `want` of another.
+	Offer {
+		#[arg(long)]
+		give_asset: String,
+		#[arg(long)]
+		give: u64,
+		#[arg(long)]
+		want_asset: String,
+		#[arg(long)]
+		want: u64,
+	},
+	/// Takes an offer, signing the wallet's side.
+	Accept { offer: String },
+	/// Completes the wallet's offer with an acceptance.
+	Complete { accept: String },
+	/// Cancels an offer or acceptance not completed.
+	Cancel { swap: String },
+}
+
+fn asset(s: &str) -> Result<AssetId, bark::arca::Error> {
+	AssetId::from_str(s).map_err(|e| bark::arca::Error::Parse(format!("asset {:?}: {}", s, e)))
+}
+
+/// Bark's binary, beside this one.
+fn bark_exe() -> PathBuf {
+	std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("bark"))).unwrap_or_else(|| PathBuf::from("bark"))
+}
+
+fn bitcoin(datadir: &Path, args: &[String]) -> Result<Value, bark::arca::Error> {
+	let dir = datadir.join("bitcoin");
+	let status = Command::new(bark_exe()).arg("--datadir").arg(&dir).args(args).status()
+		.map_err(|e| bark::arca::Error::Io(format!("cannot run Bark ({}): {}", bark_exe().display(), e)))?;
+	std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The Bitcoin side's balance, from Bark, or why there is none.
+fn bitcoin_balance(datadir: &Path) -> Value {
+	let dir = datadir.join("bitcoin");
+	if !dir.exists() {
+		return json!({"wallet": null, "note": "no Bitcoin ark wallet yet: create one with `arca bitcoin create …`"});
+	}
+	match Command::new(bark_exe()).arg("--datadir").arg(&dir).arg("--quiet").arg("balance").output() {
+		Ok(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&o.stdout)})),
+		Ok(o) => json!({"error": String::from_utf8_lossy(&o.stderr)}),
+		Err(e) => json!({"error": e.to_string()}),
+	}
+}
+
+fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
+	let datadir = PathBuf::from(&cli.datadir);
+	if let Cmd::Bitcoin { args } = &cli.command {
+		return bitcoin(&datadir, args);
+	}
+	if let Cmd::Create { server, node_url, node_user, node_password, node_cookie, mnemonic, account, exit_delay_units,
+		min_exit_delay_units, max_exit_delay_units } = cli.command
+	{
+		let mut cfg = Config::spec_delays(&server, &node_url);
+		cfg.node_user = node_user;
+		cfg.node_password = node_password;
+		cfg.node_cookie = node_cookie;
+		cfg.account = account;
+		if let Some(d) = exit_delay_units {
+			cfg.exit_delay_units = d;
+		}
+		if let Some(d) = min_exit_delay_units {
+			cfg.min_exit_delay_units = d;
+		}
+		if let Some(d) = max_exit_delay_units {
+			cfg.max_exit_delay_units = d;
+		}
+		let w = Wallet::create(&datadir, mnemonic.as_deref(), cfg)?;
+		let mut info = w.info()?;
+		info["mnemonic_file"] = json!(w.mnemonic_path().display().to_string());
+		return Ok(info);
+	}
+	let mut w = Wallet::open(&datadir)?;
+	// The re-check runs on every start: a rollback since the last command
+	// un-credits what it took out before anything is spent or shown.
+	let startup = match &cli.command {
+		Cmd::Recheck | Cmd::Sync => None,
+		_ => match w.recheck() {
+			Ok(v) => Some(v),
+			Err(e) => {
+				eprintln!("arca: the re-check on start could not run: {}", e);
+				None
+			},
+		},
+	};
+	if let Some(v) = &startup {
+		if v["reorganised"] == json!(true) || v["changes"].as_array().is_some_and(|a| !a.is_empty()) {
+			eprintln!("arca: re-check on start: {}", v);
+		}
+	}
+	match cli.command {
+		Cmd::Create { .. } | Cmd::Bitcoin { .. } => unreachable!("handled above"),
+		Cmd::Info => w.info(),
+		Cmd::Address => w.address(),
+		Cmd::Balance => {
+			let mut b = w.balance()?;
+			b["bitcoin"] = bitcoin_balance(&datadir);
+			Ok(b)
+		},
+		Cmd::Coins => w.coins(),
+		Cmd::Record { leaf_id } => w.record(&leaf_id),
+		Cmd::Board { asset: a, amount, fee_asset } => w.board(asset(&a)?, amount, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Boards => w.boards(),
+		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
+		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
+		Cmd::Mailbox => w.mailbox(),
+		Cmd::Participate { leaves, not_before } => w.participate(&leaves, not_before),
+		Cmd::Sync => w.sync(),
+		Cmd::Recheck => w.recheck(),
+		Cmd::Exit { leaf_id, fee_asset } => w.exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
+		Cmd::Swap(SwapCmd::Accept { offer }) => w.swap_accept(&offer),
+		Cmd::Swap(SwapCmd::Complete { accept }) => w.swap_complete(&accept),
+		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
+		Cmd::Refusals => w.refusals(),
+	}
+}
+
+fn main() {
+	let cli = Cli::parse();
+	match run(cli) {
+		Ok(v) => println!("{}", serde_json::to_string_pretty(&v).expect("JSON")),
+		Err(e) => {
+			let mut out = json!({"error": {"kind": e.kind(), "message": e.to_string()}});
+			if let bark::arca::Error::Server { code, status, .. } = &e {
+				out["error"]["code"] = json!(code);
+				out["error"]["status"] = json!(status);
+			}
+			println!("{}", serde_json::to_string_pretty(&out).expect("JSON"));
+			eprintln!("arca: {}", e);
+			std::process::exit(1);
+		},
+	}
+}

@@ -166,6 +166,16 @@ state is in PostgreSQL, so its tests need a PostgreSQL server named by
 `ARCA_TEST_POSTGRES`, where each test makes a database of its own
 (`server/README.md`).
 
+The Arca wallet is `bark::arca` (`bark/src/arca/`, the `arca` feature of
+`arca-wallet`) and its command line is `arca` (`bark-cli/`,
+[bark-cli/README.md](bark-cli/README.md)). Like the server, it uses
+`arca-covenant` for every script, record and check and writes none of its
+own. It sits beside Bark's wallet for Bitcoin arks, which stays: every Arca
+wallet is dual-chain, and `arca bitcoin …` runs Bark's `bark`. Bark's crates
+compile their gRPC protocol, so building `arca-wallet` or `arca-cli` needs
+`protoc` (`protobuf-compiler`). Its scenario tests need what the server's
+need, and the `arca-signer` binary built first.
+
 `regtest/` is the independent reference for every Arca script: a Python suite
 on the node's functional test framework, and the golden vectors it exports
 (`regtest/README.md`). Rust code that builds an Arca script must reproduce the

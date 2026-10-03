@@ -1,0 +1,725 @@
+//! The wallet: its configuration, its policies, the check of every coin it
+//! holds against the chain, the re-check after a rollback, its on-chain coins
+//! and the board.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, XOnlyPublicKey};
+use elements::{AssetId, OutPoint, Script, Transaction, TxOut, Txid};
+use serde_json::{json, Value};
+
+use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, Recheck, RelativeTime, Template, ValidCoin, ValidOrigin, WalletPolicy};
+
+use super::chain::{hex, ChainSource, Finality};
+use super::client::ServerClient;
+use super::keys::{p2wpkh, Keys, CHANGE, RECEIVE};
+use super::store::{CoinRow, Store};
+use super::{random32, Error};
+
+/// The file beside the database that holds the mnemonic.
+pub const MNEMONIC_FILE: &str = "mnemonic";
+/// The database.
+pub const DB_FILE: &str = "arca.sqlite";
+/// How many unused on-chain scripts past the last handed out the wallet looks at.
+const GAP: u32 = 20;
+
+/// How the wallet reaches its node and its server, and what it asks for and
+/// accepts.
+#[derive(Debug, Clone)]
+pub struct Config {
+	/// The server's base URL (`https://host/arca`): calls go under `/v1/`.
+	pub server: String,
+	/// The node's JSON-RPC URL and credentials.
+	pub node_url: String,
+	pub node_user: Option<String>,
+	pub node_password: Option<String>,
+	pub node_cookie: Option<String>,
+	/// The account of the leaf keys, `m/6'/account'/…`.
+	pub account: u32,
+	/// The exit delay the wallet asks for its own leaves, in 512-second units.
+	pub exit_delay_units: u16,
+	/// The bounds on the exit delay of any leaf it accepts, its lineage
+	/// included.
+	pub min_exit_delay_units: u16,
+	pub max_exit_delay_units: u16,
+}
+
+impl Config {
+	/// The specification's delays: leaves asked for at 36 hours, accepted from
+	/// 36 to 48 hours.
+	pub fn spec_delays(server: &str, node_url: &str) -> Config {
+		let d = RelativeTime::from_seconds_ceil(WalletPolicy::SPEC_DELAY_SECONDS).expect("36 hours").units();
+		let max = RelativeTime::from_seconds_ceil(WalletPolicy::DEFAULT_MAX_EXIT_SECONDS).expect("48 hours").units();
+		Config {
+			server: server.into(), node_url: node_url.into(), node_user: None, node_password: None, node_cookie: None,
+			account: 0, exit_delay_units: d, min_exit_delay_units: d, max_exit_delay_units: max,
+		}
+	}
+}
+
+/// The wallet. See the [module documentation](super).
+pub struct Wallet {
+	pub(crate) datadir: PathBuf,
+	pub(crate) store: Store,
+	pub(crate) keys: Keys,
+	pub(crate) chain: ChainSource,
+	pub(crate) server: ServerClient,
+	pub(crate) genesis: Chain,
+	pub(crate) operator: XOnlyPublicKey,
+	pub(crate) cfg: Config,
+	pub(crate) secp: Secp256k1<elements::secp256k1_zkp::All>,
+}
+
+fn parse<T: FromStr>(what: &str, s: &str) -> Result<T, Error> where T::Err: std::fmt::Display {
+	s.parse::<T>().map_err(|e| Error::Parse(format!("{} {:?}: {}", what, s, e)))
+}
+
+pub(crate) fn amount(v: &Value, what: &str) -> Result<u64, Error> {
+	parse(what, v.as_str().ok_or_else(|| Error::Parse(format!("{} is missing", what)))?)
+}
+
+/// A coin record's kind, as the store names it.
+pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
+	match record {
+		CoinRecord::Leaf { .. } => "batch",
+		CoinRecord::Transfer(_) => "transfer",
+		CoinRecord::Board(_) => "board",
+	}
+}
+
+/// The owner key and nonce a coin record names for its coin.
+pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
+	match record {
+		CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce),
+		CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce),
+		CoinRecord::Board(b) => (b.owner, b.owner_nonce),
+	}
+}
+
+/// Every output a coin rests on: the batch output of each batch leaf and each
+/// board output in its record, from the coin up.
+fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> {
+	match record {
+		CoinRecord::Leaf { record, .. } => {
+			out.push(record.branch().map_err(|e| Error::Refused(e.to_string()))?.batch_output().txout());
+		},
+		CoinRecord::Board(b) => out.push(b.output().txout()),
+		CoinRecord::Transfer(t) => {
+			for i in &t.inputs {
+				base_outputs(&i.coin, out)?;
+			}
+		},
+	}
+	Ok(())
+}
+
+/// A coin the wallet has checked against the chain.
+pub(crate) struct Assessed {
+	pub valid: ValidCoin,
+	/// The rounds and boards it rests on, with where each stands.
+	pub bases: Vec<(Transaction, Finality)>,
+}
+
+impl Assessed {
+	pub fn all_final(&self) -> bool {
+		self.bases.iter().all(|(_, f)| f.is_final())
+	}
+
+	/// Why the coin is not spendable yet, for people; empty when it is.
+	pub fn waiting(&self) -> String {
+		self.bases.iter().filter(|(_, f)| !f.is_final())
+			.map(|(t, f)| format!("{} is {}", t.txid(), f.word())).collect::<Vec<_>>().join("; ")
+	}
+
+	pub fn lowest_height(&self) -> u64 {
+		self.bases.iter().filter_map(|(_, f)| f.height()).min().unwrap_or(0)
+	}
+}
+
+impl Wallet {
+	// -----------------------------------------------------------------------
+	// Creating and opening
+	// -----------------------------------------------------------------------
+
+	/// Creates a wallet in `datadir`: a new mnemonic unless one is given, the
+	/// node's chain, and the server's operator key, pinned. Refuses a node that
+	/// does not validate its anchors, and a server on another chain.
+	pub fn create(datadir: &Path, mnemonic: Option<&str>, cfg: Config) -> Result<Wallet, Error> {
+		if datadir.join(DB_FILE).exists() {
+			return Err(Error::Refused(format!("{} already holds a wallet", datadir.display())));
+		}
+		std::fs::create_dir_all(datadir).map_err(|e| Error::Io(format!("{}: {}", datadir.display(), e)))?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let _ = std::fs::set_permissions(datadir, std::fs::Permissions::from_mode(0o700));
+		}
+		let mnemonic = match mnemonic {
+			Some(m) => bip39::Mnemonic::from_str(m).map_err(|e| Error::Parse(format!("the mnemonic: {}", e)))?,
+			None => bip39::Mnemonic::generate(12).map_err(|e| Error::Keys(e.to_string()))?,
+		};
+		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
+		if !chain.validates_anchors()? {
+			return Err(Error::Refused("the node does not validate its anchors against the parent chain (-validateanchor): \
+				without that it has no notion of finality".into()));
+		}
+		let genesis = chain.genesis()?;
+		let chain_name = chain.chain_name()?;
+		let server = ServerClient::new(&cfg.server);
+		let info = server.info()?;
+		let server_genesis = info["genesis_hash"].as_str().unwrap_or("");
+		if server_genesis != genesis.to_string() {
+			return Err(Error::Refused(format!("the server serves the chain of genesis {}; the node is on {}", server_genesis, genesis)));
+		}
+		let operator: XOnlyPublicKey = parse("the operator key", info["operator"].as_str().unwrap_or(""))?;
+		for (what, d) in [("asked", cfg.exit_delay_units), ("least", cfg.min_exit_delay_units), ("most", cfg.max_exit_delay_units)] {
+			RelativeTime::from_units(d).map_err(|e| Error::Refused(format!("the {} exit delay: {}", what, e)))?;
+		}
+		if !(cfg.min_exit_delay_units..=cfg.max_exit_delay_units).contains(&cfg.exit_delay_units) {
+			return Err(Error::Refused("the exit delay asked for is outside the bounds the wallet accepts".into()));
+		}
+		let path = datadir.join(MNEMONIC_FILE);
+		std::fs::write(&path, mnemonic.to_string()).map_err(|e| Error::Io(format!("{}: {}", path.display(), e)))?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::Io(e.to_string()))?;
+		}
+		let store = Store::open(&datadir.join(DB_FILE))?;
+		let tip = chain.tip()?;
+		let meta = [
+			("server", cfg.server.clone()), ("node_url", cfg.node_url.clone()),
+			("node_user", cfg.node_user.clone().unwrap_or_default()), ("node_password", cfg.node_password.clone().unwrap_or_default()),
+			("node_cookie", cfg.node_cookie.clone().unwrap_or_default()),
+			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
+			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
+			("genesis", genesis.to_string()), ("chain_name", chain_name), ("operator", operator.to_string()),
+			("birthday", tip.height.to_string()), ("tip_height", tip.height.to_string()), ("tip_hash", tip.hash.to_string()),
+		];
+		for (k, v) in meta {
+			store.set_meta(k, &v)?;
+		}
+		drop(store);
+		Wallet::open(datadir)
+	}
+
+	/// Opens the wallet in `datadir`. Contacts neither node nor server.
+	pub fn open(datadir: &Path) -> Result<Wallet, Error> {
+		let db = datadir.join(DB_FILE);
+		if !db.exists() {
+			return Err(Error::Refused(format!("{} holds no wallet; create one first", datadir.display())));
+		}
+		let store = Store::open(&db)?;
+		let get = |k: &str| -> Result<String, Error> { store.meta(k)?.ok_or_else(|| Error::Store(format!("{} is not set", k))) };
+		let opt = |k: &str| -> Result<Option<String>, Error> { Ok(store.meta(k)?.filter(|v| !v.is_empty())) };
+		let cfg = Config {
+			server: get("server")?, node_url: get("node_url")?,
+			node_user: opt("node_user")?, node_password: opt("node_password")?, node_cookie: opt("node_cookie")?,
+			account: parse("account", &get("account")?)?,
+			exit_delay_units: parse("exit delay", &get("exit_delay_units")?)?,
+			min_exit_delay_units: parse("exit delay", &get("min_exit_delay_units")?)?,
+			max_exit_delay_units: parse("exit delay", &get("max_exit_delay_units")?)?,
+		};
+		let genesis = Chain::new(parse("the genesis hash", &get("genesis")?)?);
+		let operator = parse("the operator key", &get("operator")?)?;
+		let coin_type = if get("chain_name")? == "sequentia" { 0 } else { 1 };
+		let mnemonic = std::fs::read_to_string(datadir.join(MNEMONIC_FILE))
+			.map_err(|e| Error::Io(format!("{}: {}", datadir.join(MNEMONIC_FILE).display(), e)))?;
+		let keys = Keys::new(mnemonic.trim(), cfg.account, coin_type)?;
+		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
+		let server = ServerClient::new(&cfg.server);
+		Ok(Wallet { datadir: datadir.to_path_buf(), store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new() })
+	}
+
+	pub fn mnemonic_path(&self) -> PathBuf {
+		self.datadir.join(MNEMONIC_FILE)
+	}
+
+	// -----------------------------------------------------------------------
+	// Policies
+	// -----------------------------------------------------------------------
+
+	/// The chain's median time at the tip: what the wallet takes as now.
+	pub(crate) fn now(&self) -> Result<MedianTime, Error> {
+		MedianTime::from_consensus(self.chain.tip()?.median_time).map_err(|e| Error::Node(e.to_string()))
+	}
+
+	fn delay(units: u16) -> RelativeTime {
+		RelativeTime::from_units(units).expect("checked when the wallet was created")
+	}
+
+	pub(crate) fn exit_delay(&self) -> RelativeTime {
+		Self::delay(self.cfg.exit_delay_units)
+	}
+
+	/// The policy for accepting a leaf from a round, at `now`.
+	pub(crate) fn accept_policy(&self, now: MedianTime) -> WalletPolicy {
+		WalletPolicy {
+			min_exit_delay: Self::delay(self.cfg.min_exit_delay_units),
+			max_exit_delay: Self::delay(self.cfg.max_exit_delay_units),
+			..WalletPolicy::new(self.genesis, self.operator, now)
+		}
+	}
+
+	/// The policy for a coin held or received out of round, at `now`.
+	pub(crate) fn receipt_policy(&self, now: MedianTime) -> WalletPolicy {
+		self.accept_policy(now).receipt()
+	}
+
+	/// The server's `info`, checked against what the wallet pinned when it was
+	/// created: the same chain and the same operator key.
+	pub(crate) fn server_info(&self) -> Result<Value, Error> {
+		let info = self.server.info()?;
+		if info["genesis_hash"].as_str() != Some(&self.genesis.genesis_hash().to_string()) {
+			return Err(Error::Refused(format!("the server now serves the chain of genesis {}; this wallet is on {}",
+				info["genesis_hash"], self.genesis.genesis_hash())));
+		}
+		if info["operator"].as_str() != Some(&self.operator.to_string()) {
+			return Err(Error::Refused(format!("the server now names operator key {}; this wallet was created with {}",
+				info["operator"], self.operator)));
+		}
+		Ok(info)
+	}
+
+	/// The smallest leaf the server takes in `asset`, or a refusal when it
+	/// does not serve `asset`.
+	pub(crate) fn min_leaf(info: &Value, asset: AssetId) -> Result<u64, Error> {
+		info["assets"].as_array().into_iter().flatten()
+			.find(|a| a["asset"].as_str() == Some(&asset.to_string()))
+			.map(|a| amount(&a["min_leaf"], "min_leaf"))
+			.unwrap_or_else(|| Err(Error::Refused(format!("the server does not serve asset {}", asset))))
+	}
+
+	// -----------------------------------------------------------------------
+	// Coins against the chain
+	// -----------------------------------------------------------------------
+
+	/// The transactions `record` rests on: from the store when the wallet has
+	/// seen them, else found on the chain by the output they pay.
+	pub(crate) fn base_txs(&self, record: &CoinRecord) -> Result<Vec<Transaction>, Error> {
+		let mut outs = vec![];
+		base_outputs(record, &mut outs)?;
+		let mut txs: Vec<Transaction> = vec![];
+		for o in outs {
+			if txs.iter().any(|t| t.output.contains(&o)) {
+				continue;
+			}
+			if let Some(t) = self.known_base(&o)? {
+				txs.push(t);
+				continue;
+			}
+			let found = self.chain.coins_at(std::slice::from_ref(&o.script_pubkey))?.into_iter()
+				.find(|(_, out, _)| *out == o).map(|(op, _, _)| op.txid);
+			let tx = match found {
+				Some(txid) => self.chain.transaction(&txid)?,
+				None => {
+					let from: u64 = self.store.meta("birthday")?.and_then(|b| b.parse().ok()).unwrap_or(0);
+					self.chain.find_payment(&o, from.saturating_sub(1000))?.map(|(t, _)| t)
+				},
+			};
+			match tx {
+				Some(t) => {
+					self.store.put_tx(&t.txid().to_string(), &elements::encode::serialize(&t), "base")?;
+					txs.push(t);
+				},
+				None => return Err(Error::Refused(format!("no transaction on the chain pays the batch or board output {} it rests on",
+					hex(o.script_pubkey.as_bytes())))),
+			}
+		}
+		Ok(txs)
+	}
+
+	fn known_base(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
+		// The wallet's few base transactions, scanned.
+		for c in self.store.coins()? {
+			for txid in &c.bases {
+				if let Some(raw) = self.store.tx(txid)? {
+					let t: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+					if t.output.contains(o) {
+						return Ok(Some(t));
+					}
+				}
+			}
+		}
+		Ok(None)
+	}
+
+	/// Checks `record` against the chain under `policy`, owned by the wallet
+	/// key of `nonce` when given: the library's validation, and where each
+	/// base transaction stands.
+	pub(crate) fn assess(&self, record: &CoinRecord, policy: &WalletPolicy, owner: Option<(&XOnlyPublicKey, &[u8; 32])>)
+		-> Result<Assessed, Error>
+	{
+		let txs = self.base_txs(record)?;
+		let valid = match owner {
+			Some((k, n)) => record.validate(&txs, policy, k, n),
+			None => record.resolve(&txs, policy),
+		}.map_err(|e| Error::Refused(e.to_string()))?;
+		let mut bases = vec![];
+		for t in txs {
+			let f = self.chain.finality(&t.txid())?;
+			bases.push((t, f));
+		}
+		Ok(Assessed { valid, bases })
+	}
+
+	/// The store's row for a coin the wallet accepts.
+	pub(crate) fn row(&self, record: &CoinRecord, a: &Assessed, state: &str, note: &str) -> Result<CoinRow, Error> {
+		let (_, nonce) = owner_of(record);
+		let bytes = record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?;
+		for (t, _) in &a.bases {
+			self.store.put_tx(&t.txid().to_string(), &elements::encode::serialize(t), "base")?;
+		}
+		Ok(CoinRow {
+			leaf_id: a.valid.id.to_string(), owner_nonce: nonce, kind: kind_of(record).into(),
+			asset: a.valid.asset.to_string(), value: a.valid.value, record: bytes, salt: a.valid.leaf.salt,
+			state: state.into(), note: note.into(), expiry: a.valid.expiry.to_consensus_u32(),
+			bases: a.bases.iter().map(|(t, _)| t.txid().to_string()).collect(), spent_by: None,
+		})
+	}
+
+	/// A held coin's record, decoded.
+	pub(crate) fn record_of(c: &CoinRow) -> Result<CoinRecord, Error> {
+		CoinRecord::from_bytes(&c.record).map_err(|e| Error::Store(format!("coin {}: {}", c.leaf_id, e)))
+	}
+
+	/// A held coin, resolved as its owner holds it now.
+	pub(crate) fn held(&self, c: &CoinRow) -> Result<(CoinRecord, Assessed), Error> {
+		let record = Self::record_of(c)?;
+		let a = self.assess(&record, &self.receipt_policy(self.now()?), None)?;
+		Ok((record, a))
+	}
+
+	// -----------------------------------------------------------------------
+	// The re-check
+	// -----------------------------------------------------------------------
+
+	/// Checks every coin the wallet can spend, or is waiting on, against the
+	/// chain as it is now: a coin whose round or board is not final (a
+	/// rollback took it out, or it has not got there yet) is not spendable,
+	/// and one whose bases are final again is. Run on start and after any
+	/// reorganisation. Returns what changed, and whether the tip the wallet
+	/// last saw has been reorganised away.
+	pub fn recheck(&mut self) -> Result<Value, Error> {
+		let tip = self.chain.tip()?;
+		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
+		let last_hash = self.store.meta("tip_hash")?;
+		let reorg = match (last_h, last_hash) {
+			(Some(h), Some(hash)) => self.chain.block_hash(h)?.map(|b| b.to_string()) != Some(hash),
+			_ => false,
+		};
+		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
+		let policy = self.receipt_policy(now);
+		let mut changes = vec![];
+		for c in self.store.coins()? {
+			if !matches!(c.state.as_str(), "pending" | "live") {
+				continue;
+			}
+			let record = Self::record_of(&c)?;
+			let (state, note) = match self.assess(&record, &policy, None) {
+				Err(e) => ("pending", format!("re-check: {}", e)),
+				Ok(a) => {
+					let mut extra = String::new();
+					if let (CoinRecord::Leaf { record: lr, .. }, ValidOrigin::Leaf { valid, .. }) = (&record, &a.valid.origin) {
+						// The round the leaf was accepted from, or another
+						// transaction now paying its batch output.
+						let round = a.bases.iter().find(|(t, _)| t.txid() == valid.round_txid).cloned();
+						if let Some((round, finality)) = round {
+							if !finality.in_chain() {
+								let out = valid.branch.batch_output().txout();
+								if let Some((other, _)) = self.chain.find_payment(&out, a.lowest_height().saturating_sub(10))? {
+									if let Ok(Recheck::NewRound(_)) = lr.recheck(valid, &other, &policy) {
+										extra = format!("; another transaction, {}, now pays its batch output: a new round, \
+											so nothing signed for {} carries over", other.txid(), round.txid());
+									}
+								}
+							} else if let Err(e) = lr.recheck(valid, &round, &policy) {
+								extra = format!("; re-check: {}", e);
+							}
+						}
+					}
+					if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
+						("pending", format!("{}{}", e, extra))
+					} else if a.all_final() && extra.is_empty() {
+						("live", String::new())
+					} else if a.all_final() {
+						("pending", extra.trim_start_matches("; ").to_string())
+					} else {
+						("pending", format!("waiting: {}{}", a.waiting(), extra))
+					}
+				},
+			};
+			if state != c.state || note != c.note {
+				if state != c.state {
+					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": state, "why": note}));
+				}
+				self.store.set_coin_state(&c.leaf_id, state, &note)?;
+			}
+		}
+		self.store.set_meta("tip_height", &tip.height.to_string())?;
+		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
+		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes}))
+	}
+
+	// -----------------------------------------------------------------------
+	// Reading
+	// -----------------------------------------------------------------------
+
+	fn coin_json(c: &CoinRow) -> Value {
+		json!({
+			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
+			"note": c.note, "expiry": if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry) },
+			"spent_by": c.spent_by,
+		})
+	}
+
+	/// Every coin the wallet holds or held.
+	pub fn coins(&self) -> Result<Value, Error> {
+		Ok(Value::Array(self.store.coins()?.iter().map(Self::coin_json).collect()))
+	}
+
+	/// What the wallet holds, per asset: off-chain coins by state, and its
+	/// on-chain coins on Sequentia. No asset is set apart.
+	pub fn balance(&self) -> Result<Value, Error> {
+		let mut per: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+		for c in self.store.coins()? {
+			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
+				continue;
+			}
+			*per.entry(c.asset.clone()).or_default().entry(c.state.clone()).or_default() += c.value;
+		}
+		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
+		for (_, o, _, _) in self.onchain_coins()? {
+			if let (Some(a), Some(v)) = (o.asset.explicit(), o.value.explicit()) {
+				*onchain.entry(a.to_string()).or_default() += v;
+			}
+		}
+		let arca: Value = per.into_iter().map(|(a, m)| (a, json!(m.into_iter().map(|(s, v)| (s, json!(v.to_string()))).collect::<serde_json::Map<_, _>>())))
+			.collect::<serde_json::Map<_, _>>().into();
+		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
+		Ok(json!({"arca": arca, "sequentia_onchain": onchain}))
+	}
+
+	/// The wallet's own view: its chain, its operator, its policy, its tip.
+	pub fn info(&self) -> Result<Value, Error> {
+		let tip = self.chain.tip()?;
+		Ok(json!({
+			"datadir": self.datadir.display().to_string(),
+			"server": self.cfg.server, "node": self.cfg.node_url,
+			"genesis_hash": self.genesis.genesis_hash().to_string(),
+			"chain": self.store.meta("chain_name")?,
+			"operator": self.operator.to_string(),
+			"mailbox_key": self.keys.mailbox()?.x_only_public_key().0.to_string(),
+			"exit_delay_units": self.cfg.exit_delay_units,
+			"accepted_exit_delay_units": {"min": self.cfg.min_exit_delay_units, "max": self.cfg.max_exit_delay_units},
+			"tip": {"height": tip.height, "hash": tip.hash.to_string(), "median_time": tip.median_time},
+			"server_info": self.server_info().map_err(|e| e.to_string()).unwrap_or_else(|e| json!({"unreachable": e})),
+		}))
+	}
+
+	/// Every refusal the wallet made, with its reason.
+	pub fn refusals(&self) -> Result<Value, Error> {
+		Ok(Value::Array(self.store.refusals()?.into_iter().map(|(at, what, why)| json!({"at": at, "what": what, "reason": why})).collect()))
+	}
+
+	// -----------------------------------------------------------------------
+	// On-chain coins
+	// -----------------------------------------------------------------------
+
+	/// A new on-chain script of `chain`.
+	pub(crate) fn new_script(&self, chain: u32) -> Result<Script, Error> {
+		let i = self.store.take_index(chain)?;
+		self.keys.onchain_script(chain, i)
+	}
+
+	/// A new on-chain receive address on Sequentia (an unblinded P2WPKH, the
+	/// same key as the Bitcoin address of that script), and its script.
+	pub fn address(&self) -> Result<Value, Error> {
+		let s = self.new_script(RECEIVE)?;
+		Ok(json!({"address": self.chain.address(&s)?, "script_pubkey": hex(s.as_bytes())}))
+	}
+
+	/// Every on-chain script the wallet watches, with its key.
+	fn onchain_keys(&self) -> Result<Vec<(Script, Keypair)>, Error> {
+		let mut out = vec![];
+		for chain in [RECEIVE, CHANGE] {
+			for i in 0..self.store.indices(chain)? + GAP {
+				let k = self.keys.onchain(chain, i)?;
+				out.push((p2wpkh(&k), k));
+			}
+		}
+		Ok(out)
+	}
+
+	/// The wallet's unspent on-chain coins (spends in the mempool excluded),
+	/// each with its key and height.
+	pub(crate) fn onchain_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
+		let keys = self.onchain_keys()?;
+		let scripts: Vec<Script> = keys.iter().map(|(s, _)| s.clone()).collect();
+		let mut out = vec![];
+		for (op, o, h) in self.chain.coins_at(&scripts)? {
+			if !self.chain.unspent(&op)? {
+				continue;
+			}
+			if let Some((_, k)) = keys.iter().find(|(s, _)| *s == o.script_pubkey) {
+				out.push((op, o, *k, h));
+			}
+		}
+		Ok(out)
+	}
+
+	/// Signs input `i` of `tx`, a P2WPKH coin `prev` of `key`.
+	pub(crate) fn sign_p2wpkh(&self, tx: &mut Transaction, i: usize, prev: &TxOut, key: &Keypair) {
+		let pk = key.public_key();
+		let h = elements::hashes::hash160::Hash::hash(&pk.serialize());
+		let code = Script::new_p2pkh(&elements::PubkeyHash::from_raw_hash(h));
+		let sighash = elements::sighash::SighashCache::new(&*tx)
+			.segwitv0_sighash(i, &code, prev.value, elements::EcdsaSighashType::All);
+		let msg = Message::from_digest(sighash.to_byte_array());
+		let sig = self.secp.sign_ecdsa_low_r(&msg, &key.secret_key());
+		let mut der = sig.serialize_der().to_vec();
+		der.push(elements::EcdsaSighashType::All as u8);
+		tx.input[i].witness.script_witness = vec![der, pk.serialize().to_vec()];
+	}
+
+	/// The fee for `vsize` vbytes in `asset`'s own atoms, from the node's floor
+	/// and rate now; a refusal when the node does not accept `asset` for fees.
+	pub(crate) fn fee_for(&self, asset: AssetId, vsize: u64) -> Result<u64, Error> {
+		let floor = self.chain.floor_per_kvb(asset)?.ok_or_else(|| Self::not_accepted(asset))?;
+		Ok(vsize.saturating_mul(floor).div_ceil(1000).max(1))
+	}
+
+	pub(crate) fn not_accepted(asset: AssetId) -> Error {
+		Error::Refused(format!("asset {} is not accepted for fees by the node now; name an asset it accepts (--fee-asset): \
+			the wallet pays fees in no other asset than the one named, or the one moved", asset))
+	}
+
+	/// The vsize `tx` will have once each of its P2WPKH inputs is signed
+	/// (inputs at `p2wpkh`), the others as they are.
+	pub(crate) fn signed_vsize(tx: &Transaction, p2wpkh: &[usize]) -> u64 {
+		let mut t = tx.clone();
+		for &i in p2wpkh {
+			t.input[i].witness.script_witness = vec![vec![0; 72], vec![0; 33]];
+		}
+		(t.weight() as u64).div_ceil(4)
+	}
+
+	// -----------------------------------------------------------------------
+	// The board
+	// -----------------------------------------------------------------------
+
+	/// Brings `value` of `asset` from the wallet's on-chain coins into Arca:
+	/// a board record under a fresh key, the operator's nonce, the board
+	/// transaction paying it, the fee in `fee_asset` (the boarded asset unless
+	/// another is named). The server registers it first; only then is it
+	/// broadcast, so a refused board spends nothing. The coin is spendable once
+	/// the board transaction is final.
+	pub fn board(&mut self, asset: AssetId, value: u64, fee_asset: Option<AssetId>) -> Result<Value, Error> {
+		let fee_asset = fee_asset.unwrap_or(asset);
+		self.fee_for(fee_asset, 1)?;
+		let info = self.server_info()?;
+		let min = Self::min_leaf(&info, asset)?;
+		if value < min {
+			return Err(Error::Refused(format!("a board of {} is below the server's smallest leaf in asset {}, {}", value, asset, min)));
+		}
+		// The coins to spend: the boarded asset's, then the fee asset's.
+		let coins = self.onchain_coins()?;
+		let mut chosen: Vec<(OutPoint, TxOut, Keypair)> = vec![];
+		let mut fee = self.fee_for(fee_asset, 300)?;
+		let change = self.new_script(CHANGE)?;
+		let operator_nonce = self.server.operator_nonce()?;
+		let owner_nonce = random32();
+		let key = self.keys.leaf(&owner_nonce)?;
+		let owner = key.x_only_public_key().0;
+		self.store.put_nonce(&owner_nonce, &owner.serialize(), "board")?;
+		let record = BoardRecord {
+			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
+			asset, value, chain: self.genesis, operator: self.operator,
+		};
+		let tx = loop {
+			chosen.clear();
+			let mut need: BTreeMap<AssetId, u64> = BTreeMap::new();
+			*need.entry(asset).or_default() += value;
+			*need.entry(fee_asset).or_default() += fee;
+			for (a, n) in &need {
+				let mut have = 0u64;
+				let mut of: Vec<_> = coins.iter().filter(|(_, o, _, _)| o.asset.explicit() == Some(*a)).collect();
+				of.sort_by_key(|(_, o, _, _)| std::cmp::Reverse(o.value.explicit().unwrap_or(0)));
+				for (op, o, k, _) in of {
+					if have >= *n {
+						break;
+					}
+					have += o.value.explicit().unwrap_or(0);
+					chosen.push((*op, o.clone(), *k));
+				}
+				if have < *n {
+					return Err(Error::Refused(format!("the wallet holds {} of asset {} on-chain that it can spend, and needs {}", have, a, n)));
+				}
+			}
+			let pairs: Vec<(OutPoint, TxOut)> = chosen.iter().map(|(op, o, _)| (*op, o.clone())).collect();
+			let mut tx = record.tx(&pairs, fee_asset, fee, &change).map_err(|e| Error::Refused(e.to_string()))?.tx;
+			let all: Vec<usize> = (0..tx.input.len()).collect();
+			let needed = self.fee_for(fee_asset, Self::signed_vsize(&tx, &all))?;
+			if needed <= fee {
+				for (i, (_, o, k)) in chosen.iter().enumerate() {
+					self.sign_p2wpkh(&mut tx, i, o, k);
+				}
+				break tx;
+			}
+			fee = needed;
+		};
+		let valid = record.validate(&tx, &self.accept_policy(self.now()?)).map_err(|e| Error::Refused(e.to_string()))?;
+		let leaf_id = valid.leaf_id.to_string();
+		let coin = CoinRecord::Board(record);
+		let row = CoinRow {
+			leaf_id: leaf_id.clone(), owner_nonce, kind: "board".into(), asset: asset.to_string(), value,
+			record: coin.to_bytes().map_err(|e| Error::Refused(e.to_string()))?, salt: record.salt(), state: "pending".into(),
+			note: "board registered; waiting for its transaction to be final".into(), expiry: u32::MAX,
+			bases: vec![tx.txid().to_string()], spent_by: None,
+		};
+		self.store.atomically(|s| {
+			s.put_tx(&tx.txid().to_string(), &elements::encode::serialize(&tx), "base")?;
+			s.put_coin(&row)?;
+			s.use_nonce(&owner_nonce, &leaf_id)
+		})?;
+		let reg = self.server.post("register_board", &json!({
+			"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?),
+			"tx": hex(&elements::encode::serialize(&tx)),
+		}));
+		if let Err(e) = reg {
+			self.store.set_coin_state(&leaf_id, "lost", &format!("the server refused the board, which was never broadcast: {}", e))?;
+			self.store.refused(&format!("board {}", leaf_id), &e.to_string())?;
+			return Err(e);
+		}
+		self.chain.broadcast(&tx)?;
+		Ok(json!({
+			"leaf_id": leaf_id, "txid": tx.txid().to_string(), "vsize": tx.vsize(), "asset": asset.to_string(),
+			"value": value.to_string(), "fee": {"asset": fee_asset.to_string(), "amount": fee.to_string()},
+			"state": "pending",
+		}))
+	}
+
+	/// Where each board the wallet holds stands, by the server and by the
+	/// wallet's own reading of the chain.
+	pub fn boards(&self) -> Result<Value, Error> {
+		let mut out = vec![];
+		for c in self.store.coins()?.into_iter().filter(|c| c.kind == "board") {
+			let server = self.server.post("board_status", &json!({"leaf_id": c.leaf_id})).unwrap_or_else(|e| json!({"error": e.to_string()}));
+			let own = match c.bases.first().map(|t| Txid::from_str(t)) {
+				Some(Ok(t)) => self.chain.finality(&t)?.word().to_string(),
+				_ => "unknown".into(),
+			};
+			out.push(json!({"leaf_id": c.leaf_id, "state": c.state, "finality": own, "server": server}));
+		}
+		Ok(Value::Array(out))
+	}
+}
+
+/// Signs `digest` with `key`, BIP340, fresh randomness.
+pub(crate) fn sign(key: &Keypair, digest: &[u8; 32]) -> elements::secp256k1_zkp::schnorr::Signature {
+	arca_covenant::sign::sign_digest(key, digest, &random32())
+}
+
+use elements::hashes::Hash as _;
