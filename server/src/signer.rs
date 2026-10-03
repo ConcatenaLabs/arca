@@ -1,7 +1,7 @@
 //! The operator key `S`, behind a narrow interface in a process of its own.
 //!
 //! The server never holds `S`. The signer (`arca-signer`) loads it, listens on
-//! a Unix socket, and answers two requests, one JSON object per line:
+//! a Unix socket, and answers three requests, one JSON object per line:
 //!
 //! - `{"op":"pubkey"}`: the x-only key `S`;
 //! - `{"op":"rebind","salt":…,"asset_in":…,"value_in":…,"outputs":[…]}`: `S`'s
@@ -9,13 +9,24 @@
 //!   signer builds itself from the parts, on its own chain:
 //!   `SHA256(K ‖ asset_in ‖ 0x01 ‖ 0x01 ‖ value_in ‖ m ‖ SHA256(record 0) ‖ …)`
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis) ‖ salt)`, for 1 to 4
-//!   committed outputs.
+//!   committed outputs;
+//! - `{"op":"spend","tx":…,"prevouts":[…],"input":…,"leaf":…}`: `S`'s signature
+//!   over the spend of input `input` of the transaction by the tapscript leaf
+//!   `leaf`, whose signature hash (Elements taproot, `SIGHASH_DEFAULT`, its
+//!   own chain's genesis hash) the signer computes itself from the
+//!   transaction and the outputs every input spends. It signs only for a leaf
+//!   that names `S` with `OP_CHECKSIG` or `OP_CHECKSIGVERIFY` (one of the
+//!   operator's own paths: a clock's release or roll, `R`, a sweep, a reclaim,
+//!   a forfeit's claim, the connector's issuance, an offboard's reclaim), and
+//!   only for an input that spends a taproot output.
 //!
-//! It signs nothing else: no digest handed to it, no transaction, no unroll
-//! authorisation, no release. Whoever reaches the socket can have it sign a
-//! rebindable message for any salt, which is what co-signing is; the socket
-//! sits in a directory only the operator's user can enter, and the server
-//! checks every rule before it asks.
+//! It signs nothing else: no digest handed to it, no unroll authorisation, no
+//! release, and no spend by a path that checks `S` with
+//! `OP_CHECKSIGFROMSTACK`, which only the rebindable message reaches. Whoever
+//! reaches the socket can have it sign a rebindable message for any salt,
+//! which is what co-signing is, and spend any output on the operator's own
+//! paths; the socket sits in a directory only the operator's user can enter,
+//! and the server checks every rule before it asks.
 //!
 //! Amounts are decimal strings, asset ids in display order, everything else
 //! hex.
@@ -32,7 +43,7 @@ use tokio::net::UnixStream;
 use arca_covenant::ExplicitOutput;
 
 /// The longest request line the signer reads.
-pub const MAX_REQUEST: usize = 16 * 1024;
+pub const MAX_REQUEST: usize = 64 * 1024;
 
 /// An output a rebindable signature commits to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +75,34 @@ pub enum Request {
 	/// lets a unit variant of a tagged enum through with any fields).
 	Pubkey {},
 	Rebind { salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput> },
+	/// The transaction and each output its inputs spend, in Sequentia's
+	/// encoding as hex; the input signed; the leaf it spends by, as hex.
+	Spend { tx: String, prevouts: Vec<String>, input: u32, leaf: String },
+}
+
+/// Why the signer will not sign a spend: `Ok` when `leaf` names `operator`
+/// with `OP_CHECKSIG` or `OP_CHECKSIGVERIFY`, the input exists, every input's
+/// spent output is given, and the input spends a taproot output.
+pub fn check_spend(operator: &XOnlyPublicKey, tx: &elements::Transaction, prevouts: &[elements::TxOut], input: usize, leaf: &Script)
+	-> Result<(), String>
+{
+	use elements::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY};
+	use elements::script::Instruction;
+	if prevouts.len() != tx.input.len() {
+		return Err(format!("{} spent outputs for {} inputs", prevouts.len(), tx.input.len()));
+	}
+	let spent = prevouts.get(input).ok_or_else(|| format!("input {} of {}", input, tx.input.len()))?;
+	if !spent.script_pubkey.is_v1_p2tr() {
+		return Err(format!("input {} spends no taproot output", input));
+	}
+	let key = operator.serialize();
+	let ins: Vec<Instruction> = leaf.instructions().collect::<Result<_, _>>().map_err(|e| format!("the leaf does not parse: {}", e))?;
+	let names_key = ins.windows(2).any(|w| matches!((&w[0], &w[1]),
+		(Instruction::PushBytes(k), Instruction::Op(op)) if *k == key && (*op == OP_CHECKSIG || *op == OP_CHECKSIGVERIFY)));
+	if !names_key {
+		return Err("the leaf is not one of the operator's paths: it names no S with OP_CHECKSIG or OP_CHECKSIGVERIFY".into());
+	}
+	Ok(())
 }
 
 /// The signer's answer.
@@ -153,6 +192,26 @@ impl SignerClient {
 		let r = self.ask(&Request::Rebind {
 			salt: hex(salt), asset_in: asset_in.to_string(), value_in: value_in.to_string(),
 			outputs: outputs.iter().map(WireOutput::from_output).collect(),
+		}).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s signature over the spend of input `input` of `tx` by `leaf`,
+	/// `prevouts` the outputs every input spends. The transaction goes without
+	/// its witnesses, which the signature hash does not cover.
+	pub async fn spend(&self, tx: &elements::Transaction, prevouts: &[elements::TxOut], input: usize, leaf: &Script)
+		-> Result<Signature, SignerError>
+	{
+		let mut bare = tx.clone();
+		for i in &mut bare.input {
+			i.witness = Default::default();
+		}
+		let r = self.ask(&Request::Spend {
+			tx: hex(&elements::encode::serialize(&bare)),
+			prevouts: prevouts.iter().map(|p| hex(&elements::encode::serialize(p))).collect(),
+			input: input as u32,
+			leaf: hex(leaf.as_bytes()),
 		}).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))

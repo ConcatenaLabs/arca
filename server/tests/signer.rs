@@ -62,7 +62,7 @@ async fn the_signer_process() {
 			"00".repeat(32), asset, vec![format!(r#"{{"asset":"{}","value":"1","script":"51"}}"#, asset); 5].join(","))),
 		("an unknown field", format!(r#"{{"op":"pubkey","digest":"{}"}}"#, "00".repeat(32))),
 		("a value with a sign", format!(r#"{{"op":"rebind","salt":"{}","asset_in":"{}","value_in":"-1","outputs":[{{"asset":"{}","value":"1","script":"51"}}]}}"#, "00".repeat(32), asset, asset)),
-		("a line over the limit", format!(r#"{{"op":"pubkey","x":"{}"}}"#, "a".repeat(20_000))),
+		("a line over the limit", format!(r#"{{"op":"pubkey","x":"{}"}}"#, "a".repeat(70_000))),
 	] {
 		let answer = raw(&p.socket, &line).await;
 		let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
@@ -71,6 +71,41 @@ async fn the_signer_process() {
 	}
 	let e = client.rebind(&[0; 32], asset, 1, &[]).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+
+	// The spend of one of the operator's own paths: a clock's release. The
+	// signer computes the signature hash itself, on its own chain.
+	let schedule = arca_covenant::ClockSchedule::new(asset, xonly(&s), arca_covenant::RelativeTime::from_units(254).unwrap(),
+		vec![arca_covenant::MedianTime::from_consensus(1_800_000_000).unwrap()]).unwrap();
+	let fee_coin = sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(asset, 9_000), Script::from(vec![0x51]));
+	let fee = arca_covenant::spend::FeeSource::Coin {
+		outpoint: elements::OutPoint::new(elements::Txid::from_raw_hash(sha256d::Hash::hash(b"fee coin")), 0),
+		coin: fee_coin, fee: 1_000, change: Script::from(vec![0x51]),
+	};
+	let token = elements::OutPoint::new(elements::Txid::from_raw_hash(sha256d::Hash::hash(b"token")), 1);
+	let release = schedule.release_tx(0, token, &fee).unwrap();
+	let sig = client.spend(&release.tx, &release.prevouts, 0, &release.script).await.unwrap();
+	assert!(verify_digest(&sig, &release.sighash(genesis).unwrap(), &xonly(&s)), "the release's signature verifies");
+	println!("signed the release of clock 0: it verifies over the signature hash arca-covenant builds");
+
+	// A path that is not the operator's: refused, whatever the transaction.
+	let collab = leaf.collab_script();
+	let exit = leaf.exit_script();
+	let cases: Vec<(&str, Vec<elements::TxOut>, usize, Script)> = vec![
+		("the leaf's collaborative path (S under OP_CHECKSIGFROMSTACK)", release.prevouts.clone(), 0, collab),
+		("the owner's exit path", release.prevouts.clone(), 0, exit),
+		("an input past the last", release.prevouts.clone(), 2, release.script.clone()),
+		("one spent output for two inputs", release.prevouts[..1].to_vec(), 0, release.script.clone()),
+		("an input spending a bare OP_TRUE", vec![release.prevouts[1].clone(), release.prevouts[1].clone()], 0, release.script.clone()),
+	];
+	for (what, prevouts, input, script) in cases {
+		let e = client.spend(&release.tx, &prevouts, input, &script).await.unwrap_err();
+		assert!(matches!(e, SignerError::Refused(_)), "{}: {}", what, e);
+		println!("refused, {}: {}", what, e);
+	}
+	let line = format!(r#"{{"op":"spend","tx":"00","prevouts":[],"input":0,"leaf":"51","digest":"{}"}}"#, "00".repeat(32));
+	let v: serde_json::Value = serde_json::from_str(&raw(&p.socket, &line).await).unwrap();
+	assert!(v["error"].is_string() && v["signature"].is_null(), "a stray digest: {}", v);
+	println!("refused, a spend request carrying a digest: {}", v["error"].as_str().unwrap());
 
 	// A key file others can read is refused at start.
 	let dir = signer_dir();

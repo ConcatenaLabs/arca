@@ -1,6 +1,7 @@
 //! `arca-signer`: holds the operator key `S` and signs the rebindable messages
-//! of collaborative paths, and nothing else, for the server on a Unix socket.
-//! See `server::signer` for the protocol.
+//! of collaborative paths and the spends of the operator's own paths, each
+//! built by the signer itself, and nothing else, for the server on a Unix
+//! socket. See `server::signer` for the protocol.
 //!
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path>
 //!
@@ -19,9 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use arca_covenant::message::rebind_message;
-use arca_covenant::sign::sign_digest;
+use arca_covenant::sign::{script_spend_sighash, sign_digest};
 use arca_covenant::Chain;
-use server::signer::{hex, parse_amount, unhex32, Request, Response, MAX_REQUEST};
+use server::signer::{check_spend, hex, parse_amount, unhex, unhex32, Request, Response, MAX_REQUEST};
 
 struct Args {
 	key_file: PathBuf,
@@ -62,7 +63,7 @@ fn load_key(path: &PathBuf) -> Result<Keypair, String> {
 }
 
 /// Answers one request line.
-fn answer(key: &Keypair, chain: &Chain, line: &str) -> Response {
+fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, line: &str) -> Response {
 	let none = Response { pubkey: None, signature: None, error: None };
 	let req: Request = match serde_json::from_str(line) {
 		Ok(r) => r,
@@ -95,6 +96,27 @@ fn answer(key: &Keypair, chain: &Chain, line: &str) -> Response {
 			eprintln!("arca-signer: signed rebind {} for salt {}", hex(&message.digest), hex(&salt));
 			Response { signature: Some(hex(sig.as_ref())), ..none }
 		},
+		Request::Spend { tx, prevouts, input, leaf } => {
+			let parsed = (|| -> Result<_, String> {
+				let tx: elements::Transaction = elements::encode::deserialize(&unhex(&tx)?).map_err(|e| format!("tx: {}", e))?;
+				let prevouts = prevouts.iter()
+					.map(|p| elements::encode::deserialize::<elements::TxOut>(&unhex(p)?).map_err(|e| format!("prevout: {}", e)))
+					.collect::<Result<Vec<_>, String>>()?;
+				let leaf = elements::Script::from(unhex(&leaf)?);
+				check_spend(&key.x_only_public_key().0, &tx, &prevouts, input as usize, &leaf)?;
+				let digest = script_spend_sighash(&tx, input as usize, &prevouts, &leaf, genesis).map_err(|e| e.to_string())?;
+				Ok((tx.txid(), digest))
+			})();
+			let (txid, digest) = match parsed {
+				Ok(p) => p,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &digest, &aux);
+			eprintln!("arca-signer: signed spend of input {} of {}", input, txid);
+			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
 	}
 }
 
@@ -115,6 +137,7 @@ async fn main() {
 		},
 	};
 	let chain = Chain::new(args.genesis);
+	let genesis = args.genesis;
 	let _ = std::fs::remove_file(&args.socket);
 	let listener = match UnixListener::bind(&args.socket) {
 		Ok(l) => l,
@@ -142,7 +165,7 @@ async fn main() {
 			let mut line = String::new();
 			let reply = match reader.read_line(&mut line).await {
 				Ok(n) if n > MAX_REQUEST => Response { pubkey: None, signature: None, error: Some("request too long".into()) },
-				Ok(_) => answer(&key, &chain, line.trim_end()),
+				Ok(_) => answer(&key, &chain, genesis, line.trim_end()),
 				Err(e) => Response { pubkey: None, signature: None, error: Some(e.to_string()) },
 			};
 			let mut out = serde_json::to_string(&reply).unwrap_or_else(|_| "{\"error\":\"internal\"}".into());
