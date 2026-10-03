@@ -22,6 +22,7 @@ use crate::http::{router, App};
 use crate::nursery::Nursery;
 use crate::params::{AssetParams, FeeSchedule, Params};
 use crate::participations::Participations;
+use crate::rounds::{RoundConfig, Rounds};
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
 use crate::wallet::{SpendFrom, Wallet, WalletConfig};
@@ -48,6 +49,10 @@ pub struct Config {
 	/// How long a challenge is good for, in seconds.
 	#[serde(default = "default_challenge_ttl")]
 	pub challenge_ttl_seconds: u64,
+	/// How often a round is built when participations wait, in seconds; 0
+	/// builds none on a timer (a round is then built by `Rounds::run_round`).
+	#[serde(default = "default_round_interval")]
+	pub round_interval_seconds: u64,
 	pub node: NodeConfig,
 	#[serde(default)]
 	pub finality: FinalitySection,
@@ -91,6 +96,10 @@ fn default_max_request() -> usize {
 
 fn default_challenge_ttl() -> u64 {
 	120
+}
+
+fn default_round_interval() -> u64 {
+	60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +179,7 @@ pub struct Server {
 	pub wallet: Arc<Wallet>,
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
+	pub rounds: Arc<Rounds>,
 	tasks: Vec<JoinHandle<()>>,
 }
 
@@ -231,15 +241,18 @@ impl Server {
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone());
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer);
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
+		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
 
 		// The first pass before anything is answered, so the chain is known.
 		finality.sync().await.map_err(err("the first pass over the chain"))?;
-		let mut tasks = vec![nursery.spawn(), boards.spawn()];
+		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
+		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
+		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval)];
 		tasks.push(finality.spawn());
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
-			participations: participations.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
+			participations: participations.clone(), rounds: rounds.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 		});
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
@@ -251,7 +264,7 @@ impl Server {
 			}
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, tasks })
+		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, tasks })
 	}
 
 	/// Stops every task.

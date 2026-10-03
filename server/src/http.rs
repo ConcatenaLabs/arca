@@ -15,6 +15,7 @@
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
+//! | `tree` | POST | no: the operator publishes every tree |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
 
 use std::str::FromStr;
@@ -42,6 +43,7 @@ use crate::boards::{BoardError, BoardStatus, Boards};
 use crate::chain::{Certification, Finality};
 use crate::cosign::{CosignError, Cosigner, InputRequest, OutputRequest, TransferRequest};
 use crate::params::{FeeSchedule, Params};
+use crate::rounds::{RoundError, Rounds};
 use crate::participations::{self as part, ParticipationError, ParticipationRequest, Participations, Status};
 use crate::signer::{hex, parse_amount, unhex, unhex32};
 use crate::store::{ChallengeError, LeafKind, LeafState, Store, WantedKind};
@@ -53,6 +55,7 @@ pub struct App {
 	pub boards: Arc<Boards>,
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
+	pub rounds: Arc<Rounds>,
 	pub certification: Certification,
 	pub anchor_depth: u32,
 	pub max_request: usize,
@@ -90,7 +93,7 @@ fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"unknown_participation" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"signer_unavailable" | "not_synced" => StatusCode::SERVICE_UNAVAILABLE,
@@ -126,6 +129,13 @@ impl From<ParticipationError> for Refusal {
 			log::error!("participation: {}", e);
 		}
 		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+impl From<RoundError> for Refusal {
+	fn from(e: RoundError) -> Refusal {
+		log::error!("rounds: {}", e);
+		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
 	}
 }
 
@@ -394,6 +404,43 @@ async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Byt
 	Ok(Json(participation_status(&app.participations.status(&id).await?)))
 }
 
+async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::PublishedTree>, Refusal> {
+	let req: api::TreeRequest = parse(body, app.max_request)?;
+	let txid = elements::Txid::from_str(&req.txid).map_err(|e| Refusal::malformed(format!("txid: {}", e)))?;
+	let t = app.rounds.tree(&txid, req.vout).await?
+		.ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "unknown_batch", format!("no batch is paid by {}:{}", txid, req.vout)))?;
+	use arca_covenant::encode::Encoding;
+	Ok(Json(api::PublishedTree {
+		round_txid: t.round_txid.to_string(),
+		batch_vout: t.batch_vout,
+		token_vout: t.token_vout,
+		connector_vout: t.connector_vout,
+		asset: t.params.asset.to_string(),
+		genesis_hash: t.params.chain.genesis_hash().to_string(),
+		schedule: hex(&t.params.schedule.encode()),
+		burn: t.params.burn,
+		radix: t.params.radix as u32,
+		reserve: match t.params.reserve {
+			arca_covenant::ReserveRule::FeeRate { floor_per_kvb, multiple } => api::TreeReserve::FeeRate(api::FeeRateReserve {
+				floor_per_kvb: floor_per_kvb.to_string(), multiple: multiple.to_string(),
+			}),
+			arca_covenant::ReserveRule::Fixed { node, entry } => api::TreeReserve::Fixed(api::FixedReserve {
+				node: node.to_string(), entry: entry.to_string(),
+			}),
+		},
+		min_leaf: t.params.min_leaf.to_string(),
+		leaves: t.leaves.iter().map(|l| api::TreeLeaf {
+			template: l.template.to_string(),
+			owner: hex(&l.owner.serialize()),
+			owner_nonce: hex(&l.owner_nonce),
+			operator_nonce: hex(&l.operator_nonce),
+			exit_delay_units: l.exit_delay.units(),
+			value: l.value.to_string(),
+			unlock_hash: hex(&l.unlock_hash),
+		}).collect(),
+	}))
+}
+
 /// The most messages one read returns.
 pub const MAILBOX_PAGE: u32 = 100;
 
@@ -452,6 +499,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/cosign_transfer", post(cosign_transfer))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
+		.route("/v1/tree", post(tree))
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
 		.layer(DefaultBodyLimit::max(limit))

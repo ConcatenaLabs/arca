@@ -22,7 +22,10 @@
 //! it builds every transaction in whatever accepted asset it holds.
 //!
 //! A round-shaped transaction carries the round's connector output
-//! ([`arca_covenant::ConnectorPolicy`]) right after the outputs it pays.
+//! ([`arca_covenant::ConnectorPolicy`]) right after the outputs it pays. A
+//! round transaction ([`Wallet::build_round`]) also issues each batch's sweep
+//! token, one explicit atom with no reissuance token, from one of the
+//! wallet's own coins per batch.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -32,7 +35,8 @@ use elements::bitcoin::bip32::{DerivationPath, Fingerprint};
 use elements::hashes::Hash;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut, Txid, WPubkeyHash};
+use elements::secp256k1_zkp::ZERO_TWEAK;
+use elements::{confidential, AssetId, AssetIssuance, ContractHash, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut, Txid, WPubkeyHash};
 use lwk_common::Signer as _;
 use lwk_signer::SwSigner;
 use tokio::sync::Mutex;
@@ -69,6 +73,10 @@ pub enum WalletError {
 	Raced,
 	#[error("the finality service: {0}")]
 	Finality(String),
+	#[error("a round of {need} batches needs {need} spendable coins to issue their tokens; the wallet has {have}")]
+	TooFewCoins { need: usize, have: usize },
+	#[error("the round's outputs: {0}")]
+	Round(String),
 }
 
 /// How spendable a coin must be.
@@ -124,6 +132,16 @@ pub struct Wallet {
 	/// One build at a time, so two never choose the same coin.
 	building: Mutex<()>,
 }
+
+/// The sweep token a wallet coin issues in a round: the asset its outpoint
+/// issues with a zero contract hash.
+pub fn token_of(c: &WalletCoin) -> AssetId {
+	AssetId::new_issuance(OutPoint::new(Txid::from_byte_array(c.txid), c.vout), ContractHash::from_byte_array([0; 32]))
+}
+
+/// The denomination a sweep token is issued with. It is not part of what a
+/// wallet checks of the token, and the kit's PSET signs every issuance as 8.
+pub const TOKEN_DENOMINATION: u8 = 8;
 
 /// The size, in bytes, of a P2WPKH witness with a low-R signature: what the
 /// fee is sized for before the transaction is signed.
@@ -215,35 +233,91 @@ impl Wallet {
 		if req.outputs.is_empty() && req.connector.is_none() {
 			return Err(WalletError::Empty);
 		}
-		for o in &req.outputs {
+		// Refuse an asset the node does not accept before anything else.
+		self.fee_for(req.fee_asset, 1).await?;
+		let _one = self.building.lock().await;
+		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[]).await
+	}
+
+	/// Builds and signs a round transaction that creates `batches` batches.
+	/// The wallet chooses one of its spendable coins per batch, each of which
+	/// issues one explicit atom of a new asset, with a zero contract hash and
+	/// no reissuance token: that batch's sweep token, whose id follows from the
+	/// coin's outpoint. `make` is given the tokens, in that order, and returns
+	/// the outputs to pay (each token exactly once, as one atom) and whatever
+	/// else it made of them; the connector output follows those outputs, then
+	/// change per asset, then the one fee output, in `fee_asset`. The issuing
+	/// coins are the first inputs, in the order of the tokens. The lock time is
+	/// 0 and every input final, so the transaction can always return to the
+	/// mempool unchanged after a rollback.
+	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, make: F)
+		-> Result<(Built, R), WalletError>
+	where
+		F: FnOnce(&[AssetId]) -> Result<(Vec<ExplicitOutput>, R), String>,
+	{
+		self.fee_for(fee_asset, 1).await?;
+		let _one = self.building.lock().await;
+		let mut coins = vec![];
+		for c in self.store.wallet_coins(None).await? {
+			if self.spendable(&c).await? {
+				coins.push(c);
+			}
+		}
+		if coins.len() < batches {
+			return Err(WalletError::TooFewCoins { need: batches, have: coins.len() });
+		}
+		// The fee asset's coins first, the largest first: an issuing coin's
+		// value goes on to pay the round like any other.
+		let fee = fee_asset.into_inner().to_byte_array();
+		coins.sort_by(|a, b| (b.asset == fee).cmp(&(a.asset == fee)).then(b.value.cmp(&a.value)).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
+		let issuers: Vec<WalletCoin> = coins.into_iter().take(batches).collect();
+		let tokens: Vec<AssetId> = issuers.iter().map(token_of).collect();
+		let (outputs, made) = make(&tokens).map_err(WalletError::Round)?;
+		for t in &tokens {
+			let held: Vec<&ExplicitOutput> = outputs.iter().filter(|o| o.asset == *t).collect();
+			if held.len() != 1 || held[0].value != 1 {
+				return Err(WalletError::Round(format!("the token {} must be paid once, as one atom", t)));
+			}
+		}
+		let built = self.build_locked(&outputs, Some(connector), fee_asset, &issuers).await?;
+		Ok((built, made))
+	}
+
+	/// Builds and signs, the build lock held: `issuers` are the first inputs,
+	/// each issuing one atom of its token ([`token_of`]).
+	async fn build_locked(&self, outputs_req: &[ExplicitOutput], connector: Option<AssetAmount>, fee_asset: AssetId,
+		issuers: &[WalletCoin]) -> Result<Built, WalletError>
+	{
+		for o in outputs_req {
 			if o.value == 0 {
 				return Err(WalletError::ZeroOutput(o.asset));
 			}
 		}
-		// Refuse an asset the node does not accept before anything else.
-		self.fee_for(req.fee_asset, 1).await?;
-
-		let _one = self.building.lock().await;
-		let mut outputs: Vec<TxOut> = req.outputs.iter().map(|o| o.txout()).collect();
-		let connector_vout = req.connector.map(|c| {
+		let issued: Vec<AssetId> = issuers.iter().map(token_of).collect();
+		let mut outputs: Vec<TxOut> = outputs_req.iter().map(|o| o.txout()).collect();
+		let connector_vout = connector.map(|c| {
 			outputs.push(ConnectorPolicy { operator: self.operator }.output(c.asset, c.amount).txout());
 			(outputs.len() - 1) as u32
 		});
 
-		// What each asset must cover, the fee aside.
+		// What each asset must cover, the fee aside; the tokens the issuing
+		// inputs create cover themselves.
 		let mut need: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for o in &outputs {
 			let a = o.asset.explicit().expect("explicit");
-			*need.entry(a).or_insert(0) += o.value.explicit().expect("explicit");
+			if !issued.contains(&a) {
+				*need.entry(a).or_insert(0) += o.value.explicit().expect("explicit");
+			}
 		}
-		need.entry(req.fee_asset).or_insert(0);
+		need.entry(fee_asset).or_insert(0);
 
-		// The spendable coins of every asset involved.
+		// The spendable coins of every asset involved, the issuers apart.
+		let taken: Vec<([u8; 32], u32)> = issuers.iter().map(|c| (c.txid, c.vout)).collect();
 		let mut available: BTreeMap<AssetId, Vec<WalletCoin>> = BTreeMap::new();
 		for a in need.keys() {
 			let mut coins = vec![];
 			for c in self.store.wallet_coins(Some(&a.into_inner().to_byte_array())).await? {
-				if self.spendable(&c).await? {
+				if !taken.contains(&(c.txid, c.vout)) && self.spendable(&c).await? {
 					coins.push(c);
 				}
 			}
@@ -252,14 +326,14 @@ impl Wallet {
 
 		// Choose coins and size the fee until they agree. A fee is never
 		// zero, so the fee asset always gives at least one coin.
-		let mut fee = self.fee_for(req.fee_asset, 1).await?;
+		let mut fee = self.fee_for(fee_asset, 1).await?;
 		let mut change_scripts: BTreeMap<AssetId, Script> = BTreeMap::new();
 		loop {
-			let mut chosen: Vec<WalletCoin> = vec![];
+			let mut chosen: Vec<WalletCoin> = issuers.to_vec();
 			for (a, amount) in &need {
-				let want = amount + if *a == req.fee_asset { fee } else { 0 };
+				let want = amount + if *a == fee_asset { fee } else { 0 };
+				let mut sum: u64 = issuers.iter().filter(|c| AssetId::from_byte_array(c.asset) == *a).map(|c| c.value).sum();
 				let coins = &available[a];
-				let mut sum = 0u64;
 				for c in coins {
 					if sum >= want {
 						break;
@@ -268,12 +342,13 @@ impl Wallet {
 					chosen.push(c.clone());
 				}
 				if sum < want {
-					return Err(WalletError::Insufficient { asset: *a, need: want, have: coins.iter().map(|c| c.value).sum() });
+					let have = sum.max(coins.iter().map(|c| c.value).sum());
+					return Err(WalletError::Insufficient { asset: *a, need: want, have });
 				}
 			}
-			let (tx, paid) = self.assemble(&chosen, &outputs, req.fee_asset, fee, &mut change_scripts).await?;
+			let (tx, paid) = self.assemble(&chosen, issuers.len(), &outputs, fee_asset, fee, &mut change_scripts).await?;
 			let vsize = Self::signed_vsize(&tx);
-			let needed = self.fee_for(req.fee_asset, vsize).await?;
+			let needed = self.fee_for(fee_asset, vsize).await?;
 			if needed <= paid {
 				let mut tx = tx;
 				self.sign(&mut tx, &chosen).await?;
@@ -282,10 +357,9 @@ impl Wallet {
 				if !self.store.spend_wallet_coins(&spent, &txid.to_byte_array()).await? {
 					return Err(WalletError::Raced);
 				}
-				let fee = paid;
 				return Ok(Built {
 					tx,
-					fee: AssetAmount::new(req.fee_asset, fee),
+					fee: AssetAmount::new(fee_asset, paid),
 					connector_vout,
 					spent: chosen.iter().map(|c| OutPoint::new(Txid::from_byte_array(c.txid), c.vout)).collect(),
 				});
@@ -294,16 +368,20 @@ impl Wallet {
 		}
 	}
 
-	/// The unsigned transaction: `coins` in, `outputs`, then change per
-	/// asset to the wallet's change scripts, then the fee output. Change in
-	/// the fee asset smaller than the fee goes to the fee rather than make
-	/// an output too small to relay. Returns the fee it pays.
-	async fn assemble(&self, coins: &[WalletCoin], outputs: &[TxOut], fee_asset: AssetId, fee: u64,
+	/// The unsigned transaction: `coins` in, the first `issuing` of them each
+	/// issuing one atom of its token, `outputs`, then change per asset to the
+	/// wallet's change scripts, then the fee output. Change in the fee asset
+	/// smaller than the fee goes to the fee rather than make an output too
+	/// small to relay. Returns the fee it pays.
+	async fn assemble(&self, coins: &[WalletCoin], issuing: usize, outputs: &[TxOut], fee_asset: AssetId, fee: u64,
 		change_scripts: &mut BTreeMap<AssetId, Script>) -> Result<(Transaction, u64), WalletError>
 	{
 		let mut held: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for c in coins {
 			*held.entry(AssetId::from_byte_array(c.asset)).or_insert(0) += c.value;
+		}
+		for c in &coins[..issuing] {
+			*held.entry(token_of(c)).or_insert(0) += 1;
 		}
 		for o in outputs {
 			let a = o.asset.explicit().expect("explicit");
@@ -333,10 +411,25 @@ impl Wallet {
 		let tx = Transaction {
 			version: 2,
 			lock_time: LockTime::ZERO,
-			input: coins.iter().map(|c| TxIn {
-				previous_output: OutPoint::new(Txid::from_byte_array(c.txid), c.vout),
-				sequence: Sequence::MAX,
-				..Default::default()
+			input: coins.iter().enumerate().map(|(i, c)| {
+				let mut input = TxIn {
+					previous_output: OutPoint::new(Txid::from_byte_array(c.txid), c.vout),
+					sequence: Sequence::MAX,
+					..Default::default()
+				};
+				if i < issuing {
+					input.asset_issuance = AssetIssuance {
+						asset_blinding_nonce: ZERO_TWEAK,
+						asset_entropy: [0; 32],
+						amount: confidential::Value::Explicit(1),
+						inflation_keys: confidential::Value::Null,
+						// The kit's PSET carries no denomination and signs an
+						// issuance as denomination 8; the transaction must say
+						// the same, or the signature covers another hash.
+						denomination: TOKEN_DENOMINATION,
+					};
+				}
+				input
 			}).collect(),
 			output: all,
 		};
@@ -356,6 +449,14 @@ impl Wallet {
 	/// Signs every input through the kit's PSET signer.
 	async fn sign(&self, tx: &mut Transaction, coins: &[WalletCoin]) -> Result<(), WalletError> {
 		let mut pset = PartiallySignedTransaction::from_tx(tx.clone());
+		// The kit's PSET keeps an input's issuance flag in its output index
+		// (bit 31), and the transaction it extracts to sign then names
+		// another outpoint than the one spent. The index is the outpoint's.
+		for (i, input) in tx.input.iter().enumerate() {
+			if input.has_issuance() {
+				pset.inputs_mut()[i].previous_output_index = input.previous_output.vout;
+			}
+		}
 		let mut keys = vec![];
 		for (i, c) in coins.iter().enumerate() {
 			let pk = self.public_key(c.chain, c.index)?;

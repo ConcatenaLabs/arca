@@ -25,6 +25,10 @@ max_request_bytes = 65536
 # How long an authentication challenge is good for.
 challenge_ttl_seconds = 120
 
+# How often a round is built while participations wait, in seconds. 0 builds
+# none on a timer.
+round_interval_seconds = 60
+
 # The exit delay bounds, in 512-second units: [min, max]. The default is the
 # specification's 36 to 48 hours, [254, 338].
 # exit_delay_units = [254, 338]

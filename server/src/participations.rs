@@ -219,6 +219,7 @@ impl ParticipationError {
 			Coin(CoinError::NotLive(..)) => "not_live",
 			Coin(CoinError::Spent(_)) => "in_use",
 			Coin(CoinError::BoardNotFinal(_)) => "board_not_final",
+			Coin(CoinError::RoundNotFinal(_)) => "round_not_final",
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::InvalidCoin { .. }) => "invalid_coin",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
@@ -404,8 +405,9 @@ impl Participations {
 
 		// The coins given up, each checked, each attested by its owner.
 		let mut coins = Vec::with_capacity(n);
+		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
-			let c = coins::check(&self.store, p, &i.leaf_id, &id, now).await?;
+			let c = coins::check(&self.store, &policy, &i.leaf_id, &id).await?;
 			if !verify_digest(&i.attestation, &id, &c.coin.leaf.owner) {
 				return Err(ParticipationError::BadAttestation(k));
 			}
@@ -502,8 +504,27 @@ impl Participations {
 	/// The participation `id` and where it stands.
 	pub async fn status(&self, id: &[u8; 32]) -> Result<Status, ParticipationError> {
 		let row = self.store.participation(id).await?.ok_or_else(|| ParticipationError::Unknown(crate::signer::hex(id)))?;
-		let placed = vec![Placed::default(); row.outputs.len()];
-		Ok(Status { row, round: None, placed })
+		let mut placed = vec![Placed::default(); row.outputs.len()];
+		let round = match row.round_id {
+			Some(round_id) => {
+				let r = self.store.round(round_id).await?
+					.ok_or_else(|| ParticipationError::Internal(format!("round {} is not recorded", round_id)))?;
+				let at = self.store.placement(id, row.attempt).await?;
+				for (j, leaf, vout, idx) in at.leaves {
+					if let Some(p) = placed.get_mut(j as usize) {
+						*p = Placed { leaf_id: Some(LeafId(leaf)), batch_vout: Some(vout), leaf_index: Some(idx), offboard_vout: None };
+					}
+				}
+				for (j, vout) in at.offboards {
+					if let Some(p) = placed.get_mut(j as usize) {
+						p.offboard_vout = Some(vout);
+					}
+				}
+				Some(RoundRef { txid: elements::Txid::from_byte_array(r.txid), connector_vout: r.connector_vout })
+			},
+			None => None,
+		};
+		Ok(Status { row, round, placed })
 	}
 }
 

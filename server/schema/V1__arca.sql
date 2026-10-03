@@ -219,12 +219,24 @@ CREATE TABLE transfer_output (
 
 -- A round transaction the operator built and signed. It is kept whole, with
 -- nLockTime 0, and broadcast again unchanged after a rollback.
+--
+-- built: signed and recorded, not yet handed to the nursery;
+-- broadcast: in the nursery, which keeps it broadcast until final;
+-- final: certified, and its anchor buried;
+-- lost: it can never return (an input is spent by another transaction that
+--   is final).
 CREATE TABLE round (
-	round_id   BIGSERIAL PRIMARY KEY,
-	txid       BYTEA NOT NULL UNIQUE CHECK (length(txid) = 32),
-	tx         BYTEA NOT NULL,
-	state      TEXT NOT NULL CHECK (state IN ('built', 'broadcast', 'final', 'lost')),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	round_id    BIGSERIAL PRIMARY KEY,
+	txid        BYTEA NOT NULL UNIQUE CHECK (length(txid) = 32),
+	tx          BYTEA NOT NULL,
+	state       TEXT NOT NULL CHECK (state IN ('built', 'broadcast', 'final', 'lost')),
+	-- The one fee the round pays, in one asset, from the operator's coins.
+	fee_asset   BYTEA NOT NULL CHECK (length(fee_asset) = 32),
+	fee         BIGINT NOT NULL CHECK (fee > 0),
+	-- The median time the round's clock schedules count from.
+	created_mtp BIGINT NOT NULL,
+	created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- The round's connector output, which only the issuance of the round's
@@ -234,7 +246,7 @@ CREATE TABLE connector_output (
 	vout            INTEGER NOT NULL CHECK (vout >= 0),
 	asset           BYTEA NOT NULL CHECK (length(asset) = 32),
 	value           BIGINT NOT NULL CHECK (value > 0),
-	connector_asset BYTEA NOT NULL CHECK (length(connector_asset) = 32),
+	connector_asset BYTEA NOT NULL UNIQUE CHECK (length(connector_asset) = 32),
 	issuance_txid   BYTEA CHECK (length(issuance_txid) = 32)
 );
 
@@ -320,6 +332,69 @@ CREATE TABLE participation_fee (
 	asset            BYTEA NOT NULL CHECK (length(asset) = 32),
 	amount           BIGINT NOT NULL CHECK (amount >= 0),
 	PRIMARY KEY (participation_id, asset)
+);
+
+-- A batch: one output of a round committing to a tree of leaves in one asset,
+-- with everything the tree builder needs to rebuild every script in it (the
+-- leaves are in batch_leaf). This is what the operator publishes.
+CREATE TABLE batch (
+	round_id     BIGINT NOT NULL REFERENCES round,
+	vout         INTEGER NOT NULL CHECK (vout >= 0),
+	asset        BYTEA NOT NULL CHECK (length(asset) = 32),
+	value        BIGINT NOT NULL CHECK (value > 0),
+	-- The sweep token, issued as one atom by the round's input that spends
+	-- the issuer outpoint, and paid to the first clock at token_vout.
+	token        BYTEA NOT NULL UNIQUE CHECK (length(token) = 32),
+	token_vout   INTEGER NOT NULL CHECK (token_vout >= 0),
+	issuer_txid  BYTEA NOT NULL CHECK (length(issuer_txid) = 32),
+	issuer_vout  INTEGER NOT NULL CHECK (issuer_vout >= 0),
+	-- The published schedule (T, S, W, E_0 … E_K), in arca-covenant's
+	-- canonical encoding.
+	schedule     BYTEA NOT NULL,
+	burn         BOOLEAN NOT NULL,
+	radix        SMALLINT NOT NULL,
+	-- The reserve rule: fee_rate (a: the floor per 1,000 vbytes in the
+	-- asset's atoms, b: the multiple) or fixed (a: per node, b: per entry).
+	reserve_kind TEXT NOT NULL CHECK (reserve_kind IN ('fee_rate', 'fixed')),
+	reserve_a    BIGINT NOT NULL CHECK (reserve_a >= 0),
+	reserve_b    BIGINT NOT NULL CHECK (reserve_b >= 0),
+	min_leaf     BIGINT NOT NULL CHECK (min_leaf >= 0),
+	PRIMARY KEY (round_id, vout)
+);
+
+-- Each leaf of a batch, in the tree's order, with the parts the builder took
+-- for it and the leaf record it gave. The leaf's row in leaf is the coin;
+-- its record there is filled in once the owner hands over its forfeits.
+CREATE TABLE batch_leaf (
+	leaf_id          BYTEA PRIMARY KEY REFERENCES leaf,
+	round_id         BIGINT NOT NULL,
+	vout             INTEGER NOT NULL,
+	idx              INTEGER NOT NULL CHECK (idx >= 0),
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	output_idx       SMALLINT NOT NULL,
+	attempt          INTEGER NOT NULL,
+	template         TEXT NOT NULL,
+	owner_key        BYTEA NOT NULL CHECK (length(owner_key) = 32),
+	owner_nonce      BYTEA NOT NULL CHECK (length(owner_nonce) = 32),
+	operator_nonce   BYTEA NOT NULL REFERENCES operator_nonce,
+	exit_delay_units INTEGER NOT NULL,
+	value            BIGINT NOT NULL CHECK (value > 0),
+	unlock_hash      BYTEA NOT NULL CHECK (length(unlock_hash) = 32),
+	record           BYTEA NOT NULL,
+	UNIQUE (round_id, vout, idx),
+	FOREIGN KEY (round_id, vout) REFERENCES batch
+);
+
+-- Each offboard output a round pays.
+CREATE TABLE round_offboard (
+	round_id         BIGINT NOT NULL REFERENCES round,
+	vout             INTEGER NOT NULL CHECK (vout >= 0),
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	output_idx       SMALLINT NOT NULL,
+	attempt          INTEGER NOT NULL,
+	-- The output: the destination's value and the margin for its unlock.
+	value            BIGINT NOT NULL CHECK (value > 0),
+	PRIMARY KEY (round_id, vout)
 );
 
 -- A forfeit of a leaf for a round: the owner's and the operator's signatures

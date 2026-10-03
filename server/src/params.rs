@@ -135,6 +135,19 @@ impl Params {
 		Ok(())
 	}
 
+	/// The policy a coin given up in a participation is checked under, at
+	/// `now`: [`Params::policy`], with the coin's first expiry at least
+	/// [`Params::PARTICIPATION_HORIZON`] after now, so that the coin can still
+	/// be refreshed inside the free window of the last two days, while the
+	/// round has time to become final and the forfeit to come in.
+	pub fn participation_policy(&self, now: MedianTime) -> WalletPolicy {
+		WalletPolicy { horizon: Self::PARTICIPATION_HORIZON, ..self.policy(now) }
+	}
+
+	/// How long before its first expiry a coin may still be given up, in
+	/// seconds: one day.
+	pub const PARTICIPATION_HORIZON: u32 = 86_400;
+
 	/// The policy the server checks records and coins under, at `now`: its
 	/// own chain and key, its exit-delay bounds, and the receipt horizon (a
 	/// coin's first expiry past the exit deadline), as a receiver would.

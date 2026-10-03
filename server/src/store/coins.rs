@@ -164,10 +164,17 @@ pub(super) async fn take_nonce(tx: &tokio_postgres::Transaction<'_>, nonce: &[u8
 }
 
 /// Inserts `coin` inside `tx`: takes its nonce, records its scripts, writes
-/// the leaf.
+/// the leaf. A key wanted by a participation is refused for any coin but
+/// the batch leaf that participation's round makes.
 pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &NewCoin) -> Result<(), StoreError> {
 	if let Some(nonce) = &coin.operator_nonce {
 		take_nonce(tx, nonce, &coin.leaf_id).await?;
+	}
+	// A key a participation wants is promised to the leaf its round makes.
+	if coin.kind != LeafKind::Batch
+		&& tx.query_opt("SELECT 1 FROM participation_output WHERE owner_key = $1 AND kind = 'leaf'", &[&&coin.owner_key[..]]).await?.is_some()
+	{
+		return Err(StoreError::KeyReused);
 	}
 	for s in &coin.scripts {
 		let r = tx.execute(

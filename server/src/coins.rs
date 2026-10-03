@@ -13,10 +13,9 @@
 use elements::hashes::Hash;
 use elements::Transaction;
 
-use arca_covenant::{CoinRecord, LeafId, MedianTime, TransferError, ValidCoin};
+use arca_covenant::{CoinRecord, LeafId, TransferError, ValidCoin, WalletPolicy};
 
-use crate::params::Params;
-use crate::store::{BoardState, LeafState, Store, StoreError};
+use crate::store::{BoardState, LeafState, RoundState, Store, StoreError};
 
 /// A coin given up, checked.
 #[derive(Debug, Clone)]
@@ -39,6 +38,8 @@ pub enum CoinError {
 	Spent(LeafId),
 	#[error("leaf {0} rests on a board that is not credited: its transaction is not final")]
 	BoardNotFinal(LeafId),
+	#[error("leaf {0} rests on a leaf of a round that is not final")]
+	RoundNotFinal(LeafId),
 	#[error("leaf {leaf}: {what} is on-chain, so its owner could take it under the receiver; the server takes no off-chain spend of it")]
 	OnChain { leaf: LeafId, what: String },
 	#[error("leaf {leaf}'s coin does not check out: {error}")]
@@ -50,7 +51,7 @@ pub enum CoinError {
 }
 
 /// The transactions a coin record's bases came from: each board's, as
-/// registered. A leaf of a batch rests on its round.
+/// registered, and each batch leaf's round, which must be final.
 pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction>) -> Result<(), CoinError> {
 	match record {
 		CoinRecord::Board(b) => {
@@ -64,7 +65,20 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 				Box::pin(bases(store, &i.coin, out)).await?;
 			}
 		},
-		CoinRecord::Leaf { .. } => {},
+		CoinRecord::Leaf { record, .. } => {
+			let id = record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?;
+			let leaf = store.batch_leaf(&id.0).await?
+				.ok_or_else(|| CoinError::Internal(format!("leaf {} of a known coin is in no batch the server built", id)))?;
+			let round = store.round(leaf.round_id).await?
+				.ok_or_else(|| CoinError::Internal(format!("the round of leaf {} is not recorded", id)))?;
+			if round.state != RoundState::Final {
+				return Err(CoinError::RoundNotFinal(id));
+			}
+			let tx: Transaction = elements::encode::deserialize(&round.tx).map_err(|e| CoinError::Internal(e.to_string()))?;
+			if !out.iter().any(|t| t.txid() == tx.txid()) {
+				out.push(tx);
+			}
+		},
 	}
 	Ok(())
 }
@@ -72,9 +86,7 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 /// Checks the coin `id` given up by `holder` (a transfer, or a
 /// participation): see the [module documentation](self). A coin already
 /// spent by `holder` itself passes, so a repeated request gets its answer.
-pub async fn check(store: &Store, params: &Params, id: &LeafId, holder: &[u8; 32], now: MedianTime)
-	-> Result<Checked, CoinError>
-{
+pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32]) -> Result<Checked, CoinError> {
 	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;
 	match row.state {
 		LeafState::Live => {},
@@ -86,7 +98,7 @@ pub async fn check(store: &Store, params: &Params, id: &LeafId, holder: &[u8; 32
 	let record = CoinRecord::from_bytes(&row.record).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
 	let mut found = vec![];
 	bases(store, &record, &mut found).await?;
-	let coin = record.resolve(&found, &params.policy(now)).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
+	let coin = record.resolve(&found, policy).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
 	if coin.id != *id {
 		return Err(CoinError::Internal(format!("the record of leaf {} gives the id {}", id, coin.id)));
 	}
