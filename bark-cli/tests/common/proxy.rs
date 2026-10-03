@@ -1,6 +1,8 @@
 //! A proxy between a wallet and the server that can rewrite any answer the
 //! server gives, or hold a call unanswered: an operator lying to one wallet,
-//! or gone mid-call. It logs every call as the wallet saw it.
+//! or gone mid-call. It logs every call as the wallet saw it. In front of a
+//! node's RPC (it passes the request's credentials on) it is another node,
+//! one that answers some calls otherwise.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -37,6 +39,7 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 	let mut parts = line.split_whitespace();
 	let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
 	let mut len = 0usize;
+	let mut auth = None;
 	loop {
 		let mut h = String::new();
 		r.read_line(&mut h)?;
@@ -46,6 +49,9 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 		if let Some((k, v)) = h.split_once(':') {
 			if k.eq_ignore_ascii_case("content-length") {
 				len = v.trim().parse().unwrap_or(0);
+			}
+			if k.eq_ignore_ascii_case("authorization") {
+				auth = Some(v.trim().to_string());
 			}
 		}
 	}
@@ -59,7 +65,11 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 	}
 	let url = format!("{}{}", target, path);
 	let resp = if method == "GET" { minreq::get(url).send() } else {
-		minreq::post(url).with_header("Content-Type", "application/json").with_body(body).send()
+		let mut q = minreq::post(url).with_header("Content-Type", "application/json").with_body(body);
+		if let Some(a) = &auth {
+			q = q.with_header("Authorization", a.as_str());
+		}
+		q.send()
 	};
 	let (mut status, text) = match resp {
 		Ok(r) => (r.status_code as u16, r.as_str().unwrap_or("").to_string()),

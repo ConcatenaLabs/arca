@@ -1234,3 +1234,119 @@ async fn a_refund_decides_the_coin_only_once_it_is_final() {
 	assert_eq!(coin_of(&c, &board)["state"], "exited");
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
+
+// ---------------------------------------------------------------------------
+// Margins: the operator's, within the wallet's bound
+// ---------------------------------------------------------------------------
+
+/// A rewrite of the node's `getfeeexchangerates` answer for `asset`, as
+/// another node on the same chain may value it: scaled by `factor`, dropped
+/// (not accepted for fees), or set to `set`.
+fn rates_rewrite(asset: AssetId, factor: Option<f64>, set: Option<u64>) -> common::proxy::Rewrite {
+	let a = asset.to_string();
+	Arc::new(move |_: &str, req: &Value, _: u16, v: &mut Value| {
+		if req["method"] != "getfeeexchangerates" {
+			return None;
+		}
+		let rates = v["result"].as_object_mut()?;
+		match (factor, set) {
+			(_, Some(r)) => {
+				rates.insert(a.clone(), json!(r));
+			},
+			(Some(f), None) => {
+				if let Some(r) = rates.get(&a).and_then(|r| r.as_u64()) {
+					rates.insert(a.clone(), json!((r as f64 * f) as u64));
+				}
+			},
+			(None, None) => {
+				rates.remove(&a);
+			},
+		}
+		None
+	})
+}
+
+/// Review R8b's probe P4 turned around. Nodes value an asset each for
+/// itself, so a wallet's node may value X higher or lower than the
+/// operator's, or not accept it, or accept Y, which the operator's node does
+/// not. The wallet prices its margins from the floors the operator
+/// publishes (`info.fees.floors`), never from its own node, so each of these
+/// wallets sends; and it refuses, before anything is signed, margins an
+/// operator's floor would take above its own bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_margins_are_the_operators_whatever_the_wallets_node_says() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x, r.y);
+	let url = r.url();
+	let cases: Vec<(&str, AssetId, common::proxy::Rewrite)> = vec![
+		("the wallet's node is the operator's", x, Arc::new(|_: &str, _: &Value, _: u16, _: &mut Value| None)),
+		("the wallet's node values X 10% higher", x, rates_rewrite(x, Some(1.10), None)),
+		("the wallet's node values X 25% higher", x, rates_rewrite(x, Some(1.25), None)),
+		("the wallet's node values X 10% lower", x, rates_rewrite(x, Some(0.90), None)),
+		("the wallet's node does not accept X for fees", x, rates_rewrite(x, None, None)),
+		("the wallet's node accepts Y for fees, the operator's does not", y, rates_rewrite(y, None, Some(100_000_000))),
+	];
+	let b = Arca::new("P4recv");
+	b.ok(&create_args(&url, &r.node_url()));
+	let mut wallets = vec![];
+	for (k, (what, asset, rewrite)) in cases.into_iter().enumerate() {
+		// The wallet's node: the operator's, through a proxy that answers
+		// as the wallet's own node would, once the wallet holds its coin.
+		let node = Proxy::start(&r.node_url().trim_end_matches('/').to_string());
+		let w = Arca::new(&format!("P4w{}", k));
+		w.ok(&create_args(&url, &format!("{}/", node.url)));
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s.clone(), asset, 5_000_000);
+		if asset != x {
+			r.pay_to(s, x, 5_000_000);
+		}
+		r.produce().await;
+		let mut args = vec!["board".to_string(), asset.to_string(), "2000000".into()];
+		if asset != x {
+			args.extend(["--fee-asset".into(), x.to_string()]);
+		}
+		w.ok(&args.iter().map(|a| a.as_str()).collect::<Vec<_>>());
+		wallets.push((what, asset, w, node, rewrite));
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for (_, _, w, node, rewrite) in &wallets {
+		r.wait("the board to be credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited"))
+			.await;
+		w.ok(&["sync"]);
+		node.rewrite(Some(rewrite.clone()));
+	}
+	for (what, asset, w, _, _) in &wallets {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		let (ok, v) = w.run(&["send", &req, "--amount", "600000", "--asset", &asset.to_string()]);
+		println!("P4 {}: send {} {}", what, if ok { "co-signed, margins" } else { "refused:" },
+			if ok { v["margins"].to_string() } else { v["error"]["message"].to_string() });
+		assert!(ok, "{}: {}", what, v);
+	}
+
+	// An operator publishing a floor that would take margins above the
+	// wallet's bound: refused before anything is signed.
+	let server = Proxy::start(&url);
+	let greedy = Arca::new("P4greedy");
+	let board = boarded(&mut r, &greedy, &server.url.clone(), &[(x, 2_000_000)]).await;
+	let xs = x.to_string();
+	server.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			for f in v["fees"]["floors"].as_array_mut().into_iter().flatten() {
+				if f["asset"] == xs.as_str() {
+					f["floor_per_kvb"] = json!("10000");
+				}
+			}
+		}
+		None
+	})));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let why = greedy.refused(&["send", &req, "--amount", "600000", "--asset", &x.to_string()], "bound");
+	println!("P4 an operator's floor taking margins above the wallet's bound: REFUSED: {}", why);
+	assert_eq!(server.count("/v1/cosign_transfer"), 0, "nothing was sent to be signed");
+	assert_eq!(coin_of(&greedy, &board[0])["state"], "live");
+	for w in wallets.iter().map(|(_, _, w, _, _)| w).chain([&b, &greedy]) {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

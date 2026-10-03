@@ -19,8 +19,55 @@ use super::wallet::{amount, kind_of, owner_of, sign, Assessed, Wallet};
 use super::{random32, Error};
 
 /// How many times the floor a pre-signed transaction's margin holds: the
-/// specification's cover for a fourfold rise in the fee floor.
+/// specification's cover for a fourfold rise in the fee floor. It is the
+/// operator's least margin (`info.fees.margin_multiple`).
 pub const MARGIN_MULTIPLE: u64 = 4;
+
+/// How many times the operator's least margin the wallet leaves, within the
+/// operator's most: room for the operator's floor to rise between the
+/// wallet reading it and the operator co-signing.
+pub const MARGIN_HEADROOM: u64 = 2;
+
+/// The margins a transfer leaves, as the operator bounds them: its node's
+/// floor in the asset now (`None` where it does not accept the asset for
+/// fees: a margin of one atom), the least margin's multiple of it, and the
+/// most margin's multiple of the least. Read from the operator's `info`,
+/// never from the wallet's own node, whose view of the open fee market may
+/// differ from the operator's.
+#[derive(Debug, Clone, Copy)]
+pub struct Margins {
+	pub floor: Option<u64>,
+	pub multiple: u64,
+	pub max_multiple: u64,
+}
+
+impl Margins {
+	/// The operator's margins in `asset`, from its `info`.
+	pub fn of(info: &Value, asset: AssetId) -> Result<Margins, Error> {
+		let fees = &info["fees"];
+		let floors = fees["floors"].as_array().ok_or_else(|| Error::Unreachable(
+			"the operator publishes no fee floor now (its node did not answer it): no margin can be priced; try again".into()))?;
+		let row = floors.iter().find(|f| f["asset"].as_str() == Some(&asset.to_string()))
+			.ok_or_else(|| Error::Refused(format!("the operator publishes no fee floor in asset {}", asset)))?;
+		let floor = match &row["floor_per_kvb"] {
+			Value::Null => None,
+			v => Some(amount(v, "floor_per_kvb")?),
+		};
+		let multiple = fees["margin_multiple"].as_u64().filter(|m| *m > 0).unwrap_or(MARGIN_MULTIPLE);
+		let max_multiple = fees["max_margin_multiple"].as_u64().filter(|m| *m > 0).unwrap_or(1);
+		Ok(Margins { floor, multiple, max_multiple })
+	}
+
+	/// The margin the wallet leaves on a transaction of `vsize` vbytes: the
+	/// operator's least times [`MARGIN_HEADROOM`], within its most.
+	pub fn margin(&self, vsize: usize) -> u64 {
+		let least = match self.floor {
+			Some(f) => margin_for(vsize, f, self.multiple).max(1),
+			None => 1,
+		};
+		least.saturating_mul(MARGIN_HEADROOM.min(self.max_multiple))
+	}
+}
 
 /// A script of a leaf's size, to size an output whose leaf is not known yet:
 /// every leaf pays a taproot output, and the operator prices a margin from
@@ -168,22 +215,18 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// The checkpoint margin of `coin`, and the vsize of a reassignment of
-	/// `inputs` into `outputs`, each at the node's floor in the asset now.
-	fn checkpoint_margin(&self, coin: &ValidCoin, floor: Option<u64>) -> Result<u64, Error> {
-		// One atom in an asset the node does not accept for fees: the least
-		// the operator co-signs.
-		let Some(f) = floor else { return Ok(1) };
+	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
+	/// into `outputs`, each as the operator bounds them ([`Margins`]).
+	fn checkpoint_margin(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
 		let vi = ValidInput {
 			coin: coin.clone(), checkpoint: coin.checkpoint(), checkpoint_value: coin.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
 		};
 		let tx = vi.checkpoint_tx(OutPoint::default(), &FeeSource::Reserve).map_err(|e| Error::Refused(e.to_string()))?.tx;
-		Ok(margin_for(tx.vsize(), f, MARGIN_MULTIPLE))
+		Ok(m.margin(tx.vsize()))
 	}
 
-	fn reassignment_margin(&self, inputs: &[&ValidCoin], outputs: &[ExplicitOutput], floor: Option<u64>) -> Result<u64, Error> {
-		let Some(f) = floor else { return Ok(1) };
+	fn reassignment_margin(&self, inputs: &[&ValidCoin], outputs: &[ExplicitOutput], m: &Margins) -> Result<u64, Error> {
 		let vis: Vec<ValidInput> = inputs.iter().map(|c| ValidInput {
 			coin: (*c).clone(), checkpoint: c.checkpoint(), checkpoint_value: c.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
@@ -195,22 +238,38 @@ impl Wallet {
 		let cps: Vec<OutPoint> = (0..vis.len()).map(|i| OutPoint::new(elements::Txid::all_zeros(), i as u32)).collect();
 		let tx = arca_covenant::transfer::reassignment_tx(&vis, &small, &cps, &FeeSource::Reserve)
 			.map_err(|e| Error::Refused(e.to_string()))?.tx;
-		Ok(margin_for(tx.vsize(), f, MARGIN_MULTIPLE))
+		Ok(m.margin(tx.vsize()))
+	}
+
+	/// Refuses margins above the wallet's own bound: together, at most
+	/// [`super::DEFAULT_MAX_FEE_PPM`] of the coins they come out of. The
+	/// margins are taken out of the coins given up, priced from the floor the
+	/// operator publishes, so that floor never takes the wallet past its own
+	/// bound.
+	fn margins_within_bound(&self, inputs: &[In], margin: u64, asset: AssetId) -> Result<(), Error> {
+		let value: u64 = inputs.iter().map(|i| i.coin.value).sum();
+		let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum::<u64>() + margin;
+		if !super::round::fee_within(margins, value, super::DEFAULT_MAX_FEE_PPM) {
+			return Err(Error::Refused(format!("the operator's floor in asset {} asks margins of {} on coins of {}, above the \
+				wallet's bound of {} ppm: nothing is signed", asset, margins, value, super::DEFAULT_MAX_FEE_PPM)));
+		}
+		Ok(())
 	}
 
 	/// Chooses coins of `asset` to pay `paid` (outputs of `asset` the wallet
 	/// pays, plus `extra` atoms more), each input's checkpoint keeping its
 	/// value less its margin; returns the inputs, the reassignment's margin
 	/// when `pays_margin`, and the change.
-	fn choose(&self, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64, other_inputs: usize)
-		-> Result<(Vec<In>, u64, u64), Error>
+	#[allow(clippy::too_many_arguments)]
+	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
 	{
-		let floor = self.chain.floor_per_kvb(asset)?;
+		let margins = Margins::of(info, asset)?;
 		let candidates = self.spendable(asset)?;
 		let total_live: u64 = candidates.iter().map(|c| c.coin.value).sum();
 		let mut chosen: Vec<In> = vec![];
 		for c in candidates {
-			let m = self.checkpoint_margin(&c.coin, floor)?;
+			let m = self.checkpoint_margin(&c.coin, &margins)?;
 			chosen.push(In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), ..c });
 			let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
 			// Size the reassignment with a change output, which it may need.
@@ -223,7 +282,7 @@ impl Wallet {
 			for _ in 0..other_inputs {
 				all.push(&chosen[0].coin);
 			}
-			let margin = if pays_margin { self.reassignment_margin(&all, &outs, floor)? } else { 0 };
+			let margin = if pays_margin { self.reassignment_margin(&all, &outs, &margins)? } else { 0 };
 			if kept >= paid + margin {
 				let change = kept - paid - margin;
 				if change > 0 && change < min_leaf {
@@ -231,6 +290,7 @@ impl Wallet {
 						continue;
 					}
 				} else {
+					self.margins_within_bound(&chosen, margin, asset)?;
 					return Ok((chosen, margin, change));
 				}
 			}
@@ -283,7 +343,7 @@ impl Wallet {
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
 		};
 		let to_out = to.explicit(self);
-		let (inputs, margin, change) = self.choose(asset, value, std::slice::from_ref(&to_out), true, min, 0)?;
+		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0)?;
 		let mut outs = vec![to];
 		if change > 0 {
 			let leaf = self.own_leaf("change")?;
@@ -558,7 +618,7 @@ impl Wallet {
 		// with probes of the same shape.
 		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
 		let others = vec![wanted.explicit(self), probe(give_asset), probe(want_asset)];
-		let (inputs, margin, change) = self.choose(give_asset, give, &others, true, min_give, 1)?;
+		let (inputs, margin, change) = self.choose(&info, give_asset, give, &others, true, min_give, 1)?;
 		let mut outs = vec![wanted];
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox });
@@ -646,7 +706,7 @@ impl Wallet {
 		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
-		let (mine, _, change) = self.choose(want_asset, want, &others, false, min_want, 0)?;
+		let (mine, _, change) = self.choose(&info, want_asset, want, &others, false, min_want, 0)?;
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf("change")?, mailbox });
 		}
@@ -803,18 +863,18 @@ impl Wallet {
 	/// own, through the server, with the margins a transfer leaves.
 	fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
 		let asset = AssetId::from_str(&rows[0].asset).map_err(|e| Error::Store(e.to_string()))?;
-		let floor = self.chain.floor_per_kvb(asset)?;
+		let margins = Margins::of(&self.server_info()?, asset)?;
 		let mut inputs = vec![];
 		for row in rows {
 			let (_, a) = self.held(&row)?;
-			let m = self.checkpoint_margin(&a.valid, floor)?;
+			let m = self.checkpoint_margin(&a.valid, &margins)?;
 			inputs.push(In { checkpoint_value: a.valid.value - m.min(a.valid.value - 1), row, coin: a.valid });
 		}
 		let leaf = self.own_leaf("cancel")?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox };
 		let all: Vec<&ValidCoin> = inputs.iter().map(|i| &i.coin).collect();
-		let margin = self.reassignment_margin(&all, &[probe.explicit(self)], floor)?;
+		let margin = self.reassignment_margin(&all, &[probe.explicit(self)], &margins)?;
 		let kept: u64 = inputs.iter().map(|i| i.checkpoint_value).sum();
 		let value = kept.checked_sub(margin).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused("the coins do not cover the margins of a transfer to the wallet itself".into()))?;

@@ -73,6 +73,36 @@ pub struct App {
 	/// The addresses of the reverse proxies whose forwarded address names a
 	/// request's source.
 	pub trusted_proxies: Vec<IpAddr>,
+	/// The floors `info` last published, and when: asked of the node at most
+	/// once every [`FLOORS_FOR`].
+	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
+}
+
+/// How long `info` publishes the floors it read from the node before it reads
+/// them again.
+pub const FLOORS_FOR: Duration = Duration::from_secs(5);
+
+/// The operator's node's floor in every asset served, as `info` publishes
+/// it; `None` when the node does not answer.
+async fn floors(app: &App) -> Option<Vec<api::FloorInfo>> {
+	let mut cached = app.floors.lock().await;
+	if let Some((at, f)) = cached.as_ref() {
+		if at.elapsed() < FLOORS_FOR {
+			return Some(f.clone());
+		}
+	}
+	let mut out = vec![];
+	for asset in app.params.assets.keys() {
+		match crate::fees::floor_per_kvb(app.cosigner.finality(), *asset).await {
+			Ok(f) => out.push(api::FloorInfo { asset: asset.to_string(), floor_per_kvb: f.map(|f| f.to_string()) }),
+			Err(e) => {
+				log::warn!("info: the node's floor in asset {}: {}", asset, e);
+				return None;
+			},
+		}
+	}
+	*cached = Some((Instant::now(), out.clone()));
+	Some(out)
 }
 
 impl App {
@@ -373,6 +403,7 @@ fn board_status(s: &BoardStatus) -> api::BoardStatus {
 }
 
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
+	let floors = floors(&app).await;
 	let p = &app.params;
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
@@ -396,6 +427,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			offboard_ppm: p.fees.offboard_ppm,
 			margin_multiple: crate::fees::MULTIPLE,
 			max_margin_multiple: p.max_margin_multiple,
+			floors,
 		},
 		participations: api::ParticipationsInfo {
 			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,

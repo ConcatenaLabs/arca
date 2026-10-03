@@ -126,6 +126,21 @@ pub struct FeesInfo {
 	/// that least.
 	pub margin_multiple: u64,
 	pub max_margin_multiple: u64,
+	/// The operator's node's relay floor in each asset served, now: what the
+	/// operator prices every margin it bounds from. Absent when the node did
+	/// not answer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub floors: Option<Vec<FloorInfo>>,
+}
+
+/// The relay floor of the operator's node in one asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorInfo {
+	pub asset: String,
+	/// In the asset's own atoms per 1,000 vbytes; `null` when the node does
+	/// not accept the asset for fees now (a margin is then one atom).
+	pub floor_per_kvb: Option<String>,
 }
 
 /// `POST /v1/operator_nonce`: a fresh operator nonce for one leaf the

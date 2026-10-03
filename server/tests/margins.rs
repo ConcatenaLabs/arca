@@ -117,3 +117,20 @@ async fn a_large_margin_pays_the_fee_and_the_rest_comes_back() {
 	println!("the reassignment {} is in block {}", txid, conf["blockhash"]);
 	assert!(conf["blockhash"].is_string(), "the node took the reassignment and a block holds it");
 }
+
+/// `info` publishes the operator's node's floor in every asset served, from
+/// which a wallet prices the margins the operator bounds: X, which the node
+/// accepts for fees, at its floor now; Y, which it does not, as `null` (a
+/// margin of one atom).
+#[tokio::test(flavor = "multi_thread")]
+async fn info_publishes_the_operators_floors() {
+	let r = common::rounds::start().await;
+	let info = r.http.get("info").ok();
+	let floors = info["fees"]["floors"].as_array().expect("the floors are published");
+	let of = |a: elements::AssetId| floors.iter().find(|f| f["asset"] == a.to_string().as_str()).cloned().unwrap();
+	let x = server::fees::floor_per_kvb(&r.server.finality, r.x).await.unwrap().expect("X is accepted for fees");
+	println!("info.fees.floors: {}", info["fees"]["floors"]);
+	assert_eq!(of(r.x)["floor_per_kvb"], serde_json::json!(x.to_string()));
+	assert!(of(r.y)["floor_per_kvb"].is_null());
+	assert_eq!(floors.len(), 2);
+}
