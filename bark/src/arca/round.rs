@@ -19,15 +19,16 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use elements::hashes::{sha256, Hash};
-use elements::{AssetId, Txid};
+use elements::{AssetId, OutPoint, Transaction, Txid};
 use serde_json::{json, Value};
 
 use arca_covenant::encode::Encoding;
-use arca_covenant::spend::margin_for;
+use arca_covenant::spend::{margin_for, FeeSource};
 use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
-use arca_covenant::{Chain, ClockSchedule, CoinRecord, Forfeit, LeafRecord, MedianTime, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
+use arca_covenant::{connector_asset, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit, LeafRecord, MedianTime, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
+use super::store::ForfeitRow;
 use super::client::{participation_id, Wanted};
 use super::pay::MARGIN_MULTIPLE;
 use super::wallet::{amount, sign, Wallet};
@@ -180,13 +181,16 @@ impl Wallet {
 	}
 
 	/// Moves every participation on as far as it can go now: submits one the
-	/// server never answered, completes one whose round is final, and puts
-	/// back the coins of one the server voided.
+	/// server never answered, completes one whose round is final, and gives
+	/// back the coins of one the server will not run (`void`, or `expired`
+	/// after its forfeit day), except a coin under a forfeit the wallet
+	/// signed that could still be claimed. One participation the server does
+	/// not answer for stops no other.
 	pub(crate) fn progress_participations(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for (pid, body, given, wanted, state, _, _) in self.store.participations()? {
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
-			if matches!(state.as_str(), "released" | "void" | "refused") {
+			if matches!(state.as_str(), "released" | "void" | "expired" | "refused" | "lost") {
 				continue;
 			}
 			if state == "submitting" {
@@ -197,18 +201,19 @@ impl Wallet {
 				}
 				continue;
 			}
-			let st = self.server.post("participation_status", &json!({"participation_id": pid}))?;
-			match st["state"].as_str().unwrap_or("") {
-				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
-				"void" => {
-					self.store.atomically(|s| {
-						for l in &given {
-							s.set_coin_state(l, "live", "")?;
-						}
-						s.set_participation(&pid, "void", None, None)
-					})?;
-					out.push(json!({"participation": pid, "state": "void", "note": "the server will not run it; its coins are live again"}));
+			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+				Ok(st) => st,
+				Err(e) => {
+					out.push(json!({"participation": pid, "state": state, "error": e.to_string()}));
+					continue;
 				},
+			};
+			match st["state"].as_str().unwrap_or("") {
+				// The server will not run it, or its forfeit day passed.
+				s @ ("void" | "expired") => out.push(self.give_back(&pid, &given, s)?),
+				_ if state == "withdrawn" => out.push(json!({"participation": pid, "state": "withdrawn",
+					"note": "the wallet is taking a coin of it on-chain, and signs nothing for it"})),
+				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
 				"issued" | "released" => {
 					let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
 					match self.complete(&pid, &st, &given, &wanted) {
@@ -223,6 +228,39 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// The server will not run participation `pid` (`why` is `void` or
+	/// `expired`): each coin it gave up is live again, unless the wallet
+	/// signed a forfeit of it for a round that is not gone, which the
+	/// operator could still claim. Such a coin stays given up, and the
+	/// wallet follows its forfeit on the chain ([`Self::watch_forfeits`]); it
+	/// can still be exited.
+	fn give_back(&mut self, pid: &str, given: &[String], why: &str) -> Result<Value, Error> {
+		let mut back = vec![];
+		let mut held = vec![];
+		for l in given {
+			let Some(c) = self.store.coin(l)? else { continue };
+			if !matches!(c.state.as_str(), "given" | "forfeited") {
+				continue;
+			}
+			let open: Vec<String> = self.store.forfeits_of(l)?.into_iter().filter(|f| f.state == "signed").map(|f| f.round).collect();
+			if open.is_empty() {
+				back.push(l.clone());
+			} else {
+				held.push(json!({"leaf_id": l, "forfeit_for_round": open}));
+			}
+		}
+		self.store.atomically(|s| {
+			for l in &back {
+				s.set_coin_state(l, "live", "")?;
+			}
+			s.set_participation(pid, why, None, None)
+		})?;
+		Ok(json!({"participation": pid, "state": why, "live_again": back, "held": held,
+			"note": if held.is_empty() { "the server will not run it; its coins are live again".to_string() } else {
+				"the server will not run it; a coin under a forfeit signed for a round still in the chain stays given up until that round \
+				is gone or the forfeit is answered on the chain, and can be exited".to_string() }}))
 	}
 
 	/// The forfeit swap of an issued participation, once its round is final.
@@ -242,9 +280,6 @@ impl Wallet {
 		if !finality.is_final() {
 			return Ok(json!({"participation": pid, "state": "issued", "round": round_txid.to_string(),
 				"note": format!("the round is {}; the wallet signs nothing for it before it is final", finality.word())}));
-		}
-		if st["forfeit_first"].as_bool() == Some(true) {
-			return Ok(json!({"participation": pid, "state": st["state"], "note": "forfeit-first: the preimage comes only from the claim of the forfeit on-chain"}));
 		}
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
@@ -315,6 +350,7 @@ impl Wallet {
 		let c = st["round"]["connector_vout"].as_u64().ok_or_else(|| Error::Parse("no connector_vout".into()))? as u32;
 		let mut forfeits = vec![];
 		let mut releases = vec![];
+		let mut signed = vec![];
 		for l in given {
 			let row = self.store.coin(l)?.ok_or_else(|| Error::Store(format!("coin {} is gone", l)))?;
 			let (record, a) = self.held(&row)?;
@@ -338,6 +374,7 @@ impl Wallet {
 				.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
 			let key = self.keys.leaf(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
+			signed.push((l.clone(), margin));
 			// A batch leaf's lowest node is released for this round alone: the
 			// release names the round's connector asset, so it is void if the
 			// round leaves the chain.
@@ -360,35 +397,42 @@ impl Wallet {
 				"auths": sigs.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}));
 			auths_of.push(sigs);
 		}
-		let done = self.server.post("forfeit_leaves", &json!({"participation_id": pid, "forfeits": forfeits, "leaves": leaves}))?;
+		// Before any forfeit leaves the wallet: each forfeit it signs, the
+		// round it is bound to, and the new leaves it validated, so that it
+		// can follow every forfeit on the chain and complete the leaves with a
+		// preimage the chain publishes, whatever the server does next.
+		let news_json = json!({"round": round_txid.to_string(), "leaves": news.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
+			Ok(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(nonce),
+				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))
+		}).collect::<Result<Vec<_>, Error>>()?});
+		let from_height = finality.height().unwrap_or(0).saturating_sub(100);
+		self.store.put_tx(&round_txid.to_string(), &elements::encode::serialize(&round), "round")?;
+		self.store.atomically(|s| {
+			for (l, margin) in &signed {
+				s.put_forfeit(&ForfeitRow {
+					leaf_id: l.clone(), participation: pid.to_string(), round: round_txid.to_string(), connector_vout: c,
+					unlock_hash: hex(&unlock_hash), refund_units: refund.units(), margin: *margin, from_height,
+					state: "signed".into(), note: String::new(),
+				})?;
+				if s.coin(l)?.is_some_and(|c| c.state == "given") {
+					s.set_coin_state(l, "forfeited", &format!("participation {}: its forfeit for round {} is signed", pid, round_txid))?;
+				}
+			}
+			s.set_participation_news(pid, &news_json.to_string())?;
+			s.set_participation(pid, "forfeiting", None, Some(&round_txid.to_string()))
+		})?;
+		let done = match self.server.post("forfeit_leaves", &json!({"participation_id": pid, "forfeits": forfeits, "leaves": leaves})) {
+			Ok(d) => d,
+			Err(e) => return Ok(json!({"participation": pid, "state": "forfeiting", "error": e.to_string(),
+				"note": "the forfeits may have reached the server: the wallet follows each one's output on the chain"})),
+		};
 		let Some(pre) = done["preimage"].as_str() else {
-			return Ok(json!({"participation": pid, "state": done["state"], "note": "forfeits in; the preimage is not out yet"}));
+			return Ok(json!({"participation": pid, "state": "forfeiting", "forfeit_first": done["forfeit_first"],
+				"note": "forfeits in; the preimage is not out yet: the wallet follows each forfeit's output on the chain, takes the preimage \
+				from a claim of it, and takes the refund when its delay passes with no claim"}));
 		};
 		let preimage = unhex32(pre)?;
-		let mut kept = vec![];
-		for ((valid, record, nonce), auths) in news.iter().zip(auths_of) {
-			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
-				return Err(Error::Refused("the server's preimage does not open the new leaves".into()));
-			}
-			let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
-			let a = self.assess(&coin, &self.receipt_policy(now), Some((&record.owner, nonce)))?;
-			let row = self.row(&coin, &a, if a.all_final() { "live" } else { "pending" }, "")?;
-			if self.store.coin(&row.leaf_id)?.is_none() {
-				let id = row.leaf_id.clone();
-				self.store.atomically(|s| {
-					s.put_coin(&row)?;
-					s.use_nonce(nonce, &id)
-				})?;
-			}
-			kept.push(json!({"leaf_id": valid.leaf_id.to_string(), "asset": record.asset.to_string(), "value": record.value.to_string(),
-				"expiry": record.schedule.expiries()[0].to_consensus_u32()}));
-		}
-		self.store.atomically(|s| {
-			for l in given {
-				s.set_coin_spent(l, &format!("participation {}", pid))?;
-			}
-			s.set_participation(pid, "released", Some(pre), Some(&round_txid.to_string()))
-		})?;
+		let kept = self.finish(pid, preimage, "settled")?;
 		// The release of each old batch leaf's lowest node, now that the
 		// preimage is in hand, the new leaves validated and their round final.
 		let released = if releases.is_empty() {
@@ -400,5 +444,202 @@ impl Wallet {
 			}
 		};
 		Ok(json!({"participation": pid, "state": "released", "round": round_txid.to_string(), "new_leaves": kept, "released": released}))
+	}
+
+	/// Completes participation `pid` with `preimage`: its new leaves, as the
+	/// wallet validated them before signing its forfeits, opened and kept;
+	/// the coins it gave up spent; its forfeits `how` (`settled` with the
+	/// server's answer, `claimed` from a claim on the chain).
+	pub(crate) fn finish(&mut self, pid: &str, preimage: [u8; 32], how: &str) -> Result<Vec<Value>, Error> {
+		let news: Value = serde_json::from_str(&self.store.participation_news(pid)?
+			.ok_or_else(|| Error::Store(format!("participation {} has no new leaves recorded", pid)))?)
+			.map_err(|e| Error::Store(e.to_string()))?;
+		let (given, round) = self.store.participations()?.into_iter().find(|p| p.0 == pid)
+			.map(|p| (p.2, news["round"].as_str().unwrap_or("").to_string()))
+			.ok_or_else(|| Error::Store(format!("no participation {}", pid)))?;
+		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+		let now = self.now()?;
+		let mut kept = vec![];
+		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
+			let nonce = unhex32(n["nonce"].as_str().unwrap_or(""))?;
+			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+				return Err(Error::Refused("the preimage does not open the new leaves".into()));
+			}
+			let mut auths = vec![];
+			for a in n["auths"].as_array().cloned().unwrap_or_default() {
+				let sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&unhex(a["signature"].as_str().unwrap_or(""))?)
+					.map_err(|e| Error::Store(e.to_string()))?;
+				let t = MedianTime::from_consensus(a["time"].as_u64().unwrap_or(0) as u32).map_err(|e| Error::Store(e.to_string()))?;
+				auths.push((sig, t));
+			}
+			let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
+			let a = self.assess(&coin, &self.receipt_policy(now), Some((&record.owner, &nonce)))?;
+			let row = self.row(&coin, &a, if a.all_final() { "live" } else { "pending" }, "")?;
+			if self.store.coin(&row.leaf_id)?.is_none() {
+				let id = row.leaf_id.clone();
+				self.store.atomically(|s| {
+					s.put_coin(&row)?;
+					s.use_nonce(&nonce, &id)
+				})?;
+			}
+			kept.push(json!({"leaf_id": row.leaf_id, "asset": record.asset.to_string(), "value": record.value.to_string(),
+				"expiry": record.schedule.expiries()[0].to_consensus_u32()}));
+		}
+		self.store.atomically(|s| {
+			for l in &given {
+				s.set_coin_spent(l, &format!("participation {}", pid))?;
+				s.set_forfeit_state(l, &round, how, "")?;
+			}
+			s.set_participation(pid, "released", Some(&hex(&preimage)), Some(&round))
+		})?;
+		Ok(kept)
+	}
+}
+
+impl Wallet {
+	/// The forfeit the wallet signed, as `f` records it, of the coin `row`.
+	pub(crate) fn forfeit_of(&self, row: &super::store::CoinRow, f: &ForfeitRow) -> Result<Forfeit, Error> {
+		let record = Self::record_of(row)?;
+		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		let coin = record.resolve(&self.accepted_bases(&record)?, &policy).map_err(|e| Error::Refused(e.to_string()))?;
+		let round = Txid::from_str(&f.round).map_err(|e| Error::Store(e.to_string()))?;
+		let refund = RelativeTime::from_units(f.refund_units).map_err(|e| Error::Store(e.to_string()))?;
+		Forfeit::new(coin.leaf, (coin.asset, coin.value), coin.id, unhex32(&f.unlock_hash)?, connector_asset(round, f.connector_vout), refund, f.margin)
+			.map_err(|e| Error::Refused(e.to_string()))
+	}
+
+	/// Follows on the chain every forfeit the wallet signed whose preimage it
+	/// does not hold, whatever the server says of it: a claim of the
+	/// forfeit's output publishes the preimage, which completes the new
+	/// leaves; an output left unclaimed until the refund delay has run since
+	/// it confirmed is the wallet's to refund; a forfeit never published,
+	/// whose round can never return, is void, and its coin is the wallet's
+	/// again.
+	pub(crate) fn watch_forfeits(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for f in self.store.forfeits_in("signed")? {
+			match self.watch_forfeit(&f) {
+				Ok(Some(v)) => out.push(v),
+				Ok(None) => {},
+				Err(e) => out.push(json!({"leaf_id": f.leaf_id, "round": f.round, "error": e.to_string()})),
+			}
+		}
+		Ok(out)
+	}
+
+	/// [`Self::watch_forfeits`] for one forfeit, its outcome for people.
+	pub(crate) fn watch_forfeit_now(&mut self, f: &ForfeitRow) -> Value {
+		match self.watch_forfeit(f) {
+			Ok(Some(v)) => v,
+			Ok(None) => json!({"leaf_id": f.leaf_id, "round": f.round, "state": "signed"}),
+			Err(e) => json!({"leaf_id": f.leaf_id, "round": f.round, "error": e.to_string()}),
+		}
+	}
+
+	fn watch_forfeit(&mut self, f: &ForfeitRow) -> Result<Option<Value>, Error> {
+		let row = self.store.coin(&f.leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", f.leaf_id)))?;
+		let forfeit = self.forfeit_of(&row, f)?;
+		let out = forfeit.output().txout();
+		// Published and unspent: the refund, once its delay has run.
+		if let Some(at) = self.chain.locate(std::slice::from_ref(&out))?[0] {
+			return self.refund_forfeit(f, &forfeit, at, &row).map(Some);
+		}
+		// Published and spent: by a claim, which publishes the preimage, or by
+		// the wallet's own refund.
+		if let Some((ftx, h)) = self.chain.find_payment(&out, f.from_height)? {
+			let vout = ftx.output.iter().position(|o| *o == out).expect("pays it") as u32;
+			let at = OutPoint::new(ftx.txid(), vout);
+			if let Some((spender, _)) = self.chain.spender(&at, h)? {
+				let unlock = unhex32(&f.unlock_hash)?;
+				let preimage = spender.input.iter().filter(|i| i.previous_output == at).flat_map(|i| i.witness.script_witness.iter())
+					.find(|w| w.len() == 32 && sha256::Hash::hash(w).to_byte_array() == unlock)
+					.map(|w| <[u8; 32]>::try_from(w.as_slice()).expect("32 bytes"));
+				if let Some(pre) = preimage {
+					let kept = self.finish(&f.participation, pre, "claimed")?;
+					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "claimed", "claim": spender.txid().to_string(),
+						"note": "the operator claimed the forfeit on the chain, which publishes the preimage: the new leaves are the wallet's",
+						"new_leaves": kept})));
+				}
+				self.store.atomically(|s| {
+					s.set_forfeit_state(&f.leaf_id, &f.round, "refunded", &spender.txid().to_string())?;
+					s.set_coin_state(&f.leaf_id, "exited", &format!("its forfeit's output refunded by {}", spender.txid()))
+				})?;
+				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "refunded", "refund": spender.txid().to_string()})));
+			}
+		}
+		// Never published: void once its round can never return.
+		if let Some(raw) = self.store.tx(&f.round)? {
+			let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+			if self.chain.gone(&round)? {
+				let why = format!("round {} can never return, so its forfeit can never be claimed: the coin is the wallet's again", f.round);
+				self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
+				let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| x.state == "signed");
+				if !open && matches!(row.state.as_str(), "forfeited" | "spent") {
+					self.store.set_coin_state(&f.leaf_id, "live", &why)?;
+				}
+				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "note": why})));
+			}
+		}
+		Ok(None)
+	}
+
+	/// The owner's refund of the forfeit output at `at`, once the refund
+	/// delay has run from its confirmation, to an address of the wallet's.
+	fn refund_forfeit(&mut self, f: &ForfeitRow, forfeit: &Forfeit, at: OutPoint, row: &super::store::CoinRow) -> Result<Value, Error> {
+		let base = json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string()});
+		if !self.chain.finality(&at.txid)?.in_chain() {
+			let mut v = base;
+			v["state"] = json!("published");
+			v["note"] = json!("the operator's forfeit of the coin is in the mempool: its refund delay runs once it is in a block");
+			return Ok(v);
+		}
+		let key = self.keys.leaf(&row.owner_nonce)?;
+		let index_key = format!("refund_index_{}_{}", f.leaf_id, f.round);
+		let index = match self.store.meta(&index_key)?.and_then(|v| v.parse().ok()) {
+			Some(i) => i,
+			None => {
+				let i = self.store.take_index(super::keys::RECEIVE)?;
+				self.store.set_meta(&index_key, &i.to_string())?;
+				i
+			},
+		};
+		let to = self.keys.onchain_script(super::keys::RECEIVE, index)?;
+		let (asset, value) = (forfeit.asset, forfeit.value - forfeit.margin);
+		let mut payer = super::exit::Payer::new(None);
+		let built = self.key_spend(&mut payer, &key, &|fs| {
+			let out = match fs {
+				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
+				_ => {
+					let fee = self.fee_for(asset, 220)?;
+					if fee >= value {
+						return Err(Error::Refused(format!("the forfeit's {} atoms do not cover its refund's fee", value)));
+					}
+					ExplicitOutput::new(asset, value - fee, to.clone())
+				},
+			};
+			forfeit.refund(at, &[out], fs).map_err(|e| Error::Refused(e.to_string()))
+		});
+		let mut v = base;
+		match built.and_then(|u| self.chain.broadcast(&u.tx).map(|txid| (txid, u))) {
+			Ok((txid, u)) => {
+				self.store.atomically(|s| {
+					s.set_forfeit_state(&f.leaf_id, &f.round, "refunded", &txid.to_string())?;
+					s.set_coin_state(&f.leaf_id, "exited", &format!("its forfeit's output refunded by {}", txid))
+				})?;
+				v["state"] = json!("refunded");
+				v["refund"] = json!({"txid": txid.to_string(), "vsize": u.tx.vsize(), "pays": u.tx.output[0].value.explicit().map(|x| x.to_string())});
+			},
+			Err(e) if e.to_string().contains("non-BIP68-final") => {
+				v["state"] = json!("published");
+				v["note"] = json!(format!("the operator published the coin's forfeit and has not claimed it; the wallet takes the refund once \
+					{} s have run from its confirmation", forfeit.policy.refund_delay.seconds()));
+			},
+			Err(e) => {
+				v["state"] = json!("published");
+				v["error"] = json!(e.to_string());
+			},
+		}
+		Ok(v)
 	}
 }

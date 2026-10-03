@@ -76,6 +76,22 @@ the keys, but which coins were spent off-chain is in the store and the server.
   the chain, not from what it stored: when another transaction now pays a
   batch output a coin rests on, the checks run again on that one, and a coin
   that fails them on a transaction the chain holds goes into its exit at once.
+  A coin resting on a round that can never return (a coin the round spends is
+  spent by another transaction that is final) is `lost`.
+- **A coin handed over stays the wallet's until the chain says otherwise.** A
+  coin given to a participation, or sent in a transfer the server has not
+  answered, can be exited at any time; exiting it withdraws the wallet from the
+  participation, or abandons the request. A coin whose participation the
+  server calls `void`, or lets expire, is live again, unless the wallet signed
+  a forfeit of it for a round that is not gone: such a coin is `forfeited`, and
+  is spent again only once that round can never return. Every forfeit is
+  recorded before it leaves the wallet, with the new leaves it was signed for,
+  and `sync` follows each one whose preimage the wallet does not hold on the
+  chain: a claim of the forfeit's output publishes the preimage, which the
+  wallet reads from the claim's witness to complete its new leaves; an output
+  left unclaimed until the refund delay has run since it confirmed is the
+  wallet's to refund; a forfeit never published whose round can never return
+  is void, and the coin is live again.
 
 ### Fees
 
@@ -105,9 +121,9 @@ publishes (`max_margin_multiple`).
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
 | `participate [--leaf L]… [--not-before T]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset |
-| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), and moves every exit on |
+| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, and reports what changed and whether the tip it last saw was reorganised away |
-| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
+| `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
 | `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up and its coins freed |
@@ -116,7 +132,8 @@ publishes (`max_margin_multiple`).
 
 A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 (held for a swap), `sending` (in a transfer the server has not answered),
-`given` (in a participation), `spent`, `exiting`, `exited` and `lost`.
+`given` (in a participation, no forfeit signed), `forfeited` (a forfeit of it
+signed, the preimage not in hand), `spent`, `exiting`, `exited` and `lost`.
 
 ### An example
 
@@ -157,7 +174,12 @@ lies, stalls or vanishes, or a sender goes back on a payment, and each ends
 with the wallet refusing before it signs anything, or taking its coin on-chain
 and holding it there, with the reason shown: a refresh whose status hides a new
 leaf or names another unlock hash; a round rolled back and replaced by one
-that fails check 1, which the wallet's re-check exits from at once.
+that fails check 1, which the wallet's re-check exits from at once; a coin
+given to a participation that expires, or that the operator never runs; a coin
+in flight when the operator vanishes; a preimage withheld and a participation
+called void after its forfeit, the preimage then read from the operator's
+claim on the chain; and a round that can never return, whose coins come back,
+a forfeit of one of them published anyway and refunded after its delay.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

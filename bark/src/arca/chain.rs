@@ -373,6 +373,57 @@ impl ChainSource {
 		Ok(None)
 	}
 
+	/// The transaction that spends `outpoint`, in the mempool or in a block
+	/// of the active chain from `from_height` up, and its height (`None` for
+	/// the mempool).
+	pub fn spender(&self, outpoint: &OutPoint, from_height: u64) -> Result<Option<(Transaction, Option<u64>)>, Error> {
+		let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *outpoint);
+		let ids: Vec<String> = self.client.call("getrawmempool", &[]).map_err(node)?;
+		for id in ids {
+			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
+			if let Some(tx) = self.transaction(&txid)? {
+				if spends(&tx) {
+					return Ok(Some((tx, None)));
+				}
+			}
+		}
+		let tip = self.tip()?;
+		for h in from_height..=tip.height {
+			let Some(hash) = self.block_hash(h)? else { break };
+			for tx in self.client.block(&hash).map_err(node)?.txdata {
+				if spends(&tx) {
+					return Ok(Some((tx, Some(h))));
+				}
+			}
+		}
+		Ok(None)
+	}
+
+	/// Whether `tx` can never return to the chain: it is in no block of the
+	/// active chain and not in the mempool, and one of the coins it spends is
+	/// spent by another transaction that is final. One that is merely out of
+	/// the chain, its coins unspent or spent only in blocks not yet final,
+	/// can still return.
+	pub fn gone(&self, tx: &Transaction) -> Result<bool, Error> {
+		if self.whereabouts(&tx.txid())? != (false, false) {
+			return Ok(false);
+		}
+		for i in &tx.input {
+			let op = i.previous_output;
+			let Some((_, height)) = self.tx_block(&op.txid)? else { continue };
+			let v: Value = self.client.call("gettxout", &[json!(op.txid.to_string()), json!(op.vout), json!(false)]).map_err(node)?;
+			if !v.is_null() {
+				continue;
+			}
+			if let Some((other, Some(_))) = self.spender(&op, height)? {
+				if other.txid() != tx.txid() && self.finality(&other.txid())?.is_final() {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
+
 	/// The node's address for `script`, unblinded, on its own chain.
 	pub fn address(&self, script: &Script) -> Result<Option<String>, Error> {
 		let v: Value = self.client.call("decodescript", &[json!(hex(script.as_bytes()))]).map_err(node)?;

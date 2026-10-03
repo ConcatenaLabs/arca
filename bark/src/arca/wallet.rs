@@ -121,6 +121,9 @@ enum Checked {
 	Holds(&'static str, String),
 	/// A base the chain holds fails the wallet's checks, for this reason.
 	Fails(String),
+	/// A base can never return to the chain: an input of it is spent by
+	/// another transaction that is final.
+	Lost(Txid),
 }
 
 /// A coin the wallet has checked against the chain.
@@ -469,6 +472,13 @@ impl Wallet {
 			let record = Self::record_of(&c)?;
 			let (state, note) = match self.recheck_one(&c, &record, &policy)? {
 				Checked::Holds(state, note) => (state, note),
+				Checked::Lost(base) => {
+					let why = format!("{} can never return to the chain: a coin it spends is spent by another transaction that is final", base);
+					self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
+					let back = self.round_lost(&base)?;
+					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lost", "why": why, "given_back": back}));
+					continue;
+				},
 				Checked::Fails(why) => {
 					// A base the chain holds fails the wallet's checks: the coin
 					// is brought on-chain from its record now, before anyone
@@ -526,6 +536,11 @@ impl Wallet {
 			format!("; {} now pays an output it rests on, in place of what the wallet accepted, and passes every check: \
 				nothing the wallet signed for the other round carries over", replaced.join(", "))
 		};
+		for (t, f) in &bases {
+			if matches!(f, Finality::NotInChain { in_mempool: false }) && self.chain.gone(t)? {
+				return Ok(Checked::Lost(t.txid()));
+			}
+		}
 		let a = Assessed { valid, bases };
 		Ok(if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
 			Checked::Holds("pending", format!("{}{}", e, extra))
@@ -534,6 +549,40 @@ impl Wallet {
 		} else {
 			Checked::Holds("pending", format!("waiting: {}{}", waiting, extra))
 		})
+	}
+
+	/// Round `round` can never return: every participation it completed or
+	/// was completing gives its coins back. Each forfeit the wallet signed for
+	/// it is followed again ([`Self::watch_forfeits`]): one never published
+	/// is void, and its coin is live again; one the operator published is the
+	/// wallet's to refund once its delay has run.
+	fn round_lost(&mut self, round: &Txid) -> Result<Vec<Value>, Error> {
+		let r = round.to_string();
+		let mut back = vec![];
+		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
+			if pround.as_deref() != Some(r.as_str()) || !matches!(state.as_str(), "released" | "forfeiting") {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			let why = format!("round {} of participation {} can never return", r, pid);
+			self.store.atomically(|s| {
+				for l in &given {
+					for f in s.forfeits_of(l)? {
+						if f.round == r && matches!(f.state.as_str(), "settled" | "claimed") {
+							s.set_forfeit_state(l, &r, "signed", &why)?;
+						}
+					}
+					if s.coin(l)?.is_some_and(|c| c.state == "spent") {
+						s.set_coin_state(l, "forfeited", &why)?;
+					}
+				}
+				s.set_participation(&pid, "lost", None, None)
+			})?;
+			for f in self.store.forfeits_in("signed")?.into_iter().filter(|f| f.round == r) {
+				back.push(self.watch_forfeit_now(&f));
+			}
+		}
+		Ok(back)
 	}
 
 	// -----------------------------------------------------------------------

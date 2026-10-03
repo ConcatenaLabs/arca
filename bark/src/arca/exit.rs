@@ -51,12 +51,19 @@ impl Here {
 }
 
 /// Who pays the fees an output's own reserve cannot.
-struct Payer {
+pub(crate) struct Payer {
 	asset: Option<AssetId>,
 	coin: Option<(OutPoint, TxOut, Keypair)>,
 	change: Option<(Script, Keypair)>,
 	/// Coins the exit has already taken.
 	used: Vec<OutPoint>,
+}
+
+impl Payer {
+	/// A payer of fees in `asset`, when named.
+	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
+		Payer { asset, coin: None, change: None, used: vec![] }
+	}
 }
 
 fn txs_fee(tx: &Transaction) -> Vec<(AssetId, u64)> {
@@ -136,7 +143,7 @@ impl Wallet {
 
 	/// A spend ending in the owner's key: built with the fee as `with_fee`
 	/// chooses, signed by `key`.
-	fn key_spend(&self, payer: &mut Payer, key: &Keypair, build: &dyn Fn(&FeeSource) -> Result<KeySpend, Error>) -> Result<UnrollTx, Error> {
+	pub(crate) fn key_spend(&self, payer: &mut Payer, key: &Keypair, build: &dyn Fn(&FeeSource) -> Result<KeySpend, Error>) -> Result<UnrollTx, Error> {
 		let genesis = self.genesis.genesis_hash();
 		self.with_fee(payer, &|f| {
 			let ks = build(f)?;
@@ -250,7 +257,10 @@ impl Wallet {
 	/// one address of the wallet's, chosen when the exit starts.
 	pub fn exit(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered") {
+		// A coin handed over to a participation or a transfer is the wallet's
+		// until the chain shows otherwise: one taken by a round or a
+		// co-signed spend is `spent`, and is not exited.
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		let record = Self::record_of(&row)?;
@@ -270,17 +280,26 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		// One claim address for the exit, however many times it is run.
-		let claim_index = match prior["claim_index"].as_u64() {
-			Some(i) => i as u32,
-			None => self.store.take_index(super::keys::RECEIVE)?,
-		};
 		let mut payer = Payer { asset: fee_asset, coin: None, change: None, used: vec![] };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
 		let mut built = vec![];
-		let leaf_at = self.bring(&coin, &mut payer, &mut built, &here)?;
+		let leaf_at = match self.bring(&coin, &mut payer, &mut built, &here) {
+			Ok(at) => at,
+			// Nothing of the path is left unspent: someone else spent the coin.
+			Err(e) if here.at.iter().all(Option::is_none) => return match self.taken(leaf_id, &coin, &prior)? {
+				Some(v) => Ok(v),
+				None => Err(e),
+			},
+			Err(e) => return Err(e),
+		};
+		self.let_go(leaf_id, &row.state)?;
+		// One claim address for the exit, however many times it is run.
+		let claim_index = match prior["claim_index"].as_u64() {
+			Some(i) => i as u32,
+			None => self.store.take_index(super::keys::RECEIVE)?,
+		};
 		let plan: Vec<Transaction> = built.into_iter().map(|u| u.tx).collect();
 		let record_exit = |state: &str, s: &Wallet| -> Result<(), Error> {
 			let v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
@@ -349,6 +368,90 @@ impl Wallet {
 		}
 	}
 
+	/// What a coin handed over gives up when its exit starts: a coin given
+	/// to a participation withdraws the wallet from it (it signs no forfeit
+	/// for it from then on), and one in a transfer request the server never
+	/// answered abandons the request (it is not posted again). A forfeit
+	/// already signed stays watched.
+	fn let_go(&mut self, leaf_id: &str, state: &str) -> Result<(), Error> {
+		match state {
+			"given" => {
+				for (pid, _, given, _, pstate, _, _) in self.store.participations()? {
+					if matches!(pstate.as_str(), "submitting" | "pending" | "issued") && given.contains(&format!("\"{}\"", leaf_id)) {
+						self.store.set_participation(&pid, "withdrawn", None, None)?;
+					}
+				}
+			},
+			"sending" => {
+				for (id, _, inputs) in self.store.transfers_in("requested")? {
+					if inputs.contains(&format!("\"{}\"", leaf_id)) {
+						self.store.set_transfer(id, "abandoned", &format!("the wallet exits coin {}", leaf_id))?;
+					}
+				}
+			},
+			_ => {},
+		}
+		Ok(())
+	}
+
+	/// Who spent `coin`, when nothing of its path is left unspent: its leaf or
+	/// board, found on the chain, and the transaction that spends it. The
+	/// operator's forfeit of it puts the coin back under that forfeit, which
+	/// the wallet follows on the chain; its co-signed checkpoint means the
+	/// transfer it was sent in stands; the wallet's own claim means it is
+	/// exited. `None` when the coin's leaf is not on the chain at all.
+	fn taken(&mut self, leaf_id: &str, coin: &ValidCoin, prior: &Value) -> Result<Option<Value>, Error> {
+		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+		let mut spots: Vec<OutPoint> = prior["leaf"].as_str().and_then(|l| OutPoint::from_str(l).ok()).into_iter().collect();
+		if let Some((_, board)) = coin.board() {
+			spots.push(board);
+		}
+		if spots.is_empty() {
+			if let Some((tx, _)) = self.chain.find_payment(&coin.output().txout(), from)? {
+				let vout = tx.output.iter().position(|o| *o == coin.output().txout()).expect("pays it") as u32;
+				spots.push(OutPoint::new(tx.txid(), vout));
+			}
+		}
+		for at in spots {
+			if self.chain.unspent(&at)? {
+				continue;
+			}
+			let h = self.chain.finality(&at.txid)?.height().unwrap_or(from);
+			let Some((sp, _)) = self.chain.spender(&at, h)? else { continue };
+			let txid = sp.txid().to_string();
+			let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
+			for f in self.store.forfeits_of(leaf_id)? {
+				let out = self.forfeit_of(&row, &f)?.output().txout();
+				if sp.output.contains(&out) {
+					let why = format!("the operator answered the exit with its forfeit for round {} ({}): the wallet takes the preimage \
+						from a claim of it, or the refund once its delay has run", f.round, txid);
+					self.store.atomically(|s| {
+						if f.state == "void" {
+							s.set_forfeit_state(&f.leaf_id, &f.round, "signed", "")?;
+						}
+						s.set_coin_state(leaf_id, "forfeited", &why)
+					})?;
+					return Ok(Some(json!({"leaf_id": leaf_id, "state": "forfeited", "spent_by": txid, "note": why})));
+				}
+			}
+			if sp.output.first().is_some_and(|o| o.script_pubkey == coin.checkpoint().script_pubkey()) {
+				let why = format!("taken on the chain by its co-signed checkpoint {}: the transfer it was sent in stands", txid);
+				self.store.set_coin_spent(leaf_id, &format!("checkpoint {}", txid))?;
+				return Ok(Some(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": txid, "note": why})));
+			}
+			if let Some(i) = prior["claim_index"].as_u64() {
+				let to = self.keys.onchain_script(super::keys::RECEIVE, i as u32)?;
+				if sp.output.iter().any(|o| o.script_pubkey == to) {
+					self.store.set_coin_state(leaf_id, "exited", &format!("claimed by {}", txid))?;
+					return Ok(Some(json!({"leaf_id": leaf_id, "state": "exited", "claim": txid})));
+				}
+			}
+			return Err(Error::Refused(format!("coin {} was spent on the chain by {}, which is none of the wallet's and no spend it signed",
+				leaf_id, txid)));
+		}
+		Ok(None)
+	}
+
 	/// Moves on every exit the wallet has started, with the fee asset each was
 	/// started with.
 	pub(crate) fn progress_exits(&mut self) -> Result<Vec<Value>, Error> {
@@ -361,14 +464,18 @@ impl Wallet {
 
 	/// Everything the wallet does on its own: the re-check of every coin
 	/// against the chain, transfer requests the server never answered, the
-	/// mailbox, and every participation as far as it can go.
+	/// mailbox, every participation as far as it can go, every forfeit it
+	/// signed without the preimage in hand, followed on the chain, and every
+	/// exit it started.
 	pub fn sync(&mut self) -> Result<Value, Error> {
 		let recheck = self.recheck()?;
 		let transfers = self.retry_transfers()?;
 		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let participations = self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		Ok(json!({"recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations, "exits": exits}))
+		Ok(json!({"recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations, "forfeits": forfeits,
+			"exits": exits}))
 	}
 
 	/// The decoded coin record of `leaf_id`, for people.

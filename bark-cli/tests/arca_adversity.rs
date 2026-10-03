@@ -288,3 +288,282 @@ async fn a_replacement_round_that_fails_a_check_puts_the_coin_into_exit_at_once(
 	assert!(refused.to_string().contains("missingorspent"), "{}", refused);
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
+
+// ---------------------------------------------------------------------------
+// A coin handed over stays the wallet's until the chain says otherwise
+// ---------------------------------------------------------------------------
+
+/// The unspent outpoint paying exactly `out`, found by its script.
+fn find_unspent(r: &Running, out: &elements::TxOut) -> elements::OutPoint {
+	let found = rpc(r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(out.script_pubkey.as_bytes()))])]);
+	let u = found["unspents"].as_array().unwrap().first().unwrap_or_else(|| panic!("nothing pays {}", hex(out.script_pubkey.as_bytes())));
+	elements::OutPoint::new(elements::Txid::from_str(u["txid"].as_str().unwrap()).unwrap(), u["vout"].as_u64().unwrap() as u32)
+}
+
+fn hex(b: &[u8]) -> String {
+	b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// The transaction spending `op` in the last 200 blocks or the mempool.
+fn spender_of(r: &Running, op: &elements::OutPoint) -> Option<Transaction> {
+	let spends = |t: &Transaction| t.input.iter().any(|i| i.previous_output == *op);
+	let mempool: Vec<String> = serde_json::from_value(rpc(r, "getrawmempool", &[])).unwrap();
+	for id in mempool {
+		let t = r.rt.client().raw_transaction(&elements::Txid::from_str(&id).unwrap()).unwrap();
+		if spends(&t) {
+			return Some(t);
+		}
+	}
+	let tip = r.rt.client().blockchain_info().unwrap().blocks;
+	for h in tip.saturating_sub(200)..=tip {
+		let hash = r.rt.client().block_hash(h).unwrap();
+		if let Some(t) = r.rt.client().block(&hash).unwrap().txdata.into_iter().find(|t| spends(t)) {
+			return Some(t);
+		}
+	}
+	None
+}
+
+/// Runs `exit` on `leaf` until it is claimed: once to bring the coin
+/// on-chain, again after a block (waiting out the delay), and again once
+/// the exit delay has run. Returns the confirmed claim.
+async fn exit_and_claim(r: &Running, w: &Arca, leaf: &str, fee_asset: Option<&str>) -> Transaction {
+	let mut args = vec!["exit", leaf];
+	if let Some(a) = fee_asset {
+		args.extend(["--fee-asset", a]);
+	}
+	let e = w.ok(&args);
+	assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+	r.produce().await;
+	let e = w.ok(&args);
+	assert_eq!(e["state"], "waiting", "the claim waits out the exit delay: {}", e);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let e = w.ok(&args);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	r.produce().await;
+	let claim = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+	assert!(confirmations(r, &claim) >= 1, "the claim confirms");
+	r.rt.client().raw_transaction(&claim).unwrap()
+}
+
+/// A coin given to a participation is the wallet's while no forfeit of it is
+/// signed: when the participation expires (its forfeit day passed while the
+/// wallet was away) the coin is live again, and a coin given to a
+/// participation the operator never runs can be exited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_given_coin_comes_back_when_its_participation_expires_and_can_be_exited() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let c = Arca::new("F3a");
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	let board = &boards[0];
+	let p = c.ok(&["participate"]);
+	let pid = p["participation"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&c, board)["state"], "given");
+	final_round(&r).await;
+	// The wallet is away for the forfeit day: the participation expires.
+	let expired = r.server.store.expire_participations(u32::MAX).await.unwrap();
+	assert!(expired.iter().any(|e| hex(e) == pid), "the server expires the participation");
+	let s = c.ok(&["sync"]);
+	println!("F3a the wallet's sync after the expiry: {}", s["participations"]);
+	assert_eq!(s["participations"][0]["state"], "expired", "{}", s);
+	assert_eq!(coin_of(&c, board)["state"], "live", "an expired participation gives its coin back");
+
+	// Given again, and the operator never runs a round: the wallet exits it.
+	c.ok(&["participate"]);
+	assert_eq!(coin_of(&c, board)["state"], "given");
+	let claim = exit_and_claim(&r, &c, board, Some(&x.to_string())).await;
+	println!("F3a the given coin exited: claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	let paid = claim.output[0].value.explicit().unwrap();
+	assert_eq!(claim.output[0].asset.explicit(), Some(x));
+	assert!(paid > 1_999_900, "the board's value, less its claim's fee: {}", paid);
+	assert_eq!(coin_of(&c, board)["state"], "exited");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// The operator vanishes while a payment is in flight: the transfer request
+/// is never answered. The coin can be exited, and the request is not posted
+/// again once it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_in_flight_when_the_operator_vanishes_is_exited() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("F3bA");
+	let b = Arca::new("F3bB");
+	let boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	proxy.hold("/v1/cosign_transfer");
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("F3b send, the operator gone mid-call: ok={} {}", ok, v);
+	assert!(!ok);
+	r.server.stop();
+	assert_eq!(coin_of(&a, &boards[0])["state"], "sending");
+	let claim = exit_and_claim(&r, &a, &boards[0], Some(&x.to_string())).await;
+	println!("F3b the coin in flight exited: claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	let s = a.ok(&["sync"]);
+	assert_eq!(s["transfers"], json!([]), "the abandoned request is not posted again: {}", s);
+	assert_eq!(proxy.count("/v1/cosign_transfer"), 1);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The server takes the forfeit and withholds the preimage, then calls the
+/// participation void. A coin under a forfeit signed for a round in the
+/// chain is not given back by a void: it is not spent again. The operator's
+/// claim of the forfeit on the chain publishes the preimage, which the
+/// wallet reads from the claim's witness: the new leaf is its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_coin() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F7");
+	let d = Arca::new("F7D");
+	let x = r.x;
+	let boards = boarded(&mut r, &c, &proxy.url.clone(), &[(x, 2_000_000)]).await;
+	d.ok(&create_args(&r.url(), &r.node_url()));
+	c.ok(&["participate"]);
+	final_round(&r).await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/forfeit_leaves" && status == 200 {
+			v["preimage"] = Value::Null;
+		}
+		None
+	})));
+	let s = c.ok(&["sync"]);
+	println!("F7 the forfeit handed over, the preimage withheld: {}", s["participations"][0]);
+	assert_eq!(s["participations"][0]["state"], "forfeiting", "{}", s);
+	assert_eq!(coin_of(&c, &boards[0])["state"], "forfeited");
+	// The operator calls it void.
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/participation_status" && status == 200 {
+			v["state"] = json!("void");
+		}
+		if path == "/v1/forfeit_leaves" && status == 200 {
+			v["preimage"] = Value::Null;
+		}
+		None
+	})));
+	let s = c.ok(&["sync"]);
+	println!("F13 the status says void after the forfeit: {}", s["participations"][0]);
+	assert_eq!(coin_of(&c, &boards[0])["state"], "forfeited", "a void does not free a coin under a forfeit for a round in the chain");
+	let req = d.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let why = c.refused(&["send", &req, "--amount", "500000", "--asset", &x.to_string()], "in live coins");
+	println!("F13 a second spend of the forfeited coin: REFUSED: {}", why);
+	assert_eq!(proxy.count("/v1/cosign_transfer"), 0, "nothing was signed for a second spend");
+
+	// The operator claims the forfeit on the chain, which publishes the
+	// preimage; the wallet reads it there.
+	let mut done = Value::Null;
+	for _ in 0..30 {
+		r.produce().await;
+		let s = c.ok(&["sync"]);
+		if let Some(f) = s["forfeits"].as_array().and_then(|a| a.iter().find(|f| f["state"] == "claimed")) {
+			done = f.clone();
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	println!("F7 the wallet's watch of its forfeit: {}", done);
+	assert_eq!(done["state"], "claimed", "the claim is read from the chain");
+	let leaf = done["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	r.bury().await;
+	c.ok(&["sync"]);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live", "the new leaf is the wallet's: {}", coin_of(&c, &leaf));
+	assert_eq!(coin_of(&c, &boards[0])["state"], "spent");
+	for w in [&c, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Two boards refreshed in one round, whose forfeits the operator's watcher
+/// publishes; then the round can never return (one of its inputs is spent
+/// elsewhere, final), and the operator publishes one board's forfeit again.
+/// The new leaves are lost; the board whose forfeit is not on the chain is
+/// live again and is exited; the other's forfeit output, unclaimable without
+/// the round, is refunded to the wallet once its delay has run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let c = Arca::new("F3c");
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
+	let outs: Vec<_> = boards.iter().map(|b| {
+		let CoinRecord::Board(rec) = record_of(&c, b) else { panic!("a board") };
+		find_unspent(&r, &rec.output().txout())
+	}).collect();
+	for b in &boards {
+		c.ok(&["participate", "--leaf", b]);
+	}
+	let r1 = final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let leaves: Vec<String> = s["participations"].as_array().unwrap().iter()
+		.map(|p| p["new_leaves"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("released: {}", s)).to_string()).collect();
+	// The watcher publishes each board's forfeit.
+	let mut forfeits = vec![None, None];
+	for _ in 0..40 {
+		for (k, op) in outs.iter().enumerate() {
+			if forfeits[k].is_none() {
+				forfeits[k] = spender_of(&r, op);
+			}
+		}
+		if forfeits.iter().all(Option::is_some) {
+			break;
+		}
+		r.produce().await;
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	let second = forfeits[1].clone().expect("the watcher publishes the second board's forfeit");
+	println!("F3c the operator's forfeit of the second board: {} ({} vB)", second.txid(), second.vsize());
+
+	// The round can never return: rolled back, the mempool emptied, one of
+	// its inputs spent by another transaction, buried.
+	r.server.stop();
+	let block = block_of(&r, &r1.txid().to_string());
+	rpc(&r, "invalidateblock", &[json!(block)]);
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let op = r1.input[0].previous_output;
+	let prev = r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone();
+	let (a, v) = (prev.asset.explicit().unwrap(), prev.value.explicit().unwrap());
+	let mut conflict = Transaction { version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: op, ..Default::default() }],
+		output: vec![sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(a, v - 5_000), common::node::op_true()),
+			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(a, 5_000))] };
+	operator_signs(&r, &mut conflict);
+	let cid = r.rt.client().send_raw_transaction(&conflict).expect("the conflict relays");
+	// The operator publishes the second board's forfeit again.
+	let fid = r.rt.client().send_raw_transaction(&second).expect("the forfeit relays without its round");
+	r.produce().await;
+	r.bury().await;
+	println!("F3c conflict {} confirmed: round {} can never return; forfeit {} confirmed", cid, r1.txid(), fid);
+
+	let rc = c.ok(&["recheck"]);
+	println!("F3c the wallet's re-check: {}", rc["changes"]);
+	for l in &leaves {
+		assert_eq!(coin_of(&c, l)["state"], "lost", "the new leaf of the lost round");
+	}
+	assert_eq!(coin_of(&c, &boards[0])["state"], "live", "the board whose forfeit is not on the chain is the wallet's again: {}",
+		coin_of(&c, &boards[0]));
+	assert_eq!(coin_of(&c, &boards[1])["state"], "forfeited", "the board in its published forfeit: {}", coin_of(&c, &boards[1]));
+	let claim = exit_and_claim(&r, &c, &boards[0], Some(&x.to_string())).await;
+	println!("F3c the board given back is exited: claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+
+	// The refund, once its delay has run.
+	let refund_s = r.config.exit_delay_units.unwrap().1 as u32 * 512;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, refund_s));
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[1].as_str()).cloned()
+		.unwrap_or_else(|| panic!("the forfeit is watched: {}", s));
+	println!("F3c the wallet's refund of the second board's forfeit: {}", f);
+	assert_eq!(f["state"], "refunded", "{}", f);
+	r.produce().await;
+	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
+	assert!(confirmations(&r, &refund) >= 1, "the refund confirms");
+	assert_eq!(coin_of(&c, &boards[1])["state"], "exited");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
