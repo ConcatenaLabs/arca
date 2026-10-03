@@ -706,10 +706,15 @@ async fn a_receiver_answers_a_stale_board_conversion_at_once() {
 	println!("F5 the receiver's re-check: {}", ch);
 	assert_eq!(ch["to"], "exiting", "{}", ch);
 	assert!(ch["why"].as_str().unwrap().contains("spent"), "{}", ch);
+	// The answer: the checkpoint from the converted leaf, then the
+	// reassignment. The operator's watcher answers a stale exit too, and may
+	// have published the checkpoint first; the wallet publishes what is left.
 	let steps = ch["exit"]["broadcast"].as_array().unwrap_or_else(|| panic!("the answer is published: {}", ch)).clone();
-	assert_eq!(steps.len(), 2, "the checkpoint and the reassignment: {}", ch);
-	let checkpoint = r.rt.client().raw_transaction(&elements::Txid::from_str(steps[0]["txid"].as_str().unwrap()).unwrap()).unwrap();
-	assert_eq!(checkpoint.input[0].previous_output, OutPoint::new(conv_id, 0), "the checkpoint spends the converted leaf");
+	assert!(!steps.is_empty() || ch["exit"]["state"] == "waiting", "{}", ch);
+	let checkpoint = spender_of(&r, &OutPoint::new(conv_id, 0)).expect("the converted leaf is answered with its checkpoint");
+	let CoinRecord::Transfer(t) = record_of(&b, &coin) else { panic!("a coin of a transfer") };
+	assert_eq!(checkpoint.output[0].value.explicit(), Some(t.inputs[0].checkpoint_value), "the checkpoint the receiver holds: {}", ch);
+	println!("F5 the converted leaf answered by checkpoint {}; the receiver published {} step(s)", checkpoint.txid(), steps.len());
 	r.produce().await;
 	let claim = exit_and_claim(&r, &b, &coin, None).await;
 	println!("F5 the receiver's claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
