@@ -420,6 +420,7 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 			out
 		}).collect(),
 		fees: r.fees.iter().map(|(a, v)| api::FeeAmount { asset: AssetId::from_byte_array(*a).to_string(), amount: v.to_string() }).collect(),
+		waiting: r.waiting.clone().filter(|_| r.state == crate::store::ParticipationState::Pending),
 	}
 }
 
