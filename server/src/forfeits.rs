@@ -35,7 +35,9 @@
 //! claimed, which reveals it on the chain anyway.
 //!
 //! The step is idempotent: the same request again, for a released
-//! participation, verifies again and returns the same preimage.
+//! participation, verifies every forfeit again and returns the same
+//! preimage, whatever the chain has seen of the coins given up since (the
+//! watcher publishes a forfeit when its coin comes on-chain).
 //!
 //! The forfeits are due within a day of the round being found final
 //! ([`crate::params::Params::FORFEIT_DEADLINE`]): after that the
@@ -260,7 +262,15 @@ impl Forfeits {
 		let mut built = Vec::with_capacity(given.len());
 		for i in &p.inputs {
 			let leaf = LeafId(i.leaf_id);
-			let checked = coins::check(&self.store, &policy, &leaf, &id).await?;
+			// A participation already released took its forfeits once, each
+			// coin checked then; asked again, it verifies them again but
+			// does not ask of the chain what the forfeits since published
+			// there (by the watcher, answering an owner) have changed.
+			let checked = if p.state == ParticipationState::Released {
+				coins::resolve(&self.store, &policy, &leaf).await?
+			} else {
+				coins::check(&self.store, &policy, &leaf, &id).await?
+			};
 			let c = &checked.coin;
 			let f = Forfeit::new(c.leaf, (c.asset, c.value), c.id, p.unlock_hash, m, refund, i.margin)
 				.map_err(|e| ForfeitError::Internal(e.to_string()))?;

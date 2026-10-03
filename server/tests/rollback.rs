@@ -296,7 +296,7 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 		}
 		u.tx
 	};
-	refused_by_node("the reclaim of A's old node with its release for R and Y's connector asset", &reclaim(&[atom]),
+	refused_by_node("the reclaim of A's old node with its release for R and Y's connector asset", &reclaim(std::slice::from_ref(&atom)),
 		"Invalid Schnorr signature");
 	refused_by_node("the reclaim of A's old node with its release for R and no connector asset", &reclaim(&[]),
 		"Introspection index out of bounds");
@@ -345,4 +345,64 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	let spend_c = transfer_body(&[(&c_board, c_old.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)], xonly(&r.s), r.chain);
 	refused(r.http.post("cosign_transfer", &spend_c), 409, "double_spend");
 	println!("C expired in Y; its coin stays given up under its forfeit for R");
+
+	// The watcher completes A's run: it brings A's old coin, round 0's leaf,
+	// onto the chain from the server's own record of it (the node above it by
+	// A's authorisation, the entry with round 0's preimage), publishes A's
+	// forfeit for Y, and once that is final claims it, which reveals Y's
+	// preimage on the chain; once the claim is final A is released.
+	let a_old_id = a_board.id.0.to_vec();
+	// The atom of Y's connector asset this test issued by hand above, at an
+	// output anyone can spend, goes to the operator's wallet, where the
+	// watcher keeps its atoms.
+	let to = r.server.wallet.receive_script().await.unwrap();
+	let policy = r.purse.policy;
+	let fee_coin = r.purse.take_coin(policy);
+	let fv = fee_coin.1.value.explicit().unwrap();
+	let mut mv = Transaction {
+		version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: atom.0, ..Default::default() },
+			elements::TxIn { previous_output: fee_coin.0, ..Default::default() }],
+		output: vec![
+			sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(m_y, 1), to),
+			sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(policy, fv - 5_000), node::op_true()),
+			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(policy, 5_000)),
+		],
+	};
+	mv.input[0].witness.script_witness = op_true_tap().witness(&elements::Script::from(vec![0x51]), vec![]);
+	r.rt.client().send_raw_transaction(&mv).unwrap();
+	r.purse.put((elements::OutPoint::new(mv.txid(), 1), mv.output[1].clone()));
+	r.produce().await;
+	let mut released = false;
+	for n in 0..16 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		r.server.nursery.pass().await.unwrap();
+		if status(&r, &pa)["state"] == "released" {
+			println!("A's forfeit-first run released after {} pass(es)", n + 1);
+			released = true;
+			break;
+		}
+	}
+	let log = r.server.store.watcher_log().await.unwrap();
+	for w in &log {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		println!("  watcher: {} {} ({} vB, {:?}): {}", w.kind, Txid::from_byte_array(w.txid), tx.vsize(), w.state, w.detail);
+	}
+	assert!(released, "A's participation is released");
+	let kinds: Vec<&str> = log.iter().filter(|w| w.subject == a_old_id).map(|w| w.kind.as_str()).collect();
+	assert_eq!(kinds, vec!["entry", "forfeit", "claim"], "A's old coin brought on-chain, forfeited, claimed");
+	assert!(!r.unspent(&lowest_at), "the watcher unrolled A's old node, by A's own authorisation");
+	let claim = log.iter().find(|w| w.kind == "claim" && w.subject == a_old_id).unwrap();
+	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
+	let y_preimage = arca_covenant::witness::find_preimage(&ctx.input[0].witness.script_witness,
+		&unhex(status(&r, &pa)["unlock_hash"].as_str().unwrap()).try_into().unwrap()).expect("the claim reveals Y's preimage");
+	let again = r.http.post("forfeit_leaves", &body).ok();
+	assert_eq!((again["state"].as_str(), again["preimage"].as_str()), (Some("released"), Some(hex(&y_preimage).as_str())),
+		"the server hands over the preimage the claim revealed");
+	assert_eq!(leaf_states(&r, &a2), vec!["live", "lost"], "A's leaf of Y is live");
+	println!("A's run completed forfeit-first: the claim {} revealed Y's preimage, A's new leaf is live", Txid::from_byte_array(claim.txid));
 }

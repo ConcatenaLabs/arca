@@ -53,6 +53,21 @@ certification = "required"
 poll_interval_ms = 1000
 # start_height = 0
 
+[watcher]
+# Whether the watcher acts on its own as it follows the chain. An operator
+# runs it: without it nothing answers a stale exit, and no batch is swept.
+enabled = true
+# Unroll a node all of whose owners have released their lowest nodes, and
+# reclaim those lowest nodes, so a fully refreshed batch comes back before it
+# expires. A node with an owner who has not released is never unrolled.
+reclaim_early = true
+# The most outputs one sweep takes.
+max_sweep_inputs = 50
+# How often the watcher's recovery work (claims, offboards, expiry, reclaims)
+# runs when no block arrives; stale exits are answered on every pass over the
+# chain.
+recovery_interval_seconds = 30
+
 [fees]
 # The most a refresh costs, in parts per million of the coin's value: due in
 # full for a coin 28 days or more from its first expiry, falling to nothing in
