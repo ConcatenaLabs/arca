@@ -634,3 +634,97 @@ async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
 	assert_eq!(p["fees"], json!([]), "the honest schedule asks nothing in the free window: {}", p);
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
+
+// ---------------------------------------------------------------------------
+// A sender going back on a payment
+// ---------------------------------------------------------------------------
+
+/// Signs input `i`, a P2WPKH coin `prev` of `key`.
+fn sign_p2wpkh(tx: &mut Transaction, i: usize, prev: &elements::TxOut, key: &elements::secp256k1_zkp::Keypair) {
+	use elements::hashes::Hash;
+	let pk = key.public_key();
+	let h = elements::hashes::hash160::Hash::hash(&pk.serialize());
+	let code = Script::new_p2pkh(&elements::PubkeyHash::from_raw_hash(h));
+	let sighash = elements::sighash::SighashCache::new(&*tx).segwitv0_sighash(i, &code, prev.value, elements::EcdsaSighashType::All);
+	let msg = elements::secp256k1_zkp::Message::from_digest(sighash.to_byte_array());
+	let sig = elements::secp256k1_zkp::Secp256k1::new().sign_ecdsa_low_r(&msg, &key.secret_key());
+	let mut der = sig.serialize_der().to_vec();
+	der.push(elements::EcdsaSighashType::All as u8);
+	tx.input[i].witness.script_witness = vec![der, pk.serialize().to_vec()];
+}
+
+/// The sender of a payment converts, with its own key, the board it paid
+/// from: a stale exit. The receiver's re-check sees the board spent and the
+/// converted leaf on the chain, and answers at once with what it holds:
+/// the checkpoint from the converted leaf, then the reassignment; it claims
+/// its leaf after its exit delay, and the sender's claim of the converted
+/// leaf finds it spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receiver_answers_a_stale_board_conversion_at_once() {
+	use arca_covenant::{ExplicitOutput, FeeSource};
+	use elements::OutPoint;
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("F5A");
+	let b = Arca::new("F5B");
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let got = b.ok(&["mailbox"]);
+	let coin = got["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&b, &coin)["state"], "live");
+
+	// The sender converts its board with its own key, a fee coin of its own.
+	let CoinRecord::Board(rec) = record_of(&a, &boards[0]) else { panic!("a board") };
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let keys = bark::arca::keys::Keys::new(mnemonic.trim(), 0, 1).unwrap();
+	let leaf_key = keys.leaf(&rec.owner_nonce).unwrap();
+	let board_at = find_unspent(&r, &rec.output().txout());
+	let fee_key = common::running::keypair("sender fee coin");
+	let fee_script = bark::arca::keys::p2wpkh(&fee_key);
+	let paid = r.pay_to(fee_script.clone(), x, 100_000);
+	r.produce().await;
+	let j = paid.output.iter().position(|o| o.script_pubkey == fee_script).unwrap();
+	let fee_coin = (OutPoint::new(paid.txid(), j as u32), paid.output[j].clone());
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let ks = rec.policy().conversion(board_at, &FeeSource::Coin { outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 2_000,
+		change: fee_script.clone() }).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&leaf_key, &ks.sighash(genesis).unwrap(), &[0; 32]);
+	let mut conv = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+	let fi = conv.input.iter().position(|i| i.previous_output == fee_coin.0).unwrap();
+	sign_p2wpkh(&mut conv, fi, &fee_coin.1, &fee_key);
+	let conv_id = r.rt.client().send_raw_transaction(&conv).expect("the conversion relays");
+	r.produce().await;
+	println!("F5 the sender's conversion {} ({} vB), confirmations {}", conv_id, conv.vsize(), confirmations(&r, &conv_id));
+
+	// The receiver's re-check answers at once.
+	let rc = b.ok(&["recheck"]);
+	let ch = rc["changes"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("the re-check acts on the coin: {}", rc));
+	println!("F5 the receiver's re-check: {}", ch);
+	assert_eq!(ch["to"], "exiting", "{}", ch);
+	assert!(ch["why"].as_str().unwrap().contains("spent"), "{}", ch);
+	let steps = ch["exit"]["broadcast"].as_array().unwrap_or_else(|| panic!("the answer is published: {}", ch)).clone();
+	assert_eq!(steps.len(), 2, "the checkpoint and the reassignment: {}", ch);
+	let checkpoint = r.rt.client().raw_transaction(&elements::Txid::from_str(steps[0]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert_eq!(checkpoint.input[0].previous_output, OutPoint::new(conv_id, 0), "the checkpoint spends the converted leaf");
+	r.produce().await;
+	let claim = exit_and_claim(&r, &b, &coin, None).await;
+	println!("F5 the receiver's claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	assert!(claim.output[0].value.explicit().unwrap() > 599_000);
+
+	// The sender's claim of the converted leaf after its delay.
+	let leaf = rec.leaf();
+	let ks = leaf.exit_tx(OutPoint::new(conv_id, 0), rec.asset, rec.value, &[ExplicitOutput::new(rec.asset, rec.value - 2_000,
+		Script::from(vec![0x53]))], &FeeSource::Reserve).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&leaf_key, &ks.sighash(genesis).unwrap(), &[0; 32]);
+	let stale = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+	let refused = r.rt.client().send_raw_transaction(&stale).expect_err("the converted leaf is the receiver's checkpoint's");
+	println!("F5 the sender's claim of its converted leaf: REFUSED: {}", refused);
+	assert!(refused.to_string().contains("missingorspent"), "{}", refused);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

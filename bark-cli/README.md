@@ -66,7 +66,14 @@ the keys, but which coins were spent off-chain is in the store and the server.
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
   Its key and nonce must be ones the wallet drew and is waiting on (a receive
   request is single use); no leaf or checkpoint of its lineage may be on the
-  chain; every board it rests on must be unspent.
+  chain; every board it rests on must be unspent. After that, the re-check
+  watches every coin the wallet holds, handed over or not: when a leaf or
+  checkpoint it descends from, its own leaf, or a board it rests on spent
+  shows on the chain (a sender converting the board it paid from, or exiting
+  a coin it gave up), no off-chain spend of the coin is co-signed any more,
+  and the wallet takes the coin on-chain at once, publishing what it holds
+  (the checkpoint from a converted board's leaf, then the reassignment)
+  before any exit delay runs out.
 - **Finality** is the node's: a round or board is final when its block is
   certified by the committee and its Bitcoin anchor buried two blocks. A coin
   is spendable only while everything it rests on is final. The wallet asks again
@@ -129,7 +136,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
-| `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, and reports what changed and whether the tip it last saw was reorganised away |
+| `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
@@ -187,7 +194,8 @@ in flight when the operator vanishes; a preimage withheld and a participation
 called void after its forfeit, the preimage then read from the operator's
 claim on the chain; and a round that can never return, whose coins come back,
 a forfeit of one of them published anyway and refunded after its delay; a
-refresh fee of half of every coin, and one inside a coin's free window.
+refresh fee of half of every coin, and one inside a coin's free window; and a
+sender converting the board it paid from, answered at once by the receiver.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own.

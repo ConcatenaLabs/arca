@@ -464,6 +464,7 @@ impl Wallet {
 		};
 		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
 		let policy = self.receipt_policy(now);
+		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
 		let mut changes = vec![];
 		for c in self.store.coins()? {
 			if !matches!(c.state.as_str(), "pending" | "live") {
@@ -497,9 +498,72 @@ impl Wallet {
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
 		}
+		// What the lineage watch does to a coin is the coin's one change.
+		for mut ch in self.watch_lineages()? {
+			let id = ch["leaf_id"].as_str().unwrap_or("").to_string();
+			changes.retain(|c| c["leaf_id"].as_str() != Some(id.as_str()));
+			ch["from"] = json!(before.get(&id));
+			changes.push(ch);
+		}
 		self.store.set_meta("tip_height", &tip.height.to_string())?;
 		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
 		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes}))
+	}
+
+	/// Every coin the wallet still holds, live or handed over, against the
+	/// chain, for anything of its lineage there: a leaf or checkpoint it
+	/// descends from, its own leaf, or a board it rests on spent. Any of them
+	/// on the chain means someone has started to bring the coin, or one it
+	/// rests on, on-chain (a sender converting the board it paid from, or
+	/// exiting a coin it gave up), and that no off-chain spend of the coin is
+	/// co-signed any more: the wallet takes the coin on-chain at once, from
+	/// where the chain holds it, publishing what it signed in advance (the
+	/// checkpoint from a converted board's leaf, then the reassignment) before
+	/// any exit delay runs out. One look at the chain covers every coin.
+	fn watch_lineages(&mut self) -> Result<Vec<Value>, Error> {
+		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		let mut held = vec![];
+		for c in self.store.coins()? {
+			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending") {
+				continue;
+			}
+			let record = Self::record_of(&c)?;
+			let Ok(txs) = self.accepted_bases(&record) else { continue };
+			let Ok(coin) = record.resolve(&txs, &policy) else { continue };
+			held.push((c, coin));
+		}
+		let mut outputs = vec![];
+		for (_, coin) in &held {
+			outputs.extend(coin.lineage().into_iter().map(|o| o.output.txout()));
+			outputs.push(coin.output().txout());
+		}
+		let here = self.chain.locate(&outputs)?;
+		let on_chain = |o: &elements::TxOut| outputs.iter().zip(&here).any(|(w, at)| w == o && at.is_some());
+		let mut changes = vec![];
+		for (c, coin) in held {
+			let mut seen: Vec<String> = coin.lineage().into_iter().filter(|o| on_chain(&o.output.txout()))
+				.map(|o| format!("a {} it descends from ({})", o.kind, hex(o.output.script_pubkey.as_bytes()))).collect();
+			if on_chain(&coin.output().txout()) && coin.board().is_none() {
+				seen.push("its own leaf".into());
+			}
+			for b in coin.boards() {
+				if !self.chain.unspent(&b)? && coin.board().is_none() {
+					seen.push(format!("the board at {} it rests on, spent", b));
+				}
+			}
+			if seen.is_empty() {
+				continue;
+			}
+			let why = format!("on the chain: {}; no off-chain spend of it is co-signed any more, and the wallet takes it on-chain \
+				before any exit delay runs out", seen.join("; "));
+			let exit = self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"error": e.to_string()}));
+			let to = self.store.coin(&c.leaf_id)?.map(|r| r.state).unwrap_or_default();
+			if to == "exiting" {
+				self.store.set_coin_state(&c.leaf_id, "exiting", &why)?;
+			}
+			changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": to, "why": why, "exit": exit}));
+		}
+		Ok(changes)
 	}
 
 	/// One coin against the chain: where it stands, or why a base the chain
