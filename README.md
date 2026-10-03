@@ -9,6 +9,21 @@ operator's co-signature, and can always leave unilaterally by publishing the pat
 from the batch to their leaf and claiming it after the exit delay. A batch carries
 one asset, and every asset issued on Sequentia can have batches of its own.
 
+A batch expires 28 days after its round, and after a public notice the operator
+may then sweep what is left in it, so a holder moves each leaf into a new batch
+before then: a refresh. The holder submits a participation once, naming the leaves
+it gives up and the leaves it wants, and the operator runs it in the next round
+without the holder online. The operator takes a leaf in a participation only up to
+its exit deadline, three days before its batch's expiry, and a refresh is free in
+the two days before that deadline. Once the round is final the holder hands over a
+forfeit of each old leaf, bound to that round, and receives the preimage that
+completes its new leaves; it has a day to do so, after which the participation
+expires and the old leaves are the holder's again. Finally the holder signs a
+release of the lowest node above each old leaf, naming the new round's connector
+asset, so that the operator can reclaim the node before the batch expires. Forfeit
+and release alike are void if the new round leaves the chain: neither can be used
+without an asset that only that round can issue.
+
 This repository is a fork of [Bark](https://gitlab.com/ark-bitcoin/bark), the Ark
 implementation by Second, taken at its `0.7.1` release with the full upstream
 history. Bark's tags (`bark-0.7.1`, `lib-0.7.1`, `server-0.7.1`) mark the fork
@@ -27,10 +42,10 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `bark-cli/` | `arca-cli` | `bark_cli` | The `arca` command-line wallet, dual-chain: Arca coins on Sequentia, and Bitcoin arks through Bark's `bark` wallet and `barkd` daemon ([bark-cli/README.md](bark-cli/README.md)) |
 | `bark-json/`, `bark-rest/`, `bark-rest-client/` | `arca-json`, `arca-rest`, `arca-rest-client` | `bark_json`, `bark_rest`, `bark_rest_client` | JSON types, the daemon's REST server and its generated client |
 | `bark-common/`, `bark-runtime/` | `arca-common`, `arca-runtime` | `bark_common`, `bark_runtime` | Helpers shared by the wallet and the server; the async runtime abstraction |
-| `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL, the finality service, the on-chain wallet on the Sequentia Wallet Kit, the nursery, boards, transfer co-signing, rounds with their participations and published trees, and the JSON interface (`arcad`), and the signer holding the operator key (`arca-signer`) ([server/README.md](server/README.md)) |
+| `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL, the finality service, the on-chain wallet on the Sequentia Wallet Kit, the nursery, boards, transfer co-signing, rounds with their participations, published trees, forfeits and releases, and the JSON interface (`arcad`), and the signer holding the operator key (`arca-signer`) ([server/README.md](server/README.md)) |
 | `server-rpc/` | `arca-server-rpc` | `server_rpc` | The gRPC protocol of Bark's server, which the Bark wallet speaks |
 | `sequentia-ext/` | `arca-sequentia-ext` | `sequentia_ext` | Sequentia chain types (anchored block headers, issuances with a denomination, asset-tagged amounts), a JSON-RPC client for `sequentiad`, and a regtest harness ([sequentia-ext/README.md](sequentia-ext/README.md)) |
-| `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf, the entry, the forfeit, the checkpoint and `htlc-1`, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the board, the forfeit and its connector asset, the offboard, and the transactions that spend a leaf off the tree ([covenant/README.md](covenant/README.md)) |
+| `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf, the entry, the forfeit, the checkpoint and `htlc-1`, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the board, the forfeit and its connector asset, the release and the reclaim, the offboard, and the transactions that spend a leaf off the tree ([covenant/README.md](covenant/README.md)) |
 | `consensus/` | `arca-consensus` | `arca_consensus` | Script verification under Sequentia's consensus rules for tests, through the node's own interpreter ([consensus/README.md](consensus/README.md)) |
 | `bip321/` | `bip321` | `bip321` | Payment URI parser |
 | `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
