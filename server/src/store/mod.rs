@@ -24,6 +24,7 @@ mod chain;
 mod coins;
 mod mailbox;
 mod nursery;
+mod transfers;
 mod wallet;
 
 pub use auth::ChallengeError;
@@ -32,6 +33,7 @@ pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
+pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
 
 /// The migrations, in order: `(version, SQL)`. The schema is squashed into the
@@ -62,6 +64,13 @@ pub enum StoreError {
 	LeafExists(String),
 	#[error("leaf {0} is not known")]
 	LeafUnknown(String),
+	#[error("leaf {0} is already spent")]
+	LeafSpent(String),
+	#[error("leaf {0} is {1}, not live")]
+	LeafNotLive(String, &'static str),
+	/// The merge rule refused a reassignment.
+	#[error("{0}")]
+	Mergeable(String),
 }
 
 impl StoreError {
@@ -142,4 +151,8 @@ impl Store {
 /// Reads a fixed-length byte column.
 fn array32(v: Vec<u8>, what: &str) -> Result<[u8; 32], StoreError> {
 	v.try_into().map_err(|v: Vec<u8>| StoreError::Corrupt(format!("{} of {} bytes", what, v.len())))
+}
+
+fn hex(b: &[u8]) -> String {
+	b.iter().map(|x| format!("{:02x}", x)).collect()
 }

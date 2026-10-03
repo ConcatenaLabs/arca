@@ -1,8 +1,12 @@
 # arca-server
 
 The Arca operator's server on Sequentia. It holds the operator's side of Arca:
-the durable state of every leaf, board and transfer the operator has taken part
-in, kept in PostgreSQL.
+it hands out the second nonce of the salt of every leaf it creates, registers
+boards and credits them once final, co-signs out-of-round transfers and delivers them to
+their receivers' mailboxes, re-serves a key's leaves, and keeps its own
+on-chain wallet and the transactions it relies on broadcast. Its state is in
+PostgreSQL; what is final comes from one finality service; the operator key
+lives in a separate signer process. Wallets speak JSON over HTTP to `arcad`.
 
 The scripts, records and their validation come from
 [`arca-covenant`](../covenant/README.md); the server uses them and builds no
@@ -25,11 +29,17 @@ requests can race past them:
 - **Arca scripts.** Every leaf, board and checkpoint script the server has
   created or co-signed into appears once: a leaf script is never funded twice,
   across batches, boards and transfers alike.
-- **Operator nonces.** The operator's half of every leaf's salt is 32 random
-  bytes, recorded as issued before it is handed out and taken by one leaf at
-  most. A nonce that was never issued, or was already taken, is refused.
+- **Operator nonces.** A leaf's salt is built from two nonces, its owner's and
+  its creator's. For a leaf the operator creates (a board, a leaf of a round)
+  the creator's is the operator's: 32 random bytes, recorded as issued before
+  it is handed out and taken by one leaf at most. A nonce that was never
+  issued, or was already taken, is refused. A leaf a reassignment creates
+  takes its sender's creator nonce instead.
 - **Transfers.** A leaf is the input of one transfer at most, recorded before
   any signature leaves the server.
+- **Reassignments.** Every reassignment the server co-signed, kept by the hash
+  of its output 0's record with its inputs and outputs: the merge rule below
+  reads them, so it survives a restart.
 - **The chain as the server saw it**, rounds and their connector outputs,
   participations and forfeits, mailboxes, authentication challenges, the
   on-chain wallet's coins and the server's own transactions.
@@ -99,6 +109,102 @@ transaction final. A rollback that takes a credited board out uncredits it at
 once; the nursery broadcasts the same transaction again and the board is
 credited again when final again. A board whose transaction can no longer
 confirm is lost.
+
+## Out-of-round transfers
+
+A sender gives up coins the server knows, by leaf id, each with the value its
+checkpoint keeps and its owner's signatures over the checkpoint and the
+reassignment, for one to four new leaves, each named by its receiver's key and
+nonce, a creator nonce the sender draws fresh for that leaf, an exit delay, an
+asset and a value. The server co-signs only when every rule holds:
+
+- each input is live (a board once credited) and spent by nothing else: a
+  second spend of a leaf is refused, which is the whole of the double-spend
+  protection before a round;
+- nothing of the coin's lineage, its own leaf included, has been seen paid on
+  the chain, in a block or in the mempool, and every board it rests on is
+  credited and unspent: an Arca leaf on the chain past its exit delay can be
+  exited by its owner at once, so the server co-signs no off-chain spend of
+  it, a converted board included;
+- the new coins are at most five reassignments from a round or a board;
+- each new leaf is within the published bounds: an asset served, a value
+  within its bounds, an exit delay within the bounds, a key that owns no other
+  leaf, a script never seen;
+- no transaction could satisfy both it and a reassignment the server
+  co-signed before: their committed outputs do not agree at every index both
+  commit to (the same outputs, or one set the first outputs of the other).
+  Such a transaction would spend both sides' checkpoints, create the outputs
+  once and give one side's value to whoever broadcast it. The rule is
+  `arca-covenant`'s (`TransferPlan::admit`), run against every reassignment
+  recorded with the same output 0, under a lock on that output, so two
+  requests racing cannot both pass;
+- every checkpoint keeps between one atom and the whole coin, the outputs take
+  no more of any asset than the checkpoints keep, and each owner signature
+  verifies.
+
+The transfer is then recorded, inputs spent, before the operator key signs
+anything, so the server never signs a spend it has not durably recorded and
+two spends racing for one leaf leave exactly one standing. Each new coin's
+record is checked by the server as a receiver would check it, stored, and
+posted to the receiver's mailbox (the leaf's key, unless the output names
+another). A request repeated byte for byte gets the same answer; one that
+found the signer unreachable completes when repeated. Transfers are free.
+
+The same record of spends answers the round's question, before it accepts an
+owner's release of a leaf's lowest node, whether the leaf has an open
+out-of-round reassignment (`Cosigner::check_release`).
+
+## The interface
+
+JSON over HTTP, every call under `/v1/`, so the server sits behind one
+same-origin path of a reverse proxy that terminates TLS. Every request body is
+bounded (64 KiB by default) before it is read: a larger one is refused with
+413, whatever it holds. Every refusal is
+`{"error": {"code": …, "message": …}}` with a stable code. Amounts are decimal
+strings, asset ids and the genesis hash in display order, keys, nonces,
+signatures, leaf ids and records lower-case hex; records travel in their
+canonical binary form. Every object refuses a field it does not know.
+
+| Call | Does |
+|---|---|
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule, the request limit |
+| `POST operator_nonce` | A fresh operator nonce, for a board |
+| `POST challenge` | A challenge to authenticate with, good once, for a short while |
+| `POST register_board` | Registers a board record with its transaction |
+| `POST board_status` | A board's state (`pending`, `credited`, `lost`) and its transaction's finality |
+| `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
+| `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
+| `POST leaf_data` | The leaves a key owns, with their records |
+
+`mailbox_read` and `leaf_data` need a proof of the key: a challenge from
+`challenge`, signed with BIP340 over the tagged hash
+`SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key)` with
+`T = SHA256("Arca/auth")`. The tag keeps it apart from everything else a leaf
+key signs, the genesis hash to one chain, the call to one request, the
+challenge to one use. There is no bearer token. `cosign_transfer` is
+authenticated by the owners' signatures over the transfer itself.
+
+## The signer
+
+The operator key `S` lives in `arca-signer`, a process of its own; the server
+never holds it. It loads the key from a file only its owner can read (it
+refuses one others can), listens on a Unix socket of mode 0600, and answers two
+requests: its public key, and `S`'s signature over the rebindable message of a
+collaborative path, which it builds itself from the parts (the salt, the coin's
+asset and value, one to four committed outputs) on its own chain. It signs no
+digest it is handed, no transaction, no unroll authorisation and no release.
+The server checks each signature it gets back against the message it built.
+
+## Running
+
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock
+    arcad /etc/arca/arcad.toml
+
+[`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
+address, the database, the signer's socket, the wallet's mnemonic file, the
+node's RPC, the finality rule, the exit-delay bounds, and the assets served
+with their smallest leaf. The node must run with `-txindex` and
+`-validateanchor`.
 
 ## The on-chain wallet
 

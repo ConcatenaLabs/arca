@@ -1,0 +1,49 @@
+# The Arca server's configuration (arcad). Every setting, with its default
+# where it has one.
+
+# Where the JSON interface listens. A reverse proxy in front terminates TLS
+# and serves it under one same-origin path.
+listen = "127.0.0.1:3535"
+
+# PostgreSQL. The schema is built on first start.
+database = "postgres://arca@127.0.0.1:5432/arca"
+
+# The socket arca-signer listens on; the operator key lives there, not here.
+signer_socket = "/run/arca/signer.sock"
+
+# The on-chain wallet's BIP39 mnemonic, alone in a file only the operator can
+# read.
+wallet_mnemonic_file = "/etc/arca/wallet.mnemonic"
+
+# The multiple of the node's relay floor the wallet pays, in the fee asset it
+# names for each transaction.
+fee_multiple = 2
+
+# The largest request body read, in bytes.
+max_request_bytes = 65536
+
+# How long an authentication challenge is good for.
+challenge_ttl_seconds = 120
+
+# The exit delay bounds, in 512-second units: [min, max]. The default is the
+# specification's 36 to 48 hours, [254, 338].
+# exit_delay_units = [254, 338]
+
+[node]
+# sequentiad, with -txindex and -validateanchor.
+rpc_url = "http://127.0.0.1:18884/"
+cookie_file = "/var/lib/sequentia/.cookie"
+# or: rpc_user = "...", rpc_password = "..."
+
+[finality]
+# Certified, and the anchor buried this many Bitcoin blocks.
+anchor_depth = 2
+# "required" on every chain with a committee.
+certification = "required"
+poll_interval_ms = 1000
+# start_height = 0
+
+# Each asset served, with the smallest leaf taken, in the asset's atoms.
+[[assets]]
+asset = "<asset id>"
+min_leaf = "1000"

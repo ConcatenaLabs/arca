@@ -89,7 +89,7 @@ pub struct NewScript {
 	pub kind: ScriptKind,
 }
 
-/// A coin to record: the leaf, the operator nonce its salt took, and every
+/// A coin to record: the leaf, the operator nonce its salt took if any, and every
 /// Arca script it brings (its own leaf script first).
 #[derive(Debug, Clone)]
 pub struct NewCoin {
@@ -104,9 +104,11 @@ pub struct NewCoin {
 	/// The coin record, binary form.
 	pub record: Vec<u8>,
 	pub state: LeafState,
-	/// The operator nonce in the leaf's salt; `None` only for a leaf whose
-	/// nonce the server has already taken (a batch leaf the round runner
-	/// records after building the tree).
+	/// The operator nonce in the leaf's salt, for a leaf the operator
+	/// created (a board); `None` for a leaf a reassignment created, whose
+	/// salt takes its sender's creator nonce, and for a leaf whose nonce the
+	/// server has already taken (a batch leaf the round runner records after
+	/// building the tree).
 	pub operator_nonce: Option<[u8; 32]>,
 	/// Every Arca script the coin brings, its own included.
 	pub scripts: Vec<NewScript>,
@@ -144,10 +146,6 @@ pub(super) fn leaf_row(r: &tokio_postgres::Row) -> Result<LeafRow, StoreError> {
 		state: LeafState::parse(r.get(8))?,
 		spent_by: r.get(9),
 	})
-}
-
-fn hex(b: &[u8]) -> String {
-	b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
 /// Takes an operator nonce for `leaf_id` inside `tx`: it must have been issued
@@ -194,7 +192,7 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 	).await;
 	match r {
 		Ok(_) => Ok(()),
-		Err(e) if StoreError::is_unique(&e, "leaf_pkey") => Err(StoreError::LeafExists(hex(&coin.leaf_id))),
+		Err(e) if StoreError::is_unique(&e, "leaf_pkey") => Err(StoreError::LeafExists(super::hex(&coin.leaf_id))),
 		Err(e) if StoreError::is_unique(&e, "leaf_owner_key_key") => Err(StoreError::KeyReused),
 		Err(e) if StoreError::is_unique(&e, "leaf_script_pubkey_key") => Err(StoreError::ScriptReused),
 		Err(e) => Err(e.into()),

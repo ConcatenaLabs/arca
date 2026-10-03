@@ -343,9 +343,11 @@ version = "0.1.0"
 dependencies = [
  "arca-covenant",
  "arca-sequentia-ext",
+ "axum",
  "bb8",
  "bb8-postgres",
  "elements",
+ "env_logger",
  "log",
  "lwk_common",
  "lwk_signer",
@@ -355,6 +357,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "toml",
 ]
 
 [[package]]

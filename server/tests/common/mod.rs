@@ -7,4 +7,5 @@ pub mod db;
 pub mod fake;
 pub mod keys;
 pub mod node;
+pub mod signer;
 pub mod stack;
