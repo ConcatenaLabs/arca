@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::margin_for;
 use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
-use arca_covenant::{Chain, ClockSchedule, CoinRecord, Forfeit, LeafRecord, MedianTime, RelativeTime, Template, ValidLeaf, WalletPolicy};
+use arca_covenant::{Chain, ClockSchedule, CoinRecord, Forfeit, LeafRecord, MedianTime, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::{participation_id, Wanted};
@@ -298,9 +298,14 @@ impl Wallet {
 				.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
 			let key = self.keys.leaf(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
+			// A batch leaf's lowest node is released for this round alone: the
+			// release names the round's connector asset, so it is void if the
+			// round leaves the chain.
 			if let (CoinRecord::Leaf { .. }, arca_covenant::ValidOrigin::Leaf { valid, .. }) = (&record, &old.origin) {
-				if let Some(rec) = valid.branch.nodes.last().and_then(|n| n.reclaim.as_ref()) {
-					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rec.release.digest).as_ref())}));
+				if valid.branch.nodes.last().is_some_and(|n| n.reclaim.is_some()) {
+					let rel = Release::for_refresh(valid, &news[0].0, &round, c)
+						.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
+					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
 			}
 		}

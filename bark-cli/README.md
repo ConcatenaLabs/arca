@@ -97,7 +97,7 @@ case whoever broadcasts attaches a fee coin.
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason |
 | `participate [--leaf L]… [--not-before T]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, paying the operator's refresh fee in each coin's own asset |
-| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, and moves every participation on: once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old leaves' lowest nodes |
+| `sync` | Re-checks every coin, posts again the transfer requests the server never answered, reads the mailbox, and moves every participation on: once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset |
 | `recheck` | Re-checks every coin against the chain as it is now, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to the wallet's on-chain address. Each run goes as far as the chain allows; run it again to go on |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
@@ -137,7 +137,9 @@ stopped, through its unroll, its checkpoints, its reassignment and its claim,
 a fee coin paying where its asset is not accepted for fees. A second test puts
 a proxy between a wallet and the server that rewrites the published tree (a
 leaf's value, the last expiry, a clock running backwards): the wallet refuses
-each before it signs anything, and completes once the tree is honest. Every
+each before it signs anything, and completes once the tree is honest; a
+second refresh then gives up that batch leaf and releases its lowest node for
+the new round. Every
 refusal is asserted by its reason. `tests/arca_digests.rs` checks the wallet's
 call authentication and participation id against the server's own.
 

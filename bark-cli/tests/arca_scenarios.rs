@@ -300,6 +300,21 @@ async fn a_dishonest_published_tree_is_refused_before_anything_is_signed() {
 	let s = c.ok(&["sync"]);
 	assert_eq!(s["participations"][0]["state"], "released", "{}", s);
 	assert_eq!(coin(&c.ok(&["coins"]), &board)["state"], "spent");
+	let first = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+
+	// A second refresh gives up that batch leaf: once the new round is final
+	// and the new leaf validated, the wallet releases the old leaf's lowest
+	// node for that round.
+	c.ok(&["participate"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let s = c.ok(&["sync"]);
+	let p = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released" && p["round"] == built.tx.txid().to_string())
+		.unwrap_or_else(|| panic!("the second refresh: {}", s));
+	assert_eq!(p["released"], json!([first]), "the old batch leaf's lowest node is released: {}", s);
+	println!("C released the lowest node of {} for round {}", first, built.tx.txid());
 	println!("C's refusals: {}", c.ok(&["refusals"]));
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
