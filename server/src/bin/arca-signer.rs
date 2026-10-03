@@ -4,14 +4,18 @@
 //! socket. See `server::signer` for the protocol.
 //!
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file>
+//!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. The genesis hash is in display
 //! order, as `getblockhash 0` prints it. The socket is created with mode 0600.
 //! The record is the signer's append-only record of every rebindable message
-//! it signed (`server::signer::SpendRecord`), created when absent: it is what
-//! makes the signer the one-spend authority, so it is kept on durable storage
-//! and never rolled back, whatever is done to the server's database.
+//! it signed (`server::signer::SpendRecord`): it is what makes the signer the
+//! one-spend authority, so it is kept on durable storage and never rolled
+//! back, whatever is done to the server's database. The signer starts only on
+//! its record and locks it while it runs. `--create-record` makes a new,
+//! empty record for this key and chain, once, and exits: a record is never
+//! made in passing, so one that is lost is never silently replaced.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -29,14 +33,17 @@ use arca_covenant::message::rebind_message;
 use arca_covenant::sign::{script_spend_sighash, sign_digest, verify_digest};
 use arca_covenant::Chain;
 use server::signer::{
-	check_spend, hex, parse_amount, unhex, unhex32, Request, Response, Signed, SpendRecord, ALREADY_SIGNED, MAX_REQUEST,
+	check_spend, hex, parse_amount, unhex, unhex32, Request, Response, Signed, SpendRecord, WireEntryRef, ALREADY_SIGNED, MAX_ENTRIES,
+	MAX_REQUEST, RECORD_BEHIND, RECORD_DIFFERS,
 };
 
 struct Args {
 	key_file: PathBuf,
 	genesis: BlockHash,
-	socket: PathBuf,
+	/// `None` with `--create-record`, which serves nothing.
+	socket: Option<PathBuf>,
 	record: PathBuf,
+	create_record: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -44,6 +51,7 @@ fn args() -> Result<Args, String> {
 	let mut genesis = None;
 	let mut socket = None;
 	let mut record = None;
+	let mut create_record = false;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -52,14 +60,19 @@ fn args() -> Result<Args, String> {
 			"--genesis" => genesis = Some(BlockHash::from_str(&value()?).map_err(|e| format!("--genesis: {}", e))?),
 			"--socket" => socket = Some(PathBuf::from(value()?)),
 			"--record" => record = Some(PathBuf::from(value()?)),
+			"--create-record" => create_record = true,
 			other => return Err(format!("unknown argument {}", other)),
 		}
+	}
+	if !create_record && socket.is_none() {
+		return Err("--socket is required".into());
 	}
 	Ok(Args {
 		key_file: key_file.ok_or("--key-file is required")?,
 		genesis: genesis.ok_or("--genesis is required")?,
-		socket: socket.ok_or("--socket is required")?,
+		socket,
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
+		create_record,
 	})
 }
 
@@ -83,7 +96,16 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 	};
 	match req {
 		Request::Pubkey {} => Response { pubkey: Some(hex(&key.x_only_public_key().0.serialize())), ..none },
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit } => {
+		Request::Head {} => {
+			let (n, hash) = record.lock().unwrap_or_else(|e| e.into_inner()).head();
+			Response { entry: Some(WireEntryRef { entry: n, hash: hex(&hash) }), ..none }
+		},
+		Request::Entries { after, limit } => {
+			let r = record.lock().unwrap_or_else(|e| e.into_inner());
+			let list = r.entries_after(after, limit.min(MAX_ENTRIES) as usize).iter().map(|e| e.to_wire()).collect();
+			Response { entries: Some(list), ..none }
+		},
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -107,9 +129,13 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 						Signed::Forfeit(policy.connector.into_inner().to_byte_array())
 					},
 				};
-				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind))
+				let known = match &known {
+					Some(k) => (k.entry, unhex32(&k.hash)?),
+					None => (0, [0; 32]),
+				};
+				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known))
 			})();
-			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind) = match parsed {
+			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known) = match parsed {
 				Ok(p) => p,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
@@ -126,20 +152,28 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 					..none
 				};
 			}
-			// On disk before anything is signed.
-			let admitted = record.lock().unwrap_or_else(|e| e.into_inner()).admit(&owner.serialize(), &salt, kind, &message.digest);
-			if let Err(e) = admitted {
-				eprintln!("arca-signer: refused rebind {} for the leaf of {} under salt {}: {}", hex(&message.digest),
-					hex(&owner.serialize()), hex(&salt), e);
-				let code = e.starts_with(ALREADY_SIGNED).then(|| ALREADY_SIGNED.to_string());
-				return Response { error: Some(e), code, ..none };
-			}
+			// The record holds what the database knows, the same; then the
+			// message is on disk before anything is signed.
+			let admitted = {
+				let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
+				r.check_known(known.0, &known.1).and_then(|_| r.admit(&owner.serialize(), &salt, kind, &message.digest))
+			};
+			let entry = match admitted {
+				Ok(e) => e,
+				Err(e) => {
+					eprintln!("arca-signer: refused rebind {} for the leaf of {} under salt {}: {}", hex(&message.digest),
+						hex(&owner.serialize()), hex(&salt), e);
+					let code = [ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS].into_iter()
+						.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string);
+					return Response { error: Some(e), code, ..none };
+				},
+			};
 			let mut aux = [0u8; 32];
 			rand::rngs::OsRng.fill_bytes(&mut aux);
 			let sig = sign_digest(key, &message.digest, &aux);
-			eprintln!("arca-signer: signed rebind {} ({}) for the leaf of {} under salt {}", hex(&message.digest),
-				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt));
-			Response { signature: Some(hex(sig.as_ref())), ..none }
+			eprintln!("arca-signer: signed rebind {} ({}) for the leaf of {} under salt {}: entry {}", hex(&message.digest),
+				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt), entry.n);
+			Response { signature: Some(hex(sig.as_ref())), entry: Some(WireEntryRef { entry: entry.n, hash: hex(&entry.hash) }), ..none }
 		},
 		Request::Spend { tx, prevouts, input, leaf } => {
 			let parsed = (|| -> Result<_, String> {
@@ -181,8 +215,27 @@ async fn main() {
 			std::process::exit(2);
 		},
 	};
-	let record = match SpendRecord::open(&args.record) {
-		Ok(r) => Arc::new(Mutex::new(r)),
+	let operator = key.x_only_public_key().0;
+	if args.create_record {
+		match SpendRecord::create(&args.record, &operator, &args.genesis) {
+			Ok(()) => {
+				eprintln!("arca-signer: created the record {} for S = {} on {}", args.record.display(), hex(&operator.serialize()),
+					args.genesis);
+				std::process::exit(0);
+			},
+			Err(e) => {
+				eprintln!("arca-signer: the record: {}", e);
+				std::process::exit(2);
+			},
+		}
+	}
+	let record = match SpendRecord::open(&args.record, &operator, &args.genesis) {
+		Ok((r, repaired)) => {
+			if let Some(note) = repaired {
+				eprintln!("arca-signer: {}", note);
+			}
+			Arc::new(Mutex::new(r))
+		},
 		Err(e) => {
 			eprintln!("arca-signer: the record: {}", e);
 			std::process::exit(2);
@@ -190,20 +243,21 @@ async fn main() {
 	};
 	let chain = Chain::new(args.genesis);
 	let genesis = args.genesis;
-	let _ = std::fs::remove_file(&args.socket);
-	let listener = match UnixListener::bind(&args.socket) {
+	let socket = args.socket.clone().expect("a socket when serving");
+	let _ = std::fs::remove_file(&socket);
+	let listener = match UnixListener::bind(&socket) {
 		Ok(l) => l,
 		Err(e) => {
-			eprintln!("arca-signer: {}: {}", args.socket.display(), e);
+			eprintln!("arca-signer: {}: {}", socket.display(), e);
 			std::process::exit(2);
 		},
 	};
-	if let Err(e) = std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600)) {
-		eprintln!("arca-signer: {}: {}", args.socket.display(), e);
+	if let Err(e) = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)) {
+		eprintln!("arca-signer: {}: {}", socket.display(), e);
 		std::process::exit(2);
 	}
-	eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}", hex(&key.x_only_public_key().0.serialize()),
-		args.socket.display(), record.lock().unwrap_or_else(|e| e.into_inner()).len(), args.record.display());
+	eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}", hex(&operator.serialize()),
+		socket.display(), record.lock().unwrap_or_else(|e| e.into_inner()).len(), args.record.display());
 	loop {
 		let (stream, _) = match listener.accept().await {
 			Ok(s) => s,

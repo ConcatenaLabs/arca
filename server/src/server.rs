@@ -389,6 +389,32 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 	Ok(found)
 }
 
+/// Refuses to start when the signer's record is not the one the database
+/// knows: it ends before the latest entry the database was given (cut back,
+/// or replaced by an older copy), or holds another entry there (another
+/// record, or one two signers wrote).
+async fn check_signer_record(store: &Store, signer: &SignerClient) -> Result<(), StartError> {
+	let known = match store.signer_head().await.map_err(err("the database"))? {
+		Some(k) => k,
+		None => return Ok(()),
+	};
+	let (held, _) = signer.head().await.map_err(err("the signer"))?;
+	if known.0 > held {
+		return Err(StartError(format!(
+			"the signer's record ends at entry {} and the database knows entry {} ({}): the record has been cut back or \
+			 replaced by an older copy, and a signer on it could sign again what it signed before; start the signer on its \
+			 whole record (see the server's README)", held, known.0, crate::signer::hex(&known.1))));
+	}
+	let there = signer.entries(known.0 - 1).await.map_err(err("the signer"))?;
+	match there.first() {
+		Some(e) if e.n == known.0 && e.hash == known.1 => Ok(()),
+		other => Err(StartError(format!(
+			"entry {} of the signer's record is not the one the database knows: the record holds {}, the database {}; \
+			 this is another record, or one two signers wrote (see the server's README)", known.0,
+			other.map(|e| crate::signer::hex(&e.hash)).unwrap_or_else(|| "nothing".into()), crate::signer::hex(&known.1)))),
+	}
+}
+
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
@@ -430,8 +456,9 @@ impl Server {
 		};
 		let finality = FinalityService::new(store.clone(), source.clone(), fconfig).await.map_err(err("the finality service"))?;
 		let genesis = finality.call(|c| c.genesis()).await.map_err(err("the node"))?;
-		let signer = SignerClient::new(&config.signer_socket);
+		let signer = SignerClient::new(&config.signer_socket).with_store(store.clone());
 		let operator = signer.pubkey().await.map_err(err("the signer"))?;
+		check_signer_record(&store, &signer).await?;
 
 		let mut assets = BTreeMap::new();
 		let mut order = vec![];

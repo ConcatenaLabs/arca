@@ -22,7 +22,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 ([`schema/V2__watcher.sql`](schema/V2__watcher.sql),
 [`schema/V3__operator_scripts.sql`](schema/V3__operator_scripts.sql),
 [`schema/V4__participation_waiting.sql`](schema/V4__participation_waiting.sql),
-[`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql)). `Store::connect` builds it
+[`schema/V5__leaf_salt.sql`](schema/V5__leaf_salt.sql),
+[`schema/V6__signer_head.sql`](schema/V6__signer_head.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -89,12 +90,16 @@ to an older state:
   backup with every archived WAL segment to the end. Never restore to an
   earlier point, and never start the server on a copy taken earlier.
 - The signer's record (`arca-signer --record`) is never restored with the
-  database or from any older copy; it lives on its own durable storage and
-  only grows. It is what keeps `S` from co-signing a second spend of a coin
-  whatever the database says, so a database that has lost a transfer gets a
-  refusal (`double_spend`) where it would co-sign the second spend. A record
-  lost or rolled back opens that hole again, so the signer is not run without
-  its record whole.
+  database or from any older copy; it lives on its own durable storage (one
+  that loses no write, such as a mirror) and only grows. It is what keeps `S`
+  from co-signing a second spend of a coin whatever the database says, so a
+  database that has lost a transfer gets a refusal (`double_spend`) where it
+  would co-sign the second spend. A record lost or rolled back would open
+  that hole again, so the signer notices both: it does not start where its
+  record is missing, and the database remembers the latest entry it was
+  given, so a record cut back or replaced by an older copy signs nothing
+  (`record_behind`) and the server does not start against it. A record that
+  is lost cannot be replaced by a new one: the operator stops co-signing.
 - The server refuses to start on a database that does not know what the
   chain shows of the operator's: a transaction paying the operator's
   connector script that is no round it knows (a round it built and forgot,
@@ -618,8 +623,7 @@ The signer is the one-spend authority. Before it returns a rebindable
 signature it appends the owner key, the salt, the kind and the message's
 digest to its record, an append-only file it alone writes, and syncs it to
 disk; it reads the record whole when it starts, and refuses to start on a line
-it cannot read (a last line cut short by a crash was never answered, and is
-dropped). The record is kept per leaf: a leaf is its owner key together with
+it cannot read. The record is kept per leaf: a leaf is its owner key together with
 its salt (a leaf's, a board's, a checkpoint's, whose owner is its coin's), so
 another leaf under the same salt is another leaf, and since every entry needs
 the named owner's signature, nothing one holder sends changes what `S` signs
@@ -633,8 +637,36 @@ forfeit after a spend, and a second forfeit for one round are refused
 (`already_signed`), whatever the database holds. The server answers such a
 refusal with `double_spend`, and logs that its database has lost a spend.
 
+The record cannot be lost, cut back, torn or shared without the signer
+noticing:
+
+- **Lost.** The signer starts only on its record. One is made once, for a new
+  operator key, by `arca-signer --create-record`, which refuses a path where a
+  record is; a signer pointed at a path where there is none does not start,
+  so a lost record is never silently replaced by an empty one, which would
+  sign again what was signed before.
+- **Cut back or replaced.** The record's first line names its format, the
+  operator key and the chain, and a record of another key or chain does not
+  start. Every entry carries its number and a running hash over everything
+  before it, so an edited line stops the start. The server's database
+  remembers the latest entry the signer gave it, and every rebind request
+  names it: a record that ends before it has been cut back, or replaced by an
+  older copy (`record_behind`), and one that holds another entry there is
+  another record (`record_differs`). Either way the signer signs nothing more
+  until it runs on its whole record, the server answers `signer_unavailable`,
+  and the server does not start against such a record, naming both entries.
+- **Torn.** A write that fails (a full disk) is undone at once, so the line it
+  cut short is never followed by another; a last line cut short by a crash
+  was never answered, and is removed when the record is opened, with a line
+  in the signer's log.
+- **Shared.** The signer locks its record while it runs, so a second signer
+  on the same file does not start; a copy written by another signer is
+  another record, caught by the entry the database knows.
+
 ## Running
 
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
+        --create-record                    # once, for a new operator key
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
         --record /var/lib/arca/signer.record
     arcad /etc/arca/arcad.toml
@@ -942,8 +974,22 @@ another salt refused and not recorded; forfeits of one coin for two rounds
 signed and a second forfeit for one round refused; a spend after forfeits and
 a forfeit after a spend refused; forfeit parts that do not make the output
 refused and not recorded; the same refusals after a restart; a last line cut
-short dropped, and a line that does not read, or one of a record kept by salt
-alone, refusing the start.
+short dropped, and a line that does not read, or a record kept by salt alone,
+refusing the start. And the record's integrity: no start where there is no
+record, and nothing made there; `--create-record` making one of mode 0600,
+and refusing where one is; a second signer on one record not starting; the
+record cut back to an older copy refusing the request that names the
+database's later entry (`record_behind`), and everything after it; a copy
+another signer wrote refusing the database's entry (`record_differs`); a write
+past a file size limit undone at once and the next entry whole once there is
+room; a line cut short by a crash removed at start, which says so; an edited
+line, and a record of another key, refusing the start.
+
+`tests/signer_record.rs` runs it with the server: after a payment the
+database knows entry 2; the record replaced by its empty copy, the next
+payment is answered `signer_unavailable` (`record_behind`) and the server does
+not start, naming both entries; with the whole record back the server starts
+and the payment, sent again byte for byte, is co-signed.
 
 `tests/salts.rs` names other leaves' salts. A transfer to a leaf of the
 attacker's under a batch leaf's salt read from the public tree, two new leaves
