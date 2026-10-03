@@ -26,6 +26,10 @@
 //!    a sender's coin, in both shapes. A receiver offered a coin that rests on
 //!    the one leaf twice refuses it; after the merge, only one of that coin's
 //!    two checkpoints can be made.
+//! 3. A sender that rebuilds a leaf the receiver has already paid on, with
+//!    the first sender's creator nonce: the record validates (only the
+//!    wallet, which kept the salt, can refuse it), and the receiver's old
+//!    pairs move the second payment to the earlier payee.
 //!
 //! Needs `SEQUENTIAD_EXEC`; `--nocapture` prints every transaction.
 
@@ -338,5 +342,54 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 	c.net.pass("merge 2/D's first checkpoint, on the merged leaf", &d_inputs[0].checkpoint_tx(merged_leaf, &FeeSource::Reserve).unwrap().tx);
 	c.net.refuse("merge 2/neg D's second checkpoint: the leaf is spent", &d_inputs[1].checkpoint_tx(merged_leaf, &FeeSource::Reserve).unwrap().tx,
 		"bad-txns-inputs-missingorspent");
+	c.net.print();
+}
+
+// ---------------------------------------------------------------------------
+// 3. A leaf rebuilt from a salt its owner has signed under
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_leaf_rebuilt_under_a_spent_salt_follows_the_old_pairs() {
+	let mut c = Arca::start();
+	let s = keypair("merge 3 operator");
+	let (sd, rounds) = senders(&mut c, &s, "merge 3", &[LEAF, LEAF]);
+	let policy = c.policy(&s);
+	let chain = c.net.chain;
+	let v = LEAF - 2 * MARGIN;
+
+	// Sender 0 pays R; R pays its coin on to D, signing pairs over its leaf.
+	let r = keypair("merge 3 receiver");
+	let leaf = NewLeaf {
+		owner: xonly(&r), owner_nonce: label32("merge 3 receive request nonce"),
+		creator_nonce: label32("merge 3 sender 0 creator nonce"), exit_delay: delay(),
+	};
+	let out = ExplicitOutput::new(c.net.x, v, leaf.policy(xonly(&s), chain).script_pubkey());
+	let (_, rec0) = pay(&sd[0], &s, vec![out.clone()], 0, leaf);
+	let k0 = rec0.validate(&rounds, &policy.receipt(), &leaf.owner, &leaf.owner_nonce).unwrap();
+	let (_d, d_leaf) = party("merge 3 D", delay());
+	let rec_d = one_hop(&rec0, &k0, &r, &s, d_leaf, chain);
+	let kd = rec_d.validate(&rounds, &policy.receipt(), &d_leaf.owner, &d_leaf.owner_nonce).unwrap();
+
+	// Sender 1 pays R again, choosing sender 0's creator nonce: the same leaf.
+	// The record alone is sound, so validation accepts it; only the wallet,
+	// which knows it has signed under this salt, can refuse it.
+	let (_, rec1) = pay(&sd[1], &s, vec![out.clone()], 0, leaf);
+	let k1 = rec1.validate(&rounds, &policy.receipt(), &leaf.owner, &leaf.owner_nonce).unwrap();
+	assert_eq!(k1.leaf.salt, k0.leaf.salt);
+	println!("merge 3: a second payment at the salt R has signed under validates: {} atoms at {}", k1.value, hex(&out.script_pubkey));
+
+	// Sender 1's payment on-chain: the rebuilt leaf.
+	let at = bring_all(&mut c, "merge 3", &sd);
+	let in1 = inputs(&k1).remove(0);
+	let cp1 = c.net.pass("merge 3/sender 1's checkpoint", &in1.checkpoint_tx(at[1], &FeeSource::Reserve).unwrap().tx);
+	let re1 = c.net.pass("merge 3/sender 1's reassignment, the rebuilt leaf", &k1.reassignment_tx(&[OutPoint::new(cp1, 0)], &FeeSource::Reserve).unwrap().tx);
+	// R's old pairs, made for the first leaf, move the second to D.
+	let old = inputs(&kd).remove(0);
+	let cpd = c.net.pass("merge 3/R's old checkpoint pair, on the rebuilt leaf", &old.checkpoint_tx(OutPoint::new(re1, 0), &FeeSource::Reserve).unwrap().tx);
+	let red = c.net.pass("merge 3/R's old reassignment pair: the second payment goes to D", &kd.reassignment_tx(&[OutPoint::new(cpd, 0)], &FeeSource::Reserve).unwrap().tx);
+	let (to, _) = paid_out(&c, &red, &outputs_of(&kd));
+	println!("merge 3: R's old pairs took the second payment: D's leaf gets {}, R keeps nothing of it", to[0]);
+	assert_eq!(to[0], kd.value);
 	c.net.print();
 }

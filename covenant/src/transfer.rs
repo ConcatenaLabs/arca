@@ -42,9 +42,13 @@
 //! any other reassignment it has co-signed ([`TransferPlan::admit`],
 //! [`SeenReassignments`]). And [`CoinRecord::validate`] refuses a record in
 //! which two coins share a salt: one leaf promised by two reassignments may
-//! exist on-chain only once. Nor does a wallet count two records at one leaf
-//! as two coins: it refuses a coin whose salt is that of one it holds, which
-//! a second honest payment, under another creator nonce, never meets.
+//! exist on-chain only once. The record cannot show the coins a wallet holds
+//! or has held, so the wallet keeps every salt it has held a coin under and
+//! refuses a coin at one of them: two records at one leaf are one coin, and
+//! a leaf rebuilt at a salt its owner has signed under is spent by the
+//! owner's old pairs, at the same asset and value. The sender chooses the
+//! creator nonce, so it could rebuild such a leaf; a second honest payment,
+//! under another creator nonce, never meets the refusal.
 //!
 //! # The checkpoint's salt
 //!

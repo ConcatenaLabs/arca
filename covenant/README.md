@@ -378,10 +378,13 @@ every index both commit to, and admits the same reassignment again. And
 `CoinRecord::validate` refuses a record in which two coins share a salt: a leaf
 promised by two reassignments may exist on-chain only once, and a coin that
 rests on it twice could be brought on-chain only in part. `validate` cannot see
-the coins a wallet already holds, and two records at one leaf are one coin: a
-wallet refuses a coin whose salt (`coin.leaf.salt`) is that of a coin it holds.
-A second honest payment never meets that refusal, since its sender drew another
-creator nonce.
+the coins a wallet holds or has held, so the wallet keeps every salt it has held
+a coin under and refuses a coin whose salt (`coin.leaf.salt`) is one of them.
+Two records at one leaf are one coin, and a leaf rebuilt at a salt its owner has
+signed under is spent by the owner's old pairs, at the same asset and value:
+the sender chooses the creator nonce, so it could rebuild such a leaf. A second
+honest payment never meets that refusal, since its sender drew another creator
+nonce.
 
 A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
 the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
@@ -560,7 +563,11 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   the other; the pairs made anyway merge, the leaf is created once and the
   broadcaster takes a sender's whole checkpoint, in both shapes; a receiver
   refuses the coin that rests on the one leaf twice, and after the merge only
-  one of its two checkpoints can be made.
+  one of its two checkpoints can be made. A sender that rebuilds a leaf the
+  receiver has already paid on, with the first sender's creator nonce: the
+  record validates, and the receiver's old pairs move the second payment to
+  the earlier payee, which is why a wallet refuses a coin at a salt it has
+  held.
 - `tests/rollback.rs`: on an anchored regtest chain, what each party holds after
   a rollback (`invalidateblock` standing in for an anchor rollback). A round
   broadcast again returns with its txid, the re-check finds the same round, `M`
