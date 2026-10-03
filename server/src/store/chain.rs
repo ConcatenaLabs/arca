@@ -101,12 +101,30 @@ async fn record_scan(tx: &tokio_postgres::Transaction<'_>, scan: &Scan, seen_in:
 	let prev_txids: Vec<Vec<u8>> = scan.spends.iter().map(|(t, _, _)| t.to_vec()).collect();
 	let prev_vouts: Vec<i32> = scan.spends.iter().map(|(_, v, _)| *v as i32).collect();
 	let spenders: Vec<Vec<u8>> = scan.spends.iter().map(|(_, _, s)| s.to_vec()).collect();
-	tx.execute(
+	// A spend seen in a block replaces one seen in the mempool, and its
+	// spender is watched, so the finality service can say whether the spend
+	// is final.
+	let in_block = seen_in == "block";
+	let spent = tx.query(
 		"UPDATE watched_outpoint w SET spent_by = s.by, spent_at = now()
 		 FROM unnest($1::bytea[], $2::int4[], $3::bytea[]) AS s(t, v, by)
-		 WHERE w.txid = s.t AND w.vout = s.v AND w.spent_by IS NULL",
-		&[&prev_txids, &prev_vouts, &spenders],
+		 WHERE w.txid = s.t AND w.vout = s.v AND (w.spent_by IS NULL OR ($4 AND w.spent_by <> s.by))
+		 RETURNING s.by",
+		&[&prev_txids, &prev_vouts, &spenders, &in_block],
 	).await?;
+	if in_block {
+		for r in spent {
+			let by: Vec<u8> = r.get(0);
+			tx.execute("INSERT INTO watched_tx (txid, kind) VALUES ($1, 'spend') ON CONFLICT DO NOTHING", &[&by]).await?;
+		}
+		// The wallet's own coins, spent in a block by whatever spent them.
+		tx.execute(
+			"UPDATE wallet_coin c SET spent_by = s.by
+			 FROM unnest($1::bytea[], $2::int4[], $3::bytea[]) AS s(t, v, by)
+			 WHERE c.txid = s.t AND c.vout = s.v AND c.spent_by IS DISTINCT FROM s.by",
+			&[&prev_txids, &prev_vouts, &spenders],
+		).await?;
+	}
 	Ok(())
 }
 
@@ -134,8 +152,6 @@ async fn record_wallet_coins(tx: &tokio_postgres::Transaction<'_>, scan: &Scan, 
 					&[&&o.txid[..], &(o.vout as i32), &&asset[..], &value, &o.script_pubkey, &&block[..]],
 				).await?;
 				tx.execute("INSERT INTO watched_tx (txid, kind) VALUES ($1, 'wallet') ON CONFLICT DO NOTHING", &[&&o.txid[..]]).await?;
-				tx.execute("INSERT INTO tx_block (txid, block_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-					&[&&o.txid[..], &&block[..]]).await?;
 			},
 			Some(_) => {},
 			None => {
@@ -190,14 +206,17 @@ impl Store {
 				&&block.anchor_hash[..], &i64_of(block.median_time), &block.certified,
 			],
 		).await?;
+		// Coins first, so a coin created and spent in one block is found spent.
+		record_wallet_coins(&tx, scan, &block.hash).await?;
+		record_scan(&tx, scan, "block").await?;
+		// Every watched transaction the block holds, those the scan has just
+		// begun to watch included.
 		let txids: Vec<Vec<u8>> = scan.txids.iter().map(|t| t.to_vec()).collect();
 		tx.execute(
 			"INSERT INTO tx_block (txid, block_hash) SELECT txid, $2 FROM watched_tx WHERE txid = ANY($1)
 			 ON CONFLICT DO NOTHING",
 			&[&txids, &&block.hash[..]],
 		).await?;
-		record_scan(&tx, scan, "block").await?;
-		record_wallet_coins(&tx, scan, &block.hash).await?;
 		tx.execute("INSERT INTO chain_event (kind, height, hash) VALUES ('connected', $1, $2)",
 			&[&i64_of(block.height), &&block.hash[..]]).await?;
 		tx.commit().await?;

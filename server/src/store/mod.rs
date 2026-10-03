@@ -22,12 +22,14 @@ mod auth;
 mod chain;
 mod coins;
 mod mailbox;
+mod nursery;
 mod wallet;
 
 pub use auth::ChallengeError;
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
+pub use nursery::{NurseryRow, NurseryState};
 pub use wallet::{WalletCoin, WalletRefusal};
 
 /// The migrations, in order: `(version, SQL)`. The schema is squashed into the

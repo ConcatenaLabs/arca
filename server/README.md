@@ -100,6 +100,24 @@ signer signs every input.
   (`arca_covenant::ConnectorPolicy`), right after the outputs they pay, then
   change per asset, then the one fee output.
 
+## The nursery
+
+The nursery keeps every transaction the server relies on broadcast until the
+finality service calls it final: the server's own (a round, a wallet
+transaction, each with its fee asset named) and those it relies on without
+having built them (a board). A transaction enters byte for byte and is only
+ever broadcast again as those bytes: the nursery never builds a replacement,
+so a round returns with its txid and every forfeit signed for it still holds,
+and a board returns as its owner signed it.
+
+When a rollback disconnects a block holding one of them, final or not, it goes
+back to pending and is broadcast again at once, oldest first, so a parent
+precedes its child. On each pass a transaction the finality service calls
+final is marked final (and stays watched, since a rollback can take it out
+again), one not in the chain is broadcast again, and one whose input a final
+transaction of another txid has spent is marked lost, freeing the wallet coins
+it held: it can no longer confirm, and what depends on it learns so.
+
 ## Testing
 
 The tests run against a real PostgreSQL server. `ARCA_TEST_POSTGRES` names it,
