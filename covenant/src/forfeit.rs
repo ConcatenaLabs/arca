@@ -74,6 +74,15 @@
 //! elsewhere and force a replacement. Fills go in their own round
 //! transactions.
 //!
+//! A round that cannot return leaves every owner who gave up a leaf for it a
+//! forfeit no claim can answer, signed by both and ending in the owner's
+//! refund. So a participation run again after it is forfeit-first, as a
+//! board's is: the operator publishes the forfeit for the new round and sees
+//! it final before it hands over the preimage. With the preimage released
+//! first, the owner publishes the old forfeit instead, refunds it, and keeps
+//! the new leaf too. For the same reason the operator co-signs no other
+//! off-chain spend of a leaf given up for a lost round.
+//!
 //! [`Forfeit`] builds the transactions. The forfeit itself moves the old leaf
 //! into the forfeit output by the leaf's collaborative path; owner and
 //! operator sign it in advance ([`Forfeit::message`]), committing to the
