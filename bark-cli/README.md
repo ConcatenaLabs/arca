@@ -128,8 +128,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   since it confirmed is the wallet's to refund, and the coin is `exited` once
   that refund is final. A refund in the mempool, or a claim in a block not
   yet final, decides nothing: the other may still take the output. A forfeit
-  never published whose round can never return is void, and the coin is live
-  again.
+  decided by a final refund or claim is still looked at until its new
+  leaves' batch has expired: a rollback, however deep, that leaves that
+  spend not final makes the forfeit undecided again, and the chain decides
+  it again, so a claim that confirms in place of a refund still gives the
+  wallet the preimage and its new leaves. A forfeit never published whose
+  round can never return is void, and the coin is live again.
 
 ### Fees
 
@@ -242,8 +246,11 @@ and holding it there, with the reason shown:
   the refund is final;
 - a forfeit's refund sent once its delay has run and replaced in the mempool
   by the operator's claim, which confirms: the wallet reads the preimage from
-  the claim and holds its new leaf, and the coin given up is spent; and a
-  refund that confirms, which decides the coin only once it is final;
+  the claim and holds its new leaf, and the coin given up is spent; a refund
+  that confirms, which decides the coin only once it is final; and a final
+  refund taken out by an anchor-driven rollback (the Bitcoin parent block it
+  is anchored to orphaned) and replaced by the claim, after which the wallet
+  holds its new leaf;
 - a refresh fee of half of every coin, and one inside a coin's free window;
 - wallets whose own nodes value an asset 10% or 25% above or 10% below the
   operator's, do not accept it, or accept one the operator's node does not,
