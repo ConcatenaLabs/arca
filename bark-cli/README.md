@@ -119,12 +119,15 @@ the keys, but which coins were spent off-chain is in the store and the server.
   a forfeit of it for a round that is not gone: such a coin is `forfeited`, and
   is spent again only once that round can never return. Every forfeit is
   recorded before it leaves the wallet, with the new leaves it was signed for,
-  and `sync` follows each one whose preimage the wallet does not hold on the
-  chain: a claim of the forfeit's output publishes the preimage, which the
-  wallet reads from the claim's witness to complete its new leaves; an output
-  left unclaimed until the refund delay has run since it confirmed is the
-  wallet's to refund; a forfeit never published whose round can never return
-  is void, and the coin is live again.
+  and `sync` follows each forfeit's output on the chain until a spend of it is
+  final: a claim of the output publishes the preimage, which the wallet reads
+  from the claim's witness to complete its new leaves at once, whatever it
+  broadcast itself; an output left unclaimed until the refund delay has run
+  since it confirmed is the wallet's to refund, and the coin is `exited` once
+  that refund is final. A refund in the mempool, or a claim in a block not
+  yet final, decides nothing: the other may still take the output. A forfeit
+  never published whose round can never return is void, and the coin is live
+  again.
 
 ### Fees
 
@@ -227,7 +230,12 @@ and holding it there, with the reason shown:
 - a preimage withheld and a participation called void after its forfeit, the
   preimage then read from the operator's claim on the chain;
 - a round that can never return, whose coins come back, a forfeit of one of
-  them published anyway and refunded after its delay;
+  them published anyway and refunded after its delay, the coin `exited` once
+  the refund is final;
+- a forfeit's refund sent once its delay has run and replaced in the mempool
+  by the operator's claim, which confirms: the wallet reads the preimage from
+  the claim and holds its new leaf, and the coin given up is spent; and a
+  refund that confirms, which decides the coin only once it is final;
 - a refresh fee of half of every coin, and one inside a coin's free window;
 - a sender converting the board it paid from, answered at once by the
   receiver;

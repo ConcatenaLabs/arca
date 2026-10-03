@@ -181,8 +181,15 @@ fn confirmations(r: &Running, txid: &elements::Txid) -> i64 {
 
 /// Signs every input of `tx` the operator's on-chain wallet owns.
 fn operator_signs(r: &Running, tx: &mut Transaction) {
-	use elements::hashes::Hash;
 	for i in 0..tx.input.len() {
+		operator_signs_input(r, tx, i);
+	}
+}
+
+/// Signs input `i` of `tx`, a coin of the operator's on-chain wallet.
+fn operator_signs_input(r: &Running, tx: &mut Transaction, i: usize) {
+	use elements::hashes::Hash;
+	{
 		let op = tx.input[i].previous_output;
 		let prev = r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone();
 		let signed = (0..2u8).flat_map(|chain| (0..64u32).map(move |index| (chain, index))).any(|(chain, index)| {
@@ -468,17 +475,22 @@ async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_
 	for _ in 0..30 {
 		r.produce().await;
 		let s = c.ok(&["sync"]);
-		if let Some(f) = s["forfeits"].as_array().and_then(|a| a.iter().find(|f| f["state"] == "claimed")) {
+		if let Some(f) = s["forfeits"].as_array().and_then(|a| a.iter().find(|f| f["state"] == "claimed" || f["state"] == "claiming")) {
 			done = f.clone();
 			break;
 		}
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 	}
 	println!("F7 the wallet's watch of its forfeit: {}", done);
-	assert_eq!(done["state"], "claimed", "the claim is read from the chain");
+	assert!(done["state"] == "claimed" || done["state"] == "claiming", "the claim is read from the chain: {}", done);
 	let leaf = done["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
 	r.bury().await;
-	c.ok(&["sync"]);
+	let s = c.ok(&["sync"]);
+	if done["state"] == "claiming" {
+		let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[0].as_str()).cloned()
+			.unwrap_or_else(|| panic!("the claim is followed until final: {}", s));
+		assert_eq!(f["state"], "claimed", "{}", f);
+	}
 	assert_eq!(coin_of(&c, &leaf)["state"], "live", "the new leaf is the wallet's: {}", coin_of(&c, &leaf));
 	assert_eq!(coin_of(&c, &boards[0])["state"], "spent");
 	for w in [&c, &d] {
@@ -566,10 +578,16 @@ async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded()
 	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[1].as_str()).cloned()
 		.unwrap_or_else(|| panic!("the forfeit is watched: {}", s));
 	println!("F3c the wallet's refund of the second board's forfeit: {}", f);
-	assert_eq!(f["state"], "refunded", "{}", f);
+	assert_eq!(f["state"], "refunding", "sent, which decides nothing yet: {}", f);
+	assert_eq!(coin_of(&c, &boards[1])["state"], "forfeited", "a refund in the mempool decides nothing");
 	r.produce().await;
 	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
 	assert!(confirmations(&r, &refund) >= 1, "the refund confirms");
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[1].as_str()).cloned()
+		.unwrap_or_else(|| panic!("the forfeit is followed until its refund is final: {}", s));
+	assert_eq!(f["state"], "refunded", "{}", f);
 	assert_eq!(coin_of(&c, &boards[1])["state"], "exited");
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
@@ -1043,4 +1061,176 @@ async fn secrets_stay_private_a_fresh_wallet_shows_btc_and_a_restore_finds_its_c
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// A coin under a forfeit, decided by the chain
+// ---------------------------------------------------------------------------
+
+/// The participation's status from the server's database (the server is
+/// stopped): what the wallet was shown before.
+fn stored_status(r: &Running, pid: &str) -> (u16, u32, u64, [u8; 32]) {
+	let pid32: [u8; 32] = unhex(pid).try_into().unwrap();
+	let store = r.server.store.clone();
+	let p = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(store.participation(&pid32))).unwrap().unwrap();
+	let round = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(store.round(p.round_id.unwrap())))
+		.unwrap().unwrap();
+	(p.refund_delay_units as u16, round.connector_vout, p.inputs[0].margin, p.unlock_hash)
+}
+
+fn in_mempool(r: &Running, txid: &elements::Txid) -> bool {
+	let pool: Vec<String> = serde_json::from_value(rpc(r, "getrawmempool", &[])).unwrap();
+	pool.iter().any(|t| *t == txid.to_string())
+}
+
+/// A board refreshed, its forfeit handed over and the preimage withheld;
+/// the operator's watcher publishes the forfeit and the round's atom, then
+/// the operator stops, holding back its claim, and the refund delay runs.
+/// Returns the board, the participation, the forfeit's txid and the atom's,
+/// and the preimage the operator holds.
+async fn forfeit_left_unclaimed(r: &mut Running, proxy: &Proxy, c: &Arca) -> (String, String, elements::Txid, elements::Txid, [u8; 32]) {
+	use elements::hashes::Hash;
+	let x = r.x;
+	let board = boarded(r, c, &proxy.url.clone(), &[(x, 2_000_000)]).await.remove(0);
+	let pid = c.ok(&["participate"])["participation"].as_str().unwrap().to_string();
+	final_round(r).await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/forfeit_leaves" && status == 200 {
+			v["preimage"] = Value::Null;
+		}
+		None
+	})));
+	let s = c.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "forfeiting", "{}", s);
+	let (mut forfeit, mut atom) = (None, None);
+	for _ in 0..60 {
+		let log = r.server.store.watcher_log().await.unwrap();
+		forfeit = log.iter().find(|w| w.kind == "forfeit").map(|w| elements::Txid::from_byte_array(w.txid));
+		atom = log.iter().find(|w| w.kind == "issue").map(|w| elements::Txid::from_byte_array(w.txid));
+		assert!(!log.iter().any(|w| w.kind == "claim"), "the server is stopped before any claim");
+		if forfeit.is_some() && atom.is_some() {
+			break;
+		}
+		if forfeit.is_none() {
+			r.produce().await;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+	}
+	let (forfeit, atom) = (forfeit.expect("the watcher publishes the forfeit"), atom.expect("and the atom"));
+	let pid32: [u8; 32] = unhex(&pid).try_into().unwrap();
+	let preimage = r.server.store.participation(&pid32).await.unwrap().unwrap().preimage;
+	r.server.stop();
+	r.produce().await;
+	assert!(confirmations(r, &forfeit) >= 1 && confirmations(r, &atom) >= 1, "the forfeit and the atom confirm");
+	let (units, _, _, _) = stored_status(r, &pid);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, units as u32 * 512));
+	(board, pid, forfeit, atom, preimage)
+}
+
+/// Review R8b's probe P2 turned around. Once the refund delay of a forfeit
+/// the operator published has run, the wallet sends its refund; the
+/// operator's claim, paying more, replaces it in the mempool and confirms,
+/// its witness carrying the preimage. The refund in the mempool decided
+/// nothing: the wallet follows the forfeit's output until a spend of it is
+/// final, reads the preimage from the claim and holds the new leaf, and the
+/// coin given up is spent, not exited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_replaced_by_the_operators_claim_leaves_the_wallet_its_new_leaf() {
+	use arca_covenant::spend::FeeSource;
+	use arca_covenant::ExplicitOutput;
+	use elements::OutPoint;
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("P2claim");
+	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
+	let (units, cvout, margin, unlock) = stored_status(&r, &pid);
+
+	// The wallet takes its refund: sent, and nothing decided.
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
+		.unwrap_or_else(|| panic!("the forfeit is followed: {}", s));
+	println!("P2 the wallet's refund: {}", f);
+	assert_eq!(f["state"], "refunding", "{}", f);
+	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
+	assert!(in_mempool(&r, &refund), "the refund is in the mempool");
+	assert_eq!(coin_of(&c, &board)["state"], "forfeited", "a refund in the mempool decides nothing: {}", coin_of(&c, &board));
+
+	// The operator's claim, paying more, replaces it, and confirms.
+	let CoinRecord::Board(rec) = record_of(&c, &board) else { panic!("a board") };
+	let board_txid = r.server.store.board(&rec.leaf_id().0).await.unwrap().map(|b| b.txid).expect("the board is registered");
+	let board_tx = r.rt.client().raw_transaction(&elements::hashes::Hash::from_byte_array(board_txid)).unwrap();
+	let mtp = rpc(&r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	let old = CoinRecord::Board(rec).resolve(std::slice::from_ref(&board_tx), &arca_covenant::WalletPolicy {
+		min_exit_delay: RelativeTime::from_units(1).unwrap(), horizon: 0,
+		..arca_covenant::WalletPolicy::new(rec.chain, rec.operator, arca_covenant::MedianTime::from_consensus(mtp).unwrap())
+	}).unwrap();
+	let round_txid = r.server.store.round(r.server.store.participation(&unhex(&pid).try_into().unwrap()).await.unwrap().unwrap()
+		.round_id.unwrap()).await.unwrap().unwrap().txid;
+	let m = connector_asset(elements::hashes::Hash::from_byte_array(round_txid), cvout);
+	let forfeit = Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, m, RelativeTime::from_units(units).unwrap(), margin).unwrap();
+	let fo = forfeit.output();
+	let atx = r.rt.client().raw_transaction(&atom_txid).unwrap();
+	let av = atx.output.iter().position(|o| o.asset.explicit() == Some(m)).unwrap() as u32;
+	let m_out = atx.output[av as usize].clone();
+	let ct = arca_covenant::batch_claim_tx(&[(&forfeit, OutPoint::new(forfeit_txid, 0))], (OutPoint::new(atom_txid, av), m_out.clone()),
+		&[ExplicitOutput::new(fo.asset, fo.value - 40_000, common::node::op_true())], m_out.script_pubkey.clone(), &FeeSource::Reserve).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &ct.sighash(0, genesis).unwrap(), &[0; 32]);
+	let mut claim = ct.finish(&[sig], &[preimage]).unwrap().tx;
+	operator_signs_input(&r, &mut claim, 1);
+	r.rt.client().send_raw_transaction(&claim).expect("the claim replaces the refund");
+	assert!(!in_mempool(&r, &refund), "the refund is out of the mempool");
+	r.produce().await;
+	let refund_seen = r.rt.client().call::<Value>("getrawtransaction", &[json!(refund.to_string()), json!(true)]).ok();
+	assert!(confirmations(&r, &claim.txid()) >= 1 && refund_seen.is_none(), "the claim confirms, the refund is gone: {:?}", refund_seen);
+	println!("P2 the operator's claim {} replaced the refund and confirmed", claim.txid());
+
+	// The wallet reads the preimage from the claim at once, and holds the
+	// new leaf; the forfeit is followed until the claim is final.
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
+		.unwrap_or_else(|| panic!("the forfeit is followed: {}", s));
+	println!("P2 the claim in a block, not yet final: {}", f);
+	assert_eq!(f["state"], "claiming", "{}", f);
+	let leaf = f["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
+		.unwrap_or_else(|| panic!("the forfeit is followed until final: {}", s));
+	println!("P2 the claim final: {}", f);
+	assert_eq!(f["state"], "claimed", "{}", f);
+	c.ok(&["sync"]);
+	println!("P2 RESULT: the coin given up is {}, the new leaf {} is {}", coin_of(&c, &board)["state"], leaf, coin_of(&c, &leaf)["state"]);
+	assert_eq!(coin_of(&c, &board)["state"], "spent", "the coin given up is the operator's: {}", coin_of(&c, &board));
+	assert_eq!(coin_of(&c, &leaf)["state"], "live", "the new leaf is the wallet's: {}", coin_of(&c, &leaf));
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// The other way the chain may decide: the operator never claims, the
+/// wallet's refund confirms, and the coin is the wallet's on the chain
+/// (`exited`) only once that refund is final.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_decides_the_coin_only_once_it_is_final() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("P2refund");
+	let (board, _, _, _, _) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	assert_eq!(f["state"], "refunding", "{}", f);
+	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
+	r.produce().await;
+	assert!(confirmations(&r, &refund) >= 1);
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	println!("P2 the refund in a block, not yet final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
+	assert_eq!(f["state"], "refunding", "{}", f);
+	assert_eq!(coin_of(&c, &board)["state"], "forfeited");
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	println!("P2 the refund final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
+	assert_eq!(f["state"], "refunded", "{}", f);
+	assert_eq!(coin_of(&c, &board)["state"], "exited");
+	let _ = std::fs::remove_dir_all(&c.dir);
 }
