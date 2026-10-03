@@ -25,7 +25,7 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{BlockHash, Transaction, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{CoinRecord, Forfeit, LeafId, RelativeTime, ValidCoin, ValidLeaf};
+use arca_covenant::{CoinRecord, Forfeit, LeafId, RelativeTime, Release, ValidCoin, ValidLeaf};
 use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, transfer_body, unhex, want_leaf, Answer, Held};
 use common::keys::{keypair, xonly};
 use common::node;
@@ -178,7 +178,8 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	assert_eq!(status(&r, &pb)["state"], "issued");
 	// A, holding R's preimage, releases the lowest node of its old leaf.
 	let lowest = a_valid0.branch.nodes.last().unwrap();
-	let release = lowest.reclaim.as_ref().unwrap().release.digest;
+	let c_r = st_r["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let release = Release::for_refresh(&a_valid0, &a2_r, &round_r, c_r).unwrap().message().digest;
 	let rel = r.http.post("release_leaves", &json!({"participation_id": hex(&pa), "releases": [{"leaf_id": a_board.id.to_string(),
 		"signature": hex(arca_covenant::sign::sign_digest(&a, &release, &common::client::random32()).as_ref())}]})).ok();
 	assert_eq!(rel["released"].as_array().unwrap().len(), 1);

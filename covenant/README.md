@@ -15,7 +15,7 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 
 | Module | Output | Leaves |
 |---|---|---|
-| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep; RECLAIM on a lowest node |
+| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep; RECLAIM on a lowest node, each owner's release naming its own round's connector asset, read from an input |
 | `sweep` | The sweep path of every output above a leaf | The token check (`T` at `R` in input `k`), the notice `W` on every output but the batch output, burn-only for an issuer-operated batch |
 | `clock` | `R` and the clock chain from a published schedule `(T, S, W, E_0 … E_K)` | ROLL, RELEASE; `R` is `<W> CSV DROP <S> CHECKSIG` |
 | `leaf` | The leaf (`vtxo-1`) | The rebindable collaborative path for 1 to 4 committed outputs, and the exit |
@@ -31,13 +31,14 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
 the board and its record, `spend` the transactions that spend a leaf off the
-tree (forfeits, exits, the offboard's unlock and reclaim), and `transfer` the
-out-of-round transfer and the coin record a receiver validates; all described
-below.
+tree (forfeits, exits, the offboard's unlock and reclaim), `release` the
+release an owner signs for the lowest node above a coin it gave up, and
+`transfer` the out-of-round transfer and the coin record a receiver validates;
+all described below.
 
 `message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
-authorisation, the release), `sign` the Elements taproot signature hash and BIP340
+authorisation, the release bound to the round of the owner's new leaf), `sign` the Elements taproot signature hash and BIP340
 signing, `checks` the five client checks (`check_round` returns the check that
 failed), `encode` a canonical binary encoding of every policy and of the clock
 schedule, and `witness` the reading of witnesses found on-chain (the preimage a
@@ -284,6 +285,37 @@ let issue = ConnectorPolicy { operator }.issuance(connector_coin, (asset, value)
 let issue = issue.finish(vec![sig_over(issue.sighash(genesis)?)]);           // the operator, when it must claim
 let claim = f.claim(forfeit_coin, (m_coin, m_txout), &outputs, m_back_to, &FeeSource::Reserve)?;
 let claim = claim.finish(ForfeitPolicy::claim_items(&sig_over(claim.sighash(genesis)?), &preimage, Forfeit::CONNECTOR_INPUT));
+```
+
+**The release.** Once every owner under a lowest node has moved on, the
+operator need not wait for the batch to expire: each owner signs a release of
+the node, and the operator spends it by its RECLAIM leaf. The release is
+`SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `H` the node's children hash
+and `M` the connector asset of the round that made the owner's new leaf (or
+paid its offboard). RECLAIM pushes `"Arca/release" ‖ genesis_hash ‖ H` and, for
+each owner in turn, reads `M` from the input the witness names, explicitly, and
+checks the owner's signature over the hash of the two. So a reclaim confirms
+only with an atom of each named `M` among its inputs, `M` exists only while its
+round is in the chain, and a release is void with the round it names: a reclaim
+that confirmed is disconnected with that round and cannot return without it.
+Owners who refreshed in different rounds each name their own; owners of one
+round share one input. The operator reuses one atom of each `M` across that
+round's claims and reclaims, paying it back to itself each time. A wallet signs
+only a release built by `Release::for_refresh` (or `Release::for_offboard`),
+which takes `H` from the old leaf it holds and `M` from the round its new leaf
+was validated against, and refuses another round, an output that is not the
+operator's connector and an old leaf under another operator; it signs once it
+holds the new leaf's preimage and that round is final. A reclaim of four owners
+with one atom of `M` is 485 vB.
+
+```rust
+let r = Release::for_refresh(&old_valid, &new_valid, &round, c)?;   // H from the old leaf, M from the round
+let sig = sign_digest(&old_key, &r.message().digest, &aux);       // the owner's release
+r.verify(&sig)?;                                                   // the server's check
+let lowest = old_valid.branch.nodes.last().unwrap();
+let ks = lowest.reclaim_tx(node_coin, &[(m_coin, m_txout)], &outputs, m_back_to, &FeeSource::Reserve)?;
+let k = node::connector_index(&ks.prevouts, r.connector).unwrap();    // the input RECLAIM reads M from
+let tx = ks.finish(node::reclaim_items(&sig_over(ks.sighash(genesis)?), &releases_in_owner_order, owners)?);
 ```
 
 **The board.** The owner brings its own coins into Arca with a board
@@ -586,6 +618,22 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   exit. A board's forfeit seen in one block and disconnected: the owner has no
   exit from the board itself, its conversion starts the leaf's delay, and the
   same pair's forfeit takes the converted leaf.
+- `tests/reclaim.rs`: on an anchored regtest chain, the reclaim of a lowest
+  node whose owners refreshed into new rounds, each release built with
+  `Release::for_refresh`. The reclaim with an atom of `M` confirms; without it,
+  with another round's `M`, with another asset, with the batch asset or the
+  node itself at the index, with three releases of four, with releases over the
+  message that named no round, with a release by another key and with the
+  operator's signature by another key, it is refused. Owners of two rounds are
+  reclaimed with one atom of each, and refused when an index names the wrong
+  round or one round's atom is missing; one atom of `M` serves a forfeit's
+  claim and two reclaims. The owners' round disconnected and replaced by another
+  with a new txid: its `M` can no longer be issued, the reclaim with the
+  releases is refused with the replacement's `M` and with none, and an owner
+  takes its old leaf alone. A reclaim already confirmed goes with its round: the
+  round's block disconnected and the round replaced, the reclaim cannot return,
+  the node is unspent again and an owner exits its old leaf. Every negative case
+  is refused by the mempool and in a block, for its reason.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and

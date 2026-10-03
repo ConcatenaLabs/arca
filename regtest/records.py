@@ -182,11 +182,10 @@ def issued_asset(txid_internal, vout, contract_hash=bytes(32)):
 # The tree
 # --------------------------------------------------------------------------
 
-def reclaim_script(release, owners, s_x):
-    """RECLAIM for one owner or more."""
-    if len(owners) == 1:
-        return CScript([release, owners[0], OP_CHECKSIGFROMSTACKVERIFY, s_x, OP_CHECKSIG])
-    return reclaim_leaf(release, owners, s_x)
+def reclaim_script(prefix, owners, s_x):
+    """RECLAIM for one owner or more (arklib3.reclaim_leaf): each owner's
+    release, SHA256(prefix || M), names the round of that owner's new leaf."""
+    return reclaim_leaf(prefix, owners, s_x)
 
 
 class Batch:
@@ -240,7 +239,7 @@ class Batch:
                 unroll = hgate_unroll(mlevels[-1][0], len(mlevels) - 1, tuples, timed=True)
                 reclaim = None
                 if lowest:
-                    reclaim = reclaim_script(release_msg(p["genesis"], tuples), [leaves[o]["owner"] for o in owners], S)
+                    reclaim = reclaim_script(release_prefix(p["genesis"], tuples), [leaves[o]["owner"] for o in owners], S)
                 tap, _ = node_taptree3(unroll, sweep(is_root), reclaim)
                 nodes.append({"tap": tap, "prog": bytes(tap.scriptPubKey)[2:], "kids": kids, "owners": owners,
                               "first": kids[0]["first"], "mlevels": mlevels, "lo": lo, "hi": hi,

@@ -70,7 +70,7 @@ class T21(Ark3, ArkBase, BitcoinTestFramework):
                 lv = {"unroll": unroll, "sweep": sw}
             else:
                 sw = sweep_token(T_id, Rprog, self.s_x, W)
-                rc = reclaim_leaf(release_msg(self.gen, tuples), [self.ox[i] for i in idx], self.s_x)
+                rc = reclaim_leaf(release_prefix(self.gen, tuples), [self.ox[i] for i in idx], self.s_x)
                 tree = [("unroll", unroll), [("sweep", sw), ("reclaim", rc)]]
                 lv = {"unroll": unroll, "sweep": sw, "reclaim": rc}
             self.members[unroll] = (levels, keys, idx)
@@ -159,15 +159,21 @@ class T21(Ark3, ArkBase, BitcoinTestFramework):
         self.setwit(tx, 0, [self.sign(self.s_sec, tx, 0, claim), pre, bytes(claim), control_block(ftap, "claim")])
         self.send(tx, "leaf/forfeit_claim_by_operator")
 
-        # reclaim of lowest node 1 (on-chain since the root unroll): owners 4..7 have released
+        # reclaim of lowest node 1 (on-chain since the root unroll): owners 4..7
+        # refreshed in one round and released, naming its connector asset M;
+        # the operator issues M from that round's connector output and spends
+        # the atom beside the node
+        m = self.connector_atom(self.s_sec, "reclaim/issue M of the owners' new round")
         n1 = root["children"][1]
         tuples = [(self.X_ID, k["value"], k["spk"][2:]) for k in n1["children"]]
-        rel = release_msg(self.gen, tuples)
+        rel = release_msg(self.gen, tuples, m["M_id"])
         sigs = [sign_schnorr(self.osec[i], rel) for i in (4, 5, 6, 7)]
         rc = n1["leaves"]["reclaim"]
-        tx = self.mktx([ns[1]], [self.out(ns[1].amount - FEE, self.wallet_spk(), self.X_OUT), self.fee(FEE, self.X_OUT)])
-        self.setwit(tx, 0, [self.sign(self.s_sec, tx, 0, rc)] + list(reversed(sigs)) + [bytes(rc),
-                                                                                    control_block(n1["tap"], "reclaim")])
+        tx = self.mktx([ns[1], m["M_u"]], [self.out(ns[1].amount - FEE, self.wallet_spk(), self.X_OUT),
+                                           self.out(1, OP_TRUE_SPK, m["M_OUT"]), self.fee(FEE, self.X_OUT)])
+        self.setwit(tx, 0, reclaim_items(self.sign(self.s_sec, tx, 0, rc), sigs, [1] * 4)
+                    + [bytes(rc), control_block(n1["tap"], "reclaim")])
+        self.setwit(tx, 1, OP_TRUE_WITNESS)
         self.send(tx, "reclaim/lowest1")
 
         # watch service for owner 8 (lowest node 2): authorisation not before E0 - 3 days
@@ -234,7 +240,7 @@ class T21(Ark3, ArkBase, BitcoinTestFramework):
             unroll = hgate_unroll(levels[-1][0], depth_expected, tuples, timed=True)
             if lowest:
                 sw = sweep_token(T_fake, Rprog, self.s_x, W)
-                rc = reclaim_leaf(release_msg(self.gen, tuples), [compute_xonly_pubkey(s)[0] for s in secs], self.s_x)
+                rc = reclaim_leaf(release_prefix(self.gen, tuples), [compute_xonly_pubkey(s)[0] for s in secs], self.s_x)
                 tap = taproot_construct(NUMS, [("unroll", unroll), [("sweep", sw), ("reclaim", rc)]])
             else:
                 sw = sweep_token(T_fake, Rprog, self.s_x, W)

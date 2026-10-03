@@ -7,7 +7,9 @@
 //! the witnesses that spend them:
 //!
 //! - the tree ([`node`]): the gated UNROLL with its timed authorisation, the
-//!   sweep behind the token ([`sweep`]), and the RECLAIM of a lowest node;
+//!   sweep behind the token ([`sweep`]), and the RECLAIM of a lowest node,
+//!   with the release each owner signs for it, bound to the round of its new
+//!   leaf ([`release`]);
 //! - the expiry clock ([`clock`]): ROLL, RELEASE, the script `R` the token
 //!   rests at once released, and the chain of clocks built last one first;
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit;
@@ -61,6 +63,7 @@ pub mod message;
 pub mod node;
 pub mod offboard;
 pub mod record;
+pub mod release;
 #[cfg(feature = "json")]
 pub mod record_json;
 pub mod script;
@@ -87,6 +90,7 @@ pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
+pub use release::Release;
 pub use script::{Child, ExplicitOutput};
 pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
 pub use sweep::Sweep;

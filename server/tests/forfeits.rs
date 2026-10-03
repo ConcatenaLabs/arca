@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::script::sha256;
 use arca_covenant::sign::sign_digest;
-use arca_covenant::{connector_asset, CoinRecord, Forfeit, LeafId, MedianTime, RelativeTime, ValidCoin, ValidLeaf};
+use arca_covenant::{connector_asset, CoinRecord, Forfeit, LeafId, MedianTime, RelativeTime, Release, ValidCoin, ValidLeaf};
 use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, transfer_body, unhex, want_leaf, Answer, Held};
 use common::keys::{keypair, xonly};
 use common::rounds::{created, credited_board, round_final, start, status, validate_new_leaf, VALUE};
@@ -204,7 +204,8 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	let a2_old = coin_of(&r, &a2_held, std::slice::from_ref(&round));
 	let f3 = forfeit_for(&a2_old, &a3_valid, &round2, &st3, 0);
 	// The release of A's old batch leaf, signed with that leaf's key.
-	let release = a2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap().release.digest;
+	let c2 = st3["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let release = Release::for_refresh(&a2_valid, &a3_valid, &round2, c2).unwrap().message().digest;
 	let rel_body = |key: &Keypair, leaf: LeafId| json!({"participation_id": hex(&pa3),
 		"releases": [{"leaf_id": leaf.to_string(), "signature": hex(sign_digest(key, &release, &random32()).as_ref())}]});
 	refused(r.http.post("release_leaves", &rel_body(&a2, a2_valid.leaf_id)), 422, "release_early");
@@ -221,7 +222,9 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	// A coin not in this participation, and B's new leaf, which has an open
 	// reassignment to C: refused whatever participation is named.
 	refused(r.http.post("release_leaves", &rel_body(&a2, b_board.id)), 422, "not_participating");
-	let b_rel = b2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap().release.digest;
+	let c1 = stb["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let b_rel = b2_valid.branch.nodes.last().unwrap().reclaim.as_ref().unwrap()
+		.release_message(connector_asset(round.txid(), c1)).digest;
 	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pb),
 		"releases": [{"leaf_id": b2_valid.leaf_id.to_string(), "signature": hex(sign_digest(&b2, &b_rel, &random32()).as_ref())}]})), 422, "open_reassignment");
 }

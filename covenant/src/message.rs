@@ -8,10 +8,12 @@
 //!   `SHA256(K ‖ asset_in ‖ 0x01 ‖ 0x01 ‖ value_in ‖ m ‖ SHA256(record 0) ‖ … ‖ SHA256(record m-1))`
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis_hash) ‖ salt)`;
 //! - the unroll authorisation, `SHA256("Arca/unroll" ‖ H ‖ t)`;
-//! - the release a lowest node's owners sign, `SHA256("Arca/release" ‖ genesis_hash ‖ H)`.
+//! - the release each owner under a lowest node signs,
+//!   `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset
+//!   of the round that made the owner's new leaf ([`crate::release`]).
 //!
-//! The genesis hash is in internal byte order, the reverse of what
-//! `getblockhash` prints.
+//! The genesis hash and asset ids are in internal byte order, the reverse of
+//! what the node's RPCs print.
 
 use elements::hashes::Hash;
 use elements::{AssetId, BlockHash};
@@ -77,13 +79,22 @@ impl Chain {
 		sha256(&b)
 	}
 
-	/// The release a lowest node's owners sign for the node whose children
-	/// hash is `children_hash`.
-	pub fn release_message(&self, children_hash: &[u8; 32]) -> CsfsMessage {
+	/// The fixed part of every release of the lowest node whose children hash
+	/// is `children_hash`: `"Arca/release" ‖ genesis_hash ‖ H`, 76 bytes. Its
+	/// RECLAIM pushes it and appends each owner's `M`.
+	pub fn release_prefix(&self, children_hash: &[u8; 32]) -> Vec<u8> {
 		let mut b = RELEASE_TAG.to_vec();
 		b.extend(self.genesis_bytes());
 		b.extend(children_hash);
-		CsfsMessage::new(b)
+		b
+	}
+
+	/// The release an owner signs for the lowest node whose children hash is
+	/// `children_hash`, naming `connector`, the connector asset `M` of the
+	/// round that made the owner's new leaf:
+	/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`.
+	pub fn release_message(&self, children_hash: &[u8; 32], connector: AssetId) -> CsfsMessage {
+		release_message(&self.release_prefix(children_hash), connector)
 	}
 }
 
@@ -105,6 +116,13 @@ pub fn rebind_message(k: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &
 		b.extend(sha256(&o.record()));
 	}
 	Ok(CsfsMessage::new(b))
+}
+
+/// The release over `prefix` ([`Chain::release_prefix`]) naming `connector`.
+pub fn release_message(prefix: &[u8], connector: AssetId) -> CsfsMessage {
+	let mut b = prefix.to_vec();
+	b.extend(asset_bytes(connector));
+	CsfsMessage::new(b)
 }
 
 /// The unroll authorisation for the node whose children hash is

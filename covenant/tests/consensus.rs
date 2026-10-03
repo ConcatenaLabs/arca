@@ -639,6 +639,8 @@ fn sweep_cases(f: &F, book: &mut Book) {
 // ---------------------------------------------------------------------------
 
 fn reclaim_cases(f: &F, book: &mut Book) {
+	// The connector assets of two rounds the owners refreshed in.
+	let (m1, m2) = (asset("connector asset of round 1"), asset("connector asset of round 2"));
 	let reclaim = |n_owners: usize, n_children: usize, label: &str| {
 		let os: Vec<Keypair> = (0..n_owners).map(|i| keypair(&format!("{} owner{}", label, i))).collect();
 		let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
@@ -646,73 +648,132 @@ fn reclaim_cases(f: &F, book: &mut Book) {
 		let node = NodePolicy::new(children, xonly(&f.s), keys, f.schedule.sweep(true, false), Some(f.chain)).unwrap();
 		(os, node)
 	};
-	let spend = |node: &NodePolicy, op_key: &Keypair, owner_sigs: Vec<Vec<u8>>| {
+	// The reclaim of `node`, built by the policy: the atoms `ms` at inputs
+	// 1.., each paid back to OP_TRUE; the operator signs with `op_key`; then
+	// `items` below that signature (each owner's release and index, owner
+	// n-1 first). The atoms' own inputs spend OP_TRUE. The policy builds only
+	// on explicit atoms; a blinded one is put in its place before signing.
+	let spend = |node: &NodePolicy, op_key: &Keypair, ms: &[TxOut], items: Vec<Vec<u8>>| {
 		let value = node.children().len() as u64 * LEAF + RESERVE;
-		let coin = explicit(f.x, value, node.script_pubkey());
-		let mut s = Spend::new(0).fake_input("lowest", coin, 0xffff_ffff)
-			.outputs(vec![explicit(f.x, value - FEE, f.operator_spk()), fee(f.x, FEE)]);
-		let script = node.reclaim_script().unwrap();
-		let os = s.sign(op_key, 0, &script, f.genesis);
+		let connectors: Vec<(elements::OutPoint, TxOut)> = ms.iter().enumerate()
+			.map(|(j, m)| {
+				let at = elements::OutPoint::new(elements::Txid::from_raw_hash(elements::hashes::sha256d::Hash::hash(format!("atom {}", j).as_bytes())), 0);
+				let built = if m.asset.explicit().is_some() { m.clone() } else { explicit(m1, 1, op_true().script_pubkey()) };
+				(at, built)
+			})
+			.collect();
+		let node_at = elements::OutPoint::new(elements::Txid::from_raw_hash(elements::hashes::sha256d::Hash::hash(b"lowest")), 0);
+		let mut ks = node.reclaim_tx(node_at, value, &connectors, &[ExplicitOutput::new(f.x, value - FEE, f.operator_spk())],
+			op_true().script_pubkey(), &FeeSource::Reserve).unwrap();
+		for (j, m) in ms.iter().enumerate() {
+			ks.prevouts[1 + j] = m.clone();
+		}
+		let os = sig(op_key, &ks.sighash(f.genesis).unwrap());
 		let mut below = vec![os.as_ref().to_vec()];
-		below.extend(owner_sigs.into_iter().rev());
-		s.witness(0, node.taproot().witness(&script, below));
+		below.extend(items);
+		let u = ks.finish(below);
+		let mut s = Spend { tx: u.tx, prevouts: u.prevouts };
+		for j in 0..ms.len() {
+			s.witness(1 + j, op_true_witness());
+		}
 		s
 	};
+	let atom = |m: AssetId| explicit(m, 1, op_true().script_pubkey());
+	// Each owner's release and index, owner n-1 first.
+	let items = |sigs: &[Vec<u8>], ks: &[u32]| -> Vec<Vec<u8>> {
+		sigs.iter().zip(ks).rev().flat_map(|(s, k)| [s.clone(), arca_covenant::script::scriptnum(*k as i64)]).collect()
+	};
+	let signed = |os: &[Keypair], node: &NodePolicy, ms: &[AssetId]| -> Vec<Vec<u8>> {
+		os.iter().zip(ms).map(|(k, m)| sig(k, &node.release_message(*m).unwrap().digest).as_ref().to_vec()).collect()
+	};
+
 	let (os, node) = reclaim(4, 4, "four");
-	let rel = node.release_message().unwrap();
-	let good: Vec<Vec<u8>> = os.iter().map(|k| sig(k, &rel.digest).as_ref().to_vec()).collect();
-	// The witness built by the policy matches the one assembled here.
+	let good = signed(&os, &node, &[m1; 4]);
+	let k1 = [1u32; 4];
+	// The witness built by the policy matches the one assembled here, and
+	// the release a wallet builds is the one the node's RECLAIM checks.
 	{
-		let s = spend(&node, &f.s, good.clone());
+		let s = spend(&node, &f.s, &[atom(m1)], items(&good, &k1));
 		let op = Signature::from_slice(&s.tx.input[0].witness.script_witness[0]).unwrap();
-		let owner_sigs: Vec<Signature> = good.iter().map(|g| Signature::from_slice(g).unwrap()).collect();
-		assert_eq!(node.reclaim_witness(&op, &owner_sigs).unwrap(), s.tx.input[0].witness.script_witness);
+		let releases: Vec<(Signature, u32)> = good.iter().zip(k1).map(|(g, k)| (Signature::from_slice(g).unwrap(), k)).collect();
+		assert_eq!(node.reclaim_witness(&op, &releases).unwrap(), s.tx.input[0].witness.script_witness);
+		assert_eq!(arca_covenant::node::connector_index(&s.prevouts, m1), Some(1));
+		let r = Release { chain: f.chain, node_hash: node.children_hash(), owner: xonly(&os[2]), connector: m1 };
+		assert_eq!(r.message(), node.release_message(m1).unwrap());
+		r.verify(&Signature::from_slice(&good[2]).unwrap()).unwrap();
+		assert!(r.verify(&Signature::from_slice(&good[1]).unwrap()).is_err());
+		assert_eq!(node.release_message(m1).unwrap().preimage.len(), 108);
 	}
-	book.pass("reclaim/four owners and the operator", &spend(&node, &f.s, good.clone()));
+	book.pass("reclaim/four owners and the operator, M of their round at input 1", &spend(&node, &f.s, &[atom(m1)], items(&good, &k1)));
+	book.fail("reclaim/neg without M", &spend(&node, &f.s, &[], items(&good, &k1)), 0, "Introspection index out of bounds");
+	book.fail("reclaim/neg another round's M", &spend(&node, &f.s, &[atom(m2)], items(&good, &k1)), 0, BAD_SIG);
+	book.fail("reclaim/neg another asset at k", &spend(&node, &f.s, &[atom(f.y)], items(&good, &k1)), 0, BAD_SIG);
+	book.fail("reclaim/neg k names the node itself", &spend(&node, &f.s, &[atom(m1)], items(&good, &[0; 4])), 0, BAD_SIG);
+	let blinded = {
+		let secp = elements::secp256k1_zkp::Secp256k1::new();
+		let bf = elements::confidential::AssetBlindingFactor::from_slice(&label32("blinding")).unwrap();
+		TxOut { asset: elements::confidential::Asset::new_confidential(&secp, m1, bf), ..atom(m1) }
+	};
+	book.fail("reclaim/neg M blinded at k", &spend(&node, &f.s, &[blinded], items(&good, &k1)), 0, EQUALVERIFY);
 	let mut v = good.clone();
 	v[1] = vec![];
-	book.fail("reclaim/neg three of four, one empty", &spend(&node, &f.s, v), 0, "OP_CHECKSIGVERIFY");
+	book.fail("reclaim/neg three of four, one empty", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, "OP_CHECKSIGVERIFY");
 	let mut v = good.clone();
 	v[3] = vec![];
-	book.fail("reclaim/neg three of four, the last empty", &spend(&node, &f.s, v), 0, "OP_CHECKSIGVERIFY");
+	book.fail("reclaim/neg three of four, the last empty", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, "OP_CHECKSIGVERIFY");
 	let mut v = good.clone();
 	v[2] = vec![7; 64];
-	book.fail("reclaim/neg three of four, one junk", &spend(&node, &f.s, v), 0, BAD_SIG);
+	book.fail("reclaim/neg three of four, one junk", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, BAD_SIG);
+	// Releases over the old message, SHA256("Arca/release" ‖ genesis ‖ H),
+	// in the new witness shape and in the old one.
+	let old_digest = sha256(&node.release_prefix().unwrap());
+	let old: Vec<Vec<u8>> = os.iter().map(|k| sig(k, &old_digest).as_ref().to_vec()).collect();
+	book.fail("reclaim/neg releases over the old message", &spend(&node, &f.s, &[atom(m1)], items(&old, &k1)), 0, BAD_SIG);
+	book.fail("reclaim/neg releases over the old message, the old witness", &spend(&node, &f.s, &[atom(m1)], old.iter().rev().cloned().collect()),
+		0, "unknown error");
+	let mut v = good.clone();
+	v[3] = signed(&os[3..], &node, &[m2])[0].clone();
+	book.fail("reclaim/neg one release names round 2, its k round 1", &spend(&node, &f.s, &[atom(m1), atom(m2)], items(&v, &k1)), 0, BAD_SIG);
 	let (_, other) = reclaim(4, 4, "other");
-	let other_rel = other.release_message().unwrap();
-	let all_other: Vec<Vec<u8>> = os.iter().map(|k| sig(k, &other_rel.digest).as_ref().to_vec()).collect();
-	book.fail("reclaim/neg all four signed another node's release", &spend(&node, &f.s, all_other.clone()), 0, BAD_SIG);
+	let all_other = signed(&os, &other, &[m1; 4]);
+	book.fail("reclaim/neg all four signed another node's release", &spend(&node, &f.s, &[atom(m1)], items(&all_other, &k1)), 0, BAD_SIG);
 	let mut v = good.clone();
 	v[0] = all_other[0].clone();
-	book.fail("reclaim/neg one signature for another node", &spend(&node, &f.s, v), 0, BAD_SIG);
+	book.fail("reclaim/neg one signature for another node", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, BAD_SIG);
 	let other_chain = Chain::new(BlockHash::from_byte_array(label32("another chain")));
-	let rel_chain = other_chain.release_message(&node.children_hash());
+	let rel_chain = other_chain.release_message(&node.children_hash(), m1);
 	let v: Vec<Vec<u8>> = os.iter().map(|k| sig(k, &rel_chain.digest).as_ref().to_vec()).collect();
-	book.fail("reclaim/neg signed for another genesis hash", &spend(&node, &f.s, v), 0, BAD_SIG);
-	let mut s = spend(&node, &f.s, good.clone());
+	book.fail("reclaim/neg signed for another genesis hash", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, BAD_SIG);
+	let mut s = spend(&node, &f.s, &[atom(m1)], items(&good, &k1));
 	s.tx.input[0].witness.script_witness[0] = vec![];
 	book.fail("reclaim/neg no operator signature", &s, 0, FALSE);
-	book.fail("reclaim/neg the operator's signature by the wrong key", &spend(&node, &f.stranger, good.clone()), 0, BAD_SIG);
+	book.fail("reclaim/neg the operator's signature by the wrong key", &spend(&node, &f.stranger, &[atom(m1)], items(&good, &k1)), 0, BAD_SIG);
 	let mut v = good.clone();
 	v.swap(1, 2);
-	book.fail("reclaim/neg owner signatures out of order", &spend(&node, &f.s, v), 0, BAD_SIG);
-	let mut v = good.clone();
-	v.reverse();
-	book.fail("reclaim/neg owner signatures in owner order bottom to top", &spend(&node, &f.s, v), 0, BAD_SIG);
+	book.fail("reclaim/neg owner signatures out of order", &spend(&node, &f.s, &[atom(m1)], items(&v, &k1)), 0, BAD_SIG);
+
+	// Owners 0 and 1 refreshed in round 1, owners 2 and 3 in round 2.
+	let two = signed(&os, &node, &[m1, m1, m2, m2]);
+	let k12 = [1, 1, 2, 2];
+	book.pass("reclaim/owners of two rounds, one atom of each", &spend(&node, &f.s, &[atom(m1), atom(m2)], items(&two, &k12)));
+	book.fail("reclaim/neg two rounds, every k names round 1", &spend(&node, &f.s, &[atom(m1), atom(m2)], items(&two, &k1)), 0, BAD_SIG);
+	book.fail("reclaim/neg two rounds, round 2's M missing", &spend(&node, &f.s, &[atom(m1)], items(&two, &k12)), 0, "Introspection index out of bounds");
 
 	let (os16, node16) = reclaim(16, 4, "sixteen");
-	let rel16 = node16.release_message().unwrap();
-	let good16: Vec<Vec<u8>> = os16.iter().map(|k| sig(k, &rel16.digest).as_ref().to_vec()).collect();
-	book.pass("reclaim/sixteen owners and the operator", &spend(&node16, &f.s, good16.clone()));
+	let good16 = signed(&os16, &node16, &[m1; 16]);
+	book.pass("reclaim/sixteen owners and the operator", &spend(&node16, &f.s, &[atom(m1)], items(&good16, &[1; 16])));
 	let mut v = good16.clone();
 	v[9] = vec![];
-	book.fail("reclaim/neg fifteen of sixteen", &spend(&node16, &f.s, v), 0, "OP_CHECKSIGVERIFY");
+	book.fail("reclaim/neg fifteen of sixteen", &spend(&node16, &f.s, &[atom(m1)], items(&v, &[1; 16])), 0, "OP_CHECKSIGVERIFY");
 
 	let (os1, node1) = reclaim(1, 1, "one");
-	let rel1 = node1.release_message().unwrap();
-	book.pass("reclaim/one owner and the operator", &spend(&node1, &f.s, vec![sig(&os1[0], &rel1.digest).as_ref().to_vec()]));
-	book.fail("reclaim/neg one owner, signature missing", &spend(&node1, &f.s, vec![vec![]]), 0, "OP_CHECKSIGVERIFY");
-	book.fail("reclaim/neg one owner, signed by a stranger", &spend(&node1, &f.s, vec![sig(&f.stranger, &rel1.digest).as_ref().to_vec()]), 0, BAD_SIG);
+	let good1 = signed(&os1, &node1, &[m1]);
+	book.pass("reclaim/one owner and the operator", &spend(&node1, &f.s, &[atom(m1)], items(&good1, &[1])));
+	book.fail("reclaim/neg one owner, without M", &spend(&node1, &f.s, &[], items(&good1, &[1])), 0, "Introspection index out of bounds");
+	book.fail("reclaim/neg one owner, another round's M", &spend(&node1, &f.s, &[atom(m2)], items(&good1, &[1])), 0, BAD_SIG);
+	book.fail("reclaim/neg one owner, signature missing", &spend(&node1, &f.s, &[atom(m1)], items(&[vec![]], &[1])), 0, "OP_CHECKSIGVERIFY");
+	let stranger = vec![sig(&f.stranger, &node1.release_message(m1).unwrap().digest).as_ref().to_vec()];
+	book.fail("reclaim/neg one owner, signed by a stranger", &spend(&node1, &f.s, &[atom(m1)], items(&stranger, &[1])), 0, BAD_SIG);
 }
 
 // ---------------------------------------------------------------------------
