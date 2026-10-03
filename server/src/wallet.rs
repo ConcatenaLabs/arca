@@ -11,7 +11,11 @@
 //! its asset or value (those are recorded as refused: the server is
 //! transparent at its boundary). A coin whose block is disconnected is not in
 //! the chain again until its transaction is; the wallet spends a coin only once
-//! the finality service says its transaction is final, unless told otherwise.
+//! the finality service says its transaction is final, unless told otherwise,
+//! with one exception: a fee coin for the watcher may be the change of one of
+//! the watcher's own transactions the nursery still holds as pending
+//! ([`Wallet::with_fee_coin`]), which the wallet records when the watcher
+//! publishes it and forgets if it can never confirm.
 //!
 //! Every transaction the wallet builds is built by hand and names its fee
 //! asset. There is no default and no fallback: an asset the node does not
@@ -104,6 +108,11 @@ pub enum SpendFrom {
 	/// Its transaction is in a block of the active chain.
 	Confirmed,
 }
+
+/// The most of the watcher's transactions waiting for a block that a fee
+/// coin of its own change may rest on: below the node's limit of 25
+/// unconfirmed ancestors.
+pub const MAX_PENDING_CHAIN: u32 = 20;
 
 #[derive(Debug, Clone)]
 pub struct WalletConfig {
@@ -506,10 +515,15 @@ impl Wallet {
 		self.fee_for(asset, vsize).await
 	}
 
-	/// Builds, with `build`, a transaction whose fee a coin of the wallet's
-	/// pays: the first asset of `assets` the node accepts for fees now in
-	/// which the wallet holds a spendable coin of at least twice the fee
-	/// (its largest), with the change to a new change script. `build` is
+	/// Builds, with `build`, a transaction of the watcher's whose fee a coin
+	/// of the wallet's pays: the first asset of `assets` the node accepts for
+	/// fees now in which the wallet holds a coin of at least twice the fee
+	/// (its largest), with the change to a new change script. The coin is a
+	/// spendable one, or the change of a transaction of the watcher's the
+	/// nursery holds as pending, resting on fewer than
+	/// [`MAX_PENDING_CHAIN`] of the watcher's transactions waiting for a
+	/// block: the watcher's own work need not wait for its change to be
+	/// final, which a round's always does. `build` is
 	/// given the fee source and returns what it built, its txid and the
 	/// virtual size it will have once signed; the fee is sized again from
 	/// that size until it covers it. The coin is marked spent by that txid
@@ -527,9 +541,15 @@ impl Wallet {
 				Err(WalletError::FeeAssetNotAccepted(_)) => continue,
 				Err(e) => return Err(e),
 			};
+			let a = asset.into_inner().to_byte_array();
 			let mut coins = vec![];
-			for c in self.store.wallet_coins(Some(&asset.into_inner().to_byte_array())).await? {
+			for c in self.store.wallet_coins(Some(&a)).await? {
 				if self.spendable(&c).await? {
+					coins.push(c);
+				}
+			}
+			for (c, depth) in self.store.pending_change(&a).await? {
+				if depth < MAX_PENDING_CHAIN && !coins.iter().any(|k| (k.txid, k.vout) == (c.txid, c.vout)) {
 					coins.push(c);
 				}
 			}
@@ -561,6 +581,26 @@ impl Wallet {
 			}
 		}
 		Err(WalletError::NoFeeCoin(assets.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")))
+	}
+
+	/// What the watcher can pay fees with in `asset` now: its spendable coins
+	/// and the change of its own pending transactions, as
+	/// [`Wallet::with_fee_coin`] takes them.
+	pub async fn fee_pool(&self, asset: AssetId) -> Result<u64, WalletError> {
+		let a = asset.into_inner().to_byte_array();
+		let mut total = 0u64;
+		let mut seen = std::collections::HashSet::new();
+		for c in self.store.wallet_coins(Some(&a)).await? {
+			if self.spendable(&c).await? && seen.insert((c.txid, c.vout)) {
+				total = total.saturating_add(c.value);
+			}
+		}
+		for (c, depth) in self.store.pending_change(&a).await? {
+			if depth < MAX_PENDING_CHAIN && seen.insert((c.txid, c.vout)) {
+				total = total.saturating_add(c.value);
+			}
+		}
+		Ok(total)
 	}
 
 	/// The wallet's coins of `asset` in a block of the active chain and not
@@ -610,6 +650,7 @@ impl Wallet {
 	/// Frees the coins a built transaction took, once it will never be
 	/// broadcast or can never confirm.
 	pub async fn release(&self, txid: &Txid) -> Result<u64, WalletError> {
+		self.store.forget_pending_outputs(&txid.to_byte_array()).await?;
 		Ok(self.store.release_wallet_coins(&txid.to_byte_array()).await?)
 	}
 

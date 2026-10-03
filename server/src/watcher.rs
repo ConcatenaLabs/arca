@@ -2,9 +2,10 @@
 //!
 //! A round leaves the operator holding signatures and rights it must use on
 //! the chain, and a holder who breaks its word must be answered there within
-//! a delay. The watcher acts on each pass, in this order, and never builds a
-//! second spend of an outpoint while a spend of its own is in the nursery and
-//! not lost:
+//! a delay. The watcher acts on each pass in the order of the deadlines
+//! (answers to stale exits, then claims, then new forfeits and the rest), and
+//! never builds a second spend of an outpoint while a spend of its own is in
+//! the nursery and not lost:
 //!
 //! 1. **Stale exits.** A coin the server holds as given up (by a
 //!    participation whose forfeit it stored, or by a co-signed transfer) whose
@@ -213,6 +214,42 @@ struct Payout<T> {
 	fee: AssetAmount,
 }
 
+/// What the watcher's fee pool stood at after its last pass over the boards:
+/// its metric. Forfeits whose claim a coin of the wallet's must pay (their
+/// asset not accepted for fees) are published only while the pool covers
+/// what is outstanding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeeStatus {
+	/// Per fee asset: what the pool holds, and what the forfeits waiting for
+	/// their claim, and those published this pass, take of it.
+	pub pools: BTreeMap<AssetId, (u64, u64)>,
+	/// Board forfeits held back for block space, and for the fee pool.
+	pub held_for_space: usize,
+	pub held_for_fees: usize,
+}
+
+impl FeeStatus {
+	/// The metric in the text format Prometheus reads.
+	pub fn metrics(&self) -> String {
+		let mut out = String::new();
+		out.push_str("# HELP arca_watcher_fee_pool What the watcher can pay fees with, in the asset's atoms.\n");
+		out.push_str("# TYPE arca_watcher_fee_pool gauge\n");
+		for (a, (pool, _)) in &self.pools {
+			out.push_str(&format!("arca_watcher_fee_pool{{asset=\"{}\"}} {}\n", a, pool));
+		}
+		out.push_str("# HELP arca_watcher_fee_outstanding The fees the forfeits waiting for their claim will take, in the asset's atoms.\n");
+		out.push_str("# TYPE arca_watcher_fee_outstanding gauge\n");
+		for (a, (_, owed)) in &self.pools {
+			out.push_str(&format!("arca_watcher_fee_outstanding{{asset=\"{}\"}} {}\n", a, owed));
+		}
+		out.push_str("# HELP arca_watcher_forfeits_held Board forfeits not published in the last pass, and why.\n");
+		out.push_str("# TYPE arca_watcher_forfeits_held gauge\n");
+		out.push_str(&format!("arca_watcher_forfeits_held{{reason=\"block_space\"}} {}\n", self.held_for_space));
+		out.push_str(&format!("arca_watcher_forfeits_held{{reason=\"fee_pool\"}} {}\n", self.held_for_fees));
+		out
+	}
+}
+
 /// See the [module documentation](self).
 pub struct Watcher {
 	store: Store,
@@ -231,6 +268,7 @@ pub struct Watcher {
 	/// is paid to, handed out once: a step the node refuses, and takes again
 	/// on a later pass, hands out no new script each time.
 	pay_to: Mutex<Option<Script>>,
+	status: std::sync::Mutex<FeeStatus>,
 }
 
 impl Watcher {
@@ -241,7 +279,13 @@ impl Watcher {
 		Arc::new(Watcher {
 			store, finality, params, wallet, nursery, signer, rounds, config,
 			running: Mutex::new(()), trees: Mutex::new(HashMap::new()), pay_to: Mutex::new(None),
+			status: std::sync::Mutex::new(FeeStatus::default()),
 		})
+	}
+
+	/// The fee pool and what waits on it, after the last pass.
+	pub fn fee_status(&self) -> FeeStatus {
+		self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	pub fn config(&self) -> &WatcherConfig {
@@ -252,15 +296,17 @@ impl Watcher {
 	// Passes
 	// -----------------------------------------------------------------------
 
-	/// One whole pass: the stale exits, then every recovery step.
+	/// One whole pass, in the order of the deadlines: the stale exits (the
+	/// exit delay), then the claims (the refund delay), then new forfeits
+	/// and the rest, which have none.
 	pub async fn pass(&self) -> Result<(), WatcherError> {
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
+		self.claim_forfeits().await?;
 		self.recover_boards(now).await?;
 		self.recover_board_transfers(now).await?;
 		self.forfeit_first(now).await?;
-		self.claim_forfeits().await?;
 		self.answer_stale_exits().await?;
 		self.offboards().await?;
 		self.expiries(now).await?;
@@ -414,6 +460,8 @@ impl Watcher {
 			inputs: r.tx.input.iter().map(|i| (i.previous_output.txid.to_byte_array(), i.previous_output.vout)).collect(),
 		};
 		let result = self.nursery.submit_watcher(&w).await.map_err(|e| WatcherError::Nursery(e.to_string()))?;
+		// Its change, for the watcher's next transaction.
+		self.store.record_pending_outputs(&r.tx).await?;
 		log::info!("watcher: {} {} ({} vB): {}; {}", kind, txid, vsize.unwrap_or(0), detail, result);
 		Ok(Some(txid))
 	}
@@ -754,7 +802,9 @@ impl Watcher {
 	async fn recover_boards(&self, _now: MedianTime) -> Result<(), WatcherError> {
 		let mut waiting = self.waiting_vbytes().await?;
 		let mut held_back = 0usize;
+		let mut held_for_fees = 0usize;
 		let mut atoms: HashSet<i64> = HashSet::new();
+		let mut pools = self.fee_pools().await?;
 		for id in self.store.boards_to_recover().await? {
 			let b = match self.store.board(&id).await? {
 				Some(b) if b.state == BoardState::Credited => b,
@@ -786,6 +836,19 @@ impl Watcher {
 				held_back += 1;
 				continue;
 			}
+			// Funded: a forfeit whose claim a wallet coin must pay goes out
+			// only while the pool covers it and its claim beside what is
+			// outstanding, twice over, since a coin pays a fee of at most
+			// half its value.
+			let asset = AssetId::from_byte_array(leaf.asset);
+			if let Some((fa, cost)) = self.coin_cost(asset).await? {
+				let (pool, owed) = pools.entry(fa).or_insert((0, 0));
+				if owed.saturating_add(cost).saturating_mul(2) > *pool {
+					held_for_fees += 1;
+					continue;
+				}
+				*owed += cost;
+			}
 			let r = async {
 				let coin = self.coin(&b.leaf_id).await?;
 				let (board, _) = coin.board().ok_or_else(|| WatcherError::Build("a board's coin is not a board".into()))?;
@@ -814,7 +877,65 @@ impl Watcher {
 			log::info!("watcher: {} board forfeit(s) wait for block space: {} vB of the watcher's wait for a block (share {})",
 				held_back, waiting, self.config.block_share_vbytes);
 		}
+		for (fa, (pool, owed)) in &pools {
+			if held_for_fees > 0 || owed.saturating_mul(2) > *pool {
+				log::warn!("watcher: the fee pool cannot cover what is outstanding: it holds {} of {} and the claims of the forfeits \
+					waiting take {}; {} board forfeit(s) are held back until the wallet is paid more of it", pool, fa, owed, held_for_fees);
+			}
+		}
+		*self.status.lock().unwrap_or_else(|e| e.into_inner()) = FeeStatus { pools, held_for_space: held_back, held_for_fees };
 		Ok(())
+	}
+
+	/// The fee asset a wallet coin pays in for a forfeit of `asset` and its
+	/// claim, and what the two take of it, when the node does not accept
+	/// `asset` for fees now; `None` when it does (the margin pays the forfeit
+	/// and the forfeited value its claim).
+	async fn coin_cost(&self, asset: AssetId) -> Result<Option<(AssetId, u64)>, WatcherError> {
+		if self.accepted(asset).await?.is_some() {
+			return Ok(None);
+		}
+		for fa in self.fee_assets(asset) {
+			if self.accepted(fa).await?.is_none() {
+				continue;
+			}
+			// A forfeit with a fee coin, and its share of a claim with one.
+			let forfeit = self.wallet.fee_in(fa, 450).await?;
+			let claim = self.wallet.fee_in(fa, CLAIM_INPUT_VSIZE + 150).await?;
+			return Ok(Some((fa, forfeit + claim)));
+		}
+		Err(WatcherError::Wallet(WalletError::NoFeeCoin(format!("no asset of {:?} is accepted for fees", self.fee_assets(asset)))))
+	}
+
+	/// Each fee asset's pool, and what the forfeits published and not yet
+	/// claimed will take of it for their claims.
+	async fn fee_pools(&self) -> Result<BTreeMap<AssetId, (u64, u64)>, WatcherError> {
+		let mut pools: BTreeMap<AssetId, (u64, u64)> = BTreeMap::new();
+		for (txid, subject) in self.store.unclaimed_forfeits().await? {
+			let op = OutPoint::new(txid_of(&txid), 0);
+			if self.spending(&op).await? {
+				continue;
+			}
+			let leaf: [u8; 32] = match subject.try_into() {
+				Ok(l) => l,
+				Err(_) => continue,
+			};
+			let row = match self.store.leaf(&leaf).await? {
+				Some(r) => r,
+				None => continue,
+			};
+			if let Some((fa, _)) = self.coin_cost(AssetId::from_byte_array(row.asset)).await? {
+				let claim = self.wallet.fee_in(fa, CLAIM_INPUT_VSIZE + 150).await?;
+				pools.entry(fa).or_insert((0, 0)).1 += claim;
+			}
+		}
+		for fa in self.params.fee_assets.clone() {
+			if self.accepted(fa).await?.is_some() {
+				let pool = self.wallet.fee_pool(fa).await?;
+				pools.entry(fa).or_insert((0, 0)).0 = pool;
+			}
+		}
+		Ok(pools)
 	}
 
 	/// Brings onto the chain every coin of a transfer given up in a round

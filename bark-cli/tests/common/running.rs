@@ -84,6 +84,7 @@ impl Running {
 			// The scenarios ask for nonces and challenges faster than one
 			// wallet does.
 			limits: LimitsSection { issue_per_second: 10_000, issue_burst: 10_000, ..Default::default() },
+			metrics_listen: None,
 		};
 		let server = Server::start(&config).await.unwrap();
 		let mut r = Running { server, config, rt, purse, x, y, signer, db };
