@@ -880,3 +880,102 @@ async fn a_mailbox_coin_refused_during_a_rollback_is_taken_once_its_board_return
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// What the wallet accepts, and what it shows
+// ---------------------------------------------------------------------------
+
+/// Sets the node's fee whitelist to exactly `rates`.
+fn set_fee_rates(r: &Running, rates: &[(AssetId, u64)]) {
+	let map: serde_json::Map<String, Value> = rates.iter().map(|(a, v)| (a.to_string(), json!(v))).collect();
+	rpc(r, "setfeeexchangerates", &[Value::Object(map)]);
+}
+
+/// A round whose tree in asset Y holds one-atom reserves, the operator's
+/// rule for an asset the node does not take for fees, while the wallet's
+/// node does take Y: the wallet refuses the leaf before it signs anything,
+/// since its reserves would not pay its own exit. Where the node does not
+/// take Y, one atom is the rule, and the wallet says, before it gives up a
+/// coin and again when it takes the leaf, that every exit of it needs a fee
+/// coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tree_whose_reserves_cannot_pay_its_exit_is_refused() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let c = Arca::new("F11");
+	c.ok(&create_args(&url, &r.node_url()));
+	for (a, v) in [(y, 5_000_000), (x, 1_000_000)] {
+		let s = script(&c.ok(&["address"]));
+		r.pay_to(s, a, v);
+	}
+	r.produce().await;
+	let board = c.ok(&["board", &y.to_string(), "2000000", "--fee-asset", &x.to_string()])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || c.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	c.ok(&["sync"]);
+	let p = c.ok(&["participate", "--leaf", &board]);
+	println!("F11 participate in Y, which the node does not take for fees: {}", p["exit_needs_fee_coin"]);
+	assert_eq!(p["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "stated before the coin is given up: {}", p);
+	let round = final_round(&r).await;
+	println!("F11 round {} built while Y is not taken for fees", round.txid());
+	// The wallet's node now takes Y for fees.
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = c.ok(&["sync"]);
+	let why = s["participations"][0]["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F11 one-atom reserves in an asset the node takes for fees: REFUSED: {}", why);
+	assert!(why.contains("reserve of 1"), "{}", why);
+	assert_eq!(coin_of(&c, &board)["state"], "given", "no forfeit was signed");
+	// The node no longer takes Y: one atom is the rule there.
+	set_fee_rates(&r, &[(x, 100_000_000)]);
+	let s = c.ok(&["sync"]);
+	let done = &s["participations"][0];
+	println!("F11 the same tree where the node does not take Y: {}", done["exit_needs_fee_coin"]);
+	assert_eq!(done["state"], "released", "{}", s);
+	assert_eq!(done["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "{}", s);
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// A taker accepts an offer and cancels: the wallet spends the coin it
+/// signed into the acceptance to a fresh leaf of its own, so the maker's
+/// completion is refused. That leaf rests on a reassignment the operator
+/// co-signed and is shown as operator-confirmed until a round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_acceptance_cannot_complete() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let a = Arca::new("F14A");
+	let b = Arca::new("F14B");
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	for (asset, v) in [(y, 5_000_000), (x, 1_000_000)] {
+		let s = script(&b.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	let bb = b.ok(&["board", &y.to_string(), "3000000", "--fee-asset", &x.to_string()])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || b.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	b.ok(&["sync"]);
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "400000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	let cancel = b.ok(&["swap", "cancel", acc["swap"].as_str().unwrap()]);
+	println!("F14 the taker cancels its acceptance: {}", cancel);
+	assert_eq!(cancel["cancelled"], true, "{}", cancel);
+	assert_eq!(coin_of(&b, &bb)["state"], "spent", "the coin signed into the acceptance is spent elsewhere");
+	let why = a.refused(&["swap", "complete", acc["accept"].as_str().unwrap()], "double_spend");
+	println!("F14 the maker completes after the cancel: REFUSED: {}", why);
+	let bal = b.ok(&["balance"]);
+	println!("F12 the taker's balance: {}", bal["arca"]);
+	let kept: u64 = bal["arca"][y.to_string()]["operator-confirmed"].as_str().unwrap_or_else(|| panic!("{}", bal)).parse().unwrap();
+	assert!(kept > 2_999_000, "the coin, less its margins, operator-confirmed: {}", bal);
+	assert!(bal["arca"][y.to_string()].get("live").is_none(), "{}", bal);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

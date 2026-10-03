@@ -80,6 +80,21 @@ pub(crate) fn amount(v: &Value, what: &str) -> Result<u64, Error> {
 	parse(what, v.as_str().ok_or_else(|| Error::Parse(format!("{} is missing", what)))?)
 }
 
+/// How many times the node's relay floor every reserve on a new leaf's path
+/// holds, when the node accepts the leaf's asset for fees: the
+/// specification's cover for a fourfold rise in the floor.
+pub const RESERVE_MULTIPLE: u64 = 4;
+
+/// The least reserve the wallet accepts on a new leaf's path, given the
+/// node's relay floor in the leaf's asset (`None` when the node does not
+/// accept the asset for fees).
+pub fn reserve_floor(floor_per_kvb: Option<u64>) -> arca_covenant::ReserveFloor {
+	match floor_per_kvb {
+		Some(f) => arca_covenant::ReserveFloor::FeeRate { floor_per_kvb: f, multiple: RESERVE_MULTIPLE },
+		None => arca_covenant::ReserveFloor::Atoms(1),
+	}
+}
+
 /// A coin record's kind, as the store names it.
 pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 	match record {
@@ -272,6 +287,18 @@ impl Wallet {
 			max_exit_delay: Self::delay(self.cfg.max_exit_delay_units),
 			..WalletPolicy::new(self.genesis, self.operator, now)
 		}
+	}
+
+	/// The policy for accepting a leaf of `asset` from a round, at `now`,
+	/// and whether every exit of it will need a fee coin: its reserves must
+	/// cover [`RESERVE_MULTIPLE`] times the node's relay floor in `asset`
+	/// when the node accepts `asset` for fees, so the leaf's own value pays
+	/// its way out; where the node does not accept it, one atom, the
+	/// operator's own rule, and each transaction of an exit then takes a fee
+	/// coin in an accepted asset.
+	pub(crate) fn leaf_policy(&self, asset: AssetId, now: MedianTime) -> Result<(WalletPolicy, bool), Error> {
+		let floor = self.chain.floor_per_kvb(asset)?;
+		Ok((WalletPolicy { min_reserve: reserve_floor(floor), ..self.accept_policy(now) }, floor.is_none()))
 	}
 
 	/// The policy for a coin held or received out of round, at `now`.
@@ -653,10 +680,18 @@ impl Wallet {
 	// Reading
 	// -----------------------------------------------------------------------
 
+	/// What a coin's state is for people: a coin the wallet received out of
+	/// round and has not refreshed rests on a reassignment the operator
+	/// co-signed, and is `operator-confirmed` (it relies on the operator and
+	/// the sender not colluding) until a round makes it a leaf of a batch.
+	pub(crate) fn standing(c: &CoinRow) -> &str {
+		if c.kind == "transfer" && c.state == "live" { "operator-confirmed" } else { &c.state }
+	}
+
 	fn coin_json(c: &CoinRow) -> Value {
 		json!({
 			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
-			"note": c.note, "expiry": if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry) },
+			"standing": Self::standing(c), "note": c.note, "expiry": if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry) },
 			"spent_by": c.spent_by,
 		})
 	}
@@ -666,15 +701,16 @@ impl Wallet {
 		Ok(Value::Array(self.store.coins()?.iter().map(Self::coin_json).collect()))
 	}
 
-	/// What the wallet holds, per asset: off-chain coins by state, and its
-	/// on-chain coins on Sequentia. No asset is set apart.
+	/// What the wallet holds, per asset: off-chain coins by state (a coin
+	/// received out of round and not yet refreshed as `operator-confirmed`),
+	/// and its on-chain coins on Sequentia. No asset is set apart.
 	pub fn balance(&self) -> Result<Value, Error> {
 		let mut per: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
 		for c in self.store.coins()? {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}
-			*per.entry(c.asset.clone()).or_default().entry(c.state.clone()).or_default() += c.value;
+			*per.entry(c.asset.clone()).or_default().entry(Self::standing(&c).to_string()).or_default() += c.value;
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
 		for (_, o, _, _) in self.onchain_coins()? {
@@ -909,3 +945,45 @@ pub(crate) fn sign(key: &Keypair, digest: &[u8; 32]) -> elements::secp256k1_zkp:
 }
 
 use elements::hashes::Hash as _;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
+	use arca_covenant::{ClockSchedule, RecordError};
+	use elements::hashes::Hash as _;
+
+	fn key(i: u8) -> Keypair {
+		Keypair::from_seckey_slice(&Secp256k1::new(), &[i.max(1); 32]).unwrap()
+	}
+
+	/// A 16-leaf tree with one-atom reserves on every node and entry, as the
+	/// operator builds for an asset the node does not accept for fees.
+	fn one_atom_tree() -> (arca_covenant::LeafRecord, WalletPolicy) {
+		let s = key(200).x_only_public_key().0;
+		let chain = Chain::new(elements::BlockHash::all_zeros());
+		let asset = AssetId::from_slice(&[7; 32]).unwrap();
+		let now = MedianTime::from_consensus(1_800_000_000).unwrap();
+		let w = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
+		let e: Vec<MedianTime> = (1..=3u32).map(|k| MedianTime::from_consensus(1_800_000_000 + k * 28 * 86_400).unwrap()).collect();
+		let schedule = ClockSchedule::new(AssetId::from_slice(&[9; 32]).unwrap(), s, w, e).unwrap();
+		let leaves: Vec<LeafSpec> = (0..16u8).map(|i| LeafSpec {
+			template: Template::Vtxo1, owner: key(i + 1).x_only_public_key().0, value: 1_000_000,
+			owner_nonce: [i; 32], operator_nonce: [i + 100; 32], exit_delay: w, unlock_hash: [i + 50; 32],
+		}).collect();
+		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
+		let tree = Tree::build(params, &leaves).unwrap();
+		(tree.record(5), WalletPolicy::new(chain, s, now))
+	}
+
+	#[test]
+	fn reserves_cover_four_times_the_floor_where_the_asset_pays_fees() {
+		let (record, policy) = one_atom_tree();
+		let accepted = WalletPolicy { min_reserve: reserve_floor(Some(100)), ..policy };
+		assert!(matches!(accepted.check(&record), Err(RecordError::NodeReserve { level: 0, reserve: 1, .. })),
+			"{:?}", accepted.check(&record));
+		// The operator's own rule where the node does not take the asset.
+		let not_accepted = WalletPolicy { min_reserve: reserve_floor(None), ..policy };
+		assert!(not_accepted.check(&record).is_ok());
+	}
+}

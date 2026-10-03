@@ -70,6 +70,11 @@ fn ppm_of(fee: u64, value: u64) -> u64 {
 	((fee as u128 * 1_000_000).div_ceil(value.max(1) as u128)).min(u64::MAX as u128) as u64
 }
 
+/// What the wallet says of a leaf in an asset the node does not accept for
+/// fees, before it takes one.
+const FEE_COIN_NOTE: &str = "the node does not accept these assets for fees, so the new leaves' reserves are one atom: every transaction \
+	of an exit of them needs a fee coin of the wallet's in an asset the node accepts (exit --fee-asset)";
+
 /// A refresh as [`Wallet::refresh_quote`] prices it: the coins it gives up
 /// and what each costs, checked against the wallet's bound.
 pub struct RefreshQuote {
@@ -190,6 +195,12 @@ impl Wallet {
 	/// time `not_before`, when given.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
 		let RefreshQuote { info, rows, ids, per, coins } = quote;
+		let mut needs_fee_coin = vec![];
+		for asset in per.keys() {
+			if self.chain.floor_per_kvb(*asset)?.is_none() {
+				needs_fee_coin.push(asset.to_string());
+			}
+		}
 		let mut wanted = vec![];
 		let mut nonces = vec![];
 		let mut fees = vec![];
@@ -232,8 +243,12 @@ impl Wallet {
 			Ok(())
 		})?;
 		let answer = self.submit(&pid, &body, &given)?;
-		Ok(json!({"participation": pid, "state": answer["state"], "gives": given, "wants": nonces,
-			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(), "quote": coins}))
+		let mut out = json!({"participation": pid, "state": answer["state"], "gives": given, "wants": nonces,
+			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(), "quote": coins});
+		if !needs_fee_coin.is_empty() {
+			out["exit_needs_fee_coin"] = json!({"assets": needs_fee_coin, "note": FEE_COIN_NOTE});
+		}
+		Ok(out)
 	}
 
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
@@ -359,7 +374,7 @@ impl Wallet {
 		}
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
-		let accept = self.accept_policy(now);
+		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
 			.map_err(|_| Error::Refused("the status names no unlock hash for the participation".into()))?;
 		// The coins given up: exactly the participation's, each once.
@@ -395,6 +410,12 @@ impl Wallet {
 			}
 			let record = tree.record(index);
 			let owner = self.keys.leaf_xonly(&nonce)?;
+			// The reserves, at four times the node's floor in the leaf's asset
+			// when it accepts that asset for fees, one atom when it does not.
+			let (accept, fee_coin) = self.leaf_policy(record.asset, now)?;
+			if fee_coin {
+				needs_fee_coin.push(record.asset.to_string());
+			}
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
 			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
@@ -519,7 +540,11 @@ impl Wallet {
 				Err(e) => json!({"error": e.to_string()}),
 			}
 		};
-		Ok(json!({"participation": pid, "state": "released", "round": round_txid.to_string(), "new_leaves": kept, "released": released}))
+		let mut out = json!({"participation": pid, "state": "released", "round": round_txid.to_string(), "new_leaves": kept, "released": released});
+		if !needs_fee_coin.is_empty() {
+			out["exit_needs_fee_coin"] = json!({"assets": needs_fee_coin, "note": FEE_COIN_NOTE});
+		}
+		Ok(out)
 	}
 
 	/// Completes participation `pid` with `preimage`: its new leaves, as the
