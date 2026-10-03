@@ -178,7 +178,7 @@ impl Wallet {
 		}
 		let genesis = chain.genesis()?;
 		let chain_name = chain.chain_name()?;
-		let server = ServerClient::new(&cfg.server);
+		let server = ServerClient::new(&cfg.server)?;
 		let info = server.info()?;
 		let server_genesis = info["genesis_hash"].as_str().unwrap_or("");
 		if server_genesis != genesis.to_string() {
@@ -240,7 +240,7 @@ impl Wallet {
 			.map_err(|e| Error::Io(format!("{}: {}", datadir.join(MNEMONIC_FILE).display(), e)))?;
 		let keys = Keys::new(mnemonic.trim(), cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
-		let server = ServerClient::new(&cfg.server);
+		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir: datadir.to_path_buf(), store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new() })
 	}
 

@@ -728,3 +728,75 @@ async fn a_receiver_answers_a_stale_board_conversion_at_once() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The way to the server
+// ---------------------------------------------------------------------------
+
+/// A TLS server on this machine whose certificate no root vouches for, as
+/// `openssl s_server` runs it.
+struct TlsServer {
+	child: std::process::Child,
+	dir: std::path::PathBuf,
+	port: u16,
+}
+
+impl TlsServer {
+	fn start() -> TlsServer {
+		let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("arca-cli-tls-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let ok = std::process::Command::new("openssl")
+			.args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+				"-subj", "/CN=127.0.0.1", "-keyout"]).arg(dir.join("key.pem")).arg("-out").arg(dir.join("cert.pem"))
+			.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().expect("openssl");
+		assert!(ok.success());
+		let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+		let child = std::process::Command::new("openssl")
+			.args(["s_server", "-quiet", "-www", "-accept", &port.to_string(), "-cert"]).arg(dir.join("cert.pem"))
+			.arg("-key").arg(dir.join("key.pem"))
+			.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("openssl s_server");
+		let start = std::time::Instant::now();
+		while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+			assert!(start.elapsed() < std::time::Duration::from_secs(10), "s_server did not listen");
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+		TlsServer { child, dir, port }
+	}
+}
+
+impl Drop for TlsServer {
+	fn drop(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+		let _ = std::fs::remove_dir_all(&self.dir);
+	}
+}
+
+/// The wallet speaks TLS to a server named `https://`, and refuses a server
+/// whose certificate no root vouches for; it speaks plain HTTP to this
+/// machine alone, refusing any other host before it sends anything; and
+/// `create` shows the operator key it pins, for the user to compare.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_is_reached_over_tls_and_plain_http_only_on_this_machine() {
+	let r = Running::start().await;
+	let node = r.node_url();
+	let c = Arca::new("F8a");
+	let why = c.refused(&create_args("http://192.0.2.1:3535/arca", &node), "plain http");
+	println!("F8 plain http to another host: REFUSED: {}", why);
+	let tls = tokio::task::block_in_place(TlsServer::start);
+	let c = Arca::new("F8b");
+	let url = format!("https://127.0.0.1:{}/arca", tls.port);
+	let why = c.refused(&create_args(&url, &node), "cannot reach the server");
+	println!("F8 https to a server with a certificate no root vouches for: REFUSED: {}", why);
+	assert!(!why.contains("https feature"), "{}", why);
+	assert!(why.to_lowercase().contains("certificate") || why.to_lowercase().contains("issuer"), "TLS refused it: {}", why);
+	let c = Arca::new("F8c");
+	let (ok, info, err) = c.run_full(&create_args(&r.url(), &node));
+	assert!(ok, "{}", info);
+	println!("F8 create: {}", err.trim());
+	let op = info["operator"].as_str().unwrap();
+	assert!(info["operator_key_check"].as_str().unwrap().contains(op) && err.contains(op), "the pinned key is shown: {}", info);
+	for d in ["F8a", "F8b", "F8c"] {
+		let _ = std::fs::remove_dir_all(Arca::new(d).dir);
+	}
+}

@@ -1,5 +1,6 @@
-//! The wallet's client of the Arca server: JSON over HTTP, every call under
-//! `/v1/`.
+//! The wallet's client of the Arca server: JSON over HTTPS, every call under
+//! `/v1/`. Plain HTTP is spoken only to this machine (a loopback address or
+//! `localhost`), as to a server behind a local TLS proxy or in a test.
 //!
 //! The calls that read a key's mailbox or leaves are authenticated with a
 //! challenge from the server, signed with the key (BIP340) over the tagged
@@ -103,6 +104,34 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// Whether `base` is a server URL the wallet will speak to: `https://`, or
+/// `http://` to this machine alone (a loopback address or `localhost`).
+/// Plain HTTP across a network lets anyone on the path answer as the
+/// operator: change a status, a fee or a tree, or name another operator
+/// key when the wallet is created.
+pub fn check_server_url(base: &str) -> Result<(), Error> {
+	let lower = base.trim().to_ascii_lowercase();
+	if lower.starts_with("https://") {
+		return Ok(());
+	}
+	let Some(rest) = lower.strip_prefix("http://") else {
+		return Err(Error::Refused(format!("the server URL {:?} is neither https:// nor http://", base)));
+	};
+	let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+	let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+	let host = if let Some(v6) = authority.strip_prefix('[') {
+		v6.split(']').next().unwrap_or("")
+	} else {
+		authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+	};
+	let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+	if loopback {
+		return Ok(());
+	}
+	Err(Error::Refused(format!("the server URL {} is plain http to {}, which is not this machine: anyone on the path could answer \
+		as the operator; use https://", base, host)))
+}
+
 /// The server, at its base URL.
 #[derive(Debug, Clone)]
 pub struct ServerClient {
@@ -111,8 +140,14 @@ pub struct ServerClient {
 }
 
 impl ServerClient {
-	pub fn new(base: &str) -> ServerClient {
-		ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60 }
+	/// The server at `base`, which must be `https://`, or `http://` to this
+	/// machine ([`check_server_url`]).
+	pub fn new(base: &str) -> Result<ServerClient, Error> {
+		check_server_url(base)?;
+		// rustls picks no crypto provider by itself when the build enables
+		// more than one; one already installed is kept.
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60 })
 	}
 
 	pub fn base(&self) -> &str {
@@ -128,7 +163,7 @@ impl ServerClient {
 		}
 		let code = json["error"]["code"].as_str().unwrap_or("").to_string();
 		let message = json["error"]["message"].as_str().map(|s| s.to_string()).unwrap_or_else(|| text.to_string());
-		Err(Error::Server { call: call.to_string(), status: r.status_code, code, message })
+		Err(Error::Server { call: call.to_string(), status: r.status_code as i32, code, message })
 	}
 
 	pub fn get(&self, call: &str) -> Result<Value, Error> {
@@ -169,5 +204,24 @@ impl ServerClient {
 	pub fn leaf_data(&self, key: &Keypair, chain: &Chain) -> Result<Value, Error> {
 		let auth = self.auth("leaf_data", key, chain)?;
 		self.post("leaf_data", &json!({"auth": auth}))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn plain_http_only_to_this_machine() {
+		for ok in ["https://example.org/arca", "HTTPS://example.org", "http://127.0.0.1:3535", "http://localhost/arca",
+			"http://[::1]:80/", "http://127.0.0.5", "http://user@127.0.0.1:1/x"]
+		{
+			assert!(check_server_url(ok).is_ok(), "{}", ok);
+		}
+		for bad in ["http://example.org/arca", "http://192.0.2.1:3535", "http://[2001:db8::1]/", "http://127.0.0.1.example.org/",
+			"http://localhost.example.org", "ftp://127.0.0.1", "example.org"]
+		{
+			assert!(check_server_url(bad).is_err(), "{}", bad);
+		}
 	}
 }
