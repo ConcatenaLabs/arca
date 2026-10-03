@@ -209,12 +209,24 @@ impl Store {
 		Ok(())
 	}
 
-	/// The next index of on-chain `chain`, taken.
+	/// The next index of on-chain `chain`, taken, in one statement: two
+	/// processes on one store never take the same index.
 	pub fn take_index(&self, chain: u32) -> Result<u32, Error> {
 		let key = format!("onchain_next_{}", chain);
-		let next: u32 = self.meta(&key)?.map(|v| v.parse().unwrap_or(0)).unwrap_or(0);
-		self.set_meta(&key, &(next + 1).to_string())?;
-		Ok(next)
+		let next: i64 = self.conn.query_row(
+			"INSERT INTO meta (key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+			 RETURNING CAST(value AS INTEGER) - 1",
+			params![key], |r| r.get(0)).map_err(db)?;
+		u32::try_from(next).map_err(|_| Error::Store(format!("on-chain index {} out of range", next)))
+	}
+
+	/// Moves the next index of on-chain `chain` to at least `next`: past an
+	/// index found in use on the chain, which the store never handed out.
+	pub fn bump_index(&self, chain: u32, next: u32) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key)
+			DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?2 AS INTEGER))",
+			params![format!("onchain_next_{}", chain), next.to_string()]).map_err(db)?;
+		Ok(())
 	}
 
 	/// How many indices of on-chain `chain` have been taken.
@@ -540,5 +552,38 @@ impl Store {
 				Err(e)
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn two_stores_on_one_file_never_take_one_index() {
+		let dir = std::env::temp_dir().join(format!("arca-store-index-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("arca.sqlite");
+		drop(Store::open(&path).unwrap());
+		let threads: Vec<_> = (0..8).map(|_| {
+			let path = path.clone();
+			std::thread::spawn(move || {
+				let s = Store::open(&path).unwrap();
+				s.conn.busy_timeout(std::time::Duration::from_secs(30)).unwrap();
+				(0..50).map(|_| s.take_index(0).unwrap()).collect::<Vec<_>>()
+			})
+		}).collect();
+		let mut all: Vec<u32> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+		all.sort();
+		let n = all.len();
+		all.dedup();
+		assert_eq!(all.len(), n, "an index was handed out twice");
+		assert_eq!(all, (0..400).collect::<Vec<_>>());
+		let s = Store::open(&path).unwrap();
+		s.bump_index(0, 1000).unwrap();
+		s.bump_index(0, 10).unwrap();
+		assert_eq!(s.take_index(0).unwrap(), 1000);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

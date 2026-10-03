@@ -59,7 +59,7 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 	// --- Create ---
 	let a = Arca::new("A");
 	let b = Arca::new("B");
-	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--node-password", "arca",
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
 		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
 	let ia = a.ok(&create);
 	b.ok(&create);
@@ -211,6 +211,9 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 	let tx = r.rt.client().raw_transaction(&claim).unwrap();
 	assert_eq!(tx.output[0].value.explicit(), Some(400_000), "the whole leaf, the fee from a coin of X");
 	assert_eq!(tx.output[0].asset.explicit().map(|a| a.to_string()), Some(y.clone()));
+	assert_eq!(coin(&a.ok(&["coins"]), &a_y)["state"], "exiting", "the claim is followed until it is final");
+	r.bury().await;
+	a.ok(&["sync"]);
 	assert_eq!(coin(&a.ok(&["coins"]), &a_y)["state"], "exited");
 	a.refused(&["exit", &a_y], "there is nothing of the wallet's to exit");
 
@@ -263,7 +266,7 @@ async fn a_dishonest_published_tree_is_refused_before_anything_is_signed() {
 	let proxy = common::proxy::Proxy::start(&r.url());
 	let node = r.node_url();
 	let c = Arca::new("C");
-	c.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca", "--node-password", "arca",
+	c.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca",
 		"--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
 	let s = script(&c.ok(&["address"]));
 	r.pay_to(s, r.x, 5_000_000);

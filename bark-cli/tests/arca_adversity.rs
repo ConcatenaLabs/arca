@@ -37,7 +37,7 @@ fn script(v: &Value) -> Script {
 }
 
 fn create_args<'a>(server: &'a str, node: &'a str) -> Vec<&'a str> {
-	vec!["create", "--server", server, "--node-url", node, "--node-user", "arca", "--node-password", "arca",
+	vec!["create", "--server", server, "--node-url", node, "--node-user", "arca",
 		"--exit-delay-units", "1", "--min-exit-delay-units", "1"]
 }
 
@@ -267,7 +267,9 @@ async fn a_replacement_round_that_fails_a_check_puts_the_coin_into_exit_at_once(
 	assert!(confirmations(&r, &claim) >= 1);
 	assert_eq!(ctx.output[0].asset.explicit(), Some(x));
 	println!("F2 the wallet's claim {} pays {} of X to its own address, confirmed", claim, ctx.output[0].value.explicit().unwrap());
-	assert_eq!(coin_of(&c, &leaf)["state"], "exited");
+	r.bury().await;
+	c.ok(&["sync"]);
+	assert_eq!(coin_of(&c, &leaf)["state"], "exited", "once its claim is final");
 
 	// The operator's sweep of the batch output, once the notice has run.
 	let branch = record.branch().unwrap();
@@ -343,6 +345,10 @@ async fn exit_and_claim(r: &Running, w: &Arca, leaf: &str, fee_asset: Option<&st
 	r.produce().await;
 	let claim = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
 	assert!(confirmations(r, &claim) >= 1, "the claim confirms");
+	assert_eq!(coin_of(w, leaf)["state"], "exiting", "the claim is followed until it is final");
+	r.bury().await;
+	w.ok(&["sync"]);
+	assert_eq!(coin_of(w, leaf)["state"], "exited", "the claim is final");
 	r.rt.client().raw_transaction(&claim).unwrap()
 }
 
@@ -980,6 +986,60 @@ async fn a_cancelled_acceptance_cannot_complete() {
 	let kept: u64 = bal["arca"][y.to_string()]["operator-confirmed"].as_str().unwrap_or_else(|| panic!("{}", bal)).parse().unwrap();
 	assert!(kept > 2_999_000, "the coin, less its margins, operator-confirmed: {}", bal);
 	assert!(bal["arca"][y.to_string()].get("live").is_none(), "{}", bal);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What the wallet keeps, and what it finds again
+// ---------------------------------------------------------------------------
+
+/// The node's password is never an argument: the wallet reads it once from
+/// the environment and keeps it in a file of its own directory that only its
+/// owner can read, never in its database, which only its owner can read too.
+/// A fresh wallet shows one row, 0 BTC. A wallet restored from the mnemonic
+/// finds on-chain coins past the first window of unused addresses, gap by
+/// gap, and hands out no address it found in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_stay_private_a_fresh_wallet_shows_btc_and_a_restore_finds_its_coins() {
+	use std::os::unix::fs::PermissionsExt;
+	let mut r = Running::start().await;
+	let url = r.url();
+	let node = r.node_url();
+	let x = r.x;
+	let a = Arca::new("F16");
+	let args = create_args(&url, &node);
+	assert!(!args.contains(&"--node-password"), "the password is not an argument");
+	a.ok(&args);
+	let mode = |f: &str| std::fs::metadata(a.dir.join(f)).unwrap().permissions().mode() & 0o777;
+	println!("F16 modes: dir {:o}, mnemonic {:o}, node_password {:o}, arca.sqlite {:o}", mode(""), mode("mnemonic"),
+		mode("node_password"), mode("arca.sqlite"));
+	assert_eq!((mode(""), mode("mnemonic"), mode("node_password"), mode("arca.sqlite")), (0o700, 0o600, 0o600, 0o600));
+	for f in ["arca.sqlite", "arca.sqlite-wal"] {
+		let bytes = std::fs::read(a.dir.join(f)).unwrap_or_default();
+		assert!(!bytes.windows(13).any(|w| w == b"node_password"), "{} holds no node password", f);
+	}
+	let bal = a.ok(&["balance"]);
+	println!("F16 a fresh wallet's balance rows: {}", bal["rows"]);
+	assert_eq!(bal["rows"], json!([{"asset": "BTC", "total": "0", "unit": "sat"}]), "one row, 0 BTC: {}", bal);
+
+	// Coins at receive indices 15 and 30, the second past the first window.
+	let addrs: Vec<Value> = (0..31).map(|_| a.ok(&["address"])).collect();
+	r.pay_to(script(&addrs[15]), x, 700_000);
+	r.pay_to(script(&addrs[30]), x, 300_000);
+	r.produce().await;
+	assert_eq!(a.ok(&["balance"])["sequentia_onchain"][x.to_string()], "1000000");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let b = Arca::new("F16R");
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	b.ok(&args);
+	let bal = b.ok(&["balance"]);
+	println!("F16 the restored wallet's on-chain balance: {}", bal["sequentia_onchain"]);
+	assert_eq!(bal["sequentia_onchain"][x.to_string()], "1000000", "both coins are found: {}", bal);
+	let next = b.ok(&["address"]);
+	assert!(addrs.iter().all(|u| u["address"] != next["address"]), "no address found in use is handed out again: {}", next);
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}

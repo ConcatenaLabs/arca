@@ -351,9 +351,12 @@ impl Wallet {
 		};
 		match self.chain.broadcast(&claim.tx) {
 			Ok(txid) => {
+				// The coin is exited once the claim is final; until then the
+				// wallet follows it, and builds it again should it leave the
+				// chain and the mempool.
 				let txs = self.store.exit(leaf_id)?.expect("set").1;
 				self.store.set_exit(leaf_id, "claimed", &txs, Some(&txid.to_string()))?;
-				self.store.set_coin_state(leaf_id, "exited", &format!("claimed by {}", txid))?;
+				self.store.set_coin_state(leaf_id, "exiting", &format!("claimed by {}; the wallet follows the claim until it is final", txid))?;
 				Ok(json!({"leaf_id": leaf_id, "state": "claimed", "broadcast": steps, "claim": {"txid": txid.to_string(),
 					"vsize": claim.tx.vsize(), "pays": claim.tx.output[0].value.explicit().map(|v| v.to_string()),
 					"to": self.chain.address(&to)?}}))
@@ -442,8 +445,15 @@ impl Wallet {
 			if let Some(i) = prior["claim_index"].as_u64() {
 				let to = self.keys.onchain_script(super::keys::RECEIVE, i as u32)?;
 				if sp.output.iter().any(|o| o.script_pubkey == to) {
-					self.store.set_coin_state(leaf_id, "exited", &format!("claimed by {}", txid))?;
-					return Ok(Some(json!({"leaf_id": leaf_id, "state": "exited", "claim": txid})));
+					// The wallet's own claim: the coin is exited once it is final.
+					let f = self.chain.finality(&sp.txid())?;
+					if f.is_final() {
+						self.store.set_coin_state(leaf_id, "exited", &format!("claimed by {}, final", txid))?;
+						return Ok(Some(json!({"leaf_id": leaf_id, "state": "exited", "claim": txid})));
+					}
+					self.store.set_coin_state(leaf_id, "exiting", &format!("claimed by {}, which is {}; the wallet follows the claim until \
+						it is final", txid, f.word()))?;
+					return Ok(Some(json!({"leaf_id": leaf_id, "state": "claimed", "claim": {"txid": txid, "finality": f.word()}})));
 				}
 			}
 			return Err(Error::Refused(format!("coin {} was spent on the chain by {}, which is none of the wallet's and no spend it signed",
