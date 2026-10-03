@@ -484,13 +484,21 @@ async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_
 	println!("F7 the wallet's watch of its forfeit: {}", done);
 	assert!(done["state"] == "claimed" || done["state"] == "claiming", "the claim is read from the chain: {}", done);
 	let leaf = done["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	r.bury().await;
-	let s = c.ok(&["sync"]);
-	if done["state"] == "claiming" {
-		let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[0].as_str()).cloned()
-			.unwrap_or_else(|| panic!("the claim is followed until final: {}", s));
-		assert_eq!(f["state"], "claimed", "{}", f);
+	// Followed until the claim is final: a block for it, its anchor buried,
+	// as many times as that takes.
+	let mut state = done["state"].clone();
+	for _ in 0..10 {
+		if state == "claimed" {
+			break;
+		}
+		r.produce().await;
+		r.bury().await;
+		let s = c.ok(&["sync"]);
+		if let Some(f) = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[0].as_str()) {
+			state = f["state"].clone();
+		}
 	}
+	assert_eq!(state, "claimed", "the claim is followed until final");
 	assert_eq!(coin_of(&c, &leaf)["state"], "live", "the new leaf is the wallet's: {}", coin_of(&c, &leaf));
 	assert_eq!(coin_of(&c, &boards[0])["state"], "spent");
 	for w in [&c, &d] {
@@ -719,6 +727,10 @@ async fn a_receiver_answers_a_stale_board_conversion_at_once() {
 	let mut conv = ks.finish(vec![sig.as_ref().to_vec()]).tx;
 	let fi = conv.input.iter().position(|i| i.previous_output == fee_coin.0).unwrap();
 	sign_p2wpkh(&mut conv, fi, &fee_coin.1, &fee_key);
+	// The operator is gone: the receiver answers on its own, from what it
+	// holds, and the test does not race the operator's watcher, which
+	// answers the same stale exit when it runs.
+	r.server.stop();
 	let conv_id = r.rt.client().send_raw_transaction(&conv).expect("the conversion relays");
 	r.produce().await;
 	println!("F5 the sender's conversion {} ({} vB), confirmations {}", conv_id, conv.vsize(), confirmations(&r, &conv_id));
@@ -730,12 +742,12 @@ async fn a_receiver_answers_a_stale_board_conversion_at_once() {
 	println!("F5 the receiver's re-check: {}", ch);
 	assert_eq!(ch["to"], "exiting", "{}", ch);
 	assert!(ch["why"].as_str().unwrap().contains("spent"), "{}", ch);
-	// The answer: the checkpoint from the converted leaf, then the
-	// reassignment. The operator's watcher answers a stale exit too, and may
-	// have published the checkpoint first; the wallet publishes what is left.
+	// The answer, the receiver's own: the checkpoint from the converted
+	// leaf, then the reassignment.
 	let steps = ch["exit"]["broadcast"].as_array().unwrap_or_else(|| panic!("the answer is published: {}", ch)).clone();
-	assert!(!steps.is_empty() || ch["exit"]["state"] == "waiting", "{}", ch);
+	assert!(!steps.is_empty(), "{}", ch);
 	let checkpoint = spender_of(&r, &OutPoint::new(conv_id, 0)).expect("the converted leaf is answered with its checkpoint");
+	assert_eq!(steps[0]["txid"], checkpoint.txid().to_string(), "the receiver's own checkpoint answers: {}", ch);
 	let CoinRecord::Transfer(t) = record_of(&b, &coin) else { panic!("a coin of a transfer") };
 	assert_eq!(checkpoint.output[0].value.explicit(), Some(t.inputs[0].checkpoint_value), "the checkpoint the receiver holds: {}", ch);
 	println!("F5 the converted leaf answered by checkpoint {}; the receiver published {} step(s)", checkpoint.txid(), steps.len());
@@ -1542,6 +1554,167 @@ async fn a_receivers_refresh_leaves_the_senders_change_live_until_the_boards_exp
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The signer's record, witnessed by the wallet
+// ---------------------------------------------------------------------------
+
+/// D48. Every `info` and every published tree carries the signer's record's
+/// latest entry and running hash, and the wallet keeps each one it is shown.
+/// A pays B, and B refreshes the coin: the round's published tree carries
+/// the record's head when the round was built. Then the operator's database
+/// and record are copied (a backup), A pays B again, which A's wallet sees
+/// as a later entry; both are rolled back to the copy, and the server starts
+/// on them, since the database knows nothing the record lacks and the chain
+/// shows nothing new of the operator's. A's wallet refuses to go on, saying
+/// why: the record now ends below an entry it showed. An operator showing
+/// another hash at an entry the wallet has seen is refused the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_and_database_rolled_back_together_are_refused_by_a_wallet_that_saw_them() {
+	use server::server::Server;
+	let mut r = Running::start().await;
+	let addr = r.server.addr;
+	let x = r.x;
+	let proxy = Proxy::start(&r.url());
+	let a = Arca::new("D48A");
+	let b = Arca::new("D48B");
+	boarded(&mut r, &a, &proxy.url.clone(), &[(x, 4_000_000)]).await;
+	b.ok(&create_args(&r.url(), &r.node_url()));
+	let first = a.ok(&["info"])["server_info"]["signer_record"].clone();
+	println!("D48 the operator's record at first: {}", first);
+	assert_eq!(first["entry"], 0);
+
+	// A pays B (entries 1 and 2), and B refreshes the coin: the round's tree
+	// carries the record's head when it was built.
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	b.ok(&["mailbox"]);
+	b.ok(&["participate"]);
+	let round = final_round(&r).await;
+	assert_eq!(b.ok(&["sync"])["participations"][0]["state"], "released");
+	let tree: Value = serde_json::from_str(minreq::post(format!("{}/v1/tree", r.url())).with_header("Content-Type", "application/json")
+		.with_body(json!({"txid": round.txid().to_string(), "vout": 0}).to_string()).send().unwrap().as_str().unwrap()).unwrap();
+	println!("D48 the round's published tree carries the record at {}", tree["signer_record"]);
+	assert_eq!(tree["signer_record"]["entry"], 2, "the latest entry when the round was built");
+
+	// The operator's backup: server and signer stopped, database and record
+	// copied.
+	let (admin_url, db) = {
+		let url = std::env::var("ARCA_TEST_POSTGRES").unwrap();
+		let db = r.config.database.rsplit_once('/').unwrap().1.to_string();
+		(url, db)
+	};
+	let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let disconnect = |name: String| {
+		let admin = &admin;
+		async move {
+			admin.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&name])
+				.await.unwrap();
+		}
+	};
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let config = |r: &Running| {
+		let mut c = r.config.clone();
+		c.listen = addr.to_string();
+		c
+	};
+	r.server.stop();
+	r.signer.halt();
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	disconnect(db.clone()).await;
+	admin.batch_execute(&format!("CREATE DATABASE {}_backup TEMPLATE {}", db, db)).await.unwrap();
+	let record_backup = std::fs::read(r.signer.record()).unwrap();
+	let backed_up = String::from_utf8_lossy(&record_backup).lines().count() - 1;
+	r.signer.resume(genesis);
+	r.server = Server::start(&config(&r)).await.unwrap();
+	r.synced().await;
+
+	// A pays B again, which A's wallet is shown.
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	let seen = a.ok(&["info"])["server_info"]["signer_record"].clone();
+	println!("D48 the backup holds {} entries; A's wallet after its second payment is shown the record at {}", backed_up, seen);
+	assert_eq!(seen["entry"].as_u64(), Some(backed_up as u64 + 2));
+
+	// Both rolled back to the copy; the server starts on them.
+	r.server.stop();
+	r.signer.halt();
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	disconnect(db.clone()).await;
+	admin.batch_execute(&format!("DROP DATABASE {}", db)).await.unwrap();
+	disconnect(format!("{}_backup", db)).await;
+	admin.batch_execute(&format!("CREATE DATABASE {} TEMPLATE {}_backup", db, db)).await.unwrap();
+	admin.batch_execute(&format!("DROP DATABASE {}_backup", db)).await.unwrap();
+	std::fs::write(r.signer.record(), &record_backup).unwrap();
+	r.signer.resume(genesis);
+	r.server = Server::start(&config(&r)).await.expect("the server starts on a database and record rolled back together");
+	r.synced().await;
+	let info: Value = serde_json::from_str(minreq::get(format!("{}/v1/info", r.url())).send().unwrap().as_str().unwrap()).unwrap();
+	println!("D48 database and record rolled back together; the server started on them, its record at {}", info["signer_record"]);
+	assert_eq!(info["signer_record"]["entry"].as_u64(), Some(backed_up as u64));
+
+	// A's wallet refuses to go on, with the reason.
+	let why = a.refused(&["send", &req, "--amount", "100000", "--asset", &x.to_string()], "rolled back together");
+	println!("D48 A's wallet: {}", why);
+	assert!(why.contains(&format!("ending at entry {}", backed_up)) && why.contains(&format!("showed entry {}", backed_up + 2)), "{}", why);
+	let info = a.ok(&["info"]);
+	assert!(info["server_info"]["unreachable"].as_str().unwrap_or("").contains("rolled back together"), "{}", info);
+	assert!(a.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["what"] == "the operator's signer's record"));
+
+	// Another hash at an entry the wallet has seen: refused as well.
+	let c2 = Arca::new("D48C");
+	c2.ok(&create_args(&proxy.url, &r.node_url()));
+	c2.ok(&["info"]);
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["signer_record"]["hash"] = json!("ab".repeat(32));
+		}
+		None
+	})));
+	let shown = c2.ok(&["info"]);
+	println!("D48 another hash at an entry it saw: {}", shown["server_info"]);
+	assert!(shown["server_info"]["unreachable"].as_str().unwrap_or("").contains("replaced or rolled back"), "{}", shown);
+	proxy.rewrite(None);
+	for w in [&a, &b, &c2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7c's F8: the forfeit's margin is bounded from the floor the operator
+/// publishes, as a transfer's margins are, whatever the wallet's own node
+/// makes of the asset. A wallet whose node values X five times higher than
+/// the operator's (its floor in X atoms five times lower) completes its
+/// refresh; a bound from its own node would have refused the forfeit.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_forfeit_margin_is_bounded_from_the_operators_floor() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let url = r.url();
+	let node_proxy = Proxy::start(&r.node_url().trim_end_matches('/'));
+	let w = Arca::new("F8M");
+	w.ok(&["create", "--server", &url, "--node-url", &node_proxy.url, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	let s = script(&w.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	let board = w.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	w.ok(&["sync"]);
+	assert_eq!(coin_of(&w, &board)["state"], "live");
+	w.ok(&["participate"]);
+	final_round(&r).await;
+	// From here the wallet's node values X five times higher.
+	node_proxy.rewrite(Some(rates_rewrite(x, Some(5.0), None)));
+	let s = w.ok(&["sync"]);
+	println!("F8 the refresh with the wallet's node valuing X five times higher: {}", s["participations"][0]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	assert_eq!(coin_of(&w, &board)["state"], "spent");
+	let _ = std::fs::remove_dir_all(&w.dir);
 }
 
 // ---------------------------------------------------------------------------

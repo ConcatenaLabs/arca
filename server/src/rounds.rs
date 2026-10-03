@@ -170,6 +170,10 @@ pub struct PublishedTree {
 	pub connector_vout: u32,
 	pub params: TreeParams,
 	pub leaves: Vec<LeafSpec>,
+	/// The latest entry of the signer's record, and its running hash, when
+	/// the round was built: a witness of the record every wallet reading the
+	/// tree keeps.
+	pub signer_head: Option<(u64, [u8; 32])>,
 }
 
 /// One leaf the round builds: the participation, the output, the spec.
@@ -644,6 +648,7 @@ impl Rounds {
 			batches: new_batches,
 			offboards: new_offboards,
 			participations: chosen.iter().map(|r| (r.id, r.attempt)).collect(),
+			signer_head: self.store.signer_head().await?,
 		};
 		let round_id = match self.store.insert_round(&new).await {
 			Ok(id) => id,
@@ -797,8 +802,10 @@ impl Rounds {
 				unlock_hash: l.unlock_hash,
 			});
 		}
+		let signer_head = self.store.round_signer_head(b.round_id).await?;
 		Ok(Some(PublishedTree {
 			round_txid: *txid, batch_vout: b.vout, token_vout: b.token_vout, connector_vout: round.connector_vout, params, leaves: specs,
+			signer_head,
 		}))
 	}
 

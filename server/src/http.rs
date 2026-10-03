@@ -78,6 +78,8 @@ pub struct App {
 	/// The floors `info` last published, and when: asked of the node at most
 	/// once every [`FLOORS_FOR`].
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
+	/// The signer's record head `info` last published, and when.
+	pub record_head: tokio::sync::Mutex<Option<(Instant, (u64, [u8; 32]))>>,
 }
 
 /// How long `info` publishes the floors it read from the node before it reads
@@ -430,8 +432,39 @@ fn board_status(s: &BoardStatus) -> api::BoardStatus {
 	}
 }
 
+/// How long `info` publishes the signer's record head it read before it asks
+/// again.
+pub const RECORD_HEAD_FOR: Duration = Duration::from_secs(2);
+
+/// The signer's record's latest entry and running hash, as `info` publishes
+/// it: asked of the signer at most once every [`RECORD_HEAD_FOR`], and again
+/// at once when the database has been given a later entry since; `None`
+/// while the signer does not answer (the database's latest may lag the
+/// record by an entry after a crash, and would read as a rollback).
+async fn record_head(app: &App) -> Option<api::RecordHead> {
+	let known = app.store.signer_head().await.ok().flatten().map(|h| h.0).unwrap_or(0);
+	let mut cached = app.record_head.lock().await;
+	if let Some((at, h)) = cached.as_ref() {
+		if at.elapsed() < RECORD_HEAD_FOR && known <= h.0 {
+			return Some(api::RecordHead { entry: h.0, hash: hex(&h.1) });
+		}
+	}
+	let head = match app.cosigner.signer().head().await {
+		Ok(h) => Some(h),
+		Err(e) => {
+			log::warn!("info: the signer's record head: {}", e);
+			None
+		},
+	};
+	if let Some(h) = head {
+		*cached = Some((Instant::now(), h));
+	}
+	head.map(|(entry, h)| api::RecordHead { entry, hash: hex(&h) })
+}
+
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let floors = floors(&app).await;
+	let signer_record = record_head(&app).await;
 	let p = &app.params;
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
@@ -466,6 +499,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			exit_deadline_seconds: arca_covenant::WalletPolicy::EXIT_DEADLINE,
 			refresh_until_seconds: Params::ROUND_HORIZON,
 		},
+		signer_record,
 		max_request_bytes: app.max_request as u64,
 	})
 }
@@ -667,6 +701,7 @@ async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) 
 			}),
 		},
 		min_leaf: t.params.min_leaf.to_string(),
+		signer_record: t.signer_head.map(|(entry, h)| api::RecordHead { entry, hash: hex(&h) }),
 		leaves: t.leaves.iter().map(|l| api::TreeLeaf {
 			template: l.template.to_string(),
 			owner: hex(&l.owner.serialize()),

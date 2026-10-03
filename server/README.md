@@ -26,7 +26,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V6__signer_head.sql`](schema/V6__signer_head.sql),
 [`schema/V7__signer_messages.sql`](schema/V7__signer_messages.sql),
 [`schema/V8__stateless_challenges.sql`](schema/V8__stateless_challenges.sql),
-[`schema/V9__wanted_keys_freed.sql`](schema/V9__wanted_keys_freed.sql)). `Store::connect` builds it
+[`schema/V9__wanted_keys_freed.sql`](schema/V9__wanted_keys_freed.sql),
+[`schema/V10__round_signer_head.sql`](schema/V10__round_signer_head.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -104,6 +105,15 @@ to an older state:
   given, so a record cut back or replaced by an older copy signs nothing
   (`record_behind`) and the server does not start against it. A record that
   is lost cannot be replaced by a new one: the operator stops co-signing.
+- A record and a database rolled back together (a snapshot of the whole
+  machine restored) pass every check the server makes of itself, so the
+  record has witnesses outside it: `info` carries its latest entry and
+  running hash (`signer_record`, asked of the signer, and again whenever
+  the database has been given a later entry), and every published tree the
+  entry the database knew when its round was built. A wallet keeps every
+  entry it is shown, and refuses an operator that later shows a latest
+  entry below one it showed, or another hash at an entry it has seen: every
+  wallet that was online in between sees the rollback.
 - The server records every message it asks the signer to sign before it
   asks, in the same transaction as what the signature is for (a transfer,
   a forfeit), and refuses to start on a database that does not know an
@@ -383,9 +393,10 @@ it gave up are given back.
 Every batch is published by `tree`: the round, the batch output, its token's
 output and the round's connector output, the asset, the schedule in
 `arca-covenant`'s canonical encoding, burn-only or not, the radix, the
-reserve rule and the smallest leaf, and every leaf as the builder took it
+reserve rule and the smallest leaf, every leaf as the builder took it
 (template, owner key and nonce, operator nonce, exit delay, value, unlock
-hash). From that alone a wallet, an explorer or any mirror rebuilds every
+hash), and the latest entry of the signer's record, with its running hash,
+when the round was built (`signer_record`). From that alone a wallet, an explorer or any mirror rebuilds every
 script of the tree with `Tree::build` and checks the leaf it cares about
 against the round transaction with `LeafRecord::validate`.
 
@@ -615,7 +626,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry and running hash (`signer_record`, absent while the signer does not answer), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -623,7 +634,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, and while it is pending why the last round did not take it (`waiting`) |
-| `POST tree` | The published tree of a batch, by its round's txid and output |
+| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |

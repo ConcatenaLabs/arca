@@ -392,6 +392,7 @@ impl Wallet {
 		}
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
+		let info = self.server_info()?;
 		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
 			.map_err(|_| Error::Refused("the status names no unlock hash for the participation".into()))?;
@@ -421,6 +422,7 @@ impl Wallet {
 			if tree["round_txid"].as_str() != Some(&round_txid.to_string()) {
 				return Err(Error::Refused("the server published the tree of another round".into()));
 			}
+			self.witness_record(&tree["signer_record"], false)?;
 			let tree = rebuild(&tree)?;
 			let index = o["leaf_index"].as_u64().ok_or_else(|| Error::Parse("no leaf_index".into()))? as usize;
 			if index >= tree.records().len() {
@@ -476,9 +478,12 @@ impl Wallet {
 			let new = &news.iter().find(|(_, r, _)| r.asset == old.asset)
 				.ok_or_else(|| Error::Refused(format!("the participation has no new leaf in the asset of coin {}", l)))?.0;
 			// The margin is the fee of a forfeit someone broadcasts: a few
-			// times the floor, or one atom where the node does not take the
-			// asset for fees. More is value handed to the broadcaster.
-			let ceiling = match self.chain.floor_per_kvb(old.asset)? {
+			// times the floor, or one atom where the operator's node does not
+			// take the asset for fees, priced from the floor the operator
+			// publishes, as a transfer's margins are, whatever the wallet's
+			// own node makes of the asset. More is value handed to the
+			// broadcaster.
+			let ceiling = match super::pay::Margins::of(&info, old.asset)?.floor {
 				Some(f) => margin_for(1000, f, MARGIN_MULTIPLE),
 				None => 1,
 			};

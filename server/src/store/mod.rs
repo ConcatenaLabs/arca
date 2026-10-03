@@ -4,8 +4,8 @@
 //! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`,
 //! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
 //! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
-//! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`),
-//! built from
+//! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
+//! `schema/V10__round_signer_head.sql`), built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
@@ -70,6 +70,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(7, include_str!("../../schema/V7__signer_messages.sql")),
 	(8, include_str!("../../schema/V8__stateless_challenges.sql")),
 	(9, include_str!("../../schema/V9__wanted_keys_freed.sql")),
+	(10, include_str!("../../schema/V10__round_signer_head.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

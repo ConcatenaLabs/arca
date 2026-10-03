@@ -17,6 +17,9 @@
 //!   unlock hash, the refund delay and the margin, so the wallet can find the
 //!   forfeit's output on the chain, read a preimage from its claim, or take
 //!   the refund, whatever the server says;
+//! - **every entry of the operator's signer's record it was shown**, by
+//!   number, with its running hash: a witness of the record outside the
+//!   server, which the wallet checks every later showing against;
 //! - the transactions its coins rest on (rounds, boards), its participations
 //!   with the new leaves it validated for them, its board registrations and
 //!   transfer requests, each kept until the server answers it, its
@@ -108,6 +111,7 @@ CREATE TABLE IF NOT EXISTS forfeit (
 	PRIMARY KEY (leaf_id, round)
 );
 CREATE TABLE IF NOT EXISTS refusal (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, what TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS signer_seen (entry INTEGER PRIMARY KEY, hash TEXT NOT NULL, at INTEGER NOT NULL);
 ";
 
 /// A coin as the store holds it.
@@ -569,6 +573,27 @@ impl Store {
 		self.conn.execute("INSERT INTO exit (leaf_id, state, txs, claim) VALUES (?1, ?2, ?3, ?4)
 			ON CONFLICT(leaf_id) DO UPDATE SET state = ?2, txs = ?3, claim = COALESCE(?4, claim)",
 			params![leaf_id, state, txs, claim]).map_err(db)?;
+		Ok(())
+	}
+
+	// --- the operator's signer's record ---
+
+	/// The running hash the operator showed for entry `entry` of its
+	/// signer's record, if it showed one.
+	pub fn seen_entry(&self, entry: u64) -> Result<Option<String>, Error> {
+		self.conn.query_row("SELECT hash FROM signer_seen WHERE entry = ?1", params![entry as i64], |r| r.get(0)).optional().map_err(db)
+	}
+
+	/// The latest entry of the signer's record the operator showed, and its
+	/// running hash.
+	pub fn seen_latest(&self) -> Result<Option<(u64, String)>, Error> {
+		self.conn.query_row("SELECT entry, hash FROM signer_seen ORDER BY entry DESC LIMIT 1", [], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+			.optional().map_err(db)
+	}
+
+	pub fn put_seen(&self, entry: u64, hash: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT OR IGNORE INTO signer_seen (entry, hash, at) VALUES (?1, ?2, ?3)", params![entry as i64, hash, now()])
+			.map_err(db)?;
 		Ok(())
 	}
 

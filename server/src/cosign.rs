@@ -617,6 +617,11 @@ impl Cosigner {
 		Ok(())
 	}
 
+	/// The signer the cosigner asks.
+	pub fn signer(&self) -> &SignerClient {
+		&self.signer
+	}
+
 	pub fn finality(&self) -> &Arc<FinalityService> {
 		&self.finality
 	}
