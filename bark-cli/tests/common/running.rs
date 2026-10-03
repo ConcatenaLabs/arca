@@ -11,7 +11,7 @@ use elements::{AssetId, Transaction, Txid};
 
 use sequentia_ext::regtest::Regtest;
 use sequentia_ext::{explicit_txout, AssetAmount};
-use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server};
+use server::server::{AssetSection, Config, FinalitySection, NodeConfig, Server, WatcherSection};
 use server::store::RoundState;
 
 use super::db::TestDb;
@@ -78,6 +78,10 @@ impl Running {
 			],
 			fee_assets: None,
 			fees: Default::default(),
+			// The scenarios take every step a wallet takes, and the server's
+			// own on-chain work would change the coins they hold; the
+			// watcher has tests of its own in the server.
+			watcher: WatcherSection { enabled: false, ..Default::default() },
 		};
 		let server = Server::start(&config).await.unwrap();
 		let mut r = Running { server, config, rt, purse, x, y, signer, db };
