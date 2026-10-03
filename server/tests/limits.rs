@@ -1,9 +1,11 @@
 //! What the calls anyone may make without proving a key leave behind: review
 //! R7's load (P3, P3b) turned around. A board is registered only once the
 //! node takes its transaction, so junk boards leave no row and nothing in
-//! the nursery; operator nonces and challenges are handed out at a bounded
-//! rate and deleted once expired; and a board the node took that never
-//! confirms is dropped after a set time.
+//! the nursery; operator nonces are handed out at a bounded rate and deleted
+//! once expired; a challenge is checked, never stored, and leaves no row;
+//! and a board the node took that never confirms is dropped after a set
+//! time. A few sources asking as fast as they can leave an honest caller
+//! every challenge and every nonce it asks for.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -27,15 +29,15 @@ const PER_SECOND: u32 = 20;
 const BURST: u32 = 60;
 const TTL: u64 = 3;
 
-/// The rows the unauthenticated calls could leave: nonces, challenges,
-/// leaves, boards, and the nursery's transactions.
-async fn rows(r: &Running) -> [i64; 5] {
+/// The rows the unauthenticated calls could leave: nonces, leaves, boards,
+/// and the nursery's transactions. A challenge has no table.
+async fn rows(r: &Running) -> [i64; 4] {
 	let (client, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
 	tokio::spawn(conn);
 	let row = client.query_one(
-		"SELECT (SELECT count(*) FROM operator_nonce), (SELECT count(*) FROM auth_challenge), (SELECT count(*) FROM leaf),
-		        (SELECT count(*) FROM board), (SELECT count(*) FROM nursery_tx)", &[]).await.unwrap();
-	[row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)]
+		"SELECT (SELECT count(*) FROM operator_nonce), (SELECT count(*) FROM leaf), (SELECT count(*) FROM board),
+		        (SELECT count(*) FROM nursery_tx)", &[]).await.unwrap();
+	[row.get(0), row.get(1), row.get(2), row.get(3)]
 }
 
 /// The mean time of `n` nursery passes.
@@ -75,7 +77,7 @@ async fn the_reviewers_load_leaves_no_rows() {
 	r.synced().await;
 	let before = nursery_pass(&r, 5).await;
 	let start = rows(&r).await;
-	println!("before the load: nursery pass {:?}; rows nonce|challenge|leaf|board|nursery = {:?}", before, start);
+	println!("before the load: nursery pass {:?}; rows nonce|leaf|board|nursery = {:?}", before, start);
 
 	// P3: 50 junk boards, each with a nonce of the operator's.
 	for i in 0..50u32 {
@@ -107,7 +109,8 @@ async fn the_reviewers_load_leaves_no_rows() {
 	}
 	println!("500 more junk boards in {:?}, every one refused: {:?}", t.elapsed(), refused);
 
-	// 1,000 nonces and 1,000 challenges, as fast as they go.
+	// 1,000 nonces and 1,000 challenges, as fast as they go: the nonces
+	// within the rate, every challenge handed out, none stored.
 	let t = Instant::now();
 	let (mut nonces, mut challenges) = (0u32, 0u32);
 	for _ in 0..1000 {
@@ -117,18 +120,16 @@ async fn the_reviewers_load_leaves_no_rows() {
 			_ => assert_eq!((a.status, a.refusal().0.as_str()), (429, "rate_limited"), "{}", a.json),
 		}
 	}
+	let spent = t.elapsed();
 	for _ in 0..1000 {
 		let a = r.http.post("challenge", &json!({}));
-		match a.status {
-			200 => challenges += 1,
-			_ => assert_eq!((a.status, a.refusal().0.as_str()), (429, "rate_limited"), "{}", a.json),
-		}
+		assert_eq!(a.status, 200, "{}", a.json);
+		challenges += 1;
 	}
-	let spent = t.elapsed();
 	let bound = BURST + (spent.as_secs_f64() * f64::from(PER_SECOND)).ceil() as u32 + 1;
-	println!("1,000 nonce and 1,000 challenge requests in {:?}: {} nonces and {} challenges handed out (bound {})",
-		spent, nonces, challenges, bound);
-	assert!(nonces <= bound && challenges <= bound, "the rate holds");
+	println!("1,000 nonce requests in {:?}: {} handed out (bound {}); 1,000 challenge requests: {} handed out",
+		spent, nonces, bound, challenges);
+	assert!(nonces <= bound, "the rate holds");
 
 	for _ in 0..3 {
 		r.produce().await;
@@ -137,17 +138,17 @@ async fn the_reviewers_load_leaves_no_rows() {
 		r.server.boards.pass().await.unwrap();
 	}
 	let after_load = rows(&r).await;
-	println!("after the load: rows nonce|challenge|leaf|board|nursery = {:?}", after_load);
+	println!("after the load: rows nonce|leaf|board|nursery = {:?}", after_load);
 	assert_eq!(after_load[2..], start[2..], "no leaf, board or nursery row");
 
-	// Once expired, the nonces and challenges are deleted.
+	// Once expired, the nonces are deleted.
 	tokio::time::sleep(Duration::from_secs(TTL + 1)).await;
-	let (n, c) = r.server.store.delete_expired(Duration::from_secs(TTL)).await.unwrap();
+	let n = r.server.store.delete_expired(Duration::from_secs(TTL)).await.unwrap();
 	let end = rows(&r).await;
 	let after = nursery_pass(&r, 5).await;
-	println!("deleted {} nonces and {} challenges; rows nonce|challenge|leaf|board|nursery = {:?}; nursery pass {:?} (before the load {:?})",
-		n, c, end, after, before);
-	assert_eq!(end, [0, 0, start[2], start[3], start[4]], "the load leaves no row");
+	println!("deleted {} nonces; rows nonce|leaf|board|nursery = {:?}; nursery pass {:?} (before the load {:?})",
+		n, end, after, before);
+	assert_eq!(end, [0, start[1], start[2], start[3]], "the load leaves no row");
 	assert!(after < before * 5 + Duration::from_millis(20), "the nursery pass is not slower: {:?} against {:?}", after, before);
 }
 
@@ -194,12 +195,13 @@ async fn a_board_that_never_confirms_is_dropped() {
 	assert_eq!(r.http.board_status(&record.leaf_id()).ok()["state"], "lost");
 }
 
-/// Review R7b's probe P6 turned around: the nonces and challenges anyone may
-/// ask for are bounded for each source as well as overall, so a stranger
-/// asking as fast as it can leaves an honest wallet its share. The server
-/// sits behind a proxy on this machine, which names each request's source in
-/// `X-Forwarded-For`; a request that does not come from a trusted proxy is
-/// counted against the address that connected, whatever it claims.
+/// Review R7b's probe P6 turned around: the nonces anyone may ask for are
+/// bounded for each source, so a stranger asking as fast as it can leaves an
+/// honest wallet its share; a challenge, stored nowhere, is handed to every
+/// caller. The server sits behind a proxy on this machine, which names each
+/// request's source in `X-Forwarded-For`; a request that does not come from a
+/// trusted proxy is counted against the address that connected, whatever it
+/// claims.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_caller_cannot_use_up_what_every_caller_needs() {
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -212,7 +214,7 @@ async fn one_caller_cannot_use_up_what_every_caller_needs() {
 
 	/// A stranger asking about 100 times a second for each call, from
 	/// `from` (a function of the request's number), for as long as `body`
-	/// runs; how many it got.
+	/// runs; how many nonces it got.
 	async fn hammered<F, B, T>(base: &str, from: F, body: B) -> (T, usize, usize, u64)
 	where
 		F: Fn(usize) -> String + Send + Sync + 'static,
@@ -228,7 +230,7 @@ async fn one_caller_cannot_use_up_what_every_caller_needs() {
 			hammers.push(std::thread::spawn(move || {
 				while !stop.load(Ordering::SeqCst) {
 					let n = sent.fetch_add(1, Ordering::SeqCst);
-					if ask(&base, call, &from(n)) == 200 {
+					if ask(&base, call, &from(n)) == 200 && call == "operator_nonce" {
 						given.fetch_add(1, Ordering::SeqCst);
 					}
 					std::thread::sleep(Duration::from_millis(10));
@@ -243,8 +245,8 @@ async fn one_caller_cannot_use_up_what_every_caller_needs() {
 		(out, sent.load(Ordering::SeqCst), given.load(Ordering::SeqCst), began.elapsed().as_secs() + 1)
 	}
 
-	// The defaults: 5 a second overall with bursts of 50; 1 a second for
-	// each source, with bursts of 10. The proxy is on this machine.
+	// The defaults: nonces at 1 a second for each source, with bursts of 10,
+	// within a high bound overall. The proxy is on this machine.
 	let r = Running::start_with(|c, _| c.limits = LimitsSection::default()).await;
 	let base = r.http.base.clone();
 	let ((ok, limited), sent, given, secs) = hammered(&base, |_| "203.0.113.7".to_string(), async {
@@ -263,11 +265,11 @@ async fn one_caller_cannot_use_up_what_every_caller_needs() {
 		}
 		(ok, limited)
 	}).await;
-	println!("P6 a stranger asking about 100/s for each through the proxy (sent {}, given {}); an honest wallet asking once a \
+	println!("P6 a stranger asking about 100/s for each through the proxy (sent {}, nonces given {}); an honest wallet asking once a \
 		second for 20 s: challenges {} given, {} rate_limited; nonces {} given, {} rate_limited", sent, given, ok.0, limited.0, ok.1, limited.1);
 	assert_eq!((ok, limited), ((20, 20), (0, 0)), "the honest wallet gets every one it asks for");
-	// Its own burst of 10 and one a second, for each of the two calls.
-	assert!(given as u64 <= 2 * (10 + secs), "the stranger gets its own share and no more: {} of {} in {} s", given, sent, secs);
+	// Its own burst of 10 and one a second.
+	assert!(given as u64 <= 10 + secs, "the stranger gets its own share of nonces and no more: {} of {} in {} s", given, sent, secs);
 
 	// No proxy trusted: a caller that names a new source in every request is
 	// still one source, the address that connected.
@@ -278,6 +280,69 @@ async fn one_caller_cannot_use_up_what_every_caller_needs() {
 	let (_, sent, given, secs) = hammered(&base, |n| format!("198.51.{}.{}", (n / 250) % 250, n % 250), async {
 		tokio::time::sleep(Duration::from_secs(5)).await;
 	}).await;
-	println!("P6 a caller naming a new source in every request, from no trusted proxy, for 5 s: given {} of {}", given, sent);
-	assert!(given as u64 <= 2 * (10 + secs), "counted against the address that connected: {} of {} in {} s", given, sent, secs);
+	println!("P6 a caller naming a new source in every request, from no trusted proxy, for 5 s: nonces given {} of {}", given, sent);
+	assert!(given as u64 <= 10 + secs, "counted against the address that connected: {} of {} in {} s", given, sent, secs);
+}
+
+/// Review R7c's probe L1 turned around. Six sources, each asking for a
+/// challenge and a nonce every 10 ms through the proxy, each held to its own
+/// rate: with a challenge checked rather than stored there is no budget they
+/// share, and the overall bound on nonces lies far above six sources' rates.
+/// An honest caller from a seventh source, asking once a second for 30 s, gets
+/// every challenge and every nonce it asks for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_few_sources_leave_an_honest_caller_served() {
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use std::sync::Arc;
+
+	fn ask(base: &str, call: &str, from: &str) -> i32 {
+		minreq::post(format!("{}/v1/{}", base, call)).with_header("Content-Type", "application/json")
+			.with_header("X-Forwarded-For", from).with_body("{}").with_timeout(5).send().map(|r| r.status_code).unwrap_or(0)
+	}
+
+	let r = Running::start_with(|c, _| c.limits = LimitsSection::default()).await;
+	let base = r.http.base.clone();
+	let d = LimitsSection::default();
+	println!("defaults: nonces overall {}/s burst {}; per source {}/s burst {}; trusted proxies {:?}",
+		d.issue_per_second, d.issue_burst, d.source_per_second, d.source_burst, d.trusted_proxies);
+	let sources: Vec<String> = (1..=6).map(|i| format!("203.0.113.{}", i)).collect();
+	let stop = Arc::new(AtomicBool::new(false));
+	let (given, sent) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+	let mut hammers = vec![];
+	for s in &sources {
+		for call in ["challenge", "operator_nonce"] {
+			let (base, stop, given, sent, s) = (base.clone(), stop.clone(), given.clone(), sent.clone(), s.clone());
+			hammers.push(std::thread::spawn(move || {
+				while !stop.load(Ordering::SeqCst) {
+					sent.fetch_add(1, Ordering::SeqCst);
+					if ask(&base, call, &s) == 200 {
+						given.fetch_add(1, Ordering::SeqCst);
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+			}));
+		}
+	}
+	// Every source's own burst used up first.
+	tokio::time::sleep(Duration::from_secs(15)).await;
+	let t = Instant::now();
+	let (mut ok, mut limited) = ([0u32; 2], [0u32; 2]);
+	for _ in 0..30 {
+		for (k, call) in ["challenge", "operator_nonce"].iter().enumerate() {
+			match tokio::task::block_in_place(|| ask(&base, call, "198.51.100.9")) {
+				200 => ok[k] += 1,
+				429 => limited[k] += 1,
+				s => panic!("{} answered {}", call, s),
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(1000)).await;
+	}
+	stop.store(true, Ordering::SeqCst);
+	for h in hammers {
+		h.join().unwrap();
+	}
+	println!("L1 {} sources, each asking each call every 10 ms: {} requests, {} granted; an honest caller from another source, 30 s, \
+		one challenge and one nonce a second: challenges {} given, {} rate_limited; nonces {} given, {} rate_limited ({:?})",
+		sources.len(), sent.load(Ordering::SeqCst), given.load(Ordering::SeqCst), ok[0], limited[0], ok[1], limited[1], t.elapsed());
+	assert_eq!((ok, limited), ([30, 30], [0, 0]), "the honest caller gets every challenge and every nonce it asks for");
 }

@@ -4,7 +4,7 @@
 mod common;
 
 use common::db::TestDb;
-use server::store::{ChallengeError, LeafKind, LeafState, NewCoin, NewScript, ScriptKind};
+use server::store::{LeafKind, LeafState, NewCoin, NewScript, ScriptKind};
 use server::StoreError;
 
 fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
@@ -29,11 +29,11 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 7);
+	assert_eq!(db.store.schema_version().await.unwrap(), 8);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 7);
+	assert_eq!(again.schema_version().await.unwrap(), 8);
 }
 
 #[tokio::test]
@@ -156,14 +156,17 @@ async fn mailbox_by_cursor() {
 }
 
 #[tokio::test]
-async fn challenge_used_once() {
+async fn a_challenge_is_checked_and_stored_nowhere() {
+	use server::auth::{check_challenge, issue_challenge, ChallengeError};
 	let db = TestDb::new().await;
-	let s = &db.store;
-	let c = s.issue_challenge(std::time::Duration::from_secs(60)).await.unwrap();
-	assert_eq!(s.use_challenge(&c).await.unwrap(), Ok(()));
-	assert_eq!(s.use_challenge(&c).await.unwrap(), Err(ChallengeError::Used));
-	assert_eq!(s.use_challenge(&[1; 32]).await.unwrap(), Err(ChallengeError::Unknown));
-	let short = s.issue_challenge(std::time::Duration::from_millis(1)).await.unwrap();
-	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	assert_eq!(s.use_challenge(&short).await.unwrap(), Err(ChallengeError::Expired));
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let tables: i64 = client.query_one("SELECT count(*) FROM information_schema.tables WHERE table_name = 'auth_challenge'", &[])
+		.await.unwrap().get(0);
+	assert_eq!(tables, 0, "the schema keeps no challenge");
+	let key = [5u8; 32];
+	let c = issue_challenge(&key, 1_800_000_000, [3; 12]);
+	assert_eq!(check_challenge(&key, &c, 1_800_000_060, 120), Ok(()));
+	assert_eq!(check_challenge(&key, &[1; 32], 1_800_000_060, 120), Err(ChallengeError::Unknown));
+	assert_eq!(check_challenge(&key, &c, 1_800_000_121, 120), Err(ChallengeError::Expired));
 }

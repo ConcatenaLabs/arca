@@ -3,7 +3,8 @@
 //! The schema is `schema/V1__arca.sql` and the migrations after it
 //! (`schema/V2__watcher.sql`, `schema/V3__operator_scripts.sql`,
 //! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
-//! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`), built from
+//! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
+//! `schema/V8__stateless_challenges.sql`), built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
@@ -26,7 +27,6 @@ use bb8_postgres::PostgresConnectionManager;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
 
-mod auth;
 mod boards;
 mod chain;
 mod coins;
@@ -38,7 +38,6 @@ mod transfers;
 mod wallet;
 mod watcher;
 
-pub use auth::ChallengeError;
 pub use boards::{BoardRow, BoardState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
@@ -66,6 +65,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(5, include_str!("../../schema/V5__leaf_salt.sql")),
 	(6, include_str!("../../schema/V6__signer_head.sql")),
 	(7, include_str!("../../schema/V7__signer_messages.sql")),
+	(8, include_str!("../../schema/V8__stateless_challenges.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

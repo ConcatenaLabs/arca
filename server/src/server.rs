@@ -91,15 +91,17 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
-	/// Operator nonces handed out per second at most, and the same for
-	/// authentication challenges, each counted on its own.
+	/// Operator nonces handed out per second at most, over every source
+	/// together, and how many at once before that rate holds: a high bound on
+	/// the rows nonces hold (the rate times their lifetime), set far above
+	/// what honest callers ask, so a few sources cannot use it up.
 	#[serde(default = "default_issue_per_second")]
 	pub issue_per_second: u32,
-	/// How many of either may be handed out at once before the rate holds.
 	#[serde(default = "default_issue_burst")]
 	pub issue_burst: u32,
-	/// The same for each source (an IPv4 address, an IPv6 /64), within the
-	/// overall bounds, so one caller cannot use up what every caller needs.
+	/// Operator nonces handed out to each source (an IPv4 address, an IPv6
+	/// /48) per second at most, and how many at once: what keeps one caller
+	/// from using up what every caller needs.
 	#[serde(default = "default_source_per_second")]
 	pub source_per_second: u32,
 	#[serde(default = "default_source_burst")]
@@ -118,7 +120,7 @@ pub struct LimitsSection {
 	/// was registered before it is dropped.
 	#[serde(default = "default_board_unconfirmed")]
 	pub board_unconfirmed_seconds: u64,
-	/// How often expired nonces and challenges are deleted.
+	/// How often expired nonces are deleted.
 	#[serde(default = "default_cleanup_interval")]
 	pub cleanup_interval_seconds: u64,
 }
@@ -136,11 +138,11 @@ impl Default for LimitsSection {
 }
 
 fn default_issue_per_second() -> u32 {
-	5
+	250
 }
 
 fn default_issue_burst() -> u32 {
-	50
+	10_000
 }
 
 fn default_source_per_second() -> u32 {
@@ -363,14 +365,14 @@ pub async fn receive_address(config: &Config) -> Result<(u32, elements::Script, 
 }
 
 /// Deletes, every `every`, the operator nonces no board took within
-/// `nonce_ttl` and the challenges used or expired.
+/// `nonce_ttl`.
 fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		loop {
 			match store.delete_expired(nonce_ttl).await {
-				Ok((0, 0)) => {},
-				Ok((n, c)) => log::info!("deleted {} expired operator nonce(s) and {} used or expired challenge(s)", n, c),
-				Err(e) => log::warn!("deleting expired nonces and challenges: {}", e),
+				Ok(0) => {},
+				Ok(n) => log::info!("deleted {} expired operator nonce(s)", n),
+				Err(e) => log::warn!("deleting expired nonces: {}", e),
 			}
 			tokio::time::sleep(every).await;
 		}
@@ -630,8 +632,11 @@ impl Server {
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
-			challenges: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
-				config.limits.source_burst),
+			challenge_key: {
+				let mut k = [0u8; 32];
+				rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+				k
+			},
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			floors: tokio::sync::Mutex::new(None),
@@ -690,7 +695,9 @@ mod tests {
 		assert_eq!(c.fees.refresh_ppm, 0);
 		assert!(c.watcher.reclaim_early);
 		assert_eq!(c.watcher.max_sweep_inputs, 50);
-		assert_eq!(c.limits.issue_per_second, 5);
+		assert_eq!(c.limits.issue_per_second, 250);
+		assert_eq!(c.limits.issue_per_second, super::LimitsSection::default().issue_per_second, "the example names the defaults");
+		assert_eq!(c.limits.issue_burst, super::LimitsSection::default().issue_burst);
 		assert_eq!(c.limits.nonce_ttl_seconds, 3600);
 	}
 }

@@ -22,7 +22,8 @@ fee_multiple = 2
 # The largest request body read, in bytes.
 max_request_bytes = 65536
 
-# How long an authentication challenge is good for.
+# How long an authentication challenge is good for. A challenge is checked
+# by a key the server draws when it starts, not stored.
 challenge_ttl_seconds = 120
 
 # How often a round is built while participations wait, in seconds. 0 builds
@@ -85,13 +86,16 @@ block_interval_seconds = 60
 
 [limits]
 # The calls anyone may make without proving a key are bounded in what they
-# leave behind. Operator nonces and authentication challenges are each handed
-# out at most this many per second, with bursts of up to issue_burst, and to
-# each source (an IPv4 address, an IPv6 /64) at most source_per_second, with
+# leave behind. An operator nonce, the one that writes a row, is handed to
+# each source (an IPv4 address, an IPv6 /48) at most source_per_second, with
 # bursts of up to source_burst, so that one caller cannot use up what every
-# caller needs; a request past either is refused with 429 rate_limited.
-issue_per_second = 5
-issue_burst = 50
+# caller needs; and over every source together at most issue_per_second,
+# with bursts of up to issue_burst: a high bound on the rows nonces hold (the
+# rate times their lifetime), far above what honest callers ask. A request
+# past either is refused with 429 rate_limited. A challenge writes no row
+# and is not limited.
+issue_per_second = 250
+issue_burst = 10000
 source_per_second = 1
 source_burst = 10
 # The reverse proxies in front of the server: a request from one of these
@@ -107,7 +111,7 @@ nonce_ttl_seconds = 3600
 # credited whose transaction is still in no block this long after it was
 # registered is dropped: marked lost, and no longer broadcast.
 board_unconfirmed_seconds = 21600
-# How often expired nonces and used or expired challenges are deleted.
+# How often expired nonces are deleted.
 cleanup_interval_seconds = 60
 
 [fees]

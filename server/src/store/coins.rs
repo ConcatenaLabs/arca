@@ -281,16 +281,14 @@ impl Store {
 	}
 
 	/// Deletes every operator nonce handed out more than `nonce_ttl` ago and
-	/// never taken, and every authentication challenge used or expired.
-	/// Returns how many of each went.
-	pub async fn delete_expired(&self, nonce_ttl: std::time::Duration) -> Result<(u64, u64), StoreError> {
+	/// never taken. Returns how many went.
+	pub async fn delete_expired(&self, nonce_ttl: std::time::Duration) -> Result<u64, StoreError> {
 		let conn = self.conn().await?;
 		let nonces = conn.execute(
 			"DELETE FROM operator_nonce WHERE used_at IS NULL AND issued_at < now() - make_interval(secs => $1)",
 			&[&nonce_ttl.as_secs_f64()],
 		).await?;
-		let challenges = conn.execute("DELETE FROM auth_challenge WHERE used_at IS NOT NULL OR expires_at <= now()", &[]).await?;
-		Ok((nonces, challenges))
+		Ok(nonces)
 	}
 
 	/// Records `coins` together, or none of them: each takes its operator
