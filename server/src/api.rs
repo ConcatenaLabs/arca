@@ -55,6 +55,10 @@ pub struct Info {
 	pub fees: FeesInfo,
 	pub participations: ParticipationsInfo,
 	pub boards: BoardsInfo,
+	/// The signer's record's latest entry and running hash; absent while the
+	/// signer does not answer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
 	/// The largest request body the server reads.
 	pub max_request_bytes: u64,
 }
@@ -515,6 +519,19 @@ pub struct PublishedTree {
 	pub min_leaf: String,
 	/// Every leaf, in the tree's order.
 	pub leaves: Vec<TreeLeaf>,
+	/// The latest entry of the signer's record when the round was built.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
+}
+
+/// An entry of the signer's record: its number and running hash. A wallet
+/// keeps every one it is shown, and refuses an operator that later shows a
+/// lower latest entry, or another hash at an entry it has seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordHead {
+	pub entry: u64,
+	pub hash: String,
 }
 
 /// The tree's reserve rule: `{"fee_rate": …}` or `{"fixed": …}`.

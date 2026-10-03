@@ -151,6 +151,14 @@ the keys, but which coins were spent off-chain is in the store and the server.
   from the chain, refuses a server that serves boards for less than 28 days,
   and moves them with the board's block after a rollback.
 
+- **The operator's signer's record.** The operator publishes its signer's
+  record's latest entry and running hash with `info` and with every round's
+  tree. The wallet keeps every entry it is shown, and refuses to go on with
+  an operator that later shows a latest entry below one it showed, or
+  another hash at an entry it has seen: the operator's record and database
+  have been rolled back together, so its signer may sign again what it
+  signed. The refusal says so, and is kept with the wallet's refusals.
+
 ### Fees
 
 Fees are paid in the asset being moved unless another is named
@@ -168,7 +176,10 @@ from its own node's: it leaves twice the operator's least, within the
 operator's most, as room for the operator's floor to rise before it
 co-signs. And it stays within its own bound: margins above 10,000 millionths
 of the coins they come out of are refused before anything is signed, whatever
-floor the operator publishes.
+floor the operator publishes. A forfeit signed in a refresh leaves the
+margin the operator prices; the wallet takes one only up to four times the
+operator's published floor over 1,000 vbytes, or one atom where the
+operator's node does not accept the asset.
 
 The operator's refresh fee is bounded by the wallet, not by what the server
 publishes: a fee above 10,000 millionths of a coin, or any fee for a coin in
@@ -274,7 +285,15 @@ and holding it there, with the reason shown:
   floor that would take margins above the wallet's bound, refused before
   anything is signed;
 - a sender converting the board it paid from, answered at once by the
-  receiver;
+  receiver, on its own, with the operator stopped;
+- an operator whose database and signer's record are rolled back together
+  to a backup, after which the server starts: the wallet that was shown a
+  later entry refuses to go on, and says why; and one shown another hash at
+  an entry it saw, refused the same way; a round's published tree carries
+  the record's latest entry when the round was built;
+- a forfeit's margin bounded from the operator's published floor: a wallet
+  whose node values the asset five times higher than the operator's
+  completes its refresh;
 - a receiver's refresh of two coins paid from a board, which leaves the
   sender's change on the same lineage live off chain (nothing of the lineage
   published, the sender's wallet untouched), every coin showing the board's

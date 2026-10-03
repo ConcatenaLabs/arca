@@ -378,7 +378,41 @@ impl Wallet {
 			return Err(Error::Refused(format!("the server now names operator key {}; this wallet was created with {}",
 				info["operator"], self.operator)));
 		}
+		self.witness_record(&info["signer_record"], true)?;
 		Ok(info)
+	}
+
+	/// Checks what the operator shows of its signer's record, `{entry, hash}`
+	/// (the latest, in `info`, when `latest`; a round's, in its published
+	/// tree, otherwise), against every entry it showed before, and keeps it.
+	/// An operator that shows another running hash at an entry it showed, or
+	/// a latest entry below one it showed, has had its record replaced or
+	/// rolled back, with its database (which would refuse to start on a
+	/// record older than itself): the signer may then sign again what it
+	/// signed. The wallet refuses to go on with it, and says why.
+	pub(crate) fn witness_record(&self, shown: &Value, latest: bool) -> Result<(), Error> {
+		let (Some(entry), Some(hash)) = (shown["entry"].as_u64(), shown["hash"].as_str()) else { return Ok(()) };
+		if let Some(seen) = self.store.seen_entry(entry)? {
+			if seen != hash {
+				let why = format!("the operator shows entry {} of its signer's record with the running hash {}, and showed {} for that \
+					entry before: its record has been replaced or rolled back, with its database, so it may sign again what it signed; \
+					the wallet goes no further with this operator", entry, hash, seen);
+				self.store.refused("the operator's signer's record", &why)?;
+				return Err(Error::Refused(why));
+			}
+		}
+		if latest {
+			if let Some((top, _)) = self.store.seen_latest()? {
+				if entry < top {
+					let why = format!("the operator shows its signer's record ending at entry {}, and showed entry {} before: its record \
+						and its database have been rolled back together, so it may sign again what it signed; the wallet goes no further \
+						with this operator", entry, top);
+					self.store.refused("the operator's signer's record", &why)?;
+					return Err(Error::Refused(why));
+				}
+			}
+		}
+		self.store.put_seen(entry, hash)
 	}
 
 	/// The smallest leaf the server takes in `asset`, or a refusal when it

@@ -56,6 +56,33 @@ impl SignerProcess {
 		}
 		SignerProcess { child, dir, socket }
 	}
+
+	/// The signer's record.
+	pub fn record(&self) -> PathBuf {
+		self.dir.join("signer.record")
+	}
+
+	/// Stops the signer; its record stays.
+	pub fn halt(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+		let _ = std::fs::remove_file(&self.socket);
+	}
+
+	/// Starts the signer again on its record.
+	pub fn resume(&mut self, genesis: BlockHash) {
+		let file = self.dir.join("operator.key");
+		self.child = Command::new(signer_exe())
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
+				"--record", self.record().to_str().unwrap()])
+			.stdout(Stdio::null()).stderr(Stdio::null())
+			.spawn().unwrap();
+		let start = Instant::now();
+		while !self.socket.exists() {
+			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket");
+			std::thread::sleep(Duration::from_millis(50));
+		}
+	}
 }
 
 impl Drop for SignerProcess {

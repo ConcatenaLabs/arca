@@ -162,6 +162,9 @@ pub struct NewRound {
 	pub offboards: Vec<NewOffboard>,
 	/// Every participation the round runs, with the attempt it runs.
 	pub participations: Vec<([u8; 32], u32)>,
+	/// The latest entry of the signer's record the database knew when the
+	/// round was built, and its running hash.
+	pub signer_head: Option<(u64, [u8; 32])>,
 }
 
 /// Where a participation's outputs are in the round of its current attempt.
@@ -247,6 +250,18 @@ fn batch_leaf_row(r: &tokio_postgres::Row) -> Result<BatchLeafRow, StoreError> {
 }
 
 impl Store {
+	/// The latest entry of the signer's record the database knew when round
+	/// `round_id` was built, and its running hash; `None` for a round built
+	/// before rounds kept it.
+	pub async fn round_signer_head(&self, round_id: i64) -> Result<Option<(u64, [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let row = conn.query_opt("SELECT signer_entry, signer_hash FROM round WHERE round_id = $1", &[&round_id]).await?;
+		match row.map(|r| (r.get::<_, Option<i64>>(0), r.get::<_, Option<Vec<u8>>>(1))) {
+			Some((Some(n), Some(h))) => Ok(Some((n as u64, super::array32(h, "signer hash")?))),
+			_ => Ok(None),
+		}
+	}
+
 	/// Records a round, whole or not at all: the round (built), its connector
 	/// output, each batch with each of its leaves as a pending coin (its
 	/// script new to the server, its key owning no other leaf), each offboard
@@ -257,8 +272,10 @@ impl Store {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let row = t.query_one(
-			"INSERT INTO round (txid, tx, state, fee_asset, fee, created_mtp) VALUES ($1, $2, 'built', $3, $4, $5) RETURNING round_id",
-			&[&&r.txid[..], &r.tx, &&r.fee_asset[..], &i64_of(r.fee)?, &(r.created_mtp as i64)],
+			"INSERT INTO round (txid, tx, state, fee_asset, fee, created_mtp, signer_entry, signer_hash)
+			 VALUES ($1, $2, 'built', $3, $4, $5, $6, $7) RETURNING round_id",
+			&[&&r.txid[..], &r.tx, &&r.fee_asset[..], &i64_of(r.fee)?, &(r.created_mtp as i64),
+				&r.signer_head.map(|h| h.0 as i64), &r.signer_head.map(|h| h.1.to_vec())],
 		).await?;
 		let round_id: i64 = row.get(0);
 		let (cv, ca, cval, cm) = &r.connector;
