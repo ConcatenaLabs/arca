@@ -503,7 +503,8 @@ impl Rounds {
 
 	/// One pass over every round not lost: a round recorded but never handed
 	/// to the nursery goes to it; a round the finality service calls final is
-	/// marked final, and one no longer final goes back to broadcast.
+	/// marked final, and the new leaves of its released participations are
+	/// credited; one no longer final goes back to broadcast.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
@@ -524,7 +525,8 @@ impl Rounds {
 		let fin = self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?;
 		match (r.state, fin.is_final()) {
 			(RoundState::Broadcast, true) if self.store.set_round_state(r.round_id, RoundState::Broadcast, RoundState::Final).await? => {
-				log::info!("round {} ({}) is final", r.round_id, txid);
+				let credited = self.store.credit_round(r.round_id).await?;
+				log::info!("round {} ({}) is final; {} leaf/leaves credited", r.round_id, txid, credited);
 			},
 			(RoundState::Final, false) if self.store.set_round_state(r.round_id, RoundState::Final, RoundState::Broadcast).await? => {
 				log::warn!("round {} ({}) is no longer final: {:?}", r.round_id, txid, fin);

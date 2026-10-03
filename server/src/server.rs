@@ -22,6 +22,7 @@ use crate::http::{router, App};
 use crate::nursery::Nursery;
 use crate::params::{AssetParams, FeeSchedule, Params};
 use crate::participations::Participations;
+use crate::forfeits::Forfeits;
 use crate::rounds::{RoundConfig, Rounds};
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
@@ -180,6 +181,7 @@ pub struct Server {
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
 	pub rounds: Arc<Rounds>,
+	pub forfeits: Arc<Forfeits>,
 	tasks: Vec<JoinHandle<()>>,
 }
 
@@ -239,9 +241,10 @@ impl Server {
 			.map_err(err("the wallet"))?);
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone());
-		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer);
+		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
+		let forfeits = Forfeits::new(store.clone(), params.clone(), signer, cosigner.clone());
 
 		// The first pass before anything is answered, so the chain is known.
 		finality.sync().await.map_err(err("the first pass over the chain"))?;
@@ -252,7 +255,7 @@ impl Server {
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
-			participations: participations.clone(), rounds: rounds.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
+			participations: participations.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 		});
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
@@ -264,7 +267,7 @@ impl Server {
 			}
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, tasks })
+		Ok(Server { addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, tasks })
 	}
 
 	/// Stops every task.

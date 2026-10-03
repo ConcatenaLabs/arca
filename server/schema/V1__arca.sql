@@ -397,18 +397,40 @@ CREATE TABLE round_offboard (
 	PRIMARY KEY (round_id, vout)
 );
 
--- A forfeit of a leaf for a round: the owner's and the operator's signatures
--- over the leaf's move into the forfeit output.
+-- A forfeit of a coin given up in a participation, for the round of one of
+-- its attempts: the owner's and the operator's signatures over the coin's move
+-- into the forfeit output, which names the participation's unlock hash, the
+-- round's connector asset and the coin's leaf id; the refund delay and the
+-- margin it carries. With these the operator can publish the forfeit whenever
+-- the coin reaches the chain, and claim it by revealing the preimage.
 CREATE TABLE forfeit (
 	leaf_id            BYTEA NOT NULL REFERENCES leaf,
 	round_id           BIGINT NOT NULL REFERENCES round,
 	participation_id   BYTEA NOT NULL REFERENCES participation,
+	attempt            INTEGER NOT NULL CHECK (attempt >= 0),
 	owner_sig          BYTEA NOT NULL CHECK (length(owner_sig) = 64),
 	operator_sig       BYTEA NOT NULL CHECK (length(operator_sig) = 64),
-	refund_delay_units INTEGER NOT NULL,
-	margin             BIGINT NOT NULL CHECK (margin >= 0),
+	refund_delay_units INTEGER NOT NULL CHECK (refund_delay_units > 0),
+	margin             BIGINT NOT NULL CHECK (margin > 0),
+	unlock_hash        BYTEA NOT NULL CHECK (length(unlock_hash) = 32),
+	connector_asset    BYTEA NOT NULL CHECK (length(connector_asset) = 32),
+	created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 	PRIMARY KEY (leaf_id, round_id)
 );
+
+-- An owner's release of the lowest node of a coin it gave up: its signature,
+-- with the coin's key, over SHA256("Arca/release" ‖ genesis_hash ‖ H), H the
+-- node's children hash. Taken only after the participation's preimage went
+-- out, and never for a coin with an open out-of-round reassignment. Once every
+-- owner under a lowest node has released it, the operator may reclaim it.
+CREATE TABLE node_release (
+	leaf_id          BYTEA PRIMARY KEY REFERENCES leaf,
+	participation_id BYTEA NOT NULL REFERENCES participation,
+	node_hash        BYTEA NOT NULL CHECK (length(node_hash) = 32),
+	signature        BYTEA NOT NULL CHECK (length(signature) = 64),
+	created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX node_release_by_node ON node_release (node_hash);
 
 ------------------------------------------------------------------------------
 -- Mailboxes and authentication

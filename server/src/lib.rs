@@ -20,6 +20,7 @@ pub mod chain;
 pub mod coins;
 pub mod cosign;
 pub mod fees;
+pub mod forfeits;
 pub mod http;
 pub mod nursery;
 pub mod params;

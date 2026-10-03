@@ -16,6 +16,8 @@
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `tree` | POST | no: the operator publishes every tree |
+//! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
+//! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
 
 use std::str::FromStr;
@@ -43,6 +45,7 @@ use crate::boards::{BoardError, BoardStatus, Boards};
 use crate::chain::{Certification, Finality};
 use crate::cosign::{CosignError, Cosigner, InputRequest, OutputRequest, TransferRequest};
 use crate::params::{FeeSchedule, Params};
+use crate::forfeits::{AuthsRequest, ForfeitError, ForfeitLeaves, ForfeitRequest, Forfeits, ReleaseRequest};
 use crate::rounds::{RoundError, Rounds};
 use crate::participations::{self as part, ParticipationError, ParticipationRequest, Participations, Status};
 use crate::signer::{hex, parse_amount, unhex, unhex32};
@@ -56,6 +59,7 @@ pub struct App {
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
 	pub rounds: Arc<Rounds>,
+	pub forfeits: Arc<Forfeits>,
 	pub certification: Certification,
 	pub anchor_depth: u32,
 	pub max_request: usize,
@@ -127,6 +131,16 @@ impl From<ParticipationError> for Refusal {
 		let code = e.code();
 		if code == "internal" {
 			log::error!("participation: {}", e);
+		}
+		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+impl From<ForfeitError> for Refusal {
+	fn from(e: ForfeitError) -> Refusal {
+		let code = e.code();
+		if code == "internal" {
+			log::error!("forfeits: {}", e);
 		}
 		Refusal::new(status_of(code), code, e.to_string())
 	}
@@ -441,6 +455,41 @@ async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) 
 	}))
 }
 
+async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Forfeited>, Refusal> {
+	let req: api::ForfeitLeaves = parse(body, app.max_request)?;
+	let participation_id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
+	let mut forfeits = Vec::with_capacity(req.forfeits.len());
+	for f in &req.forfeits {
+		forfeits.push(ForfeitRequest { leaf_id: leaf_id(&f.leaf_id)?, signature: sig(&f.signature)? });
+	}
+	let mut leaves = Vec::with_capacity(req.leaves.len());
+	for l in &req.leaves {
+		let mut auths = Vec::with_capacity(l.auths.len());
+		for a in &l.auths {
+			auths.push((sig(&a.signature)?, MedianTime::from_consensus(a.time).map_err(|e| Refusal::malformed(format!("time: {}", e)))?));
+		}
+		leaves.push(AuthsRequest { leaf_id: leaf_id(&l.leaf_id)?, auths });
+	}
+	let done = app.forfeits.forfeit_leaves(&ForfeitLeaves { participation_id, forfeits, leaves }).await?;
+	Ok(Json(api::Forfeited {
+		participation_id: hex(&done.participation_id),
+		state: done.state.as_str().into(),
+		preimage: done.preimage.map(|p| hex(&p)),
+		forfeit_first: done.forfeit_first,
+	}))
+}
+
+async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Released>, Refusal> {
+	let req: api::ReleaseLeaves = parse(body, app.max_request)?;
+	let id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
+	let mut releases = Vec::with_capacity(req.releases.len());
+	for r in &req.releases {
+		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, signature: sig(&r.signature)? });
+	}
+	let done = app.forfeits.release_leaves(&id, &releases).await?;
+	Ok(Json(api::Released { participation_id: hex(&id), released: done.iter().map(|l| l.to_string()).collect() }))
+}
+
 /// The most messages one read returns.
 pub const MAILBOX_PAGE: u32 = 100;
 
@@ -500,6 +549,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/tree", post(tree))
+		.route("/v1/forfeit_leaves", post(forfeit_leaves))
+		.route("/v1/release_leaves", post(release_leaves))
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
 		.layer(DefaultBodyLimit::max(limit))

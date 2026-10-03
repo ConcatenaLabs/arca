@@ -37,7 +37,7 @@ pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
-	NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, WantedKind,
+	ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, WantedKind,
 };
 pub use rounds::{
 	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, Placement, RoundRow, RoundState, StoredReserve,
