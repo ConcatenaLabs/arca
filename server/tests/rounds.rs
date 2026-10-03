@@ -13,66 +13,15 @@ mod common;
 use elements::encode::deserialize;
 use elements::hashes::Hash;
 use elements::secp256k1_zkp::Keypair;
-use elements::{AssetId, Transaction, Txid};
+use elements::{Transaction, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{CoinRecord, LeafId, RecordError, RoundCheckFailure, WalletPolicy};
-use common::client::{hex, participation_body, rebuild, txid, want_leaf, Held};
+use arca_covenant::{RecordError, RoundCheckFailure, WalletPolicy};
+use common::client::{hex, participation_body, rebuild, txid, want_leaf};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::running::{Running, MIN_LEAF};
+use common::rounds::{accept_policy, credited_board, round_final, start, VALUE};
 use server::participations::OutputRequest;
-use server::server::AssetSection;
-
-const VALUE: u64 = 1_000_000;
-
-/// A server serving X (listed for fees) and Y (not listed), its wallet paid
-/// two coins of X and one of Y, all final.
-async fn start() -> Running {
-	let mut r = Running::start_with(|c, y| {
-		c.assets.push(AssetSection { asset: y.to_string(), min_leaf: MIN_LEAF.to_string() });
-	}).await;
-	let (x, y) = (r.x, r.y);
-	r.fund_wallet_in(x, 50_000_000).await;
-	r.fund_wallet_in(x, 50_000_000).await;
-	r.fund_wallet_in(y, 50_000_000).await;
-	r.produce().await;
-	r.bury().await;
-	r.synced().await;
-	r
-}
-
-/// A credited board for `owner` in `asset`, held as a coin.
-async fn credited_board(r: &mut Running, owner: &Keypair, asset: AssetId) -> Held {
-	let (record, _, _) = r.board_in(owner, asset, VALUE);
-	r.produce().await;
-	r.bury().await;
-	let id = record.leaf_id();
-	let http = r.http.clone();
-	r.wait("the board to be credited", || http.board_status(&id).json["state"] == "credited").await;
-	Held { key: *owner, nonce: record.owner_nonce, id, record: CoinRecord::Board(record) }
-}
-
-/// Waits until the server calls the round `txid` final.
-async fn round_final(r: &Running, round_txid: &Txid) {
-	let store = r.server.store.clone();
-	let t = round_txid.to_byte_array();
-	let start = std::time::Instant::now();
-	loop {
-		r.server.rounds.pass().await.unwrap();
-		if store.round_by_txid(&t).await.unwrap().map(|x| x.state) == Some(server::store::RoundState::Final) {
-			return;
-		}
-		assert!(start.elapsed() < std::time::Duration::from_secs(60), "the round did not become final");
-		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-	}
-}
-
-/// A wallet's acceptance policy at the chain's tip.
-fn accept_policy(r: &Running) -> WalletPolicy {
-	let mtp = r.rt.client().blockchain_info().unwrap().median_time as u32;
-	WalletPolicy::new(r.chain, xonly(&r.s), arca_covenant::MedianTime::from_consensus(mtp).unwrap())
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_round_in_two_assets_published_and_validated() {
@@ -85,9 +34,9 @@ async fn a_round_in_two_assets_published_and_validated() {
 
 	// Three owners: A refreshes into X, B into X with an offboard, C into Y.
 	let (a, b, c) = (keypair("A"), keypair("B"), keypair("C"));
-	let a_coin = credited_board(&mut r, &a, x).await;
-	let b_coin = credited_board(&mut r, &b, x).await;
-	let c_coin = credited_board(&mut r, &c, y).await;
+	let (a_coin, _) = credited_board(&mut r, &a, x).await;
+	let (b_coin, _) = credited_board(&mut r, &b, x).await;
+	let (c_coin, _) = credited_board(&mut r, &c, y).await;
 	let (a2, b2, c2) = (keypair("A, new"), keypair("B, new"), keypair("C, new"));
 	let (wa, a2_nonce) = want_leaf(&a2, x, VALUE);
 	let (wb, _) = want_leaf(&b2, x, 600_000);
@@ -214,7 +163,7 @@ async fn round_sizes_by_leaves() {
 		let mut bodies = vec![];
 		for i in 0..n {
 			let k = keypair(&format!("size {} owner {}", n, i));
-			let coin = credited_board(&mut r, &k, x).await;
+			let (coin, _) = credited_board(&mut r, &k, x).await;
 			let (w, _) = want_leaf(&keypair(&format!("size {} owner {} new", n, i)), x, VALUE);
 			bodies.push(participation_body(&[&coin], &[w], &[], None, s, chain).0);
 		}
@@ -228,6 +177,5 @@ async fn round_sizes_by_leaves() {
 		r.produce().await;
 		r.bury().await;
 		round_final(&r, &tx.txid()).await;
-		let _ = LeafId([0; 32]);
 	}
 }

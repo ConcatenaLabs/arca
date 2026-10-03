@@ -285,3 +285,26 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// The forfeit swap
+// ---------------------------------------------------------------------------
+
+use arca_covenant::{Forfeit, ValidLeaf};
+
+/// The owner's unroll authorisations for every node above `valid`, at `t`,
+/// as `forfeit_leaves` takes them.
+pub fn auths_json(valid: &ValidLeaf, key: &Keypair, t: arca_covenant::MedianTime) -> Value {
+	json!({
+		"leaf_id": valid.leaf_id.to_string(),
+		"auths": valid.branch.nodes.iter().map(|n| json!({
+			"signature": hex(sign_digest(key, &n.unroll_authorisation(t).digest, &random32()).as_ref()),
+			"time": t.to_consensus_u32(),
+		})).collect::<Vec<_>>(),
+	})
+}
+
+/// The owner's signature over forfeit `f`.
+pub fn forfeit_sig(f: &Forfeit, key: &Keypair) -> String {
+	hex(sign_digest(key, &f.message().digest, &random32()).as_ref())
+}

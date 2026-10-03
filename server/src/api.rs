@@ -463,3 +463,66 @@ pub struct TreeLeaf {
 	pub value: String,
 	pub unlock_hash: String,
 }
+
+/// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each
+/// coin the participation gave up, and its unroll authorisations for every
+/// node above each new leaf, from the batch output down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForfeitLeaves {
+	pub participation_id: String,
+	pub forfeits: Vec<ForfeitSignature>,
+	pub leaves: Vec<LeafAuths>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForfeitSignature {
+	pub leaf_id: String,
+	pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafAuths {
+	pub leaf_id: String,
+	pub auths: Vec<UnrollAuth>,
+}
+
+/// An unroll authorisation: the signature over
+/// `SHA256("Arca/unroll" ‖ H ‖ t)` and its time `t`, a median time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnrollAuth {
+	pub signature: String,
+	pub time: u32,
+}
+
+/// What `forfeit_leaves` returns: the participation's state, and its
+/// preimage once released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forfeited {
+	pub participation_id: String,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+	pub forfeit_first: bool,
+}
+
+/// `POST /v1/release_leaves`: the owner's release of the lowest node of each
+/// coin given up, signed with that coin's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseLeaves {
+	pub participation_id: String,
+	pub releases: Vec<ForfeitSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Released {
+	pub participation_id: String,
+	/// The coins whose release is recorded.
+	pub released: Vec<String>,
+}

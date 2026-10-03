@@ -155,9 +155,9 @@ posted to the receiver's mailbox (the leaf's key, unless the output names
 another). A request repeated byte for byte gets the same answer; one that
 found the signer unreachable completes when repeated. Transfers are free.
 
-The same record of spends answers the round's question, before it accepts an
-owner's release of a leaf's lowest node, whether the leaf has an open
-out-of-round reassignment (`Cosigner::check_release`).
+The same record of spends answers the question `release_leaves` asks before
+it takes an owner's release of a leaf's lowest node: whether the leaf has an
+open out-of-round reassignment (`Cosigner::check_release`).
 
 ## Participations
 
@@ -258,6 +258,53 @@ hash). From that alone a wallet, an explorer or any mirror rebuilds every
 script of the tree with `Tree::build` and checks the leaf it cares about
 against the round transaction with `LeafRecord::validate`.
 
+## The forfeit swap
+
+Once its round is final, an owner validates each new leaf from the published
+tree, then hands over with `forfeit_leaves` the forfeit of every coin its
+participation gave up, built with `Forfeit::for_refresh` from that validated
+leaf and round and the refund delay and margin of the participation's status,
+together with its unroll authorisations for every node above each new leaf.
+The server takes it only for a participation in a round it calls final, and
+only when:
+
+- the forfeits are exactly the coins given up, one each;
+- each verifies against the forfeit the server builds itself from what it
+  chose: the participation's unlock hash, the connector asset of its round's
+  connector output (which exists only while that round is in the chain), the
+  coin's own leaf id, and the published refund delay and margin. A forfeit for
+  another hash, another round's connector, another coin, or with another delay
+  or margin, does not verify;
+- each coin given up still passes the coin check: nothing of its lineage on
+  the chain, its boards credited and unspent, its expiry not past;
+- the authorisations are one set per new leaf, and each new leaf's full coin
+  record (its record, the preimage, the authorisations) validates against the
+  round as a receiver checks a coin.
+
+The signer then signs the operator's half of each forfeit, which the server
+checks and keeps: it is never returned to anyone, and leaves the server only
+inside a forfeit the operator publishes. An owner therefore never holds a
+forfeit it could publish itself. In one database transaction the forfeits are stored, each new leaf's
+coin record filled in, the participation released and its new leaves
+credited; only then does the preimage go back. The same request again gets
+the same preimage. A participation that runs again forfeit-first, after a
+round it was released in could not return, has its forfeits stored and its
+preimage withheld: that preimage goes out only by the claim of the forfeit,
+once published, which reveals it on the chain.
+
+A new leaf is live, and can be paid on out of round, once its participation
+is released and its round final; a coin resting on a leaf of a round that is
+not final is not co-signed (`round_not_final`).
+
+`release_leaves` then takes the owner's release of the lowest node of each
+coin it gave up: its signature, with the coin's own key, over the node's
+release message. It is refused for a coin with an open out-of-round
+reassignment, whatever else holds; for a coin not given up in the
+participation named; before the participation's preimage went out; for a
+board or a coin a reassignment made, which have no lowest node; and for a
+signature by another key. Once every owner under a lowest node has released
+it, the operator may reclaim the node before expiry.
+
 ## The interface
 
 JSON over HTTP, every call under `/v1/`, so the server sits behind one
@@ -280,6 +327,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it |
 | `POST tree` | The published tree of a batch, by its round's txid and output |
+| `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
+| `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
 | `POST leaf_data` | The leaves a key owns, with their records |
 
@@ -292,7 +341,9 @@ challenge to one use. There is no bearer token. `cosign_transfer` is
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
-of its request, and `tree` is public.
+of its request, and `tree` is public. `forfeit_leaves` and `release_leaves`
+are authenticated by the owners' signatures over the forfeits and releases
+themselves.
 
 ## The signer
 
@@ -413,6 +464,18 @@ new leaf from the published tree alone, and a published tree with a leaf's
 value or unlock hash, the last expiry, the clock's order or the reserve rule
 changed is refused. It also builds rounds of 1, 4 and 16 leaves and prints
 their sizes.
+
+`tests/forfeits.rs` runs a refresh end to end: a board, its participation,
+the round final, the new leaf validated from the published tree, the forfeit
+and the preimage that opens the new leaf's entry, the new leaf live and paid on
+out of round, then a second refresh of that batch leaf and the release of its
+lowest node. Each refusal is asserted by its code: forfeits before the round
+and before it is final, for the wrong unlock hash, the wrong connector (another
+output, another round), another coin, another margin, another refund delay or
+another key, a forfeit set that is not exact (none, another coin, one twice,
+one more), no authorisations, authorisations by another key or not yet usable,
+a release before the preimage, by another key, of a board, of a coin not in the
+participation, and of a coin with an open reassignment.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,
