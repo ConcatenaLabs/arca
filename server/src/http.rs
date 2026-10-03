@@ -9,8 +9,8 @@
 //! | Call | Method | Authenticated |
 //! |---|---|---|
 //! | `info` | GET | no |
-//! | `operator_nonce` | POST | no: issued at a bounded rate ([`Limiter`]) |
-//! | `challenge` | POST | no: issued at a bounded rate ([`Limiter`]) |
+//! | `operator_nonce` | POST | no: issued at a bounded rate, overall and for each source ([`Limiter`]) |
+//! | `challenge` | POST | no: issued at a bounded rate, overall and for each source ([`Limiter`]) |
 //! | `register_board`, `board_status` | POST | no |
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
@@ -20,14 +20,16 @@
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
 
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -68,44 +70,140 @@ pub struct App {
 	pub nonces: Limiter,
 	/// Bounds the authentication challenges handed out.
 	pub challenges: Limiter,
+	/// The addresses of the reverse proxies whose forwarded address names a
+	/// request's source.
+	pub trusted_proxies: Vec<IpAddr>,
 }
 
-/// A token bucket over one unauthenticated call that writes a row: at most
-/// `burst` at once, refilled at `per_second`. Each row it lets through is
-/// deleted once expired (`Store::delete_expired`), so what the calls can
-/// hold in the database is bounded by the rate times the row's lifetime.
+impl App {
+	/// Where a request comes from, as the limits count it ([`source_of`]).
+	pub fn source(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+		source_of(peer, headers, &self.trusted_proxies)
+	}
+}
+
+/// Where a request from `peer` comes from, as the limits count it: `peer`,
+/// unless it is one of the `trusted` proxies, in which case the nearest
+/// address in its `X-Forwarded-For` that is not a trusted proxy (a proxy
+/// appends the address that connected to it; anything before that, a
+/// client may have written itself). A request that does not come from a
+/// trusted proxy names its own source, whatever header it carries; a header
+/// that does not read names none.
+pub fn source_of(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAddr {
+	if !trusted.contains(&peer) {
+		return peer;
+	}
+	let forwarded: Vec<IpAddr> = headers.get_all("x-forwarded-for").iter()
+		.map(|v| v.to_str().ok())
+		.collect::<Option<Vec<&str>>>()
+		.and_then(|vs| vs.iter().flat_map(|v| v.split(',')).map(|a| a.trim().parse::<IpAddr>().ok()).collect::<Option<Vec<_>>>())
+		.unwrap_or_default();
+	forwarded.into_iter().rev().find(|a| !trusted.contains(a)).unwrap_or(peer)
+}
+
+/// A token bucket: at most `burst` tokens, refilled at `per_second`.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+	tokens: f64,
+	at: Instant,
+}
+
+impl Bucket {
+	fn refill(&mut self, per_second: f64, burst: f64, now: Instant) {
+		self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * per_second).min(burst);
+		self.at = now;
+	}
+
+	fn wait(&self, per_second: f64) -> Duration {
+		if per_second <= 0.0 {
+			return Duration::from_secs(60);
+		}
+		Duration::from_secs_f64((1.0 - self.tokens).max(0.0) / per_second)
+	}
+}
+
+/// The most sources a [`Limiter`] keeps a bucket for at once. One whose
+/// bucket is full again is forgotten first; while every one is in use, a new
+/// source waits.
+pub const MAX_SOURCES: usize = 65_536;
+
+/// Where a request comes from, as a [`Limiter`] counts it: an IPv4 address,
+/// or the /64 an IPv6 address is in (a host is handed a /64, so its
+/// addresses are one source).
+pub fn source_key(ip: IpAddr) -> IpAddr {
+	match ip {
+		IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+			Some(v4) => IpAddr::V4(v4),
+			None => {
+				let s = v6.segments();
+				IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+			},
+		},
+		v4 => v4,
+	}
+}
+
+/// Bounds one unauthenticated call that writes a row: a token bucket over
+/// every caller together (at most `burst` at once, refilled at
+/// `per_second`), and one for each source (`source_burst`, refilled at
+/// `source_per_second`), so that one caller cannot use up what every caller
+/// needs. Each row it lets through is deleted once expired
+/// (`Store::delete_expired`), so what the calls can hold in the database is
+/// bounded by the overall rate times the row's lifetime.
 #[derive(Debug)]
 pub struct Limiter {
 	per_second: f64,
 	burst: f64,
-	state: std::sync::Mutex<(f64, std::time::Instant)>,
+	source_per_second: f64,
+	source_burst: f64,
+	state: std::sync::Mutex<(Bucket, HashMap<IpAddr, Bucket>)>,
 }
 
 impl Limiter {
-	pub fn new(per_second: u32, burst: u32) -> Limiter {
+	pub fn new(per_second: u32, burst: u32, source_per_second: u32, source_burst: u32) -> Limiter {
 		let burst = f64::from(burst.max(1));
-		Limiter { per_second: f64::from(per_second), burst, state: std::sync::Mutex::new((burst, std::time::Instant::now())) }
+		let all = Bucket { tokens: burst, at: Instant::now() };
+		Limiter {
+			per_second: f64::from(per_second), burst, source_per_second: f64::from(source_per_second),
+			source_burst: f64::from(source_burst.max(1)), state: std::sync::Mutex::new((all, HashMap::new())),
+		}
 	}
 
-	/// Takes one token, or says how long until one is there.
-	pub fn take(&self) -> Result<(), Duration> {
+	/// Takes one token for a request from `source`, from its own bucket and
+	/// from everyone's, or says how long until both have one.
+	pub fn take(&self, source: IpAddr) -> Result<(), Duration> {
 		let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		let now = std::time::Instant::now();
-		s.0 = (s.0 + now.duration_since(s.1).as_secs_f64() * self.per_second).min(self.burst);
-		s.1 = now;
-		if s.0 >= 1.0 {
-			s.0 -= 1.0;
-			return Ok(());
+		let now = Instant::now();
+		let (all, sources) = &mut *s;
+		all.refill(self.per_second, self.burst, now);
+		let key = source_key(source);
+		if !sources.contains_key(&key) && sources.len() >= MAX_SOURCES {
+			let (rate, cap) = (self.source_per_second, self.source_burst);
+			sources.retain(|_, b| {
+				b.refill(rate, cap, now);
+				b.tokens < cap
+			});
+			if sources.len() >= MAX_SOURCES {
+				return Err(Duration::from_secs(1));
+			}
 		}
-		if self.per_second <= 0.0 {
-			return Err(Duration::from_secs(60));
+		let mine = sources.entry(key).or_insert(Bucket { tokens: self.source_burst, at: now });
+		mine.refill(self.source_per_second, self.source_burst, now);
+		if mine.tokens < 1.0 {
+			return Err(mine.wait(self.source_per_second));
 		}
-		Err(Duration::from_secs_f64((1.0 - s.0) / self.per_second))
+		if all.tokens < 1.0 {
+			return Err(all.wait(self.per_second));
+		}
+		mine.tokens -= 1.0;
+		all.tokens -= 1.0;
+		Ok(())
 	}
 
-	fn refusal(&self, call: &str) -> Result<(), Refusal> {
-		self.take().map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
-			format!("{} is handed out at a bounded rate; try again in {} ms", call, wait.as_millis().max(1))))
+	fn refusal(&self, call: &str, source: IpAddr) -> Result<(), Refusal> {
+		self.take(source).map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
+			format!("{} is handed out at a bounded rate, overall and to each source; try again in {} ms", call,
+				wait.as_millis().max(1))))
 	}
 }
 
@@ -307,16 +405,20 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	})
 }
 
-async fn operator_nonce(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::NonceResponse>, Refusal> {
+async fn operator_nonce(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::NonceResponse>, Refusal>
+{
 	let _: api::Empty = parse(body, app.max_request)?;
-	app.nonces.refusal("an operator nonce")?;
+	app.nonces.refusal("an operator nonce", app.source(peer.ip(), &headers))?;
 	let n = app.store.issue_nonce().await?;
 	Ok(Json(api::NonceResponse { operator_nonce: hex(&n) }))
 }
 
-async fn challenge(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChallengeResponse>, Refusal> {
+async fn challenge(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChallengeResponse>, Refusal>
+{
 	let _: api::Empty = parse(body, app.max_request)?;
-	app.challenges.refusal("a challenge")?;
+	app.challenges.refusal("a challenge", app.source(peer.ip(), &headers))?;
 	let c = app.store.issue_challenge(app.challenge_ttl).await?;
 	Ok(Json(api::ChallengeResponse { challenge: hex(&c), expires_in_seconds: app.challenge_ttl.as_secs() }))
 }
@@ -610,4 +712,53 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/leaf_data", post(leaf_data))
 		.layer(DefaultBodyLimit::max(limit))
 		.with_state(app)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	fn forwarded(v: &str) -> HeaderMap {
+		let mut h = HeaderMap::new();
+		h.insert("x-forwarded-for", v.parse().unwrap());
+		h
+	}
+
+	/// The source is the proxy's forwarded address only when the request
+	/// comes from the proxy, and then the nearest one not a proxy.
+	#[test]
+	fn the_source_is_forwarded_only_by_a_trusted_proxy() {
+		let trusted = [ip("127.0.0.1"), ip("::1")];
+		assert_eq!(source_of(ip("203.0.113.7"), &forwarded("198.51.100.9"), &trusted), ip("203.0.113.7"),
+			"a request from elsewhere names its own source, whatever it carries");
+		assert_eq!(source_of(ip("127.0.0.1"), &HeaderMap::new(), &trusted), ip("127.0.0.1"));
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("198.51.100.9"), &trusted), ip("198.51.100.9"));
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("10.9.9.9, 198.51.100.9"), &trusted), ip("198.51.100.9"),
+			"what a client wrote before the proxy's own entry is not taken");
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("198.51.100.9, ::1"), &trusted), ip("198.51.100.9"),
+			"a chain of trusted proxies is walked back");
+		assert_eq!(source_of(ip("127.0.0.1"), &forwarded("not an address"), &trusted), ip("127.0.0.1"));
+	}
+
+	/// One source's bucket is its own: a caller that used up its own leaves
+	/// another its share, while the overall bound still holds.
+	#[test]
+	fn one_source_cannot_use_up_another_s() {
+		let l = Limiter::new(0, 5, 0, 2);
+		let (a, b) = (ip("203.0.113.7"), ip("198.51.100.9"));
+		assert!(l.take(a).is_ok() && l.take(a).is_ok());
+		assert!(l.take(a).is_err(), "a's own burst is used up");
+		assert!(l.take(b).is_ok() && l.take(b).is_ok(), "b's is whole");
+		assert!(l.take(ip("192.0.2.1")).is_ok());
+		assert!(l.take(ip("192.0.2.2")).is_err(), "the overall burst of 5 is used up");
+		// The addresses of one IPv6 /64 are one source.
+		let l = Limiter::new(0, 10, 0, 1);
+		assert!(l.take(ip("2001:db8:1:2::1")).is_ok());
+		assert!(l.take(ip("2001:db8:1:2::ffff")).is_err());
+		assert!(l.take(ip("2001:db8:1:3::1")).is_ok());
+	}
 }

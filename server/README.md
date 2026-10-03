@@ -606,9 +606,15 @@ are authenticated by the owners' signatures over the forfeits and releases
 themselves.
 
 The two calls that write a row for anyone who asks, `operator_nonce` and
-`challenge`, are each handed out at a bounded rate (`[limits]`: five a second
-with bursts of fifty, by default, for the server as a whole); a request past
-it is refused with 429 `rate_limited`. A nonce no board took within its
+`challenge`, are each handed out at a bounded rate, for the server as a whole
+and for each source (`[limits]`: five a second with bursts of fifty overall,
+and one a second with bursts of ten for each source, by default), so one
+caller asking as fast as it can leaves every other its share; a request past
+either is refused with 429 `rate_limited`. A source is an IPv4 address, or an
+IPv6 /64. A request from a trusted proxy (`trusted_proxies`, loopback by
+default, for a proxy on the same machine) is counted against the nearest
+address in its `X-Forwarded-For` that is not a trusted proxy; any other
+request against the address that connected, whatever header it carries. A nonce no board took within its
 lifetime (`nonce_ttl_seconds`), and a challenge once used or expired, is
 deleted, so what these calls hold in the database is bounded by the rate times
 the lifetime. A board naming a deleted nonce is refused (`nonce_unknown`): a
@@ -698,7 +704,8 @@ with their smallest leaf, how often a round is built, the assets a round's
 fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
-behind (`[limits]`: the rate of nonces and challenges, a nonce's lifetime,
+behind (`[limits]`: the rate of nonces and challenges, overall and for each
+source, the proxies trusted to name a request's source, a nonce's lifetime,
 how long a board may stay out of every block), and where the operator's
 metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
 
@@ -1027,6 +1034,16 @@ not start either, naming the forfeit; the latest state starts. A round
 built after the copy makes the server refuse to start on it, naming the
 round. A forfeit whose operator's half was never stored is given it at
 start, and the signer's record does not grow.
+
+`tests/limits.rs` bounds what the calls anyone may make leave behind: junk
+boards whose transactions the node refuses leave no row and nothing in the
+nursery; nonces and challenges asked for a thousand times each are handed out
+within the rate and deleted once expired; a board the node took that never
+confirms is dropped. A stranger asking about a hundred times a second for
+each, through the proxy, leaves an honest wallet asking once a second every
+one of its twenty, and gets its own share and no more; a caller naming a new
+source in every request, from no trusted proxy, is counted as the address
+that connected.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,

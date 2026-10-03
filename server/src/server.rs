@@ -98,6 +98,18 @@ pub struct LimitsSection {
 	/// How many of either may be handed out at once before the rate holds.
 	#[serde(default = "default_issue_burst")]
 	pub issue_burst: u32,
+	/// The same for each source (an IPv4 address, an IPv6 /64), within the
+	/// overall bounds, so one caller cannot use up what every caller needs.
+	#[serde(default = "default_source_per_second")]
+	pub source_per_second: u32,
+	#[serde(default = "default_source_burst")]
+	pub source_burst: u32,
+	/// The addresses of the reverse proxies in front: a request from one is
+	/// counted against the address its `X-Forwarded-For` names, any other
+	/// against the address that connected. Loopback when absent, for a proxy
+	/// on the same machine.
+	#[serde(default = "default_trusted_proxies")]
+	pub trusted_proxies: Vec<String>,
 	/// How long an operator nonce is good for: one no board took in that
 	/// time is deleted, and a board naming it is refused.
 	#[serde(default = "default_nonce_ttl")]
@@ -115,6 +127,8 @@ impl Default for LimitsSection {
 	fn default() -> LimitsSection {
 		LimitsSection {
 			issue_per_second: default_issue_per_second(), issue_burst: default_issue_burst(),
+			source_per_second: default_source_per_second(), source_burst: default_source_burst(),
+			trusted_proxies: default_trusted_proxies(),
 			nonce_ttl_seconds: default_nonce_ttl(), board_unconfirmed_seconds: default_board_unconfirmed(),
 			cleanup_interval_seconds: default_cleanup_interval(),
 		}
@@ -127,6 +141,18 @@ fn default_issue_per_second() -> u32 {
 
 fn default_issue_burst() -> u32 {
 	50
+}
+
+fn default_source_per_second() -> u32 {
+	1
+}
+
+fn default_source_burst() -> u32 {
+	10
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+	vec!["127.0.0.1".into(), "::1".into()]
 }
 
 fn default_nonce_ttl() -> u64 {
@@ -597,8 +623,12 @@ impl Server {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
 			participations: participations.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
-			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
-			challenges: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst),
+			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
+				config.limits.source_burst),
+			challenges: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
+				config.limits.source_burst),
+			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
+				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {
@@ -618,7 +648,7 @@ impl Server {
 		}
 		let listener = tokio::net::TcpListener::bind(&config.listen).await.map_err(err("listen"))?;
 		let addr = listener.local_addr().map_err(err("listen"))?;
-		let routes = router(app);
+		let routes = router(app).into_make_service_with_connect_info::<SocketAddr>();
 		tasks.push(tokio::spawn(async move {
 			if let Err(e) = axum::serve(listener, routes).await {
 				log::error!("the HTTP listener stopped: {}", e);
