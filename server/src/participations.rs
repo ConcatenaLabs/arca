@@ -459,7 +459,7 @@ impl Participations {
 		let mut last_times = Vec::with_capacity(n);
 		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
-			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, Params::ROUND_HORIZON).await?;
+			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::ROUND_HORIZON)).await?;
 			if !verify_digest(&i.attestation, &id, &c.coin.leaf.owner) {
 				return Err(ParticipationError::BadAttestation(k));
 			}

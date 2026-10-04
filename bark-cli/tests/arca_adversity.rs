@@ -888,6 +888,70 @@ async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() 
 	}
 }
 
+/// A payment asked for while the signer is away: the server records the
+/// transfer, its coin spent by it, and answers 503 before anything is
+/// signed; the sender's wallet keeps the request standing. The board's exit
+/// deadline passes before the sender looks again. Posted again, the request
+/// completes whatever the board's dates have become since: it was within
+/// them when the server recorded it. The receiver takes the coin, past its
+/// board's exit deadline, as one it can only refresh or exit, and refreshes
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_recorded_while_the_signer_was_away_completes_past_the_boards_exit_deadline() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, w) = (Arca::new("T1A"), Arca::new("T1W"));
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	w.ok(&create_args(&url, &r.node_url()));
+	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	r.signer.halt();
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("T1 A pays W with the signer away: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!(v["error"]["kind"], "unreachable", "a 503 is not a refusal: {}", v);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "sending");
+	let id: LeafId = boards[0].parse().unwrap();
+	let at_server = r.server.store.leaf(&id.0).await.unwrap().unwrap();
+	println!("T1 A's coin at the server: {:?}", at_server.state);
+	assert_eq!(at_server.state, server::store::LeafState::Spent, "the server recorded the transfer");
+	// The board's exit deadline passes.
+	let deadline = coin_of(&a, &boards[0])["exit_deadline"].as_u64().unwrap() as u32;
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, deadline - now + 3_600));
+	r.bury().await;
+	r.synced().await;
+	println!("T1 now {}: past the board's exit deadline {}", common::node::median_time(&r.rt), deadline);
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let s = a.ok(&["sync"]);
+	println!("T1 A's sync, the signer back: transfers {}", s["transfers"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string(), "the request posted again completes: {}", s);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "spent");
+	let kept = &s["transfers"][0]["kept"][0];
+	println!("T1 A's change: {}", kept);
+	assert_eq!(kept["state"], "live", "{}", kept);
+	let m = w.ok(&["sync"])["mailbox"].clone();
+	println!("T1 W's mailbox: {}", m);
+	let got = m["accepted"][0].clone();
+	assert_eq!((got["value"].as_str(), got["state"].as_str()), (Some("600000"), Some("live")), "{}", m);
+	assert!(got["board"]["note"].as_str().unwrap().contains("past its exit deadline"), "{}", got);
+	// W refreshes it: the operator takes it into a refresh until a day
+	// before the board's expiry.
+	let p = w.ok(&["participate"]);
+	println!("T1 W refreshes the coin: {}", p["state"]);
+	assert_eq!(p["state"], "pending");
+	final_round(&r).await;
+	let s = w.ok(&["sync"]);
+	println!("T1 W's sync once the round is final: {}", s["participations"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s);
+	let new = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&w, &new)["state"], "live");
+	for c in [&a, &w] {
+		let _ = std::fs::remove_dir_all(&c.dir);
+	}
+}
+
 /// A participation the server took, its answer lost as a gateway's 502: the
 /// wallet keeps it `submitting` and `sync` posts its stored body again. The
 /// body is posted without its key proofs, as a wallet stored it before they

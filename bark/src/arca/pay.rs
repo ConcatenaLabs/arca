@@ -504,19 +504,24 @@ impl Wallet {
 			return Err(Error::Refused(format!("the coin's salt is that of coin {} the wallet has held: its old pairs would spend it", c.leaf_id)));
 		}
 		a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).map_err(|e| Error::Refused(e.to_string()))?;
-		// A coin resting on a board carries the board's dates: past its exit
-		// deadline the operator co-signs no spend of it.
+		// A coin resting on a board carries the board's dates. One that
+		// arrives past its exit deadline (a payment the server recorded
+		// before it and completed when it was asked again) is still the
+		// wallet's, co-signed and checked: refusing it would undo nothing.
+		// It is kept, and shown as a coin the operator takes only into a
+		// refresh, or to exit.
 		let board_expiry = self.board_expiry(&record, &a.bases)?;
-		if let Some(e) = board_expiry {
-			if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64 {
-				return Err(Error::Refused(format!("the coin rests on a board whose exit deadline has passed (its service ends at median time \
-					{}): the operator co-signs no spend of it, and takes it only into a refresh", e)));
-			}
-		}
+		let past_deadline = board_expiry.is_some_and(|e| now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64);
 		let lineage: BTreeSet<Script> = a.valid.lineage().into_iter().map(|o| o.output.script_pubkey).collect();
 		let seen = self.chain.scripts_seen(&lineage, a.lowest_height())?;
 		a.valid.check_lineage(|s| seen.contains(s)).map_err(|e| Error::Refused(e.to_string()))?;
-		let (state, note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		if past_deadline {
+			let e = board_expiry.expect("past a deadline");
+			let why = format!("it rests on a board past its exit deadline: the operator co-signs no spend of it and takes it only into a \
+				refresh, until median time {}; exit it after that", e.saturating_sub(super::wallet::BOARD_REFRESH_UNTIL));
+			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
+		}
 		let coin = self.row(&record, &a, state, &note)?;
 		// The wallet's own coins this transfer spent (a swap's side).
 		let spent: Vec<String> = match &record {
@@ -542,6 +547,10 @@ impl Wallet {
 			"hops": a.valid.hops, "state": state, "note": note, "from": source});
 		if super::wallet::rests_on_board(&record) {
 			out["board"] = match board_expiry {
+				Some(e) if past_deadline => json!({"exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE), "expiry": e,
+					"refresh_until": e.saturating_sub(super::wallet::BOARD_REFRESH_UNTIL),
+					"note": "the coin rests on a board past its exit deadline: it cannot be paid on; the operator takes it only into a \
+					refresh, until a day before its expiry, and it can be exited at any time"}),
 				Some(e) => json!({"exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE), "expiry": e,
 					"note": "the coin rests on a board, which carries the dates of a batch made when it confirmed: pay it on or refresh it \
 					before its exit deadline; after it the operator takes it only into a refresh, until a day before its expiry, and from \

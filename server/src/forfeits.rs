@@ -274,7 +274,7 @@ impl Forfeits {
 			let checked = if p.state == ParticipationState::Released {
 				coins::resolve(&self.store, &policy, &leaf).await?
 			} else {
-				coins::check(&self.store, &policy, &leaf, &id, 0).await?
+				coins::check(&self.store, &policy, &leaf, &id, coins::BoardDates::Within(0)).await?
 			};
 			let c = &checked.coin;
 			let f = Forfeit::new(c.leaf, (c.asset, c.value), c.id, p.unlock_hash, m, refund, i.margin)
