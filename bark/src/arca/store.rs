@@ -271,6 +271,11 @@ impl Store {
 		Ok(())
 	}
 
+	pub fn delete_meta(&self, key: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM meta WHERE key = ?1", params![key]).map_err(db)?;
+		Ok(())
+	}
+
 	/// The next index of on-chain `chain`, taken, in one statement: two
 	/// processes on one store never take the same index.
 	pub fn take_index(&self, chain: u32) -> Result<u32, Error> {

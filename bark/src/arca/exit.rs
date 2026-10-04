@@ -34,7 +34,7 @@ use arca_covenant::{CoinRecord, ExplicitOutput, UnrollTx, ValidCoin, ValidOrigin
 
 use super::chain::hex;
 use super::keys::CHANGE;
-use super::wallet::{sign, Wallet};
+use super::wallet::{sign, Home, Wallet};
 use super::Error;
 
 /// Where each output of a coin's path is now, from the chain's `locate`.
@@ -559,6 +559,7 @@ impl Wallet {
 		// the operator: it does only what it does on the chain.
 		let witness = self.witness();
 		let witnessed = witness.is_ok();
+		let failed = witness.as_ref().err().map(|e| e.to_string());
 		let witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let gone = self.rolled_back()?.is_some();
 		let talk = witnessed && !gone;
@@ -572,15 +573,42 @@ impl Wallet {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		// After a stop the wallet brings everything home: each coin it still
-		// holds off the chain shown with the date by which it must be exited,
-		// and taken on the chain when that date is within three days.
-		let home = if gone { self.home(true).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
+		// D56: a coin the wallet cannot have refreshed goes home before its
+		// date, whatever the reason. After a stop, or while the operator
+		// cannot refresh anything (no witness succeeds, the server does not
+		// answer or refuses the wallet), each coin it still holds off the
+		// chain is shown with the date by which it must be exited, and taken
+		// on the chain when that date is within three days; while the
+		// operator answers, so is each coin whose refresh it refused. Nothing
+		// is refused for good: once the operator answers again, a coin whose
+		// date is further off stays.
+		let cannot = match (gone, failed) {
+			(true, _) => None,
+			(false, Some(e)) => Some(e),
+			(false, None) => self.server_info().err().map(|e| e.to_string()),
+		};
+		let (why, unreachable) = match (gone, cannot) {
+			(true, _) => (Home::Stopped, Value::Null),
+			(false, Some(e)) => {
+				self.set_unreachable(Some(&e))?;
+				(Home::Unreachable(e.clone()), json!({"why": e, "note": "the operator cannot refresh the wallet's coins now: run `arca sync` \
+					before each coin's exit date (exit_by): it takes the coin on the chain once that date is within three days, and keeps \
+					it while the operator answers"}))
+			},
+			(false, None) => {
+				self.set_unreachable(None)?;
+				(Home::Refused, Value::Null)
+			},
+		};
+		let home = self.home(true, &why).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
 			"participations": participations, "forfeits": forfeits, "exits": exits});
-		if gone {
+		if !matches!(why, Home::Refused) || home.as_array().is_none_or(|h| !h.is_empty()) {
 			out["home"] = home;
+		}
+		if !unreachable.is_null() {
+			out["unreachable"] = unreachable;
 		}
 		Ok(out)
 	}
