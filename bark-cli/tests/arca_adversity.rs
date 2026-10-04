@@ -3592,6 +3592,95 @@ async fn a_wallet_takes_no_coin_without_its_keepers_acknowledgements() {
 	}
 }
 
+/// R7f F9. Once a mailbox coin waits (its head without the keeper's
+/// acknowledgement, stripped by a proxy), the messages after it are read
+/// again on every read until it is taken: the coins among them the wallet
+/// took already are reported as held, never again as accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mailbox_read_again_reports_no_held_coin_as_taken() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let pb = Proxy::start(&url);
+	let (a, b) = (Arca::new("MRA"), Arca::new("MRB"));
+	boarded(&mut r, &a, &url, &[(x, 4_000_000)]).await;
+	b.ok(&create_args(&pb.url.clone(), &r.node_url()));
+	for amount in ["100000", "200000"] {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		a.ok(&["send", &req, "--amount", amount, "--asset", &x.to_string()]);
+	}
+	// The first message's head loses its acknowledgements on the way.
+	let first: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+	let f2 = first.clone();
+	pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/mailbox_read" {
+			for m in v["messages"].as_array_mut().into_iter().flatten() {
+				let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
+				let mut f = f2.lock().unwrap();
+				if f.is_none() {
+					*f = Some(leaf.clone());
+				}
+				if f.as_deref() == Some(leaf.as_str()) {
+					if let Some(o) = m["signer_record"].as_object_mut() {
+						o.remove("acks");
+					}
+				}
+			}
+		}
+		None
+	})));
+	let held_in_accepted = |s: &Value| s["mailbox"]["accepted"].as_array().unwrap().iter().any(|c| !c["already_held"].is_null());
+	let s = b.ok(&["sync"]);
+	println!("MR B's first read: accepted {} | waiting {}", s["mailbox"]["accepted"], s["mailbox"]["waiting"]);
+	let p2 = s["mailbox"]["accepted"][0]["leaf_id"].as_str().expect("the second coin taken").to_string();
+	assert_eq!(s["mailbox"]["waiting"].as_array().unwrap().len(), 1);
+	let s = b.ok(&["sync"]);
+	println!("MR B's second read: accepted {} | already_held {} | waiting {}", s["mailbox"]["accepted"], s["mailbox"]["already_held"],
+		s["mailbox"]["waiting"]);
+	assert!(!held_in_accepted(&s) && s["mailbox"]["accepted"].as_array().unwrap().is_empty(), "nothing is reported taken: {}", s["mailbox"]);
+	assert_eq!(s["mailbox"]["already_held"][0]["leaf_id"].as_str(), Some(p2.as_str()), "{}", s["mailbox"]);
+	pb.rewrite(None);
+	let s = b.ok(&["sync"]);
+	println!("MR B's read with the answers whole: accepted {} | already_held {}", s["mailbox"]["accepted"], s["mailbox"]["already_held"]);
+	assert!(!held_in_accepted(&s));
+	assert_eq!(s["mailbox"]["accepted"][0]["leaf_id"].as_str(), first.lock().unwrap().as_deref(), "the coin that waited is taken");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7f F9. A rollback note kept by an older version of the wallet without
+/// the signer's proof (R7e F4's lie, believed before the wallet asked for
+/// proof) is checked once against the signer: its witness proves no
+/// rollback, so the note is dropped, saying so, nothing is exited, and the
+/// wallet goes on with the operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_wallets_rollback_note_without_proof_is_dropped() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("ONA");
+	let boards = boarded(&mut r, &a, &url, &[(x, 1_000_000)]).await;
+	{
+		let c = rusqlite::Connection::open(a.dir.join("arca.sqlite")).unwrap();
+		c.execute("INSERT INTO meta (key, value) VALUES ('operator_rolled_back', ?1)",
+			[r#"{"at":0,"why":"the server says the record ends before entry 1"}"#]).unwrap();
+	}
+	let s = a.ok(&["sync"]);
+	println!("ON A's sync with an older wallet's note: witness {} | home {}", s["witness"], s["home"]);
+	assert!(s["witness"]["rolled_back"].is_null() && s["witness"]["error"].is_null(), "{}", s["witness"]);
+	assert!(s["home"].is_null(), "nothing brought home: {}", s["home"]);
+	let refusals = a.ok(&["refusals"]);
+	let dropped = refusals.as_array().unwrap().iter().find(|r| r["reason"].as_str().unwrap_or("").contains("whose witness proves no rollback: dropped"))
+		.cloned();
+	println!("ON the wallet's record of it: {:?}", dropped.as_ref().map(|d| d["reason"].clone()));
+	assert!(dropped.is_some(), "{}", refusals);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "live");
+	let req = a.ok(&["receive"]);
+	assert!(req["request"].is_string(), "the wallet goes on with the operator: {}", req);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
 /// R7c's F8: the forfeit's margin is bounded from the floor the operator
 /// publishes, as a transfer's margins are, whatever the wallet's own node
 /// makes of the asset. A wallet whose node values X five times higher than

@@ -516,6 +516,28 @@ impl Wallet {
 	/// lineage or a board it rests on is on the chain already, and taken on
 	/// the chain at once, since the operator co-signs nothing more and
 	/// exiting it is its holder's only chance.
+	/// What a coin the wallet already holds, arriving again as `bytes` (its
+	/// record, checked), is: the same record, held; or another record of the
+	/// same coin, which every check passed, so validly signed: since a coin's
+	/// id commits to its outputs, both pay the same outputs and the wallet's
+	/// coin is safe, but the operator co-signed two checkpoint values for one
+	/// coin, which it never should. That is kept with the wallet's refusals as
+	/// evidence, the second record with it, and reported. `None` for a coin
+	/// the wallet does not hold.
+	pub(crate) fn held_again(&self, id: &str, bytes: &[u8]) -> Result<Option<Value>, Error> {
+		let Some(c) = self.store.coin(id)? else { return Ok(None) };
+		// Each in its canonical encoding.
+		let held = CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.to_bytes().ok());
+		if c.record.is_empty() || c.record == bytes || held.as_deref() == Some(bytes) {
+			return Ok(Some(json!({"leaf_id": id, "already_held": c.state})));
+		}
+		let why = format!("a second record of coin {}, every check of it passed, carries other checkpoint values than the record the \
+			wallet holds: the operator co-signed two checkpoint values for one coin. Both pay the same outputs, so the coin is safe; the \
+			second record is kept here as evidence: {}", id, hex(bytes));
+		self.store.refused(&format!("evidence: coin {}", id), &why)?;
+		Ok(Some(json!({"leaf_id": id, "already_held": c.state, "evidence": why})))
+	}
+
 	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| Error::Refused(format!("the record does not decode: {}", e)))?;
 		let (owner, nonce) = owner_of(&record);
@@ -543,8 +565,8 @@ impl Wallet {
 		if !claimed.is_empty() && claimed != id {
 			return Err(Error::Refused(format!("the server names the coin {}, its record makes it {}", claimed, id)));
 		}
-		if let Some(c) = self.store.coin(&id)? {
-			return Ok(json!({"leaf_id": id, "already_held": c.state}));
+		if let Some(v) = self.held_again(&id, &record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?)? {
+			return Ok(v);
 		}
 		if row.state != "pending" {
 			return Err(Error::Refused(format!("a second coin for the single-use key {} (it already holds {})",
@@ -685,6 +707,9 @@ impl Wallet {
 		let mut accepted = vec![];
 		let mut refused = vec![];
 		let mut waiting = vec![];
+		// Coins read again that the wallet holds already (the messages after
+		// one that waits are read again with it): never reported as taken.
+		let mut held = vec![];
 		for (leaf, bytes, head) in self.store.kept_for_retry()? {
 			let head_v: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
 			if let (Err(why), None) = (self.held_outside(&head_v), &home) {
@@ -699,7 +724,7 @@ impl Wallet {
 					if let Err(e) = self.keep_coin_head(&leaf, &head) {
 						self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
 					}
-					accepted.push(v);
+					if v["already_held"].is_null() { accepted.push(v) } else { held.push(v) }
 				},
 				Err(e) if passing(&e) => {
 					self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), None)?;
@@ -741,7 +766,7 @@ impl Wallet {
 							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
 								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
 							}
-							accepted.push(v)
+							if v["already_held"].is_null() { accepted.push(v) } else { held.push(v) }
 						},
 						Err(e) if passing(&e) => {
 							let head = (!m["signer_record"].is_null()).then(|| m["signer_record"].to_string());
@@ -761,6 +786,9 @@ impl Wallet {
 			}
 		}
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
+		if !held.is_empty() {
+			out["already_held"] = json!(held);
+		}
 		if let Some((at, why)) = home {
 			out["witness"] = witness;
 			out["note"] = json!(format!("the operator's signer's record was rolled back past entry {} ({}): the operator co-signs \

@@ -543,11 +543,27 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// The rollback of the operator's signer's record the wallet found, if
-	/// it found one: the highest entry the record still agreed with, and why.
+	/// The rollback of the operator's signer's record the wallet found on
+	/// the signer's own proof, if it found one: the highest entry the record
+	/// still agreed with, and why. A note an older version of the wallet kept
+	/// without that proof is not acted on: the next witness that succeeds
+	/// checks it against the signer and drops it unless the signer proves it.
 	pub(crate) fn rolled_back(&self) -> Result<Option<(u64, String)>, Error> {
 		Ok(self.store.meta(ROLLED_BACK)?.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+			.filter(|v| v["proven"] == json!(true))
 			.map(|v| (v["at"].as_u64().unwrap_or(0), v["why"].as_str().unwrap_or("").to_string())))
+	}
+
+	/// Drops a rollback note kept without the signer's proof, once a witness
+	/// found the record agreeing with the wallet: the signer proved nothing.
+	fn drop_unproven_rollback(&self) -> Result<(), Error> {
+		let Some(note) = self.store.meta(ROLLED_BACK)? else { return Ok(()) };
+		if serde_json::from_str::<Value>(&note).ok().is_some_and(|v| v["proven"] == json!(true)) {
+			return Ok(());
+		}
+		self.store.delete_meta(ROLLED_BACK)?;
+		self.store.refused("the operator's signer's record", &format!("a rollback note an older version of the wallet kept without the \
+			signer's proof ({}) was checked against the signer, whose witness proves no rollback: dropped, nothing refused for it", note))
 	}
 
 	/// Keeps the rollback found, `why`, the record agreeing with the wallet
@@ -558,7 +574,7 @@ impl Wallet {
 		if prior.is_some_and(|(was, w)| was == at && w == why) {
 			return Ok(());
 		}
-		self.store.set_meta(ROLLED_BACK, &json!({"at": at, "why": why}).to_string())?;
+		self.store.set_meta(ROLLED_BACK, &json!({"at": at, "why": why, "proven": true}).to_string())?;
 		self.store.refused("the operator's signer's record", why)
 	}
 
@@ -768,6 +784,7 @@ impl Wallet {
 			},
 		};
 		if judged.is_none() && prior.is_none() {
+			self.drop_unproven_rollback()?;
 			if !answer["head"].is_null() {
 				self.witness_record(&answer["head"], false)?;
 			}
@@ -1951,6 +1968,78 @@ mod tests {
 		let tried = w.exit_after(0, "a stop").unwrap();
 		assert_eq!(tried.len(), 1, "{:?}", tried);
 		assert_eq!(tried[0]["leaf_id"], "old");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A wallet's directory and store, as the unit tests make one: its
+	/// meta set, nothing else in it.
+	fn bare_wallet(tag: &str) -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!("arca-wallet-unit-{}-{}", std::process::id(), tag));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join(MNEMONIC_FILE), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+			.unwrap();
+		let store = Store::open(&dir.join(DB_FILE)).unwrap();
+		let operator = key(9).x_only_public_key().0;
+		for (k, v) in [("server", "http://127.0.0.1:1"), ("node_url", "http://127.0.0.1:1/"), ("account", "0"), ("exit_delay_units", "254"),
+			("min_exit_delay_units", "254"), ("max_exit_delay_units", "338"), ("genesis", &elements::BlockHash::all_zeros().to_string()),
+			("chain_name", "elementsregtest"), ("operator", &operator.to_string())]
+		{
+			store.set_meta(k, v).unwrap();
+		}
+		dir
+	}
+
+	/// R7f F9: a second record of a coin the wallet holds, whose checks all
+	/// passed (so validly signed), with other checkpoint values: kept as
+	/// evidence that the operator co-signed two checkpoint values for one
+	/// coin, and reported; the same record again is held, as before.
+	#[test]
+	fn a_second_record_of_a_held_coin_is_kept_as_evidence() {
+		let dir = bare_wallet("second-record");
+		{
+			let store = Store::open(&dir.join(DB_FILE)).unwrap();
+			let nonce = [4u8; 32];
+			store.put_nonce(&nonce, &key(4).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.put_coin(&CoinRow {
+				leaf_id: "c".into(), owner_nonce: nonce, kind: "transfer".into(), asset: AssetId::from_slice(&[7; 32]).unwrap().to_string(),
+				value: 1_000, record: vec![1, 2, 3], salt: [4; 32], state: "live".into(), note: String::new(), expiry: u32::MAX,
+				bases: vec![], spent_by: None,
+			}).unwrap();
+			store.use_nonce(&nonce, "c").unwrap();
+		}
+		let w = Wallet::open(&dir).unwrap();
+		assert!(w.held_again("not held", &[1, 2, 3]).unwrap().is_none());
+		let same = w.held_again("c", &[1, 2, 3]).unwrap().unwrap();
+		assert_eq!(same, json!({"leaf_id": "c", "already_held": "live"}));
+		let other = w.held_again("c", &[1, 2, 4]).unwrap().unwrap();
+		println!("a second record of a held coin: {}", other["evidence"]);
+		assert_eq!(other["already_held"], "live");
+		assert!(other["evidence"].as_str().unwrap().contains("the operator co-signed two checkpoint values for one coin")
+			&& other["evidence"].as_str().unwrap().ends_with("010204"), "{}", other);
+		let refusals = w.refusals().unwrap();
+		assert!(refusals.as_array().unwrap().iter().any(|r| r["what"] == "evidence: coin c"), "{}", refusals);
+		assert_eq!(w.store.coin("c").unwrap().unwrap().record, vec![1, 2, 3], "the coin held stays as it was");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// R7f F9: a rollback note an older version of the wallet kept without
+	/// the signer's proof is not acted on, and a witness that finds the
+	/// record agreeing drops it; a note kept on the signer's proof stands.
+	#[test]
+	fn a_rollback_note_without_the_signers_proof_is_not_acted_on() {
+		let dir = bare_wallet("old-note");
+		let w = Wallet::open(&dir).unwrap();
+		w.store.set_meta(ROLLED_BACK, &json!({"at": 2, "why": "an older wallet's note"}).to_string()).unwrap();
+		assert_eq!(w.rolled_back().unwrap(), None, "not acted on");
+		w.drop_unproven_rollback().unwrap();
+		assert_eq!(w.store.meta(ROLLED_BACK).unwrap(), None, "dropped once the record agrees");
+		assert!(w.refusals().unwrap().as_array().unwrap().iter().any(|r| r["reason"].as_str().unwrap_or("").contains("was checked against the \
+			signer, whose witness proves no rollback: dropped")));
+		w.found_rollback(3, "the signer's proof").unwrap();
+		assert_eq!(w.rolled_back().unwrap(), Some((3, "the signer's proof".to_string())));
+		w.drop_unproven_rollback().unwrap();
+		assert_eq!(w.rolled_back().unwrap(), Some((3, "the signer's proof".to_string())), "a proven note stands");
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
