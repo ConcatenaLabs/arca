@@ -143,7 +143,9 @@ the keys, but which coins were spent off-chain is in the store and the server.
   `exit_deadline`, and whether it rests on a board; the wallet says so when it
   receives such a coin. Up to the exit deadline the operator co-signs spends
   of it; after it the wallet pays nothing with it, and the operator takes it
-  only into a refresh, until a day before the expiry. From the expiry the
+  only into a refresh, until a day before the expiry. A coin that arrives
+  past its exit deadline (a payment the server recorded before it, while its
+  signer was away, and completed when asked again) is kept and shown so. From the expiry the
   operator may bring the board's lineage on the chain to collect a coin of it
   given up in a refresh; a coin of the wallet's on that lineage then goes on
   the chain, and the wallet exits it. A refresh before the deadline avoids
@@ -304,6 +306,9 @@ and holding it there, with the reason shown:
   TLS itself, and a plain-HTTP server on another host, refused before anything
   is sent;
 - a payment whose answer comes back as a gateway's 502, posted again;
+- a payment asked for while the operator's signer is away (503), posted again
+  after the board's exit deadline has passed: it completes, and the receiver
+  keeps the coin, past its deadline, and refreshes it;
 - a participation whose answer comes back as a gateway's 502, posted again
   without its key proofs: the server, which holds it, answers with its
   status, the coin stays given up and the participation completes, while a

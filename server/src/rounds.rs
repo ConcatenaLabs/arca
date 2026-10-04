@@ -240,7 +240,7 @@ impl Rounds {
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
 		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
-			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, Params::ROUND_HORIZON).await {
+			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, coins::BoardDates::Within(Params::ROUND_HORIZON)).await {
 				Ok(_) => {},
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
 				Err(coins::CoinError::InvalidCoin {

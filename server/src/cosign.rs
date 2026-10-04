@@ -45,7 +45,10 @@
 //! (`double_spend`). Each new coin's
 //! record is checked by the server as a receiver would check it, stored, and
 //! posted to the receiver's mailbox. A request repeated byte for byte gets the
-//! same answer.
+//! same answer. One recorded and not yet signed (the signer was not reached)
+//! completes when repeated, whatever the dates of the boards its coins rest
+//! on have become since: it was within them when it was recorded
+//! ([`coins::BoardDates::WithinUnlessRecorded`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -284,7 +287,7 @@ impl Cosigner {
 	/// deadline not past, nothing of its lineage on-chain
 	/// ([`crate::coins::check`]).
 	async fn check_input(&self, id: &LeafId, transfer: &[u8; 32], now: MedianTime) -> Result<Checked, CosignError> {
-		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, WalletPolicy::EXIT_DEADLINE).await?)
+		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 
 	/// Co-signs `req`: see the [module documentation](self).

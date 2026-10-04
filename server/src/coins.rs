@@ -13,7 +13,9 @@
 //! A coin resting on a board is taken only within the board's dates
 //! ([`Params::BOARD_LIFETIME`]): the board's service expiry, 28 days after the
 //! median time of the block that confirms it, less a horizon the caller
-//! names (the exit deadline for a transfer, a day for a refresh).
+//! names (the exit deadline for a transfer, a day for a refresh). A transfer
+//! the server recorded, which was within them then, completes when repeated
+//! whatever they have become since ([`BoardDates`]).
 
 use elements::hashes::Hash;
 use elements::Transaction;
@@ -149,13 +151,26 @@ pub async fn resolve(store: &Store, policy: &WalletPolicy, id: &LeafId) -> Resul
 	Ok(Checked { record, coin, bases: found, board_expiry })
 }
 
+/// How a coin resting on a board is held to the board's dates in
+/// [`check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardDates {
+	/// Taken only while the board's service expiry lies more than this many
+	/// seconds ahead, whoever holds the coin now: a round checks the coins
+	/// its participations gave up against it.
+	Within(u32),
+	/// The same, except for a coin already spent by the holder itself: a
+	/// transfer the server recorded was within the board's dates when it was
+	/// recorded, and completes when repeated whatever they have become
+	/// since.
+	WithinUnlessRecorded(u32),
+}
+
 /// Checks the coin `id` given up by `holder` (a transfer, or a
-/// participation): see the [module documentation](self). A coin resting on a
-/// board is taken only while the board's service expiry lies more than
-/// `board_horizon` seconds ahead, whoever holds it now: a round checks the
-/// coins its participations gave up against it. A coin already spent by
-/// `holder` itself passes the rest, so a repeated request gets its answer.
-pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], board_horizon: u32)
+/// participation): see the [module documentation](self), and [`BoardDates`]
+/// for the board's dates. A coin already spent by `holder` itself passes the
+/// rest, so a repeated request gets its answer.
+pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
 	-> Result<Checked, CoinError>
 {
 	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;
@@ -169,9 +184,14 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		LeafState::Expired => return Err(CoinError::NotLive(*id, "expired")),
 	}
 	let Checked { record, coin, bases: found, board_expiry } = resolve(store, policy, id).await?;
-	if let Some(e) = board_expiry {
-		if (policy.now.to_consensus_u32() as u64) + board_horizon as u64 >= e as u64 {
-			return Err(CoinError::PastBoardDate { leaf: *id, expiry: e, horizon: board_horizon });
+	let horizon = match dates {
+		BoardDates::Within(h) => Some(h),
+		BoardDates::WithinUnlessRecorded(_) if repeat => None,
+		BoardDates::WithinUnlessRecorded(h) => Some(h),
+	};
+	if let (Some(e), Some(h)) = (board_expiry, horizon) {
+		if (policy.now.to_consensus_u32() as u64) + h as u64 >= e as u64 {
+			return Err(CoinError::PastBoardDate { leaf: *id, expiry: e, horizon: h });
 		}
 	}
 	// Its own leaf and every leaf and checkpoint it descends from.
