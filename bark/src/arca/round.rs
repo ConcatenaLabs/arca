@@ -268,6 +268,40 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// Every participation the wallet made, from its own store, oldest
+	/// first, asking nothing of the operator: its id, where it stands, the
+	/// round it ran in (its transaction id, once known), whether it was
+	/// released, each coin it gave up and each new leaf it wanted, with the
+	/// state of each the wallet holds. `sync` reports a release once; a
+	/// client that missed that report asks here, as often as it likes.
+	pub fn participations(&self) -> Result<Value, Error> {
+		let mut out = vec![];
+		for (pid, _, given, wanted, state, preimage, round) in self.store.participations()? {
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+			let mut gives = vec![];
+			for l in &given {
+				let c = self.store.coin(l)?;
+				gives.push(json!({"leaf_id": l, "state": c.map(|c| c.state)}));
+			}
+			let mut new_leaves = vec![];
+			for w in wanted.as_array().cloned().unwrap_or_default() {
+				let leaf = match w["nonce"].as_str().and_then(|n| unhex32(n).ok()) {
+					Some(n) => self.store.nonce(&n)?.and_then(|r| r.leaf_id),
+					None => None,
+				};
+				let coin = match &leaf {
+					Some(l) => self.store.coin(l)?,
+					None => None,
+				};
+				new_leaves.push(json!({"asset": w["asset"], "value": w["value"], "leaf_id": leaf, "state": coin.map(|c| c.state)}));
+			}
+			out.push(json!({"participation": pid, "state": state, "round": round, "released": preimage.is_some(), "gives": gives,
+				"new_leaves": new_leaves}));
+		}
+		Ok(Value::Array(out))
+	}
+
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
 		match self.server.post("submit_participation", body) {
 			Ok(a) => {

@@ -131,6 +131,9 @@ enum Cmd {
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
 	},
+	/// Every participation the wallet made, from its own store: where it
+	/// stands, its round, the coins it gave up and its new leaves.
+	Participations,
 	/// Re-checks every coin against the chain, retries what the server never
 	/// answered, reads the mailbox and moves every participation on.
 	Sync,
@@ -295,7 +298,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// needs nothing of the operator) do not wait on the server. The library
 	// witnesses again in every entry point that takes a coin or signs a
 	// spend through the operator, and refuses while no witness succeeds.
-	if !matches!(cli.command, Cmd::Address | Cmd::Balance | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Exit { .. }) {
+	if !matches!(cli.command, Cmd::Address | Cmd::Balance | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
+		| Cmd::Exit { .. })
+	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
 			Ok(_) => {},
@@ -354,6 +359,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
 		Cmd::Refusals => w.refusals(),
+		Cmd::Participations => w.participations(),
 	}
 }
 

@@ -3681,6 +3681,46 @@ async fn an_older_wallets_rollback_note_without_proof_is_dropped() {
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
+/// A wallet asks where its participations stand, from its own store, as
+/// often as it likes: `sync` reports a release once, and a client that
+/// missed that report (the testnet trial's script waited an hour on it)
+/// asks `participations`, which names each one's state, its round, the coins
+/// it gave up and its new leaves, the same before and after the release is
+/// reported, and with the operator gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_lists_its_participations_with_their_round_and_new_leaves() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let c = Arca::new("PL");
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	assert_eq!(c.ok(&["participations"]), json!([]));
+	let p = c.ok(&["participate"]);
+	let pid = p["participation"].as_str().unwrap().to_string();
+	let listed = c.ok(&["participations"]);
+	println!("PL before the round: {}", listed);
+	assert_eq!(listed[0]["participation"].as_str(), Some(pid.as_str()));
+	assert_eq!(listed[0]["state"], "pending");
+	assert_eq!(listed[0]["gives"][0], json!({"leaf_id": boards[0], "state": "given"}));
+	assert!(listed[0]["round"].is_null() && listed[0]["new_leaves"][0]["leaf_id"].is_null() && listed[0]["released"] == false);
+	let round = final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	// The report missed: asked again, twice, and with the operator gone.
+	let first = c.ok(&["participations"]);
+	println!("PL after the release: {}", first);
+	assert_eq!(c.ok(&["participations"]), first, "the same answer each time");
+	assert_eq!((first[0]["state"].as_str(), first[0]["released"].as_bool()), (Some("released"), Some(true)));
+	assert_eq!(first[0]["round"].as_str(), Some(round.txid().to_string().as_str()));
+	let leaf = first[0]["new_leaves"][0]["leaf_id"].as_str().expect("its new leaf").to_string();
+	assert_eq!(first[0]["new_leaves"][0]["state"], "live");
+	assert_eq!(first[0]["new_leaves"][0]["value"], coin_of(&c, &leaf)["value"]);
+	assert_eq!(first[0]["gives"][0]["state"], "spent");
+	r.server.stop();
+	assert_eq!(c.ok(&["participations"]), first, "from the wallet's own store, the operator gone");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 /// R7c's F8: the forfeit's margin is bounded from the floor the operator
 /// publishes, as a transfer's margins are, whatever the wallet's own node
 /// makes of the asset. A wallet whose node values X five times higher than
