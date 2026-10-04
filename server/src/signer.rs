@@ -522,6 +522,39 @@ pub fn stopped_path(record: &Path) -> PathBuf {
 	PathBuf::from(p)
 }
 
+/// Where the signer notes, beside the record at `record`, that a head of the
+/// record has been acknowledged by as many keepers as it requires: from
+/// then on a keeper that holds no head has lost its heads file, and is no
+/// answer ([`mark_acknowledged`]).
+pub fn acknowledged_path(record: &Path) -> PathBuf {
+	let mut p = record.as_os_str().to_owned();
+	p.push(".acknowledged");
+	PathBuf::from(p)
+}
+
+/// Notes beside the record at `record` that its head `entry`, `hash` has
+/// been acknowledged by as many keepers as it requires, once: the file is
+/// made and synced, with its directory, the first time, and left as it is
+/// after. The record's keepers held nothing before the first such head; from
+/// then on a keeper that holds none has lost its heads file.
+pub fn mark_acknowledged(record: &Path, entry: u64, hash: &[u8; 32]) -> Result<(), String> {
+	use std::io::Write;
+	use std::os::unix::fs::OpenOptionsExt;
+	let path = acknowledged_path(record);
+	let fail = |e: std::io::Error| format!("{}: {}", path.display(), e);
+	let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+		Ok(f) => f,
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+		Err(e) => return Err(fail(e)),
+	};
+	f.write_all(format!("entry {} {}: the first head of the record its keepers acknowledged; a keeper that holds no head from \
+		now on has lost its heads file\n", entry, hex(hash)).as_bytes()).and_then(|_| f.sync_all()).map_err(fail)?;
+	if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+		std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)?;
+	}
+	Ok(())
+}
+
 /// The head a proof of a rollback kept beside the record names, from its
 /// `head <entry> <hash> <signature>` line.
 fn stop_head_of(text: &str) -> Option<WireEntryRef> {
@@ -1521,6 +1554,14 @@ impl SpendRecord {
 				Ok(true)
 			})
 		})?;
+		// What the keepers have acknowledged goes over too: the new record's
+		// keepers are the old one's, and hold its heads.
+		if let Ok(text) = std::fs::read_to_string(acknowledged_path(from)) {
+			let (entry, hash) = text.split(' ').nth(1).zip(text.split(' ').nth(2))
+				.and_then(|(n, h)| Some((n.parse::<u64>().ok()?, unhex32(h.trim_end_matches(':')).ok()?)))
+				.unwrap_or((base.0, base.1));
+			mark_acknowledged(into, entry, &hash)?;
+		}
 		Ok((carried, dropped, base))
 	}
 }

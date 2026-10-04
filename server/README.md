@@ -970,8 +970,7 @@ than one that serves without its keepers. A compacted record carries the set
 over. Changing the set, replacing a keeper whose machine or key was lost, or
 adding keepers to an operator that had none, is a new operator: a new key
 and a new record. So an operator requires fewer than all of its keepers (two
-of three), so that one lost keeper does not end it, and backs each keeper's
-key up as it backs up its own.
+of three), so that one lost keeper does not end it at once.
 
 After it has written and synced an entry, the signer hands the
 record's latest head, signed, to every keeper, and releases the
@@ -996,9 +995,27 @@ would; and until enough keepers have answered it signs nothing the record
 governs. Enough is the keepers minus the required plus one, so that any set
 of keepers that acknowledged a head includes one that answered: with all
 of them required, one answer is enough; with one of two required, both
-must answer. A keeper restored from an older copy, while the signer was
-not, holds heads the record still holds: it stops nothing, takes the
-record's latest at the next hand-over, and is whole again.
+must answer. A keeper that holds no head is no answer once a head of the
+record has been acknowledged by as many keepers as it requires: the signer
+notes that beside its record the first time it happens
+(`<record>.acknowledged`, carried over by a compaction). Before then the
+keepers of a new operator have held nothing, and their "no head" counts.
+
+A keeper is only as good as its heads file. One whose heads file is lost,
+or would come back from an older copy, no longer holds what it
+acknowledged: it is a lost keeper, and it is never started again under its
+key, neither on a new heads file nor on an old one. With two of three
+required, the operator runs on with the other two and moves to a new
+operator, a new key and a new record that its holders' coins are refreshed
+into, while it still can. With one keeper, or with all of them required,
+the keeper's heads file is the whole of the protection: a lost keeper ends
+the operator, and the file lives on durable storage of its own, never
+restored, and never on the signer's machine. Where the signer can tell, it
+counts a lost keeper no more while it runs, and says so: a keeper that
+names no head once a head has been acknowledged, or a latest below one it
+was seen to hold. A signer started afresh cannot tell a keeper restored
+from an older copy from one that lagged, which is why the rule is the
+operator's to keep.
 
 Every head the signer hands out carries the acknowledgements it has of it,
 and they travel with the head wherever a head travels: `info`, the witness
@@ -1061,11 +1078,12 @@ new one when it next needs it), and when an accept fails (out of
 descriptors, say) waits before accepting again, saying so once in a while.
 A firewall that admits the signer's address alone to the keeper's port does
 the same a step earlier, and is the better place for it where the machine
-has one. Its heads
-file is never restored from an older copy while the signer runs on, and
-never together with the signer's machine. Its key file is backed up as the
-operator key is: a keeper whose key is lost cannot be replaced, since the
-record names it for good.
+has one. A keeper whose heads file is lost, or would come back from an
+older copy, is a lost keeper (see [The keepers](#the-keepers)), and is never
+started again under its key. Its key file is backed up as the operator key
+is, for one case: a key file lost while its heads file survives. A keeper
+whose key is lost without a backup cannot be replaced, since the record
+names it for good.
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`).

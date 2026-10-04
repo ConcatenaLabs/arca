@@ -72,8 +72,14 @@
 //! with another hash at an entry the record holds, is proof the record was
 //! rolled back, and stops the signer; and until enough keepers have answered
 //! (enough that any set of as many as the record requires includes one) it
-//! signs nothing the record governs. Every head it hands out carries the
-//! acknowledgements it has of it, and `pubkey` names the record's keepers.
+//! signs nothing the record governs. Once a head of the record has been
+//! acknowledged by as many keepers as it requires, which the signer notes
+//! beside the record (`server::signer::acknowledged_path`), a keeper that
+//! holds no head has lost its heads file and is no answer. A keeper seen to
+//! go back, naming no head or a latest below one it held, is a lost keeper:
+//! the signer counts it no more while it runs, and says so. Every head it
+//! hands out carries the acknowledgements it has of it, and `pubkey` names
+//! the record's keepers.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -211,6 +217,66 @@ struct Keepers {
 	/// are answered by the head it gets acknowledged when that head covers
 	/// their entry.
 	acked: tokio::sync::Mutex<Option<(WireEntryRef, Vec<WireAck>)>>,
+	/// What each keeper was seen to hold since the signer started, in the
+	/// list's order.
+	seen: Mutex<Vec<Seen>>,
+	/// Whether a head of the record has been acknowledged by as many keepers
+	/// as it requires (`<record>.acknowledged`): from then on a keeper that
+	/// holds no head has lost its heads file, and is no answer.
+	acknowledged: std::sync::atomic::AtomicBool,
+	record: PathBuf,
+}
+
+/// What one keeper was seen to hold since the signer started: the highest
+/// entry it named, and why it is a lost keeper, once it is one.
+#[derive(Debug, Clone, Default)]
+struct Seen {
+	held: Option<u64>,
+	lost: Option<String>,
+}
+
+impl Keepers {
+	/// Takes `latest`, the entry keeper `i` names as the latest it holds (in
+	/// an answer for its latest, or with an acknowledgement), and says why it
+	/// is no answer when it is a lost keeper: its heads file no longer holds
+	/// what it held. A keeper that holds no head once a head of the record has
+	/// been acknowledged, or less than it was seen to hold, is one, and stays
+	/// one while the signer runs. Its contradictions still stop the signer;
+	/// its answers count for nothing.
+	fn note(&self, i: usize, latest: Option<u64>) -> Option<String> {
+		let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+		let s = &mut seen[i];
+		if let Some(why) = &s.lost {
+			return Some(why.clone());
+		}
+		let addr = &self.list[i].addr.addr;
+		let why = match (latest, s.held) {
+			(None, Some(was)) => Some(format!("{} holds no head, where it held entry {}", addr, was)),
+			(None, None) if self.acknowledged.load(std::sync::atomic::Ordering::SeqCst) => Some(format!("{} holds no head, though a \
+				head of the record has been acknowledged by as many keepers as it requires", addr)),
+			(Some(n), Some(was)) if n < was => Some(format!("{} holds entry {}, below entry {} it held", addr, n, was)),
+			_ => None,
+		};
+		match why {
+			Some(w) => {
+				let why = format!("{}: a lost keeper, whose heads file was lost or restored from an older copy, so it no longer holds \
+					what it acknowledged; the signer counts it no more while it runs, and it is never started again under its key", w);
+				eprintln!("arca-signer: {}", why);
+				s.lost = Some(why.clone());
+				Some(why)
+			},
+			None => {
+				s.held = s.held.max(latest);
+				None
+			},
+		}
+	}
+
+	/// Notes that keeper `i` acknowledged `entry`.
+	fn holds(&self, i: usize, entry: u64) {
+		let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+		seen[i].held = seen[i].held.max(Some(entry));
+	}
 }
 
 /// What every request is answered from.
@@ -311,18 +377,25 @@ impl State {
 		let answers = futures_join(k.list.iter().map(|c| c.latest(&genesis, &operator))).await;
 		let mut answered = 0;
 		let mut notes = vec![];
-		for (c, a) in k.list.iter().zip(answers) {
+		for (i, (c, a)) in k.list.iter().zip(answers).enumerate() {
 			match a {
 				Ok(head) => {
-					answered += 1;
-					if let Some(h) = head {
-						if let Some(why) = self.against_record(&h)? {
+					if let Some(h) = &head {
+						if let Some(why) = self.against_record(h)? {
 							return Err(why);
 						}
-						notes.push(format!("{} holds entry {}", c.addr.addr, h.entry));
-					} else {
-						notes.push(format!("{} holds no head", c.addr.addr));
 					}
+					// A keeper that holds nothing, once a head has been
+					// acknowledged, has lost its heads file: no answer.
+					if let Some(why) = k.note(i, head.as_ref().map(|h| h.entry)) {
+						notes.push(why);
+						continue;
+					}
+					answered += 1;
+					notes.push(match &head {
+						Some(h) => format!("{} holds entry {}", c.addr.addr, h.entry),
+						None => format!("{} holds no head", c.addr.addr),
+					});
 				},
 				Err(e) => notes.push(e),
 			}
@@ -369,7 +442,7 @@ impl State {
 		let answers = futures_join(k.list.iter().map(|c| c.hold(&genesis, &operator, &head))).await;
 		let mut acks = vec![];
 		let mut notes = vec![];
-		for (c, a) in k.list.iter().zip(answers) {
+		for (i, (c, a)) in k.list.iter().zip(answers).enumerate() {
 			match a {
 				Ok(Held::Ack(ack, latest)) => {
 					if let Some(l) = &latest {
@@ -377,6 +450,13 @@ impl State {
 							return Err(why);
 						}
 					}
+					// A lost keeper's acknowledgement counts for nothing, and
+					// goes to nobody.
+					if let Some(why) = k.note(i, latest.as_ref().map(|l| l.entry)) {
+						notes.push(why);
+						continue;
+					}
+					k.holds(i, head.entry);
 					acks.push(ack);
 				},
 				Ok(Held::Contradicts(held)) => {
@@ -392,6 +472,15 @@ impl State {
 			return Err(format!("{}: {} of the {} keepers acknowledged entry {}, and {} must before the signer answers it; the entry \
 				stays, and the same request again completes once they do ({})", KEEPERS_UNAVAILABLE, acks.len(), k.list.len(), head.entry,
 				k.required, notes.join("; ")));
+		}
+		// The first head the keepers acknowledged: from now on, one that holds
+		// none has lost its heads file.
+		if !k.acknowledged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			if let Err(e) = server::signer::mark_acknowledged(&k.record, head.entry, &unhex32(&head.hash)?) {
+				eprintln!("arca-signer: noting beside the record that a head was acknowledged: {}; a start of the signer before it \
+					is noted counts a keeper with no head as an answer", e);
+				k.acknowledged.store(false, std::sync::atomic::Ordering::SeqCst);
+			}
 		}
 		*acked = Some((head.clone(), acks.clone()));
 		Ok((head, acks))
@@ -770,6 +859,9 @@ async fn main() {
 		list: addrs.iter().map(|k| KeeperClient::new(k.clone(), args.keeper_timeout)).collect(),
 		checked: tokio::sync::Mutex::new(false),
 		acked: tokio::sync::Mutex::new(None),
+		seen: Mutex::new(vec![Seen::default(); addrs.len()]),
+		acknowledged: std::sync::atomic::AtomicBool::new(server::signer::acknowledged_path(&args.record).exists()),
+		record: args.record.clone(),
 	});
 	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default() });
 	match &state.keepers {
