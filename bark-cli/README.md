@@ -148,7 +148,10 @@ the keys, but which coins were spent off-chain is in the store and the server.
   (read from a claim a rollback then took out) sends no refund while their
   round can return, nor while the participation stands in another of its
   rounds in the chain: the coin was exchanged for those leaves, and the
-  output is the operator's to claim again. A refund in the mempool, or a claim in a block not
+  output is the operator's to claim again. That lasts until the new leaves'
+  batch has expired, when the wallet refunds; until then, a round in no block
+  and no mempool, its inputs unspent, the wallet sends again itself from its
+  own copy, so its new leaves are in the chain whoever else is gone. A refund in the mempool, or a claim in a block not
   yet final, decides nothing: the other may still take the output. A forfeit
   decided by a final refund or claim is still looked at until its new
   leaves' batch has expired: a rollback, however deep, that leaves that
@@ -377,6 +380,10 @@ and holding it there, with the reason shown:
   holds its new leaf; and a final claim taken out by a rollback after the
   wallet read the preimage from it, the refund delay long run: the wallet
   sends no refund, keeps its new leaf, and the claim sent again is taken;
+- that claim and its round both taken out, the operator gone, and only the
+  forfeit sent again: the wallet sends the round again from its own copy
+  and sends no refund; and a wallet away until the new leaf's batch has
+  expired refunds the forfeit;
 - a refresh fee of half of every coin, and one inside a coin's free window;
 - wallets whose own nodes value an asset 10% or 25% above or 10% below the
   operator's, do not accept it, or accept one the operator's node does not,
