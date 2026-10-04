@@ -346,10 +346,17 @@ impl Run {
 	/// file beside the socket. Waits for
 	/// its socket, or for it to exit; `None` when it exited.
 	fn start(dir: &std::path::Path, name: &str, genesis: BlockHash, record: &std::path::Path, prefix: &str) -> Result<Run, String> {
+		Self::start_of(env!("CARGO_BIN_EXE_arca-signer"), dir, name, genesis, record, prefix)
+	}
+
+	/// `start`, of the signer binary at `bin`.
+	fn start_of(bin: &str, dir: &std::path::Path, name: &str, genesis: BlockHash, record: &std::path::Path, prefix: &str)
+		-> Result<Run, String>
+	{
 		let socket = dir.join(format!("{}.sock", name));
 		let log = dir.join(format!("{}.log", name));
 		let _ = std::fs::remove_file(&socket);
-		let cmd = format!("{}{} --key-file {} --genesis {} --socket {} --record {} 2> {}", prefix, env!("CARGO_BIN_EXE_arca-signer"),
+		let cmd = format!("{}{} --key-file {} --genesis {} --socket {} --record {} 2> {}", prefix, bin,
 			dir.join("operator.key").display(), genesis, socket.display(), record.display(), log.display());
 		let mut child = Command::new("bash").args(["-c", &cmd]).spawn().unwrap();
 		let start = std::time::Instant::now();
@@ -758,4 +765,113 @@ fn own_spend(s: &Keypair) -> (elements::Transaction, Vec<elements::TxOut>, Scrip
 			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(asset, 1_000))],
 	};
 	(tx, vec![prev], leaf)
+}
+
+/// A record compacted in format 2, which kept no hash for the entries it
+/// dropped, is opened by this signer: it signs on from the record's latest
+/// entry, refuses another message under a carried salt, answers the hash at
+/// a carried entry and none at a dropped one, so a signed head of a dropped
+/// entry stops nothing; a database knowing a dropped entry is refused
+/// (`record_differs`, compacted away). Compacted again, it becomes format 3
+/// and keeps what it had. With `ARCA_FORMAT2_SIGNER` naming a signer binary
+/// that compacts in format 2, that signer makes the record and compacts it;
+/// without it, this signer's compaction is written back as format 2 wrote
+/// it: the carried entry lines alone, counted and hashed in the header.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_compacted_in_format_2_is_read() {
+	use elements::hashes::{sha256, HashEngine};
+	use server::signer::hex;
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let a = keypair("owner");
+	let old = std::env::var("ARCA_FORMAT2_SIGNER").ok();
+	let maker = old.clone().unwrap_or_else(|| env!("CARGO_BIN_EXE_arca-signer").to_string());
+	println!("the record made and compacted by {}", maker);
+	let made = Command::new(&maker)
+		.args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(), "--create-record"])
+		.output().unwrap();
+	assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+	let run = Run::start_of(&maker, &dir, "first", genesis, &record, "exec ").unwrap();
+	let mut known = None;
+	let mut entries = vec![];
+	for k in 1..=5u8 {
+		let e = ask(&run.socket, &rebind_line(&a, genesis, [k; 32], asset, 1, known)).await.unwrap();
+		entries.push(e);
+		known = Some(e);
+	}
+	run.stop();
+	let compact = |bin: &str, drop: &std::path::Path, into: &std::path::Path| Command::new(bin)
+		.args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
+			"--compact-into", into.to_str().unwrap(), "--drop-salts", drop.to_str().unwrap()])
+		.output().unwrap();
+	let drop = dir.join("expired.salts");
+	std::fs::write(&drop, format!("{}\n{}\n", hex(&[1; 32]), hex(&[2; 32]))).unwrap();
+	let new = dir.join("signer.record.new");
+	let out = compact(&maker, &drop, &new);
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let text = std::fs::read_to_string(&new).unwrap();
+	let v2 = match old {
+		Some(_) => text,
+		None => {
+			let header: Vec<&str> = text.lines().next().unwrap().split(' ').collect();
+			let carried: Vec<&str> = text.lines().skip(1).filter(|l| l.split(' ').count() > 2).collect();
+			let mut e = sha256::Hash::engine();
+			e.input(server::signer::RECORD_CARRIED_TAG);
+			for l in &carried {
+				e.input(l.as_bytes());
+				e.input(b"\n");
+			}
+			format!("{} 2 {} {} {} {} {} {}\n{}\n", header[0], header[2], header[3], header[4], header[5], carried.len(),
+				hex(&sha256::Hash::from_engine(e).to_byte_array()), carried.join("\n"))
+		},
+	};
+	println!("the format-2 record:\n{}", v2.trim());
+	assert!(v2.starts_with("arca-signer-record 2 ") && v2.lines().count() == 4, "{}", v2);
+	std::fs::remove_file(&new).unwrap();
+	std::fs::write(&record, &v2).unwrap();
+
+	let run = Run::start(&dir, "format2", genesis, &record, "exec ").unwrap();
+	println!("this signer on it: {}", run.log().trim());
+	assert!(run.log().contains("3 message(s) in the record") && run.log().contains("its latest entry 5"), "{}", run.log());
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [4; 32], asset, 2, known)).await.unwrap_err();
+	println!("salt 4, carried, another message: {:?}", e);
+	assert_eq!(e.0, "already_signed");
+	let w = witness(&run.socket, &[
+		(4, entries[3].1, Some(head_sig(&s, genesis, 4, &entries[3].1))),
+		(1, entries[0].1, Some(head_sig(&s, genesis, 1, &entries[0].1))),
+	]).await;
+	println!("signed heads of carried entry 4 and dropped entry 1: {}", w);
+	assert_eq!(w["hashes"][0]["hash"], serde_json::json!(hex(&entries[3].1)));
+	assert!(w["hashes"][1]["hash"].is_null(), "format 2 kept no hash for a dropped entry");
+	assert!(w["stopped"].is_null(), "a head the record cannot tell stops nothing");
+	let e6 = ask(&run.socket, &rebind_line(&a, genesis, [1; 32], asset, 2, known)).await.expect("signs on, a dropped salt free again");
+	assert_eq!(e6.0, 6);
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [7; 32], asset, 1, Some(entries[1]))).await.unwrap_err();
+	println!("the database knowing dropped entry 2: {:?}", e);
+	assert_eq!(e.0, "record_differs");
+	assert!(e.1.contains("compacted away"), "{}", e.1);
+	run.stop();
+
+	// Compacted again by this signer: format 3, the hash of the entry it
+	// drops kept, the entries format 2 dropped still without one.
+	std::fs::write(&drop, format!("{}\n", hex(&[3; 32]))).unwrap();
+	let out = compact(env!("CARGO_BIN_EXE_arca-signer"), &drop, &new);
+	let said = String::from_utf8_lossy(&out.stderr).to_string();
+	println!("compacted again: {}", said.trim());
+	assert!(said.contains("3 entries carried over, 1 dropped; it goes on from entry 6"), "{}", said);
+	std::fs::rename(&new, &record).unwrap();
+	let run = Run::start(&dir, "format3", genesis, &record, "exec ").unwrap();
+	assert!(run.log().contains("3 message(s) in the record") && run.log().contains("its latest entry 6"), "{}", run.log());
+	let w = witness(&run.socket, &[(3, entries[2].1, None), (2, entries[1].1, None), (6, e6.1, Some(head_sig(&s, genesis, 6, &e6.1)))]).await;
+	println!("format 3 from format 2, entries 3, 2 and 6: {}", w);
+	assert_eq!(w["hashes"][0]["hash"], serde_json::json!(hex(&entries[2].1)));
+	assert!(w["hashes"][1]["hash"].is_null() && w["stopped"].is_null());
+	assert_eq!(w["hashes"][2]["hash"], serde_json::json!(hex(&e6.1)));
+	assert_eq!(ask(&run.socket, &rebind_line(&a, genesis, [5; 32], asset, 1, Some(e6))).await.unwrap(), entries[4]);
+	run.stop();
+	let _ = std::fs::remove_dir_all(&dir);
 }
