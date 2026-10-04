@@ -696,7 +696,10 @@ impl Wallet {
 	/// preimage of the new leaves the coin was given up for (read from a
 	/// claim a rollback took out) and their round can return: the output is
 	/// then the operator's to claim, and the wallet sends no refund and
-	/// follows it; a forfeit never published,
+	/// follows it, until the new leaves' batch has expired, sending the round
+	/// again from its own copy whenever it is in no block and no mempool with
+	/// its inputs unspent, so that its leaves are the wallet's in the chain
+	/// whoever else is gone; a forfeit never published,
 	/// whose round is lost, is void, and its coin is the wallet's
 	/// again. A refund in the mempool, or a claim in a block not yet final,
 	/// decides nothing: the other may still take the output.
@@ -806,11 +809,21 @@ impl Wallet {
 					"note": format!("the forfeit's output is unspent, and the participation stands in round {}, whose leaves the wallet \
 					holds for this coin: the wallet sends no refund of it while that round is in the chain", other)})));
 			}
-			if self.holds_preimage(f)? && !self.round_gone(f)? {
-				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string(), "state": f.state,
+			// Withheld only until the new leaves' batch has expired, after which
+			// no preimage opens anything and the coin is the wallet's to take
+			// back. Until then, a round in no block and no mempool, its inputs
+			// unspent, is sent again from the wallet's own copy: its leaves are
+			// the wallet's once it is in the chain, and the operator's claim
+			// can follow.
+			if self.holds_preimage(f)? && !self.round_gone(f)? && !self.new_leaves_expired(&f.participation)? {
+				let mut v = json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string(), "state": f.state,
 					"note": "the forfeit's output is unspent, and the wallet holds the preimage of the new leaves it was given up for, \
 					read from the operator's claim: the output is the operator's to claim while its round can return, so the wallet \
-					sends no refund and follows it"})));
+					sends no refund and follows it until the new leaves' batch has expired"});
+				if let Some(sent) = self.send_round_again(&f.round)? {
+					v["round_sent"] = sent;
+				}
+				return Ok(Some(v));
 			}
 			return self.refund_forfeit(f, &forfeit, at, &row).map(Some);
 		}
@@ -1033,6 +1046,27 @@ impl Wallet {
 		let unlock = unhex32(&f.unlock_hash)?;
 		Ok(self.store.participations()?.into_iter().filter(|p| p.0 == f.participation).filter_map(|p| p.5)
 			.filter_map(|pre| unhex32(&pre).ok()).any(|pre| sha256::Hash::hash(&pre).to_byte_array() == unlock))
+	}
+
+	/// Sends the round `round` again from the wallet's own copy when it is in
+	/// no block and not in the mempool and every coin it spends is unspent:
+	/// what the node answered, or `None` when there was nothing to send.
+	fn send_round_again(&self, round: &str) -> Result<Option<Value>, Error> {
+		let Some(raw) = self.store.tx(round)? else { return Ok(None) };
+		let tx: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+		if self.chain.whereabouts(&tx.txid())? != (false, false) {
+			return Ok(None);
+		}
+		for i in &tx.input {
+			if !self.chain.unspent(&i.previous_output)? {
+				return Ok(None);
+			}
+		}
+		Ok(Some(match self.chain.broadcast(&tx) {
+			Ok(txid) => json!({"txid": txid.to_string(), "note": "the round was in no block and no mempool, its inputs unspent: the wallet \
+				sent it again from its own copy"}),
+			Err(e) => json!({"txid": tx.txid().to_string(), "error": e.to_string()}),
+		}))
 	}
 
 	/// Whether the round forfeit `f` is bound to is lost: out of the chain,

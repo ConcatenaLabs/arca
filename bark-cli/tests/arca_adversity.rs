@@ -2144,6 +2144,141 @@ async fn a_claim_rolled_back_is_left_to_the_operator_by_a_wallet_holding_the_pre
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// Review R7e, F6: the refund withheld while the wallet holds the preimage
+/// has an end. The wallet reads the preimage of its new leaf from the
+/// operator's claim; then the round's block is taken out, the node forgets
+/// its mempool, and the operator is gone: the round is in no block and no
+/// mempool, its inputs unspent, and only the forfeit, sent again by someone
+/// who saw it, is on the chain. Returns the wallet, its board and new leaf,
+/// the round and the forfeit.
+async fn round_out_forfeit_on_chain(r: &mut Running, proxy: &Proxy, c: &Arca, tag: &str)
+	-> (String, String, Transaction, elements::Txid)
+{
+	use arca_covenant::spend::FeeSource;
+	use arca_covenant::ExplicitOutput;
+	use elements::OutPoint;
+	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(r, proxy, c).await;
+	let (units, cvout, margin, unlock) = stored_status(r, &pid);
+	let CoinRecord::Board(rec) = record_of(c, &board) else { panic!("a board") };
+	let board_txid = r.server.store.board(&rec.leaf_id().0).await.unwrap().map(|b| b.txid).expect("the board is registered");
+	let board_tx = r.rt.client().raw_transaction(&elements::hashes::Hash::from_byte_array(board_txid)).unwrap();
+	let mtp = rpc(r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	let old = CoinRecord::Board(rec).resolve(std::slice::from_ref(&board_tx), &arca_covenant::WalletPolicy {
+		min_exit_delay: RelativeTime::from_units(1).unwrap(), horizon: 0,
+		..arca_covenant::WalletPolicy::new(rec.chain, rec.operator, arca_covenant::MedianTime::from_consensus(mtp).unwrap())
+	}).unwrap();
+	let round_txid: elements::Txid = elements::hashes::Hash::from_byte_array(r.server.store.round(r.server.store
+		.participation(&unhex(&pid).try_into().unwrap()).await.unwrap().unwrap().round_id.unwrap()).await.unwrap().unwrap().txid);
+	let round = r.rt.client().raw_transaction(&round_txid).unwrap();
+	let m = connector_asset(round_txid, cvout);
+	let forfeit = Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, m, RelativeTime::from_units(units).unwrap(), margin).unwrap();
+	let fo = forfeit.output();
+	let atx = r.rt.client().raw_transaction(&atom_txid).unwrap();
+	let av = atx.output.iter().position(|o| o.asset.explicit() == Some(m)).unwrap() as u32;
+	let m_out = atx.output[av as usize].clone();
+	let ct = arca_covenant::batch_claim_tx(&[(&forfeit, OutPoint::new(forfeit_txid, 0))], (OutPoint::new(atom_txid, av), m_out.clone()),
+		&[ExplicitOutput::new(fo.asset, fo.value - 40_000, common::node::op_true())], m_out.script_pubkey.clone(), &FeeSource::Reserve).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &ct.sighash(0, genesis).unwrap(), &[0; 32]);
+	let mut claim = ct.finish(&[sig], &[preimage]).unwrap().tx;
+	operator_signs_input(r, &mut claim, 1);
+	r.rt.client().send_raw_transaction(&claim).expect("the claim");
+	r.produce().await;
+	r.bury().await;
+	let mut leaf = String::new();
+	for _ in 0..3 {
+		let s = c.ok(&["sync"]);
+		if let Some(l) = s["forfeits"].as_array().unwrap().iter().find_map(|f| f["new_leaves"][0]["leaf_id"].as_str()) {
+			leaf = l.to_string();
+		}
+		r.bury().await;
+	}
+	c.ok(&["sync"]);
+	assert_eq!(coin_of(c, &leaf)["state"], "live");
+	let forfeit_tx = r.rt.client().raw_transaction(&forfeit_txid).unwrap();
+	// The round's block taken out, and everything after it; the node
+	// restarts at its own clock with an empty mempool; the forfeit, sent
+	// again by someone who saw it, confirms without its round.
+	let round_block = block_of(r, &round_txid.to_string());
+	rpc(r, "invalidateblock", &[json!(round_block)]);
+	let tip = rpc(r, "getbestblockhash", &[]);
+	let tip_time = rpc(r, "getblockheader", &[tip])["time"].as_u64().unwrap();
+	let mock = format!("-mocktime={}", tip_time + 120);
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0", &mock])).unwrap();
+	r.rt.client().send_raw_transaction(&forfeit_tx).expect("the forfeit, without its round");
+	r.produce().await;
+	println!("{} the round {} in a block {} or the mempool {}; the forfeit {} confirmations {}; the claim {} confirmations {}", tag, round_txid,
+		confirmations(r, &round_txid) >= 1, in_mempool(r, &round_txid), forfeit_txid, confirmations(r, &forfeit_txid), claim.txid(),
+		confirmations(r, &claim.txid()));
+	assert!(confirmations(r, &round_txid) <= 0 && !in_mempool(r, &round_txid));
+	assert!(confirmations(r, &forfeit_txid) >= 1 && confirmations(r, &claim.txid()) <= 0);
+	(board, leaf, round, forfeit_txid)
+}
+
+/// The round out of every block and mempool, its inputs unspent: the wallet
+/// holding the preimage sends the round again from its own copy, which
+/// confirms, and sends no refund.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_holding_the_preimage_sends_its_round_again_when_no_one_else_does() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F6a");
+	let (board, leaf, round, _) = round_out_forfeit_on_chain(&mut r, &proxy, &c, "F6a").await;
+	let s = c.ok(&["sync"]);
+	println!("F6a the wallet's sync: forfeits {}", s["forfeits"]);
+	let f = s["forfeits"].as_array().unwrap().iter().filter(|f| f["leaf_id"] == board.as_str()).last().cloned().unwrap();
+	assert_eq!(f["round_sent"]["txid"], round.txid().to_string(), "{}", f);
+	assert!(f["refund"].is_null() && f["state"] != "refunding", "no refund: {}", f);
+	assert!(in_mempool(&r, &round.txid()));
+	r.produce().await;
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	println!("F6a the round sent again: confirmations {}; the leaf {}", confirmations(&r, &round.txid()), coin_of(&c, &leaf)["state"]);
+	assert!(confirmations(&r, &round.txid()) >= 1);
+	assert!(s["forfeits"].as_array().unwrap().iter().all(|f| f["state"] != "refunding" && f["refund"].is_null()), "{}", s["forfeits"]);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live");
+	assert_eq!(coin_of(&c, &board)["state"], "spent");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// The same, the round the wallet sends again never confirming (the node
+/// forgets it) and the wallet away until the new leaf's batch has expired:
+/// no preimage opens anything then, and the wallet takes its coin back by
+/// the forfeit's refund.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_holding_the_preimage_refunds_once_the_new_leafs_batch_has_expired() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F6b");
+	let (board, leaf, round, _) = round_out_forfeit_on_chain(&mut r, &proxy, &c, "F6b").await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().filter(|f| f["leaf_id"] == board.as_str()).last().cloned().unwrap();
+	assert_eq!(f["round_sent"]["txid"], round.txid().to_string(), "{}", f);
+	let tip = rpc(&r, "getbestblockhash", &[]);
+	let tip_time = rpc(&r, "getblockheader", &[tip])["time"].as_u64().unwrap();
+	let mock = format!("-mocktime={}", tip_time + 120);
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0", &mock])).unwrap();
+	assert!(!in_mempool(&r, &round.txid()), "the node forgot the round the wallet sent");
+	let CoinRecord::Leaf { record, .. } = record_of(&c, &leaf) else { panic!("a batch leaf") };
+	let last = record.schedule.expiries().last().unwrap().to_consensus_u32();
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, last.saturating_sub(now) + 3_600));
+	let s = c.ok(&["sync"]);
+	println!("F6b past the new leaf's last expiry ({}), the wallet's sync: forfeits {}", last, s["forfeits"]);
+	let f = s["forfeits"].as_array().unwrap().iter().filter(|f| f["leaf_id"] == board.as_str()).last().cloned().unwrap();
+	assert_eq!(f["state"], "refunding", "{}", f);
+	assert!(f["round_sent"].is_null(), "{}", f);
+	assert!(!in_mempool(&r, &round.txid()));
+	r.produce().await;
+	r.bury().await;
+	let s = c.ok(&["sync"]);
+	let f = s["forfeits"].as_array().unwrap().iter().filter(|f| f["leaf_id"] == board.as_str()).last().cloned().unwrap();
+	println!("F6b the refund: {}; the board {}", f, coin_of(&c, &board)["state"]);
+	assert_eq!(f["state"], "refunded");
+	assert_eq!(coin_of(&c, &board)["state"], "exited");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 // ---------------------------------------------------------------------------
 // A board's dates
 // ---------------------------------------------------------------------------
