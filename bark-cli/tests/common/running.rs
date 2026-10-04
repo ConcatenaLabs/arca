@@ -16,6 +16,7 @@ use server::store::RoundState;
 
 use super::db::TestDb;
 use super::node::{self, Purse};
+use super::keeper::KeeperProcess;
 use super::signer::SignerProcess;
 
 pub const MIN_LEAF: u64 = 1_000;
@@ -39,12 +40,21 @@ pub struct Running {
 	pub y: AssetId,
 	pub signer: SignerProcess,
 	pub db: TestDb,
+	/// The keepers of the signer's record, each on a port of its own, as on
+	/// other machines; none unless the test starts some.
+	pub keepers: Vec<KeeperProcess>,
 }
 
 impl Running {
 	/// The server, its wallet funded in X and Y and final. Leaves take exit
 	/// delays from one 512-second unit, so a test can wait one out.
 	pub async fn start() -> Running {
+		Self::start_kept(0, None).await
+	}
+
+	/// The server, its signer handing every head to `keepers` keepers of its
+	/// own, `required` of them (all, unless named) to hold each.
+	pub async fn start_kept(keepers: usize, required: Option<usize>) -> Running {
 		let db = TestDb::new().await;
 		let rt = tokio::task::block_in_place(node::start);
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
@@ -53,7 +63,20 @@ impl Running {
 		node::list_fee_asset(&rt, x, 100_000_000);
 		let s = keypair("operator");
 		let genesis = rt.client().genesis_hash().unwrap();
-		let signer = tokio::task::block_in_place(|| SignerProcess::start(&s, genesis));
+		let keepers: Vec<KeeperProcess> = (0..keepers).map(|i| tokio::task::block_in_place(||
+			KeeperProcess::start(&keypair(&format!("keeper {}", i)), s.x_only_public_key().0, genesis))).collect();
+		let mut extra = vec![];
+		for k in &keepers {
+			extra.push("--keeper".to_string());
+			extra.push(k.arg());
+		}
+		if let Some(r) = required {
+			extra.push("--keepers-required".into());
+			extra.push(r.to_string());
+		}
+		extra.push("--keeper-timeout-ms".into());
+		extra.push("2000".into());
+		let signer = tokio::task::block_in_place(|| SignerProcess::start_with(&s, genesis, extra));
 		let mnemonic = signer.dir.join("wallet.mnemonic");
 		std::fs::write(&mnemonic, MNEMONIC).unwrap();
 		let config = Config {
@@ -91,7 +114,7 @@ impl Running {
 			metrics_listen: None,
 		};
 		let server = Server::start(&config).await.unwrap();
-		let mut r = Running { server, config, rt, purse, x, y, signer, db };
+		let mut r = Running { server, config, rt, purse, x, y, signer, db, keepers };
 		r.fund_server(x, 50_000_000).await;
 		r.fund_server(x, 50_000_000).await;
 		r.fund_server(y, 50_000_000).await;

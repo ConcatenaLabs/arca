@@ -107,6 +107,11 @@ pub const MAX_WITNESS: usize = 32;
 /// server: the server's bound.
 pub const MAX_UNSIGNED_WITNESS: usize = 4;
 
+/// What the wallet says of an operator with no keeper, and of every coin it
+/// receives from one out of round.
+pub(crate) const NO_KEEPER: &str = "the operator runs no keeper of its signer's record: a coin received out of round rests on the \
+	operator's machine alone until it is refreshed, and a restore of that machine can let its sender spend it twice";
+
 /// Where the wallet keeps a rollback of the operator's signer's record it
 /// found: `{"at": <the highest entry the record still agrees with>, "why"}`.
 const ROLLED_BACK: &str = "operator_rolled_back";
@@ -285,6 +290,7 @@ impl Wallet {
 			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
 			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
 			("genesis", genesis.to_string()), ("chain_name", chain_name), ("operator", operator.to_string()),
+			("keepers", Self::keepers_of(&info)?.to_string()),
 			("birthday", tip.height.to_string()), ("tip_height", tip.height.to_string()), ("tip_hash", tip.hash.to_string()),
 		];
 		for (k, v) in meta {
@@ -412,8 +418,73 @@ impl Wallet {
 			return Err(Error::Refused(format!("the server now names operator key {}; this wallet was created with {}",
 				info["operator"], self.operator)));
 		}
+		if self.store.meta("keepers")?.is_none() && !info["keepers"].is_null() {
+			self.store.set_meta("keepers", &Self::keepers_of(&info)?.to_string())?;
+		}
 		self.witness_record(&info["signer_record"], true)?;
 		Ok(info)
+	}
+
+	/// The keepers `info` names, checked, as the wallet pins them:
+	/// `{"keys": […], "required": n}`, no keys and 0 for an operator with no
+	/// keeper.
+	fn keepers_of(info: &Value) -> Result<Value, Error> {
+		let k = &info["keepers"];
+		let mut keys = vec![];
+		for x in k["keys"].as_array().cloned().unwrap_or_default() {
+			let key: XOnlyPublicKey = parse("a keeper's key", x.as_str().unwrap_or(""))?;
+			if keys.contains(&key.to_string()) {
+				return Err(Error::Refused(format!("the server names the keeper {} twice", key)));
+			}
+			keys.push(key.to_string());
+		}
+		let required = k["required"].as_u64().unwrap_or(0) as usize;
+		if (keys.is_empty() && required != 0) || (!keys.is_empty() && !(1..=keys.len()).contains(&required)) {
+			return Err(Error::Refused(format!("the server names {} keeper(s), {} of them required", keys.len(), required)));
+		}
+		Ok(json!({"keys": keys, "required": required}))
+	}
+
+	/// The keepers of the operator's signer's record the wallet pinned when
+	/// it was created, and how many must hold a head; none for an operator
+	/// with no keeper. A wallet made before keepers existed pins them from
+	/// the first `info` it reads, as it pinned the operator key then.
+	pub(crate) fn keepers(&self) -> Result<(Vec<XOnlyPublicKey>, usize), Error> {
+		let v: Value = match self.store.meta("keepers")? {
+			Some(v) => serde_json::from_str(&v).map_err(|e| Error::Store(format!("keepers: {}", e)))?,
+			None => return Ok((vec![], 0)),
+		};
+		let keys = v["keys"].as_array().cloned().unwrap_or_default().iter()
+			.map(|k| parse("a keeper's key", k.as_str().unwrap_or(""))).collect::<Result<Vec<XOnlyPublicKey>, _>>()?;
+		Ok((keys, v["required"].as_u64().unwrap_or(0) as usize))
+	}
+
+	/// Whether `head` (`{entry, hash, signature, acks}`) is held outside the
+	/// operator's machine as the wallet requires: acknowledged by as many of
+	/// the keepers it pinned as must hold a head, each acknowledgement the
+	/// keeper's signature over the head ([`super::client::keeper_ack_digest`]).
+	/// Always, for an operator with no keeper.
+	pub(crate) fn held_outside(&self, head: &Value) -> Result<(), String> {
+		let (keys, required) = self.keepers().map_err(|e| e.to_string())?;
+		if keys.is_empty() {
+			return Ok(());
+		}
+		let (Some(entry), Some(hash)) = (head["entry"].as_u64(), head["hash"].as_str().and_then(|h| unhex32(h).ok())) else {
+			return Err("no head of the operator's signer's record comes with it".into());
+		};
+		let acks = head["acks"].as_array().cloned().unwrap_or_default();
+		let held = keys.iter().filter(|k| acks.iter().any(|a| {
+			a["key"].as_str() == Some(&hex(&k.serialize()))
+				&& unhex32(a["nonce"].as_str().unwrap_or("")).ok()
+					.zip(unhex(a["signature"].as_str().unwrap_or("")).ok().and_then(|b| elements::secp256k1_zkp::schnorr::Signature::from_slice(&b).ok()))
+					.is_some_and(|(n, s)| arca_covenant::sign::verify_digest(&s, &super::client::keeper_ack_digest(&self.genesis, &self.operator,
+						entry, &hash, &n), k))
+		})).count();
+		if held < required {
+			return Err(format!("entry {} of the operator's signer's record comes with {} of the {} acknowledgements of its keepers the \
+				wallet requires: it is not held outside the operator's machine", entry, held, required));
+		}
+		Ok(())
 	}
 
 	/// The rollback of the operator's signer's record the wallet found, if
@@ -502,7 +573,9 @@ impl Wallet {
 				}
 			}
 		}
-		if signed {
+		// A head is kept only once it is held outside the operator's machine
+		// as the wallet requires; one that is not is compared, not kept.
+		if signed && self.held_outside(shown).is_ok() {
 			self.store.put_seen(entry, hash, signature)?;
 		}
 		Ok(())
@@ -1230,9 +1303,18 @@ impl Wallet {
 		})
 	}
 
-	/// Every coin the wallet holds or held.
+	/// Every coin the wallet holds or held. From an operator with no keeper,
+	/// a coin received out of round and held says it rests on the operator's
+	/// machine alone.
 	pub fn coins(&self) -> Result<Value, Error> {
-		Ok(Value::Array(self.store.coins()?.iter().map(Self::coin_json).collect()))
+		let alone = self.keepers()?.0.is_empty();
+		Ok(Value::Array(self.store.coins()?.iter().map(|c| {
+			let mut v = Self::coin_json(c);
+			if alone && c.kind == "transfer" && HELD.contains(&c.state.as_str()) {
+				v["record_held"] = json!(NO_KEEPER);
+			}
+			v
+		}).collect()))
 	}
 
 	/// What the wallet holds, per asset: off-chain coins by state (a coin
@@ -1270,9 +1352,22 @@ impl Wallet {
 			"mailbox_key": self.keys.mailbox()?.x_only_public_key().0.to_string(),
 			"exit_delay_units": self.cfg.exit_delay_units,
 			"accepted_exit_delay_units": {"min": self.cfg.min_exit_delay_units, "max": self.cfg.max_exit_delay_units},
+			"keepers": self.keepers_json()?,
 			"tip": {"height": tip.height, "hash": tip.hash.to_string(), "median_time": tip.median_time},
 			"server_info": self.server_info().map_err(|e| e.to_string()).unwrap_or_else(|e| json!({"unreachable": e})),
 		}))
+	}
+
+	/// The keepers the wallet pinned, for people.
+	fn keepers_json(&self) -> Result<Value, Error> {
+		let (keys, required) = self.keepers()?;
+		Ok(if keys.is_empty() {
+			json!({"keys": [], "required": 0, "note": NO_KEEPER})
+		} else {
+			json!({"keys": keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(), "required": required,
+				"note": format!("the operator's signer answers an entry only once {} of these keepers, on other machines, hold its head; the \
+					wallet takes no coin and keeps no head without their acknowledgements", required)})
+		})
 	}
 
 	/// Every refusal the wallet made, with its reason.

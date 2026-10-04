@@ -11,6 +11,7 @@
 
 pub mod cli;
 pub mod db;
+pub mod keeper;
 pub mod node;
 pub mod proxy;
 pub mod running;

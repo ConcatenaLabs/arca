@@ -2294,6 +2294,8 @@ fn info_of(r: &Running) -> Value {
 /// and the second board as its own.
 struct JointRollback {
 	r: Running,
+	/// A receive request of M's, made before the snapshot.
+	m_req: String,
 	/// A, and its older copy, reach the server through it.
 	proxy: Proxy,
 	a: Arca,
@@ -2308,7 +2310,14 @@ struct JointRollback {
 }
 
 async fn joint_rollback(tag: &str) -> JointRollback {
-	let mut r = Running::start().await;
+	joint_rollback_kept(tag, 0).await
+}
+
+/// [`joint_rollback`], the operator's signer handing every head to
+/// `keepers` keepers of its own, on other machines: the snapshot restores
+/// the signer's record and the database, not the keepers.
+async fn joint_rollback_kept(tag: &str, keepers: usize) -> JointRollback {
+	let mut r = Running::start_kept(keepers, None).await;
 	let url = r.url();
 	let x = r.x;
 	let proxy = Proxy::start(&url);
@@ -2319,6 +2328,8 @@ async fn joint_rollback(tag: &str) -> JointRollback {
 	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
 	let p1 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	// M's request, made before the snapshot: M holds no later head.
+	let m_req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let backup = Backup::take(&mut r).await;
 	let head_at_backup = info_of(&r)["signer_record"].clone();
 	println!("{} the operator's snapshot: {} entries, its head {}", tag, backup.entries, head_at_backup);
@@ -2331,8 +2342,10 @@ async fn joint_rollback(tag: &str) -> JointRollback {
 	println!("{} A paid B 300000 from C_A {} after the snapshot: B's P2 {}; the record at {}", tag, c_a, p2, info_of(&r)["signer_record"]);
 	backup.restore(&mut r).await;
 	println!("{} database and record rolled back together; the server started on them, its record at {}", tag, info_of(&r)["signer_record"]);
-	assert_eq!(info_of(&r)["signer_record"]["entry"].as_u64(), Some(backup.entries));
-	JointRollback { r, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup }
+	if keepers == 0 {
+		assert_eq!(info_of(&r)["signer_record"]["entry"].as_u64(), Some(backup.entries));
+	}
+	JointRollback { r, m_req, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup }
 }
 
 /// R7d's W1 turned around (D49). A receiver that only syncs witnesses the
@@ -2348,7 +2361,7 @@ async fn joint_rollback(tag: &str) -> JointRollback {
 /// P2 is on the chain.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joint_rollback_is_caught_by_a_receiver_that_only_syncs_and_stops_the_signer() {
-	let JointRollback { mut r, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup } = joint_rollback("W1").await;
+	let JointRollback { mut r, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup, .. } = joint_rollback("W1").await;
 	let x = r.x;
 	let m_req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let s = b.ok(&["sync"]);
@@ -2573,6 +2586,12 @@ async fn a_rewritten_witness_is_an_unreachable_server_and_takes_nothing() {
 		assert_eq!(coin_of(&b, p)["state"], "live");
 	}
 	assert!(!b.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["reason"].as_str().unwrap_or("").contains("goes no further")));
+	// D52.3: an operator with no keeper, said in `info` and on every coin
+	// received out of round.
+	let i = b.ok(&["info"]);
+	println!("D54 B's info on an operator with no keeper: {}", i["keepers"]);
+	assert!(i["keepers"]["note"].as_str().unwrap_or("").contains("rests on the operator's machine alone"));
+	assert!(coin_of(&b, &p1)["record_held"].as_str().unwrap_or("").contains("rests on the operator's machine alone"), "{}", coin_of(&b, &p1));
 	r.produce().await;
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
@@ -2639,6 +2658,170 @@ async fn a_wallet_whose_witness_fails_takes_no_coin_and_signs_no_spend() {
 	assert_eq!(s["mailbox"]["accepted"].as_array().map(|a| a.len()), Some(1));
 	let sent = b.ok(&["send", &to_a, "--amount", "100000", "--asset", &x.to_string()]);
 	assert!(sent["transfer"]["transfer_id"].is_string(), "{}", sent);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7e F1 turned around (D52): the reviewer's W2r with a keeper running.
+/// After the operator's snapshot restores the signer's record and the
+/// database together (the keeper, on another machine, is not restored), the
+/// signer asks the keeper for its latest before it serves anything: the
+/// keeper holds the head of P2's transfer, past the restored record's end,
+/// and the signer stops at once, before any wallet contact. A's older copy
+/// then tries the second spend of C_A to M: nothing is co-signed, and M gets
+/// nothing. B's next sync learns of the stop on the signer's own proof (the
+/// keeper's head) and takes P2 on the chain; P1 stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn w2r_with_a_keeper_the_restored_signer_stops_before_any_second_spend() {
+	let JointRollback { mut r, m_req, proxy, a, a_old, b, m, p1, p2, c_a, backup, .. } = joint_rollback_kept("W2K", 1).await;
+	let x = r.x;
+	println!("W2K the keeper holds up to entry {:?}; the restored record ends at entry {}", r.keepers[0].latest(), backup.entries);
+	assert!(r.keepers[0].latest() > Some(backup.entries));
+	let stopped = std::fs::read_to_string(server::signer::stopped_path(&r.signer.record())).expect("stopped at start, before any wallet");
+	println!("W2K the signer's proof, at start: {}", stopped.lines().next().unwrap());
+	assert!(stopped.contains("past the record's end"), "{}", stopped);
+	assert!(info_of(&r)["signer_record"].is_null(), "a stopped signer hands out no head");
+
+	proxy.rewrite(None);
+	let (ok, v) = a_old.run(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("W2K A's older copy spends C_A {} again, to M: ok={} {}", c_a, ok, v["error"]["message"]);
+	assert!(!ok, "the second spend is not co-signed");
+	let id: LeafId = c_a.parse().unwrap();
+	println!("W2K C_A at the server: {:?}", r.server.store.leaf(&id.0).await.unwrap().map(|l| l.state));
+	let got = m.ok(&["sync"]);
+	println!("W2K M's sync: mailbox {}", got["mailbox"]);
+	assert!(m.ok(&["coins"]).as_array().unwrap().is_empty(), "M gets nothing");
+
+	let s = b.ok(&["sync"]);
+	println!("W2K B's sync: rolled_back {} | exits {}", s["witness"]["rolled_back"], s["witness"]["exits"]);
+	assert_eq!(s["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries));
+	let exits = s["witness"]["exits"].as_array().unwrap();
+	assert!(exits.iter().any(|e| e["leaf_id"] == p2.as_str()), "P2 goes on the chain: {:?}", exits);
+	assert!(!exits.iter().any(|e| e["leaf_id"] == p1.as_str()));
+	r.produce().await;
+	let e = b.ok(&["exit", &p2]);
+	println!("W2K B's P2: {} | {}", e["state"], coin_of(&b, &p2)["note"]);
+	assert!(matches!(e["state"].as_str(), Some("waiting" | "claimed")), "P2's leaf is on the chain: {}", e);
+	let _ = (&a, &mut r);
+	for w in [&a, &a_old, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D52.4, the control for the test above: the same restore with no keeper.
+/// The signer starts on the restored record and co-signs the older copy's
+/// second spend of C_A, as an operator with no keeper is documented to do:
+/// such an operator is for its own coins.
+#[tokio::test(flavor = "multi_thread")]
+async fn w2r_without_a_keeper_the_second_spend_is_still_cosigned() {
+	let JointRollback { r, m_req, a, a_old, b, m, c_a, .. } = joint_rollback_kept("W2N", 0).await;
+	let x = r.x;
+	assert!(!server::signer::stopped_path(&r.signer.record()).exists(), "nothing at start shows the restore");
+	let paid = a_old.ok(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("W2N with no keeper, A's older copy spends C_A {} again, to M: inputs {}", c_a, paid["inputs"]);
+	assert_eq!(paid["inputs"][0].as_str(), Some(c_a.as_str()), "co-signed");
+	for w in [&a, &a_old, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D52. A keeper down holds a payment up: the server records it, the
+/// signer records the entry and answers `keepers_unavailable`, and the
+/// wallet keeps the request standing, nothing taken. Once the keeper is
+/// back, the sender's `sync` posts it again and it completes; the receiver
+/// takes the coin, whose head comes with the keeper's acknowledgement, and
+/// shows the keeper it pinned when it was created.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_down_holds_a_payment_up_until_it_returns() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("KDA"), Arca::new("KDB"));
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let info = b.ok(&["info"]);
+	println!("KD B's wallet pinned the keepers: {}", info["keepers"]);
+	assert_eq!(info["keepers"]["keys"][0].as_str(), Some(r.keepers[0].xonly().to_string().as_str()));
+	assert_eq!(info["keepers"]["required"], 1);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	r.keepers[0].halt();
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("KD A pays B with the keeper down: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	assert!(v["error"]["message"].as_str().unwrap().contains("keepers_unavailable"), "{}", v);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "sending", "the request stands");
+	assert!(b.ok(&["sync"])["mailbox"]["accepted"].as_array().unwrap().is_empty());
+
+	r.keepers[0].resume();
+	let s = a.ok(&["sync"]);
+	println!("KD A's sync with the keeper back: transfers {}", s["transfers"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string(), "{}", s["transfers"]);
+	let got = b.ok(&["sync"]);
+	let leaf = got["mailbox"]["accepted"][0]["leaf_id"].as_str().expect("B takes the coin").to_string();
+	assert_eq!(coin_of(&b, &leaf)["value"], "600000");
+	assert!(!coin_of(&b, &leaf)["note"].as_str().unwrap_or("").contains("no keeper"));
+	let msg = minreq::get(format!("{}/v1/info", url)).send().unwrap();
+	let i: Value = serde_json::from_str(msg.as_str().unwrap()).unwrap();
+	println!("KD info: keepers {} | head {} with {} acknowledgement(s)", i["keepers"], i["signer_record"]["entry"],
+		i["signer_record"]["acks"].as_array().map(|a| a.len()).unwrap_or(0));
+	assert_eq!(i["signer_record"]["acks"].as_array().map(|a| a.len()), Some(1));
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D52.3. A wallet that pinned the operator's keepers takes no coin and
+/// keeps no head without their acknowledgements. A proxy strips them from
+/// what the server answers B: the co-signature of B's own payment (the
+/// request stands, nothing taken), and the head of a coin in B's mailbox
+/// (the coin waits, and its message is read again). With the answers whole
+/// again, the payment completes and the coin is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_takes_no_coin_without_its_keepers_acknowledgements() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let pb = Proxy::start(&url);
+	let (a, b) = (Arca::new("KAA"), Arca::new("KAB"));
+	boarded(&mut r, &a, &url, &[(x, 4_000_000)]).await;
+	let boards = boarded(&mut r, &b, &pb.url.clone(), &[(x, 2_000_000)]).await;
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	let to_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let strip = |v: &mut Value| {
+		if let Some(o) = v.as_object_mut() {
+			o.remove("acks");
+		}
+	};
+	pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+		match path {
+			"/v1/cosign_transfer" => strip(&mut v["signer_record"]),
+			"/v1/mailbox_read" => for m in v["messages"].as_array_mut().into_iter().flatten() {
+				strip(&mut m["signer_record"]);
+			},
+			_ => {},
+		}
+		None
+	})));
+	let s = b.ok(&["sync"]);
+	println!("KA B's mailbox, the acknowledgements stripped: {}", s["mailbox"]);
+	assert!(s["mailbox"]["accepted"].as_array().unwrap().is_empty());
+	let waited = s["mailbox"]["waiting"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(s["mailbox"]["waiting"][0]["reason"].as_str().unwrap_or("").contains("acknowledgements of its keepers"), "{}", s["mailbox"]);
+	let (ok, v) = b.run(&["send", &to_a, "--amount", "500000", "--asset", &x.to_string()]);
+	println!("KA B pays A, the co-signature's acknowledgements stripped: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	assert_eq!(coin_of(&b, &boards[0])["state"], "sending", "the request stands, nothing taken");
+	assert_eq!(b.ok(&["coins"]).as_array().unwrap().len(), 1, "no coin taken");
+
+	pb.rewrite(None);
+	let s = b.ok(&["sync"]);
+	println!("KA B with the answers whole: transfers {} | mailbox {}", s["transfers"][0]["transfer_id"], s["mailbox"]["accepted"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string());
+	assert!(s["mailbox"]["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == waited.as_str() && c["already_held"].is_null()),
+		"the coin that waited is read again and taken: {}", s["mailbox"]);
+	assert_eq!(coin_of(&b, &waited)["value"], "300000");
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}

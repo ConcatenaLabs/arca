@@ -22,6 +22,7 @@ pub mod cosign;
 pub mod fees;
 pub mod forfeits;
 pub mod http;
+pub mod keeper;
 pub mod nursery;
 pub mod params;
 pub mod participations;

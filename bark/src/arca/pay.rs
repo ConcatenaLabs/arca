@@ -423,6 +423,14 @@ impl Wallet {
 	/// the first time.
 	fn post_transfer(&mut self, id: i64, body: &Value, mine: &[String]) -> Result<Value, Error> {
 		match self.server.post("cosign_transfer", body) {
+			// A co-signature whose head is not held outside the operator's
+			// machine as the wallet requires is taken as no answer: the
+			// request stands, and is posted again.
+			Ok(answer) if self.held_outside(&answer["signer_record"]).is_err() => {
+				let why = self.held_outside(&answer["signer_record"]).err().unwrap_or_default();
+				Err(Error::Unreachable(format!("the operator co-signed transfer request {} without the acknowledgements of its keepers: {}; \
+					the wallet takes no coin of it, and the request stands, to be posted again", id, why)))
+			},
 			Ok(answer) => {
 				let transfer_id = answer["transfer_id"].as_str().unwrap_or("").to_string();
 				let mut kept = vec![];
@@ -559,6 +567,11 @@ impl Wallet {
 			}
 		}
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		// A coin received out of round from an operator with no keeper rests
+		// on the operator's machine alone until it is refreshed.
+		if matches!(record, CoinRecord::Transfer(_)) && self.keepers()?.0.is_empty() {
+			note = if note.is_empty() { super::wallet::NO_KEEPER.to_string() } else { format!("{}; {}", note, super::wallet::NO_KEEPER) };
+		}
 		if past_deadline {
 			let e = board_expiry.expect("past a deadline");
 			let why = format!("it rests on a board past its exit deadline: the operator co-signs no spend of it and takes it only into a \
@@ -626,7 +639,10 @@ impl Wallet {
 	/// kept or refused with its reason; one refused for a passing reason
 	/// (what it rests on not on the chain now, the node or the server not
 	/// answering) is kept aside and checked again on every read until it is
-	/// kept or refused for good. The cursor moves past all of them.
+	/// kept or refused for good. The cursor moves past all of them but one
+	/// whose head of the operator's signer's record comes without the
+	/// acknowledgements of the keepers the wallet pinned: that coin is not
+	/// taken, and its message is read again on the next read.
 	pub fn mailbox(&mut self) -> Result<Value, Error> {
 		let witness = self.witness()?;
 		if let Some((at, why)) = self.rolled_back()? {
@@ -644,6 +660,12 @@ impl Wallet {
 		let mut refused = vec![];
 		let mut waiting = vec![];
 		for (leaf, bytes, head) in self.store.kept_for_retry()? {
+			let head_v: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
+			if let Err(why) = self.held_outside(&head_v) {
+				self.store.keep_for_retry(&leaf, &bytes, &why, None)?;
+				waiting.push(json!({"leaf_id": leaf, "reason": why}));
+				continue;
+			}
 			match self.accept_coin(&bytes, &leaf, "mailbox") {
 				Ok(v) => {
 					self.store.drop_retry(&leaf)?;
@@ -666,6 +688,7 @@ impl Wallet {
 		}
 		for key in keys {
 			let k = key.x_only_public_key().0.serialize();
+			let mut read_again: Option<i64> = None;
 			loop {
 				let after = self.store.cursor(&k)?;
 				let v = self.server.mailbox_read(&key, &self.genesis, after, 100)?;
@@ -677,6 +700,16 @@ impl Wallet {
 					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
 					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
 					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
+					// A coin is taken only once the head it rests on is held
+					// outside the operator's machine as the wallet requires;
+					// until then it waits, and its message is read again from
+					// the server, which hands the head on with what it holds.
+					if let Err(why) = self.held_outside(&m["signer_record"]) {
+						waiting.push(json!({"leaf_id": leaf, "reason": why}));
+						read_again = Some(read_again.map_or(cursor - 1, |c: i64| c.min(cursor - 1)));
+						self.store.set_cursor(&k, cursor)?;
+						continue;
+					}
 					match self.accept_coin(&bytes, &leaf, "mailbox") {
 						Ok(v) => {
 							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
@@ -696,6 +729,9 @@ impl Wallet {
 					}
 					self.store.set_cursor(&k, cursor)?;
 				}
+			}
+			if let Some(c) = read_again {
+				self.store.set_cursor(&k, c)?;
 			}
 		}
 		Ok(json!({"accepted": accepted, "refused": refused, "waiting": waiting}))

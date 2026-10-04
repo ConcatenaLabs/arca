@@ -77,10 +77,10 @@ jobs:
       - name: The wallet's unit tests
         run: cargo test --locked -p arca-wallet --features arca --lib "arca::"
 
-      # The scenarios run the operator's signer as its own process, as the
-      # server's own tests do.
-      - name: Build the signer
-        run: cargo build --locked -p arca-server --bin arca-signer
+      # The scenarios run the operator's signer, and its keepers, each as
+      # its own process, as the server's own tests do.
+      - name: Build the signer and the keeper
+        run: cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
 
       - name: Scenarios
         run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_digests -- --nocapture

@@ -84,6 +84,8 @@ pub struct App {
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
 	/// The signer's record head `info` last published, signed, and when.
 	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
+	/// The keepers of the signer's record, as `info` publishes them.
+	pub keepers: api::KeepersInfo,
 }
 
 /// How long `info` publishes the floors it read from the node before it reads
@@ -442,7 +444,14 @@ fn board_status(s: &BoardStatus) -> api::BoardStatus {
 pub const RECORD_HEAD_FOR: Duration = Duration::from_secs(2);
 
 fn record_head_json(h: &crate::signer::SignedHead) -> api::RecordHead {
-	api::RecordHead { entry: h.entry, hash: hex(&h.hash), signature: h.signature.map(|s| hex(s.as_ref())) }
+	api::RecordHead { entry: h.entry, hash: hex(&h.hash), signature: h.signature.map(|s| hex(s.as_ref())), acks: h.acks.clone() }
+}
+
+/// Head `entry`, `hash` of the signer's record, with the signer's signature
+/// `sig` and every keeper's acknowledgement of it the database holds: how a
+/// head travels with a transfer's answer, a mailbox record and a tree.
+async fn head_with_acks(app: &App, entry: u64, hash: &[u8; 32], sig: Option<&[u8; 64]>) -> Result<api::RecordHead, Refusal> {
+	Ok(api::RecordHead { entry, hash: hex(hash), signature: sig.map(|s| hex(s)), acks: app.store.head_acks(entry, hash).await? })
 }
 
 /// The signer's record's latest entry and running hash, with the signer's
@@ -466,8 +475,8 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 			None
 		},
 	};
-	if let Some(h) = head {
-		*cached = Some((Instant::now(), h));
+	if let Some(h) = &head {
+		*cached = Some((Instant::now(), h.clone()));
 	}
 	head.as_ref().map(record_head_json)
 }
@@ -510,6 +519,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			refresh_until_seconds: Params::ROUND_HORIZON,
 		},
 		signer_record,
+		keepers: app.keepers.clone(),
 		max_request_bytes: app.max_request as u64,
 	})
 }
@@ -586,7 +596,10 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 			leaf_id: id.to_string(),
 			record: hex(&r.to_bytes().map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?),
 		})).collect::<Result<_, Refusal>>()?,
-		signer_record: done.signer_head.map(|(entry, h, s)| api::RecordHead { entry, hash: hex(&h), signature: Some(hex(&s)) }),
+		signer_record: match done.signer_head {
+			Some((entry, h, s)) => Some(head_with_acks(&app, entry, &h, Some(&s)).await?),
+			None => None,
+		},
 	}))
 }
 
@@ -713,7 +726,10 @@ async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) 
 			}),
 		},
 		min_leaf: t.params.min_leaf.to_string(),
-		signer_record: t.signer_head.map(|(entry, h, sig)| api::RecordHead { entry, hash: hex(&h), signature: sig.map(|s| hex(&s)) }),
+		signer_record: match t.signer_head {
+			Some((entry, h, sig)) => Some(head_with_acks(&app, entry, &h, sig.as_ref()).await?),
+			None => None,
+		},
 		leaves: t.leaves.iter().map(|l| api::TreeLeaf {
 			template: l.template.to_string(),
 			owner: hex(&l.owner.serialize()),
@@ -807,7 +823,7 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 		// `info` shows no head of a stopped signer's record from now on.
 		*app.record_head.lock().await = None;
 	}
-	let wire = |h: crate::signer::WireEntryRef| api::RecordHead { entry: h.entry, hash: h.hash, signature: h.signature };
+	let wire = |h: crate::signer::WireEntryRef| api::RecordHead { entry: h.entry, hash: h.hash, signature: h.signature, acks: vec![] };
 	Ok(Json(api::Witness {
 		head: w.head.as_ref().map(record_head_json),
 		hashes: w.hashes.into_iter().map(|h| api::EntryHash { entry: h.entry, hash: h.hash, signature: h.signature }).collect(),
@@ -828,15 +844,21 @@ async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesReje
 	let k = authenticate(&app, "mailbox_read", &req.auth, &auth::mailbox_read_request(after as u64, req.limit)).await?;
 	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
 	let msgs = app.store.mailbox_read(&k.serialize(), after, limit).await?;
-	Ok(Json(api::Mailbox {
-		messages: msgs.into_iter().map(|m| api::MailboxMessage {
+	let mut messages = Vec::with_capacity(msgs.len());
+	for m in msgs {
+		let signer_record = match m.signer_head {
+			Some((entry, h, s)) => Some(head_with_acks(&app, entry, &h, Some(&s)).await?),
+			None => None,
+		};
+		messages.push(api::MailboxMessage {
 			cursor: m.cursor.to_string(),
 			kind: m.kind,
 			leaf_id: m.leaf_id.map(|l| hex(&l)).unwrap_or_default(),
 			record: hex(&m.payload),
-			signer_record: m.signer_head.map(|(entry, h, s)| api::RecordHead { entry, hash: hex(&h), signature: Some(hex(&s)) }),
-		}).collect(),
-	}))
+			signer_record,
+		});
+	}
+	Ok(Json(api::Mailbox { messages }))
 }
 
 async fn leaf_data(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LeafData>, Refusal> {

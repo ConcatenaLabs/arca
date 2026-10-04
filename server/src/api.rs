@@ -59,8 +59,25 @@ pub struct Info {
 	/// signer does not answer.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub signer_record: Option<RecordHead>,
+	/// The keepers the signer hands every head of its record to, on other
+	/// machines, and how many must hold a head before the signer answers an
+	/// entry: a wallet pins them when it is created, as it pins the operator
+	/// key. No keys and 0 for an operator with no keeper, whose record rests
+	/// on its own machine alone.
+	pub keepers: KeepersInfo,
 	/// The largest request body the server reads.
 	pub max_request_bytes: u64,
+}
+
+/// The keepers of the signer's record ([`crate::keeper`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepersInfo {
+	/// Each keeper's own key (x-only, hex), which signs its acknowledgements.
+	pub keys: Vec<String>,
+	/// How many of them acknowledge every head the signer answers an entry
+	/// with.
+	pub required: u32,
 }
 
 /// The times a participation keeps to.
@@ -543,8 +560,10 @@ pub struct PublishedTree {
 }
 
 /// An entry of the signer's record: its number and running hash, with `S`'s
-/// signature over them. A wallet keeps every one it is shown that carries
-/// that signature, and hands them back on every contact (`witness`).
+/// signature over them, and the keepers' acknowledgements of it. A wallet
+/// keeps every one it is shown that carries that signature and, where the
+/// operator has keepers, the acknowledgements the wallet requires, and hands
+/// them back on every contact (`witness`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordHead {
@@ -555,6 +574,11 @@ pub struct RecordHead {
 	/// heads were signed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub signature: Option<String>,
+	/// Each keeper's acknowledgement that it holds this head
+	/// (`keeper::ack_digest`): its key, the nonce of the request it
+	/// answered, and its signature.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub acks: Vec<crate::keeper::WireAck>,
 }
 
 /// `POST /v1/witness`: the heads of the signer's record a wallet holds, each
