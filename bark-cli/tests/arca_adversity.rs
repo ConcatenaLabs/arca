@@ -2401,3 +2401,131 @@ async fn the_margins_are_the_operators_whatever_the_wallets_node_says() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The production delays
+// ---------------------------------------------------------------------------
+
+/// The specification's delays, run on the regtest chain's clock: a wallet
+/// made with its defaults asks a 36-hour exit delay of its leaves, and the
+/// operator's forfeits a 48-hour refund delay. A board exited: its claim is
+/// refused by the node an hour before the exit delay has run from the
+/// leaf's confirmation and taken after it, and the coin is `exited` once the
+/// claim is final. A forfeit the operator published and never claimed: no
+/// refund an hour before its delay has run, then the refund, final, and the
+/// coin the wallet's on the chain. The watcher is on throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exit_and_a_refund_run_at_the_production_delays() {
+	use elements::hashes::Hash;
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let x = r.x;
+	let hour = 3_600u32;
+	let spec = |w: &Arca, server: &str, node: &str| w.ok(&["create", "--server", server, "--node-url", node, "--node-user", "arca"]);
+	let board = |w: &Arca, r: &mut Running| {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x, 5_000_000);
+	};
+
+	// The exit at 36 hours.
+	let e = Arca::new("P8E");
+	let created = spec(&e, &r.url(), &r.node_url());
+	let delay = created["exit_delay_units"].as_u64().unwrap() as u32 * 512;
+	println!("P8 a wallet with its defaults: exit delay {} units ({} s), accepted {}", created["exit_delay_units"], delay,
+		created["accepted_exit_delay_units"]);
+	assert!((36 * hour..=36 * hour + 512).contains(&delay));
+	board(&e, &mut r);
+	r.produce().await;
+	let leaf = e.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || e.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	e.ok(&["sync"]);
+	let xs = x.to_string();
+	let exit_args = ["exit", leaf.as_str(), "--fee-asset", xs.as_str()];
+	let first = e.ok(&exit_args);
+	println!("P8 the exit: {}", first["state"]);
+	r.produce().await;
+	r.bury().await;
+	let w = e.ok(&exit_args);
+	assert_eq!(w["state"], "waiting", "{}", w);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, delay - hour));
+	let w = e.ok(&exit_args);
+	println!("P8 an hour before the exit delay has run: {} | {}", w["state"], w["next"]);
+	assert_eq!(w["state"], "waiting", "{}", w);
+	assert!(w["next"].as_str().unwrap_or("").contains("non-BIP68-final"), "{}", w);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 2 * hour));
+	let c = e.ok(&exit_args);
+	println!("P8 past it: {} {}", c["state"], c["claim"]);
+	assert_eq!(c["state"], "claimed", "{}", c);
+	r.produce().await;
+	r.bury().await;
+	e.ok(&["sync"]);
+	assert_eq!(coin_of(&e, &leaf)["state"], "exited", "{}", coin_of(&e, &leaf));
+	let paid = e.ok(&["balance"])["sequentia_onchain"][x.to_string()].as_str().unwrap().to_string();
+	println!("P8 the board exited at 36 hours: {}; on-chain X {}", coin_of(&e, &leaf)["note"], paid);
+
+	// The refund at 48 hours.
+	let f = Arca::new("P8F");
+	spec(&f, &proxy.url, &r.node_url());
+	board(&f, &mut r);
+	r.produce().await;
+	let given = f.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || f.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	f.ok(&["sync"]);
+	let pid = f.ok(&["participate"])["participation"].as_str().unwrap().to_string();
+	final_round(&r).await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/forfeit_leaves" && status == 200 {
+			v["preimage"] = Value::Null;
+		}
+		None
+	})));
+	let s = f.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "forfeiting", "{}", s);
+	let mut forfeit = None;
+	for _ in 0..60 {
+		let log = r.server.store.watcher_log().await.unwrap();
+		forfeit = log.iter().find(|w| w.kind == "forfeit").map(|w| elements::Txid::from_byte_array(w.txid));
+		assert!(!log.iter().any(|w| w.kind == "claim"), "the server is stopped before any claim");
+		if forfeit.is_some() && log.iter().any(|w| w.kind == "issue") {
+			break;
+		}
+		if forfeit.is_none() {
+			r.produce().await;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+	}
+	let forfeit = forfeit.expect("the watcher publishes the forfeit");
+	r.server.stop();
+	r.produce().await;
+	r.bury().await;
+	let (units, _, _, _) = stored_status(&r, &pid);
+	let refund_delay = units as u32 * 512;
+	println!("P8 the operator's forfeit {} published, the operator stopped; its refund delay {} units ({} s)", forfeit, units, refund_delay);
+	assert!((48 * hour..=48 * hour + 512).contains(&refund_delay));
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, refund_delay - hour));
+	let s = f.ok(&["sync"]);
+	let fo = s["forfeits"].as_array().unwrap().iter().find(|x| x["leaf_id"] == given.as_str()).cloned().unwrap();
+	println!("P8 an hour before the refund delay has run: {} | {}", fo["state"], fo["note"]);
+	assert_eq!(fo["state"], "published", "{}", fo);
+	assert!(fo.get("refund").is_none());
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 2 * hour));
+	let s = f.ok(&["sync"]);
+	let fo = s["forfeits"].as_array().unwrap().iter().find(|x| x["leaf_id"] == given.as_str()).cloned().unwrap();
+	println!("P8 past it: {} {}", fo["state"], fo["refund"]);
+	assert_eq!(fo["state"], "refunding", "{}", fo);
+	r.produce().await;
+	r.bury().await;
+	f.ok(&["sync"]);
+	f.ok(&["sync"]);
+	println!("P8 the forfeit refunded at 48 hours: {} | {}", coin_of(&f, &given)["state"], coin_of(&f, &given)["note"]);
+	assert_eq!(coin_of(&f, &given)["state"], "exited", "{}", coin_of(&f, &given));
+	for w in [&e, &f] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

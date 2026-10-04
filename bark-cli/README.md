@@ -359,6 +359,12 @@ and holding it there, with the reason shown:
   which the coins then carry; and one whose coins reach their exit deadline
   a day and a half later refused, saying so, and taken with
   `--accept-near-deadline`;
+- an exit and a forfeit's refund at the specification's delays, on the
+  regtest chain's clock, with a wallet made with its defaults: the claim of
+  a board's leaf refused by the node an hour before its 36-hour exit delay
+  has run and taken after it, and a forfeit the operator published and
+  never claimed refunded only once its 48-hour refund delay has run, each
+  coin `exited` once final;
 - the files a fresh wallet writes, readable by their owner alone, the node's
   password in none of the store's, and its balance of one row, 0 BTC; and a
   wallet restored from the mnemonic that finds on-chain coins past the first
