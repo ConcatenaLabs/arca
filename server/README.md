@@ -1427,6 +1427,15 @@ database forgets the leaf's salt, and it makes a second leaf of its own under
 that salt and pays from it: the signer refuses the second spend under the
 salt, which would have been a signature valid on the first coin too.
 
+`tests/transfer_values.rs` asks for one transfer twice, the second time with
+another checkpoint value: a coin a transfer makes is named by its inputs' ids,
+their checkpoints' programs and the outputs, not by the checkpoints' values,
+so both would make coins of the same ids. The second is refused (`salt`: its
+outputs' salts are known), and the signer, asked directly for the other
+value's checkpoint with the owner's signature over it, refuses it too
+(`already_signed`): the operator co-signs one checkpoint value for a coin, so
+at most one record of a coin ever carries its signatures.
+
 `tests/restore.rs` restores the database from an older copy. A board pays B
 and the copy forgets it: the server does not start on it, naming the two
 entries of the signer's record the payment made; B's coin validates and its
