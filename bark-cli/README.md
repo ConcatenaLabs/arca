@@ -110,8 +110,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   the chain, not from what it stored: when another transaction now pays a
   batch output a coin rests on, the checks run again on that one, and a coin
   that fails them on a transaction the chain holds goes into its exit at once.
-  A coin resting on a round that is out of the chain while a coin the round
-  spends is spent by another transaction that is final is `lost`. A board
+  A coin resting on a round is as final as that round: one resting on a
+  round that is out of the chain while a coin the round spends is spent by
+  another transaction that is final is `lost`, its note naming the round, and
+  a coin paid to the wallet out of a leaf of that round with it; each is the
+  wallet's again once every round and board it rests on is final in the chain
+  again. A board
   held as `lost` whose transaction the chain holds is followed again once the
   server reports it credited. Every participation such a round ran, the
   operator runs again, under the same keys and owner nonces, in a round that
@@ -371,6 +375,11 @@ and holding it there, with the reason shown:
   chain takes that transaction out and R confirms in its place: the node
   refuses Y, and the wallet holds its leaf of R, live, and its leaf of Y
   `lost`, one leaf for the coin it gave up;
+- a coin paid out of a lost round's leaf: B pays M out of its leaf of a round
+  that is then lost; the server holds M's coin `lost` and voids B's re-run,
+  saying B's leaf of the round was paid on; M's wallet shows the coin `lost`,
+  resting on that round; when the round returns, M's coin is live again, at
+  the server and in M's wallet, and B's participation is back in the round;
 - a forfeit's refund sent once its delay has run and replaced in the mempool
   by the operator's claim, which confirms: the wallet reads the preimage from
   the claim and holds its new leaf, and the coin given up is spent; a refund

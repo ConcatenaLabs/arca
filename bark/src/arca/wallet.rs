@@ -216,8 +216,9 @@ enum Checked {
 	Holds(&'static str, String),
 	/// A base the chain holds fails the wallet's checks, for this reason.
 	Fails(String),
-	/// A base can never return to the chain: an input of it is spent by
-	/// another transaction that is final.
+	/// A base is out of the chain while an input of it is spent by another
+	/// transaction that is final; it returns only if the parent chain takes
+	/// that one out.
 	Lost(Txid),
 }
 
@@ -1143,7 +1144,8 @@ impl Wallet {
 			let (state, note) = match self.recheck_one(&c, &record, &policy)? {
 				Checked::Holds(state, note) => (state, note),
 				Checked::Lost(base) => {
-					let why = format!("{} can never return to the chain: a coin it spends is spent by another transaction that is final", base);
+					let why = format!("rests on {}, which is out of the chain while a coin it spends is spent by another transaction that is \
+						final: the coin is worth nothing while that stands, and the wallet follows it should the parent chain bring {} back", base, base);
 					self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
 					let back = self.round_lost(&base)?;
 					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lost", "why": why, "given_back": back}));

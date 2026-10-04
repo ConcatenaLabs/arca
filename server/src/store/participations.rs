@@ -146,6 +146,8 @@ pub struct Restored {
 	pub rerun: Vec<[u8; 32]>,
 	/// How many of its new leaves were credited.
 	pub credited: u64,
+	/// How many coins made out of its leaves by transfers are live again.
+	pub revived: u64,
 }
 
 /// A participation as the database holds it.
@@ -486,6 +488,20 @@ impl Store {
 		Ok(())
 	}
 
+	/// A new leaf of participation `id`, of a lost round, that was spent
+	/// before the round was lost: the leaf, the round's transaction, and what
+	/// spent it (a transfer's id or a participation's).
+	pub async fn spent_leaf_of_lost_round(&self, id: &[u8; 32]) -> Result<Option<([u8; 32], [u8; 32], [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT l.leaf_id, r.txid, l.spent_by FROM leaf l JOIN batch_leaf bl ON bl.leaf_id = l.leaf_id
+			 JOIN round r ON r.round_id = bl.round_id
+			 WHERE bl.participation_id = $1 AND l.state = 'spent' AND r.state = 'lost' ORDER BY bl.round_id DESC LIMIT 1",
+			&[&&id[..]],
+		).await?;
+		r.map(|r| Ok((array32(r.get(0), "leaf id")?, array32(r.get(1), "txid")?, array32(r.get(2), "spent by")?))).transpose()
+	}
+
 	/// The participation the forfeit of `leaf_id` for the round `round_id`
 	/// was signed for.
 	pub async fn forfeit_participation(&self, leaf_id: &[u8; 32], round_id: i64) -> Result<Option<[u8; 32]>, StoreError> {
@@ -774,6 +790,34 @@ impl Store {
 			out.restored.push(id);
 		}
 		out.credited = credit(&t, round_id).await?;
+		// Every coin a transfer made out of a leaf of the round that is lost
+		// is the holder's again, unless it rests on another round still lost,
+		// or on a board lost: live once the transfer is signed.
+		let lost = t.query(
+			&format!("{} SELECT l.leaf_id, tr.state FROM leaf l JOIN transfer_output o ON o.leaf_id = l.leaf_id
+			 JOIN transfer tr ON tr.transfer_id = o.transfer_id
+			 WHERE l.kind = 'transfer' AND l.state = 'lost' AND l.leaf_id IN (SELECT leaf_id FROM d)", DESCENDANTS),
+			&[&round_id],
+		).await?;
+		for r in lost {
+			let leaf: Vec<u8> = r.get(0);
+			let signed = r.get::<_, &str>(1) == "signed";
+			let still = t.query_one(
+				"WITH RECURSIVE a(leaf_id) AS (
+				   SELECT $1::bytea
+				   UNION
+				   SELECT i.leaf_id FROM a JOIN transfer_output o ON o.leaf_id = a.leaf_id JOIN transfer_input i ON i.transfer_id = o.transfer_id)
+				 SELECT EXISTS (SELECT 1 FROM a JOIN batch_leaf bl ON bl.leaf_id = a.leaf_id JOIN round r ON r.round_id = bl.round_id
+				                WHERE r.state = 'lost')
+				     OR EXISTS (SELECT 1 FROM a JOIN board b ON b.leaf_id = a.leaf_id WHERE b.state = 'lost')",
+				&[&leaf],
+			).await?;
+			if !still.get::<_, bool>(0) {
+				t.execute("UPDATE leaf SET state = $2::text::leaf_state, updated_at = now() WHERE leaf_id = $1",
+					&[&leaf, &if signed { "live" } else { "pending" }]).await?;
+				out.revived += 1;
+			}
+		}
 		// Every forfeit naming the round can be claimed again: the nursery
 		// follows each, and judges it again, as it does any transaction.
 		t.execute(
@@ -908,6 +952,13 @@ impl Store {
 	}
 }
 
+/// The coins a transfer made out of a leaf of the round `$1`, at any depth:
+/// the common table `d`.
+const DESCENDANTS: &str = "WITH RECURSIVE d(leaf_id) AS (
+	SELECT leaf_id FROM batch_leaf WHERE round_id = $1
+	UNION
+	SELECT o.leaf_id FROM d JOIN transfer_input i ON i.leaf_id = d.leaf_id JOIN transfer_output o ON o.transfer_id = i.transfer_id)";
+
 /// [`Store::retire_round`] inside `t`, but the participations in `keep`,
 /// whose attempt in the round is kept with the others and which the caller
 /// moves on itself: `None` when the round was lost already, else the
@@ -926,6 +977,13 @@ async fn retire_in(t: &tokio_postgres::Transaction<'_>, round_id: i64, keep: &st
 	t.execute(
 		"UPDATE leaf SET state = 'lost', updated_at = now()
 		 WHERE state IN ('pending', 'live') AND leaf_id IN (SELECT leaf_id FROM batch_leaf WHERE round_id = $1)",
+		&[&round_id],
+	).await?;
+	// Every coin a transfer made out of a leaf of the round, at any depth,
+	// rests on the round: lost while it is out.
+	t.execute(
+		&format!("{} UPDATE leaf SET state = 'lost', updated_at = now()
+		 WHERE kind = 'transfer' AND state IN ('pending', 'live') AND leaf_id IN (SELECT leaf_id FROM d)", DESCENDANTS),
 		&[&round_id],
 	).await?;
 	let rows = t.query(

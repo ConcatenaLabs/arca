@@ -22,7 +22,10 @@ expires and the old leaves are the holder's again. Finally the holder signs a
 release of the lowest node above each old leaf, naming the new round's connector
 asset, so that the operator can reclaim the node before the batch expires. Forfeit
 and release alike are void if the new round leaves the chain: neither can be used
-without an asset that only that round can issue.
+without an asset that only that round can issue. A coin resting on a round, a
+leaf of it or a coin paid out of one, is as final as that round: while the round
+is out of the chain the coin is worth nothing, and it is good again if the round
+returns.
 
 The operator's server watches the chain for what follows. A holder who brings a
 leaf it gave up back on-chain is answered, before the leaf's exit delay runs out,

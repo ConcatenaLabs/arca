@@ -761,6 +761,92 @@ async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rer
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// A coin paid out of a lost round's leaf (review R7e, F3's B and M). B
+/// refreshes a leaf of an earlier round in round R and pays its new leaf on
+/// to M out of round. R goes out of the chain with its parent block while a
+/// transaction of the operator's takes R's input (paying the operator back),
+/// buried: M's coin rests on R. The server holds M's coin lost, and B's
+/// re-run void, saying its leaf of R was paid on; M's wallet shows the coin
+/// lost, resting on a round out of the chain, not live. Then the parent
+/// chain takes that transaction out and R returns: M's coin is live again,
+/// at the server and in M's wallet, and B's participation is back in R.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_paid_out_of_a_lost_rounds_leaf_is_as_final_as_that_round() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (b, m) = (Arca::new("PB"), Arca::new("PM"));
+	let boards = boarded(&mut r, &b, &url, &[(x, 2_000_000)]).await;
+	b.ok(&["participate", "--leaf", &boards[0]]);
+	final_round(&r).await;
+	let s = b.ok(&["sync"]);
+	let leaf0 = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	let pid = b.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let p_r = own_anchor(&r).await;
+	let rtx = final_round(&r).await;
+	b.ok(&["sync"]);
+	// B pays M out of its leaf of R.
+	m.ok(&create_args(&url, &r.node_url()));
+	let req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = b.ok(&["send", &req, "--amount", "1500000", "--asset", &x.to_string()]);
+	println!("PB pays M 1500000 out of its leaf of R: {}", sent["inputs"]);
+	let got = m.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&m, &got)["state"], "live");
+	let got_id: [u8; 32] = unhex(&got).try_into().unwrap();
+	let server_state = |r: &Running| tokio::runtime::Handle::current().block_on(r.server.store.leaf(&got_id)).unwrap().unwrap().state;
+
+	// R goes out of the chain; X takes its input, paying the operator back.
+	let back = r.server.wallet.receive_script().await.unwrap();
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let p_x = own_anchor(&r).await;
+	let mut xtx = taking(&r, &rtx, back);
+	operator_signs(&r, &mut xtx);
+	r.rt.client().send_raw_transaction(&xtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Lost).await;
+	let pid32: [u8; 32] = unhex(&pid).try_into().unwrap();
+	r.wait("B's re-run looked at", || tokio::runtime::Handle::current().block_on(r.server.store.participation(&pid32)).unwrap().unwrap()
+		.state == server::store::ParticipationState::Void).await;
+	let p = r.server.store.participation(&pid32).await.unwrap().unwrap();
+	let lost_at_server = tokio::task::block_in_place(|| server_state(&r));
+	println!("PB R lost: M's coin at the server {:?}; B's re-run {:?}: {}", lost_at_server, p.state, p.void_reason.clone().unwrap_or_default());
+	assert_eq!(lost_at_server, server::store::LeafState::Lost);
+	let why = p.void_reason.unwrap();
+	assert!(why.contains("paid on out of round") && why.contains(&rtx.txid().to_string()), "{}", why);
+	m.ok(&["sync"]);
+	let mc = coin_of(&m, &got);
+	println!("PM M's coin while R is out: {} ({})", mc["state"], mc["note"]);
+	assert_eq!(mc["state"], "lost");
+	assert!(mc["note"].as_str().unwrap().contains("out of the chain") && mc["note"].as_str().unwrap().contains(&rtx.txid().to_string()));
+	assert!(m.ok(&["balance"])["arca"].as_object().is_none_or(|a| a.is_empty()), "nothing of it counted");
+
+	// The parent chain takes X out; R confirms in its place.
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_x)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	r.rt.client().send_raw_transaction(&rtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Final).await;
+	let p = r.server.store.participation(&pid32).await.unwrap().unwrap();
+	let back_at_server = tokio::task::block_in_place(|| server_state(&r));
+	println!("PB R back: M's coin at the server {:?}; B's participation {:?} attempt {}", back_at_server, p.state, p.attempt);
+	assert_eq!(back_at_server, server::store::LeafState::Live);
+	assert_eq!((p.state, p.attempt), (server::store::ParticipationState::Released, 0));
+	let s = m.ok(&["sync"]);
+	println!("PM M's sync with R back: {}", s["recheck"]["changes"]);
+	assert_eq!(coin_of(&m, &got)["state"], "live", "{}", coin_of(&m, &got));
+	assert_eq!(m.ok(&["balance"])["arca"][x.to_string()]["operator-confirmed"], "1500000");
+	let _ = (std::fs::remove_dir_all(&b.dir), std::fs::remove_dir_all(&m.dir));
+}
+
 // ---------------------------------------------------------------------------
 // The fee a refresh pays
 // ---------------------------------------------------------------------------

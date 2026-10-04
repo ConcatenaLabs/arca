@@ -377,7 +377,8 @@ impl Rounds {
 				}
 			}
 			if taken {
-				let voided = self.store.void_participation(&row.id, "a key it wants a leaf under owns a leaf already").await?;
+				let why = self.paid_on(&row.id).await?.unwrap_or_else(|| "a key it wants a leaf under owns a leaf already".into());
+				let voided = self.store.void_participation(&row.id, &why).await?;
 				log::warn!("participation {} cannot run: a key it wants owns a leaf (voided: {})", crate::signer::hex(&row.id), voided);
 				continue;
 			}
@@ -962,7 +963,7 @@ impl Rounds {
 					round is out", round_id, t, LeafId(leaf));
 			}
 			let Some(p) = self.store.participation(id).await? else { continue };
-			let mut why = self.barred(&p).await?;
+			let mut why = match self.paid_on(id).await? { Some(w) => Some(w), None => self.barred(&p).await? };
 			if why.is_none() {
 				for l in self.lost_rounds(id).await? {
 					if !ties.contains_key(&l) {
@@ -1047,9 +1048,27 @@ impl Rounds {
 		}
 		let never = self.rerun(r.round_id, &done.rerun).await?;
 		log::warn!("round {} ({}) is final again: restored; {} participation(s) back as they stood in it, {} leaf/leaves credited, \
-			{} round(s) retired, {} participation(s) of those run again, {} never taken", r.round_id, txid, done.restored.len(),
-			done.credited, done.retired.len(), done.rerun.len() - never, never);
+			{} coin(s) paid out of its leaves live again, {} round(s) retired, {} participation(s) of those run again, {} never taken",
+			r.round_id, txid, done.restored.len(), done.credited, done.revived, done.retired.len(), done.rerun.len() - never, never);
 		Ok(())
+	}
+
+	/// Why the participation `id`, run again after a lost round, is not run
+	/// again when its new leaf of a lost round was spent before the round was
+	/// lost: paid on out of round, or given up in another participation. What
+	/// that spend made rests on the round, and is lost while the round is out;
+	/// a second leaf would leave its owner what it spent.
+	async fn paid_on(&self, id: &[u8; 32]) -> Result<Option<String>, RoundError> {
+		let Some((leaf, round, by)) = self.store.spent_leaf_of_lost_round(id).await? else { return Ok(None) };
+		let how = if self.store.transfer(&by).await?.is_some() {
+			format!("paid on out of round (transfer {})", crate::signer::hex(&by))
+		} else {
+			format!("given up in participation {}", crate::signer::hex(&by))
+		};
+		Ok(Some(format!("its new leaf {} of round {}, which went out of the chain, was {} before the round was lost: what that \
+			spend made rests on the round, and is lost while the round is out of the chain. The participation is not run again, since \
+			a second leaf would leave its owner what it spent; its coins are its owner's on the chain, and if the round returns the \
+			participation is restored as it stood in it, and what the spend made with it", LeafId(leaf), Txid::from_byte_array(round), how)))
 	}
 
 	/// Why the participation `p`, run again after a round that could not
