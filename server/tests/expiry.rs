@@ -143,7 +143,7 @@ async fn a_participation_whose_forfeits_never_come_expires() {
 	// A forfeit step already past its first check when the expiry ran is
 	// refused where it records: nothing is stored, the participation is not
 	// released.
-	match r.server.store.complete_participation(&pa, 0, built.round_id, &[], &[], true).await {
+	match r.server.store.complete_participation(&pa, 0, built.round_id, &[], &[]).await {
 		Err(server::store::StoreError::NotInRound(state)) => assert_eq!(state, "expired"),
 		other => panic!("an expired participation completed: {:?}", other.map(|_| ())),
 	}

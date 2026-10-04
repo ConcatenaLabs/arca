@@ -33,10 +33,11 @@
 //! new leaves credited, and only then is the preimage returned. A forfeit
 //! left without the operator's half (the server stopped before the answer
 //! was stored) is completed later ([`Forfeits::fill_unsigned`]). The coins given up have been spent by the participation
-//! since it was accepted. A participation run again forfeit-first, after a
-//! round it was released in could not return, has its forfeits stored and its
-//! preimage withheld: it goes out only once the forfeit is published and
-//! claimed, which reveals it on the chain anyway.
+//! since it was accepted. A participation run again after a round it was in
+//! could not return completes the same way: its forfeits for the new round
+//! are taken and checked, and its new preimage goes out against them. The
+//! forfeits it gave for the lost round can never be claimed, and the server
+//! never publishes them ([`crate::rounds`]).
 //!
 //! The step is idempotent: the same request again, for a released
 //! participation, verifies every forfeit again and returns the same
@@ -112,10 +113,8 @@ pub struct ForfeitLeaves {
 pub struct Forfeited {
 	pub participation_id: [u8; 32],
 	pub state: ParticipationState,
-	/// The preimage of the participation's unlock hash; `None` while a
-	/// forfeit-first participation waits for its forfeit to be claimed.
-	pub preimage: Option<[u8; 32]>,
-	pub forfeit_first: bool,
+	/// The preimage of the participation's unlock hash.
+	pub preimage: [u8; 32],
 }
 
 /// One coin's release: the owner's signature, and the connector asset of the
@@ -347,23 +346,13 @@ impl Forfeits {
 
 		// Recorded, then the preimage. A participation that expired meanwhile
 		// takes nothing.
-		let release = !p.forfeit_first;
-		let released = match self.store.complete_participation(&id, p.attempt, round_id, &forfeits, &records, release).await {
-			Ok(r) => r,
+		match self.store.complete_participation(&id, p.attempt, round_id, &forfeits, &records).await {
+			Ok(()) => {},
 			Err(StoreError::NotInRound(state)) => return Err(ForfeitError::NotInRound(state)),
 			Err(e) => return Err(e.into()),
-		};
-		if released {
-			log::info!("participation {} released: {} forfeit(s) in, preimage handed over", hex(&id), forfeits.len());
-		} else {
-			log::info!("participation {} runs forfeit-first: {} forfeit(s) in, preimage withheld", hex(&id), forfeits.len());
 		}
-		Ok(Forfeited {
-			participation_id: id,
-			state: if released { ParticipationState::Released } else { ParticipationState::Issued },
-			preimage: released.then_some(p.preimage),
-			forfeit_first: p.forfeit_first,
-		})
+		log::info!("participation {} released: {} forfeit(s) in, preimage handed over", hex(&id), forfeits.len());
+		Ok(Forfeited { participation_id: id, state: ParticipationState::Released, preimage: p.preimage })
 	}
 
 	/// Fills in the operator's half of every forfeit recorded without it

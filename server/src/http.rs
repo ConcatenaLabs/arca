@@ -597,7 +597,6 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 		state: r.state.as_str().into(),
 		attempt: r.attempt,
 		unlock_hash: hex(&r.unlock_hash),
-		forfeit_first: r.forfeit_first,
 		refund_delay_units: r.refund_delay_units,
 		round: s.round.as_ref().map(|rr| api::RoundRef { txid: rr.txid.to_string(), connector_vout: rr.connector_vout }),
 		inputs: r.inputs.iter().map(|i| api::ParticipationInputStatus {
@@ -605,6 +604,7 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 			asset: AssetId::from_byte_array(i.asset).to_string(),
 			value: i.value.to_string(),
 			margin: i.margin.to_string(),
+			returned: i.returned,
 		}).collect(),
 		outputs: r.outputs.iter().zip(&s.placed).map(|(o, at)| {
 			let mut out = api::ParticipationOutputStatus {
@@ -634,6 +634,7 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 		}).collect(),
 		fees: r.fees.iter().map(|(a, v)| api::FeeAmount { asset: AssetId::from_byte_array(*a).to_string(), amount: v.to_string() }).collect(),
 		waiting: r.waiting.clone().filter(|_| r.state == crate::store::ParticipationState::Pending),
+		void_reason: r.void_reason.clone().filter(|_| r.state == crate::store::ParticipationState::Void),
 	}
 }
 
@@ -744,8 +745,7 @@ async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	Ok(Json(api::Forfeited {
 		participation_id: hex(&done.participation_id),
 		state: done.state.as_str().into(),
-		preimage: done.preimage.map(|p| hex(&p)),
-		forfeit_first: done.forfeit_first,
+		preimage: hex(&done.preimage),
 	}))
 }
 

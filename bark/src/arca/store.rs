@@ -207,11 +207,46 @@ impl Store {
 		let conn = Connection::open(path).map_err(db)?;
 		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;").map_err(db)?;
 		conn.execute_batch(SCHEMA).map_err(db)?;
-		let store = Store { conn };
+		let mut store = Store { conn };
 		store.add_column("participation", "news", "TEXT")?;
 		store.add_column("signer_seen", "signature", "TEXT")?;
 		store.add_column("mailbox_retry", "head", "TEXT")?;
+		store.follow_lost_participations()?;
 		Ok(store)
+	}
+
+	/// A participation a wallet held as `lost` (its round could never
+	/// return, and the wallet stopped following it, a state no wallet sets
+	/// now) is followed again, as the operator runs it again: `pending`, each
+	/// coin it gave up that the wallet still holds (`live`, `forfeited`)
+	/// `given` to it, and the owner nonce of each leaf it wants waiting again.
+	/// Done once.
+	fn follow_lost_participations(&mut self) -> Result<(), Error> {
+		if self.meta("lost_participations_followed")?.is_some() {
+			return Ok(());
+		}
+		let lost: Vec<(String, String, String)> = {
+			let mut st = self.conn.prepare("SELECT id, given, wanted FROM participation WHERE state = 'lost'").map_err(db)?;
+			let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?;
+			rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+		};
+		self.atomically(|s| {
+			for (id, given, wanted) in &lost {
+				let given: Vec<String> = serde_json::from_str(given).map_err(|e| Error::Store(e.to_string()))?;
+				let wanted: serde_json::Value = serde_json::from_str(wanted).map_err(|e| Error::Store(e.to_string()))?;
+				s.conn.execute("UPDATE participation SET state = 'pending' WHERE id = ?1", params![id]).map_err(db)?;
+				for l in &given {
+					s.conn.execute("UPDATE coin SET state = 'given', note = ?2 WHERE leaf_id = ?1 AND state IN ('live', 'forfeited')",
+						params![l, format!("given up to participation {}, which the operator runs again", id)]).map_err(db)?;
+				}
+				for w in wanted.as_array().cloned().unwrap_or_default() {
+					if let Some(n) = w["nonce"].as_str().and_then(|n| super::chain::unhex32(n).ok()) {
+						s.wait_on_nonce(&n)?;
+					}
+				}
+			}
+			s.set_meta("lost_participations_followed", &lost.len().to_string())
+		})
 	}
 
 	/// Adds `column` to `table` in a store made before it existed.
@@ -293,6 +328,15 @@ impl Store {
 	}
 
 	/// Marks a nonce used by `leaf_id`. A nonce is used once.
+	/// The owner nonce `nonce`, whose leaf a round that can never return
+	/// made, waiting again: the participation that wanted it runs again
+	/// under the same owner nonce.
+	pub fn wait_on_nonce(&self, nonce: &[u8; 32]) -> Result<(), Error> {
+		self.conn.execute("UPDATE nonce SET state = 'pending', leaf_id = NULL WHERE nonce = ?1 AND state = 'used'", params![&nonce[..]])
+			.map_err(db)?;
+		Ok(())
+	}
+
 	pub fn use_nonce(&self, nonce: &[u8; 32], leaf_id: &str) -> Result<(), Error> {
 		let n = self.conn.execute("UPDATE nonce SET state = 'used', leaf_id = ?2 WHERE nonce = ?1 AND state = 'pending'",
 			params![&nonce[..], leaf_id]).map_err(db)?;
@@ -690,6 +734,40 @@ mod tests {
 		s.bump_index(0, 1000).unwrap();
 		s.bump_index(0, 10).unwrap();
 		assert_eq!(s.take_index(0).unwrap(), 1000);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A store an earlier wallet left with a participation held as `lost`
+	/// opens with it followed again: `pending`, its coin `given`, the nonce of
+	/// its leaf waiting; once, so a later open changes nothing.
+	#[test]
+	fn a_participation_held_as_lost_is_followed_again() {
+		let dir = std::env::temp_dir().join(format!("arca-store-lost-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("arca.sqlite");
+		let s = Store::open(&path).unwrap();
+		s.conn.execute("DELETE FROM meta WHERE key = 'lost_participations_followed'", []).unwrap();
+		for (n, k, state, leaf) in [([1u8; 32], [2u8; 32], "used", Some("old leaf")), ([3u8; 32], [4u8; 32], "used", Some("lost leaf"))] {
+			s.conn.execute("INSERT INTO nonce (nonce, owner_key, purpose, state, leaf_id, created_at) VALUES (?1, ?2, 'leaf', ?3, ?4, 0)",
+				params![&n[..], &k[..], state, leaf]).unwrap();
+		}
+		s.conn.execute("INSERT INTO coin (leaf_id, owner_nonce, kind, asset, value, record, salt, state, expiry, bases, created_at)
+			VALUES ('old leaf', ?1, 'board', 'x', 1, x'00', x'01', 'live', 0, '[]', 0)", params![&[1u8; 32][..]]).unwrap();
+		s.conn.execute("INSERT INTO participation (id, body, given, wanted, state, round, created_at)
+			VALUES ('p', '{}', '[\"old leaf\"]', ?1, 'lost', 'r', 0)",
+			params![serde_json::json!([{"asset": "x", "value": "1", "nonce": super::super::chain::hex(&[3u8; 32])}]).to_string()]).unwrap();
+		drop(s);
+		let s = Store::open(&path).unwrap();
+		let p = s.participations().unwrap().into_iter().find(|p| p.0 == "p").unwrap();
+		assert_eq!(p.4, "pending");
+		assert_eq!(s.coin("old leaf").unwrap().unwrap().state, "given");
+		assert_eq!(s.nonce(&[3u8; 32]).unwrap().unwrap().state, "pending");
+		assert_eq!(s.meta("lost_participations_followed").unwrap().as_deref(), Some("1"));
+		s.conn.execute("UPDATE coin SET state = 'live' WHERE leaf_id = 'old leaf'", []).unwrap();
+		drop(s);
+		let s = Store::open(&path).unwrap();
+		assert_eq!(s.coin("old leaf").unwrap().unwrap().state, "live", "done once");
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

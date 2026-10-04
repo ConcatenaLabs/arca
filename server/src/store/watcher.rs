@@ -76,6 +76,9 @@ pub struct NewWatcherTx {
 	pub detail: String,
 	/// The outpoints it spends.
 	pub inputs: Vec<([u8; 32], u32)>,
+	/// For a forfeit, the round it names: a round that can never return
+	/// refuses it ([`StoreError::RoundLost`]).
+	pub round: Option<i64>,
 }
 
 /// A transaction the watcher published, and where the nursery has it.
@@ -132,10 +135,19 @@ impl Store {
 	/// Takes a transaction of the watcher's into the nursery (kind
 	/// `watcher`), its inputs watched for spends, with its log entry and the
 	/// outpoints it spends, whole or not at all. A transaction already there
-	/// is left as it was; returns whether it is new.
+	/// is left as it was; returns whether it is new. A forfeit naming a round
+	/// that can never return is refused ([`StoreError::RoundLost`]).
 	pub async fn insert_watcher_tx(&self, w: &NewWatcherTx) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		// Under the round's row lock, which retiring the round takes too:
+		// a forfeit naming it is logged before it is lost, or never.
+		if let Some(round) = w.round {
+			let live = t.query_opt("SELECT 1 FROM round WHERE round_id = $1 AND state <> 'lost' FOR SHARE", &[&round]).await?;
+			if live.is_none() {
+				return Err(StoreError::RoundLost(round));
+			}
+		}
 		let (fee_asset, fee) = match w.fee {
 			Some((a, f)) => (Some(a.to_vec()), Some(i64_of(f)?)),
 			None => (None, None),
@@ -147,8 +159,8 @@ impl Store {
 		if n == 0 {
 			return Ok(false);
 		}
-		t.execute("INSERT INTO watcher_tx (txid, kind, subject, detail) VALUES ($1, $2, $3, $4)",
-			&[&&w.txid[..], &w.kind, &w.subject, &w.detail]).await?;
+		t.execute("INSERT INTO watcher_tx (txid, kind, subject, detail, round_id) VALUES ($1, $2, $3, $4, $5)",
+			&[&&w.txid[..], &w.kind, &w.subject, &w.detail, &w.round]).await?;
 		for (pt, pv) in &w.inputs {
 			t.execute(
 				"INSERT INTO watched_outpoint (txid, vout, kind, watched_for) VALUES ($1, $2, 'nursery', $3) ON CONFLICT DO NOTHING",
@@ -159,6 +171,18 @@ impl Store {
 		}
 		t.commit().await?;
 		Ok(true)
+	}
+
+	/// For a forfeit in the watcher's log that names its round: that round's
+	/// transaction, and whether the round is lost.
+	pub async fn forfeit_round(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], bool)>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT r.txid, r.state = 'lost' FROM watcher_tx w JOIN round r ON r.round_id = w.round_id
+			 WHERE w.txid = $1 AND w.kind = 'forfeit'",
+			&[&&txid[..]],
+		).await?;
+		r.map(|r| Ok((array32(r.get(0), "round txid")?, r.get(1)))).transpose()
 	}
 
 	/// The watcher's transaction spending `txid:vout` that the nursery holds
@@ -284,19 +308,6 @@ impl Store {
 		r.map(|r| array32(r.get(0), "preimage")).transpose()
 	}
 
-	/// The participation ids that run forfeit-first and wait for their
-	/// forfeits to be claimed: issued, with their forfeits for the round
-	/// they are in stored.
-	pub async fn forfeit_first_waiting(&self) -> Result<Vec<[u8; 32]>, StoreError> {
-		let conn = self.conn().await?;
-		let rows = conn.query(
-			"SELECT p.participation_id FROM participation p WHERE p.state = 'issued' AND p.forfeit_first
-			   AND EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = p.participation_id AND f.round_id = p.round_id)
-			 ORDER BY p.created_at, p.participation_id",
-			&[],
-		).await?;
-		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
-	}
 
 	/// Every coin a transfer made that is given up in a participation and
 	/// has a forfeit stored, but those whose forfeit the watcher published

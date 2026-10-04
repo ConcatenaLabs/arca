@@ -325,8 +325,7 @@ impl Store {
 	/// participation's preimage, so it is served empty until that preimage
 	/// went out: the participation released at the leaf's attempt, then or
 	/// at an earlier attempt that a round it was in could never return
-	/// retired. A forfeit-first participation's preimage goes out only by
-	/// the claim of its forfeit.
+	/// retired.
 	pub async fn leaves_by_owner(&self, key: &[u8; 32]) -> Result<Vec<LeafRow>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(

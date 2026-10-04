@@ -29,11 +29,45 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 12);
+	assert_eq!(db.store.schema_version().await.unwrap(), 13);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 12);
+	assert_eq!(again.schema_version().await.unwrap(), 13);
+}
+
+/// A database of schema 12, with a participation running again
+/// forfeit-first, moves to 13 in place: the participation is an ordinary
+/// re-run, pending, with no reason to be void.
+#[tokio::test]
+async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
+	let db = TestDb::new().await;
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	// Schema 12 as a server before it left it.
+	client.batch_execute(
+		"ALTER TABLE participation ADD COLUMN forfeit_first BOOLEAN NOT NULL DEFAULT false;
+		 ALTER TABLE participation DROP COLUMN void_reason;
+		 ALTER TABLE watcher_tx DROP COLUMN round_id;
+		 DELETE FROM arca_schema WHERE version = 13;"
+	).await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 12);
+	let id = [7u8; 32];
+	client.execute(
+		"INSERT INTO participation (participation_id, unlock_hash, preimage, attempt, state, forfeit_first, refund_delay_units)
+		 VALUES ($1, $2, $3, 1, 'pending', true, 338)",
+		&[&&id[..], &&[8u8; 32][..], &&[9u8; 32][..]],
+	).await.unwrap();
+	db.store.migrate().await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 13);
+	let p = db.store.participation(&id).await.unwrap().unwrap();
+	assert_eq!((p.state, p.attempt, p.void_reason.clone()), (server::store::ParticipationState::Pending, 1, None));
+	println!("schema 12 -> 13: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
+	let cols: Vec<String> = client.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'participation'", &[])
+		.await.unwrap().iter().map(|r| r.get(0)).collect();
+	assert!(!cols.contains(&"forfeit_first".to_string()) && cols.contains(&"void_reason".to_string()));
 }
 
 #[tokio::test]

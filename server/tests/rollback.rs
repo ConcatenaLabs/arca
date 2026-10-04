@@ -9,15 +9,19 @@
 //! 2. A round that can never return, the operator's coin it spent taken by
 //!    another transaction that becomes final: the round is retired, its new
 //!    leaves lost, and its participations run again in a new round under new
-//!    unlock hashes. The one whose preimage had gone out (giving up a leaf of
-//!    an earlier round, whose lowest node its owner had released) runs
-//!    forfeit-first: its release is retired, its forfeit for the new round is
-//!    taken and its preimage withheld; the one whose preimage had not runs as
-//!    before. The coins they gave up stay given up. No release is taken while
-//!    a round is not final. The release, which named the lost round's
-//!    connector asset, is void on the chain as well: that asset can no longer
-//!    be issued, and the reclaim of the old node with the release and the new
-//!    round's connector asset is refused.
+//!    unlock hashes, as ordinary participations, the one whose preimage had
+//!    gone out (giving up a leaf of an earlier round, whose lowest node its
+//!    owner had released) as well: its release is retired, and its forfeit
+//!    for the new round is taken and its new preimage released against it.
+//!    The coins they gave up stay given up. No release is taken while a round
+//!    is not final. The release, which named the lost round's connector
+//!    asset, is void on the chain as well: that asset can no longer be
+//!    issued, and the reclaim of the old node with the release and the new
+//!    round's connector asset is refused. One that never hands over its
+//!    forfeit for the new round expires, and its coin, whose only forfeit is
+//!    for the lost round and was never published, is given back. An exit of
+//!    an old coin after its re-run completed is answered with its forfeit
+//!    for the new round, which the operator claims.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -166,7 +170,7 @@ async fn a_round_disconnected_returns_and_is_credited_again() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_round_that_cannot_return_runs_again_forfeit_first() {
+async fn a_round_that_cannot_return_runs_its_participations_again_as_ordinary_ones() {
 	let mut r = start().await;
 	let x = r.x;
 	let (a0, b) = (keypair("A, board"), keypair("B"));
@@ -250,12 +254,14 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	// The release A gave on the strength of R is retired, never to be used.
 	assert!(r.server.store.releases(&lowest.children_hash()).await.unwrap().is_empty());
 
-	// Both participations run again, under new unlock hashes; A forfeit-first.
+	// Every participation runs again, under a new unlock hash, as an
+	// ordinary one, A's as well, whose preimage had gone out.
 	let sa = status(&r, &pa);
 	let sb = status(&r, &pb);
 	println!("A after the loss: {}", sa);
-	assert_eq!((sa["state"].as_str(), sa["attempt"].as_u64(), sa["forfeit_first"].as_bool()), (Some("pending"), Some(1), Some(true)));
-	assert_eq!((sb["state"].as_str(), sb["attempt"].as_u64(), sb["forfeit_first"].as_bool()), (Some("pending"), Some(1), Some(false)));
+	assert_eq!((sa["state"].as_str(), sa["attempt"].as_u64()), (Some("pending"), Some(1)));
+	assert_eq!((sb["state"].as_str(), sb["attempt"].as_u64()), (Some("pending"), Some(1)));
+	assert!(sa.get("forfeit_first").is_none() && sa["void_reason"].is_null());
 	assert_ne!(sa["unlock_hash"], st_r["unlock_hash"]);
 	assert_ne!(sa["outputs"][0]["operator_nonce"], st_r["outputs"][0]["operator_nonce"], "a new operator nonce: a new leaf script");
 	// The coins they gave up stay given up: no other off-chain spend of them.
@@ -329,53 +335,55 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	let st_a = status(&r, &pa);
 	let a_auths = auths_json(&a2_y, &a2, created(&a2_y_record));
 	refused(r.http.post("forfeit_leaves", &forfeit_body(&pa, a_board.id, forfeit_sig(&f_r, &a), a_auths.clone())), 422, "bad_forfeit");
-	// A's forfeit for Y: taken, the preimage withheld.
+	// No release before the preimage, and no answer carries Y's preimage
+	// before A's forfeit for Y: `leaf_data` serves A's pending leaf of Y
+	// with an empty record.
+	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
+		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "release_early");
+	let y_hash: [u8; 32] = unhex(st_a["unlock_hash"].as_str().unwrap()).try_into().unwrap();
+	for (state, pre) in served_preimages(&r, &a2) {
+		assert!(pre.is_none_or(|p| arca_covenant::script::sha256(&p) != y_hash), "leaf_data serves Y's preimage early ({} leaf)", state);
+	}
+	// A's forfeit for Y: taken, checked, and Y's preimage released against it.
 	let f_y = forfeit_for(&a_old, &a2_y, &round_y, &st_a);
 	let body = forfeit_body(&pa, a_board.id, forfeit_sig(&f_y, &a), a_auths);
 	let done_a = r.http.post("forfeit_leaves", &body).ok();
 	println!("A's forfeit for Y: {}", done_a);
-	assert_eq!((done_a["state"].as_str(), done_a["forfeit_first"].as_bool()), (Some("issued"), Some(true)));
-	assert!(done_a.get("preimage").is_none(), "forfeit-first: no preimage until the forfeit is claimed");
+	assert_eq!(done_a["state"], "released");
+	let y_preimage: [u8; 32] = unhex(done_a["preimage"].as_str().unwrap()).try_into().unwrap();
+	assert_eq!(arca_covenant::script::sha256(&y_preimage), y_hash, "the preimage of Y's leaves");
+	assert_ne!(hex(&y_preimage), r_preimage, "not R's");
 	assert_eq!(r.http.post("forfeit_leaves", &body).ok(), done_a, "the same again");
 	assert_eq!(r.server.store.forfeits(&pa, built_y.round_id).await.unwrap().len(), 1, "the forfeit for Y is held");
-	assert_eq!(leaf_states(&r, &a2), vec!["lost", "pending"]);
-	// No answer carries Y's preimage while it is withheld: `leaf_data` serves
-	// A's pending leaf of Y with an empty record.
-	let y_hash: [u8; 32] = unhex(st_a["unlock_hash"].as_str().unwrap()).try_into().unwrap();
-	for (state, pre) in served_preimages(&r, &a2) {
-		assert!(pre.is_none_or(|p| arca_covenant::script::sha256(&p) != y_hash), "leaf_data serves Y's withheld preimage ({} leaf)", state);
-		if state == "pending" {
-			assert!(pre.is_none(), "the pending leaf's record is served empty");
-		}
-	}
-	// No release before the preimage.
-	refused(r.http.post("release_leaves", &json!({"participation_id": hex(&pa),
-		"releases": [{"leaf_id": a_board.id.to_string(), "connector_asset": "0000000000000000000000000000000000000000000000000000000000000000", "signature": hex(&[1; 64])}]})), 422, "release_early");
-	println!("A ran again forfeit-first: R's preimage {} is useless, Y's withheld", &r_preimage[..16]);
+	assert_eq!(leaf_states(&r, &a2), vec!["live", "lost"], "A's leaf of Y is live");
+	let live: Vec<Option<[u8; 32]>> = served_preimages(&r, &a2).into_iter().filter(|(s, _)| s == "live").map(|(_, p)| p).collect();
+	assert_eq!(live, vec![Some(y_preimage)], "once released, leaf_data serves the leaf's record whole");
+	println!("A ran again as an ordinary participation: R's preimage {} is useless, Y's released", &r_preimage[..16]);
 
-	// C, which forfeited in R and runs again forfeit-first in Y, never hands
-	// over its forfeit for Y: a day after Y is final it expires. Its coin
-	// stays given up, since the operator holds a forfeit pair for it, signed
-	// for R, and co-signs no other off-chain spend of it. A, whose forfeit for
-	// Y came, does not expire.
+	// C, which forfeited in R and runs again in Y, never hands over its
+	// forfeit for Y: a day after Y is final it expires. Its coin stays given
+	// up, since the signer signed a forfeit under its salt, for R, and
+	// co-signs no spend under it; the status says it is not given back, and
+	// it is C's on the chain. A, whose forfeit for Y came, does not expire.
 	assert_eq!(status(&r, &pc)["state"], "issued");
 	advance_mtp(&r, 86_400 + 600).await;
 	r.synced().await;
 	r.server.rounds.pass().await.unwrap();
-	assert_eq!(status(&r, &pc)["state"], "expired");
-	assert_eq!(status(&r, &pa)["state"], "issued");
-	assert_eq!(leaf_states(&r, &c), vec!["spent"], "C's coin, under a forfeit pair for R, is not given back");
+	let sc = status(&r, &pc);
+	assert_eq!(sc["state"], "expired");
+	assert_eq!(sc["inputs"][0]["returned"], false, "C's coin is not given back");
+	assert_eq!(status(&r, &pa)["state"], "released");
+	assert_eq!(leaf_states(&r, &c), vec!["spent"], "C's coin, under a forfeit signed for R, stays given up");
 	assert_eq!(leaf_states(&r, &c2), vec!["expired", "lost"]);
 	let (d_leaf, _) = new_leaf(&keypair("D"));
 	let spend_c = transfer_body(&[(&c_board, c_old.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)], xonly(&r.s), r.chain);
 	refused(r.http.post("cosign_transfer", &spend_c), 409, "double_spend");
-	println!("C expired in Y; its coin stays given up under its forfeit for R");
+	assert!(r.unspent(&c_old.board().unwrap().1), "C's board is C's to exit on the chain");
+	println!("C expired in Y; its coin stays given up under its forfeit for R, its board C's on the chain");
 
-	// The watcher completes A's run: it brings A's old coin, round 0's leaf,
-	// onto the chain from the server's own record of it (the node above it by
-	// A's authorisation, the entry with round 0's preimage), publishes A's
-	// forfeit for Y, and once that is final claims it, which reveals Y's
-	// preimage on the chain; once the claim is final A is released.
+	// A goes back on its word after its re-run completed: it brings its old
+	// coin, round 0's leaf, on the chain by its own authorisations and
+	// preimage. The watcher answers with A's forfeit for Y, and claims it.
 	let a_old_id = a_board.id.0.to_vec();
 	// The atom of Y's connector asset this test issued by hand above, at an
 	// output anyone can spend, goes to the operator's wallet, where the
@@ -398,7 +406,20 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 	r.rt.client().send_raw_transaction(&mv).unwrap();
 	r.purse.put((elements::OutPoint::new(mv.txid(), 1), mv.output[1].clone()));
 	r.produce().await;
-	let mut released = false;
+	let v = a_old.clone();
+	let (valid, preimage, auths) = match &v.origin {
+		arca_covenant::ValidOrigin::Leaf { valid, preimage, auths } => (valid, preimage, auths),
+		_ => panic!("A's old coin is a batch leaf"),
+	};
+	let txs = valid.branch.unroll(elements::OutPoint::new(valid.round_txid, valid.batch_vout), auths, &vec![FeeSource::Reserve; auths.len()])
+		.unwrap();
+	for u in &txs {
+		r.rt.client().send_raw_transaction(&u.tx).unwrap();
+	}
+	let entry = valid.branch.entry_tx(valid.branch.entry_outpoint(&txs).unwrap(), preimage, &FeeSource::Reserve).unwrap();
+	r.rt.client().send_raw_transaction(&entry.tx).unwrap();
+	println!("A's stale exit: {} unroll(s) and its entry {}, its old leaf on the chain", txs.len(), entry.tx.txid());
+	let mut claimed = false;
 	for n in 0..16 {
 		r.synced().await;
 		r.server.watcher.pass().await.unwrap();
@@ -406,9 +427,10 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 		r.bury().await;
 		r.synced().await;
 		r.server.nursery.pass().await.unwrap();
-		if status(&r, &pa)["state"] == "released" {
-			println!("A's forfeit-first run released after {} pass(es)", n + 1);
-			released = true;
+		let log = r.server.store.watcher_log().await.unwrap();
+		if common::flow::final_of(&log, "claim", &a_old_id) {
+			println!("A's forfeit for Y claimed, final, after {} pass(es)", n + 1);
+			claimed = true;
 			break;
 		}
 	}
@@ -417,20 +439,18 @@ async fn a_round_that_cannot_return_runs_again_forfeit_first() {
 		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
 		println!("  watcher: {} {} ({} vB, {:?}): {}", w.kind, Txid::from_byte_array(w.txid), tx.vsize(), w.state, w.detail);
 	}
-	assert!(released, "A's participation is released");
-	let kinds: Vec<&str> = log.iter().filter(|w| w.subject == a_old_id).map(|w| w.kind.as_str()).collect();
-	assert_eq!(kinds, vec!["entry", "forfeit"], "A's old coin brought on-chain and forfeited");
-	assert!(common::flow::claim_of(&log, &a_old_id).is_some(), "and its forfeit claimed");
-	assert!(!r.unspent(&lowest_at), "the watcher unrolled A's old node, by A's own authorisation");
+	assert!(claimed, "A's forfeit for Y is claimed");
+	let ours: Vec<&server::store::WatcherTxRow> = log.iter().filter(|w| w.subject == a_old_id).collect();
+	assert_eq!(ours.iter().map(|w| w.kind.as_str()).collect::<Vec<_>>(), vec!["forfeit"], "the watcher answers A's exit with a forfeit");
+	assert!(ours[0].detail.contains(&format!("for round {}", built_y.round_id)), "A's forfeit for Y, never R's: {}", ours[0].detail);
+	let ftx: Transaction = elements::encode::deserialize(&ours[0].tx).unwrap();
+	assert!(ftx.output.contains(&f_y.output().txout()), "it pays A's forfeit output for Y");
+	assert!(!ftx.output.contains(&f_r.output().txout()), "and not R's");
 	let claim = common::flow::claim_of(&log, &a_old_id).unwrap();
 	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
-	let y_preimage = arca_covenant::witness::find_preimage(&ctx.input[0].witness.script_witness,
-		&unhex(status(&r, &pa)["unlock_hash"].as_str().unwrap()).try_into().unwrap()).expect("the claim reveals Y's preimage");
-	let again = r.http.post("forfeit_leaves", &body).ok();
-	assert_eq!((again["state"].as_str(), again["preimage"].as_str()), (Some("released"), Some(hex(&y_preimage).as_str())),
-		"the server hands over the preimage the claim revealed");
-	assert_eq!(leaf_states(&r, &a2), vec!["live", "lost"], "A's leaf of Y is live");
-	let live: Vec<Option<[u8; 32]>> = served_preimages(&r, &a2).into_iter().filter(|(s, _)| s == "live").map(|(_, p)| p).collect();
-	assert_eq!(live, vec![Some(y_preimage)], "once released, leaf_data serves the leaf's record whole");
-	println!("A's run completed forfeit-first: the claim {} revealed Y's preimage, A's new leaf is live", Txid::from_byte_array(claim.txid));
+	let revealed = arca_covenant::witness::find_preimage(&ctx.input[0].witness.script_witness, &y_hash).expect("the claim reveals Y's preimage");
+	assert_eq!(revealed, y_preimage);
+	assert_eq!(status(&r, &pa)["state"], "released");
+	println!("A's old coin, exited after its re-run completed, was answered by its forfeit for Y {} and claimed by {}",
+		Txid::from_byte_array(ours[0].txid), Txid::from_byte_array(claim.txid));
 }
