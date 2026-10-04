@@ -1526,11 +1526,75 @@ async fn a_swap_shows_the_dates_it_gives_and_is_refused_near_the_exit_deadline()
 	assert!(left < 2 * 86_400 && left > 0, "{}", acc["dates"]);
 	let d = acc["dates"]["exit_deadline"].as_u64().unwrap();
 	assert_eq!(d as u64, now + left);
-	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	// The maker gets coins resting on the same coins: refused alike, and
+	// completed only when it takes them anyway.
+	let why = a.refused(&["swap", "complete", acc["accept"].as_str().unwrap()], "earliest exit deadline");
+	println!("D51 the maker near the deadline, refused: {}", why);
+	let done = a.ok(&["swap", "complete", acc["accept"].as_str().unwrap(), "--accept-near-deadline"]);
+	assert_eq!(done["dates"]["exit_deadline"].as_u64(), Some(d), "{}", done["dates"]);
 	let got = b.ok(&["sync"])["mailbox"]["accepted"].as_array().unwrap().iter()
 		.find(|c| c["asset"] == x.to_string().as_str()).cloned().unwrap();
 	println!("D51 the coin it got: {}", got["board"]);
 	assert_eq!(got["board"]["exit_deadline"].as_u64(), Some(d), "the dates shown are the coin's");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D51, the maker's side (review R7e, F6). The taker's coin rests on a
+/// board a day and a half from its exit deadline, the maker's on a fresh
+/// one: every coin the swap makes rests on both, so the coin the maker gets
+/// carries the taker's board's dates. The maker sees them before it signs,
+/// and its completion is refused until it takes them anyway, as a taker's
+/// acceptance is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_shows_the_maker_the_dates_it_gets_and_is_refused_near_the_exit_deadline() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let (a, b) = (Arca::new("D51mA"), Arca::new("D51mB"));
+	// The taker boards first.
+	b.ok(&create_args(&url, &r.node_url()));
+	for (asset, v) in [(y, 10_000_000), (x, 1_000_000)] {
+		let s = script(&b.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	b.ok(&["board", &y.to_string(), "3000000", "--fee-asset", &x.to_string()]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || b.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	b.ok(&["sync"]);
+	// 23½ days on, the maker boards: its coin is fresh, the taker's a day
+	// and a half from its exit deadline.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 23 * 86_400 + 43_200));
+	r.bury().await;
+	r.synced().await;
+	b.ok(&["sync"]);
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "400000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap(), "--accept-near-deadline"]);
+	let d = acc["dates"]["exit_deadline"].as_u64().unwrap();
+	println!("D51m the taker accepts, its own coin near its deadline: {}", acc["dates"]);
+	let why = a.refused(&["swap", "complete", acc["accept"].as_str().unwrap()], "earliest exit deadline");
+	println!("D51m the maker, the taker's coin near its deadline, refused: {}", why);
+	assert!(why.contains("--accept-near-deadline"), "{}", why);
+	let held = a.ok(&["coins"]);
+	assert!(held.as_array().unwrap().iter().any(|c| c["state"] == "offered"), "nothing signed, the offer stands: {}", held);
+	let done = a.ok(&["swap", "complete", acc["accept"].as_str().unwrap(), "--accept-near-deadline"]);
+	let now = common::node::median_time(&r.rt) as u64;
+	println!("D51m completed with --accept-near-deadline: {}", done["dates"]);
+	let left = done["dates"]["seconds_to_exit_deadline"].as_u64().unwrap();
+	assert!(left < 2 * 86_400 && left > 0, "{}", done["dates"]);
+	assert_eq!(done["dates"]["exit_deadline"].as_u64(), Some(d));
+	assert_eq!(d, now + left);
+	// The maker takes its own outputs when the server answers.
+	a.ok(&["sync"]);
+	let got = a.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|c| c["asset"] == y.to_string().as_str() && c["state"] != "spent").cloned().unwrap();
+	println!("D51m the coin the maker got: {}", got);
+	assert_eq!(got["exit_deadline"].as_u64(), Some(d), "the dates shown are the coin's");
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
