@@ -318,7 +318,7 @@ impl Wallet {
 			};
 			match st["state"].as_str().unwrap_or("") {
 				// The server will not run it, or its forfeit day passed.
-				s @ ("void" | "expired") => out.push(self.give_back(&pid, &given, s)?),
+				s @ ("void" | "expired") => out.push(self.give_back(&pid, &given, s, &st)?),
 				_ if state == "withdrawn" => out.push(json!({"participation": pid, "state": "withdrawn",
 					"note": "the wallet is taking a coin of it on-chain, and signs nothing for it"})),
 				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
@@ -339,12 +339,20 @@ impl Wallet {
 	}
 
 	/// The server will not run participation `pid` (`why` is `void` or
-	/// `expired`): each coin it gave up is live again, unless the wallet
-	/// signed a forfeit of it for a round that is not gone, which the
-	/// operator could still claim. Such a coin stays given up, and the
-	/// wallet follows its forfeit on the chain ([`Self::watch_forfeits`]); it
-	/// can still be exited.
-	fn give_back(&mut self, pid: &str, given: &[String], why: &str) -> Result<Value, Error> {
+	/// `expired`), and `st` is its status: each coin it gave up that the
+	/// operator gave back (`returned`) is live again. Any other is held
+	/// under a forfeit the wallet signed: one for a round that is not gone,
+	/// which the operator could still claim, or one the operator published,
+	/// or handed to the node, for a round that can never return, which may
+	/// still confirm (the status's `void_reason` says so). The coin stays
+	/// given up, `forfeited`: the wallet follows its forfeit on the chain
+	/// ([`Self::watch_forfeits`]) and refunds it once its delay has run, and
+	/// a coin whose forfeit is for a round that can never return and is not
+	/// on the chain is taken on the chain at once, by its exit, whichever of
+	/// the two confirms first. An operator that does not say which coins it
+	/// gave back is taken to give back every coin with no forfeit open.
+	fn give_back(&mut self, pid: &str, given: &[String], why: &str, st: &Value) -> Result<Value, Error> {
+		let reason = st["void_reason"].as_str().map(str::to_string);
 		let mut back = vec![];
 		let mut held = vec![];
 		for l in given {
@@ -352,24 +360,69 @@ impl Wallet {
 			if !matches!(c.state.as_str(), "given" | "forfeited") {
 				continue;
 			}
-			let open: Vec<String> = self.store.forfeits_of(l)?.into_iter().filter(|f| FOLLOWED.contains(&f.state.as_str()))
-				.map(|f| f.round).collect();
-			if open.is_empty() {
+			let followed: Vec<ForfeitRow> = self.store.forfeits_of(l)?.into_iter().filter(|f| FOLLOWED.contains(&f.state.as_str())).collect();
+			let returned = st["inputs"].as_array().and_then(|a| a.iter().find(|i| i["leaf_id"].as_str() == Some(l.as_str())))
+				.and_then(|i| i["returned"].as_bool());
+			// A forfeit the wallet found void (never published, its round
+			// gone) is followed again for a coin the operator keeps given up:
+			// the operator holds it whole, and it may still confirm.
+			let mut open = followed.clone();
+			if returned == Some(false) {
+				for f in self.store.forfeits_of(l)? {
+					if f.state == "void" && self.round_gone(&f)? {
+						open.push(f);
+					}
+				}
+			}
+			if returned.unwrap_or(followed.is_empty()) {
 				back.push(l.clone());
 			} else {
-				held.push(json!({"leaf_id": l, "forfeit_for_round": open}));
+				held.push((l.clone(), open));
 			}
 		}
+		let note = match &reason {
+			Some(r) => format!("the server will not run participation {}: {}", pid, r),
+			None => format!("the server will not run participation {}", pid),
+		};
 		self.store.atomically(|s| {
 			for l in &back {
 				s.set_coin_state(l, "live", "")?;
 			}
+			for (l, open) in &held {
+				s.set_coin_state(l, "forfeited", &format!("{}; the coin is held under its forfeit, and is the wallet's on the chain, \
+					by that forfeit's refund or its exit", note))?;
+				for f in open.iter().filter(|f| f.state == "void") {
+					s.set_forfeit_state(l, &f.round, "signed", "the operator keeps the coin given up under this forfeit: followed until \
+						the coin's exit or this forfeit's refund is final")?;
+				}
+			}
 			s.set_participation(pid, why, None, None)
 		})?;
-		Ok(json!({"participation": pid, "state": why, "live_again": back, "held": held,
-			"note": if held.is_empty() { "the server will not run it; its coins are live again".to_string() } else {
-				"the server will not run it; a coin under a forfeit signed for a round still in the chain stays given up until that round \
-				is gone or the forfeit is answered on the chain, and can be exited".to_string() }}))
+		let mut out_held = vec![];
+		for (l, open) in &held {
+			let mut h = json!({"leaf_id": l, "forfeit_for_round": open.iter().map(|f| f.round.clone()).collect::<Vec<_>>()});
+			// A forfeit for a round that can never return, not on the chain:
+			// the coin goes on the chain at once by its exit.
+			let mut exit = !open.is_empty();
+			for f in open {
+				let row = self.store.coin(l)?.ok_or_else(|| Error::Store(format!("no coin {}", l)))?;
+				let on_chain = self.chain.locate(std::slice::from_ref(&self.forfeit_of(&row, f)?.output().txout()))?[0].is_some();
+				exit &= !on_chain && self.round_gone(f)?;
+			}
+			if exit {
+				h["exit"] = self.exit(l, None).unwrap_or_else(|e| json!({"error": e.to_string(),
+					"note": "exit the coin, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			}
+			out_held.push(h);
+		}
+		let mut out = json!({"participation": pid, "state": why, "live_again": back, "held": out_held,
+			"note": if held.is_empty() { format!("{}; its coins are live again", note) } else {
+				format!("{}; a coin under a forfeit that may still be claimed or confirm stays given up: its forfeit is followed on \
+				the chain and refunded once its delay has run, and one whose forfeit is not on the chain is exited", note) }});
+		if let Some(r) = reason {
+			out["void_reason"] = json!(r);
+		}
+		Ok(out)
 	}
 
 	/// The forfeit swap of an issued participation, once its round is final.
@@ -547,7 +600,7 @@ impl Wallet {
 				"note": "the forfeits may have reached the server: the wallet follows each one's output on the chain"})),
 		};
 		let Some(pre) = done["preimage"].as_str() else {
-			return Ok(json!({"participation": pid, "state": "forfeiting", "forfeit_first": done["forfeit_first"],
+			return Ok(json!({"participation": pid, "state": "forfeiting",
 				"note": "forfeits in; the preimage is not out yet: the wallet follows each forfeit's output on the chain, takes the preimage \
 				from a claim of it, and takes the refund when its delay passes with no claim"}));
 		};
@@ -684,7 +737,7 @@ impl Wallet {
 	/// median time is past the last expiry of every batch they are in, after
 	/// which no preimage opens anything. A participation with no new leaves
 	/// recorded has not.
-	fn new_leaves_expired(&self, pid: &str) -> Result<bool, Error> {
+	pub(crate) fn new_leaves_expired(&self, pid: &str) -> Result<bool, Error> {
 		let Some(news) = self.store.participation_news(pid)? else { return Ok(false) };
 		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
 		let mut last = 0u32;
@@ -803,12 +856,18 @@ impl Wallet {
 			return Ok(None);
 		}
 		if self.round_gone(f)? {
-			let why = format!("round {} can never return, so its forfeit can never be claimed: the coin is the wallet's again", f.round);
-			self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
-			let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| FOLLOWED.contains(&x.state.as_str()));
-			if !open && matches!(row.state.as_str(), "forfeited" | "spent") {
-				self.store.set_coin_state(&f.leaf_id, "live", &why)?;
+			let pstate = self.store.participations()?.into_iter().find(|p| p.0 == f.participation).map(|p| p.4).unwrap_or_default();
+			// A coin the operator keeps given up under this forfeit (its
+			// participation will never run) is still to be taken on the
+			// chain: the forfeit may still confirm, from any mempool that
+			// saw it, and is followed until the coin is exited.
+			if matches!(pstate.as_str(), "void" | "expired") && matches!(row.state.as_str(), "forfeited" | "exiting") {
+				return Ok(None);
 			}
+			// The coin follows its participation, which the operator runs
+			// again: it is the wallet's again only once the operator says so.
+			let why = format!("round {} can never return, so its forfeit can never be claimed", f.round);
+			self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
 			return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "note": why})));
 		}
 		Ok(None)

@@ -113,14 +113,24 @@ the keys, but which coins were spent off-chain is in the store and the server.
   A coin resting on a round that can never return (a coin the round spends is
   spent by another transaction that is final) is `lost`. A board held as
   `lost` whose transaction the chain holds is followed again once the server
-  reports it credited.
+  reports it credited. Every participation such a round ran, the operator
+  runs again, under the same keys and owner nonces, and the wallet follows
+  it as any participation: it hands over its forfeit for the new round and
+  takes its new leaves. One the operator will never take (a coin of it whose
+  forfeit for the lost round the operator published, or whose output is spent
+  on the chain) is `void`, with the operator's reason shown, and the wallet
+  waits on it no more.
 - **A coin handed over stays the wallet's until the chain says otherwise.** A
   coin given to a participation, or sent in a transfer the server has not
   answered, can be exited at any time; exiting it withdraws the wallet from the
   participation, or abandons the request. A coin whose participation the
-  server calls `void`, or lets expire, is live again, unless the wallet signed
-  a forfeit of it for a round that is not gone: such a coin is `forfeited`, and
-  is spent again only once that round can never return. Every forfeit is
+  server calls `void`, or lets expire, is live again when the server gives it
+  back; one it keeps given up, under a forfeit the wallet signed, is
+  `forfeited`, and is the wallet's on the chain: by that forfeit's refund when
+  the forfeit is on the chain, else by its exit, which the wallet starts at
+  once (naming the fee coin's asset is the user's when the coin's own reserve
+  cannot pay, as for a board), and the forfeit is followed until one of the
+  two is final. Every forfeit is
   recorded before it leaves the wallet, with the new leaves it was signed for,
   and `sync` follows each forfeit's output on the chain until a spend of it is
   final: a claim of the output publishes the preimage, which the wallet reads
@@ -137,7 +147,7 @@ the keys, but which coins were spent off-chain is in the store and the server.
   spend not final makes the forfeit undecided again, and the chain decides
   it again, so a claim that confirms in place of a refund still gives the
   wallet the preimage and its new leaves. A forfeit never published whose
-  round can never return is void, and the coin is live again.
+  round can never return is void.
 
 - **A board's dates.** A board, and every coin resting on it, carries the
   dates of a batch made when the board confirmed: its service expiry is 28
@@ -291,9 +301,13 @@ and holding it there, with the reason shown:
 - a coin in flight when the operator vanishes;
 - a preimage withheld and a participation called void after its forfeit, the
   preimage then read from the operator's claim on the chain;
-- a round that can never return, whose coins come back, a forfeit of one of
-  them published anyway and refunded after its delay, the coin `exited` once
-  the refund is final;
+- a round that can never return, which refreshed two boards and a leaf of an
+  earlier round, both boards' forfeits published: the leaf's participation,
+  run again, is taken into the next round and the wallet takes its new leaf;
+  each board's is `void`, the operator's reason shown, the wallet waiting on
+  it no more; the board whose forfeit someone sent again is refunded after
+  its delay, `exited` once the refund is final, and the other, its forfeit
+  not on the chain, is exited at once (with a fee asset named) and claimed;
 - a forfeit's refund sent once its delay has run and replaced in the mempool
   by the operator's claim, which confirms: the wallet reads the preimage from
   the claim and holds its new leaf, and the coin given up is spent; a refund

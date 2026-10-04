@@ -56,9 +56,25 @@
 //! is out of the chain its new leaves are uncredited, and they are credited
 //! again once it is final again. A round that can never return (an input of
 //! it spent by another transaction that is final) is retired: its new leaves
-//! are lost, and its participations run again in a later round under new
-//! unlock hashes and operator nonces, forfeit-first where their preimage had
-//! gone out, the releases given for it retired.
+//! are lost, the releases given for it retired, and its participations run
+//! again in a later round under new unlock hashes and operator nonces.
+//!
+//! A coin with a forfeit for an earlier round in the watcher's log, or whose
+//! output the server has seen spent, is never taken into a re-run: such a
+//! forfeit may still confirm, from any mempool that saw it, and is its
+//! owner's to refund once its delay has run, since no claim of a round that
+//! can never return can be made. The participation is voided, saying why;
+//! its coins stay given up, as every coin with a forfeit signed does, and are
+//! their owners' on the chain, by that forfeit's refund or by their exit. Every
+//! forfeit of the retired round's coins in the watcher's log is given up by
+//! the nursery, and the log refuses a new one naming the round, so the
+//! server never publishes a forfeit naming it again, by any path, a restart
+//! included. Any other re-run completes as an ordinary participation: its
+//! forfeit for the new round is taken and checked, the preimage released
+//! against it, and the coin left like any forfeited coin (a board lineage to
+//! the board's dates, a batch leaf to its batch's expiry, either answered at
+//! once if its owner exits). Nothing goes on the chain for a re-run that an
+//! ordinary participation would not put there.
 //!
 //! Each batch is published ([`Rounds::tree`]): its round, its output, its
 //! token's output, the round's connector output, its asset, schedule, radix,
@@ -238,6 +254,13 @@ impl Rounds {
 	/// coin past that horizon can never run: it is voided, its coins given
 	/// back.
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
+		if p.attempt > 0 {
+			if let Some(why) = self.barred(p).await? {
+				let voided = self.store.void_participation(&p.id, &why).await?;
+				log::warn!("participation {} is never taken again (voided: {}): {}", crate::signer::hex(&p.id), voided, why);
+				return Ok(false);
+			}
+		}
 		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
 			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, coins::BoardDates::Within(Params::ROUND_HORIZON)).await {
@@ -246,9 +269,9 @@ impl Rounds {
 				Err(coins::CoinError::InvalidCoin {
 					error: arca_covenant::TransferError::Record(arca_covenant::RecordError::ExpiryTooSoon { .. }), ..
 				}) | Err(coins::CoinError::PastBoardDate { .. }) => {
-					let voided = self.store.void_participation(&p.id).await?;
-					log::warn!("participation {} can never run: coin {} is past its last round time (voided: {})",
-						crate::signer::hex(&p.id), LeafId(i.leaf_id), voided);
+					let why = format!("coin {} is past the last time a round takes it", LeafId(i.leaf_id));
+					let voided = self.store.void_participation(&p.id, &why).await?;
+					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&p.id), why, voided);
 					return Ok(false);
 				},
 				Err(e) => {
@@ -301,7 +324,7 @@ impl Rounds {
 				}
 			}
 			if taken {
-				let voided = self.store.void_participation(&row.id).await?;
+				let voided = self.store.void_participation(&row.id, "a key it wants a leaf under owns a leaf already").await?;
 				log::warn!("participation {} cannot run: a key it wants owns a leaf (voided: {})", crate::signer::hex(&row.id), voided);
 				continue;
 			}
@@ -718,14 +741,85 @@ impl Rounds {
 		Ok(self.store.nursery_get(&r.txid).await?.is_some_and(|n| n.state == NurseryState::Lost))
 	}
 
-	/// Retires a round that can never return: its unspent new leaves are
-	/// lost, and its participations run again in a later round under new
-	/// unlock hashes, forfeit-first where their preimage had gone out.
+	/// Retires a round that can never return ([`Store::retire_round`]): its
+	/// unspent new leaves are lost, and its participations run again as
+	/// ordinary ones. Every forfeit in the watcher's log of a coin they gave
+	/// up names this round or an earlier one that could not return: the
+	/// nursery gives each up, never to broadcast it again, and the wallet's
+	/// coins of one not in the chain are freed. A participation with a coin
+	/// [`Self::barred`] is voided, saying why.
 	async fn retire(&self, r: &RoundRow) -> Result<(), RoundError> {
 		let again = self.store.retire_round(r.round_id).await?;
-		log::warn!("round {} ({}) can never return: retired; {} participation(s) run again, {} of them forfeit-first",
-			r.round_id, Txid::from_byte_array(r.txid), again.len(), again.iter().filter(|(_, f)| *f).count());
+		let mut never = 0;
+		for id in &again {
+			for (txid, leaf) in self.store.logged_forfeits_of(id).await? {
+				let t = Txid::from_byte_array(txid);
+				let in_chain = self.finality.status(&t).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain();
+				self.store.nursery_set_state(&txid, NurseryState::Lost).await?;
+				if !in_chain {
+					self.wallet.release(&t).await?;
+				}
+				log::warn!("round {}: the forfeit {} of coin {} names a round that can never return; it is never broadcast again",
+					r.round_id, t, LeafId(leaf));
+			}
+			let Some(p) = self.store.participation(id).await? else { continue };
+			if let Some(why) = self.barred(&p).await? {
+				if self.store.void_participation(id, &why).await? {
+					never += 1;
+				}
+				log::warn!("participation {} is never taken again: {}", crate::signer::hex(id), why);
+			}
+		}
+		log::warn!("round {} ({}) can never return: retired; {} participation(s) run again, {} never taken",
+			r.round_id, Txid::from_byte_array(r.txid), again.len() - never, never);
 		Ok(())
+	}
+
+	/// Why the participation `p`, run again after a round that could not
+	/// return, is never taken: a coin it gave up with a forfeit in the
+	/// watcher's log (one for an earlier round of it, which may still
+	/// confirm, and is its owner's to refund once its delay has run), or
+	/// whose output the server has seen spent on the chain. `None` when it
+	/// runs as an ordinary participation.
+	async fn barred(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
+		for i in &p.inputs {
+			let id = LeafId(i.leaf_id);
+			if let Some(w) = self.store.watcher_txs("forfeit", &i.leaf_id).await?.first() {
+				return Ok(Some(format!("coin {} has a forfeit for an earlier round of this participation, one that can never \
+					return, in the operator's log ({}): that forfeit may still confirm, and is its owner's to refund once its refund \
+					delay has run; the coin is never taken into a round again", id, Txid::from_byte_array(w.txid))));
+			}
+			if let Some(at) = self.spent_on_chain(&i.leaf_id).await? {
+				return Ok(Some(format!("coin {}'s output {} is spent on the chain: the coin is never taken into a round again", id, at)));
+			}
+		}
+		Ok(None)
+	}
+
+	/// The output of the coin `leaf_id` (its board output, for a board; its
+	/// leaf, wherever the chain shows it) when the server has seen it spent
+	/// on the chain.
+	async fn spent_on_chain(&self, leaf_id: &[u8; 32]) -> Result<Option<OutPoint>, RoundError> {
+		let Some(row) = self.store.leaf(leaf_id).await? else { return Ok(None) };
+		let outs: Vec<OutPoint> = if row.kind == LeafKind::Board {
+			match self.store.board(leaf_id).await? {
+				Some(b) => vec![OutPoint::new(Txid::from_byte_array(b.txid), b.vout)],
+				None => vec![],
+			}
+		} else {
+			self.store.sightings_of(&row.script_pubkey).await?.into_iter().map(|(t, v)| OutPoint::new(Txid::from_byte_array(t), v)).collect()
+		};
+		for op in outs {
+			if self.store.outpoint_spender(&op.txid.to_byte_array(), op.vout).await?.is_some() {
+				return Ok(Some(op));
+			}
+			let in_chain = self.finality.status(&op.txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain();
+			let unspent = self.finality.call(move |c| c.unspent(&op, true)).await.map_err(|e| RoundError::Chain(e.to_string()))?;
+			if in_chain && unspent.is_none() {
+				return Ok(Some(op));
+			}
+		}
+		Ok(None)
 	}
 
 	/// A round that was final and no longer is: back to broadcast, its live

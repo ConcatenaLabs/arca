@@ -311,9 +311,13 @@ participations run again, and a round that carries refreshes takes no input of a
 third party (a covenant fill, say), which could be spent elsewhere and force a
 replacement; fills go in their own round transactions. A round that cannot
 return leaves each owner who gave up a leaf for it a forfeit that no claim can
-answer and that ends in the owner's refund, so a participation run again after
-it is forfeit-first: the operator publishes the forfeit for the new round and
-sees it final before it hands over the preimage, and it
+answer and that ends in the owner's refund. An owner holding that forfeit
+whole, which happens only when the operator published it, and the preimage of
+a re-run would refund the old coin and keep the new leaf too. So a coin whose
+forfeit for the lost round the operator published is never taken into a
+re-run, the operator never publishes a forfeit for a round once it is lost,
+and any other re-run completes as an ordinary participation, its forfeit for
+the new round taken and its preimage released against it. The operator
 co-signs no other off-chain spend of a leaf given up for the lost round.
 
 ```rust
@@ -657,9 +661,11 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   forfeit over; `M` of the old round cannot be issued and the new round's does
   not satisfy the claim, so the owner ends with the old coin and the new leaf.
   A round whose third party's input is spent elsewhere cannot return; the new
-  round has a new tree and new unlock hashes: re-run forfeit-first, the old
-  forfeit has no coin left and the operator claims; re-run with the preimage
-  first, the owner publishes the old forfeit, refunds it and keeps the new leaf.
+  round has a new tree and new unlock hashes: with the new forfeit published
+  first, the old forfeit has no coin left and the operator claims; with the
+  preimage released to an owner holding the old forfeit whole (one the
+  operator published), the owner publishes it, refunds it and keeps the new
+  leaf, which is why such a coin is never taken into a re-run.
   A forfeit disconnected late in its refund delay restarts it. A receiver's
   checkpoint disconnected while the replacing chain runs past the sender's exit
   delay: the leaf's delay does not restart, and a producer mines the sender's

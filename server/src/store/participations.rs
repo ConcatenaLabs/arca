@@ -48,6 +48,9 @@ pub struct ParticipationInput {
 	/// What the forfeit leaves uncommitted for its own fee.
 	pub margin: u64,
 	pub attestation: [u8; 64],
+	/// Given back to its owner, live again: by a participation that will
+	/// never run, or whose forfeits never came.
+	pub returned: bool,
 }
 
 /// What an output wanted is.
@@ -126,7 +129,6 @@ pub struct ParticipationRow {
 	pub attempt: u32,
 	pub round_id: Option<i64>,
 	pub state: ParticipationState,
-	pub forfeit_first: bool,
 	pub not_before: Option<u32>,
 	pub refund_delay_units: u16,
 	pub inputs: Vec<ParticipationInput>,
@@ -134,6 +136,8 @@ pub struct ParticipationRow {
 	pub fees: Vec<([u8; 32], u64)>,
 	/// Why a round that could have taken it did not, while it is pending.
 	pub waiting: Option<String>,
+	/// Why it will never run, once void.
+	pub void_reason: Option<String>,
 }
 
 fn u64_of(v: i64, what: &str) -> Result<u64, StoreError> {
@@ -178,7 +182,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	-> Result<Option<ParticipationRow>, StoreError>
 {
 	let r = c.query_opt(
-		"SELECT participation_id, unlock_hash, preimage, attempt, round_id, state::text, forfeit_first, not_before,
+		"SELECT participation_id, unlock_hash, preimage, attempt, round_id, state::text, void_reason, not_before,
 		        refund_delay_units, waiting
 		 FROM participation WHERE participation_id = $1",
 		&[&&id[..]],
@@ -197,16 +201,16 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 		attempt: attempt as u32,
 		round_id: r.get(4),
 		state: ParticipationState::parse(r.get(5))?,
-		forfeit_first: r.get(6),
 		not_before: not_before.map(|t| t as u32),
 		refund_delay_units: refund as u16,
 		inputs: vec![],
 		outputs: vec![],
 		fees: vec![],
 		waiting: r.get(9),
+		void_reason: r.get(6),
 	};
 	for r in c.query(
-		"SELECT leaf_id, asset, value, margin, attestation FROM participation_input WHERE participation_id = $1 ORDER BY idx",
+		"SELECT leaf_id, asset, value, margin, attestation, active FROM participation_input WHERE participation_id = $1 ORDER BY idx",
 		&[&&id[..]],
 	).await? {
 		let att: Vec<u8> = r.get(4);
@@ -216,6 +220,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 			value: u64_of(r.get(2), "value")?,
 			margin: u64_of(r.get(3), "margin")?,
 			attestation: att.try_into().map_err(|_| StoreError::Corrupt("attestation".into()))?,
+			returned: !r.get::<_, bool>(5),
 		});
 	}
 	for r in c.query(
@@ -421,12 +426,11 @@ impl Store {
 	/// round `round_id`, whole or not at all: records each forfeit whole (the
 	/// operator's half filled in where [`Store::begin_forfeits`] left it
 	/// out; a whole forfeit already recorded stays as it was), fills in each
-	/// new leaf's coin record (a record already there stays), and, when
-	/// `release`, moves the participation from issued to released and credits
-	/// its new leaves if the round is final. Returns whether the
-	/// participation is released.
+	/// new leaf's coin record (a record already there stays), and moves the
+	/// participation from issued to released (it may be released already)
+	/// and credits its new leaves if the round is final.
 	pub async fn complete_participation(&self, id: &[u8; 32], attempt: u32, round_id: i64, forfeits: &[NewForfeit],
-		records: &[([u8; 32], Vec<u8>)], release: bool) -> Result<bool, StoreError>
+		records: &[([u8; 32], Vec<u8>)]) -> Result<(), StoreError>
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
@@ -445,18 +449,13 @@ impl Store {
 			t.execute("UPDATE leaf SET record = $2, updated_at = now() WHERE leaf_id = $1 AND kind = 'batch' AND record = ''::bytea",
 				&[&&leaf[..], record]).await?;
 		}
-		let released = match (state, release) {
-			(ParticipationState::Released, _) => true,
-			(ParticipationState::Issued, true) => {
-				t.execute("UPDATE participation SET state = 'released', updated_at = now() WHERE participation_id = $1",
-					&[&&id[..]]).await?;
-				credit(&t, round_id).await?;
-				true
-			},
-			_ => false,
-		};
+		if state == ParticipationState::Issued {
+			t.execute("UPDATE participation SET state = 'released', updated_at = now() WHERE participation_id = $1",
+				&[&&id[..]]).await?;
+			credit(&t, round_id).await?;
+		}
 		t.commit().await?;
-		Ok(released)
+		Ok(())
 	}
 
 	/// The forfeits of participation `id` for the round `round_id`.
@@ -552,14 +551,15 @@ impl Store {
 
 	/// Retires the round `round_id`, which can never return, whole or not at
 	/// all: the round is lost, its new leaves not yet spent are lost, and every
-	/// participation it ran runs again in a later round, under a new unlock
-	/// hash, with a new operator nonce for each leaf it wants (its keys and
-	/// owner nonces as before), the attempt it leaves recorded, and any
-	/// release of the coins it gave up retired. A participation whose
-	/// preimage had gone out runs again forfeit-first.
-	/// The coins those participations gave up stay given up. Returns the
-	/// participations that run again, and which of them forfeit-first.
-	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<([u8; 32], bool)>, StoreError> {
+	/// participation it ran runs again in a later round as an ordinary
+	/// participation, under a new unlock hash, with a new operator nonce for
+	/// each leaf it wants (its keys and owner nonces as before), the attempt
+	/// it leaves recorded, and any release of the coins it gave up retired.
+	/// The coins those participations gave up stay given up. The round's row
+	/// lock orders this against [`Store::insert_watcher_tx`]: a forfeit naming
+	/// the round is logged before it is lost, or never. Returns the
+	/// participations that run again.
+	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let n = t.execute(
@@ -575,7 +575,7 @@ impl Store {
 			&[&round_id],
 		).await?;
 		let rows = t.query(
-			"SELECT participation_id, attempt, unlock_hash, preimage, state::text, forfeit_first FROM participation
+			"SELECT participation_id, attempt, unlock_hash, preimage, state::text FROM participation
 			 WHERE round_id = $1 AND state IN ('issued', 'released') FOR UPDATE",
 			&[&round_id],
 		).await?;
@@ -586,7 +586,6 @@ impl Store {
 			let unlock_hash: Vec<u8> = r.get(2);
 			let preimage: Vec<u8> = r.get(3);
 			let released = r.get::<_, &str>(4) == "released";
-			let forfeit_first = r.get::<_, bool>(5) || released;
 			t.execute(
 				"INSERT INTO participation_attempt (participation_id, attempt, round_id, unlock_hash, preimage, released)
 				 VALUES ($1, $2, $3, $4, $5, $6)",
@@ -597,8 +596,8 @@ impl Store {
 			let new_hash = arca_covenant::script::sha256(&new_preimage);
 			t.execute(
 				"UPDATE participation SET state = 'pending', round_id = NULL, attempt = attempt + 1, unlock_hash = $2,
-				 preimage = $3, forfeit_first = $4, updated_at = now() WHERE participation_id = $1",
-				&[&&id[..], &&new_hash[..], &&new_preimage[..], &forfeit_first],
+				 preimage = $3, updated_at = now() WHERE participation_id = $1",
+				&[&&id[..], &&new_hash[..], &&new_preimage[..]],
 			).await?;
 			let outputs = t.query(
 				"SELECT idx, owner_nonce FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx",
@@ -618,15 +617,27 @@ impl Store {
 			// can never be issued now: they are never used.
 			t.execute("UPDATE node_release SET retired = true WHERE participation_id = $1 AND round_id = $2",
 				&[&&id[..], &round_id]).await?;
-			again.push((id, forfeit_first));
+			again.push(id);
 		}
 		t.commit().await?;
 		Ok(again)
 	}
 
-	/// Voids the pending participation `id`, which will not run: each coin it
-	/// gave up for which no forfeit was ever signed is given back
-	/// ([`give_back`]). Returns whether it was pending.
+	/// The forfeits in the watcher's log of a coin participation `id` gave
+	/// up, not yet given up on by the nursery: `(txid, the coin's leaf id)`.
+	/// Every forfeit of such a coin names a round of the participation's.
+	pub async fn logged_forfeits_of(&self, id: &[u8; 32]) -> Result<Vec<([u8; 32], [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT w.txid, w.subject FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
+			 WHERE w.kind = 'forfeit' AND n.state <> 'lost'
+			   AND w.subject IN (SELECT leaf_id FROM participation_input WHERE participation_id = $1)
+			 ORDER BY w.created_at, w.txid",
+			&[&&id[..]],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, array32(r.get(1), "leaf id")?))).collect()
+	}
+
 	/// Says why the pending participation `id` waits, or that it does not
 	/// (`None`).
 	pub async fn set_waiting(&self, id: &[u8; 32], why: Option<&str>) -> Result<(), StoreError> {
@@ -636,12 +647,16 @@ impl Store {
 		Ok(())
 	}
 
-	pub async fn void_participation(&self, id: &[u8; 32]) -> Result<bool, StoreError> {
+	/// Voids the pending participation `id`, which will not run, for the
+	/// reason `why`, which its status shows: each coin it gave up for which
+	/// no forfeit was ever signed is given back ([`give_back`]). Returns
+	/// whether it was pending.
+	pub async fn void_participation(&self, id: &[u8; 32], why: &str) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let n = t.execute(
-			"UPDATE participation SET state = 'void', updated_at = now() WHERE participation_id = $1 AND state = 'pending'",
-			&[&&id[..]],
+			"UPDATE participation SET state = 'void', void_reason = $2, updated_at = now() WHERE participation_id = $1 AND state = 'pending'",
+			&[&&id[..], &why],
 		).await?;
 		if n != 1 {
 			return Ok(false);
@@ -730,11 +745,6 @@ impl Store {
 	}
 }
 
-/// Gives back, inside `t`, each coin the participation `id` gave up for which
-/// no forfeit was ever signed, in any of its attempts: the coin is live again
-/// and its input inactive, so it can be given up again. A coin with a forfeit
-/// signed for an earlier round that could not return stays given up: the
-/// operator co-signs no other off-chain spend of it.
 /// Locks participation `id` inside `t`, at `attempt` in the round
 /// `round_id`, and returns its state: issued or released, or
 /// [`StoreError::NotInRound`] when it expired meanwhile (its coins are the
@@ -762,6 +772,13 @@ async fn free_keys(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result
 	Ok(t.execute("UPDATE participation_output SET active = false WHERE participation_id = $1 AND kind = 'leaf'", &[&&id[..]]).await?)
 }
 
+/// Gives back, inside `t`, each coin the participation `id` gave up for which
+/// no forfeit was ever signed, in any of its attempts: the coin is live again
+/// and its input inactive, so it can be given up again. A coin with a forfeit
+/// signed, for a round that can never return included, stays given up: the
+/// signer co-signs no spend under a salt it has signed a forfeit under, and
+/// such a forfeit may still confirm if the operator published it. The coin
+/// is its owner's on the chain, by that forfeit's refund or by its exit.
 async fn give_back(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result<u64, StoreError> {
 	let free = "SELECT leaf_id FROM participation_input i WHERE i.participation_id = $1 AND i.active
 		AND NOT EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = $1 AND f.leaf_id = i.leaf_id)";

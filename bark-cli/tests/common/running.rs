@@ -103,6 +103,27 @@ impl Running {
 		format!("http://{}", self.server.addr)
 	}
 
+	/// Stops the server and starts a new one on the same database, at the
+	/// same address, so every wallet reaches it as before.
+	pub async fn restart_server(&mut self) {
+		let addr = self.server.addr;
+		self.server.stop();
+		self.config.listen = addr.to_string();
+		let start = Instant::now();
+		loop {
+			match Server::start(&self.config).await {
+				Ok(s) => {
+					self.server = s;
+					return;
+				},
+				Err(e) => {
+					assert!(start.elapsed() < Duration::from_secs(20), "the server did not start again at {}: {}", addr, e);
+					tokio::time::sleep(Duration::from_millis(200)).await;
+				},
+			}
+		}
+	}
+
 	pub fn node_url(&self) -> String {
 		format!("http://127.0.0.1:{}/", self.rt.node.rpc_port())
 	}

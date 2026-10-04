@@ -884,6 +884,21 @@ impl Wallet {
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
 		}
+		// A round a participation was released in that can never return,
+		// whatever became of its new leaves (one paid on, say): the
+		// operator runs the participation again, and the wallet follows it.
+		for (pid, _, _, _, state, _, pround) in self.store.participations()? {
+			let Some(r) = pround.filter(|_| state == "released") else { continue };
+			if self.new_leaves_expired(&pid)? {
+				continue;
+			}
+			let Some(raw) = self.store.tx(&r)? else { continue };
+			let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+			if self.chain.gone(&round)? {
+				let back = self.round_lost(&round.txid())?;
+				changes.push(json!({"round": r, "can_never_return": true, "participations": back}));
+			}
+		}
 		// What the lineage watch does to a coin is the coin's one change.
 		for mut ch in self.watch_lineages()? {
 			let id = ch["leaf_id"].as_str().unwrap_or("").to_string();
@@ -1007,35 +1022,49 @@ impl Wallet {
 	}
 
 	/// Round `round` can never return: every participation it completed or
-	/// was completing gives its coins back. Each forfeit the wallet signed for
-	/// it is followed again ([`Self::watch_forfeits`]): one never published
-	/// is void, and its coin is live again; one the operator published is the
-	/// wallet's to refund once its delay has run.
+	/// was completing runs again, in a later round, as the operator runs it
+	/// again. Its coins are given up to that run (`given`), and the wallet
+	/// follows it as it follows any participation: it hands over its
+	/// forfeits for the new round and takes its new leaves, or, when the
+	/// operator will never take it, gives each coin back or holds it under
+	/// its forfeit, as the operator's status says ([`Self::progress_participations`]).
+	/// Each forfeit the wallet signed for the lost round is followed again
+	/// ([`Self::watch_forfeits`]): one the operator published is the wallet's
+	/// to refund once its delay has run; one never published can never be
+	/// claimed, and is void.
 	fn round_lost(&mut self, round: &Txid) -> Result<Vec<Value>, Error> {
 		let r = round.to_string();
 		let mut back = vec![];
-		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
+		for (pid, _, given, wanted, state, _, pround) in self.store.participations()? {
 			if pround.as_deref() != Some(r.as_str()) || !matches!(state.as_str(), "released" | "forfeiting") {
 				continue;
 			}
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
-			let why = format!("round {} of participation {} can never return", r, pid);
+			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+			let nonces: Vec<[u8; 32]> = wanted.as_array().cloned().unwrap_or_default().iter()
+				.filter_map(|w| w["nonce"].as_str().and_then(|n| unhex32(n).ok())).collect();
+			let why = format!("round {} of participation {} can never return: the coin is given up to the participation's next run", r, pid);
 			self.store.atomically(|s| {
+				// The next run wants its leaves under the same owner nonces.
+				for n in &nonces {
+					s.wait_on_nonce(n)?;
+				}
 				for l in &given {
 					for f in s.forfeits_of(l)? {
 						if f.round == r && matches!(f.state.as_str(), "settled" | "claimed" | "claiming") {
 							s.set_forfeit_state(l, &r, "signed", &why)?;
 						}
 					}
-					if s.coin(l)?.is_some_and(|c| c.state == "spent") {
-						s.set_coin_state(l, "forfeited", &why)?;
+					if s.coin(l)?.is_some_and(|c| matches!(c.state.as_str(), "spent" | "forfeited")) {
+						s.set_coin_state(l, "given", &why)?;
 					}
 				}
-				s.set_participation(&pid, "lost", None, None)
+				s.set_participation(&pid, "pending", None, None)
 			})?;
 			for f in self.store.forfeits_in("signed")?.into_iter().filter(|f| f.round == r) {
 				back.push(self.watch_forfeit_now(&f));
 			}
+			back.push(json!({"participation": pid, "state": "pending", "note": why}));
 		}
 		Ok(back)
 	}

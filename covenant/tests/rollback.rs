@@ -18,10 +18,12 @@
 //!    which is why a round with another txid is always a new round.
 //! 3. A round whose third party's input is spent elsewhere cannot return.
 //!    The new round has a new tree and new unlock hashes, and the
-//!    participations run again; each owner still holds the forfeit it signed
-//!    for the lost round, which no claim can answer. Published first, the new
-//!    forfeit wins; with the preimage released first, the owner publishes the
-//!    old one, refunds it and keeps the new leaf too.
+//!    participations run again; the forfeit each owner signed for the lost
+//!    round can be answered by no claim. Published first, the new forfeit
+//!    wins; an owner holding the old forfeit whole (one the operator
+//!    published) and given the preimage publishes the old one, refunds it
+//!    and keeps the new leaf too, which is why such a coin is never taken
+//!    into a re-run.
 //! 4. A forfeit disconnected late in its refund delay and mined again later:
 //!    the delay restarts.
 //! 5. A receiver's checkpoint disconnected, the replacing chain running past

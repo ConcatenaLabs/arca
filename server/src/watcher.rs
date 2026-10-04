@@ -10,7 +10,9 @@
 //! 1. **Stale exits.** A coin the server holds as given up (by a
 //!    participation whose forfeit it stored, or by a co-signed transfer) whose
 //!    leaf is seen on the chain unspent, in a block or the mempool, is
-//!    answered at once: by its forfeit, or by its checkpoint; and a
+//!    answered at once: by its forfeit for the round its participation is in
+//!    now (never one for a round that can never return), or by its
+//!    checkpoint; and a
 //!    reassignment is published once every checkpoint it spends is on the
 //!    chain. The answer confirms before the leaf's exit delay runs out, so
 //!    the leaf's owner can no longer exit it. A board given up and then
@@ -29,32 +31,24 @@
 //!    made, so it is published at once only when none of those is a coin
 //!    another holder may still hold; otherwise not before the latest board
 //!    service expiry among them ([`Params::BOARD_LIFETIME`]).
-//! 3. **Forfeit-first.** A participation run again after a round it was in
-//!    could not return has its forfeits stored and its preimage withheld. The
-//!    watcher brings each coin it gave up onto the chain from the coin's own
-//!    record (each node of a batch leaf's path by its owner's authorisation,
-//!    then its entry with its preimage; the checkpoint of a board in its
-//!    lineage), so 1 publishes the forfeit; once every forfeit is final, the
-//!    claims reveal the preimage, and once the claims are final the
-//!    participation is released.
-//! 4. **Claims.** The forfeits the watcher published that are in a block are
+//! 3. **Claims.** The forfeits the watcher published that are in a block are
 //!    claimed, every one of a round in one transaction (up to
 //!    `max_claim_inputs`), each with the preimage of its unlock hash, against
 //!    one atom of the round's connector asset `M`, which every claim names
 //!    and which goes back to the wallet for the next. The atom is issued
 //!    from the round's connector output when the first board forfeit of the
 //!    round is published, so it is held by the time the forfeits confirm.
-//! 5. **Offboards.** A released participation's offboard output is unlocked
+//! 4. **Offboards.** A released participation's offboard output is unlocked
 //!    to its destination with the preimage, which the owner already holds. One
 //!    whose participation expired or was voided (its preimage never went out)
 //!    is reclaimed once its reclaim delay has passed since it confirmed. An
 //!    offboard whose preimage went out is never reclaimed.
-//! 6. **Expiry.** At the expiry `E` of the clock that holds a batch's token,
+//! 5. **Expiry.** At the expiry `E` of the clock that holds a batch's token,
 //!    the release moves the token to `R`; once it has waited the notice `W`
 //!    there, each sweep takes every unspent output of the batch whose own
 //!    notice has passed (the batch output, a node or entry someone unrolled, a
 //!    checkpoint of a coin from the batch) and returns the token to `R`.
-//! 7. **Reclaim.** A lowest node every owner of which has released it is
+//! 6. **Reclaim.** A lowest node every owner of which has released it is
 //!    reclaimed with an atom of each `M` the releases name. With
 //!    `reclaim_early`, a node all of whose lowest nodes are released is
 //!    unrolled first, by a released owner's authorisation from the server's
@@ -70,7 +64,11 @@
 //! transaction goes to the nursery, which broadcasts it again unchanged after
 //! a rollback, however deep: an anchor-driven reorganisation that takes out a
 //! round and the watcher's answers puts them back in the order they were
-//! made, and the watcher answers again whatever does not return.
+//! made, and the watcher answers again whatever does not return. A forfeit
+//! naming a round that can never return is the exception: the log refuses
+//! one ([`StoreError::RoundLost`]), and the nursery gives up every forfeit
+//! of the round's coins when the round is retired ([`crate::rounds`]), so
+//! no path, a restart included, publishes one again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -101,7 +99,7 @@ use crate::params::Params;
 use crate::rounds::Rounds;
 use crate::signer::{hex, SignerClient, SignerError};
 use crate::store::{
-	BoardState, ForfeitRow, LeafState, NewWatcherTx, NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store,
+	BoardState, ForfeitRow, LeafState, NewWatcherTx, ParticipationState, RoundRow, RoundState, ScriptKind, Store,
 	StoreError, TreeScriptKind, WalletCoin, WantedKind,
 };
 use crate::wallet::{Wallet, WalletError};
@@ -310,7 +308,6 @@ impl Watcher {
 		self.claim_forfeits().await?;
 		self.recover_boards(now).await?;
 		self.recover_board_transfers(now).await?;
-		self.forfeit_first(now).await?;
 		self.answer_stale_exits().await?;
 		self.offboards().await?;
 		self.expiries(now).await?;
@@ -442,7 +439,29 @@ impl Watcher {
 	/// Signs the wallet's inputs and publishes: the node must take the
 	/// transaction now, or nothing is recorded and the wallet's coins are
 	/// given back. Returns its txid, or `None` when the node refused it.
-	async fn publish(&self, mut r: Ready, kind: &'static str, subject: Vec<u8>, detail: String) -> Result<Option<Txid>, WatcherError> {
+	async fn publish(&self, r: Ready, kind: &'static str, subject: Vec<u8>, detail: String) -> Result<Option<Txid>, WatcherError> {
+		self.publish_naming(r, kind, subject, detail, None).await
+	}
+
+	/// [`Self::publish`] for the forfeit of the coin `subject` for the round
+	/// `round_id`, which the log refuses, and the wallet's coins with it, once
+	/// that round can never return.
+	async fn publish_forfeit(&self, r: Ready, round_id: i64, subject: Vec<u8>, detail: String) -> Result<Option<Txid>, WatcherError> {
+		// A round the server has not found lost yet whose transaction can
+		// never confirm is lost all the same.
+		let round = self.store.round(round_id).await?.ok_or_else(|| WatcherError::Build(format!("no round {}", round_id)))?;
+		let gone = self.nursery.can_never_return(&txid_of(&round.txid)).await.map_err(|e| WatcherError::Nursery(e.to_string()))?;
+		if gone {
+			self.wallet.release(&r.tx.txid()).await?;
+			log::info!("watcher: the forfeit of {} not published: round {} can never return", hex(&subject), round_id);
+			return Ok(None);
+		}
+		self.publish_naming(r, "forfeit", subject, detail, Some(round_id)).await
+	}
+
+	async fn publish_naming(&self, mut r: Ready, kind: &'static str, subject: Vec<u8>, detail: String, round: Option<i64>)
+		-> Result<Option<Txid>, WatcherError>
+	{
 		let txid = r.tx.txid();
 		for (i, c) in &r.wallet {
 			self.wallet.sign_input(&mut r.tx, *i, c)?;
@@ -462,8 +481,17 @@ impl Watcher {
 			subject,
 			detail: detail.clone(),
 			inputs: r.tx.input.iter().map(|i| (i.previous_output.txid.to_byte_array(), i.previous_output.vout)).collect(),
+			round,
 		};
-		let result = self.nursery.submit_watcher(&w).await.map_err(|e| WatcherError::Nursery(e.to_string()))?;
+		let result = match self.nursery.submit_watcher(&w).await {
+			Ok(result) => result,
+			Err(crate::nursery::NurseryError::Store(StoreError::RoundLost(round))) => {
+				self.wallet.release(&txid).await?;
+				log::info!("watcher: {} for {} not published: round {} can never return", kind, hex(&w.subject), round);
+				return Ok(None);
+			},
+			Err(e) => return Err(WatcherError::Nursery(e.to_string())),
+		};
 		// Its change, for the watcher's next transaction.
 		self.store.record_pending_outputs(&r.tx).await?;
 		log::info!("watcher: {} {} ({} vB): {}; {}", kind, txid, vsize.unwrap_or(0), detail, result);
@@ -691,8 +719,8 @@ impl Watcher {
 				Ok((u, t))
 			}).await?;
 			let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
-			self.publish(Ready { tx: u.tx, wallet, fee }, "forfeit", leaf_id.to_vec(),
-				format!("the forfeit of coin {}, on the chain at {}", hex(leaf_id), op)).await?;
+			self.publish_forfeit(Ready { tx: u.tx, wallet, fee }, f.round_id, leaf_id.to_vec(),
+				format!("the forfeit of coin {} for round {}, on the chain at {}", hex(leaf_id), f.round_id, op)).await?;
 			return Ok(());
 		}
 		if let Some(t) = self.store.spent_by_transfer(leaf_id).await? {
@@ -826,9 +854,8 @@ impl Watcher {
 				Some(p) => p,
 				None => continue,
 			};
-			let ready = p.state == ParticipationState::Released || (p.forfeit_first && p.state == ParticipationState::Issued);
 			let round_final = self.store.round(f.round_id).await?.is_some_and(|r| r.state == RoundState::Final);
-			if !ready || !round_final {
+			if p.state != ParticipationState::Released || !round_final {
 				continue;
 			}
 			let op = OutPoint::new(txid_of(&b.txid), b.vout);
@@ -864,7 +891,7 @@ impl Watcher {
 				}).await?;
 				let vsize = u.tx.vsize() as u64;
 				let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
-				let done = self.publish(Ready { tx: u.tx, wallet, fee }, "forfeit", b.leaf_id.to_vec(),
+				let done = self.publish_forfeit(Ready { tx: u.tx, wallet, fee }, f.round_id, b.leaf_id.to_vec(),
 					format!("the forfeit of board {}, given up in round {}", hex(&b.leaf_id), f.round_id)).await?;
 				Ok::<_, WatcherError>(done.map(|_| vsize))
 			}.await;
@@ -1080,44 +1107,6 @@ impl Watcher {
 		Ok(dates.into_iter().min())
 	}
 
-	// -----------------------------------------------------------------------
-	// 3. Forfeit-first
-	// -----------------------------------------------------------------------
-
-	/// Brings onto the chain each coin a forfeit-first participation gave
-	/// up, and releases the participation once every claim of its forfeits
-	/// is final.
-	async fn forfeit_first(&self, now: MedianTime) -> Result<(), WatcherError> {
-		for id in self.store.forfeit_first_waiting().await? {
-			let p = match self.store.participation(&id).await? {
-				Some(p) => p,
-				None => continue,
-			};
-			let round_id = p.round_id.unwrap_or_default();
-			if !self.store.round(round_id).await?.is_some_and(|r| r.state == RoundState::Final) {
-				continue;
-			}
-			let mut claimed = 0;
-			for i in &p.inputs {
-				if self.claimed_final(&i.leaf_id).await? {
-					claimed += 1;
-					continue;
-				}
-				let r = async {
-					let coin = self.coin(&i.leaf_id).await?;
-					self.bring_on_chain(&coin, now).await
-				}.await;
-				Self::item(&format!("forfeit-first coin {}", hex(&i.leaf_id)), r)?;
-			}
-			if claimed == p.inputs.len() {
-				let released = self.store.complete_participation(&id, p.attempt, round_id, &[], &[], true).await?;
-				log::info!("watcher: participation {} ran forfeit-first; every forfeit claimed and final, so it is released ({})",
-					hex(&id), released);
-			}
-		}
-		Ok(())
-	}
-
 	/// Takes the next step that brings `coin` onto the chain: a node of a
 	/// batch leaf's path by its owner's authorisation, or its entry with its
 	/// preimage; the checkpoint of a board its lineage spent; the same for
@@ -1251,22 +1240,9 @@ impl Watcher {
 		Ok(None)
 	}
 
-	/// Whether a forfeit the watcher published of the coin `leaf_id` is
-	/// claimed by a transaction of the watcher's that is final.
-	async fn claimed_final(&self, leaf_id: &[u8; 32]) -> Result<bool, WatcherError> {
-		for f in self.store.watcher_txs("forfeit", leaf_id).await? {
-			if self.store.watcher_spend(&f.txid, 0).await?.is_some_and(|w| w.kind == "claim" && w.state == NurseryState::Final) {
-				return Ok(true);
-			}
-		}
-		Ok(false)
-	}
-
 	/// Claims the forfeits the watcher published that are in a block and
 	/// unspent: every one of a round in one transaction, up to
 	/// `max_claim_inputs`, against one atom of the round's connector asset.
-	/// A forfeit-first participation's are claimed only once all its
-	/// forfeits are final, since the claim reveals the preimage.
 	async fn claim_forfeits(&self) -> Result<(), WatcherError> {
 		let mut by_round: BTreeMap<i64, Vec<Claimable>> = BTreeMap::new();
 		for (txid, subject) in self.store.unclaimed_forfeits().await? {
@@ -1301,17 +1277,6 @@ impl Watcher {
 			Some(f) => f,
 			None => return Ok(None),
 		};
-		let p = self.store.participation(&f.participation_id).await?
-			.ok_or_else(|| WatcherError::Build("a forfeit of no participation".into()))?;
-		if p.forfeit_first && p.state == ParticipationState::Issued {
-			// Every forfeit of it final before the preimage goes out.
-			for i in &p.inputs {
-				let done = self.store.watcher_txs("forfeit", &i.leaf_id).await?.iter().any(|w| w.state == NurseryState::Final);
-				if !done {
-					return Ok(None);
-				}
-			}
-		}
 		let coin = self.coin(leaf_id).await?;
 		let (forfeit, _) = self.forfeit(&coin, &f)?;
 		let held = forfeit.output();

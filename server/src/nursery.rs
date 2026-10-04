@@ -28,6 +28,14 @@
 //!   catches it. It is marked lost the same way, and the watcher does its work
 //!   again. A final transaction stays watched: a rollback can take it out
 //!   again, and then it is pending.
+//! - **A forfeit of a round that can never return.** A forfeit of the
+//!   watcher's that names a round lost, or whose round transaction can never
+//!   confirm (lost here, or an input of it spent by another transaction that
+//!   is final), is given up once it is not final, on a pass or a
+//!   disconnection, before anything could broadcast it again: marked lost,
+//!   its wallet coins freed when it is in no block, and never broadcast
+//!   again. No claim of it can be made, and it is
+//!   its coin owner's to refund if it is on the chain.
 //!
 //! The nursery decides nothing about finality itself; it asks the finality
 //! service.
@@ -169,6 +177,10 @@ impl Nursery {
 					if row.state == NurseryState::Lost {
 						continue;
 					}
+					if self.names_a_round_gone(&row).await? {
+						self.give_up(&row).await?;
+						continue;
+					}
 					if row.state == NurseryState::Final {
 						let _ = self.events.send(NurseryEvent::Unfinal { txid: *txid });
 					}
@@ -188,6 +200,11 @@ impl Nursery {
 		for row in rows {
 			let txid = Txid::from_byte_array(row.txid);
 			let status = self.finality.status(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
+			// Before anything that could broadcast it again.
+			if !status.is_final() && self.names_a_round_gone(&row).await? {
+				self.give_up(&row).await?;
+				continue;
+			}
 			if status.is_final() {
 				if row.state != NurseryState::Final {
 					self.store.nursery_set_state(&row.txid, NurseryState::Final).await?;
@@ -236,6 +253,44 @@ impl Nursery {
 				self.broadcast(&row).await?;
 			}
 		}
+		Ok(())
+	}
+
+	/// Whether the transaction `txid`, a round, can never confirm: lost here,
+	/// or an input of it spent by another transaction that is final.
+	pub async fn can_never_return(&self, txid: &Txid) -> Result<bool, NurseryError> {
+		match self.store.nursery_get(&txid.to_byte_array()).await? {
+			Some(r) if r.state == NurseryState::Lost => Ok(true),
+			Some(r) => Ok(self.final_conflict(&r).await?.is_some()),
+			None => Ok(false),
+		}
+	}
+
+	/// Whether `row` is a forfeit of the watcher's naming a round that can
+	/// never return: see the [module documentation](self).
+	async fn names_a_round_gone(&self, row: &NurseryRow) -> Result<bool, NurseryError> {
+		if row.kind != NurseryKind::Watcher.as_str() {
+			return Ok(false);
+		}
+		match self.store.forfeit_round(&row.txid).await? {
+			Some((_, true)) => Ok(true),
+			Some((round, false)) => self.can_never_return(&Txid::from_byte_array(round)).await,
+			None => Ok(false),
+		}
+	}
+
+	/// Gives up `row`, a forfeit naming a round that can never return: lost,
+	/// its wallet coins freed when it is in no block.
+	async fn give_up(&self, row: &NurseryRow) -> Result<(), NurseryError> {
+		let txid = Txid::from_byte_array(row.txid);
+		let in_chain = self.finality.status(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?.in_chain();
+		self.store.nursery_set_state(&row.txid, NurseryState::Lost).await?;
+		if !in_chain {
+			if let Some(w) = &self.wallet {
+				w.release(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
+			}
+		}
+		log::warn!("nursery: {} is a forfeit of a round that can never return: given up, never broadcast again", txid);
 		Ok(())
 	}
 

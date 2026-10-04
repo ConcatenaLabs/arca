@@ -506,31 +506,45 @@ async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_
 	}
 }
 
-/// Two boards refreshed in one round, whose forfeits the operator's watcher
-/// publishes; then the round can never return (one of its inputs is spent
-/// elsewhere, final), and the operator publishes one board's forfeit again.
-/// The new leaves are lost; the board whose forfeit is not on the chain is
-/// live again and is exited; the other's forfeit output, unclaimable without
-/// the round, is refunded to the wallet once its delay has run.
+/// A round that can never return, and the participations it ran (D50). The
+/// wallet refreshes two boards and a leaf of an earlier round in round R; the
+/// operator's watcher publishes both boards' forfeits for R, as it does for
+/// every board given up in a final round. Then R can never return (one of
+/// its inputs is spent elsewhere, final, and the node forgets its mempool),
+/// and one board's forfeit is sent again by someone who saw it. The new
+/// leaves of R are lost, and the wallet follows each participation as the
+/// operator runs it again: the leaf's re-run is taken in round Y, the wallet
+/// hands over its forfeit for Y and takes its new leaf; each board's re-run
+/// is never taken, which the wallet shows with the operator's reason and
+/// does not wait on. The board whose forfeit for R is on the chain is
+/// refunded once its delay has run; the other, whose forfeit is not on the
+/// chain, is exited at once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded() {
+async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	let mut r = Running::start().await;
 	let url = r.url();
 	let x = r.x;
-	let c = Arca::new("F3c");
-	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
-	let outs: Vec<_> = boards.iter().map(|b| {
+	let c = Arca::new("D50c");
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000), (x, 2_000_000), (x, 2_000_000)]).await;
+	// A leaf of an earlier round, from the first board.
+	c.ok(&["participate", "--leaf", &boards[0]]);
+	final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let leaf = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&c, &leaf)["state"], "live");
+	let outs: Vec<_> = boards[1..].iter().map(|b| {
 		let CoinRecord::Board(rec) = record_of(&c, b) else { panic!("a board") };
 		find_unspent(&r, &rec.output().txout())
 	}).collect();
-	for b in &boards {
-		c.ok(&["participate", "--leaf", b]);
+	// Round R: the two other boards and the leaf.
+	let mut pids = vec![];
+	for l in [&boards[1], &boards[2], &leaf] {
+		pids.push(c.ok(&["participate", "--leaf", l])["participation"].as_str().unwrap().to_string());
 	}
 	let r1 = final_round(&r).await;
 	let s = c.ok(&["sync"]);
-	let leaves: Vec<String> = s["participations"].as_array().unwrap().iter()
-		.map(|p| p["new_leaves"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("released: {}", s)).to_string()).collect();
-	// The watcher publishes each board's forfeit.
+	assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "released"), "{}", s["participations"]);
+	// The watcher publishes each board's forfeit for R.
 	let mut forfeits = vec![None, None];
 	for _ in 0..40 {
 		for (k, op) in outs.iter().enumerate() {
@@ -544,11 +558,13 @@ async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded()
 		r.produce().await;
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 	}
+	let first = forfeits[0].clone().expect("the watcher publishes the first board's forfeit");
 	let second = forfeits[1].clone().expect("the watcher publishes the second board's forfeit");
-	println!("F3c the operator's forfeit of the second board: {} ({} vB)", second.txid(), second.vsize());
+	println!("D50c the operator's forfeits for R: {} and {}", first.txid(), second.txid());
 
-	// The round can never return: rolled back, the mempool emptied, one of
-	// its inputs spent by another transaction, buried.
+	// R can never return: rolled back, the mempool emptied, one of its
+	// inputs spent by another transaction, buried; someone who saw the
+	// first board's forfeit sends it again.
 	r.server.stop();
 	let block = block_of(&r, &r1.txid().to_string());
 	rpc(&r, "invalidateblock", &[json!(block)]);
@@ -562,42 +578,71 @@ async fn a_lost_round_gives_back_its_coins_and_a_published_forfeit_is_refunded()
 			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(a, 5_000))] };
 	operator_signs(&r, &mut conflict);
 	let cid = r.rt.client().send_raw_transaction(&conflict).expect("the conflict relays");
-	// The operator publishes the second board's forfeit again.
-	let fid = r.rt.client().send_raw_transaction(&second).expect("the forfeit relays without its round");
+	let fid = r.rt.client().send_raw_transaction(&first).expect("the forfeit relays without its round");
 	r.produce().await;
 	r.bury().await;
-	println!("F3c conflict {} confirmed: round {} can never return; forfeit {} confirmed", cid, r1.txid(), fid);
+	println!("D50c conflict {} confirmed: round {} can never return; the first board's forfeit {} confirmed", cid, r1.txid(), fid);
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&r1.txid(), RoundState::Lost).await;
 
-	let rc = c.ok(&["recheck"]);
-	println!("F3c the wallet's re-check: {}", rc["changes"]);
-	for l in &leaves {
-		assert_eq!(coin_of(&c, l)["state"], "lost", "the new leaf of the lost round");
+	// The wallet follows: the leaf's run again is pending; each board's is
+	// void, with the operator's reason.
+	let s = c.ok(&["sync"]);
+	println!("D50c the wallet's sync after R is lost: recheck {} participations {}", s["recheck"]["changes"], s["participations"]);
+	let of = |s: &Value, pid: &str| s["participations"].as_array().unwrap().iter().find(|p| p["participation"] == pid).cloned()
+		.unwrap_or(Value::Null);
+	for (k, b) in boards[1..].iter().enumerate() {
+		let p = of(&s, &pids[k]);
+		println!("D50c board {}'s participation: {}", k + 1, p);
+		assert!(p["void_reason"].as_str().is_some_and(|w| w.contains("operator's log")), "the operator's reason, shown: {}", p);
+		assert_ne!(coin_of(&c, b)["state"], "live", "a board under a forfeit for R is not the wallet's off the chain");
 	}
-	assert_eq!(coin_of(&c, &boards[0])["state"], "live", "the board whose forfeit is not on the chain is the wallet's again: {}",
-		coin_of(&c, &boards[0]));
-	assert_eq!(coin_of(&c, &boards[1])["state"], "forfeited", "the board in its published forfeit: {}", coin_of(&c, &boards[1]));
-	let claim = exit_and_claim(&r, &c, &boards[0], Some(&x.to_string())).await;
-	println!("F3c the board given back is exited: claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	assert_eq!(coin_of(&c, &boards[1])["state"], "forfeited", "its forfeit for R is on the chain: {}", coin_of(&c, &boards[1]));
+	assert!(of(&s, &pids[0])["held"][0]["exit"].is_null(), "a coin whose forfeit is on the chain is refunded, not exited");
+	// The second board's forfeit for R is not on the chain: the wallet takes
+	// the board on the chain at once, and says the fee coin a board's
+	// conversion needs.
+	let tried = &of(&s, &pids[1])["held"][0]["exit"];
+	println!("D50c the second board's exit, tried at once: {}", tried);
+	assert!(tried["error"].as_str().is_some_and(|e| e.contains("--fee-asset")), "{}", tried);
+	assert_eq!(coin_of(&c, &boards[2])["state"], "forfeited");
+	assert_eq!(of(&s, &pids[2])["state"], "pending", "the leaf's run again waits for a round: {}", s["participations"]);
+	let s = c.ok(&["sync"]);
+	for pid in &pids[..2] {
+		assert!(of(&s, pid).is_null(), "a void participation is not followed again: {}", s["participations"]);
+	}
 
-	// The refund, once its delay has run.
+	// Round Y takes the leaf's: the wallet hands over its forfeit for Y and
+	// takes its new leaf.
+	final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let p = of(&s, &pids[2]);
+	println!("D50c the leaf's participation in Y: {}", p);
+	assert_eq!(p["state"], "released", "{}", s["participations"]);
+	let new = p["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&c, &new)["state"], "live");
+	assert_eq!(coin_of(&c, &leaf)["state"], "spent");
+
+	// The second board is exited and claimed.
+	let claim = exit_and_claim(&r, &c, &boards[2], Some(&x.to_string())).await;
+	println!("D50c the second board, exited: claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	// The first board's forfeit for R is refunded once its delay has run.
 	let refund_s = r.config.exit_delay_units.unwrap().1 as u32 * 512;
 	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, refund_s));
 	let s = c.ok(&["sync"]);
 	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[1].as_str()).cloned()
 		.unwrap_or_else(|| panic!("the forfeit is watched: {}", s));
-	println!("F3c the wallet's refund of the second board's forfeit: {}", f);
-	assert_eq!(f["state"], "refunding", "sent, which decides nothing yet: {}", f);
-	assert_eq!(coin_of(&c, &boards[1])["state"], "forfeited", "a refund in the mempool decides nothing");
+	println!("D50c the wallet's refund of the first board's forfeit for R: {}", f);
+	assert_eq!(f["state"], "refunding", "{}", f);
 	r.produce().await;
-	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
-	assert!(confirmations(&r, &refund) >= 1, "the refund confirms");
 	r.bury().await;
 	let s = c.ok(&["sync"]);
 	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == boards[1].as_str()).cloned()
 		.unwrap_or_else(|| panic!("the forfeit is followed until its refund is final: {}", s));
 	assert_eq!(f["state"], "refunded", "{}", f);
 	assert_eq!(coin_of(&c, &boards[1])["state"], "exited");
-	let _ = std::fs::remove_dir_all(&c.dir);
+	let _ = (second, std::fs::remove_dir_all(&c.dir));
 }
 
 // ---------------------------------------------------------------------------

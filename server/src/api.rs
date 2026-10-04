@@ -435,9 +435,6 @@ pub struct ParticipationStatus {
 	/// How often a round it was in could not return and it ran again.
 	pub attempt: u32,
 	pub unlock_hash: String,
-	/// Set after a round it was released in could not return: the next
-	/// preimage goes out only once its forfeit is published and claimed.
-	pub forfeit_first: bool,
 	/// The refund delay every forfeit of it carries.
 	pub refund_delay_units: u16,
 	/// Its round, once issued.
@@ -450,6 +447,10 @@ pub struct ParticipationStatus {
 	/// (the operator's wallet could not fund its outputs, say).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub waiting: Option<String>,
+	/// Once void: why it will never run (a coin of it whose forfeit for a
+	/// round that could not return the operator published, say).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub void_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +469,12 @@ pub struct ParticipationInputStatus {
 	pub value: String,
 	/// What the forfeit of this coin leaves uncommitted for its own fee.
 	pub margin: String,
+	/// Once the participation is void or expired: whether the coin is its
+	/// owner's again off the chain. A coin not given back has a forfeit
+	/// signed, and is its owner's on the chain, by that forfeit's refund or by
+	/// its exit.
+	#[serde(default)]
+	pub returned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,16 +655,14 @@ pub struct UnrollAuth {
 	pub time: u32,
 }
 
-/// What `forfeit_leaves` returns: the participation's state, and its
-/// preimage once released.
+/// What `forfeit_leaves` returns: the participation, released, and its
+/// preimage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Forfeited {
 	pub participation_id: String,
 	pub state: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub preimage: Option<String>,
-	pub forfeit_first: bool,
+	pub preimage: String,
 }
 
 /// `POST /v1/release_leaves`: the owner's release of the lowest node of each

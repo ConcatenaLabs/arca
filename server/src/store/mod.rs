@@ -6,7 +6,8 @@
 //! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
 //! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
-//! `schema/V12__challenge_key.sql`), built from
+//! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`),
+//! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
@@ -18,7 +19,9 @@
 //! credited, owns none, and a key a void or expired participation wanted is
 //! free again), a leaf is given up once, by one transfer or by
 //! one participation at a time (a participation that never runs, or whose
-//! forfeits never come, gives back the coins no forfeit was signed for). Each
+//! forfeits never come, gives back the coins no forfeit was signed for), and
+//! no forfeit naming a round that can never return enters the watcher's log
+//! ([`StoreError::RoundLost`]). Each
 //! operation that changes more than one row runs in one transaction, so it
 //! happens whole or not at all.
 //!
@@ -74,6 +77,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(10, include_str!("../../schema/V10__round_signer_head.sql")),
 	(11, include_str!("../../schema/V11__signed_record_heads.sql")),
 	(12, include_str!("../../schema/V12__challenge_key.sql")),
+	(13, include_str!("../../schema/V13__reruns_are_ordinary.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -137,6 +141,10 @@ pub enum StoreError {
 	/// The participation is no longer in its round's forfeit step.
 	#[error("the participation is {0}")]
 	NotInRound(&'static str),
+	/// A forfeit names a round that can never return: the server never
+	/// publishes it.
+	#[error("round {0} can never return: no forfeit naming it is published")]
+	RoundLost(i64),
 }
 
 impl StoreError {

@@ -57,8 +57,8 @@
 //!   says; the same message again is signed again, so a request repeated
 //!   after a signer outage completes;
 //! - or any number of **forfeits**, one for each round's connector asset `M`:
-//!   a leaf given up in a round, and again forfeit-first in a later round
-//!   after the first could never return. A forfeit is a rebind request that
+//!   a leaf given up in a round, and again in a later round after the first
+//!   could never return. A forfeit is a rebind request that
 //!   names the forfeit's parts (`forfeit`), from which the signer rebuilds
 //!   the forfeit output and checks it is the one output committed to; it is
 //!   refused once the salt has a spend, and a second forfeit message for the

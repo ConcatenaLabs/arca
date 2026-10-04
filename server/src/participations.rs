@@ -555,6 +555,7 @@ impl Participations {
 				value: c.value,
 				margin: *margin,
 				attestation: *i.attestation.as_ref(),
+				returned: false,
 			}).collect(),
 			outputs: wanted,
 			fees: req.fees.iter().map(|(a, v)| (a.into_inner().to_byte_array(), *v)).collect(),

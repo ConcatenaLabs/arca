@@ -76,12 +76,17 @@
 //!
 //! A round that cannot return leaves every owner who gave up a leaf for it a
 //! forfeit no claim can answer, signed by both and ending in the owner's
-//! refund. So a participation run again after it is forfeit-first: the
-//! operator publishes the forfeit for the new round and sees it final before
-//! it hands over the preimage. With the preimage released
-//! first, the owner publishes the old forfeit instead, refunds it, and keeps
-//! the new leaf too. For the same reason the operator co-signs no other
-//! off-chain spend of a leaf given up for a lost round.
+//! refund, once on the chain. An owner holding that forfeit whole and the
+//! preimage of a re-run would publish the old forfeit, refund it, and keep
+//! the new leaf too. The owner holds it whole only if the operator published
+//! it: the operator's half never leaves the operator otherwise. So a coin
+//! whose forfeit for the lost round the operator published is never taken
+//! into a re-run (its owner refunds that forfeit), the operator never
+//! publishes a forfeit for the lost round once it is lost, and any other
+//! re-run completes as an ordinary participation: its forfeit for the new
+//! round taken and its preimage released against it. For the same reason
+//! the operator co-signs no other off-chain spend of a leaf given up for a
+//! lost round.
 //!
 //! [`Forfeit`] builds the transactions. The forfeit itself moves the old leaf
 //! into the forfeit output by the leaf's collaborative path; owner and
