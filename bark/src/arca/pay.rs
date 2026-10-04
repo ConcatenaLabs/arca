@@ -23,6 +23,10 @@ use super::{random32, Error};
 /// operator's least margin (`info.fees.margin_multiple`).
 pub const MARGIN_MULTIPLE: u64 = 4;
 
+/// The least time between accepting a swap and the exit deadline of the
+/// coins it gives the wallet, unless the user takes it anyway: two days.
+pub const SWAP_DEADLINE_MARGIN: u32 = 2 * 86_400;
+
 /// How many times the operator's least margin the wallet leaves, within the
 /// operator's most: room for the operator's floor to rise between the
 /// wallet reading it and the operator co-signing.
@@ -722,10 +726,13 @@ impl Wallet {
 			if cp == 0 || cp > a.valid.value {
 				return Err(Error::Refused("an offered checkpoint keeps nothing, or more than its coin".into()));
 			}
+			// Its dates: the earliest first expiry of the batches it rests
+			// on, or a board's service expiry, whichever comes first.
+			let expiry = self.service_expiry(&record, &a)?;
 			let row = CoinRow {
 				leaf_id: a.valid.id.to_string(), owner_nonce: owner_of(&record).1, kind: kind_of(&record).into(),
 				asset: a.valid.asset.to_string(), value: a.valid.value, record: bytes, salt: a.valid.leaf.salt, state: "theirs".into(),
-				note: String::new(), expiry: a.valid.expiry.to_consensus_u32(), bases: vec![], spent_by: None,
+				note: String::new(), expiry, bases: vec![], spent_by: None,
 			};
 			out.push(In { row, coin: a.valid, checkpoint_value: cp });
 		}
@@ -735,8 +742,13 @@ impl Wallet {
 	/// Takes an offer: checks the maker's coins and that they fund what the
 	/// maker gives, adds the wallet's coins of the asset wanted and the leaf it
 	/// gets, signs its own inputs over the full output set, and returns the
-	/// acceptance for the maker to complete.
-	pub fn swap_accept(&mut self, offer_text: &str) -> Result<Value, Error> {
+	/// acceptance for the maker to complete. Every coin the swap makes rests
+	/// on every coin it spends, so the coins the wallet gets carry the
+	/// earliest dates among them (a batch's first expiry, or a board's
+	/// service expiry): they are shown, and the swap is refused when their
+	/// exit deadline is less than [`SWAP_DEADLINE_MARGIN`] away, unless
+	/// `near_deadline` says to take it anyway.
+	pub fn swap_accept(&mut self, offer_text: &str, near_deadline: bool) -> Result<Value, Error> {
 		let offer = decode(OFFER_PREFIX, offer_text, "the offer")?;
 		self.check_chain(&offer, "offer")?;
 		let id = hex(&sha256::Hash::hash(offer.to_string().as_bytes()).to_byte_array());
@@ -774,6 +786,23 @@ impl Wallet {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outs.len(),
 				arca_covenant::leaf::MAX_OUTPUTS)));
 		}
+		// The dates of the coins the wallet gets: the earliest of every coin
+		// spent, the maker's and its own.
+		let now = self.now()?.to_consensus_u32() as u64;
+		let expiry = theirs.iter().chain(mine.iter()).map(|i| i.row.expiry).min().unwrap_or(u32::MAX);
+		let on_board = theirs.iter().chain(mine.iter()).any(|i| CoinRecord::from_bytes(&i.row.record)
+			.is_ok_and(|r| super::wallet::rests_on_board(&r)));
+		let deadline = (expiry != u32::MAX).then(|| expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE));
+		let dates = json!({"expiry": (expiry != u32::MAX).then_some(expiry), "exit_deadline": deadline, "rests_on_board": on_board,
+			"seconds_to_exit_deadline": deadline.map(|d| (d as u64).saturating_sub(now))});
+		if let Some(d) = deadline {
+			if (d as u64) < now + SWAP_DEADLINE_MARGIN as u64 && !near_deadline {
+				return Err(Error::Refused(format!("the coins this swap gives the wallet rest on coins whose earliest exit deadline is at \
+					median time {} ({} s from now): they could be paid on for less than {} s, and after it the operator takes them only \
+					into a refresh; take the swap anyway with --accept-near-deadline", d, (d as u64).saturating_sub(now),
+					SWAP_DEADLINE_MARGIN)));
+			}
+		}
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
@@ -803,8 +832,12 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
+		let mut gets = vec![json!({"asset": give_asset.to_string(), "value": give.to_string(), "dates": dates})];
+		if change > 0 {
+			gets.push(json!({"asset": want_asset.to_string(), "value": change.to_string(), "change": true, "dates": dates}));
+		}
 		Ok(json!({"swap": id, "accept": encode(ACCEPT_PREFIX, &accept), "gets": {"asset": give_asset.to_string(), "value": give.to_string()},
-			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}}))
+			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "coins": gets, "dates": dates}))
 	}
 
 	/// Completes a swap the wallet offered: checks that the acceptance keeps
