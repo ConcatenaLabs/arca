@@ -724,7 +724,7 @@ impl Server {
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			floors: tokio::sync::Mutex::new(None),
 			record_head: tokio::sync::Mutex::new(None),
-			keepers,
+			keepers: std::sync::Mutex::new(keepers),
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {

@@ -2658,6 +2658,13 @@ impl Backup {
 	/// Database and record rolled back together to the copy; the server
 	/// starts on them.
 	async fn restore(&self, r: &mut Running) {
+		self.restore_files(r).await;
+		self.start(r).await;
+	}
+
+	/// Server and signer stopped, database and record rolled back together
+	/// to the copy; nothing started.
+	async fn restore_files(&self, r: &mut Running) {
 		r.server.stop();
 		r.signer.halt();
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2666,7 +2673,6 @@ impl Backup {
 		self.disconnect(&format!("{}_backup", self.db)).await;
 		self.admin.batch_execute(&format!("CREATE DATABASE {} TEMPLATE {}_backup", self.db, self.db)).await.unwrap();
 		std::fs::write(r.signer.record(), &self.record).unwrap();
-		self.start(r).await;
 	}
 }
 
@@ -3108,6 +3114,144 @@ async fn w2r_with_a_keeper_the_restored_signer_stops_before_any_second_spend() {
 	for w in [&a, &a_old, &b, &m] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+/// D55, R7f's K1 turned around (F1 to F3). The keepers are part of the
+/// operator's identity, written into its signer's record when it is made.
+/// The operator runs with a keeper; A pays B 600,000 (P1); the box's
+/// snapshot; A pays B 300,000 from its change C_A (P2), which the keeper
+/// holds. The restore brings back record and database, and a start without
+/// `--keeper`: the signer refuses to start, naming the record's keeper that
+/// has no address. R7f's K2 and K2b cannot be set up either: a start with
+/// a keeper of another key is refused, naming that key. Started with its
+/// keeper, the keeper's head stops it before any wallet contact. M, a
+/// wallet made after the restore, pins the record's keeper from `info` and
+/// asks for no payment from a stopped operator; A's older copy's second
+/// spend of C_A to N, whose request was made before the snapshot, is not
+/// co-signed: N gets nothing. B's sync proves the rollback and takes P2 on
+/// the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_signer_without_its_keepers_does_not_start() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let kept = r.keepers[0].xonly().to_string();
+	let (a, b, n) = (Arca::new("K1A"), Arca::new("K1B"), Arca::new("K1N"));
+	boarded(&mut r, &a, &url, &[(x, 4_000_000), (x, 1_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	n.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let p1 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(b.ok(&["info"])["keepers"]["keys"], serde_json::json!([kept]));
+	let n_req = n.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let record = std::fs::read_to_string(r.signer.record()).unwrap();
+	println!("K1 the record's first line: {}", record.lines().next().unwrap());
+	assert!(record.lines().next().unwrap().ends_with(&format!(" keepers=1:{}", kept)));
+	let backup = Backup::take(&mut r).await;
+	let a_old = copy_wallet(&a, "K1Aold");
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	let c_a = paid["inputs"][0].as_str().unwrap().to_string();
+	let p2 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	println!("K1 after the snapshot: A paid B 300000 from C_A {} (P2 {}); the keeper holds up to entry {:?}; the snapshot's record ends at {}",
+		c_a, p2, r.keepers[0].latest(), backup.entries);
+	assert!(r.keepers[0].latest() > Some(backup.entries));
+
+	// The restore, with the snapshot's start script, which lost --keeper.
+	backup.restore_files(&mut r).await;
+	let with_keeper = vec!["--keeper".to_string(), r.keepers[0].arg(), "--keeper-timeout-ms".into(), "2000".into()];
+	r.signer.set_extra(vec![]);
+	let e = r.signer.try_resume(genesis).expect_err("no start without the record's keeper");
+	println!("K1 the restored signer started without --keeper: {}", e.lines().last().unwrap_or(""));
+	assert!(e.starts_with("exit Some(2)") && e.contains(&format!("the record's keeper {} has no address", kept)), "{}", e);
+	// K2, K2b: the keeper replaced by one of another key.
+	let other = tokio::task::block_in_place(|| common::keeper::KeeperProcess::start(&common::running::keypair("keeper replaced"),
+		common::running::keypair("operator").x_only_public_key().0, genesis));
+	r.signer.set_extra(vec!["--keeper".to_string(), other.arg()]);
+	let e = r.signer.try_resume(genesis).expect_err("no start with another keeper");
+	println!("K1 (K2, K2b) started with a keeper of another key: {}", e.lines().last().unwrap_or(""));
+	assert!(e.contains(&format!("={}: that key is not one of the record's keepers", other.xonly())), "{}", e);
+	assert!(!server::signer::stopped_path(&r.signer.record()).exists(), "nothing started, nothing signed");
+	drop(other);
+
+	// Started with its keeper: the keeper's head stops it at once.
+	r.signer.set_extra(with_keeper);
+	backup.start(&mut r).await;
+	let stopped = std::fs::read_to_string(server::signer::stopped_path(&r.signer.record())).expect("stopped at start, before any wallet");
+	println!("K1 started with its keeper: {}", stopped.lines().next().unwrap());
+	assert!(stopped.contains("past the record's end"), "{}", stopped);
+	let i = info_of(&r);
+	println!("K1 info: signer_record {} | keepers {}", i["signer_record"], i["keepers"]);
+	assert_eq!(i["keepers"], serde_json::json!({"keys": [kept], "required": 1}), "info shows what the record says");
+
+	// M, made now, pins the record's keeper, and asks a stopped operator
+	// for no payment.
+	let m = Arca::new("K1M");
+	m.ok(&create_args(&url, &r.node_url()));
+	let pinned = m.ok(&["info"])["keepers"].clone();
+	println!("K1 M pinned: {}", pinned);
+	assert_eq!(pinned["keys"], serde_json::json!([kept]));
+	let (ok, v) = m.run(&["receive"]);
+	println!("K1 M asks for a payment: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["message"].as_str().unwrap_or("").contains("the operator's signer is stopped on its own proof"), "{}", v);
+	// The second spend of C_A, to N's request from before the snapshot.
+	let (ok, v) = a_old.run(&["send", &n_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("K1 A's older copy spends C_A again, to N: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok, "the second spend is not co-signed");
+	let id: LeafId = c_a.parse().unwrap();
+	println!("K1 C_A at the server: {:?}", r.server.store.leaf(&id.0).await.unwrap().map(|l| l.state));
+	let got = n.ok(&["sync"]);
+	println!("K1 N's sync: mailbox {}", got["mailbox"]);
+	assert!(n.ok(&["coins"]).as_array().unwrap().is_empty(), "N gets nothing");
+	let s = b.ok(&["sync"]);
+	println!("K1 B's sync: rolled_back {} | exits {}", s["witness"]["rolled_back"]["at"], s["witness"]["exits"]);
+	assert_eq!(s["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries));
+	let exits = s["witness"]["exits"].as_array().unwrap();
+	assert!(exits.iter().any(|e| e["leaf_id"] == p2.as_str()) && !exits.iter().any(|e| e["leaf_id"] == p1.as_str()), "{:?}", exits);
+	for w in [&a, &a_old, &b, &m, &n] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D55 at the wallet. A wallet made before keepers existed has none pinned,
+/// and pins them from the first `info` it reads: its `info` shows the
+/// keepers it pinned on that very call, not "no keeper" (R7f F9). From then
+/// on the keepers are part of the operator's identity: an operator showing
+/// others (a proxy rewrites them) is refused, as an operator key it was not
+/// created with is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_pins_the_keepers_as_part_of_the_operator() {
+	let r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let kept = r.keepers[0].xonly().to_string();
+	let proxy = Proxy::start(&url);
+	let b = Arca::new("PKB");
+	b.ok(&create_args(&proxy.url.clone(), &r.node_url()));
+	// As made before keepers existed: no keepers pinned.
+	{
+		let c = rusqlite::Connection::open(b.dir.join("arca.sqlite")).unwrap();
+		assert_eq!(c.execute("DELETE FROM meta WHERE key = 'keepers'", []).unwrap(), 1);
+	}
+	let i = b.ok(&["info"]);
+	println!("PK the first info of a wallet with no keepers pinned: keepers {}", i["keepers"]);
+	assert_eq!(i["keepers"]["keys"], serde_json::json!([kept]), "the call that pins the keepers shows them: {}", i["keepers"]);
+	assert_eq!(i["keepers"]["required"], 1);
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/info" {
+			v["keepers"] = serde_json::json!({"keys": [], "required": 0});
+		}
+		None
+	})));
+	let i = b.ok(&["info"]);
+	println!("PK the operator showing no keeper: {}", i["server_info"]);
+	assert!(i["server_info"]["unreachable"].as_str().unwrap_or("").contains("the server now names the keepers"), "{}", i["server_info"]);
+	assert_eq!(i["keepers"]["keys"], serde_json::json!([kept]), "the pin stands");
+	let (ok, v) = b.run(&["sync"]);
+	println!("PK its sync: ok={} {}", ok, v["witness"]);
+	drop(r);
+	let _ = std::fs::remove_dir_all(&b.dir);
 }
 
 /// D52.4, the control for the test above: the same restore with no keeper.

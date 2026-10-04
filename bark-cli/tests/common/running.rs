@@ -65,18 +65,26 @@ impl Running {
 		let genesis = rt.client().genesis_hash().unwrap();
 		let keepers: Vec<KeeperProcess> = (0..keepers).map(|i| tokio::task::block_in_place(||
 			KeeperProcess::start(&keypair(&format!("keeper {}", i)), s.x_only_public_key().0, genesis))).collect();
+		// The record names its keepers when it is made; a start says where
+		// each is reached.
+		let mut create = vec![];
 		let mut extra = vec![];
 		for k in &keepers {
+			create.push("--keeper-key".to_string());
+			create.push(k.xonly().to_string());
 			extra.push("--keeper".to_string());
 			extra.push(k.arg());
 		}
-		if let Some(r) = required {
-			extra.push("--keepers-required".into());
-			extra.push(r.to_string());
+		match keepers.len() {
+			0 => create.push("--no-keepers".into()),
+			n => {
+				create.push("--keepers-required".into());
+				create.push(required.unwrap_or(n).to_string());
+			},
 		}
 		extra.push("--keeper-timeout-ms".into());
 		extra.push("2000".into());
-		let signer = tokio::task::block_in_place(|| SignerProcess::start_with(&s, genesis, extra));
+		let signer = tokio::task::block_in_place(|| SignerProcess::start_with(&s, genesis, create, extra));
 		let mnemonic = signer.dir.join("wallet.mnemonic");
 		std::fs::write(&mnemonic, MNEMONIC).unwrap();
 		let config = Config {

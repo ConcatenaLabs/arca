@@ -8,9 +8,13 @@
 //!     arca-keeper --key-file <file> --operator <S> --genesis <hash> --heads <file> --listen <host:port>
 //!
 //! The key file holds the keeper's own 32-byte secret key as 64 hex
-//! characters, and must not be readable by anyone but its owner; `--pubkey`
-//! prints the key's public half, which the signer's operator names in the
-//! signer's configuration (`arca-signer --keeper <host:port>=<key>`). The
+//! characters, and must not be readable by anyone but its owner, and is
+//! backed up as the operator key is: the signer's record names the keeper's
+//! key for good, so a keeper whose key is lost cannot be replaced. `--pubkey`
+//! prints the key's public half, which the operator names when it makes the
+//! signer's record (`arca-signer --create-record --keeper-key <key>`), and
+//! again, with where the keeper listens, when it starts the signer
+//! (`arca-signer --keeper <host:port>=<key>`). The
 //! operator key `S` is the signer's public key, as `info` shows it; the
 //! genesis hash is in display order. `--create` makes a new, empty heads
 //! file, once, and exits: a heads file is never made in passing, so one that

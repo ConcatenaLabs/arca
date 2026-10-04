@@ -84,8 +84,10 @@ pub struct App {
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
 	/// The signer's record head `info` last published, signed, and when.
 	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
-	/// The keepers of the signer's record, as `info` publishes them.
-	pub keepers: api::KeepersInfo,
+	/// The keepers the signer's record names, as `info` publishes them: read
+	/// from the signer at start and again whenever `info` asks it for its
+	/// head, so `info` shows what the record says.
+	pub keepers: std::sync::Mutex<api::KeepersInfo>,
 }
 
 /// How long `info` publishes the floors it read from the node before it reads
@@ -475,6 +477,19 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 			None
 		},
 	};
+	// The keepers the record names, as the signer reads them from it.
+	match app.cosigner.signer().keepers().await {
+		Ok((keys, required)) => {
+			let now = api::KeepersInfo { keys: keys.iter().map(|k| hex(&k.serialize())).collect(), required };
+			let mut k = app.keepers.lock().unwrap_or_else(|e| e.into_inner());
+			if *k != now {
+				log::error!("the signer's record names the keepers {:?}, {} required, where it named {:?}, {} required: the record \
+					is not the one the server started on", now.keys, now.required, k.keys, k.required);
+				*k = now;
+			}
+		},
+		Err(e) => log::warn!("info: the signer's keepers: {}", e),
+	}
 	if let Some(h) = &head {
 		*cached = Some((Instant::now(), h.clone()));
 	}
@@ -519,7 +534,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			refresh_until_seconds: Params::ROUND_HORIZON,
 		},
 		signer_record,
-		keepers: app.keepers.clone(),
+		keepers: app.keepers.lock().unwrap_or_else(|e| e.into_inner()).clone(),
 		max_request_bytes: app.max_request as u64,
 	})
 }

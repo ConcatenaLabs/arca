@@ -354,6 +354,43 @@ impl std::str::FromStr for KeeperAddr {
 	}
 }
 
+/// Where each of the record's keepers is reached, from the signer's command
+/// line (`given`): the record names the keepers, the command line only where
+/// each listens. Every key the record names needs an address, and every
+/// address must be for one of them; otherwise this says which key has no
+/// address and which is not the record's, and the signer does not start. A
+/// record without keepers takes none. Returned in the record's order.
+pub fn reached(record: &crate::signer::RecordKeepers, given: &[KeeperAddr]) -> Result<Vec<KeeperAddr>, String> {
+	if record.is_none() {
+		if given.is_empty() {
+			return Ok(vec![]);
+		}
+		return Err(format!("the record was made without keepers, as its first line says, and never gains any, so --keeper ({}) is \
+			refused: keepers for this operator are a new operator, with a new key and a record made with them (arca-signer \
+			--create-record --keeper-key <key> … --keepers-required <k>)", given.iter().map(|g| hex(&g.key.serialize())).collect::<Vec<_>>()
+			.join(", ")));
+	}
+	let mut problems = vec![];
+	for g in given {
+		if !record.keys.contains(&g.key) {
+			problems.push(format!("--keeper {}={}: that key is not one of the record's keepers ({}); the keepers are fixed when the \
+				record is made, and another set is another operator", g.addr, hex(&g.key.serialize()), record.describe()));
+		}
+	}
+	let mut out = vec![];
+	for k in &record.keys {
+		match given.iter().find(|g| g.key == *k) {
+			Some(g) => out.push(g.clone()),
+			None => problems.push(format!("the record's keeper {} has no address: name it with --keeper <host:port>={}; the signer \
+				serves only with every keeper its record names", hex(&k.serialize()), hex(&k.serialize()))),
+		}
+	}
+	if !problems.is_empty() {
+		return Err(problems.join("; "));
+	}
+	Ok(out)
+}
+
 /// How many of `n` keepers must answer for their latest, at a start, when
 /// `required` of them must hold every head: enough that any `required` of
 /// them include one that answered (`n - required + 1`), so the latest head

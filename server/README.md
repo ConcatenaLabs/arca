@@ -807,14 +807,16 @@ The record cannot be lost, cut back, torn or shared without the signer
 noticing:
 
 - **Lost.** The signer starts only on its record. One is made once, for a new
-  operator key, by `arca-signer --create-record`, which refuses a path where a
-  record is; a signer pointed at a path where there is none does not start,
+  operator key, by `arca-signer --create-record`, which names the record's
+  keepers for its whole life (see [The keepers](#the-keepers)) and refuses a
+  path where a record is; a signer pointed at a path where there is none does not start,
   so a lost record is never silently replaced by an empty one, which would
   sign again what was signed before.
 - **Cut back or replaced.** The record's first line names its format, the
-  operator key and the chain, and a record of another key or chain does not
-  start. Every entry carries its number and a running hash over everything
-  before it, so an edited line stops the start. The server's database
+  operator key, the chain and the record's keepers, and a record of another
+  key or chain does not start. Every entry carries its number and a running
+  hash over everything before it, the first line included, so an edited line
+  stops the start. The server's database
   remembers the latest entry the signer gave it, and every rebind request
   names it: a record that ends before it has been cut back, or replaced by an
   older copy (`record_behind`), and one that holds another entry there is
@@ -839,12 +841,12 @@ salts of every leaf whose coin rests on batches alone, all past their last
 expiry, and of their checkpoints (a board's covenant never expires, so a coin
 resting on one is never listed), and `arca-signer --compact-into <new file>
 --drop-salts <list>` writes a new record without the entries under those
-salts. The new record's first line names the old record's latest entry and
-running hash, from which its own entries go on, so the entry the server's
+salts. The new record's first line names the old record's keepers, and its
+latest entry and running hash, from which its own entries go on, so the entry the server's
 database knows is still the record's; it carries every other entry's line
 over verbatim, and for every entry it drops a line with that entry's number
 and running hash (about 70 bytes an entry, on disk), with a hash over all of
-them in that first line, which the signer checks at start. So the record
+them and the keepers in that first line, which the signer checks at start. So the record
 answers the running hash at every one of its entries for its whole life. The
 operator then puts the new file in the record's place and starts the signer
 on it.
@@ -932,9 +934,25 @@ acknowledgement or replay an older latest. Its heads file, like the
 record, is made once on purpose (`--create`), locked while it runs, and
 synced when it is opened; a last line cut short by a crash is removed.
 
-The signer is configured with its keepers (`--keeper <host:port>=<key>`,
-one for each) and how many must hold a head (`--keepers-required`, all of
-them by default). After it has written and synced an entry, it hands the
+The keepers are part of the operator's identity, fixed when its record is
+made: `arca-signer --create-record` takes each keeper's key (`--keeper-key`,
+as `arca-keeper --pubkey` prints it) and how many of them must hold every
+head (`--keepers-required`), and writes them into the record's first line
+(`keepers=<required>:<key>,<key>,…`), under the running hash every head
+commits to. From then on the signer serves only with that set. Its command
+line says only where each keeper is reached (`--keeper <host:port>=<key>`):
+one address for every key the record names, and none for a key it does not
+name. A start that lacks one, or names another, is refused, saying which key
+has no address or which is not the record's, so a restore of the machine, or
+a start script that lost a flag, gives a signer that does not start rather
+than one that serves without its keepers. A compacted record carries the set
+over. Changing the set, replacing a keeper whose machine or key was lost, or
+adding keepers to an operator that had none, is a new operator: a new key
+and a new record. So an operator requires fewer than all of its keepers (two
+of three), so that one lost keeper does not end it, and backs each keeper's
+key up as it backs up its own.
+
+After it has written and synced an entry, the signer hands the
 record's latest head, signed, to every keeper, and releases the
 co-signature only when the required number have acknowledged it; otherwise
 it answers `keepers_unavailable` (the server's `signer_unavailable`), the
@@ -955,16 +973,21 @@ Every head the signer hands out carries the acknowledgements it has of it,
 and they travel with the head wherever a head travels: `info`, the witness
 answer, a transfer's answer, a mailbox record, a published tree (the server
 keeps them, by head, in its database). `info` names the keepers' keys and
-how many are required (`keepers`). A wallet pins them when it is created, as
-it pins the operator key, and from then on takes no coin and keeps no head
-that lacks the required acknowledgements. A keeper on the signer's own
+how many are required (`keepers`), as the record names them. A wallet pins
+them when it is created, as it pins the operator key, and from then on takes
+no coin and keeps no head that lacks the required acknowledgements; an
+operator that shows other keepers is not the operator it pinned, and is
+refused as one showing another key is. A keeper on the signer's own
 machine adds under a millisecond to a co-signature, and one 50 ms away each
 way about 100 ms: one round trip, over a connection the signer keeps open
 to each keeper.
 
-With no keeper configured the signer works without one, and says so when it
-starts; `info` names no keeper, and a wallet says so in its own `info` and
-on every coin it receives out of round. Such an operator's record rests on
+A record made with `--no-keepers` says so in its first line
+(`keepers=none`) and never gains any: the signer refuses `--keeper` on it,
+and on a record of the formats before records named keepers, which is a
+record without keepers. Its signer says so when it starts; `info` names no
+keeper, and a wallet says so in its own `info` and on every coin it
+receives out of round. Such an operator's record rests on
 its own machine alone: a restore of that machine, its database and record
 together, can let a coin paid out of round be spent twice, until a wallet
 holding a later head witnesses. Such an operator is for its own coins.
@@ -972,10 +995,12 @@ holding a later head witnesses. Such an operator is for its own coins.
 ## Running
 
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
-        --create-record                    # once, for a new operator key
+        --create-record --keeper-key <keeper 1 key> --keeper-key <keeper 2 key> --keeper-key <keeper 3 key> \
+        --keepers-required 2               # once, for a new operator key; --no-keepers for an operator for its own coins
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
         --record /var/lib/arca/signer.record \
-        --keeper keeper-1.example:7341=<keeper 1 key> --keeper keeper-2.example:7341=<keeper 2 key>
+        --keeper keeper-1.example:7341=<keeper 1 key> --keeper keeper-2.example:7341=<keeper 2 key> \
+        --keeper keeper-3.example:7341=<keeper 3 key>
     arcad /etc/arca/arcad.toml
     arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
     arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
@@ -984,9 +1009,9 @@ holding a later head witnesses. Such an operator is for its own coins.
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --clear-stopped                    # removes the proof of a rollback, with the signer stopped
 
-Each keeper, on a machine of its own:
+Each keeper, on a machine of its own, before the record is made:
 
-    arca-keeper --key-file /etc/arca/keeper.key --pubkey     # its key, for the signer's --keeper
+    arca-keeper --key-file /etc/arca/keeper.key --pubkey     # its key, for the record's --keeper-key
     arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
         --heads /var/lib/arca/keeper.heads --create          # once
     arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
@@ -997,7 +1022,9 @@ readable by its owner alone. A keeper speaks plain TCP, one JSON object a
 line: every answer it gives is signed by its key over the asker's nonce,
 and it takes nothing but heads `S` signed, so it needs no TLS. Its heads
 file is never restored from an older copy while the signer runs on, and
-never together with the signer's machine.
+never together with the signer's machine. Its key file is backed up as the
+operator key is: a keeper whose key is lost cannot be replaced, since the
+record names it for good.
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`).

@@ -190,6 +190,7 @@ dependencies = [
  "lnurl-rs",
  "log",
  "minreq 2.14.1",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

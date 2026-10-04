@@ -239,9 +239,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
 
 - **The operator's keepers.** An operator's signer may hand every head of its
   record to keepers on other machines, and answer an entry only once enough
-  of them hold it; `info` names their keys and how many are required. The
-  wallet pins them when it is created, as it pins the operator key, and from
-  then on takes no coin and keeps no head without their acknowledgements, each
+  of them hold it; the record names them when it is made, for good, and
+  `info` names their keys and how many are required. The
+  wallet pins them when it is created, as it pins the operator key (a wallet
+  made before keepers existed pins them from the first `info` it reads, and
+  shows them on that call), and refuses an operator that shows other
+  keepers. From then on it takes no coin and keeps no head without their acknowledgements, each
   a keeper's signature over the head: a co-signature of the wallet's own
   payment that comes without them leaves the payment standing, posted again
   by `sync`, and a coin in the mailbox whose head comes without them waits,
@@ -427,8 +430,11 @@ and holding it there, with the reason shown:
   older signed head in `info`: each is an unreachable server, the wallet
   exits nothing, takes no coin from its mailbox, refuses nothing for good,
   and goes on once the answers are honest; the signer is never stopped;
-- the same restore with a keeper running, on another machine: the signer,
-  started on the restored record, asks the keeper for its latest head before
+- the same restore with a keeper running, on another machine, and the
+  snapshot's start script, which lost `--keeper`: the signer refuses to start,
+  naming the record's keeper that has no address, and refuses a keeper of
+  another key, naming it; started with its keeper, it
+  asks the keeper for its latest head before
   it serves anything, finds it past its record's end and stops; the older
   copy's second spend is never co-signed, the receiver of it gets nothing,
   and the receiver of the lost payment learns of the stop on the signer's own
@@ -442,6 +448,8 @@ and holding it there, with the reason shown:
   the restore with no keeper, the coin whose second spend reached the chain
   first is shown as lost, with the coin the operator co-signed another spend
   of, and not counted as pending;
+- a wallet made before keepers existed shows the keepers it pins on the
+  `info` that pins them, and refuses the operator once it shows others;
 - a keeper down: a payment is held up with nothing taken, the request
   standing, and completes when the keeper is back; the receiver shows the
   keeper it pinned;

@@ -4,8 +4,9 @@
 //! socket. See `server::signer` for the protocol.
 //!
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
-//!         [--keeper <host:port>=<key> …] [--keepers-required <n>] [--keeper-timeout-ms <ms>]
-//!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record
+//!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>]
+//!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
+//!         (--keeper-key <key> … --keepers-required <k> | --no-keepers)
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --clear-stopped
 //!
@@ -19,6 +20,18 @@
 //! its record and locks it while it runs. `--create-record` makes a new,
 //! empty record for this key and chain, once, and exits: a record is never
 //! made in passing, so one that is lost is never silently replaced.
+//!
+//! The record names its keepers in its first line, fixed when it is made:
+//! `--create-record` takes each keeper's key (`--keeper-key`, as
+//! `arca-keeper --pubkey` prints it) and how many of them must hold every
+//! head (`--keepers-required`), or `--no-keepers` for an operator without
+//! keepers, for its own coins. From then on the signer serves only with
+//! that set: `--keeper <host:port>=<key>` says only where each of the
+//! record's keepers is reached, one for every key the record names and for
+//! no other, and the signer refuses to start otherwise, saying which key has
+//! no address or which is not the record's. A record made without keepers
+//! (and every record of format 1 to 3) refuses `--keeper`: it never gains
+//! any. A changed set is a new operator, with a new key and a new record.
 //!
 //! `--compact-into` writes a compacted copy of the record to a new file and
 //! exits (`server::signer::SpendRecord::compact`): every entry under a salt
@@ -39,20 +52,20 @@
 //! every witness with that proof. Only `--clear-stopped`, run with the
 //! signer stopped, removes that file, after printing it.
 //!
-//! With keepers (`--keeper`, one for each, on other machines: `server::keeper`),
-//! the signer answers an entry of its record only once its signed head is
-//! held outside this machine: after it has written and synced an entry and
-//! signed its head, it hands the record's latest head to every keeper and
-//! releases the co-signature only when `--keepers-required` of them (all, by
-//! default) have acknowledged it; otherwise it answers that it cannot sign
+//! With keepers (on other machines: `server::keeper`), the signer answers an
+//! entry of its record only once its signed head is held outside this
+//! machine: after it has written and synced an entry and signed its head, it
+//! hands the record's latest head to every keeper and releases the
+//! co-signature only when as many of them as the record requires have
+//! acknowledged it; otherwise it answers that it cannot sign
 //! now (`keepers_unavailable`), the entry stays, and the same request again
 //! completes. At start, and before the first signature after a start, it asks
 //! the keepers for the latest head each holds: one past the record's end, or
 //! with another hash at an entry the record holds, is proof the record was
 //! rolled back, and stops the signer; and until enough keepers have answered
-//! (enough that any set of `--keepers-required` of them includes one) it
+//! (enough that any set of as many as the record requires includes one) it
 //! signs nothing the record governs. Every head it hands out carries the
-//! acknowledgements it has of it.
+//! acknowledgements it has of it, and `pubkey` names the record's keepers.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -69,9 +82,10 @@ use tokio::net::UnixListener;
 use arca_covenant::message::rebind_message;
 use arca_covenant::sign::{script_spend_sighash, sign_digest, verify_digest};
 use arca_covenant::Chain;
-use server::keeper::{start_quorum, Held, KeeperAddr, KeeperClient, WireAck, KEEPERS_UNAVAILABLE};
+use server::keeper::{reached, start_quorum, Held, KeeperAddr, KeeperClient, WireAck, KEEPERS_UNAVAILABLE};
 use server::signer::{
-	check_spend, hex, parse_amount, record_end_digest, record_head_digest, unhex, unhex32, Request, Response, Signed, SpendRecord,
+	check_spend, hex, parse_amount, record_end_digest, record_head_digest, unhex, unhex32, RecordKeepers, Request, Response, Signed,
+	SpendRecord,
 	WireEntryRef, WireKeepers, WireStopProof, ALREADY_SIGNED, MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS,
 	STOPPED,
 };
@@ -82,13 +96,13 @@ struct Args {
 	/// `None` with `--create-record`, which serves nothing.
 	socket: Option<PathBuf>,
 	record: PathBuf,
-	create_record: bool,
 	/// `--compact-into` and `--drop-salts`.
 	compact: Option<(PathBuf, PathBuf)>,
 	clear_stopped: bool,
+	/// Where each of the record's keepers is reached.
 	keepers: Vec<KeeperAddr>,
-	/// How many keepers must hold a head; all of them by default.
-	keepers_required: Option<usize>,
+	/// With `--create-record`: the keepers the new record names.
+	record_keepers: Option<RecordKeepers>,
 	keeper_timeout: std::time::Duration,
 }
 
@@ -102,6 +116,8 @@ fn args() -> Result<Args, String> {
 	let mut drop_salts = None;
 	let mut clear_stopped = false;
 	let mut keepers: Vec<KeeperAddr> = vec![];
+	let mut keeper_keys: Vec<XOnlyPublicKey> = vec![];
+	let mut no_keepers = false;
 	let mut keepers_required = None;
 	let mut keeper_timeout = std::time::Duration::from_secs(5);
 	let mut it = std::env::args().skip(1);
@@ -117,6 +133,9 @@ fn args() -> Result<Args, String> {
 			"--drop-salts" => drop_salts = Some(PathBuf::from(value()?)),
 			"--clear-stopped" => clear_stopped = true,
 			"--keeper" => keepers.push(value()?.parse().map_err(|e| format!("--keeper: {}", e))?),
+			"--keeper-key" => keeper_keys.push(XOnlyPublicKey::from_slice(&unhex(&value()?).map_err(|e| format!("--keeper-key: {}", e))?)
+				.map_err(|e| format!("--keeper-key: {}", e))?),
+			"--no-keepers" => no_keepers = true,
 			"--keepers-required" => keepers_required = Some(value()?.parse::<usize>().map_err(|e| format!("--keepers-required: {}", e))?),
 			"--keeper-timeout-ms" => keeper_timeout = std::time::Duration::from_millis(value()?.parse::<u64>()
 				.map_err(|e| format!("--keeper-timeout-ms: {}", e))?),
@@ -131,11 +150,32 @@ fn args() -> Result<Args, String> {
 	if !create_record && !clear_stopped && compact.is_none() && socket.is_none() {
 		return Err("--socket is required".into());
 	}
-	match keepers_required {
-		Some(_) if keepers.is_empty() => return Err("--keepers-required needs a --keeper".into()),
-		Some(k) if k == 0 || k > keepers.len() => return Err(format!("--keepers-required {}: from 1 to the {} keepers named", k, keepers.len())),
-		_ => {},
-	}
+	// The keepers are the record's, named once, when it is made; a start
+	// says only where each is reached.
+	let record_keepers = if create_record {
+		if !keepers.is_empty() {
+			return Err("--create-record takes each keeper's key (--keeper-key <key>); where a keeper is reached is given when the \
+				signer starts (--keeper <host:port>=<key>)".into());
+		}
+		match (keeper_keys.is_empty(), no_keepers, keepers_required) {
+			(true, true, None) => Some(RecordKeepers::default()),
+			(false, false, Some(k)) => Some(RecordKeepers::new(keeper_keys, k).map_err(|e| format!("the record's keepers: {}", e))?),
+			(false, false, None) => return Err("--keeper-key needs --keepers-required <k>: how many of the keepers must hold every head \
+				(fewer than all, such as two of three, so that one keeper lost does not end the operator)".into()),
+			(_, true, _) => return Err("--no-keepers names no keeper and no number required".into()),
+			(true, false, _) => return Err("--create-record needs the record's keepers, fixed for its whole life: --keeper-key <key> \
+				for each (as arca-keeper --pubkey prints it) and --keepers-required <k>, or --no-keepers for an operator without \
+				keepers, for its own coins".into()),
+		}
+	} else {
+		if !keeper_keys.is_empty() || no_keepers {
+			return Err("--keeper-key and --no-keepers go with --create-record: the record names its keepers when it is made".into());
+		}
+		if keepers_required.is_some() {
+			return Err("--keepers-required is the record's, named when it is made (--create-record), and read from its first line".into());
+		}
+		None
+	};
 	if keepers.iter().enumerate().any(|(i, k)| keepers[..i].iter().any(|o| o.key == k.key)) {
 		return Err("--keeper: two keepers with one key".into());
 	}
@@ -144,11 +184,10 @@ fn args() -> Result<Args, String> {
 		genesis: genesis.ok_or("--genesis is required")?,
 		socket,
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
-		create_record,
 		compact,
 		clear_stopped,
 		keepers,
-		keepers_required,
+		record_keepers,
 		keeper_timeout,
 	})
 }
@@ -576,11 +615,11 @@ async fn main() {
 		},
 	};
 	let operator = key.x_only_public_key().0;
-	if args.create_record {
-		match SpendRecord::create(&args.record, &operator, &args.genesis) {
+	if let Some(keepers) = &args.record_keepers {
+		match SpendRecord::create(&args.record, &operator, &args.genesis, keepers) {
 			Ok(()) => {
-				eprintln!("arca-signer: created the record {} for S = {} on {}", args.record.display(), hex(&operator.serialize()),
-					args.genesis);
+				eprintln!("arca-signer: created the record {} for S = {} on {}, its keepers {}", args.record.display(),
+					hex(&operator.serialize()), args.genesis, keepers.describe());
 				std::process::exit(0);
 			},
 			Err(e) => {
@@ -633,16 +672,27 @@ async fn main() {
 			if let Some(note) = repaired {
 				eprintln!("arca-signer: {}", note);
 			}
-			Mutex::new(r)
+			r
 		},
 		Err(e) => {
 			eprintln!("arca-signer: the record: {}", e);
 			std::process::exit(2);
 		},
 	};
-	let keepers = (!args.keepers.is_empty()).then(|| Keepers {
-		required: args.keepers_required.unwrap_or(args.keepers.len()),
-		list: args.keepers.iter().map(|k| KeeperClient::new(k.clone(), args.keeper_timeout)).collect(),
+	// The keepers are the record's: the command line says only where each
+	// is reached, and the signer serves with all of them or not at all.
+	let named = record.keepers().clone();
+	let addrs = match reached(&named, &args.keepers) {
+		Ok(a) => a,
+		Err(e) => {
+			eprintln!("arca-signer: the record {} names its keepers ({}): {}", args.record.display(), named.describe(), e);
+			std::process::exit(2);
+		},
+	};
+	let record = Mutex::new(record);
+	let keepers = (!named.is_none()).then(|| Keepers {
+		required: named.required,
+		list: addrs.iter().map(|k| KeeperClient::new(k.clone(), args.keeper_timeout)).collect(),
 		checked: tokio::sync::Mutex::new(false),
 		acked: tokio::sync::Mutex::new(None),
 	});
@@ -653,14 +703,14 @@ async fn main() {
 		// now; with too few answers, it serves, and signs nothing the record
 		// governs until enough answer.
 		Some(k) => {
-			eprintln!("arca-signer: {} keeper(s), {} of them to hold every head: {}", k.list.len(), k.required,
+			eprintln!("arca-signer: the record's {} keeper(s), {} of them to hold every head: {}", k.list.len(), k.required,
 				k.list.iter().map(|c| format!("{} ({})", c.addr.addr, hex(&c.addr.key.serialize()))).collect::<Vec<_>>().join(", "));
 			if let Err(e) = state.check_keepers().await {
 				eprintln!("arca-signer: at start: {}", e);
 			}
 		},
-		None => eprintln!("arca-signer: no keeper: the record rests on this machine alone, and a restore of the machine can let a coin \
-			paid out of round be spent twice"),
+		None => eprintln!("arca-signer: the record names no keeper: it rests on this machine alone, and a restore of the machine can let \
+			a coin paid out of round be spent twice; this operator is for its own coins"),
 	}
 	let socket = args.socket.clone().expect("a socket when serving");
 	let _ = std::fs::remove_file(&socket);

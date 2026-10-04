@@ -76,4 +76,5 @@ arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
 elements.workspace = true
 tokio-postgres = "0.7"
 minreq = "2.14"
+rusqlite = "0.31.0"
 tokio = { workspace = true, features = [ "time" ] }

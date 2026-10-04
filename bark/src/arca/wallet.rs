@@ -429,8 +429,25 @@ impl Wallet {
 			return Err(Error::Refused(format!("the server now names operator key {}; this wallet was created with {}",
 				info["operator"], self.operator)));
 		}
-		if self.store.meta("keepers")?.is_none() && !info["keepers"].is_null() {
-			self.store.set_meta("keepers", &Self::keepers_of(&info)?.to_string())?;
+		// The keepers are part of the operator's identity, fixed in its
+		// signer's record when it is made: the wallet pins them as it pins the
+		// operator key, and an operator showing others is not the one it
+		// pinned. A wallet made before keepers existed pins them here, from
+		// the first `info` it reads; such an operator never gains any.
+		match self.store.meta("keepers")? {
+			None if !info["keepers"].is_null() => self.store.set_meta("keepers", &Self::keepers_of(&info)?.to_string())?,
+			None => {},
+			Some(pinned) => {
+				let shown = match info["keepers"].is_null() {
+					true => json!({"keys": [], "required": 0}),
+					false => Self::keepers_of(&info)?,
+				};
+				let pinned: Value = serde_json::from_str(&pinned).map_err(|e| Error::Store(format!("keepers: {}", e)))?;
+				if shown != pinned {
+					return Err(Error::Refused(format!("the server now names the keepers {}; this wallet was created with {}: the keepers \
+						are part of the operator's identity, fixed when its signer's record was made", shown, pinned)));
+				}
+			},
 		}
 		self.witness_record(&info["signer_record"], true)?;
 		Ok(info)
@@ -1434,6 +1451,9 @@ impl Wallet {
 	/// The wallet's own view: its chain, its operator, its policy, its tip.
 	pub fn info(&self) -> Result<Value, Error> {
 		let tip = self.chain.tip()?;
+		// The server's view first: a wallet made before keepers existed pins
+		// them from it, and shows what it pinned.
+		let server_info = self.server_info().map_err(|e| e.to_string()).unwrap_or_else(|e| json!({"unreachable": e}));
 		Ok(json!({
 			"datadir": self.datadir.display().to_string(),
 			"server": self.cfg.server, "node": self.cfg.node_url,
@@ -1445,7 +1465,7 @@ impl Wallet {
 			"accepted_exit_delay_units": {"min": self.cfg.min_exit_delay_units, "max": self.cfg.max_exit_delay_units},
 			"keepers": self.keepers_json()?,
 			"tip": {"height": tip.height, "hash": tip.hash.to_string(), "median_time": tip.median_time},
-			"server_info": self.server_info().map_err(|e| e.to_string()).unwrap_or_else(|e| json!({"unreachable": e})),
+			"server_info": server_info,
 		}))
 	}
 
