@@ -477,7 +477,10 @@ is good and usable now, every pair verifies, no reassignment creates more than
 its checkpoints hold, every leaf in the lineage (whoever owns it) has an exit
 delay within the policy's bounds, the coin's output is the leaf the record names
 for the receiver's key and nonce and the sender's creator nonce, no coin is
-spent twice in the record and no two share a salt, and the chain is at most
+spent by two reassignments or at two inputs of one anywhere in the record (two
+coins descending from one reassignment, such as two payments from one payer,
+both carry its spends, which one transaction brings on-chain), no two coins
+share a salt, and the chain is at most
 five reassignments from a round. A receiver passes
 `policy.receipt()`: a coin from a reassignment is safe only until the earliest
 first expiry among the batches it descends from (`expiry`), and the receipt
@@ -581,7 +584,10 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   in the record, one leaf promised by two reassignments and both spent, a coin
   paid back into the leaf it came from, an authorisation by another key or not
   yet usable, a wrong preimage, a missing round, the horizon, batch leaves of
-  another operator, six hops); the operator's rule admitting the chain's three
+  another operator, six hops); two coins of one reassignment (a payment and
+  the payer's change) spent together, accepted, with that reassignment built
+  once to bring the coin on-chain, while a coin spent by two reassignments
+  or at both inputs of one is refused; the operator's rule admitting the chain's three
   reassignments and refusing another with the same outputs, with only the first
   of them, or with one more after them, in either order, while admitting the
   same reassignment again and one whose outputs part at output 1; the receipt

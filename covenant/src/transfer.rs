@@ -85,7 +85,10 @@
 //! coin's lineage, whoever owns it, has an exit delay within the policy's
 //! bounds; the coin's output is the leaf its record names, for the receiver's
 //! key and the nonce it published, and the sender's creator nonce; no coin is
-//! spent twice anywhere in the record, and no two coins in it share a salt;
+//! spent by two reassignments, or at two inputs of one, anywhere in the
+//! record (two coins descending from one reassignment, such as two payments
+//! from one payer, each carry its spends, which one transaction brings
+//! on-chain: one spend, met twice), and no two coins in it share a salt;
 //! and the chain is no deeper than [`DEPTH_LIMIT`] reassignments. A
 //! coin from a reassignment is safe only until the earliest expiry among the
 //! batches it descends from ([`ValidCoin::expiry`]), since a sweep of any of
@@ -737,26 +740,46 @@ impl TransferPlan {
 // Validation
 // ---------------------------------------------------------------------------
 
-/// Every coin a record's lineage spends, by its id and its leaf's salt: to
-/// refuse one spent twice, and one leaf promised by two reassignments.
-struct Spent(Vec<(LeafId, [u8; 32])>);
+/// Every coin a record's lineage spends, by its id and its leaf's salt, with
+/// the spend that took it (the reassignment's hash and its checkpoints'
+/// values, [`spend_hash`]) and its input there: to refuse a coin spent twice
+/// and one leaf promised by two reassignments. A coin is met again wherever
+/// two coins of the record descend from one reassignment (two payments from
+/// one payer, a payment and its change): reached through the same input of
+/// the same spend, it is that spend seen again, which one transaction
+/// carries on the chain, and not a second one.
+struct Spent(Vec<(LeafId, [u8; 32], [u8; 32], usize)>);
 
 impl Spent {
-	fn add(&mut self, coin: &ValidCoin) -> Result<(), TransferError> {
-		if self.0.iter().any(|(id, _)| *id == coin.id) {
+	fn add(&mut self, coin: &ValidCoin, spend: &[u8; 32], input: usize) -> Result<(), TransferError> {
+		if let Some((_, _, s, i)) = self.0.iter().find(|(id, ..)| *id == coin.id) {
+			if s == spend && *i == input {
+				return Ok(());
+			}
 			return Err(TransferError::DoubleSpend(coin.id));
 		}
 		self.check_salt(coin)?;
-		self.0.push((coin.id, coin.leaf.salt));
+		self.0.push((coin.id, coin.leaf.salt, *spend, input));
 		Ok(())
 	}
 
 	fn check_salt(&self, coin: &ValidCoin) -> Result<(), TransferError> {
-		match self.0.iter().find(|(_, salt)| *salt == coin.leaf.salt) {
-			Some((first, _)) => Err(TransferError::SaltTwice { first: *first, second: coin.id }),
+		match self.0.iter().find(|(_, salt, ..)| *salt == coin.leaf.salt) {
+			Some((first, ..)) => Err(TransferError::SaltTwice { first: *first, second: coin.id }),
 			None => Ok(()),
 		}
 	}
+}
+
+/// What one spend of a reassignment's inputs is: the reassignment's hash
+/// ([`reassignment_hash`]: each input's coin and checkpoint, the outputs)
+/// and each checkpoint's value, which its pairs sign.
+fn spend_hash(inputs: &[(LeafId, [u8; 32])], values: &[u64], outputs: &[ExplicitOutput]) -> [u8; 32] {
+	let mut b = reassignment_hash(inputs, outputs).to_vec();
+	for v in values {
+		b.extend(v.to_le_bytes());
+	}
+	sha256(&b)
 }
 
 impl CoinRecord {
@@ -869,13 +892,18 @@ impl CoinRecord {
 						return Err(TransferError::DuplicateOutput);
 					}
 				}
+				// Every input resolves under the receiver's policy, so its
+				// leaf is the policy's operator's, on the policy's chain.
+				let coins = t.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
+				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().map(|c| (c.id, c.checkpoint().taproot().program())).collect();
+				let values: Vec<u64> = t.inputs.iter().map(|i| i.checkpoint_value).collect();
+				let spend = spend_hash(&parts, &values, &t.outputs);
+				for (k, coin) in coins.iter().enumerate() {
+					spent.add(coin, &spend, k)?;
+				}
 				let mut inputs = Vec::with_capacity(n);
 				let mut held: Vec<(AssetId, u64)> = vec![];
-				for (k, input) in t.inputs.iter().enumerate() {
-					// Every input resolves under the receiver's policy, so its
-					// leaf is the policy's operator's, on the policy's chain.
-					let coin = input.coin.resolve_in(rounds, policy, spent, depth + 1)?;
-					spent.add(&coin)?;
+				for (k, (input, coin)) in t.inputs.iter().zip(coins).enumerate() {
 					if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 						return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 					}
@@ -916,7 +944,6 @@ impl CoinRecord {
 				if mine.script_pubkey != leaf.script_pubkey() {
 					return Err(TransferError::LeafMismatch);
 				}
-				let parts: Vec<(LeafId, [u8; 32])> = inputs.iter().map(|i| (i.coin.id, i.checkpoint.taproot().program())).collect();
 				let id = transfer_id(&parts, &t.outputs, t.index, &leaf.program());
 				Ok(ValidCoin {
 					id, leaf, asset: mine.asset, value: mine.value, sweep: first.sweep,

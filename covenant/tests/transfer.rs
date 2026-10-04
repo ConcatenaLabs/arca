@@ -138,6 +138,101 @@ fn a_chain_three_hops_deep_is_received_and_brought_on_chain() {
 	}
 }
 
+/// Where an output `out` built earlier lands, if one of `out`'s
+/// transactions pays it.
+fn built_at(out: &[(String, UnrollTx)], o: &ExplicitOutput) -> Option<OutPoint> {
+	let o = o.txout();
+	out.iter().find_map(|(_, u)| u.tx.output.iter().position(|x| *x == o).map(|j| OutPoint::new(u.tx.txid(), j as u32)))
+}
+
+/// `bring`, building each transaction once however often the lineage
+/// reaches it: two coins of one reassignment carry its spends both.
+fn bring_once(coin: &ValidCoin, out: &mut Vec<(String, UnrollTx)>) -> OutPoint {
+	if let Some(at) = built_at(out, &coin.output()) {
+		return at;
+	}
+	match &coin.origin {
+		ValidOrigin::Transfer { inputs, index, .. } => {
+			let mut cps = vec![];
+			for (k, i) in inputs.iter().enumerate() {
+				let at = bring_once(&i.coin, out);
+				let cp = i.checkpoint_tx(at, &FeeSource::Reserve).unwrap();
+				cps.push(OutPoint::new(cp.tx.txid(), 0));
+				out.push((format!("checkpoint {} of coin {}", k, coin.id), cp));
+			}
+			let re = coin.reassignment_tx(&cps, &FeeSource::Reserve).unwrap();
+			let at = OutPoint::new(re.tx.txid(), *index as u32);
+			out.push((format!("reassignment creating coin {}", coin.id), re));
+			at
+		},
+		_ => bring(coin, out),
+	}
+}
+
+/// Two coins of one reassignment, B's and A's change from hop 1, spent
+/// together: each carries hop 1's spend of A's leaf, which is one spend met
+/// twice, and the record is good; one transaction of hop 1 brings both on
+/// the chain. A's leaf spent by two reassignments, or one coin at both
+/// inputs, is still refused.
+#[test]
+fn two_coins_of_one_reassignment_are_spent_together() {
+	let f = fx();
+	let h = &f.hops;
+	let p = &f.policy;
+	let s = &f.b.s;
+	let (b1, ch) = (h.b1_record.resolve(&f.rounds, p).unwrap(), h.a_change_record.resolve(&f.rounds, p).unwrap());
+	let e = Party::new("E, paid both", h.d.leaf.exit_delay);
+	let pay_both = |records: [&CoinRecord; 2], coins: [&ValidCoin; 2], keys: [&elements::secp256k1_zkp::Keypair; 2], to: &Party| {
+		let plan = TransferPlan {
+			inputs: coins.iter().map(|c| ((*c).clone(), c.value - MARGIN)).collect(),
+			outputs: vec![ExplicitOutput::new(coins[0].asset, coins[0].value + coins[1].value - 3 * MARGIN,
+				to.leaf.policy(xonly(s), p.chain).script_pubkey())],
+		};
+		CoinRecord::Transfer(Box::new(Transfer {
+			inputs: (0..2).map(|i| {
+				let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
+				TransferInput { coin: records[i].clone(), checkpoint_value: plan.inputs[i].1,
+					checkpoint: Pair { operator: sig(s, &cp), owner: sig(keys[i], &cp) },
+					reassignment: Pair { operator: sig(s, &re), owner: sig(keys[i], &re) } }
+			}).collect(),
+			outputs: plan.outputs.clone(), index: 0, leaf: to.leaf,
+		}))
+	};
+	let rec = pay_both([&h.b1_record, &h.a_change_record], [&b1, &ch], [&h.b1.key, &h.a_change.key], &e);
+	let coin = rec.validate(&f.rounds, p, &e.leaf.owner, &e.leaf.owner_nonce)
+		.unwrap_or_else(|err| panic!("two coins of hop 1 spent together: {} ({})", err, err.kind()));
+	assert_eq!(coin.value, b1.value + ch.value - 3 * MARGIN);
+	println!("B's coin and A's change of hop 1 spent together: coin {} of {} atoms, {} hops", coin.id, coin.value, coin.hops);
+	let mut txs = vec![];
+	bring_once(&coin, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+		f.standard.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {} (standard): {}", name, i, e));
+		println!("{:<90} {:>4} vB, verifies", name, u.tx.vsize());
+	}
+	let hop1: Vec<&String> = txs.iter().map(|(n, _)| n).filter(|n| n.contains(&format!("coin {}", b1.id)) || n.contains(&format!("coin {}", ch.id))).collect();
+	assert_eq!(txs.iter().filter(|(n, _)| n.starts_with("reassignment")).count(), 2, "hop 1's reassignment once, then E's: {:?}", hop1);
+	// The two inputs' checkpoints both spend outputs of hop 1's one reassignment.
+	let re1 = txs.iter().find(|(n, _)| n == &format!("reassignment creating coin {}", b1.id)).expect("hop 1's reassignment").1.tx.txid();
+	assert_eq!(txs.iter().filter(|(n, u)| n.starts_with("checkpoint") && u.tx.input[0].previous_output.txid == re1).count(), 2);
+
+	// Refused still: A's leaf spent by a second reassignment, paying F, and
+	// F's coin spent beside B's.
+	let a_coin = h.a_base.resolve(&f.rounds, p).unwrap();
+	let fp = Party::new("F, A's second spend", h.d.leaf.exit_delay);
+	let f_rec = pay(&h.a_base, &a_coin, &f.b.a, s, fp.leaf, p.chain);
+	let f_coin = f_rec.resolve(&f.rounds, p).unwrap();
+	let m = pay_both([&h.b1_record, &f_rec], [&b1, &f_coin], [&h.b1.key, &fp.key], &e);
+	let err = m.validate(&f.rounds, p, &e.leaf.owner, &e.leaf.owner_nonce).unwrap_err();
+	println!("{:<64} {} ({})", "A's leaf spent by two reassignments, both coins spent", err, err.kind());
+	assert!(matches!(err, TransferError::DoubleSpend(id) if id == a_coin.id), "{}", err);
+	// One coin at both inputs, reached through one spend.
+	let m = pay_both([&h.b1_record, &h.b1_record], [&b1, &b1], [&h.b1.key, &h.b1.key], &e);
+	let err = m.validate(&f.rounds, p, &e.leaf.owner, &e.leaf.owner_nonce).unwrap_err();
+	println!("{:<64} {} ({})", "B's coin at both inputs", err, err.kind());
+	assert!(matches!(err, TransferError::DoubleSpend(id) if id == b1.id), "{}", err);
+}
+
 fn transfer(r: &CoinRecord) -> &Transfer {
 	match r {
 		CoinRecord::Transfer(t) => t,

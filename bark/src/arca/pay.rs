@@ -282,6 +282,8 @@ impl Wallet {
 		let candidates = self.spendable(asset)?;
 		let total_live: u64 = candidates.iter().map(|c| c.coin.value).sum();
 		let mut chosen: Vec<In> = vec![];
+		// The reassignment's margin with every coin chosen so far.
+		let mut margin = 0;
 		for c in candidates {
 			let m = self.checkpoint_margin(&c.coin, &margins)?;
 			chosen.push(In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), ..c });
@@ -296,7 +298,7 @@ impl Wallet {
 			for _ in 0..other_inputs {
 				all.push(&chosen[0].coin);
 			}
-			let margin = if pays_margin { self.reassignment_margin(&all, &outs, &margins)? } else { 0 };
+			margin = if pays_margin { self.reassignment_margin(&all, &outs, &margins)? } else { 0 };
 			if kept >= paid + margin {
 				let change = kept - paid - margin;
 				if change > 0 && change < min_leaf {
@@ -310,12 +312,12 @@ impl Wallet {
 			}
 		}
 		let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
-		if kept >= paid {
+		if kept >= paid + margin {
 			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
 				pay a little less, or that much more", asset, min_leaf)));
 		}
 		Err(Error::Refused(format!("the wallet holds {} of asset {} in live coins, and paying {} takes {} with the margins its \
-			transactions leave for their fees", total_live, asset, paid, paid + (total_live.saturating_sub(kept)))))
+			transactions leave for their fees", total_live, asset, paid, paid + total_live.saturating_sub(kept) + margin)))
 	}
 
 	/// Pays `value` of `asset` to the receive request `request`, out of round:

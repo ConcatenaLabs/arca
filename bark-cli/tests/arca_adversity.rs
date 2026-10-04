@@ -1284,6 +1284,82 @@ async fn a_swap_shows_the_dates_it_gives_and_is_refused_near_the_exit_deadline()
 	}
 }
 
+/// Two payments from one payer share its first transfer: A pays B twice,
+/// the second payment out of the first's change, so both of B's coins
+/// descend from A's first transfer. B pays C the sum of both, less the
+/// margins, in one transfer, which the server co-signs and C accepts. C
+/// then exits the coin: the exit builds A's first transfer once, and C
+/// claims the coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_payments_from_one_payer_are_paid_on_together_and_exited() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b, c) = (Arca::new("SHA"), Arca::new("SHB"), Arca::new("SHC"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	c.ok(&create_args(&url, &r.node_url()));
+	for v in ["300000", "100000"] {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		let sent = a.ok(&["send", &req, "--amount", v, "--asset", &x.to_string()]);
+		println!("SH A pays B {} from {:?}", v, sent["inputs"]);
+		assert_eq!(b.ok(&["mailbox"])["accepted"].as_array().unwrap().len(), 1);
+	}
+	let held: Vec<Value> = b.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live").cloned().collect();
+	assert_eq!(held.len(), 2, "B holds the two payments");
+	let total: u64 = held.iter().map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	assert_eq!(total, 400_000);
+
+	// The most B can pay out of both: the sum less the margins, which the
+	// wallet's refusal of the whole sum names.
+	let req = c.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let msg = b.refused(&["send", &req, "--amount", "400000", "--asset", &x.to_string()], " takes ");
+	let takes: u64 = msg.split(" takes ").nth(1).and_then(|t| t.split(' ').next()).and_then(|t| t.parse().ok()).expect("what paying takes");
+	let most = total - (takes - total);
+	b.refused(&["send", &req, "--amount", &(most + 1).to_string(), "--asset", &x.to_string()], &format!("takes {} ", total + 1));
+	let sent = b.ok(&["send", &req, "--amount", &most.to_string(), "--asset", &x.to_string()]);
+	println!("SH B pays C out of both coins: {}", sent);
+	let mut inputs: Vec<&str> = sent["inputs"].as_array().unwrap().iter().map(|i| i.as_str().unwrap()).collect();
+	let mut ids: Vec<&str> = held.iter().map(|c| c["leaf_id"].as_str().unwrap()).collect();
+	inputs.sort();
+	ids.sort();
+	assert_eq!(inputs, ids, "both of B's coins in one transfer");
+	assert!(sent["change"].is_null(), "the sum of both, less the margins: {}", sent);
+	let got = c.ok(&["mailbox"])["accepted"][0].clone();
+	let leaf = got["leaf_id"].as_str().expect("C accepts the coin").to_string();
+	assert_eq!(got["value"].as_str(), sent["sent"]["value"].as_str());
+	// The coin's record reaches A's first transfer through both inputs.
+	let CoinRecord::Transfer(t) = record_of(&c, &leaf) else { panic!("a transfer") };
+	let first = |r: &CoinRecord| -> Option<Vec<arca_covenant::ExplicitOutput>> {
+		let mut r = r;
+		let mut last = None;
+		while let CoinRecord::Transfer(t) = r {
+			last = Some(t.outputs.clone());
+			r = &t.inputs[0].coin;
+		}
+		last
+	};
+	assert_eq!(first(&t.inputs[0].coin), first(&t.inputs[1].coin), "both inputs descend from A's first transfer");
+
+	// C exits the coin: A's first transfer is built once.
+	let s = script(&c.ok(&["address"]));
+	r.pay_to(s, x, 2_000_000);
+	r.produce().await;
+	let e = c.ok(&["exit", &leaf, "--fee-asset", &x.to_string()]);
+	println!("SH C's exit: {}", e);
+	assert!(e["error"].is_null(), "every step of the exit is taken: {}", e);
+	let txids: Vec<&str> = e["broadcast"].as_array().map(|b| b.iter().map(|s| s["txid"].as_str().unwrap()).collect()).unwrap_or_default();
+	let mut unique = txids.clone();
+	unique.sort();
+	unique.dedup();
+	assert_eq!(unique.len(), txids.len(), "no step built twice: {:?}", txids);
+	let claim = exit_and_claim(&r, &c, &leaf, Some(&x.to_string())).await;
+	println!("SH C's claim: {} ({} vB)", claim.txid(), claim.vsize());
+	for w in [&a, &b, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// A taker accepts an offer and cancels: the wallet spends the coin it
 /// signed into the acceptance to a fresh leaf of its own, so the maker's
 /// completion is refused. That leaf rests on a reassignment the operator

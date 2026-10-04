@@ -353,6 +353,10 @@ and holding it there, with the reason shown:
 - a tree whose reserves are one atom in an asset the wallet's node accepts for
   fees, refused before any forfeit, and the same tree accepted where the node
   does not accept the asset, the fee coin its exit needs stated;
+- two payments from one payer, both resting on the payer's first transfer,
+  paid on together for their whole value less the margins, which the
+  wallet's refusal of the whole sum names; the receiver accepts the coin and
+  exits it, its exit building that first transfer once;
 - an acceptance of a swap cancelled, after which the maker's completion is
   refused;
 - a swap of fresh coins taken with the dates of the coins it gives shown,
