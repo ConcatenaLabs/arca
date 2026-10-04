@@ -10,16 +10,20 @@
 //!
 //! The key file holds the keeper's own 32-byte secret key as 64 hex
 //! characters, and must not be readable by anyone but its owner, and is
-//! backed up as the operator key is: the signer's record names the keeper's
-//! key for good, so a keeper whose key is lost cannot be replaced. `--pubkey`
+//! backed up as the operator key is, for a key file lost while its heads
+//! file survives: the signer's record names the keeper's key for good, so a
+//! keeper whose key is lost cannot be replaced. A keeper whose heads file is
+//! lost, or would come back from an older copy, no longer holds what it
+//! acknowledged: it is a lost keeper, never started again under its key, on
+//! a new heads file or an old one. `--pubkey`
 //! prints the key's public half, which the operator names when it makes the
 //! signer's record (`arca-signer --create-record --keeper-key <key>`), and
 //! again, with where the keeper listens, when it starts the signer
 //! (`arca-signer --keeper <host:port>=<key>`). The
 //! operator key `S` is the signer's public key, as `info` shows it; the
 //! genesis hash is in display order. `--create` makes a new, empty heads
-//! file, once, and exits: a heads file is never made in passing, so one that
-//! is lost is not silently replaced. The keeper locks its file while it
+//! file, once, for a new keeper, and exits: a heads file is never made in
+//! passing, so one that is lost is not silently replaced. The keeper locks its file while it
 //! runs and syncs every head it takes before it answers.
 //!
 //! A keeper is reached from the signer alone: it admits a connection only
@@ -245,7 +249,8 @@ async fn main() {
 	if a.create {
 		match HeadsFile::create(&path, &operator, &genesis) {
 			Ok(()) => {
-				eprintln!("arca-keeper: created the heads file {} for S = {} on {}", path.display(), hex(&operator.serialize()), genesis);
+				eprintln!("arca-keeper: created the heads file {} for S = {} on {}: for a new keeper only; a keeper whose heads file was \
+					lost is a lost keeper, never started again under its key", path.display(), hex(&operator.serialize()), genesis);
 				return;
 			},
 			Err(e) => fail(e),

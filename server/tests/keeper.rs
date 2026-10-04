@@ -5,7 +5,9 @@
 //! start by a keeper's head, and one restored with its memory by the latest
 //! head a keeper's acknowledgement names, whether its first hand-overs were
 //! missed or its requests came at once; a keeper that lies is no keeper; a keeper
-//! restored from an older copy catches up; with one of two keepers required,
+//! restored from an older copy, or started again empty, is a lost keeper and
+//! no answer, while keepers that never held a head answer until one is
+//! acknowledged; with one of two keepers required,
 //! one down holds nothing up, but a start needs both; and what a keeper adds
 //! to a co-signature, on this machine and at 50 ms each way.
 
@@ -359,46 +361,186 @@ async fn a_keeper_that_lies_is_no_keeper() {
 	let _ = std::fs::remove_dir_all(&t.dir);
 }
 
-/// D52.1. A keeper restored from an older copy of its heads file, while the
-/// signer's record was not restored: its latest (entry 2) is a head the
-/// record still holds, so it proves nothing and stops nothing, at a start or
-/// in a hand-over. It takes the record's latest head, past its own, and is
-/// whole again: the record never went back, and it is the record, not the
-/// keeper, that refuses a second spend; the keeper only lost, for a moment,
-/// heads the record still holds.
+/// R7g F3. A keeper whose heads file is restored from an older copy, or made
+/// again empty under its key, while the signer runs, is a lost keeper: it no
+/// longer holds what it acknowledged, so it is no longer part of what makes a
+/// head held outside the signer's machine. The signer saw it hold entry 4;
+/// when it names a latest below that (entry 2), or none, the signer counts it
+/// no more while it runs and says why, and with it the record's only keeper,
+/// signs nothing. Nothing stops: the record is whole. The keeper still takes
+/// the heads it is handed.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_keeper_restored_from_an_older_copy_catches_up() {
-	let k = keypair("keeper one");
-	let t = setup(&[&k], 1);
-	let mut keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
-	let args = keepers_args(&[keeper.arg()]);
-	let signer = Signer::start(&t.dir, "first", t.genesis, &args);
-	let mut copy = vec![];
-	for i in 1..=4u8 {
-		assert!(raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [i; 32], t.asset)).await["signature"].is_string());
-		if i == 2 {
-			copy = std::fs::read(keeper.heads()).unwrap();
+async fn a_keeper_restored_from_an_older_copy_or_emptied_is_a_lost_keeper() {
+	for emptied in [false, true] {
+		let k = keypair("keeper one");
+		let t = setup(&[&k], 1);
+		let mut keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
+		let args = keepers_args(&[keeper.arg()]);
+		let signer = Signer::start(&t.dir, "first", t.genesis, &args);
+		let mut copy = vec![];
+		for i in 1..=4u8 {
+			assert!(raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [i; 32], t.asset)).await["signature"].is_string());
+			if i == 2 {
+				copy = std::fs::read(keeper.heads()).unwrap();
+			}
 		}
+		keeper.halt();
+		if emptied {
+			std::fs::remove_file(keeper.heads()).unwrap();
+			let made = Command::new(env!("CARGO_BIN_EXE_arca-keeper"))
+				.args(["--key-file", keeper.dir.join("keeper.key").to_str().unwrap(), "--operator", &hex(&xonly(&t.s).serialize()),
+					"--genesis", &t.genesis.to_string(), "--heads", keeper.heads().to_str().unwrap(), "--create"]).output().unwrap();
+			assert!(made.status.success());
+		} else {
+			std::fs::write(keeper.heads(), &copy).unwrap();
+		}
+		keeper.resume();
+		let what = if emptied { "made again empty" } else { "restored from its copy at entry 2" };
+		println!("the keeper's heads file {}: it holds {:?}", what, keeper.held());
+		for salt in [5u8, 6] {
+			let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [salt; 32], t.asset)).await;
+			println!("a rebind after it ({}): signed {} | {} | {}", what, v["signature"].is_string(), v["code"],
+				v["error"].as_str().unwrap_or(""));
+			assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+			assert!(v["signature"].is_null());
+			let e = v["error"].as_str().unwrap();
+			assert!(e.contains("0 of the 1 keepers acknowledged") && e.contains("a lost keeper"), "{}", e);
+			assert!(e.contains(if emptied { "holds no head" } else { "entry 2, below entry" }), "{}", e);
+		}
+		assert!(!signer.stopped(), "the record is whole: nothing stops");
+		assert!(signer.log().contains("a lost keeper"), "{}", signer.log());
+		println!("the keeper took the heads all the same: {:?}", keeper.held());
+		drop(signer);
+		let _ = std::fs::remove_dir_all(&t.dir);
 	}
-	keeper.halt();
-	std::fs::write(keeper.heads(), &copy).unwrap();
-	keeper.resume();
-	println!("the keeper restored from its copy holds {:?}", keeper.held());
-	assert_eq!(keeper.held().1, Some(2));
-	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [5; 32], t.asset)).await;
-	println!("the next rebind: entry {} acks {:?} | the keeper now holds {:?}", v["entry"]["entry"], v["acks"].as_array().map(|a| a.len()),
-		keeper.held());
-	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]));
-	assert_eq!(keeper.held().1, Some(5), "the keeper took the record's latest, past its own");
+}
+
+/// R7g F3, KB turned around. Two of three keepers. Entry 1 is held by all
+/// three; a copy of the record is taken; keeper 2 is down while entries 2
+/// and 3 are signed (keepers 0 and 1 hold 3). Then the signer's machine is
+/// restored from the copy, keeper 0's heads file is made again empty under
+/// its key (its machine lost, its key kept), keeper 1 is unreachable and
+/// keeper 2 is back at entry 1. A keeper that holds nothing, once a head of
+/// the record has been acknowledged, has not answered: the start check has
+/// one answer of the two it needs, the restored signer signs nothing, and
+/// the second spend of entry 2's leaf is refused. Once keeper 1 answers, its
+/// entry 3, past the record's end, stops the signer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_started_empty_under_its_key_is_no_answer() {
+	let (k0, k1, k2) = (keypair("keeper zero"), keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k0, &k1, &k2], 2);
+	let mut keeper0 = KeeperProcess::start(&k0, xonly(&t.s), t.genesis);
+	let mut keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let mut keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let args = keepers_args(&[keeper0.arg(), keeper1.arg(), keeper2.arg()]);
+	let record = t.dir.join("signer.record");
+	let signer = Signer::start(&t.dir, "first", t.genesis, &args);
+	let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [1; 32], t.asset, 9_000)).await;
+	assert!(acked_by(&v, &t.s, t.genesis, &[&k0, &k1, &k2]), "{}", v);
+	let snapshot = std::fs::read(&record).unwrap();
+	keeper2.halt();
+	for i in 2..=3u8 {
+		let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k0, &k1]), "{}", v);
+	}
 	drop(signer);
-	// And a signer started while the keeper is still behind is not stopped.
-	keeper.halt();
-	std::fs::write(keeper.heads(), &copy).unwrap();
-	keeper.resume();
+	println!("before: keeper 0 holds {:?}, keeper 1 {:?}, keeper 2 {:?}", keeper0.held(), keeper1.held(), keeper2.held());
+	// The restore, with whatever beside the record the copy holds.
+	std::fs::write(&record, &snapshot).unwrap();
+	keeper0.halt();
+	std::fs::remove_file(keeper0.heads()).unwrap();
+	let made = Command::new(env!("CARGO_BIN_EXE_arca-keeper"))
+		.args(["--key-file", keeper0.dir.join("keeper.key").to_str().unwrap(), "--operator", &hex(&xonly(&t.s).serialize()),
+			"--genesis", &t.genesis.to_string(), "--heads", keeper0.heads().to_str().unwrap(), "--create"]).output().unwrap();
+	assert!(made.status.success());
+	keeper0.resume();
+	keeper1.halt();
+	keeper2.resume();
+	println!("at the restore: keeper 0 holds {:?} (made again empty), keeper 1 down, keeper 2 holds {:?}", keeper0.held(), keeper2.held());
+	let signer = Signer::start(&t.dir, "restored", t.genesis, &args);
+	let start = signer.log().lines().filter(|l| l.contains("at start")).collect::<Vec<_>>().join(" / ");
+	println!("the restored signer at start: {}", start);
+	assert!(!signer.log().contains("the keepers agree with the record"), "{}", signer.log());
+	assert!(start.contains("1 of the 3 keepers answered") && start.contains("holds no head") && start.contains("a lost keeper"), "{}", start);
+	for salt in [2u8, 9] {
+		let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [salt; 32], t.asset, 8_000)).await;
+		println!("a rebind under salt {} on the restored record: signed {} | {} | {}", salt, v["signature"].is_string(), v["code"],
+			v["error"].as_str().unwrap_or(""));
+		assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+		assert!(v["signature"].is_null());
+	}
+	assert_eq!(keeper0.held().1, None, "nothing was handed to the keeper made again empty");
+	keeper1.resume();
+	let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [2; 32], t.asset, 8_000)).await;
+	println!("with keeper 1 back: signed {} | {} | stopped {}", v["signature"].is_string(), v["code"], signer.stopped());
+	assert_eq!(v["code"], "stopped", "{}", v);
+	assert!(signer.stopped());
+	drop(signer);
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// R7g F3, the other side. Before any head of the record has been
+/// acknowledged by as many keepers as it requires, a keeper's "no head" is
+/// an answer: the keepers of a new operator have never held one. Two of
+/// three keepers: the first request is recorded while two keepers are down
+/// (keeper 0 alone takes the head, which is not enough), and the signer is
+/// started again with every keeper up. Keepers 1 and 2 hold nothing and
+/// count, the start check passes and the same request completes. Once a
+/// head has been acknowledged, a keeper with no head no longer counts at a
+/// start: the record says so beside it (`<record>.acknowledged`), and the
+/// next start with keeper 2 emptied needs keepers 0 and 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn keepers_that_never_held_a_head_answer_until_one_is_acknowledged() {
+	let (k0, k1, k2) = (keypair("keeper zero"), keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k0, &k1, &k2], 2);
+	let keeper0 = KeeperProcess::start(&k0, xonly(&t.s), t.genesis);
+	let mut keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let mut keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let args = keepers_args(&[keeper0.arg(), keeper1.arg(), keeper2.arg()]);
+	let marker = server::signer::acknowledged_path(&t.dir.join("signer.record"));
+	let signer = Signer::start(&t.dir, "new", t.genesis, &args);
+	keeper1.halt();
+	keeper2.halt();
+	let line = rebind_into(&t.owner, t.genesis, [1; 32], t.asset, 9_000);
+	let v = raw(&signer.socket, &line).await;
+	println!("the first request, keepers 1 and 2 down: {} | {}", v["code"], v["error"]);
+	assert_eq!(v["code"], "keepers_unavailable");
+	assert_eq!(keeper0.held().1, Some(1));
+	assert!(!marker.exists(), "no head acknowledged yet");
+	drop(signer);
+	keeper1.resume();
+	keeper2.resume();
 	let signer = Signer::start(&t.dir, "again", t.genesis, &args);
-	assert!(!signer.stopped(), "{}", signer.log());
+	println!("started again: {}", signer.log().lines().filter(|l| l.contains("keepers agree") || l.contains("at start")).collect::<Vec<_>>()
+		.join(" / "));
 	assert!(signer.log().contains("the keepers agree with the record"), "{}", signer.log());
-	assert!(raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [6; 32], t.asset)).await["signature"].is_string());
+	let v = raw(&signer.socket, &line).await;
+	println!("the same request: signed {} | entry {} | acked by all three {}", v["signature"].is_string(), v["entry"]["entry"],
+		acked_by(&v, &t.s, t.genesis, &[&k0, &k1, &k2]));
+	assert!(v["signature"].is_string() && v["entry"]["entry"] == 1 && acked_by(&v, &t.s, t.genesis, &[&k0, &k1, &k2]), "{}", v);
+	let said = std::fs::read_to_string(&marker).unwrap_or_default();
+	println!("beside the record: {}", said.trim());
+	assert!(said.starts_with("entry 1 "), "{}", said);
+	drop(signer);
+	// Keeper 2 made again empty: no answer now. With keeper 1 down too, the
+	// start waits; with keeper 1 back, keepers 0 and 1 are enough.
+	keeper2.halt();
+	std::fs::remove_file(keeper2.heads()).unwrap();
+	let made = Command::new(env!("CARGO_BIN_EXE_arca-keeper"))
+		.args(["--key-file", keeper2.dir.join("keeper.key").to_str().unwrap(), "--operator", &hex(&xonly(&t.s).serialize()),
+			"--genesis", &t.genesis.to_string(), "--heads", keeper2.heads().to_str().unwrap(), "--create"]).output().unwrap();
+	assert!(made.status.success());
+	keeper2.resume();
+	keeper1.halt();
+	let signer = Signer::start(&t.dir, "emptied", t.genesis, &args);
+	let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [2; 32], t.asset, 9_000)).await;
+	println!("keeper 2 emptied, keeper 1 down: {} | {}", v["code"], v["error"]);
+	assert_eq!(v["code"], "keepers_unavailable");
+	assert!(v["error"].as_str().unwrap().contains("1 of the 3 keepers answered"), "{}", v);
+	keeper1.resume();
+	let v = raw(&signer.socket, &rebind_into(&t.owner, t.genesis, [2; 32], t.asset, 9_000)).await;
+	println!("keeper 1 back: signed {} | acked by keepers 0 and 1 {}", v["signature"].is_string(), acked_by(&v, &t.s, t.genesis, &[&k0, &k1]));
+	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k0, &k1]) && !acked_by(&v, &t.s, t.genesis, &[&k2]), "{}", v);
 	drop(signer);
 	let _ = std::fs::remove_dir_all(&t.dir);
 }
@@ -564,6 +706,9 @@ async fn the_record_names_its_keepers_and_the_signer_serves_only_with_them() {
 	let text = std::fs::read_to_string(&compacted).unwrap();
 	let header = text.lines().next().unwrap().to_string();
 	println!("the compacted record's first line: {}", header);
+	// What the keepers acknowledged goes over with it.
+	let said = std::fs::read_to_string(server::signer::acknowledged_path(&compacted)).unwrap();
+	assert_eq!(said, std::fs::read_to_string(server::signer::acknowledged_path(&record)).unwrap());
 	assert!(header.starts_with(&format!("arca-signer-record 4 {} {} keepers=2:{},{} 3 ", hex(&xonly(&t.s).serialize()), t.genesis, h1, h2)),
 		"{}", header);
 	std::fs::write(&record, text.replacen(&format!("keepers=2:{},{}", h1, h2), &format!("keepers=1:{}", h1), 1)).unwrap();
