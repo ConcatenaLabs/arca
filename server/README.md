@@ -460,7 +460,13 @@ restored one runs again as after any lost round. A participation a coin of
 which was taken back on the chain while the round was out (its forfeit for
 the round refunded) is not brought back: its leaves of the round are never
 credited (`expired`), and the operator sweeps them with their batch. A coin
-resting on a round is as final as that round.
+resting on a round is as final as that round: while the round is lost, every
+coin a transfer made out of one of its leaves, at any depth, is lost too, and
+it is the holder's again once the round is restored, unless it rests on
+another round or a board still lost. A
+re-run whose leaf of the lost round was spent before the round was lost (paid
+on out of round, or given up in another participation) is not run again, its
+status saying so: a second leaf would leave its owner what it spent.
 
 A coin with a forfeit for an earlier round in the watcher's log, or whose
 output the server has seen spent, is never taken into a re-run: such a

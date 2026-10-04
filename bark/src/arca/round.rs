@@ -907,7 +907,9 @@ impl Wallet {
 	/// the wallet took on the chain itself is not followed: its leaves are
 	/// the operator's, who sweeps them with their batch. Run by the re-check,
 	/// so the wallet holds one leaf for each coin it gave up, whichever round
-	/// stands. Returns what changed.
+	/// stands. A coin paid to the wallet out of a leaf of a round that went
+	/// out of the chain, lost with it, is the wallet's again once every round
+	/// and board it rests on is final again. Returns what changed.
 	pub(crate) fn follow_standing_rounds(&mut self) -> Result<Vec<Value>, Error> {
 		let mut changes = vec![];
 		let coins = self.store.coins()?;
@@ -1025,6 +1027,25 @@ impl Wallet {
 					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lost", "why": why}));
 				}
 			}
+		}
+		// A coin paid out of a leaf of a round that went out of the chain is
+		// lost with it; once every round and board it rests on is final in the
+		// chain again and its checks pass, it is the wallet's again.
+		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		for c in self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "transfer") {
+			let record = Self::record_of(&c)?;
+			let Ok(bases) = self.accepted_bases(&record) else { continue };
+			let Ok(valid) = record.resolve(&bases, &policy) else { continue };
+			let mut fin = true;
+			for t in &bases {
+				fin &= self.chain.finality(&t.txid())?.is_final();
+			}
+			if !fin || valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).is_err() {
+				continue;
+			}
+			let why = "every round and board it rests on is final in the chain again".to_string();
+			self.store.set_coin_state(&c.leaf_id, "live", &why)?;
+			changes.push(json!({"leaf_id": c.leaf_id, "from": "lost", "to": "live", "why": why}));
 		}
 		Ok(changes)
 	}
