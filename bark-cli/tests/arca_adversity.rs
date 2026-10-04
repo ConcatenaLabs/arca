@@ -204,6 +204,20 @@ fn operator_signs_input(r: &Running, tx: &mut Transaction, i: usize) {
 	}
 }
 
+/// A transaction of the operator's that takes the first input of `round`
+/// and pays it back to the operator's `back`, less a fee: the round's
+/// participations run again in a round that spends this output, which keeps
+/// the two apart. Not signed.
+fn taking(r: &Running, round: &Transaction, back: Script) -> Transaction {
+	let op = round.input[0].previous_output;
+	let prev = r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone();
+	let (a, v) = (prev.asset.explicit().unwrap(), prev.value.explicit().unwrap());
+	Transaction { version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: op, ..Default::default() }],
+		output: vec![sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(a, v - 5_000), back),
+			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(a, 5_000))] }
+}
+
 /// The operator rolls back a final round and confirms in its place a
 /// transaction that pays the same batch output and issues the sweep token
 /// twice, one atom at `R` (what check 1 answers). The wallet's re-check
@@ -506,11 +520,12 @@ async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_
 	}
 }
 
-/// A round that can never return, and the participations it ran (D50). The
-/// wallet refreshes two boards and a leaf of an earlier round in round R; the
-/// operator's watcher publishes both boards' forfeits for R, as it does for
-/// every board given up in a final round. Then R can never return (one of
-/// its inputs is spent elsewhere, final, and the node forgets its mempool),
+/// A lost round, and the participations it ran (D50). The wallet refreshes
+/// two boards and a leaf of an earlier round in round R; the operator's
+/// watcher publishes both boards' forfeits for R, as it does for every board
+/// given up in a final round. Then R is lost (one of its inputs is spent by
+/// a transaction of the operator's, final, paying the operator back, and the
+/// node forgets its mempool),
 /// and one board's forfeit is sent again by someone who saw it. The new
 /// leaves of R are lost, and the wallet follows each participation as the
 /// operator runs it again: the leaf's re-run is taken in round Y, the wallet
@@ -562,26 +577,21 @@ async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	let second = forfeits[1].clone().expect("the watcher publishes the second board's forfeit");
 	println!("D50c the operator's forfeits for R: {} and {}", first.txid(), second.txid());
 
-	// R can never return: rolled back, the mempool emptied, one of its
-	// inputs spent by another transaction, buried; someone who saw the
-	// first board's forfeit sends it again.
+	// R is lost: rolled back, the mempool emptied, one of its inputs spent
+	// by another transaction, which pays the operator back, buried; someone
+	// who saw the first board's forfeit sends it again.
+	let back = r.server.wallet.receive_script().await.unwrap();
 	r.server.stop();
 	let block = block_of(&r, &r1.txid().to_string());
 	rpc(&r, "invalidateblock", &[json!(block)]);
 	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
-	let op = r1.input[0].previous_output;
-	let prev = r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone();
-	let (a, v) = (prev.asset.explicit().unwrap(), prev.value.explicit().unwrap());
-	let mut conflict = Transaction { version: 2, lock_time: elements::LockTime::ZERO,
-		input: vec![elements::TxIn { previous_output: op, ..Default::default() }],
-		output: vec![sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(a, v - 5_000), common::node::op_true()),
-			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(a, 5_000))] };
+	let mut conflict = taking(&r, &r1, back);
 	operator_signs(&r, &mut conflict);
 	let cid = r.rt.client().send_raw_transaction(&conflict).expect("the conflict relays");
 	let fid = r.rt.client().send_raw_transaction(&first).expect("the forfeit relays without its round");
 	r.produce().await;
 	r.bury().await;
-	println!("D50c conflict {} confirmed: round {} can never return; the first board's forfeit {} confirmed", cid, r1.txid(), fid);
+	println!("D50c conflict {} confirmed: round {} is lost; the first board's forfeit {} confirmed", cid, r1.txid(), fid);
 	r.restart_server().await;
 	r.synced().await;
 	r.round_state(&r1.txid(), RoundState::Lost).await;
@@ -643,6 +653,112 @@ async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	assert_eq!(f["state"], "refunded", "{}", f);
 	assert_eq!(coin_of(&c, &boards[1])["state"], "exited");
 	let _ = (second, std::fs::remove_dir_all(&c.dir));
+}
+
+/// A parent block of its own, and the Sequentia tip anchored to it: what is
+/// mined next is anchored there, so orphaning it takes that out. Returns its
+/// height.
+async fn own_anchor(r: &Running) -> u64 {
+	tokio::task::block_in_place(|| {
+		r.rt.mine_parent(1).unwrap();
+		r.rt.anchor_to_parent_tip().unwrap();
+	});
+	r.rt.parent.client().block_count().unwrap()
+}
+
+/// A lost round that returns, with the wallet following. A leaf of the
+/// wallet's is refreshed in round R, which goes out of the chain with its
+/// parent block while another transaction X of the operator's takes R's
+/// input (paying the operator back), buried. The operator runs the
+/// participation again in Y, which spends X's output; the wallet takes Y's
+/// leaf. Then the parent chain takes X out and R, sent by anyone who holds
+/// it, confirms in its place: Y never can. The wallet follows R: its leaf of
+/// R is live again and its leaf of Y lost, so it holds one leaf for the coin
+/// it gave up, as it did at every step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rerun() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let c = Arca::new("D53w");
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	c.ok(&["participate", "--leaf", &boards[0]]);
+	final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let leaf0 = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	let held = |c: &Arca| -> Vec<(String, String, String)> {
+		c.ok(&["coins"]).as_array().unwrap().iter().filter(|k| matches!(k["state"].as_str(), Some("live" | "pending")))
+			.map(|k| (k["leaf_id"].as_str().unwrap().to_string(), k["state"].as_str().unwrap().to_string(), k["value"].as_str().unwrap().to_string()))
+			.collect()
+	};
+
+	// Round R, alone in a parent block of its own; the wallet takes its leaf.
+	let pid = c.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let p_r = own_anchor(&r).await;
+	let rtx = final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let of = |s: &Value| s["participations"].as_array().unwrap().iter().find(|p| p["participation"] == pid.as_str()).cloned()
+		.unwrap_or(Value::Null);
+	let leaf_r = of(&s)["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	println!("D53w R = {}; the wallet holds {:?}", rtx.txid(), held(&c));
+	assert_eq!(held(&c).len(), 1);
+
+	// R goes out with its parent block; X takes its input, paying the
+	// operator back; buried.
+	let back = r.server.wallet.receive_script().await.unwrap();
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	assert!(confirmations(&r, &rtx.txid()) < 1);
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let p_x = own_anchor(&r).await;
+	let mut xtx = taking(&r, &rtx, back);
+	operator_signs(&r, &mut xtx);
+	r.rt.client().send_raw_transaction(&xtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Lost).await;
+	let s = c.ok(&["sync"]);
+	println!("D53w after R is lost: the participation {}; the wallet holds {:?}", of(&s), held(&c));
+	assert_eq!(coin_of(&c, &leaf_r)["state"], "lost");
+	assert_eq!(of(&s)["state"], "pending", "{}", s["participations"]);
+
+	// Y runs it again, spending X's output; the wallet takes Y's leaf.
+	let ytx = final_round(&r).await;
+	assert!(ytx.input.iter().any(|i| i.previous_output == elements::OutPoint::new(xtx.txid(), 0)), "Y spends X's output");
+	let s = c.ok(&["sync"]);
+	let leaf_y = of(&s)["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	println!("D53w Y = {}; the wallet holds {:?}", ytx.txid(), held(&c));
+	assert_eq!(held(&c), vec![(leaf_y.clone(), "live".to_string(), coin_of(&c, &leaf_y)["value"].as_str().unwrap().to_string())]);
+
+	// The parent chain takes X out; R confirms in its place.
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_x)).unwrap();
+	assert!(confirmations(&r, &xtx.txid()) < 1 && confirmations(&r, &ytx.txid()) < 1);
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	r.rt.client().send_raw_transaction(&rtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Final).await;
+	let y_verdict = r.rt.client().test_mempool_accept(&[&ytx]).unwrap().remove(0);
+	println!("D53w R back in the chain; the node's verdict on Y: {:?}", y_verdict.reject_reason);
+	assert!(!y_verdict.allowed);
+
+	// The wallet follows R: one leaf for the coin it gave up.
+	let s = c.ok(&["sync"]);
+	println!("D53w the wallet's sync: recheck {}", s["recheck"]["changes"]);
+	println!("D53w the wallet holds {:?}", held(&c));
+	assert_eq!(coin_of(&c, &leaf_r)["state"], "live", "{}", coin_of(&c, &leaf_r));
+	assert_eq!(coin_of(&c, &leaf_y)["state"], "lost", "{}", coin_of(&c, &leaf_y));
+	assert_eq!(held(&c).len(), 1);
+	let bal = c.ok(&["balance"]);
+	println!("D53w balance {}", bal);
+	assert_eq!(bal["arca"][x.to_string()]["live"], coin_of(&c, &leaf_r)["value"]);
+	assert!(bal["arca"][x.to_string()].get("pending").is_none());
+	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
 // ---------------------------------------------------------------------------

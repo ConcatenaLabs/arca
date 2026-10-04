@@ -75,6 +75,20 @@ impl Store {
 		rows.iter().map(coin).collect()
 	}
 
+	/// The wallet's coin at `txid:vout`, spent or not, if it is one.
+	pub async fn wallet_coin_at(&self, txid: &[u8; 32], vout: u32) -> Result<Option<WalletCoin>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(&format!("{} WHERE c.txid = $1 AND c.vout = $2", COIN_QUERY), &[&&txid[..], &(vout as i32)]).await?;
+		r.as_ref().map(coin).transpose()
+	}
+
+	/// The wallet's coins that `txid` pays, spent or not.
+	pub async fn wallet_coins_of_tx(&self, txid: &[u8; 32]) -> Result<Vec<WalletCoin>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("{} WHERE c.txid = $1 ORDER BY c.vout", COIN_QUERY), &[&&txid[..]]).await?;
+		rows.iter().map(coin).collect()
+	}
+
 	/// Marks `coins` spent by `txid`, all or none: a coin another
 	/// transaction already took is refused.
 	pub async fn spend_wallet_coins(&self, coins: &[([u8; 32], u32)], txid: &[u8; 32]) -> Result<bool, StoreError> {

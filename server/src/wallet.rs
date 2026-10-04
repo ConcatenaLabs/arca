@@ -244,6 +244,11 @@ impl Wallet {
 		})
 	}
 
+	/// Whether the coin `c` is spendable now under the configuration.
+	pub async fn spendable_now(&self, c: &WalletCoin) -> Result<bool, WalletError> {
+		self.spendable(c).await
+	}
+
 	/// What the wallet can spend now, per asset.
 	pub async fn balance(&self) -> Result<BTreeMap<AssetId, u64>, WalletError> {
 		let mut b = BTreeMap::new();
@@ -282,7 +287,7 @@ impl Wallet {
 		// Refuse an asset the node does not accept before anything else.
 		self.fee_for(req.fee_asset, 1).await?;
 		let _one = self.building.lock().await;
-		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[]).await
+		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[], &[]).await
 	}
 
 	/// Builds and signs a round transaction that creates `batches` batches.
@@ -293,22 +298,30 @@ impl Wallet {
 	/// the outputs to pay (each token exactly once, as one atom) and whatever
 	/// else it made of them; the connector output follows those outputs, then
 	/// change per asset, then the one fee output, in `fee_asset`. The issuing
-	/// coins are the first inputs, in the order of the tokens. The lock time is
-	/// 0 and every input final, so the transaction can always return to the
-	/// mempool unchanged after a rollback.
-	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, make: F)
+	/// coins are the first inputs, in the order of the tokens, and every coin
+	/// of `ties` follows them, whatever the round needs: a coin that keeps the
+	/// round apart from a lost round whose participations it runs again. The
+	/// lock time is 0 and every input final, so the transaction can always
+	/// return to the mempool unchanged after a rollback.
+	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, ties: &[WalletCoin], make: F)
 		-> Result<(Built, R), WalletError>
 	where
 		F: FnOnce(&[AssetId]) -> Result<(Vec<ExplicitOutput>, R), String>,
 	{
 		self.fee_for(fee_asset, 1).await?;
 		let _one = self.building.lock().await;
+		for c in ties {
+			if !self.store.wallet_coin_at(&c.txid, c.vout).await?.is_some_and(|w| w.spent_by.is_none()) || !self.spendable(c).await? {
+				return Err(WalletError::Raced);
+			}
+		}
+		let tied = |c: &WalletCoin| ties.iter().any(|t| (t.txid, t.vout) == (c.txid, c.vout));
 		// A connector asset's atom is the watcher's, for its claims and
 		// reclaims: it never issues a token.
 		let connectors = self.store.connector_assets().await?;
 		let mut coins = vec![];
 		for c in self.store.wallet_coins(None).await? {
-			if !connectors.contains(&c.asset) && self.spendable(&c).await? {
+			if !connectors.contains(&c.asset) && !tied(&c) && self.spendable(&c).await? {
 				coins.push(c);
 			}
 		}
@@ -328,14 +341,15 @@ impl Wallet {
 				return Err(WalletError::Round(format!("the token {} must be paid once, as one atom", t)));
 			}
 		}
-		let built = self.build_locked(&outputs, Some(connector), fee_asset, &issuers).await?;
+		let built = self.build_locked(&outputs, Some(connector), fee_asset, &issuers, ties).await?;
 		Ok((built, made))
 	}
 
 	/// Builds and signs, the build lock held: `issuers` are the first inputs,
-	/// each issuing one atom of its token ([`token_of`]).
+	/// each issuing one atom of its token ([`token_of`]), and `forced` follow
+	/// them.
 	async fn build_locked(&self, outputs_req: &[ExplicitOutput], connector: Option<AssetAmount>, fee_asset: AssetId,
-		issuers: &[WalletCoin]) -> Result<Built, WalletError>
+		issuers: &[WalletCoin], forced: &[WalletCoin]) -> Result<Built, WalletError>
 	{
 		for o in outputs_req {
 			if o.value == 0 {
@@ -360,8 +374,9 @@ impl Wallet {
 		}
 		need.entry(fee_asset).or_insert(0);
 
-		// The spendable coins of every asset involved, the issuers apart.
-		let taken: Vec<([u8; 32], u32)> = issuers.iter().map(|c| (c.txid, c.vout)).collect();
+		// The spendable coins of every asset involved, the issuers and the
+		// forced coins apart.
+		let taken: Vec<([u8; 32], u32)> = issuers.iter().chain(forced).map(|c| (c.txid, c.vout)).collect();
 		let mut available: BTreeMap<AssetId, Vec<WalletCoin>> = BTreeMap::new();
 		for a in need.keys() {
 			let mut coins = vec![];
@@ -378,10 +393,10 @@ impl Wallet {
 		let mut fee = self.fee_for(fee_asset, 1).await?;
 		let mut change_scripts: BTreeMap<AssetId, Script> = BTreeMap::new();
 		loop {
-			let mut chosen: Vec<WalletCoin> = issuers.to_vec();
+			let mut chosen: Vec<WalletCoin> = issuers.iter().chain(forced).cloned().collect();
 			for (a, amount) in &need {
 				let want = amount + if *a == fee_asset { fee } else { 0 };
-				let mut sum: u64 = issuers.iter().filter(|c| AssetId::from_byte_array(c.asset) == *a).map(|c| c.value).sum();
+				let mut sum: u64 = issuers.iter().chain(forced).filter(|c| AssetId::from_byte_array(c.asset) == *a).map(|c| c.value).sum();
 				let coins = &available[a];
 				for c in coins {
 					if sum >= want {

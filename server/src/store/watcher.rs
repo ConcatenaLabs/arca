@@ -76,8 +76,8 @@ pub struct NewWatcherTx {
 	pub detail: String,
 	/// The outpoints it spends.
 	pub inputs: Vec<([u8; 32], u32)>,
-	/// For a forfeit, the round it names: a round that can never return
-	/// refuses it ([`StoreError::RoundLost`]).
+	/// For a forfeit, the round it names: a lost round refuses it
+	/// ([`StoreError::RoundLost`]).
 	pub round: Option<i64>,
 }
 
@@ -135,8 +135,8 @@ impl Store {
 	/// Takes a transaction of the watcher's into the nursery (kind
 	/// `watcher`), its inputs watched for spends, with its log entry and the
 	/// outpoints it spends, whole or not at all. A transaction already there
-	/// is left as it was; returns whether it is new. A forfeit naming a round
-	/// that can never return is refused ([`StoreError::RoundLost`]).
+	/// is left as it was; returns whether it is new. A forfeit naming a lost
+	/// round is refused ([`StoreError::RoundLost`]).
 	pub async fn insert_watcher_tx(&self, w: &NewWatcherTx) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
@@ -183,6 +183,15 @@ impl Store {
 			&[&&txid[..]],
 		).await?;
 		r.map(|r| Ok((array32(r.get(0), "round txid")?, r.get(1)))).transpose()
+	}
+
+	/// The forfeits in the watcher's log naming the round `round_id`, lost
+	/// or not: `(txid, the coin's leaf id)`.
+	pub async fn forfeits_naming(&self, round_id: i64) -> Result<Vec<([u8; 32], [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT txid, subject FROM watcher_tx WHERE kind = 'forfeit' AND round_id = $1 ORDER BY created_at, txid",
+			&[&round_id]).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, array32(r.get(1), "leaf id")?))).collect()
 	}
 
 	/// The watcher's transaction spending `txid:vout` that the nursery holds

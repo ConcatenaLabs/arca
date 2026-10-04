@@ -6,7 +6,7 @@
 //!    transfer of one is refused), the server broadcasts the same bytes
 //!    again to a node that forgot them, the round returns with its txid and
 //!    is credited again, and the leaf is paid on.
-//! 2. A round that can never return, the operator's coin it spent taken by
+//! 2. A round that is lost, the operator's coin it spent taken by
 //!    another transaction that becomes final: the round is retired, its new
 //!    leaves lost, and its participations run again in a new round under new
 //!    unlock hashes, as ordinary participations, the one whose preimage had
@@ -234,13 +234,18 @@ async fn a_round_that_cannot_return_runs_its_participations_again_as_ordinary_on
 
 	// The rollback, the server stopped meanwhile: the round's block
 	// disconnected, and the operator's coin it spent taken by another
-	// transaction, which becomes final. R can never return.
+	// transaction, which becomes final. R is lost.
 	r.server.stop();
 	let w = built.tx.input[0].previous_output;
 	let w_out = r.rt.client().raw_transaction(&w.txid).unwrap().output[w.vout as usize].clone();
 	node::invalidate(&r.rt, &block_of(&r, &lost_txid));
 	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
-	let elsewhere = spend_wallet_coin(w, &w_out, vec![], 2_000);
+	// Most of it back to the operator: a re-run spends that output, which
+	// keeps it apart from R should R return.
+	let (_, to) = server::wallet::Wallet::hand_out_receive_script(&r.db.store, common::keys::MNEMONIC).await.unwrap();
+	let back = sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(w_out.asset.explicit().unwrap(),
+		w_out.value.explicit().unwrap() - 3_000), to);
+	let elsewhere = spend_wallet_coin(w, &w_out, vec![back], 2_000);
 	r.rt.client().send_raw_transaction(&elsewhere).unwrap();
 	r.produce().await;
 	r.bury().await;

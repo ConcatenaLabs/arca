@@ -120,6 +120,34 @@ pub struct ForfeitRow {
 	pub attempt: u32,
 }
 
+/// An earlier attempt of a participation: the round it was in, its unlock
+/// hash and preimage then, whether that preimage went out, and whether the
+/// round is lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRow {
+	pub attempt: u32,
+	pub round_id: i64,
+	pub unlock_hash: [u8; 32],
+	pub preimage: [u8; 32],
+	pub released: bool,
+	pub round_lost: bool,
+}
+
+/// What [`Store::restore_round`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+	/// The participations back as they stood in the round.
+	pub restored: Vec<[u8; 32]>,
+	/// Those left where they are, and why.
+	pub left: Vec<([u8; 32], String)>,
+	/// The rounds retired with it.
+	pub retired: Vec<i64>,
+	/// The participations of those rounds that run again, never in this one.
+	pub rerun: Vec<[u8; 32]>,
+	/// How many of its new leaves were credited.
+	pub credited: u64,
+}
+
 /// A participation as the database holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParticipationRow {
@@ -458,6 +486,14 @@ impl Store {
 		Ok(())
 	}
 
+	/// The participation the forfeit of `leaf_id` for the round `round_id`
+	/// was signed for.
+	pub async fn forfeit_participation(&self, leaf_id: &[u8; 32], round_id: i64) -> Result<Option<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT participation_id FROM forfeit WHERE leaf_id = $1 AND round_id = $2", &[&&leaf_id[..], &round_id]).await?;
+		r.map(|r| array32(r.get(0), "participation id")).transpose()
+	}
+
 	/// The forfeits of participation `id` for the round `round_id`.
 	pub async fn forfeits(&self, id: &[u8; 32], round_id: i64) -> Result<Vec<ForfeitRow>, StoreError> {
 		let conn = self.conn().await?;
@@ -549,9 +585,9 @@ impl Store {
 		).await?)
 	}
 
-	/// Retires the round `round_id`, which can never return, whole or not at
-	/// all: the round is lost, its new leaves not yet spent are lost, and every
-	/// participation it ran runs again in a later round as an ordinary
+	/// Retires the round `round_id`, which went out of the chain, whole or not
+	/// at all: the round is lost, its new leaves not yet spent are lost, and
+	/// every participation it ran runs again in a later round as an ordinary
 	/// participation, under a new unlock hash, with a new operator nonce for
 	/// each leaf it wants (its keys and owner nonces as before), the attempt
 	/// it leaves recorded, and any release of the coins it gave up retired.
@@ -562,65 +598,192 @@ impl Store {
 	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
-		let n = t.execute(
-			"UPDATE round SET state = 'lost', updated_at = now() WHERE round_id = $1 AND state <> 'lost'",
+		let again = retire_in(&t, round_id, &std::collections::HashSet::new()).await?.unwrap_or_default();
+		t.commit().await?;
+		Ok(again)
+	}
+
+	/// The earlier attempts of participation `id`: each round it was in that
+	/// went out of the chain, or that another of its rounds replaced, newest
+	/// first.
+	pub async fn attempts(&self, id: &[u8; 32]) -> Result<Vec<AttemptRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT a.attempt, a.round_id, a.unlock_hash, a.preimage, a.released, r.state = 'lost'
+			 FROM participation_attempt a JOIN round r ON r.round_id = a.round_id
+			 WHERE a.participation_id = $1 ORDER BY a.attempt DESC",
+			&[&&id[..]],
+		).await?;
+		rows.iter().map(|r| Ok(AttemptRow {
+			attempt: r.get::<_, i32>(0) as u32,
+			round_id: r.get(1),
+			unlock_hash: array32(r.get(2), "unlock hash")?,
+			preimage: array32(r.get(3), "preimage")?,
+			released: r.get(4),
+			round_lost: r.get(5),
+		})).collect()
+	}
+
+	/// The participations with an earlier attempt in the round `round_id`,
+	/// and the round each is in now, if any.
+	pub async fn earlier_in(&self, round_id: i64) -> Result<Vec<([u8; 32], Option<i64>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT p.participation_id, p.round_id FROM participation_attempt a
+			 JOIN participation p ON p.participation_id = a.participation_id
+			 WHERE a.round_id = $1 ORDER BY p.participation_id",
 			&[&round_id],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "participation id")?, r.get(1)))).collect()
+	}
+
+	/// Restores the round `round_id`, held as lost, which is final in the
+	/// chain again, whole or not at all: the round is final, every round in
+	/// `retire` (each one that ran its participations again, which can now
+	/// never confirm beside it) is retired, and every participation it ran is
+	/// back as it stood when the round was final, under that round's unlock
+	/// hash and operator nonces, its new leaves pending again (credited at
+	/// once if it was released), its releases for the round good again, and
+	/// every forfeit naming the round in the watcher's log followed by the
+	/// nursery again; a leaf of it in a retired round that it paid on is lost,
+	/// resting on a round that can never confirm beside this one. A
+	/// participation is left where it is when the round it is in now is not
+	/// retired (it stands too), when it was never released in the round and
+	/// gave a coin back since, or when a key it wants has been taken by
+	/// another since; its leaves of the round stay lost. Nothing runs
+	/// a third time for a participation brought back: a round in `retire`
+	/// runs again only those of its participations that were never in this
+	/// one. Returns `None` when the round is not lost.
+	///
+	/// A participation in `refunded` (a forfeit for the round of a coin it
+	/// gave up was refunded on the chain while the round was out) is left
+	/// where it is, its new leaves of the round never credited (`expired`:
+	/// the operator sweeps them with their batch), its status saying why if
+	/// it is void.
+	pub async fn restore_round(&self, round_id: i64, retire: &[i64], final_mtp: u32, refunded: &[[u8; 32]])
+		-> Result<Option<Restored>, StoreError>
+	{
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let n = t.execute(
+			"UPDATE round SET state = 'final', final_mtp = $2, updated_at = now() WHERE round_id = $1 AND state = 'lost'",
+			&[&round_id, &(final_mtp as i64)],
 		).await?;
 		if n != 1 {
-			return Ok(vec![]);
+			return Ok(None);
 		}
-		t.execute(
-			"UPDATE leaf SET state = 'lost', updated_at = now()
-			 WHERE state IN ('pending', 'live') AND leaf_id IN (SELECT leaf_id FROM batch_leaf WHERE round_id = $1)",
+		let back = t.query(
+			"SELECT participation_id, attempt, unlock_hash, preimage, released FROM participation_attempt WHERE round_id = $1
+			 ORDER BY participation_id",
 			&[&round_id],
 		).await?;
-		let rows = t.query(
-			"SELECT participation_id, attempt, unlock_hash, preimage, state::text FROM participation
-			 WHERE round_id = $1 AND state IN ('issued', 'released') FOR UPDATE",
-			&[&round_id],
-		).await?;
-		let mut again = Vec::with_capacity(rows.len());
-		for r in rows {
+		let keep: std::collections::HashSet<[u8; 32]> = back.iter().map(|r| array32(r.get(0), "participation id")).collect::<Result<_, _>>()?;
+		let mut out = Restored::default();
+		for y in retire {
+			if let Some(again) = retire_in(&t, *y, &keep).await? {
+				out.retired.push(*y);
+				out.rerun.extend(again);
+			}
+		}
+		for r in back {
 			let id = array32(r.get(0), "participation id")?;
 			let attempt: i32 = r.get(1);
 			let unlock_hash: Vec<u8> = r.get(2);
 			let preimage: Vec<u8> = r.get(3);
-			let released = r.get::<_, &str>(4) == "released";
-			t.execute(
-				"INSERT INTO participation_attempt (participation_id, attempt, round_id, unlock_hash, preimage, released)
-				 VALUES ($1, $2, $3, $4, $5, $6)",
-				&[&&id[..], &attempt, &round_id, &unlock_hash, &preimage, &released],
-			).await?;
-			let mut new_preimage = [0u8; 32];
-			rand::rngs::OsRng.fill_bytes(&mut new_preimage);
-			let new_hash = arca_covenant::script::sha256(&new_preimage);
-			t.execute(
-				"UPDATE participation SET state = 'pending', round_id = NULL, attempt = attempt + 1, unlock_hash = $2,
-				 preimage = $3, updated_at = now() WHERE participation_id = $1",
-				&[&&id[..], &&new_hash[..], &&new_preimage[..]],
-			).await?;
-			let outputs = t.query(
-				"SELECT idx, owner_nonce FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx",
+			let released: bool = r.get(4);
+			let cur = t.query_one(
+				"SELECT p.state::text, p.round_id, p.attempt, p.unlock_hash, p.preimage, r.state
+				 FROM participation p LEFT JOIN round r ON r.round_id = p.round_id WHERE p.participation_id = $1 FOR UPDATE OF p",
 				&[&&id[..]],
 			).await?;
-			for o in outputs {
-				let idx: i16 = o.get(0);
-				let owner_nonce = array32(o.get(1), "owner nonce")?;
-				let nonce = draw_salted_nonce(&t, &id, &owner_nonce).await?;
+			let (state, cur_round, cur_attempt): (&str, Option<i64>, i32) = (cur.get(0), cur.get(1), cur.get(2));
+			let cur_round_state: Option<String> = cur.get(5);
+			if refunded.contains(&id) {
+				let why = format!("a forfeit for round {} of a coin it gave up was refunded on the chain while that round was out of it: \
+					the coin is its owner's again, so its new leaves of the round are never credited, and the operator sweeps them with \
+					their batch", round_id);
 				t.execute(
-					"UPDATE participation_output SET operator_nonce = $3, leaf_id = NULL WHERE participation_id = $1 AND idx = $2",
-					&[&&id[..], &idx, &&nonce[..]],
+					"UPDATE leaf SET state = 'expired', updated_at = now() WHERE state = 'lost' AND leaf_id IN (
+					   SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = $2 AND attempt = $3)",
+					&[&&id[..], &round_id, &attempt],
+				).await?;
+				t.execute("UPDATE participation SET void_reason = $2 WHERE participation_id = $1 AND state = 'void'", &[&&id[..], &why]).await?;
+				out.left.push((id, why));
+				continue;
+			}
+			if cur_round.is_some_and(|c| c != round_id) && cur_round_state.as_deref() != Some("lost") {
+				out.left.push((id, "the round it is in now stands".into()));
+				continue;
+			}
+			if !released && t.query_opt("SELECT 1 FROM participation_input WHERE participation_id = $1 AND NOT active", &[&&id[..]])
+				.await?.is_some()
+			{
+				out.left.push((id, "it was never released in the round, and a coin it gave up was given back since".into()));
+				continue;
+			}
+			// A leaf of a round retired here that it paid on rests on a round
+			// that can never confirm beside this one: lost, its key free for
+			// the leaf brought back.
+			t.execute(
+				"UPDATE leaf SET state = 'lost', spent_by = NULL, updated_at = now() WHERE state = 'spent' AND leaf_id IN (
+				   SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = ANY($2))",
+				&[&&id[..], &out.retired],
+			).await?;
+			let taken = t.query_opt(
+				"SELECT 1 FROM participation_output o WHERE o.participation_id = $1 AND o.kind = 'leaf' AND (
+				   EXISTS (SELECT 1 FROM participation_output x WHERE x.owner_key = o.owner_key AND x.kind = 'leaf' AND x.active
+				           AND x.participation_id <> $1)
+				   OR EXISTS (SELECT 1 FROM leaf l WHERE l.owner_key = o.owner_key AND l.state NOT IN ('lost', 'expired')
+				           AND l.leaf_id NOT IN (SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = $2 AND attempt = $3)))",
+				&[&&id[..], &round_id, &attempt],
+			).await?;
+			if taken.is_some() {
+				out.left.push((id, "a key it wants a leaf under has been taken by another since".into()));
+				continue;
+			}
+			// The attempt it is in now, if it has a round, is kept with the
+			// others, so that round can be restored in turn.
+			if let Some(c) = cur_round.filter(|c| *c != round_id) {
+				let cur_hash: Vec<u8> = cur.get(3);
+				let cur_pre: Vec<u8> = cur.get(4);
+				t.execute(
+					"INSERT INTO participation_attempt (participation_id, attempt, round_id, unlock_hash, preimage, released)
+					 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+					&[&&id[..], &cur_attempt, &c, &cur_hash, &cur_pre, &(state == "released")],
 				).await?;
 			}
-			t.execute("UPDATE participation_output SET leaf_id = NULL WHERE participation_id = $1", &[&&id[..]]).await?;
-			// Releases given for this round name its connector asset, which
-			// can never be issued now: they are never used.
-			t.execute("UPDATE node_release SET retired = true WHERE participation_id = $1 AND round_id = $2",
-				&[&&id[..], &round_id]).await?;
-			again.push(id);
+			t.execute("DELETE FROM participation_attempt WHERE participation_id = $1 AND attempt = $2", &[&&id[..], &attempt]).await?;
+			t.execute(
+				"UPDATE participation SET state = $2::text::participation_state, round_id = $3, attempt = $4, unlock_hash = $5,
+				 preimage = $6, void_reason = NULL, waiting = NULL, updated_at = now() WHERE participation_id = $1",
+				&[&&id[..], &if released { "released" } else { "issued" }, &round_id, &attempt, &unlock_hash, &preimage],
+			).await?;
+			t.execute(
+				"UPDATE participation_output o SET operator_nonce = bl.operator_nonce, leaf_id = bl.leaf_id
+				 FROM batch_leaf bl WHERE bl.participation_id = $1 AND bl.round_id = $2 AND bl.attempt = $3
+				   AND o.participation_id = $1 AND o.idx = bl.output_idx",
+				&[&&id[..], &round_id, &attempt],
+			).await?;
+			t.execute("UPDATE participation_output SET active = true WHERE participation_id = $1", &[&&id[..]]).await?;
+			t.execute(
+				"UPDATE leaf SET state = 'pending', updated_at = now() WHERE state = 'lost' AND leaf_id IN (
+				   SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = $2 AND attempt = $3)",
+				&[&&id[..], &round_id, &attempt],
+			).await?;
+			t.execute("UPDATE node_release SET retired = false WHERE participation_id = $1 AND round_id = $2", &[&&id[..], &round_id]).await?;
+			out.restored.push(id);
 		}
+		out.credited = credit(&t, round_id).await?;
+		// Every forfeit naming the round can be claimed again: the nursery
+		// follows each, and judges it again, as it does any transaction.
+		t.execute(
+			"UPDATE nursery_tx SET state = 'pending' WHERE state = 'lost'
+			 AND (txid IN (SELECT txid FROM watcher_tx WHERE kind = 'forfeit' AND round_id = $1)
+			      OR txid = (SELECT txid FROM round WHERE round_id = $1))",
+			&[&round_id],
+		).await?;
 		t.commit().await?;
-		Ok(again)
+		Ok(Some(out))
 	}
 
 	/// The forfeits in the watcher's log of a coin participation `id` gave
@@ -745,6 +908,78 @@ impl Store {
 	}
 }
 
+/// [`Store::retire_round`] inside `t`, but the participations in `keep`,
+/// whose attempt in the round is kept with the others and which the caller
+/// moves on itself: `None` when the round was lost already, else the
+/// participations that run again. A participation runs again under an
+/// attempt number above every one it has had.
+async fn retire_in(t: &tokio_postgres::Transaction<'_>, round_id: i64, keep: &std::collections::HashSet<[u8; 32]>)
+	-> Result<Option<Vec<[u8; 32]>>, StoreError>
+{
+	let n = t.execute(
+		"UPDATE round SET state = 'lost', final_mtp = NULL, updated_at = now() WHERE round_id = $1 AND state <> 'lost'",
+		&[&round_id],
+	).await?;
+	if n != 1 {
+		return Ok(None);
+	}
+	t.execute(
+		"UPDATE leaf SET state = 'lost', updated_at = now()
+		 WHERE state IN ('pending', 'live') AND leaf_id IN (SELECT leaf_id FROM batch_leaf WHERE round_id = $1)",
+		&[&round_id],
+	).await?;
+	let rows = t.query(
+		"SELECT participation_id, attempt, unlock_hash, preimage, state::text FROM participation
+		 WHERE round_id = $1 AND state IN ('issued', 'released') FOR UPDATE",
+		&[&round_id],
+	).await?;
+	let mut again = Vec::with_capacity(rows.len());
+	for r in rows {
+		let id = array32(r.get(0), "participation id")?;
+		let attempt: i32 = r.get(1);
+		let unlock_hash: Vec<u8> = r.get(2);
+		let preimage: Vec<u8> = r.get(3);
+		let released = r.get::<_, &str>(4) == "released";
+		t.execute(
+			"INSERT INTO participation_attempt (participation_id, attempt, round_id, unlock_hash, preimage, released)
+			 VALUES ($1, $2, $3, $4, $5, $6)",
+			&[&&id[..], &attempt, &round_id, &unlock_hash, &preimage, &released],
+		).await?;
+		// Releases given for this round name its connector asset, which
+		// is not issued while the round is out of the chain.
+		t.execute("UPDATE node_release SET retired = true WHERE participation_id = $1 AND round_id = $2",
+			&[&&id[..], &round_id]).await?;
+		if keep.contains(&id) {
+			continue;
+		}
+		let mut new_preimage = [0u8; 32];
+		rand::rngs::OsRng.fill_bytes(&mut new_preimage);
+		let new_hash = arca_covenant::script::sha256(&new_preimage);
+		t.execute(
+			"UPDATE participation SET state = 'pending', round_id = NULL,
+			 attempt = GREATEST(attempt, (SELECT coalesce(max(attempt), 0) FROM participation_attempt WHERE participation_id = $1)) + 1,
+			 unlock_hash = $2, preimage = $3, updated_at = now() WHERE participation_id = $1",
+			&[&&id[..], &&new_hash[..], &&new_preimage[..]],
+		).await?;
+		let outputs = t.query(
+			"SELECT idx, owner_nonce FROM participation_output WHERE participation_id = $1 AND kind = 'leaf' ORDER BY idx",
+			&[&&id[..]],
+		).await?;
+		for o in outputs {
+			let idx: i16 = o.get(0);
+			let owner_nonce = array32(o.get(1), "owner nonce")?;
+			let nonce = draw_salted_nonce(t, &id, &owner_nonce).await?;
+			t.execute(
+				"UPDATE participation_output SET operator_nonce = $3, leaf_id = NULL WHERE participation_id = $1 AND idx = $2",
+				&[&&id[..], &idx, &&nonce[..]],
+			).await?;
+		}
+		t.execute("UPDATE participation_output SET leaf_id = NULL WHERE participation_id = $1", &[&&id[..]]).await?;
+		again.push(id);
+	}
+	Ok(Some(again))
+}
+
 /// Locks participation `id` inside `t`, at `attempt` in the round
 /// `round_id`, and returns its state: issued or released, or
 /// [`StoreError::NotInRound`] when it expired meanwhile (its coins are the
@@ -775,7 +1010,7 @@ async fn free_keys(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result
 /// Gives back, inside `t`, each coin the participation `id` gave up for which
 /// no forfeit was ever signed, in any of its attempts: the coin is live again
 /// and its input inactive, so it can be given up again. A coin with a forfeit
-/// signed, for a round that can never return included, stays given up: the
+/// signed, for a lost round included, stays given up: the
 /// signer co-signs no spend under a salt it has signed a forfeit under, and
 /// such a forfeit may still confirm if the operator published it. The coin
 /// is its owner's on the chain, by that forfeit's refund or by its exit.

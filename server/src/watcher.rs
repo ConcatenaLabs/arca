@@ -11,7 +11,7 @@
 //!    participation whose forfeit it stored, or by a co-signed transfer) whose
 //!    leaf is seen on the chain unspent, in a block or the mempool, is
 //!    answered at once: by its forfeit for the round its participation is in
-//!    now (never one for a round that can never return), or by its
+//!    now (never one for a lost round), or by its
 //!    checkpoint; and a
 //!    reassignment is published once every checkpoint it spends is on the
 //!    chain. The answer confirms before the leaf's exit delay runs out, so
@@ -65,10 +65,12 @@
 //! a rollback, however deep: an anchor-driven reorganisation that takes out a
 //! round and the watcher's answers puts them back in the order they were
 //! made, and the watcher answers again whatever does not return. A forfeit
-//! naming a round that can never return is the exception: the log refuses
-//! one ([`StoreError::RoundLost`]), and the nursery gives up every forfeit
-//! of the round's coins when the round is retired ([`crate::rounds`]), so
-//! no path, a restart included, publishes one again.
+//! naming a lost round is the exception: the log refuses one
+//! ([`StoreError::RoundLost`]), and the nursery gives up every forfeit of the
+//! round's coins when the round is retired ([`crate::rounds`]), so no path, a
+//! restart included, publishes one while the round is lost. A lost round
+//! that is final again is restored, and its forfeits are the operator's to
+//! publish and claim again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -444,16 +446,16 @@ impl Watcher {
 	}
 
 	/// [`Self::publish`] for the forfeit of the coin `subject` for the round
-	/// `round_id`, which the log refuses, and the wallet's coins with it, once
-	/// that round can never return.
+	/// `round_id`, which the log refuses, and the wallet's coins with it,
+	/// while that round is lost or cannot confirm as the chain stands.
 	async fn publish_forfeit(&self, r: Ready, round_id: i64, subject: Vec<u8>, detail: String) -> Result<Option<Txid>, WatcherError> {
-		// A round the server has not found lost yet whose transaction can
-		// never confirm is lost all the same.
+		// A round the server has not found lost yet whose transaction cannot
+		// confirm as the chain stands is lost all the same.
 		let round = self.store.round(round_id).await?.ok_or_else(|| WatcherError::Build(format!("no round {}", round_id)))?;
 		let gone = self.nursery.can_never_return(&txid_of(&round.txid)).await.map_err(|e| WatcherError::Nursery(e.to_string()))?;
 		if gone {
 			self.wallet.release(&r.tx.txid()).await?;
-			log::info!("watcher: the forfeit of {} not published: round {} can never return", hex(&subject), round_id);
+			log::info!("watcher: the forfeit of {} not published: round {} cannot confirm as the chain stands", hex(&subject), round_id);
 			return Ok(None);
 		}
 		self.publish_naming(r, "forfeit", subject, detail, Some(round_id)).await
@@ -487,7 +489,7 @@ impl Watcher {
 			Ok(result) => result,
 			Err(crate::nursery::NurseryError::Store(StoreError::RoundLost(round))) => {
 				self.wallet.release(&txid).await?;
-				log::info!("watcher: {} for {} not published: round {} can never return", kind, hex(&w.subject), round);
+				log::info!("watcher: {} for {} not published: round {} is lost", kind, hex(&w.subject), round);
 				return Ok(None);
 			},
 			Err(e) => return Err(WatcherError::Nursery(e.to_string())),

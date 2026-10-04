@@ -166,6 +166,20 @@ pub struct NewRound {
 	/// round was built, its running hash, and the signer's signature over
 	/// them when it gave one.
 	pub signer_head: Option<(u64, [u8; 32], Option<[u8; 64]>)>,
+	/// Each lost round whose participations it runs again, and the coin it
+	/// spends that keeps the two apart.
+	pub reruns: Vec<NewRerun>,
+}
+
+/// A lost round a round runs participations of again, and the coin of the
+/// round's that keeps them apart: an input of the lost round that was still
+/// unspent, or an output of a transaction descending from one that took an
+/// input of it (`via`, the transaction that took it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRerun {
+	pub replaces: i64,
+	pub tie: ([u8; 32], u32),
+	pub via: Option<[u8; 32]>,
 }
 
 /// Where a participation's outputs are in the round of its current attempt.
@@ -339,8 +353,46 @@ impl Store {
 				&[&round_id, &(o.vout as i32), &&o.participation_id[..], &(o.output_idx as i16), &(o.attempt as i32), &i64_of(o.value)?],
 			).await?;
 		}
+		for x in &r.reruns {
+			t.execute(
+				"INSERT INTO round_rerun (round_id, replaces, tie_txid, tie_vout, via_txid) VALUES ($1, $2, $3, $4, $5)",
+				&[&round_id, &x.replaces, &&x.tie.0[..], &(x.tie.1 as i32), &x.via.map(|v| v.to_vec())],
+			).await?;
+		}
 		t.commit().await?;
 		Ok(round_id)
+	}
+
+	/// The lost rounds round `round_id` runs participations of again, each
+	/// with the coin that keeps it apart from them.
+	pub async fn replaced_by(&self, round_id: i64) -> Result<Vec<NewRerun>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT replaces, tie_txid, tie_vout, via_txid FROM round_rerun WHERE round_id = $1 ORDER BY replaces",
+			&[&round_id]).await?;
+		rows.iter().map(|r| Ok(NewRerun {
+			replaces: r.get(0),
+			tie: (array32(r.get(1), "tie txid")?, r.get::<_, i32>(2) as u32),
+			via: r.get::<_, Option<Vec<u8>>>(3).map(|v| array32(v, "via txid")).transpose()?,
+		})).collect()
+	}
+
+	/// The transactions of the lost rounds the round whose transaction is
+	/// `txid` runs participations of again.
+	pub async fn replaced_txids(&self, txid: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT l.txid FROM round y JOIN round_rerun x ON x.round_id = y.round_id JOIN round l ON l.round_id = x.replaces
+			 WHERE y.txid = $1 ORDER BY l.round_id",
+			&[&&txid[..]],
+		).await?;
+		rows.iter().map(|r| array32(r.get(0), "round txid")).collect()
+	}
+
+	/// The rounds that run participations of the round `round_id` again.
+	pub async fn reruns_of(&self, round_id: i64) -> Result<Vec<i64>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT round_id FROM round_rerun WHERE replaces = $1 ORDER BY round_id", &[&round_id]).await?;
+		Ok(rows.iter().map(|r| r.get(0)).collect())
 	}
 
 	/// The round `round_id`.

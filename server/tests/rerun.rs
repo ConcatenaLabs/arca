@@ -1,9 +1,10 @@
-//! Participations run again after a round that can never return, against a
-//! whole server on an anchored proof-of-stake regtest chain, the watcher
-//! driven by hand. The round's block is disconnected (`invalidateblock`, for
-//! an anchor rollback), the node forgets its mempool, and the operator's coin
-//! the round spent is taken by another transaction, buried: the round can
-//! never come back.
+//! Participations run again after a lost round, against a whole server on an
+//! anchored proof-of-stake regtest chain, the watcher driven by hand. The
+//! round's block is disconnected (`invalidateblock`, for an anchor
+//! rollback), the node forgets its mempool, and the operator's coin the round
+//! spent is taken by another transaction, buried, which pays the operator
+//! back: the round is lost, and a re-run spends that output. What happens
+//! when such a round returns is `tests/rerun_returns.rs`'s.
 //!
 //! 1. A coin whose forfeit for the lost round the watcher published is never
 //!    taken into a re-run: its participation is void, saying why, and the
@@ -57,18 +58,23 @@ fn in_a_block(r: &Running, txid: &Txid) -> bool {
 		.and_then(|v| v["confirmations"].as_u64()).unwrap_or(0) > 0
 }
 
-/// The round `built` can never return: the server stopped, the round's block
+/// The round `built` is lost: the server stopped, the round's block
 /// disconnected, the node restarted with an empty mempool, the operator's
 /// coin the round spent taken by another transaction, and that buried;
 /// `meanwhile` runs before the server starts again. Waits until the server
-/// holds the round lost.
+/// holds the round lost. The transaction that takes the coin pays most of it
+/// back to the operator's wallet: a re-run spends that output, which keeps it
+/// apart from the round should the round return.
 async fn lose<F: FnOnce(&Running)>(r: &mut Running, built: &Transaction, meanwhile: F) {
 	r.server.stop();
 	let wi = built.input[0].previous_output;
 	let w_out = r.rt.client().raw_transaction(&wi.txid).unwrap().output[wi.vout as usize].clone();
 	node::invalidate(&r.rt, &block_of(r, &built.txid()));
 	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
-	let elsewhere = spend_wallet_coin(wi, &w_out, vec![], 2_000);
+	let (_, to) = server::wallet::Wallet::hand_out_receive_script(&r.db.store, common::keys::MNEMONIC).await.unwrap();
+	let back = sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(w_out.asset.explicit().unwrap(),
+		w_out.value.explicit().unwrap() - 3_000), to);
+	let elsewhere = spend_wallet_coin(wi, &w_out, vec![back], 2_000);
 	r.rt.client().send_raw_transaction(&elsewhere).unwrap();
 	r.produce().await;
 	r.bury().await;
@@ -261,7 +267,7 @@ async fn a_lost_rounds_forfeit_is_never_published_again_by_any_path() {
 
 	// The watcher logs A's forfeit for R, and the server stops before it
 	// reaches the node; then the node stops taking X for fees, so a
-	// broadcast of it is refused; then R can never return.
+	// broadcast of it is refused; then R is lost.
 	r.server.stop();
 	let fa_tx = tokio::task::block_in_place(|| whole(&r, &pa, &fa_r, &ca));
 	assert!(r.db.store.insert_watcher_tx(&logged(&fa_tx, &ca)).await.unwrap());
@@ -304,7 +310,7 @@ async fn a_lost_rounds_forfeit_is_never_published_again_by_any_path() {
 	match r.server.store.insert_watcher_tx(&logged(&fb_tx, &cb)).await {
 		Err(StoreError::RoundLost(id)) => {
 			assert_eq!(id, built.round_id);
-			println!("G2 the log refuses B's forfeit for R: round {} can never return", id);
+			println!("G2 the log refuses B's forfeit for R: round {} is lost", id);
 		},
 		other => panic!("B's forfeit for R logged: {:?}", other),
 	}
@@ -355,7 +361,7 @@ async fn paid_from(r: &mut Running, from: &Coin, tag: &str) -> (Coin, Coin, Vec<
 	(cb, ca2, transfer)
 }
 
-/// B refreshes `cb` in round R, released; R can never return; B's re-run
+/// B refreshes `cb` in round R, released; R is lost; B's re-run
 /// completes in round Y as an ordinary participation. Nothing of the
 /// lineage `subjects` name goes on the chain, and A pays with its change
 /// `ca2`, live off the chain.

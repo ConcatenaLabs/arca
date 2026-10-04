@@ -7,7 +7,7 @@
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
 //! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
 //! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`,
-//! `schema/V14__keeper_acks.sql`),
+//! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -21,7 +21,7 @@
 //! free again), a leaf is given up once, by one transfer or by
 //! one participation at a time (a participation that never runs, or whose
 //! forfeits never come, gives back the coins no forfeit was signed for), and
-//! no forfeit naming a round that can never return enters the watcher's log
+//! no forfeit naming a lost round enters the watcher's log
 //! ([`StoreError::RoundLost`]). Each
 //! operation that changes more than one row runs in one transaction, so it
 //! happens whole or not at all.
@@ -52,11 +52,12 @@ pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use mailbox::MailboxMessage;
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
-	ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState, ReleaseRow,
-	WantedKind,
+	AttemptRow, ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState,
+	ReleaseRow, Restored, WantedKind,
 };
 pub use rounds::{
-	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, OffboardRow, Placement, RoundRow, RoundState, StoredReserve,
+	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRerun, NewRound, OffboardRow, Placement, RoundRow, RoundState,
+	StoredReserve,
 };
 pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, RecordHeadRow, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
@@ -80,6 +81,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(12, include_str!("../../schema/V12__challenge_key.sql")),
 	(13, include_str!("../../schema/V13__reruns_are_ordinary.sql")),
 	(14, include_str!("../../schema/V14__keeper_acks.sql")),
+	(15, include_str!("../../schema/V15__rerun_ties.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -143,9 +145,9 @@ pub enum StoreError {
 	/// The participation is no longer in its round's forfeit step.
 	#[error("the participation is {0}")]
 	NotInRound(&'static str),
-	/// A forfeit names a round that can never return: the server never
-	/// publishes it.
-	#[error("round {0} can never return: no forfeit naming it is published")]
+	/// A forfeit names a lost round: the server publishes none while the
+	/// round is lost.
+	#[error("round {0} is lost: no forfeit naming it is published while it is")]
 	RoundLost(i64),
 }
 
