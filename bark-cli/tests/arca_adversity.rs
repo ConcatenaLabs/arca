@@ -1210,6 +1210,80 @@ async fn a_tree_whose_reserves_cannot_pay_its_exit_is_refused() {
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// D51. A swap's taker sees the dates of the coins it would get before it
+/// signs: they rest on every coin the swap spends, so they carry the
+/// earliest dates among them. A swap of fresh coins is taken at once, its
+/// dates shown. After 23½ days, the maker's change rests on boards whose
+/// exit deadline is a day and a half away: the taker's accept is refused,
+/// saying so, and taken with `--accept-near-deadline`, whose coins arrive
+/// with the dates it showed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_shows_the_dates_it_gives_and_is_refused_near_the_exit_deadline() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let (a, b) = (Arca::new("D51A"), Arca::new("D51B"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	for (asset, v) in [(y, 10_000_000), (x, 1_000_000)] {
+		let s = script(&b.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	b.ok(&["board", &y.to_string(), "3000000", "--fee-asset", &x.to_string()]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || b.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	b.ok(&["sync"]);
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "400000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	let now = common::node::median_time(&r.rt) as u64;
+	println!("D51 a swap of fresh coins: taken; the coins it gives: {}", acc["coins"]);
+	let d = acc["dates"]["exit_deadline"].as_u64().unwrap();
+	assert!(d > now + 20 * 86_400, "{}", acc["dates"]);
+	assert_eq!(acc["dates"]["rests_on_board"], true);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	let got = b.ok(&["sync"])["mailbox"]["accepted"].as_array().unwrap().iter()
+		.find(|c| c["asset"] == x.to_string().as_str()).cloned().unwrap();
+	println!("D51 the coin it got: {}", got["board"]);
+	assert_eq!(got["board"]["exit_deadline"].as_u64(), Some(d), "the dates shown are the coin's");
+
+	// 23½ days on: the exit deadline of every coin here is a day and a half
+	// away.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 23 * 86_400 + 43_200));
+	r.bury().await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	// B pays from a fresh board: the swap's coins still carry the maker's
+	// change's dates, the earliest.
+	b.ok(&["board", &y.to_string(), "4000000", "--fee-asset", &x.to_string()]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || b.ok(&["boards"]).as_array().unwrap().iter().all(|x| x["server"]["state"] == "credited")).await;
+	b.ok(&["sync"]);
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "200000"]);
+	let why = b.refused(&["swap", "accept", offer["offer"].as_str().unwrap()], "earliest exit deadline");
+	println!("D51 near the deadline, refused: {}", why);
+	assert!(why.contains("--accept-near-deadline"), "{}", why);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap(), "--accept-near-deadline"]);
+	let now = common::node::median_time(&r.rt) as u64;
+	let left = acc["dates"]["seconds_to_exit_deadline"].as_u64().unwrap();
+	println!("D51 taken with --accept-near-deadline: {} ({} s to the exit deadline)", acc["dates"], left);
+	assert!(left < 2 * 86_400 && left > 0, "{}", acc["dates"]);
+	let d = acc["dates"]["exit_deadline"].as_u64().unwrap();
+	assert_eq!(d as u64, now + left);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	let got = b.ok(&["sync"])["mailbox"]["accepted"].as_array().unwrap().iter()
+		.find(|c| c["asset"] == x.to_string().as_str()).cloned().unwrap();
+	println!("D51 the coin it got: {}", got["board"]);
+	assert_eq!(got["board"]["exit_deadline"].as_u64(), Some(d), "the dates shown are the coin's");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// A taker accepts an offer and cancels: the wallet spends the coin it
 /// signed into the acceptance to a fresh leaf of its own, so the maker's
 /// completion is refused. That leaf rests on a reassignment the operator

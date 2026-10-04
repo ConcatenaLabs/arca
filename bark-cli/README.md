@@ -226,7 +226,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
-| `swap accept OFFER` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`) |
+| `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
 | `refusals` | Every refusal the wallet made, with its reason |
 | `bitcoin [--] ARGS…` | Runs Bark's `bark` with `--datadir <datadir>/bitcoin` and the arguments given: the wallet's Bitcoin side. Put `--` before an argument `arca` would read itself, such as `--help` |
@@ -355,6 +355,10 @@ and holding it there, with the reason shown:
   does not accept the asset, the fee coin its exit needs stated;
 - an acceptance of a swap cancelled, after which the maker's completion is
   refused;
+- a swap of fresh coins taken with the dates of the coins it gives shown,
+  which the coins then carry; and one whose coins reach their exit deadline
+  a day and a half later refused, saying so, and taken with
+  `--accept-near-deadline`;
 - the files a fresh wallet writes, readable by their owner alone, the node's
   password in none of the store's, and its balance of one row, 0 BTC; and a
   wallet restored from the mnemonic that finds on-chain coins past the first

@@ -170,8 +170,17 @@ enum SwapCmd {
 		#[arg(long)]
 		want: u64,
 	},
-	/// Takes an offer, signing the wallet's side.
-	Accept { offer: String },
+	/// Takes an offer, signing the wallet's side. The coins the swap gives
+	/// the wallet carry the earliest dates of every coin it spends, which are
+	/// shown; it is refused when their exit deadline is less than two days
+	/// away.
+	Accept {
+		offer: String,
+		/// Takes the swap even when the coins it gives the wallet reach their
+		/// exit deadline within two days.
+		#[arg(long)]
+		accept_near_deadline: bool,
+	},
 	/// Completes the wallet's offer with an acceptance.
 	Complete { accept: String },
 	/// Cancels an offer or acceptance not completed.
@@ -329,7 +338,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Recheck => w.recheck(),
 		Cmd::Exit { leaf_id, fee_asset } => w.exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
-		Cmd::Swap(SwapCmd::Accept { offer }) => w.swap_accept(&offer),
+		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept }) => w.swap_complete(&accept),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
 		Cmd::Refusals => w.refusals(),
