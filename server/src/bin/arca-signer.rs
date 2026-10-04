@@ -62,9 +62,12 @@
 //! machine: after it has written and synced an entry and signed its head, it
 //! hands the record's latest head to every keeper and releases the
 //! co-signature only when as many of them as the record requires have
-//! acknowledged it; otherwise it answers that it cannot sign
-//! now (`keepers_unavailable`), the entry stays, and the same request again
-//! completes. At start, and before the first signature after a start, it asks
+//! acknowledged it, each acknowledgement naming the latest head the keeper
+//! held when asked, which the record must hold with the same hash (a latest
+//! it does not hold stops the signer, so a signer restored with its memory
+//! cannot pass a keeper's latest with a head past it); otherwise it answers
+//! that it cannot sign now (`keepers_unavailable`), the entry stays, and the
+//! same request again completes. At start, and before the first signature after a start, it asks
 //! the keepers for the latest head each holds: one past the record's end, or
 //! with another hash at an entry the record holds, is proof the record was
 //! rolled back, and stops the signer; and until enough keepers have answered
@@ -340,7 +343,14 @@ impl State {
 	/// head acknowledged last when it covers `at_least`, or the record's
 	/// latest, handed to every keeper now. A keeper's answer that the head
 	/// contradicts what it holds hands the head it holds to the record, which
-	/// stops the signer on it.
+	/// stops the signer on it; so does the latest head an acknowledgement
+	/// says the keeper held when it was asked. A keeper takes a head past its
+	/// latest on its number alone, so a signer restored with its memory, past
+	/// its start check, whose first hand-overs a keeper missed, or which took
+	/// several requests at once before the first hand-over, hands over a head
+	/// past the keeper's latest: nothing is released until the record holds
+	/// that latest, with that hash, and a latest it does not hold stops the
+	/// signer, as at a start.
 	async fn held_outside(&self, at_least: u64) -> Result<(WireEntryRef, Vec<WireAck>), String> {
 		let k = self.keepers.as_ref().expect("keepers");
 		let mut acked = k.acked.lock().await;
@@ -361,7 +371,14 @@ impl State {
 		let mut notes = vec![];
 		for (c, a) in k.list.iter().zip(answers) {
 			match a {
-				Ok(Held::Ack(ack)) => acks.push(ack),
+				Ok(Held::Ack(ack, latest)) => {
+					if let Some(l) = &latest {
+						if let Some(why) = self.against_record(l)? {
+							return Err(why);
+						}
+					}
+					acks.push(ack);
+				},
 				Ok(Held::Contradicts(held)) => {
 					if let Some(why) = self.against_record(&held)? {
 						return Err(why);

@@ -945,8 +945,13 @@ an acknowledgement is the keeper's signature over `SHA256(T ‖ T ‖ genesis �
 S ‖ entry ‖ hash ‖ nonce)`, `T = SHA256("Arca/keeper-ack")`, and an answer
 naming its latest head over `SHA256(T ‖ T ‖ genesis ‖ S ‖ nonce ‖ 0x01 ‖
 entry ‖ hash)` (`‖ 0x00` alone when it holds none), `T =
-SHA256("Arca/keeper-latest")`. Nobody on the path can make an
-acknowledgement or replay an older latest. Its heads file, like the
+SHA256("Arca/keeper-latest")`. An acknowledgement also names the latest head
+the keeper held when it was asked, with `S`'s signature, and the keeper's
+signature over `SHA256(T ‖ T ‖ genesis ‖ S ‖ entry ‖ hash ‖ nonce ‖ 0x01 ‖
+latest entry ‖ latest hash)` (`‖ 0x00` alone when it held none), `T =
+SHA256("Arca/keeper-held")`, `entry` and `hash` the head it acknowledges.
+Nobody on the path can make an acknowledgement, replay an older latest, or
+hide what the keeper held. Its heads file, like the
 record, is made once on purpose (`--create`), locked while it runs, and
 synced when it is opened; a last line cut short by a crash is removed.
 
@@ -973,8 +978,18 @@ record's latest head, signed, to every keeper, and releases the
 co-signature only when the required number have acknowledged it; otherwise
 it answers `keepers_unavailable` (the server's `signer_unavailable`), the
 entry stays, and the same request again completes once they do. Requests
-waiting at once share one hand-over. At start, and before the first
-signature after a start, it asks the keepers for their latest: a keeper's
+waiting at once share one hand-over. A keeper takes a head past its latest
+on its number alone, without knowing whether it extends what the keeper
+holds, so the signer checks the latest head each acknowledgement names
+against its record before it releases anything: a latest the record does
+not hold, past its end or with another hash, is the proof of a rollback
+and stops the signer, as at a start. A signer restored together with its
+memory has passed its start check already; whether its first hand-overs
+miss the keepers or several requests arrive at once before the first
+hand-over, the first acknowledgement that names a keeper's latest from the
+lost window stops it before it releases a second spend.
+
+At start, and before the first signature after a start, it asks the keepers for their latest: a keeper's
 head past the record's end, or with another hash at an entry the record
 holds, is the proof of a rollback, and stops the signer as a wallet's head
 would; and until enough keepers have answered it signs nothing the record

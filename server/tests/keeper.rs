@@ -2,7 +2,9 @@
 //! is held outside its machine, by `arca-keeper` processes, each on a port of
 //! its own as on another machine: a keeper down holds up the answer and the
 //! same request completes when it is back; a restored signer is stopped at
-//! start by a keeper's head; a keeper that lies is no keeper; a keeper
+//! start by a keeper's head, and one restored with its memory by the latest
+//! head a keeper's acknowledgement names, whether its first hand-overs were
+//! missed or its requests came at once; a keeper that lies is no keeper; a keeper
 //! restored from an older copy catches up; with one of two keepers required,
 //! one down holds nothing up, but a start needs both; and what a keeper adds
 //! to a co-signature, on this machine and at 50 ms each way.
@@ -257,9 +259,10 @@ async fn a_restored_signer_is_stopped_at_start_by_its_keeper() {
 
 /// D52.1. A keeper that lies is no keeper. Behind a proxy that rewrites its
 /// answers: an acknowledgement signed by another key, an acknowledgement
-/// replayed from an earlier request, and a latest replayed from an earlier
-/// request are each refused, so the signer signs nothing. Straight to the
-/// keeper, the same requests complete.
+/// replayed from an earlier request, an acknowledgement that does not say
+/// the latest head the keeper held or hides it, and a latest replayed from
+/// an earlier request are each refused, so the signer signs nothing.
+/// Straight to the keeper, the same requests complete.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keeper_that_lies_is_no_keeper() {
 	let k = keypair("keeper one");
@@ -299,6 +302,28 @@ async fn a_keeper_that_lies_is_no_keeper() {
 	println!("(b) an earlier acknowledgement replayed: {} | {}", v["code"], v["error"]);
 	assert_eq!(v["code"], "keepers_unavailable");
 	assert!(v["signature"].is_null());
+
+	// (d) An acknowledgement that does not say the latest head the keeper
+	// held (as from a keeper older than the signer), and (e) one whose
+	// latest is hidden (`null`, "it held none"): neither counts.
+	proxy.rewrite(Some(Arc::new(|req: &Value, v: &mut Value| {
+		if req["op"] == "hold" && !v["ack"].is_null() {
+			v.as_object_mut().unwrap().remove("latest");
+		}
+	})));
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [2; 32], t.asset)).await;
+	println!("(d) an acknowledgement without the keeper's latest: {} | {}", v["code"], v["error"]);
+	assert_eq!(v["code"], "keepers_unavailable");
+	assert!(v["signature"].is_null() && v["error"].as_str().unwrap().contains("does not say the latest head the keeper held"), "{}", v);
+	proxy.rewrite(Some(Arc::new(|req: &Value, v: &mut Value| {
+		if req["op"] == "hold" && !v["ack"].is_null() {
+			v["latest"] = Value::Null;
+		}
+	})));
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [2; 32], t.asset)).await;
+	println!("(e) an acknowledgement whose latest is hidden: {} | {}", v["code"], v["error"]);
+	assert_eq!(v["code"], "keepers_unavailable");
+	assert!(v["signature"].is_null() && v["error"].as_str().unwrap().contains("made or replayed by someone else"), "{}", v);
 	drop(signer);
 
 	// (c) An earlier latest replayed, at a start: the start check counts no
@@ -734,4 +759,179 @@ async fn a_keeper_admits_its_signer_alone_and_holds_up_under_a_flood() {
 	println!("(c) a fresh request once the idle ones are closed: {}", answer.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "none".into()));
 	assert!(answer.is_some_and(|a| a["signature"].is_string()));
 	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// A rebind request line for `owner`'s leaf under `salt`, spending 10,000 of
+/// `asset` into one output of `out`: with another `out` than a request
+/// before it under the salt, a second spend of the leaf.
+fn rebind_into(owner: &Keypair, genesis: BlockHash, salt: [u8; 32], asset: AssetId, out: u64) -> String {
+	let o = ExplicitOutput::new(asset, out, Script::from(vec![0x51, 1]));
+	let m = rebind_message(&Chain::new(genesis).leaf_constant(&salt), asset, 10_000, std::slice::from_ref(&o)).unwrap();
+	let sig = sign_digest(owner, &m.digest, &[1; 32]);
+	json!({
+		"op": "rebind", "owner": hex(&xonly(owner).serialize()), "owner_sig": hex(sig.as_ref()), "salt": hex(&salt),
+		"asset_in": asset.to_string(), "value_in": "10000", "outputs": [server::signer::WireOutput::from_output(&o)],
+	}).to_string()
+}
+
+/// Hands `head` to the keeper at `addr` as a signer would (`hold`), on a
+/// fresh connection: its answer.
+async fn hold_at(addr: &str, head: &Value) -> Value {
+	let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+	let line = json!({"op": "hold", "head": head, "nonce": hex(&[0x5a; 32])}).to_string();
+	s.write_all(line.as_bytes()).await.unwrap();
+	s.write_all(b"\n").await.unwrap();
+	let mut r = BufReader::new(s);
+	let mut out = String::new();
+	r.read_line(&mut out).await.unwrap();
+	serde_json::from_str(&out).unwrap()
+}
+
+/// What the signer signed before its machine was restored: entries 3 and 4
+/// of its record, after the two `t`'s record holds, each a spend of 9,000
+/// under salts 3 and 4, made on a copy of the record under the same key
+/// (beside a scratch keeper of `k`'s key) and handed to `keeper` as that
+/// signer would. The keeper then holds entry 4.
+async fn the_lost_window(t: &Setup, k: &Keypair, keeper: &KeeperProcess) {
+	let copy = signer_dir();
+	std::fs::copy(t.dir.join("operator.key"), copy.join("operator.key")).unwrap();
+	std::fs::copy(t.dir.join("signer.record"), copy.join("signer.record")).unwrap();
+	let scratch = KeeperProcess::start(k, xonly(&t.s), t.genesis);
+	let before = Signer::start(&copy, "before", t.genesis, &keepers_args(&[scratch.arg()]));
+	for i in 3..=4u8 {
+		let v = raw(&before.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string(), "{}", v);
+		assert!(!hold_at(&keeper.addr, &v["entry"]).await["ack"].is_null(), "the keeper takes entry {}", i);
+	}
+	drop(before);
+	let _ = std::fs::remove_dir_all(&copy);
+	assert_eq!(keeper.held().1, Some(4));
+}
+
+/// R7g F1, KD turned around. A signer restored with its memory (a snapshot of
+/// its machine taken with its RAM): its process passed its start check
+/// already, so it asks the keeper nothing at start, and its record ends at
+/// entry 2, while the keeper holds entries 3 and 4 the signer signed before
+/// the restore. Its keeper is unreachable for its first requests (second
+/// spends of the leaves of entries 3 and 4, and a third request): each is
+/// recorded, as entries 3 to 5, and answered `keepers_unavailable`. Once the
+/// keeper is back, the next hand-over is of entry 5, past the keeper's
+/// latest: the keeper takes it, and its acknowledgement names the latest
+/// head it held, entry 4, which the record does not hold. The signer
+/// releases nothing and is stopped on that head, the proof kept. And with
+/// the keeper up throughout, the first hand-over (entry 3, which the keeper
+/// holds with another hash) stops it, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signer_restored_with_its_memory_is_stopped_by_the_keepers_latest() {
+	for keeper_down in [true, false] {
+		let k = keypair("keeper one");
+		let t = setup(&[&k], 1);
+		let mut keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
+		let args = keepers_args(&[keeper.arg()]);
+		let tag = if keeper_down { "the keeper unreachable for the first requests" } else { "the keeper up" };
+		// The restored signer: its process past its start check, its record
+		// at entry 2.
+		let a = Signer::start(&t.dir, "restored", t.genesis, &args);
+		for i in 1..=2u8 {
+			let v = raw(&a.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+			assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "{}", v);
+		}
+		the_lost_window(&t, &k, &keeper).await;
+		if keeper_down {
+			keeper.halt();
+		}
+		let mut signed = vec![];
+		for i in [3u8, 4, 5] {
+			let v = raw(&a.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 8_000)).await;
+			println!("{}: the second spend of salt {} (8,000 where 9,000 was signed): signed {} | {} | {}", tag, i, v["signature"].is_string(),
+				v["code"], v["error"].as_str().map(|e| &e[..e.len().min(160)]).unwrap_or(""));
+			if v["signature"].is_string() {
+				signed.push(i);
+			}
+		}
+		if keeper_down {
+			keeper.resume();
+			for i in [5u8, 3, 4] {
+				let v = raw(&a.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 8_000)).await;
+				println!("{}: with the keeper back, salt {} again: signed {} | {} | {}", tag, i, v["signature"].is_string(), v["code"],
+					v["error"].as_str().map(|e| &e[..e.len().min(160)]).unwrap_or(""));
+				if v["signature"].is_string() {
+					signed.push(i);
+				}
+				assert_eq!(v["code"], "stopped", "{}", v);
+			}
+		}
+		let proof = std::fs::read_to_string(server::signer::stopped_path(&t.dir.join("signer.record"))).unwrap_or_default();
+		println!("{}: signed {:?} | stopped {} | the proof: {} | the keeper holds {:?}", tag, signed, a.stopped(),
+			proof.lines().next().unwrap_or(""), keeper.held());
+		assert!(signed.is_empty(), "{}: second spends co-signed under salts {:?}", tag, signed);
+		assert!(a.stopped(), "{}: the signer is stopped: {}", tag, a.log());
+		if keeper_down {
+			// Stopped on the keeper's latest, which its acknowledgement of
+			// entry 5 named: entry 4, another hash than the record's.
+			assert!(proof.contains("head 4 ") && proof.contains("entry 4 with the running hash"), "{}", proof);
+		}
+		drop(a);
+		let _ = std::fs::remove_dir_all(&t.dir);
+	}
+}
+
+/// R7g F1, KE turned around: requests at once to a signer restored with its
+/// memory. Its record ends at entry 2, the keeper holds entries 3 and 4 the
+/// signer signed before the restore. A hand-over is held in flight (a `head`
+/// request, through a proxy that delays every line 300 ms each way) while
+/// eight rebinds arrive, the second spends of salts 3 and 4 among them: each
+/// is recorded and waits for the hand-over, so the next hand-over is of the
+/// record's latest, entry 10, past the keeper's latest. Nothing is co-signed
+/// and the signer is stopped. Then the same eight requests at once without
+/// the hand-over held, twenty times. A test that fails if the route ever
+/// opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_at_once_to_a_signer_restored_with_its_memory_release_nothing() {
+	for run in 0..21 {
+		let held_in_flight = run == 0;
+		let k = keypair("keeper one");
+		let t = setup(&[&k], 1);
+		let keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
+		let slow = LineProxy::start(&keeper.addr, Duration::from_millis(if held_in_flight { 300 } else { 0 }));
+		let args = keepers_args(&[slow.arg(&xonly(&k))]);
+		// Entries 1 and 2, then the signer started again on them: its start
+		// check passes (the keeper holds entry 2), and it has handed nothing
+		// over since.
+		{
+			let first = Signer::start(&t.dir, "first", t.genesis, &keepers_args(&[keeper.arg()]));
+			for i in 1..=2u8 {
+				assert!(raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await["signature"].is_string());
+			}
+		}
+		let a = Signer::start(&t.dir, "restored", t.genesis, &args);
+		assert!(!a.stopped() && a.log().contains("the keepers agree with the record"), "{}", a.log());
+		the_lost_window(&t, &k, &keeper).await;
+		let mut tasks = vec![];
+		if held_in_flight {
+			let socket = a.socket.clone();
+			tasks.push(tokio::spawn(async move { (0u8, raw(&socket, r#"{"op":"head"}"#).await) }));
+			tokio::time::sleep(Duration::from_millis(150)).await;
+		}
+		for i in 3u8..=10 {
+			let (socket, owner, genesis, asset) = (a.socket.clone(), t.owner, t.genesis, t.asset);
+			tasks.push(tokio::spawn(async move { (i, raw(&socket, &rebind_into(&owner, genesis, [i; 32], asset, 8_000)).await) }));
+		}
+		let mut signed = vec![];
+		let mut codes = std::collections::BTreeMap::new();
+		for h in tasks {
+			let (i, v) = h.await.unwrap();
+			if i > 0 && v["signature"].is_string() {
+				signed.push((i, v["entry"]["entry"].as_u64().unwrap_or(0)));
+			}
+			*codes.entry(v["code"].as_str().unwrap_or("-").to_string()).or_insert(0) += 1;
+		}
+		let entries = std::fs::read_to_string(t.dir.join("signer.record")).unwrap().lines().count() - 1;
+		println!("run {}{}: signed (salt, head entry) {:?} | codes {:?} | the record holds {} entries | stopped {} | the keeper holds {:?}", run,
+			if held_in_flight { ", a hand-over held in flight" } else { "" }, signed, codes, entries, a.stopped(), keeper.held());
+		assert!(signed.is_empty(), "run {}: co-signed {:?}", run, signed);
+		assert!(a.stopped(), "run {}: the signer is stopped: {}", run, a.log());
+		drop(a);
+		let _ = std::fs::remove_dir_all(&t.dir);
+	}
 }

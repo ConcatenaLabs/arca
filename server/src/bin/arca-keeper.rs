@@ -47,7 +47,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use arca_covenant::sign::sign_digest;
-use server::keeper::{ack_digest, latest_digest, HeadsFile, Taken, MAX_LINE};
+use server::keeper::{ack_digest, held_digest, latest_digest, HeadsFile, Taken, MAX_LINE};
 use server::signer::{hex, unhex, unhex32, WireEntryRef};
 
 struct Args {
@@ -155,11 +155,21 @@ fn answer(key: &Keypair, operator: &XOnlyPublicKey, genesis: &BlockHash, heads: 
 				Err(e) => return json!({"error": format!("head: {}", e)}),
 			};
 			let mut h = heads.lock().unwrap_or_else(|e| e.into_inner());
+			// The latest head it held when asked, which a head past it is
+			// taken on top of: named, signed, with the acknowledgement.
+			let before = match h.latest() {
+				Ok(l) => l,
+				Err(e) => return json!({"error": format!("the heads file could not be read: {}", e)}),
+			};
 			match h.take(&head) {
 				Ok(Taken::Holds) => {
 					let hash = unhex32(&head.hash).expect("taken");
+					let held = before.as_ref().map(|l| (l.entry, unhex32(&l.hash).expect("held")));
 					json!({"ack": {"key": hex(&key.x_only_public_key().0.serialize()), "nonce": hex(&nonce),
-						"signature": sign(key, &ack_digest(genesis, operator, head.entry, &hash, &nonce))}})
+						"signature": sign(key, &ack_digest(genesis, operator, head.entry, &hash, &nonce))},
+						"latest": before.as_ref().map(head_json),
+						"latest_signature": sign(key, &held_digest(genesis, operator, head.entry, &hash, &nonce,
+							held.as_ref().map(|(n, x)| (*n, x))))})
 				},
 				Ok(Taken::Contradicts(held)) => {
 					let hash = unhex32(&held.hash).expect("held");
