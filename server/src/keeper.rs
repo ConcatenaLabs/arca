@@ -19,8 +19,11 @@
 //!
 //! - `{"op":"key"}`: `{"key": K}`;
 //! - `{"op":"hold","head":{"entry":…,"hash":…,"signature":…},"nonce":…}`:
-//!   `{"ack":{"key":K,"nonce":…,"signature":…}}`, `K`'s signature over
-//!   [`ack_digest`]: the keeper holds that head, now; or
+//!   `{"ack":{"key":K,"nonce":…,"signature":…},"latest":{…}|null,
+//!   "latest_signature":…}`, `K`'s signature over [`ack_digest`]: the keeper
+//!   holds that head, now; with the latest head it held when the request
+//!   came (`null` when it held none) and `K`'s signature over
+//!   [`held_digest`], so a head past its latest says what it extends; or
 //!   `{"refused":…,"holds":{…},"signature":…}`, the head it holds at that
 //!   entry or its latest, with `K`'s signature over [`latest_digest`];
 //! - `{"op":"latest","nonce":…}`: `{"head":{…}|null,"signature":…}`, the
@@ -30,7 +33,12 @@
 //! request, so nobody on the path can make an acknowledgement or replay an
 //! older latest. The acknowledgement travels on with the head, to every
 //! wallet that is shown it: a wallet that pinned the keeper's key checks it
-//! as the signer does.
+//! as the signer does. The latest head the keeper held stays with the
+//! signer: a head past it is taken on its number, so the signer releases
+//! nothing until its record holds that latest, with that hash; one it does
+//! not hold is the proof, signed by `S`, that the record was rolled back.
+//! A signer restored with its memory hands over such a head after missed
+//! hand-overs, or after several requests taken at once.
 
 use std::path::Path;
 
@@ -45,6 +53,8 @@ use crate::signer::{hex, record_head_digest, unhex, unhex32, WireEntryRef};
 pub const ACK_TAG: &[u8] = b"Arca/keeper-ack";
 /// The tag of a keeper's answer naming the latest head it holds.
 pub const LATEST_TAG: &[u8] = b"Arca/keeper-latest";
+/// The tag of what a keeper's acknowledgement says it held before.
+pub const HELD_TAG: &[u8] = b"Arca/keeper-held";
 /// The first word of a heads file's first line.
 pub const HEADS_MAGIC: &str = "arca-keeper-heads";
 /// The heads file's format.
@@ -88,6 +98,33 @@ pub fn latest_digest(genesis: &elements::BlockHash, operator: &XOnlyPublicKey, n
 	e.input(&operator.serialize());
 	e.input(nonce);
 	match head {
+		None => e.input(&[0]),
+		Some((n, h)) => {
+			e.input(&[1]);
+			e.input(&n.to_le_bytes());
+			e.input(h);
+		},
+	}
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
+/// What keeper `K` signs, with its acknowledgement of head `entry`, `hash`
+/// of `S`'s record on the chain of `genesis` answering a request that
+/// carried `nonce`, to name the latest head it held when the request came,
+/// `latest` (`None` when it held none): `SHA256(T ‖ T ‖ genesis ‖ S ‖
+/// entry ‖ hash ‖ nonce ‖ 0x00)` when it held none, `SHA256(T ‖ T ‖ genesis
+/// ‖ S ‖ entry ‖ hash ‖ nonce ‖ 0x01 ‖ latest entry ‖ latest hash)`
+/// otherwise, `T = SHA256("Arca/keeper-held")`.
+pub fn held_digest(genesis: &elements::BlockHash, operator: &XOnlyPublicKey, entry: u64, hash: &[u8; 32], nonce: &[u8; 32],
+	latest: Option<(u64, &[u8; 32])>) -> [u8; 32]
+{
+	let mut e = tagged(HELD_TAG);
+	e.input(&arca_covenant::Chain::new(*genesis).genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	e.input(nonce);
+	match latest {
 		None => e.input(&[0]),
 		Some((n, h)) => {
 			e.input(&[1]);
@@ -408,8 +445,10 @@ pub const KEEPERS_UNAVAILABLE: &str = "keepers_unavailable";
 /// What a keeper answered to a head handed to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Held {
-	/// It holds the head: its acknowledgement, checked.
-	Ack(WireAck),
+	/// It holds the head: its acknowledgement, checked, and the latest head
+	/// it held when it was asked, signed by `S` (checked), `None` when it
+	/// held none.
+	Ack(WireAck, Option<WireEntryRef>),
 	/// The head contradicts what it holds: the head it holds there, or its
 	/// latest, signed by `S` (checked).
 	Contradicts(WireEntryRef),
@@ -496,8 +535,10 @@ impl KeeperClient {
 		Ok(head)
 	}
 
-	/// Hands the keeper `head`, signed by `S`: its acknowledgement, or the
-	/// head it holds that `head` contradicts, each checked.
+	/// Hands the keeper `head`, signed by `S`: its acknowledgement with the
+	/// latest head it held when asked, or the head it holds that `head`
+	/// contradicts, each checked. An acknowledgement that does not say what
+	/// the keeper held, with its key's signature, is no acknowledgement.
 	pub async fn hold(&self, genesis: &elements::BlockHash, operator: &XOnlyPublicKey, head: &WireEntryRef) -> Result<Held, String> {
 		let nonce = random_nonce();
 		let v = self.ask(&serde_json::json!({"op": "hold", "head": head, "nonce": hex(&nonce)})).await?;
@@ -508,7 +549,26 @@ impl KeeperClient {
 				return Err(format!("{}: an acknowledgement not signed by its key over this head and this request's nonce: made or \
 					replayed by someone else", self.addr.addr));
 			}
-			return Ok(Held::Ack(ack));
+			if v.get("latest").is_none() {
+				return Err(format!("{}: an acknowledgement that does not say the latest head the keeper held: a keeper older than \
+					this signer, which takes a head past its latest without saying what it extends; upgrade it", self.addr.addr));
+			}
+			let latest: Option<WireEntryRef> = match &v["latest"] {
+				serde_json::Value::Null => None,
+				l => Some(serde_json::from_value(l.clone()).map_err(|e| format!("{}: the latest head it held: {}", self.addr.addr, e))?),
+			};
+			let held = latest.as_ref().map(|l| unhex32(&l.hash)).transpose()?;
+			let digest = held_digest(genesis, operator, head.entry, &hash, &nonce, latest.as_ref().zip(held.as_ref()).map(|(l, x)| (l.entry, x)));
+			if !self.signed(&v["latest_signature"], &digest) {
+				return Err(format!("{}: the latest head its acknowledgement names is not signed by its key over this head and this \
+					request's nonce: made or replayed by someone else", self.addr.addr));
+			}
+			if let Some(l) = &latest {
+				if !signed_by(genesis, operator, l) {
+					return Err(format!("{}: the latest head it held, entry {}, is not signed by S", self.addr.addr, l.entry));
+				}
+			}
+			return Ok(Held::Ack(ack, latest));
 		}
 		if let Some(why) = v["refused"].as_str() {
 			let holds: WireEntryRef = serde_json::from_value(v["holds"].clone()).map_err(|e| format!("{}: the head it holds: {}", self.addr.addr, e))?;
