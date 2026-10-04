@@ -209,7 +209,10 @@ the keys, but which coins were spent off-chain is in the store and the server.
   write one), is an unreachable server: the wallet exits nothing and refuses
   nothing for good, and tries again; and so is a latest entry in `info`
   below the highest the wallet holds, which an older head replayed shows
-  just as well. The wallet then finds the
+  just as well. A rollback note kept by an older version of the wallet,
+  which acted without that proof, is acted on no more: the next witness
+  that succeeds checks it against the signer and drops it unless the signer
+  proves it, saying so among the refusals. The wallet then finds the
   highest entry it holds that the record still agrees with, takes on the
   chain at once every coin a transfer recorded after it made (a coin whose
   entry it was never given counts as after), and goes no further with the
@@ -310,7 +313,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset, each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
-| `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read |
+| `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, each under a fresh key whose own signature proves the wallet holds it, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), follows on the chain every forfeit whose preimage it does not hold, and moves every exit on |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
@@ -468,7 +471,10 @@ and holding it there, with the reason shown:
   standing, and completes when the keeper is back; the receiver shows the
   keeper it pinned;
 - a proxy stripping the keepers' acknowledgements: the wallet's own payment
-  stands and a coin in its mailbox waits, until the answers are whole;
+  stands and a coin in its mailbox waits, until the answers are whole; the
+  coins after it, read again with it, are shown as held, never as taken;
+- a rollback note an older wallet kept without the signer's proof: dropped
+  at the next witness, saying so, nothing exited, the wallet going on;
 - a coin the operator cannot refresh: with the signer's proof withheld from
   every witness, and with the server gone, `sync` and `coins` show each
   board's exit date and say `sync` must run before it, taking nothing weeks
