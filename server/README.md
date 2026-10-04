@@ -110,8 +110,12 @@ to an older state:
   is lost cannot be replaced by a new one: the operator stops co-signing.
 - A record and a database rolled back together (a snapshot of the whole
   machine restored) pass every check the server makes of itself, so the
-  record has witnesses outside it, and a proven rollback stops the signer
-  ([The signed head, witnessed](#the-signed-head-witnessed)).
+  record is held outside the machine: by keepers on other machines, which
+  hold every head before the signer answers it and which the signer asks
+  before it signs anything after a start ([The keepers](#the-keepers)), and
+  by the wallets that witness it; a proven rollback stops the signer
+  ([The signed head, witnessed](#the-signed-head-witnessed)). Keep each
+  keeper's heads file off the signer's machine and out of its snapshots.
 - The server records every message it asks the signer to sign before it
   asks, in the same transaction as what the signature is for (a transfer,
   a forfeit), and refuses to start on a database that does not know an
@@ -646,7 +650,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them (`signer_record`, absent while the signer does not answer or is stopped), the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -868,12 +872,77 @@ stop to carry on: it resumes only with a new signer key and a new record,
 which is a new operator to every wallet. `arca-signer --clear-stopped`
 removes the proof, with the signer stopped, after printing it.
 
+### The keepers
+
+Wallets are not always online, so a record and a database restored together
+(a snapshot of the whole machine) could co-sign a second spend of a coin
+paid in the lost window before any wallet witnesses. The keepers close that
+window: the signer answers an entry only once its signed head is held
+outside its machine.
+
+A keeper is `arca-keeper`, a small program of its own, run on another
+machine than the signer. It holds the operator key `S` (public), the
+chain's genesis hash and a key of its own, and keeps an append-only file of
+the heads of `S`'s record it was given, each synced before it answers. It
+takes a head only with `S`'s valid signature, and only when it extends what
+it holds: an entry after its latest, or an entry it holds with the same
+running hash. A head that contradicts what it holds is refused and answered
+with the signed head it holds at that entry, or with its latest when it
+never held that entry. It answers "your latest" on request. Every answer is
+signed by the keeper's key over the asker's nonce, fresh for each request:
+an acknowledgement is the keeper's signature over `SHA256(T ‖ T ‖ genesis ‖
+S ‖ entry ‖ hash ‖ nonce)`, `T = SHA256("Arca/keeper-ack")`, and an answer
+naming its latest head over `SHA256(T ‖ T ‖ genesis ‖ S ‖ nonce ‖ 0x01 ‖
+entry ‖ hash)` (`‖ 0x00` alone when it holds none), `T =
+SHA256("Arca/keeper-latest")`. Nobody on the path can make an
+acknowledgement or replay an older latest. Its heads file, like the
+record, is made once on purpose (`--create`), locked while it runs, and
+synced when it is opened; a last line cut short by a crash is removed.
+
+The signer is configured with its keepers (`--keeper <host:port>=<key>`,
+one for each) and how many must hold a head (`--keepers-required`, all of
+them by default). After it has written and synced an entry, it hands the
+record's latest head, signed, to every keeper, and releases the
+co-signature only when the required number have acknowledged it; otherwise
+it answers `keepers_unavailable` (the server's `signer_unavailable`), the
+entry stays, and the same request again completes once they do. Requests
+waiting at once share one hand-over. At start, and before the first
+signature after a start, it asks the keepers for their latest: a keeper's
+head past the record's end, or with another hash at an entry the record
+holds, is the proof of a rollback, and stops the signer as a wallet's head
+would; and until enough keepers have answered it signs nothing the record
+governs. Enough is the keepers minus the required plus one, so that any set
+of keepers that acknowledged a head includes one that answered: with all
+of them required, one answer is enough; with one of two required, both
+must answer. A keeper restored from an older copy, while the signer was
+not, holds heads the record still holds: it stops nothing, takes the
+record's latest at the next hand-over, and is whole again.
+
+Every head the signer hands out carries the acknowledgements it has of it,
+and they travel with the head wherever a head travels: `info`, the witness
+answer, a transfer's answer, a mailbox record, a published tree (the server
+keeps them, by head, in its database). `info` names the keepers' keys and
+how many are required (`keepers`). A wallet pins them when it is created, as
+it pins the operator key, and from then on takes no coin and keeps no head
+that lacks the required acknowledgements. A keeper on the signer's own
+machine adds under a millisecond to a co-signature, and one 50 ms away each
+way about 100 ms: one round trip, over a connection the signer keeps open
+to each keeper.
+
+With no keeper configured the signer works without one, and says so when it
+starts; `info` names no keeper, and a wallet says so in its own `info` and
+on every coin it receives out of round. Such an operator's record rests on
+its own machine alone: a restore of that machine, its database and record
+together, can let a coin paid out of round be spent twice, until a wallet
+holding a later head witnesses. Such an operator is for its own coins.
+
 ## Running
 
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --create-record                    # once, for a new operator key
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
-        --record /var/lib/arca/signer.record
+        --record /var/lib/arca/signer.record \
+        --keeper keeper-1.example:7341=<keeper 1 key> --keeper keeper-2.example:7341=<keeper 2 key>
     arcad /etc/arca/arcad.toml
     arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
     arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
@@ -881,6 +950,21 @@ removes the proof, with the signer stopped, after printing it.
         --compact-into /var/lib/arca/signer.record.new --drop-salts expired.salts   # with the signer stopped
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --clear-stopped                    # removes the proof of a rollback, with the signer stopped
+
+Each keeper, on a machine of its own:
+
+    arca-keeper --key-file /etc/arca/keeper.key --pubkey     # its key, for the signer's --keeper
+    arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
+        --heads /var/lib/arca/keeper.heads --create          # once
+    arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
+        --heads /var/lib/arca/keeper.heads --listen 0.0.0.0:7341
+
+The keeper's key file holds its 32-byte secret key as 64 hex characters,
+readable by its owner alone. A keeper speaks plain TCP, one JSON object a
+line: every answer it gives is signed by its key over the asker's nonce,
+and it takes nothing but heads `S` signed, so it needs no TLS. Its heads
+file is never restored from an older copy while the signer runs on, and
+never together with the signer's machine.
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`).
@@ -1258,6 +1342,22 @@ And the witness's bounds: on a record of 5,000 entries, 32 heads with
 garbage signatures at entries read back from the file refused, with no read
 of the record (watched with `strace`), four of them answered, and 32 heads
 the signer signed answered, each read back.
+
+`tests/keeper.rs` runs the signer with `arca-keeper` processes, each on a
+port of its own: every rebind answered only with the keeper's
+acknowledgement, which verifies under its key and not another's, the head
+in its file, and `head` carrying it; the keeper down, the entry recorded
+and `keepers_unavailable` answered with nothing signed, the same request
+completing as the same entry once it is back; a signer's record restored to
+entry 2 while the keeper holds entry 4, stopped at start, every rebind
+(the second spend of a lost entry's salt among them) refused `stopped`, its
+witness showing the keeper's head as the proof; behind a proxy, an
+acknowledgement signed by another key, one replayed from an earlier
+request, and a latest replayed at a start each refused, nothing signed; a
+keeper restored from an older copy stopping nothing and taking the
+record's latest; two keepers with one required, one down holding nothing
+up, a start with one down signing nothing until it is back; and what a
+keeper adds to a co-signature, printed.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next

@@ -594,6 +594,14 @@ impl Server {
 		let genesis = finality.call(|c| c.genesis()).await.map_err(err("the node"))?;
 		let signer = SignerClient::new(&config.signer_socket).with_store(store.clone());
 		let operator = signer.pubkey().await.map_err(err("the signer"))?;
+		let (keeper_keys, keepers_required) = signer.keepers().await.map_err(err("the signer"))?;
+		let keepers = crate::api::KeepersInfo {
+			keys: keeper_keys.iter().map(|k| crate::signer::hex(&k.serialize())).collect(), required: keepers_required,
+		};
+		if keepers.keys.is_empty() {
+			log::warn!("the signer has no keeper: its record rests on this machine alone, so a restore of the machine can let a coin \
+				paid out of round be spent twice; this operator is for its own coins");
+		}
 		// A signer stopped by a proven rollback of its record signs nothing
 		// the record governs; the server still starts, so every wallet's
 		// witness learns it and its holders exit, and serves no co-signature.
@@ -716,6 +724,7 @@ impl Server {
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			floors: tokio::sync::Mutex::new(None),
 			record_head: tokio::sync::Mutex::new(None),
+			keepers,
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {

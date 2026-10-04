@@ -209,6 +209,20 @@ the keys, but which coins were spent off-chain is in the store and the server.
   `sync` does only what it does on the chain. The reason is shown, and kept with the
   wallet's refusals.
 
+- **The operator's keepers.** An operator's signer may hand every head of its
+  record to keepers on other machines, and answer an entry only once enough
+  of them hold it; `info` names their keys and how many are required. The
+  wallet pins them when it is created, as it pins the operator key, and from
+  then on takes no coin and keeps no head without their acknowledgements, each
+  a keeper's signature over the head: a co-signature of the wallet's own
+  payment that comes without them leaves the payment standing, posted again
+  by `sync`, and a coin in the mailbox whose head comes without them waits,
+  its message read again. Against an operator with no keeper, the wallet's
+  `info` says so, and so does every coin it receives out of round
+  (`record_held`): such a coin rests on the operator's machine alone until it
+  is refreshed, since a restore of that machine can let its sender spend it
+  twice.
+
 ### Fees
 
 Fees are paid in the asset being moved unless another is named
@@ -286,7 +300,8 @@ which a round removes.
 ## Testing
 
 `tests/arca_scenarios.rs` runs `arca` as a user runs it against a whole Arca
-server (`arca-signer` in its own process, `Server::start` with its tasks, its
+server (`arca-signer` in its own process, with `arca-keeper` processes where
+a test runs keepers, `Server::start` with its tasks, its
 watcher and its HTTP listener) on an anchored proof-of-stake regtest chain, its wallet
 paid in an issued asset and never the policy asset. Two wallets are created
 and board, a board is credited once final; one pays the other out of round,
@@ -368,6 +383,18 @@ and holding it there, with the reason shown:
   older signed head in `info`: each is an unreachable server, the wallet
   exits nothing, takes no coin from its mailbox, refuses nothing for good,
   and goes on once the answers are honest; the signer is never stopped;
+- the same restore with a keeper running, on another machine: the signer,
+  started on the restored record, asks the keeper for its latest head before
+  it serves anything, finds it past its record's end and stops; the older
+  copy's second spend is never co-signed, the receiver of it gets nothing,
+  and the receiver of the lost payment learns of the stop on the signer's own
+  proof and takes that coin on the chain; and the same restore with no
+  keeper, where the second spend is still co-signed;
+- a keeper down: a payment is held up with nothing taken, the request
+  standing, and completes when the keeper is back; the receiver shows the
+  keeper it pinned;
+- a proxy stripping the keepers' acknowledgements: the wallet's own payment
+  stands and a coin in its mailbox waits, until the answers are whole;
 - the witness denied (a 503 on the way): `send`, `board`, `participate`, a
   swap's offer and the mailbox are refused before anything reaches the
   operator, and `sync` does only what it does on the chain; once the witness
@@ -434,11 +461,12 @@ against the server's: the wallet takes every code the server answers with a
 4xx for a refusal (but `rate_limited`, a request to slow down), and no other.
 
 They need `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` (as for the server's tests:
-[server/README.md](../server/README.md)) and the signer binary, built beside
-`arca` or named by `ARCA_SIGNER_EXEC`. Building the workspace's Bark crates
-needs `protoc` (`apt install protobuf-compiler`).
+[server/README.md](../server/README.md)) and the signer and keeper binaries,
+built beside `arca` or named by `ARCA_SIGNER_EXEC` and `ARCA_KEEPER_EXEC`.
+Building the workspace's Bark crates needs `protoc` (`apt install
+protobuf-compiler`).
 
-    cargo build -p arca-server --bin arca-signer
+    cargo build -p arca-server --bin arca-signer --bin arca-keeper
     ARCA_TEST_POSTGRES=postgres://arca@127.0.0.1:55432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-cli --test arca_scenarios --test arca_adversity -- --nocapture
     cargo test -p arca-wallet --features arca --lib arca::

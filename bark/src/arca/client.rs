@@ -89,6 +89,27 @@ pub fn record_end_digest(chain: &Chain, entry: u64, hash: &[u8; 32], nonce: &[u8
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of a keeper's acknowledgement of a head of the operator's signer's
+/// record.
+pub const KEEPER_ACK_TAG: &[u8] = b"Arca/keeper-ack";
+
+/// What a keeper signs to acknowledge that it holds head `entry`, `hash` of
+/// the record of `operator`'s signer, answering a request that carried
+/// `nonce`: `SHA256(T ‖ T ‖ genesis ‖ operator ‖ entry ‖ hash ‖ nonce)`,
+/// `T = SHA256("Arca/keeper-ack")`. The server's (`server::keeper::ack_digest`).
+pub fn keeper_ack_digest(chain: &Chain, operator: &XOnlyPublicKey, entry: u64, hash: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(KEEPER_ACK_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	e.input(nonce);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// What a `mailbox_read` asks besides its proof, as the proof binds it: the
 /// cursor (eight bytes) and the page size (four), little-endian; a
 /// `leaf_data` asks nothing more. The server's

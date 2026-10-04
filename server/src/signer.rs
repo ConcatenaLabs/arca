@@ -346,6 +346,24 @@ pub struct Response {
 	/// The proof a stopped signer stopped on.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub proof: Option<WireStopProof>,
+	/// The keepers' acknowledgements of `entry`, the head handed out: each
+	/// keeper's signature over it ([`crate::keeper::ack_digest`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub acks: Option<Vec<crate::keeper::WireAck>>,
+	/// The keepers the signer hands every head to, and how many must hold
+	/// one before it is answered (`pubkey`'s answer).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub keepers: Option<WireKeepers>,
+}
+
+/// The keepers a signer hands every head to before it answers an entry
+/// ([`crate::keeper`]): their keys, and how many must acknowledge a head.
+/// None and 0 for a signer with no keeper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WireKeepers {
+	pub keys: Vec<String>,
+	pub required: u32,
 }
 
 /// The refusal code of a message the one-spend record does not admit.
@@ -1373,18 +1391,27 @@ pub fn parse_amount(s: &str) -> Result<u64, String> {
 }
 
 /// A head of the signer's record as the signer hands it out: an entry, its
-/// running hash and `S`'s signature over them ([`record_head_digest`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// running hash and `S`'s signature over them ([`record_head_digest`]), with
+/// the keepers' acknowledgements of it when it has keepers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedHead {
 	pub entry: u64,
 	pub hash: [u8; 32],
 	pub signature: Option<Signature>,
+	pub acks: Vec<crate::keeper::WireAck>,
 }
 
 impl SignedHead {
 	pub fn from_wire(w: &WireEntryRef) -> Result<SignedHead, String> {
 		let signature = w.signature.as_deref().map(|s| Signature::from_slice(&unhex(s)?).map_err(|e| e.to_string())).transpose()?;
-		Ok(SignedHead { entry: w.entry, hash: unhex32(&w.hash)?, signature })
+		Ok(SignedHead { entry: w.entry, hash: unhex32(&w.hash)?, signature, acks: vec![] })
+	}
+
+	fn from_answer(r: &Response) -> Result<Option<SignedHead>, SignerError> {
+		let Some(e) = &r.entry else { return Ok(None) };
+		let mut h = SignedHead::from_wire(e).map_err(SignerError::Answer)?;
+		h.acks = r.acks.clone().unwrap_or_default();
+		Ok(Some(h))
 	}
 
 	pub fn to_wire(&self) -> WireEntryRef {
@@ -1458,10 +1485,31 @@ impl SignerClient {
 	}
 
 	/// The latest entry of the signer's record, with the signer's signature
-	/// over it.
+	/// over it, and its keepers' acknowledgements when they hold it (kept in
+	/// the server's database, which hands them on with the head).
 	pub async fn signed_head(&self) -> Result<SignedHead, SignerError> {
 		let r = self.ask(&Request::Head {}).await?;
-		SignedHead::from_wire(&r.entry.ok_or_else(|| SignerError::Answer("no entry".into()))?).map_err(SignerError::Answer)
+		let h = SignedHead::from_answer(&r)?.ok_or_else(|| SignerError::Answer("no entry".into()))?;
+		self.keep_acks(&h).await?;
+		Ok(h)
+	}
+
+	/// The keepers the signer hands every head to, and how many must hold
+	/// one before it answers an entry.
+	pub async fn keepers(&self) -> Result<(Vec<XOnlyPublicKey>, u32), SignerError> {
+		let r = self.ask(&Request::Pubkey {}).await?;
+		let k = r.keepers.unwrap_or_default();
+		let keys = k.keys.iter().map(|x| XOnlyPublicKey::from_slice(&unhex(x).map_err(SignerError::Answer)?)
+			.map_err(|e| SignerError::Answer(e.to_string()))).collect::<Result<Vec<_>, _>>()?;
+		Ok((keys, k.required))
+	}
+
+	/// Keeps the keepers' acknowledgements of `h` in the server's database.
+	async fn keep_acks(&self, h: &SignedHead) -> Result<(), SignerError> {
+		if let (Some(store), false) = (&self.store, h.acks.is_empty()) {
+			store.put_head_acks(h.entry, &h.hash, &h.acks).await.map_err(|e| SignerError::Database(e.to_string()))?;
+		}
+		Ok(())
 	}
 
 	/// What the signer's record holds at each of `heads`, heads of it a
@@ -1472,7 +1520,10 @@ impl SignerClient {
 	/// record does not hold stops it ([`SpendRecord::witness`]).
 	pub async fn witness(&self, heads: &[WireEntryRef], nonce: Option<&[u8; 32]>) -> Result<Witnessed, SignerError> {
 		let r = self.ask(&Request::Witness { heads: heads.to_vec(), nonce: nonce.map(|n| hex(n)) }).await?;
-		let head = r.entry.as_ref().map(SignedHead::from_wire).transpose().map_err(SignerError::Answer)?;
+		let head = SignedHead::from_answer(&r)?;
+		if let Some(h) = &head {
+			self.keep_acks(h).await?;
+		}
 		Ok(Witnessed { head, hashes: r.hashes.unwrap_or_default(), stopped: r.stopped, end: r.end, proof: r.proof })
 	}
 
@@ -1532,8 +1583,9 @@ impl SignerClient {
 			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
 		}).await?;
-		let head = r.entry.as_ref().map(SignedHead::from_wire).transpose().map_err(SignerError::Answer)?;
+		let head = SignedHead::from_answer(&r)?;
 		if let (Some(store), Some(h)) = (&self.store, &head) {
+			self.keep_acks(h).await?;
 			store.set_signer_head_signed(h.entry, &h.hash, h.signature.as_ref()).await.map_err(|e| SignerError::Database(e.to_string()))?;
 		}
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;

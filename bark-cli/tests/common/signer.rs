@@ -13,6 +13,8 @@ pub struct SignerProcess {
 	child: Child,
 	pub dir: PathBuf,
 	pub socket: PathBuf,
+	/// What every start passes besides the key, chain, socket and record.
+	extra: Vec<String>,
 }
 
 /// The signer binary: `ARCA_SIGNER_EXEC`, or `arca-signer` beside `arca`.
@@ -28,6 +30,12 @@ pub fn signer_exe() -> PathBuf {
 
 impl SignerProcess {
 	pub fn start(key: &Keypair, genesis: BlockHash) -> SignerProcess {
+		Self::start_with(key, genesis, vec![])
+	}
+
+	/// The signer, started with `extra` arguments (its keepers): every start
+	/// and resume passes them.
+	pub fn start_with(key: &Keypair, genesis: BlockHash, extra: Vec<String>) -> SignerProcess {
 		static N: AtomicUsize = AtomicUsize::new(0);
 		// Short: a Unix socket path is limited to about 100 bytes.
 		let dir = PathBuf::from(format!("/tmp/arca-cli-signer-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
@@ -47,6 +55,7 @@ impl SignerProcess {
 		let child = Command::new(signer_exe())
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
 				"--record", dir.join("signer.record").to_str().unwrap()])
+			.args(&extra)
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();
@@ -54,7 +63,7 @@ impl SignerProcess {
 			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket");
 			std::thread::sleep(Duration::from_millis(50));
 		}
-		SignerProcess { child, dir, socket }
+		SignerProcess { child, dir, socket, extra }
 	}
 
 	/// The signer's process id.
@@ -80,6 +89,7 @@ impl SignerProcess {
 		self.child = Command::new(signer_exe())
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
 				"--record", self.record().to_str().unwrap()])
+			.args(&self.extra)
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();

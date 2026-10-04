@@ -6,6 +6,7 @@ pub mod client;
 pub mod db;
 pub mod fake;
 pub mod flow;
+pub mod keeper;
 pub mod keys;
 pub mod node;
 pub mod rounds;

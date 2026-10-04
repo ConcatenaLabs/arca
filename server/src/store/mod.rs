@@ -6,7 +6,8 @@
 //! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
 //! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
-//! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`),
+//! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`,
+//! `schema/V14__keeper_acks.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -78,6 +79,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(11, include_str!("../../schema/V11__signed_record_heads.sql")),
 	(12, include_str!("../../schema/V12__challenge_key.sql")),
 	(13, include_str!("../../schema/V13__reruns_are_ordinary.sql")),
+	(14, include_str!("../../schema/V14__keeper_acks.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -274,6 +276,34 @@ impl Store {
 			Ok((u64::try_from(n).map_err(|_| StoreError::Corrupt(format!("entry {}", n)))?, array32(r.get(1), "hash")?,
 				sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a signature of another length".into()))).transpose()?))
 		}).transpose()
+	}
+
+	/// Keeps the keepers' acknowledgements `acks` of head `entry`, `hash` of
+	/// the signer's record; one kept before is left as it is.
+	pub async fn put_head_acks(&self, entry: u64, hash: &[u8; 32], acks: &[crate::keeper::WireAck]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		let n = i64::try_from(entry).map_err(|_| StoreError::Corrupt(format!("entry {}", entry)))?;
+		for a in acks {
+			let bytes = |s: &str| crate::signer::unhex(s).map_err(StoreError::Corrupt);
+			conn.execute(
+				"INSERT INTO record_head_ack (entry, hash, keeper, nonce, signature) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+				&[&n, &&hash[..], &bytes(&a.key)?, &bytes(&a.nonce)?, &bytes(&a.signature)?],
+			).await?;
+		}
+		Ok(())
+	}
+
+	/// The keepers' acknowledgements kept of head `entry`, `hash` of the
+	/// signer's record.
+	pub async fn head_acks(&self, entry: u64, hash: &[u8; 32]) -> Result<Vec<crate::keeper::WireAck>, StoreError> {
+		let conn = self.conn().await?;
+		let n = i64::try_from(entry).map_err(|_| StoreError::Corrupt(format!("entry {}", entry)))?;
+		let rows = conn.query("SELECT keeper, nonce, signature FROM record_head_ack WHERE entry = $1 AND hash = $2 ORDER BY keeper",
+			&[&n, &&hash[..]]).await?;
+		Ok(rows.iter().map(|r| {
+			let (k, nonce, s): (Vec<u8>, Vec<u8>, Vec<u8>) = (r.get(0), r.get(1), r.get(2));
+			crate::keeper::WireAck { key: crate::signer::hex(&k), nonce: crate::signer::hex(&nonce), signature: crate::signer::hex(&s) }
+		}).collect())
 	}
 
 	/// Which of `messages` (the leaf's owner key, its salt, the digest) the

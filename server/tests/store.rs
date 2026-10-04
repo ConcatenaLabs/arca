@@ -29,11 +29,34 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 13);
+	assert_eq!(db.store.schema_version().await.unwrap(), 14);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 13);
+	assert_eq!(again.schema_version().await.unwrap(), 14);
+}
+
+/// A database of schema 13 moves to 14 in place: the table of the keepers'
+/// acknowledgements is made, empty, and what the database held stays.
+#[tokio::test]
+async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
+	let db = TestDb::new().await;
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	client.batch_execute("DROP TABLE record_head_ack; DELETE FROM arca_schema WHERE version = 14;").await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 13);
+	db.store.set_signer_head_signed(3, &[3; 32], None).await.unwrap();
+	db.store.migrate().await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 14);
+	assert_eq!(db.store.signer_head().await.unwrap(), Some((3, [3; 32])), "what the database held stays");
+	assert!(db.store.head_acks(3, &[3; 32]).await.unwrap().is_empty());
+	let ack = server::keeper::WireAck { key: "11".repeat(32), nonce: "22".repeat(32), signature: "33".repeat(64) };
+	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
+	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
+	assert_eq!(db.store.head_acks(3, &[3; 32]).await.unwrap(), vec![ack], "kept once");
+	println!("schema 13 -> 14: the keepers' acknowledgements kept by head");
 }
 
 /// A database of schema 12, with a participation running again
@@ -51,7 +74,8 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		"ALTER TABLE participation ADD COLUMN forfeit_first BOOLEAN NOT NULL DEFAULT false;
 		 ALTER TABLE participation DROP COLUMN void_reason;
 		 ALTER TABLE watcher_tx DROP COLUMN round_id;
-		 DELETE FROM arca_schema WHERE version = 13;"
+		 DROP TABLE record_head_ack;
+		 DELETE FROM arca_schema WHERE version >= 13;"
 	).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 12);
 	let id = [7u8; 32];
@@ -61,7 +85,7 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		&[&&id[..], &&[8u8; 32][..], &&[9u8; 32][..]],
 	).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 13);
+	assert_eq!(db.store.schema_version().await.unwrap(), 14);
 	let p = db.store.participation(&id).await.unwrap().unwrap();
 	assert_eq!((p.state, p.attempt, p.void_reason.clone()), (server::store::ParticipationState::Pending, 1, None));
 	println!("schema 12 -> 13: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
