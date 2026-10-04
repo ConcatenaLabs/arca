@@ -103,9 +103,11 @@ source_burst = 10
 # from the nonces': at most witness_per_second over every source together,
 # with bursts of up to witness_burst, and witness_source_per_second to each
 # source, with bursts of up to witness_source_burst. A wallet makes one each
-# command.
-witness_per_second = 500
-witness_burst = 5000
+# command. The overall budget stays well under what the signer answers (about
+# 2,500 witnesses a second of heads it never saw, on a release build), so
+# witnesses leave co-signing its time.
+witness_per_second = 250
+witness_burst = 1000
 witness_source_per_second = 5
 witness_source_burst = 60
 # The reverse proxies in front of the server: a request from one of these

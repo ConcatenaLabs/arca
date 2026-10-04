@@ -44,7 +44,12 @@
 //!
 //! Every head of the record the signer hands out is signed with `S`, and so
 //! is every running hash a witness is answered with, and the record's end
-//! together with the nonce the witness carried. A head it signed that its
+//! together with the nonce the witness carried. A head's signature never
+//! changes, so the signer keeps each one it made or checked, by entry and
+//! running hash, and hands that one out again; a witness copies what it
+//! needs from the record under the record's lock and signs after releasing
+//! it, so witnesses never hold up a co-signature for longer than the
+//! lookups take. A head it signed that its
 //! record does not hold, handed back by a wallet, proves the record was
 //! rolled back or replaced: the signer writes the proof to
 //! `<record>.stopped` and signs no rebindable message and no head from then
@@ -212,11 +217,62 @@ struct State {
 	genesis: BlockHash,
 	record: Mutex<SpendRecord>,
 	keepers: Option<Keepers>,
+	/// `S`'s signature over each head, by entry and running hash, that the
+	/// signer made or checked: handed out again rather than made again, and
+	/// a head handed back with it needs no check. At most [`MAX_KEPT_SIGS`].
+	sigs: Mutex<std::collections::HashMap<(u64, [u8; 32]), [u8; 64]>>,
 }
+
+/// How many heads' signatures the signer keeps at hand: about 15 MB. Past
+/// that it forgets them all and makes or checks each again as it is asked.
+const MAX_KEPT_SIGS: usize = 100_000;
 
 impl State {
 	fn operator(&self) -> XOnlyPublicKey {
 		self.key.x_only_public_key().0
+	}
+
+	fn keep_sig(&self, n: u64, hash: &[u8; 32], sig: [u8; 64]) {
+		let mut k = self.sigs.lock().unwrap_or_else(|e| e.into_inner());
+		if k.len() >= MAX_KEPT_SIGS {
+			k.clear();
+		}
+		k.insert((n, *hash), sig);
+	}
+
+	/// `S`'s signature over entry `n` of the record, whose running hash is
+	/// `hash`: the one kept, or a new one, kept. How every head the signer
+	/// hands out is signed.
+	fn signed_head(&self, n: u64, hash: &[u8; 32]) -> WireEntryRef {
+		let kept = self.sigs.lock().unwrap_or_else(|e| e.into_inner()).get(&(n, *hash)).copied();
+		let sig = match kept {
+			Some(s) => s,
+			None => {
+				let mut aux = [0u8; 32];
+				rand::rngs::OsRng.fill_bytes(&mut aux);
+				let s: [u8; 64] = *sign_digest(&self.key, &record_head_digest(&self.genesis, n, hash), &aux).as_ref();
+				self.keep_sig(n, hash, s);
+				s
+			},
+		};
+		WireEntryRef { entry: n, hash: hex(hash), signature: Some(hex(&sig)) }
+	}
+
+	/// The running hash `head` names when it carries `S`'s valid signature
+	/// over it on this chain: the signature kept for that head needs no
+	/// check, and another valid one is kept in its place.
+	fn check_head(&self, head: &WireEntryRef) -> Option<[u8; 32]> {
+		let hash = unhex32(&head.hash).ok()?;
+		let sig: [u8; 64] = unhex(head.signature.as_deref()?).ok()?.try_into().ok()?;
+		if self.sigs.lock().unwrap_or_else(|e| e.into_inner()).get(&(head.entry, hash)) == Some(&sig) {
+			return Some(hash);
+		}
+		let parsed = Signature::from_slice(&sig).ok()?;
+		if !verify_digest(&parsed, &record_head_digest(&self.genesis, head.entry, &hash), &self.operator()) {
+			return None;
+		}
+		self.keep_sig(head.entry, &hash, sig);
+		Some(hash)
 	}
 
 	/// Why the signer is stopped, if it is.
@@ -296,9 +352,9 @@ impl State {
 			if let Some(why) = r.stopped() {
 				return Err(why.to_string());
 			}
-			let (n, hash) = r.head();
-			signed_head(&self.key, &self.genesis, n, &hash)
+			r.head()
 		};
+		let head = self.signed_head(head.0, &head.1);
 		let (genesis, operator) = (self.genesis, self.operator());
 		let answers = futures_join(k.list.iter().map(|c| c.hold(&genesis, &operator, &head))).await;
 		let mut acks = vec![];
@@ -351,15 +407,6 @@ async fn futures_join<F: std::future::Future>(fs: impl Iterator<Item = F>) -> Ve
 fn code_of(e: &str) -> Option<String> {
 	[ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED, KEEPERS_UNAVAILABLE].into_iter()
 		.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string)
-}
-
-/// `S`'s signature over entry `n` of the record, whose running hash is
-/// `hash`: how every head the signer hands out is signed.
-fn signed_head(key: &Keypair, genesis: &BlockHash, n: u64, hash: &[u8; 32]) -> WireEntryRef {
-	let mut aux = [0u8; 32];
-	rand::rngs::OsRng.fill_bytes(&mut aux);
-	let sig = sign_digest(key, &record_head_digest(genesis, n, hash), &aux);
-	WireEntryRef { entry: n, hash: hex(hash), signature: Some(hex(sig.as_ref())) }
 }
 
 fn load_key(path: &PathBuf) -> Result<Keypair, String> {
@@ -415,7 +462,7 @@ async fn answer(state: &State, line: &str) -> Response {
 					},
 				}
 			}
-			Response { entry: Some(signed_head(key, &genesis, n, &hash)), ..none }
+			Response { entry: Some(state.signed_head(n, &hash)), ..none }
 		},
 		Request::Witness { heads, nonce } => {
 			if heads.len() > MAX_WITNESS {
@@ -425,25 +472,42 @@ async fn answer(state: &State, line: &str) -> Response {
 				Ok(n) => n,
 				Err(e) => return Response { error: Some(format!("nonce: {}", e)), ..none },
 			};
-			let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
-			let was = r.stopped().is_some();
-			let mut hashes = match r.witness(&heads) {
-				Ok(h) => h,
-				Err(e) => return Response { error: Some(e), ..none },
+			// Every signature is checked before the record is locked, the
+			// ones the signer made or checked before by a look-up alone.
+			let signed: Vec<Option<[u8; 32]>> = heads.iter().map(|h| state.check_head(h)).collect();
+			// Under the record's lock, only what the answer needs from it:
+			// the running hashes, whether it is stopped, its end, and the
+			// proof's parts. Everything is signed after the lock is
+			// released, so a witness holds no co-signature up for longer.
+			let (mut hashes, stopped, (n, hash), stop_parts) = {
+				let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
+				let was = r.stopped().is_some();
+				let hashes = match r.witness_checked(&heads, &signed) {
+					Ok(h) => h,
+					Err(e) => return Response { error: Some(e), ..none },
+				};
+				let stopped = r.stopped().map(str::to_string);
+				if let (false, Some(why)) = (was, &stopped) {
+					eprintln!("arca-signer: STOPPED: {}", why);
+				}
+				let parts = match (&stopped, r.stop_head()) {
+					(Some(_), Some(p)) => match r.hash_of(p.entry) {
+						Ok(Some(x)) if hex(&x) != p.hash => Some((p.clone(), Some(x))),
+						Ok(_) => Some((p.clone(), None)),
+						Err(e) => return Response { error: Some(format!("the record could not be read: {}", e)), ..none },
+					},
+					_ => None,
+				};
+				(hashes, stopped, r.head(), parts)
 			};
 			// Every running hash answered is signed as a head: another hash
 			// at an entry a wallet holds is then two heads `S` signed at one
 			// entry, which nobody without `S` can make.
 			for h in &mut hashes {
 				if let Some(x) = h.hash.as_deref().and_then(|x| unhex32(x).ok()) {
-					h.signature = signed_head(key, &genesis, h.entry, &x).signature;
+					h.signature = state.signed_head(h.entry, &x).signature;
 				}
 			}
-			let stopped = r.stopped().map(str::to_string);
-			if let (false, Some(why)) = (was, &stopped) {
-				eprintln!("arca-signer: STOPPED: {}", why);
-			}
-			let (n, hash) = r.head();
 			// The record's end with the asker's nonce: not an older head
 			// replayed. A stopped signer signs it too, as part of its proof.
 			let end = nonce.map(|nonce| {
@@ -452,18 +516,10 @@ async fn answer(state: &State, line: &str) -> Response {
 				let sig = sign_digest(key, &record_end_digest(&genesis, n, &hash, &nonce), &aux);
 				WireEntryRef { entry: n, hash: hex(&hash), signature: Some(hex(sig.as_ref())) }
 			});
-			let proof = match (&stopped, r.stop_head()) {
-				(Some(_), Some(p)) => {
-					let held = match r.hash_of(p.entry) {
-						Ok(Some(x)) if hex(&x) != p.hash => Some(signed_head(key, &genesis, p.entry, &x)),
-						Ok(_) => None,
-						Err(e) => return Response { error: Some(format!("the record could not be read: {}", e)), ..none },
-					};
-					Some(WireStopProof { head: p.clone(), held })
-				},
-				_ => None,
-			};
-			drop(r);
+			let proof = stop_parts.map(|(head, held)| {
+				let held = held.map(|x| state.signed_head(head.entry, &x));
+				WireStopProof { head, held }
+			});
 			// The latest head goes with the keepers' acknowledgements when
 			// they acknowledged it last.
 			let acks = match &state.keepers {
@@ -472,7 +528,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				None => None,
 			};
 			Response {
-				entry: stopped.is_none().then(|| signed_head(key, &genesis, n, &hash)),
+				entry: stopped.is_none().then(|| state.signed_head(n, &hash)),
 				acks: acks.filter(|_| stopped.is_none()),
 				hashes: Some(hashes),
 				stopped,
@@ -565,7 +621,7 @@ async fn answer(state: &State, line: &str) -> Response {
 						return Response { code: code_of(&e), error: Some(e), ..none };
 					},
 				},
-				None => (signed_head(key, &genesis, entry.n, &entry.hash), None),
+				None => (state.signed_head(entry.n, &entry.hash), None),
 			};
 			let mut aux = [0u8; 32];
 			rand::rngs::OsRng.fill_bytes(&mut aux);
@@ -598,7 +654,9 @@ async fn answer(state: &State, line: &str) -> Response {
 	}
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Requests are answered on several threads at once: a witness's signing
+// runs beside a co-signature, which waits only for the record's lock.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
 	let args = match args() {
 		Ok(a) => a,
@@ -696,7 +754,7 @@ async fn main() {
 		checked: tokio::sync::Mutex::new(false),
 		acked: tokio::sync::Mutex::new(None),
 	});
-	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers });
+	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default() });
 	match &state.keepers {
 		// At start, before anything is served: the keepers' latest heads
 		// against the record. One the record does not hold stops the signer

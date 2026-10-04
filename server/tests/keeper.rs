@@ -602,3 +602,136 @@ async fn the_record_names_its_keepers_and_the_signer_serves_only_with_them() {
 	let _ = std::fs::remove_dir_all(&t.dir);
 	let _ = std::fs::remove_dir_all(&none.dir);
 }
+
+/// Asks the keeper at `addr` for its latest head on a fresh connection,
+/// within `wait`: its answer, or `None`.
+async fn ask_latest(addr: &str, wait: Duration) -> Option<Value> {
+	tokio::time::timeout(wait, async {
+		let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
+		s.write_all(format!("{{\"op\":\"latest\",\"nonce\":\"{}\"}}\n", hex(&[9; 32])).as_bytes()).await.ok()?;
+		let mut r = BufReader::new(s);
+		let mut out = String::new();
+		r.read_line(&mut out).await.ok()?;
+		serde_json::from_str(&out).ok()
+	}).await.ok().flatten()
+}
+
+/// Whether the keeper closed connection `s` within `wait`.
+async fn closed(s: &mut tokio::net::TcpStream, wait: Duration) -> bool {
+	use tokio::io::AsyncReadExt;
+	let mut b = [0u8; 64];
+	matches!(tokio::time::timeout(wait, s.read(&mut b)).await, Ok(Ok(0)) | Ok(Err(_)))
+}
+
+/// The keeper process's CPU time, user and system, in clock ticks.
+fn cpu_ticks(pid: u32) -> u64 {
+	let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap();
+	let f: Vec<&str> = stat.rsplit_once(") ").unwrap().1.split(' ').collect();
+	f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// R7f F8 turned around. A keeper is reached from the signer alone, and a
+/// flood of connections neither stops it nor fills its log. With its open
+/// descriptors limited to 32: (a) 300 connections from an address `--allow`
+/// does not name are each closed at once, one line in its log says so, and
+/// the signer's co-signature goes through meanwhile; (b) 40 idle
+/// connections from the signer's own address: at most `--max-connections`
+/// (8) stay open, the rest closed at once, and once they have been idle for
+/// `--idle-timeout-ms` they are closed too and the next co-signature goes
+/// through; (c) a keeper allowed more connections than it has descriptors,
+/// 100 opened to it: its accept fails, it waits before trying again and
+/// says so a few times rather than in a loop, and answers again once the
+/// idle ones are closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_admits_its_signer_alone_and_holds_up_under_a_flood() {
+	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
+	let listen = |max: &str| ["--allow", "127.0.0.1", "--max-connections", max, "--idle-timeout-ms", "1500"].iter().map(|a| a.to_string())
+		.collect::<Vec<_>>();
+	let keeper = KeeperProcess::start_with(&k, xonly(&t.s), t.genesis, listen("8"), Some(32));
+	let signer = Signer::start(&t.dir, "flooded", t.genesis, &keepers_args(&[keeper.arg()]));
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [1; 32], t.asset)).await;
+	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "{}", v);
+
+	// (a) From an address --allow does not name.
+	let addr: std::net::SocketAddr = keeper.addr.parse().unwrap();
+	let mut outsiders = vec![];
+	for _ in 0..300 {
+		let sock = tokio::net::TcpSocket::new_v4().unwrap();
+		sock.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+		if let Ok(s) = sock.connect(addr).await {
+			outsiders.push(s);
+		}
+	}
+	let mut shut = 0;
+	for s in &mut outsiders {
+		shut += closed(s, Duration::from_secs(2)).await as usize;
+	}
+	let refused_lines = keeper.log().lines().filter(|l| l.contains("refused a connection from 127.0.0.2")).count();
+	println!("(a) {} connections from 127.0.0.2, {} closed at once by the keeper; {} line(s) in its log", outsiders.len(), shut, refused_lines);
+	assert_eq!((outsiders.len(), shut), (300, 300));
+	assert!(refused_lines <= 2, "{}", keeper.log());
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [2; 32], t.asset)).await;
+	println!("(a) a co-signature meanwhile: signed {} | acks {}", v["signature"].is_string(), v["acks"].as_array().map(|a| a.len()).unwrap_or(0));
+	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "{}", v);
+	drop(outsiders);
+
+	// (b) Idle connections from the signer's own address.
+	let mut idle = vec![];
+	for _ in 0..40 {
+		idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+	}
+	// Every connection looked at together, for 300 ms.
+	let mut looked = tokio::task::JoinSet::new();
+	for mut s in idle {
+		looked.spawn(async move {
+			let c = closed(&mut s, Duration::from_millis(300)).await;
+			(s, c)
+		});
+	}
+	let mut idle = vec![];
+	let mut shut = 0;
+	while let Some(Ok((s, c))) = looked.join_next().await {
+		shut += c as usize;
+		idle.push(s);
+	}
+	println!("(b) 40 idle connections from 127.0.0.1: {} closed at once, {} held (the signer's own included in the bound of 8)", shut, 40 - shut);
+	assert!(shut >= 32, "{} closed", shut);
+	tokio::time::sleep(Duration::from_millis(2500)).await;
+	let mut later = 0;
+	for s in &mut idle {
+		later += closed(s, Duration::from_millis(100)).await as usize;
+	}
+	println!("(b) after 1.5 s idle: {} of 40 closed", later);
+	assert_eq!(later, 40);
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [3; 32], t.asset)).await;
+	println!("(b) the next co-signature: signed {} | acks {}", v["signature"].is_string(), v["acks"].as_array().map(|a| a.len()).unwrap_or(0));
+	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "{}", v);
+	drop(idle);
+	drop(signer);
+
+	// (c) More connections than descriptors.
+	let k2 = keypair("keeper two");
+	let keeper2 = KeeperProcess::start_with(&k2, xonly(&t.s), t.genesis, listen("1000"), Some(32));
+	let pid = keeper2.pid().unwrap();
+	let ticks = cpu_ticks(pid);
+	let at = Instant::now();
+	let mut many = vec![];
+	for _ in 0..100 {
+		many.push(tokio::net::TcpStream::connect(&keeper2.addr).await.unwrap());
+	}
+	tokio::time::sleep(Duration::from_millis(1200)).await;
+	let used = cpu_ticks(pid) - ticks;
+	let log = keeper2.log();
+	let accept_lines = log.lines().filter(|l| l.contains("accept:")).count();
+	println!("(c) 100 connections to a keeper with 32 descriptors: {} accept line(s) in its log ({} bytes), {} CPU tick(s) in {} ms; {}",
+		accept_lines, log.len(), used, at.elapsed().as_millis(), log.lines().find(|l| l.contains("accept:")).unwrap_or("no accept failure"));
+	assert!(accept_lines >= 1 && accept_lines <= 3, "{}", log);
+	assert!(used < 50, "the keeper waits rather than spinning: {} ticks", used);
+	drop(many);
+	tokio::time::sleep(Duration::from_millis(2000)).await;
+	let answer = ask_latest(&keeper2.addr, Duration::from_secs(3)).await;
+	println!("(c) a fresh request once the idle ones are closed: {}", answer.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "none".into()));
+	assert!(answer.is_some_and(|a| a["signature"].is_string()));
+	let _ = std::fs::remove_dir_all(&t.dir);
+}

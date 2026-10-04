@@ -31,12 +31,22 @@ pub struct KeeperProcess {
 	pub key: Keypair,
 	operator: XOnlyPublicKey,
 	genesis: BlockHash,
+	/// What `--listen` goes with: whom it admits, its bounds.
+	listen: Vec<String>,
+	/// The soft limit on its open descriptors, when the test sets one.
+	nofile: Option<u32>,
 }
 
 impl KeeperProcess {
 	/// A new keeper with a key of its own, its heads file made once, serving
-	/// on a port of its own.
+	/// on a port of its own to this machine's signer (`--allow 127.0.0.1`).
 	pub fn start(key: &Keypair, operator: XOnlyPublicKey, genesis: BlockHash) -> KeeperProcess {
+		Self::start_with(key, operator, genesis, vec!["--allow".into(), "127.0.0.1".into()], None)
+	}
+
+	/// [`Self::start`], `listen` going with `--listen`, and its open
+	/// descriptors limited to `nofile`.
+	pub fn start_with(key: &Keypair, operator: XOnlyPublicKey, genesis: BlockHash, listen: Vec<String>, nofile: Option<u32>) -> KeeperProcess {
 		static N: AtomicUsize = AtomicUsize::new(0);
 		let dir = PathBuf::from(format!("/tmp/arca-keeper-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
 		let _ = std::fs::remove_dir_all(&dir);
@@ -45,7 +55,7 @@ impl KeeperProcess {
 		let file = dir.join("keeper.key");
 		std::fs::write(&file, hex(&key.secret_bytes())).unwrap();
 		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-		let mut k = KeeperProcess { child: None, dir, addr: format!("127.0.0.1:{}", free_port()), key: *key, operator, genesis };
+		let mut k = KeeperProcess { child: None, dir, addr: format!("127.0.0.1:{}", free_port()), key: *key, operator, genesis, listen, nofile };
 		let made = k.command().arg("--create").output().unwrap();
 		assert!(made.status.success(), "the keeper's heads file: {}", String::from_utf8_lossy(&made.stderr));
 		k.resume();
@@ -69,6 +79,11 @@ impl KeeperProcess {
 		format!("{}={}", self.addr, hex(&self.key.x_only_public_key().0.serialize()))
 	}
 
+	/// The keeper's process id.
+	pub fn pid(&self) -> Option<u32> {
+		self.child.as_ref().map(|c| c.id())
+	}
+
 	/// Stops the keeper; its heads file stays.
 	pub fn halt(&mut self) {
 		if let Some(mut c) = self.child.take() {
@@ -81,7 +96,18 @@ impl KeeperProcess {
 	pub fn resume(&mut self) {
 		self.halt();
 		let log = std::fs::File::create(self.dir.join("keeper.log")).unwrap();
-		self.child = Some(self.command().args(["--listen", &self.addr]).stdout(Stdio::null()).stderr(log).spawn().unwrap());
+		let mut c = match self.nofile {
+			// Through a shell that lowers the descriptor limit, then becomes
+			// the keeper.
+			Some(n) => {
+				let mut c = Command::new("sh");
+				c.arg("-c").arg(format!("ulimit -n {} && exec \"$0\" \"$@\"", n)).arg(env!("CARGO_BIN_EXE_arca-keeper"));
+				c.args(self.command().get_args());
+				c
+			},
+			None => self.command(),
+		};
+		self.child = Some(c.args(["--listen", &self.addr]).args(&self.listen).stdout(Stdio::null()).stderr(log).spawn().unwrap());
 		let start = Instant::now();
 		while TcpStream::connect(&self.addr).is_err() {
 			assert!(start.elapsed() < Duration::from_secs(20), "the keeper did not listen: {}", self.log());
