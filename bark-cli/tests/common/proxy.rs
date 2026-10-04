@@ -1,5 +1,5 @@
 //! A proxy between a wallet and the server that can rewrite any answer the
-//! server gives, or hold a call unanswered: an operator lying to one wallet,
+//! server gives, or a request on its way to it, or hold a call unanswered: an operator lying to one wallet,
 //! or gone mid-call. It logs every call as the wallet saw it. In front of a
 //! node's RPC (it passes the request's credentials on) it is another node,
 //! one that answers some calls otherwise.
@@ -22,10 +22,15 @@ pub type Rewrite = Arc<dyn Fn(&str, &Value, u16, &mut Value) -> Option<u16> + Se
 /// (status 0 for a call held unanswered).
 pub type Logged = (String, Value, u16, Value);
 
+/// Called with the call's path and the request's body before it is sent on;
+/// may rewrite the body, which then goes to the server as rewritten.
+pub type RewriteRequest = Arc<dyn Fn(&str, &mut Value) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Proxy {
 	pub url: String,
 	rewrite: Arc<Mutex<Option<Rewrite>>>,
+	rewrite_request: Arc<Mutex<Option<RewriteRequest>>>,
 	log: Arc<Mutex<Vec<Logged>>>,
 	/// Paths whose requests are held unanswered past the wallet's timeout and
 	/// never forwarded.
@@ -57,7 +62,15 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 	}
 	let mut body = vec![0u8; len];
 	r.read_exact(&mut body)?;
-	let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+	let mut req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+	let g = p.rewrite_request.lock().unwrap().clone();
+	if let Some(g) = g {
+		let before = req.clone();
+		g(&path, &mut req);
+		if req != before {
+			body = req.to_string().into_bytes();
+		}
+	}
 	if p.hold.lock().unwrap().contains(&path) {
 		p.log.lock().unwrap().push((path.clone(), req, 0, Value::Null));
 		std::thread::sleep(Duration::from_secs(75));
@@ -94,6 +107,7 @@ impl Proxy {
 		let p = Proxy {
 			url: format!("http://{}", l.local_addr().unwrap()),
 			rewrite: Arc::new(Mutex::new(None)),
+			rewrite_request: Arc::new(Mutex::new(None)),
 			log: Arc::new(Mutex::new(vec![])),
 			hold: Arc::new(Mutex::new(vec![])),
 		};
@@ -124,6 +138,11 @@ impl Proxy {
 	/// Rewrites answers with `f`, or nothing.
 	pub fn rewrite(&self, f: Option<Rewrite>) {
 		*self.rewrite.lock().unwrap() = f;
+	}
+
+	/// Rewrites requests with `f` before they reach the server, or nothing.
+	pub fn rewrite_request(&self, f: Option<RewriteRequest>) {
+		*self.rewrite_request.lock().unwrap() = f;
 	}
 
 	/// Holds every call to `path` unanswered from now on.

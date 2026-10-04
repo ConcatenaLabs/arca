@@ -33,10 +33,12 @@
 //! take it before the round makes the leaf), prices each
 //! forfeit's margin, and records it all, the coins given up becoming spent by
 //! the participation, in one database transaction. A participation submitted
-//! again byte for byte is the same participation and gets its status.
+//! again is the same participation and gets its status, whatever key proofs
+//! it carries: the id does not cover them, and they were checked when it was
+//! taken, so a request repeated without them is answered too.
 //!
 //! The participation's id is a tagged hash of the whole request but the
-//! attestations:
+//! attestations and key proofs, which sign it:
 //!
 //! ```text
 //! SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body),   T = SHA256("Arca/participation")
@@ -137,7 +139,9 @@ pub struct ParticipationRequest {
 	pub inputs: Vec<InputRequest>,
 	pub outputs: Vec<OutputRequest>,
 	/// For each output, in order, the proof of its key ([`key_proof_digest`],
-	/// signed by the key a leaf is wanted under); `None` for an offboard.
+	/// signed by the key a leaf is wanted under); `None` for an offboard, and
+	/// for a leaf of a request that brings none, which is refused unless the
+	/// server holds the participation already.
 	pub key_proofs: Vec<Option<Signature>>,
 	/// The fee paid, per asset, in that asset.
 	pub fees: Vec<(AssetId, u64)>,
@@ -374,7 +378,8 @@ impl Participations {
 	}
 
 	/// Accepts `req`: see the [module documentation](self). A participation
-	/// submitted again gets its status.
+	/// submitted again gets its status, whatever key proofs it carries: the
+	/// id does not cover them, and they were checked when it was taken.
 	pub async fn submit(&self, req: &ParticipationRequest) -> Result<Status, ParticipationError> {
 		let n = req.inputs.len();
 		if n == 0 || n > MAX_INPUTS {

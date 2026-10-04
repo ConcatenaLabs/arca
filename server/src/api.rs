@@ -385,8 +385,11 @@ pub struct WantedLeaf {
 	pub exit_delay_units: u16,
 	/// The owner key's BIP340 signature over the participation's key-proof
 	/// digest (`participations::key_proof_digest`): a participation wants a
-	/// leaf only under a key it holds.
-	pub key_proof: String,
+	/// leaf only under a key it holds. Required of a participation the
+	/// server does not hold yet; one it holds is answered with its status
+	/// whatever its body lacks (the id does not cover the proofs).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub key_proof: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

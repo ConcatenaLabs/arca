@@ -638,7 +638,7 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	let mut key_proofs = Vec::with_capacity(req.outputs.len());
 	for o in &req.outputs {
 		key_proofs.push(match o {
-			api::WantedOutput::Leaf(l) => Some(sig(&l.key_proof)?),
+			api::WantedOutput::Leaf(l) => l.key_proof.as_deref().map(sig).transpose()?,
 			api::WantedOutput::Offboard(_) => None,
 		});
 		outputs.push(match o {
