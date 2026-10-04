@@ -561,4 +561,9 @@ async fn a_refreshed_coin_paid_from_a_board_waits_for_the_change_and_then_comes_
 	let after = x_balance(&r).await;
 	println!("the wallet holds {} more of X: both coins back, less the fees", after as i64 - before as i64);
 	assert!(after > before + 590_000 + change - 20_000);
+	// The coins whose forfeit's claim is final are scanned no more.
+	let left: Vec<String> = r.server.store.forfeited_transfer_coins().await.unwrap().iter()
+		.map(|(l, _)| common::client::hex(l)).collect();
+	println!("forfeited transfer coins still scanned once both claims are final: {:?}", left);
+	assert!(!left.contains(&common::client::hex(&bid)) && !left.contains(&common::client::hex(&a2id)), "{:?}", left);
 }

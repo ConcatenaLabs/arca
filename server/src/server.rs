@@ -679,11 +679,7 @@ impl Server {
 				config.limits.source_burst),
 			witnesses: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
-			challenge_key: {
-				let mut k = [0u8; 32];
-				rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
-				k
-			},
+			challenge_key: store.challenge_key().await.map_err(err("the database"))?,
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			floors: tokio::sync::Mutex::new(None),

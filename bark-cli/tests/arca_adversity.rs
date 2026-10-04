@@ -2243,6 +2243,8 @@ async fn a_second_spend_before_any_witness_is_answered_by_the_receivers_next_syn
 	let (ok, v) = m.run(&["exit", &got_m]);
 	println!("W2 M's exit again: ok={} {}", ok, v);
 	assert!(!(ok && v["state"] == "waiting"), "the second spend's coin does not reach the chain: {}", v);
+	assert!(v["error"]["message"].as_str().unwrap_or("").contains(&format!("co-signed another spend of coin {}", c_a)),
+		"the refusal names the coin paid twice: {}", v);
 	let _ = (&a, &mut r);
 	for w in [&a, &a_old, &b, &m, &d] {
 		let _ = std::fs::remove_dir_all(&w.dir);

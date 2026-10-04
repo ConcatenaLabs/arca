@@ -4,24 +4,28 @@
 //! BIP340, the tagged hash
 //!
 //! ```text
-//! SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key),   T = SHA256("Arca/auth")
+//! SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request)),   T = SHA256("Arca/auth")
 //! ```
 //!
 //! where `call` names the request it authenticates (`mailbox_read`,
+//! `leaf_data`) and `request` is what that request asks besides its proof
+//! ([`mailbox_read_request`]: the cursor and page size; nothing for
 //! `leaf_data`). The tag keeps the signature apart from everything else a leaf
 //! key signs (rebindable messages, unroll authorisations, releases, exit
 //! claims), whose preimages never begin with `T ‖ T`; the genesis hash keeps
-//! it to one chain, the call to one request, the challenge to a short while,
-//! the key to one signer. No shared bearer token exists.
+//! it to one chain, the call and the request to one read, the challenge to a
+//! short while, the key to one signer. No shared bearer token exists.
 //!
 //! A challenge is stored nowhere: it is the time it was issued (4 bytes, the
 //! server's clock in seconds, little-endian), 12 random bytes, and a keyed
-//! check over both (the first 16 bytes of HMAC-SHA256 under a key the server
-//! draws when it starts, over `"Arca/challenge" ‖ time ‖ random`). The server
-//! takes one it issued, by the check, within its lifetime. So handing one out
-//! costs a hash and leaves no row, and needs no budget shared by every caller;
-//! a challenge used again within its lifetime only repeats a read the same
-//! key made, since the signature binds the call and the key.
+//! check over both (the first 16 bytes of HMAC-SHA256, over
+//! `"Arca/challenge" ‖ time ‖ random`, under a key drawn once and kept in the
+//! database, so every server on it takes the challenges of every other, and
+//! of itself before a restart). The server takes one it issued, by the check,
+//! within its lifetime. So handing one out costs a hash and leaves no row, and
+//! needs no budget shared by every caller; a proof used again within the
+//! challenge's lifetime only repeats the very read it was signed for, since
+//! the signature binds the call, the key and the request.
 
 use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::schnorr::Signature;
@@ -33,8 +37,18 @@ use arca_covenant::Chain;
 /// The tag of the signed message.
 pub const AUTH_TAG: &[u8] = b"Arca/auth";
 
-/// The digest a client signs to authenticate `call` with `key`.
-pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey) -> [u8; 32] {
+/// What a `mailbox_read` asks besides its proof, as the proof binds it: the
+/// cursor (eight bytes) and the page size (four), little-endian. A
+/// `leaf_data` asks nothing more: its request is empty.
+pub fn mailbox_read_request(after: u64, limit: u32) -> Vec<u8> {
+	let mut b = after.to_le_bytes().to_vec();
+	b.extend(limit.to_le_bytes());
+	b
+}
+
+/// The digest a client signs to authenticate `call` with `key`, asking
+/// `request` ([`mailbox_read_request`]).
+pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey, request: &[u8]) -> [u8; 32] {
 	let tag = sha256::Hash::hash(AUTH_TAG);
 	let mut e = sha256::Hash::engine();
 	e.input(tag.as_byte_array());
@@ -44,12 +58,14 @@ pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyP
 	e.input(call.as_bytes());
 	e.input(challenge);
 	e.input(&key.serialize());
+	e.input(sha256::Hash::hash(request).as_byte_array());
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
-/// Whether `sig` authenticates `call` with `key` for `challenge`.
-pub fn verify(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey, sig: &Signature) -> bool {
-	verify_digest(sig, &auth_digest(chain, call, challenge, key), key)
+/// Whether `sig` authenticates `call` with `key` for `challenge`, asking
+/// `request`.
+pub fn verify(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey, request: &[u8], sig: &Signature) -> bool {
+	verify_digest(sig, &auth_digest(chain, call, challenge, key, request), key)
 }
 
 /// The tag of a challenge's keyed check.

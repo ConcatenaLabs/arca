@@ -23,7 +23,7 @@ fee_multiple = 2
 max_request_bytes = 65536
 
 # How long an authentication challenge is good for. A challenge is checked
-# by a key the server draws when it starts, not stored.
+# by a key kept in the database, drawn once, and is itself stored nowhere.
 challenge_ttl_seconds = 120
 
 # How often a round is built while participations wait, in seconds. 0 builds

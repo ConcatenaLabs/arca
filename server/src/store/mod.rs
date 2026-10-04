@@ -5,7 +5,8 @@
 //! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
 //! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
-//! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`), built from
+//! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
+//! `schema/V12__challenge_key.sql`), built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
@@ -72,6 +73,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(9, include_str!("../../schema/V9__wanted_keys_freed.sql")),
 	(10, include_str!("../../schema/V10__round_signer_head.sql")),
 	(11, include_str!("../../schema/V11__signed_record_heads.sql")),
+	(12, include_str!("../../schema/V12__challenge_key.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -203,6 +205,17 @@ impl Store {
 		}
 		tx.commit().await?;
 		Ok(())
+	}
+
+	/// The key of every challenge's keyed check: drawn by the first server
+	/// to ask, kept, and the same for every server on the database after.
+	pub async fn challenge_key(&self) -> Result<[u8; 32], StoreError> {
+		let mut fresh = [0u8; 32];
+		rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fresh);
+		let conn = self.conn().await?;
+		conn.execute("INSERT INTO challenge_key (one, key) VALUES (true, $1) ON CONFLICT (one) DO NOTHING", &[&&fresh[..]]).await?;
+		let row = conn.query_one("SELECT key FROM challenge_key", &[]).await?;
+		array32(row.get(0), "challenge key")
 	}
 
 	/// The latest entry of the signer's record the server was given: its

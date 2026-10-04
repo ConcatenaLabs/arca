@@ -9,7 +9,7 @@ use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey};
 use elements::{AssetId, BlockHash};
 
 use arca_covenant::{Chain, LeafId, MedianTime, RelativeTime, Template};
-use bark::arca::client::{auth_digest, key_proof_digest, participation_id, record_head_digest, Wanted};
+use bark::arca::client::{auth_digest, key_proof_digest, mailbox_read_request, participation_id, record_head_digest, Wanted};
 use server::participations::OutputRequest;
 
 fn key(label: &str) -> Keypair {
@@ -44,7 +44,14 @@ fn the_wallets_digests_are_the_servers() {
 	let chain = Chain::new(BlockHash::from_str("3ce8ab6c8f9836c0cebca304f3cbed3e824e6c53f4cacd2822f6f8441eed1a3e").unwrap());
 	let k = key("owner").x_only_public_key().0;
 	for call in ["mailbox_read", "leaf_data"] {
-		assert_eq!(auth_digest(&chain, call, &[7; 32], &k), server::auth::auth_digest(&chain, call, &[7; 32], &k));
+		for (after, limit) in [(0u64, 100u32), (17, 3), (u64::MAX, u32::MAX)] {
+			let mine = mailbox_read_request(after, limit);
+			assert_eq!(mine, server::auth::mailbox_read_request(after, limit));
+			assert_eq!(auth_digest(&chain, call, &[7; 32], &k, &mine), server::auth::auth_digest(&chain, call, &[7; 32], &k, &mine));
+		}
+		assert_eq!(auth_digest(&chain, call, &[7; 32], &k, &[]), server::auth::auth_digest(&chain, call, &[7; 32], &k, &[]));
+		assert_ne!(auth_digest(&chain, call, &[7; 32], &k, &mailbox_read_request(0, 100)),
+			auth_digest(&chain, call, &[7; 32], &k, &mailbox_read_request(1, 100)), "the request is bound");
 	}
 	let s = key("operator").x_only_public_key().0;
 	let a = AssetId::from_slice(&[0x28; 32]).unwrap();

@@ -4,8 +4,10 @@
 //!
 //! The calls that read a key's mailbox or leaves are authenticated with a
 //! challenge from the server, signed with the key (BIP340) over the tagged
-//! hash `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key)`,
-//! `T = SHA256("Arca/auth")`. A transfer is authenticated by its owners'
+//! hash `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖
+//! SHA256(request))`, `T = SHA256("Arca/auth")`, `request` what the read asks
+//! besides its proof ([`mailbox_read_request`]), so a proof seen by anyone on
+//! the way repeats only that very read. A transfer is authenticated by its owners'
 //! signatures over the transfer itself, a participation by each owner's
 //! attestation over the participation's id, and by each key it wants a leaf
 //! under, signing its key-proof digest. There is no bearer token.
@@ -67,8 +69,20 @@ pub fn record_head_digest(chain: &Chain, entry: u64, hash: &[u8; 32]) -> [u8; 32
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
-/// The digest `key` signs to authenticate `call` with `challenge`.
-pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey) -> [u8; 32] {
+/// What a `mailbox_read` asks besides its proof, as the proof binds it: the
+/// cursor (eight bytes) and the page size (four), little-endian; a
+/// `leaf_data` asks nothing more. The server's
+/// (`server::auth::mailbox_read_request`).
+pub fn mailbox_read_request(after: u64, limit: u32) -> Vec<u8> {
+	let mut b = after.to_le_bytes().to_vec();
+	b.extend(limit.to_le_bytes());
+	b
+}
+
+/// The digest `key` signs to authenticate `call` with `challenge`, asking
+/// `request` ([`mailbox_read_request`]): `SHA256(T ‖ T ‖ genesis_hash ‖
+/// len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`.
+pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey, request: &[u8]) -> [u8; 32] {
 	let tag = sha256::Hash::hash(AUTH_TAG);
 	let mut e = sha256::Hash::engine();
 	e.input(tag.as_byte_array());
@@ -78,6 +92,7 @@ pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyP
 	e.input(call.as_bytes());
 	e.input(challenge);
 	e.input(&key.serialize());
+	e.input(sha256::Hash::hash(request).as_byte_array());
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
@@ -251,12 +266,12 @@ impl ServerClient {
 		unhex32(v["operator_nonce"].as_str().unwrap_or(""))
 	}
 
-	/// A proof of `key` for `call`.
-	pub fn auth(&self, call: &str, key: &Keypair, chain: &Chain) -> Result<Value, Error> {
+	/// A proof of `key` for `call`, asking `request`.
+	pub fn auth(&self, call: &str, key: &Keypair, chain: &Chain, request: &[u8]) -> Result<Value, Error> {
 		let v = self.post("challenge", &json!({}))?;
 		let challenge = unhex32(v["challenge"].as_str().unwrap_or(""))?;
 		let xonly = key.x_only_public_key().0;
-		let sig = sign_digest(key, &auth_digest(chain, call, &challenge, &xonly), &random32());
+		let sig = sign_digest(key, &auth_digest(chain, call, &challenge, &xonly, request), &random32());
 		Ok(json!({"key": hex(&xonly.serialize()), "challenge": hex(&challenge), "signature": hex(sig.as_ref())}))
 	}
 
@@ -270,13 +285,13 @@ impl ServerClient {
 
 	/// The coin records in `key`'s mailbox after `after`.
 	pub fn mailbox_read(&self, key: &Keypair, chain: &Chain, after: i64, limit: u32) -> Result<Value, Error> {
-		let auth = self.auth("mailbox_read", key, chain)?;
+		let auth = self.auth("mailbox_read", key, chain, &mailbox_read_request(after.max(0) as u64, limit))?;
 		self.post("mailbox_read", &json!({"auth": auth, "after": after.to_string(), "limit": limit}))
 	}
 
 	/// The leaves `key` owns, as the server holds them.
 	pub fn leaf_data(&self, key: &Keypair, chain: &Chain) -> Result<Value, Error> {
-		let auth = self.auth("leaf_data", key, chain)?;
+		let auth = self.auth("leaf_data", key, chain, &[])?;
 		self.post("leaf_data", &json!({"auth": auth}))
 	}
 }

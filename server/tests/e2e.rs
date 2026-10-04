@@ -211,13 +211,19 @@ async fn board_transfer_mailbox_and_rules() {
 
 	// Authentication: B's mailbox needs B's key, and a challenge this server
 	// issued; the same proof again within the challenge's lifetime only
-	// repeats B's own read.
-	let mut auth = r.http.auth("mailbox_read", &a, &r.chain);
+	// repeats the very read B signed: another cursor or page size is refused.
+	let first_page = server::auth::mailbox_read_request(0, 10);
+	let mut auth = r.http.auth_for("mailbox_read", &a, &r.chain, &first_page);
 	auth["key"] = json!(hex(&xonly(&b).serialize()));
 	refused(r.http.post("mailbox_read", &json!({"auth": auth, "after": "0", "limit": 10})), 401, "unauthenticated");
-	let good = r.http.auth("mailbox_read", &b, &r.chain);
+	let good = r.http.auth_for("mailbox_read", &b, &r.chain, &first_page);
 	let first = r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})).ok();
 	assert_eq!(r.http.post("mailbox_read", &json!({"auth": good, "after": "0", "limit": 10})).ok(), first);
+	for (after, limit) in [("1", 10), ("0", 11), ("100", 100)] {
+		let replayed = r.http.post("mailbox_read", &json!({"auth": good, "after": after, "limit": limit}));
+		println!("B's proof for (0, 10) replayed with ({}, {}): {} {:?}", after, limit, replayed.status, replayed.refusal());
+		refused(replayed, 401, "unauthenticated");
+	}
 	let mut other_call = r.http.auth("leaf_data", &b, &r.chain);
 	other_call["key"] = json!(hex(&xonly(&b).serialize()));
 	refused(r.http.post("mailbox_read", &json!({"auth": other_call, "after": "0", "limit": 10})), 401, "unauthenticated");
@@ -491,4 +497,30 @@ async fn no_policy_asset_cosigns_and_broadcasts() {
 	}
 	let v: Value = r.rt.client().call("getrawtransaction", &[json!(txid.to_string()), json!(true)]).unwrap();
 	println!("broadcast {} with its fee of {} atoms in X; final; {} confirmations", txid, built.fee.amount, v["confirmations"]);
+}
+
+/// The key of every challenge's check is kept in the database, drawn once: a
+/// challenge issued before a restart is taken after it, and two servers on
+/// one database take each other's (R7d F6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_challenge_is_taken_across_a_restart_and_by_another_server_on_the_database() {
+	let mut r = Running::start().await;
+	let b = keypair("B");
+	let request = server::auth::mailbox_read_request(0, 10);
+	let proof = r.http.auth_for("mailbox_read", &b, &r.chain, &request);
+	let read = |http: &common::client::Http| http.post("mailbox_read", &json!({"auth": proof, "after": "0", "limit": 10}));
+	let mut second = r.config.clone();
+	second.listen = "127.0.0.1:0".into();
+	let other = server::server::Server::start(&second).await.unwrap();
+	let http2 = common::client::Http { base: format!("http://{}", other.addr) };
+	let a = read(&http2);
+	println!("a challenge of the first server, read through a second on the same database: {} {}", a.status, a.json);
+	assert_eq!(a.status, 200, "{}", a.json);
+	other.stop();
+	r.restart_server().await;
+	let a = read(&r.http);
+	println!("the same proof after the first server restarted: {} {}", a.status, a.json);
+	assert_eq!(a.status, 200, "{}", a.json);
+	let c2 = r.http.post("challenge", &json!({})).ok();
+	assert!(c2["challenge"].is_string());
 }

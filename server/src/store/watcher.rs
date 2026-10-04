@@ -299,14 +299,20 @@ impl Store {
 	}
 
 	/// Every coin a transfer made that is given up in a participation and
-	/// has a forfeit stored, but those whose claim is final: with its record.
+	/// has a forfeit stored, but those whose forfeit the watcher published
+	/// and a claim of its own spent, final: with its record. A claim's
+	/// subject is its round's connector asset, so the claim is found as the
+	/// spender of the forfeit's output.
 	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
 			"SELECT DISTINCT l.leaf_id, l.record FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
 			 WHERE l.kind = 'transfer' AND l.state = 'spent'
-			   AND NOT EXISTS (SELECT 1 FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
-			                   WHERE w.kind = 'claim' AND w.subject = l.leaf_id AND n.state = 'final')
+			   AND NOT EXISTS (SELECT 1 FROM watcher_tx fw
+			                   JOIN watcher_input wi ON wi.prev_txid = fw.txid AND wi.prev_vout = 0
+			                   JOIN watcher_tx cw ON cw.txid = wi.txid AND cw.kind = 'claim'
+			                   JOIN nursery_tx n ON n.txid = cw.txid
+			                   WHERE fw.kind = 'forfeit' AND fw.subject = l.leaf_id AND n.state = 'final')
 			 ORDER BY l.leaf_id",
 			&[],
 		).await?;
