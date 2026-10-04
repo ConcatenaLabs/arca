@@ -1068,13 +1068,13 @@ impl Drop for TlsServer {
 async fn the_server_is_reached_over_tls_and_plain_http_only_on_this_machine() {
 	let r = Running::start().await;
 	let node = r.node_url();
-	let c = Arca::new("F8a");
-	let why = c.refused(&create_args("http://192.0.2.1:3535/arca", &node), "plain http");
+	let ca = Arca::new("F8a");
+	let why = ca.refused(&create_args("http://192.0.2.1:3535/arca", &node), "plain http");
 	println!("F8 plain http to another host: REFUSED: {}", why);
 	let tls = tokio::task::block_in_place(TlsServer::start);
-	let c = Arca::new("F8b");
+	let cb = Arca::new("F8b");
 	let url = format!("https://127.0.0.1:{}/arca", tls.port);
-	let why = c.refused(&create_args(&url, &node), "cannot reach the server");
+	let why = cb.refused(&create_args(&url, &node), "cannot reach the server");
 	println!("F8 https to a server with a certificate no root vouches for: REFUSED: {}", why);
 	assert!(!why.contains("https feature"), "{}", why);
 	assert!(why.to_lowercase().contains("certificate") || why.to_lowercase().contains("issuer"), "TLS refused it: {}", why);
@@ -1084,8 +1084,8 @@ async fn the_server_is_reached_over_tls_and_plain_http_only_on_this_machine() {
 	println!("F8 create: {}", err.trim());
 	let op = info["operator"].as_str().unwrap();
 	assert!(info["operator_key_check"].as_str().unwrap().contains(op) && err.contains(op), "the pinned key is shown: {}", info);
-	for d in ["F8a", "F8b", "F8c"] {
-		let _ = std::fs::remove_dir_all(Arca::new(d).dir);
+	for w in [&ca, &cb, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
 
@@ -2046,7 +2046,7 @@ async fn a_final_refund_orphaned_with_its_anchor_gives_way_to_the_claim_and_the_
 	use elements::OutPoint;
 	let mut r = Running::start().await;
 	let proxy = Proxy::start(&r.url());
-	let c = Arca::new("F2");
+	let c = Arca::new("FRO");
 	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
 	let (units, cvout, margin, unlock) = stored_status(&r, &pid);
 	let s = c.ok(&["sync"]);

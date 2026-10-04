@@ -11,8 +11,19 @@ pub struct Arca {
 	pub dir: PathBuf,
 }
 
+/// Every wallet name taken in this process: the tests of one binary run at
+/// once in one process, and two wallets of one name would share, and delete,
+/// one directory.
+static NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 impl Arca {
 	pub fn new(name: &str) -> Arca {
+		{
+			let mut taken = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+			assert!(!taken.iter().any(|n| n == name), "two wallets named {} in one test binary: the tests run at once in one process, \
+				and would share, and delete, one wallet directory", name);
+			taken.push(name.to_string());
+		}
 		let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("arca-cli-wallet-{}-{}", std::process::id(), name));
 		let _ = std::fs::remove_dir_all(&dir);
 		Arca { name: name.into(), dir }
