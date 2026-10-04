@@ -1093,7 +1093,10 @@ signer signs every input.
   change per asset, then the one fee output. A round transaction also issues
   each batch's sweep token from one of the wallet's coins per batch, those
   coins first among its inputs; each token's id follows from that coin's
-  outpoint and a zero contract hash. The token is issued with denomination 8,
+  outpoint and a zero contract hash. So a coin whose token already names a
+  batch, of any round (the issuing coin of a round retired or lost, freed
+  again), never issues again, since its token would be that batch's; it can
+  still pay a round as an ordinary input. The token is issued with denomination 8,
   which is what the kit's PSET signs an issuance as, and the wallet sets the
   PSET's output index of an issuing input back to the outpoint's own (the kit
   keeps the issuance flag in it).

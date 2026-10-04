@@ -524,3 +524,241 @@ async fn a_barred_participants_forfeit_is_claimed_when_its_round_returns() {
 async fn a_forfeit_refunded_while_its_round_was_out_leaves_the_returning_leaf_uncredited() {
 	barred("Rd2", true).await;
 }
+
+/// A fresh participant `who`'s credited board, as a coin, and its key.
+async fn fresh_board(r: &mut Running, tag: &str, who: &str) -> (Coin, Keypair) {
+	let x = r.x;
+	let b = keypair(&format!("{} {}", tag, who));
+	let (hb, tb) = credited_board(r, &b, x).await;
+	(Coin { held: hb, bases: vec![tb] }, b)
+}
+
+/// An ordinary round for a fresh participant `who`, built now: its board
+/// credited, given up, the round built, confirmed in a parent block of its
+/// own, final, and the participant released. The round, and what it issued
+/// its token from.
+async fn ordinary_round(r: &mut Running, tag: &str, who: &str) -> (Transaction, OutPoint) {
+	let (cb, _) = fresh_board(r, tag, who).await;
+	ordinary_round_of(r, tag, who, &cb).await
+}
+
+/// [`ordinary_round`] for the board `cb`, credited already.
+async fn ordinary_round_of(r: &mut Running, tag: &str, who: &str, cb: &Coin) -> (Transaction, OutPoint) {
+	let b2 = keypair(&format!("{} {} 2", tag, who));
+	let (pb, b2n) = participate(r, cb, &b2);
+	let _ = own_anchor(r).await;
+	// The operator's round loop, a pass of the watcher and the nursery
+	// between tries: a round the reorganisation took out is sent again, and
+	// its change confirms, before the wallet has a coin to issue from.
+	let mut built = None;
+	for k in 0..6 {
+		match r.server.rounds.run_round().await {
+			Ok(Some(b)) => {
+				built = Some(b);
+				break;
+			},
+			other => {
+				println!("{} {}'s round, try {}: {:?}", tag, who, k, other.map(|b| b.map(|b| b.tx.txid())).map_err(|e| e.to_string()));
+				r.server.rounds.pass().await.unwrap();
+				passes(r, 1).await;
+				r.bury().await;
+				r.synced().await;
+			},
+		}
+	}
+	let Some(built) = built else {
+		for c in r.server.store.wallet_coins(None).await.unwrap() {
+			println!("{} the wallet's coin {}:{} value {} in_chain {} spent {}", tag, Txid::from_byte_array(c.txid), c.vout, c.value, c.in_chain,
+				c.spent_by.is_some());
+		}
+		panic!("{} {}'s round is not built", tag, who);
+	};
+	let tx = built.tx.clone();
+	let issuer = tx.input[0].previous_output;
+	r.produce().await;
+	r.bury().await;
+	round_final(r, &tx.txid()).await;
+	let _ = hand_over(r, &pb, cb, &b2, &b2n);
+	println!("{} {}'s round {} built and final; it issues from {}", tag, who, tx.txid(), issuer);
+	(tx, issuer)
+}
+
+/// The batch tokens round `tx` issues: one atom of each, from its first
+/// inputs.
+fn tokens_of(tx: &Transaction) -> Vec<elements::AssetId> {
+	tx.input.iter().filter(|i| i.has_issuance()).map(|i| i.issuance_ids().0).collect()
+}
+
+/// R7f F4, its Z1b turned around. A lost round returns and its re-run Y is
+/// retired, which frees Y's coins, the coin Y issued its batch token from
+/// among them. That coin's token is Y's batch's for good, so it never
+/// issues again: the next ordinary round, for B, is built, issuing from
+/// another coin, and its token is not Y's. (Before, the next round chose
+/// Y's issuing coin again, and every build failed on the batch token's
+/// uniqueness until a larger coin arrived.)
+#[tokio::test(flavor = "multi_thread")]
+async fn the_next_round_after_a_return_issues_from_another_coin() {
+	let tag = "Z1b";
+	let mut r = start().await;
+	let x = r.x;
+	let (a, a2) = (keypair("Z1b A"), keypair("Z1b A2"));
+	let (ha, ta) = credited_board(&mut r, &a, x).await;
+	let ca = Coin { held: ha, bases: vec![ta] };
+	let (pa, a2n) = participate(&r, &ca, &a2);
+	let p_r = own_anchor(&r).await;
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let rtx = built.tx.clone();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &rtx.txid()).await;
+	let _a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
+	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, Taker::ToOperator, |_| {}).await;
+	r.server.rounds.pass().await.unwrap();
+	wait_state(&r, &pa, "pending").await;
+	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
+	let ytx = built_y.tx.clone();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &ytx.txid()).await;
+	let _a_y = hand_over(&r, &pa, &ca, &a2, &a2n);
+	let (y_issuer, y_tokens) = (ytx.input[0].previous_output, tokens_of(&ytx));
+	println!("{} Y = {} issues {:?} from {}", tag, ytx.txid(), y_tokens, y_issuer);
+	r_returns(&mut r, tag, &rtx, &xtx, p_x, None, |_| {}).await;
+	r.server.rounds.pass().await.unwrap();
+	let (rs, ys) = (r.server.store.round(built.round_id).await.unwrap().map(|x| x.state),
+		r.server.store.round(built_y.round_id).await.unwrap().map(|x| x.state));
+	println!("{} R restored: R {:?}, Y {:?}", tag, rs, ys);
+	assert_eq!((rs, ys), (Some(RoundState::Final), Some(RoundState::Lost)));
+	let freed = r.server.store.wallet_coin_at(&y_issuer.txid.to_byte_array(), y_issuer.vout).await.unwrap();
+	println!("{} Y's issuing coin, freed: spent_by {:?}", tag, freed.as_ref().map(|c| c.spent_by.is_some()));
+
+	// B, a new participant: an ordinary round.
+	let (btx, b_issuer) = ordinary_round(&mut r, tag, "B").await;
+	assert_ne!(b_issuer, y_issuer, "the next round issues from another coin than Y's");
+	assert!(tokens_of(&btx).iter().all(|t| !y_tokens.contains(t)), "its token is not Y's");
+}
+
+/// R7f Z1 with a round built after each of its four parent-chain
+/// reorganisations, the operator's wallet funded once, at the start, and the
+/// four fresh participants' boards made then, below every reorganisation: R lost
+/// (X takes its input) and A run again in Y; R returns (X and Y out); R lost
+/// again (X back) and A run again in Z; Y returns (Z out). After each, an
+/// ordinary round for a fresh participant is built and final, and exactly
+/// one of A's leaves can reach the chain, the one the server credits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_is_built_after_each_reorganisation() {
+	let tag = "Z1";
+	let mut r = start().await;
+	let x = r.x;
+	let (a, a2) = (keypair("Z1 A"), keypair("Z1 A2"));
+	let (ha, ta) = credited_board(&mut r, &a, x).await;
+	let ca = Coin { held: ha, bases: vec![ta] };
+	let mut fresh = vec![];
+	for k in 1..=4 {
+		fresh.push(fresh_board(&mut r, tag, &format!("B{}", k)).await.0);
+	}
+	let (pa, a2n) = participate(&r, &ca, &a2);
+	let p_r = own_anchor(&r).await;
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let rtx = built.tx.clone();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &rtx.txid()).await;
+	let a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
+	let leaf = |r: &Running, x: &Released| {
+		let id = x.leaf.leaf_id.0;
+		tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(r.server.store.leaf(&id))).unwrap().map(|l| l.state)
+	};
+	// Exactly one of A's leaves comes onto the chain, the one credited.
+	let one = |r: &Running, step: &str, leaves: &[(&str, &Released)], live: &str| {
+		let mut seen = vec![];
+		for (n, x) in leaves {
+			let (st, v) = (leaf(r, x), verdict(r, &first_unroll(x, &a2)));
+			seen.push(format!("leaf of {}: server {:?}, its unroll {:?}", n, st, v.as_ref().map_err(|e| e.chars().take(40).collect::<String>())));
+			if *n == live {
+				assert_eq!((st, v.is_ok()), (Some(LeafState::Live), true), "{} {}: the leaf of {}", tag, step, n);
+			} else {
+				assert!(st != Some(LeafState::Live) && missing_or_spent(&v), "{} {}: the leaf of {}: {:?} {:?}", tag, step, n, st, v);
+			}
+		}
+		println!("{} {}: {}", tag, step, seen.join("; "));
+	};
+
+	// 1. R lost: X takes its input, paying the operator; A runs again in Y.
+	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, Taker::ToOperator, |_| {}).await;
+	r.server.rounds.pass().await.unwrap();
+	wait_state(&r, &pa, "pending").await;
+	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
+	let ytx = built_y.tx.clone();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &ytx.txid()).await;
+	let a_y = hand_over(&r, &pa, &ca, &a2, &a2n);
+	one(&r, "(1) R lost, Y final", &[("R", &a_r), ("Y", &a_y)], "Y");
+	let (_, i1) = ordinary_round_of(&mut r, tag, "B1", &fresh[0]).await;
+
+	// 2. R returns: X (and Y, and B1's round, with it) out, R confirmed in
+	// a parent block of its own.
+	r.server.stop();
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_x)).unwrap();
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
+	println!("{} (2) {} parent block(s) from height {} orphaned; the node restarted with an empty mempool", tag, orphaned.len(), p_x);
+	let p_r2 = own_anchor(&r).await;
+	println!("{} (2) R sent again: {:?}", tag, r.rt.client().send_raw_transaction(&rtx).map(|t| t.to_string()).map_err(|e| e.to_string()));
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	round_state(&r, &rtx.txid(), RoundState::Final).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(r.server.store.round(built_y.round_id).await.unwrap().map(|x| x.state), Some(RoundState::Lost), "Y retired");
+	one(&r, "(2) R returned", &[("R", &a_r), ("Y", &a_y)], "R");
+	let (_, i2) = ordinary_round_of(&mut r, tag, "B2", &fresh[1]).await;
+	assert_ne!(i2, ytx.input[0].previous_output, "not from Y's issuing coin");
+
+	// 3. R lost again: R's block out, X sent again and confirmed; A runs
+	// again in Z.
+	let (_, p_x2) = {
+		r.server.stop();
+		let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r2)).unwrap();
+		tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
+		println!("{} (3) {} parent block(s) from height {} orphaned; the node restarted with an empty mempool", tag, orphaned.len(), p_r2);
+		let p = own_anchor(&r).await;
+		println!("{} (3) X sent again: {:?}", tag, r.rt.client().send_raw_transaction(&xtx).map(|t| t.to_string()).map_err(|e| e.to_string()));
+		r.produce().await;
+		r.bury().await;
+		r.restart_server().await;
+		round_state(&r, &rtx.txid(), RoundState::Lost).await;
+		((), p)
+	};
+	r.server.rounds.pass().await.unwrap();
+	let sa = wait_state(&r, &pa, "pending").await;
+	println!("{} (3) A {} attempt {}", tag, sa["state"], sa["attempt"]);
+	let p_z = own_anchor(&r).await;
+	let built_z = r.server.rounds.run_round().await.unwrap().expect("Z is built, from the coins the wallet holds");
+	let ztx = built_z.tx.clone();
+	println!("{} (3) Z = {} ties: {:?}", tag, ztx.txid(), r.server.store.replaced_by(built_z.round_id).await.unwrap());
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &ztx.txid()).await;
+	let a_z = hand_over(&r, &pa, &ca, &a2, &a2n);
+	one(&r, "(3) Z final", &[("R", &a_r), ("Y", &a_y), ("Z", &a_z)], "Z");
+	let (_, i3) = ordinary_round_of(&mut r, tag, "B3", &fresh[2]).await;
+	let _ = p_x2;
+
+	// 4. Y returns: Z (and B3's round) out, Y sent by anyone who holds it.
+	r.server.stop();
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_z)).unwrap();
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
+	println!("{} (4) {} parent block(s) from height {} orphaned; X in a block {}", tag, orphaned.len(), p_z, in_a_block(&r, &xtx.txid()));
+	println!("{} (4) Y sent again: {:?}", tag, r.rt.client().send_raw_transaction(&ytx).map(|t| t.to_string()).map_err(|e| e.to_string()));
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	round_state(&r, &ytx.txid(), RoundState::Final).await;
+	r.server.rounds.pass().await.unwrap();
+	one(&r, "(4) Y returned", &[("R", &a_r), ("Y", &a_y), ("Z", &a_z)], "Y");
+	let (_, i4) = ordinary_round_of(&mut r, tag, "B4", &fresh[3]).await;
+	println!("{} the four rounds after each reorganisation issued from {}, {}, {}, {}", tag, i1, i2, i3, i4);
+	let issued = [ytx.input[0].previous_output, ztx.input[0].previous_output];
+	assert!([i1, i2, i3, i4].iter().all(|i| !issued.contains(i)), "never a re-run's issuing coin");
+}
