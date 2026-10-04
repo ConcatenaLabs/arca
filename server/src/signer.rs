@@ -613,7 +613,10 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// holds an exclusive lock on the file while it runs, so two signers never
 /// write one record. A write that fails is undone at once, so a torn line is
 /// never followed by another; a last line left cut short by a crash was never
-/// answered, and is removed when the record is opened, which says so. Any
+/// answered, and is removed when the record is opened, which says so; and the
+/// record is synced when it is opened, before it answers anything, so a whole
+/// line a crash left in the page cache alone is on disk before its head is
+/// signed. Any
 /// other line that does not read, or whose number or running hash does not
 /// follow, stops the signer from starting.
 ///
@@ -836,6 +839,11 @@ impl SpendRecord {
 		record.size = at;
 		record.kept.sort_unstable();
 		record.kept.shrink_to_fit();
+		// A signer that crashed between writing a line and syncing it leaves
+		// a whole line that may be in the page cache alone: synced now,
+		// before the record answers anything, so its latest entry is on disk
+		// before its head is signed.
+		record.file.sync_all().map_err(fail)?;
 		Ok((record, repaired))
 	}
 
