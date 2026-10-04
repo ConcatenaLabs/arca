@@ -888,6 +888,71 @@ async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() 
 	}
 }
 
+/// A participation the server took, its answer lost as a gateway's 502: the
+/// wallet keeps it `submitting` and `sync` posts its stored body again. The
+/// body is posted without its key proofs, as a wallet stored it before they
+/// existed. The server holds the participation, so it answers with its
+/// status whatever the body lacks: the coin stays given up, and the wallet
+/// completes the participation once its round is final, its new leaf live. A
+/// participation the server does not hold still needs its proofs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participation_the_server_holds_is_answered_whatever_its_body_lacks() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let x = r.x;
+	let a = Arca::new("M1A");
+	let boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 2_000_000), (x, 1_000_000)]).await;
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/submit_participation" && status == 200 {
+			*v = json!({"error": {"code": "bad_gateway", "message": "upstream timed out"}});
+			return Some(502);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["participate", "--leaf", &boards[0]]);
+	println!("M1 participate, answered 502 after the server took it: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!(v["error"]["kind"], "unreachable", "a 502 is not a refusal: {}", v);
+	proxy.rewrite(None);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "given");
+	// Posted again without its key proofs.
+	let strip: common::proxy::RewriteRequest = Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/submit_participation" {
+			for o in body["outputs"].as_array_mut().into_iter().flatten() {
+				if let Some(l) = o["leaf"].as_object_mut() {
+					l.remove("key_proof");
+				}
+			}
+		}
+	});
+	proxy.rewrite_request(Some(strip.clone()));
+	let s = a.ok(&["sync"]);
+	println!("M1 sync, the stored body posted again without its key proofs: participations {}", s["participations"]);
+	let (req, status, answer) = proxy.last("/v1/submit_participation").unwrap();
+	assert!(req["outputs"][0]["leaf"].get("key_proof").is_none(), "{}", req);
+	println!("M1 the server's answer: {} {}", status, answer);
+	assert_eq!((status, answer["state"].as_str()), (200, Some("pending")), "{}", answer);
+	assert_eq!(s["participations"][0]["state"], "pending", "{}", s);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "given", "the coin the server holds stays given up");
+	// A participation the server does not hold: refused without its proofs.
+	let (ok, v) = a.run(&["participate", "--leaf", &boards[1]]);
+	println!("M1 a new participation without its key proofs: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!((v["error"]["status"].as_i64(), v["error"]["code"].as_str()), (Some(422), Some("bad_attestation")), "{}", v);
+	assert_eq!(coin_of(&a, &boards[1])["state"], "live", "a refusal gives the coin back");
+	proxy.rewrite_request(None);
+	// The round runs it; the wallet completes it.
+	final_round(&r).await;
+	let s = a.ok(&["sync"]);
+	println!("M1 sync once the round is final: {}", s["participations"]);
+	let done = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released").cloned()
+		.unwrap_or_else(|| panic!("the participation completes: {}", s));
+	let new = done["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&a, &boards[0])["state"], "spent");
+	assert_eq!(coin_of(&a, &new)["state"], "live", "{}", coin_of(&a, &new));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
 /// The server registers a board, and broadcasts it itself, but the answer
 /// comes back as a gateway's 502. That is no refusal: the coin stays pending
 /// with its transaction, `sync` posts the same registration again, and the

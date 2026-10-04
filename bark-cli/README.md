@@ -254,7 +254,7 @@ the new round. Every
 refusal is asserted by its reason.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
-answer of the server or hold a call unanswered, and with transactions the test
+answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
 builds itself as the operator or as a sender. Each case is one way an operator
 lies, stalls or vanishes, or a sender goes back on a payment, and each ends
 with the wallet refusing before it signs anything, or taking its coin on-chain
@@ -304,6 +304,10 @@ and holding it there, with the reason shown:
   TLS itself, and a plain-HTTP server on another host, refused before anything
   is sent;
 - a payment whose answer comes back as a gateway's 502, posted again;
+- a participation whose answer comes back as a gateway's 502, posted again
+  without its key proofs: the server, which holds it, answers with its
+  status, the coin stays given up and the participation completes, while a
+  participation the server does not hold is refused without them;
 - a board whose registration is answered with a 502 after the server took
   it, kept pending and registered again, and one answered with a refusal the
   server never made, followed again once the server reports it credited;

@@ -238,7 +238,7 @@ async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_r
 	let (body, id) = participation_body(&[&xb], std::slice::from_ref(&want_y), &[(x, fee)], None, s, chain);
 	let a = r.http.post("submit_participation", &body);
 	println!("X's participation wanting Y's key, no key proof: {} {:?}", a.status, a.refusal());
-	refused(a, 400, "malformed");
+	refused(a, 422, "bad_attestation");
 	let mut forged = body.clone();
 	let digest = server::participations::key_proof_digest(&id);
 	forged["outputs"][0]["leaf"]["key_proof"] = json!(hex(sign_digest(&keypair("X"), &digest, &random32()).as_ref()));

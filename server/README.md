@@ -312,11 +312,13 @@ never handed out again), prices each forfeit's margin and each offboard
 output's margin from the node's floor in that asset, and records everything in
 one database transaction, the coins given up becoming spent by the
 participation. The same request again is the same participation and gets its
-status.
+status, with or without its key proofs: they sign the id, which does not
+cover them, and are required only of a participation the server does not
+hold yet.
 
 The participation's id is
 `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body)`, `T = SHA256("Arca/participation")`,
-where the body is the request without its attestations: the leaf ids given up,
+where the body is the request without its attestations and key proofs: the leaf ids given up,
 each output (kind, asset, value, then a leaf's template id and version, owner
 key, owner nonce and exit delay, or an offboard's script), each fee and the
 earliest round time (the layout is in `participations.rs`). The tag keeps the
@@ -1175,7 +1177,7 @@ delay, an asset, a leaf value or a round time outside the bounds; an offboard
 to an Arca script; an unknown coin, a board not yet final, a stray field, a
 coin given twice, and an unknown participation. A
 participation naming a key it does not hold (another holder's receive key)
-is refused, without a key proof (`malformed`) and with one by another key
+is refused, without a key proof and with one by another key
 (`bad_attestation`), and a payer then pays that key; a key wanted by a
 participation that expired, or that a round voided because its board coin
 passed its last round time, is free again and paid.
