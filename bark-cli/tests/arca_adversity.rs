@@ -952,6 +952,77 @@ async fn a_payment_recorded_while_the_signer_was_away_completes_past_the_boards_
 	}
 }
 
+/// R7d F5. A payment out of a batch leaf, recorded while the operator's
+/// signer was away, completes when it is asked again whatever has changed
+/// since: the node's floor in the asset fell a hundredfold, which puts the
+/// margins the server took above its bound of the moment, and the batch's
+/// exit deadline passed. The margins are judged as they were when the
+/// transfer was recorded, and only the batch's expiry would refuse it. The
+/// receiver takes the coin, past that deadline, and exits it at once, as
+/// the sender does its change; the receiver claims it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_recorded_while_the_signer_was_away_completes_whatever_changed_since() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, w) = (Arca::new("F5RA"), Arca::new("F5RW"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let s = a.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	let leaf = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&a, &leaf)["state"], "live");
+	w.ok(&create_args(&url, &r.node_url()));
+	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	r.signer.halt();
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("F5R A pays W out of its batch leaf with the signer away: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!(v["error"]["kind"], "unreachable", "a 503 is not a refusal: {}", v);
+	let id: LeafId = leaf.parse().unwrap();
+	assert_eq!(r.server.store.leaf(&id.0).await.unwrap().unwrap().state, server::store::LeafState::Spent, "the server recorded it");
+
+	// The floor in X falls a hundredfold: X is worth a hundred times more.
+	let rates = rpc(&r, "getfeeexchangerates", &[]);
+	let rate = rates[x.to_string()].as_u64().expect("X is listed");
+	common::node::list_fee_asset(&r.rt, x, rate * 100);
+	// The batch's exit deadline passes.
+	let deadline = coin_of(&a, &leaf)["exit_deadline"].as_u64().unwrap() as u32;
+	let expiry = coin_of(&a, &leaf)["expiry"].as_u64().unwrap() as u32;
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, deadline - now + 3_600));
+	r.bury().await;
+	r.synced().await;
+	let now = common::node::median_time(&r.rt);
+	println!("F5R now {}: past the batch's exit deadline {}, before its expiry {}", now, deadline, expiry);
+	assert!(now > deadline && now < expiry);
+
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let s = a.ok(&["sync"]);
+	println!("F5R A's sync, the signer back: transfers {}", s["transfers"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string(), "the request posted again completes: {}", s);
+	assert_eq!(coin_of(&a, &leaf)["state"], "spent");
+	let kept = &s["transfers"][0]["kept"][0];
+	println!("F5R A's change: {}", kept);
+	assert_eq!(kept["state"], "exiting", "the change, past the batch's exit deadline, is exited at once: {}", kept);
+	let m = w.ok(&["sync"])["mailbox"].clone();
+	println!("F5R W's mailbox: {}", m);
+	let got = m["accepted"][0].clone();
+	assert_eq!(got["value"].as_str(), Some("600000"), "{}", m);
+	assert_eq!(got["state"], "exiting", "{}", got);
+	assert!(got["batch"]["note"].as_str().unwrap().contains("past its exit deadline"), "{}", got);
+	assert!(got["exit"]["error"].is_null(), "{}", got["exit"]);
+	let new = got["leaf_id"].as_str().unwrap().to_string();
+	let claim = exit_and_claim(&r, &w, &new, None).await;
+	println!("F5R W's claim: {} ({} vB), before the batch's expiry", claim.txid(), claim.vsize());
+	assert!(common::node::median_time(&r.rt) < expiry);
+	for c in [&a, &w] {
+		let _ = std::fs::remove_dir_all(&c.dir);
+	}
+}
+
 /// A participation the server took, its answer lost as a gateway's 502: the
 /// wallet keeps it `submitting` and `sync` posts its stored body again. The
 /// body is posted without its key proofs, as a wallet stored it before they

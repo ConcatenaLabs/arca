@@ -46,8 +46,10 @@
 //! record is checked by the server as a receiver would check it, stored, and
 //! posted to the receiver's mailbox. A request repeated byte for byte gets the
 //! same answer. One recorded and not yet signed (the signer was not reached)
-//! completes when repeated, whatever the dates of the boards its coins rest
-//! on have become since: it was within them when it was recorded
+//! completes when repeated, whatever has changed since: its margins are the
+//! ones the server took when it recorded it, against the floor of that
+//! moment, and the dates of the boards and batches its coins rest on, which
+//! it was within then, refuse it only once a batch has expired
 //! ([`coins::BoardDates::WithinUnlessRecorded`]).
 
 use std::collections::{BTreeMap, HashSet};
@@ -386,7 +388,11 @@ impl Cosigner {
 			}
 		}
 
-		self.check_margins(req, &checked, &outputs).await?;
+		// A transfer recorded passed this check when it was recorded, against
+		// the floor of that moment; the same bytes are judged as they were.
+		if !recorded {
+			self.check_margins(req, &checked, &outputs).await?;
+		}
 
 		// The owners' signatures.
 		let plan = TransferPlan {
@@ -505,10 +511,12 @@ impl Cosigner {
 			sigs.push((cp, re));
 		}
 
-		// Each new coin's record, checked as its receiver will check it.
+		// Each new coin's record, checked as its receiver will check it; for
+		// a transfer recorded earlier, with no horizon: its coins may have
+		// passed a batch's exit deadline since, and only the expiry refuses.
 		let mut bases: Vec<Transaction> = checked.iter().flat_map(|c| c.bases.clone()).collect();
 		bases.dedup_by_key(|t| t.txid());
-		let policy = self.params.policy(now);
+		let policy = if recorded { WalletPolicy { horizon: 0, ..self.params.policy(now) } } else { self.params.policy(now) };
 		let mut records = Vec::with_capacity(m);
 		for (j, o) in req.outputs.iter().enumerate() {
 			let record = CoinRecord::Transfer(Box::new(Transfer {
