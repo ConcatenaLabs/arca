@@ -328,6 +328,16 @@ impl Wallet {
 		if coins.len() < batches {
 			return Err(WalletError::TooFewCoins { need: batches, have: coins.len() });
 		}
+		// A coin whose token already names a batch (the issuing coin of a
+		// round retired or lost, freed again) never issues again: its token
+		// would be that batch's. It can still pay the round as an ordinary
+		// input.
+		let named = self.store.tokens_naming_batches(&coins.iter().map(|c| token_of(c).into_inner().to_byte_array()).collect::<Vec<_>>())
+			.await?;
+		coins.retain(|c| !named.contains(&token_of(c).into_inner().to_byte_array()));
+		if coins.len() < batches {
+			return Err(WalletError::TooFewCoins { need: batches, have: coins.len() });
+		}
 		// The fee asset's coins first, the largest first: an issuing coin's
 		// value goes on to pay the round like any other.
 		let fee = fee_asset.into_inner().to_byte_array();

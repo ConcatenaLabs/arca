@@ -190,4 +190,15 @@ impl Store {
 		let rows = conn.query("SELECT connector_asset FROM connector_output", &[]).await?;
 		rows.iter().map(|r| super::array32(r.get(0), "connector asset")).collect()
 	}
+
+	/// Which of `tokens` already name a batch of some round, whatever that
+	/// round's state: a token is a function of its issuing coin's outpoint,
+	/// so a coin whose token names a batch never issues again (a retired or
+	/// lost round's issuing coin, freed again, would issue the same token).
+	pub async fn tokens_naming_batches(&self, tokens: &[[u8; 32]]) -> Result<std::collections::HashSet<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let list: Vec<&[u8]> = tokens.iter().map(|t| &t[..]).collect();
+		let rows = conn.query("SELECT DISTINCT token FROM batch WHERE token = ANY($1)", &[&list]).await?;
+		rows.iter().map(|r| super::array32(r.get(0), "token")).collect()
+	}
 }
