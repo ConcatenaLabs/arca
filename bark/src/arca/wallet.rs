@@ -112,8 +112,8 @@ pub const MAX_UNSIGNED_WITNESS: usize = 4;
 pub(crate) const NO_KEEPER: &str = "the operator runs no keeper of its signer's record: a coin received out of round rests on the \
 	operator's machine alone until it is refreshed, and a restore of that machine can let its sender spend it twice";
 
-/// How long before a coin's exit date `sync` takes it on the chain, once the
-/// operator's signer is stopped: three days.
+/// How long before a coin's exit date `sync` takes it on the chain when the
+/// wallet cannot have it refreshed: three days.
 pub const HOME_WINDOW: u32 = 3 * 86_400;
 
 /// What the wallet says of a coin it still holds off the chain once the
@@ -121,6 +121,34 @@ pub const HOME_WINDOW: u32 = 3 * 86_400;
 pub(crate) const HOME_NOTE: &str = "the operator's signer is stopped: the coin can no longer be paid on or refreshed, and must be \
 	exited by its exit date (exit_by, a median time); sync takes it on the chain when that date is within three days, and `arca exit` \
 	takes it now";
+
+/// What the wallet says of a coin it holds off the chain while the operator
+/// cannot refresh it: its witness fails, or the server does not answer or
+/// refuses the wallet.
+pub(crate) const UNREACHABLE_NOTE: &str = "the operator cannot refresh the coin now: unless it answers again before the coin's exit \
+	date (exit_by, a median time), the coin must be exited by then. Run `arca sync` before that date: it takes the coin on the chain \
+	once the date is within three days, and keeps it while the operator answers; `arca exit` takes it now";
+
+/// What the wallet says of a coin whose refresh the operator refused.
+pub(crate) const REFUSED_NOTE: &str = "the operator refused to refresh the coin: unless a refresh of it succeeds before its exit \
+	date (exit_by, a median time), the coin must be exited by then. `arca sync` takes it on the chain once that date is within three \
+	days; `arca exit` takes it now";
+
+/// Why `sync` takes coins home (D56): the wallet cannot have them refreshed.
+pub(crate) enum Home {
+	/// The operator's signer is stopped, on its own proof: every held coin.
+	Stopped,
+	/// The operator cannot refresh anything now, and why: every held coin.
+	Unreachable(String),
+	/// The operator answers, but refused to refresh these coins.
+	Refused,
+}
+
+/// Where the wallet keeps why the operator could not refresh its coins,
+/// as `sync` last found it: `{"since": <median time>, "why"}`. The next
+/// `sync` that finds the operator answering removes it: the wallet refuses
+/// nothing for good on that ground.
+const UNREACHABLE: &str = "operator_unreachable";
 
 /// Where the wallet keeps a rollback of the operator's signer's record it
 /// found: `{"at": <the highest entry the record still agrees with>, "why"}`.
@@ -912,38 +940,108 @@ impl Wallet {
 		Ok(false)
 	}
 
-	/// After a stop of the operator's signer, the date by which each coin
-	/// the wallet still holds off the chain must be exited, its exit
+	/// When the wallet cannot have its coins refreshed (D56), the date by
+	/// which each coin it still holds off the chain must be exited, its exit
 	/// deadline: from then on its batch's sweep, or the operator's claim of a
-	/// board's lineage, draws near. Each held coin not taken on the chain
-	/// already, but one given up for new leaves the wallet holds; with
-	/// `exit`, `sync`'s work: each one whose date is within three days goes
-	/// on the chain now (`arca exit` takes any of them at once, on the user's
-	/// word).
-	pub(crate) fn home(&mut self, exit: bool) -> Result<Vec<Value>, Error> {
+	/// board's lineage, draws near. After a stop of the operator's signer, or
+	/// while the operator cannot refresh anything (`why`), each held coin not
+	/// taken on the chain already, but one given up for new leaves the
+	/// wallet holds; while the operator answers, each such coin whose refresh
+	/// it refused. With `exit`, `sync`'s work: each one whose date is within
+	/// three days goes on the chain now (`arca exit` takes any of them at
+	/// once, on the user's word). It refuses nothing for good: a coin whose
+	/// date is further off stays, and stays once the operator answers again.
+	pub(crate) fn home(&mut self, exit: bool, why: &Home) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32() as u64;
+		let refused = match why {
+			Home::Refused => self.refused_refreshes()?,
+			_ => Default::default(),
+		};
 		let mut out = vec![];
 		for c in self.store.coins()? {
-			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending") || self.given_up_for_held_leaves(&c)? {
+			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
+				continue;
+			}
+			if matches!(why, Home::Refused) && !refused.contains_key(&c.leaf_id) {
 				continue;
 			}
 			let by = (c.expiry != u32::MAX).then(|| c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE));
 			let due = by.is_none_or(|b| now + HOME_WINDOW as u64 >= b as u64);
+			let note = match why {
+				Home::Stopped => HOME_NOTE,
+				Home::Unreachable(_) => UNREACHABLE_NOTE,
+				Home::Refused => REFUSED_NOTE,
+			};
 			let mut v = json!({"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
-				"exit_by": by, "note": HOME_NOTE});
+				"exit_by": by, "note": note});
 			if exit && due {
 				// Fees in the asset moved, where the coin's own reserves
 				// cannot pay them (a board's conversion has none).
 				let fee_asset = AssetId::from_str(&c.asset).ok();
 				v["exit"] = self.exit(&c.leaf_id, fee_asset).unwrap_or_else(|e| json!({"error": e.to_string()}));
 				if let Some(row) = self.store.coin(&c.leaf_id)?.filter(|r| r.state == "exiting") {
-					self.store.set_coin_state(&row.leaf_id, "exiting", &format!("taken on the chain: the operator's signer is stopped, and \
-						the coin's exit date{} is within three days", by.map(|b| format!(", median time {},", b)).unwrap_or_default()))?;
+					let date = by.map(|b| format!(", median time {},", b)).unwrap_or_default();
+					let because = match why {
+						Home::Stopped => "the operator's signer is stopped".to_string(),
+						Home::Unreachable(w) => format!("the operator could not refresh it ({})", w),
+						Home::Refused => format!("the operator refused its refresh (participation {})",
+							refused.get(&c.leaf_id).map(String::as_str).unwrap_or("refused")),
+					};
+					self.store.set_coin_state(&row.leaf_id, "exiting", &format!("taken on the chain: {}, and the coin's exit date{} is \
+						within three days", because, date))?;
 				}
 			}
 			out.push(v);
 		}
 		Ok(out)
+	}
+
+	/// Whether a coin in `state` is one the wallet may still hold off the
+	/// chain, and so brings home when it cannot have it refreshed.
+	fn homeward(state: &str) -> bool {
+		matches!(state, "live" | "pending" | "given" | "forfeited" | "offered" | "sending")
+	}
+
+	/// The coins the wallet holds live whose latest refresh the operator
+	/// refused: given in a participation it refused, voided or let expire,
+	/// and not refreshed since (a coin refreshed since is spent, or given
+	/// again). By leaf id, with the participation's state.
+	pub(crate) fn refused_refreshes(&self) -> Result<BTreeMap<String, String>, Error> {
+		let mut out = BTreeMap::new();
+		for (pid, _, given, _, state, _, _) in self.store.participations()? {
+			if !matches!(state.as_str(), "refused" | "void" | "expired") {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			for l in given {
+				if self.store.coin(&l)?.is_some_and(|c| c.state == "live") {
+					out.insert(l, format!("{} {}", &pid[..16.min(pid.len())], state));
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// Why the operator could not refresh the wallet's coins, as `sync` last
+	/// found it; `None` once a `sync` found it answering.
+	pub(crate) fn unreachable(&self) -> Result<Option<String>, Error> {
+		Ok(self.store.meta(UNREACHABLE)?.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+			.and_then(|v| v["why"].as_str().map(str::to_string)))
+	}
+
+	/// Keeps why the operator cannot refresh the wallet's coins now, or
+	/// forgets it (`None`) once it answers: nothing is refused for good.
+	pub(crate) fn set_unreachable(&self, why: Option<&str>) -> Result<(), Error> {
+		match why {
+			Some(w) => {
+				let since = match self.store.meta(UNREACHABLE)?.and_then(|v| serde_json::from_str::<Value>(&v).ok()) {
+					Some(v) => v["since"].clone(),
+					None => json!(self.now()?.to_consensus_u32()),
+				};
+				self.store.set_meta(UNREACHABLE, &json!({"since": since, "why": w}).to_string())
+			},
+			None => self.store.delete_meta(UNREACHABLE),
+		}
 	}
 
 	/// The smallest leaf the server takes in `asset`, or a refusal when it
@@ -1406,19 +1504,30 @@ impl Wallet {
 	pub fn coins(&self) -> Result<Value, Error> {
 		let alone = self.keepers()?.0.is_empty();
 		let stopped = self.rolled_back()?.is_some();
+		let unreachable = self.unreachable()?;
+		let refused = self.refused_refreshes()?;
 		let mut out = vec![];
 		for c in self.store.coins()? {
 			let mut v = Self::coin_json(&c);
 			if alone && c.kind == "transfer" && HELD.contains(&c.state.as_str()) {
 				v["record_held"] = json!(NO_KEEPER);
 			}
-			// After a stop: the date by which each coin still held must be
-			// exited.
-			if stopped && matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending")
-				&& !self.given_up_for_held_leaves(&c)?
-			{
-				v["exit_by"] = if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)) };
-				v["home"] = json!(HOME_NOTE);
+			// When the wallet cannot have the coin refreshed (after a stop,
+			// while the operator cannot refresh anything, or once it refused
+			// this coin's refresh): the date by which it must be exited, and
+			// that `sync` must run before it.
+			let home = if stopped {
+				Some(HOME_NOTE.to_string())
+			} else if let Some(why) = &unreachable {
+				Some(format!("{} (as the last sync found: {})", UNREACHABLE_NOTE, why))
+			} else {
+				refused.get(&c.leaf_id).map(|p| format!("{} (participation {})", REFUSED_NOTE, p))
+			};
+			if let Some(note) = home.filter(|_| Self::homeward(&c.state)) {
+				if !self.given_up_for_held_leaves(&c)? {
+					v["exit_by"] = if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)) };
+					v["home"] = json!(note);
+				}
 			}
 			out.push(v);
 		}

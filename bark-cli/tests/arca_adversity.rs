@@ -3365,6 +3365,132 @@ async fn after_a_stop_every_coin_comes_home() {
 	}
 }
 
+/// D56, R7f's U2 turned around (F6). A wallet that cannot have a coin
+/// refreshed takes it home before its date, whatever the reason, and
+/// refuses nothing for good on that ground. A's server withholds the
+/// signer's proof from every witness (a proxy drops `end` and `proof`), and
+/// G's server is simply gone: each `sync` shows each coin's exit date and
+/// says `sync` must run before it, and so does `coins`; a date weeks off
+/// takes nothing. The operator answers again, two days before the window
+/// opens: at two days before the exit date, with the operator answering,
+/// both boards stay. The proof withheld again, and the server gone again,
+/// within the window: each board goes on the chain. And with the operator
+/// answering, a coin whose refresh it refused goes home within its window,
+/// while a coin never refused stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_the_operator_cannot_refresh_goes_home_before_its_date() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let proxy = Proxy::start(&url);
+	let (a, g) = (Arca::new("D56A"), Arca::new("D56G"));
+	let a_boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 1_000_000), (x, 1_100_000)]).await;
+	let g_boards = boarded(&mut r, &g, &url, &[(x, 1_000_000)]).await;
+	let (board, refused, g_board) = (a_boards[0].clone(), a_boards[1].clone(), g_boards[0].clone());
+	// A's refresh of its second board, refused by the operator.
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/submit_participation" {
+			*v = json!({"error": {"code": "not_accepted", "message": "the operator refuses this refresh"}});
+			return Some(409);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["participate", "--leaf", &refused]);
+	println!("D56 A's refresh of {} refused: ok={} {}", &refused[..8], ok, v["error"]["message"]);
+	assert!(!ok);
+	assert_eq!(coin_of(&a, &refused)["state"], "live");
+	let withhold = || proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/witness" {
+			if let Some(o) = v.as_object_mut() {
+				o.remove("end");
+				o.remove("proof");
+			}
+		}
+		None
+	})));
+	let home_of = |s: &Value, leaf: &str| s["home"].as_array().and_then(|h| h.iter().find(|x| x["leaf_id"] == leaf).cloned());
+
+	// The proof withheld: weeks before the date, the date shown, nothing taken.
+	withhold();
+	let s = a.ok(&["sync"]);
+	println!("D56 A's sync, the proof withheld: witness {} | unreachable {}", s["witness"]["error"], s["unreachable"]["note"]);
+	assert!(s["witness"]["error"].as_str().unwrap_or("").contains("carries no proof the signer made"), "{}", s["witness"]);
+	let shown = home_of(&s, &board).expect("the board is shown");
+	let by = shown["exit_by"].as_u64().expect("its exit date") as u32;
+	println!("D56 A's board {}: exit_by {} | {}", &board[..8], by, shown["note"]);
+	assert!(shown["exit"].is_null() && shown["note"].as_str().unwrap().contains("Run `arca sync` before that date"), "{}", shown);
+	assert!(s["unreachable"]["note"].as_str().unwrap().contains("run `arca sync` before each coin's exit date"), "{}", s);
+	let c = coin_of(&a, &board);
+	assert_eq!((c["state"].as_str(), c["exit_by"].as_u64()), (Some("live"), Some(by as u64)), "coins shows the date: {}", c);
+	assert!(c["home"].as_str().unwrap().contains("Run `arca sync` before that date"), "{}", c);
+
+	// Five days before the date: still not within three days.
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, by - now - 5 * 86_400));
+	let s = a.ok(&["sync"]);
+	assert!(home_of(&s, &board).unwrap()["exit"].is_null(), "not within three days: {}", s["home"]);
+	assert_eq!(coin_of(&a, &board)["state"], "live");
+	// The server gone: the same for G.
+	r.server.stop();
+	let s = g.ok(&["sync"]);
+	println!("D56 G's sync, the server gone: witness {} | home {}", s["witness"]["error"], s["home"]);
+	assert!(s["witness"]["error"].as_str().unwrap_or("").contains("cannot reach the server"), "{}", s["witness"]);
+	let shown = home_of(&s, &g_board).expect("G's board is shown");
+	assert!(shown["exit"].is_null() && shown["exit_by"].as_u64().is_some(), "{}", shown);
+	assert!(coin_of(&g, &g_board)["exit_by"].as_u64().is_some());
+
+	// The operator answers again, two days before the window opens: within
+	// it, both boards stay, and nothing shows a date any more.
+	proxy.rewrite(None);
+	r.restart_server().await;
+	r.synced().await;
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, by - now - 2 * 86_400));
+	r.synced().await;
+	println!("D56 two days before the date, the operator answering");
+	for (w, leaf) in [(&a, &board), (&g, &g_board)] {
+		let s = w.ok(&["sync"]);
+		println!("D56 {}'s sync: witness ok {} | unreachable {} | home {}", w.name, s["witness"]["error"].is_null(), s["unreachable"], s["home"]);
+		assert!(s["witness"]["error"].is_null() && s["unreachable"].is_null(), "{}", s);
+		assert!(home_of(&s, leaf).is_none(), "the board stays: {}", s["home"]);
+		let c = coin_of(w, leaf);
+		assert_eq!(c["state"], "live", "{}", c);
+		assert!(c["exit_by"].is_null(), "{}", c);
+	}
+	// The refused coin, with the operator answering: home within its window
+	// (A's sync above took it).
+	let c = coin_of(&a, &refused);
+	println!("D56 A's refused coin: {} | {}", c["state"], c["note"]);
+	assert_eq!(c["state"], "exiting", "{}", c);
+	assert!(c["note"].as_str().unwrap().contains("the operator refused its refresh"), "{}", c);
+
+	// The proof withheld again, within the window: A's board goes home.
+	withhold();
+	let s = a.ok(&["sync"]);
+	let shown = home_of(&s, &board).unwrap();
+	println!("D56 A's sync, the proof withheld within the window: {}", shown["exit"]["state"]);
+	assert!(shown["exit"]["state"].is_string(), "{}", shown);
+	let c = coin_of(&a, &board);
+	assert_eq!(c["state"], "exiting");
+	assert!(c["note"].as_str().unwrap().contains("the operator could not refresh it"), "{}", c);
+	// The server gone again, within the window: G's board goes home.
+	r.server.stop();
+	let s = g.ok(&["sync"]);
+	let shown = home_of(&s, &g_board).unwrap();
+	println!("D56 G's sync, the server gone within the window: {}", shown["exit"]["state"]);
+	assert!(shown["exit"]["state"].is_string(), "{}", shown);
+	assert_eq!(coin_of(&g, &g_board)["state"], "exiting");
+	r.produce().await;
+	for (w, leaf) in [(&a, &board), (&a, &refused), (&g, &g_board)] {
+		let e = w.ok(&["exit", leaf]);
+		println!("D56 {}'s exit of {}: {}", w.name, &leaf[..8], e["state"]);
+		assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting" | "claimed")), "on its way to the chain: {}", e);
+	}
+	for w in [&a, &g] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// D52. A keeper down holds a payment up: the server records it, the
 /// signer records the entry and answers `keepers_unavailable`, and the
 /// wallet keeps the request standing, nothing taken. Once the keeper is

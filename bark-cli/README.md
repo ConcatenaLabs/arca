@@ -234,8 +234,22 @@ the keys, but which coins were spent off-chain is in the store and the server.
   `sync`), so a program built on the library cannot leave it out; while no
   witness succeeds (the server denies it, or its answer carries no proof)
   the wallet takes no coin and signs no spend through the operator, and
-  `sync` does only what it does on the chain. The reason is shown, and kept with the
+  `sync` does only what it does on the chain, and brings home what it
+  cannot have refreshed (below). The reason is shown, and kept with the
   wallet's refusals.
+
+- **A coin the operator cannot refresh goes home before its date.**
+  Whatever the reason the wallet cannot have its coins refreshed (no witness
+  succeeds, the server does not answer or refuses the wallet, the operator's
+  signer is stopped), `sync` shows each coin it holds off the chain with the
+  date by which it must be exited (`exit_by`, its exit deadline, in `sync`'s
+  `home` and in `coins`), says that `sync` must run before that date, and
+  takes on the chain every coin whose date is within three days. While the
+  operator answers, it does the same for each coin whose refresh the
+  operator refused (a refresh refused, voided or left to expire, and not
+  made since). Nothing is refused for good on that ground: a coin whose
+  date is further off stays, and stays when the operator answers again
+  before it.
 
 - **The operator's keepers.** An operator's signer may hand every head of its
   record to keepers on other machines, and answer an entry only once enough
@@ -455,6 +469,13 @@ and holding it there, with the reason shown:
   keeper it pinned;
 - a proxy stripping the keepers' acknowledgements: the wallet's own payment
   stands and a coin in its mailbox waits, until the answers are whole;
+- a coin the operator cannot refresh: with the signer's proof withheld from
+  every witness, and with the server gone, `sync` and `coins` show each
+  board's exit date and say `sync` must run before it, taking nothing weeks
+  ahead; with the operator answering again before the window, the boards
+  stay; withheld again, and gone again, within three days of the date, each
+  board goes on the chain; and a coin whose refresh the operator refused
+  goes home within its window while the operator answers;
 - the witness denied (a 503 on the way): `send`, `board`, `participate`, a
   swap's offer and the mailbox are refused before anything reaches the
   operator, and `sync` does only what it does on the chain; once the witness
