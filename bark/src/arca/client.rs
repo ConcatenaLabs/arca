@@ -69,6 +69,26 @@ pub fn record_head_digest(chain: &Chain, entry: u64, hash: &[u8; 32]) -> [u8; 32
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the signer's record's end, signed with a witness's nonce.
+pub const RECORD_END_TAG: &[u8] = b"Arca/record-end";
+
+/// What the operator key signs to answer a witness that carried `nonce`: its
+/// signer's record ends at entry `entry`, whose running hash is `hash`:
+/// `SHA256(T ‖ T ‖ genesis ‖ entry ‖ hash ‖ nonce)`,
+/// `T = SHA256("Arca/record-end")`. The server's
+/// (`server::signer::record_end_digest`).
+pub fn record_end_digest(chain: &Chain, entry: u64, hash: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(RECORD_END_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	e.input(nonce);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// What a `mailbox_read` asks besides its proof, as the proof binds it: the
 /// cursor (eight bytes) and the page size (four), little-endian; a
 /// `leaf_data` asks nothing more. The server's
@@ -276,11 +296,12 @@ impl ServerClient {
 	}
 
 	/// Hands the server the heads of its signer's record the wallet holds
-	/// (`{"entry", "hash", "signature"}` each) and gets back the running hash
-	/// the record holds at each entry, its latest entry, signed, and whether
-	/// the signer is stopped.
-	pub fn witness(&self, heads: &[Value]) -> Result<Value, Error> {
-		self.post("witness", &json!({"heads": heads}))
+	/// (`{"entry", "hash", "signature"}` each) with a fresh `nonce`, and gets
+	/// back the running hash the record holds at each entry and its latest
+	/// entry, each signed by the signer, the record's end signed with the
+	/// nonce, and whether the signer is stopped, with its proof.
+	pub fn witness(&self, heads: &[Value], nonce: &[u8; 32]) -> Result<Value, Error> {
+		self.post("witness", &json!({"heads": heads, "nonce": hex(nonce)}))
 	}
 
 	/// The coin records in `key`'s mailbox after `after`.

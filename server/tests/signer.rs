@@ -806,6 +806,129 @@ async fn a_head_the_signer_signed_that_its_record_does_not_hold_stops_it() {
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The signer's answer to a witness of `heads` carrying `nonce`.
+async fn witness_with(socket: &std::path::Path, heads: &[(u64, [u8; 32], Option<elements::secp256k1_zkp::schnorr::Signature>)],
+	nonce: &[u8; 32]) -> serde_json::Value
+{
+	use server::signer::hex;
+	let heads: Vec<serde_json::Value> = heads.iter().map(|(n, h, s)| {
+		let mut v = serde_json::json!({"entry": n, "hash": hex(h)});
+		if let Some(s) = s {
+			v["signature"] = serde_json::json!(hex(s.as_ref()));
+		}
+		v
+	}).collect();
+	serde_json::from_str(&raw(socket, &serde_json::json!({"op": "witness", "heads": heads, "nonce": hex(nonce)}).to_string()).await).unwrap()
+}
+
+/// Whether `v` (`{entry, hash, signature}`) is signed by `s` as a head.
+fn signed_as_head(v: &serde_json::Value, s: &Keypair, genesis: BlockHash) -> bool {
+	let (Some(n), Some(h), Some(sig)) = (v["entry"].as_u64(), v["hash"].as_str(), v["signature"].as_str()) else { return false };
+	let sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&server::signer::unhex(sig).unwrap()).unwrap();
+	verify_digest(&sig, &server::signer::record_head_digest(&genesis, n, &server::signer::unhex32(h).unwrap()), &xonly(s))
+}
+
+/// Whether `v` (`{entry, hash, signature}`) is signed by `s` as the record's
+/// end together with `nonce`.
+fn signed_as_end(v: &serde_json::Value, s: &Keypair, genesis: BlockHash, nonce: &[u8; 32]) -> bool {
+	let (Some(n), Some(h), Some(sig)) = (v["entry"].as_u64(), v["hash"].as_str(), v["signature"].as_str()) else { return false };
+	let sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&server::signer::unhex(sig).unwrap()).unwrap();
+	verify_digest(&sig, &server::signer::record_end_digest(&genesis, n, &server::signer::unhex32(h).unwrap(), nonce), &xonly(s))
+}
+
+/// D54. A witness answer is the signer's own word: every running hash it
+/// answers is signed as a head, so another hash at an entry a wallet holds
+/// is two heads `S` signed at one entry; and the record's end is signed
+/// together with the nonce the witness carried, so an older end replayed
+/// does not pass for it (its signature does not hold under another nonce,
+/// and a head's signature is not an end's). A stopped signer answers with its
+/// proof: the head that stopped it, as it was handed over, and the head its
+/// record holds at that entry, signed, or, where it holds none, its end
+/// before it; across a restart too, read back from the proof kept beside
+/// the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_witness_answer_is_the_signers_own_word_and_a_stop_carries_its_proof() {
+	use server::signer::hex;
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let a = keypair("owner");
+	assert!(common::signer::create_record(&key, genesis, &record).status.success());
+	let run = Run::start(&dir, "first", genesis, &record, "exec ").unwrap();
+	let mut known = None;
+	let mut entries = vec![];
+	let mut snapshot = vec![];
+	for k in 1..=4u8 {
+		let e = ask(&run.socket, &rebind_line(&a, genesis, [k; 32], asset, 1, known)).await.unwrap();
+		entries.push((e.0, e.1, head_sig(&s, genesis, e.0, &e.1)));
+		known = Some(e);
+		if k == 2 {
+			snapshot = std::fs::read(&record).unwrap();
+		}
+	}
+	let nonce = [0x5a; 32];
+	let w = witness_with(&run.socket, &[(1, entries[0].1, Some(entries[0].2)), (3, [0; 32], None), (9, [9; 32], None)], &nonce).await;
+	println!("a witness with a nonce: {}", w);
+	assert!(signed_as_head(&w["hashes"][0], &s, genesis) && signed_as_head(&w["hashes"][1], &s, genesis), "each hash answered is signed");
+	assert_eq!(w["hashes"][1]["hash"], serde_json::json!(hex(&entries[2].1)), "the record's hash at entry 3, whatever was asked");
+	assert!(w["hashes"][2]["hash"].is_null() && w["hashes"][2]["signature"].is_null(), "nothing past the end, nothing signed");
+	assert_eq!(w["end"]["entry"], 4);
+	assert!(signed_as_end(&w["end"], &s, genesis, &nonce), "the end is signed with the nonce");
+	assert!(!signed_as_end(&w["end"], &s, genesis, &[0x5b; 32]), "and with no other nonce");
+	assert!(!signed_as_head(&w["end"], &s, genesis), "an end's signature is not a head's");
+	assert!(!signed_as_end(&w["entry"], &s, genesis, &nonce), "nor a head's an end's");
+	assert_eq!((w["entry"]["entry"].clone(), w["entry"]["hash"].clone()), (w["end"]["entry"].clone(), w["end"]["hash"].clone()));
+	let without: serde_json::Value = witness(&run.socket, &[]).await;
+	assert!(without["end"].is_null(), "no end without a nonce: {}", without);
+	run.stop();
+
+	// Rolled back to entry 2, then entry 3 of another branch: entry 4's head
+	// handed back stops it on "past the end"; the proof shows that head, no
+	// head held there, and the end signed with the nonce before it.
+	std::fs::write(&record, &snapshot).unwrap();
+	let run = Run::start(&dir, "rolledback", genesis, &record, "exec ").unwrap();
+	let b = keypair("another owner");
+	ask(&run.socket, &rebind_line(&b, genesis, [13; 32], asset, 1, None)).await.unwrap();
+	let (n4, h4, sig4) = entries[3];
+	let nonce = [0x6b; 32];
+	let w = witness_with(&run.socket, &[(n4, h4, Some(sig4))], &nonce).await;
+	println!("stopped on a head past the end: {}", w);
+	assert!(w["stopped"].as_str().unwrap().contains("past the record's end"), "{}", w);
+	assert_eq!(w["proof"]["head"], serde_json::json!({"entry": n4, "hash": hex(&h4), "signature": hex(sig4.as_ref())}));
+	assert!(w["proof"]["held"].is_null(), "the record holds no entry 4");
+	assert_eq!(w["end"]["entry"], 3);
+	assert!(signed_as_end(&w["end"], &s, genesis, &nonce), "the stopped signer's end is signed with the nonce: {}", w);
+	assert!(w["entry"].is_null(), "no head from a stopped signer");
+	run.stop();
+
+	// Across a restart, read back from the proof beside the record; and a
+	// stop on another hash at an entry the record holds shows the head held.
+	let run = Run::start(&dir, "restarted", genesis, &record, "exec ").unwrap();
+	let w = witness_with(&run.socket, &[(3, entries[2].1, Some(entries[2].2))], &nonce).await;
+	println!("after a restart: proof {} | end {} | hash at 3 {}", w["proof"], w["end"], w["hashes"][0]);
+	assert_eq!(w["proof"]["head"]["entry"].as_u64(), Some(n4));
+	assert!(signed_as_end(&w["end"], &s, genesis, &nonce));
+	assert!(signed_as_head(&w["hashes"][0], &s, genesis), "a stopped signer still signs the hashes it answers");
+	assert_ne!(w["hashes"][0]["hash"], serde_json::json!(hex(&entries[2].1)), "another branch's entry 3");
+	run.stop();
+	assert!(Command::new(env!("CARGO_BIN_EXE_arca-signer")).args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(),
+		"--record", record.to_str().unwrap(), "--clear-stopped"]).output().unwrap().status.success());
+	let run = Run::start(&dir, "cleared", genesis, &record, "exec ").unwrap();
+	let w = witness_with(&run.socket, &[(3, entries[2].1, Some(entries[2].2))], &nonce).await;
+	println!("stopped on another hash at entry 3: {}", w);
+	assert!(w["stopped"].as_str().unwrap().contains("is not the record's"), "{}", w);
+	assert_eq!(w["proof"]["head"]["hash"], serde_json::json!(hex(&entries[2].1)));
+	assert_eq!(w["proof"]["held"]["entry"], 3);
+	assert_ne!(w["proof"]["held"]["hash"], w["proof"]["head"]["hash"]);
+	assert!(signed_as_head(&w["proof"]["held"], &s, genesis), "the head held there, signed: two heads S signed at one entry");
+	run.stop();
+	let _ = (known, &key);
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A spend of one of the operator's own paths: a coin at a taproot output
 /// whose one leaf is `<S> OP_CHECKSIG`, spent to a bare `OP_TRUE`.
 fn own_spend(s: &Keypair) -> (elements::Transaction, Vec<elements::TxOut>, Script) {

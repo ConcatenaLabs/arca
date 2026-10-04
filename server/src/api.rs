@@ -559,31 +559,55 @@ pub struct RecordHead {
 
 /// `POST /v1/witness`: the heads of the signer's record a wallet holds, each
 /// with the signature it was handed out with, at most
-/// [`crate::signer::MAX_WITNESS`].
+/// [`crate::signer::MAX_WITNESS`], and a nonce the wallet draws fresh for the
+/// call (32 bytes), which the signer signs the record's end together with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WitnessRequest {
 	pub heads: Vec<RecordHead>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub nonce: Option<String>,
 }
 
 /// The running hash the record holds at an entry a wallet named: `None` past
-/// its end, or where a compaction kept no hash.
+/// its end, or where a compaction kept no hash; with `S`'s signature over it
+/// as a head when there is one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryHash {
 	pub entry: u64,
 	pub hash: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signature: Option<String>,
+}
+
+/// What a stopped signer shows of why it stopped: the head it was handed that
+/// its record does not hold, signed by `S`, and the head the record holds at
+/// that entry, signed, when it holds another there; when it holds none
+/// there, the witness's `end` lies before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopProof {
+	pub head: RecordHead,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub held: Option<RecordHead>,
 }
 
 /// The answer to a witness: the record's latest entry, signed (none while the
-/// signer is stopped), the running hash at each entry named, in order, and
-/// why the signer is stopped, if it is.
+/// signer is stopped), the running hash at each entry named, in order, each
+/// signed, the record's latest entry signed together with the request's
+/// nonce (`signer::record_end_digest`; absent when the request carried
+/// none), and why the signer is stopped, if it is, with its proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Witness {
 	pub head: Option<RecordHead>,
 	pub hashes: Vec<EntryHash>,
 	pub stopped: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub end: Option<RecordHead>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub proof: Option<StopProof>,
 }
 
 /// The tree's reserve rule: `{"fee_rate": …}` or `{"fixed": …}`.

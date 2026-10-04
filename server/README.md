@@ -659,7 +659,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at |
 | `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records; a round's leaf is served with an empty record until its participation's preimage went out |
-| `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`), hands them to the signer, and answers the running hash the record holds at each entry, its latest entry, signed, and whether the signer is stopped |
+| `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`) and a nonce the wallet draws fresh for the call, hands them to the signer, and answers the running hash the record holds at each entry, each signed, its latest entry, signed (`head`), the record's end signed together with the nonce (`end`), and whether the signer is stopped (`stopped`), with its proof (`proof`: the signed head that stopped it and, when the record holds another there, that head, signed) |
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
@@ -817,12 +817,20 @@ the one its last signature was recorded at. A wallet keeps each head it is
 shown with that signature, and on every contact (each command that reaches
 the server, `sync`, the mailbox and the re-check on start among them) makes
 one `witness` call: it hands over the highest head it holds, the heads its
-coins were recorded at, and as many more as fit, and gets back the running
-hash the record holds at each entry and the record's latest entry, signed. A
-latest entry below the highest it holds, or another hash at an entry it
-holds, is a rollback; since the wallet asks for its own highest entry by
+coins were recorded at, and as many more as fit, with a nonce it draws fresh
+for the call, and gets back the running hash the record holds at each entry,
+each signed as a head, the record's latest entry, signed, and the record's
+end signed together with the nonce, over `SHA256(T ‖ T ‖ genesis ‖ entry ‖
+hash ‖ nonce)`, `T = SHA256("Arca/record-end")`. Another hash the signer
+signed at an entry the wallet holds signed is two heads `S` signed at one
+entry, and an end signed with the call's nonce before such an entry is the
+record's end now, not an older head replayed: each is a rollback, and the
+signer's own proof of it. Since the wallet asks for its own highest entry by
 number every time, a rolled-back record that has signed past it again is
-caught as well.
+caught as well. The wallet acts on nothing else: the server (and anything
+between it and the wallet) passes the signer's signatures on, and an answer
+without them, or a latest entry in `info` below what the wallet holds, is an
+unreachable server, which the wallet asks again and refuses nothing for.
 
 A head that carries `S`'s valid signature and that the record does not hold
 (an entry past its end, or another hash at that entry) is proof the record
@@ -832,8 +840,11 @@ the proof beside its record (`<record>.stopped`), and from then on signs no
 rebindable message and no head, across restarts. It still signs the spends
 of the operator's own paths (a claim, a sweep), which the record does not
 govern. The server still starts on a stopped signer and answers every
-wallet's witness with the stop, so one wallet that was online in between
-protects every holder. A head without `S`'s valid signature, altered, of
+wallet's witness with the stop and its proof: the head that stopped it, as it
+was handed over, and the head the record holds at that entry, signed, or,
+where it holds none, the record's end signed with the asker's nonce before
+it. So one wallet that was online in between protects every holder, and no
+wallet takes a stop on the server's word. A head without `S`'s valid signature, altered, of
 another chain, or one the record holds, stops nothing; neither does a head
 from before a compaction, whose hash the compacted record keeps.
 
@@ -1227,7 +1238,13 @@ entries of another branch, handed the head it lost, stopped, the proof
 written beside it, every rebind and `head` refused (`stopped`) across a
 restart while the spend of one of the operator's own paths is still signed;
 `--clear-stopped` removing the proof, after which it signs again; and a
-signed head past the record's end stopping it as well.
+signed head past the record's end stopping it as well. And the witness's
+answer as the signer's own word: every running hash answered signed as a
+head, nothing signed past the end, the end signed with the request's nonce
+and with no other, an end's signature not a head's nor a head's an end's;
+a stopped signer answering with the head that stopped it, as handed over,
+and its end before it signed with the nonce, across a restart, and, stopped
+on another hash at an entry it holds, with the head it holds there, signed.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next

@@ -762,9 +762,13 @@ async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 }
 
 /// Hands the heads of the signer's record a wallet holds to the signer, and
-/// answers what the record holds at each entry, its latest entry, signed, and
-/// whether the signer is stopped. A head the signer signed that its record
-/// does not hold stops it (`crate::signer::SpendRecord::witness`).
+/// answers what the record holds at each entry, its latest entry, each
+/// signed by the signer, the record's end signed with the wallet's nonce,
+/// and whether the signer is stopped, with its proof. A head the signer
+/// signed that its record does not hold stops it
+/// (`crate::signer::SpendRecord::witness`). The server passes the signer's
+/// signatures on and adds nothing a wallet would act on: a wallet acts on a
+/// rollback only on proof the signer made.
 async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
 	body: Result<Bytes, BytesRejection>) -> Result<Json<api::Witness>, Refusal>
 {
@@ -781,7 +785,8 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 		}
 		heads.push(crate::signer::WireEntryRef { entry: h.entry, hash: h.hash.clone(), signature: h.signature.clone() });
 	}
-	let w = app.cosigner.signer().witness(&heads).await.map_err(|e| match e {
+	let nonce = req.nonce.as_deref().map(unhex32).transpose().map_err(Refusal::malformed)?;
+	let w = app.cosigner.signer().witness(&heads, nonce.as_ref()).await.map_err(|e| match e {
 		crate::signer::SignerError::Unreachable { .. } => Refusal::new(StatusCode::SERVICE_UNAVAILABLE, "signer_unavailable", e.to_string()),
 		other => Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", other.to_string()),
 	})?;
@@ -790,10 +795,13 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 		// `info` shows no head of a stopped signer's record from now on.
 		*app.record_head.lock().await = None;
 	}
+	let wire = |h: crate::signer::WireEntryRef| api::RecordHead { entry: h.entry, hash: h.hash, signature: h.signature };
 	Ok(Json(api::Witness {
 		head: w.head.as_ref().map(record_head_json),
-		hashes: w.hashes.into_iter().map(|h| api::EntryHash { entry: h.entry, hash: h.hash }).collect(),
+		hashes: w.hashes.into_iter().map(|h| api::EntryHash { entry: h.entry, hash: h.hash, signature: h.signature }).collect(),
 		stopped: w.stopped,
+		end: w.end.map(wire),
+		proof: w.proof.map(|p| api::StopProof { head: wire(p.head), held: p.held.map(wire) }),
 	}))
 }
 

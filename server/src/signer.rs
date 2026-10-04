@@ -15,13 +15,18 @@
 //! - `{"op":"head"}` and `{"op":"entries","after":…,"limit":…}`: the record's
 //!   latest entry, signed ([`record_head_digest`]), and its entries after
 //!   one, for the server to check its database against at start;
-//! - `{"op":"witness","heads":[{"entry":…,"hash":…,"signature":…},…]}`: the
-//!   running hash at each entry named, and the record's latest entry,
-//!   signed. A head among them that carries `S`'s signature and that the
-//!   record does not hold (an entry past its end, or another hash at that
-//!   entry) is proof the record was rolled back or replaced: the signer
+//! - `{"op":"witness","heads":[{"entry":…,"hash":…,"signature":…},…],"nonce":…}`:
+//!   the running hash at each entry named, each signed as a head
+//!   ([`record_head_digest`]); the record's latest entry, signed as a head
+//!   (none once stopped); and, when the request carries a nonce (32 bytes,
+//!   fresh for each call), the record's latest entry signed together with it
+//!   ([`record_end_digest`]), so an older head replayed cannot pass for the
+//!   record's end. A head among them that carries `S`'s signature and that
+//!   the record does not hold (an entry past its end, or another hash at
+//!   that entry) is proof the record was rolled back or replaced: the signer
 //!   writes it beside the record and signs nothing the record governs from
-//!   then on ([`SpendRecord::witness`]);
+//!   then on ([`SpendRecord::witness`]); a stopped signer answers with that
+//!   proof and the head its record holds at the proof's entry, signed;
 //! - `{"op":"spend","tx":…,"prevouts":[…],"input":…,"leaf":…}`: `S`'s signature
 //!   over the spend of input `input` of the transaction by the tapscript leaf
 //!   `leaf`, whose signature hash (Elements taproot, `SIGHASH_DEFAULT`, its
@@ -205,8 +210,14 @@ pub enum Request {
 	/// The latest entry of the record: its number and running hash, signed.
 	Head {},
 	/// Heads a wallet holds, each with the signature it was handed out with:
-	/// the running hash at each entry, and the latest entry, signed.
-	Witness { heads: Vec<WireEntryRef> },
+	/// the running hash at each entry, signed, and the latest entry, signed
+	/// as a head and, with the wallet's fresh `nonce` (32 bytes, hex), as the
+	/// record's end.
+	Witness {
+		heads: Vec<WireEntryRef>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		nonce: Option<String>,
+	},
 	/// The entries after entry `after`, at most `limit` of them.
 	Entries { after: u64, limit: u32 },
 	/// The transaction and each output its inputs spend, in Sequentia's
@@ -251,12 +262,29 @@ pub struct WireEntryRef {
 }
 
 /// The running hash the record holds at an entry: `None` past its end, or for
-/// an entry a compaction kept no hash of.
+/// an entry a compaction kept no hash of; with `S`'s signature over it as a
+/// head ([`record_head_digest`]) when there is one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireEntryHash {
 	pub entry: u64,
 	pub hash: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signature: Option<String>,
+}
+
+/// What a stopped signer shows of why it stopped: the head it was handed
+/// that its record does not hold, with `S`'s signature as it was handed
+/// over, and the head its record holds at that entry, signed, when it holds
+/// one there (another hash). When it holds none there (the head lies past
+/// the record's end), the record's end signed with the asker's nonce shows
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireStopProof {
+	pub head: WireEntryRef,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub held: Option<WireEntryRef>,
 }
 
 /// The most heads one `witness` request names.
@@ -306,6 +334,13 @@ pub struct Response {
 	/// Why the signer signs nothing the record governs: a proven rollback.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub stopped: Option<String>,
+	/// The record's latest entry, signed with the nonce a witness carried
+	/// ([`record_end_digest`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub end: Option<WireEntryRef>,
+	/// The proof a stopped signer stopped on.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub proof: Option<WireStopProof>,
 }
 
 /// The refusal code of a message the one-spend record does not admit.
@@ -356,11 +391,47 @@ pub fn record_head_digest(genesis: &elements::BlockHash, entry: u64, hash: &[u8;
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the record's end signed together with a witness's nonce.
+pub const RECORD_END_TAG: &[u8] = b"Arca/record-end";
+
+/// What `S` signs to answer a witness that carried `nonce`: its record ends
+/// at entry `entry`, whose running hash is `hash`, on the chain of
+/// `genesis`: `SHA256(T ‖ T ‖ genesis ‖ entry ‖ hash ‖ nonce)`,
+/// `T = SHA256("Arca/record-end")`, the genesis hash in internal byte order,
+/// the entry eight bytes little-endian. The nonce is the asker's, fresh for
+/// each call, so the answer cannot be an older end replayed: a record that
+/// ends, after a wallet was handed a head, before that head's entry has been
+/// rolled back.
+pub fn record_end_digest(genesis: &elements::BlockHash, entry: u64, hash: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(RECORD_END_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&arca_covenant::Chain::new(*genesis).genesis_bytes());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	e.input(nonce);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// Where the proof of a rollback is kept beside the record at `record`.
 pub fn stopped_path(record: &Path) -> PathBuf {
 	let mut p = record.as_os_str().to_owned();
 	p.push(".stopped");
 	PathBuf::from(p)
+}
+
+/// The head a proof of a rollback kept beside the record names, from its
+/// `head <entry> <hash> <signature>` line.
+fn stop_head_of(text: &str) -> Option<WireEntryRef> {
+	let l = text.lines().find(|l| l.starts_with("head "))?;
+	let f: Vec<&str> = l.split(' ').collect();
+	match f.as_slice() {
+		["head", n, h, sig] => Some(WireEntryRef {
+			entry: n.parse().ok()?, hash: h.to_string(), signature: (!sig.is_empty()).then(|| sig.to_string()),
+		}),
+		_ => None,
+	}
 }
 
 /// `SHA256("Arca/signer-record" ‖ prev ‖ text)`: the running hash after a
@@ -657,6 +728,8 @@ pub struct SpendRecord {
 	stopped: Option<String>,
 	/// Where that proof is kept.
 	stop_path: PathBuf,
+	/// The head that proved it, as it was handed over.
+	stop_head: Option<WireEntryRef>,
 	/// The operator key and the chain the record is kept for, which every
 	/// head it hands out is signed under.
 	operator: XOnlyPublicKey,
@@ -760,15 +833,16 @@ impl SpendRecord {
 		// About 300 bytes a line: room for every entry at once.
 		let lines = file.metadata().map(|m| m.len()).unwrap_or(0) / 280 + 16;
 		let stop_path = stopped_path(path);
-		let stopped = match std::fs::read_to_string(&stop_path) {
-			Ok(text) => Some(format!("{}: {} (the proof is kept in {}; the operator clears it with arca-signer --clear-stopped)", STOPPED,
-				text.lines().next().unwrap_or("the record was rolled back or replaced"), stop_path.display())),
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+		let (stopped, stop_head) = match std::fs::read_to_string(&stop_path) {
+			Ok(text) => (Some(format!("{}: {} (the proof is kept in {}; the operator clears it with arca-signer --clear-stopped)", STOPPED,
+				text.lines().next().unwrap_or("the record was rolled back or replaced"), stop_path.display())), stop_head_of(&text)),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
 			Err(e) => return Err(format!("{}: {}", stop_path.display(), e)),
 		};
 		let mut record = SpendRecord {
 			file, size: first, first, base, head: base, count: 0, kept: Vec::with_capacity(lines as usize), added: Default::default(),
-			lines: 0, marks: vec![], recent: Default::default(), refusing: None, stopped, stop_path, operator: *operator, genesis: *genesis,
+			lines: 0, marks: vec![], recent: Default::default(), refusing: None, stopped, stop_path, stop_head, operator: *operator,
+			genesis: *genesis,
 		};
 		let mut at = first;
 		let mut k = 1u64;
@@ -993,6 +1067,12 @@ impl SpendRecord {
 		self.stopped.as_deref()
 	}
 
+	/// The head that stopped the signer, as it was handed over, with `S`'s
+	/// signature: a head the record does not hold.
+	pub fn stop_head(&self) -> Option<&WireEntryRef> {
+		self.stop_head.as_ref()
+	}
+
 	/// Checks the heads a wallet holds, each `(entry, running hash)` with the
 	/// signature it was handed out with, against the record, and returns the
 	/// running hash the record holds at each entry (`None` past its end, or
@@ -1010,7 +1090,7 @@ impl SpendRecord {
 		let mut proof = None;
 		for h in heads {
 			let held = self.hash_of(h.entry).map_err(|e| format!("the record could not be read: {}", e))?;
-			out.push(WireEntryHash { entry: h.entry, hash: held.map(|x| hex(&x)) });
+			out.push(WireEntryHash { entry: h.entry, hash: held.map(|x| hex(&x)), signature: None });
 			if proof.is_some() || self.stopped.is_some() {
 				continue;
 			}
@@ -1057,6 +1137,7 @@ impl SpendRecord {
 		};
 		self.stopped = Some(format!("{}: the signer's record was rolled back or replaced: {}; it signs nothing the record governs ({})",
 			STOPPED, why, kept));
+		self.stop_head = Some(head.clone());
 	}
 
 	/// Removes the proof of a rollback kept beside the record at `record`,
@@ -1298,6 +1379,9 @@ pub struct Witnessed {
 	pub head: Option<SignedHead>,
 	pub hashes: Vec<WireEntryHash>,
 	pub stopped: Option<String>,
+	/// The record's latest entry signed with the witness's nonce.
+	pub end: Option<WireEntryRef>,
+	pub proof: Option<WireStopProof>,
 }
 
 /// The server's end of the signer's socket. With the server's database
@@ -1362,18 +1446,15 @@ impl SignerClient {
 	}
 
 	/// What the signer's record holds at each of `heads`, heads of it a
-	/// wallet was handed: the running hash at each entry, the record's
-	/// latest entry, signed (none while the signer is stopped), and why it is
-	/// stopped, if it is. A head the signer signed that the record does not
-	/// hold stops it ([`SpendRecord::witness`]).
-	pub async fn witness(&self, heads: &[WireEntryRef]) -> Result<Witnessed, SignerError> {
-		let r = match self.ask(&Request::Witness { heads: heads.to_vec() }).await {
-			Ok(r) => r,
-			Err(SignerError::Stopped(why)) => return Err(SignerError::Stopped(why)),
-			Err(e) => return Err(e),
-		};
+	/// wallet was handed: the running hash at each entry, signed, the
+	/// record's latest entry, signed (none while the signer is stopped) and,
+	/// with the wallet's `nonce`, signed together with it, and why it is
+	/// stopped, if it is, with the proof. A head the signer signed that the
+	/// record does not hold stops it ([`SpendRecord::witness`]).
+	pub async fn witness(&self, heads: &[WireEntryRef], nonce: Option<&[u8; 32]>) -> Result<Witnessed, SignerError> {
+		let r = self.ask(&Request::Witness { heads: heads.to_vec(), nonce: nonce.map(|n| hex(n)) }).await?;
 		let head = r.entry.as_ref().map(SignedHead::from_wire).transpose().map_err(SignerError::Answer)?;
-		Ok(Witnessed { head, hashes: r.hashes.unwrap_or_default(), stopped: r.stopped })
+		Ok(Witnessed { head, hashes: r.hashes.unwrap_or_default(), stopped: r.stopped, end: r.end, proof: r.proof })
 	}
 
 	/// The entries of the signer's record after entry `after`, at most
