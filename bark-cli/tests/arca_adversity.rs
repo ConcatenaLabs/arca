@@ -1573,6 +1573,111 @@ async fn a_final_refund_orphaned_with_its_anchor_gives_way_to_the_claim_and_the_
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// Review R7d's probe P1e turned around. The operator's claim of a forfeit is
+/// final and the wallet has read the preimage from it, holding its new leaf.
+/// A rollback then takes the claim's block out, and the node restarts with an
+/// empty mempool before the operator sends the claim again; the refund delay
+/// has long run. The wallet holds the preimage of the participation, and the
+/// round can return, so the forfeit's output is the operator's claim to make:
+/// it sends no refund, keeps its new leaf, and follows the output. The
+/// claim, sent again, is taken, and decides the forfeit again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_rolled_back_is_left_to_the_operator_by_a_wallet_holding_the_preimage() {
+	use arca_covenant::spend::FeeSource;
+	use arca_covenant::ExplicitOutput;
+	use elements::OutPoint;
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("P1e");
+	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
+	let (units, cvout, margin, unlock) = stored_status(&r, &pid);
+	// The operator's claim, built as the watcher builds it, final before the
+	// wallet looks again.
+	let CoinRecord::Board(rec) = record_of(&c, &board) else { panic!("a board") };
+	let board_txid = r.server.store.board(&rec.leaf_id().0).await.unwrap().map(|b| b.txid).expect("the board is registered");
+	let board_tx = r.rt.client().raw_transaction(&elements::hashes::Hash::from_byte_array(board_txid)).unwrap();
+	let mtp = rpc(&r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	let old = CoinRecord::Board(rec).resolve(std::slice::from_ref(&board_tx), &arca_covenant::WalletPolicy {
+		min_exit_delay: RelativeTime::from_units(1).unwrap(), horizon: 0,
+		..arca_covenant::WalletPolicy::new(rec.chain, rec.operator, arca_covenant::MedianTime::from_consensus(mtp).unwrap())
+	}).unwrap();
+	let round_txid = r.server.store.round(r.server.store.participation(&unhex(&pid).try_into().unwrap()).await.unwrap().unwrap()
+		.round_id.unwrap()).await.unwrap().unwrap().txid;
+	let m = connector_asset(elements::hashes::Hash::from_byte_array(round_txid), cvout);
+	let forfeit = Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, m, RelativeTime::from_units(units).unwrap(), margin).unwrap();
+	let fo = forfeit.output();
+	let atx = r.rt.client().raw_transaction(&atom_txid).unwrap();
+	let av = atx.output.iter().position(|o| o.asset.explicit() == Some(m)).unwrap() as u32;
+	let m_out = atx.output[av as usize].clone();
+	let ct = arca_covenant::batch_claim_tx(&[(&forfeit, OutPoint::new(forfeit_txid, 0))], (OutPoint::new(atom_txid, av), m_out.clone()),
+		&[ExplicitOutput::new(fo.asset, fo.value - 40_000, common::node::op_true())], m_out.script_pubkey.clone(), &FeeSource::Reserve).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &ct.sighash(0, genesis).unwrap(), &[0; 32]);
+	let mut claim = ct.finish(&[sig], &[preimage]).unwrap().tx;
+	operator_signs_input(&r, &mut claim, 1);
+	r.rt.client().send_raw_transaction(&claim).expect("the claim");
+	r.produce().await;
+	let claim_block = block_of(&r, &claim.txid().to_string());
+	r.bury().await;
+	r.bury().await;
+	let mut leaf = String::new();
+	for _ in 0..3 {
+		let s = c.ok(&["sync"]);
+		if let Some(l) = s["forfeits"].as_array().unwrap().iter().find_map(|f| f["new_leaves"][0]["leaf_id"].as_str()) {
+			leaf = l.to_string();
+		}
+		r.bury().await;
+	}
+	c.ok(&["sync"]);
+	let f = c.ok(&["coins"]);
+	println!("P1e the claim final: new leaf {} {}, the coin given up {}", leaf, coin_of(&c, &leaf)["state"], coin_of(&c, &board)["state"]);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live", "{}", f);
+	assert_eq!(coin_of(&c, &board)["state"], "spent");
+	// The claim's block taken out; the node restarts at its own clock with
+	// an empty mempool; the operator has not sent the claim again.
+	rpc(&r, "invalidateblock", &[json!(claim_block)]);
+	let tip = rpc(&r, "getbestblockhash", &[]);
+	let tip_time = rpc(&r, "getblockheader", &[tip])["time"].as_u64().unwrap();
+	let mock = format!("-mocktime={}", tip_time + 120);
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0", &mock])).unwrap();
+	r.produce().await;
+	println!("P1e the claim's block invalidated, the node restarted: the claim's confirmations {}, in the mempool {}; the forfeit's {}",
+		confirmations(&r, &claim.txid()), in_mempool(&r, &claim.txid()), confirmations(&r, &forfeit_txid));
+	assert!(confirmations(&r, &claim.txid()) <= 0 && !in_mempool(&r, &claim.txid()));
+	assert!(confirmations(&r, &forfeit_txid) >= 1);
+	for k in 0..2 {
+		let s = c.ok(&["sync"]);
+		println!("P1e the wallet's sync {} after the rollback: forfeits {}", k, s["forfeits"]);
+		let sent = s["forfeits"].as_array().unwrap().iter().any(|f| f["refund"].is_object() || f["state"] == "refunding");
+		assert!(!sent, "no refund while the wallet holds the preimage and the round can return: {}", s["forfeits"]);
+		r.produce().await;
+	}
+	let pool: Vec<String> = serde_json::from_value(rpc(&r, "getrawmempool", &[])).unwrap();
+	assert!(pool.is_empty(), "nothing of the wallet's in the mempool: {:?}", pool);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live");
+	assert_eq!(coin_of(&c, &board)["state"], "spent");
+	// The operator's claim, sent again, is taken; it decides the forfeit
+	// again.
+	r.rt.client().send_raw_transaction(&claim).expect("the claim, sent again, is taken");
+	r.produce().await;
+	r.bury().await;
+	r.bury().await;
+	let mut state = Value::Null;
+	for _ in 0..3 {
+		let s = c.ok(&["sync"]);
+		if let Some(f) = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()) {
+			state = f["state"].clone();
+		}
+		r.bury().await;
+	}
+	println!("P1e the claim sent again: confirmations {}; the wallet's forfeit {}; the balance {}", confirmations(&r, &claim.txid()), state,
+		c.ok(&["balance"])["arca"]);
+	assert!(confirmations(&r, &claim.txid()) >= 1);
+	assert_eq!(coin_of(&c, &leaf)["state"], "live");
+	assert_eq!(coin_of(&c, &board)["state"], "spent");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 // ---------------------------------------------------------------------------
 // A board's dates
 // ---------------------------------------------------------------------------
