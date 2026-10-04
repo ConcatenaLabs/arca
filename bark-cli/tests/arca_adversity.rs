@@ -2712,16 +2712,110 @@ async fn w2r_with_a_keeper_the_restored_signer_stops_before_any_second_spend() {
 /// D52.4, the control for the test above: the same restore with no keeper.
 /// The signer starts on the restored record and co-signs the older copy's
 /// second spend of C_A, as an operator with no keeper is documented to do:
-/// such an operator is for its own coins.
+/// such an operator is for its own coins. M takes that coin on the chain
+/// first, and B's P2, whose coin the operator co-signed another spend of, is
+/// then shown as lost with that reason (D49 amended), not as pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn w2r_without_a_keeper_the_second_spend_is_still_cosigned() {
-	let JointRollback { r, m_req, a, a_old, b, m, c_a, .. } = joint_rollback_kept("W2N", 0).await;
+	let JointRollback { r, m_req, a, a_old, b, m, c_a, p2, .. } = joint_rollback_kept("W2N", 0).await;
 	let x = r.x;
 	assert!(!server::signer::stopped_path(&r.signer.record()).exists(), "nothing at start shows the restore");
 	let paid = a_old.ok(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
 	println!("W2N with no keeper, A's older copy spends C_A {} again, to M: inputs {}", c_a, paid["inputs"]);
 	assert_eq!(paid["inputs"][0].as_str(), Some(c_a.as_str()), "co-signed");
+	// D49 amended: M takes its coin on the chain first; B's P2, whose coin
+	// the operator co-signed another spend of, is shown as lost, with that
+	// reason, once that spend is final, and not as pending.
+	let got_m = m.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	println!("W2N M's exit at once: {}", m.ok(&["exit", &got_m])["state"]);
+	r.produce().await;
+	m.ok(&["exit", &got_m]);
+	r.produce().await;
+	r.bury().await;
+	let s = b.ok(&["sync"]);
+	println!("W2N B's sync: rolled_back {} | exits {}", s["witness"]["rolled_back"]["at"], s["exits"]);
+	let s = b.ok(&["sync"]);
+	let p2_now = coin_of(&b, &p2);
+	println!("W2N B's P2 now: {} | {}", p2_now["state"], p2_now["note"]);
+	assert_eq!(p2_now["state"], "lost", "{} | exits {}", p2_now, s["exits"]);
+	assert!(p2_now["note"].as_str().unwrap().contains(&format!("co-signed another spend of coin {}", c_a)), "{}", p2_now);
+	assert!(b.ok(&["balance"])["arca"].to_string().find("pending").is_none(), "P2 is not counted as pending");
 	for w in [&a, &a_old, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7e F2 turned around, and D49 amended: after a stop the wallet brings
+/// everything home. A pays U 200,000 while U is offline; the operator's
+/// snapshot; A pays B 300,000; database and record restored together, and
+/// B's sync stops the signer. U then comes online: its mailbox is still read,
+/// the coin it was sent checked as ever and taken on the chain at once
+/// (its lineage already there from B's exit), and U ends with it on the
+/// chain. A's second board, which no transfer made, is shown with the date
+/// by which it must be exited and kept; within three days of that date,
+/// A's sync takes it on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_stop_every_coin_comes_home() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b, u) = (Arca::new("HOA"), Arca::new("HOB"), Arca::new("HOU"));
+	let boards = boarded(&mut r, &a, &url, &[(x, 4_000_000), (x, 1_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	u.ok(&create_args(&url, &r.node_url()));
+	let req_u = u.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req_u, "--amount", "200000", "--asset", &x.to_string()]);
+	let backup = Backup::take(&mut r).await;
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	b.ok(&["sync"]);
+	backup.restore(&mut r).await;
+	let s = b.ok(&["sync"]);
+	println!("HO B's sync after the joint rollback: rolled_back {}", s["witness"]["rolled_back"]["at"]);
+	assert_eq!(s["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries));
+	assert!(server::signer::stopped_path(&r.signer.record()).exists());
+	r.produce().await;
+
+	// U comes online.
+	let s = u.ok(&["sync"]);
+	println!("HO U comes online: mailbox {}", s["mailbox"]["accepted"]);
+	let leaf = s["mailbox"]["accepted"][0]["leaf_id"].as_str().expect("U's coin is read and taken").to_string();
+	assert_eq!(s["mailbox"]["accepted"][0]["value"], "200000");
+	assert!(s["mailbox"]["note"].as_str().unwrap_or("").contains("takes every coin it is sent on the chain at once"), "{}", s["mailbox"]);
+	assert_eq!(coin_of(&u, &leaf)["state"], "exiting", "on its way to the chain at once");
+	r.produce().await;
+	u.ok(&["exit", &leaf]);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let e = u.ok(&["exit", &leaf]);
+	println!("HO U's claim: {} {}", e["state"], e["claim"]);
+	r.produce().await;
+	r.bury().await;
+	u.ok(&["sync"]);
+	let c = coin_of(&u, &leaf);
+	let onchain = u.ok(&["balance"])["sequentia_onchain"][x.to_string()].as_str().unwrap_or("0").parse::<u64>().unwrap();
+	println!("HO U at the end: {} | {} | on the chain {}", c["state"], c["note"], onchain);
+	assert_eq!(c["state"], "exited");
+	assert!(onchain > 199_000 && onchain <= 200_000, "U ends with its 200,000 on the chain, less its claim's fee: {}", onchain);
+
+	// A's second board: shown with its date, kept; taken within three days
+	// of it.
+	let s = a.ok(&["sync"]);
+	let board = &boards[1];
+	let shown = s["home"].as_array().unwrap().iter().find(|h| h["leaf_id"] == board.as_str()).cloned()
+		.unwrap_or_else(|| panic!("A's second board is shown: {}", s["home"]));
+	println!("HO A's second board after the stop: {}", shown);
+	let by = shown["exit_by"].as_u64().expect("its exit date") as u32;
+	assert!(shown["exit"].is_null(), "not taken yet: its date is weeks away");
+	assert_eq!(coin_of(&a, board)["state"], "live");
+	assert_eq!(coin_of(&a, board)["exit_by"].as_u64(), Some(by as u64), "coins shows the date too");
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, by - now - 2 * 86_400));
+	let s = a.ok(&["sync"]);
+	let shown = s["home"].as_array().unwrap().iter().find(|h| h["leaf_id"] == board.as_str()).cloned().unwrap();
+	println!("HO two days before its date: {}", shown["exit"]);
+	assert!(shown["exit"]["state"].is_string(), "{}", shown);
+	assert_eq!(coin_of(&a, board)["state"], "exiting");
+	for w in [&a, &b, &u] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

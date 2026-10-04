@@ -305,10 +305,16 @@ impl Wallet {
 						return Ok(v);
 					}
 				}
-				// The path is cut: say where, when another spend cut it.
+				// The path is cut: say where, when another spend cut it. Once
+				// that spend is final the coin is lost, and shown so.
 				return Err(match self.paid_elsewhere(&coin)? {
-					Some(why) => {
+					Some((why, by)) => {
 						self.store.refused(&format!("exit of {}", leaf_id), &why)?;
+						if self.chain.finality(&by)?.is_final() {
+							self.store.set_coin_state(leaf_id, "lost", &format!("lost: {}; that spend is final", why))?;
+						} else {
+							self.store.set_coin_state(leaf_id, &row.state, &format!("{}; that spend is not final yet", why))?;
+						}
 						Error::Refused(why)
 					},
 					None => e,
@@ -489,7 +495,7 @@ impl Wallet {
 	/// spent by a reassignment `coin` is no output of. The operator
 	/// co-signed another spend of the coin, which reached the chain first.
 	/// Says so, or `None`.
-	fn paid_elsewhere(&self, coin: &ValidCoin) -> Result<Option<String>, Error> {
+	fn paid_elsewhere(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
 		let ValidOrigin::Transfer { inputs, .. } = &coin.origin else { return Ok(None) };
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 		let mine = coin.output().txout();
@@ -498,9 +504,9 @@ impl Wallet {
 			let vout = tx.output.iter().position(|o| o == out).expect("pays it") as u32;
 			Ok(self.chain.spender(&OutPoint::new(tx.txid(), vout), h)?.map(|(sp, _)| (tx, sp)))
 		};
-		let elsewhere = |id: &arca_covenant::LeafId, sp: &Transaction| format!("coin {} it rests on is spent on the chain by {}, which \
+		let elsewhere = |id: &arca_covenant::LeafId, sp: &Transaction| (format!("coin {} it rests on is spent on the chain by {}, which \
 			is not this coin's way out: the operator co-signed another spend of coin {} (a payment, or a forfeit), which reached the \
-			chain first, so this coin cannot be brought on the chain", id, sp.txid(), id);
+			chain first, so this coin cannot be brought on the chain", id, sp.txid(), id), sp.txid());
 		for i in inputs {
 			let cp = i.checkpoint_output().txout();
 			let own = i.coin.output().txout();
@@ -566,9 +572,17 @@ impl Wallet {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		// After a stop the wallet brings everything home: each coin it still
+		// holds off the chain shown with the date by which it must be exited,
+		// and taken on the chain when that date is within three days.
+		let home = if gone { self.home(true).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		Ok(json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
-			"participations": participations, "forfeits": forfeits, "exits": exits}))
+		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
+			"participations": participations, "forfeits": forfeits, "exits": exits});
+		if gone {
+			out["home"] = home;
+		}
+		Ok(out)
 	}
 
 	/// The decoded coin record of `leaf_id`, for people.

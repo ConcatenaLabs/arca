@@ -508,6 +508,15 @@ impl Wallet {
 	/// batch's expiry) is kept and exited at once, whatever of its lineage is
 	/// on the chain.
 	pub(crate) fn accept_coin(&mut self, bytes: &[u8], claimed: &str, source: &str) -> Result<Value, Error> {
+		self.accept_coin_as(bytes, claimed, source, false)
+	}
+
+	/// [`Self::accept_coin`], and with `home`, for a wallet whose operator's
+	/// signer is stopped: the coin is checked as ever, kept even where its
+	/// lineage or a board it rests on is on the chain already, and taken on
+	/// the chain at once, since the operator co-signs nothing more and
+	/// exiting it is its holder's only chance.
+	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| Error::Refused(format!("the record does not decode: {}", e)))?;
 		let (owner, nonce) = owner_of(&record);
 		let row = self.store.nonce(&nonce)?
@@ -544,7 +553,12 @@ impl Wallet {
 		if let Some(c) = self.store.coin_by_salt(&a.valid.leaf.salt)? {
 			return Err(Error::Refused(format!("the coin's salt is that of coin {} the wallet has held: its old pairs would spend it", c.leaf_id)));
 		}
-		a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).map_err(|e| Error::Refused(e.to_string()))?;
+		let boards_spent = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).err();
+		if let Some(e) = &boards_spent {
+			if !home {
+				return Err(Error::Refused(e.to_string()));
+			}
+		}
 		// A coin resting on a board carries the board's dates. One that
 		// arrives past its exit deadline (a payment the server recorded
 		// before it and completed when it was asked again) is still the
@@ -562,7 +576,7 @@ impl Wallet {
 		// step first: refusing it would only lose it.
 		let on_chain = a.valid.check_lineage(|s| seen.contains(s)).err();
 		if let Some(e) = &on_chain {
-			if !late {
+			if !late && !home {
 				return Err(Error::Refused(e.to_string()));
 			}
 		}
@@ -581,7 +595,7 @@ impl Wallet {
 		if late {
 			let why = format!("it rests on a batch past its exit deadline (the batch expires at median time {}): the operator co-signs \
 				no spend of it and takes it into no round, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
-				on_chain.map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default());
+				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default());
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		let coin = self.row(&record, &a, state, &note)?;
@@ -621,6 +635,18 @@ impl Wallet {
 					confirms, shown once it does"}),
 			};
 		}
+		if home && !late {
+			let why = format!("the operator's signer is stopped and co-signs nothing more: the wallet takes the coin on the chain at once{}{}",
+				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default(),
+				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
+			self.store.set_coin_state(&id, &coin.state, &why)?;
+			out["note"] = json!(why);
+			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
+				"note": "exit the coin, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			if let Some(c) = self.store.coin(&id)? {
+				out["state"] = json!(c.state);
+			}
+		}
 		if late {
 			let e = a.valid.expiry.to_consensus_u32();
 			out["batch"] = json!({"expiry": e, "exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE),
@@ -645,11 +671,11 @@ impl Wallet {
 	/// taken, and its message is read again on the next read.
 	pub fn mailbox(&mut self) -> Result<Value, Error> {
 		let witness = self.witness()?;
-		if let Some((at, why)) = self.rolled_back()? {
-			return Ok(json!({"accepted": [], "refused": [], "waiting": [], "witness": witness,
-				"note": format!("the operator's signer's record was rolled back past entry {} ({}): the wallet takes no coin from this \
-					operator", at, why)}));
-		}
+		// After a stop, the mailbox and the coins kept for a retry are still
+		// read, each coin checked as ever and taken on the chain at once: the
+		// operator co-signs nothing more, so exiting is its holder's only
+		// chance, and refusing it would gain nothing.
+		let home = self.rolled_back()?;
 		let mut keys = vec![self.keys.mailbox()?];
 		for n in self.store.nonces()? {
 			if n.purpose == "receive" && n.state == "pending" {
@@ -661,12 +687,12 @@ impl Wallet {
 		let mut waiting = vec![];
 		for (leaf, bytes, head) in self.store.kept_for_retry()? {
 			let head_v: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
-			if let Err(why) = self.held_outside(&head_v) {
+			if let (Err(why), None) = (self.held_outside(&head_v), &home) {
 				self.store.keep_for_retry(&leaf, &bytes, &why, None)?;
 				waiting.push(json!({"leaf_id": leaf, "reason": why}));
 				continue;
 			}
-			match self.accept_coin(&bytes, &leaf, "mailbox") {
+			match self.accept_coin_as(&bytes, &leaf, "mailbox", home.is_some()) {
 				Ok(v) => {
 					self.store.drop_retry(&leaf)?;
 					let head: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
@@ -704,13 +730,13 @@ impl Wallet {
 					// outside the operator's machine as the wallet requires;
 					// until then it waits, and its message is read again from
 					// the server, which hands the head on with what it holds.
-					if let Err(why) = self.held_outside(&m["signer_record"]) {
+					if let (Err(why), None) = (self.held_outside(&m["signer_record"]), &home) {
 						waiting.push(json!({"leaf_id": leaf, "reason": why}));
 						read_again = Some(read_again.map_or(cursor - 1, |c: i64| c.min(cursor - 1)));
 						self.store.set_cursor(&k, cursor)?;
 						continue;
 					}
-					match self.accept_coin(&bytes, &leaf, "mailbox") {
+					match self.accept_coin_as(&bytes, &leaf, "mailbox", home.is_some()) {
 						Ok(v) => {
 							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
 								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
@@ -734,7 +760,13 @@ impl Wallet {
 				self.store.set_cursor(&k, c)?;
 			}
 		}
-		Ok(json!({"accepted": accepted, "refused": refused, "waiting": waiting}))
+		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
+		if let Some((at, why)) = home {
+			out["witness"] = witness;
+			out["note"] = json!(format!("the operator's signer's record was rolled back past entry {} ({}): the operator co-signs \
+				nothing more, so the wallet takes every coin it is sent on the chain at once", at, why));
+		}
+		Ok(out)
 	}
 
 	// -----------------------------------------------------------------------

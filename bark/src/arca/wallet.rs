@@ -112,6 +112,16 @@ pub const MAX_UNSIGNED_WITNESS: usize = 4;
 pub(crate) const NO_KEEPER: &str = "the operator runs no keeper of its signer's record: a coin received out of round rests on the \
 	operator's machine alone until it is refreshed, and a restore of that machine can let its sender spend it twice";
 
+/// How long before a coin's exit date `sync` takes it on the chain, once the
+/// operator's signer is stopped: three days.
+pub const HOME_WINDOW: u32 = 3 * 86_400;
+
+/// What the wallet says of a coin it still holds off the chain once the
+/// operator's signer is stopped.
+pub(crate) const HOME_NOTE: &str = "the operator's signer is stopped: the coin can no longer be paid on or refreshed, and must be \
+	exited by its exit date (exit_by, a median time); sync takes it on the chain when that date is within three days, and `arca exit` \
+	takes it now";
+
 /// Where the wallet keeps a rollback of the operator's signer's record it
 /// found: `{"at": <the highest entry the record still agrees with>, "why"}`.
 const ROLLED_BACK: &str = "operator_rolled_back";
@@ -829,7 +839,7 @@ impl Wallet {
 	fn exit_after(&mut self, at: u64, why: &str) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for c in self.store.coins()? {
-			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) {
+			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) || self.given_up_for_held_leaves(&c)? {
 				continue;
 			}
 			let entry = self.store.coin_entry(&c.leaf_id)?;
@@ -848,6 +858,72 @@ impl Wallet {
 				Ok(v) => json!({"leaf_id": c.leaf_id, "entry": entry, "exit": v}),
 				Err(e) => json!({"leaf_id": c.leaf_id, "entry": entry, "error": e.to_string()}),
 			});
+		}
+		Ok(out)
+	}
+
+	/// Whether coin `c` was given up, under its forfeit, in a participation
+	/// that was released, whose new leaves the wallet holds: the coin is then
+	/// paid for already, and exiting it would only be answered with the
+	/// forfeit, at the holder's cost.
+	pub(crate) fn given_up_for_held_leaves(&self, c: &CoinRow) -> Result<bool, Error> {
+		if c.state != "forfeited" {
+			return Ok(false);
+		}
+		for (pid, _, given, wanted, state, _, _) in self.store.participations()? {
+			if state != "released" || !given.contains(&format!("\"{}\"", c.leaf_id)) {
+				continue;
+			}
+			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+			let nonces: Vec<[u8; 32]> = wanted.as_array().cloned().unwrap_or_default().iter()
+				.filter_map(|w| w["nonce"].as_str().and_then(|n| unhex32(n).ok())).collect();
+			let mut held = !nonces.is_empty();
+			for n in &nonces {
+				let leaf = self.store.nonce(n)?.and_then(|r| r.leaf_id);
+				let row = match leaf {
+					Some(l) => self.store.coin(&l)?,
+					None => None,
+				};
+				held &= row.is_some_and(|r| !matches!(r.state.as_str(), "lost" | "spent"));
+			}
+			if held {
+				let _ = pid;
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// After a stop of the operator's signer, the date by which each coin
+	/// the wallet still holds off the chain must be exited, its exit
+	/// deadline: from then on its batch's sweep, or the operator's claim of a
+	/// board's lineage, draws near. Each held coin not taken on the chain
+	/// already, but one given up for new leaves the wallet holds; with
+	/// `exit`, `sync`'s work: each one whose date is within three days goes
+	/// on the chain now (`arca exit` takes any of them at once, on the user's
+	/// word).
+	pub(crate) fn home(&mut self, exit: bool) -> Result<Vec<Value>, Error> {
+		let now = self.now()?.to_consensus_u32() as u64;
+		let mut out = vec![];
+		for c in self.store.coins()? {
+			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending") || self.given_up_for_held_leaves(&c)? {
+				continue;
+			}
+			let by = (c.expiry != u32::MAX).then(|| c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE));
+			let due = by.is_none_or(|b| now + HOME_WINDOW as u64 >= b as u64);
+			let mut v = json!({"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
+				"exit_by": by, "note": HOME_NOTE});
+			if exit && due {
+				// Fees in the asset moved, where the coin's own reserves
+				// cannot pay them (a board's conversion has none).
+				let fee_asset = AssetId::from_str(&c.asset).ok();
+				v["exit"] = self.exit(&c.leaf_id, fee_asset).unwrap_or_else(|e| json!({"error": e.to_string()}));
+				if let Some(row) = self.store.coin(&c.leaf_id)?.filter(|r| r.state == "exiting") {
+					self.store.set_coin_state(&row.leaf_id, "exiting", &format!("taken on the chain: the operator's signer is stopped, and \
+						the coin's exit date{} is within three days", by.map(|b| format!(", median time {},", b)).unwrap_or_default()))?;
+				}
+			}
+			out.push(v);
 		}
 		Ok(out)
 	}
@@ -1308,13 +1384,24 @@ impl Wallet {
 	/// machine alone.
 	pub fn coins(&self) -> Result<Value, Error> {
 		let alone = self.keepers()?.0.is_empty();
-		Ok(Value::Array(self.store.coins()?.iter().map(|c| {
-			let mut v = Self::coin_json(c);
+		let stopped = self.rolled_back()?.is_some();
+		let mut out = vec![];
+		for c in self.store.coins()? {
+			let mut v = Self::coin_json(&c);
 			if alone && c.kind == "transfer" && HELD.contains(&c.state.as_str()) {
 				v["record_held"] = json!(NO_KEEPER);
 			}
-			v
-		}).collect()))
+			// After a stop: the date by which each coin still held must be
+			// exited.
+			if stopped && matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending")
+				&& !self.given_up_for_held_leaves(&c)?
+			{
+				v["exit_by"] = if c.expiry == u32::MAX { Value::Null } else { json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)) };
+				v["home"] = json!(HOME_NOTE);
+			}
+			out.push(v);
+		}
+		Ok(Value::Array(out))
 	}
 
 	/// What the wallet holds, per asset: off-chain coins by state (a coin
@@ -1686,6 +1773,52 @@ mod tests {
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();
 		(tree.record(5), WalletPolicy::new(chain, s, now))
+	}
+
+	/// D49 amended: a coin given up in a released participation, whose new
+	/// leaf the wallet holds, is not exited after a stop; once that leaf is
+	/// gone, it is.
+	#[test]
+	fn a_coin_given_up_for_new_leaves_the_wallet_holds_is_not_exited() {
+		let dir = std::env::temp_dir().join(format!("arca-wallet-unit-{}-given-up", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join(MNEMONIC_FILE), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+			.unwrap();
+		let store = Store::open(&dir.join(DB_FILE)).unwrap();
+		let operator = key(9).x_only_public_key().0;
+		for (k, v) in [("server", "http://127.0.0.1:1"), ("node_url", "http://127.0.0.1:1/"), ("account", "0"), ("exit_delay_units", "254"),
+			("min_exit_delay_units", "254"), ("max_exit_delay_units", "338"), ("genesis", &elements::BlockHash::all_zeros().to_string()),
+			("chain_name", "elementsregtest"), ("operator", &operator.to_string())]
+		{
+			store.set_meta(k, v).unwrap();
+		}
+		let row = |id: &str, kind: &str, state: &str, nonce: [u8; 32]| CoinRow {
+			leaf_id: id.into(), owner_nonce: nonce, kind: kind.into(), asset: AssetId::from_slice(&[7; 32]).unwrap().to_string(),
+			value: 1_000, record: vec![], salt: [nonce[0]; 32], state: state.into(), note: String::new(), expiry: u32::MAX, bases: vec![],
+			spent_by: None,
+		};
+		let (old, new) = ([1u8; 32], [2u8; 32]);
+		store.put_nonce(&old, &key(2).x_only_public_key().0.serialize(), "receive").unwrap();
+		store.put_coin(&row("old", "transfer", "forfeited", old)).unwrap();
+		store.use_nonce(&old, "old").unwrap();
+		store.put_nonce(&new, &key(3).x_only_public_key().0.serialize(), "participation").unwrap();
+		store.put_coin(&row("new", "batch", "live", new)).unwrap();
+		store.use_nonce(&new, "new").unwrap();
+		store.put_participation("p", "{}", "[\"old\"]", &json!([{"nonce": hex(&new)}]).to_string()).unwrap();
+		store.set_participation("p", "released", Some(&hex(&[5; 32])), None).unwrap();
+		drop(store);
+		let mut w = Wallet::open(&dir).unwrap();
+		let c = w.store.coin("old").unwrap().unwrap();
+		assert!(w.given_up_for_held_leaves(&c).unwrap());
+		assert!(w.exit_after(0, "a stop").unwrap().is_empty(), "nothing exited");
+		// The new leaf lost: the old coin is the wallet's to take on the chain.
+		w.store.set_coin_state("new", "lost", "gone").unwrap();
+		assert!(!w.given_up_for_held_leaves(&c).unwrap());
+		let tried = w.exit_after(0, "a stop").unwrap();
+		assert_eq!(tried.len(), 1, "{:?}", tried);
+		assert_eq!(tried[0]["leaf_id"], "old");
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]
