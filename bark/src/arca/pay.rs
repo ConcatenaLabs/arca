@@ -160,6 +160,10 @@ impl Wallet {
 	/// is stored before the request is shown, and a second coin to it is
 	/// refused.
 	pub fn receive(&mut self, asset: Option<AssetId>, value: Option<u64>) -> Result<Value, Error> {
+		if let Some((at, why)) = self.rolled_back()? {
+			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
+				asks for no payment through this operator", at, why)));
+		}
 		let nonce = random32();
 		let key = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &key.serialize(), "receive")?;
@@ -419,7 +423,12 @@ impl Wallet {
 					let (_, nonce) = owner_of(&record);
 					if self.store.nonce(&nonce)?.is_some() {
 						match self.accept_coin(&bytes, o["leaf_id"].as_str().unwrap_or(""), "transfer answer") {
-							Ok(v) => kept.push(v),
+							Ok(v) => {
+								if let Err(e) = self.keep_coin_head(v["leaf_id"].as_str().unwrap_or(""), &answer["signer_record"]) {
+									self.store.refused(&format!("the head of transfer {}", transfer_id), &e.to_string())?;
+								}
+								kept.push(v)
+							},
 							Err(e) => kept.push(json!({"leaf_id": o["leaf_id"], "refused": e.to_string()})),
 						}
 					} else {
@@ -569,6 +578,12 @@ impl Wallet {
 	/// answering) is kept aside and checked again on every read until it is
 	/// kept or refused for good. The cursor moves past all of them.
 	pub fn mailbox(&mut self) -> Result<Value, Error> {
+		let witness = self.witness()?;
+		if let Some((at, why)) = self.rolled_back()? {
+			return Ok(json!({"accepted": [], "refused": [], "waiting": [], "witness": witness,
+				"note": format!("the operator's signer's record was rolled back past entry {} ({}): the wallet takes no coin from this \
+					operator", at, why)}));
+		}
 		let mut keys = vec![self.keys.mailbox()?];
 		for n in self.store.nonces()? {
 			if n.purpose == "receive" && n.state == "pending" {
@@ -578,14 +593,18 @@ impl Wallet {
 		let mut accepted = vec![];
 		let mut refused = vec![];
 		let mut waiting = vec![];
-		for (leaf, bytes) in self.store.kept_for_retry()? {
+		for (leaf, bytes, head) in self.store.kept_for_retry()? {
 			match self.accept_coin(&bytes, &leaf, "mailbox") {
 				Ok(v) => {
 					self.store.drop_retry(&leaf)?;
+					let head: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
+					if let Err(e) = self.keep_coin_head(&leaf, &head) {
+						self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
+					}
 					accepted.push(v);
 				},
 				Err(e) if passing(&e) => {
-					self.store.keep_for_retry(&leaf, &bytes, &e.to_string())?;
+					self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), None)?;
 					waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 				},
 				Err(e) => {
@@ -609,9 +628,15 @@ impl Wallet {
 					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
 					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
 					match self.accept_coin(&bytes, &leaf, "mailbox") {
-						Ok(v) => accepted.push(v),
+						Ok(v) => {
+							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
+								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
+							}
+							accepted.push(v)
+						},
 						Err(e) if passing(&e) => {
-							self.store.keep_for_retry(&leaf, &bytes, &e.to_string())?;
+							let head = (!m["signer_record"].is_null()).then(|| m["signer_record"].to_string());
+							self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), head.as_deref())?;
 							waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 						},
 						Err(e) => {

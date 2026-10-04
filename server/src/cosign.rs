@@ -115,6 +115,10 @@ pub struct Cosigned {
 	pub signatures: Vec<(Signature, Signature)>,
 	/// Each new coin: its id and its record, as its receiver gets it.
 	pub outputs: Vec<(LeafId, CoinRecord)>,
+	/// The entry of the signer's record the transfer's last signature was
+	/// recorded as, its running hash, and the signer's signature over them:
+	/// what the coins it makes rest on, which their holders keep.
+	pub signer_head: Option<crate::store::RecordHeadRow>,
 }
 
 /// Why a transfer was refused, or could not be co-signed.
@@ -472,16 +476,29 @@ impl Cosigner {
 		}
 
 		// Now S signs, in its own process; each signature is checked against
-		// the message the server built.
+		// the message the server built. The latest entry of the record they
+		// were recorded as, signed, goes with the coins.
 		let mut sigs = Vec::with_capacity(n);
+		let mut head: Option<crate::store::RecordHeadRow> = None;
+		let mut latest = |h: Option<crate::signer::SignedHead>| {
+			if let Some(h) = h {
+				if let Some(s) = h.signature {
+					if head.is_none_or(|x| x.0 < h.entry) {
+						head = Some((h.entry, h.hash, sig_bytes(&s)));
+					}
+				}
+			}
+		};
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
-			let cp = self.signer.rebind(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
+			let (cp, h) = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
 				std::slice::from_ref(&cp_out)).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			latest(h);
 			let checkpoint = plan.checkpoint(k);
-			let re = self.signer.rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset, plan.inputs[k].1,
-				&outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset,
+				plan.inputs[k].1, &outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
 			}
@@ -513,7 +530,7 @@ impl Cosigner {
 			records.push((new_ids[j].0, record.to_bytes().map_err(|e| CosignError::Internal(e.to_string()))?));
 		}
 		let sig_bytes_list: Vec<([u8; 64], [u8; 64])> = sigs.iter().map(|(a, b)| (sig_bytes(a), sig_bytes(b))).collect();
-		self.store.complete_transfer(&transfer, &sig_bytes_list, &records).await?;
+		self.store.complete_transfer(&transfer, &sig_bytes_list, &records, head).await?;
 		log::info!("co-signed transfer {} of {} input(s) into {} new leaf/leaves",
 			crate::signer::hex(&transfer), n, m);
 		self.answer(&transfer).await
@@ -605,7 +622,7 @@ impl Cosigner {
 			let record = CoinRecord::from_bytes(&row.record).map_err(|e| CosignError::Internal(e.to_string()))?;
 			outputs.push((LeafId(*id), record));
 		}
-		Ok(Cosigned { transfer_id: *transfer, signatures, outputs })
+		Ok(Cosigned { transfer_id: *transfer, signatures, outputs, signer_head: t.signer_head })
 	}
 
 	/// The check a round makes before it accepts an owner's release of a

@@ -1794,16 +1794,19 @@ async fn a_receivers_refresh_leaves_the_senders_change_live_until_the_boards_exp
 // The signer's record, witnessed by the wallet
 // ---------------------------------------------------------------------------
 
-/// D48. Every `info` and every published tree carries the signer's record's
-/// latest entry and running hash, and the wallet keeps each one it is shown.
-/// A pays B, and B refreshes the coin: the round's published tree carries
-/// the record's head when the round was built. Then the operator's database
-/// and record are copied (a backup), A pays B again, which A's wallet sees
-/// as a later entry; both are rolled back to the copy, and the server starts
-/// on them, since the database knows nothing the record lacks and the chain
-/// shows nothing new of the operator's. A's wallet refuses to go on, saying
-/// why: the record now ends below an entry it showed. An operator showing
-/// another hash at an entry the wallet has seen is refused the same way.
+/// D48 and D49. Every `info` and every published tree carries the signer's
+/// record's latest entry and running hash, signed by the signer, and the
+/// wallet keeps each one it is shown. A pays B, and B refreshes the coin: the
+/// round's published tree carries the record's head when the round was
+/// built. A head whose hash an operator altered no longer carries the
+/// signer's signature, and is refused. Then the operator's database and
+/// record are copied (a backup), A pays B again, which A's wallet sees as a
+/// later entry; both are rolled back to the copy, and the server starts on
+/// them, since the database knows nothing the record lacks and the chain
+/// shows nothing new of the operator's. A's next command witnesses the
+/// record: it ends below a head A holds, signed, which stops the signer; A
+/// takes its change of the second payment on the chain and refuses to go
+/// on, saying why.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_record_and_database_rolled_back_together_are_refused_by_a_wallet_that_saw_them() {
 	use server::server::Server;
@@ -1831,6 +1834,22 @@ async fn a_record_and_database_rolled_back_together_are_refused_by_a_wallet_that
 		.with_body(json!({"txid": round.txid().to_string(), "vout": 0}).to_string()).send().unwrap().as_str().unwrap()).unwrap();
 	println!("D48 the round's published tree carries the record at {}", tree["signer_record"]);
 	assert_eq!(tree["signer_record"]["entry"], 2, "the latest entry when the round was built");
+	assert!(tree["signer_record"]["signature"].is_string(), "signed");
+
+	// A head whose hash is altered no longer carries the signer's signature.
+	let c2 = Arca::new("D48C");
+	c2.ok(&create_args(&proxy.url, &r.node_url()));
+	c2.ok(&["info"]);
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["signer_record"]["hash"] = json!("ab".repeat(32));
+		}
+		None
+	})));
+	let shown = c2.ok(&["info"]);
+	println!("D48 a head with an altered hash: {}", shown["server_info"]);
+	assert!(shown["server_info"]["unreachable"].as_str().unwrap_or("").contains("a signature that is not its signer's"), "{}", shown);
+	proxy.rewrite(None);
 
 	// The operator's backup: server and signer stopped, database and record
 	// copied.
@@ -1889,29 +1908,269 @@ async fn a_record_and_database_rolled_back_together_are_refused_by_a_wallet_that
 	println!("D48 database and record rolled back together; the server started on them, its record at {}", info["signer_record"]);
 	assert_eq!(info["signer_record"]["entry"].as_u64(), Some(backed_up as u64));
 
-	// A's wallet refuses to go on, with the reason.
-	let why = a.refused(&["send", &req, "--amount", "100000", "--asset", &x.to_string()], "rolled back together");
+	// A's next command witnesses the record and refuses to go on, with the
+	// reason; the signer is stopped.
+	let why = a.refused(&["send", &req, "--amount", "100000", "--asset", &x.to_string()], "rolled back");
 	println!("D48 A's wallet: {}", why);
-	assert!(why.contains(&format!("ending at entry {}", backed_up)) && why.contains(&format!("showed entry {}", backed_up + 2)), "{}", why);
+	assert!(why.contains(&format!("past entry {}", backed_up)) && why.contains(&format!("past the record's end at entry {}", backed_up)),
+		"{}", why);
 	let info = a.ok(&["info"]);
-	assert!(info["server_info"]["unreachable"].as_str().unwrap_or("").contains("rolled back together"), "{}", info);
+	assert!(info["server_info"]["unreachable"].as_str().unwrap_or("").contains("rolled back"), "{}", info);
 	assert!(a.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["what"] == "the operator's signer's record"));
+	assert!(server::signer::stopped_path(&r.signer.record()).exists(), "the signer is stopped");
+	for w in [&a, &b, &c2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
 
-	// Another hash at an entry the wallet has seen: refused as well.
-	let c2 = Arca::new("D48C");
-	c2.ok(&create_args(&proxy.url, &r.node_url()));
-	c2.ok(&["info"]);
-	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
-		if path == "/v1/info" && status == 200 {
-			v["signer_record"]["hash"] = json!("ab".repeat(32));
+/// The operator's database and signer's record, copied with the server and
+/// signer stopped, as a snapshot of the box takes them, and put back
+/// together; the server keeps its address, so wallets keep their URL.
+struct Backup {
+	admin: tokio_postgres::Client,
+	db: String,
+	record: Vec<u8>,
+	addr: std::net::SocketAddr,
+	/// How many entries the copied record holds.
+	entries: u64,
+}
+
+impl Backup {
+	async fn disconnect(&self, name: &str) {
+		self.admin.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&name])
+			.await.unwrap();
+	}
+
+	async fn take(r: &mut Running) -> Backup {
+		let url = std::env::var("ARCA_TEST_POSTGRES").unwrap();
+		let db = r.config.database.rsplit_once('/').unwrap().1.to_string();
+		let (admin, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+		tokio::spawn(conn);
+		let addr = r.server.addr;
+		r.server.stop();
+		r.signer.halt();
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		let record = std::fs::read(r.signer.record()).unwrap();
+		let entries = String::from_utf8_lossy(&record).lines().count() as u64 - 1;
+		let b = Backup { admin, db, record, addr, entries };
+		b.disconnect(&b.db).await;
+		b.admin.batch_execute(&format!("CREATE DATABASE {}_backup TEMPLATE {}", b.db, b.db)).await.unwrap();
+		b.start(r).await;
+		b
+	}
+
+	async fn start(&self, r: &mut Running) {
+		let genesis = r.rt.client().genesis_hash().unwrap();
+		r.signer.resume(genesis);
+		let mut c = r.config.clone();
+		c.listen = self.addr.to_string();
+		r.server = server::server::Server::start(&c).await.expect("the server starts");
+		r.synced().await;
+	}
+
+	/// Database and record rolled back together to the copy; the server
+	/// starts on them.
+	async fn restore(&self, r: &mut Running) {
+		r.server.stop();
+		r.signer.halt();
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		self.disconnect(&self.db).await;
+		self.admin.batch_execute(&format!("DROP DATABASE {}", self.db)).await.unwrap();
+		self.disconnect(&format!("{}_backup", self.db)).await;
+		self.admin.batch_execute(&format!("CREATE DATABASE {} TEMPLATE {}_backup", self.db, self.db)).await.unwrap();
+		std::fs::write(r.signer.record(), &self.record).unwrap();
+		self.start(r).await;
+	}
+}
+
+/// A copy of wallet `w`'s directory, as a user restores a wallet from an
+/// older backup of it.
+fn copy_wallet(w: &Arca, name: &str) -> Arca {
+	let c = Arca::new(name);
+	std::fs::create_dir_all(&c.dir).unwrap();
+	for e in std::fs::read_dir(&w.dir).unwrap() {
+		let e = e.unwrap();
+		if e.file_type().unwrap().is_file() {
+			std::fs::copy(e.path(), c.dir.join(e.file_name())).unwrap();
+		}
+	}
+	c
+}
+
+fn info_of(r: &Running) -> Value {
+	serde_json::from_str(minreq::get(format!("{}/v1/info", r.url())).send().unwrap().as_str().unwrap()).unwrap()
+}
+
+/// What A, B and M hold before the operator's snapshot is restored: A, with
+/// boards of 4,000,000 and 1,000,000, paid B 600,000 (P1) from the first
+/// and, after the snapshot, 300,000 more from its change C_A (P2); B only
+/// syncs, and A's older wallet copy, taken at the snapshot, still holds C_A
+/// and the second board as its own.
+struct JointRollback {
+	r: Running,
+	/// A, and its older copy, reach the server through it.
+	proxy: Proxy,
+	a: Arca,
+	a_old: Arca,
+	b: Arca,
+	m: Arca,
+	p1: String,
+	p2: String,
+	c_a: String,
+	backup: Backup,
+	head_at_backup: Value,
+}
+
+async fn joint_rollback(tag: &str) -> JointRollback {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let proxy = Proxy::start(&url);
+	let (a, b, m) = (Arca::new(&format!("{}A", tag)), Arca::new(&format!("{}B", tag)), Arca::new(&format!("{}M", tag)));
+	boarded(&mut r, &a, &proxy.url.clone(), &[(x, 4_000_000), (x, 1_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	m.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let p1 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let backup = Backup::take(&mut r).await;
+	let head_at_backup = info_of(&r)["signer_record"].clone();
+	println!("{} the operator's snapshot: {} entries, its head {}", tag, backup.entries, head_at_backup);
+	let a_old = copy_wallet(&a, &format!("{}Aold", tag));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	let c_a = paid["inputs"][0].as_str().unwrap().to_string();
+	let got = b.ok(&["sync"]);
+	let p2 = got["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	println!("{} A paid B 300000 from C_A {} after the snapshot: B's P2 {}; the record at {}", tag, c_a, p2, info_of(&r)["signer_record"]);
+	backup.restore(&mut r).await;
+	println!("{} database and record rolled back together; the server started on them, its record at {}", tag, info_of(&r)["signer_record"]);
+	assert_eq!(info_of(&r)["signer_record"]["entry"].as_u64(), Some(backup.entries));
+	JointRollback { r, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup }
+}
+
+/// R7d's W1 turned around (D49). A receiver that only syncs witnesses the
+/// operator's signer's record on every contact: after the operator's
+/// database and record are rolled back together, B's next `sync` hands back
+/// the signed head of P2's transfer, which the record lost. The signer
+/// stops, B finds the record agrees with it up to the snapshot and takes
+/// P2, which rests on a transfer recorded after it, on the chain at once.
+/// Every other wallet that witnesses learns the signer is stopped, and goes
+/// no further with the operator. The older copy of A's wallet, shown the
+/// record as it was by a proxy, finds C_A's lineage on the chain (P2's
+/// exit), and pays from its other coin: the stopped signer refuses it. B's
+/// P2 is on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joint_rollback_is_caught_by_a_receiver_that_only_syncs_and_stops_the_signer() {
+	let JointRollback { mut r, proxy, a, a_old, b, m, p1, p2, c_a, backup, head_at_backup } = joint_rollback("W1").await;
+	let x = r.x;
+	let m_req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let s = b.ok(&["sync"]);
+	println!("W1 B's sync after the rollback: witness {}", s["witness"]);
+	assert_eq!(s["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries), "{}", s["witness"]);
+	let exits = s["witness"]["exits"].as_array().unwrap();
+	assert!(exits.iter().any(|e| e["leaf_id"] == p2.as_str() && e["exit"]["state"].is_string()), "P2 goes on the chain: {:?}", exits);
+	assert!(!exits.iter().any(|e| e["leaf_id"] == p1.as_str()), "P1 rests on what the record still holds: {:?}", exits);
+	assert_eq!(coin_of(&b, &p2)["state"], "exiting");
+	// P1 rests on the transfer that made C_A too: P2's unroll brings its
+	// leaf on the chain, where the re-check takes it into its exit.
+	println!("W1 B's P1: {} | {}", coin_of(&b, &p1)["state"], coin_of(&b, &p1)["note"]);
+	assert!(matches!(coin_of(&b, &p1)["state"].as_str(), Some("live" | "exiting")));
+	let w = info_of(&r);
+	println!("W1 the operator's info after B's sync: signer_record {}", w["signer_record"]);
+	assert!(w["signer_record"].is_null(), "a stopped signer hands out no signed head");
+	let stopped = std::fs::read_to_string(server::signer::stopped_path(&r.signer.record())).expect("the proof beside the record");
+	println!("W1 the signer's proof: {}", stopped.lines().next().unwrap());
+	assert!(stopped.contains("past the record's end"), "{}", stopped);
+	// B goes no further with the operator.
+	let why = b.refused(&["receive"], "rolled back");
+	println!("W1 B after: {}", why);
+
+	// The older copy of A's wallet spends C_A again, to M, through a proxy
+	// that shows it the record as it was at the snapshot: the stopped signer
+	// refuses the second spend.
+	let head = head_at_backup.clone();
+	proxy.rewrite(Some(Arc::new(move |path: &str, req: &Value, _: u16, v: &mut Value| {
+		match path {
+			"/v1/info" => v["signer_record"] = head.clone(),
+			"/v1/witness" => {
+				*v = json!({"head": head.clone(), "stopped": null, "hashes": req["heads"].as_array().unwrap().iter()
+					.map(|h| json!({"entry": h["entry"], "hash": h["hash"]})).collect::<Vec<_>>()});
+				return Some(200);
+			},
+			_ => {},
 		}
 		None
 	})));
-	let shown = c2.ok(&["info"]);
-	println!("D48 another hash at an entry it saw: {}", shown["server_info"]);
-	assert!(shown["server_info"]["unreachable"].as_str().unwrap_or("").contains("replaced or rolled back"), "{}", shown);
-	proxy.rewrite(None);
-	for w in [&a, &b, &c2] {
+	let (ok, v) = a_old.run(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("W1 A's older copy pays M: ok={} {}", ok, v);
+	println!("W1 C_A in A's older copy: {} | {}", coin_of(&a_old, &c_a)["state"], coin_of(&a_old, &c_a)["note"]);
+	assert_ne!(coin_of(&a_old, &c_a)["state"], "live", "C_A's lineage is on the chain: no off-chain spend of it");
+	assert!(!ok);
+	assert!(v["error"]["message"].as_str().unwrap().contains("stopped"), "the stopped signer refuses it: {}", v);
+	let id: LeafId = c_a.parse().unwrap();
+	println!("W1 C_A at the server: {:?}", r.server.store.leaf(&id.0).await.unwrap().map(|l| l.state));
+
+	// P2 on the chain.
+	r.produce().await;
+	let s = b.ok(&["sync"]);
+	println!("W1 B's exits: {}", s["exits"]);
+	let e = b.ok(&["exit", &p2]);
+	println!("W1 B's P2 now: {} | {}", e["state"], coin_of(&b, &p2)["note"]);
+	assert!(matches!(e["state"].as_str(), Some("waiting" | "claimed")), "P2's leaf is on the chain: {}", e);
+	let _ = (&a, &mut r);
+	for w in [&a, &a_old, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7d's W2 turned around (D49). After the joint rollback, and before any
+/// wallet witnesses the record, the older copy of A's wallet spends C_A
+/// again, to M: the rolled-back record co-signs it, and another payment
+/// takes the record past every entry B holds, so a count no longer shows
+/// the rollback. B's next `sync` asks for the hash at its own highest
+/// entry, finds another one, stops the signer, and takes P2 on the chain at
+/// once; M's exit of the coin of the second spend then cannot take C_A.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_spend_before_any_witness_is_answered_by_the_receivers_next_sync() {
+	let JointRollback { mut r, a, a_old, b, m, p1, p2, c_a, backup, .. } = joint_rollback("W2").await;
+	let x = r.x;
+	let url = r.url();
+	let m_req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = a_old.ok(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("W2 A's older copy spends C_A {} again, to M: inputs {}", c_a, paid["inputs"]);
+	assert_eq!(paid["inputs"][0].as_str(), Some(c_a.as_str()));
+	let got_m = m.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	// Another payment: the record goes past every entry B holds.
+	let d = Arca::new("W2D");
+	d.ok(&create_args(&url, &r.node_url()));
+	let req_d = d.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a_old.ok(&["send", &req_d, "--amount", "100000", "--asset", &x.to_string()]);
+	let now = info_of(&r)["signer_record"]["entry"].as_u64().unwrap();
+	println!("W2 the record now at entry {} (the snapshot held {}; B's highest is past it)", now, backup.entries);
+	assert!(now >= backup.entries + 4);
+	let s = b.ok(&["sync"]);
+	println!("W2 B's sync: witness {}", s["witness"]);
+	assert_eq!(s["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries), "{}", s["witness"]);
+	let exits = s["witness"]["exits"].as_array().unwrap();
+	let p2_exit = exits.iter().find(|e| e["leaf_id"] == p2.as_str()).unwrap_or_else(|| panic!("P2 goes on the chain: {:?}", exits));
+	println!("W2 P2's exit: {}", p2_exit);
+	assert!(!exits.iter().any(|e| e["leaf_id"] == p1.as_str()));
+	assert!(std::fs::read_to_string(server::signer::stopped_path(&r.signer.record())).unwrap().contains("is not the record's"));
+	r.produce().await;
+	// M's exit of the coin of the second spend.
+	let (ok, v) = m.run(&["exit", &got_m]);
+	println!("W2 M's exit of its coin: ok={} {}", ok, v);
+	r.produce().await;
+	b.ok(&["sync"]);
+	let e = b.ok(&["exit", &p2]);
+	println!("W2 B's P2 after M's attempt: {} | {}", e["state"], coin_of(&b, &p2)["note"]);
+	assert!(matches!(e["state"].as_str(), Some("waiting" | "claimed")), "P2's leaf is on the chain: {}", e);
+	let (ok, v) = m.run(&["exit", &got_m]);
+	println!("W2 M's exit again: ok={} {}", ok, v);
+	assert!(!(ok && v["state"] == "waiting"), "the second spend's coin does not reach the chain: {}", v);
+	let _ = (&a, &mut r);
+	for w in [&a, &a_old, &b, &m, &d] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

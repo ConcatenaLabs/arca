@@ -5,7 +5,7 @@
 //! `schema/V4__participation_waiting.sql`, `schema/V5__leaf_salt.sql`,
 //! `schema/V6__signer_head.sql`, `schema/V7__signer_messages.sql`,
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
-//! `schema/V10__round_signer_head.sql`), built from
+//! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`), built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
 //! rule that two requests could otherwise race past is held by the database
@@ -53,7 +53,7 @@ pub use participations::{
 pub use rounds::{
 	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRound, OffboardRow, Placement, RoundRow, RoundState, StoredReserve,
 };
-pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, StoredInput, TransferRow};
+pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, RecordHeadRow, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
 pub use watcher::{NewTreeScript, NewWatcherTx, TreeOutput, TreeScriptKind, WatcherTxRow};
 
@@ -71,6 +71,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(8, include_str!("../../schema/V8__stateless_challenges.sql")),
 	(9, include_str!("../../schema/V9__wanted_keys_freed.sql")),
 	(10, include_str!("../../schema/V10__round_signer_head.sql")),
+	(11, include_str!("../../schema/V11__signed_record_heads.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -218,15 +219,40 @@ impl Store {
 	/// Remembers entry `entry` of the signer's record, with its running
 	/// hash, when it is later than the one remembered.
 	pub async fn set_signer_head(&self, entry: u64, hash: &[u8; 32]) -> Result<(), StoreError> {
+		self.set_signer_head_signed(entry, hash, None).await
+	}
+
+	/// Remembers entry `entry` of the signer's record, with its running hash
+	/// and the signer's signature over them, when it is later than the one
+	/// remembered, or the same without a signature.
+	pub async fn set_signer_head_signed(&self, entry: u64, hash: &[u8; 32], signature: Option<&elements::secp256k1_zkp::schnorr::Signature>)
+		-> Result<(), StoreError>
+	{
 		let conn = self.conn().await?;
 		let n = i64::try_from(entry).map_err(|_| StoreError::Corrupt(format!("entry {}", entry)))?;
+		let sig: Option<Vec<u8>> = signature.map(|s| s.as_ref().to_vec());
 		conn.execute(
-			"INSERT INTO signer_head (one, entry, hash) VALUES (true, $1, $2)
-			 ON CONFLICT (one) DO UPDATE SET entry = EXCLUDED.entry, hash = EXCLUDED.hash, updated_at = now()
-			 WHERE signer_head.entry < EXCLUDED.entry",
-			&[&n, &&hash[..]],
+			"INSERT INTO signer_head (one, entry, hash, signature) VALUES (true, $1, $2, $3)
+			 ON CONFLICT (one) DO UPDATE SET entry = EXCLUDED.entry, hash = EXCLUDED.hash, signature = EXCLUDED.signature,
+			   updated_at = now()
+			 WHERE signer_head.entry < EXCLUDED.entry
+			   OR (signer_head.entry = EXCLUDED.entry AND signer_head.hash = EXCLUDED.hash AND signer_head.signature IS NULL)",
+			&[&n, &&hash[..], &sig],
 		).await?;
 		Ok(())
+	}
+
+	/// The latest entry of the signer's record the server was given, with
+	/// the signer's signature over it when the signer gave one.
+	pub async fn signer_head_signed(&self) -> Result<Option<(u64, [u8; 32], Option<[u8; 64]>)>, StoreError> {
+		let conn = self.conn().await?;
+		let row = conn.query_opt("SELECT entry, hash, signature FROM signer_head", &[]).await?;
+		row.map(|r| {
+			let n: i64 = r.get(0);
+			let sig: Option<Vec<u8>> = r.get(2);
+			Ok((u64::try_from(n).map_err(|_| StoreError::Corrupt(format!("entry {}", n)))?, array32(r.get(1), "hash")?,
+				sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a signature of another length".into()))).transpose()?))
+		}).transpose()
 	}
 
 	/// Which of `messages` (the leaf's owner key, its salt, the digest) the

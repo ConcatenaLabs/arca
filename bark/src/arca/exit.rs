@@ -478,15 +478,21 @@ impl Wallet {
 	/// can go, every forfeit it signed without the preimage in hand, followed
 	/// on the chain, and every exit it started.
 	pub fn sync(&mut self) -> Result<Value, Error> {
-		let boards = self.retry_boards()?;
+		// The witness first: after a rollback of the operator's signer's
+		// record the wallet does only what it does on the chain.
+		let witness = self.witness().unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let gone = self.rolled_back()?.is_some();
+		let boards = if gone { vec![] } else { self.retry_boards()? };
 		let recheck = self.recheck()?;
-		let transfers = self.retry_transfers()?;
+		let transfers = if gone { vec![] } else { self.retry_transfers()? };
 		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
-		let participations = self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let participations = if gone { Value::Array(vec![]) } else {
+			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		};
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		Ok(json!({"boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox, "participations": participations,
-			"forfeits": forfeits, "exits": exits}))
+		Ok(json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
+			"participations": participations, "forfeits": forfeits, "exits": exits}))
 	}
 
 	/// The decoded coin record of `leaf_id`, for people.

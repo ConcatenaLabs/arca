@@ -115,8 +115,11 @@ async fn the_record_compacted_against_the_expired_salts_still_starts_the_server(
 	let (d_leaf, _) = new_leaf(&keypair("D"));
 	r.http.post("cosign_transfer", &transfer_body(&[(&c, cv, ck)], &[(x, ck - MARGIN, d_leaf)], s, chain)).ok();
 	let head = r.server.store.signer_head().await.unwrap().unwrap();
-	let lines_before = std::fs::read_to_string(r.signer.record()).unwrap().lines().count();
-	println!("the record holds {} entries, the database knows entry {}", lines_before - 1, head.0);
+	// Entry lines: a compaction leaves a hash line for each entry it drops.
+	let entry_lines = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().lines().skip(1)
+		.filter(|l| l.contains(" spend ") || l.contains(" forfeit ")).count();
+	let lines_before = entry_lines(&r.signer.record());
+	println!("the record holds {} entries, the database knows entry {}", lines_before, head.0);
 
 	// Past the batch's last expiry.
 	let last = match &leaf.held.record { CoinRecord::Leaf { record, .. } => record.schedule.expiries().last().unwrap().to_consensus_u32(),
@@ -149,8 +152,9 @@ async fn the_record_compacted_against_the_expired_salts_still_starts_the_server(
 	println!("{}", String::from_utf8_lossy(&out.stderr).trim());
 	assert!(out.status.success());
 	std::fs::rename(&compacted, r.signer.record()).unwrap();
-	let lines_after = std::fs::read_to_string(r.signer.record()).unwrap().lines().count();
-	println!("the compacted record holds {} entries", lines_after - 1);
+	let lines_after = entry_lines(&r.signer.record());
+	println!("the compacted record holds {} entries, and {} hash lines", lines_after,
+		std::fs::read_to_string(r.signer.record()).unwrap().lines().count() - 1 - lines_after);
 	assert!(lines_after < lines_before, "entries were dropped");
 	r.signer.restart(&r.s, chain.genesis_hash());
 	r.restart_server().await;

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, RelativeTime, Template, ValidCoin, WalletPolicy};
 
-use super::chain::{hex, ChainSource, Finality};
+use super::chain::{hex, unhex, unhex32, ChainSource, Finality};
 use super::client::ServerClient;
 use super::keys::{p2wpkh, Keys, CHANGE, RECEIVE};
 use super::store::{CoinRow, Store};
@@ -90,7 +90,25 @@ pub struct Wallet {
 	pub(crate) operator: XOnlyPublicKey,
 	pub(crate) cfg: Config,
 	pub(crate) secp: Secp256k1<elements::secp256k1_zkp::All>,
+	/// What witnessing the operator's signer's record found, and when
+	/// ([`Wallet::witness`]): once a command, and again after
+	/// [`WITNESS_FOR`] in a process that runs longer.
+	pub(crate) witnessed: std::cell::RefCell<Option<(std::time::Instant, Value)>>,
 }
+
+/// How long a witness of the operator's signer's record stands before the
+/// wallet witnesses it again.
+pub const WITNESS_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most heads one witness hands the server: the server's bound.
+pub const MAX_WITNESS: usize = 32;
+
+/// Where the wallet keeps a rollback of the operator's signer's record it
+/// found: `{"at": <the highest entry the record still agrees with>, "why"}`.
+const ROLLED_BACK: &str = "operator_rolled_back";
+
+/// The states of a coin the wallet holds, or may still hold, off the chain.
+const HELD: [&str; 6] = ["live", "pending", "sending", "offered", "given", "forfeited"];
 
 fn parse<T: FromStr>(what: &str, s: &str) -> Result<T, Error> where T::Err: std::fmt::Display {
 	s.parse::<T>().map_err(|e| Error::Parse(format!("{} {:?}: {}", what, s, e)))
@@ -310,7 +328,8 @@ impl Wallet {
 		let keys = Keys::new(mnemonic.trim(), cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
 		let server = ServerClient::new(&cfg.server)?;
-		Ok(Wallet { datadir: datadir.to_path_buf(), store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new() })
+		Ok(Wallet { datadir: datadir.to_path_buf(), store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
+			witnessed: std::cell::RefCell::new(None) })
 	}
 
 	pub fn mnemonic_path(&self) -> PathBuf {
@@ -361,8 +380,15 @@ impl Wallet {
 	}
 
 	/// The server's `info`, checked against what the wallet pinned when it was
-	/// created: the same chain and the same operator key.
+	/// created: the same chain and the same operator key; and the head of
+	/// its signer's record it shows, signed, against every head the wallet
+	/// holds. An operator whose record the wallet found rolled back is
+	/// refused.
 	pub(crate) fn server_info(&self) -> Result<Value, Error> {
+		if let Some((at, why)) = self.rolled_back()? {
+			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
+				goes no further with this operator, and takes on the chain every coin resting on what it signed after", at, why)));
+		}
 		let info = self.server.info()?;
 		if let Some(l) = info["boards"]["lifetime_seconds"].as_u64() {
 			if l < BOARD_LIFETIME as u64 {
@@ -382,22 +408,57 @@ impl Wallet {
 		Ok(info)
 	}
 
-	/// Checks what the operator shows of its signer's record, `{entry, hash}`
-	/// (the latest, in `info`, when `latest`; a round's, in its published
-	/// tree, otherwise), against every entry it showed before, and keeps it.
-	/// An operator that shows another running hash at an entry it showed, or
-	/// a latest entry below one it showed, has had its record replaced or
-	/// rolled back, with its database (which would refuse to start on a
-	/// record older than itself): the signer may then sign again what it
-	/// signed. The wallet refuses to go on with it, and says why.
+	/// The rollback of the operator's signer's record the wallet found, if
+	/// it found one: the highest entry the record still agreed with, and why.
+	pub(crate) fn rolled_back(&self) -> Result<Option<(u64, String)>, Error> {
+		Ok(self.store.meta(ROLLED_BACK)?.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+			.map(|v| (v["at"].as_u64().unwrap_or(0), v["why"].as_str().unwrap_or("").to_string())))
+	}
+
+	/// Keeps the rollback found, `why`, the record agreeing with the wallet
+	/// up to entry `at`: the lowest such entry found stands.
+	fn found_rollback(&self, at: u64, why: &str) -> Result<(), Error> {
+		let prior = self.rolled_back()?;
+		let at = prior.as_ref().map_or(at, |(was, _)| (*was).min(at));
+		if prior.is_some_and(|(was, w)| was == at && w == why) {
+			return Ok(());
+		}
+		self.store.set_meta(ROLLED_BACK, &json!({"at": at, "why": why}).to_string())?;
+		self.store.refused("the operator's signer's record", why)
+	}
+
+	/// Checks a head of the operator's signer's record it shows,
+	/// `{entry, hash, signature}` (the latest, in `info` or a witness, when
+	/// `latest`; a round's, in its published tree, or a transfer's, with the
+	/// coins it made, otherwise): a signature that is not `S`'s over it
+	/// ([`super::client::record_head_digest`]) is refused; another running
+	/// hash at an entry the wallet holds, or a latest entry below the highest
+	/// it holds, is a rollback of the record, with the operator's database:
+	/// the signer may then sign again what it signed. The wallet keeps the
+	/// rollback found, takes the coins resting on what was signed after it
+	/// on the chain at its next witness ([`Self::witness`]), and refuses to go
+	/// on with the operator, saying why. A signed head is kept; one without a
+	/// signature (a round's tree from before heads were signed) only
+	/// compared.
 	pub(crate) fn witness_record(&self, shown: &Value, latest: bool) -> Result<(), Error> {
 		let (Some(entry), Some(hash)) = (shown["entry"].as_u64(), shown["hash"].as_str()) else { return Ok(()) };
+		let signature = shown["signature"].as_str();
+		if let Some(sig) = signature {
+			let ok = unhex32(hash).ok().zip(unhex(sig).ok().and_then(|b| elements::secp256k1_zkp::schnorr::Signature::from_slice(&b).ok()))
+				.is_some_and(|(h, s)| arca_covenant::sign::verify_digest(&s, &super::client::record_head_digest(&self.genesis, entry, &h), &self.operator));
+			if !ok {
+				let why = format!("the operator shows entry {} of its signer's record with a signature that is not its signer's: the \
+					wallet takes nothing from it", entry);
+				self.store.refused("the operator's signer's record", &why)?;
+				return Err(Error::Refused(why));
+			}
+		}
 		if let Some(seen) = self.store.seen_entry(entry)? {
 			if seen != hash {
 				let why = format!("the operator shows entry {} of its signer's record with the running hash {}, and showed {} for that \
 					entry before: its record has been replaced or rolled back, with its database, so it may sign again what it signed; \
 					the wallet goes no further with this operator", entry, hash, seen);
-				self.store.refused("the operator's signer's record", &why)?;
+				self.found_rollback(entry.saturating_sub(1), &why)?;
 				return Err(Error::Refused(why));
 			}
 		}
@@ -407,12 +468,181 @@ impl Wallet {
 					let why = format!("the operator shows its signer's record ending at entry {}, and showed entry {} before: its record \
 						and its database have been rolled back together, so it may sign again what it signed; the wallet goes no further \
 						with this operator", entry, top);
-					self.store.refused("the operator's signer's record", &why)?;
+					self.found_rollback(entry, &why)?;
 					return Err(Error::Refused(why));
 				}
 			}
 		}
-		self.store.put_seen(entry, hash)
+		if signature.is_some() {
+			self.store.put_seen(entry, hash, signature)?;
+		}
+		Ok(())
+	}
+
+	/// Keeps the head of the signer's record the transfer that made coin
+	/// `leaf_id` was recorded at (`{entry, hash, signature}`, from the
+	/// transfer's answer or the coin's mailbox message), and the coin's entry
+	/// with it. A head missing or not the signer's leaves the coin's entry
+	/// unknown, which a rollback counts as after every entry.
+	pub(crate) fn keep_coin_head(&self, leaf_id: &str, head: &Value) -> Result<(), Error> {
+		if head["signature"].as_str().is_none() {
+			return Ok(());
+		}
+		self.witness_record(head, false)?;
+		if let Some(entry) = head["entry"].as_u64() {
+			self.store.put_coin_entry(leaf_id, entry)?;
+		}
+		Ok(())
+	}
+
+	/// Witnesses the operator's signer's record, once a command: hands the
+	/// server the highest head the wallet holds, the heads its coins were
+	/// recorded at, and as many more as fit in [`MAX_WITNESS`], and checks the
+	/// running hash the record holds at each, and its latest entry, signed.
+	/// A latest entry below the highest the wallet holds, another hash at an
+	/// entry it holds, an entry it holds past the record's end, or a signer
+	/// stopped by such a proof (handed over by any wallet) is a rollback of
+	/// the record, and each signed head the wallet hands over that the record
+	/// does not hold stops the signer. The wallet then finds the highest
+	/// entry it holds that the record still agrees with, and takes on the
+	/// chain at once every coin it holds that a transfer recorded after it
+	/// made (a coin whose entry it was never given counts as after); its own
+	/// leaves and boards, which no transfer made, stay. It goes no further
+	/// with the operator after that, and says why.
+	pub fn witness(&mut self) -> Result<Value, Error> {
+		if let Some((at, v)) = self.witnessed.borrow().as_ref() {
+			if at.elapsed() < WITNESS_FOR {
+				return Ok(v.clone());
+			}
+		}
+		let held = self.store.seen_heads()?;
+		let mut ask: Vec<(u64, String, Option<String>)> = vec![];
+		let add = |h: &(u64, String, Option<String>), ask: &mut Vec<(u64, String, Option<String>)>| {
+			if ask.len() < MAX_WITNESS && !ask.iter().any(|a| a.0 == h.0) {
+				ask.push(h.clone());
+			}
+		};
+		if let Some(top) = held.first() {
+			add(top, &mut ask);
+		}
+		for c in self.store.coins()? {
+			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) {
+				continue;
+			}
+			if let Some(e) = self.store.coin_entry(&c.leaf_id)? {
+				if let Some(h) = held.iter().find(|h| h.0 == e) {
+					add(h, &mut ask);
+				}
+			}
+		}
+		for h in &held {
+			add(h, &mut ask);
+		}
+		let heads: Vec<Value> = ask.iter().map(|(e, h, s)| {
+			let mut v = json!({"entry": e, "hash": h});
+			if let Some(s) = s {
+				v["signature"] = json!(s);
+			}
+			v
+		}).collect();
+		let answer = match self.server.witness(&heads) {
+			Ok(a) => a,
+			Err(e) => {
+				// A rollback found before is acted on whatever the server says.
+				if let Some((at, why)) = self.rolled_back()? {
+					let exits = self.exit_after(at, &why)?;
+					return Ok(json!({"rolled_back": {"at": at, "why": why}, "exits": exits, "server": e.to_string()}));
+				}
+				return Err(e);
+			},
+		};
+		let mut found: Vec<String> = vec![];
+		let mut below: Option<u64> = None;
+		let top = held.first().map(|h| h.0).unwrap_or(0);
+		let record_end = answer["head"]["entry"].as_u64();
+		if !answer["head"].is_null() {
+			match self.witness_record(&answer["head"], true) {
+				Ok(()) => {},
+				Err(e) => found.push(e.to_string()),
+			}
+		}
+		let mut agrees = 0u64;
+		for ((e, h, _), got) in ask.iter().zip(answer["hashes"].as_array().cloned().unwrap_or_default()) {
+			if got["entry"].as_u64() != Some(*e) {
+				return Err(Error::Refused("the operator's witness answers for other entries than the wallet named".into()));
+			}
+			match got["hash"].as_str() {
+				Some(x) if x == h => agrees = agrees.max(*e),
+				Some(x) => {
+					found.push(format!("the record holds {} at entry {}, where the wallet holds {}", x, e, h));
+					below = Some(below.map_or(*e, |b| b.min(*e)));
+				},
+				None if record_end.is_some_and(|end| *e > end) => {
+					found.push(format!("the record ends at entry {}, before entry {} the wallet holds", record_end.unwrap_or(0), e));
+					below = Some(below.map_or(*e, |b| b.min(*e)));
+				},
+				None => {},
+			}
+		}
+		if let Some(why) = answer["stopped"].as_str() {
+			found.push(format!("the operator's signer is stopped: {}", why));
+		}
+		let prior = self.rolled_back()?;
+		if found.is_empty() && prior.is_none() {
+			let v = json!({"witnessed": ask.len(), "record": answer["head"]});
+			*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
+			return Ok(v);
+		}
+		// The highest entry the record still agrees with: below any it
+		// disagrees at, and below the end of a record ending below the
+		// wallet's highest.
+		let mut at = agrees;
+		if let Some(b) = below {
+			at = at.min(b.saturating_sub(1));
+		}
+		if let Some(end) = record_end.filter(|end| *end < top) {
+			at = at.min(end);
+		}
+		let why = if found.is_empty() { prior.as_ref().map(|p| p.1.clone()).unwrap_or_default() } else { found.join("; ") };
+		if !found.is_empty() {
+			self.found_rollback(at, &why)?;
+		}
+		let at = self.rolled_back()?.map_or(at, |(a, _)| a);
+		let exits = self.exit_after(at, &why)?;
+		let v = json!({"rolled_back": {"at": at, "why": why}, "exits": exits,
+			"note": "the operator's signer's record was rolled back or replaced: the wallet takes on the chain every coin a transfer \
+			recorded after the entry it last agrees with made, and goes no further with this operator"});
+		*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
+		Ok(v)
+	}
+
+	/// Takes on the chain every coin the wallet holds that a transfer
+	/// recorded after entry `at` of the signer's record made, or one whose
+	/// entry it was never given; `why` is noted on each.
+	fn exit_after(&mut self, at: u64, why: &str) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for c in self.store.coins()? {
+			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) {
+				continue;
+			}
+			let entry = self.store.coin_entry(&c.leaf_id)?;
+			if entry.is_some_and(|e| e <= at) {
+				continue;
+			}
+			let r = self.exit(&c.leaf_id, None);
+			if let Ok(row) = self.store.coin(&c.leaf_id) {
+				if let Some(row) = row.filter(|r| r.state == "exiting") {
+					self.store.set_coin_state(&row.leaf_id, "exiting", &format!("taken on the chain: it rests on a transfer the \
+						operator's signer recorded at entry {}, after entry {} its record still agrees with ({})",
+						entry.map(|e| e.to_string()).unwrap_or_else(|| "unknown".into()), at, why))?;
+				}
+			}
+			out.push(match r {
+				Ok(v) => json!({"leaf_id": c.leaf_id, "entry": entry, "exit": v}),
+				Err(e) => json!({"leaf_id": c.leaf_id, "entry": entry, "error": e.to_string()}),
+			});
+		}
+		Ok(out)
 	}
 
 	/// The smallest leaf the server takes in `asset`, or a refusal when it

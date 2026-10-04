@@ -274,6 +274,10 @@ pub struct Cosigned {
 	pub signatures: Vec<OperatorSignatures>,
 	/// Each new coin, with its record as its receiver gets it.
 	pub outputs: Vec<Coin>,
+	/// The entry of the signer's record the transfer's last signature was
+	/// recorded as, signed: what the coins it makes rest on.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +318,10 @@ pub struct MailboxMessage {
 	pub kind: String,
 	pub leaf_id: String,
 	pub record: String,
+	/// For a coin a transfer made, the entry of the signer's record that
+	/// transfer's last signature was recorded as, signed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
 }
 
 /// `POST /v1/leaf_data`: the leaves the authenticated key owns.
@@ -527,14 +535,48 @@ pub struct PublishedTree {
 	pub signer_record: Option<RecordHead>,
 }
 
-/// An entry of the signer's record: its number and running hash. A wallet
-/// keeps every one it is shown, and refuses an operator that later shows a
-/// lower latest entry, or another hash at an entry it has seen.
+/// An entry of the signer's record: its number and running hash, with `S`'s
+/// signature over them. A wallet keeps every one it is shown that carries
+/// that signature, and hands them back on every contact (`witness`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordHead {
 	pub entry: u64,
 	pub hash: String,
+	/// `S`'s signature over the entry and its running hash
+	/// (`signer::record_head_digest`); absent only for a round built before
+	/// heads were signed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signature: Option<String>,
+}
+
+/// `POST /v1/witness`: the heads of the signer's record a wallet holds, each
+/// with the signature it was handed out with, at most
+/// [`crate::signer::MAX_WITNESS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessRequest {
+	pub heads: Vec<RecordHead>,
+}
+
+/// The running hash the record holds at an entry a wallet named: `None` past
+/// its end, or where a compaction kept no hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryHash {
+	pub entry: u64,
+	pub hash: Option<String>,
+}
+
+/// The answer to a witness: the record's latest entry, signed (none while the
+/// signer is stopped), the running hash at each entry named, in order, and
+/// why the signer is stopped, if it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Witness {
+	pub head: Option<RecordHead>,
+	pub hashes: Vec<EntryHash>,
+	pub stopped: Option<String>,
 }
 
 /// The tree's reserve rule: `{"fee_rate": …}` or `{"fixed": …}`.

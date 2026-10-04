@@ -562,8 +562,23 @@ impl Server {
 		let genesis = finality.call(|c| c.genesis()).await.map_err(err("the node"))?;
 		let signer = SignerClient::new(&config.signer_socket).with_store(store.clone());
 		let operator = signer.pubkey().await.map_err(err("the signer"))?;
-		check_signer_record(&store, &signer).await?;
-		check_signer_entries(&store, &signer).await?;
+		// A signer stopped by a proven rollback of its record signs nothing
+		// the record governs; the server still starts, so every wallet's
+		// witness learns it and its holders exit, and serves no co-signature.
+		match signer.witness(&[]).await.map_err(err("the signer"))?.stopped {
+			Some(why) => log::error!("the signer is stopped: {}; the server co-signs nothing, and answers each wallet's witness with \
+				it so that holders exit", why),
+			None => {
+				check_signer_record(&store, &signer).await?;
+				check_signer_entries(&store, &signer).await?;
+				// The record's latest entry, signed, so a round built before
+				// the next co-signature publishes a head wallets keep.
+				let h = signer.signed_head().await.map_err(err("the signer"))?;
+				if h.entry > 0 {
+					store.set_signer_head_signed(h.entry, &h.hash, h.signature.as_ref()).await.map_err(err("the database"))?;
+				}
+			},
+		}
 
 		let mut assets = BTreeMap::new();
 		let mut order = vec![];
@@ -661,6 +676,8 @@ impl Server {
 			participations: participations.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
+				config.limits.source_burst),
+			witnesses: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
 			challenge_key: {
 				let mut k = [0u8; 32];

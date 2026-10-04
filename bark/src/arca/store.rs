@@ -17,9 +17,12 @@
 //!   unlock hash, the refund delay and the margin, so the wallet can find the
 //!   forfeit's output on the chain, read a preimage from its claim, or take
 //!   the refund, whatever the server says;
-//! - **every entry of the operator's signer's record it was shown**, by
-//!   number, with its running hash: a witness of the record outside the
-//!   server, which the wallet checks every later showing against;
+//! - **every head of the operator's signer's record it was shown**, by
+//!   entry, with its running hash and the signer's signature over them: a
+//!   witness of the record outside the server, which the wallet hands back
+//!   on every contact and checks every later showing against; and for each
+//!   coin a transfer made, the entry of the record that transfer was
+//!   recorded at;
 //! - the transactions its coins rest on (rounds, boards), its participations
 //!   with the new leaves it validated for them, its board registrations and
 //!   transfer requests, each kept until the server answers it, its
@@ -112,6 +115,7 @@ CREATE TABLE IF NOT EXISTS forfeit (
 );
 CREATE TABLE IF NOT EXISTS refusal (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, what TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS signer_seen (entry INTEGER PRIMARY KEY, hash TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS coin_entry (leaf_id TEXT PRIMARY KEY, entry INTEGER NOT NULL);
 ";
 
 /// A coin as the store holds it.
@@ -205,6 +209,8 @@ impl Store {
 		conn.execute_batch(SCHEMA).map_err(db)?;
 		let store = Store { conn };
 		store.add_column("participation", "news", "TEXT")?;
+		store.add_column("signer_seen", "signature", "TEXT")?;
+		store.add_column("mailbox_retry", "head", "TEXT")?;
 		Ok(store)
 	}
 
@@ -542,17 +548,19 @@ impl Store {
 	}
 
 	/// A coin from the mailbox refused for a passing reason, kept to be
-	/// checked again.
-	pub fn keep_for_retry(&self, leaf_id: &str, record: &[u8], reason: &str) -> Result<(), Error> {
-		self.conn.execute("INSERT INTO mailbox_retry (leaf_id, record, reason, at) VALUES (?1, ?2, ?3, ?4)
-			ON CONFLICT(leaf_id) DO UPDATE SET reason = ?3, at = ?4", params![leaf_id, record, reason, now()]).map_err(db)?;
+	/// checked again, with the head of the signer's record it came with.
+	pub fn keep_for_retry(&self, leaf_id: &str, record: &[u8], reason: &str, head: Option<&str>) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO mailbox_retry (leaf_id, record, reason, at, head) VALUES (?1, ?2, ?3, ?4, ?5)
+			ON CONFLICT(leaf_id) DO UPDATE SET reason = ?3, at = ?4, head = COALESCE(?5, head)",
+			params![leaf_id, record, reason, now(), head]).map_err(db)?;
 		Ok(())
 	}
 
-	/// `(leaf_id, record)` of every coin kept for another check.
-	pub fn kept_for_retry(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
-		let mut st = self.conn.prepare("SELECT leaf_id, record FROM mailbox_retry ORDER BY at").map_err(db)?;
-		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+	/// `(leaf_id, record, head)` of every coin kept for another check.
+	#[allow(clippy::type_complexity)]
+	pub fn kept_for_retry(&self) -> Result<Vec<(String, Vec<u8>, Option<String>)>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, record, head FROM mailbox_retry ORDER BY at").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
 	}
 
@@ -591,10 +599,37 @@ impl Store {
 			.optional().map_err(db)
 	}
 
-	pub fn put_seen(&self, entry: u64, hash: &str) -> Result<(), Error> {
-		self.conn.execute("INSERT OR IGNORE INTO signer_seen (entry, hash, at) VALUES (?1, ?2, ?3)", params![entry as i64, hash, now()])
-			.map_err(db)?;
+	/// Keeps the head `entry` of the signer's record, its running hash and
+	/// the signer's signature over them; a head kept before without a
+	/// signature gains it.
+	pub fn put_seen(&self, entry: u64, hash: &str, signature: Option<&str>) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO signer_seen (entry, hash, at, signature) VALUES (?1, ?2, ?3, ?4)
+			ON CONFLICT(entry) DO UPDATE SET signature = ?4 WHERE signer_seen.hash = ?2 AND signer_seen.signature IS NULL AND ?4 IS NOT NULL",
+			params![entry as i64, hash, now(), signature]).map_err(db)?;
 		Ok(())
+	}
+
+	/// Every head of the signer's record the wallet keeps, latest first:
+	/// `(entry, hash, signature)`.
+	pub fn seen_heads(&self) -> Result<Vec<(u64, String, Option<String>)>, Error> {
+		let mut st = self.conn.prepare("SELECT entry, hash, signature FROM signer_seen ORDER BY entry DESC").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The entry of the signer's record the transfer that made coin `leaf_id`
+	/// was recorded at.
+	pub fn put_coin_entry(&self, leaf_id: &str, entry: u64) -> Result<(), Error> {
+		self.conn.execute("INSERT OR IGNORE INTO coin_entry (leaf_id, entry) VALUES (?1, ?2)", params![leaf_id, entry as i64]).map_err(db)?;
+		Ok(())
+	}
+
+	/// The entry the transfer that made coin `leaf_id` was recorded at, when
+	/// the wallet was given it.
+	pub fn coin_entry(&self, leaf_id: &str) -> Result<Option<u64>, Error> {
+		Ok(self.conn.query_row("SELECT entry FROM coin_entry WHERE leaf_id = ?1", params![leaf_id], |r| r.get::<_, i64>(0)).optional()
+			.map_err(db)?.map(|n| n as u64))
 	}
 
 	// --- refusals ---

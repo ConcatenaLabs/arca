@@ -92,8 +92,10 @@ block_interval_seconds = 60
 # caller needs; and over every source together at most issue_per_second,
 # with bursts of up to issue_burst: a high bound on the rows nonces hold (the
 # rate times their lifetime), far above what honest callers ask. A request
-# past either is refused with 429 rate_limited. A challenge writes no row
-# and is not limited.
+# past either is refused with 429 rate_limited. A witness of the signer's
+# record, which reads the record under the signer's lock, is answered within
+# the same rates from a bucket of its own. A challenge writes no row and is
+# not limited.
 issue_per_second = 250
 issue_burst = 10000
 source_per_second = 1

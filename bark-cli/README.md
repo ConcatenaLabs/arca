@@ -156,13 +156,27 @@ the keys, but which coins were spent off-chain is in the store and the server.
   from the chain, refuses a server that serves boards for less than 28 days,
   and moves them with the board's block after a rollback.
 
-- **The operator's signer's record.** The operator publishes its signer's
-  record's latest entry and running hash with `info` and with every round's
-  tree. The wallet keeps every entry it is shown, and refuses to go on with
-  an operator that later shows a latest entry below one it showed, or
-  another hash at an entry it has seen: the operator's record and database
-  have been rolled back together, so its signer may sign again what it
-  signed. The refusal says so, and is kept with the wallet's refusals.
+- **The operator's signer's record.** The operator's signer signs every head
+  of its record it hands out, an entry and its running hash: the latest with
+  `info`, a round's with its tree, and a transfer's with its answer and with
+  each coin it made in the mailbox. The wallet keeps each head it is shown
+  with the signer's signature (one whose signature is not the signer's is
+  refused), and the entry each of its coins was recorded at. Every command
+  that reaches the server starts with a witness of the record: the wallet
+  hands the server the highest head it holds, its coins' heads and as many
+  more as fit, and checks the running hash the record holds at each and its
+  latest entry. A latest entry below the highest it holds, another hash at
+  an entry it holds, or a signer stopped by such a proof means the
+  operator's record has been rolled back or replaced, with its database, so
+  its signer may sign again what it signed. A signed head the record does
+  not hold stops the signer for every holder. The wallet then finds the
+  highest entry it holds that the record still agrees with, takes on the
+  chain at once every coin a transfer recorded after it made (a coin whose
+  entry it was never given counts as after; its own leaves and boards stay),
+  and goes no further with the operator: it asks for no payment through it,
+  takes no coin from its mailbox and signs nothing for it. `sync` then does
+  only what it does on the chain. The reason is shown, and kept with the
+  wallet's refusals.
 
 ### Fees
 
@@ -295,9 +309,22 @@ and holding it there, with the reason shown:
   receiver, on its own, with the operator stopped;
 - an operator whose database and signer's record are rolled back together
   to a backup, after which the server starts: the wallet that was shown a
-  later entry refuses to go on, and says why; and one shown another hash at
-  an entry it saw, refused the same way; a round's published tree carries
-  the record's latest entry when the round was built;
+  later entry stops the signer at its next command, takes its coin of the
+  lost payment on the chain and refuses to go on, saying why; a head whose
+  hash an operator altered is refused, its signature no longer the
+  signer's; a round's published tree carries the record's latest entry when
+  the round was built, signed;
+- the same rollback seen by a receiver that only syncs: its `sync` hands
+  back the head of the payment the record lost, which stops the signer, and
+  takes that coin on the chain at once; every other wallet then learns the
+  signer is stopped, and the older copy of the sender's wallet, shown the
+  record as it was, finds the spent coin's lineage on the chain and is
+  refused by the stopped signer on its other coin; and the same rollback
+  where that older copy spends the coin again before any wallet witnesses,
+  and another payment takes the record past every entry the receiver holds:
+  the receiver's next `sync` finds another hash at its own highest entry,
+  stops the signer and takes its coin on the chain first, and the second
+  spend's coin cannot follow;
 - a forfeit's margin bounded from the operator's published floor: a wallet
   whose node values the asset five times higher than the operator's
   completes its refresh;
