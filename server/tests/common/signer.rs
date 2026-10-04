@@ -39,12 +39,35 @@ pub fn key_file(dir: &std::path::Path, key: &Keypair, mode: u32) -> PathBuf {
 	path
 }
 
-/// Makes a new record at `record` for the key in `key_file`, as an operator
-/// does once for a new key: the signer's output.
+/// Makes a new record at `record` for the key in `key_file`, without
+/// keepers, as an operator does once for a new key: the signer's output.
 pub fn create_record(key_file: &std::path::Path, genesis: BlockHash, record: &std::path::Path) -> std::process::Output {
+	create_record_with(key_file, genesis, record, &["--no-keepers".to_string()])
+}
+
+/// Makes a new record at `record` naming the keepers `keys`, `required` of
+/// them to hold every head: the signer's output.
+pub fn create_record_kept(key_file: &std::path::Path, genesis: BlockHash, record: &std::path::Path,
+	keys: &[elements::secp256k1_zkp::XOnlyPublicKey], required: usize) -> std::process::Output
+{
+	let mut a = vec![];
+	for k in keys {
+		a.push("--keeper-key".to_string());
+		a.push(hex(&k.serialize()));
+	}
+	a.push("--keepers-required".into());
+	a.push(required.to_string());
+	create_record_with(key_file, genesis, record, &a)
+}
+
+/// `arca-signer --create-record` with `args` (the record's keepers).
+pub fn create_record_with(key_file: &std::path::Path, genesis: BlockHash, record: &std::path::Path, args: &[String])
+	-> std::process::Output
+{
 	Command::new(env!("CARGO_BIN_EXE_arca-signer"))
 		.args(["--key-file", key_file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
 			"--create-record"])
+		.args(args)
 		.output().unwrap()
 }
 

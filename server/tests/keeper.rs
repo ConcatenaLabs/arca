@@ -64,19 +64,28 @@ impl Signer {
 	/// Starts `arca-signer` on the record in `dir` with `extra` arguments
 	/// (the keepers), and waits for its socket.
 	fn start(dir: &std::path::Path, name: &str, genesis: BlockHash, extra: &[String]) -> Signer {
+		Self::try_start(dir, name, genesis, extra).unwrap_or_else(|e| panic!("the signer did not start: {}", e))
+	}
+
+	/// [`Self::start`], or the signer's exit status and log when it exits
+	/// before it opens its socket.
+	fn try_start(dir: &std::path::Path, name: &str, genesis: BlockHash, extra: &[String]) -> Result<Signer, String> {
 		let socket = dir.join(format!("{}.sock", name));
 		let log = dir.join(format!("{}.log", name));
 		let _ = std::fs::remove_file(&socket);
-		let child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+		let mut child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
 			.args(["--key-file", dir.join("operator.key").to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket",
 				socket.to_str().unwrap(), "--record", dir.join("signer.record").to_str().unwrap()])
 			.args(extra).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
 		let start = Instant::now();
 		while !socket.exists() {
+			if let Some(status) = child.try_wait().unwrap() {
+				return Err(format!("exit {:?}: {}", status.code(), std::fs::read_to_string(&log).unwrap_or_default().trim()));
+			}
 			assert!(start.elapsed() < Duration::from_secs(30), "the signer did not open its socket: {}", std::fs::read_to_string(&log).unwrap_or_default());
 			std::thread::sleep(Duration::from_millis(50));
 		}
-		Signer { child, dir: dir.to_path_buf(), socket, log }
+		Ok(Signer { child, dir: dir.to_path_buf(), socket, log })
 	}
 
 	fn log(&self) -> String {
@@ -95,15 +104,13 @@ impl Drop for Signer {
 	}
 }
 
-fn keepers_args(list: &[String], required: Option<usize>) -> Vec<String> {
+/// Where each keeper is reached, as the signer's command line says it: the
+/// record names the keepers and how many are required.
+fn keepers_args(list: &[String]) -> Vec<String> {
 	let mut a = vec![];
 	for k in list {
 		a.push("--keeper".to_string());
 		a.push(k.clone());
-	}
-	if let Some(r) = required {
-		a.push("--keepers-required".into());
-		a.push(r.to_string());
 	}
 	a.push("--keeper-timeout-ms".into());
 	a.push("2000".into());
@@ -136,12 +143,19 @@ struct Setup {
 	owner: Keypair,
 }
 
-fn setup() -> Setup {
+/// An operator whose record names the keepers `keepers`, `required` of them
+/// to hold every head (none: a record without keepers).
+fn setup(keepers: &[&Keypair], required: usize) -> Setup {
 	let s = keypair("operator");
 	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
 	let dir = signer_dir();
 	let key = key_file(&dir, &s, 0o600);
-	assert!(common::signer::create_record(&key, genesis, &dir.join("signer.record")).status.success());
+	let made = match keepers {
+		[] => common::signer::create_record(&key, genesis, &dir.join("signer.record")),
+		k => common::signer::create_record_kept(&key, genesis, &dir.join("signer.record"), &k.iter().map(|k| xonly(k)).collect::<Vec<_>>(),
+			required),
+	};
+	assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
 	Setup { s, genesis, dir, asset: AssetId::from_slice(&[3; 32]).unwrap(), owner: keypair("owner") }
 }
 
@@ -154,10 +168,10 @@ fn setup() -> Setup {
 /// `head`, carries the acknowledgement too, and `pubkey` names the keeper.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keeper_holds_every_head_before_the_signer_answers_and_one_down_holds_it_up() {
-	let t = setup();
 	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
 	let mut keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
-	let signer = Signer::start(&t.dir, "one", t.genesis, &keepers_args(&[keeper.arg()], None));
+	let signer = Signer::start(&t.dir, "one", t.genesis, &keepers_args(&[keeper.arg()]));
 	println!("the signer at start: {}", signer.log().trim());
 	let p = raw(&signer.socket, r#"{"op":"pubkey"}"#).await;
 	assert_eq!(p["keepers"], json!({"keys": [hex(&xonly(&k).serialize())], "required": 1}), "{}", p);
@@ -205,10 +219,10 @@ async fn a_keeper_holds_every_head_before_the_signer_answers_and_one_down_holds_
 /// witness carries the keeper's head as the proof.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_signer_is_stopped_at_start_by_its_keeper() {
-	let t = setup();
 	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
 	let keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
-	let args = keepers_args(&[keeper.arg()], None);
+	let args = keepers_args(&[keeper.arg()]);
 	let signer = Signer::start(&t.dir, "first", t.genesis, &args);
 	let mut snapshot = vec![];
 	for i in 1..=4u8 {
@@ -248,11 +262,11 @@ async fn a_restored_signer_is_stopped_at_start_by_its_keeper() {
 /// keeper, the same requests complete.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keeper_that_lies_is_no_keeper() {
-	let t = setup();
 	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
 	let keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
 	let proxy = LineProxy::start(&keeper.addr, Duration::ZERO);
-	let args = keepers_args(&[proxy.arg(&xonly(&k))], None);
+	let args = keepers_args(&[proxy.arg(&xonly(&k))]);
 	let signer = Signer::start(&t.dir, "through", t.genesis, &args);
 	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [1; 32], t.asset)).await;
 	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "honest through the proxy: {}", v);
@@ -313,7 +327,7 @@ async fn a_keeper_that_lies_is_no_keeper() {
 	drop(signer);
 
 	// Straight to the keeper, the request completes.
-	let signer = Signer::start(&t.dir, "straight", t.genesis, &keepers_args(&[keeper.arg()], None));
+	let signer = Signer::start(&t.dir, "straight", t.genesis, &keepers_args(&[keeper.arg()]));
 	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [2; 32], t.asset)).await;
 	assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k]), "{}", v);
 	drop(signer);
@@ -329,10 +343,10 @@ async fn a_keeper_that_lies_is_no_keeper() {
 /// heads the record still holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keeper_restored_from_an_older_copy_catches_up() {
-	let t = setup();
 	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
 	let mut keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
-	let args = keepers_args(&[keeper.arg()], None);
+	let args = keepers_args(&[keeper.arg()]);
 	let signer = Signer::start(&t.dir, "first", t.genesis, &args);
 	let mut copy = vec![];
 	for i in 1..=4u8 {
@@ -372,11 +386,11 @@ async fn a_keeper_restored_from_an_older_copy_catches_up() {
 /// down at a start it signs nothing until it is back.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_keepers_with_one_required() {
-	let t = setup();
 	let (k1, k2) = (keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k1, &k2], 1);
 	let keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
 	let mut keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
-	let args = keepers_args(&[keeper1.arg(), keeper2.arg()], Some(1));
+	let args = keepers_args(&[keeper1.arg(), keeper2.arg()]);
 	let signer = Signer::start(&t.dir, "both", t.genesis, &args);
 	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [1; 32], t.asset)).await;
 	assert!(acked_by(&v, &t.s, t.genesis, &[&k1, &k2]), "both acknowledge: {}", v);
@@ -405,18 +419,21 @@ async fn two_keepers_with_one_required() {
 /// slowest; asserts only that each completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn what_a_keeper_adds_to_a_cosignature() {
-	let t = setup();
 	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
 	let keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
 	let far = LineProxy::start(&keeper.addr, Duration::from_millis(50));
 	let mut salt = 0u32;
 	let mut runs = vec![];
-	for (what, args) in [
-		("no keeper", vec![]),
-		("a keeper on this machine", keepers_args(&[keeper.arg()], None)),
-		("a keeper 50 ms away each way", keepers_args(&[far.arg(&xonly(&k))], None)),
+	// The record names its keepers for good: the run without one is on a
+	// record of its own.
+	let alone = setup(&[], 0);
+	for (what, dir, args) in [
+		("no keeper", &alone.dir, vec![]),
+		("a keeper on this machine", &t.dir, keepers_args(&[keeper.arg()])),
+		("a keeper 50 ms away each way", &t.dir, keepers_args(&[far.arg(&xonly(&k))])),
 	] {
-		let signer = Signer::start(&t.dir, &format!("m{}", runs.len()), t.genesis, &args);
+		let signer = Signer::start(dir, &format!("m{}", runs.len()), t.genesis, &args);
 		let mut times = vec![];
 		for _ in 0..40 {
 			salt += 1;
@@ -435,4 +452,153 @@ async fn what_a_keeper_adds_to_a_cosignature() {
 		drop(signer);
 	}
 	let _ = std::fs::remove_dir_all(&t.dir);
+	let _ = std::fs::remove_dir_all(&alone.dir);
+}
+
+/// D55 (R7f F1 to F3 at the signer). The keepers are part of the operator's
+/// identity, fixed when its record is made: the record's first line names
+/// them and how many must hold a head, and the signer serves only with that
+/// set. The command line says only where each keeper is reached: with no
+/// address for a keeper the record names (a start that lost `--keeper`, as a
+/// restored start script would), with a keeper the record does not name (a
+/// keeper replaced, R7f's K2 and K2b), or with `--keepers-required` of its
+/// own, the signer refuses to start and says why. A record made without
+/// keepers, or of format 1, refuses `--keeper`: it never gains any. The
+/// first line is under the running hash, so a hand-edited set does not
+/// open; a compacted record carries the set over, under its carried hash.
+/// The command that makes a record takes the set, or `--no-keepers`, and
+/// nothing less.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_names_its_keepers_and_the_signer_serves_only_with_them() {
+	use server::signer::record_header;
+	let (k1, k2, k3) = (keypair("keeper one"), keypair("keeper two"), keypair("keeper three"));
+	let t = setup(&[&k1, &k2], 2);
+	let record = t.dir.join("signer.record");
+	let first = std::fs::read_to_string(&record).unwrap();
+	println!("the record's first line: {}", first.trim());
+	assert_eq!(first.trim(), format!("arca-signer-record 4 {} {} keepers=2:{},{}", hex(&xonly(&t.s).serialize()), t.genesis,
+		hex(&xonly(&k1).serialize()), hex(&xonly(&k2).serialize())));
+	let keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let keeper3 = KeeperProcess::start(&k3, xonly(&t.s), t.genesis);
+	let (h1, h2, h3) = (hex(&xonly(&k1).serialize()), hex(&xonly(&k2).serialize()), hex(&xonly(&k3).serialize()));
+
+	let refused = |name: &str, args: &[String]| -> String {
+		let e = Signer::try_start(&t.dir, name, t.genesis, args).err().unwrap_or_else(|| panic!("{}: the signer started", name));
+		println!("{}: {}", name, e.lines().last().unwrap_or(""));
+		assert!(e.starts_with("exit Some(2)"), "{}", e);
+		e
+	};
+	// A start that lost --keeper: every key without an address is named.
+	let e = refused("no --keeper", &keepers_args(&[]));
+	assert!(e.contains(&format!("the record's keeper {} has no address", h1)) && e.contains(&format!("the record's keeper {} has no address", h2)), "{}", e);
+	let e = refused("one of the two", &keepers_args(&[keeper1.arg()]));
+	assert!(e.contains(&format!("the record's keeper {} has no address", h2)) && !e.contains(&format!("keeper {} has no address", h1)), "{}", e);
+	// K2 and K2b: a keeper replaced by another key.
+	let e = refused("keeper two replaced by three", &keepers_args(&[keeper1.arg(), keeper3.arg()]));
+	assert!(e.contains(&format!("={}: that key is not one of the record's keepers", h3)), "{}", e);
+	assert!(e.contains(&format!("the record's keeper {} has no address", h2)), "{}", e);
+	let e = refused("a third keeper beside the two", &keepers_args(&[keeper1.arg(), keeper2.arg(), keeper3.arg()]));
+	assert!(e.contains(&format!("={}: that key is not one of the record's keepers", h3)) && !e.contains("has no address"), "{}", e);
+	let mut fewer = keepers_args(&[keeper1.arg(), keeper2.arg()]);
+	fewer.extend(["--keepers-required".to_string(), "1".to_string()]);
+	let e = refused("fewer required than the record", &fewer);
+	assert!(e.contains("--keepers-required is the record's"), "{}", e);
+	assert!(!server::signer::stopped_path(&record).exists());
+
+	// With every keeper the record names, it serves, and names them.
+	let signer = Signer::start(&t.dir, "both", t.genesis, &keepers_args(&[keeper2.arg(), keeper1.arg()]));
+	let p = raw(&signer.socket, r#"{"op":"pubkey"}"#).await;
+	println!("with both: pubkey's keepers {}", p["keepers"]);
+	assert_eq!(p["keepers"], json!({"keys": [h1, h2], "required": 2}));
+	for i in 1..=3u8 {
+		let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [i; 32], t.asset)).await;
+		assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k1, &k2]), "{}", v);
+	}
+	drop(signer);
+
+	// The first line is under the running hash: the set edited out of a
+	// record with entries does not open.
+	let whole = std::fs::read_to_string(&record).unwrap();
+	let edited = whole.replacen(&format!("keepers=2:{},{}", h1, h2), "keepers=none", 1);
+	std::fs::write(&record, &edited).unwrap();
+	let e = refused("the keepers edited out of the first line", &keepers_args(&[]));
+	assert!(e.contains("line 2"), "{}", e);
+	std::fs::write(&record, &whole).unwrap();
+
+	// Compacted, the set goes over, and stays the record's.
+	let key = t.dir.join("operator.key");
+	let drop_file = t.dir.join("expired.salts");
+	std::fs::write(&drop_file, format!("{}\n", hex(&[1; 32]))).unwrap();
+	let compacted = t.dir.join("signer.record.new");
+	let out = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+		.args(["--key-file", key.to_str().unwrap(), "--genesis", &t.genesis.to_string(), "--record", record.to_str().unwrap(),
+			"--compact-into", compacted.to_str().unwrap(), "--drop-salts", drop_file.to_str().unwrap()])
+		.output().unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let text = std::fs::read_to_string(&compacted).unwrap();
+	let header = text.lines().next().unwrap().to_string();
+	println!("the compacted record's first line: {}", header);
+	assert!(header.starts_with(&format!("arca-signer-record 4 {} {} keepers=2:{},{} 3 ", hex(&xonly(&t.s).serialize()), t.genesis, h1, h2)),
+		"{}", header);
+	std::fs::write(&record, text.replacen(&format!("keepers=2:{},{}", h1, h2), &format!("keepers=1:{}", h1), 1)).unwrap();
+	let e = refused("a compacted record's keepers edited", &keepers_args(&[keeper1.arg()]));
+	assert!(e.contains("the carried lines do not hash to the header's"), "{}", e);
+	std::fs::rename(&compacted, &record).unwrap();
+	let e = refused("the compacted record started without --keeper", &keepers_args(&[]));
+	assert!(e.contains("has no address"), "{}", e);
+	let signer = Signer::start(&t.dir, "compacted", t.genesis, &keepers_args(&[keeper1.arg(), keeper2.arg()]));
+	assert_eq!(raw(&signer.socket, r#"{"op":"pubkey"}"#).await["keepers"], json!({"keys": [h1, h2], "required": 2}));
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [4; 32], t.asset)).await;
+	assert!(v["signature"].is_string() && v["entry"]["entry"] == 4 && acked_by(&v, &t.s, t.genesis, &[&k1, &k2]), "{}", v);
+	drop(signer);
+
+	// A record made without keepers never gains any.
+	let none = setup(&[], 0);
+	let line = std::fs::read_to_string(none.dir.join("signer.record")).unwrap();
+	println!("a record without keepers: {}", line.trim());
+	assert!(line.trim().ends_with(" keepers=none"), "{}", line);
+	let e = Signer::try_start(&none.dir, "gains one", none.genesis, &keepers_args(&[keeper1.arg()])).err().expect("refused");
+	println!("--keeper on a record without keepers: {}", e.lines().last().unwrap_or(""));
+	assert!(e.starts_with("exit Some(2)") && e.contains("the record was made without keepers, as its first line says, and never gains any"), "{}", e);
+	let signer = Signer::start(&none.dir, "alone", none.genesis, &[]);
+	assert_eq!(raw(&signer.socket, r#"{"op":"pubkey"}"#).await["keepers"], json!({"keys": [], "required": 0}));
+	assert!(signer.log().contains("the record names no keeper"), "{}", signer.log());
+	drop(signer);
+	// A record of format 1, made before records named keepers, is one
+	// without keepers.
+	std::fs::write(none.dir.join("signer.record"), format!("{}\n", record_header(&xonly(&none.s), &none.genesis))).unwrap();
+	let e = Signer::try_start(&none.dir, "format 1 gains one", none.genesis, &keepers_args(&[keeper1.arg()])).err().expect("refused");
+	println!("--keeper on a record of format 1: {}", e.lines().last().unwrap_or(""));
+	assert!(e.contains("never gains any"), "{}", e);
+	drop(Signer::start(&none.dir, "format 1", none.genesis, &[]));
+
+	// The command that makes a record takes the set, or --no-keepers.
+	let make = |args: &[&str]| {
+		let fresh = signer_dir();
+		let key = key_file(&fresh, &t.s, 0o600);
+		let out = common::signer::create_record_with(&key, t.genesis, &fresh.join("signer.record"),
+			&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+		let made = fresh.join("signer.record").exists();
+		let _ = std::fs::remove_dir_all(&fresh);
+		(out.status.code(), String::from_utf8_lossy(&out.stderr).trim().to_string(), made)
+	};
+	for (args, want) in [
+		(vec![], "--create-record needs the record's keepers"),
+		(vec!["--keeper-key", &h1], "--keeper-key needs --keepers-required"),
+		(vec!["--keeper-key", &h1, "--keepers-required", "2"], "2 keepers required: from 1 to the 1 keepers named"),
+		(vec!["--keeper-key", &h1, "--keeper-key", &h1, "--keepers-required", "1"], "a keeper's key named twice"),
+		(vec!["--no-keepers", "--keeper-key", &h1], "--no-keepers names no keeper"),
+		(vec!["--keeper", &keeper1.arg(), "--keepers-required", "1"], "--create-record takes each keeper's key"),
+	] {
+		let (code, said, made) = make(&args);
+		println!("--create-record {:?}: {}", args, said);
+		assert_eq!(code, Some(2), "{}", said);
+		assert!(said.contains(want) && !made, "{}", said);
+	}
+	let (code, said, made) = make(&["--keeper-key", &h1, "--keeper-key", &h2, "--keeper-key", &h3, "--keepers-required", "2"]);
+	println!("--create-record two of three: {}", said);
+	assert!(code == Some(0) && made && said.contains(&format!("its keepers 2 of {}, {}, {}", h1, h2, h3)), "{}", said);
+	let _ = std::fs::remove_dir_all(&t.dir);
+	let _ = std::fs::remove_dir_all(&none.dir);
 }

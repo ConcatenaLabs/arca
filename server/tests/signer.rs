@@ -622,8 +622,9 @@ async fn the_record_is_compacted_and_goes_on_from_its_latest_entry() {
 	assert_eq!(compact(&new, &drop).status.code(), Some(2), "never over a file that is there");
 	let text = std::fs::read_to_string(&new).unwrap();
 	let header: Vec<&str> = text.lines().next().unwrap().split(' ').collect();
-	assert_eq!(header[..2], ["arca-signer-record", "3"]);
-	assert_eq!((header[4], header[5], header[6]), ("7", hex(&entries[6].1).as_str(), "7"));
+	assert_eq!(header[..2], ["arca-signer-record", "4"]);
+	assert_eq!(header[4], "keepers=none", "the keepers go over to the compacted record: none");
+	assert_eq!((header[5], header[6], header[7]), ("7", hex(&entries[6].1).as_str(), "7"));
 	let old = std::fs::read_to_string(&record).unwrap();
 	for (k, line) in text.lines().skip(1).enumerate() {
 		if k < 3 {
@@ -1042,6 +1043,7 @@ async fn a_record_compacted_in_format_2_is_read() {
 	println!("the record made and compacted by {}", maker);
 	let made = Command::new(&maker)
 		.args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(), "--create-record"])
+		.args(old.is_none().then_some("--no-keepers"))
 		.output().unwrap();
 	assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
 	let run = Run::start_of(&maker, &dir, "first", genesis, &record, "exec ").unwrap();
@@ -1074,7 +1076,7 @@ async fn a_record_compacted_in_format_2_is_read() {
 				e.input(l.as_bytes());
 				e.input(b"\n");
 			}
-			format!("{} 2 {} {} {} {} {} {}\n{}\n", header[0], header[2], header[3], header[4], header[5], carried.len(),
+			format!("{} 2 {} {} {} {} {} {}\n{}\n", header[0], header[2], header[3], header[5], header[6], carried.len(),
 				hex(&sha256::Hash::from_engine(e).to_byte_array()), carried.join("\n"))
 		},
 	};

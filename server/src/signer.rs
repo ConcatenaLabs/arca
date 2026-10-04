@@ -113,6 +113,17 @@
 //! is undone, and a line cut short by a crash removed at start; and the
 //! signer locks the record while it runs.
 //!
+//! # The record's keepers
+//!
+//! The keepers ([`crate::keeper`]) are part of the operator's identity: the
+//! record names them in its first line when it is made, their keys and how
+//! many must hold a head ([`RecordKeepers`]), or says it has none, and that
+//! set is the record's for its whole life. The signer serves only with it:
+//! its command line says only where each keeper is reached. A changed set,
+//! or keepers for an operator that had none, is a new operator: a new key
+//! and a new record. A record of format 1 to 3, made before records named
+//! their keepers, is a record without keepers.
+//!
 //! Amounts are decimal strings, asset ids in display order, everything else
 //! hex.
 
@@ -383,8 +394,75 @@ pub type LeafKey = ([u8; 32], [u8; 32]);
 
 /// The first word of a record's first line.
 pub const RECORD_MAGIC: &str = "arca-signer-record";
-/// The record's format.
+/// The record's first format, which names no keepers: a record of it is a
+/// record without keepers. Read, never written.
 pub const RECORD_VERSION: u32 = 1;
+/// The record's format: its first line names its keepers
+/// ([`RecordKeepers`]), and a compacted record's first line goes on as
+/// [`RECORD_VERSION_HASHES`]'s.
+pub const RECORD_VERSION_KEEPERS: u32 = 4;
+
+/// The keepers a record names in its first line, fixed when it is made: each
+/// keeper's own key and how many of them must hold a head before the signer
+/// answers an entry. No keys and 0 for a record without keepers, which never
+/// gains any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordKeepers {
+	pub keys: Vec<XOnlyPublicKey>,
+	pub required: usize,
+}
+
+impl RecordKeepers {
+	/// The keepers `keys`, `required` of them to hold every head: at least
+	/// one keeper, no key twice, from 1 to all of them required.
+	pub fn new(keys: Vec<XOnlyPublicKey>, required: usize) -> Result<RecordKeepers, String> {
+		if keys.is_empty() {
+			return Err("a record with keepers names at least one".into());
+		}
+		if keys.iter().enumerate().any(|(i, k)| keys[..i].contains(k)) {
+			return Err("a keeper's key named twice".into());
+		}
+		if required == 0 || required > keys.len() {
+			return Err(format!("{} keepers required: from 1 to the {} keepers named", required, keys.len()));
+		}
+		Ok(RecordKeepers { keys, required })
+	}
+
+	/// Whether the record has no keepers.
+	pub fn is_none(&self) -> bool {
+		self.keys.is_empty()
+	}
+
+	/// The field of the record's first line that names them:
+	/// `keepers=none`, or `keepers=<required>:<key>,<key>,…`.
+	pub fn field(&self) -> String {
+		if self.keys.is_empty() {
+			return "keepers=none".into();
+		}
+		format!("keepers={}:{}", self.required, self.keys.iter().map(|k| hex(&k.serialize())).collect::<Vec<_>>().join(","))
+	}
+
+	/// Reads [`Self::field`] back.
+	pub fn from_field(field: &str) -> Result<RecordKeepers, String> {
+		let v = field.strip_prefix("keepers=").ok_or_else(|| format!("{:?} does not name the record's keepers", field))?;
+		if v == "none" {
+			return Ok(RecordKeepers::default());
+		}
+		let (required, keys) = v.split_once(':').ok_or_else(|| format!("keepers {:?}: <required>:<key>,…", v))?;
+		let required: usize = required.parse().map_err(|_| format!("keepers {:?}: the number required", v))?;
+		let keys = keys.split(',').map(|k| unhex32(k).and_then(|b| XOnlyPublicKey::from_slice(&b).map_err(|e| format!("{}: {}", k, e))))
+			.collect::<Result<Vec<_>, _>>().map_err(|e| format!("keepers: a key {}", e))?;
+		RecordKeepers::new(keys, required)
+	}
+
+	/// For people: `none`, or `<required> of <key>, <key>, …`.
+	pub fn describe(&self) -> String {
+		if self.keys.is_empty() {
+			return "none".into();
+		}
+		format!("{} of {}", self.required, self.keys.iter().map(|k| hex(&k.serialize())).collect::<Vec<_>>().join(", "))
+	}
+}
 /// The tag of the record's running hash.
 pub const RECORD_TAG: &[u8] = b"Arca/signer-record";
 /// The refusal code when the database knows a later entry than the record
@@ -467,9 +545,18 @@ pub fn chain_hash(prev: &[u8; 32], text: &str) -> [u8; 32] {
 	arca_covenant::script::sha256(&b)
 }
 
-/// The header of a record kept for `operator` on the chain of `genesis`.
+/// The header of a record of the first format ([`RECORD_VERSION`]), without
+/// keepers, kept for `operator` on the chain of `genesis`.
 pub fn record_header(operator: &XOnlyPublicKey, genesis: &elements::BlockHash) -> String {
 	format!("{} {} {} {}", RECORD_MAGIC, RECORD_VERSION, hex(&operator.serialize()), genesis)
+}
+
+/// The header of a record kept for `operator` on the chain of `genesis`,
+/// naming its keepers: `arca-signer-record 4 <S> <genesis> keepers=…`. It is
+/// the first line the running hash goes over, so every head the signer
+/// signs commits to the keepers.
+pub fn kept_record_header(operator: &XOnlyPublicKey, genesis: &elements::BlockHash, keepers: &RecordKeepers) -> String {
+	format!("{} {} {} {} {}", RECORD_MAGIC, RECORD_VERSION_KEEPERS, hex(&operator.serialize()), genesis, keepers.field())
 }
 
 /// One message in the record: its number (from 1), what it is, the leaf it
@@ -673,8 +760,11 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// The signer's append-only record of every rebindable message it signed:
 /// see the [module documentation](self).
 ///
-/// The first line names the format, the operator key and the chain:
-/// `arca-signer-record 1 <S> <genesis>`. Then one line per message,
+/// The first line names the format, the operator key, the chain and the
+/// record's keepers ([`RecordKeepers`]):
+/// `arca-signer-record 4 <S> <genesis> keepers=<required>:<key>,…`, or
+/// `keepers=none`; a record of format 1, `arca-signer-record 1 <S> <genesis>`,
+/// has no keepers. Then one line per message,
 /// `<n> spend <owner> <salt> <digest> <hash>` or
 /// `<n> forfeit <owner> <salt> <digest> <connector> <hash>`, numbered from 1,
 /// each ending with the running hash ([`chain_hash`]) over the header and
@@ -692,10 +782,13 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// A record can be compacted into a new one ([`SpendRecord::compact`]),
 /// dropping the entries under salts the server no longer serves (leaves
 /// whose batches have expired): the new record's first line,
-/// `arca-signer-record 3 <S> <genesis> <n> <hash> <carried> <carried hash>`,
-/// names the old record's latest entry and running hash, from which its own
-/// entries go on, and how many lines it carries over from it, with a hash
-/// over them (`SHA256("Arca/signer-record-carried" ‖ lines)`): every entry
+/// `arca-signer-record 4 <S> <genesis> keepers=… <n> <hash> <carried> <carried hash>`,
+/// names the old record's keepers, its latest entry and running hash, from
+/// which its own entries go on, and how many lines it carries over from it,
+/// with a hash over the keepers field and them
+/// (`SHA256("Arca/signer-record-carried" ‖ keepers=… ‖ 0x0a ‖ lines)`;
+/// format 3, `arca-signer-record 3 <S> <genesis> <n> <hash> <carried> <carried hash>`,
+/// names no keepers and hashes the lines alone): every entry
 /// it keeps, verbatim, and for every entry it drops a hash line
 /// `<n> <hash>`, its running hash, so the record answers the running hash
 /// at any of its entries for its whole life. A record of format 2, compacted
@@ -757,14 +850,18 @@ pub struct SpendRecord {
 	/// head it hands out is signed under.
 	operator: XOnlyPublicKey,
 	genesis: elements::BlockHash,
+	/// The keepers its first line names: none for a record of format 1 to 3.
+	keepers: RecordKeepers,
 }
 
 impl SpendRecord {
 	/// Makes a new, empty record at `path` (mode 0600) for `operator` on the
-	/// chain of `genesis`, and syncs it and its directory: an act of its own,
-	/// for a new operator key. It never replaces a record already there.
-	pub fn create(path: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash) -> Result<(), String> {
-		Self::write_new(path, &format!("{}\n", record_header(operator, genesis)), |_| Ok(()))
+	/// chain of `genesis`, naming `keepers` (none, for a record without
+	/// keepers) for its whole life, and syncs it and its directory: an act of
+	/// its own, for a new operator key. It never replaces a record already
+	/// there.
+	pub fn create(path: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash, keepers: &RecordKeepers) -> Result<(), String> {
+		Self::write_new(path, &format!("{}\n", kept_record_header(operator, genesis, keepers)), |_| Ok(()))
 	}
 
 	/// Writes a new file at `path` (mode 0600, refused where one is) with
@@ -835,19 +932,36 @@ impl SpendRecord {
 		let ours = record_header(operator, genesis);
 		let ours: Vec<&str> = ours.split(' ').collect();
 		let mut hash_lines = false;
-		let (base, carried) = match f.get(1).and_then(|v| v.parse::<u32>().ok()) {
-			Some(RECORD_VERSION) => (None, None),
+		// The fields after the operator key and the chain: the keepers in
+		// format 4, then, in a compacted record, where it was compacted from.
+		let version = f.get(1).and_then(|v| v.parse::<u32>().ok());
+		let (keepers, rest) = match version {
+			Some(RECORD_VERSION_KEEPERS) if f.len() == 5 || f.len() == 9 => (
+				RecordKeepers::from_field(f[4]).map_err(|e| format!("{}: the header: {}", path.display(), e))?, &f[5..]),
+			Some(RECORD_VERSION_KEEPERS) => return Err(format!("{}: a header of format 4 with {} fields", path.display(), f.len())),
+			_ => (RecordKeepers::default(), f.get(4..).unwrap_or(&[])),
+		};
+		let compacted = |rest: &[&str]| -> Result<_, String> {
+			let n: u64 = rest[0].parse().map_err(|_| format!("{}: the header's latest entry {:?}", path.display(), rest[0]))?;
+			let carried: u64 = rest[2].parse().map_err(|_| format!("{}: the header's carried count {:?}", path.display(), rest[2]))?;
+			Ok((Some((n, unhex32(rest[1]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)),
+				Some((carried, unhex32(rest[3]).map_err(|e| format!("{}: the header: {}", path.display(), e))?))))
+		};
+		let (base, carried) = match version {
+			Some(RECORD_VERSION) if f.len() == 4 => (None, None),
+			Some(RECORD_VERSION_KEEPERS) if rest.is_empty() => (None, None),
+			Some(RECORD_VERSION_KEEPERS) => {
+				hash_lines = true;
+				compacted(rest)?
+			},
 			Some(v @ (RECORD_VERSION_COMPACTED | RECORD_VERSION_HASHES)) if f.len() == 8 => {
 				hash_lines = v == RECORD_VERSION_HASHES;
-				let n: u64 = f[4].parse().map_err(|_| format!("{}: the header's latest entry {:?}", path.display(), f[4]))?;
-				let carried: u64 = f[6].parse().map_err(|_| format!("{}: the header's carried count {:?}", path.display(), f[6]))?;
-				(Some((n, unhex32(f[5]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)),
-					Some((carried, unhex32(f[7]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)))
+				compacted(rest)?
 			},
-			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {}, {} and {}", path.display(), f.get(1),
-				RECORD_VERSION, RECORD_VERSION_COMPACTED, RECORD_VERSION_HASHES)),
+			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {}, {}, {} and {}", path.display(), f.get(1),
+				RECORD_VERSION, RECORD_VERSION_COMPACTED, RECORD_VERSION_HASHES, RECORD_VERSION_KEEPERS)),
 		};
-		if f.get(2..4) != ours.get(2..4) || (base.is_none() && f.len() != 4) {
+		if f.get(2..4) != ours.get(2..4) {
 			return Err(format!("{}: the record is kept for another operator key or another chain ({:?}); this signer holds \
 				{} on {}", path.display(), header, hex(&operator.serialize()), genesis));
 		}
@@ -865,7 +979,7 @@ impl SpendRecord {
 		let mut record = SpendRecord {
 			file, size: first, first, base, head: base, count: 0, kept: Vec::with_capacity(lines as usize), added: Default::default(),
 			lines: 0, marks: vec![], recent: Default::default(), refusing: None, stopped, stop_path, stop_head, operator: *operator,
-			genesis: *genesis,
+			genesis: *genesis, keepers,
 		};
 		let mut at = first;
 		let mut k = 1u64;
@@ -874,6 +988,10 @@ impl SpendRecord {
 		if let Some((carried, want)) = carried {
 			let mut e = sha256::Hash::engine();
 			e.input(RECORD_CARRIED_TAG);
+			if version == Some(RECORD_VERSION_KEEPERS) {
+				e.input(record.keepers.field().as_bytes());
+				e.input(b"\n");
+			}
 			let mut last = 0u64;
 			for _ in 0..carried {
 				k += 1;
@@ -1022,6 +1140,12 @@ impl SpendRecord {
 
 	pub fn is_empty(&self) -> bool {
 		self.count == 0
+	}
+
+	/// The keepers the record's first line names: none for a record of
+	/// format 1 to 3, made before records named them.
+	pub fn keepers(&self) -> &RecordKeepers {
+		&self.keepers
 	}
 
 	/// The latest entry's number and running hash: 0 and the header's hash
@@ -1290,7 +1414,8 @@ impl SpendRecord {
 	/// new record at `into`, dropping every entry under a salt of `drop`: the
 	/// salts of leaves whose batches have expired, which the server no longer
 	/// serves (`arcad <config> expired-salts`). The new record's first line
-	/// names the old record's latest entry and running hash, from which its
+	/// names the old record's keepers (none for a record of format 1 to 3),
+	/// and its latest entry and running hash, from which its
 	/// own entries go on, so the server's database, which knows that entry,
 	/// knows the new record; it carries every other entry's line over
 	/// verbatim, and for each entry it drops a hash line with its running
@@ -1315,6 +1440,11 @@ impl SpendRecord {
 		let (mut carried, mut dropped, mut lines) = (0u64, 0u64, 0u64);
 		let mut e = sha256::Hash::engine();
 		e.input(RECORD_CARRIED_TAG);
+		// The keepers go over to the new record with the rest: a record never
+		// gains keepers, nor loses them.
+		let keepers = old.keepers.field();
+		e.input(keepers.as_bytes());
+		e.input(b"\n");
 		old.each_from(old.first, |text, l, _| {
 			match l {
 				Line::Entry(x) if drop.contains(&x.salt) => dropped += 1,
@@ -1328,8 +1458,8 @@ impl SpendRecord {
 		})?;
 		let carried_hash = sha256::Hash::from_engine(e).to_byte_array();
 		let base = old.head();
-		let header = format!("{} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_HASHES, hex(&operator.serialize()), genesis,
-			base.0, hex(&base.1), lines, hex(&carried_hash));
+		let header = format!("{} {} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_KEEPERS, hex(&operator.serialize()), genesis,
+			keepers, base.0, hex(&base.1), lines, hex(&carried_hash));
 		Self::write_new(into, &header, |w| {
 			old.each_from(old.first, |text, l, _| {
 				w.write_all(carry(text, l).as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| format!("{}: {}", into.display(), e))?;

@@ -13,7 +13,8 @@ pub struct SignerProcess {
 	child: Child,
 	pub dir: PathBuf,
 	pub socket: PathBuf,
-	/// What every start passes besides the key, chain, socket and record.
+	/// What every start passes besides the key, chain, socket and record:
+	/// where each of the record's keepers is reached.
 	extra: Vec<String>,
 }
 
@@ -29,13 +30,15 @@ pub fn signer_exe() -> PathBuf {
 }
 
 impl SignerProcess {
+	/// The signer on a record made without keepers.
 	pub fn start(key: &Keypair, genesis: BlockHash) -> SignerProcess {
-		Self::start_with(key, genesis, vec![])
+		Self::start_with(key, genesis, vec!["--no-keepers".into()], vec![])
 	}
 
-	/// The signer, started with `extra` arguments (its keepers): every start
-	/// and resume passes them.
-	pub fn start_with(key: &Keypair, genesis: BlockHash, extra: Vec<String>) -> SignerProcess {
+	/// The signer on a record made with `create` (the record's keepers, or
+	/// `--no-keepers`), started with `extra` arguments (where each keeper is
+	/// reached): every start and resume passes them.
+	pub fn start_with(key: &Keypair, genesis: BlockHash, create: Vec<String>, extra: Vec<String>) -> SignerProcess {
 		static N: AtomicUsize = AtomicUsize::new(0);
 		// Short: a Unix socket path is limited to about 100 bytes.
 		let dir = PathBuf::from(format!("/tmp/arca-cli-signer-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
@@ -50,20 +53,49 @@ impl SignerProcess {
 		let made = Command::new(signer_exe())
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(),
 				"--record", dir.join("signer.record").to_str().unwrap(), "--create-record"])
+			.args(&create)
 			.output().unwrap();
 		assert!(made.status.success(), "the signer's record: {}", String::from_utf8_lossy(&made.stderr));
-		let child = Command::new(signer_exe())
+		let mut s = SignerProcess { child: Self::spawn(&dir, &file, genesis, &socket, &extra), dir, socket, extra };
+		s.wait_for_socket().unwrap_or_else(|e| panic!("the signer did not start: {}", e));
+		s
+	}
+
+	/// `arca-signer` on the record in `dir`, its log appended to
+	/// `signer.log` there.
+	fn spawn(dir: &std::path::Path, file: &std::path::Path, genesis: BlockHash, socket: &std::path::Path, extra: &[String]) -> Child {
+		let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("signer.log")).unwrap();
+		Command::new(signer_exe())
 			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", socket.to_str().unwrap(),
 				"--record", dir.join("signer.record").to_str().unwrap()])
-			.args(&extra)
-			.stdout(Stdio::null()).stderr(Stdio::null())
-			.spawn().unwrap();
+			.args(extra)
+			.stdout(Stdio::null()).stderr(log)
+			.spawn().unwrap()
+	}
+
+	/// Waits for the signer's socket; its exit status and log when it exits
+	/// first.
+	fn wait_for_socket(&mut self) -> Result<(), String> {
 		let start = Instant::now();
-		while !socket.exists() {
-			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket");
+		while !self.socket.exists() {
+			if let Some(status) = self.child.try_wait().unwrap() {
+				return Err(format!("exit {:?}: {}", status.code(), self.log().trim()));
+			}
+			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket: {}", self.log());
 			std::thread::sleep(Duration::from_millis(50));
 		}
-		SignerProcess { child, dir, socket, extra }
+		Ok(())
+	}
+
+	/// Everything the signer wrote to its log, every start.
+	pub fn log(&self) -> String {
+		std::fs::read_to_string(self.dir.join("signer.log")).unwrap_or_default()
+	}
+
+	/// What every later start passes: where the keepers are reached, as a
+	/// start script restored from another time would say.
+	pub fn set_extra(&mut self, extra: Vec<String>) {
+		self.extra = extra;
 	}
 
 	/// The signer's process id.
@@ -85,18 +117,15 @@ impl SignerProcess {
 
 	/// Starts the signer again on its record.
 	pub fn resume(&mut self, genesis: BlockHash) {
+		self.try_resume(genesis).unwrap_or_else(|e| panic!("the signer did not start again: {}", e));
+	}
+
+	/// [`Self::resume`], or the signer's exit status and log when it refuses
+	/// to start.
+	pub fn try_resume(&mut self, genesis: BlockHash) -> Result<(), String> {
 		let file = self.dir.join("operator.key");
-		self.child = Command::new(signer_exe())
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
-				"--record", self.record().to_str().unwrap()])
-			.args(&self.extra)
-			.stdout(Stdio::null()).stderr(Stdio::null())
-			.spawn().unwrap();
-		let start = Instant::now();
-		while !self.socket.exists() {
-			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket");
-			std::thread::sleep(Duration::from_millis(50));
-		}
+		self.child = Self::spawn(&self.dir, &file, genesis, &self.socket, &self.extra);
+		self.wait_for_socket()
 	}
 }
 
