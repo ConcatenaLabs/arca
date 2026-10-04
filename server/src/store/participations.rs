@@ -671,12 +671,12 @@ impl Store {
 	/// runs again only those of its participations that were never in this
 	/// one. Returns `None` when the round is not lost.
 	///
-	/// A participation in `refunded` (a forfeit for the round of a coin it
-	/// gave up was refunded on the chain while the round was out) is left
-	/// where it is, its new leaves of the round never credited (`expired`:
-	/// the operator sweeps them with their batch), its status saying why if
-	/// it is void.
-	pub async fn restore_round(&self, round_id: i64, retire: &[i64], final_mtp: u32, refunded: &[[u8; 32]])
+	/// A participation in `uncredited` (one of whose coins was spent on the
+	/// chain otherwise than by its forfeit for the round, and why) is left
+	/// void, saying why, its new leaves of the round never credited
+	/// (`expired`: theirs to take on the chain who holds their records, the
+	/// operator's loss, and swept with their batch if left).
+	pub async fn restore_round(&self, round_id: i64, retire: &[i64], final_mtp: u32, uncredited: &[([u8; 32], String)])
 		-> Result<Option<Restored>, StoreError>
 	{
 		let mut conn = self.conn().await?;
@@ -714,17 +714,20 @@ impl Store {
 			).await?;
 			let (state, cur_round, cur_attempt): (&str, Option<i64>, i32) = (cur.get(0), cur.get(1), cur.get(2));
 			let cur_round_state: Option<String> = cur.get(5);
-			if refunded.contains(&id) {
-				let why = format!("a forfeit for round {} of a coin it gave up was refunded on the chain while that round was out of it: \
-					the coin is its owner's again, so its new leaves of the round are never credited, and the operator sweeps them with \
-					their batch", round_id);
+			if let Some((_, why)) = uncredited.iter().find(|(p, _)| *p == id) {
 				t.execute(
-					"UPDATE leaf SET state = 'expired', updated_at = now() WHERE state = 'lost' AND leaf_id IN (
+					"UPDATE leaf SET state = 'expired', updated_at = now() WHERE state IN ('lost', 'pending', 'live') AND leaf_id IN (
 					   SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = $2 AND attempt = $3)",
 					&[&&id[..], &round_id, &attempt],
 				).await?;
-				t.execute("UPDATE participation SET void_reason = $2 WHERE participation_id = $1 AND state = 'void'", &[&&id[..], &why]).await?;
-				out.left.push((id, why));
+				// Void, whatever it stands at now: its round of now, if
+				// another, was retired here or is lost.
+				let cur_lost = cur_round.is_none_or(|c| c == round_id || out.retired.contains(&c)) || cur_round_state.as_deref() == Some("lost");
+				if state == "void" || cur_lost {
+					t.execute("UPDATE participation SET state = 'void', round_id = NULL, void_reason = $2, waiting = NULL, updated_at = now()
+					           WHERE participation_id = $1", &[&&id[..], why]).await?;
+				}
+				out.left.push((id, why.clone()));
 				continue;
 			}
 			if cur_round.is_some_and(|c| c != round_id) && cur_round_state.as_deref() != Some("lost") {

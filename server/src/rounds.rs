@@ -78,10 +78,14 @@
 //! releases and its forfeits for the round good again), and each round that
 //! ran them again, which can now never confirm beside it, is retired with it;
 //! nothing runs a third time for a participation whose first round stands.
-//! A participation one of whose coins was taken back on the chain while the
-//! round was out (its forfeit for the round refunded) is not brought back:
-//! its leaves of the round are never credited, and the operator sweeps them
-//! with their batch.
+//! A participation one of whose coins was spent on the chain otherwise than
+//! by its forfeit for the round (that forfeit refunded while the round was
+//! out, the coin exited by its owner, or taken by another round's forfeit
+//! that came back with the reorganisation) is not brought back: its leaves
+//! of the round are never credited, and the server serves them nothing. Their
+//! owner holds their records, so they are its to take on the chain, and the
+//! loss, one coin's worth, is the operator's; whatever the owner leaves of
+//! them the operator sweeps with their batch.
 //!
 //! A coin with a forfeit for an earlier round in the watcher's log, or whose
 //! output the server has seen spent, is never taken into a re-run: such a
@@ -1016,25 +1020,12 @@ impl Rounds {
 			}
 			retire.push(y);
 		}
-		// A coin whose forfeit for the round was refunded while the round was
-		// out is its owner's again: its participation's leaves of the round
-		// are never credited.
-		let mut refunded = vec![];
-		for (f, leaf) in self.store.forfeits_naming(r.round_id).await? {
-			let at = OutPoint::new(Txid::from_byte_array(f), 0);
-			if !self.finality.status(&at.txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain() {
-				continue;
-			}
-			let unspent = self.finality.call(move |c| c.unspent(&at, true)).await.map_err(|e| RoundError::Chain(e.to_string()))?.is_some();
-			if unspent || self.store.watcher_spend(&f, 0).await?.is_some() {
-				continue;
-			}
-			if let Some(p) = self.store.forfeit_participation(&leaf, r.round_id).await? {
-				refunded.push(p);
-			}
-		}
+		// A participation one of whose coins was spent on the chain otherwise
+		// than by its forfeit for the round is its owner's again: its leaves
+		// of the round are never credited.
+		let uncredited = self.spent_otherwise(r.round_id).await?;
 		let now = self.now().await?.to_consensus_u32();
-		let Some(done) = self.store.restore_round(r.round_id, &retire, now, &refunded).await? else { return Ok(()) };
+		let Some(done) = self.store.restore_round(r.round_id, &retire, now, &uncredited).await? else { return Ok(()) };
 		for y in &done.retired {
 			if let Some(row) = self.store.round(*y).await? {
 				self.store.nursery_set_state(&row.txid, NurseryState::Lost).await?;
@@ -1046,11 +1037,125 @@ impl Rounds {
 		for (id, why) in &done.left {
 			log::warn!("participation {} is not brought back to round {}: {}", crate::signer::hex(id), r.round_id, why);
 		}
+		if !uncredited.is_empty() {
+			log::error!("round {} ({}) is final again with {} participation(s) whose new leaves are their owners' to take on the chain \
+				while the coins they gave up went otherwise: the operator's loss, one coin each", r.round_id, txid, uncredited.len());
+		}
 		let never = self.rerun(r.round_id, &done.rerun).await?;
 		log::warn!("round {} ({}) is final again: restored; {} participation(s) back as they stood in it, {} leaf/leaves credited, \
 			{} coin(s) paid out of its leaves live again, {} round(s) retired, {} participation(s) of those run again, {} never taken",
 			r.round_id, txid, done.restored.len(), done.credited, done.revived, done.retired.len(), done.rerun.len() - never, never);
 		Ok(())
+	}
+
+	/// The participations of round `round_id`, final in the chain again, one
+	/// of whose coins was spent on the chain otherwise than by its forfeit for
+	/// that round, and why: that forfeit refunded while the round was out;
+	/// or the coin's last output on the chain (its board output, or a leaf
+	/// output of its script the chain shows) spent, in a block or a mempool,
+	/// by anything but its forfeit for the round (its owner's exit, another
+	/// round's forfeit that came back with the reorganisation). Their leaves
+	/// of the round are never credited: their owners hold the records, so the
+	/// leaves are theirs to take on the chain, and the loss is the operator's.
+	async fn spent_otherwise(&self, round_id: i64) -> Result<Vec<([u8; 32], String)>, RoundError> {
+		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
+		let forfeits = self.store.forfeits_naming(round_id).await?;
+		let mempool: std::collections::HashSet<Txid> = self.finality.call(|c| c.mempool()).await.map_err(chain)?.into_iter().collect();
+		let mut out: Vec<([u8; 32], String)> = vec![];
+		let owners = "its new leaves of the round are never credited: they are its owner's to take on the chain, who holds their \
+			records, and the loss is the operator's";
+		// A forfeit for the round refunded while the round was out.
+		for (f, leaf) in &forfeits {
+			let at = OutPoint::new(Txid::from_byte_array(*f), 0);
+			if !self.finality.status(&at.txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain() {
+				continue;
+			}
+			let unspent = self.finality.call(move |c| c.unspent(&at, true)).await.map_err(chain)?.is_some();
+			if unspent || self.store.watcher_spend(f, 0).await?.is_some() {
+				continue;
+			}
+			if let Some(p) = self.store.forfeit_participation(leaf, round_id).await? {
+				if !out.iter().any(|(q, _)| *q == p) {
+					out.push((p, format!("its forfeit {} for round {} of coin {} it gave up was refunded on the chain while that round was out \
+						of it: {}", at.txid, round_id, LeafId(*leaf), owners)));
+				}
+			}
+		}
+		// A coin whose last output on the chain went otherwise.
+		for (pid, _) in self.store.earlier_in(round_id).await? {
+			if out.iter().any(|(q, _)| *q == pid) {
+				continue;
+			}
+			let Some(p) = self.store.participation(&pid).await? else { continue };
+			for i in &p.inputs {
+				let mine: Vec<Txid> = forfeits.iter().filter(|(_, l)| *l == i.leaf_id).map(|(f, _)| Txid::from_byte_array(*f)).collect();
+				if let Some(how) = self.taken_otherwise(&i.leaf_id, &mine, &mempool).await? {
+					out.push((pid, format!("coin {} it gave up was spent on the chain {}, otherwise than by its forfeit for round {}, while \
+						that round was out of it: {}", LeafId(i.leaf_id), how, round_id, owners)));
+					break;
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// How the coin `leaf_id` was spent on the chain otherwise than by one of
+	/// `forfeits` (its forfeits for a round): its board output, or every
+	/// leaf output of its script the chain shows, spent in a block or a
+	/// mempool, and none of `forfeits` in a block or in `mempool`. `None`
+	/// while any of those outputs is unspent (the coin is still to be
+	/// claimed, or exited, a conversion or an unroll on its way included), or
+	/// the chain shows none of them (it is still off the chain).
+	async fn taken_otherwise(&self, leaf_id: &[u8; 32], forfeits: &[Txid], mempool: &std::collections::HashSet<Txid>)
+		-> Result<Option<String>, RoundError>
+	{
+		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
+		let Some(row) = self.store.leaf(leaf_id).await? else { return Ok(None) };
+		// Its board output and the leaf its conversion makes, for a board;
+		// every output of its script the chain shows, for a leaf.
+		let mut outs: Vec<OutPoint> = vec![];
+		let mut scripts = vec![row.script_pubkey.clone()];
+		if row.kind == LeafKind::Board {
+			if let Some(b) = self.store.board(leaf_id).await? {
+				outs.push(OutPoint::new(Txid::from_byte_array(b.txid), b.vout));
+				if let Ok(record) = arca_covenant::BoardRecord::from_bytes(&b.record) {
+					scripts.push(record.policy().leaf.script_pubkey().to_bytes());
+				}
+			}
+		}
+		for s in &scripts {
+			outs.extend(self.store.sightings_of(s).await?.into_iter().map(|(t, v)| OutPoint::new(Txid::from_byte_array(t), v)));
+		}
+		// The last of them the chain shows spent, and what spent it when the
+		// server saw that.
+		let mut last: Option<(OutPoint, Option<Txid>)> = None;
+		for op in outs {
+			let txid = op.txid;
+			let exists = mempool.contains(&txid) || self.finality.call(move |c| c.tx_block(&txid)).await.map_err(chain)?.is_some();
+			if !exists {
+				continue;
+			}
+			if self.finality.call(move |c| c.unspent(&op, true)).await.map_err(chain)?.is_some() {
+				return Ok(None);
+			}
+			let by = self.store.outpoint_spender(&op.txid.to_byte_array(), op.vout).await?.map(Txid::from_byte_array);
+			last = Some((op, by));
+		}
+		let Some((op, spent_by)) = last else { return Ok(None) };
+		for f in forfeits {
+			let f = *f;
+			if mempool.contains(&f) || self.finality.call(move |c| c.tx_block(&f)).await.map_err(chain)?.is_some() {
+				return Ok(None);
+			}
+		}
+		let what = match spent_by {
+			Some(t) => match self.store.forfeit_round_id(&t.to_byte_array()).await? {
+				Some(n) => format!("(its output {}:{}) by {}, a forfeit for round {}", op.txid, op.vout, t, n),
+				None => format!("(its output {}:{}) by {}", op.txid, op.vout, t),
+			},
+			None => format!("(its output {}:{})", op.txid, op.vout),
+		};
+		Ok(Some(what))
 	}
 
 	/// Why the participation `id`, run again after a lost round, is not run
