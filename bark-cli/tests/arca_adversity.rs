@@ -947,11 +947,16 @@ async fn a_payment_recorded_while_the_signer_was_away_completes_past_the_boards_
 	let url = r.url();
 	let x = r.x;
 	let (a, w) = (Arca::new("T1A"), Arca::new("T1W"));
-	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let p = Proxy::start(&url);
+	let boards = boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
 	w.ok(&create_args(&url, &r.node_url()));
 	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
-	r.signer.halt();
+	// The signer goes away after A's witness, as the payment reaches the
+	// server.
+	signer_goes_away_at_the_payment(&p, &r);
 	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
 	println!("T1 A pays W with the signer away: ok={} {}", ok, v);
 	assert!(!ok);
 	assert_eq!(v["error"]["kind"], "unreachable", "a 503 is not a refusal: {}", v);
@@ -997,6 +1002,18 @@ async fn a_payment_recorded_while_the_signer_was_away_completes_past_the_boards_
 	}
 }
 
+/// Takes the operator's signer away (its process killed) when the next
+/// payment reaches the server through `p`: after the paying wallet's witness,
+/// which needs the signer, and before the server asks the signer to co-sign.
+fn signer_goes_away_at_the_payment(p: &Proxy, r: &Running) {
+	let pid = r.signer.pid().to_string();
+	p.rewrite_request(Some(Arc::new(move |path: &str, _: &mut Value| {
+		if path == "/v1/cosign_transfer" {
+			let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+		}
+	})));
+}
+
 /// R7d F5. A payment out of a batch leaf, recorded while the operator's
 /// signer was away, completes when it is asked again whatever has changed
 /// since: the node's floor in the asset fell a hundredfold, which puts the
@@ -1011,7 +1028,8 @@ async fn a_payment_recorded_while_the_signer_was_away_completes_whatever_changed
 	let url = r.url();
 	let x = r.x;
 	let (a, w) = (Arca::new("F5RA"), Arca::new("F5RW"));
-	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let p = Proxy::start(&url);
+	boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
 	a.ok(&["participate"]);
 	final_round(&r).await;
 	let s = a.ok(&["sync"]);
@@ -1020,8 +1038,10 @@ async fn a_payment_recorded_while_the_signer_was_away_completes_whatever_changed
 	assert_eq!(coin_of(&a, &leaf)["state"], "live");
 	w.ok(&create_args(&url, &r.node_url()));
 	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
-	r.signer.halt();
+	signer_goes_away_at_the_payment(&p, &r);
 	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
 	println!("F5R A pays W out of its batch leaf with the signer away: ok={} {}", ok, v);
 	assert!(!ok);
 	assert_eq!(v["error"]["kind"], "unreachable", "a 503 is not a refusal: {}", v);
@@ -2369,11 +2389,19 @@ async fn a_joint_rollback_is_caught_by_a_receiver_that_only_syncs_and_stops_the_
 		None
 	})));
 	let (ok, v) = a_old.run(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
-	println!("W1 A's older copy pays M: ok={} {}", ok, v);
+	println!("W1 A's older copy pays M, shown a witness answer the signer did not make: ok={} {}", ok, v);
 	println!("W1 C_A in A's older copy: {} | {}", coin_of(&a_old, &c_a)["state"], coin_of(&a_old, &c_a)["note"]);
 	assert_ne!(coin_of(&a_old, &c_a)["state"], "live", "C_A's lineage is on the chain: no off-chain spend of it");
 	assert!(!ok);
-	assert!(v["error"]["message"].as_str().unwrap().contains("stopped"), "the stopped signer refuses it: {}", v);
+	assert!(v["error"]["message"].as_str().unwrap().contains("carries no proof the signer made"),
+		"without the signer's own witness the wallet signs nothing: {}", v);
+	// Shown the signer's own answer, it learns of the stop on the signer's
+	// proof, and goes no further with the operator.
+	proxy.rewrite(None);
+	let (ok, v) = a_old.run(&["send", &m_req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("W1 A's older copy pays M, shown the signer's own witness: ok={} {}", ok, v);
+	assert!(!ok);
+	assert!(v["error"]["message"].as_str().unwrap().contains("the operator's signer is stopped on its own proof"), "{}", v);
 	let id: LeafId = c_a.parse().unwrap();
 	println!("W1 C_A at the server: {:?}", r.server.store.leaf(&id.0).await.unwrap().map(|l| l.state));
 
@@ -2546,6 +2574,71 @@ async fn a_rewritten_witness_is_an_unreachable_server_and_takes_nothing() {
 	}
 	assert!(!b.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["reason"].as_str().unwrap_or("").contains("goes no further")));
 	r.produce().await;
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7e F6 turned around. A wallet whose witness of the operator's signer's
+/// record fails (the server denies it, here with a 503 on the way) takes no
+/// coin and signs no spend through the operator until one succeeds: the
+/// library witnesses inside every entry point, whatever its caller did
+/// first. `send`, `board`, `participate` and a swap's offer are refused
+/// before anything is signed, the mailbox is not read, and `sync` does only
+/// what it does on the chain. Once the witness answers again, all of it
+/// goes on: the coin that waited in the mailbox is taken, and the payment
+/// goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_whose_witness_fails_takes_no_coin_and_signs_no_spend() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let pb = Proxy::start(&url);
+	let (a, b) = (Arca::new("F6A"), Arca::new("F6B"));
+	boarded(&mut r, &a, &url, &[(x, 4_000_000)]).await;
+	let board = boarded(&mut r, &b, &pb.url.clone(), &[(x, 2_000_000)]).await.remove(0);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	let to_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let onchain_before = b.ok(&["balance"])["sequentia_onchain"].clone();
+	pb.rewrite(Some(Arc::new(|path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/witness" {
+			*v = json!({"error": {"code": "signer_unavailable", "message": "the signer is not answering"}});
+			return Some(503);
+		}
+		None
+	})));
+	let calls = |w: &str| pb.count(w);
+	let (sends, boards_posted, mails) = (calls("/v1/cosign_transfer"), calls("/v1/register_board"), calls("/v1/mailbox_read"));
+	for (what, args) in [
+		("send", vec!["send", to_a.as_str(), "--amount", "100000", "--asset", &x.to_string()]),
+		("board", vec!["board", &x.to_string(), "1000000"]),
+		("participate", vec!["participate"]),
+		("swap offer", vec!["swap", "offer", "--give-asset", &x.to_string(), "--give", "100000", "--want-asset", &y.to_string(), "--want", "100000"]),
+		("mailbox", vec!["mailbox"]),
+	] {
+		let (ok, v) = b.run(&args);
+		println!("F6 with the witness failing, {}: ok={} {}", what, ok, v["error"]);
+		assert!(!ok && v["error"]["kind"] == "unreachable", "{} is refused while no witness succeeds: {}", what, v);
+	}
+	let s = b.ok(&["sync"]);
+	println!("F6 with the witness failing, sync: witness {} | mailbox {} | participations {}", s["witness"], s["mailbox"], s["participations"]);
+	assert!(s["witness"]["error"].is_string());
+	assert!(s["mailbox"]["note"].as_str().unwrap_or("").contains("takes no coin and signs no spend"), "{}", s["mailbox"]);
+	assert_eq!((calls("/v1/cosign_transfer"), calls("/v1/register_board"), calls("/v1/mailbox_read")), (sends, boards_posted, mails),
+		"nothing was asked of the operator that signs a spend or takes a coin");
+	let coins = b.ok(&["coins"]);
+	assert_eq!(coins.as_array().unwrap().len(), 1, "no coin taken: {}", coins);
+	assert_eq!(coin_of(&b, &board)["state"], "live", "the board was not given up nor spent");
+	assert_eq!(b.ok(&["balance"])["sequentia_onchain"], onchain_before, "no board transaction");
+
+	// The witness answers again: everything goes on.
+	pb.rewrite(None);
+	let s = b.ok(&["sync"]);
+	println!("F6 the witness answers again: mailbox {}", s["mailbox"]["accepted"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|a| a.len()), Some(1));
+	let sent = b.ok(&["send", &to_a, "--amount", "100000", "--asset", &x.to_string()]);
+	assert!(sent["transfer"]["transfer_id"].is_string(), "{}", sent);
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}

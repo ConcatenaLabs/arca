@@ -548,16 +548,23 @@ impl Wallet {
 	/// on the chain, and every exit it started.
 	pub fn sync(&mut self) -> Result<Value, Error> {
 		// The witness first: after a rollback of the operator's signer's
-		// record the wallet does only what it does on the chain.
-		let witness = self.witness().unwrap_or_else(|e| json!({"error": e.to_string()}));
+		// record the wallet does only what it does on the chain, and while
+		// no witness succeeds it takes no coin and signs no spend through
+		// the operator: it does only what it does on the chain.
+		let witness = self.witness();
+		let witnessed = witness.is_ok();
+		let witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let gone = self.rolled_back()?.is_some();
-		let boards = if gone { vec![] } else { self.retry_boards()? };
+		let talk = witnessed && !gone;
+		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
+			signs no spend through the operator until one does"});
+		let boards = if talk { self.retry_boards()? } else { vec![] };
 		let recheck = self.recheck()?;
-		let transfers = if gone { vec![] } else { self.retry_transfers()? };
-		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
-		let participations = if gone { Value::Array(vec![]) } else {
+		let transfers = if talk { self.retry_transfers()? } else { vec![] };
+		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
+		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
-		};
+		} else if gone { Value::Array(vec![]) } else { waiting() };
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		Ok(json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,

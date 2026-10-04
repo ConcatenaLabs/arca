@@ -929,6 +929,76 @@ async fn a_witness_answer_is_the_signers_own_word_and_a_stop_carries_its_proof()
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// R7e F6, the witness's own points. A witness naming more than four heads
+/// without `S`'s valid signature is refused, before the record is read: the
+/// signer checks every signature before it looks anything up. On a record of
+/// 5,000 entries, whose older entries are read back from the file, 32 heads
+/// with garbage signatures at those entries are refused with no read of the
+/// record (watched with `strace`: no `lseek` of a copy of its file between
+/// the answer before and this answer), while four of them are answered, and
+/// 32 heads `S` signed are answered, each read back from the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_witness_checks_signatures_before_it_reads_and_bounds_the_unsigned() {
+	use server::signer::{chain_hash, hex, record_header};
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	// 5,000 entries, written as a signer writes them.
+	let header = record_header(&xonly(&s), &genesis);
+	let mut text = format!("{}\n", header);
+	let mut prev = chain_hash(&[0; 32], &header);
+	let mut hashes = vec![prev];
+	for n in 1..=5000u64 {
+		let mut salt = [0u8; 32];
+		salt[..8].copy_from_slice(&n.to_le_bytes());
+		let line = format!("{} spend {} {} {}", n, "02".repeat(32), hex(&salt), "0b".repeat(32));
+		prev = chain_hash(&prev, &line);
+		hashes.push(prev);
+		text.push_str(&format!("{} {}\n", line, hex(&prev)));
+	}
+	std::fs::write(&record, text).unwrap();
+	let trace = dir.join("witness.trace");
+	let run = Run::start(&dir, "traced", genesis, &record, &format!(
+		"exec strace -f -qq -s 48 -e trace=lseek,pread64,sendto,write -o {} ", trace.display())).unwrap();
+	let garbage = elements::secp256k1_zkp::schnorr::Signature::from_slice(&[1; 64]).unwrap();
+	let mark = || raw(&run.socket, r#"{"op":"pubkey"}"#);
+	let _ = mark().await;
+	let unsigned: Vec<_> = (1..=32u64).map(|n| (n * 10, hashes[(n * 10) as usize], Some(garbage))).collect();
+	let w = witness(&run.socket, &unsigned).await;
+	println!("32 heads with garbage signatures at old entries: {}", w["error"]);
+	assert!(w["error"].as_str().unwrap_or("").contains("32 heads without the signer's valid signature; a witness names at most 4"), "{}", w);
+	let _ = mark().await;
+	let w = witness(&run.socket, &unsigned[..4]).await;
+	assert_eq!(w["hashes"].as_array().map(|a| a.len()), Some(4), "four are answered: {}", w);
+	assert_eq!(w["hashes"][0]["hash"], serde_json::json!(hex(&hashes[10])));
+	let _ = mark().await;
+	let signed: Vec<_> = (1..=32u64).map(|n| (n * 10, hashes[(n * 10) as usize], Some(head_sig(&s, genesis, n * 10, &hashes[(n * 10) as usize]))))
+		.collect();
+	let w = witness(&run.socket, &signed).await;
+	assert_eq!(w["hashes"].as_array().map(|a| a.len()), Some(32), "{}", w);
+	assert!(w["stopped"].is_null());
+	let _ = mark().await;
+	let tracer = run.child.id();
+	let children = std::fs::read_to_string(format!("/proc/{}/task/{}/children", tracer, tracer)).unwrap_or_default();
+	for pid in children.split_whitespace() {
+		let _ = Command::new("kill").args(["-9", pid]).status();
+	}
+	run.stop();
+	let t = std::fs::read_to_string(&trace).unwrap();
+	let lines: Vec<&str> = t.lines().collect();
+	// The marks are the answers to the `pubkey` requests between.
+	let marks: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.contains("{\\\"pubkey\\\":")).map(|(i, _)| i).collect();
+	let reads = |from: usize, to: usize| lines[from..to].iter().filter(|l| l.contains(" lseek(") || l.contains(" pread64(")).count();
+	println!("the trace: {} marks; reads of the record: refused call {}, four unsigned {}, 32 signed {}", marks.len(),
+		reads(marks[0], marks[1]), reads(marks[1], marks[2]), reads(marks[2], marks[3]));
+	assert_eq!(marks.len(), 4, "{}", t);
+	assert_eq!(reads(marks[0], marks[1]), 0, "nothing of the record is read for a call refused on its signatures");
+	assert!(reads(marks[1], marks[2]) >= 4 && reads(marks[2], marks[3]) >= 32, "the heads answered are read back from the file");
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A spend of one of the operator's own paths: a coin at a taproot output
 /// whose one leaf is `<S> OP_CHECKSIG`, spent to a bare `OP_TRUE`.
 fn own_spend(s: &Keypair) -> (elements::Transaction, Vec<elements::TxOut>, Script) {

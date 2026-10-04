@@ -693,9 +693,18 @@ sources could use up; a request past either is refused with 429
 what bounds the rows, since a nonce's row is what makes it single use, and a
 caller holding more sources than the overall rate (more than 250 IPv4
 addresses or IPv6 /48s, at the defaults) can take every overall token while
-it keeps asking, after which boarding waits for the bucket to refill. A `witness`, which reads the signer's record under its lock,
-is answered within the same rates, from a bucket of its own: a wallet makes
-one each command. A `challenge` writes no row and is not limited. A source is
+it keeps asking, after which boarding waits for the bucket to refill. A
+`witness`, which reads the signer's record under its lock and carries up to
+34 of the signer's signatures, has a budget of its own, apart from the
+nonces' (`witness_per_second` and `witness_burst` overall,
+`witness_source_per_second` and `witness_source_burst` for each source; 500
+a second with bursts of 5,000, and 5 a second with bursts of 60, at the
+defaults): a wallet makes one each command, and a caller that uses up the
+nonces leaves every wallet its witness. A witness names at most 32 heads, of
+which at most four without the signer's valid signature; the server and the
+signer each check every signature before anything is looked up, and refuse a
+call naming more (`malformed`), so only the signer's own heads cost a read of
+the record. A `challenge` writes no row and is not limited. A source is
 an IPv4 address, or an IPv6 /48. A request from a trusted proxy
 (`trusted_proxies`, loopback by default, for a proxy on the same machine) is
 counted against the nearest address in its `X-Forwarded-For` that is not a
@@ -883,7 +892,7 @@ with their smallest leaf, how often a round is built, the assets a round's
 fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
-behind (`[limits]`: the rate of nonces and of witnesses, for each source and overall, the
+behind (`[limits]`: the rate of nonces, and the witness's own, for each source and overall, the
 proxies trusted to name a request's source, a nonce's lifetime,
 how long a board may stay out of every block), and where the operator's
 metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
@@ -1245,6 +1254,10 @@ and with no other, an end's signature not a head's nor a head's an end's;
 a stopped signer answering with the head that stopped it, as handed over,
 and its end before it signed with the nonce, across a restart, and, stopped
 on another hash at an entry it holds, with the head it holds there, signed.
+And the witness's bounds: on a record of 5,000 entries, 32 heads with
+garbage signatures at entries read back from the file refused, with no read
+of the record (watched with `strace`), four of them answered, and 32 heads
+the signer signed answered, each read back.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next
@@ -1296,7 +1309,10 @@ honest wallet asking once a second every one of its twenty, and gets its own
 share of nonces and no more; a caller naming a new source in every request,
 from no trusted proxy, is counted as the address that connected. Six sources
 each asking every 10 ms, each held to its own rate, leave an honest caller
-from a seventh every challenge and every nonce it asks for over 30 s.
+from a seventh every challenge and every nonce it asks for over 30 s. The
+witness's budget is its own: with nonces held to one in all, twenty witnesses
+from five sources are each answered, and with witnesses held to two in all,
+the third is refused while nonces go on.
 
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,
