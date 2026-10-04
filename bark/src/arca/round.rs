@@ -343,11 +343,11 @@ impl Wallet {
 	/// operator gave back (`returned`) is live again. Any other is held
 	/// under a forfeit the wallet signed: one for a round that is not gone,
 	/// which the operator could still claim, or one the operator published,
-	/// or handed to the node, for a round that can never return, which may
+	/// or handed to the node, for a round that is lost, which may
 	/// still confirm (the status's `void_reason` says so). The coin stays
 	/// given up, `forfeited`: the wallet follows its forfeit on the chain
 	/// ([`Self::watch_forfeits`]) and refunds it once its delay has run, and
-	/// a coin whose forfeit is for a round that can never return and is not
+	/// a coin whose forfeit is for a lost round and is not
 	/// on the chain is taken on the chain at once, by its exit, whichever of
 	/// the two confirms first. An operator that does not say which coins it
 	/// gave back is taken to give back every coin with no forfeit open.
@@ -401,7 +401,7 @@ impl Wallet {
 		let mut out_held = vec![];
 		for (l, open) in &held {
 			let mut h = json!({"leaf_id": l, "forfeit_for_round": open.iter().map(|f| f.round.clone()).collect::<Vec<_>>()});
-			// A forfeit for a round that can never return, not on the chain:
+			// A forfeit for a lost round, not on the chain:
 			// the coin goes on the chain at once by its exit.
 			let mut exit = !open.is_empty();
 			for f in open {
@@ -697,7 +697,7 @@ impl Wallet {
 	/// claim a rollback took out) and their round can return: the output is
 	/// then the operator's to claim, and the wallet sends no refund and
 	/// follows it; a forfeit never published,
-	/// whose round can never return, is void, and its coin is the wallet's
+	/// whose round is lost, is void, and its coin is the wallet's
 	/// again. A refund in the mempool, or a claim in a block not yet final,
 	/// decides nothing: the other may still take the output.
 	///
@@ -798,6 +798,14 @@ impl Wallet {
 		// the output is the operator's claim to make: the wallet only
 		// follows it.
 		if let Some(at) = self.chain.locate(std::slice::from_ref(&out))?[0] {
+			// The participation stands in another of its rounds: the coin was
+			// exchanged for that round's leaves, whatever becomes of this
+			// forfeit's.
+			if let Some(other) = self.stands_elsewhere(f)? {
+				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string(), "state": f.state,
+					"note": format!("the forfeit's output is unspent, and the participation stands in round {}, whose leaves the wallet \
+					holds for this coin: the wallet sends no refund of it while that round is in the chain", other)})));
+			}
 			if self.holds_preimage(f)? && !self.round_gone(f)? {
 				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string(), "state": f.state,
 					"note": "the forfeit's output is unspent, and the wallet holds the preimage of the new leaves it was given up for, \
@@ -851,7 +859,7 @@ impl Wallet {
 					"finality": finality.word(), "note": why})));
 			}
 		}
-		// Never published: void once its round can never return.
+		// Never published: void once its round is lost.
 		if f.state != "signed" {
 			return Ok(None);
 		}
@@ -866,11 +874,156 @@ impl Wallet {
 			}
 			// The coin follows its participation, which the operator runs
 			// again: it is the wallet's again only once the operator says so.
-			let why = format!("round {} can never return, so its forfeit can never be claimed", f.round);
+			let why = format!("round {} is lost, so its forfeit cannot be claimed while it is", f.round);
 			self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
 			return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "note": why})));
 		}
 		Ok(None)
+	}
+
+	/// Follows each participation to the one of its rounds that stands. A
+	/// participation can have been in several rounds: one that went out of
+	/// the chain, and the round that ran it again, which spends a coin that
+	/// cannot exist beside the first, so at most one of them is in the chain
+	/// whatever the parent chain does. When one of them is final, and the
+	/// wallet holds its new leaves (their preimage in their records), the
+	/// participation is released in it: its leaves of that round are the
+	/// wallet's again once their round is final, and its leaves of every
+	/// other round are lost. Only a round whose forfeit of a coin given up
+	/// the wallet refunded (that coin came back to it) or whose coin given up
+	/// the wallet took on the chain itself is not followed: its leaves are
+	/// the operator's, who sweeps them with their batch. Run by the re-check,
+	/// so the wallet holds one leaf for each coin it gave up, whichever round
+	/// stands. Returns what changed.
+	pub(crate) fn follow_standing_rounds(&mut self) -> Result<Vec<Value>, Error> {
+		let mut changes = vec![];
+		let coins = self.store.coins()?;
+		let opens = |c: &super::store::CoinRow, round: &str, h: &str| -> bool {
+			c.kind == "batch" && c.bases.iter().any(|b| b == round) && matches!(Self::record_of(c),
+				Ok(CoinRecord::Leaf { record, .. }) if hex(&record.unlock_hash) == h)
+		};
+		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
+			if matches!(state.as_str(), "submitting" | "withdrawn" | "refused") {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			// Its rounds, each with the unlock hash its forfeits name.
+			let mut rounds: BTreeMap<String, String> = BTreeMap::new();
+			let mut forfeits: Vec<ForfeitRow> = vec![];
+			for l in &given {
+				for f in self.store.forfeits_of(l)? {
+					if f.participation == pid {
+						rounds.insert(f.round.clone(), f.unlock_hash.clone());
+						forfeits.push(f);
+					}
+				}
+			}
+			let held_of = |k: &str| -> Vec<&super::store::CoinRow> { coins.iter().filter(|c| opens(c, k, &rounds[k])).collect() };
+			// One round, released in it, its leaves not lost: nothing to follow.
+			if rounds.len() == 1 && state == "released" && pround.as_deref().is_some_and(|r| rounds.contains_key(r))
+				&& held_of(pround.as_deref().unwrap_or("")).iter().all(|c| c.state != "lost")
+			{
+				continue;
+			}
+			let mut standing = vec![];
+			for k in rounds.keys() {
+				let txid = Txid::from_str(k).map_err(|e| Error::Store(e.to_string()))?;
+				if !held_of(k).is_empty() && self.chain.finality(&txid)?.is_final() {
+					standing.push(k.clone());
+				}
+			}
+			let [k] = standing.as_slice() else { continue };
+			let leaves = held_of(k);
+			let already = state == "released" && pround.as_deref() == Some(k.as_str());
+			if !already || leaves.iter().any(|c| c.state == "lost") {
+				// A coin given up for this round that came back to the wallet on
+				// the chain while the round was out leaves its leaves to the
+				// operator.
+				let refunded = forfeits.iter().any(|f| &f.round == k && matches!(f.state.as_str(), "refunded" | "refunding"));
+				let exited = given.iter().any(|l| coins.iter().any(|c| &c.leaf_id == l && c.state == "exited"));
+				if refunded || exited {
+					let why = format!("round {} is in the chain again, but the coin given up for this leaf came back to the wallet on \
+						the chain while it was out (by {}): the leaf is the operator's, who sweeps it with its batch", k,
+						if refunded { "its forfeit's refund" } else { "its exit" });
+					for c in leaves.iter().filter(|c| matches!(c.state.as_str(), "live" | "pending" | "lost") && c.note != why) {
+						self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
+						changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lost", "why": why}));
+					}
+					continue;
+				}
+			}
+			let CoinRecord::Leaf { preimage, .. } = Self::record_of(leaves[0])? else { continue };
+			if !already {
+				let mut news = vec![];
+				for c in &leaves {
+					let CoinRecord::Leaf { record, auths, .. } = Self::record_of(c)? else { continue };
+					news.push(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Store(e.to_string()))?), "nonce": hex(&c.owner_nonce),
+						"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}));
+				}
+				let news = json!({"round": k, "leaves": news});
+				let why = format!("round {} of participation {} is final in the chain: the participation stands in it, and its leaves of \
+					any other round it was in are out of the chain", k, pid);
+				let given = given.clone();
+				let leaves_ids: Vec<(String, [u8; 32])> = leaves.iter().map(|c| (c.leaf_id.clone(), c.owner_nonce)).collect();
+				self.store.atomically(|s| {
+					s.set_participation_news(&pid, &news.to_string())?;
+					s.set_participation(&pid, "released", Some(&hex(&preimage)), Some(k))?;
+					for l in &given {
+						if s.coin(l)?.is_some_and(|c| matches!(c.state.as_str(), "given" | "forfeited")) {
+							s.set_coin_spent(l, &format!("participation {}", pid))?;
+						}
+						for f in s.forfeits_of(l)? {
+							if f.participation == pid && &f.round == k && f.state == "void" {
+								s.set_forfeit_state(l, k, "signed", &why)?;
+							}
+						}
+					}
+					for (leaf, nonce) in &leaves_ids {
+						s.wait_on_nonce(nonce)?;
+						s.use_nonce(nonce, leaf)?;
+					}
+					Ok(())
+				})?;
+				changes.push(json!({"participation": pid, "from": state, "to": "released", "round": k, "why": why}));
+			}
+			// Its leaves of the round that stands, the wallet's again; of every
+			// other round, out of the chain.
+			let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+			for c in leaves.iter().filter(|c| c.state == "lost") {
+				let record = Self::record_of(c)?;
+				let Ok(bases) = self.accepted_bases(&record) else { continue };
+				if record.resolve(&bases, &policy).is_err() {
+					continue;
+				}
+				let mut fin = true;
+				for t in &bases {
+					fin &= self.chain.finality(&t.txid())?.is_final();
+				}
+				let (to, why) = if fin { ("live", format!("round {} is final in the chain again", k)) } else {
+					("pending", format!("round {} is in the chain again, not yet final", k)) };
+				self.store.set_coin_state(&c.leaf_id, to, &why)?;
+				changes.push(json!({"leaf_id": c.leaf_id, "from": "lost", "to": to, "why": why}));
+			}
+			for (j, h) in rounds.iter().filter(|(j, _)| *j != k) {
+				for c in coins.iter().filter(|c| opens(c, j, h) && matches!(c.state.as_str(), "live" | "pending")) {
+					let why = format!("round {} is out of the chain: round {} of the same participation stands, and the wallet holds its \
+						leaves in their place", j, k);
+					self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
+					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lost", "why": why}));
+				}
+			}
+		}
+		Ok(changes)
+	}
+
+	/// The round, other than the one forfeit `f` was signed for, that the
+	/// participation `f` belongs to stands in: released in it and in a
+	/// block of the chain. The coin was exchanged for that round's leaves.
+	fn stands_elsewhere(&self, f: &ForfeitRow) -> Result<Option<String>, Error> {
+		let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == f.participation) else { return Ok(None) };
+		let Some(round) = p.6.filter(|r| p.4 == "released" && *r != f.round) else { return Ok(None) };
+		let txid = Txid::from_str(&round).map_err(|e| Error::Store(e.to_string()))?;
+		Ok(self.chain.finality(&txid)?.in_chain().then_some(round))
 	}
 
 	/// Whether the wallet holds the preimage of the participation forfeit
@@ -882,9 +1035,10 @@ impl Wallet {
 			.filter_map(|pre| unhex32(&pre).ok()).any(|pre| sha256::Hash::hash(&pre).to_byte_array() == unlock))
 	}
 
-	/// Whether the round forfeit `f` is bound to can never return: an input
-	/// of it is spent by another transaction that is final. Its connector
-	/// asset can then never be issued, so no claim of the forfeit can be made.
+	/// Whether the round forfeit `f` is bound to is lost: out of the chain,
+	/// and an input of it spent by another transaction that is final. Its
+	/// connector asset is then not issued, so no claim of the forfeit can be
+	/// made while that stands.
 	fn round_gone(&self, f: &ForfeitRow) -> Result<bool, Error> {
 		let Some(raw) = self.store.tx(&f.round)? else { return Ok(false) };
 		let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;

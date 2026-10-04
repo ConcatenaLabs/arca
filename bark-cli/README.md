@@ -110,16 +110,23 @@ the keys, but which coins were spent off-chain is in the store and the server.
   the chain, not from what it stored: when another transaction now pays a
   batch output a coin rests on, the checks run again on that one, and a coin
   that fails them on a transaction the chain holds goes into its exit at once.
-  A coin resting on a round that can never return (a coin the round spends is
-  spent by another transaction that is final) is `lost`. A board held as
-  `lost` whose transaction the chain holds is followed again once the server
-  reports it credited. Every participation such a round ran, the operator
-  runs again, under the same keys and owner nonces, and the wallet follows
-  it as any participation: it hands over its forfeit for the new round and
-  takes its new leaves. One the operator will never take (a coin of it whose
-  forfeit for the lost round the operator published, or whose output is spent
-  on the chain) is `void`, with the operator's reason shown, and the wallet
-  waits on it no more.
+  A coin resting on a round that is out of the chain while a coin the round
+  spends is spent by another transaction that is final is `lost`. A board
+  held as `lost` whose transaction the chain holds is followed again once the
+  server reports it credited. Every participation such a round ran, the
+  operator runs again, under the same keys and owner nonces, in a round that
+  cannot stand in the chain beside the lost one, and the wallet follows it as
+  any participation: it hands over its forfeit for the new round and takes its
+  new leaves. One the operator will never take (a coin of it whose forfeit for
+  the lost round the operator published, or whose output is spent on the
+  chain, or with no coin of the operator's to keep a re-run apart from the
+  lost round) is `void`, with the operator's reason shown. A lost round can
+  return with the parent chain, however deep: a participation follows
+  whichever of its rounds is final in the chain, its leaves of that round
+  live again and its leaves of the other `lost`, so the wallet holds one leaf
+  for each coin it gave up. A leaf of a round that returns after the coin
+  given up for it came back to the wallet on the chain (its forfeit's refund,
+  or its exit) is the operator's, and stays `lost`.
 - **A coin handed over stays the wallet's until the chain says otherwise.** A
   coin given to a participation, or sent in a transfer the server has not
   answered, can be exited at any time; exiting it withdraws the wallet from the
@@ -139,15 +146,16 @@ the keys, but which coins were spent off-chain is in the store and the server.
   since it confirmed is the wallet's to refund, and the coin is `exited` once
   that refund is final. A wallet that holds the preimage of the new leaves
   (read from a claim a rollback then took out) sends no refund while their
-  round can return: the coin was exchanged for those leaves, and the output
-  is the operator's to claim again. A refund in the mempool, or a claim in a block not
+  round can return, nor while the participation stands in another of its
+  rounds in the chain: the coin was exchanged for those leaves, and the
+  output is the operator's to claim again. A refund in the mempool, or a claim in a block not
   yet final, decides nothing: the other may still take the output. A forfeit
   decided by a final refund or claim is still looked at until its new
   leaves' batch has expired: a rollback, however deep, that leaves that
   spend not final makes the forfeit undecided again, and the chain decides
   it again, so a claim that confirms in place of a refund still gives the
   wallet the preimage and its new leaves. A forfeit never published whose
-  round can never return is void.
+  round is lost is void.
 
 - **A board's dates.** A board, and every coin resting on it, carries the
   dates of a batch made when the board confirmed: its service expiry is 28
@@ -346,13 +354,20 @@ and holding it there, with the reason shown:
 - a coin in flight when the operator vanishes;
 - a preimage withheld and a participation called void after its forfeit, the
   preimage then read from the operator's claim on the chain;
-- a round that can never return, which refreshed two boards and a leaf of an
+- a lost round, which refreshed two boards and a leaf of an
   earlier round, both boards' forfeits published: the leaf's participation,
   run again, is taken into the next round and the wallet takes its new leaf;
   each board's is `void`, the operator's reason shown, the wallet waiting on
   it no more; the board whose forfeit someone sent again is refunded after
   its delay, `exited` once the refund is final, and the other, its forfeit
   not on the chain, is exited at once (with a fee asset named) and claimed;
+- a lost round that returns: a leaf refreshed in round R, which goes out of
+  the chain with its Bitcoin parent block while another transaction of the
+  operator's takes R's input; the participation run again in Y, which spends
+  that transaction's output, the wallet taking Y's leaf; then the parent
+  chain takes that transaction out and R confirms in its place: the node
+  refuses Y, and the wallet holds its leaf of R, live, and its leaf of Y
+  `lost`, one leaf for the coin it gave up;
 - a forfeit's refund sent once its delay has run and replaced in the mempool
   by the operator's claim, which confirms: the wallet reads the preimage from
   the claim and holds its new leaf, and the coin given up is spent; a refund

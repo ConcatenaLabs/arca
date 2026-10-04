@@ -29,14 +29,14 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 14);
+	assert_eq!(db.store.schema_version().await.unwrap(), 15);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 14);
+	assert_eq!(again.schema_version().await.unwrap(), 15);
 }
 
-/// A database of schema 13 moves to 14 in place: the table of the keepers'
+/// A database of schema 13 moves to 15 in place: the table of the keepers'
 /// acknowledgements is made, empty, and what the database held stays.
 #[tokio::test]
 async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
@@ -45,23 +45,24 @@ async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
 	tokio::spawn(async move {
 		let _ = conn.await;
 	});
-	client.batch_execute("DROP TABLE record_head_ack; DELETE FROM arca_schema WHERE version = 14;").await.unwrap();
+	client.batch_execute("DROP TABLE record_head_ack; DROP TABLE round_rerun; DELETE FROM arca_schema WHERE version >= 14;").await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 13);
 	db.store.set_signer_head_signed(3, &[3; 32], None).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 14);
+	assert_eq!(db.store.schema_version().await.unwrap(), 15);
 	assert_eq!(db.store.signer_head().await.unwrap(), Some((3, [3; 32])), "what the database held stays");
 	assert!(db.store.head_acks(3, &[3; 32]).await.unwrap().is_empty());
 	let ack = server::keeper::WireAck { key: "11".repeat(32), nonce: "22".repeat(32), signature: "33".repeat(64) };
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	assert_eq!(db.store.head_acks(3, &[3; 32]).await.unwrap(), vec![ack], "kept once");
-	println!("schema 13 -> 14: the keepers' acknowledgements kept by head");
+	println!("schema 13 -> 15: the keepers' acknowledgements kept by head");
 }
 
 /// A database of schema 12, with a participation running again
-/// forfeit-first, moves to 13 in place: the participation is an ordinary
-/// re-run, pending, with no reason to be void.
+/// forfeit-first, moves to 15 in place: the participation is an ordinary
+/// re-run, pending, with no reason to be void, and the table of the coins
+/// that keep re-runs apart from their lost rounds is there, empty.
 #[tokio::test]
 async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 	let db = TestDb::new().await;
@@ -75,6 +76,7 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		 ALTER TABLE participation DROP COLUMN void_reason;
 		 ALTER TABLE watcher_tx DROP COLUMN round_id;
 		 DROP TABLE record_head_ack;
+		 DROP TABLE round_rerun;
 		 DELETE FROM arca_schema WHERE version >= 13;"
 	).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 12);
@@ -85,10 +87,12 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		&[&&id[..], &&[8u8; 32][..], &&[9u8; 32][..]],
 	).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 14);
+	assert_eq!(db.store.schema_version().await.unwrap(), 15);
 	let p = db.store.participation(&id).await.unwrap().unwrap();
 	assert_eq!((p.state, p.attempt, p.void_reason.clone()), (server::store::ParticipationState::Pending, 1, None));
-	println!("schema 12 -> 13: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
+	println!("schema 12 -> 15: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
+	let ties: i64 = client.query_one("SELECT count(*) FROM round_rerun", &[]).await.unwrap().get(0);
+	assert_eq!(ties, 0);
 	let cols: Vec<String> = client.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'participation'", &[])
 		.await.unwrap().iter().map(|r| r.get(0)).collect();
 	assert!(!cols.contains(&"forfeit_first".to_string()) && cols.contains(&"void_reason".to_string()));

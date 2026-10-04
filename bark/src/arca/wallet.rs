@@ -1182,6 +1182,8 @@ impl Wallet {
 				changes.push(json!({"round": r, "can_never_return": true, "participations": back}));
 			}
 		}
+		// Each participation follows the one of its rounds that stands.
+		changes.extend(self.follow_standing_rounds()?);
 		// What the lineage watch does to a coin is the coin's one change.
 		for mut ch in self.watch_lineages()? {
 			let id = ch["leaf_id"].as_str().unwrap_or("").to_string();

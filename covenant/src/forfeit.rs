@@ -74,19 +74,29 @@
 //! elsewhere and force a replacement. Fills go in their own round
 //! transactions.
 //!
-//! A round that cannot return leaves every owner who gave up a leaf for it a
-//! forfeit no claim can answer, signed by both and ending in the owner's
-//! refund, once on the chain. An owner holding that forfeit whole and the
-//! preimage of a re-run would publish the old forfeit, refund it, and keep
-//! the new leaf too. The owner holds it whole only if the operator published
-//! it: the operator's half never leaves the operator otherwise. So a coin
-//! whose forfeit for the lost round the operator published is never taken
-//! into a re-run (its owner refunds that forfeit), the operator never
-//! publishes a forfeit for the lost round once it is lost, and any other
-//! re-run completes as an ordinary participation: its forfeit for the new
-//! round taken and its preimage released against it. For the same reason
-//! the operator co-signs no other off-chain spend of a leaf given up for a
-//! lost round.
+//! A round out of the chain whose input another transaction took leaves
+//! every owner who gave up a leaf for it a forfeit no claim can answer while
+//! it is out, signed by both and ending in the owner's refund, once on the
+//! chain. An owner holding that forfeit whole and the preimage of a re-run
+//! would publish the old forfeit, refund it, and keep the new leaf too. The
+//! owner holds it whole only if the operator published it: the operator's
+//! half never leaves the operator otherwise. So a coin whose forfeit for the
+//! lost round the operator published is never taken into a re-run (its owner
+//! refunds that forfeit, unless the round returns and the operator claims it
+//! first), the operator publishes no forfeit for the lost round while it is
+//! lost, and any other re-run completes as an ordinary participation: its
+//! forfeit for the new round taken and its preimage released against it.
+//! For the same reason the operator co-signs no other off-chain spend of a
+//! leaf given up for a lost round.
+//!
+//! A lost round can still return, with the parent chain, however deep. So
+//! the round that runs its participations again spends a coin of the
+//! operator's that cannot exist while the lost round is in the chain (an
+//! input of the lost round still unspent, or an output of a transaction that
+//! took one), and at most one of the two rounds is ever in the chain: each
+//! owner holds one leaf for each coin it gave up, and the operator one
+//! forfeit it can claim for it, whichever round stands. That is a choice of
+//! the round's inputs, not a script: nothing here changes for it.
 //!
 //! [`Forfeit`] builds the transactions. The forfeit itself moves the old leaf
 //! into the forfeit output by the leaf's collaborative path; owner and

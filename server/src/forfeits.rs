@@ -65,8 +65,9 @@
 //! before the participation's preimage went out; while the participation's
 //! round is not final; and for a coin that has no lowest node (a board, or a
 //! coin a reassignment made). Each release is stored with its round and `M`.
-//! When a round can never return, the releases given for it are retired:
-//! their `M` can never be issued.
+//! When a round is lost, the releases given for it are retired: their `M`
+//! is not issued while the round is out of the chain. A lost round that is
+//! final again is restored, and its releases with it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

@@ -323,9 +323,8 @@ impl Store {
 	/// The coins owned by `key` (one that is not lost at most: a key owns one
 	/// leaf), as their owner may see them. A batch leaf's record holds its
 	/// participation's preimage, so it is served empty until that preimage
-	/// went out: the participation released at the leaf's attempt, then or
-	/// at an earlier attempt that a round it was in could never return
-	/// retired.
+	/// went out: the participation released at the leaf's attempt, now or
+	/// at an earlier attempt kept when a round it was in was lost.
 	pub async fn leaves_by_owner(&self, key: &[u8; 32]) -> Result<Vec<LeafRow>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(

@@ -30,7 +30,9 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V10__round_signer_head.sql`](schema/V10__round_signer_head.sql),
 [`schema/V11__signed_record_heads.sql`](schema/V11__signed_record_heads.sql),
 [`schema/V12__challenge_key.sql`](schema/V12__challenge_key.sql),
-[`schema/V13__reruns_are_ordinary.sql`](schema/V13__reruns_are_ordinary.sql)). `Store::connect` builds it
+[`schema/V13__reruns_are_ordinary.sql`](schema/V13__reruns_are_ordinary.sql),
+[`schema/V14__keeper_acks.sql`](schema/V14__keeper_acks.sql),
+[`schema/V15__rerun_ties.sql`](schema/V15__rerun_ties.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -417,40 +419,72 @@ broadcasts the round again byte for byte, so it returns with its txid, every
 forfeit signed for it still good, and its leaves are credited again once it is
 final again.
 
-A round that can never return (the nursery finds an input of it spent by
-another transaction that is final) is retired, in one database transaction:
-the round is lost, its new leaves not yet spent are lost, and every
-participation it ran runs again in a later round, under a new unlock hash and
-with a new operator nonce for each leaf it wants (its keys and owner nonces as
-before, so its owner's wallet recognises the new leaves), the attempt it
-leaves recorded. A round with another txid is always a new round with new
-hashes: nothing signed for the old one carries over. The coins those
+A round out of the chain whose input another transaction took, final, is
+lost (the nursery finds the conflict) and is retired, in one database
+transaction: the round is lost, its new leaves not yet spent are lost, and
+every participation it ran runs again in a later round, under a new unlock
+hash and with a new operator nonce for each leaf it wants (its keys and owner
+nonces as before, so its owner's wallet recognises the new leaves), the
+attempt it leaves recorded. A round with another txid is always a new round
+with new hashes: nothing signed for the old one carries over. The coins those
 participations gave up stay given up, so the operator co-signs no other
 off-chain spend of them, and any release of their lowest nodes given for the
-lost round is retired: it names the lost round's connector asset, which can
-never be issued, so no reclaim can use it.
+lost round is retired: it names the lost round's connector asset, which is
+not issued while the round is out of the chain.
+
+A lost round can still return: finality is modulo Bitcoin, so the parent
+chain can take out the transaction that took its input, however deep, and
+anyone holding the round can send it again. A round that runs a lost round's
+participations again therefore spends a coin of the operator's that cannot
+exist while the lost round is in the chain: an input of the lost round that
+is still unspent, or, where there is none, an output of a transaction that
+took one (or of a transaction of the operator's descending from it). Whatever
+the parent chain does, at most one of the two rounds is in the chain. The
+round records each lost round it replaces and the coin that keeps them apart
+(`round_rerun`). A re-run runs only with such a coin for every lost round its
+participation was in; where none of the operator's exists, the participation
+is voided and its status says so (`void_reason`), and its coins are its
+owner's on the chain. A round's inputs are the operator's choice, not a
+format: no script or transaction format changes for this.
+
+A round held as lost that is final in the chain again is restored, in one
+database transaction: the round is final; every round that ran its
+participations again and is not in the chain, which can now never confirm
+beside it, is retired; and each participation the round ran is back as it
+stood in it, under its unlock hash and operator nonces, its new leaves
+credited, its releases good again, and every forfeit naming the round
+followed by the nursery again, so the watcher publishes and claims them as
+for any final round. Nothing runs a third time for a participation whose
+first round stands; a participation a retired round ran that was never in the
+restored one runs again as after any lost round. A participation a coin of
+which was taken back on the chain while the round was out (its forfeit for
+the round refunded) is not brought back: its leaves of the round are never
+credited (`expired`), and the operator sweeps them with their batch. A coin
+resting on a round is as final as that round.
 
 A coin with a forfeit for an earlier round in the watcher's log, or whose
 output the server has seen spent, is never taken into a re-run: such a
 forfeit may still confirm, from any mempool that saw it, and is its owner's
-to refund once its delay has run, since no claim of a round that can never
-return can be made. The participation is voided and its status says why
+to refund once its delay has run while the round is out, since no claim of
+it can be made then. The participation is voided and its status says why
 (`void_reason`); its coins stay given up (the signer co-signs no spend under
 a salt it signed a forfeit under), so each is its owner's on the chain, by
-that forfeit's refund or by its exit. Any other re-run completes as an
-ordinary participation: its forfeit for the new round is taken and checked,
-the preimage released against it, and the coin left like any forfeited coin
-(a board lineage to the board's dates, a batch leaf to its batch's expiry,
+that forfeit's refund or by its exit, unless the round returns first and the
+watcher claims the forfeit. Any other re-run completes as an ordinary
+participation: its forfeit for the new round is taken and checked, the
+preimage released against it, and the coin left like any forfeited coin (a
+board lineage to the board's dates, a batch leaf to its batch's expiry,
 either answered at once if its owner exits). Nothing goes on the chain for a
 re-run that an ordinary participation would not put there.
 
-The server never publishes a forfeit naming a round that can never return,
-by any path. The watcher's log records the round each forfeit names and
-refuses one naming a round retired, under that round's row lock, so a
-forfeit is logged before its round is lost or never; the watcher publishes
-none whose round transaction can never confirm, retired or not yet; and the
-nursery gives up every such forfeit it holds before it could broadcast it
-again, on a pass, after a disconnection or at a restart.
+The server publishes no forfeit naming a lost round, by any path. The
+watcher's log records the round each forfeit names and refuses one naming a
+round retired, under that round's row lock, so a forfeit is logged before its
+round is lost or never; the watcher publishes none whose round transaction
+cannot confirm as the chain stands (lost, retired or not yet, or a re-run of
+a lost round that is final again); and the nursery gives up every such
+forfeit it holds before it could broadcast it again, on a pass, after a
+disconnection or at a restart, until the round is restored.
 
 The nursery does not call a round lost when its input's own transaction is
 reorganised away and never returns: such a round stays broadcast, its
@@ -493,8 +527,8 @@ is given it at start and every minute after; the signer signs again what it
 signed, and a forfeit is its owner's consent, so completing it takes
 nothing from anyone. The same request again gets
 the same preimage, whatever the chain has seen of the coins given up
-meanwhile. A participation run again after a round that could not return
-completes the same way, with its forfeits for the new round.
+meanwhile. A participation run again after a lost round completes the same
+way, with its forfeits for the new round.
 
 A new leaf is live, and can be paid on out of round, once its participation
 is released and its round final; a coin resting on a leaf of a round that is
@@ -505,8 +539,7 @@ participation whose forfeits have not come by then expires: its new leaves
 are never credited (their preimage never goes out, and the operator sweeps
 them with their batch at expiry), and each coin it gave up for which no
 forfeit was signed is given back, live again and free to be given up again. A
-coin under a forfeit signed for an earlier round that could not return stays
-given up. A forfeit step that reaches the server after the expiry, even one in
+coin under a forfeit signed for an earlier, lost round stays given up. A forfeit step that reaches the server after the expiry, even one in
 flight when it ran, is refused (`not_in_round`) and stores nothing. A round
 that stops being final and becomes final again starts the day again.
 
@@ -583,14 +616,6 @@ one, nor for a reclaim before an owner under it has released.
   next. A claim acts for its round (its log entry names `M`) and takes each
   forfeit as an input; it pays what the forfeits hold to the wallet, less the
   fee in the first of their assets the node accepts, or a wallet coin pays.
-- **Forfeit-first.** A participation run again after a round that could not
-  return has its forfeits stored and its preimage withheld. The watcher brings
-  each coin it gave up onto the chain from the coin's own record (each node of a
-  batch leaf's path by its owner's unroll authorisation, then its entry with
-  its preimage; the checkpoint of any board in its lineage), so the answer to
-  stale exits publishes its forfeit; it claims the forfeits, which reveals the
-  preimage, only once all of them are final, and releases the participation
-  once the claims are final.
 - **Offboards.** A released participation's offboard output is unlocked to its
   destination with the preimage, which its owner already holds, so the owner
   need do nothing more. One whose participation expired or was voided, its
@@ -1188,9 +1213,9 @@ not in the participation, and of a coin with an open reassignment.
 `tests/rollback.rs` disconnects a final round: its new leaf is uncredited at
 once and a transfer of it refused, a release refused, the round broadcast
 again by the server to a node restarted with an empty mempool, final again
-with its txid, the leaf credited again and paid on. Then a round that can never
-return, the operator's coin it spent taken by another transaction that becomes
-final: the round is retired, its leaves lost, and its participations run
+with its txid, the leaf credited again and paid on. Then a round that is lost, the
+operator's coin it spent taken by another transaction that becomes final and
+pays the operator back: the round is retired, its leaves lost, and its participations run
 again in a new round under new unlock hashes and operator nonces, as ordinary
 participations. The one whose preimage had gone out (giving up a leaf whose
 lowest node its owner had released) has its release retired, its old forfeit
@@ -1208,20 +1233,37 @@ completed (its node unrolled by its own authorisation, its entry unlocked):
 the watcher answers with its forfeit for the new round, never the lost
 round's, and claims it.
 
-`tests/rerun.rs` holds a round that can never return to its participations'
-coins. A board whose forfeit for the lost round the watcher published is never
-taken into its re-run: void, saying why, its coin not given back, the server's
-copy of that forfeit never broadcast again, no preimage for the re-run; the
-forfeit, sent by whoever saw it, confirms and is refunded by its owner once
-its delay has run, while the other participation of the round, whose forfeit
-was never published, completes in the next round with its preimage. A
-forfeit for the lost round the watcher logged and never got onto the chain is
-given up: not broadcast on a pass, once the node takes its fee asset again or
-after a restart; the log refuses another naming the round; an exit of a coin
-given up in it is answered with no forfeit, and that coin, its output spent,
-is never taken into its re-run. A sender's change on a board's lineage, and on
-a batch leaf's, stays live off the chain after the receiver's re-run
-completes, nothing of the lineage published, and the sender pays with it.
+`tests/rerun.rs` holds a lost round to its participations' coins. A board
+whose forfeit for the lost round the watcher published is never taken into
+its re-run: void, saying why, its coin not given back, the server's copy of
+that forfeit never broadcast again, no preimage for the re-run; the forfeit,
+sent by whoever saw it, confirms and is refunded by its owner once its delay
+has run, while the other participation of the round, whose forfeit was never
+published, completes in the next round with its preimage. A forfeit for the
+lost round the watcher logged and never got onto the chain is given up: not
+broadcast on a pass, once the node takes its fee asset again or after a
+restart; the log refuses another naming the round; an exit of a coin given up
+in it is answered with no forfeit, and that coin, its output spent, is never
+taken into its re-run. A sender's change on a board's lineage, and on a batch
+leaf's, stays live off the chain after the receiver's re-run completes,
+nothing of the lineage published, and the sender pays with it.
+
+`tests/rerun_returns.rs` brings a lost round back, every reorganisation driven
+through the parent chain: the round R goes out with its Bitcoin block, another
+transaction X takes its input, and its participations run again in Y; then
+the parent chain takes X out and R, sent again, confirms in its place. Where Y
+spends an input of R that was still unspent, and where it spends X's output
+(R's only input taken), the node refuses Y once R is in the chain
+(`missing-inputs`), the server restores R and retires Y, A's participation is
+back in R, its leaf of R live and its leaf of Y lost (the first unroll of the
+one taken, of the other refused), and the watcher claims A's board with its
+forfeit for R while its forfeit for Y can never confirm. Where X pays the
+operator nothing and R had no other input, the participation is voided,
+saying so, and restored when R returns, its board claimed with its forfeit
+for R. A participant whose forfeit for R the watcher published while R was
+final, voided while R is out, is restored with R and its forfeit claimed with
+R's connector asset; one that refunded that forfeit while R was out keeps the
+refund, and its leaf of R is never credited.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards
