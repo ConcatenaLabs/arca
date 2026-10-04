@@ -125,8 +125,12 @@ pub struct LimitsSection {
 	pub cleanup_interval_seconds: u64,
 	/// Witnesses of the signer's record answered per second at most, over
 	/// every source together, and how many at once: a budget of the
-	/// witness's own, apart from the nonces'. Each witness takes the
-	/// signer's record lock and up to 34 of its signatures.
+	/// witness's own, apart from the nonces', set well under what the
+	/// signer answers (about 2,500 witnesses of 32 heads it never saw a
+	/// second, on a record of 200,000 entries, measured on a release build),
+	/// so that witnesses leave co-signing its time. Each witness reads up to
+	/// 32 running hashes under the signer's record lock and carries up to 34
+	/// of its signatures.
 	#[serde(default = "default_witness_per_second")]
 	pub witness_per_second: u32,
 	#[serde(default = "default_witness_burst")]
@@ -154,11 +158,11 @@ impl Default for LimitsSection {
 }
 
 fn default_witness_per_second() -> u32 {
-	500
+	250
 }
 
 fn default_witness_burst() -> u32 {
-	5_000
+	1_000
 }
 
 fn default_witness_source_per_second() -> u32 {

@@ -732,10 +732,17 @@ it keeps asking, after which boarding waits for the bucket to refill. A
 `witness`, which reads the signer's record under its lock and carries up to
 34 of the signer's signatures, has a budget of its own, apart from the
 nonces' (`witness_per_second` and `witness_burst` overall,
-`witness_source_per_second` and `witness_source_burst` for each source; 500
-a second with bursts of 5,000, and 5 a second with bursts of 60, at the
+`witness_source_per_second` and `witness_source_burst` for each source; 250
+a second with bursts of 1,000, and 5 a second with bursts of 60, at the
 defaults): a wallet makes one each command, and a caller that uses up the
-nonces leaves every wallet its witness. A witness names at most 32 heads, of
+nonces leaves every wallet its witness. The overall budget is set well
+under what the signer answers: it keeps the signature of every head it made
+or checked and hands that one out again, reads the running hashes a witness
+asks for under its record's lock and signs after releasing it, and answers
+witnesses on several threads, so on a release build it answers about 2,500
+witnesses of 32 heads it never saw a second, on a record of 200,000 entries,
+while a co-signature beside eight callers witnessing as fast as they can
+waits a couple of milliseconds. A witness names at most 32 heads, of
 which at most four without the signer's valid signature; the server and the
 signer each check every signature before anything is looked up, and refuse a
 call naming more (`malformed`), so only the signer's own heads cost a read of
@@ -1015,12 +1022,22 @@ Each keeper, on a machine of its own, before the record is made:
     arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
         --heads /var/lib/arca/keeper.heads --create          # once
     arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
-        --heads /var/lib/arca/keeper.heads --listen 0.0.0.0:7341
+        --heads /var/lib/arca/keeper.heads --listen 0.0.0.0:7341 --allow <the signer's address>
 
 The keeper's key file holds its 32-byte secret key as 64 hex characters,
 readable by its owner alone. A keeper speaks plain TCP, one JSON object a
 line: every answer it gives is signed by its key over the asker's nonce,
-and it takes nothing but heads `S` signed, so it needs no TLS. Its heads
+and it takes nothing but heads `S` signed, so it needs no TLS. It is
+reached from the signer alone: it admits a connection only from an address
+`--allow` names (the signer's machine, one `--allow` for each address it may
+come from) and closes any other at once; it holds at most
+`--max-connections` open (16 by default; the signer keeps one), closes one
+left idle for `--idle-timeout-ms` (60 seconds by default; the signer opens a
+new one when it next needs it), and when an accept fails (out of
+descriptors, say) waits before accepting again, saying so once in a while.
+A firewall that admits the signer's address alone to the keeper's port does
+the same a step earlier, and is the better place for it where the machine
+has one. Its heads
 file is never restored from an older copy while the signer runs on, and
 never together with the signer's machine. Its key file is backed up as the
 operator key is: a keeper whose key is lost cannot be replaced, since the

@@ -83,7 +83,8 @@ impl KeeperProcess {
 	/// Starts the keeper again on its heads file, at the same address.
 	pub fn resume(&mut self) {
 		self.halt();
-		self.child = Some(self.command().args(["--listen", &self.addr]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+		self.child = Some(self.command().args(["--listen", &self.addr, "--allow", "127.0.0.1"]).stdout(Stdio::null()).stderr(Stdio::null())
+			.spawn().unwrap());
 		let start = Instant::now();
 		while TcpStream::connect(&self.addr).is_err() {
 			assert!(start.elapsed() < Duration::from_secs(20), "the keeper did not listen");

@@ -1111,11 +1111,17 @@ impl SpendRecord {
 
 	/// Calls `f` with each line from `from` on (its text, what it holds and
 	/// where it starts) until `f` says stop.
-	fn each_from(&self, from: u64, mut f: impl FnMut(&str, Line, u64) -> Result<bool, String>) -> Result<(), String> {
+	fn each_from(&self, from: u64, f: impl FnMut(&str, Line, u64) -> Result<bool, String>) -> Result<(), String> {
+		self.each_from_by(from, 1 << 20, f)
+	}
+
+	/// [`Self::each_from`], reading the file `chunk` bytes at a time: a
+	/// look-up that reads a few lines reads a few kilobytes, not a megabyte.
+	fn each_from_by(&self, from: u64, chunk: usize, mut f: impl FnMut(&str, Line, u64) -> Result<bool, String>) -> Result<(), String> {
 		use std::io::{BufRead, Seek};
 		let mut file = self.file.try_clone().map_err(|e| e.to_string())?;
 		file.seek(std::io::SeekFrom::Start(from)).map_err(|e| e.to_string())?;
-		let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+		let mut reader = std::io::BufReader::with_capacity(chunk, file);
 		let mut line = String::with_capacity(512);
 		let mut at = from;
 		while at < self.size {
@@ -1193,14 +1199,52 @@ impl SpendRecord {
 		if i == 0 {
 			return Ok(None);
 		}
+		let from = self.marks[i - 1].1;
+		if let Some(found) = self.scan_hash(from, n)? {
+			return Ok(found);
+		}
 		let mut found = None;
-		self.each_from(self.marks[i - 1].1, |_, l, _| {
+		self.each_from_by(from, 16 << 10, |_, l, _| {
 			if l.n() == n {
 				found = Some(l.hash());
 			}
 			Ok(l.n() < n)
 		})?;
 		Ok(found)
+	}
+
+	/// The running hash of entry `n` read from the whole lines of one read
+	/// of 32 KiB at `from`, a mark at or before it, taking of each line only
+	/// its number and its last field (every line was checked when the record
+	/// was opened, or written by this signer): `Some(None)` when the lines
+	/// pass `n` without it, `None` when the read ends before them.
+	fn scan_hash(&self, from: u64, n: u64) -> Result<Option<Option<[u8; 32]>>, String> {
+		use std::os::unix::fs::FileExt;
+		let len = (self.size.saturating_sub(from) as usize).min(32 << 10);
+		let mut buf = vec![0u8; len];
+		let mut got = 0;
+		while got < len {
+			let k = self.file.read_at(&mut buf[got..], from + got as u64).map_err(|e| e.to_string())?;
+			if k == 0 {
+				break;
+			}
+			got += k;
+		}
+		let mut rest = &buf[..got];
+		while let Some(end) = rest.iter().position(|b| *b == b'\n') {
+			let line = &rest[..end];
+			rest = &rest[end + 1..];
+			let at = line.iter().position(|b| *b == b' ').ok_or("a line without fields")?;
+			let m: u64 = std::str::from_utf8(&line[..at]).ok().and_then(|x| x.parse().ok()).ok_or("a line without its number")?;
+			if m > n {
+				return Ok(Some(None));
+			}
+			if m == n {
+				let last = line.iter().rposition(|b| *b == b' ').expect("a field");
+				return Ok(Some(Some(unhex32(std::str::from_utf8(&line[last + 1..]).map_err(|e| e.to_string())?)?)));
+			}
+		}
+		Ok(None)
 	}
 
 	/// Why the signer signs nothing more, if it does not.
@@ -1239,13 +1283,24 @@ impl SpendRecord {
 		// heads without one that holds are few: only `S`'s heads cost a read
 		// of the record beyond that bound.
 		let signed: Vec<Option<[u8; 32]>> = heads.iter().map(|h| self.signed_head(h)).collect();
+		self.witness_checked(heads, &signed)
+	}
+
+	/// [`Self::witness`], each head's signature checked already by the
+	/// caller, outside the lock the record is held under: `signed[i]` is
+	/// the running hash `heads[i]` names when it carries `S`'s valid
+	/// signature over it on this chain, `None` otherwise.
+	pub fn witness_checked(&mut self, heads: &[WireEntryRef], signed: &[Option<[u8; 32]>]) -> Result<Vec<WireEntryHash>, String> {
+		if signed.len() != heads.len() {
+			return Err("a signature check for every head".into());
+		}
 		let unsigned = signed.iter().filter(|s| s.is_none()).count();
 		if unsigned > MAX_UNSIGNED_WITNESS {
 			return Err(format!("{} heads without the signer's valid signature; a witness names at most {}", unsigned, MAX_UNSIGNED_WITNESS));
 		}
 		let mut out = Vec::with_capacity(heads.len());
 		let mut proof = None;
-		for (h, signed) in heads.iter().zip(signed) {
+		for (h, signed) in heads.iter().zip(signed.iter().copied()) {
 			let held = self.hash_of(h.entry).map_err(|e| format!("the record could not be read: {}", e))?;
 			out.push(WireEntryHash { entry: h.entry, hash: held.map(|x| hex(&x)), signature: None });
 			if proof.is_some() || self.stopped.is_some() {

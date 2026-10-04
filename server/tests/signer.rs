@@ -1126,3 +1126,148 @@ async fn a_record_compacted_in_format_2_is_read() {
 	run.stop();
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R7f F7, measured. What witnesses cost the signer, on a record of 200,000
+/// entries written as a signer writes them, each witness naming 32 heads
+/// `S` signed with a nonce. Warm: the same heads every time, as a wallet
+/// hands back what it holds, whose signatures the signer keeps. Cold: 32
+/// heads the signer never saw each call, every signature checked and every
+/// hash signed. Then how long a `head` and a co-signature (`rebind`) wait
+/// while eight callers witness at once, warm and cold, and the witnesses
+/// answered a second meanwhile. Prints what it measures (the signer named by
+/// `ARCA_MEASURED_SIGNER`, a release build, or this build's); asserts only
+/// that every answer is whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_witness_costs_the_signer() {
+	use server::signer::{chain_hash, hex, record_header};
+	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use std::sync::Arc;
+	use std::time::Instant;
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let header = record_header(&xonly(&s), &genesis);
+	let mut text = format!("{}\n", header);
+	let mut prev = chain_hash(&[0; 32], &header);
+	let mut hashes = vec![prev];
+	let n_entries = 200_000u64;
+	let nonces = std::cell::Cell::new(0u64);
+	let random32 = || {
+		nonces.set(nonces.get() + 1);
+		arca_covenant::script::sha256(&nonces.get().to_le_bytes())
+	};
+	for n in 1..=n_entries {
+		let mut salt = [0u8; 32];
+		salt[..8].copy_from_slice(&n.to_le_bytes());
+		let line = format!("{} spend {} {} {}", n, "02".repeat(32), hex(&salt), "0b".repeat(32));
+		prev = chain_hash(&prev, &line);
+		hashes.push(prev);
+		text.push_str(&format!("{} {}\n", line, hex(&prev)));
+	}
+	std::fs::write(&record, text).unwrap();
+	let exe = std::env::var("ARCA_MEASURED_SIGNER").unwrap_or_else(|_| env!("CARGO_BIN_EXE_arca-signer").to_string());
+	println!("MEASURE the signer: {}", exe);
+	let run = Run::start_of(&exe, &dir, "measured", genesis, &record, "exec ").unwrap();
+	let witness_line = |entries: &[u64]| {
+		let heads: Vec<serde_json::Value> = entries.iter().map(|e| serde_json::json!({"entry": e, "hash": hex(&hashes[*e as usize]),
+			"signature": hex(head_sig(&s, genesis, *e, &hashes[*e as usize]).as_ref())})).collect();
+		serde_json::json!({"op": "witness", "heads": heads, "nonce": hex(&random32())}).to_string()
+	};
+	let warm: Vec<u64> = (1..=32u64).map(|n| n * (n_entries / 33)).collect();
+	let warm_line = witness_line(&warm);
+	// Cold lines: 32 heads each, none named before (every 61st entry,
+	// round the record, past those the warm line names).
+	let mut next = 0u64;
+	let mut cold = || {
+		let e: Vec<u64> = (0..32).map(|_| { next += 61; next % n_entries + 1 }).collect();
+		witness_line(&e)
+	};
+	let one = |v: &serde_json::Value| assert_eq!(v["hashes"].as_array().map(|a| a.len()), Some(32), "{}", v);
+	let median = |t: &mut Vec<f64>| { t.sort_by(|a, b| a.partial_cmp(b).unwrap()); (t[t.len() / 2], t[t.len() - 1]) };
+	let mut tw = vec![];
+	for _ in 0..100 {
+		let at = Instant::now();
+		one(&serde_json::from_str(&raw(&run.socket, &warm_line).await).unwrap());
+		tw.push(at.elapsed().as_secs_f64() * 1000.0);
+	}
+	let mut tc = vec![];
+	for _ in 0..100 {
+		let line = cold();
+		let at = Instant::now();
+		one(&serde_json::from_str(&raw(&run.socket, &line).await).unwrap());
+		tc.push(at.elapsed().as_secs_f64() * 1000.0);
+	}
+	let ((wm, ws), (cm, cs)) = (median(&mut tw), median(&mut tc));
+	println!("MEASURE one witness of 32 signed heads with a nonce, {} entries: warm median {:.2} ms, slowest {:.2} ms; cold median {:.2} ms, \
+		slowest {:.2} ms (100 calls each, one at a time)", n_entries, wm, ws, cm, cs);
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let owner = keypair("owner");
+	let mut salt = 0u32;
+	let mut probe = |n: usize| {
+		let mut lines = vec![];
+		for _ in 0..n {
+			salt += 1;
+			let mut x = [0xaau8; 32];
+			x[..4].copy_from_slice(&salt.to_le_bytes());
+			lines.push(rebind_line(&owner, genesis, x, asset, 1, None));
+		}
+		lines
+	};
+	let quiet = probe(30);
+	let (mut h0, mut r0) = (vec![], vec![]);
+	for l in &quiet {
+		let at = Instant::now();
+		let _ = raw(&run.socket, r#"{"op":"head"}"#).await;
+		h0.push(at.elapsed().as_secs_f64() * 1000.0);
+		let at = Instant::now();
+		let v: serde_json::Value = serde_json::from_str(&raw(&run.socket, l).await).unwrap();
+		r0.push(at.elapsed().as_secs_f64() * 1000.0);
+		assert!(v["signature"].is_string(), "{}", v);
+	}
+	let ((h0m, _), (r0m, _)) = (median(&mut h0), median(&mut r0));
+	println!("MEASURE alone: a head median {:.2} ms; a co-signature median {:.2} ms", h0m, r0m);
+	let cold_lines: Vec<String> = (0..4000).map(|_| cold()).collect();
+	let cold_lines = Arc::new(cold_lines);
+	for (what, warm_load) in [("warm", true), ("cold", false)] {
+		let stop = Arc::new(AtomicBool::new(false));
+		let done = Arc::new(AtomicU64::new(0));
+		let mut tasks = vec![];
+		for c in 0..8u64 {
+			let (sock, wl, cl, stop, done) = (run.socket.clone(), warm_line.clone(), cold_lines.clone(), stop.clone(), done.clone());
+			tasks.push(tokio::spawn(async move {
+				let mut i = c as usize;
+				while !stop.load(Ordering::Relaxed) {
+					let l = if warm_load { wl.clone() } else { cl[i % cl.len()].clone() };
+					i += 8;
+					let _ = raw(&sock, &l).await;
+					done.fetch_add(1, Ordering::Relaxed);
+				}
+			}));
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		let started = Instant::now();
+		let before = done.load(Ordering::Relaxed);
+		let (mut h1, mut r1) = (vec![], vec![]);
+		for l in probe(30) {
+			let at = Instant::now();
+			let _ = raw(&run.socket, r#"{"op":"head"}"#).await;
+			h1.push(at.elapsed().as_secs_f64() * 1000.0);
+			let at = Instant::now();
+			let v: serde_json::Value = serde_json::from_str(&raw(&run.socket, &l).await).unwrap();
+			r1.push(at.elapsed().as_secs_f64() * 1000.0);
+			assert!(v["signature"].is_string(), "{}", v);
+		}
+		let rate = (done.load(Ordering::Relaxed) - before) as f64 / started.elapsed().as_secs_f64();
+		stop.store(true, Ordering::Relaxed);
+		for t in tasks {
+			let _ = t.await;
+		}
+		let ((h1m, h1s), (r1m, r1s)) = (median(&mut h1), median(&mut r1));
+		println!("MEASURE with eight callers witnessing, {}: a head median {:.2} ms, slowest {:.2} ms; a co-signature median {:.2} ms, slowest \
+			{:.2} ms; {:.0} witnesses/s answered", what, h1m, h1s, r1m, r1s, rate);
+	}
+	run.stop();
+	let _ = std::fs::remove_dir_all(&dir);
+}
