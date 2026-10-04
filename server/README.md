@@ -456,10 +456,19 @@ credited, its releases good again, and every forfeit naming the round
 followed by the nursery again, so the watcher publishes and claims them as
 for any final round. Nothing runs a third time for a participation whose
 first round stands; a participation a retired round ran that was never in the
-restored one runs again as after any lost round. A participation a coin of
-which was taken back on the chain while the round was out (its forfeit for
-the round refunded) is not brought back: its leaves of the round are never
-credited (`expired`), and the operator sweeps them with their batch. A coin
+restored one runs again as after any lost round. A participation one of
+whose coins was spent on the chain otherwise than by its forfeit for the
+round is not brought back: that forfeit refunded while the round was out,
+the coin's last output on the chain (its board output, the leaf its
+conversion made, or a leaf output its unroll made) spent by its owner's exit,
+or by another round's forfeit that came back with the reorganisation (a
+forfeit spends its coin alone, so a node puts it back in its mempool, and it
+confirms beside the round, while that round's claim of it never can). Its
+leaves of the round are never credited (`expired`), it is left void saying
+so, and the server serves them nothing; their owner holds their records, so
+they are its to take on the chain, and the loss, one coin's worth, is the
+operator's. Whatever the owner leaves of them the operator sweeps with their
+batch. Both need the parent chain to reorganise past a final transaction. A coin
 resting on a round is as final as that round: while the round is lost, every
 coin a transfer made out of one of its leaves, at any depth, is lost too, and
 it is the holder's again once the round is restored, unless it rests on
@@ -1304,19 +1313,31 @@ nothing of the lineage published, and the sender pays with it.
 `tests/rerun_returns.rs` brings a lost round back, every reorganisation driven
 through the parent chain: the round R goes out with its Bitcoin block, another
 transaction X takes its input, and its participations run again in Y; then
-the parent chain takes X out and R, sent again, confirms in its place. Where Y
+the parent chain takes X out and R, sent again, confirms in its place, and
+every other transaction of the disconnected blocks is sent again after it,
+in its order, as a node puts them back in its mempool. Where Y
 spends an input of R that was still unspent, and where it spends X's output
 (R's only input taken), the node refuses Y once R is in the chain
 (`missing-inputs`), the server restores R and retires Y, A's participation is
 back in R, its leaf of R live and its leaf of Y lost (the first unroll of the
 one taken, of the other refused), and the watcher claims A's board with its
-forfeit for R while its forfeit for Y can never confirm. Where X pays the
+forfeit for R. Where X pays the
 operator nothing and R had no other input, the participation is voided,
 saying so, and restored when R returns, its board claimed with its forfeit
 for R. A participant whose forfeit for R the watcher published while R was
 final, voided while R is out, is restored with R and its forfeit claimed with
 R's connector asset; one that refunded that forfeit while R was out keeps the
-refund, and its leaf of R is never credited.
+refund, and its leaf of R is never credited, though its first unroll is
+valid. Where A's board's forfeit for Y was published and claimed before the
+reorganisation, that forfeit comes back with it and confirms beside R, Y's
+claim never can, A is left void with its leaf of R never credited (its first
+unroll valid, A's refund of Y's forfeit opening after its delay); and where A,
+voided while R was out, exited its board below X, the same. After each
+restore an ordinary round is built; and the same, with a round built after
+each, through four reorganisations both ways (R lost, R back, R lost again
+and run again in Z, Y back): the next round never issues from a coin whose
+token names a batch, and exactly one of A's leaves can reach the chain at
+every step.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards

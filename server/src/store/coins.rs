@@ -38,8 +38,12 @@ pub enum LeafState {
 	Live,
 	Spent,
 	Lost,
-	/// A new leaf of a participation whose forfeits never came: never the
-	/// owner's; the operator sweeps it with its batch.
+	/// A new leaf never credited: one of a participation whose forfeits never
+	/// came, never the owner's, which the operator sweeps with its batch; or
+	/// one of a round that returned while a coin its participation gave up
+	/// went otherwise, which the server serves nothing of, and which is its
+	/// owner's to take on the chain (the operator's loss) before the operator
+	/// sweeps what is left with its batch.
 	Expired,
 }
 

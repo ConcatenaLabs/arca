@@ -194,6 +194,13 @@ impl Store {
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, array32(r.get(1), "leaf id")?))).collect()
 	}
 
+	/// The round the forfeit `txid` in the watcher's log names, if it is one.
+	pub async fn forfeit_round_id(&self, txid: &[u8; 32]) -> Result<Option<i64>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT round_id FROM watcher_tx WHERE txid = $1 AND kind = 'forfeit'", &[&&txid[..]]).await?;
+		Ok(r.and_then(|r| r.get::<_, Option<i64>>(0)))
+	}
+
 	/// The watcher's transaction spending `txid:vout` that the nursery holds
 	/// and has not found lost, if any.
 	pub async fn watcher_spend(&self, txid: &[u8; 32], vout: u32) -> Result<Option<WatcherTxRow>, StoreError> {
