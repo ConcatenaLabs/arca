@@ -643,14 +643,19 @@ canonical binary form. Every object refuses a field it does not know.
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
-`SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key)` with
-`T = SHA256("Arca/auth")`. The tag keeps it apart from everything else a leaf
-key signs, the genesis hash to one chain, the call to one request, the
-challenge to a short while. A challenge is stored nowhere: it is the time it
-was issued, 12 random bytes, and a keyed check over both (HMAC-SHA256 under
-a key the server draws when it starts), taken within its lifetime
-(`challenge_ttl_seconds`, two minutes by default); one used again within it
-only repeats a read the same key made. There is no bearer token. `cosign_transfer` is
+`SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`
+with `T = SHA256("Arca/auth")`, where `request` is what the read asks besides
+its proof: for `mailbox_read` its cursor (eight bytes) and page size (four),
+little-endian; for `leaf_data` nothing. The tag keeps it apart from
+everything else a leaf key signs, the genesis hash to one chain, the call and
+the request to one read, the challenge to a short while. A challenge is
+stored nowhere: it is the time it was issued, 12 random bytes, and a keyed
+check over both (HMAC-SHA256 under a key drawn once and kept in the
+database, so every server on one database takes the others' challenges, and
+its own across a restart), taken within its lifetime
+(`challenge_ttl_seconds`, two minutes by default); a proof used again within
+it repeats only the very read it was signed for, so whoever sees one (a
+proxy, a log) learns nothing more than that read. There is no bearer token. `cosign_transfer` is
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
@@ -664,7 +669,11 @@ of ten by default), so one caller asking as fast as it can leaves every other
 its share, and over every source together within a high bound (250 a second,
 bursts of 10,000), which bounds the rows nonces hold without a budget a few
 sources could use up; a request past either is refused with 429
-`rate_limited`. A `witness`, which reads the signer's record under its lock,
+`rate_limited`. The overall bound is a ceiling every caller shares: it is
+what bounds the rows, since a nonce's row is what makes it single use, and a
+caller holding more sources than the overall rate (more than 250 IPv4
+addresses or IPv6 /48s, at the defaults) can take every overall token while
+it keeps asking, after which boarding waits for the bucket to refill. A `witness`, which reads the signer's record under its lock,
 is answered within the same rates, from a bucket of its own: a wallet makes
 one each command. A `challenge` writes no row and is not limited. A source is
 an IPv4 address, or an IPv6 /48. A request from a trusted proxy
@@ -957,7 +966,9 @@ limit; outputs outside the bounds; a key already owning a leaf; a repeated
 output, equal or prefix, alone and after a restart (`salt`), and two at once
 (`merge` or `salt`, as the race falls); a bad
 signature; an unknown leaf; a board not yet final; the request size bound; and
-authentication. A board rolled back, the node restarted with an empty mempool,
+authentication, a proof replayed with another cursor or page size included. A
+challenge is taken across a restart and by a second server on the same
+database. A board rolled back, the node restarted with an empty mempool,
 is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
@@ -1092,7 +1103,8 @@ same lineage: the board shows its dates, and the watcher publishes nothing.
 Past the board's exit deadline the change is refused in a transfer
 (`invalid_coin`) and taken into a refresh; with no live coin left on the
 lineage the watcher publishes, before the board's expiry, the board's
-checkpoint, the reassignment and both forfeits, and claims them. And an anchor-driven
+checkpoint, the reassignment and both forfeits, and claims them; once the
+claims are final it no longer scans either coin. And an anchor-driven
 reorganisation: the parent
 chain orphans the block a round and the watcher's answer to a stale exit are
 anchored to and every block above; the node disconnects them all, the server

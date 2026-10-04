@@ -111,11 +111,17 @@ impl Http {
 		unhex(v["operator_nonce"].as_str().unwrap()).try_into().unwrap()
 	}
 
-	/// A proof of `key` for `call`.
+	/// A proof of `key` for `call` asking nothing more (`leaf_data`).
 	pub fn auth(&self, call: &str, key: &Keypair, chain: &Chain) -> Value {
+		self.auth_for(call, key, chain, &[])
+	}
+
+	/// A proof of `key` for `call` asking `request`
+	/// (`server::auth::mailbox_read_request`).
+	pub fn auth_for(&self, call: &str, key: &Keypair, chain: &Chain, request: &[u8]) -> Value {
 		let v = self.post("challenge", &json!({})).ok();
 		let challenge: [u8; 32] = unhex(v["challenge"].as_str().unwrap()).try_into().unwrap();
-		let digest = server::auth::auth_digest(chain, call, &challenge, &xonly(key));
+		let digest = server::auth::auth_digest(chain, call, &challenge, &xonly(key), request);
 		let sig = sign_digest(key, &digest, &random32());
 		json!({"key": hex(&xonly(key).serialize()), "challenge": hex(&challenge), "signature": hex(sig.as_ref())})
 	}
@@ -133,7 +139,9 @@ impl Http {
 
 	/// The coin records in `key`'s mailbox after `after`.
 	pub fn mailbox(&self, key: &Keypair, chain: &Chain, after: i64) -> Vec<(i64, LeafId, CoinRecord)> {
-		let v = self.post("mailbox_read", &json!({"auth": self.auth("mailbox_read", key, chain), "after": after.to_string(), "limit": 100})).ok();
+		let request = server::auth::mailbox_read_request(after as u64, 100);
+		let v = self.post("mailbox_read", &json!({"auth": self.auth_for("mailbox_read", key, chain, &request), "after": after.to_string(),
+			"limit": 100})).ok();
 		v["messages"].as_array().unwrap().iter().map(|m| (
 			m["cursor"].as_str().unwrap().parse().unwrap(),
 			LeafId::from_str(m["leaf_id"].as_str().unwrap()).unwrap(),

@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | `info` | GET | no |
 //! | `operator_nonce` | POST | no: issued at a bounded rate, overall and for each source ([`Limiter`]) |
-//! | `challenge` | POST | no: issued at a bounded rate, overall and for each source ([`Limiter`]) |
+//! | `challenge` | POST | no: stored nowhere, and not limited ([`crate::auth`]) |
 //! | `register_board`, `board_status` | POST | no |
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
@@ -73,8 +73,8 @@ pub struct App {
 	/// Bounds the witnesses answered: each reads the signer's record under
 	/// its lock.
 	pub witnesses: Limiter,
-	/// The key of every challenge's check ([`crate::auth`]), drawn when the
-	/// server starts.
+	/// The key of every challenge's check ([`crate::auth`]), kept in the
+	/// database, the same for every server on it.
 	pub challenge_key: [u8; 32],
 	/// The addresses of the reverse proxies whose forwarded address names a
 	/// request's source.
@@ -399,9 +399,10 @@ fn unix_now() -> u64 {
 	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Checks a proof of `auth.key` for `call`: its challenge issued by this
-/// server within its lifetime, and the key's signature.
-async fn authenticate(app: &App, call: &str, a: &api::Auth) -> Result<XOnlyPublicKey, Refusal> {
+/// Checks a proof of `auth.key` for `call` asking `request`: its challenge
+/// issued under this server's key within its lifetime, and the key's
+/// signature over the call, the challenge and the request.
+async fn authenticate(app: &App, call: &str, a: &api::Auth, request: &[u8]) -> Result<XOnlyPublicKey, Refusal> {
 	let k = key(&a.key)?;
 	let challenge = unhex32(&a.challenge).map_err(Refusal::malformed)?;
 	let signature = sig(&a.signature)?;
@@ -410,8 +411,8 @@ async fn authenticate(app: &App, call: &str, a: &api::Auth) -> Result<XOnlyPubli
 		Ok(()) => {},
 		Err(e @ ChallengeError::Unknown) | Err(e @ ChallengeError::Expired) => return Err(unauthenticated(e.to_string())),
 	}
-	if !auth::verify(&app.params.chain, call, &challenge, &k, &signature) {
-		return Err(unauthenticated(format!("the signature does not prove the key for {}", call)));
+	if !auth::verify(&app.params.chain, call, &challenge, &k, request, &signature) {
+		return Err(unauthenticated(format!("the signature does not prove the key for this {}", call)));
 	}
 	Ok(k)
 }
@@ -804,7 +805,7 @@ async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesReje
 	let after: i64 = if req.after == "0" { 0 } else {
 		i64::try_from(amount(&req.after)?).map_err(|_| Refusal::malformed("cursor out of range"))?
 	};
-	let k = authenticate(&app, "mailbox_read", &req.auth).await?;
+	let k = authenticate(&app, "mailbox_read", &req.auth, &auth::mailbox_read_request(after as u64, req.limit)).await?;
 	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
 	let msgs = app.store.mailbox_read(&k.serialize(), after, limit).await?;
 	Ok(Json(api::Mailbox {
@@ -820,7 +821,7 @@ async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesReje
 
 async fn leaf_data(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LeafData>, Refusal> {
 	let req: api::LeafDataRequest = parse(body, app.max_request)?;
-	let k = authenticate(&app, "leaf_data", &req.auth).await?;
+	let k = authenticate(&app, "leaf_data", &req.auth, &[]).await?;
 	let rows = app.store.leaves_by_owner(&k.serialize()).await?;
 	Ok(Json(api::LeafData {
 		leaves: rows.into_iter().map(|r| api::LeafEntry {

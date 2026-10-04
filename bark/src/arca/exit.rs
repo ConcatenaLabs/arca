@@ -287,12 +287,22 @@ impl Wallet {
 		let mut built = vec![];
 		let leaf_at = match self.bring(&coin, &mut payer, &mut built, &here) {
 			Ok(at) => at,
-			// Nothing of the path is left unspent: someone else spent the coin.
-			Err(e) if here.at.iter().all(Option::is_none) => return match self.taken(leaf_id, &coin, &prior)? {
-				Some(v) => Ok(v),
-				None => Err(e),
+			Err(e) => {
+				// Nothing of the path is left unspent: someone else spent the coin.
+				if here.at.iter().all(Option::is_none) {
+					if let Some(v) = self.taken(leaf_id, &coin, &prior)? {
+						return Ok(v);
+					}
+				}
+				// The path is cut: say where, when another spend cut it.
+				return Err(match self.paid_elsewhere(&coin)? {
+					Some(why) => {
+						self.store.refused(&format!("exit of {}", leaf_id), &why)?;
+						Error::Refused(why)
+					},
+					None => e,
+				});
 			},
-			Err(e) => return Err(e),
 		};
 		self.let_go(leaf_id, &row.state)?;
 		// One claim address for the exit, however many times it is run.
@@ -458,6 +468,54 @@ impl Wallet {
 			}
 			return Err(Error::Refused(format!("coin {} was spent on the chain by {}, which is none of the wallet's and no spend it signed",
 				leaf_id, txid)));
+		}
+		Ok(None)
+	}
+
+	/// When `coin` cannot reach the chain because a coin it rests on was spent
+	/// otherwise: that coin's output (or its board's) spent on the chain by
+	/// something other than `coin`'s checkpoint of it, or that checkpoint
+	/// spent by a reassignment `coin` is no output of. The operator
+	/// co-signed another spend of the coin, which reached the chain first.
+	/// Says so, or `None`.
+	fn paid_elsewhere(&self, coin: &ValidCoin) -> Result<Option<String>, Error> {
+		let ValidOrigin::Transfer { inputs, .. } = &coin.origin else { return Ok(None) };
+		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+		let mine = coin.output().txout();
+		let spent_by = |out: &TxOut| -> Result<Option<(Transaction, Transaction)>, Error> {
+			let Some((tx, h)) = self.chain.find_payment(out, from)? else { return Ok(None) };
+			let vout = tx.output.iter().position(|o| o == out).expect("pays it") as u32;
+			Ok(self.chain.spender(&OutPoint::new(tx.txid(), vout), h)?.map(|(sp, _)| (tx, sp)))
+		};
+		let elsewhere = |id: &arca_covenant::LeafId, sp: &Transaction| format!("coin {} it rests on is spent on the chain by {}, which \
+			is not this coin's way out: the operator co-signed another spend of coin {} (a payment, or a forfeit), which reached the \
+			chain first, so this coin cannot be brought on the chain", id, sp.txid(), id);
+		for i in inputs {
+			let cp = i.checkpoint_output().txout();
+			let own = i.coin.output().txout();
+			let mut sources = vec![own.clone()];
+			if let Some((board, _)) = i.coin.board() {
+				sources.push(board.output().txout());
+			}
+			for src in &sources {
+				let Some((_, sp)) = spent_by(src)? else { continue };
+				if sp.output.contains(&cp) {
+					// This coin's checkpoint of it: then this coin's reassignment.
+					if let Some((_, re)) = spent_by(&cp)? {
+						if !re.output.contains(&mine) {
+							return Ok(Some(elsewhere(&i.coin.id, &re)));
+						}
+					}
+				} else if *src != own && sp.output.contains(&own) {
+					// The board's conversion into the coin's leaf: the leaf is
+					// looked at as well.
+				} else {
+					return Ok(Some(elsewhere(&i.coin.id, &sp)));
+				}
+			}
+			if let Some(why) = self.paid_elsewhere(&i.coin)? {
+				return Ok(Some(why));
+			}
 		}
 		Ok(None)
 	}
