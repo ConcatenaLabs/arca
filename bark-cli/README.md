@@ -178,12 +178,23 @@ the keys, but which coins were spent off-chain is in the store and the server.
   refused), and the entry each of its coins was recorded at. Every command
   that reaches the server starts with a witness of the record: the wallet
   hands the server the highest head it holds, its coins' heads and as many
-  more as fit, and checks the running hash the record holds at each and its
-  latest entry. A latest entry below the highest it holds, another hash at
-  an entry it holds, or a signer stopped by such a proof means the
-  operator's record has been rolled back or replaced, with its database, so
-  its signer may sign again what it signed. A signed head the record does
-  not hold stops the signer for every holder. The wallet then finds the
+  more as fit, with a nonce it draws fresh for the call, and checks the
+  running hash the record holds at each and its latest entry, each signed by
+  the signer, and the record's end, signed by the signer together with the
+  nonce. The wallet acts on a rollback only on proof the signer made:
+  another hash the signer signed at an entry the wallet holds signed (two
+  heads the signer signed at one entry), a record ending, signed with the
+  call's nonce, before such an entry, or a stopped signer's own proof (the
+  signed head that stopped it, and the signed head its record holds there or
+  its end before it). Each means the operator's record has been rolled back
+  or replaced, with its database, so its signer may sign again what it
+  signed. A signed head the record does not hold stops the signer for every
+  holder. An answer without that proof, or with a part the signer did not
+  sign (whoever answers for the server, a proxy or a compromised server, can
+  write one), is an unreachable server: the wallet exits nothing and refuses
+  nothing for good, and tries again; and so is a latest entry in `info`
+  below the highest the wallet holds, which an older head replayed shows
+  just as well. The wallet then finds the
   highest entry it holds that the record still agrees with, takes on the
   chain at once every coin a transfer recorded after it made (a coin whose
   entry it was never given counts as after; its own leaves and boards stay),
@@ -343,6 +354,13 @@ and holding it there, with the reason shown:
   the receiver's next `sync` finds another hash at its own highest entry,
   stops the signer and takes its coin on the chain first, and the second
   spend's coin cannot follow, its exit naming the coin spent twice;
+- the witness rewritten for one wallet on its way, with nothing rolled back:
+  another running hash at its highest entry, an older head the signer
+  signed as the latest and as the record's end, a whole earlier answer
+  replayed, a stop without proof and with a "proof" the record holds, and an
+  older signed head in `info`: each is an unreachable server, the wallet
+  exits nothing, takes no coin from its mailbox, refuses nothing for good,
+  and goes on once the answers are honest; the signer is never stopped;
 - a forfeit's margin bounded from the operator's published floor: a wallet
   whose node values the asset five times higher than the operator's
   completes its refresh;

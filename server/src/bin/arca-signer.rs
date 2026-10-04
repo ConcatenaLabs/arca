@@ -28,13 +28,15 @@
 //! puts the new file in the record's place and starts the signer on it. The
 //! new record keeps the running hash of every entry it drops.
 //!
-//! Every head of the record the signer hands out is signed with `S`. A head
-//! it signed that its record does not hold, handed back by a wallet, proves
-//! the record was rolled back or replaced: the signer writes the proof to
+//! Every head of the record the signer hands out is signed with `S`, and so
+//! is every running hash a witness is answered with, and the record's end
+//! together with the nonce the witness carried. A head it signed that its
+//! record does not hold, handed back by a wallet, proves the record was
+//! rolled back or replaced: the signer writes the proof to
 //! `<record>.stopped` and signs no rebindable message and no head from then
-//! on, across restarts (`server::signer::SpendRecord::witness`). Only
-//! `--clear-stopped`, run with the signer stopped, removes that file, after
-//! printing it.
+//! on, across restarts (`server::signer::SpendRecord::witness`), and answers
+//! every witness with that proof. Only `--clear-stopped`, run with the
+//! signer stopped, removes that file, after printing it.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -52,8 +54,8 @@ use arca_covenant::message::rebind_message;
 use arca_covenant::sign::{script_spend_sighash, sign_digest, verify_digest};
 use arca_covenant::Chain;
 use server::signer::{
-	check_spend, hex, parse_amount, record_head_digest, unhex, unhex32, Request, Response, Signed, SpendRecord, WireEntryRef, ALREADY_SIGNED,
-	MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS, STOPPED,
+	check_spend, hex, parse_amount, record_end_digest, record_head_digest, unhex, unhex32, Request, Response, Signed, SpendRecord,
+	WireEntryRef, WireStopProof, ALREADY_SIGNED, MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS, STOPPED,
 };
 
 struct Args {
@@ -148,25 +150,58 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 			let (n, hash) = r.head();
 			Response { entry: Some(signed_head(key, &genesis, n, &hash)), ..none }
 		},
-		Request::Witness { heads } => {
+		Request::Witness { heads, nonce } => {
 			if heads.len() > MAX_WITNESS {
 				return Response { error: Some(format!("{} heads; a witness names at most {}", heads.len(), MAX_WITNESS)), ..none };
 			}
+			let nonce = match nonce.as_deref().map(unhex32).transpose() {
+				Ok(n) => n,
+				Err(e) => return Response { error: Some(format!("nonce: {}", e)), ..none },
+			};
 			let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
 			let was = r.stopped().is_some();
-			let hashes = match r.witness(&heads) {
+			let mut hashes = match r.witness(&heads) {
 				Ok(h) => h,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
+			// Every running hash answered is signed as a head: another hash
+			// at an entry a wallet holds is then two heads `S` signed at one
+			// entry, which nobody without `S` can make.
+			for h in &mut hashes {
+				if let Some(x) = h.hash.as_deref().and_then(|x| unhex32(x).ok()) {
+					h.signature = signed_head(key, &genesis, h.entry, &x).signature;
+				}
+			}
 			let stopped = r.stopped().map(str::to_string);
 			if let (false, Some(why)) = (was, &stopped) {
 				eprintln!("arca-signer: STOPPED: {}", why);
 			}
 			let (n, hash) = r.head();
+			// The record's end with the asker's nonce: not an older head
+			// replayed. A stopped signer signs it too, as part of its proof.
+			let end = nonce.map(|nonce| {
+				let mut aux = [0u8; 32];
+				rand::rngs::OsRng.fill_bytes(&mut aux);
+				let sig = sign_digest(key, &record_end_digest(&genesis, n, &hash, &nonce), &aux);
+				WireEntryRef { entry: n, hash: hex(&hash), signature: Some(hex(sig.as_ref())) }
+			});
+			let proof = match (&stopped, r.stop_head()) {
+				(Some(_), Some(p)) => {
+					let held = match r.hash_of(p.entry) {
+						Ok(Some(x)) if hex(&x) != p.hash => Some(signed_head(key, &genesis, p.entry, &x)),
+						Ok(_) => None,
+						Err(e) => return Response { error: Some(format!("the record could not be read: {}", e)), ..none },
+					};
+					Some(WireStopProof { head: p.clone(), held })
+				},
+				_ => None,
+			};
 			Response {
 				entry: stopped.is_none().then(|| signed_head(key, &genesis, n, &hash)),
 				hashes: Some(hashes),
 				stopped,
+				end,
+				proof,
 				..none
 			}
 		},

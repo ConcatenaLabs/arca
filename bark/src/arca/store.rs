@@ -636,6 +636,13 @@ impl Store {
 		self.conn.query_row("SELECT hash FROM signer_seen WHERE entry = ?1", params![entry as i64], |r| r.get(0)).optional().map_err(db)
 	}
 
+	/// The head the wallet keeps at `entry`: its running hash, and the
+	/// signer's signature over them when it was shown one.
+	pub fn seen_at(&self, entry: u64) -> Result<Option<(String, Option<String>)>, Error> {
+		self.conn.query_row("SELECT hash, signature FROM signer_seen WHERE entry = ?1", params![entry as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+			.optional().map_err(db)
+	}
+
 	/// The latest entry of the signer's record the operator showed, and its
 	/// running hash.
 	pub fn seen_latest(&self) -> Result<Option<(u64, String)>, Error> {

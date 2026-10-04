@@ -2178,8 +2178,8 @@ async fn a_record_and_database_rolled_back_together_are_refused_by_a_wallet_that
 	// reason; the signer is stopped.
 	let why = a.refused(&["send", &req, "--amount", "100000", "--asset", &x.to_string()], "rolled back");
 	println!("D48 A's wallet: {}", why);
-	assert!(why.contains(&format!("past entry {}", backed_up)) && why.contains(&format!("past the record's end at entry {}", backed_up)),
-		"{}", why);
+	assert!(why.contains(&format!("past entry {}", backed_up))
+		&& why.contains(&format!("the signer's record ends at entry {}, signed with the wallet's nonce", backed_up)), "{}", why);
 	let info = a.ok(&["info"]);
 	assert!(info["server_info"]["unreachable"].as_str().unwrap_or("").contains("rolled back"), "{}", info);
 	assert!(a.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["what"] == "the operator's signer's record"));
@@ -2439,6 +2439,114 @@ async fn a_second_spend_before_any_witness_is_answered_by_the_receivers_next_syn
 		"the refusal names the coin paid twice: {}", v);
 	let _ = (&a, &mut r);
 	for w in [&a, &a_old, &b, &m, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7e F4 turned around (D54). Whoever answers a wallet's witness call (a
+/// TLS-terminating proxy, a compromised `arcad`) rewrites the answer for one
+/// wallet, while nobody rolled anything back: another running hash at the
+/// wallet's highest entry; an older head the signer really signed, as the
+/// latest and as the record's end; a whole earlier answer replayed; a stop
+/// without proof, and with a "proof" the record holds; and an older signed
+/// head in `info`. None of them is the signer's proof, so each is an
+/// unreachable server: the wallet exits nothing and refuses nothing for
+/// good, takes no coin from its mailbox while the answers lie, and goes on
+/// as before once they are honest. The signer is never stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewritten_witness_is_an_unreachable_server_and_takes_nothing() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let pb = Proxy::start(&url);
+	let (a, b) = (Arca::new("D54A"), Arca::new("D54B"));
+	boarded(&mut r, &a, &url, &[(x, 4_000_000)]).await;
+	b.ok(&create_args(&pb.url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let p1 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let old_head = info_of(&r)["signer_record"].clone();
+	println!("D54 a head the signer signed, kept by anyone who read info: {}", old_head);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	let p2 = b.ok(&["sync"])["mailbox"]["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let honest = pb.last("/v1/witness").expect("B witnessed").2;
+	println!("D54 B's last honest witness answer: end {} | head {}", honest["end"], honest["head"]["entry"]);
+	assert!(honest["end"]["signature"].is_string(), "the record's end, signed with B's nonce: {}", honest);
+	let paid = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	// A coin waits in B's mailbox while the answers lie.
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "100000", "--asset", &x.to_string()]);
+	let _ = paid;
+
+	type Lie = Arc<dyn Fn(&mut Value) + Send + Sync>;
+	let flip = |s: &str| if s.starts_with('0') { format!("1{}", &s[1..]) } else { format!("0{}", &s[1..]) };
+	let old = old_head.clone();
+	let old2 = old_head.clone();
+	let replay = honest.clone();
+	let held = honest["head"].clone();
+	let lies: Vec<(&str, Lie)> = vec![
+		("one running hash rewritten", Arc::new(move |v: &mut Value| {
+			let h = v["hashes"][0]["hash"].as_str().unwrap_or("").to_string();
+			v["hashes"][0]["hash"] = json!(flip(&h));
+		})),
+		("an older signed head as the latest", Arc::new(move |v: &mut Value| v["head"] = old.clone())),
+		("an older signed head as the latest and as the end", Arc::new(move |v: &mut Value| {
+			v["head"] = old2.clone();
+			v["end"] = old2.clone();
+		})),
+		("a whole earlier answer replayed", Arc::new(move |v: &mut Value| *v = replay.clone())),
+		("a stop without proof", Arc::new(|v: &mut Value| v["stopped"] = json!("stopped: the signer's record was rolled back"))),
+		("a stop on a head the record holds", Arc::new(move |v: &mut Value| {
+			v["stopped"] = json!("stopped: the signer's record was rolled back or replaced");
+			v["proof"] = json!({"head": held.clone(), "held": held.clone()});
+		})),
+	];
+	std::thread::sleep(std::time::Duration::from_secs(11));
+	for (what, lie) in lies {
+		let lie2 = lie.clone();
+		pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+			if path == "/v1/witness" {
+				lie2(v);
+			}
+			None
+		})));
+		let s = b.ok(&["sync"]);
+		println!("D54 {}: B's sync: witness {} | mailbox {}", what, s["witness"], s["mailbox"]);
+		assert!(s["witness"]["rolled_back"].is_null(), "{}: no rollback without the signer's proof: {}", what, s["witness"]);
+		assert!(s["witness"]["error"].as_str().unwrap_or("").contains("carries no proof the signer made"), "{}: {}", what, s["witness"]);
+		assert!(s["mailbox"]["accepted"].as_array().is_none_or(|a| a.is_empty()), "{}: no coin taken while the answers lie: {}", what,
+			s["mailbox"]);
+		for p in [&p1, &p2] {
+			assert_eq!(coin_of(&b, p)["state"], "live", "{}: nothing exited", what);
+		}
+	}
+	// An older signed head in `info`.
+	let old = old_head.clone();
+	pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/info" {
+			v["signer_record"] = old.clone();
+		}
+		None
+	})));
+	let shown = b.ok(&["info"]);
+	println!("D54 an older signed head in info: {}", shown["server_info"]);
+	assert!(shown["server_info"]["unreachable"].as_str().unwrap_or("").contains("proves no rollback"), "{}", shown);
+	pb.rewrite(None);
+
+	// Honest again: nothing was refused for good.
+	assert!(!server::signer::stopped_path(&r.signer.record()).exists(), "the signer was never stopped");
+	let s = b.ok(&["sync"]);
+	println!("D54 B honest again: witness {} | mailbox {}", s["witness"], s["mailbox"]["accepted"]);
+	assert!(s["witness"]["witnessed"].is_number(), "{}", s["witness"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|a| a.len()), Some(1), "the coin that waited is taken now");
+	b.ok(&["receive"]);
+	for p in [&p1, &p2] {
+		assert_eq!(coin_of(&b, p)["state"], "live");
+	}
+	assert!(!b.ok(&["refusals"]).as_array().unwrap().iter().any(|f| f["reason"].as_str().unwrap_or("").contains("goes no further")));
+	r.produce().await;
+	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

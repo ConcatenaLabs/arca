@@ -565,7 +565,7 @@ impl Server {
 		// A signer stopped by a proven rollback of its record signs nothing
 		// the record governs; the server still starts, so every wallet's
 		// witness learns it and its holders exit, and serves no co-signature.
-		match signer.witness(&[]).await.map_err(err("the signer"))?.stopped {
+		match signer.witness(&[], None).await.map_err(err("the signer"))?.stopped {
 			Some(why) => log::error!("the signer is stopped: {}; the server co-signs nothing, and answers each wallet's witness with \
 				it so that holders exit", why),
 			None => {
