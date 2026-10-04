@@ -264,10 +264,11 @@ two spends racing for one leaf leave exactly one standing. Each new coin's
 record is checked by the server as a receiver would check it, stored, and
 posted to the receiver's mailbox (the leaf's key, unless the output names
 another). A request repeated byte for byte gets the same answer; one that
-found the signer unreachable completes when repeated, whatever the dates of
-the boards its coins rest on have become since: it was within them when it
-was recorded. Its margins are checked again against the node's floor of the
-moment. Transfers are free.
+found the signer unreachable completes when repeated, whatever has changed
+since it was recorded: its margins are judged as they were then, against
+the floor of that moment, and the dates of the boards and batches its coins
+rest on, which it was within then, refuse it only once a batch has expired.
+Transfers are free.
 
 The same record of spends answers the question `release_leaves` asks before
 it takes an owner's release of a leaf's lowest node: whether the leaf has an

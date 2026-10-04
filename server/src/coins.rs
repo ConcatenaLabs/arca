@@ -15,7 +15,9 @@
 //! median time of the block that confirms it, less a horizon the caller
 //! names (the exit deadline for a transfer, a day for a refresh). A transfer
 //! the server recorded, which was within them then, completes when repeated
-//! whatever they have become since ([`BoardDates`]).
+//! whatever they have become since ([`BoardDates`]); so does one of a coin
+//! resting on a batch past that batch's exit deadline, until the batch
+//! expires.
 
 use elements::hashes::Hash;
 use elements::Transaction;
@@ -160,9 +162,10 @@ pub enum BoardDates {
 	/// its participations gave up against it.
 	Within(u32),
 	/// The same, except for a coin already spent by the holder itself: a
-	/// transfer the server recorded was within the board's dates when it was
-	/// recorded, and completes when repeated whatever they have become
-	/// since.
+	/// transfer the server recorded was within the board's dates, and its
+	/// batches' exit deadlines, when it was recorded, and completes when
+	/// repeated whatever they have become since. Only a batch's expiry
+	/// itself refuses it.
 	WithinUnlessRecorded(u32),
 }
 
@@ -183,7 +186,9 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		LeafState::Lost => return Err(CoinError::NotLive(*id, "lost")),
 		LeafState::Expired => return Err(CoinError::NotLive(*id, "expired")),
 	}
-	let Checked { record, coin, bases: found, board_expiry } = resolve(store, policy, id).await?;
+	let recorded = repeat && matches!(dates, BoardDates::WithinUnlessRecorded(_));
+	let policy = if recorded { WalletPolicy { horizon: 0, ..*policy } } else { *policy };
+	let Checked { record, coin, bases: found, board_expiry } = resolve(store, &policy, id).await?;
 	let horizon = match dates {
 		BoardDates::Within(h) => Some(h),
 		BoardDates::WithinUnlessRecorded(_) if repeat => None,

@@ -148,7 +148,11 @@ the keys, but which coins were spent off-chain is in the store and the server.
   of it; after it the wallet pays nothing with it, and the operator takes it
   only into a refresh, until a day before the expiry. A coin that arrives
   past its exit deadline (a payment the server recorded before it, while its
-  signer was away, and completed when asked again) is kept and shown so. From the expiry the
+  signer was away, and completed when asked again) is kept and shown so. A
+  coin that arrives past its batch's exit deadline the same way is kept and
+  taken on the chain at once, since nothing else can be done with it before
+  the batch expires; its exit goes on from wherever its lineage is, an exit
+  of a coin sharing that lineage included. From the expiry the
   operator may bring the board's lineage on the chain to collect a coin of it
   given up in a refresh; a coin of the wallet's on that lineage then goes on
   the chain, and the wallet exits it. A refresh before the deadline avoids
@@ -340,7 +344,12 @@ and holding it there, with the reason shown:
 - a payment whose answer comes back as a gateway's 502, posted again;
 - a payment asked for while the operator's signer is away (503), posted again
   after the board's exit deadline has passed: it completes, and the receiver
-  keeps the coin, past its deadline, and refreshes it;
+  keeps the coin, past its deadline, and refreshes it; and one out of a batch
+  leaf, posted again after the batch's exit deadline has passed and the
+  node's floor in the asset has fallen a hundredfold: it completes, its
+  margins judged as when it was recorded, and the sender's change and the
+  receiver's coin are each exited at once, the receiver claiming its coin
+  before the batch expires;
 - a participation whose answer comes back as a gateway's 502, posted again
   without its key proofs: the server, which holds it, answers with its
   status, the coin stays given up and the participation completes, while a

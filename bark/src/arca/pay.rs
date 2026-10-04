@@ -438,9 +438,10 @@ impl Wallet {
 							Err(e) => kept.push(json!({"leaf_id": o["leaf_id"], "refused": e.to_string()})),
 						}
 					} else {
-						// Not ours: still, the operator must have signed it.
+						// Not ours: still, the operator must have signed it. Its
+						// dates are its receiver's to judge.
 						let txs = self.base_txs(&record)?;
-						record.resolve(&txs, &self.receipt_policy(self.now()?))
+						record.resolve(&txs, &WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) })
 							.map_err(|e| Error::Refused(format!("the server's record of output {}: {}", o["leaf_id"], e)))?;
 					}
 				}
@@ -492,7 +493,9 @@ impl Wallet {
 	/// the bounds on every leaf of the lineage, the depth limit); no leaf or
 	/// checkpoint of its lineage may be on the chain; every board it rests on
 	/// must be unspent; and its salt must be one the wallet has never held a
-	/// coin under.
+	/// coin under. A coin past its batch's exit deadline (and before the
+	/// batch's expiry) is kept and exited at once, whatever of its lineage is
+	/// on the chain.
 	pub(crate) fn accept_coin(&mut self, bytes: &[u8], claimed: &str, source: &str) -> Result<Value, Error> {
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| Error::Refused(format!("the record does not decode: {}", e)))?;
 		let (owner, nonce) = owner_of(&record);
@@ -503,7 +506,19 @@ impl Wallet {
 		}
 		let now = self.now()?;
 		let policy = self.receipt_policy(now);
-		let a: Assessed = self.assess(&record, &policy, Some((&owner, &nonce)))?;
+		// A coin resting on a batch past its exit deadline (a payment the
+		// server recorded before it and completed when it was asked again) is
+		// still the wallet's, co-signed and checked: refusing it would undo
+		// nothing. It is kept, and taken on the chain at once, since the
+		// operator co-signs no spend of it and takes it into no round, and
+		// the batch's expiry is near. Past the expiry itself it is refused.
+		let (a, late): (Assessed, bool) = match self.assess(&record, &policy, Some((&owner, &nonce))) {
+			Ok(a) => (a, false),
+			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&owner, &nonce))) {
+				Ok(a) => (a, true),
+				Err(_) => return Err(e),
+			},
+		};
 		let id = a.valid.id.to_string();
 		if !claimed.is_empty() && claimed != id {
 			return Err(Error::Refused(format!("the server names the coin {}, its record makes it {}", claimed, id)));
@@ -529,12 +544,28 @@ impl Wallet {
 		let past_deadline = board_expiry.is_some_and(|e| now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64);
 		let lineage: BTreeSet<Script> = a.valid.lineage().into_iter().map(|o| o.output.script_pubkey).collect();
 		let seen = self.chain.scripts_seen(&lineage, a.lowest_height())?;
-		a.valid.check_lineage(|s| seen.contains(s)).map_err(|e| Error::Refused(e.to_string()))?;
+		// A coin held off the chain must have nothing of its lineage there,
+		// or the owner of that step could spend it under the receiver. A
+		// coin taken on the chain at once goes on from wherever its lineage
+		// is (an exit of a coin sharing it, say), and its exit answers that
+		// step first: refusing it would only lose it.
+		let on_chain = a.valid.check_lineage(|s| seen.contains(s)).err();
+		if let Some(e) = &on_chain {
+			if !late {
+				return Err(Error::Refused(e.to_string()));
+			}
+		}
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
 		if past_deadline {
 			let e = board_expiry.expect("past a deadline");
 			let why = format!("it rests on a board past its exit deadline: the operator co-signs no spend of it and takes it only into a \
 				refresh, until median time {}; exit it after that", e.saturating_sub(super::wallet::BOARD_REFRESH_UNTIL));
+			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
+		}
+		if late {
+			let why = format!("it rests on a batch past its exit deadline (the batch expires at median time {}): the operator co-signs \
+				no spend of it and takes it into no round, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
+				on_chain.map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default());
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		let coin = self.row(&record, &a, state, &note)?;
@@ -573,6 +604,16 @@ impl Wallet {
 				None => json!({"note": "the coin rests on a board not yet in a block: it carries the dates of a batch made when the board \
 					confirms, shown once it does"}),
 			};
+		}
+		if late {
+			let e = a.valid.expiry.to_consensus_u32();
+			out["batch"] = json!({"expiry": e, "exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE),
+				"note": "the coin rests on a batch past its exit deadline: it cannot be paid on or refreshed, and is exited at once"});
+			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
+				"note": "exit the coin before its batch expires, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			if let Some(c) = self.store.coin(&id)? {
+				out["state"] = json!(c.state);
+			}
 		}
 		Ok(out)
 	}
