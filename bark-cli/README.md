@@ -197,10 +197,23 @@ the keys, but which coins were spent off-chain is in the store and the server.
   just as well. The wallet then finds the
   highest entry it holds that the record still agrees with, takes on the
   chain at once every coin a transfer recorded after it made (a coin whose
-  entry it was never given counts as after; its own leaves and boards stay),
-  and goes no further with the operator: it asks for no payment through it,
-  takes no coin from its mailbox and signs nothing for it. `sync` then does
-  only what it does on the chain. The witness runs inside the wallet library
+  entry it was never given counts as after), and goes no further with the
+  operator: it asks for no payment through it and signs nothing for it. A
+  stop is the end of that operator, so the wallet's job from then on is to
+  bring everything home: it still reads its mailbox and the coins it kept
+  for a retry, checks each coin as ever, and takes each on the chain at
+  once, a coin whose lineage is already on the chain included; every coin
+  it still holds off the chain (its own leaves and boards, and coins made
+  before the point the record agrees with) is shown with the date by which
+  it must be exited (`exit_by`, its exit deadline, in `coins` and in
+  `sync`'s `home`), and `sync` takes it on the chain when that date is
+  within three days, paying any fee its own reserves cannot in the asset it
+  moves (`arca exit` takes one at once). A coin given up in a refresh the
+  operator released, whose new leaf the wallet holds, is not exited: it is
+  paid for already. A coin whose way to the chain is cut by another spend
+  the operator co-signed, once that spend is final, is shown as lost, with
+  that reason, and is no longer counted. `sync` does nothing else with the
+  operator. The witness runs inside the wallet library
   itself, in every operation that takes a coin or signs a spend through the
   operator (sending, the mailbox, a board, a refresh, the swap calls,
   `sync`), so a program built on the library cannot leave it out; while no
@@ -390,6 +403,14 @@ and holding it there, with the reason shown:
   and the receiver of the lost payment learns of the stop on the signer's own
   proof and takes that coin on the chain; and the same restore with no
   keeper, where the second spend is still co-signed;
+- after a stop, everything brought home: a receiver offline across the
+  joint rollback comes online, reads the coin it was sent before the
+  snapshot, and takes it on the chain at once, ending with it there, less
+  its claim's fee; the sender's untouched board is shown with its exit date,
+  kept, and taken on the chain by `sync` two days before that date; and in
+  the restore with no keeper, the coin whose second spend reached the chain
+  first is shown as lost, with the coin the operator co-signed another spend
+  of, and not counted as pending;
 - a keeper down: a payment is held up with nothing taken, the request
   standing, and completes when the keeper is back; the receiver shows the
   keeper it pinned;

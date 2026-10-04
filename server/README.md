@@ -866,8 +866,10 @@ it fell back to: `S` may have co-signed a second spend of a coin a transfer
 after that point made. Each wallet finds the highest entry it holds that the
 record still agrees with, takes on the chain at once every coin it holds
 that a transfer recorded after it made (a coin whose entry it was never
-given counts as after), keeps its own leaves and boards, which no transfer
-made, and goes no further with the operator. The operator does not clear the
+given counts as after), and goes no further with the operator: it still
+reads its mailbox and takes every coin in it on the chain at once, and takes
+every other coin it holds off the chain there by that coin's exit deadline.
+The operator does not clear the
 stop to carry on: it resumes only with a new signer key and a new record,
 which is a new operator to every wallet. `arca-signer --clear-stopped`
 removes the proof, with the signer stopped, after printing it.
