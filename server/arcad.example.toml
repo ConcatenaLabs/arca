@@ -92,14 +92,22 @@ block_interval_seconds = 60
 # caller needs; and over every source together at most issue_per_second,
 # with bursts of up to issue_burst: a high bound on the rows nonces hold (the
 # rate times their lifetime), far above what honest callers ask. A request
-# past either is refused with 429 rate_limited. A witness of the signer's
-# record, which reads the record under the signer's lock, is answered within
-# the same rates from a bucket of its own. A challenge writes no row and is
-# not limited.
+# past either is refused with 429 rate_limited. A challenge writes no row and
+# is not limited.
 issue_per_second = 250
 issue_burst = 10000
 source_per_second = 1
 source_burst = 10
+# A witness of the signer's record, which reads the record under the signer's
+# lock and carries up to 34 of its signatures, has a budget of its own, apart
+# from the nonces': at most witness_per_second over every source together,
+# with bursts of up to witness_burst, and witness_source_per_second to each
+# source, with bursts of up to witness_source_burst. A wallet makes one each
+# command.
+witness_per_second = 500
+witness_burst = 5000
+witness_source_per_second = 5
+witness_source_burst = 60
 # The reverse proxies in front of the server: a request from one of these
 # addresses is counted against the address its X-Forwarded-For names (the
 # proxy appends the address that connected to it), any other request against

@@ -57,6 +57,11 @@ impl SignerProcess {
 		SignerProcess { child, dir, socket }
 	}
 
+	/// The signer's process id.
+	pub fn pid(&self) -> u32 {
+		self.child.id()
+	}
+
 	/// The signer's record.
 	pub fn record(&self) -> PathBuf {
 		self.dir.join("signer.record")

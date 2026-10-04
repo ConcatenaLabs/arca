@@ -103,6 +103,10 @@ pub const WITNESS_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most heads one witness hands the server: the server's bound.
 pub const MAX_WITNESS: usize = 32;
 
+/// The most heads without the signer's signature one witness hands the
+/// server: the server's bound.
+pub const MAX_UNSIGNED_WITNESS: usize = 4;
+
 /// Where the wallet keeps a rollback of the operator's signer's record it
 /// found: `{"at": <the highest entry the record still agrees with>, "why"}`.
 const ROLLED_BACK: &str = "operator_rolled_back";
@@ -383,12 +387,16 @@ impl Wallet {
 	/// created: the same chain and the same operator key; and the head of
 	/// its signer's record it shows, signed, against every head the wallet
 	/// holds. An operator whose record the wallet found rolled back is
-	/// refused.
+	/// refused, and so is one whose record the wallet could not witness
+	/// within [`WITNESS_FOR`] ([`Self::witnessed_now`]): every entry point
+	/// that reads `info` before it takes a coin or signs a spend witnesses
+	/// the record first.
 	pub(crate) fn server_info(&self) -> Result<Value, Error> {
 		if let Some((at, why)) = self.rolled_back()? {
 			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
 				goes no further with this operator, and takes on the chain every coin resting on what it signed after", at, why)));
 		}
+		self.witnessed_now()?;
 		let info = self.server.info()?;
 		if let Some(l) = info["boards"]["lifetime_seconds"].as_u64() {
 			if l < BOARD_LIFETIME as u64 {
@@ -542,10 +550,50 @@ impl Wallet {
 				return Ok(v.clone());
 			}
 		}
+		let mut v = self.witness_check()?;
+		if let Some(at) = v["rolled_back"]["at"].as_u64() {
+			let why = v["rolled_back"]["why"].as_str().unwrap_or("").to_string();
+			v["exits"] = json!(self.exit_after(at, &why)?);
+			*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
+		}
+		Ok(v)
+	}
+
+	/// Refuses unless a witness of the operator's signer's record succeeded
+	/// within [`WITNESS_FOR`], running one when none did: what every entry
+	/// point that takes a coin or signs a spend through the operator runs
+	/// first (`send`, `participate`, `board`, the swap calls, `sync`'s work
+	/// with the server, `mailbox`), so a client built on the library cannot
+	/// forget it. A witness that fails is an unreachable server; one that
+	/// finds a rollback refuses, and the wallet's next [`Self::witness`] takes
+	/// the coins resting on what was lost on the chain.
+	pub(crate) fn witnessed_now(&self) -> Result<(), Error> {
+		let v = self.witness_check()?;
+		match v["rolled_back"]["at"].as_u64() {
+			Some(at) => Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the \
+				wallet goes no further with this operator, and takes on the chain every coin resting on what it signed after", at,
+				v["rolled_back"]["why"].as_str().unwrap_or("")))),
+			None => Ok(()),
+		}
+	}
+
+	/// The witness itself ([`Self::witness`]), without acting on a
+	/// rollback: what the record agrees with (kept for [`WITNESS_FOR`]), or
+	/// the rollback found, now or before (kept in the store), its exits not
+	/// yet made.
+	fn witness_check(&self) -> Result<Value, Error> {
+		if let Some((at, v)) = self.witnessed.borrow().as_ref() {
+			if at.elapsed() < WITNESS_FOR {
+				return Ok(v.clone());
+			}
+		}
 		let held = self.store.seen_heads()?;
 		let mut ask: Vec<(u64, String, Option<String>)> = vec![];
+		// The signer answers few heads without its signature, which prove
+		// nothing; the wallet names few.
 		let add = |h: &(u64, String, Option<String>), ask: &mut Vec<(u64, String, Option<String>)>| {
-			if ask.len() < MAX_WITNESS && !ask.iter().any(|a| a.0 == h.0) {
+			let unsigned = ask.iter().filter(|a| a.2.is_none()).count();
+			if ask.len() < MAX_WITNESS && !ask.iter().any(|a| a.0 == h.0) && (h.2.is_some() || unsigned < MAX_UNSIGNED_WITNESS) {
 				ask.push(h.clone());
 			}
 		};
@@ -585,8 +633,7 @@ impl Wallet {
 			Err(e) => {
 				// A rollback found before is acted on whatever the server says.
 				if let Some((at, why)) = prior {
-					let exits = self.exit_after(at, &why)?;
-					return Ok(json!({"rolled_back": {"at": at, "why": why}, "exits": exits, "server": e.to_string()}));
+					return Ok(json!({"rolled_back": {"at": at, "why": why}, "server": e.to_string()}));
 				}
 				return Err(e);
 			},
@@ -599,20 +646,13 @@ impl Wallet {
 			*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
 			return Ok(v);
 		}
-		let (at, why) = match judged {
-			Some((at, why)) => {
-				self.found_rollback(at, &why)?;
-				(at, why)
-			},
-			None => prior.clone().expect("a rollback found before"),
-		};
-		let at = self.rolled_back()?.map_or(at, |(a, _)| a);
-		let exits = self.exit_after(at, &why)?;
-		let v = json!({"rolled_back": {"at": at, "why": why}, "exits": exits,
+		if let Some((at, why)) = judged {
+			self.found_rollback(at, &why)?;
+		}
+		let (at, why) = self.rolled_back()?.expect("a rollback kept");
+		Ok(json!({"rolled_back": {"at": at, "why": why},
 			"note": "the operator's signer's record was rolled back or replaced: the wallet takes on the chain every coin a transfer \
-			recorded after the entry it last agrees with made, and goes no further with this operator"});
-		*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
-		Ok(v)
+			recorded after the entry it last agrees with made, and goes no further with this operator"}))
 	}
 
 	/// Judges a witness answer to the heads `ask` (the wallet's, `top` the

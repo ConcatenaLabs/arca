@@ -19,7 +19,7 @@
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
-//! | `witness` | POST | no: the heads it hands over are the signer's, signed; answered at a bounded rate, for each source and overall ([`Limiter`]) |
+//! | `witness` | POST | no: the heads it hands over are the signer's, signed, and at most four without a valid signature; answered at a bounded rate of its own, for each source and overall ([`Limiter`]) |
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -778,12 +778,24 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 		return Err(Refusal::malformed(format!("{} heads; a witness names at most {}", req.heads.len(), crate::signer::MAX_WITNESS)));
 	}
 	let mut heads = Vec::with_capacity(req.heads.len());
+	let mut unsigned = 0;
 	for h in &req.heads {
-		unhex32(&h.hash).map_err(Refusal::malformed)?;
-		if let Some(s) = &h.signature {
-			sig(s)?;
+		let hash = unhex32(&h.hash).map_err(Refusal::malformed)?;
+		let signed = match &h.signature {
+			Some(s) => arca_covenant::sign::verify_digest(&sig(s)?, &crate::signer::record_head_digest(&app.params.chain.genesis_hash(),
+				h.entry, &hash), &app.params.operator),
+			None => false,
+		};
+		if !signed {
+			unsigned += 1;
 		}
 		heads.push(crate::signer::WireEntryRef { entry: h.entry, hash: h.hash.clone(), signature: h.signature.clone() });
+	}
+	// The signer checks each signature before it looks anything up, and so
+	// does the server, before it asks.
+	if unsigned > crate::signer::MAX_UNSIGNED_WITNESS {
+		return Err(Refusal::malformed(format!("{} heads without the signer's valid signature; a witness names at most {}", unsigned,
+			crate::signer::MAX_UNSIGNED_WITNESS)));
 	}
 	let nonce = req.nonce.as_deref().map(unhex32).transpose().map_err(Refusal::malformed)?;
 	let w = app.cosigner.signer().witness(&heads, nonce.as_ref()).await.map_err(|e| match e {

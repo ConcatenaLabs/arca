@@ -123,6 +123,20 @@ pub struct LimitsSection {
 	/// How often expired nonces are deleted.
 	#[serde(default = "default_cleanup_interval")]
 	pub cleanup_interval_seconds: u64,
+	/// Witnesses of the signer's record answered per second at most, over
+	/// every source together, and how many at once: a budget of the
+	/// witness's own, apart from the nonces'. Each witness takes the
+	/// signer's record lock and up to 34 of its signatures.
+	#[serde(default = "default_witness_per_second")]
+	pub witness_per_second: u32,
+	#[serde(default = "default_witness_burst")]
+	pub witness_burst: u32,
+	/// Witnesses answered to each source per second at most, and how many at
+	/// once: a wallet makes one each command.
+	#[serde(default = "default_witness_source_per_second")]
+	pub witness_source_per_second: u32,
+	#[serde(default = "default_witness_source_burst")]
+	pub witness_source_burst: u32,
 }
 
 impl Default for LimitsSection {
@@ -133,8 +147,26 @@ impl Default for LimitsSection {
 			trusted_proxies: default_trusted_proxies(),
 			nonce_ttl_seconds: default_nonce_ttl(), board_unconfirmed_seconds: default_board_unconfirmed(),
 			cleanup_interval_seconds: default_cleanup_interval(),
+			witness_per_second: default_witness_per_second(), witness_burst: default_witness_burst(),
+			witness_source_per_second: default_witness_source_per_second(), witness_source_burst: default_witness_source_burst(),
 		}
 	}
+}
+
+fn default_witness_per_second() -> u32 {
+	500
+}
+
+fn default_witness_burst() -> u32 {
+	5_000
+}
+
+fn default_witness_source_per_second() -> u32 {
+	5
+}
+
+fn default_witness_source_burst() -> u32 {
+	60
 }
 
 fn default_issue_per_second() -> u32 {
@@ -677,8 +709,8 @@ impl Server {
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
-			witnesses: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
-				config.limits.source_burst),
+			witnesses: Limiter::new(config.limits.witness_per_second, config.limits.witness_burst, config.limits.witness_source_per_second,
+				config.limits.witness_source_burst),
 			challenge_key: store.challenge_key().await.map_err(err("the database"))?,
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
@@ -743,5 +775,8 @@ mod tests {
 		assert_eq!(c.limits.issue_per_second, super::LimitsSection::default().issue_per_second, "the example names the defaults");
 		assert_eq!(c.limits.issue_burst, super::LimitsSection::default().issue_burst);
 		assert_eq!(c.limits.nonce_ttl_seconds, 3600);
+		let d = super::LimitsSection::default();
+		assert_eq!((c.limits.witness_per_second, c.limits.witness_burst, c.limits.witness_source_per_second, c.limits.witness_source_burst),
+			(d.witness_per_second, d.witness_burst, d.witness_source_per_second, d.witness_source_burst), "the example names the defaults");
 	}
 }

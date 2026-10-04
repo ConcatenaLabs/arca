@@ -290,6 +290,11 @@ pub struct WireStopProof {
 /// The most heads one `witness` request names.
 pub const MAX_WITNESS: usize = 32;
 
+/// The most heads without `S`'s valid signature one `witness` request
+/// names: each is looked up all the same (a wallet may hold one from before
+/// heads were signed), and none can prove anything.
+pub const MAX_UNSIGNED_WITNESS: usize = 4;
+
 /// An entry of the record, whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1084,21 +1089,27 @@ impl SpendRecord {
 	/// and the signer signs nothing the record governs from then on, across
 	/// restarts. A head without that signature stops nothing, nor does one
 	/// the record holds, or one at an entry whose hash a compaction did not
-	/// keep.
+	/// keep. Every signature is checked before anything is looked up, and a
+	/// call naming more than [`MAX_UNSIGNED_WITNESS`] heads without a valid
+	/// one is refused.
 	pub fn witness(&mut self, heads: &[WireEntryRef]) -> Result<Vec<WireEntryHash>, String> {
+		// Every signature is checked before anything is looked up, and the
+		// heads without one that holds are few: only `S`'s heads cost a read
+		// of the record beyond that bound.
+		let signed: Vec<Option<[u8; 32]>> = heads.iter().map(|h| self.signed_head(h)).collect();
+		let unsigned = signed.iter().filter(|s| s.is_none()).count();
+		if unsigned > MAX_UNSIGNED_WITNESS {
+			return Err(format!("{} heads without the signer's valid signature; a witness names at most {}", unsigned, MAX_UNSIGNED_WITNESS));
+		}
 		let mut out = Vec::with_capacity(heads.len());
 		let mut proof = None;
-		for h in heads {
+		for (h, signed) in heads.iter().zip(signed) {
 			let held = self.hash_of(h.entry).map_err(|e| format!("the record could not be read: {}", e))?;
 			out.push(WireEntryHash { entry: h.entry, hash: held.map(|x| hex(&x)), signature: None });
 			if proof.is_some() || self.stopped.is_some() {
 				continue;
 			}
-			let Ok(hash) = unhex32(&h.hash) else { continue };
-			let Some(sig) = h.signature.as_deref().and_then(|s| unhex(s).ok()).and_then(|b| Signature::from_slice(&b).ok()) else { continue };
-			if !arca_covenant::sign::verify_digest(&sig, &record_head_digest(&self.genesis, h.entry, &hash), &self.operator) {
-				continue;
-			}
+			let Some(hash) = signed else { continue };
 			let why = if h.entry > self.head.0 {
 				Some(format!("a head the signer signed, entry {} with the running hash {}, lies past the record's end at entry {}",
 					h.entry, h.hash, self.head.0))
@@ -1114,6 +1125,14 @@ impl SpendRecord {
 			self.stop(&h, &why);
 		}
 		Ok(out)
+	}
+
+	/// The running hash `head` names, when it carries `S`'s valid signature
+	/// over it on this chain ([`record_head_digest`]).
+	fn signed_head(&self, head: &WireEntryRef) -> Option<[u8; 32]> {
+		let hash = unhex32(&head.hash).ok()?;
+		let sig = Signature::from_slice(&unhex(head.signature.as_deref()?).ok()?).ok()?;
+		arca_covenant::sign::verify_digest(&sig, &record_head_digest(&self.genesis, head.entry, &hash), &self.operator).then_some(hash)
 	}
 
 	/// Stops the signer for good on the proof `head`, a head it signed that

@@ -200,7 +200,13 @@ the keys, but which coins were spent off-chain is in the store and the server.
   entry it was never given counts as after; its own leaves and boards stay),
   and goes no further with the operator: it asks for no payment through it,
   takes no coin from its mailbox and signs nothing for it. `sync` then does
-  only what it does on the chain. The reason is shown, and kept with the
+  only what it does on the chain. The witness runs inside the wallet library
+  itself, in every operation that takes a coin or signs a spend through the
+  operator (sending, the mailbox, a board, a refresh, the swap calls,
+  `sync`), so a program built on the library cannot leave it out; while no
+  witness succeeds (the server denies it, or its answer carries no proof)
+  the wallet takes no coin and signs no spend through the operator, and
+  `sync` does only what it does on the chain. The reason is shown, and kept with the
   wallet's refusals.
 
 ### Fees
@@ -347,8 +353,9 @@ and holding it there, with the reason shown:
   back the head of the payment the record lost, which stops the signer, and
   takes that coin on the chain at once; every other wallet then learns the
   signer is stopped, and the older copy of the sender's wallet, shown the
-  record as it was, finds the spent coin's lineage on the chain and is
-  refused by the stopped signer on its other coin; and the same rollback
+  record as it was in a witness answer the signer did not make, finds the
+  spent coin's lineage on the chain and signs nothing, and shown the signer's
+  own answer goes no further, on the stopped signer's proof; and the same rollback
   where that older copy spends the coin again before any wallet witnesses,
   and another payment takes the record past every entry the receiver holds:
   the receiver's next `sync` finds another hash at its own highest entry,
@@ -361,6 +368,11 @@ and holding it there, with the reason shown:
   older signed head in `info`: each is an unreachable server, the wallet
   exits nothing, takes no coin from its mailbox, refuses nothing for good,
   and goes on once the answers are honest; the signer is never stopped;
+- the witness denied (a 503 on the way): `send`, `board`, `participate`, a
+  swap's offer and the mailbox are refused before anything reaches the
+  operator, and `sync` does only what it does on the chain; once the witness
+  answers again, the coin that waited in the mailbox is taken and the
+  payment goes through;
 - a forfeit's margin bounded from the operator's published floor: a wallet
   whose node values the asset five times higher than the operator's
   completes its refresh;
@@ -374,7 +386,8 @@ and holding it there, with the reason shown:
   TLS itself, and a plain-HTTP server on another host, refused before anything
   is sent;
 - a payment whose answer comes back as a gateway's 502, posted again;
-- a payment asked for while the operator's signer is away (503), posted again
+- a payment asked for while the operator's signer is away (it goes after the
+  sender's witness, before the server asks it to co-sign: a 503), posted again
   after the board's exit deadline has passed: it completes, and the receiver
   keeps the coin, past its deadline, and refreshes it; and one out of a batch
   leaf, posted again after the batch's exit deadline has passed and the

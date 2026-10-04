@@ -81,10 +81,12 @@ impl Running {
 			// The watcher acts on the chain for the operator, as it does on a
 			// server in use: the wallet must hold its coins with it on.
 			watcher: WatcherSection::default(),
-			// The scenarios ask for nonces and challenges faster than one
-			// wallet does.
+			// The scenarios ask for nonces, challenges and witnesses faster
+			// than one wallet does.
 			limits: LimitsSection {
-				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000, ..Default::default()
+				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000,
+				witness_per_second: 10_000, witness_burst: 10_000, witness_source_per_second: 10_000, witness_source_burst: 10_000,
+				..Default::default()
 			},
 			metrics_listen: None,
 		};

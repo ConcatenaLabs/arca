@@ -380,6 +380,9 @@ impl Wallet {
 	/// the server to co-sign the whole transfer, and takes the answer. `theirs`
 	/// carries the signatures of inputs another owner signed, by index.
 	fn transfer(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)]) -> Result<Value, Error> {
+		// Nothing is signed for the operator without a witness of its
+		// signer's record, whatever entry point led here.
+		self.witnessed_now()?;
 		let plan = TransferPlan {
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),

@@ -71,6 +71,7 @@ async fn the_reviewers_load_leaves_no_rows() {
 			source_per_second: PER_SECOND, source_burst: BURST, trusted_proxies: vec!["127.0.0.1".into()],
 			// The test deletes what expired itself, when it wants to.
 			cleanup_interval_seconds: 3600,
+			..LimitsSection::default()
 		};
 		c.challenge_ttl_seconds = TTL;
 	}).await;
@@ -345,4 +346,40 @@ async fn a_few_sources_leave_an_honest_caller_served() {
 		one challenge and one nonce a second: challenges {} given, {} rate_limited; nonces {} given, {} rate_limited ({:?})",
 		sources.len(), sent.load(Ordering::SeqCst), given.load(Ordering::SeqCst), ok[0], limited[0], ok[1], limited[1], t.elapsed());
 	assert_eq!((ok, limited), ([30, 30], [0, 0]), "the honest caller gets every challenge and every nonce it asks for");
+}
+
+/// R7e F6. The witness has a budget of its own, apart from the nonces': an
+/// operator that holds operator nonces to one in all still answers every
+/// wallet's witness at the witness's own rates, and the witness's own bound
+/// refuses past it while nonces go on being handed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_witness_has_a_budget_of_its_own() {
+	fn post(base: &str, call: &str, body: &str, from: &str) -> i32 {
+		minreq::post(format!("{}/v1/{}", base, call)).with_header("Content-Type", "application/json")
+			.with_header("X-Forwarded-For", from).with_body(body).with_timeout(5).send().map(|r| r.status_code).unwrap_or(0)
+	}
+	let witness = r#"{"heads":[]}"#;
+
+	// Nonces held to one in all: witnesses go on.
+	let r = Running::start_with(|c, _| c.limits = LimitsSection { issue_per_second: 0, issue_burst: 1, ..LimitsSection::default() }).await;
+	let base = r.http.base.clone();
+	let nonces: Vec<i32> = (0..3).map(|i| tokio::task::block_in_place(|| post(&base, "operator_nonce", "{}", &format!("203.0.113.{}", i + 1))))
+		.collect();
+	let witnesses: Vec<i32> = (0..20).map(|i| tokio::task::block_in_place(|| post(&base, "witness", witness, &format!("198.51.100.{}", i % 5 + 1))))
+		.collect();
+	println!("nonces held to one in all: nonces {:?}; 20 witnesses from five sources {:?}", nonces, witnesses);
+	assert_eq!(nonces, vec![200, 429, 429]);
+	assert!(witnesses.iter().all(|s| *s == 200), "every witness answered: {:?}", witnesses);
+	drop(r);
+
+	// The witness's own bound: two in all; nonces go on.
+	let r = Running::start_with(|c, _| c.limits = LimitsSection { witness_per_second: 0, witness_burst: 2, ..LimitsSection::default() }).await;
+	let base = r.http.base.clone();
+	let witnesses: Vec<i32> = (0..3).map(|i| tokio::task::block_in_place(|| post(&base, "witness", witness, &format!("198.51.100.{}", i + 1))))
+		.collect();
+	let nonces: Vec<i32> = (0..5).map(|i| tokio::task::block_in_place(|| post(&base, "operator_nonce", "{}", &format!("203.0.113.{}", i + 1))))
+		.collect();
+	println!("witnesses held to two in all: witnesses {:?}; nonces from five sources {:?}", witnesses, nonces);
+	assert_eq!(witnesses, vec![200, 200, 429]);
+	assert!(nonces.iter().all(|s| *s == 200), "{:?}", nonces);
 }

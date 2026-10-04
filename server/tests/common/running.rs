@@ -84,10 +84,12 @@ impl Running {
 			// The tests before the watcher's drive every step by hand; a test
 			// of the watcher turns it on, or calls its pass.
 			watcher: WatcherSection { enabled: false, ..Default::default() },
-			// The tests ask for nonces and challenges faster than a wallet
-			// does; the test of the limits sets them itself.
+			// The tests ask for nonces, challenges and witnesses faster than
+			// a wallet does; the test of the limits sets them itself.
 			limits: LimitsSection {
-				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000, ..Default::default()
+				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000,
+				witness_per_second: 10_000, witness_burst: 10_000, witness_source_per_second: 10_000, witness_source_burst: 10_000,
+				..Default::default()
 			},
 			metrics_listen: None,
 		};

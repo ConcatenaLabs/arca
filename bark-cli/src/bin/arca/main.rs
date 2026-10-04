@@ -283,12 +283,15 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// every wallet that is online witnesses it: a rollback of the record
 	// takes the coins resting on what it lost on the chain at once.
 	// Commands that stay on this machine and the node (and an exit, which
-	// needs nothing of the operator) do not wait on the server.
+	// needs nothing of the operator) do not wait on the server. The library
+	// witnesses again in every entry point that takes a coin or signs a
+	// spend through the operator, and refuses while no witness succeeds.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Exit { .. }) {
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
 			Ok(_) => {},
-			Err(e) => eprintln!("arca: the witness on start could not run: {}", e),
+			Err(e) => eprintln!("arca: the witness on start could not run ({}): the wallet takes no coin and signs no spend through the \
+				operator until a witness succeeds", e),
 		}
 	}
 	// The re-check runs on every start: a rollback since the last command
