@@ -639,7 +639,11 @@ impl Wallet {
 	/// which completes the new leaves at once, whatever the wallet broadcast
 	/// itself; an output left unclaimed until the refund delay has run since
 	/// it confirmed is the wallet's to refund, and the coin is the wallet's
-	/// on the chain once that refund is final; a forfeit never published,
+	/// on the chain once that refund is final, unless the wallet holds the
+	/// preimage of the new leaves the coin was given up for (read from a
+	/// claim a rollback took out) and their round can return: the output is
+	/// then the operator's to claim, and the wallet sends no refund and
+	/// follows it; a forfeit never published,
 	/// whose round can never return, is void, and its coin is the wallet's
 	/// again. A refund in the mempool, or a claim in a block not yet final,
 	/// decides nothing: the other may still take the output.
@@ -735,8 +739,18 @@ impl Wallet {
 		let forfeit = self.forfeit_of(&row, f)?;
 		let out = forfeit.output().txout();
 		// Published and unspent: the refund, once its delay has run (again,
-		// when a refund the wallet sent left the mempool or a block).
+		// when a refund the wallet sent left the mempool or a block), unless
+		// the wallet holds the preimage its round's new leaves open and that
+		// round can return. Then the coin was exchanged for those leaves, and
+		// the output is the operator's claim to make: the wallet only
+		// follows it.
 		if let Some(at) = self.chain.locate(std::slice::from_ref(&out))?[0] {
+			if self.holds_preimage(f)? && !self.round_gone(f)? {
+				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "forfeit": at.to_string(), "state": f.state,
+					"note": "the forfeit's output is unspent, and the wallet holds the preimage of the new leaves it was given up for, \
+					read from the operator's claim: the output is the operator's to claim while its round can return, so the wallet \
+					sends no refund and follows it"})));
+			}
 			return self.refund_forfeit(f, &forfeit, at, &row).map(Some);
 		}
 		// Published and spent: by a claim, which publishes the preimage, or by
@@ -788,19 +802,34 @@ impl Wallet {
 		if f.state != "signed" {
 			return Ok(None);
 		}
-		if let Some(raw) = self.store.tx(&f.round)? {
-			let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
-			if self.chain.gone(&round)? {
-				let why = format!("round {} can never return, so its forfeit can never be claimed: the coin is the wallet's again", f.round);
-				self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
-				let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| FOLLOWED.contains(&x.state.as_str()));
-				if !open && matches!(row.state.as_str(), "forfeited" | "spent") {
-					self.store.set_coin_state(&f.leaf_id, "live", &why)?;
-				}
-				return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "note": why})));
+		if self.round_gone(f)? {
+			let why = format!("round {} can never return, so its forfeit can never be claimed: the coin is the wallet's again", f.round);
+			self.store.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
+			let open = self.store.forfeits_of(&f.leaf_id)?.iter().any(|x| FOLLOWED.contains(&x.state.as_str()));
+			if !open && matches!(row.state.as_str(), "forfeited" | "spent") {
+				self.store.set_coin_state(&f.leaf_id, "live", &why)?;
 			}
+			return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "note": why})));
 		}
 		Ok(None)
+	}
+
+	/// Whether the wallet holds the preimage of the participation forfeit
+	/// `f` was signed for: the one that opens the new leaves of its round
+	/// (`f`'s unlock hash).
+	fn holds_preimage(&self, f: &ForfeitRow) -> Result<bool, Error> {
+		let unlock = unhex32(&f.unlock_hash)?;
+		Ok(self.store.participations()?.into_iter().filter(|p| p.0 == f.participation).filter_map(|p| p.5)
+			.filter_map(|pre| unhex32(&pre).ok()).any(|pre| sha256::Hash::hash(&pre).to_byte_array() == unlock))
+	}
+
+	/// Whether the round forfeit `f` is bound to can never return: an input
+	/// of it is spent by another transaction that is final. Its connector
+	/// asset can then never be issued, so no claim of the forfeit can be made.
+	fn round_gone(&self, f: &ForfeitRow) -> Result<bool, Error> {
+		let Some(raw) = self.store.tx(&f.round)? else { return Ok(false) };
+		let round: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
+		self.chain.gone(&round)
 	}
 
 	/// The owner's refund of the forfeit output at `at`, once the refund
