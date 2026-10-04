@@ -48,6 +48,16 @@ impl Here {
 		let o = o.txout();
 		self.outputs.iter().zip(&self.at).find(|(w, _)| **w == o).and_then(|(_, a)| *a)
 	}
+
+	/// Where `o` is: on the chain, or paid by a transaction of the exit
+	/// built already. Two coins of one reassignment, or two leaves of one
+	/// tree, share the steps above them, and each is built once.
+	fn or_built(&self, txs: &[UnrollTx], o: &ExplicitOutput) -> Option<OutPoint> {
+		self.at(o).or_else(|| {
+			let o = o.txout();
+			txs.iter().find_map(|u| u.tx.output.iter().position(|x| *x == o).map(|j| OutPoint::new(u.tx.txid(), j as u32)))
+		})
+	}
 }
 
 /// Who pays the fees an output's own reserve cannot.
@@ -178,18 +188,19 @@ impl Wallet {
 	/// now (`here`, from [`Self::path_outputs`] and the chain's `locate`):
 	/// the lowest output of the path that is unspent, so the plan follows
 	/// whichever round now pays the batch output, a board's conversion, and
-	/// every step someone else has already published.
+	/// every step someone else has already published; a step the plan has
+	/// built already (a lineage reaching it twice) is not built again.
 	fn bring(&self, coin: &ValidCoin, payer: &mut Payer, txs: &mut Vec<UnrollTx>, here: &Here) -> Result<OutPoint, Error> {
-		if let Some(at) = here.at(&coin.output()) {
+		if let Some(at) = here.or_built(txs, &coin.output()) {
 			return Ok(at);
 		}
 		match &coin.origin {
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let b = &valid.branch;
 				let n = b.nodes.len();
-				let start = match here.at(&b.entry_output()) {
+				let start = match here.or_built(txs, &b.entry_output()) {
 					Some(at) => Some((n, at)),
-					None => (0..n).rev().find_map(|i| here.at(&b.nodes[i].output()).map(|at| (i, at))),
+					None => (0..n).rev().find_map(|i| here.or_built(txs, &b.nodes[i].output()).map(|at| (i, at))),
 				};
 				let (from, mut at) = start.ok_or_else(|| Error::Refused(format!("nothing of the path of leaf {} is unspent on the chain: \
 					no transaction in a block or the mempool pays its batch output, a node below it or its entry unspent", coin.id)))?;
@@ -220,10 +231,10 @@ impl Wallet {
 			ValidOrigin::Transfer { inputs, index, .. } => {
 				let mut cps = vec![];
 				for i in inputs {
-					let cp = match here.at(&i.checkpoint_output()) {
+					let cp = match here.or_built(txs, &i.checkpoint_output()) {
 						Some(at) => at,
 						None => {
-							let u = match (i.coin.board(), here.at(&i.coin.output())) {
+							let u = match (i.coin.board(), here.or_built(txs, &i.coin.output())) {
 								// A board not converted: its checkpoint spends the
 								// board output itself.
 								(Some((board, _)), None) if here.at(&board.output()).is_some() => {
