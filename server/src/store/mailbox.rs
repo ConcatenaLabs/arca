@@ -11,6 +11,9 @@ pub struct MailboxMessage {
 	pub kind: String,
 	pub leaf_id: Option<[u8; 32]>,
 	pub payload: Vec<u8>,
+	/// For a coin a transfer made, the head of the signer's record that
+	/// transfer's last signature was recorded as.
+	pub signer_head: Option<super::transfers::RecordHeadRow>,
 }
 
 impl Store {
@@ -28,8 +31,10 @@ impl Store {
 	pub async fn mailbox_read(&self, mailbox_key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<MailboxMessage>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT cursor, kind, leaf_id, payload FROM mailbox_message
-			 WHERE mailbox_key = $1 AND cursor > $2 ORDER BY cursor LIMIT $3",
+			"SELECT m.cursor, m.kind, m.leaf_id, m.payload, t.signer_entry, t.signer_hash, t.signer_sig FROM mailbox_message m
+			 LEFT JOIN transfer_output o ON o.leaf_id = m.leaf_id
+			 LEFT JOIN transfer t ON t.transfer_id = o.transfer_id
+			 WHERE m.mailbox_key = $1 AND m.cursor > $2 ORDER BY m.cursor LIMIT $3",
 			&[&&mailbox_key[..], &after, &limit],
 		).await?;
 		rows.iter().map(|r| {
@@ -39,6 +44,7 @@ impl Store {
 				kind: r.get(1),
 				leaf_id: leaf.map(|l| super::array32(l, "leaf id")).transpose()?,
 				payload: r.get(3),
+				signer_head: super::transfers::head_of(r.get(4), r.get(5), r.get(6))?,
 			})
 		}).collect()
 	}

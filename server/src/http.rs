@@ -19,6 +19,7 @@
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
+//! | `witness` | POST | no: the heads it hands over are the signer's, signed; answered at a bounded rate, for each source and overall ([`Limiter`]) |
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -69,6 +70,9 @@ pub struct App {
 	pub challenge_ttl: Duration,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
+	/// Bounds the witnesses answered: each reads the signer's record under
+	/// its lock.
+	pub witnesses: Limiter,
 	/// The key of every challenge's check ([`crate::auth`]), drawn when the
 	/// server starts.
 	pub challenge_key: [u8; 32],
@@ -78,8 +82,8 @@ pub struct App {
 	/// The floors `info` last published, and when: asked of the node at most
 	/// once every [`FLOORS_FOR`].
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
-	/// The signer's record head `info` last published, and when.
-	pub record_head: tokio::sync::Mutex<Option<(Instant, (u64, [u8; 32]))>>,
+	/// The signer's record head `info` last published, signed, and when.
+	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
 }
 
 /// How long `info` publishes the floors it read from the node before it reads
@@ -436,20 +440,25 @@ fn board_status(s: &BoardStatus) -> api::BoardStatus {
 /// again.
 pub const RECORD_HEAD_FOR: Duration = Duration::from_secs(2);
 
-/// The signer's record's latest entry and running hash, as `info` publishes
-/// it: asked of the signer at most once every [`RECORD_HEAD_FOR`], and again
-/// at once when the database has been given a later entry since; `None`
-/// while the signer does not answer (the database's latest may lag the
-/// record by an entry after a crash, and would read as a rollback).
+fn record_head_json(h: &crate::signer::SignedHead) -> api::RecordHead {
+	api::RecordHead { entry: h.entry, hash: hex(&h.hash), signature: h.signature.map(|s| hex(s.as_ref())) }
+}
+
+/// The signer's record's latest entry and running hash, with the signer's
+/// signature over them, as `info` publishes it: asked of the signer at most
+/// once every [`RECORD_HEAD_FOR`], and again at once when the database has
+/// been given a later entry since; `None` while the signer does not answer
+/// (the database's latest may lag the record by an entry after a crash, and
+/// would read as a rollback), or is stopped.
 async fn record_head(app: &App) -> Option<api::RecordHead> {
 	let known = app.store.signer_head().await.ok().flatten().map(|h| h.0).unwrap_or(0);
 	let mut cached = app.record_head.lock().await;
 	if let Some((at, h)) = cached.as_ref() {
-		if at.elapsed() < RECORD_HEAD_FOR && known <= h.0 {
-			return Some(api::RecordHead { entry: h.0, hash: hex(&h.1) });
+		if at.elapsed() < RECORD_HEAD_FOR && known <= h.entry {
+			return Some(record_head_json(h));
 		}
 	}
-	let head = match app.cosigner.signer().head().await {
+	let head = match app.cosigner.signer().signed_head().await {
 		Ok(h) => Some(h),
 		Err(e) => {
 			log::warn!("info: the signer's record head: {}", e);
@@ -459,7 +468,7 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 	if let Some(h) = head {
 		*cached = Some((Instant::now(), h));
 	}
-	head.map(|(entry, h)| api::RecordHead { entry, hash: hex(&h) })
+	head.as_ref().map(record_head_json)
 }
 
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
@@ -576,6 +585,7 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 			leaf_id: id.to_string(),
 			record: hex(&r.to_bytes().map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?),
 		})).collect::<Result<_, Refusal>>()?,
+		signer_record: done.signer_head.map(|(entry, h, s)| api::RecordHead { entry, hash: hex(&h), signature: Some(hex(&s)) }),
 	}))
 }
 
@@ -701,7 +711,7 @@ async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) 
 			}),
 		},
 		min_leaf: t.params.min_leaf.to_string(),
-		signer_record: t.signer_head.map(|(entry, h)| api::RecordHead { entry, hash: hex(&h) }),
+		signer_record: t.signer_head.map(|(entry, h, sig)| api::RecordHead { entry, hash: hex(&h), signature: sig.map(|s| hex(&s)) }),
 		leaves: t.leaves.iter().map(|l| api::TreeLeaf {
 			template: l.template.to_string(),
 			owner: hex(&l.owner.serialize()),
@@ -750,6 +760,42 @@ async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	Ok(Json(api::Released { participation_id: hex(&id), released: done.iter().map(|l| l.to_string()).collect() }))
 }
 
+/// Hands the heads of the signer's record a wallet holds to the signer, and
+/// answers what the record holds at each entry, its latest entry, signed, and
+/// whether the signer is stopped. A head the signer signed that its record
+/// does not hold stops it (`crate::signer::SpendRecord::witness`).
+async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::Witness>, Refusal>
+{
+	let req: api::WitnessRequest = parse(body, app.max_request)?;
+	app.witnesses.refusal("a witness of the signer's record", app.source(peer.ip(), &headers))?;
+	if req.heads.len() > crate::signer::MAX_WITNESS {
+		return Err(Refusal::malformed(format!("{} heads; a witness names at most {}", req.heads.len(), crate::signer::MAX_WITNESS)));
+	}
+	let mut heads = Vec::with_capacity(req.heads.len());
+	for h in &req.heads {
+		unhex32(&h.hash).map_err(Refusal::malformed)?;
+		if let Some(s) = &h.signature {
+			sig(s)?;
+		}
+		heads.push(crate::signer::WireEntryRef { entry: h.entry, hash: h.hash.clone(), signature: h.signature.clone() });
+	}
+	let w = app.cosigner.signer().witness(&heads).await.map_err(|e| match e {
+		crate::signer::SignerError::Unreachable { .. } => Refusal::new(StatusCode::SERVICE_UNAVAILABLE, "signer_unavailable", e.to_string()),
+		other => Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", other.to_string()),
+	})?;
+	if let Some(why) = &w.stopped {
+		log::error!("the signer is stopped: {}", why);
+		// `info` shows no head of a stopped signer's record from now on.
+		*app.record_head.lock().await = None;
+	}
+	Ok(Json(api::Witness {
+		head: w.head.as_ref().map(record_head_json),
+		hashes: w.hashes.into_iter().map(|h| api::EntryHash { entry: h.entry, hash: h.hash }).collect(),
+		stopped: w.stopped,
+	}))
+}
+
 /// The most messages one read returns.
 pub const MAILBOX_PAGE: u32 = 100;
 
@@ -767,6 +813,7 @@ async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesReje
 			kind: m.kind,
 			leaf_id: m.leaf_id.map(|l| hex(&l)).unwrap_or_default(),
 			record: hex(&m.payload),
+			signer_record: m.signer_head.map(|(entry, h, s)| api::RecordHead { entry, hash: hex(&h), signature: Some(hex(&s)) }),
 		}).collect(),
 	}))
 }
@@ -814,6 +861,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/release_leaves", post(release_leaves))
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
+		.route("/v1/witness", post(witness))
 		.layer(DefaultBodyLimit::max(limit))
 		.with_state(app)
 }

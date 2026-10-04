@@ -9,7 +9,7 @@ use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey};
 use elements::{AssetId, BlockHash};
 
 use arca_covenant::{Chain, LeafId, MedianTime, RelativeTime, Template};
-use bark::arca::client::{auth_digest, key_proof_digest, participation_id, Wanted};
+use bark::arca::client::{auth_digest, key_proof_digest, participation_id, record_head_digest, Wanted};
 use server::participations::OutputRequest;
 
 fn key(label: &str) -> Keypair {
@@ -59,4 +59,9 @@ fn the_wallets_digests_are_the_servers() {
 		assert_eq!(key_proof_digest(&mine), server::participations::key_proof_digest(&theirs));
 		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");
 	}
+	// A signed head of the operator's signer's record.
+	for (n, h) in [(0u64, [0u8; 32]), (1, [9; 32]), (4_000_000, [0xa5; 32])] {
+		assert_eq!(record_head_digest(&chain, n, &h), server::signer::record_head_digest(&chain.genesis_hash(), n, &h));
+	}
+	assert_ne!(record_head_digest(&chain, 1, &[9; 32]), record_head_digest(&chain, 2, &[9; 32]));
 }

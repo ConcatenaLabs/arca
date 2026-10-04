@@ -107,13 +107,8 @@ to an older state:
   is lost cannot be replaced by a new one: the operator stops co-signing.
 - A record and a database rolled back together (a snapshot of the whole
   machine restored) pass every check the server makes of itself, so the
-  record has witnesses outside it: `info` carries its latest entry and
-  running hash (`signer_record`, asked of the signer, and again whenever
-  the database has been given a later entry), and every published tree the
-  entry the database knew when its round was built. A wallet keeps every
-  entry it is shown, and refuses an operator that later shows a latest
-  entry below one it showed, or another hash at an entry it has seen: every
-  wallet that was online in between sees the rollback.
+  record has witnesses outside it, and a proven rollback stops the signer
+  ([The signed head, witnessed](#the-signed-head-witnessed)).
 - The server records every message it asks the signer to sign before it
   asks, in the same transaction as what the signature is for (a transfer,
   a forfeit), and refuses to start on a database that does not know an
@@ -631,19 +626,20 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry and running hash (`signer_record`, absent while the signer does not answer), the request limit |
+| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them (`signer_record`, absent while the signer does not answer or is stopped), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`), its transaction's finality and, once that is in a block, its dates (`exit_deadline`, `expiry`) |
-| `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins |
+| `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins, with the signed head of the signer's record its last signature was recorded at (`signer_record`) |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, and while it is pending why the last round did not take it (`waiting`) |
-| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built |
+| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
-| `POST mailbox_read` | The coin records in a key's mailbox after a cursor |
+| `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at |
 | `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records; a round's leaf is served with an empty record until its participation's preimage went out |
+| `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`), hands them to the signer, and answers the running hash the record holds at each entry, its latest entry, signed, and whether the signer is stopped |
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
@@ -668,7 +664,9 @@ of ten by default), so one caller asking as fast as it can leaves every other
 its share, and over every source together within a high bound (250 a second,
 bursts of 10,000), which bounds the rows nonces hold without a budget a few
 sources could use up; a request past either is refused with 429
-`rate_limited`. A `challenge` writes no row and is not limited. A source is
+`rate_limited`. A `witness`, which reads the signer's record under its lock,
+is answered within the same rates, from a bucket of its own: a wallet makes
+one each command. A `challenge` writes no row and is not limited. A source is
 an IPv4 address, or an IPv6 /48. A request from a trusted proxy
 (`trusted_proxies`, loopback by default, for a proxy on the same machine) is
 counted against the nearest address in its `X-Forwarded-For` that is not a
@@ -762,16 +760,61 @@ The record grows with every message signed, and protects nothing once the
 coins its entries are for can no longer be spent off-chain. It can be
 compacted, with the signer stopped: `arcad <config> expired-salts` lists the
 salts of every leaf whose coin rests on batches alone, all past their last
-expiry, and of their checkpoints (a board never expires, so a coin resting on
-one is never listed), and `arca-signer --compact-into <new file>
+expiry, and of their checkpoints (a board's covenant never expires, so a coin
+resting on one is never listed), and `arca-signer --compact-into <new file>
 --drop-salts <list>` writes a new record without the entries under those
 salts. The new record's first line names the old record's latest entry and
 running hash, from which its own entries go on, so the entry the server's
 database knows is still the record's; it carries every other entry's line
-over verbatim, with a hash over them in that first line, which the signer
-checks at start. A database that knows an entry compacted away is older than
-the compaction (`record_differs`). The operator then puts the new file in the
-record's place and starts the signer on it.
+over verbatim, and for every entry it drops a line with that entry's number
+and running hash (about 70 bytes an entry, on disk), with a hash over all of
+them in that first line, which the signer checks at start. So the record
+answers the running hash at every one of its entries for its whole life. The
+operator then puts the new file in the record's place and starts the signer
+on it.
+
+### The signed head, witnessed
+
+Every head of the record the signer hands out, an entry and its running
+hash, is signed with `S` over `SHA256(T ‖ T ‖ genesis ‖ entry ‖ hash)`,
+`T = SHA256("Arca/record-head")`, the genesis hash in internal byte order and
+the entry eight bytes little-endian; only for an entry on disk. `info`
+carries the latest, every published tree the one the database knew when its
+round was built, and every transfer's answer and its coins' mailbox records
+the one its last signature was recorded at. A wallet keeps each head it is
+shown with that signature, and on every contact (each command that reaches
+the server, `sync`, the mailbox and the re-check on start among them) makes
+one `witness` call: it hands over the highest head it holds, the heads its
+coins were recorded at, and as many more as fit, and gets back the running
+hash the record holds at each entry and the record's latest entry, signed. A
+latest entry below the highest it holds, or another hash at an entry it
+holds, is a rollback; since the wallet asks for its own highest entry by
+number every time, a rolled-back record that has signed past it again is
+caught as well.
+
+A head that carries `S`'s valid signature and that the record does not hold
+(an entry past its end, or another hash at that entry) is proof the record
+was rolled back or replaced: the signer signed it. The server hands every
+head it is given to the signer, which checks the signature itself, writes
+the proof beside its record (`<record>.stopped`), and from then on signs no
+rebindable message and no head, across restarts. It still signs the spends
+of the operator's own paths (a claim, a sweep), which the record does not
+govern. The server still starts on a stopped signer and answers every
+wallet's witness with the stop, so one wallet that was online in between
+protects every holder. A head without `S`'s valid signature, altered, of
+another chain, or one the record holds, stops nothing; neither does a head
+from before a compaction, whose hash the compacted record keeps.
+
+A stop means the record's guarantee is void for every entry after the point
+it fell back to: `S` may have co-signed a second spend of a coin a transfer
+after that point made. Each wallet finds the highest entry it holds that the
+record still agrees with, takes on the chain at once every coin it holds
+that a transfer recorded after it made (a coin whose entry it was never
+given counts as after), keeps its own leaves and boards, which no transfer
+made, and goes no further with the operator. The operator does not clear the
+stop to carry on: it resumes only with a new signer key and a new record,
+which is a new operator to every wallet. `arca-signer --clear-stopped`
+removes the proof, with the signer stopped, after printing it.
 
 ## Running
 
@@ -784,6 +827,8 @@ record's place and starts the signer on it.
     arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --compact-into /var/lib/arca/signer.record.new --drop-salts expired.salts   # with the signer stopped
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
+        --clear-stopped                    # removes the proof of a rollback, with the signer stopped
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`).
@@ -795,7 +840,7 @@ with their smallest leaf, how often a round is built, the assets a round's
 fee is paid in, the fee schedule, the watcher (`[watcher]`: whether it
 acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
-behind (`[limits]`: the rate of nonces, for each source and overall, the
+behind (`[limits]`: the rate of nonces and of witnesses, for each source and overall, the
 proxies trusted to name a request's source, a nonce's lifetime,
 how long a board may stay out of every block), and where the operator's
 metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
@@ -1113,13 +1158,24 @@ past a file size limit undone at once and the next entry whole once there is
 room; a line cut short by a crash removed at start, which says so; an edited
 line, and a record of another key, refusing the start. Its compaction: no
 compaction while a signer holds the record, nor over a file that is there;
-the entries under the salts listed dropped, the rest carried over verbatim,
-the new record going on from the old one's latest entry; the signer on it
-refusing another message under a salt carried over, signing the same message
-again as its entry, taking a dropped salt afresh, accepting the database's
-knowledge of a carried entry and refusing that of one compacted away
-(`record_differs`), listing its entries; a carried line changed refusing the
-start; and a compacted record compacted again.
+the entries under the salts listed dropped, each leaving a line with its
+running hash, the rest carried over verbatim, the new record going on from
+the old one's latest entry; the signer on it refusing another message under a
+salt carried over, signing the same message again as its entry, taking a
+dropped salt afresh, answering the running hash at a dropped entry, a head
+of it signed before the compaction stopping nothing, accepting the
+database's knowledge of an entry compacted away whose hash it kept and
+refusing another hash there (`record_differs`), listing its entries; a
+carried line changed refusing the start; and a compacted record compacted
+again. And the signed head: every rebind's entry and `head` signed by `S`; an
+unsigned head, one signed by another key or for another chain, a signature
+moved to another hash or entry, garbage, and a head the record holds each
+stopping nothing; a record rolled back to an older copy and signing two
+entries of another branch, handed the head it lost, stopped, the proof
+written beside it, every rebind and `head` refused (`stopped`) across a
+restart while the spend of one of the operator's own paths is still signed;
+`--clear-stopped` removing the proof, after which it signs again; and a
+signed head past the record's end stopping it as well.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next
@@ -1153,8 +1209,11 @@ check the chain's refuses the start too, naming the board's spend. A copy
 taken mid-round, the round final and the forfeit not yet handed over, does
 not start either, naming the forfeit; the latest state starts. A round
 built after the copy makes the server refuse to start on it, naming the
-round. A forfeit whose operator's half was never stored is given it at
-start, and the signer's record does not grow. A copy older than twelve
+round. Database and signer's record rolled back together past a round
+built and forfeited after the copy agree with each other, and the server
+still does not start, naming the round the chain holds. A forfeit whose
+operator's half was never stored is given it at start, and the signer's
+record does not grow. A copy older than twelve
 entries is refused naming the first ten, the check stopping there rather
 than read the whole of a long record against it.
 

@@ -13,8 +13,15 @@
 //!   `known` names the latest entry of the record the server's database
 //!   knows (`{"entry":…,"hash":…}`);
 //! - `{"op":"head"}` and `{"op":"entries","after":…,"limit":…}`: the record's
-//!   latest entry, and its entries after one, for the server to check its
-//!   database against at start;
+//!   latest entry, signed ([`record_head_digest`]), and its entries after
+//!   one, for the server to check its database against at start;
+//! - `{"op":"witness","heads":[{"entry":…,"hash":…,"signature":…},…]}`: the
+//!   running hash at each entry named, and the record's latest entry,
+//!   signed. A head among them that carries `S`'s signature and that the
+//!   record does not hold (an entry past its end, or another hash at that
+//!   entry) is proof the record was rolled back or replaced: the signer
+//!   writes it beside the record and signs nothing the record governs from
+//!   then on ([`SpendRecord::witness`]);
 //! - `{"op":"spend","tx":…,"prevouts":[…],"input":…,"leaf":…}`: `S`'s signature
 //!   over the spend of input `input` of the transaction by the tapscript leaf
 //!   `leaf`, whose signature hash (Elements taproot, `SIGHASH_DEFAULT`, its
@@ -72,6 +79,26 @@
 //! So a database restored from an older copy, which no longer knows a
 //! transfer it co-signed, cannot have `S` co-sign a second spend of the same
 //! coin: the record outlives it.
+//!
+//! # The signed head, witnessed
+//!
+//! Every head of the record the signer hands out, `(entry, running hash)`, is
+//! signed with `S` over `SHA256(T ‖ T ‖ genesis ‖ entry ‖ hash)`,
+//! `T = SHA256("Arca/record-head")`, the entry eight bytes little-endian
+//! ([`record_head_digest`]), and only for an entry on disk: the latest, after
+//! a message is recorded and synced, or an earlier one the record holds.
+//! Wallets keep these heads and hand them back on every contact (`witness`).
+//! A signed head the record does not hold can only come from a record that
+//! was rolled back or replaced, since the signer signed it: the signer then
+//! writes the head and why beside its record (`<record>.stopped`) and refuses
+//! every rebindable message and every signed head from then on, across
+//! restarts, until the operator removes that file by an explicit command
+//! (`arca-signer --clear-stopped`). It still signs the spends of the
+//! operator's own paths (a claim, a sweep), which the record does not
+//! govern and which hold no holder's coin. A head without `S`'s valid
+//! signature, of another chain, or that the record holds, stops nothing; so
+//! does a head the record knows only by its number, from before a
+//! compaction that kept no hash for it.
 //!
 //! The record cannot be lost, cut back, torn or shared without the signer
 //! noticing ([`SpendRecord`]): it is made once, on purpose, never in passing;
@@ -175,8 +202,11 @@ pub enum Request {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		known: Option<WireEntryRef>,
 	},
-	/// The latest entry of the record: its number and running hash.
+	/// The latest entry of the record: its number and running hash, signed.
 	Head {},
+	/// Heads a wallet holds, each with the signature it was handed out with:
+	/// the running hash at each entry, and the latest entry, signed.
+	Witness { heads: Vec<WireEntryRef> },
 	/// The entries after entry `after`, at most `limit` of them.
 	Entries { after: u64, limit: u32 },
 	/// The transaction and each output its inputs spend, in Sequentia's
@@ -209,13 +239,28 @@ pub fn check_spend(operator: &XOnlyPublicKey, tx: &elements::Transaction, prevou
 	Ok(())
 }
 
-/// An entry of the record, by its number and running hash.
+/// An entry of the record, by its number and running hash; with `S`'s
+/// signature over it ([`record_head_digest`]) when the signer hands it out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireEntryRef {
 	pub entry: u64,
 	pub hash: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signature: Option<String>,
 }
+
+/// The running hash the record holds at an entry: `None` past its end, or for
+/// an entry a compaction kept no hash of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireEntryHash {
+	pub entry: u64,
+	pub hash: Option<String>,
+}
+
+/// The most heads one `witness` request names.
+pub const MAX_WITNESS: usize = 32;
 
 /// An entry of the record, whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +300,12 @@ pub struct Response {
 	pub entry: Option<WireEntryRef>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub entries: Option<Vec<WireEntry>>,
+	/// The running hash at each entry a `witness` request named, in order.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hashes: Option<Vec<WireEntryHash>>,
+	/// Why the signer signs nothing the record governs: a proven rollback.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stopped: Option<String>,
 }
 
 /// The refusal code of a message the one-spend record does not admit.
@@ -284,6 +335,33 @@ pub const RECORD_BEHIND: &str = "record_behind";
 /// The refusal code when the database knows an entry the record holds
 /// otherwise: another record, or one two signers wrote.
 pub const RECORD_DIFFERS: &str = "record_differs";
+/// The refusal code of a signer stopped by a proven rollback of its record.
+pub const STOPPED: &str = "stopped";
+/// The tag of a signed head of the record.
+pub const RECORD_HEAD_TAG: &[u8] = b"Arca/record-head";
+
+/// What `S` signs to hand out entry `entry` of its record, whose running
+/// hash is `hash`, on the chain of `genesis`:
+/// `SHA256(T ‖ T ‖ genesis ‖ entry ‖ hash)`, `T = SHA256("Arca/record-head")`,
+/// the genesis hash in internal byte order, the entry eight bytes
+/// little-endian. The tag keeps it apart from every other message `S` signs.
+pub fn record_head_digest(genesis: &elements::BlockHash, entry: u64, hash: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(RECORD_HEAD_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&arca_covenant::Chain::new(*genesis).genesis_bytes());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
+/// Where the proof of a rollback is kept beside the record at `record`.
+pub fn stopped_path(record: &Path) -> PathBuf {
+	let mut p = record.as_os_str().to_owned();
+	p.push(".stopped");
+	PathBuf::from(p)
+}
 
 /// `SHA256("Arca/signer-record" ‖ prev ‖ text)`: the running hash after a
 /// line of the record whose text, before its own hash, is `text`; `prev` is
@@ -344,17 +422,24 @@ impl Entry {
 	}
 }
 
-/// The format of a record compacted from another
-/// ([`SpendRecord::compact`]): its first line also names the record it was
+/// The format of a record compacted from another without the running hash
+/// of each entry it dropped: its first line also names the record it was
 /// compacted from, by that record's latest entry and running hash, and how
-/// many of its entries it carries over, with a hash over their lines.
+/// many of its entries it carries over, with a hash over their lines. Read,
+/// never written.
 pub const RECORD_VERSION_COMPACTED: u32 = 2;
+/// The format of a record compacted from another
+/// ([`SpendRecord::compact`]): as [`RECORD_VERSION_COMPACTED`], with a hash
+/// line `<n> <hash>` in place of every entry it dropped, so the record
+/// answers the running hash at every entry for its whole life.
+pub const RECORD_VERSION_HASHES: u32 = 3;
 /// The tag of the hash over a compacted record's carried lines.
 pub const RECORD_CARRIED_TAG: &[u8] = b"Arca/signer-record-carried";
 
-/// How many entries apart the record remembers where a line starts, to read
-/// entries back from the file.
-const MARK_EVERY: u64 = 1024;
+/// How many lines apart the record remembers where a line starts, to read
+/// entries and running hashes back from the file: a lookup reads at most
+/// this many lines.
+const MARK_EVERY: u64 = 64;
 /// How many of the latest entries' running hashes the record keeps at hand:
 /// the entry the database knows, which every request names, is nearly always
 /// one of them.
@@ -427,6 +512,50 @@ fn parse_entry(line: &str) -> Result<Entry, String> {
 	Ok(Entry { n, kind, owner: unhex32(owner)?, salt: unhex32(salt)?, digest: unhex32(digest)?, hash: unhex32(hash)? })
 }
 
+/// A hash line of a compacted record, `<n> <hash>`: the running hash of an
+/// entry the compaction dropped.
+fn check_hash_line(line: &[u8]) -> Option<(u64, [u8; 32])> {
+	let f: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+	match f.as_slice() {
+		[n, h] if !n.is_empty() && n.iter().all(u8::is_ascii_digit) && is_hex32(h) => {
+			let n: u64 = std::str::from_utf8(n).ok()?.parse().ok()?;
+			Some((n, unhex32(std::str::from_utf8(h).ok()?).ok()?))
+		},
+		_ => None,
+	}
+}
+
+/// One line of the record after its header: an entry, or the running hash of
+/// an entry a compaction dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Line {
+	Entry(Entry),
+	Hash(u64, [u8; 32]),
+}
+
+impl Line {
+	fn n(&self) -> u64 {
+		match self {
+			Line::Entry(e) => e.n,
+			Line::Hash(n, _) => *n,
+		}
+	}
+
+	fn hash(&self) -> [u8; 32] {
+		match self {
+			Line::Entry(e) => e.hash,
+			Line::Hash(_, h) => *h,
+		}
+	}
+}
+
+fn parse_line(text: &str) -> Result<Line, String> {
+	match check_hash_line(text.as_bytes()) {
+		Some((n, h)) => Ok(Line::Hash(n, h)),
+		None => parse_entry(text).map(Line::Entry),
+	}
+}
+
 /// Reads the line that starts at `at` in `file`, without its newline.
 fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 	use std::os::unix::fs::FileExt;
@@ -461,17 +590,22 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// The record is read line by line when it is opened, every line checked,
 /// and kept at hand only as far as a lookup needs: for each entry, the first
 /// eight bytes of its salt and where its line starts, sorted; with where
-/// every 1,024th line starts, and the running hashes of the latest 4,096
-/// entries. The entries under a salt, and anything a request repeated or the
-/// database's start check asks, are read back from the file.
+/// every 64th line starts, and the running hashes of the latest 4,096
+/// entries. The entries under a salt, the running hash at an entry, and
+/// anything a request repeated or the database's start check asks, are read
+/// back from the file.
 ///
 /// A record can be compacted into a new one ([`SpendRecord::compact`]),
 /// dropping the entries under salts the server no longer serves (leaves
 /// whose batches have expired): the new record's first line,
-/// `arca-signer-record 2 <S> <genesis> <n> <hash> <carried> <carried hash>`,
+/// `arca-signer-record 3 <S> <genesis> <n> <hash> <carried> <carried hash>`,
 /// names the old record's latest entry and running hash, from which its own
-/// entries go on, and how many lines it carries over from it, verbatim, with
-/// a hash over them (`SHA256("Arca/signer-record-carried" ‖ lines)`).
+/// entries go on, and how many lines it carries over from it, with a hash
+/// over them (`SHA256("Arca/signer-record-carried" ‖ lines)`): every entry
+/// it keeps, verbatim, and for every entry it drops a hash line
+/// `<n> <hash>`, its running hash, so the record answers the running hash
+/// at any of its entries for its whole life. A record of format 2, compacted
+/// without those lines, is read too.
 ///
 /// The record is never made in passing: [`SpendRecord::create`] makes a new
 /// one, once, and [`SpendRecord::open`] refuses a path where there is none,
@@ -487,7 +621,9 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// request names it ([`SpendRecord::check_known`]). A record that ends
 /// before that entry has been cut back, and one whose entry there is another
 /// is another record: from then on the signer signs nothing until it is
-/// started again on its whole record.
+/// started again on its whole record. A head the signer signed that the
+/// record does not hold, handed back by a wallet, stops it for good
+/// ([`SpendRecord::witness`]).
 pub struct SpendRecord {
 	file: std::fs::File,
 	/// The file's length, every line in it whole.
@@ -505,12 +641,23 @@ pub struct SpendRecord {
 	kept: Vec<Kept>,
 	/// Every entry added since, by salt.
 	added: std::collections::HashMap<u64, Vec<u64>>,
-	/// `(entry, offset)` of every [`MARK_EVERY`]th entry line, from the first.
+	/// How many lines, entries and hash lines, the record holds.
+	lines: u64,
+	/// `(entry, offset)` of every [`MARK_EVERY`]th line, from the first.
 	marks: Vec<(u64, u64)>,
 	/// `(entry, running hash)` of the latest entries.
 	recent: std::collections::VecDeque<(u64, [u8; 32])>,
 	/// Why the signer signs nothing more until it is started again.
 	refusing: Option<String>,
+	/// Why the signer signs nothing the record governs, for good: a proven
+	/// rollback, kept beside the record ([`stopped_path`]).
+	stopped: Option<String>,
+	/// Where that proof is kept.
+	stop_path: PathBuf,
+	/// The operator key and the chain the record is kept for, which every
+	/// head it hands out is signed under.
+	operator: XOnlyPublicKey,
+	genesis: elements::BlockHash,
 }
 
 impl SpendRecord {
@@ -588,16 +735,18 @@ impl SpendRecord {
 		}
 		let ours = record_header(operator, genesis);
 		let ours: Vec<&str> = ours.split(' ').collect();
+		let mut hash_lines = false;
 		let (base, carried) = match f.get(1).and_then(|v| v.parse::<u32>().ok()) {
 			Some(RECORD_VERSION) => (None, None),
-			Some(RECORD_VERSION_COMPACTED) if f.len() == 8 => {
+			Some(v @ (RECORD_VERSION_COMPACTED | RECORD_VERSION_HASHES)) if f.len() == 8 => {
+				hash_lines = v == RECORD_VERSION_HASHES;
 				let n: u64 = f[4].parse().map_err(|_| format!("{}: the header's latest entry {:?}", path.display(), f[4]))?;
 				let carried: u64 = f[6].parse().map_err(|_| format!("{}: the header's carried count {:?}", path.display(), f[6]))?;
 				(Some((n, unhex32(f[5]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)),
 					Some((carried, unhex32(f[7]).map_err(|e| format!("{}: the header: {}", path.display(), e))?)))
 			},
-			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {} and {}", path.display(), f.get(1),
-				RECORD_VERSION, RECORD_VERSION_COMPACTED)),
+			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {}, {} and {}", path.display(), f.get(1),
+				RECORD_VERSION, RECORD_VERSION_COMPACTED, RECORD_VERSION_HASHES)),
 		};
 		if f.get(2..4) != ours.get(2..4) || (base.is_none() && f.len() != 4) {
 			return Err(format!("{}: the record is kept for another operator key or another chain ({:?}); this signer holds \
@@ -607,9 +756,16 @@ impl SpendRecord {
 		let first = got as u64;
 		// About 300 bytes a line: room for every entry at once.
 		let lines = file.metadata().map(|m| m.len()).unwrap_or(0) / 280 + 16;
+		let stop_path = stopped_path(path);
+		let stopped = match std::fs::read_to_string(&stop_path) {
+			Ok(text) => Some(format!("{}: {} (the proof is kept in {}; the operator clears it with arca-signer --clear-stopped)", STOPPED,
+				text.lines().next().unwrap_or("the record was rolled back or replaced"), stop_path.display())),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+			Err(e) => return Err(format!("{}: {}", stop_path.display(), e)),
+		};
 		let mut record = SpendRecord {
 			file, size: first, first, base, head: base, count: 0, kept: Vec::with_capacity(lines as usize), added: Default::default(),
-			marks: vec![], recent: Default::default(), refusing: None,
+			lines: 0, marks: vec![], recent: Default::default(), refusing: None, stopped, stop_path, operator: *operator, genesis: *genesis,
 		};
 		let mut at = first;
 		let mut k = 1u64;
@@ -628,6 +784,15 @@ impl SpendRecord {
 					return Err(bad("a carried line is missing or cut short: the record has been changed"));
 				}
 				e.input(&line[..got]);
+				if let Some((n, _)) = check_hash_line(&line[..got - 1]).filter(|_| hash_lines) {
+					if n <= last || n > base.0 {
+						return Err(bad("a carried hash line out of order"));
+					}
+					last = n;
+					record.mark(n, at);
+					at += got as u64;
+					continue;
+				}
 				let (n, salt, hash) = check_line(&line[..got - 1], None).map_err(|w| bad(&w))?;
 				if n <= last || n > base.0 {
 					return Err(bad("a carried entry out of order"));
@@ -683,14 +848,21 @@ impl SpendRecord {
 		} else {
 			self.kept.push(Kept { salt: salt_key(salt), at });
 		}
-		if self.count % MARK_EVERY == 0 {
-			self.marks.push((n, at));
-		}
+		self.mark(n, at);
 		self.count += 1;
 		self.recent.push_back((n, hash));
 		if self.recent.len() > RECENT {
 			self.recent.pop_front();
 		}
+	}
+
+	/// Counts the line of entry `n` at `at`, remembering where every
+	/// [`MARK_EVERY`]th line starts.
+	fn mark(&mut self, n: u64, at: u64) {
+		if self.lines % MARK_EVERY == 0 {
+			self.marks.push((n, at));
+		}
+		self.lines += 1;
 	}
 
 	/// Every entry under `salt`, read back from the file.
@@ -714,9 +886,9 @@ impl SpendRecord {
 		parse_entry(&line_at(&self.file, at)?)
 	}
 
-	/// Calls `f` with each entry line from `from` on (its text, its entry and
+	/// Calls `f` with each line from `from` on (its text, what it holds and
 	/// where it starts) until `f` says stop.
-	fn each_from(&self, from: u64, mut f: impl FnMut(&str, Entry, u64) -> Result<bool, String>) -> Result<(), String> {
+	fn each_from(&self, from: u64, mut f: impl FnMut(&str, Line, u64) -> Result<bool, String>) -> Result<(), String> {
 		use std::io::{BufRead, Seek};
 		let mut file = self.file.try_clone().map_err(|e| e.to_string())?;
 		file.seek(std::io::SeekFrom::Start(from)).map_err(|e| e.to_string())?;
@@ -730,7 +902,7 @@ impl SpendRecord {
 				break;
 			}
 			let text = line.trim_end_matches('\n');
-			if !f(text, parse_entry(text)?, at)? {
+			if !f(text, parse_line(text)?, at)? {
 				break;
 			}
 			at += got as u64;
@@ -763,19 +935,27 @@ impl SpendRecord {
 		}
 		let i = self.marks.partition_point(|(n, _)| *n <= after);
 		let from = if i == 0 { self.first } else { self.marks[i - 1].1 };
-		self.each_from(from, |_, e, _| {
-			if e.n > after {
-				out.push(e);
+		self.each_from(from, |_, l, _| {
+			if let Line::Entry(e) = l {
+				if e.n > after {
+					out.push(e);
+				}
 			}
 			Ok(out.len() < limit)
 		})?;
 		Ok(out)
 	}
 
-	/// The running hash of entry `n`, when the record holds it.
-	fn hash_of(&self, n: u64) -> Result<Option<[u8; 32]>, String> {
+	/// The running hash of entry `n`, when the record holds it: an entry of
+	/// its own, one it carries, or one a compaction dropped and kept the hash
+	/// of. `None` past its end, and for an entry a compaction of format 2
+	/// dropped.
+	pub fn hash_of(&self, n: u64) -> Result<Option<[u8; 32]>, String> {
 		if n == self.base.0 {
 			return Ok(Some(self.base.1));
+		}
+		if n > self.head.0 {
+			return Ok(None);
 		}
 		if let Ok(i) = self.recent.binary_search_by_key(&n, |(m, _)| *m) {
 			return Ok(Some(self.recent[i].1));
@@ -785,18 +965,107 @@ impl SpendRecord {
 			return Ok(None);
 		}
 		let mut found = None;
-		self.each_from(self.marks[i - 1].1, |_, e, _| {
-			if e.n == n {
-				found = Some(e.hash);
+		self.each_from(self.marks[i - 1].1, |_, l, _| {
+			if l.n() == n {
+				found = Some(l.hash());
 			}
-			Ok(e.n < n)
+			Ok(l.n() < n)
 		})?;
 		Ok(found)
 	}
 
 	/// Why the signer signs nothing more, if it does not.
 	pub fn refusing(&self) -> Option<&str> {
-		self.refusing.as_deref()
+		self.stopped.as_deref().or(self.refusing.as_deref())
+	}
+
+	/// Why the signer signs nothing the record governs, for good: a proven
+	/// rollback, if one was handed to it.
+	pub fn stopped(&self) -> Option<&str> {
+		self.stopped.as_deref()
+	}
+
+	/// Checks the heads a wallet holds, each `(entry, running hash)` with the
+	/// signature it was handed out with, against the record, and returns the
+	/// running hash the record holds at each entry (`None` past its end, or
+	/// for an entry a compaction of format 2 dropped). A head that carries
+	/// `S`'s valid signature on this chain and that the record does not hold
+	/// (an entry past its end, or another hash at its entry) is proof that
+	/// the record was rolled back or replaced, since the signer signed it:
+	/// the proof is written beside the record ([`stopped_path`]) and synced,
+	/// and the signer signs nothing the record governs from then on, across
+	/// restarts. A head without that signature stops nothing, nor does one
+	/// the record holds, or one at an entry whose hash a compaction did not
+	/// keep.
+	pub fn witness(&mut self, heads: &[WireEntryRef]) -> Result<Vec<WireEntryHash>, String> {
+		let mut out = Vec::with_capacity(heads.len());
+		let mut proof = None;
+		for h in heads {
+			let held = self.hash_of(h.entry).map_err(|e| format!("the record could not be read: {}", e))?;
+			out.push(WireEntryHash { entry: h.entry, hash: held.map(|x| hex(&x)) });
+			if proof.is_some() || self.stopped.is_some() {
+				continue;
+			}
+			let Ok(hash) = unhex32(&h.hash) else { continue };
+			let Some(sig) = h.signature.as_deref().and_then(|s| unhex(s).ok()).and_then(|b| Signature::from_slice(&b).ok()) else { continue };
+			if !arca_covenant::sign::verify_digest(&sig, &record_head_digest(&self.genesis, h.entry, &hash), &self.operator) {
+				continue;
+			}
+			let why = if h.entry > self.head.0 {
+				Some(format!("a head the signer signed, entry {} with the running hash {}, lies past the record's end at entry {}",
+					h.entry, h.hash, self.head.0))
+			} else {
+				held.filter(|x| *x != hash).map(|x| format!("a head the signer signed, entry {} with the running hash {}, is not the \
+					record's: it holds {} at that entry", h.entry, h.hash, hex(&x)))
+			};
+			if let Some(why) = why {
+				proof = Some((h.clone(), why));
+			}
+		}
+		if let Some((h, why)) = proof {
+			self.stop(&h, &why);
+		}
+		Ok(out)
+	}
+
+	/// Stops the signer for good on the proof `head`, a head it signed that
+	/// the record does not hold: written beside the record and synced, so a
+	/// restart keeps it. Should the write fail, the signer is stopped still,
+	/// until it is started again.
+	fn stop(&mut self, head: &WireEntryRef, why: &str) {
+		use std::io::Write;
+		use std::os::unix::fs::OpenOptionsExt;
+		let text = format!("the signer's record was rolled back or replaced: {}\nhead {} {} {}\nrecord head {} {}\n", why, head.entry, head.hash,
+			head.signature.as_deref().unwrap_or(""), self.head.0, hex(&self.head.1));
+		let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&self.stop_path)
+			.and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()))
+			.and_then(|_| match self.stop_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+				Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
+				None => Ok(()),
+			});
+		let kept = match written {
+			Ok(()) => format!("the proof is kept in {}; the operator clears it with arca-signer --clear-stopped", self.stop_path.display()),
+			Err(e) => format!("the proof could not be written to {} ({}): the signer is stopped until it is started again", self.stop_path.display(), e),
+		};
+		self.stopped = Some(format!("{}: the signer's record was rolled back or replaced: {}; it signs nothing the record governs ({})",
+			STOPPED, why, kept));
+	}
+
+	/// Removes the proof of a rollback kept beside the record at `record`,
+	/// returning what it said: the operator's explicit act, with the signer
+	/// stopped. `None` when there is none.
+	pub fn clear_stopped(record: &Path) -> Result<Option<String>, String> {
+		let path = stopped_path(record);
+		let text = match std::fs::read_to_string(&path) {
+			Ok(t) => t,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(format!("{}: {}", path.display(), e)),
+		};
+		std::fs::remove_file(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+		if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+			std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("{}: {}", dir.display(), e))?;
+		}
+		Ok(Some(text))
 	}
 
 	/// Checks the latest entry the server's database knows, entry `n` with
@@ -804,8 +1073,8 @@ impl SpendRecord {
 	/// it, the same. When it does not, the signer signs nothing more until it
 	/// is started again.
 	pub fn check_known(&mut self, n: u64, hash: &[u8; 32]) -> Result<(), String> {
-		if let Some(why) = &self.refusing {
-			return Err(why.clone());
+		if let Some(why) = self.refusing() {
+			return Err(why.to_string());
 		}
 		if n == 0 {
 			return Ok(());
@@ -844,8 +1113,8 @@ impl SpendRecord {
 	/// same round with another message.
 	pub fn admit(&mut self, owner: &[u8; 32], salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<Entry, String> {
 		use std::io::Write;
-		if let Some(why) = &self.refusing {
-			return Err(why.clone());
+		if let Some(why) = self.refusing() {
+			return Err(why.to_string());
 		}
 		let had = self.under(salt).map_err(|e| format!("the record could not be read: {}", e))?;
 		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
@@ -898,8 +1167,9 @@ impl SpendRecord {
 	/// names the old record's latest entry and running hash, from which its
 	/// own entries go on, so the server's database, which knows that entry,
 	/// knows the new record; it carries every other entry's line over
-	/// verbatim. Returns how many entries it carried and dropped, and the
-	/// entry the new record goes on from.
+	/// verbatim, and for each entry it drops a hash line with its running
+	/// hash. Returns how many entries it carried and dropped, and the entry
+	/// the new record goes on from.
 	pub fn compact(from: &Path, into: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash,
 		drop: &std::collections::HashSet<[u8; 32]>) -> Result<(u64, u64, (u64, [u8; 32])), String>
 	{
@@ -908,28 +1178,35 @@ impl SpendRecord {
 		if let Some(note) = repaired {
 			return Err(format!("{}: {}; open it with the signer first", from.display(), note));
 		}
-		let (mut carried, mut dropped) = (0u64, 0u64);
+		// Every line the new record carries: an entry kept, verbatim, or the
+		// hash line of an entry dropped (or of one dropped before).
+		let carry = |text: &str, l: Line| -> String {
+			match l {
+				Line::Entry(e) if drop.contains(&e.salt) => format!("{} {}", e.n, hex(&e.hash)),
+				_ => text.to_string(),
+			}
+		};
+		let (mut carried, mut dropped, mut lines) = (0u64, 0u64, 0u64);
 		let mut e = sha256::Hash::engine();
 		e.input(RECORD_CARRIED_TAG);
-		old.each_from(old.first, |text, entry, _| {
-			if drop.contains(&entry.salt) {
-				dropped += 1;
-			} else {
-				carried += 1;
-				e.input(text.as_bytes());
-				e.input(b"\n");
+		old.each_from(old.first, |text, l, _| {
+			match l {
+				Line::Entry(x) if drop.contains(&x.salt) => dropped += 1,
+				Line::Entry(_) => carried += 1,
+				Line::Hash(..) => {},
 			}
+			lines += 1;
+			e.input(carry(text, l).as_bytes());
+			e.input(b"\n");
 			Ok(true)
 		})?;
 		let carried_hash = sha256::Hash::from_engine(e).to_byte_array();
 		let base = old.head();
-		let header = format!("{} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_COMPACTED, hex(&operator.serialize()), genesis,
-			base.0, hex(&base.1), carried, hex(&carried_hash));
+		let header = format!("{} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_HASHES, hex(&operator.serialize()), genesis,
+			base.0, hex(&base.1), lines, hex(&carried_hash));
 		Self::write_new(into, &header, |w| {
-			old.each_from(old.first, |text, entry, _| {
-				if !drop.contains(&entry.salt) {
-					w.write_all(text.as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| format!("{}: {}", into.display(), e))?;
-				}
+			old.each_from(old.first, |text, l, _| {
+				w.write_all(carry(text, l).as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| format!("{}: {}", into.display(), e))?;
 				Ok(true)
 			})
 		})?;
@@ -951,6 +1228,11 @@ pub enum SignerError {
 	/// its whole record.
 	#[error("the signer refused: {0}")]
 	Record(String),
+	/// A head the signer signed that its record does not hold was handed
+	/// back: its record was rolled back or replaced, and it signs nothing the
+	/// record governs.
+	#[error("the signer refused: {0}")]
+	Stopped(String),
 	/// The server's database, asked for the latest entry it knows or told a
 	/// new one.
 	#[error("the database, about the signer's record: {0}")]
@@ -980,6 +1262,34 @@ pub fn parse_amount(s: &str) -> Result<u64, String> {
 		return Err(format!("not a decimal amount: {:?}", s.chars().take(40).collect::<String>()));
 	}
 	s.parse().map_err(|e| format!("amount {}: {}", s, e))
+}
+
+/// A head of the signer's record as the signer hands it out: an entry, its
+/// running hash and `S`'s signature over them ([`record_head_digest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedHead {
+	pub entry: u64,
+	pub hash: [u8; 32],
+	pub signature: Option<Signature>,
+}
+
+impl SignedHead {
+	pub fn from_wire(w: &WireEntryRef) -> Result<SignedHead, String> {
+		let signature = w.signature.as_deref().map(|s| Signature::from_slice(&unhex(s)?).map_err(|e| e.to_string())).transpose()?;
+		Ok(SignedHead { entry: w.entry, hash: unhex32(&w.hash)?, signature })
+	}
+
+	pub fn to_wire(&self) -> WireEntryRef {
+		WireEntryRef { entry: self.entry, hash: hex(&self.hash), signature: self.signature.map(|s| hex(s.as_ref())) }
+	}
+}
+
+/// The signer's answer to a witness of its record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Witnessed {
+	pub head: Option<SignedHead>,
+	pub hashes: Vec<WireEntryHash>,
+	pub stopped: Option<String>,
 }
 
 /// The server's end of the signer's socket. With the server's database
@@ -1024,6 +1334,7 @@ impl SignerClient {
 			return Err(match r.code.as_deref() {
 				Some(ALREADY_SIGNED) => SignerError::AlreadySigned(e),
 				Some(RECORD_BEHIND) | Some(RECORD_DIFFERS) => SignerError::Record(e),
+				Some(STOPPED) => SignerError::Stopped(e),
 				_ => SignerError::Refused(e),
 			});
 		}
@@ -1032,9 +1343,29 @@ impl SignerClient {
 
 	/// The latest entry of the signer's record: its number and running hash.
 	pub async fn head(&self) -> Result<(u64, [u8; 32]), SignerError> {
+		self.signed_head().await.map(|h| (h.entry, h.hash))
+	}
+
+	/// The latest entry of the signer's record, with the signer's signature
+	/// over it.
+	pub async fn signed_head(&self) -> Result<SignedHead, SignerError> {
 		let r = self.ask(&Request::Head {}).await?;
-		let e = r.entry.ok_or_else(|| SignerError::Answer("no entry".into()))?;
-		Ok((e.entry, unhex32(&e.hash).map_err(SignerError::Answer)?))
+		SignedHead::from_wire(&r.entry.ok_or_else(|| SignerError::Answer("no entry".into()))?).map_err(SignerError::Answer)
+	}
+
+	/// What the signer's record holds at each of `heads`, heads of it a
+	/// wallet was handed: the running hash at each entry, the record's
+	/// latest entry, signed (none while the signer is stopped), and why it is
+	/// stopped, if it is. A head the signer signed that the record does not
+	/// hold stops it ([`SpendRecord::witness`]).
+	pub async fn witness(&self, heads: &[WireEntryRef]) -> Result<Witnessed, SignerError> {
+		let r = match self.ask(&Request::Witness { heads: heads.to_vec() }).await {
+			Ok(r) => r,
+			Err(SignerError::Stopped(why)) => return Err(SignerError::Stopped(why)),
+			Err(e) => return Err(e),
+		};
+		let head = r.entry.as_ref().map(SignedHead::from_wire).transpose().map_err(SignerError::Answer)?;
+		Ok(Witnessed { head, hashes: r.hashes.unwrap_or_default(), stopped: r.stopped })
 	}
 
 	/// The entries of the signer's record after entry `after`, at most
@@ -1057,6 +1388,14 @@ impl SignerClient {
 	pub async fn rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
 		outputs: &[ExplicitOutput]) -> Result<Signature, SignerError>
 	{
+		self.rebind_as(owner, owner_sig, salt, asset_in, value_in, outputs, None).await.map(|(s, _)| s)
+	}
+
+	/// [`Self::rebind`], with the entry of the record the signature was
+	/// recorded as, signed.
+	pub async fn rebind_recorded(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
+		outputs: &[ExplicitOutput]) -> Result<(Signature, Option<SignedHead>), SignerError>
+	{
 		self.rebind_as(owner, owner_sig, salt, asset_in, value_in, outputs, None).await
 	}
 
@@ -1069,27 +1408,29 @@ impl SignerClient {
 		forfeit: &ForfeitPolicy, output: &ExplicitOutput) -> Result<Signature, SignerError>
 	{
 		self.rebind_as(owner, owner_sig, salt, asset_in, value_in, std::slice::from_ref(output), Some(WireForfeit::from_policy(forfeit))).await
+			.map(|(s, _)| s)
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	async fn rebind_as(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], asset_in: AssetId, value_in: u64,
-		outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>) -> Result<Signature, SignerError>
+		outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>) -> Result<(Signature, Option<SignedHead>), SignerError>
 	{
 		let known = match &self.store {
 			Some(store) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
-				.map(|(entry, hash)| WireEntryRef { entry, hash: hex(&hash) }),
+				.map(|(entry, hash)| WireEntryRef { entry, hash: hex(&hash), signature: None }),
 			None => None,
 		};
 		let r = self.ask(&Request::Rebind {
 			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
 		}).await?;
-		if let (Some(store), Some(e)) = (&self.store, &r.entry) {
-			let hash = unhex32(&e.hash).map_err(SignerError::Answer)?;
-			store.set_signer_head(e.entry, &hash).await.map_err(|e| SignerError::Database(e.to_string()))?;
+		let head = r.entry.as_ref().map(SignedHead::from_wire).transpose().map_err(SignerError::Answer)?;
+		if let (Some(store), Some(h)) = (&self.store, &head) {
+			store.set_signer_head_signed(h.entry, &h.hash, h.signature.as_ref()).await.map_err(|e| SignerError::Database(e.to_string()))?;
 		}
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
-		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+		let sig = Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))?;
+		Ok((sig, head))
 	}
 
 	/// `S`'s signature over the spend of input `input` of `tx` by `leaf`,

@@ -56,6 +56,22 @@ pub struct TransferRow {
 	pub inputs: Vec<StoredInput>,
 	/// `(leaf id, mailbox key)`, in order.
 	pub outputs: Vec<([u8; 32], [u8; 32])>,
+	/// The entry of the signer's record its last signature was recorded as,
+	/// that entry's running hash, and the signer's signature over them: once
+	/// signed, by a server that kept it.
+	pub signer_head: Option<RecordHeadRow>,
+}
+
+/// A head of the signer's record as the database keeps it: the entry, its
+/// running hash, and the signer's signature over them.
+pub type RecordHeadRow = (u64, [u8; 32], [u8; 64]);
+
+/// The head a transfer's row keeps, from its three columns.
+pub(crate) fn head_of(entry: Option<i64>, hash: Option<Vec<u8>>, sig: Option<Vec<u8>>) -> Result<Option<RecordHeadRow>, StoreError> {
+	match (entry, hash, sig) {
+		(Some(n), Some(h), Some(s)) => Ok(Some((n as u64, array32(h, "signer hash")?, sig64(s)?))),
+		_ => Ok(None),
+	}
 }
 
 fn sig64(v: Vec<u8>) -> Result<[u8; 64], StoreError> {
@@ -66,9 +82,10 @@ impl Store {
 	/// The transfer `transfer_id`, if recorded.
 	pub async fn transfer(&self, transfer_id: &[u8; 32]) -> Result<Option<TransferRow>, StoreError> {
 		let conn = self.conn().await?;
-		let row = conn.query_opt("SELECT state FROM transfer WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
-		let signed = match row {
-			Some(r) => r.get::<_, &str>(0) == "signed",
+		let row = conn.query_opt("SELECT state, signer_entry, signer_hash, signer_sig FROM transfer WHERE transfer_id = $1",
+			&[&&transfer_id[..]]).await?;
+		let (signed, signer_head) = match row {
+			Some(r) => (r.get::<_, &str>(0) == "signed", head_of(r.get(1), r.get(2), r.get(3))?),
 			None => return Ok(None),
 		};
 		let ins = conn.query(
@@ -89,7 +106,7 @@ impl Store {
 			&[&&transfer_id[..]]).await?;
 		let outputs = outs.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, array32(r.get(1), "mailbox key")?)))
 			.collect::<Result<Vec<_>, StoreError>>()?;
-		Ok(Some(TransferRow { transfer_id: *transfer_id, signed, inputs, outputs }))
+		Ok(Some(TransferRow { transfer_id: *transfer_id, signed, inputs, outputs, signer_head }))
 	}
 
 	/// Records a transfer before it is signed: see the [module
@@ -171,9 +188,10 @@ impl Store {
 	}
 
 	/// Completes a recorded transfer: the operator's signatures, each output's
-	/// coin record, live, and posted to its mailbox. All or nothing.
-	pub async fn complete_transfer(&self, transfer_id: &[u8; 32], sigs: &[([u8; 64], [u8; 64])], records: &[([u8; 32], Vec<u8>)])
-		-> Result<(), StoreError>
+	/// coin record, live, and posted to its mailbox, and the head of the
+	/// signer's record its last signature was recorded as. All or nothing.
+	pub async fn complete_transfer(&self, transfer_id: &[u8; 32], sigs: &[([u8; 64], [u8; 64])], records: &[([u8; 32], Vec<u8>)],
+		head: Option<RecordHeadRow>) -> Result<(), StoreError>
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
@@ -197,7 +215,8 @@ impl Store {
 				&[&&transfer_id[..], &record, &&leaf_id[..]],
 			).await?;
 		}
-		t.execute("UPDATE transfer SET state = 'signed' WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		t.execute("UPDATE transfer SET state = 'signed', signer_entry = $2, signer_hash = $3, signer_sig = $4 WHERE transfer_id = $1",
+			&[&&transfer_id[..], &head.map(|h| h.0 as i64), &head.map(|h| h.1.to_vec()), &head.map(|h| h.2.to_vec())]).await?;
 		t.commit().await?;
 		Ok(())
 	}

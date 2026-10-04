@@ -49,6 +49,24 @@ pub fn key_proof_digest(id: &[u8; 32]) -> [u8; 32] {
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of a signed head of the operator's signer's record.
+pub const RECORD_HEAD_TAG: &[u8] = b"Arca/record-head";
+
+/// What the operator key signs to hand out entry `entry` of its signer's
+/// record, whose running hash is `hash`: `SHA256(T ‖ T ‖ genesis ‖ entry ‖
+/// hash)`, `T = SHA256("Arca/record-head")`, the entry eight bytes
+/// little-endian. The server's (`server::signer::record_head_digest`).
+pub fn record_head_digest(chain: &Chain, entry: u64, hash: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(RECORD_HEAD_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&entry.to_le_bytes());
+	e.input(hash);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// The digest `key` signs to authenticate `call` with `challenge`.
 pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyPublicKey) -> [u8; 32] {
 	let tag = sha256::Hash::hash(AUTH_TAG);
@@ -240,6 +258,14 @@ impl ServerClient {
 		let xonly = key.x_only_public_key().0;
 		let sig = sign_digest(key, &auth_digest(chain, call, &challenge, &xonly), &random32());
 		Ok(json!({"key": hex(&xonly.serialize()), "challenge": hex(&challenge), "signature": hex(sig.as_ref())}))
+	}
+
+	/// Hands the server the heads of its signer's record the wallet holds
+	/// (`{"entry", "hash", "signature"}` each) and gets back the running hash
+	/// the record holds at each entry, its latest entry, signed, and whether
+	/// the signer is stopped.
+	pub fn witness(&self, heads: &[Value]) -> Result<Value, Error> {
+		self.post("witness", &json!({"heads": heads}))
 	}
 
 	/// The coin records in `key`'s mailbox after `after`.

@@ -301,6 +301,24 @@ fn rebind_line(owner: &Keypair, genesis: BlockHash, salt: [u8; 32], asset: Asset
 	r.to_string()
 }
 
+/// `S`'s signature over entry `n` of the record with running hash `hash`.
+fn head_sig(s: &Keypair, genesis: BlockHash, n: u64, hash: &[u8; 32]) -> elements::secp256k1_zkp::schnorr::Signature {
+	sign_digest(s, &server::signer::record_head_digest(&genesis, n, hash), &[7; 32])
+}
+
+/// The signer's answer to a witness of `heads`.
+async fn witness(socket: &std::path::Path, heads: &[(u64, [u8; 32], Option<elements::secp256k1_zkp::schnorr::Signature>)]) -> serde_json::Value {
+	use server::signer::hex;
+	let heads: Vec<serde_json::Value> = heads.iter().map(|(n, h, s)| {
+		let mut v = serde_json::json!({"entry": n, "hash": hex(h)});
+		if let Some(s) = s {
+			v["signature"] = serde_json::json!(hex(s.as_ref()));
+		}
+		v
+	}).collect();
+	serde_json::from_str(&raw(socket, &serde_json::json!({"op": "witness", "heads": heads}).to_string()).await).unwrap()
+}
+
 /// The answer to a rebind request: the entry recorded, or the refusal's
 /// code and sentence.
 async fn ask(socket: &std::path::Path, line: &str) -> Result<(u64, [u8; 32]), (String, String)> {
@@ -541,11 +559,15 @@ async fn the_record_is_compacted_and_goes_on_from_its_latest_entry() {
 	assert_eq!(compact(&new, &drop).status.code(), Some(2), "never over a file that is there");
 	let text = std::fs::read_to_string(&new).unwrap();
 	let header: Vec<&str> = text.lines().next().unwrap().split(' ').collect();
-	assert_eq!(header[..2], ["arca-signer-record", "2"]);
-	assert_eq!((header[4], header[5], header[6]), ("7", hex(&entries[6].1).as_str(), "4"));
+	assert_eq!(header[..2], ["arca-signer-record", "3"]);
+	assert_eq!((header[4], header[5], header[6]), ("7", hex(&entries[6].1).as_str(), "7"));
 	let old = std::fs::read_to_string(&record).unwrap();
 	for (k, line) in text.lines().skip(1).enumerate() {
-		assert_eq!(line, old.lines().nth(4 + k).unwrap(), "carried over verbatim");
+		if k < 3 {
+			assert_eq!(line, format!("{} {}", k + 1, hex(&entries[k].1)), "a dropped entry keeps its running hash");
+		} else {
+			assert_eq!(line, old.lines().nth(1 + k).unwrap(), "carried over verbatim");
+		}
 	}
 	assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o777, 0o600);
 	std::fs::rename(&new, &record).unwrap();
@@ -570,10 +592,17 @@ async fn the_record_is_compacted_and_goes_on_from_its_latest_entry() {
 	assert_eq!(ns, vec![4, 5, 6, 7, 8]);
 	let listed: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"entries","after":6,"limit":100}"#).await).unwrap();
 	assert_eq!(listed["entries"].as_array().unwrap().len(), 2);
-	let e = ask(&run.socket, &rebind_line(&a, genesis, [6; 32], asset, 1, Some(entries[1]))).await.unwrap_err();
-	println!("the database knowing entry 2, compacted away: {:?}", e);
+	// The record answers the running hash at a dropped entry, and a head of
+	// it signed before the compaction stops nothing.
+	let w = witness(&run.socket, &[(2, entries[1].1, Some(head_sig(&s, genesis, 2, &entries[1].1)))]).await;
+	println!("a head from before the compaction, entry 2: {}", w);
+	assert_eq!(w["hashes"][0]["hash"], serde_json::json!(hex(&entries[1].1)), "the hash at a dropped entry");
+	assert!(w["stopped"].is_null());
+	ask(&run.socket, &rebind_line(&a, genesis, [6; 32], asset, 1, Some(entries[1]))).await
+		.expect("the database knowing entry 2, compacted away, whose hash the record kept");
+	let e = ask(&run.socket, &rebind_line(&a, genesis, [6; 32], asset, 1, Some((2, [0x22; 32])))).await.unwrap_err();
+	println!("the database knowing another hash at entry 2: {:?}", e);
 	assert_eq!(e.0, "record_differs");
-	assert!(e.1.contains("compacted away"), "{}", e.1);
 	run.stop();
 
 	// Started again, it reads the carried lines and the new one; a carried
@@ -595,4 +624,138 @@ async fn the_record_is_compacted_and_goes_on_from_its_latest_entry() {
 	assert!(String::from_utf8_lossy(&out.stderr).contains("4 entries carried over, 1 dropped; it goes on from entry 8"),
 		"{}", String::from_utf8_lossy(&out.stderr));
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D49. Every head the signer hands out is signed with `S`; a head it signed
+/// that its record does not hold, handed back, proves the record rolled back
+/// or replaced, and stops the signer for good: it writes the proof beside
+/// its record and refuses every rebindable message and every signed head,
+/// across restarts, while it still signs the operator's own spends; only
+/// `--clear-stopped` removes the proof. A head without `S`'s valid
+/// signature, altered, of another chain, or that the record holds, stops
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_the_signer_signed_that_its_record_does_not_hold_stops_it() {
+	use server::signer::hex;
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let a = keypair("owner");
+	assert!(common::signer::create_record(&key, genesis, &record).status.success());
+	let run = Run::start(&dir, "first", genesis, &record, "exec ").unwrap();
+
+	// Every head handed out is signed: a rebind's entry, and `head`.
+	let mut known = None;
+	let mut entries = vec![];
+	let mut snapshot = vec![];
+	for k in 1..=4u8 {
+		let v: serde_json::Value = serde_json::from_str(&raw(&run.socket, &rebind_line(&a, genesis, [k; 32], asset, 1, known)).await).unwrap();
+		let e = (v["entry"]["entry"].as_u64().unwrap(), server::signer::unhex32(v["entry"]["hash"].as_str().unwrap()).unwrap());
+		let sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&server::signer::unhex(v["entry"]["signature"].as_str().unwrap()).unwrap()).unwrap();
+		assert!(verify_digest(&sig, &server::signer::record_head_digest(&genesis, e.0, &e.1), &xonly(&s)), "entry {} is signed by S", e.0);
+		entries.push((e.0, e.1, sig));
+		known = Some(e);
+		if k == 2 {
+			snapshot = std::fs::read(&record).unwrap();
+		}
+	}
+	let head: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"head"}"#).await).unwrap();
+	println!("the head, signed: {}", head);
+	assert_eq!(head["entry"]["entry"], 4);
+	assert!(head["entry"]["signature"].is_string());
+
+	// Heads that stop nothing.
+	let other = keypair("not the operator");
+	let other_chain = BlockHash::from_raw_hash(sha256d::Hash::hash(b"another chain"));
+	let (n4, h4, sig4) = entries[3];
+	let cases = [
+		("unsigned, past the end", (9, [9; 32], None)),
+		("signed by another key, past the end", (9, [9; 32], Some(head_sig(&other, genesis, 9, &[9; 32])))),
+		("S's signature over another chain's head, past the end", (9, [9; 32], Some(head_sig(&s, other_chain, 9, &[9; 32])))),
+		("entry 4's signature over another hash", (n4, [0x44; 32], Some(sig4))),
+		("entry 4's signature moved to entry 9", (9, h4, Some(sig4))),
+		("garbage for a signature", (9, [9; 32], Some(elements::secp256k1_zkp::schnorr::Signature::from_slice(&[1; 64]).unwrap()))),
+		("entry 3, held, signed", (entries[2].0, entries[2].1, Some(entries[2].2))),
+	];
+	for (what, h) in cases {
+		let w = witness(&run.socket, &[h]).await;
+		println!("{}: hash at entry {} {} | stopped {}", what, h.0, w["hashes"][0]["hash"], w["stopped"]);
+		assert!(w["stopped"].is_null(), "{} stops nothing: {}", what, w);
+		assert!(w["entry"]["signature"].is_string(), "{}", w);
+	}
+	assert_eq!(witness(&run.socket, &[(3, [0; 32], None)]).await["hashes"][0]["hash"], serde_json::json!(hex(&entries[2].1)));
+	let e5 = ask(&run.socket, &rebind_line(&a, genesis, [5; 32], asset, 1, known)).await.expect("still signing");
+	known = Some(e5);
+	let e5_sig = head_sig(&s, genesis, e5.0, &e5.1);
+	run.stop();
+
+	// The record rolled back to its copy at entry 2, then two entries of
+	// another branch: a head of the lost branch, handed back, stops it.
+	std::fs::write(&record, &snapshot).unwrap();
+	let run = Run::start(&dir, "rolledback", genesis, &record, "exec ").unwrap();
+	let b = keypair("another owner");
+	for k in 13..=15u8 {
+		ask(&run.socket, &rebind_line(&b, genesis, [k; 32], asset, 1, None)).await.unwrap();
+	}
+	let w = witness(&run.socket, &[(1, entries[0].1, Some(entries[0].2)), (n4, h4, Some(sig4))]).await;
+	println!("the rolled-back record past entry 4 again, handed the head of entry 4 it lost: {}", w);
+	assert!(w["stopped"].as_str().unwrap().contains("is not the record's"), "{}", w);
+	assert!(w["entry"].is_null(), "no signed head from a stopped signer");
+	assert_eq!(w["hashes"][0]["hash"], serde_json::json!(hex(&entries[0].1)));
+	assert_ne!(w["hashes"][1]["hash"], serde_json::json!(hex(&h4)));
+	let proof = std::fs::read_to_string(server::signer::stopped_path(&record)).expect("the proof beside the record");
+	println!("the proof kept: {}", proof.trim());
+	let e = ask(&run.socket, &rebind_line(&b, genesis, [16; 32], asset, 1, None)).await.unwrap_err();
+	println!("a rebind after the stop: {:?}", e);
+	assert_eq!(e.0, "stopped");
+	let h: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"head"}"#).await).unwrap();
+	assert_eq!(h["code"], "stopped", "{}", h);
+	run.stop();
+
+	// Across a restart; the operator's own spends are still signed.
+	let run = Run::start(&dir, "restarted", genesis, &record, "exec ").unwrap();
+	assert!(run.log().contains("STOPPED"), "{}", run.log());
+	assert_eq!(ask(&run.socket, &rebind_line(&b, genesis, [16; 32], asset, 1, None)).await.unwrap_err().0, "stopped");
+	let client = SignerClient::new(&run.socket);
+	let (tx, prevouts, leaf) = own_spend(&s);
+	let sig = client.spend(&tx, &prevouts, 0, &leaf).await.expect("a spend of the operator's own path is still signed");
+	println!("the operator's own spend, signed after the stop: {}", hex32(&sig));
+	run.stop();
+
+	// Only an explicit command removes the proof.
+	let out = Command::new(env!("CARGO_BIN_EXE_arca-signer")).args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(),
+		"--record", record.to_str().unwrap(), "--clear-stopped"]).output().unwrap();
+	println!("--clear-stopped: {}", String::from_utf8_lossy(&out.stderr).trim());
+	assert!(out.status.success());
+	assert!(!server::signer::stopped_path(&record).exists());
+	let run = Run::start(&dir, "cleared", genesis, &record, "exec ").unwrap();
+	ask(&run.socket, &rebind_line(&b, genesis, [16; 32], asset, 1, None)).await.expect("signing again once the operator cleared it");
+
+	// A head past the record's end, signed: a record cut back stops too.
+	let w = witness(&run.socket, &[(e5.0 + 10, e5.1, Some(head_sig(&s, genesis, e5.0 + 10, &e5.1)))]).await;
+	println!("a signed head past the end: stopped {}", w["stopped"]);
+	assert!(w["stopped"].as_str().unwrap().contains("past the record's end"), "{}", w);
+	let _ = (known, e5_sig);
+	run.stop();
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spend of one of the operator's own paths: a coin at a taproot output
+/// whose one leaf is `<S> OP_CHECKSIG`, spent to a bare `OP_TRUE`.
+fn own_spend(s: &Keypair) -> (elements::Transaction, Vec<elements::TxOut>, Script) {
+	use elements::opcodes::all::OP_CHECKSIG;
+	let leaf = elements::script::Builder::new().push_slice(&xonly(s).serialize()).push_opcode(OP_CHECKSIG).into_script();
+	let tap = arca_covenant::TapOutput::new(vec![(0, leaf.clone())]);
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let prev = sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(asset, 10_000), tap.script_pubkey());
+	let tx = elements::Transaction {
+		version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: elements::OutPoint::new(elements::Txid::all_zeros(), 0), ..Default::default() }],
+		output: vec![sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(asset, 9_000), Script::from(vec![0x51])),
+			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(asset, 1_000))],
+	};
+	(tx, vec![prev], leaf)
 }

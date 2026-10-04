@@ -160,6 +160,54 @@ async fn a_restored_database_that_forgot_a_round_does_not_start() {
 	assert!(e.to_string().contains(&format!("transaction {} pays the operator's connector script", built.tx.txid())), "{}", e);
 }
 
+/// D49's start check against the chain, with the signer's record rolled back
+/// together with the database: the record then agrees with the database, so
+/// only the chain shows what both lost. After the backup a round is built and
+/// final and A hands over its forfeit (an entry of the record); database
+/// and record are restored together, and the server does not start, naming
+/// the round the chain holds and the database does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_and_record_rolled_back_past_a_round_do_not_start() {
+	use common::client::{auths_json, forfeit_sig};
+	use common::flow::forfeit_for;
+	use common::rounds::{created, round_final, status, validate_new_leaf};
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_held, a_tx) = credited_board(&mut r, &a, x).await;
+	let record_copy = std::fs::read(r.signer.record()).unwrap();
+	let copy = backup(&mut r).await;
+	let a2 = keypair("A new");
+	let (w, nonce) = want_leaf(&a2, x, VALUE);
+	let (body, pid) = participation_body(&[&a_held], &[w], &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &pid);
+	let (new, rec, round) = validate_new_leaf(&r, &pid, 0, &a2, &nonce);
+	let old = a_held.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &new, &round, &st);
+	let done = r.http.post("forfeit_leaves", &serde_json::json!({"participation_id": common::client::hex(&pid),
+		"forfeits": [{"leaf_id": a_held.id.to_string(), "signature": forfeit_sig(&f, &a)}],
+		"leaves": [auths_json(&new, &a2, created(&rec))]})).ok();
+	assert_eq!(done["state"], "released");
+	let entries = r.signer_entries().await.len();
+	println!("round {} built, final, and A's forfeit signed after the backup: the record holds {} entries", built.tx.txid(), entries);
+
+	// Database and record rolled back together.
+	restore(&mut r, &copy).await;
+	let genesis = r.chain.genesis_hash();
+	r.signer.kill();
+	std::fs::write(r.signer.record(), &record_copy).unwrap();
+	r.signer.restart(&r.s, genesis);
+	assert!(r.signer_entries().await.len() < entries, "the record is rolled back");
+	let e = Server::start(&r.config).await.err().expect("the server refuses to start");
+	println!("start on the database and record rolled back together: {}", e);
+	assert!(e.to_string().contains(&format!("transaction {} pays the operator's connector script", built.tx.txid())), "{}", e);
+}
+
 /// A participation of one board, run in a round made final; returns the
 /// running server, the board, its owner, the participation and what the
 /// owner needs to hand over its forfeit.

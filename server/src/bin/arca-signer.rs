@@ -6,6 +6,7 @@
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file>
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
+//!     arca-signer --key-file <file> --genesis <hash> --record <file> --clear-stopped
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. The genesis hash is in display
@@ -24,7 +25,16 @@
 //! `arcad <config> expired-salts` prints them) is dropped, every other entry
 //! carried over, and the new record goes on from the old one's latest entry.
 //! It locks the record, so it runs with the signer stopped; the operator then
-//! puts the new file in the record's place and starts the signer on it.
+//! puts the new file in the record's place and starts the signer on it. The
+//! new record keeps the running hash of every entry it drops.
+//!
+//! Every head of the record the signer hands out is signed with `S`. A head
+//! it signed that its record does not hold, handed back by a wallet, proves
+//! the record was rolled back or replaced: the signer writes the proof to
+//! `<record>.stopped` and signs no rebindable message and no head from then
+//! on, across restarts (`server::signer::SpendRecord::witness`). Only
+//! `--clear-stopped`, run with the signer stopped, removes that file, after
+//! printing it.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -42,8 +52,8 @@ use arca_covenant::message::rebind_message;
 use arca_covenant::sign::{script_spend_sighash, sign_digest, verify_digest};
 use arca_covenant::Chain;
 use server::signer::{
-	check_spend, hex, parse_amount, unhex, unhex32, Request, Response, Signed, SpendRecord, WireEntryRef, ALREADY_SIGNED, MAX_ENTRIES,
-	MAX_REQUEST, RECORD_BEHIND, RECORD_DIFFERS,
+	check_spend, hex, parse_amount, record_head_digest, unhex, unhex32, Request, Response, Signed, SpendRecord, WireEntryRef, ALREADY_SIGNED,
+	MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS, STOPPED,
 };
 
 struct Args {
@@ -55,6 +65,7 @@ struct Args {
 	create_record: bool,
 	/// `--compact-into` and `--drop-salts`.
 	compact: Option<(PathBuf, PathBuf)>,
+	clear_stopped: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -65,6 +76,7 @@ fn args() -> Result<Args, String> {
 	let mut create_record = false;
 	let mut compact_into = None;
 	let mut drop_salts = None;
+	let mut clear_stopped = false;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -76,6 +88,7 @@ fn args() -> Result<Args, String> {
 			"--create-record" => create_record = true,
 			"--compact-into" => compact_into = Some(PathBuf::from(value()?)),
 			"--drop-salts" => drop_salts = Some(PathBuf::from(value()?)),
+			"--clear-stopped" => clear_stopped = true,
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
@@ -84,7 +97,7 @@ fn args() -> Result<Args, String> {
 		(None, None) => None,
 		_ => return Err("--compact-into and --drop-salts go together".into()),
 	};
-	if !create_record && compact.is_none() && socket.is_none() {
+	if !create_record && !clear_stopped && compact.is_none() && socket.is_none() {
 		return Err("--socket is required".into());
 	}
 	Ok(Args {
@@ -94,7 +107,17 @@ fn args() -> Result<Args, String> {
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
 		create_record,
 		compact,
+		clear_stopped,
 	})
+}
+
+/// `S`'s signature over entry `n` of the record, whose running hash is
+/// `hash`: how every head the signer hands out is signed.
+fn signed_head(key: &Keypair, genesis: &BlockHash, n: u64, hash: &[u8; 32]) -> WireEntryRef {
+	let mut aux = [0u8; 32];
+	rand::rngs::OsRng.fill_bytes(&mut aux);
+	let sig = sign_digest(key, &record_head_digest(genesis, n, hash), &aux);
+	WireEntryRef { entry: n, hash: hex(hash), signature: Some(hex(sig.as_ref())) }
 }
 
 fn load_key(path: &PathBuf) -> Result<Keypair, String> {
@@ -118,8 +141,34 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 	match req {
 		Request::Pubkey {} => Response { pubkey: Some(hex(&key.x_only_public_key().0.serialize())), ..none },
 		Request::Head {} => {
-			let (n, hash) = record.lock().unwrap_or_else(|e| e.into_inner()).head();
-			Response { entry: Some(WireEntryRef { entry: n, hash: hex(&hash) }), ..none }
+			let r = record.lock().unwrap_or_else(|e| e.into_inner());
+			if let Some(why) = r.stopped() {
+				return Response { error: Some(why.to_string()), code: Some(STOPPED.into()), stopped: Some(why.to_string()), ..none };
+			}
+			let (n, hash) = r.head();
+			Response { entry: Some(signed_head(key, &genesis, n, &hash)), ..none }
+		},
+		Request::Witness { heads } => {
+			if heads.len() > MAX_WITNESS {
+				return Response { error: Some(format!("{} heads; a witness names at most {}", heads.len(), MAX_WITNESS)), ..none };
+			}
+			let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
+			let was = r.stopped().is_some();
+			let hashes = match r.witness(&heads) {
+				Ok(h) => h,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			let stopped = r.stopped().map(str::to_string);
+			if let (false, Some(why)) = (was, &stopped) {
+				eprintln!("arca-signer: STOPPED: {}", why);
+			}
+			let (n, hash) = r.head();
+			Response {
+				entry: stopped.is_none().then(|| signed_head(key, &genesis, n, &hash)),
+				hashes: Some(hashes),
+				stopped,
+				..none
+			}
 		},
 		Request::Entries { after, limit } => {
 			let r = record.lock().unwrap_or_else(|e| e.into_inner());
@@ -186,7 +235,7 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 				Err(e) => {
 					eprintln!("arca-signer: refused rebind {} for the leaf of {} under salt {}: {}", hex(&message.digest),
 						hex(&owner.serialize()), hex(&salt), e);
-					let code = [ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS].into_iter()
+					let code = [ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED].into_iter()
 						.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string);
 					return Response { error: Some(e), code, ..none };
 				},
@@ -196,7 +245,7 @@ fn answer(key: &Keypair, chain: &Chain, genesis: BlockHash, record: &Mutex<Spend
 			let sig = sign_digest(key, &message.digest, &aux);
 			eprintln!("arca-signer: signed rebind {} ({}) for the leaf of {} under salt {}: entry {}", hex(&message.digest),
 				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt), entry.n);
-			Response { signature: Some(hex(sig.as_ref())), entry: Some(WireEntryRef { entry: entry.n, hash: hex(&entry.hash) }), ..none }
+			Response { signature: Some(hex(sig.as_ref())), entry: Some(signed_head(key, &genesis, entry.n, &entry.hash)), ..none }
 		},
 		Request::Spend { tx, prevouts, input, leaf } => {
 			let parsed = (|| -> Result<_, String> {
@@ -248,6 +297,22 @@ async fn main() {
 			},
 			Err(e) => {
 				eprintln!("arca-signer: the record: {}", e);
+				std::process::exit(2);
+			},
+		}
+	}
+	if args.clear_stopped {
+		match SpendRecord::clear_stopped(&args.record) {
+			Ok(Some(text)) => {
+				eprintln!("arca-signer: removed the proof of a rollback kept beside {}; it said:\n{}", args.record.display(), text.trim_end());
+				std::process::exit(0);
+			},
+			Ok(None) => {
+				eprintln!("arca-signer: there is no proof of a rollback beside {}", args.record.display());
+				std::process::exit(0);
+			},
+			Err(e) => {
+				eprintln!("arca-signer: {}", e);
 				std::process::exit(2);
 			},
 		}
@@ -306,6 +371,9 @@ async fn main() {
 		let r = record.lock().unwrap_or_else(|e| e.into_inner());
 		eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}, its latest entry {}", hex(&operator.serialize()),
 			socket.display(), r.len(), args.record.display(), r.head().0);
+		if let Some(why) = r.stopped() {
+			eprintln!("arca-signer: STOPPED: {}", why);
+		}
 	}
 	loop {
 		let (stream, _) = match listener.accept().await {
