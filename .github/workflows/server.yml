@@ -63,6 +63,12 @@ jobs:
           echo "SEQUENTIAD_EXEC=$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" -version | head -1
 
+      # One signer test watches the signer's system calls.
+      - name: Install strace
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

@@ -516,6 +516,62 @@ async fn the_record_cannot_be_lost_cut_torn_or_shared() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// R7e F5. A signer that crashed between writing an entry's line and syncing
+/// it leaves a whole line that may live only in the page cache. The signer
+/// started again reads it as its head; before it answers anything (here its
+/// signed head, which a wallet keeps), it syncs the record, so the head it
+/// signs is on disk. Watched with `strace`: the record is opened, then
+/// `fsync`ed, and only then is the first answer written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_is_synced_when_it_is_opened_before_anything_is_answered() {
+	let s = keypair("operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain"));
+	let dir = signer_dir();
+	let key = key_file(&dir, &s, 0o600);
+	let record = dir.join("signer.record");
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let a = keypair("owner");
+	assert!(common::signer::create_record(&key, genesis, &record).status.success());
+	let run = Run::start(&dir, "one", genesis, &record, "exec ").unwrap();
+	let e1 = ask(&run.socket, &rebind_line(&a, genesis, [1; 32], asset, 1, None)).await.unwrap();
+	run.stop();
+
+	// Entry 2's line, whole, as a signer that crashed before its sync left it.
+	let text = format!("2 spend {} {} {}", server::signer::hex(&xonly(&a).serialize()), "02".repeat(32), "0b".repeat(32));
+	let hash = server::signer::chain_hash(&e1.1, &text);
+	let mut f = std::fs::OpenOptions::new().append(true).open(&record).unwrap();
+	std::io::Write::write_all(&mut f, format!("{} {}\n", text, server::signer::hex(&hash)).as_bytes()).unwrap();
+	drop(f);
+
+	let trace = dir.join("open.trace");
+	let run = Run::start(&dir, "traced", genesis, &record, &format!(
+		"exec strace -f -qq -s 64 -e trace=openat,fsync,fdatasync,write,writev,sendto,sendmsg -o {} ", trace.display())).unwrap();
+	let head: serde_json::Value = serde_json::from_str(&raw(&run.socket, r#"{"op":"head"}"#).await).unwrap();
+	println!("the signer started again on the line its crash left: its head {}", head["entry"]);
+	assert_eq!(head["entry"]["entry"], 2, "{}", head);
+	// strace's child, the signer, outlives strace when strace alone is killed.
+	let tracer = run.child.id();
+	let children = std::fs::read_to_string(format!("/proc/{}/task/{}/children", tracer, tracer)).unwrap_or_default();
+	for pid in children.split_whitespace() {
+		let _ = Command::new("kill").args(["-9", pid]).status();
+	}
+	run.stop();
+	let t = std::fs::read_to_string(&trace).unwrap();
+	let lines: Vec<&str> = t.lines().collect();
+	let opened = lines.iter().position(|l| l.contains(&format!("\"{}\", ", record.display())) && l.contains("O_APPEND"))
+		.unwrap_or_else(|| panic!("the record's open is in the trace:\n{}", t));
+	let fd = lines[opened].rsplit("= ").next().unwrap().trim().to_string();
+	let synced = lines.iter().position(|l| l.contains(&format!(" fsync({})", fd)));
+	let answered = lines.iter().position(|l| l.contains("{\\\"entry\\\":{\\\"entry\\\":2"))
+		.unwrap_or_else(|| panic!("the answer is in the trace:\n{}", t));
+	println!("the trace: the record opened as fd {} (line {}), fsync'd at line {:?}, the head answered at line {}", fd, opened, synced,
+		answered);
+	println!("  {}\n  {}\n  {}", lines[opened], synced.map(|i| lines[i]).unwrap_or("(no fsync of the record)"), lines[answered]);
+	let synced = synced.unwrap_or_else(|| panic!("the record is synced when it is opened:\n{}", t));
+	assert!(opened < synced && synced < answered, "synced after it is opened and before the first answer");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The record compacted into a new one: the entries under the salts the
 /// server lists as expired dropped, every other carried over verbatim, the
 /// new record going on from the old one's latest entry, so the entry the

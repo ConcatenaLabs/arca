@@ -780,7 +780,10 @@ noticing:
 - **Torn.** A write that fails (a full disk) is undone at once, so the line it
   cut short is never followed by another; a last line cut short by a crash
   was never answered, and is removed when the record is opened, with a line
-  in the signer's log.
+  in the signer's log. A crash between a line's write and its sync can leave
+  a whole line the disk does not hold yet: the record is synced when it is
+  opened, before it answers anything, so no head is signed for an entry that
+  is not on disk.
 - **Shared.** The signer locks its record while it runs, so a second signer
   on the same file does not start; a copy written by another signer is
   another record, caught by the entry the database knows.
@@ -966,7 +969,8 @@ proof-of-stake regtest chain (`sequentia_ext::regtest::Regtest::start_pos`),
 where a committee certifies every block; the cases a live chain will not
 produce on demand (a block without its certificate, a certificate arriving
 late, a stale anchor, a rollback below where the service started) run against
-a chain held in memory.
+a chain held in memory. One signer test watches the signer's system calls
+with `strace`, which must be on the `PATH`.
 
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
@@ -1201,8 +1205,10 @@ record cut back to an older copy refusing the request that names the
 database's later entry (`record_behind`), and everything after it; a copy
 another signer wrote refusing the database's entry (`record_differs`); a write
 past a file size limit undone at once and the next entry whole once there is
-room; a line cut short by a crash removed at start, which says so; an edited
-line, and a record of another key, refusing the start. Its compaction: no
+room; a line cut short by a crash removed at start, which says so; a whole
+line a crash left unsynced read as the head after a restart, with the record
+opened, then `fsync`ed, before the first answer is written (watched with
+`strace`); an edited line, and a record of another key, refusing the start. Its compaction: no
 compaction while a signer holds the record, nor over a file that is there;
 the entries under the salts listed dropped, each leaving a line with its
 running hash, the rest carried over verbatim, the new record going on from
