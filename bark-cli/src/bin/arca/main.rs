@@ -29,6 +29,12 @@ struct Cli {
 	#[arg(long, env = "ARCA_DATADIR", global = true, default_value_t = default_datadir())]
 	datadir: String,
 
+	/// How long, in seconds, `sync` keeps trying to reach the operator, with
+	/// back-off, before it takes it for unreachable: one failed witness
+	/// decides nothing.
+	#[arg(long, global = true, default_value_t = bark::arca::WITNESS_PATIENCE.as_secs())]
+	witness_patience: u64,
+
 	#[command(subcommand)]
 	command: Cmd,
 }
@@ -291,6 +297,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		return Ok(info);
 	}
 	let mut w = Wallet::open(&datadir)?;
+	w.witness_patience = std::time::Duration::from_secs(cli.witness_patience);
 	// The witness of the operator's signer's record runs on every start, so
 	// every wallet that is online witnesses it: a rollback of the record
 	// takes the coins resting on what it lost on the chain at once.

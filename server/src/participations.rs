@@ -12,8 +12,9 @@
 //!
 //! - every coin given up passes the check of [`crate::coins`]: known, live,
 //!   held by nothing else, its record valid, its boards credited and unspent,
-//!   nothing of its lineage on-chain, and its first expiry still past its exit
-//!   deadline, three days ahead ([`Params::participation_policy`]); its
+//!   nothing of its lineage on-chain, and its first expiry (or the service
+//!   expiry of a board it rests on, whichever comes first) still past its
+//!   exit deadline, three days ahead ([`Params::participation_policy`]); its
 //!   attestation verifies; and the earliest round time asked for, if any,
 //!   lies before every coin's exit deadline;
 //! - every leaf wanted is a template the round builds (`vtxo-1`), within the
@@ -451,28 +452,27 @@ impl Participations {
 			}
 		}
 
-		// The coins given up, each checked, each attested by its owner. A coin
-		// resting on a board is taken past its exit deadline, into a refresh,
-		// up to a day before the board's service expiry.
+		// The coins given up, each checked, each attested by its owner, up to
+		// its exit deadline: three days before its first expiry, or before the
+		// service expiry of a board it rests on, whichever comes first.
 		let mut coins = Vec::with_capacity(n);
 		let mut expiries = Vec::with_capacity(n);
 		let mut last_times = Vec::with_capacity(n);
 		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
-			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::ROUND_HORIZON)).await?;
+			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 			if !verify_digest(&i.attestation, &id, &c.coin.leaf.owner) {
 				return Err(ParticipationError::BadAttestation(k));
 			}
 			let mut last = c.coin.expiry.to_consensus_u32().saturating_sub(Params::PARTICIPATION_HORIZON);
 			if let Some(b) = c.board_expiry {
-				last = last.min(b.saturating_sub(Params::ROUND_HORIZON));
+				last = last.min(b.saturating_sub(Params::PARTICIPATION_HORIZON));
 			}
 			expiries.push(c.expiry());
 			last_times.push(last);
 			coins.push(c.coin);
 		}
-		// A coin is taken only up to its exit deadline (a coin resting on a
-		// board, up to a day before the board's expiry), and so is a round
+		// A coin is taken only up to its exit deadline, and so is a round
 		// asked for later.
 		if let Some(t) = req.not_before {
 			for (last, i) in last_times.iter().zip(&req.inputs) {

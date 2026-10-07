@@ -103,10 +103,12 @@ pub struct BoardsInfo {
 	/// block that confirms it: 28 days, a batch's lifetime.
 	pub lifetime_seconds: u32,
 	/// Its exit deadline lies this long before the expiry, three days: up to
-	/// it the operator co-signs spends of a coin resting on the board; after
-	/// it, it takes the coin only into a refresh.
+	/// it the operator co-signs spends of a coin resting on the board and
+	/// takes it into a refresh; after it, the coin's owner takes it on the
+	/// chain.
 	pub exit_deadline_seconds: u32,
-	/// A refresh takes the coin until this long before the expiry, one day.
+	/// A refresh takes the coin until this long before the expiry: the exit
+	/// deadline, three days.
 	pub refresh_until_seconds: u32,
 }
 

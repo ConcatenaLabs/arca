@@ -162,28 +162,25 @@ impl Params {
 	pub const PARTICIPATION_HORIZON: u32 = WalletPolicy::EXIT_DEADLINE;
 
 	/// The policy a pending participation's coins are checked under when a
-	/// round is built, at `now`: a coin accepted before its exit deadline
-	/// still runs if a round takes it up to [`Params::ROUND_HORIZON`] before
-	/// its first expiry. A participation with a coin past that can never run
-	/// and is voided, its coins given back.
+	/// round is built, and at every pass over the rounds, at `now`: the same
+	/// horizon, the exit deadline. A pending participation with a coin past
+	/// its exit deadline can never run and is voided, its coins given back:
+	/// from then on the coin's owner takes it on the chain, and a round
+	/// that took it after would leave no time to.
 	pub fn round_policy(&self, now: MedianTime) -> WalletPolicy {
-		WalletPolicy { horizon: Self::ROUND_HORIZON, ..self.policy(now) }
+		WalletPolicy { horizon: Self::PARTICIPATION_HORIZON, ..self.policy(now) }
 	}
-
-	/// How long before its first expiry a coin a participation gave up may
-	/// still go into a round, in seconds: one day.
-	pub const ROUND_HORIZON: u32 = 86_400;
 
 	/// How long the operator serves a board, and every coin resting on it, in
 	/// seconds from the median time of the block that confirms the board: a
 	/// batch's lifetime, 28 days, so that a board carries the dates a batch
 	/// made then would have. Its exit deadline is [`WalletPolicy::EXIT_DEADLINE`]
 	/// before its expiry. Up to the exit deadline the server co-signs spends of
-	/// a coin resting on the board; after it, it takes the coin only into a
-	/// refresh, up to [`Params::ROUND_HORIZON`] before the expiry. The watcher
-	/// publishes the lineage of a forfeited coin resting on boards before the
-	/// expiry only when no coin another holder may still hold rests on it,
-	/// or to answer an exit.
+	/// a coin resting on the board and takes it into a refresh, as for a coin
+	/// resting on a batch; after it, the coin's owner takes it on the chain.
+	/// The watcher publishes the lineage of a forfeited coin resting on boards
+	/// before the expiry only when no coin another holder may still hold rests
+	/// on it, or to answer an exit.
 	pub const BOARD_LIFETIME: u32 = 28 * 86_400;
 
 	/// The service expiry of a board confirmed in a block of median time
@@ -192,10 +189,14 @@ impl Params {
 		confirmed.saturating_add(Self::BOARD_LIFETIME)
 	}
 
-	/// How long after its round is final a participation's forfeits may come,
-	/// in seconds: one day. A participation whose forfeits have not come by
-	/// then expires: the coins it gave up are the owner's again, and its new
-	/// leaves, whose preimage never goes out, are swept with their batch.
+	/// How long after its round is final a participation's forfeits may come
+	/// and be co-signed, in seconds: one day. A participation not released by
+	/// then expires, whether its forfeits never came or came and were never
+	/// co-signed (the signer away, or its keepers): each forfeit without the
+	/// operator's half is dropped, never to be asked for again, the coins it
+	/// gave up are the owner's again (one under a forfeit the operator holds
+	/// whole excepted), and its new leaves, whose preimage never goes out, are
+	/// swept with their batch.
 	pub const FORFEIT_DEADLINE: u32 = 86_400;
 
 	/// The policy the server checks records and coins under, at `now`: its
@@ -234,7 +235,6 @@ mod tests {
 		assert_eq!(f.refresh(value, t(e), t(e - 4 * DAY)), 0);
 		assert_eq!(f.refresh(value, t(e), t(e - 3 * DAY)), 0, "free up to the exit deadline");
 		assert_eq!(FeeSchedule::FREE_FROM - Params::PARTICIPATION_HORIZON, 2 * DAY, "the window is two days");
-		const { assert!(Params::ROUND_HORIZON < Params::PARTICIPATION_HORIZON) };
 	}
 
 	#[test]

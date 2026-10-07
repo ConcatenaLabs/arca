@@ -27,7 +27,19 @@
 //!
 //! Fees are paid in the asset being moved unless the user names another, and
 //! no asset is a default: when the node does not accept that asset for fees,
-//! the wallet says so and asks for one, and never falls back to another.
+//! the wallet says so and asks for one, and never falls back to another. An
+//! exit is the one exception, since a coin must reach the chain whatever its
+//! asset: where the coin's own reserves cannot pay and no asset is named, the
+//! wallet pays with an on-chain coin of its own in an asset the node takes,
+//! the asset moved first, no other preferred, and says which.
+//!
+//! `sync` keeps the wallet's coins alive by itself (D57): it asks for the
+//! refresh of each coin in the two days before its exit deadline, where the
+//! refresh is free, and from a day before takes on the chain every coin whose
+//! refresh has not completed, whatever stands in the way; it must run at
+//! least once a day in a coin's last three days before its exit deadline.
+//! [`Wallet::sync_schedule`] says when it must run next, for a client on a
+//! timer, and every coin shows its dates ([`CoinDates`]).
 
 pub mod chain;
 pub mod client;
@@ -40,7 +52,7 @@ mod round;
 mod wallet;
 
 pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};
-pub use wallet::{Config, Wallet};
+pub use wallet::{CoinDates, Config, Wallet, HOME_FROM, REFRESH_FROM, SYNC_DAILY, WITNESS_PATIENCE};
 
 pub use arca_covenant;
 pub use elements;

@@ -18,10 +18,19 @@
 //! Each transaction pays its fee from what it carries for it (a node's
 //! reserve, an entry's, a checkpoint's or reassignment's margin), in the
 //! coin's asset, when the node accepts that asset for fees and the amount
-//! covers the floor. Otherwise it takes a coin of the wallet's in the fee
-//! asset the user names, and the reserve goes to the wallet's change. No asset
-//! is a fallback: an exit that needs a fee coin and has none named stops and
-//! says so.
+//! covers the floor. Otherwise it takes an on-chain coin of the wallet's in
+//! the fee asset the user names or, when none is named, in one the wallet
+//! chooses among those the node takes for fees now: the asset moved first,
+//! where the node takes it, and otherwise none preferred
+//! ([`Wallet::choose_fee_asset`]); the reserve goes to the wallet's change.
+//! An exit that needs a fee coin the wallet does not hold stops and says so:
+//! that coin cannot come home until the wallet holds one.
+//!
+//! An exit asks nothing of the coin's expiry: past it, the wallet goes on
+//! trying until the chain says the coin is gone, since the operator sweeps
+//! a batch only once its token has waited the notice. A coin whose path a
+//! transaction outside it has cut (the operator's sweep of the batch it
+//! rests on), once that transaction is final, is lost, and shown so.
 
 use std::str::FromStr;
 
@@ -30,7 +39,7 @@ use elements::{AssetId, OutPoint, Script, Transaction, TxOut};
 use serde_json::{json, Value};
 
 use arca_covenant::spend::{FeeSource, KeySpend};
-use arca_covenant::{CoinRecord, ExplicitOutput, UnrollTx, ValidCoin, ValidOrigin, WalletPolicy};
+use arca_covenant::{CoinRecord, ExplicitOutput, MedianTime, UnrollTx, ValidCoin, ValidOrigin, WalletPolicy};
 
 use super::chain::hex;
 use super::keys::CHANGE;
@@ -63,6 +72,9 @@ impl Here {
 /// Who pays the fees an output's own reserve cannot.
 pub(crate) struct Payer {
 	asset: Option<AssetId>,
+	/// The asset the exit moves, from which the wallet chooses the fee asset
+	/// when none is named; `None` where nothing is to be chosen.
+	moved: Option<AssetId>,
 	coin: Option<(OutPoint, TxOut, Keypair)>,
 	change: Option<(Script, Keypair)>,
 	/// Coins the exit has already taken.
@@ -72,7 +84,7 @@ pub(crate) struct Payer {
 impl Payer {
 	/// A payer of fees in `asset`, when named.
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
-		Payer { asset, coin: None, change: None, used: vec![] }
+		Payer { asset, moved: None, coin: None, change: None, used: vec![] }
 	}
 }
 
@@ -106,14 +118,22 @@ impl Wallet {
 		if let Some(c) = payer.coin.clone() {
 			return Ok(c);
 		}
-		let asset = payer.asset.ok_or_else(|| Error::Refused("this exit needs a fee coin: the asset it moves is not accepted for fees \
-			by the node, or its reserve does not cover the floor; name an accepted asset the wallet holds on-chain (--fee-asset)".into()))?;
+		let asset = match (payer.asset, payer.moved) {
+			(Some(a), _) => a,
+			(None, Some(moved)) => {
+				let a = self.choose_fee_asset(moved, &self.fee_holdings()?)?;
+				payer.asset = Some(a);
+				a
+			},
+			(None, None) => return Err(Error::Refused("this exit needs a fee coin: the asset it moves is not accepted for fees by the \
+				node, or its reserve does not cover the floor; name an accepted asset the wallet holds on-chain (--fee-asset)".into())),
+		};
 		self.fee_for(asset, 1)?;
-		let c = self.onchain_coins()?.into_iter()
-			.filter(|(op, o, _, _)| o.asset.explicit() == Some(asset) && !payer.used.contains(op))
-			.max_by_key(|(_, o, _, _)| o.value.explicit().unwrap_or(0))
+		let c = self.fee_candidates()?.into_iter()
+			.filter(|(op, o, _)| o.asset.explicit() == Some(asset) && !payer.used.contains(op))
+			.max_by_key(|(_, o, _)| o.value.explicit().unwrap_or(0))
 			.ok_or_else(|| Error::Refused(format!("the wallet holds no on-chain coin of asset {} to pay the exit's fees with", asset)))?;
-		Ok((c.0, c.1, c.2))
+		Ok(c)
 	}
 
 	/// Builds one transaction of an exit: with the output's own reserve when
@@ -147,6 +167,9 @@ impl Wallet {
 			payer.coin = u.tx.output.iter().enumerate()
 				.find(|(_, o)| o.script_pubkey == change && o.asset.explicit() == Some(asset))
 				.map(|(j, o)| (OutPoint::new(txid, j as u32), o.clone(), change_key));
+			if let Some(c) = &payer.coin {
+				self.change_in_flight.borrow_mut().push(c.clone());
+			}
 			return Ok(u);
 		}
 	}
@@ -277,9 +300,16 @@ impl Wallet {
 		let record = Self::record_of(&row)?;
 		let now = self.now()?;
 		// An exit asks nothing of the expiry: it is what a wallet does when
-		// time runs short. The coin is the one the wallet accepted; where its
-		// path is now is the chain's.
-		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(now) };
+		// time runs short, and past the expiry it goes on until the chain says
+		// the coin is gone (a batch is swept only once its token has waited
+		// its notice). The coin is the one the wallet accepted, checked as of
+		// its expiry once that has passed; where its path is now is the
+		// chain's.
+		let as_of = match MedianTime::from_consensus(row.expiry) {
+			Ok(e) if row.expiry != u32::MAX && e < now => e,
+			_ => now,
+		};
+		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) };
 		let txs = self.accepted_bases(&record)?;
 		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let key = self.keys.leaf(&row.owner_nonce)?;
@@ -291,7 +321,7 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		let mut payer = Payer { asset: fee_asset, coin: None, change: None, used: vec![] };
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![] };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -303,6 +333,18 @@ impl Wallet {
 				if here.at.iter().all(Option::is_none) {
 					if let Some(v) = self.taken(leaf_id, &coin, &prior)? {
 						return Ok(v);
+					}
+					// A transaction outside its path took a batch output it
+					// rests on: the operator's sweep, past the batch's expiry and
+					// notice. Once that is final the coin is gone.
+					if let Some((why, by)) = self.swept(&coin)? {
+						self.store.refused(&format!("exit of {}", leaf_id), &why)?;
+						if self.chain.finality(&by)?.is_final() {
+							self.store.set_coin_state(leaf_id, "lost", &format!("lost: {}; that spend is final", why))?;
+							return Ok(json!({"leaf_id": leaf_id, "state": "lost", "spent_by": by.to_string(), "note": why}));
+						}
+						self.store.set_coin_state(leaf_id, &row.state, &format!("{}; that spend is not final yet", why))?;
+						return Err(Error::Refused(why));
 					}
 				}
 				// The path is cut: say where, when another spend cut it. Once
@@ -328,12 +370,14 @@ impl Wallet {
 			None => self.store.take_index(super::keys::RECEIVE)?,
 		};
 		let plan: Vec<Transaction> = built.into_iter().map(|u| u.tx).collect();
-		let record_exit = |state: &str, s: &Wallet| -> Result<(), Error> {
+		// The fee asset named, or chosen while the plan was built, for the
+		// exit's later steps.
+		let record_exit = |state: &str, fee_asset: Option<AssetId>, s: &Wallet| -> Result<(), Error> {
 			let v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
 				"fee_asset": fee_asset.map(|a| a.to_string()), "claim_index": claim_index});
 			s.store.set_exit(leaf_id, state, &v.to_string(), None)
 		};
-		record_exit("unrolling", self)?;
+		record_exit("unrolling", payer.asset, self)?;
 		if row.state != "exiting" {
 			self.store.set_coin_state(leaf_id, "exiting", "its exit has started")?;
 		}
@@ -389,7 +433,7 @@ impl Wallet {
 					"to": self.chain.address(&to)?}}))
 			},
 			Err(e) if e.to_string().contains("non-BIP68-final") => {
-				record_exit("waiting", self)?;
+				record_exit("waiting", payer.asset, self)?;
 				Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps,
 					"next": format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
 						leaf.exit_delay.seconds(), e)}))
@@ -537,6 +581,44 @@ impl Wallet {
 		Ok(None)
 	}
 
+	/// When a batch output `coin` rests on, or a node or entry of its path
+	/// below it, was spent on the chain by a transaction that is not the next
+	/// step of that path (the operator's sweep, once the batch has expired and
+	/// its token waited the notice): why, and that transaction. `None`
+	/// otherwise, and for a coin resting on boards alone (a board has no
+	/// sweep).
+	fn swept(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
+		match &coin.origin {
+			ValidOrigin::Leaf { valid, .. } => {
+				let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+				let b = &valid.branch;
+				let mut steps: Vec<TxOut> = b.nodes.iter().map(|n| n.output().txout()).collect();
+				steps.push(b.entry_output().txout());
+				steps.push(coin.output().txout());
+				for pair in steps.windows(2) {
+					let Some((tx, h)) = self.chain.find_payment(&pair[0], from)? else { continue };
+					let vout = tx.output.iter().position(|o| *o == pair[0]).expect("pays it") as u32;
+					let Some((sp, _)) = self.chain.spender(&OutPoint::new(tx.txid(), vout), h)? else { continue };
+					if !sp.output.contains(&pair[1]) {
+						return Ok(Some((format!("coin {} rests on output {}:{} of its batch, which {} spent on the chain: no step of the \
+							coin's exit, but the operator's sweep of the batch past its expiry and notice", coin.id, tx.txid(), vout, sp.txid()),
+							sp.txid())));
+					}
+				}
+				Ok(None)
+			},
+			ValidOrigin::Transfer { inputs, .. } => {
+				for i in inputs {
+					if let Some(w) = self.swept(&i.coin)? {
+						return Ok(Some(w));
+					}
+				}
+				Ok(None)
+			},
+			ValidOrigin::Board { .. } => Ok(None),
+		}
+	}
+
 	/// Moves on every exit the wallet has started, with the fee asset each was
 	/// started with.
 	pub(crate) fn progress_exits(&mut self) -> Result<Vec<Value>, Error> {
@@ -547,20 +629,59 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// The witness of the operator's signer's record and the server's `info`,
+	/// patiently: one that fails for want of an answer (none, a timeout, a
+	/// 5xx, `rate_limited`, an answer without the signer's proof) is tried
+	/// again with back-off, from a second and doubling to sixteen, until one
+	/// succeeds or [`Wallet::witness_patience`] has run; a refusal, or a
+	/// rollback proven, is not. One failed witness decides nothing. Returns
+	/// the witness (or its last failure), why `info` fails if it does, and how
+	/// many times it asked.
+	fn reach_operator(&mut self) -> (Result<Value, Error>, Option<Error>, u32) {
+		let start = std::time::Instant::now();
+		let mut wait = std::time::Duration::from_secs(1);
+		let mut tries = 0;
+		loop {
+			tries += 1;
+			let w = self.witness();
+			let info = match &w {
+				Ok(v) if !v["rolled_back"].is_null() => return (w, None, tries),
+				Ok(_) => match self.server_info() {
+					Ok(_) => return (w, None, tries),
+					Err(e @ Error::Unreachable(_)) => Some(e),
+					Err(e) => return (w, Some(e), tries),
+				},
+				Err(Error::Unreachable(_)) => None,
+				Err(_) => return (w, None, tries),
+			};
+			if start.elapsed() + wait > self.witness_patience {
+				return (w, info, tries);
+			}
+			std::thread::sleep(wait);
+			wait = (wait * 2).min(std::time::Duration::from_secs(16));
+		}
+	}
+
 	/// Everything the wallet does on its own: the re-check of every coin
 	/// against the chain, board registrations and transfer requests the
 	/// server never answered, the mailbox, every participation as far as it
-	/// can go, every forfeit it signed without the preimage in hand, followed
-	/// on the chain, and every exit it started.
+	/// can go, the refresh of every coin in its refresh window, every forfeit
+	/// it signed without the preimage in hand, followed on the chain, every
+	/// coin it cannot have refreshed in time taken home, and every exit it
+	/// started (D57). What it says includes `schedule`
+	/// ([`Wallet::sync_schedule`]): when it must run next.
 	pub fn sync(&mut self) -> Result<Value, Error> {
-		// The witness first: after a rollback of the operator's signer's
-		// record the wallet does only what it does on the chain, and while
-		// no witness succeeds it takes no coin and signs no spend through
-		// the operator: it does only what it does on the chain.
-		let witness = self.witness();
+		// The witness first, patiently: after a rollback of the operator's
+		// signer's record the wallet does only what it does on the chain, and
+		// while no witness succeeds it takes no coin and signs no spend
+		// through the operator: it does only what it does on the chain.
+		let (witness, info_failed, tries) = self.reach_operator();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
-		let witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let mut witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
+		if tries > 1 {
+			witness["tries"] = json!(tries);
+		}
 		let gone = self.rolled_back()?.is_some();
 		let talk = witnessed && !gone;
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
@@ -572,39 +693,52 @@ impl Wallet {
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
+		// D57: the refresh of every live coin in its refresh window, asked for
+		// by the wallet itself.
+		let refresh = if talk && info_failed.is_none() {
+			self.refresh_due().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else { Value::Array(vec![]) };
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
-		// D56: a coin the wallet cannot have refreshed goes home before its
-		// date, whatever the reason. After a stop, or while the operator
-		// cannot refresh anything (no witness succeeds, the server does not
-		// answer or refuses the wallet), each coin it still holds off the
-		// chain is shown with the date by which it must be exited, and taken
-		// on the chain when that date is within three days; while the
-		// operator answers, so is each coin whose refresh it refused. Nothing
-		// is refused for good: once the operator answers again, a coin whose
-		// date is further off stays.
+		// D57: a coin the wallet cannot have refreshed goes home before its
+		// date, whatever the reason: every coin whose refresh has not
+		// completed a day before its exit date, and after a stop every coin
+		// within three days of it. Before that day nothing is taken on the
+		// chain because the operator does not answer: the coins are shown
+		// with their dates, and sync tries again.
 		let cannot = match (gone, failed) {
 			(true, _) => None,
 			(false, Some(e)) => Some(e),
-			(false, None) => self.server_info().err().map(|e| e.to_string()),
+			(false, None) => info_failed.map(|e| e.to_string()),
 		};
 		let (why, unreachable) = match (gone, cannot) {
 			(true, _) => (Home::Stopped, Value::Null),
 			(false, Some(e)) => {
 				self.set_unreachable(Some(&e))?;
-				(Home::Unreachable(e.clone()), json!({"why": e, "note": "the operator cannot refresh the wallet's coins now: run `arca sync` \
-					before each coin's exit date (exit_by): it takes the coin on the chain once that date is within three days, and keeps \
-					it while the operator answers"}))
+				let busy = e.contains("rate_limited");
+				(Home::Unreachable(e.clone()), json!({"why": e, "note": if busy {
+					"the server asks the wallet to slow down (rate_limited): nothing is decided on that; the wallet asks again at its next \
+					sync. Nothing is taken on the chain for want of an answer before a coin's home_from (a day before its exit date); run \
+					`arca sync` at least once a day in each coin's last three days before its exit date"
+				} else {
+					"the operator cannot be reached now: nothing is taken on the chain for that before a coin's home_from (a day before its \
+					exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run `arca sync` at least \
+					once a day in each coin's last three days before its exit date"
+				}}))
 			},
 			(false, None) => {
 				self.set_unreachable(None)?;
-				(Home::Refused, Value::Null)
+				(Home::Answering, Value::Null)
 			},
 		};
 		let home = self.home(true, &why).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
-			"participations": participations, "forfeits": forfeits, "exits": exits});
-		if !matches!(why, Home::Refused) || home.as_array().is_none_or(|h| !h.is_empty()) {
+			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
+		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
+			out["refresh"] = refresh;
+		}
+		if !matches!(why, Home::Answering) || home.as_array().is_none_or(|h| !h.is_empty()) {
 			out["home"] = home;
 		}
 		if !unreachable.is_null() {

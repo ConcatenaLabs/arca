@@ -531,7 +531,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		boards: api::BoardsInfo {
 			lifetime_seconds: Params::BOARD_LIFETIME,
 			exit_deadline_seconds: arca_covenant::WalletPolicy::EXIT_DEADLINE,
-			refresh_until_seconds: Params::ROUND_HORIZON,
+			refresh_until_seconds: Params::PARTICIPATION_HORIZON,
 		},
 		signer_record,
 		keepers: app.keepers.lock().unwrap_or_else(|e| e.into_inner()).clone(),
