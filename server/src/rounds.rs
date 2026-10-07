@@ -46,10 +46,11 @@
 //! coin's owner takes it on the chain.
 //!
 //! The owner of each participation in a round hands over its forfeits once
-//! the round is final, and the signer co-signs them, within a day
-//! ([`Params::FORFEIT_DEADLINE`]): a participation not released a day after
-//! its round was found final expires, whether its forfeits never came or
-//! came and were never co-signed (the signer away, or its keepers). Each
+//! the round is final, and the signer co-signs them, until the later of a
+//! day after the round was found final ([`Params::FORFEIT_DEADLINE`]) and
+//! the exit deadline of the coins it gave up: a participation not released
+//! by then expires, whether its forfeits never came or came and were never
+//! co-signed (the signer away, or its keepers). Each
 //! forfeit of it without the operator's half is dropped, never to be asked
 //! of the signer again; the coins it gave up are the owner's again (a coin
 //! under a forfeit the operator holds whole, or one signed for an earlier,
@@ -915,18 +916,58 @@ impl Rounds {
 		Ok(())
 	}
 
-	/// Expires every participation whose round was found final more than
-	/// [`Params::FORFEIT_DEADLINE`] ago and that is not released: its
-	/// forfeits never came, or came and were never co-signed. Returns them.
+	/// Expires every participation that is not released by the later of
+	/// [`Params::FORFEIT_DEADLINE`] after its round was found final and its
+	/// coins' exit deadline ([`Self::exit_deadline_of`]): its forfeits never
+	/// came, or came and were never co-signed. So a wallet that asked for a
+	/// refresh in its coin's free window completes it at any sync before the
+	/// coin's exit date. Returns them.
 	pub async fn expire(&self) -> Result<Vec<[u8; 32]>, RoundError> {
 		let now = self.now().await?.to_consensus_u32();
-		let expired = self.store.expire_participations(now.saturating_sub(Params::FORFEIT_DEADLINE)).await?;
-		for id in &expired {
-			log::warn!("participation {} expired: it was not released within a day of its round being final (its forfeits did \
-				not come, or were not co-signed); its coins are given back, but one under a forfeit the operator holds whole, and \
-				its new leaves are never credited", crate::signer::hex(id));
+		let cutoff = now.saturating_sub(Params::FORFEIT_DEADLINE);
+		let mut expired = vec![];
+		for id in self.store.overdue_participations(cutoff).await? {
+			if self.exit_deadline_of(&id).await?.is_some_and(|d| now < d) {
+				continue;
+			}
+			if self.store.expire_participation(&id, cutoff).await? {
+				log::warn!("participation {} expired: it was not released by the later of a day after its round was found final \
+					and its coins' exit deadline (its forfeits did not come, or were not co-signed); its coins are given back, but \
+					one under a forfeit the operator holds whole, and its new leaves are never credited", crate::signer::hex(&id));
+				expired.push(id);
+			}
 		}
 		Ok(expired)
+	}
+
+	/// The exit deadline of the coins participation `id` gave up: the
+	/// earliest of their exit deadlines, [`Params::PARTICIPATION_HORIZON`]
+	/// before each coin's first expiry, or before the service expiry of a
+	/// board it rests on. `None` when no coin of it has a date, or one cannot
+	/// be resolved (said in the log).
+	pub async fn exit_deadline_of(&self, id: &[u8; 32]) -> Result<Option<u32>, RoundError> {
+		let Some(p) = self.store.participation(id).await? else { return Ok(None) };
+		// Whatever the time: only the coins' dates are asked for.
+		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
+		let policy = WalletPolicy { horizon: 0, ..self.params.policy(any_time) };
+		let mut earliest: Option<u32> = None;
+		for i in &p.inputs {
+			let c = match coins::resolve(&self.store, &policy, &LeafId(i.leaf_id)).await {
+				Ok(c) => c,
+				Err(coins::CoinError::Store(e)) => return Err(e.into()),
+				Err(e) => {
+					log::error!("participation {}: coin {} has no date the server can read: {}", crate::signer::hex(id), LeafId(i.leaf_id), e);
+					return Ok(None);
+				},
+			};
+			let batch = c.coin.expiry.to_consensus_u32();
+			let e = c.board_expiry.map_or(batch, |b| b.min(batch));
+			if e != u32::MAX {
+				let d = e.saturating_sub(Params::PARTICIPATION_HORIZON);
+				earliest = Some(earliest.map_or(d, |x| x.min(d)));
+			}
+		}
+		Ok(earliest)
 	}
 
 	/// Voids every pending participation with a coin past its exit deadline

@@ -480,6 +480,15 @@ impl Wallet {
 		}
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
+		// The acceptance horizon counts from the round's block, not from this
+		// sync: the server takes the forfeits until the later of a day after
+		// the round is final and the coins' exit date, and a leaf completed
+		// then is as long-lived as one completed at once. The operator cannot
+		// date the block.
+		let as_of = match finality.height() {
+			Some(h) => self.chain.median_time_at(h)?.and_then(|t| MedianTime::from_consensus(t).ok()).map_or(now, |t| t.min(now)),
+			None => now,
+		};
 		let info = self.server_info()?;
 		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
@@ -520,7 +529,7 @@ impl Wallet {
 			let owner = self.keys.leaf_xonly(&nonce)?;
 			// The reserves, at four times the node's floor in the leaf's asset
 			// when it accepts that asset for fees, one atom when it does not.
-			let (accept, fee_coin) = self.leaf_policy(record.asset, now)?;
+			let (accept, fee_coin) = self.leaf_policy(record.asset, as_of)?;
 			if fee_coin {
 				needs_fee_coin.push(record.asset.to_string());
 			}

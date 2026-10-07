@@ -396,6 +396,10 @@ async fn a_given_coin_comes_back_when_its_participation_expires_and_can_be_exite
 	println!("F3a the wallet's sync after the expiry: {}", s["participations"]);
 	assert_eq!(s["participations"][0]["state"], "expired", "{}", s);
 	assert_eq!(coin_of(&c, board)["state"], "live", "an expired participation gives its coin back");
+	// The wallet says the refresh expired, not that the operator refused it.
+	let home = coin_of(&c, board)["home"].as_str().unwrap_or("").to_string();
+	println!("F3a the coin's note: {}", home);
+	assert!(home.contains("expired at the server") && !home.contains("refused"), "{}", home);
 
 	// Given again, and the operator never runs a round: the wallet exits it.
 	c.ok(&["participate"]);
@@ -4086,11 +4090,12 @@ async fn d57_home(r: &Running, w: &Arca, leaves: &[String]) -> u32 {
 /// co-signs nothing. A holds a batch leaf it never touches (L1), a batch
 /// leaf it paid B from (L2, `sending`), a board it paid B from (bS,
 /// `sending`), and a board in asset Y whose refresh ran in a round its
-/// forfeit could not be co-signed for (bF, `forfeited`; the operator expires
-/// that participation a day after its round and gives bF back). A syncs once
-/// a day in its coins' last three days before their exit date, and no more:
-/// at three days nothing moves; at two days `sync` asks for the refresh of
-/// L1 and bF, which a round takes and nobody co-signs; at one day every coin
+/// forfeit could not be co-signed for (bF, `forfeited`; the operator takes
+/// that participation's forfeits until bF's exit deadline, so it is still
+/// issued). A syncs once a day in its coins' last three days before their
+/// exit date, and no more: at three days nothing moves; at two days `sync`
+/// asks for the refresh of L1, which a round takes and nobody co-signs; at
+/// one day every coin
 /// goes on the chain, each paying what its own reserves cannot with a fee
 /// coin the wallet chooses (Y is not taken for fees: an X coin pays bF's),
 /// and is claimed, every claim final before the first expiry: nothing of
@@ -4152,8 +4157,8 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 	println!("D57 the latest exit date {}; the first expiry {}", by, first_expiry);
 
 	// Three days before: shown, nothing moves. bF's participation, its
-	// forfeit never co-signed, expired at the server a day after its round,
-	// and bF is live again.
+	// forfeit never co-signed, is still issued at the server, which takes its
+	// forfeits until bF's exit deadline: bF stays forfeited.
 	d57_to(&r, by - 3 * 86_400 + 600).await;
 	let s = a.ok(&["sync"]);
 	println!("D57 A three days before: participations {} | home {}", s["participations"], s["home"]);
@@ -4162,26 +4167,26 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 		assert!(h["exit"].is_null(), "nothing is taken three days before: {}", h);
 		assert!(h["refresh_from"].is_u64() && h["home_from"].is_u64() && h["exit_by"].is_u64(), "{}", h);
 	}
-	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "expired"), "{}", s["participations"]);
-	assert_eq!(d57_states(&a, &all), vec!["live", "sending", "sending", "live"]);
+	assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] != "expired"), "{}", s["participations"]);
+	assert_eq!(d57_states(&a, &all), vec!["live", "sending", "sending", "forfeited"]);
 	let c = coin_of(&a, &l1);
 	println!("D57 L1 three days before: {}", c);
 	assert_eq!(c["home_from"].as_u64(), Some(c["exit_by"].as_u64().unwrap() - 86_400));
 	assert!(c["sync"].as_str().unwrap().contains("at least once a day"), "{}", c);
 	assert!(s["schedule"]["due"].is_boolean() && s["schedule"]["next_sync_at"].is_u64(), "{}", s["schedule"]);
 
-	// Two days before: the refresh window. The refresh of L1 and bF is
-	// asked for and runs in a round; nobody co-signs its forfeits.
+	// Two days before: the refresh window. The refresh of L1 is asked for
+	// and runs in a round; nobody co-signs its forfeits.
 	d57_to(&r, by - 2 * 86_400 + 600).await;
 	let s = a.ok(&["sync"]);
 	println!("D57 A two days before: refresh {}", s["refresh"]);
-	for l in [&l1, &bf] {
+	for l in [&l1] {
 		let asked = s["refresh"].as_array().expect("sync asks for the refreshes").iter().find(|x| x["leaf_id"] == l.as_str()).cloned()
 			.unwrap_or_else(|| panic!("{} is refreshed: {}", l, s));
 		assert_eq!(asked["state"], "pending", "{}", asked);
 		assert_eq!(asked["fees"], json!([]), "free in the window: {}", asked);
 	}
-	assert_eq!(d57_states(&a, &all), vec!["given", "sending", "sending", "given"]);
+	assert_eq!(d57_states(&a, &all), vec!["given", "sending", "sending", "forfeited"]);
 	let r3 = final_round(&r).await;
 	println!("D57 the operator's round {} takes the refreshes", r3.txid());
 
@@ -4714,6 +4719,56 @@ async fn a_batch_leafs_exit_and_the_answer_to_a_stale_one_run_at_the_production_
 	assert!(c.1["claim"].is_null(), "no claim of the forfeited leaf: {}", c.1);
 	assert_eq!(coin_of(&h, &h2)["state"], "live", "H holds its new leaf");
 	for w in [&g, &h, &stale] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7h F2, FW turned around (D58.4). Holders that sync once in each day of
+/// their coins' last three days complete the free refresh `sync` asked for,
+/// whatever the hour: the server takes a participation's forfeits until the
+/// later of a day after its round was found final and its coins' exit
+/// deadline. A and C board together (one exit date) and sync two days and
+/// two hours before it, in the free window: `sync` asks for each refresh,
+/// and the operator's round takes both and is final. A syncs again 25 hours
+/// after asking, C 45 hours after (an hour before its exit date). Each sync
+/// hands over the forfeits and is released, nothing goes on the chain, and
+/// each wallet holds its new leaf, live.
+#[tokio::test(flavor = "multi_thread")]
+async fn d58_syncs_a_day_apart_complete_the_free_refresh() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, c) = (Arca::new("D58FA"), Arca::new("D58FC"));
+	let ab = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let cb = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	let by = d57_latest_exit_by(&a, &ab).max(d57_latest_exit_by(&c, &cb));
+	d57_to(&r, by - 2 * 86_400 + 2 * 3_600).await;
+	let asked_at = common::node::median_time(&r.rt);
+	for w in [&a, &c] {
+		let s = w.ok(&["sync"]);
+		println!("D58F {} asks at median time {}: refresh {}", w.name, asked_at, s["refresh"]);
+		assert_eq!(s["refresh"][0]["state"], "pending", "{}", s["refresh"]);
+	}
+	let round = final_round(&r).await;
+	println!("D58F the round {} final at median time {}", round.txid(), common::node::median_time(&r.rt));
+	for (w, b, gap) in [(&a, &ab[0], 25u32), (&c, &cb[0], 45u32)] {
+		d57_to(&r, asked_at + gap * 3_600).await;
+		let now = common::node::median_time(&r.rt);
+		let s = w.ok(&["sync"]);
+		println!("D58F {} syncs {} h after asking (median time {}, {} s before its exit date): participations {} | home {}", w.name, gap,
+			now, by as i64 - now as i64, s["participations"], s["home"]);
+		assert!(now < by, "before the exit date");
+		assert_eq!(s["participations"][0]["state"], "released", "{}: {}", w.name, s["participations"]);
+		let home = s["home"].as_array().cloned().unwrap_or_default();
+		assert!(home.iter().all(|h| h["exit"].is_null()), "{}: nothing goes on the chain: {}", w.name, s["home"]);
+		let coins = w.ok(&["coins"]);
+		let board = coin_of(w, b);
+		println!("D58F {}'s board: {} | coins {}", w.name, board["state"], coins);
+		assert_ne!(board["state"], "exiting", "{}", board);
+		let new_live = coins.as_array().unwrap().iter().any(|k| k["kind"] == "batch" && k["state"] == "live");
+		assert!(new_live, "{} holds its new leaf, live: {}", w.name, coins);
+	}
+	for w in [&a, &c] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

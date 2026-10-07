@@ -44,10 +44,11 @@
 //! preimage, whatever the chain has seen of the coins given up since (the
 //! watcher publishes a forfeit when its coin comes on-chain).
 //!
-//! The forfeits are due within a day of the round being found final
-//! ([`crate::params::Params::FORFEIT_DEADLINE`]): after that the
-//! participation expires ([`crate::rounds`]), and a forfeit step for it is
-//! refused (`not_in_round`), even one that was in flight when it expired.
+//! The forfeits are due by the later of a day after the round was found
+//! final ([`crate::params::Params::FORFEIT_DEADLINE`]) and the exit deadline
+//! of the coins the participation gave up: after that the participation
+//! expires ([`crate::rounds`]), and a forfeit step for it is refused
+//! (`not_in_round`), even one that was in flight when it expired.
 //!
 //! `release_leaves` takes an owner's release of the lowest node of a coin it
 //! gave up: the owner's signature with the coin's key over

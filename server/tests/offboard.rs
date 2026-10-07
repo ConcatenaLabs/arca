@@ -184,17 +184,6 @@ async fn an_offboard_never_forfeited_is_reclaimed_after_its_delay() {
 	let (policy, _) = policy_of(&r, &pq, x, &dq);
 	println!("Q's offboard at {}, reclaimable {} units after it confirmed", at, policy.reclaim_delay.units());
 
-	// Q never hands over its forfeit: a day after the round is final the
-	// participation expires, and the board is Q's again.
-	advance_mtp(&r, 86_400 + 600).await;
-	r.synced().await;
-	r.server.rounds.pass().await.unwrap();
-	assert_eq!(status(&r, &pq)["state"], "expired");
-	let ld = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &q, &r.chain)})).ok();
-	assert_eq!(ld["leaves"][0]["state"], "live", "Q's board is Q's again");
-	r.server.watcher.pass().await.unwrap();
-	assert!(of_kind(&r, "unlock").await.is_empty() && of_kind(&r, "offboard_reclaim").await.is_empty(),
-		"neither unlocked, since its preimage never went out, nor reclaimed before its delay");
 	// A reclaim signed now is refused: the delay has not passed.
 	let held = built.tx.output[at.vout as usize].value.explicit().unwrap();
 	let early = policy.reclaim(at, held, &[ExplicitOutput::new(x, held - 2_000, common::node::op_true())], &FeeSource::Reserve).unwrap();
@@ -204,8 +193,25 @@ async fn an_offboard_never_forfeited_is_reclaimed_after_its_delay() {
 	println!("the operator's reclaim before the delay: refused, {}", e);
 	assert!(e.contains("non-BIP68-final"), "{}", e);
 
-	let before = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	// Q never hands over its forfeit. Past the reclaim delay the output is
+	// not reclaimed while Q may still hand it over: its forfeits are taken
+	// until its board's exit deadline, later than a day after the round is
+	// final.
 	advance_mtp(&r, policy.reclaim_delay.seconds() as u32 + HOUR).await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	r.server.watcher.pass().await.unwrap();
+	assert_eq!(status(&r, &pq)["state"], "issued");
+	assert!(of_kind(&r, "unlock").await.is_empty() && of_kind(&r, "offboard_reclaim").await.is_empty(),
+		"neither unlocked, since its preimage never went out, nor reclaimed while Q may still hand over its forfeit");
+
+	// Past its forfeit deadline the participation expires, the board is Q's
+	// again, and the watcher reclaims the output.
+	common::rounds::past_forfeit_deadline(&r, &pq).await;
+	assert_eq!(status(&r, &pq)["state"], "expired");
+	let ld = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &q, &r.chain)})).ok();
+	assert_eq!(ld["leaves"][0]["state"], "live", "Q's board is Q's again");
+	let before = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
 	drive(&r, "the reclaim after the delay", 4, |l| has(l, "offboard_reclaim", &subject(&at))).await;
 	settle(&r).await;
 	let l = log(&r).await;

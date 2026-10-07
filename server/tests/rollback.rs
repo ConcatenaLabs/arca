@@ -366,14 +366,13 @@ async fn a_round_that_cannot_return_runs_its_participations_again_as_ordinary_on
 	println!("A ran again as an ordinary participation: R's preimage {} is useless, Y's released", &r_preimage[..16]);
 
 	// C, which forfeited in R and runs again in Y, never hands over its
-	// forfeit for Y: a day after Y is final it expires. Its coin stays given
+	// forfeit for Y: past its forfeit deadline (its coin's exit deadline,
+	// later than a day after Y is final) it expires. Its coin stays given
 	// up, since the signer signed a forfeit under its salt, for R, and
 	// co-signs no spend under it; the status says it is not given back, and
 	// it is C's on the chain. A, whose forfeit for Y came, does not expire.
 	assert_eq!(status(&r, &pc)["state"], "issued");
-	advance_mtp(&r, 86_400 + 600).await;
-	r.synced().await;
-	r.server.rounds.pass().await.unwrap();
+	common::rounds::past_forfeit_deadline(&r, &pc).await;
 	let sc = status(&r, &pc);
 	assert_eq!(sc["state"], "expired");
 	assert_eq!(sc["inputs"][0]["returned"], false, "C's coin is not given back");

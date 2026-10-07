@@ -161,3 +161,20 @@ pub fn spend_wallet_coin(coin: elements::OutPoint, txout: &elements::TxOut, outp
 	tx.input[0].witness.script_witness = vec![sig, pk.to_bytes()];
 	tx
 }
+
+/// Moves the median time past participation `id`'s forfeit deadline, the
+/// later of a day after its round was found final and its coins' exit
+/// deadline, by ten minutes, and runs a pass over the rounds.
+#[allow(dead_code)]
+pub async fn past_forfeit_deadline(r: &Running, id: &[u8; 32]) {
+	let p = r.server.store.participation(id).await.unwrap().expect("a participation");
+	let round = r.server.store.round(p.round_id.expect("in a round")).await.unwrap().expect("its round");
+	let final_at = round.final_mtp.expect("its round is final");
+	let deadline = r.server.rounds.exit_deadline_of(id).await.unwrap().unwrap_or(0).max(final_at + server::params::Params::FORFEIT_DEADLINE);
+	let now = mtp(r).to_consensus_u32();
+	if deadline + 600 > now {
+		advance_mtp(r, deadline + 600 - now).await;
+	}
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+}
