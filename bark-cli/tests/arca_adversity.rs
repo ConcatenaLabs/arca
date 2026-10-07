@@ -4087,14 +4087,15 @@ async fn d57_home(r: &Running, w: &Arca, leaves: &[String]) -> u32 {
 
 /// D57, R7g's U1, U5 and U6 turned around (F2). The operator loses its one
 /// keeper for good: it answers every witness and `info`, builds rounds, and
-/// co-signs nothing. A holds two batch leaves it paid B from (L1 and L2,
-/// `sending`: a payment spends the coins furthest from their exit date
-/// first), a board it never touches (bS), and a board in asset Y whose refresh ran in a round its
+/// co-signs nothing. A holds two batch leaves and a board of X (L1, L2, bS),
+/// two of which it pays B from (`sending`) and one it never touches (U:
+/// which, depends on the dates, since a payment spends the coins furthest
+/// from their exit date first), and a board in asset Y whose refresh ran in a round its
 /// forfeit could not be co-signed for (bF, `forfeited`; the operator takes
 /// that participation's forfeits until bF's exit deadline, so it is still
 /// issued). A syncs once a day in its coins' last three days before their
 /// exit date, and no more: at three days nothing moves; at two days `sync`
-/// asks for the refresh of bS, which a round takes and nobody co-signs; at
+/// asks for the refresh of U, which a round takes and nobody co-signs; at
 /// one day every coin
 /// goes on the chain, each paying what its own reserves cannot with a fee
 /// coin the wallet chooses (Y is not taken for fees: an X coin pays bF's),
@@ -4149,9 +4150,17 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 	let all = vec![l1.clone(), l2.clone(), bs.clone(), bf.clone()];
 	let states = d57_states(&a, &all);
 	println!("D57 L1, L2, bS, bF: {:?}", states);
-	// A payment spends the coins furthest from their exit date first: the
-	// two batch leaves, younger than the boards. The board bS is untouched.
-	assert_eq!(states, vec!["sending", "sending", "live", "forfeited"]);
+	// A payment spends the coins furthest from their exit date first, the
+	// largest first among those of one date: which two of L1, L2 and bS it
+	// takes depends on whether the round's median time is past the boards'.
+	// The third is the coin A never touches (U).
+	assert_eq!(states[3], "forfeited");
+	assert_eq!(states[..3].iter().filter(|s| *s == "sending").count(), 2, "{:?}", states);
+	let untouched = all[..3].iter().zip(&states).find(|(_, s)| *s == "live").map(|(l, _)| l.clone()).expect("one coin untouched");
+	let expect = |u: &str| -> Vec<String> {
+		all[..3].iter().map(|l| if *l == untouched { u.to_string() } else { "sending".to_string() }).chain(["forfeited".to_string()]).collect()
+	};
+	println!("D57 the coin A never touches: {}", &untouched[..8]);
 
 	let by = d57_latest_exit_by(&a, &all);
 	let first_expiry = a.ok(&["coins"]).as_array().unwrap().iter().filter(|c| all.contains(&c["leaf_id"].as_str().unwrap_or("").to_string()))
@@ -4170,25 +4179,25 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 		assert!(h["refresh_from"].is_u64() && h["home_from"].is_u64() && h["exit_by"].is_u64(), "{}", h);
 	}
 	assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] != "expired"), "{}", s["participations"]);
-	assert_eq!(d57_states(&a, &all), vec!["sending", "sending", "live", "forfeited"]);
-	let c = coin_of(&a, &bs);
-	println!("D57 bS three days before: {}", c);
+	assert_eq!(d57_states(&a, &all), expect("live"));
+	let c = coin_of(&a, &untouched);
+	println!("D57 U three days before: {}", c);
 	assert_eq!(c["home_from"].as_u64(), Some(c["exit_by"].as_u64().unwrap() - 86_400));
 	assert!(c["sync"].as_str().unwrap().contains("at least once a day"), "{}", c);
 	assert!(s["schedule"]["due"].is_boolean() && s["schedule"]["next_sync_at"].is_u64(), "{}", s["schedule"]);
 
-	// Two days before: the refresh window. The refresh of bS is asked for
+	// Two days before: the refresh window. The refresh of U is asked for
 	// and runs in a round; nobody co-signs its forfeits.
 	d57_to(&r, by - 2 * 86_400 + 600).await;
 	let s = a.ok(&["sync"]);
 	println!("D57 A two days before: refresh {}", s["refresh"]);
-	for l in [&bs] {
+	for l in [&untouched] {
 		let asked = s["refresh"].as_array().expect("sync asks for the refreshes").iter().find(|x| x["leaf_id"] == l.as_str()).cloned()
 			.unwrap_or_else(|| panic!("{} is refreshed: {}", l, s));
 		assert_eq!(asked["state"], "pending", "{}", asked);
 		assert_eq!(asked["fees"], json!([]), "free in the window: {}", asked);
 	}
-	assert_eq!(d57_states(&a, &all), vec!["sending", "sending", "given", "forfeited"]);
+	assert_eq!(d57_states(&a, &all), expect("given"));
 	let r3 = final_round(&r).await;
 	println!("D57 the operator's round {} takes the refreshes", r3.txid());
 
