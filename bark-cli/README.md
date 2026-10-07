@@ -140,7 +140,9 @@ the keys, but which coins were spent off-chain is in the store and the server.
   participation, or abandons the request. A coin whose participation the
   server calls `void`, or lets expire, is live again when the server gives it
   back; one it keeps given up, under a forfeit the wallet signed, is
-  `forfeited`, and is the wallet's on the chain: by that forfeit's refund when
+  `forfeited` (so is a coin whose payment the operator's signer refuses
+  because it holds a forfeit of it), and is the wallet's on the chain: by
+  that forfeit's refund when
   the forfeit is on the chain, else by its exit, which the wallet starts at
   once, and the forfeit is followed until one of the two is final. Every
   forfeit is
@@ -555,6 +557,16 @@ and holding it there, with the reason shown:
 - past its expiry, a coin whose wallet was away goes on the chain ahead of
   the sweep and comes home; one whose batch the operator has swept is shown
   lost, with the sweep, once that is final;
+- holders that sync 25 and 45 hours after `sync` asked for their free
+  refresh both complete it, nothing taken on the chain;
+- a forfeit whose operator's half came ten minutes late, after the wallet
+  took its board home in the coin's last day: the server releases the
+  participation, the watcher answers the exit with the forfeit, and the
+  wallet holds its new leaf, live at the server too, and pays out of it; a
+  forfeit held back by a keeper down: with the keeper back before the
+  deadline, the participation released and paid out of, and with it down
+  past the deadline, the board kept given up, never offered for a payment,
+  and brought home whole;
 - the witness denied (a 503 on the way): `send`, `board`, `participate`, a
   swap's offer and the mailbox are refused before anything reaches the
   operator, and `sync` does only what it does on the chain; once the witness

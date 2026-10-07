@@ -566,18 +566,36 @@ The forfeits are taken, and co-signed, until the later of a day after the
 round was found final and the exit deadline of the coins the participation
 gave up (the earliest of them), so a wallet that asked for a refresh in its
 coin's free window completes it at any sync before the coin's exit date.
-A participation not released by then expires, whether its forfeits
+A forfeit the operator can claim ends in a release, whoever finishes the
+step. At every pass over the rounds the server releases, itself, a
+participation of a final round one of whose forfeits the watcher has
+claimed (the claim puts the preimage out), or every forfeit of which it
+holds whole while none of its coins went on the chain otherwise than by its
+forfeit (the operator can put the preimage out at will): its new leaves are
+credited as when the owner completes the step, and the owner's step asked
+again returns the preimage. So a forfeit whose operator's half came late
+(the server's minute task fills it in once the signer and its keepers
+answer) leaves its owner the new leaf, even when the owner's coin is on its
+way home on the chain and its own step can no longer finish.
+
+A participation not released by its deadline expires, whether its forfeits
 never came or came and were never co-signed (the signer away, or its
-keepers): its new leaves are never credited (their preimage never goes out,
+keepers), with one exception: while some of its forfeits are whole and the
+rest recorded without the operator's half, it waits, since the signer may
+still sign the rest, and the whole ones can reveal the preimage. When it
+expires, its new leaves are never credited (their preimage never goes out,
 and the operator sweeps them with their batch at expiry), each of its
 forfeits without the operator's half is dropped, never asked of the signer
-again, and each coin it gave up under no forfeit left is given back, live
-again and free to be given up again. A coin under a forfeit the operator
-holds whole, or under one signed for an earlier, lost round, stays given up:
-its owner's way home is that forfeit's refund or its exit. A forfeit step
-that reaches the server after the expiry, even one in flight when it ran, is
-refused (`not_in_round`) and stores nothing. A round that stops being final
-and becomes final again starts the day again.
+again, and each coin it gave up for which no forfeit was ever recorded is
+given back, live again and free to be given up again. A coin whose forfeit
+was recorded stays given up, whole or not: one whole can be claimed, and
+one without the operator's half may have reached the signer's record, which
+then co-signs no spend of it. So does every coin of a participation one of
+whose forfeits is whole, and a coin under a forfeit signed for an earlier,
+lost round: its owner's way home is that forfeit's refund or its exit. A
+forfeit step that reaches the server after the expiry, even one in flight
+when it ran, is refused (`not_in_round`) and stores nothing. A round that
+stops being final and becomes final again starts the day again.
 
 `release_leaves` then takes the owner's release of the lowest node of each
 coin it gave up: the owner's signature, with the coin's own key, over
@@ -839,6 +857,12 @@ first to spend takes the salt and the other's holder is refused, and can
 exit, while a second signature, which would also spend the first coin, is
 never given. The server answers such a
 refusal with `double_spend`, and logs that its database has lost a spend.
+When what the signer holds under the salt is a forfeit (a coin given up in
+a refresh and given back while its forfeit stood in the record), nothing of
+the transfer has been signed: the server drops the transfer's record, gives
+its inputs back, answers `double_spend` naming the forfeit, and logs that
+forfeit, not a lost spend. The wallet then shows that coin as given up, and
+takes it home on the chain.
 
 The record cannot be lost, cut back, torn or shared without the signer
 noticing:
@@ -1506,7 +1530,19 @@ leaf is expired, a good forfeit for it is refused and stores nothing, its new
 leaf's key is free again and wanted by a new participation, and a
 participation of the same round whose forfeits came is untouched. So does
 one whose forfeit came while the signer was away and was never co-signed:
-the forfeit is dropped, and the signer is asked nothing for it once back.
+the forfeit is dropped, the coin stays given up (its forfeit may be in the
+signer's record), and the signer is asked nothing for it once back. A
+forfeit recorded while the signer was away and filled in once it is back
+releases its participation at the next pass, the new leaf credited. Two
+coins given up together, the forfeit step stopped between their two
+co-signatures (a gate in front of the signer lets the first through): past
+the deadline the participation waits, no coin given back and the second
+forfeit kept; the gate opened, the second forfeit is filled in, the
+participation released, and the watcher takes both boards by their
+forfeits and claims them. A payment out of a coin given back while the
+signer held its forfeit (the database put as an older server left it) is
+refused `double_spend` naming the forfeit, twice alike, the transfer's
+record dropped and the coin given back each time.
 Of two participations of one round, one whose forfeit comes 25 hours after
 the round was found final is released, and one whose forfeit never comes is
 still issued ten minutes before its coin's exit deadline and expires ten

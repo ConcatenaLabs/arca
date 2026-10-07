@@ -4772,3 +4772,160 @@ async fn d58_syncs_a_day_apart_complete_the_free_refresh() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// R7h F3 (a), DH3 turned around (D59.1): the operator's half ten minutes
+/// late, at the specification's delays. One keeper. A's board: `sync` asks
+/// for its refresh in the free window and the round is final; the keeper
+/// goes down. 23 hours later, in the coin's last day, A's sync hands over
+/// the forfeit (recorded, held back) and, the refresh not complete, takes
+/// the board home. Ten minutes on the keeper is back, the server's minute
+/// task fills in the operator's half, and the next pass releases the
+/// participation, whose forfeit the operator now holds whole: A's new leaf
+/// is credited, the watcher answers A's exit with the forfeit, A holds its
+/// new leaf live, at the server too, and pays B out of it. A day on the
+/// participation is still released.
+#[tokio::test(flavor = "multi_thread")]
+async fn d59_a_forfeit_completed_late_releases_the_new_leaf() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("D59HA"), Arca::new("D59HB"));
+	a.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca"]);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	let board = a.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	// B at the same delays, so A takes B's output as a receiver checks it.
+	b.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca"]);
+	let by = d57_latest_exit_by(&a, std::slice::from_ref(&board));
+	d57_to(&r, by - 2 * 86_400 + 2 * 3_600).await;
+	let asked = common::node::median_time(&r.rt);
+	let s = a.ok(&["sync"]);
+	let pid = s["refresh"][0]["participation"].as_str().expect("asked").to_string();
+	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+	final_round(&r).await;
+	r.keepers[0].halt();
+	d57_to(&r, asked + 23 * 3_600).await;
+	let s = a.ok(&["sync"]);
+	println!("D59H A's sync 23 h on, the keeper down: participations {} | home {}", s["participations"], s["home"]);
+	assert_eq!(r.server.store.unsigned_forfeits().await.unwrap().len(), 1, "the forfeit is recorded, held back");
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+	r.keepers[0].resume();
+	r.synced().await;
+	let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let p = r.server.store.participation(&id).await.unwrap().unwrap();
+	println!("D59H the keeper back ten minutes on: {} filled in; the participation at the server: {:?}", filled, p.state);
+	assert_eq!(filled, 1);
+	assert_eq!(p.state, server::store::ParticipationState::Released);
+	for i in 0..14 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		let s = a.ok(&["sync"]);
+		let c = coin_of(&a, &board);
+		println!("D59H pass {}: board {} | forfeits {} | participations {}", i, c["state"], s["forfeits"], s["participations"]);
+		if c["state"] == "spent" || c["state"] == "exited" {
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 1_200));
+	}
+	let coins = a.ok(&["coins"]);
+	let news: Vec<String> = coins.as_array().unwrap().iter().filter(|c| c["kind"] == "batch" && c["state"] == "live")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	println!("D59H A's coins: {}", coins);
+	assert_eq!(news.len(), 1, "A holds its new leaf, live: {}", coins);
+	let leaf: [u8; 32] = unhex(&news[0]).try_into().unwrap();
+	let at_server = r.server.store.leaf(&leaf).await.unwrap().unwrap().state;
+	println!("D59H A's new leaf {} at the server: {:?}", &news[0][..8], at_server);
+	assert_eq!(at_server, server::store::LeafState::Live);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let (ok, v) = a.run(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	println!("D59H A pays B 500000: ok={} {}", ok, if ok { v["sent"].clone() } else { v["error"].clone() });
+	assert!(ok, "{}", v);
+	d57_to(&r, asked + 2 * 86_400).await;
+	r.server.rounds.pass().await.unwrap();
+	let p = r.server.store.participation(&id).await.unwrap().unwrap();
+	println!("D59H a day on: the participation at the server: {:?}", p.state);
+	assert_eq!(p.state, server::store::ParticipationState::Released);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7h F3 (b), DG turned around (D59.2, D59.3). A participation whose
+/// forfeit reached the signer's record, its release held back by a keeper
+/// down. With the keeper back before the forfeit deadline, the server's
+/// minute task completes the forfeit, the participation is released, and A
+/// pays B out of its new leaf. With the keeper down past the deadline, the
+/// participation expires and the board is not given back: the wallet shows
+/// it given up and takes it home, never offering it for a payment (no
+/// `double_spend`, no `in_use`), and it comes home whole less its fees.
+#[tokio::test(flavor = "multi_thread")]
+async fn d59_a_coin_whose_forfeit_reached_the_record_is_paid_on_or_given_up() {
+	for keeper_back_in_time in [true, false] {
+		let tag = if keeper_back_in_time { "the keeper back in time" } else { "the keeper down past the deadline" };
+		let mut r = Running::start_kept(1, None).await;
+		let url = r.url();
+		let x = r.x;
+		let n = if keeper_back_in_time { 1 } else { 2 };
+		let (a, b) = (Arca::new(&format!("D59GA{}", n)), Arca::new(&format!("D59GB{}", n)));
+		let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+		b.ok(&create_args(&url, &r.node_url()));
+		let board = boards[0].clone();
+		let p = a.ok(&["participate", "--leaf", &board, "--max-fee-ppm", "1000000"]);
+		let pid = p["participation"].as_str().unwrap().to_string();
+		let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+		final_round(&r).await;
+		r.keepers[0].halt();
+		let s = a.ok(&["sync"]);
+		println!("D59G {}: A's sync, the keeper down: participations {}", tag, s["participations"]);
+		assert_eq!(r.server.store.unsigned_forfeits().await.unwrap().len(), 1, "the forfeit is recorded, held back");
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		if keeper_back_in_time {
+			r.keepers[0].resume();
+			let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+			r.server.rounds.pass().await.unwrap();
+			let st = r.server.store.participation(&id).await.unwrap().unwrap().state;
+			let s = a.ok(&["sync"]);
+			println!("D59G {}: {} filled in; at the server {:?}; A's sync: participations {}", tag, filled, st, s["participations"]);
+			assert_eq!(st, server::store::ParticipationState::Released);
+			let (ok, v) = a.run(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+			println!("D59G {}: A pays B 500000: ok={} {}", tag, ok, if ok { v["inputs"].clone() } else { v["error"].clone() });
+			assert!(ok, "A pays out of its new leaf: {}", v);
+		} else {
+			let deadline = r.server.rounds.exit_deadline_of(&id).await.unwrap().expect("a board has a date");
+			d57_to(&r, deadline + 600).await;
+			r.server.rounds.pass().await.unwrap();
+			let st = r.server.store.participation(&id).await.unwrap().unwrap().state;
+			let leaf: [u8; 32] = unhex(&board).try_into().unwrap();
+			let at_server = r.server.store.leaf(&leaf).await.unwrap().unwrap().state;
+			println!("D59G {}: past the deadline the participation {:?}, the board at the server {:?}", tag, st, at_server);
+			assert_eq!(st, server::store::ParticipationState::Expired);
+			assert_eq!(at_server, server::store::LeafState::Spent, "the board is not given back as payable");
+			r.keepers[0].resume();
+			let s = a.ok(&["sync"]);
+			let c = coin_of(&a, &board);
+			println!("D59G {}: A's sync: participations {} | home {} | the board {} | {}", tag, s["participations"], s["home"], c["state"],
+				c["note"]);
+			assert!(matches!(c["state"].as_str(), Some("forfeited") | Some("exiting")), "shown as given up, on its way home: {}", c);
+			let (ok, v) = a.run(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+			let e = v["error"]["message"].as_str().unwrap_or("").to_string();
+			println!("D59G {}: A pays B 500000: ok={} {}", tag, ok, e);
+			assert!(!ok && !e.contains("double_spend") && !e.contains("in_use"), "the wallet never offers the board: {}", v);
+			let at = d57_home(&r, &a, std::slice::from_ref(&board)).await;
+			let c = coin_of(&a, &board);
+			println!("D59G {}: the board home at median time {}: {} | {}", tag, at, c["state"], c["note"]);
+			assert_eq!(c["state"], "exited");
+		}
+		for w in [&a, &b] {
+			let _ = std::fs::remove_dir_all(&w.dir);
+		}
+	}
+}

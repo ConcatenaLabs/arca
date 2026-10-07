@@ -884,11 +884,14 @@ impl Store {
 	/// preimage never goes out, and the operator sweeps them); each of its
 	/// forfeits for that round without the operator's half is dropped, so the
 	/// signer is never asked for it again ([`Store::unsigned_forfeits`]); and
-	/// each coin it gave up under no forfeit left is given back
-	/// ([`give_back`]). A coin under a forfeit the operator holds whole stays
-	/// given up: that forfeit's claim would reveal the preimage, and its
-	/// owner's way home is its refund or its exit. Returns the participations
-	/// expired.
+	/// each coin it gave up for which no forfeit was ever recorded is given
+	/// back ([`give_back`]). A coin whose forfeit was recorded, whole or not, stays
+	/// given up: one whole can be claimed, and one without the operator's
+	/// half may have reached the signer's record, which co-signs no spend of
+	/// it; its owner's way home is that forfeit's refund or its exit. And
+	/// while a forfeit of the participation is whole, no coin of it is given
+	/// back: that forfeit's claim reveals the preimage that opens every new
+	/// leaf. Returns the participations expired.
 	pub async fn expire_participations(&self, cutoff: u32) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut expired = vec![];
 		for id in self.overdue_participations(cutoff).await? {
@@ -931,6 +934,17 @@ impl Store {
 			Some(r) => (r.get(0), r.get(1)),
 			None => return Ok(false),
 		};
+		// What is given back is decided before the forfeits without the
+		// operator's half are dropped: a coin whose forfeit was recorded may
+		// have reached the signer's record, which then co-signs no spend of
+		// it, so it stays given up, its owner's way home its exit. And no coin
+		// is given back while a forfeit of the participation is whole: that
+		// forfeit's claim reveals the preimage that opens every new leaf.
+		let whole = t.query_opt("SELECT 1 FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NOT NULL",
+			&[&&id[..], &round_id]).await?.is_some();
+		if !whole {
+			give_back(&t, id).await?;
+		}
 		t.execute("DELETE FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NULL", &[&&id[..], &round_id])
 			.await?;
 		t.execute("UPDATE participation SET state = 'expired', updated_at = now() WHERE participation_id = $1", &[&&id[..]]).await?;
@@ -940,8 +954,46 @@ impl Store {
 				SELECT leaf_id FROM batch_leaf WHERE participation_id = $1 AND round_id = $2 AND attempt = $3)",
 			&[&&id[..], &round_id, &attempt],
 		).await?;
-		give_back(&t, id).await?;
 		free_keys(&t, id).await?;
+		t.commit().await?;
+		Ok(true)
+	}
+
+	/// The participations issued in a round that is final and not released
+	/// since, oldest id first: each a step whose forfeits are owed.
+	pub async fn issued_in_final_rounds(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		self.overdue_participations(u32::MAX).await
+	}
+
+	/// How the forfeits of participation `id` for the round `round_id` stand:
+	/// how many coins it gives up, and of their forfeits how many are
+	/// recorded whole and how many without the operator's half.
+	pub async fn forfeit_count(&self, id: &[u8; 32], round_id: i64) -> Result<(u64, u64, u64), StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_one(
+			"SELECT (SELECT count(*) FROM participation_input WHERE participation_id = $1 AND active),
+			        (SELECT count(*) FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NOT NULL),
+			        (SELECT count(*) FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NULL)",
+			&[&&id[..], &round_id],
+		).await?;
+		Ok((r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64))
+	}
+
+	/// Releases participation `id`, issued at `attempt` in the round
+	/// `round_id`, whose forfeits the operator holds whole, or one of whose
+	/// forfeits it has claimed (which put the preimage out): released, and
+	/// its new leaves credited if the round is final, as when its owner
+	/// completes it. Returns whether it was issued.
+	pub async fn release_participation(&self, id: &[u8; 32], attempt: u32, round_id: i64) -> Result<bool, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		match lock_in_round(&t, id, attempt, round_id).await {
+			Ok(ParticipationState::Issued) => {},
+			Ok(_) | Err(StoreError::NotInRound(_)) => return Ok(false),
+			Err(e) => return Err(e),
+		}
+		t.execute("UPDATE participation SET state = 'released', updated_at = now() WHERE participation_id = $1", &[&&id[..]]).await?;
+		credit(&t, round_id).await?;
 		t.commit().await?;
 		Ok(true)
 	}

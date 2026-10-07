@@ -221,6 +221,43 @@ impl Store {
 		Ok(())
 	}
 
+	/// Drops the record of transfer `transfer_id`, recorded and never signed:
+	/// its new coins (pending, never posted), its reassignment, its inputs'
+	/// checkpoint scripts and the transfer itself, and gives each of its
+	/// inputs back to its owner, live again, all or nothing. For a transfer
+	/// the signer refused before signing anything of it. Returns the inputs
+	/// given back; none when the transfer is not recorded or was signed.
+	pub async fn drop_transfer(&self, transfer_id: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let state = t.query_opt("SELECT state FROM transfer WHERE transfer_id = $1 FOR UPDATE", &[&&transfer_id[..]]).await?;
+		if state.as_ref().map(|r| r.get::<_, &str>(0)) != Some("recorded") {
+			return Ok(vec![]);
+		}
+		let inputs: Vec<Vec<u8>> = t.query("SELECT leaf_id FROM transfer_input WHERE transfer_id = $1", &[&&transfer_id[..]]).await?
+			.iter().map(|r| r.get(0)).collect();
+		let outputs: Vec<Vec<u8>> = t.query("SELECT leaf_id FROM transfer_output WHERE transfer_id = $1", &[&&transfer_id[..]]).await?
+			.iter().map(|r| r.get(0)).collect();
+		t.execute("DELETE FROM reassignment WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		t.execute("DELETE FROM transfer_output WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		t.execute("DELETE FROM leaf WHERE leaf_id = ANY($1) AND state = 'pending'", &[&outputs]).await?;
+		t.execute(
+			"DELETE FROM arca_script a WHERE ((a.kind = 'checkpoint' AND a.leaf_id = ANY($1)) OR a.leaf_id = ANY($2))
+			 AND NOT EXISTS (SELECT 1 FROM script_sighting s WHERE s.script_pubkey = a.script_pubkey)
+			 AND NOT EXISTS (SELECT 1 FROM leaf l WHERE l.script_pubkey = a.script_pubkey)",
+			&[&inputs, &outputs],
+		).await?;
+		t.execute("DELETE FROM transfer_input WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		t.execute("DELETE FROM transfer WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		let back = t.query(
+			"UPDATE leaf SET state = 'live', spent_by = NULL, updated_at = now()
+			 WHERE leaf_id = ANY($1) AND state = 'spent' AND spent_by = $2 RETURNING leaf_id",
+			&[&inputs, &&transfer_id[..]],
+		).await?;
+		t.commit().await?;
+		back.iter().map(|r| array32(r.get(0), "leaf id")).collect()
+	}
+
 	/// Which of `scripts` have been seen paid by an output, in the mempool or a
 	/// block.
 	pub async fn sighted(&self, scripts: &[Vec<u8>]) -> Result<HashSet<Vec<u8>>, StoreError> {

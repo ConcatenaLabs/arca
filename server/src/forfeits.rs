@@ -32,7 +32,10 @@
 //! Then, in one database transaction, the participation is released and its
 //! new leaves credited, and only then is the preimage returned. A forfeit
 //! left without the operator's half (the server stopped before the answer
-//! was stored) is completed later ([`Forfeits::fill_unsigned`]). The coins given up have been spent by the participation
+//! was stored) is completed later ([`Forfeits::fill_unsigned`]), and a
+//! participation whose forfeits are then all whole is released by the
+//! server's next pass over the rounds ([`crate::rounds::Rounds::release_held`]),
+//! whether or not its owner asks again. The coins given up have been spent by the participation
 //! since it was accepted. A participation run again after a round it was in
 //! could not return completes the same way: its forfeits for the new round
 //! are taken and checked, and its new preimage goes out against them. The
