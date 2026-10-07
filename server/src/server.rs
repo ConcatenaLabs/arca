@@ -670,7 +670,7 @@ impl Server {
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),
 			Duration::from_secs(config.limits.board_unconfirmed_seconds));
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
-		let participations = Participations::new(store.clone(), finality.clone(), params.clone());
+		let participations = Participations::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
 		let forfeits = Forfeits::new(store.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,

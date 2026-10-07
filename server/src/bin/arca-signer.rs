@@ -715,6 +715,17 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
+		Request::Under { salt } => {
+			let salt = match unhex32(&salt) {
+				Ok(s) => s,
+				Err(e) => return Response { error: Some(format!("salt: {}", e)), ..none },
+			};
+			let r = record.lock().unwrap_or_else(|e| e.into_inner());
+			match r.entries_under(&salt) {
+				Ok(list) => Response { entries: Some(list.iter().map(|e| e.to_wire()).collect()), ..none },
+				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
+			}
+		},
 		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
