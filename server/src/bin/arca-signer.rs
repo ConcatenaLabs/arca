@@ -80,7 +80,12 @@
 //! beside the record (`server::signer::acknowledged_path`), a keeper that
 //! holds no head has lost its heads file and is no answer. A keeper seen to
 //! go back, naming no head or a latest below one it held, is a lost keeper:
-//! the signer counts it no more while it runs, and says so. Every head it
+//! the signer counts it no more, and says so. What it saw each keeper hold,
+//! lost keepers included, it writes beside the record
+//! (`server::signer::keepers_seen_path`) before it releases anything that
+//! taught it more, and reads at every start, so a restart changes nothing of
+//! it; it releases nothing it cannot note there, nor before it has noted the
+//! first acknowledged head. Every head it
 //! hands out carries the acknowledgements it has of it, and `pubkey` names
 //! the record's keepers.
 
@@ -236,9 +241,12 @@ struct Keepers {
 	/// are answered by the head it gets acknowledged when that head covers
 	/// their entry.
 	acked: tokio::sync::Mutex<Option<(WireEntryRef, Vec<WireAck>)>>,
-	/// What each keeper was seen to hold since the signer started, in the
-	/// list's order.
+	/// What each keeper was seen to hold, in the list's order: read from
+	/// beside the record at start (`<record>.keepers-seen`), and written there
+	/// again before anything that taught the signer more is released.
 	seen: Mutex<Vec<Seen>>,
+	/// What was last written beside the record of `seen`.
+	saved: Mutex<Vec<Seen>>,
 	/// Whether a head of the record has been acknowledged by as many keepers
 	/// as it requires (`<record>.acknowledged`): from then on a keeper that
 	/// holds no head has lost its heads file, and is no answer.
@@ -246,22 +254,19 @@ struct Keepers {
 	record: PathBuf,
 }
 
-/// What one keeper was seen to hold since the signer started: the highest
-/// entry it named, and why it is a lost keeper, once it is one.
-#[derive(Debug, Clone, Default)]
-struct Seen {
-	held: Option<u64>,
-	lost: Option<String>,
-}
+/// What one keeper was seen to hold: the highest entry it named or
+/// acknowledged, and why it is a lost keeper, once it is one.
+type Seen = server::signer::KeeperSeen;
 
 impl Keepers {
 	/// Takes `latest`, the entry keeper `i` names as the latest it holds (in
 	/// an answer for its latest, or with an acknowledgement), and says why it
 	/// is no answer when it is a lost keeper: its heads file no longer holds
 	/// what it held. A keeper that holds no head once a head of the record has
-	/// been acknowledged, or less than it was seen to hold, is one, and stays
-	/// one while the signer runs. Its contradictions still stop the signer;
-	/// its answers count for nothing.
+	/// been acknowledged, or less than it was seen to hold, before a restart
+	/// of the signer as well as after, is one, and stays one, across restarts
+	/// ([`Self::save`]). Its contradictions still stop the signer; its
+	/// answers count for nothing.
 	fn note(&self, i: usize, latest: Option<u64>) -> Option<String> {
 		let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
 		let s = &mut seen[i];
@@ -279,7 +284,7 @@ impl Keepers {
 		match why {
 			Some(w) => {
 				let why = format!("{}: a lost keeper, whose heads file was lost or restored from an older copy, so it no longer holds \
-					what it acknowledged; the signer counts it no more while it runs, and it is never started again under its key", w);
+					what it acknowledged; the signer counts it no more (noted beside its record), and it is never started again under its key", w);
 				eprintln!("arca-signer: {}", why);
 				s.lost = Some(why.clone());
 				Some(why)
@@ -295,6 +300,29 @@ impl Keepers {
 	fn holds(&self, i: usize, entry: u64) {
 		let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
 		seen[i].held = seen[i].held.max(Some(entry));
+	}
+
+	/// What each keeper was seen to hold, from beside the record at `record`
+	/// (`<record>.keepers-seen`), for the keepers `list` in order: nothing
+	/// seen of a keeper the file does not name.
+	fn read_seen(record: &std::path::Path, list: &[KeeperAddr]) -> Result<Vec<Seen>, String> {
+		let kept = server::signer::read_keepers_seen(record)?;
+		Ok(list.iter().map(|k| kept.get(&k.key.serialize()).cloned().unwrap_or_default()).collect())
+	}
+
+	/// Writes what each keeper was seen to hold beside the record, when it
+	/// changed since it was last written: synced before anything that taught
+	/// the signer more is released, which nothing is when it cannot be.
+	fn save(&self) -> Result<(), String> {
+		let now = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
+		if *saved == now {
+			return Ok(());
+		}
+		let by_key: Vec<([u8; 32], Seen)> = self.list.iter().zip(&now).map(|(c, s)| (c.addr.key.serialize(), s.clone())).collect();
+		server::signer::write_keepers_seen(&self.record, &by_key)?;
+		*saved = now;
+		Ok(())
 	}
 }
 
@@ -419,11 +447,18 @@ impl State {
 				Err(e) => notes.push(e),
 			}
 		}
+		// A lost keeper stays lost across restarts: noted beside the record
+		// before anything is signed.
+		let saved = k.save();
 		let need = start_quorum(k.list.len(), k.required);
 		if answered < need {
 			return Err(format!("{}: {} of the {} keepers answered for the latest head each holds, and {} must before the signer signs \
 				anything its record governs after a start, so that it sees the latest head any {} of them hold ({})", KEEPERS_UNAVAILABLE,
 				answered, k.list.len(), need, k.required, notes.join("; ")));
+		}
+		if let Err(e) = saved {
+			return Err(format!("{}: the signer cannot note beside its record what its keepers hold ({}), and signs nothing its record \
+				governs until it can", KEEPERS_UNAVAILABLE, e));
 		}
 		eprintln!("arca-signer: the keepers agree with the record ({})", notes.join("; "));
 		*checked = true;
@@ -487,19 +522,30 @@ impl State {
 				Err(e) => notes.push(e),
 			}
 		}
+		// What the keepers were seen to hold, lost keepers included, goes
+		// beside the record before anything it taught is released.
+		let saved = k.save();
 		if acks.len() < k.required {
 			return Err(format!("{}: {} of the {} keepers acknowledged entry {}, and {} must before the signer answers it; the entry \
 				stays, and the same request again completes once they do ({})", KEEPERS_UNAVAILABLE, acks.len(), k.list.len(), head.entry,
 				k.required, notes.join("; ")));
 		}
+		let cannot = |what: &str, e: String| {
+			eprintln!("arca-signer: noting beside the record {}: {}; nothing is released until it is noted", what, e);
+			format!("{}: {} of the {} keepers acknowledged entry {}, but the signer cannot note beside its record {} ({}): it releases \
+				nothing until it can; the entry stays, and the same request again completes once it can", KEEPERS_UNAVAILABLE, acks.len(),
+				k.list.len(), head.entry, what, e)
+		};
+		if let Err(e) = saved {
+			return Err(cannot("what its keepers hold", e));
+		}
 		// The first head the keepers acknowledged: from now on, one that holds
-		// none has lost its heads file.
-		if !k.acknowledged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+		// none has lost its heads file. Noted before it is released.
+		if !k.acknowledged.load(std::sync::atomic::Ordering::SeqCst) {
 			if let Err(e) = server::signer::mark_acknowledged(&k.record, head.entry, &unhex32(&head.hash)?) {
-				eprintln!("arca-signer: noting beside the record that a head was acknowledged: {}; a start of the signer before it \
-					is noted counts a keeper with no head as an answer", e);
-				k.acknowledged.store(false, std::sync::atomic::Ordering::SeqCst);
+				return Err(cannot("that a head was acknowledged", e));
 			}
+			k.acknowledged.store(true, std::sync::atomic::Ordering::SeqCst);
 		}
 		*acked = Some((head.clone(), acks.clone()));
 		Ok((head, acks))
@@ -877,12 +923,26 @@ async fn main() {
 		},
 	};
 	let record = Mutex::new(record);
+	// What the signer saw each keeper hold, before this start as well.
+	let seen = match Keepers::read_seen(&args.record, &addrs) {
+		Ok(s) => s,
+		Err(e) => {
+			eprintln!("arca-signer: what the signer saw its keepers hold, kept beside its record: {}", e);
+			std::process::exit(2);
+		},
+	};
+	for (c, s) in addrs.iter().zip(&seen) {
+		if let Some(why) = &s.lost {
+			eprintln!("arca-signer: keeper {} is a lost keeper, as noted beside the record: {}", hex(&c.key.serialize()), why);
+		}
+	}
 	let keepers = (!named.is_none()).then(|| Keepers {
 		required: named.required,
 		list: addrs.iter().map(|k| KeeperClient::new(k.clone(), args.keeper_timeout)).collect(),
 		checked: tokio::sync::Mutex::new(false),
 		acked: tokio::sync::Mutex::new(None),
-		seen: Mutex::new(vec![Seen::default(); addrs.len()]),
+		saved: Mutex::new(seen.clone()),
+		seen: Mutex::new(seen),
 		acknowledged: std::sync::atomic::AtomicBool::new(server::signer::acknowledged_path(&args.record).exists()),
 		record: args.record.clone(),
 	});

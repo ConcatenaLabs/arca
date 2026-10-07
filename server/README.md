@@ -111,6 +111,10 @@ to an older state:
   given, so a record cut back or replaced by an older copy signs nothing
   (`record_behind`) and the server does not start against it. A record that
   is lost cannot be replaced by a new one: the operator stops co-signing.
+  The files the signer keeps beside its record live with it, on the same
+  storage, and are never restored or edited either: `<record>.acknowledged`
+  and `<record>.keepers-seen` ([The keepers](#the-keepers)), and
+  `<record>.stopped`, the proof of a rollback.
 - A record and a database rolled back together (a snapshot of the whole
   machine restored) pass every check the server makes of itself, so the
   record is held outside the machine: by keepers on other machines, which
@@ -1018,8 +1022,9 @@ of them required, one answer is enough; with one of two required, both
 must answer. A keeper that holds no head is no answer once a head of the
 record has been acknowledged by as many keepers as it requires: the signer
 notes that beside its record the first time it happens
-(`<record>.acknowledged`, carried over by a compaction). Before then the
-keepers of a new operator have held nothing, and their "no head" counts.
+(`<record>.acknowledged`, synced, carried over by a compaction), and
+releases nothing until it has. Before then the keepers of a new operator
+have held nothing, and their "no head" counts.
 
 A keeper is only as good as its heads file. One whose heads file is lost,
 or would come back from an older copy, no longer holds what it
@@ -1031,11 +1036,17 @@ into, while it still can. With one keeper, or with all of them required,
 the keeper's heads file is the whole of the protection: a lost keeper ends
 the operator, and the file lives on durable storage of its own, never
 restored, and never on the signer's machine. Where the signer can tell, it
-counts a lost keeper no more while it runs, and says so: a keeper that
-names no head once a head has been acknowledged, or a latest below one it
-was seen to hold. A signer started afresh cannot tell a keeper restored
-from an older copy from one that lagged, which is why the rule is the
-operator's to keep.
+counts a lost keeper no more, and says so: a keeper that names no head once
+a head has been acknowledged, or a latest below one it was seen to hold.
+What it has seen each keeper hold, and which keepers are lost, it writes
+beside its record (`<record>.keepers-seen`, synced, carried over by a
+compaction) before it releases anything that taught it more, and reads at
+every start, so a keeper that goes back is lost across restarts of the
+signer as within one run; it releases nothing it cannot write there. A
+restore of the signer's machine, from disk or with its memory, brings that
+file back as old as the record, and a signer so restored cannot tell a
+keeper restored from an older copy from one that lagged, which is why the
+rule is the operator's to keep.
 
 Every head the signer hands out carries the acknowledgements it has of it,
 and they travel with the head wherever a head travels: `info`, the witness
@@ -1046,9 +1057,10 @@ them when it is created, as it pins the operator key, and from then on takes
 no coin and keeps no head that lacks the required acknowledgements; an
 operator that shows other keepers is not the operator it pinned, and is
 refused as one showing another key is. A keeper on the signer's own
-machine adds under a millisecond to a co-signature, and one 50 ms away each
-way about 100 ms: one round trip, over a connection the signer keeps open
-to each keeper.
+machine adds about three milliseconds to a co-signature (its
+acknowledgement, and what the signer writes beside its record, synced), and
+one 50 ms away each way about 100 ms more: one round trip, over a
+connection the signer keeps open to each keeper.
 
 A record made with `--no-keepers` says so in its first line
 (`keepers=none`) and never gains any: the signer refuses `--keeper` on it,
@@ -1571,7 +1583,12 @@ keeper restored from an older copy stopping nothing and taking the
 record's latest; two keepers with one required, one down holding nothing
 up, a start with one down signing nothing until it is back; a signer
 whose address the keeper's `--allow` does not name told why by the keeper
-and saying so, at its start and in its `keepers_unavailable`; a new operator
+and saying so, at its start and in its `keepers_unavailable`; a keeper gone
+back to an older copy while another missed the lost window, after a
+restart of the signer, a lost keeper still (from `<record>.keepers-seen`),
+nothing released, and with the record alone put back to an earlier copy no
+second spend released; a signer that cannot write beside its record
+releasing nothing until it can; a new operator
 with three keepers made in the order "Running" gives, every command run,
 `S` read with `arca-signer --pubkey` before its record exists, the signer
 co-signing with the keepers' acknowledgements; and what a keeper adds to a
