@@ -453,7 +453,9 @@ async fn a_round_that_cannot_return_runs_its_participations_again_as_ordinary_on
 	assert!(!ftx.output.contains(&f_r.output().txout()), "and not R's");
 	let claim = common::flow::claim_of(&log, &a_old_id).unwrap();
 	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
-	let revealed = arca_covenant::witness::find_preimage(&ctx.input[0].witness.script_witness, &y_hash).expect("the claim reveals Y's preimage");
+	// One claim may take several forfeits of a round: A's is any of its inputs.
+	let revealed = ctx.input.iter().find_map(|i| arca_covenant::witness::find_preimage(&i.witness.script_witness, &y_hash))
+		.expect("the claim reveals Y's preimage");
 	assert_eq!(revealed, y_preimage);
 	assert_eq!(status(&r, &pa)["state"], "released");
 	println!("A's old coin, exited after its re-run completed, was answered by its forfeit for Y {} and claimed by {}",
