@@ -150,6 +150,23 @@ pub(crate) struct In {
 	pub checkpoint_value: u64,
 }
 
+/// What the wallet says of a coin whose forfeit the operator's signer holds.
+const FORFEIT_HELD_NOTE: &str = "given up: the operator's signer holds a forfeit of this coin, signed in a refresh that did not \
+	complete, so it co-signs no spend of it; the coin is the wallet's on the chain, and sync takes it home from home_from (`arca exit` \
+	takes it now)";
+
+/// The salt under which the operator's signer holds a forfeit, when `e` is
+/// its refusal of a spend for that reason (`double_spend`, naming the
+/// forfeit).
+fn forfeit_held(e: &Error) -> Option<[u8; 32]> {
+	let Error::Server { code, message, .. } = e else { return None };
+	if code != "double_spend" || !message.contains("already co-signed the forfeit") {
+		return None;
+	}
+	let salt = message.split("under salt ").nth(1)?.split_whitespace().next()?;
+	unhex32(salt).ok()
+}
+
 fn dummy_sig() -> Signature {
 	Signature::from_slice(&[1u8; 64]).expect("64 bytes")
 }
@@ -466,9 +483,19 @@ impl Wallet {
 					"kept": kept}))
 			},
 			Err(e @ Error::Server { .. }) => {
+				// A coin whose forfeit the operator's signer holds (given up in a
+				// refresh that the operator let go) can never be paid on: it is
+				// shown as given up, and goes home on the chain.
+				let forfeited = forfeit_held(&e).and_then(|salt| mine.iter().find(|l| {
+					self.store.coin(l).ok().flatten().is_some_and(|c| c.salt == salt)
+				}).cloned());
 				self.store.atomically(|s| {
 					for l in mine {
-						s.set_coin_state(l, "live", "")?;
+						if Some(l) == forfeited.as_ref() {
+							s.set_coin_state(l, "forfeited", FORFEIT_HELD_NOTE)?;
+						} else {
+							s.set_coin_state(l, "live", "")?;
+						}
 					}
 					s.set_transfer(id, "refused", &e.to_string())?;
 					s.refused(&format!("transfer request {}", id), &e.to_string())
@@ -1165,4 +1192,26 @@ fn passing(e: &Error) -> bool {
 
 fn to_out_owner(o: &Out) -> String {
 	o.leaf.owner.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The signer's refusal of a spend for a forfeit it holds names the salt
+	/// of the coin the wallet then shows as given up; a refusal for a spend,
+	/// or any other refusal, names none.
+	#[test]
+	fn a_refusal_for_a_held_forfeit_names_the_coins_salt() {
+		let salt = [0x5a; 32];
+		let refusal = |code: &str, what: &str| Error::Server {
+			call: "cosign_transfer".into(), status: 409, code: code.into(),
+			message: format!("the signer: the signer refused: already_signed: S has already co-signed {} {} under salt {} (entry 1, for \
+				the leaf of {}); the signer co-signs one spend under a salt", what, hex(&[1; 32]), hex(&salt), hex(&[2; 32])),
+		};
+		assert_eq!(forfeit_held(&refusal("double_spend", "the forfeit")), Some(salt));
+		assert_eq!(forfeit_held(&refusal("double_spend", "the spend")), None);
+		assert_eq!(forfeit_held(&refusal("in_use", "the forfeit")), None);
+		assert_eq!(forfeit_held(&Error::Refused("already co-signed the forfeit under salt 00".into())), None);
+	}
 }

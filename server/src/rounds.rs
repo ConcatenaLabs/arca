@@ -48,15 +48,22 @@
 //! The owner of each participation in a round hands over its forfeits once
 //! the round is final, and the signer co-signs them, until the later of a
 //! day after the round was found final ([`Params::FORFEIT_DEADLINE`]) and
-//! the exit deadline of the coins it gave up: a participation not released
-//! by then expires, whether its forfeits never came or came and were never
-//! co-signed (the signer away, or its keepers). Each
-//! forfeit of it without the operator's half is dropped, never to be asked
-//! of the signer again; the coins it gave up are the owner's again (a coin
-//! under a forfeit the operator holds whole, or one signed for an earlier,
-//! lost round, excepted), and its new leaves are never credited: their
-//! preimage never goes out, and the operator sweeps them with their batch at
-//! expiry.
+//! the exit deadline of the coins it gave up. A forfeit the operator can
+//! claim ends in a release ([`Rounds::release_held`]): a participation one
+//! of whose forfeits the watcher claimed, or every forfeit of which is whole,
+//! none of its coins taken on the chain otherwise, is released by the server
+//! itself and its new leaves credited. Otherwise a participation not
+//! released by its deadline expires, whether its forfeits never came or
+//! came and were never co-signed (the signer away, or its keepers), but for
+//! one with some forfeits whole and the rest waiting for the operator's
+//! half, which waits for the signer. Each forfeit of an expired
+//! participation without the operator's half is dropped, never to be asked
+//! of the signer again; each coin it gave up for which no forfeit was ever
+//! recorded is the owner's again, live (a coin whose forfeit was recorded,
+//! every coin of a participation with a whole forfeit, and one under a
+//! forfeit signed for an earlier, lost round stay given up, their owners'
+//! on the chain); and its new leaves are never credited: their preimage
+//! never goes out, and the operator sweeps them with their batch at expiry.
 //!
 //! After a rollback the nursery broadcasts a round again unchanged; while it
 //! is out of the chain its new leaves are uncredited, and they are credited
@@ -911,9 +918,91 @@ impl Rounds {
 			}
 			self.check_round(&r).await?;
 		}
+		self.release_held().await?;
 		self.expire().await?;
 		self.void_overdue().await?;
 		Ok(())
+	}
+
+	/// Releases every participation issued in a final round whose preimage
+	/// is out, or which the operator can put out at will: one of its
+	/// forfeits claimed by the watcher (whose claim reveals the preimage), or
+	/// every forfeit of it whole, none of its coins taken on the chain
+	/// otherwise than by its forfeit. Its new leaves are its owner's either
+	/// way, so it is released and they are credited, as when the owner
+	/// completes it itself; a forfeit step its owner can no longer finish (its
+	/// coin on its way home on the chain, say) leaves nothing stranded.
+	/// Returns them.
+	pub async fn release_held(&self) -> Result<Vec<[u8; 32]>, RoundError> {
+		let mut released = vec![];
+		for id in self.store.issued_in_final_rounds().await? {
+			let Some(p) = self.store.participation(&id).await? else { continue };
+			let Some(round_id) = p.round_id else { continue };
+			let (n, whole, _) = self.store.forfeit_count(&id, round_id).await?;
+			if whole == 0 {
+				continue;
+			}
+			let why = if self.claimed(&p, round_id).await? {
+				"the watcher claimed one of its forfeits, which put its preimage out".to_string()
+			} else if whole == n {
+				match self.coin_taken_otherwise(&p).await? {
+					None => "every forfeit of it is whole, so the operator can put its preimage out at will".to_string(),
+					Some(how) => {
+						log::warn!("participation {}: every forfeit of it is whole, but {}, otherwise than by its forfeit, so it is not \
+							released", crate::signer::hex(&id), how);
+						continue;
+					},
+				}
+			} else {
+				continue;
+			};
+			if self.store.release_participation(&id, p.attempt, round_id).await? {
+				log::info!("participation {} released by the server: {}; its new leaves are credited", crate::signer::hex(&id), why);
+				released.push(id);
+			}
+		}
+		Ok(released)
+	}
+
+	/// Whether the watcher has claimed a forfeit of participation `p` for the
+	/// round `round_id`: a claim in its log, of that round, spending one.
+	async fn claimed(&self, p: &ParticipationRow, round_id: i64) -> Result<bool, RoundError> {
+		let round = self.store.round(round_id).await?.ok_or_else(|| RoundError::Internal(format!("round {} is not recorded", round_id)))?;
+		let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
+		let claims = self.store.watcher_txs("claim", &m.into_inner().to_byte_array()).await?;
+		if claims.is_empty() {
+			return Ok(false);
+		}
+		let mut forfeits: HashSet<Txid> = HashSet::new();
+		for i in &p.inputs {
+			for w in self.store.watcher_txs("forfeit", &i.leaf_id).await? {
+				forfeits.insert(Txid::from_byte_array(w.txid));
+			}
+		}
+		for c in claims {
+			let tx: Transaction = deserialize(&c.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
+			if tx.input.iter().any(|i| forfeits.contains(&i.previous_output.txid)) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// The first coin participation `p` gave up that the chain shows spent
+	/// otherwise than by one of its forfeits in the watcher's log (its owner's
+	/// claim once its exit delay ran, say), and how ([`Self::taken_otherwise`]):
+	/// the operator can no longer take that coin by its forfeit. `None` when
+	/// there is none.
+	async fn coin_taken_otherwise(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
+		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
+		let mempool: HashSet<Txid> = self.finality.call(|c| c.mempool()).await.map_err(chain)?.into_iter().collect();
+		for i in p.inputs.iter().filter(|i| !i.returned) {
+			let mine: Vec<Txid> = self.store.watcher_txs("forfeit", &i.leaf_id).await?.iter().map(|w| Txid::from_byte_array(w.txid)).collect();
+			if let Some(how) = self.taken_otherwise(&i.leaf_id, &mine, &mempool).await? {
+				return Ok(Some(format!("coin {} was spent on the chain {}", LeafId(i.leaf_id), how)));
+			}
+		}
+		Ok(None)
 	}
 
 	/// Expires every participation that is not released by the later of
@@ -930,10 +1019,21 @@ impl Rounds {
 			if self.exit_deadline_of(&id).await?.is_some_and(|d| now < d) {
 				continue;
 			}
+			// Some forfeits whole and the rest recorded without the operator's
+			// half: the signer may still sign the rest (`fill_unsigned`), and
+			// the whole ones can reveal the preimage, so it waits.
+			if let Some(round_id) = self.store.participation(&id).await?.and_then(|p| p.round_id) {
+				let (_, whole, unsigned) = self.store.forfeit_count(&id, round_id).await?;
+				if whole > 0 && unsigned > 0 {
+					log::warn!("participation {} is past its forfeit deadline with {} forfeit(s) whole and {} waiting for the operator's \
+						half: it waits for the signer, and gives back no coin", crate::signer::hex(&id), whole, unsigned);
+					continue;
+				}
+			}
 			if self.store.expire_participation(&id, cutoff).await? {
 				log::warn!("participation {} expired: it was not released by the later of a day after its round was found final \
-					and its coins' exit deadline (its forfeits did not come, or were not co-signed); its coins are given back, but \
-					one under a forfeit the operator holds whole, and its new leaves are never credited", crate::signer::hex(&id));
+					and its coins' exit deadline (its forfeits did not come, or were not co-signed); each coin for which no forfeit was \
+					recorded is given back, the others stay given up, and its new leaves are never credited", crate::signer::hex(&id));
 				expired.push(id);
 			}
 		}

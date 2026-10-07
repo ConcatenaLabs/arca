@@ -208,10 +208,14 @@ async fn a_participation_whose_forfeits_are_never_cosigned_expires() {
 	let sa = status(&r, &pa);
 	println!("A past its coin's exit deadline, its forfeit never co-signed: {}", sa);
 	assert_eq!(sa["state"], "expired", "{}", sa);
-	assert_eq!(sa["inputs"][0]["returned"], true, "{}", sa);
+	// The forfeit was recorded and the signer asked for its half: it may be
+	// in the signer's record, which then co-signs no spend of the coin, so
+	// the coin is not given back as payable. It stays given up, its owner's
+	// way home its exit.
+	assert_eq!(sa["inputs"][0]["returned"], false, "{}", sa);
 	assert!(r.server.store.unsigned_forfeits().await.unwrap().is_empty(), "the forfeit without the operator's half is dropped");
 	assert!(r.server.store.forfeits(&pa, built.round_id).await.unwrap().is_empty());
-	assert_eq!(leaf_states(&r, &a), vec!["live"], "A's board is A's again");
+	assert_eq!(leaf_states(&r, &a), vec!["spent"], "A's board stays given up");
 	assert_eq!(leaf_states(&r, &a2), vec!["expired"], "A's new leaf is never credited");
 
 	// The signer back: nothing is asked of it for the expired participation.
@@ -409,4 +413,244 @@ async fn the_refresh_window_and_the_exit_deadline() {
 	assert_eq!(leaf_states(&r, &b.0), vec!["live"]);
 	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "no participation can run");
 	println!("B's deferred participation could never run: void at its coin's exit deadline, its coin live again");
+}
+
+// ---------------------------------------------------------------------------
+// 3. A forfeit the operator can claim ends in a release (D59)
+// ---------------------------------------------------------------------------
+
+/// R7h F3 (a) at the server. A's forfeit is recorded while the signer is
+/// away (`signer_unavailable`); the signer back, the server's minute task
+/// fills in the operator's half, and the next pass over the rounds releases
+/// the participation, whose forfeit the operator now holds whole: A's new
+/// leaf is credited, and A's forfeit step asked again returns the preimage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forfeit_completed_late_releases_its_participation() {
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (valid, record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
+	let st = status(&r, &pa);
+	let old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &valid, &round, &st);
+	let body = forfeit_body(&pa, a_board.id, forfeit_sig(&f, &a), auths_json(&valid, &a2, created(&record)));
+	r.signer.kill();
+	let ans = r.http.post("forfeit_leaves", &body);
+	println!("A's forfeit with the signer away: {} {}", ans.status, ans.json);
+	assert_eq!(ans.status, 503, "{}", ans.json);
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	r.signer.restart(&r.s, genesis);
+	let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	println!("the signer back: {} forfeit(s) filled in; A at the server: {}; A's new leaf {:?}", filled, sa["state"], leaf_states(&r, &a2));
+	assert_eq!(filled, 1);
+	assert_eq!(sa["state"], "released", "a forfeit the operator holds whole ends in a release: {}", sa);
+	assert_eq!(leaf_states(&r, &a2), vec!["live"], "A's new leaf is credited");
+	let again = r.http.post("forfeit_leaves", &body).ok();
+	assert_eq!(again["state"], "released", "{}", again);
+	assert!(again["preimage"].is_string(), "{}", again);
+}
+
+/// A gate in front of the signer's socket: it passes every request, but
+/// answers the forfeits past the first `allow` of them as a signer whose
+/// keepers are away does, without passing them on.
+struct SignerGate {
+	path: std::path::PathBuf,
+	allow: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SignerGate {
+	fn start(signer: &std::path::Path, allow: usize) -> SignerGate {
+		use std::sync::atomic::Ordering;
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		let path = signer.with_extension("gate.sock");
+		let _ = std::fs::remove_file(&path);
+		let listener = tokio::net::UnixListener::bind(&path).unwrap();
+		let allow = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(allow));
+		let (a, target) = (allow.clone(), signer.to_path_buf());
+		tokio::spawn(async move {
+			while let Ok((s, _)) = listener.accept().await {
+				let (a, target) = (a.clone(), target.clone());
+				tokio::spawn(async move {
+					let (r, mut w) = s.into_split();
+					let mut line = String::new();
+					if BufReader::new(r).read_line(&mut line).await.is_err() {
+						return;
+					}
+					let forfeit = serde_json::from_str::<Value>(&line).is_ok_and(|v| !v["forfeit"].is_null());
+					if forfeit && a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_err() {
+						let _ = w.write_all(b"{\"error\":\"keepers_unavailable: the test's gate holds this forfeit back\"}\n").await;
+						return;
+					}
+					let Ok(t) = tokio::net::UnixStream::connect(&target).await else { return };
+					let (tr, mut tw) = t.into_split();
+					if tw.write_all(line.as_bytes()).await.is_err() {
+						return;
+					}
+					let mut answer = String::new();
+					if BufReader::new(tr).read_line(&mut answer).await.is_ok() {
+						let _ = w.write_all(answer.as_bytes()).await;
+					}
+				});
+			}
+		});
+		SignerGate { path, allow }
+	}
+
+	fn open(&self) {
+		self.allow.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
+/// R7h F3's two-coin case, run. A gives up two boards in one participation
+/// for one leaf of both values. Its forfeit step stops between the two
+/// co-signatures: a gate in front of the signer lets the first forfeit
+/// through and holds the second back, so the first is whole and the second
+/// recorded without the operator's half, never signed. Past the forfeit
+/// deadline the participation is not expired, the second forfeit stays
+/// recorded, and neither coin is given back: the claim of the first forfeit,
+/// which opens the leaf of both values, cannot leave the second coin with A.
+/// The gate opened, the server's minute task completes the second forfeit,
+/// the next pass releases the participation and credits the new leaf, and
+/// the watcher takes both boards by their forfeits: the operator pays for
+/// each coin once.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_coins_one_forfeit_whole_and_nothing_is_paid_twice() {
+	let mut r = start().await;
+	let x = r.x;
+	let (a, b) = (keypair("A, first board"), keypair("A, second board"));
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let (b_board, b_tx) = credited_board(&mut r, &b, x).await;
+	let n = keypair("A, new leaf of both");
+	let (w, nonce) = want_leaf(&n, x, 2 * VALUE);
+	let (body, pa) = participation_body(&[&a_board, &b_board], &[w], &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (valid, record, round) = validate_new_leaf(&r, &pa, 0, &n, &nonce);
+	let st = status(&r, &pa);
+	let c = st["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let delay = RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap() as u16).unwrap();
+	let mut forfeits = vec![];
+	for (k, (held, tx, key)) in [(&a_board, &a_tx, &a), (&b_board, &b_tx, &b)].into_iter().enumerate() {
+		let old = held.record.resolve(std::slice::from_ref(tx), &r.policy()).unwrap();
+		let margin: u64 = st["inputs"][k]["margin"].as_str().unwrap().parse().unwrap();
+		let f = Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, &valid, &round, c, delay, margin).unwrap();
+		forfeits.push(json!({"leaf_id": held.id.to_string(), "signature": forfeit_sig(&f, key)}));
+	}
+	let body = json!({"participation_id": hex(&pa), "forfeits": forfeits, "leaves": [auths_json(&valid, &n, created(&record))]});
+
+	// The server behind the gate: the first forfeit through, the second held.
+	let gate = SignerGate::start(&r.signer.socket, 1);
+	r.config.signer_socket = gate.path.clone();
+	r.restart_server().await;
+	let ans = r.http.post("forfeit_leaves", &body);
+	println!("A's forfeits, the second held back: {} {}", ans.status, ans.json);
+	assert_eq!(ans.status, 503, "{}", ans.json);
+	let whole = r.server.store.forfeits(&pa, built.round_id).await.unwrap();
+	let unsigned = r.server.store.unsigned_forfeits().await.unwrap();
+	println!("whole: {:?}; without the operator's half: {:?}", whole.iter().map(|f| LeafId(f.forfeit.leaf_id).to_string()).collect::<Vec<_>>(),
+		unsigned.iter().map(|f| LeafId(f.forfeit.leaf_id).to_string()).collect::<Vec<_>>());
+	assert_eq!((whole.len(), unsigned.len()), (1, 1), "the step stopped between the two co-signatures");
+
+	// Past the forfeit deadline, the gate still shut.
+	common::rounds::past_forfeit_deadline(&r, &pa).await;
+	let _ = r.server.forfeits.fill_unsigned().await;
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	let (sa_board, sb_board) = (leaf_state(&r, &a_board.id).await, leaf_state(&r, &b_board.id).await);
+	println!("past the forfeit deadline, the second forfeit still held: A {} | inputs returned {} {} | the boards at the server {} {} | \
+		unsigned forfeits {}", sa["state"], sa["inputs"][0]["returned"], sa["inputs"][1]["returned"], sa_board, sb_board,
+		r.server.store.unsigned_forfeits().await.unwrap().len());
+	assert_eq!(sa["state"], "issued", "not expired while the signer can still sign the rest: {}", sa);
+	assert_eq!((sa_board.as_str(), sb_board.as_str()), ("spent", "spent"), "no coin given back while a forfeit of it is whole");
+	assert_eq!(r.server.store.unsigned_forfeits().await.unwrap().len(), 1, "the second forfeit stays recorded");
+
+	// The gate opened: the minute task completes the second forfeit, and the
+	// next pass releases the participation.
+	gate.open();
+	let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	println!("the gate opened: {} filled in; A {} | its new leaf {:?}", filled, sa["state"], leaf_states(&r, &n));
+	assert_eq!(filled, 1);
+	assert_eq!(sa["state"], "released", "{}", sa);
+	assert_eq!(leaf_states(&r, &n), vec!["live"], "the leaf of both values is credited");
+	assert_eq!(r.server.store.forfeits(&pa, built.round_id).await.unwrap().len(), 2, "both forfeits whole");
+
+	// The watcher takes both boards by their forfeits, and claims them.
+	let (ida, idb) = (a_board.id.0.to_vec(), b_board.id.0.to_vec());
+	common::flow::drive(&r, "both boards taken by their forfeits", 10,
+		|l| common::flow::has(l, "claim", &ida) && common::flow::has(l, "claim", &idb)).await;
+	common::flow::settle(&r).await;
+	let l = common::flow::log(&r).await;
+	for (who, id) in [("the first", &ida), ("the second", &idb)] {
+		assert!(common::flow::final_of(&l, "forfeit", id) && common::flow::final_of(&l, "claim", id), "{} board's forfeit and claim are final", who);
+	}
+	println!("both boards taken by their forfeits and claimed; A holds the leaf of both values, once");
+}
+
+/// The state of the coin `id` at the server.
+async fn leaf_state(r: &Running, id: &LeafId) -> String {
+	r.server.store.leaf(&id.0).await.unwrap().map(|l| format!("{:?}", l.state).to_lowercase()).unwrap_or_default()
+}
+
+/// R7h F3 (b), a coin given back by an older server while its forfeit stood
+/// in the signer's record. A's refresh completes, so the signer holds A's
+/// forfeit under the board's salt; the database is then put as an older
+/// server's expiry left it: the participation expired, its forfeit dropped,
+/// the board live again. A payment out of the board is refused
+/// `double_spend`, naming the forfeit: the transfer's record is dropped and
+/// the board given back, so the same payment again is refused the same way,
+/// never `in_use`, and no coin of the transfer is left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spend_refused_for_a_forfeit_drops_its_record() {
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (new_held, new_valid, _, _) = complete(&r, &pa, &a_board, &a, &a_tx, &a2, &a2_nonce).await;
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	db.execute("UPDATE participation SET state = 'expired' WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("DELETE FROM forfeit WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE participation_input SET active = false WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'live', spent_by = NULL WHERE leaf_id = $1", &[&&a_board.id.0[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'expired' WHERE leaf_id = $1", &[&&new_valid.leaf_id.0[..]]).await.unwrap();
+	let _ = new_held;
+	let a_old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	for attempt in ["first", "second"] {
+		let (d_leaf, _) = common::client::new_leaf(&keypair(&format!("D, {}", attempt)));
+		let spend = common::client::transfer_body(&[(&a_board, a_old.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)],
+			xonly(&r.s), r.chain);
+		let ans = r.http.post("cosign_transfer", &spend);
+		let (code, m) = ans.refusal();
+		let inputs = db.query("SELECT transfer_id FROM transfer_input WHERE leaf_id = $1", &[&&a_board.id.0[..]]).await.unwrap().len();
+		println!("the {} payment out of the board: {} {} | {} | the board at the server {} | its transfer records {}", attempt, ans.status,
+			code, m, leaf_state(&r, &a_board.id).await, inputs);
+		assert_eq!((ans.status, code.as_str()), (409, "double_spend"), "{}", ans.json);
+		assert!(m.contains("already co-signed the forfeit"), "{}", m);
+		assert_eq!(leaf_state(&r, &a_board.id).await, "live", "the board is given back");
+		assert_eq!(inputs, 0, "the transfer's record is dropped");
+	}
 }

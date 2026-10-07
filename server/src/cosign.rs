@@ -498,8 +498,15 @@ impl Cosigner {
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
-			let (cp, h) = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
-				std::slice::from_ref(&cp_out)).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
+				std::slice::from_ref(&cp_out)).await;
+			let (cp, h) = match cp {
+				Ok(x) => x,
+				// The first message of the transfer refused: nothing of it is
+				// signed, so a refusal for a forfeit drops its record.
+				Err(e) if k == 0 => return Err(self.refused_first(e, &c.coin.id, &transfer).await),
+				Err(e) => return Err(lost_spend(e, &c.coin.id)),
+			};
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset,
@@ -653,17 +660,52 @@ impl Cosigner {
 	pub fn finality(&self) -> &Arc<FinalityService> {
 		&self.finality
 	}
+
+	/// The signer's refusal of the first message of transfer `transfer`,
+	/// of coin `leaf`: nothing of the transfer is signed. When the signer
+	/// holds a forfeit of the coin (given up in a refresh, and given back
+	/// while that forfeit stood in its record), the transfer's record is
+	/// dropped and its inputs given back, and the log names the forfeit: the
+	/// database has lost no spend.
+	async fn refused_first(&self, e: SignerError, leaf: &LeafId, transfer: &[u8; 32]) -> CosignError {
+		if let SignerError::AlreadySigned(m) = &e {
+			if names_forfeit(m) {
+				match self.store.drop_transfer(transfer).await {
+					Ok(back) => log::warn!("transfer {} refused: the signer holds a forfeit of coin {}, which was given up in a refresh, \
+						so the coin is its owner's on the chain only; the transfer's record is dropped and {} input(s) given back ({})",
+						crate::signer::hex(transfer), leaf, back.len(), m),
+					Err(d) => log::error!("transfer {} refused for a forfeit of coin {} the signer holds, and its record could not be \
+						dropped: {} ({})", crate::signer::hex(transfer), leaf, d, m),
+				}
+				return CosignError::Signer(e);
+			}
+		}
+		lost_spend(e, leaf)
+	}
 }
 
 /// The signer's refusal, logged loudly when its record holds another spend
 /// of the coin: the database let through a second spend, so it has lost one
-/// the signer co-signed.
+/// the signer co-signed; or, when what it holds is a forfeit of the coin,
+/// that the coin was given up in a refresh and given back while its forfeit
+/// stood in the signer's record.
 fn lost_spend(e: SignerError, leaf: &LeafId) -> CosignError {
 	if let SignerError::AlreadySigned(m) = &e {
-		log::error!("the signer refused a second spend of leaf {} that the database allowed: the database has lost a spend \
-			the signer co-signed ({})", leaf, m);
+		if names_forfeit(m) {
+			log::error!("the signer refused a spend of leaf {}: its record holds a forfeit of the coin, signed in a refresh the \
+				database let go, so the coin is its owner's on the chain only ({})", leaf, m);
+		} else {
+			log::error!("the signer refused a second spend of leaf {} that the database allowed: the database has lost a spend \
+				the signer co-signed ({})", leaf, m);
+		}
 	}
 	CosignError::Signer(e)
+}
+
+/// Whether the signer's `already_signed` refusal names a forfeit it holds
+/// under the salt, rather than a spend.
+fn names_forfeit(m: &str) -> bool {
+	m.contains("already co-signed the forfeit")
 }
 
 fn sig_bytes(s: &Signature) -> [u8; 64] {
