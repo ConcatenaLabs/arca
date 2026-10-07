@@ -170,8 +170,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   leaves' batch has expired: a rollback, however deep, that leaves that
   spend not final makes the forfeit undecided again, and the chain decides
   it again, so a claim that confirms in place of a refund still gives the
-  wallet the preimage and its new leaves. A forfeit never published whose
-  round is lost is void.
+  wallet the preimage and its new leaves. None of this stops at the coin's
+  expiry: the chain can decide a forfeit, or undo what it decided, at any
+  time the forfeit's output lives, so the coin is checked as of its expiry
+  once that has passed, as its exit checks it, and the new leaves a claim
+  completes are taken in their last days, or past their expiry, as well. A
+  forfeit never published whose round is lost is void.
 
 - **A board's dates.** A board, and every coin resting on it, carries the
   dates of a batch made when the board confirmed: its service expiry is 28
@@ -595,6 +599,12 @@ and holding it there, with the reason shown:
   deadline, the participation released and paid out of, and with it down
   past the deadline, the board kept given up, never offered for a payment,
   and brought home whole;
+- a batch leaf's forfeit followed past the leaf's expiry, the operator gone
+  before its claim: the refund sent at the first sync past the expiry, final,
+  and the operator back finding the output spent; the forfeit claimed by the
+  operator and read only two days before the new leaf's expiry: the new leaf
+  held and brought home; and a final refund taken out past the expiry by an
+  anchor-driven rollback, sent again and final;
 - the witness denied (a 503 on the way): `send`, `board`, `participate`, a
   swap's offer and the mailbox are refused before anything reaches the
   operator, and `sync` does only what it does on the chain; once the witness

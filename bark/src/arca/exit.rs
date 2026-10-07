@@ -39,7 +39,7 @@ use elements::{AssetId, OutPoint, Script, Transaction, TxOut};
 use serde_json::{json, Value};
 
 use arca_covenant::spend::{FeeSource, KeySpend};
-use arca_covenant::{CoinRecord, ExplicitOutput, MedianTime, UnrollTx, ValidCoin, ValidOrigin, WalletPolicy};
+use arca_covenant::{CoinRecord, ExplicitOutput, UnrollTx, ValidCoin, ValidOrigin};
 
 use super::chain::hex;
 use super::keys::CHANGE;
@@ -305,11 +305,7 @@ impl Wallet {
 		// its notice). The coin is the one the wallet accepted, checked as of
 		// its expiry once that has passed; where its path is now is the
 		// chain's.
-		let as_of = match MedianTime::from_consensus(row.expiry) {
-			Ok(e) if row.expiry != u32::MAX && e < now => e,
-			_ => now,
-		};
-		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) };
+		let policy = self.followed_policy(row.expiry, now);
 		let txs = self.accepted_bases(&record)?;
 		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let key = self.keys.leaf(&row.owner_nonce)?;

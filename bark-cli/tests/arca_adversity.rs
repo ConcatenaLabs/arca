@@ -5207,3 +5207,353 @@ async fn f5_a_refused_refresh_is_asked_again_a_day_on_not_at_every_sync() {
 	assert!(coin_of(&a, &board)["home"].as_str().unwrap_or("").contains("refused"), "{}", coin_of(&a, &board));
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+// ---------------------------------------------------------------------------
+// The forfeit followed past the coin's expiry
+// ---------------------------------------------------------------------------
+
+/// `[elements]<txid>:<vout>`, as the wallet names an output, read back.
+fn outpoint_of(s: &str) -> elements::OutPoint {
+	let (txid, vout) = s.trim_start_matches("[elements]").split_once(':').unwrap_or_else(|| panic!("not an outpoint: {}", s));
+	elements::OutPoint::new(elements::Txid::from_str(txid).unwrap(), vout.parse().unwrap())
+}
+
+/// The transaction of the active chain or the mempool that spends `op`,
+/// looked for from the block holding `op` up.
+fn spent_by(r: &Running, op: &elements::OutPoint) -> Option<elements::Txid> {
+	let spends = |t: &Transaction| t.input.iter().any(|i| i.previous_output == *op);
+	let mempool: Vec<String> = serde_json::from_value(rpc(r, "getrawmempool", &[])).unwrap();
+	for id in mempool {
+		let t = r.rt.client().raw_transaction(&elements::Txid::from_str(&id).unwrap()).unwrap();
+		if spends(&t) {
+			return Some(t.txid());
+		}
+	}
+	let from = rpc(r, "getblockheader", &[json!(block_of(r, &op.txid.to_string()))])["height"].as_u64().unwrap();
+	let tip = r.rt.client().blockchain_info().unwrap().blocks;
+	for h in from..=tip {
+		let hash = r.rt.client().block_hash(h).unwrap();
+		if let Some(t) = r.rt.client().block(&hash).unwrap().txdata.into_iter().find(|t| spends(t)) {
+			return Some(t.txid());
+		}
+	}
+	None
+}
+
+/// The forfeit of `leaf` in `sync`'s answer `s`, or null.
+fn forfeit_in(s: &Value, leaf: &str) -> Value {
+	s["forfeits"].as_array().and_then(|a| a.iter().find(|f| f["leaf_id"] == leaf).cloned()).unwrap_or(Value::Null)
+}
+
+/// Runs `w`'s `sync` without asserting it succeeded, the operator perhaps
+/// gone.
+fn sync_of(w: &Arca) -> Value {
+	let (_, s) = w.run(&["sync"]);
+	s
+}
+
+/// R7h's second review, H1: the setting, on a batch leaf (a board's shown
+/// expiry is its service expiry, earlier than the date its record is
+/// checked against, so a board does not show it). A boards 2,000,000 of X
+/// and refreshes it at once into leaf L. L's refresh is asked in its free
+/// window and its round is final; the keeper is down at the forfeit step 23
+/// hours on, so the refresh does not complete, and `sync` takes L on the
+/// chain; ten minutes on the keeper is back, the operator's half of the
+/// forfeit is filled in, and the watcher answers L's exit with the forfeit,
+/// which confirms. Returns L, its first expiry, the forfeit's output and the
+/// participation.
+async fn h1_forfeit_published(r: &mut Running, a: &Arca, tag: &str) -> (String, u32, elements::OutPoint, String) {
+	let url = r.url();
+	let x = r.x;
+	a.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca"]);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &x.to_string(), "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	a.ok(&["participate"]);
+	final_round(r).await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	let l = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch" && c["state"] == "live")
+		.expect("a batch leaf")["leaf_id"].as_str().unwrap().to_string();
+	let expiry = coin_of(a, &l)["expiry"].as_u64().unwrap() as u32;
+	let by = d57_latest_exit_by(a, std::slice::from_ref(&l));
+	d57_to(r, by - 2 * 86_400 + 2 * 3_600).await;
+	let asked = common::node::median_time(&r.rt);
+	let s = a.ok(&["sync"]);
+	let pid = s["refresh"][0]["participation"].as_str().unwrap_or_else(|| panic!("L's refresh is asked: {}", s["refresh"])).to_string();
+	final_round(r).await;
+	r.keepers[0].halt();
+	d57_to(r, asked + 23 * 3_600).await;
+	let s = a.ok(&["sync"]);
+	println!("{} A's sync 23 h on, the keeper down: participations {} | home {}", tag, s["participations"], s["home"]);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+	r.keepers[0].resume();
+	r.synced().await;
+	println!("{} the keeper back: filled {:?}", tag, r.server.forfeits.fill_unsigned().await.map_err(|e| e.to_string()));
+	for i in 0..20 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		let s = a.ok(&["sync"]);
+		let f = forfeit_in(&s, &l);
+		println!("{} pass {}: L {} | forfeit {}", tag, i, coin_of(a, &l)["state"], f);
+		if f["state"] == "published" && !f["forfeit"].is_null() {
+			let at = outpoint_of(f["forfeit"].as_str().unwrap());
+			assert!(confirmations(r, &at.txid) >= 1, "the forfeit confirms");
+			println!("{} L {}: first expiry {}, exit_by {}; its forfeit {} confirmed at median time {}", tag, &l[..8], expiry, by, at,
+				common::node::median_time(&r.rt));
+			return (l, expiry, at, pid);
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 3_600));
+	}
+	panic!("the watcher never answered L's exit with its forfeit");
+}
+
+/// H1, the refund. The forfeit of L published and confirmed, the operator
+/// stops before it claims. A's first sync after comes 600 s past L's first
+/// expiry, the refund delay long run (it ran out about two days before the
+/// expiry): the wallet checks L as of its expiry, as an exit does, and sends
+/// the refund; once that is final L is the wallet's on the chain
+/// (`exited`). The operator back, its watcher finds the forfeit's output
+/// spent by the wallet's refund, and A holds L's value on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn h1_past_its_expiry_a_forfeited_leaf_is_refunded() {
+	use elements::hashes::Hash;
+	let mut r = Running::start_kept(1, None).await;
+	let a = Arca::new("H1RA");
+	let x = r.x;
+	let (l, expiry, forfeit, _) = h1_forfeit_published(&mut r, &a, "H1R").await;
+	// The operator stops before it claims.
+	r.server.stop();
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, expiry + 600 - now));
+	r.produce().await;
+	r.bury().await;
+	let now = common::node::median_time(&r.rt);
+	let first = sync_of(&a);
+	let f = forfeit_in(&first, &l);
+	println!("H1R the operator stopped; median time {} ({} s past L's first expiry {}): A's sync: forfeit {} | home {}", now,
+		now as i64 - expiry as i64, expiry, f, first["home"]);
+	let refund = f["refund"]["txid"].as_str().map(|t| elements::Txid::from_str(t).unwrap());
+	r.produce().await;
+	r.bury().await;
+	let s = sync_of(&a);
+	println!("H1R the next sync, the refund buried: forfeit {} | L {} | {}", forfeit_in(&s, &l), coin_of(&a, &l)["state"],
+		coin_of(&a, &l)["note"]);
+	let decided = coin_of(&a, &l)["state"].clone();
+	// The operator back: its watcher would claim an output still unspent.
+	r.restart_server().await;
+	r.synced().await;
+	for _ in 0..4 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 1_200));
+	}
+	r.synced().await;
+	let s = a.ok(&["sync"]);
+	let by = spent_by(&r, &forfeit);
+	let claims: Vec<String> = r.server.store.watcher_log().await.unwrap().iter().filter(|w| w.kind == "claim")
+		.map(|w| elements::Txid::from_byte_array(w.txid).to_string()).collect();
+	let balance = a.ok(&["balance"]);
+	println!("H1R the operator back, four watcher passes: the forfeit's output spent by {:?} (the wallet's refund {:?}; the watcher's \
+		claims {:?}); A's sync: forfeits {}; L {}; A's balance: arca {} | on the chain {}", by, refund, claims, s["forfeits"],
+		coin_of(&a, &l)["state"], balance["arca"], balance["sequentia_onchain"]);
+	assert!(f["error"].is_null(), "past L's expiry the wallet follows its forfeit: {}", f);
+	assert_eq!(f["state"], "refunding", "the refund is sent at the first sync past the expiry: {}", f);
+	assert_eq!(decided, "exited", "the refund final, L is the wallet's on the chain");
+	assert_eq!(by, refund, "the wallet's refund spends the forfeit's output, not the operator's claim");
+	assert_eq!(coin_of(&a, &l)["state"], "exited");
+	let onchain = balance["sequentia_onchain"][x.to_string()].as_str().unwrap().parse::<u64>().unwrap();
+	assert!(onchain > 4_990_000, "A holds L's value on the chain: {}", balance);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// H1, the claim. The forfeit of L published and confirmed; the operator's
+/// watcher claims it, which publishes the preimage, and the claim is final;
+/// then the operator is gone. A's first sync after the forfeit comes two
+/// days before the new leaf's first expiry: inside the receipt horizon's
+/// three days, and past L's own expiry. The wallet checks L as of its
+/// expiry and the new leaf with no horizon, takes the preimage from the
+/// claim, holds the new leaf, and L is spent; with the operator gone and
+/// the new leaf past its exit date, `sync` takes the new leaf on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn h1_a_claim_read_late_completes_the_refresh() {
+	let mut r = Running::start_kept(1, None).await;
+	let a = Arca::new("H1CA");
+	let (l, expiry, forfeit, pid) = h1_forfeit_published(&mut r, &a, "H1C").await;
+	// The new leaf's first expiry, from the round the participation stands in.
+	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+	let round_id = r.server.store.participation(&id).await.unwrap().unwrap().round_id.expect("in a round");
+	let rec = r.server.store.round_leaves(round_id).await.unwrap().into_iter().find(|b| b.participation_id == id)
+		.expect("the participation's new leaf").record;
+	let new_expiry = arca_covenant::LeafRecord::from_bytes(&rec).unwrap().schedule.expiries()[0].to_consensus_u32();
+	// The watcher claims the forfeit; A does not sync.
+	let mut claim = None;
+	for i in 0..20 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		claim = spent_by(&r, &forfeit);
+		println!("H1C watcher pass {}: the forfeit's output spent by {:?}", i, claim);
+		if let Some(c) = claim {
+			if confirmations(&r, &c) >= 1 {
+				break;
+			}
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+	}
+	let claim = claim.expect("the watcher claims the forfeit");
+	r.bury().await;
+	r.bury().await;
+	let p = r.server.store.participation(&id).await.unwrap().unwrap();
+	println!("H1C the claim {} final; the participation at the server {:?}; the operator goes", claim, p.state);
+	r.server.stop();
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, new_expiry - 2 * 86_400 - now));
+	r.produce().await;
+	r.bury().await;
+	let now = common::node::median_time(&r.rt);
+	let s = sync_of(&a);
+	let f = forfeit_in(&s, &l);
+	println!("H1C A's first sync since, at median time {} ({} s past L's first expiry {}, {} s before the new leaf's {}): forfeit {} | \
+		home {}", now, now as i64 - expiry as i64, expiry, new_expiry as i64 - now as i64, new_expiry, f, s["home"]);
+	let coins = a.ok(&["coins"]);
+	println!("H1C A's coins: {}", coins);
+	assert!(f["error"].is_null(), "the wallet follows its forfeit past L's expiry and within the new leaf's last days: {}", f);
+	assert_eq!(f["claim"], claim.to_string(), "{}", f);
+	let leaf = f["new_leaves"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("the new leaf is held: {}", f)).to_string();
+	assert_eq!(coin_of(&a, &l)["state"], "spent", "L was exchanged for the new leaf");
+	let held = coin_of(&a, &leaf);
+	println!("H1C the new leaf {}: {} | {}", &leaf[..8], held["state"], held["note"]);
+	assert!(matches!(held["state"].as_str(), Some("live") | Some("exiting")), "the new leaf is the wallet's: {}", held);
+	// And it comes home, the operator still gone, before its batch can be
+	// swept.
+	for _ in 0..24 {
+		r.produce().await;
+		r.bury().await;
+		sync_of(&a);
+		if coin_of(&a, &leaf)["state"] == "exited" {
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 4 * 3_600));
+	}
+	let now = common::node::median_time(&r.rt);
+	let balance = a.ok(&["balance"]);
+	println!("H1C the new leaf at median time {} ({} s after its first expiry): {} | {}; A's balance on the chain {}", now,
+		now as i64 - new_expiry as i64, coin_of(&a, &leaf)["state"], coin_of(&a, &leaf)["note"], balance["sequentia_onchain"]);
+	assert_eq!(coin_of(&a, &leaf)["state"], "exited", "the new leaf comes home");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// H1, a rollback past the expiry. The forfeit of L published and
+/// confirmed, the operator stopped before it claims. A refunds in time: the
+/// refund is final before L's first expiry, and L is `exited`. The chain
+/// runs on past the expiry; then the Bitcoin parent block the refund's block
+/// is anchored to is orphaned with every parent block above it, the node
+/// disconnects every Sequentia block anchored to them, the refund's among
+/// them, and restarts with an empty mempool; the chain runs on past L's
+/// expiry without the refund. The wallet follows a decided forfeit until
+/// the new leaf's batch has expired: the refund no longer final makes the
+/// forfeit undecided, L is checked as of its expiry, and the refund is sent
+/// again and is final. The operator back, the forfeit's output stays the
+/// wallet's.
+#[tokio::test(flavor = "multi_thread")]
+async fn h1_a_refund_rolled_back_past_the_expiry_is_sent_again() {
+	use elements::hashes::Hash;
+	let mut r = Running::start_kept(1, None).await;
+	let a = Arca::new("H1BA");
+	let (l, expiry, forfeit, pid) = h1_forfeit_published(&mut r, &a, "H1B").await;
+	let (units, _, _, _) = stored_status(&r, &pid);
+	r.server.stop();
+	// The refund once its delay has run, final before L's expiry.
+	let open = common::node::median_time(&r.rt) + units as u32 * 512 + 600;
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, open - now));
+	r.produce().await;
+	let s = sync_of(&a);
+	let f = forfeit_in(&s, &l);
+	println!("H1B the refund delay run, at median time {} ({} s before L's expiry): forfeit {}", common::node::median_time(&r.rt),
+		expiry as i64 - common::node::median_time(&r.rt) as i64, f);
+	assert_eq!(f["state"], "refunding", "{}", f);
+	let refund = elements::Txid::from_str(f["refund"]["txid"].as_str().unwrap()).unwrap();
+	r.produce().await;
+	let refund_block = block_of(&r, &refund.to_string());
+	r.bury().await;
+	let s = sync_of(&a);
+	println!("H1B the refund final: forfeit {} | L {}", forfeit_in(&s, &l), coin_of(&a, &l)["state"]);
+	assert_eq!(coin_of(&a, &l)["state"], "exited");
+	assert!(common::node::median_time(&r.rt) < expiry, "all of it before L's expiry");
+	// The chain past L's expiry; then the rollback, deeper than final,
+	// driven by the anchor.
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, expiry + 600 - now));
+	r.bury().await;
+	let hash: elements::BlockHash = refund_block.parse().unwrap();
+	let anchor = sequentia_ext::BlockHeaderExt::bitcoin_anchor(&r.rt.client().block_header(&hash).unwrap()).height as u64;
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(anchor)).unwrap();
+	let tip = rpc(&r, "getbestblockhash", &[]);
+	let tip_time = rpc(&r, "getblockheader", &[tip])["time"].as_u64().unwrap();
+	let mock = format!("-mocktime={}", tip_time + 120);
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0", &mock])).unwrap();
+	let now = common::node::median_time(&r.rt);
+	println!("H1B the refund's block {} anchored to parent height {}; {} parent blocks orphaned; the node restarted: the refund's \
+		confirmations {}, in the mempool {}; median time {}", refund_block, anchor, orphaned.len(), confirmations(&r, &refund),
+		in_mempool(&r, &refund), now);
+	assert!(confirmations(&r, &refund) < 1 && !in_mempool(&r, &refund), "the rollback took the refund out");
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, expiry + 600 - now.min(expiry)));
+	r.bury().await;
+	let now = common::node::median_time(&r.rt);
+	assert!(now > expiry, "the chain runs on past L's expiry without the refund");
+	let s = sync_of(&a);
+	let back: Vec<Value> = s["forfeits"].as_array().map(|a| a.iter().filter(|f| f["leaf_id"] == l.as_str()).cloned().collect())
+		.unwrap_or_default();
+	println!("H1B A's sync past L's expiry (median time {}, {} s past it), the refund gone: forfeits {} | L {} | {}", now,
+		now as i64 - expiry as i64, s["forfeits"], coin_of(&a, &l)["state"], coin_of(&a, &l)["note"]);
+	let mut again = None;
+	for _ in 0..3 {
+		r.produce().await;
+		r.bury().await;
+		let s = sync_of(&a);
+		let f = forfeit_in(&s, &l);
+		println!("H1B A's next sync: forfeit {} | L {}", f, coin_of(&a, &l)["state"]);
+		if again.is_none() {
+			again = spent_by(&r, &forfeit);
+		}
+		if coin_of(&a, &l)["state"] == "exited" {
+			break;
+		}
+	}
+	// The operator back.
+	r.restart_server().await;
+	r.synced().await;
+	for _ in 0..4 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 1_200));
+	}
+	r.synced().await;
+	let s = a.ok(&["sync"]);
+	let by = spent_by(&r, &forfeit);
+	let claims: Vec<String> = r.server.store.watcher_log().await.unwrap().iter().filter(|w| w.kind == "claim")
+		.map(|w| elements::Txid::from_byte_array(w.txid).to_string()).collect();
+	println!("H1B the operator back, four watcher passes: the forfeit's output spent by {:?} (the wallet's spend {:?}; the watcher's \
+		claims {:?}); forfeits {} | L {} | A's balance on the chain {}", by, again, claims, s["forfeits"], coin_of(&a, &l)["state"],
+		a.ok(&["balance"])["sequentia_onchain"]);
+	assert!(!back.is_empty() && back.iter().all(|f| f["error"].is_null()), "the re-follow past L's expiry: {:?}", back);
+	assert!(again.is_some() && by == again, "the wallet's refund, sent again, spends the forfeit's output: {:?} {:?}", by, again);
+	assert!(claims.iter().all(|c| Some(c.as_str()) != by.map(|b| b.to_string()).as_deref()), "no claim of the operator's took it");
+	assert_eq!(coin_of(&a, &l)["state"], "exited", "L is the wallet's on the chain");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}

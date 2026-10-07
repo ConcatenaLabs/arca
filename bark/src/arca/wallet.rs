@@ -535,6 +535,25 @@ impl Wallet {
 		self.accept_policy(now).receipt()
 	}
 
+	/// The policy for a coin the wallet holds, looked at again on the way
+	/// to what the chain decides of it, at `now`; `expiry` is the coin's
+	/// first expiry, or a board's service expiry where that comes first.
+	/// The coin is the one the wallet accepted, checked with no horizon, as
+	/// of now or, once its expiry has passed, as of that expiry. A coin is
+	/// followed past its expiry by design (its exit, its forfeit until a
+	/// spend of the forfeit's output is final, its re-check after a
+	/// rollback, however deep), and what decides it then is the chain, not
+	/// the date: checked as of now, it would be refused the moment the
+	/// median time passed its expiry, and whatever the chain still holds of
+	/// it would go to the operator.
+	pub(crate) fn followed_policy(&self, expiry: u32, now: MedianTime) -> WalletPolicy {
+		let as_of = match MedianTime::from_consensus(expiry) {
+			Ok(e) if expiry != u32::MAX && e < now => e,
+			_ => now,
+		};
+		WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }
+	}
+
 	/// The server's `info`, checked against what the wallet pinned when it was
 	/// created: the same chain and the same operator key; and the head of
 	/// its signer's record it shows, signed, against every head the wallet
