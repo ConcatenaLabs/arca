@@ -5912,3 +5912,45 @@ async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_
 		}
 	}
 }
+
+/// D58.1's receive requests, and when they stop holding the schedule. B
+/// holds no coin and hands out one receive request, never paid. While the
+/// request is younger than the acceptance horizon (27 days), B's schedule
+/// names a time a day ahead at most, saying it waits for a payment; the day
+/// after the request lapses it no longer does: `receive_requests` shows the
+/// request lapsed, with the median time it was asked at and the one it
+/// lapsed at, and nothing holds the schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn d58_a_receive_request_no_longer_holds_the_schedule_once_it_lapses() {
+	let r = Running::start().await;
+	let url = r.url();
+	let b = Arca::new("D58RB");
+	b.ok(&create_args(&url, &r.node_url()));
+	b.ok(&["receive"]);
+	let asked = common::node::median_time(&r.rt);
+	let horizon = 27 * 86_400;
+	let s = b.ok(&["sync"]);
+	println!("D58R the request asked at median time {}: schedule {}", asked, s["schedule"]);
+	d57_to(&r, asked + horizon - 86_400).await;
+	let s = b.ok(&["sync"]);
+	let now = common::node::median_time(&r.rt);
+	let before = s["schedule"].clone();
+	println!("D58R the day before it lapses (median time {}): next_sync_at {} ({} s ahead) | why {} | receive_requests {}", now,
+		before["next_sync_at"], before["next_sync_at"].as_i64().map(|t| t - now as i64).unwrap_or(-1), before["why"], before["receive_requests"]);
+	d57_to(&r, asked + horizon + 86_400).await;
+	let s = b.ok(&["sync"]);
+	let now = common::node::median_time(&r.rt);
+	let after = s["schedule"].clone();
+	println!("D58R the day after it lapses (median time {}): next_sync_at {} | why {} | receive_requests {}", now, after["next_sync_at"],
+		after["why"], after["receive_requests"]);
+	assert!(before["next_sync_at"].as_u64().is_some_and(|t| t <= now as u64), "a day ahead at most while the request counts: {}", before);
+	assert_eq!(before["receive_requests"][0]["state"], "waiting", "{}", before);
+	assert!(after["next_sync_at"].is_null(), "nothing holds the schedule once the request lapses: {}", after);
+	assert!(after["why"].is_null(), "{}", after);
+	let req = &after["receive_requests"][0];
+	assert_eq!(req["state"], "lapsed", "{}", after);
+	let at = req["asked_at"].as_u64().unwrap();
+	assert!(at >= asked as u64 - 600 && at <= asked as u64 + 600, "asked at {}, not {}", at, asked);
+	assert_eq!(req["lapsed_at"].as_u64(), Some(at + horizon as u64));
+	let _ = std::fs::remove_dir_all(&b.dir);
+}

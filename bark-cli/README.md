@@ -300,7 +300,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   holds a coin off the chain or waits for a payment, whatever `next_sync_at`
   says. `sync`'s `schedule` says when it must run next (`next_sync_at`), and
   never more than a day ahead while a receive request the wallet handed out
-  is unpaid, saying so (`why`); a program built on the library gets the same
+  is unpaid, saying so (`why`), for 27 days from when it was handed out (the
+  acceptance horizon, `REQUEST_HOLDS`); `receive_requests` lists every
+  unpaid request with the median time it was handed out at, `waiting` until
+  `lapses_at` and `lapsed` from then, when it no longer holds the schedule
+  (a coin paid to it later is still read by the next `sync`). A program
+  built on the library gets the same
   from `Wallet::sync_schedule`, which it can call on a timer, and runs
   `Wallet::sync` when it says so. A payment spends the coins furthest from
   their exit date first, so a receiver gets the longest life the wallet can
@@ -600,7 +605,8 @@ and holding it there, with the reason shown:
   its exit date, it takes the coin home whole; another, away, reads its
   coin past the batch's expiry, before any sweep, and takes it home too; and
   a payment out of a wallet holding an old leaf and a younger board takes
-  the board;
+  the board; and a request never paid holds the schedule at a day until it
+  lapses 27 days after it was handed out, and no longer the day after;
 - a forfeit whose operator's half came ten minutes late, after the wallet
   took its board home in the coin's last day: the server releases the
   participation, the watcher answers the exit with the forfeit, and the

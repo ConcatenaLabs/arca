@@ -145,6 +145,15 @@ pub const REFUSED_AGAIN: u32 = 86_400;
 /// refresh: `{leaf id: median time}`.
 const REFRESH_ASKED: &str = "refresh_asked";
 
+/// Where the wallet keeps when it handed out each receive request still
+/// unpaid: `{owner nonce: median time}`.
+pub(crate) const RECEIVE_ASKED: &str = "receive_asked";
+
+/// How long an unpaid receive request holds `sync`'s schedule at a day,
+/// from the median time it was handed out: the acceptance horizon, 27 days.
+/// A coin paid to it later is still read, at the next `sync`.
+pub const REQUEST_HOLDS: u32 = WalletPolicy::DEFAULT_HORIZON;
+
 /// How long `sync` keeps trying to reach the operator, with back-off, before
 /// it takes it for unreachable: about a minute. One failed witness decides
 /// nothing.
@@ -1170,6 +1179,30 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// Every receive request the wallet handed out that is still unpaid: the
+	/// key it names (`owner`), the median time it was handed out
+	/// (`asked_at`; for one handed out before the wallet kept that, the time
+	/// it was stored), and whether it still holds the schedule at a day
+	/// (`waiting`, until `lapses_at`) or no longer does (`lapsed`, since
+	/// `lapsed_at`), [`REQUEST_HOLDS`] after it was handed out.
+	pub(crate) fn receive_requests(&self, now: u32) -> Result<Vec<Value>, Error> {
+		let asked: BTreeMap<String, u32> = self.store.meta(RECEIVE_ASKED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let mut out = vec![];
+		for n in self.store.nonces()?.into_iter().filter(|n| n.purpose == "receive" && n.state == "pending") {
+			let at = match asked.get(&hex(&n.nonce)) {
+				Some(t) => *t,
+				None => self.store.nonce_created_at(&n.nonce)?.unwrap_or(0).clamp(0, u32::MAX as i64) as u32,
+			};
+			let ends = at.saturating_add(REQUEST_HOLDS);
+			out.push(if now < ends {
+				json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "waiting", "lapses_at": ends})
+			} else {
+				json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "lapsed", "lapsed_at": ends})
+			});
+		}
+		Ok(out)
+	}
+
 	/// When `sync` last asked for the refresh of each live coin (median
 	/// times), from the wallet's store; coins no longer live are forgotten.
 	pub(crate) fn refresh_asked(&self) -> Result<BTreeMap<String, u32>, Error> {
@@ -1229,10 +1262,13 @@ impl Wallet {
 	/// less, not yet on its way home), else the coming date of a coin
 	/// (`refresh_from`, then `home_from`), and never more than a day ahead
 	/// while a coin is in its last three days before its exit date, or while
-	/// the wallet waits for a payment to a receive request it handed out (a
-	/// coin paid to it is read only by `sync`, and its sender may have paid
-	/// with a coin days from its exit date); `null` when nothing waits.
-	/// `due` says whether it is now; `why` says what holds the time back.
+	/// the wallet waits for a payment to a receive request it handed out
+	/// less than [`REQUEST_HOLDS`] ago (a coin paid to it is read only by
+	/// `sync`, and its sender may have paid with a coin days from its exit
+	/// date); `null` when nothing waits. `due` says whether it is now; `why`
+	/// says what holds the time back; `receive_requests` lists every unpaid
+	/// request, waiting or lapsed, with its dates
+	/// ([`Self::receive_requests`]).
 	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
@@ -1268,14 +1304,19 @@ impl Wallet {
 			coins.push(v);
 		}
 		// D58: a payment the wallet waits for is read only by `sync`, and
-		// may rest on a coin days from its exit date: a day at most.
-		let requests = self.store.nonces()?.iter().filter(|n| n.purpose == "receive" && n.state == "pending").count();
+		// may rest on a coin days from its exit date: a day at most, while
+		// the request counts. One unpaid past the acceptance horizon holds
+		// the schedule no more (a coin paid to it is still read by the next
+		// sync), and is shown lapsed.
+		let requests = self.receive_requests(now)?;
 		let mut out = json!({"now": now, "due": false, "coins": coins, "note": if stopped { HOME_NOTE } else { SYNC_NOTE }});
-		if requests > 0 && !stopped {
+		if requests.iter().any(|r| r["state"] == "waiting") && !stopped {
 			let day = now.saturating_add(86_400);
 			next = Some(next.map_or(day, |n| n.min(day)));
-			out["receive_requests"] = json!(requests);
 			out["why"] = json!(WAITING_NOTE);
+		}
+		if !requests.is_empty() {
+			out["receive_requests"] = json!(requests);
 		}
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));
