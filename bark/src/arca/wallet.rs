@@ -137,6 +137,14 @@ pub const HOME_FROM: u32 = 86_400;
 /// coin once in its refresh window and once in its last day.
 pub const SYNC_DAILY: u32 = 3 * 86_400;
 
+/// How long after `sync` last asked for a coin's refresh it asks again,
+/// once the operator refused, voided or let expire that refresh: a day.
+pub const REFUSED_AGAIN: u32 = 86_400;
+
+/// Where the wallet keeps when `sync` last asked for each live coin's
+/// refresh: `{leaf id: median time}`.
+const REFRESH_ASKED: &str = "refresh_asked";
+
 /// How long `sync` keeps trying to reach the operator, with back-off, before
 /// it takes it for unreachable: about a minute. One failed witness decides
 /// nothing.
@@ -1025,9 +1033,11 @@ impl Wallet {
 	}
 
 	/// Whether coin `c` was given up, under its forfeit, in a participation
-	/// that was released, whose new leaves the wallet holds: the coin is then
-	/// paid for already, and exiting it would only be answered with the
-	/// forfeit, at the holder's cost.
+	/// that was released, whose new leaves the wallet holds, each on a round
+	/// that is final (not `pending`): the coin is then paid for already, and
+	/// exiting it would only be answered with the forfeit, at the holder's
+	/// cost. One given up for a leaf whose round is out of the chain is not
+	/// refreshed: `sync` takes it home by its date.
 	pub(crate) fn given_up_for_held_leaves(&self, c: &CoinRow) -> Result<bool, Error> {
 		if c.state != "forfeited" {
 			return Ok(false);
@@ -1046,7 +1056,10 @@ impl Wallet {
 					Some(l) => self.store.coin(&l)?,
 					None => None,
 				};
-				held &= row.is_some_and(|r| !matches!(r.state.as_str(), "lost" | "spent"));
+				// A new leaf whose round is out of the chain, or not final yet
+				// (`pending`), is not held: the coin given up for it is not
+				// refreshed until it is.
+				held &= row.is_some_and(|r| !matches!(r.state.as_str(), "lost" | "spent" | "pending"));
 			}
 			if held {
 				let _ = pid;
@@ -1138,21 +1151,47 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// When `sync` last asked for the refresh of each live coin (median
+	/// times), from the wallet's store; coins no longer live are forgotten.
+	pub(crate) fn refresh_asked(&self) -> Result<BTreeMap<String, u32>, Error> {
+		let all: BTreeMap<String, u32> = self.store.meta(REFRESH_ASKED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let mut out = BTreeMap::new();
+		for (l, t) in all {
+			if self.store.coin(&l)?.is_some_and(|c| c.state == "live") {
+				out.insert(l, t);
+			}
+		}
+		Ok(out)
+	}
+
 	/// D57: asks for the refresh of every live coin in its refresh window,
 	/// from [`REFRESH_FROM`] to [`HOME_FROM`] before its exit date, one
 	/// participation for each, as `participate` makes it: the refresh is
 	/// free there, so a fee the operator asks is refused before anything is
 	/// signed, and the coin stays live, asked for again at the next `sync`.
-	/// So is a coin whose refresh the operator refused. From a day before
-	/// its exit date, a coin not refreshed goes home ([`Self::home`]).
+	/// A coin whose refresh the operator refused, voided or let expire is
+	/// asked for again a day ([`REFUSED_AGAIN`]) after it was last asked for.
+	/// From a day before its exit date, a coin not refreshed goes home
+	/// ([`Self::home`]).
 	pub(crate) fn refresh_due(&mut self) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32();
+		let refused = self.refused_refreshes()?;
+		let mut asked_at = self.refresh_asked()?;
 		let mut out = vec![];
 		for c in self.store.coins_in("live")? {
 			let Some(d) = CoinDates::of(c.expiry) else { continue };
 			if now < d.refresh_from || now >= d.home_from {
 				continue;
 			}
+			// A refresh the operator refused is asked for again a day after
+			// it was asked, not at every sync.
+			if let (Some(_), Some(t)) = (refused.get(&c.leaf_id), asked_at.get(&c.leaf_id)) {
+				if now < t.saturating_add(REFUSED_AGAIN) {
+					continue;
+				}
+			}
+			asked_at.insert(c.leaf_id.clone(), now);
+			self.store.set_meta(REFRESH_ASKED, &serde_json::to_string(&asked_at).expect("a map"))?;
 			let asked = self.refresh_quote(std::slice::from_ref(&c.leaf_id), None).and_then(|q| self.participate(q, None));
 			out.push(match asked {
 				Ok(v) => json!({"leaf_id": c.leaf_id, "participation": v["participation"], "state": v["state"], "fees": v["fees"]}),
@@ -1180,6 +1219,7 @@ impl Wallet {
 		let now = self.now()?.to_consensus_u32();
 		let stopped = self.rolled_back()?.is_some();
 		let refused = self.refused_refreshes()?;
+		let asked_at = self.refresh_asked()?;
 		let mut next: Option<u32> = None;
 		let mut coins = vec![];
 		for c in self.store.coins()? {
@@ -1192,7 +1232,12 @@ impl Wallet {
 			} else if now >= d.home_from {
 				now
 			} else if now >= d.refresh_from {
-				if c.state == "live" && !refused.contains_key(&c.leaf_id) { now } else { d.home_from.min(now.saturating_add(3600)) }
+				match (c.state.as_str(), refused.contains_key(&c.leaf_id)) {
+					("live", false) => now,
+					// Refused: asked for again a day after it was last asked.
+					("live", true) => d.home_from.min(asked_at.get(&c.leaf_id).map_or(now, |t| t.saturating_add(REFUSED_AGAIN)).max(now)),
+					_ => d.home_from.min(now.saturating_add(3600)),
+				}
 			} else {
 				d.refresh_from
 			};
@@ -2262,6 +2307,11 @@ mod tests {
 		let c = w.store.coin("old").unwrap().unwrap();
 		assert!(w.given_up_for_held_leaves(&c).unwrap());
 		assert!(w.exit_after(0, "a stop").unwrap().is_empty(), "nothing exited");
+		// The new leaf's round out of the chain: not refreshed yet.
+		w.store.set_coin_state("new", "pending", "waiting: its round is out of the chain").unwrap();
+		assert!(!w.given_up_for_held_leaves(&c).unwrap(), "a coin given up for a leaf on a round out of the chain is not refreshed");
+		w.store.set_coin_state("new", "live", "").unwrap();
+		assert!(w.given_up_for_held_leaves(&c).unwrap());
 		// The new leaf lost: the old coin is the wallet's to take on the chain.
 		w.store.set_coin_state("new", "lost", "gone").unwrap();
 		assert!(!w.given_up_for_held_leaves(&c).unwrap());

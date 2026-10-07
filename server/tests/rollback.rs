@@ -41,7 +41,7 @@ use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body,
 use common::keys::{keypair, xonly};
 use common::node;
 use common::rounds::{
-	advance_mtp, created, credited_board, round_final, round_state, spend_wallet_coin, start, status, validate_new_leaf, VALUE,
+	created, credited_board, round_final, round_state, spend_wallet_coin, start, status, validate_new_leaf, VALUE,
 };
 use common::running::Running;
 use server::store::RoundState;

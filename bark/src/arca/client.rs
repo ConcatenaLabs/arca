@@ -228,8 +228,9 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 
 /// The codes with which the server refuses a request outright, with a 4xx
 /// status: the request was not taken. A busy server's `rate_limited`, and
-/// `not_synced`, `signer_unavailable` and `internal` (5xx), are not among
-/// them: the request may be taken later, or may have been.
+/// `not_synced`, `signer_unavailable`, `signer_replaced` and `internal`
+/// (5xx), are not among them: the request may be taken later, or may have
+/// been.
 ///
 /// They are the server's codes (`server::api::REFUSAL_CODES`) answered with a
 /// 4xx, but `rate_limited`: a request to slow down is sent again later. A
