@@ -1082,6 +1082,14 @@ file back as old as the record, and a signer so restored cannot tell a
 keeper restored from an older copy from one that lagged, which is why the
 rule is the operator's to keep.
 
+A keeper restored from an older copy, or a second signer run under the
+operator's key on a copy of the record, defeats the keepers: the signer's
+second spends then go out acknowledged by keys every wallet trusts. No check
+of the signer's can tell either from an honest keeper that lagged, so this
+is an operator's rule, not a limit the code keeps for it. Nor can the signer
+tell a keeper whose key is in other hands, which can name any head that
+keeper once held: a keeper's key is guarded as the operator key is.
+
 Every head the signer hands out carries the acknowledgements it has of it,
 and they travel with the head wherever a head travels: `info`, the witness
 answer, a transfer's answer, a mailbox record, a published tree (the server
@@ -1181,10 +1189,12 @@ why, at its start and in every `keepers_unavailable` it answers, and
 co-signs nothing until the keeper's `--allow`, and its firewall, name the
 address it now comes from: change every keeper's `--allow` before the
 signer moves. The keeper holds at most
-`--max-connections` open (16 by default; the signer keeps one), closes one
-left idle for `--idle-timeout-ms` (60 seconds by default; the signer opens a
-new one when it next needs it), and when an accept fails (out of
-descriptors, say) waits before accepting again, saying so once in a while.
+`--max-connections` open (16 by default; the signer keeps one); holding
+that many, it closes the next at once with nothing said, from whatever
+address, so a stranger is told why only while the keeper has room. It
+closes one left idle for `--idle-timeout-ms` (60 seconds by default; the
+signer opens a new one when it next needs it), and when an accept fails (out
+of descriptors, say) waits before accepting again, saying so once in a while.
 A firewall that admits the signer's address alone to the keeper's port does
 the same a step earlier, and is the better place for it where the machine
 has one. A keeper whose heads file is lost, or would come back from an

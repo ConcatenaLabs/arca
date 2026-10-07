@@ -41,9 +41,16 @@ every command as written, with these choices:
 - **Every key backed up offline.** The operator key and each keeper's key,
   each on offline media kept apart from the machine that uses it. A key
   file lost without a backup cannot be replaced: the record names the
-  keepers for good, and a new operator key is a new operator.
+  keepers for good, and a new operator key is a new operator. A keeper's
+  key is guarded as the operator key is: whoever holds it can make the
+  keeper name a head it held before.
 
 ## What is never done
+
+The keepers rest on these rules, and no code can keep them for the
+operator: a keeper restored from an older copy, or a second signer run under
+the operator's key, defeats the keepers, and a coin they protect can then be
+paid twice.
 
 - **Never start a keeper again whose heads file was lost, or would come back
   from an older copy.** It no longer holds what it acknowledged, so it is a

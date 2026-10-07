@@ -327,16 +327,19 @@ async fn main() {
 			},
 		};
 		wait = Duration::ZERO;
+		// Holding its most connections, the keeper closes the next at once
+		// with nothing said, whoever it comes from: a stranger is told why
+		// only while the keeper has room.
+		if open.load(Ordering::SeqCst) >= a.max_connections {
+			said.say("full", format!("refused a connection from {}: {} are open, the most it holds", peer, a.max_connections));
+			drop(stream);
+			continue;
+		}
 		let from = peer.ip().to_canonical();
 		if !a.allow.contains(&from) {
 			said.say("refused", format!("refused a connection from {}, which --allow does not name", peer));
 			refuse(stream, &refusing, format!("refused: this keeper admits connections only from the addresses its --allow names, and \
 				{} is not one: name it with --allow on the keeper (and in its firewall)", from));
-			continue;
-		}
-		if open.load(Ordering::SeqCst) >= a.max_connections {
-			said.say("full", format!("refused a connection from {}: {} are open, the most it holds", peer, a.max_connections));
-			drop(stream);
 			continue;
 		}
 		let held = Held::new(open.clone());
