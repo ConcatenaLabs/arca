@@ -4835,7 +4835,9 @@ async fn d59_a_forfeit_completed_late_releases_the_new_leaf() {
 	let p = r.server.store.participation(&id).await.unwrap().unwrap();
 	println!("D59H the keeper back ten minutes on: {} filled in; the participation at the server: {:?}", filled, p.state);
 	assert_eq!(filled, 1);
-	assert_eq!(p.state, server::store::ParticipationState::Released);
+	// A's board is on the chain: released once the watcher has answered
+	// A's exit with the forfeit and claimed it, never before.
+	assert_eq!(p.state, server::store::ParticipationState::Issued);
 	for i in 0..14 {
 		let _ = r.server.watcher.pass().await;
 		r.produce().await;
@@ -4849,6 +4851,10 @@ async fn d59_a_forfeit_completed_late_releases_the_new_leaf() {
 		}
 		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 1_200));
 	}
+	r.server.rounds.pass().await.unwrap();
+	let p = r.server.store.participation(&id).await.unwrap().unwrap();
+	println!("D59H the watcher's claim made: the participation at the server: {:?}", p.state);
+	assert_eq!(p.state, server::store::ParticipationState::Released);
 	let coins = a.ok(&["coins"]);
 	let news: Vec<String> = coins.as_array().unwrap().iter().filter(|c| c["kind"] == "batch" && c["state"] == "live")
 		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
@@ -5132,7 +5138,18 @@ async fn f5_a_participation_whose_coin_goes_home_is_not_posted_again() {
 	assert_eq!(again, 0, "not posted again while the coin goes home and the participation is issued");
 	r.keepers[0].resume();
 	assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 1);
-	r.server.rounds.pass().await.unwrap();
+	// The board on the chain: released once the watcher has answered its
+	// exit with the forfeit and claimed it.
+	for _ in 0..10 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		r.server.rounds.pass().await.unwrap();
+		if r.server.store.participation(&id).await.unwrap().unwrap().state == server::store::ParticipationState::Released {
+			break;
+		}
+	}
 	assert_eq!(r.server.store.participation(&id).await.unwrap().unwrap().state, server::store::ParticipationState::Released);
 	let s = a.ok(&["sync"]);
 	println!("F5P the keeper back, the participation released: A's sync: participations {}", s["participations"]);

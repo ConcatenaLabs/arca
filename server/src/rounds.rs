@@ -50,8 +50,8 @@
 //! day after the round was found final ([`Params::FORFEIT_DEADLINE`]) and
 //! the exit deadline of the coins it gave up. A forfeit the operator can
 //! claim ends in a release ([`Rounds::release_held`]): a participation one
-//! of whose forfeits the watcher claimed, or every forfeit of which is whole,
-//! none of its coins taken on the chain otherwise, is released by the server
+//! of whose forfeits the watcher claimed, or every forfeit of which is whole
+//! while every coin it gave up is off the chain, is released by the server
 //! itself and its new leaves credited. Otherwise a participation not
 //! released by its deadline expires, whether its forfeits never came or
 //! came and were never co-signed (the signer away, or its keepers), but for
@@ -927,12 +927,15 @@ impl Rounds {
 	/// Releases every participation issued in a final round whose preimage
 	/// is out, or which the operator can put out at will: one of its
 	/// forfeits claimed by the watcher (whose claim reveals the preimage), or
-	/// every forfeit of it whole, none of its coins taken on the chain
-	/// otherwise than by its forfeit. Its new leaves are its owner's either
-	/// way, so it is released and they are credited, as when the owner
-	/// completes it itself; a forfeit step its owner can no longer finish (its
-	/// coin on its way home on the chain, say) leaves nothing stranded.
-	/// Returns them.
+	/// every forfeit of it whole while every coin it gave up is off the
+	/// chain. Its new leaves are its owner's either way, so it is released
+	/// and they are credited, as when the owner completes it itself; a
+	/// forfeit step its owner can no longer finish (its coin on its way home
+	/// on the chain, say) leaves nothing stranded. A coin given up whose own
+	/// output is on the chain waits for the watcher's answer: until its
+	/// forfeit is claimed, its owner may still take it by its exit once the
+	/// exit delay has run, and a preimage handed out then would pay for the
+	/// coin twice. Returns them.
 	pub async fn release_held(&self) -> Result<Vec<[u8; 32]>, RoundError> {
 		let mut released = vec![];
 		for id in self.store.issued_in_final_rounds().await? {
@@ -945,11 +948,12 @@ impl Rounds {
 			let why = if self.claimed(&p, round_id).await? {
 				"the watcher claimed one of its forfeits, which put its preimage out".to_string()
 			} else if whole == n {
-				match self.coin_taken_otherwise(&p).await? {
-					None => "every forfeit of it is whole, so the operator can put its preimage out at will".to_string(),
-					Some(how) => {
-						log::warn!("participation {}: every forfeit of it is whole, but {}, otherwise than by its forfeit, so it is not \
-							released", crate::signer::hex(&id), how);
+				match self.coin_on_chain(&p).await? {
+					None => "every forfeit of it is whole and every coin it gave up off the chain, so the operator can put its \
+						preimage out at will".to_string(),
+					Some(at) => {
+						log::info!("participation {}: every forfeit of it is whole, but {}: it is released once the watcher has \
+							claimed that coin's forfeit", crate::signer::hex(&id), at);
 						continue;
 					},
 				}
@@ -988,18 +992,23 @@ impl Rounds {
 		Ok(false)
 	}
 
-	/// The first coin participation `p` gave up that the chain shows spent
-	/// otherwise than by one of its forfeits in the watcher's log (its owner's
-	/// claim once its exit delay ran, say), and how ([`Self::taken_otherwise`]):
-	/// the operator can no longer take that coin by its forfeit. `None` when
-	/// there is none.
-	async fn coin_taken_otherwise(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
-		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
-		let mempool: HashSet<Txid> = self.finality.call(|c| c.mempool()).await.map_err(chain)?.into_iter().collect();
+	/// The first coin participation `p` gave up whose own output the chain
+	/// has shown (in a block or a mempool: its owner's exit brought it there,
+	/// or another step of its lineage), and where. `None` while every coin it
+	/// gave up is off the chain.
+	async fn coin_on_chain(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
+		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
+		let policy = WalletPolicy { horizon: 0, ..self.params.policy(any_time) };
 		for i in p.inputs.iter().filter(|i| !i.returned) {
-			let mine: Vec<Txid> = self.store.watcher_txs("forfeit", &i.leaf_id).await?.iter().map(|w| Txid::from_byte_array(w.txid)).collect();
-			if let Some(how) = self.taken_otherwise(&i.leaf_id, &mine, &mempool).await? {
-				return Ok(Some(format!("coin {} was spent on the chain {}", LeafId(i.leaf_id), how)));
+			let leaf = LeafId(i.leaf_id);
+			let c = match coins::resolve(&self.store, &policy, &leaf).await {
+				Ok(c) => c,
+				Err(coins::CoinError::Store(e)) => return Err(e.into()),
+				Err(e) => return Ok(Some(format!("coin {} given up cannot be read ({})", leaf, e))),
+			};
+			let script = c.coin.output().script_pubkey.to_bytes();
+			if let Some((t, v)) = self.store.sightings_of(&script).await?.first() {
+				return Ok(Some(format!("coin {}'s own output is on the chain at {}:{}", leaf, Txid::from_byte_array(*t), v)));
 			}
 		}
 		Ok(None)
