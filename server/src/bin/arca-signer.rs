@@ -3,6 +3,7 @@
 //! built by the signer itself, and nothing else, for the server on a Unix
 //! socket. See `server::signer` for the protocol.
 //!
+//!     arca-signer --key-file <file> --pubkey
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
 //!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
@@ -11,7 +12,9 @@
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --clear-stopped
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
-//! not be readable by anyone but its owner. The genesis hash is in display
+//! not be readable by anyone but its owner. `--pubkey` prints the operator
+//! key `S` it holds, and exits: a new operator's keepers are made with it
+//! (`arca-keeper --operator <S> … --create`) before its record exists. The genesis hash is in display
 //! order, as `getblockhash 0` prints it. The socket is created with mode 0600.
 //! The record is the signer's append-only record of every rebindable message
 //! it signed (`server::signer::SpendRecord`): it is what makes the signer the
@@ -106,6 +109,8 @@ use server::signer::{
 
 struct Args {
 	key_file: PathBuf,
+	/// `--pubkey`: print `S` and exit; nothing else is read.
+	pubkey: bool,
 	genesis: BlockHash,
 	/// `None` with `--create-record`, which serves nothing.
 	socket: Option<PathBuf>,
@@ -134,11 +139,13 @@ fn args() -> Result<Args, String> {
 	let mut no_keepers = false;
 	let mut keepers_required = None;
 	let mut keeper_timeout = std::time::Duration::from_secs(5);
+	let mut pubkey = false;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
 		match a.as_str() {
 			"--key-file" => key_file = Some(PathBuf::from(value()?)),
+			"--pubkey" => pubkey = true,
 			"--genesis" => genesis = Some(BlockHash::from_str(&value()?).map_err(|e| format!("--genesis: {}", e))?),
 			"--socket" => socket = Some(PathBuf::from(value()?)),
 			"--record" => record = Some(PathBuf::from(value()?)),
@@ -155,6 +162,17 @@ fn args() -> Result<Args, String> {
 				.map_err(|e| format!("--keeper-timeout-ms: {}", e))?),
 			other => return Err(format!("unknown argument {}", other)),
 		}
+	}
+	if pubkey {
+		if genesis.is_some() || socket.is_some() || record.is_some() || create_record || clear_stopped || compact_into.is_some()
+			|| drop_salts.is_some() || !keepers.is_empty() || !keeper_keys.is_empty() || no_keepers || keepers_required.is_some()
+		{
+			return Err("--pubkey takes --key-file alone: it prints the operator key S and exits".into());
+		}
+		return Ok(Args {
+			key_file: key_file.ok_or("--key-file is required")?, pubkey, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
+			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
+		});
 	}
 	let compact = match (compact_into, drop_salts) {
 		(Some(i), Some(d)) => Some((i, d)),
@@ -195,6 +213,7 @@ fn args() -> Result<Args, String> {
 	}
 	Ok(Args {
 		key_file: key_file.ok_or("--key-file is required")?,
+		pubkey: false,
 		genesis: genesis.ok_or("--genesis is required")?,
 		socket,
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
@@ -779,6 +798,10 @@ async fn main() {
 		},
 	};
 	let operator = key.x_only_public_key().0;
+	if args.pubkey {
+		println!("{}", hex(&operator.serialize()));
+		return;
+	}
 	if let Some(keepers) = &args.record_keepers {
 		match SpendRecord::create(&args.record, &operator, &args.genesis, keepers) {
 			Ok(()) => {

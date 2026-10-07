@@ -1062,28 +1062,59 @@ holding a later head witnesses. Such an operator is for its own coins.
 
 ## Running
 
-    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
-        --create-record --keeper-key <keeper 1 key> --keeper-key <keeper 2 key> --keeper-key <keeper 3 key> \
-        --keepers-required 2               # once, for a new operator key; --no-keepers for an operator for its own coins
-    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
-        --record /var/lib/arca/signer.record \
-        --keeper keeper-1.example:7341=<keeper 1 key> --keeper keeper-2.example:7341=<keeper 2 key> \
-        --keeper keeper-3.example:7341=<keeper 3 key>
-    arcad /etc/arca/arcad.toml
-    arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
+### A new operator with keepers, in order
+
+Every key is 32 random bytes as 64 hex characters, in a file only its owner
+can read (`load_key` refuses one others can). The genesis hash is the
+chain's block 0, as `sequentia-cli getblockhash 0` prints it. Three keepers,
+each on a machine of its own, two of them required:
+
+1. On the signer's machine, the operator key and `S`, its public half:
+
+        umask 077; openssl rand -hex 32 > /etc/arca/operator.key
+        arca-signer --key-file /etc/arca/operator.key --pubkey     # prints S
+
+2. On each keeper's machine, its own key and its public half:
+
+        umask 077; openssl rand -hex 32 > /etc/arca/keeper.key
+        arca-keeper --key-file /etc/arca/keeper.key --pubkey       # prints the keeper's key
+
+3. On the signer's machine, the record, naming the keepers for good, once:
+
+        arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
+            --create-record --keeper-key <keeper 1 key> --keeper-key <keeper 2 key> --keeper-key <keeper 3 key> \
+            --keepers-required 2
+
+4. On each keeper's machine, its heads file under `S`, once, then the keeper,
+   admitting the signer's address alone:
+
+        arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
+            --heads /var/lib/arca/keeper.heads --create
+        arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
+            --heads /var/lib/arca/keeper.heads --listen 0.0.0.0:7341 --allow <the signer's address>
+
+5. On the signer's machine, the signer, saying where each keeper is reached,
+   then `arcad`, which pins the keepers the first time it reads them, and the
+   operator's wallet, funded:
+
+        arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
+            --record /var/lib/arca/signer.record \
+            --keeper keeper-1.example:7341=<keeper 1 key> --keeper keeper-2.example:7341=<keeper 2 key> \
+            --keeper keeper-3.example:7341=<keeper 3 key>
+        arcad /etc/arca/arcad.toml
+        arcad /etc/arca/arcad.toml address     # a receive address of the operator's wallet, to fund it
+
+An operator without keepers, for its own coins, makes its key as in step 1,
+its record with `--create-record --no-keepers` in place of the keepers, and
+starts the signer without `--keeper`.
+
+While it runs:
+
     arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --compact-into /var/lib/arca/signer.record.new --drop-salts expired.salts   # with the signer stopped
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --clear-stopped                    # removes the proof of a rollback, with the signer stopped
-
-Each keeper, on a machine of its own, before the record is made:
-
-    arca-keeper --key-file /etc/arca/keeper.key --pubkey     # its key, for the record's --keeper-key
-    arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
-        --heads /var/lib/arca/keeper.heads --create          # once
-    arca-keeper --key-file /etc/arca/keeper.key --operator <S> --genesis <genesis hash> \
-        --heads /var/lib/arca/keeper.heads --listen 0.0.0.0:7341 --allow <the signer's address>
 
 The keeper's key file holds its 32-byte secret key as 64 hex characters,
 readable by its owner alone. A keeper speaks plain TCP, one JSON object a
@@ -1091,7 +1122,14 @@ line: every answer it gives is signed by its key over the asker's nonce,
 and it takes nothing but heads `S` signed, so it needs no TLS. It is
 reached from the signer alone: it admits a connection only from an address
 `--allow` names (the signer's machine, one `--allow` for each address it may
-come from) and closes any other at once; it holds at most
+come from). Any other gets one answer, to its first line, before the keeper
+closes it: `refused: this keeper admits connections only from the addresses
+its --allow names, and <address> is not one`. A signer refused so (one that
+moved, or reaches the keeper through NAT or another address family) says
+why, at its start and in every `keepers_unavailable` it answers, and
+co-signs nothing until the keeper's `--allow`, and its firewall, name the
+address it now comes from: change every keeper's `--allow` before the
+signer moves. The keeper holds at most
 `--max-connections` open (16 by default; the signer keeps one), closes one
 left idle for `--idle-timeout-ms` (60 seconds by default; the signer opens a
 new one when it next needs it), and when an accept fails (out of
@@ -1531,8 +1569,13 @@ acknowledgement signed by another key, one replayed from an earlier
 request, and a latest replayed at a start each refused, nothing signed; a
 keeper restored from an older copy stopping nothing and taking the
 record's latest; two keepers with one required, one down holding nothing
-up, a start with one down signing nothing until it is back; and what a
-keeper adds to a co-signature, printed.
+up, a start with one down signing nothing until it is back; a signer
+whose address the keeper's `--allow` does not name told why by the keeper
+and saying so, at its start and in its `keepers_unavailable`; a new operator
+with three keepers made in the order "Running" gives, every command run,
+`S` read with `arca-signer --pubkey` before its record exists, the signer
+co-signing with the keepers' acknowledgements; and what a keeper adds to a
+co-signature, printed.
 
 `tests/signer_record.rs` runs it with the server: after a payment the
 database knows entry 2; the record replaced by its empty copy, the next
