@@ -193,7 +193,7 @@ async fn a_stale_exit_is_answered_and_refreshed_boards_come_back() {
 	let claim = claim_of(&l, &id1).unwrap();
 	let ctx: Transaction = elements::encode::deserialize(&claim.tx).unwrap();
 	let h = arca_covenant::script::sha256(&second[0].preimage);
-	assert_eq!(find_preimage(&ctx.input[0].witness.script_witness, &h), Some(second[0].preimage),
+	assert_eq!(ctx.input.iter().find_map(|i| find_preimage(&i.witness.script_witness, &h)), Some(second[0].preimage),
 		"the claim reveals the preimage of A's round-2 leaf, which A holds already");
 	println!("A's leaf {} answered: forfeit {}, claim {}", leaf_at, txid(forfeit), txid(claim));
 
