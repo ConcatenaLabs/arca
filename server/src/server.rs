@@ -602,6 +602,17 @@ impl Server {
 		let keepers = crate::api::KeepersInfo {
 			keys: keeper_keys.iter().map(|k| crate::signer::hex(&k.serialize())).collect(), required: keepers_required,
 		};
+		// The keepers are part of the operator's identity: pinned the first
+		// time the server reads them, as a wallet pins them, and a signer
+		// naming another set (its record replaced, or edited, a compacted
+		// record's first line included) is not this operator's.
+		let pinned = store.pin_keepers(&keepers.keys, keepers.required as usize).await.map_err(err("the database"))?;
+		if (pinned.0.as_slice(), pinned.1) != (keepers.keys.as_slice(), keepers.required as usize) {
+			return Err(StartError(format!("the signer's record names the keepers [{}], {} required; this server pinned [{}], {} required, \
+				the first time it read them: the keepers are part of the operator's identity, fixed in its record when it was made, so \
+				this signer runs on another record than this operator's (replaced, or its first line edited). Start the signer on the \
+				operator's own record", keepers.keys.join(", "), keepers.required, pinned.0.join(", "), pinned.1)));
+		}
 		if keepers.keys.is_empty() {
 			log::warn!("the signer has no keeper: its record rests on this machine alone, so a restore of the machine can let a coin \
 				paid out of round be spent twice; this operator is for its own coins");

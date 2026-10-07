@@ -32,7 +32,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V12__challenge_key.sql`](schema/V12__challenge_key.sql),
 [`schema/V13__reruns_are_ordinary.sql`](schema/V13__reruns_are_ordinary.sql),
 [`schema/V14__keeper_acks.sql`](schema/V14__keeper_acks.sql),
-[`schema/V15__rerun_ties.sql`](schema/V15__rerun_ties.sql)). `Store::connect` builds it
+[`schema/V15__rerun_ties.sql`](schema/V15__rerun_ties.sql),
+[`schema/V16__keepers_pinned.sql`](schema/V16__keepers_pinned.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -118,6 +119,13 @@ to an older state:
   by the wallets that witness it; a proven rollback stops the signer
   ([The signed head, witnessed](#the-signed-head-witnessed)). Keep each
   keeper's heads file off the signer's machine and out of its snapshots.
+- The server pins the keepers of the signer's record in the database the
+  first time it reads them from the signer (`keepers_pinned`), as a wallet
+  pins them, and refuses to start against a signer that names another set,
+  naming both: that signer runs on another record than the operator's, made
+  anew or with its first line edited. While the server runs, `info` shows
+  the pinned set whatever the signer names since, and logs the difference,
+  so no wallet made then pins another.
 - The server records every message it asks the signer to sign before it
   asks, in the same transaction as what the signature is for (a transfer,
   a forfeit), and refuses to start on a database that does not know an
@@ -966,14 +974,20 @@ made: `arca-signer --create-record` takes each keeper's key (`--keeper-key`,
 as `arca-keeper --pubkey` prints it) and how many of them must hold every
 head (`--keepers-required`), and writes them into the record's first line
 (`keepers=<required>:<key>,<key>,…`), under the running hash every head
-commits to. From then on the signer serves only with that set. Its command
+commits to while the record has not been compacted. From then on the signer
+serves only with that set. Its command
 line says only where each keeper is reached (`--keeper <host:port>=<key>`):
 one address for every key the record names, and none for a key it does not
 name. A start that lacks one, or names another, is refused, saying which key
 has no address or which is not the record's, so a restore of the machine, or
 a start script that lost a flag, gives a signer that does not start rather
 than one that serves without its keepers. A compacted record carries the set
-over. Changing the set, replacing a keeper whose machine or key was lost, or
+over, but there it is covered only by the carried hash, which anyone holding
+the file can compute again without a key: a compacted record's first line,
+edited, still opens, every running hash the one the database knows. What
+refuses it is the server, which pinned the set in its database the first
+time it read it and does not start against a signer naming another; and
+every wallet that pinned the set before. Changing the set, replacing a keeper whose machine or key was lost, or
 adding keepers to an operator that had none, is a new operator: a new key
 and a new record. So an operator requires fewer than all of its keepers (two
 of three), so that one lost keeper does not end it at once.

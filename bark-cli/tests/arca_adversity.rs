@@ -4513,3 +4513,77 @@ async fn d57_past_its_expiry_a_coin_goes_on_until_the_chain_says_it_is_gone() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// R7g's KA, its second half turned around (F5). An operator with one
+/// keeper co-signs a payment; its signer's record is compacted, and its
+/// first line edited to name no keeper, the carried hash computed again (no
+/// key needed): the signer starts on it without the keeper, every running
+/// hash the one the database knows. `arcad`, which pinned the keeper set in
+/// its database the first time it read it, goes on showing that set in
+/// `info` while it runs, so no wallet made now pins "no keeper"; and a new
+/// start against that signer is refused, naming both sets.
+#[tokio::test(flavor = "multi_thread")]
+async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
+	use elements::hashes::{sha256, Hash, HashEngine};
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("PinA"), Arca::new("PinB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let pinned = info_of(&r)["keepers"].clone();
+	println!("PK the operator's keepers, pinned: {}", pinned);
+	assert_eq!(pinned["required"], 1);
+
+	// The record compacted (nothing dropped), its keepers field edited.
+	r.signer.halt();
+	let record = r.signer.record();
+	let key = r.signer.dir.join("operator.key");
+	let drop_file = r.signer.dir.join("expired.salts");
+	std::fs::write(&drop_file, "").unwrap();
+	let compacted = r.signer.dir.join("signer.record.new");
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let out = std::process::Command::new(common::signer::signer_exe())
+		.args(["--key-file", key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
+			"--compact-into", compacted.to_str().unwrap(), "--drop-salts", drop_file.to_str().unwrap()])
+		.output().unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let text = std::fs::read_to_string(&compacted).unwrap();
+	let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+	let header: Vec<String> = lines[0].split(' ').map(str::to_string).collect();
+	assert!(header[4].starts_with("keepers=1:"), "{}", lines[0]);
+	let carried: usize = header[7].parse().unwrap();
+	let mut e = sha256::Hash::engine();
+	e.input(server::signer::RECORD_CARRIED_TAG);
+	e.input(b"keepers=none\n");
+	for l in &lines[1..1 + carried] {
+		e.input(l.as_bytes());
+		e.input(b"\n");
+	}
+	let mut edited = header.clone();
+	edited[4] = "keepers=none".into();
+	edited[8] = hex(&sha256::Hash::from_engine(e).to_byte_array());
+	lines[0] = edited.join(" ");
+	std::fs::write(&record, format!("{}\n", lines.join("\n"))).unwrap();
+	println!("PK the compacted record, its first line edited: {}", lines[0]);
+	r.signer.set_extra(vec![]);
+	tokio::task::block_in_place(|| r.signer.try_resume(genesis)).expect("the edited record opens: its hashes are the database's");
+	println!("PK the signer on it, without a keeper: {}", r.signer.log().lines().last().unwrap_or(""));
+
+	// The running server: info goes on showing the pinned set.
+	tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+	let shown = info_of(&r)["keepers"].clone();
+	println!("PK the running server's info, the signer swapped: {}", shown);
+	assert_eq!(shown, pinned, "info shows the pinned keepers, not the edited record's");
+	// A new start against the signer: refused.
+	r.server.stop();
+	let refused = server::server::Server::start(&r.config).await.err().map(|e| e.to_string())
+		.expect("arcad refuses a signer naming another keeper set");
+	println!("PK arcad started again: {}", refused);
+	assert!(refused.contains("this server pinned") && refused.contains("another record"), "{}", refused);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

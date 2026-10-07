@@ -499,6 +499,11 @@ and holding it there, with the reason shown:
   of, and not counted as pending;
 - a wallet made before keepers existed shows the keepers it pins on the
   `info` that pins them, and refuses the operator once it shows others;
+- an operator with one keeper whose record is compacted and its first line
+  edited to name none, the carried hash computed again: the signer starts on
+  it without the keeper, the running server's `info` goes on showing the
+  keeper it pinned, and a new start of the server against that signer is
+  refused, naming both sets;
 - a keeper down: a payment is held up with nothing taken, the request
   standing, and completes when the keeper is back; the receiver shows the
   keeper it pinned;
