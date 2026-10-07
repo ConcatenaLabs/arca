@@ -5557,3 +5557,230 @@ async fn h1_a_refund_rolled_back_past_the_expiry_is_sent_again() {
 	assert_eq!(coin_of(&a, &l)["state"], "exited", "L is the wallet's on the chain");
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+// ---------------------------------------------------------------------------
+// A coin looked at again past its exit date or its expiry
+// ---------------------------------------------------------------------------
+
+/// A wallet's coin refreshed in a round R of its own: a board refreshed into
+/// leaf L0, then L0 refreshed in R, alone in a parent block of its own; the
+/// wallet holds R's leaf. Returns L0, R's leaf, R and its parent height.
+async fn round_of_its_own(r: &mut Running, c: &Arca) -> (String, String, Transaction, u64) {
+	let url = r.url();
+	let x = r.x;
+	let boards = boarded(r, c, &url, &[(x, 2_000_000)]).await;
+	c.ok(&["participate", "--leaf", &boards[0]]);
+	final_round(r).await;
+	let s = c.ok(&["sync"]);
+	let leaf0 = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	let pid = c.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let p_r = own_anchor(r).await;
+	let rtx = final_round(r).await;
+	let s = c.ok(&["sync"]);
+	let leaf_r = s["participations"].as_array().unwrap().iter().find(|p| p["participation"] == pid.as_str())
+		.and_then(|p| p["new_leaves"][0]["leaf_id"].as_str()).expect("R's leaf").to_string();
+	(leaf0, leaf_r, rtx, p_r)
+}
+
+/// R goes out of the chain with its parent block, and a transaction X of
+/// the operator's takes R's input, paying the operator back, buried: R can
+/// never return while X stands. Returns X and its parent height.
+async fn round_out(r: &mut Running, rtx: &Transaction, p_r: u64) -> (Transaction, u64) {
+	let back = r.server.wallet.receive_script().await.unwrap();
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	assert!(confirmations(r, &rtx.txid()) < 1);
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let p_x = own_anchor(r).await;
+	let mut xtx = taking(r, rtx, back);
+	operator_signs(r, &mut xtx);
+	r.rt.client().send_raw_transaction(&xtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Lost).await;
+	(xtx, p_x)
+}
+
+/// The parent chain takes X out and R confirms in its place, final.
+async fn round_back(r: &mut Running, rtx: &Transaction, p_x: u64) {
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_x)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	r.rt.client().send_raw_transaction(rtx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	r.round_state(&rtx.txid(), RoundState::Final).await;
+}
+
+/// Runs `w`'s `sync` with blocks, the watcher answering and the clock moving
+/// on four hours at a time, until coin `leaf` is `exited` or `rounds` have
+/// run. Returns its state then.
+async fn home_of(r: &Running, w: &Arca, leaf: &str, rounds: usize) -> Value {
+	for _ in 0..rounds {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		sync_of(w);
+		if coin_of(w, leaf)["state"] == "exited" {
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 4 * 3_600));
+		r.synced().await;
+	}
+	coin_of(w, leaf)["state"].clone()
+}
+
+/// Sweep, the re-check: a round lost for good, seen past its leaf's exit
+/// date. The wallet's leaf L0 is refreshed in round R; R goes out of the
+/// chain and X takes its input, buried, so R can never return. The wallet is
+/// away until a day past R's leaf's exit date. Its re-check finds R's leaf
+/// resting on a round that can never return: `lost`, counted nowhere, the
+/// participation followed as one whose round is lost, and L0, which it gave
+/// up for that leaf, comes home on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_lost_for_good_seen_past_its_leafs_exit_date_brings_the_coin_home() {
+	let mut r = Running::start().await;
+	let c = Arca::new("SWRL");
+	let (leaf0, leaf_r, rtx, p_r) = round_of_its_own(&mut r, &c).await;
+	let by = d57_latest_exit_by(&c, std::slice::from_ref(&leaf_r));
+	round_out(&mut r, &rtx, p_r).await;
+	d57_to(&r, by + 86_400).await;
+	let s = sync_of(&c);
+	println!("SWRL R {} lost for good; the wallet's first sync since, a day past R's leaf's exit date {}: recheck {} | participations {} \
+		| home {}", rtx.txid(), by, s["recheck"]["changes"], s["participations"], s["home"]);
+	let (lr, l0) = (coin_of(&c, &leaf_r), coin_of(&c, &leaf0));
+	println!("SWRL R's leaf {}: {} | {}; L0 {}: {} | {}", &leaf_r[..8], lr["state"], lr["note"], &leaf0[..8], l0["state"], l0["note"]);
+	let state = home_of(&r, &c, &leaf0, 24).await;
+	let bal = c.ok(&["balance"]);
+	println!("SWRL in the end: R's leaf {} | L0 {} ({}) | balance: arca {} | on the chain {}", coin_of(&c, &leaf_r)["state"], state,
+		coin_of(&c, &leaf0)["note"], bal["arca"], bal["sequentia_onchain"]);
+	assert_eq!(lr["state"], "lost", "a leaf on a round that can never return is lost, past its exit date as before it: {}", lr);
+	assert_eq!(state, "exited", "the coin given up for it comes home");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// Sweep, a lost round that returns, its leaf read again past its expiry.
+/// The wallet's leaf L0 is refreshed in round R; R goes out of the chain
+/// and X takes its input; the wallet syncs and holds R's leaf `lost`. Then
+/// the parent chain takes X out and R confirms in its place, final; the
+/// wallet is away until past R's leaf's first expiry, before any sweep. Its
+/// next sync holds R's leaf again, its path on the chain, and takes it home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_round_back_past_its_leafs_expiry_brings_the_leaf_home() {
+	let mut r = Running::start().await;
+	let c = Arca::new("SWRB");
+	let (_, leaf_r, rtx, p_r) = round_of_its_own(&mut r, &c).await;
+	let (_, p_x) = round_out(&mut r, &rtx, p_r).await;
+	sync_of(&c);
+	println!("SWRB R {} out of the chain: R's leaf {}", rtx.txid(), coin_of(&c, &leaf_r)["state"]);
+	assert_eq!(coin_of(&c, &leaf_r)["state"], "lost");
+	let e = coin_of(&c, &leaf_r)["expiry"].as_u64().unwrap() as u32;
+	// No command of the wallet's runs from here until its sync past the
+	// expiry: any of them would look at the chain, R back, before it.
+	round_back(&mut r, &rtx, p_x).await;
+	d57_to(&r, e + 600).await;
+	let s = sync_of(&c);
+	let lr = coin_of(&c, &leaf_r);
+	println!("SWRB R back, final; the wallet's first sync since, 600 s past R's leaf's first expiry {}: recheck {} | home {} | R's leaf {} \
+		| {}", e, s["recheck"]["changes"], s["home"], lr["state"], lr["note"]);
+	let state = home_of(&r, &c, &leaf_r, 12).await;
+	println!("SWRB in the end: R's leaf {} ({}) | balance on the chain {}", state, coin_of(&c, &leaf_r)["note"],
+		c.ok(&["balance"])["sequentia_onchain"]);
+	assert_ne!(lr["state"], "lost", "R stands, and its leaf is the wallet's: {}", lr);
+	assert_eq!(state, "exited", "and comes home before the sweep");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// Sweep, a coin paid out of a lost round's leaf, read again past its
+/// expiry. B refreshes L0 in round R and pays M 1,500,000 out of R's leaf;
+/// R goes out of the chain and X takes its input; M syncs and holds the
+/// coin `lost`. The parent chain takes X out and R returns, final; M is
+/// away until past the coin's expiry, before any sweep. M's next sync holds
+/// the coin again, every round and board it rests on final, and takes it
+/// home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_paid_out_of_a_lost_round_back_past_its_expiry_comes_home() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (b, m) = (Arca::new("SWPB"), Arca::new("SWPM"));
+	let (_, _, rtx, p_r) = round_of_its_own(&mut r, &b).await;
+	m.ok(&create_args(&url, &r.node_url()));
+	let req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	b.ok(&["send", &req, "--amount", "1500000", "--asset", &x.to_string()]);
+	let got = m.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let (_, p_x) = round_out(&mut r, &rtx, p_r).await;
+	sync_of(&m);
+	println!("SWPM R {} out of the chain: M's coin {}", rtx.txid(), coin_of(&m, &got)["state"]);
+	assert_eq!(coin_of(&m, &got)["state"], "lost");
+	let e = coin_of(&m, &got)["expiry"].as_u64().unwrap() as u32;
+	// No command of M's runs from here until its sync past the expiry.
+	round_back(&mut r, &rtx, p_x).await;
+	d57_to(&r, e + 600).await;
+	let s = sync_of(&m);
+	let mc = coin_of(&m, &got);
+	println!("SWPM R back, final; M's first sync since, 600 s past its coin's expiry {}: recheck {} | home {} | M's coin {} | {}", e,
+		s["recheck"]["changes"], s["home"], mc["state"], mc["note"]);
+	let state = home_of(&r, &m, &got, 12).await;
+	println!("SWPM in the end: M's coin {} ({}) | M's balance on the chain {}", state, coin_of(&m, &got)["note"],
+		m.ok(&["balance"])["sequentia_onchain"]);
+	assert_ne!(mc["state"], "lost", "R stands, and M's coin with it: {}", mc);
+	assert_eq!(state, "exited", "and comes home before the sweep");
+	let _ = (std::fs::remove_dir_all(&b.dir), std::fs::remove_dir_all(&m.dir));
+}
+
+/// Sweep, a payment's answer read past its input's expiry. A pays B 600,000
+/// out of its batch leaf L; the server co-signs and the answer comes back as
+/// a gateway's 502, so the request stands. A is away until past L's first
+/// expiry; its next sync posts the request again and gets the server's same
+/// answer: the receiver's output is checked only for the operator's
+/// signature (its dates are its receiver's), A's change is kept and taken on
+/// the chain at once, L is spent, and the change comes home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payments_answer_read_past_its_inputs_expiry_keeps_the_change() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("SWTA"), Arca::new("SWTB"));
+	boarded(&mut r, &a, &proxy.url.clone(), &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let l = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/cosign_transfer" && status == 200 {
+			*v = json!({"error": {"code": "bad_gateway", "message": "upstream timed out"}});
+			return Some(502);
+		}
+		None
+	})));
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("SWT A pays B out of L {}, answered 502 after the server co-signed: ok={} {}", &l[..8], ok, v["error"]);
+	assert!(!ok);
+	proxy.rewrite(None);
+	assert_eq!(coin_of(&a, &l)["state"], "sending");
+	let e = coin_of(&a, &l)["expiry"].as_u64().unwrap() as u32;
+	d57_to(&r, e + 600).await;
+	let s = sync_of(&a);
+	println!("SWT A's first sync since, 600 s past L's first expiry {}: transfers {} | home {}", e, s["transfers"], s["home"]);
+	let coins = a.ok(&["coins"]);
+	println!("SWT A's coins: {}", coins);
+	let change = coins.as_array().unwrap().iter().find(|c| c["kind"] == "transfer").map(|c| c["leaf_id"].as_str().unwrap().to_string());
+	let state = match &change {
+		Some(ch) => home_of(&r, &a, ch, 12).await,
+		None => Value::Null,
+	};
+	println!("SWT in the end: L {} | the change {:?} {} | A's balance on the chain {}", coin_of(&a, &l)["state"], change, state,
+		a.ok(&["balance"])["sequentia_onchain"]);
+	assert!(s["transfers"][0]["transfer_id"].is_string(), "the request posted again completes: {}", s["transfers"]);
+	assert_eq!(coin_of(&a, &l)["state"], "spent", "L is spent by the payment");
+	assert_eq!(state, "exited", "the change comes home");
+	let _ = (std::fs::remove_dir_all(&a.dir), std::fs::remove_dir_all(&b.dir));
+}
