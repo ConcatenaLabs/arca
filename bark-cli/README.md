@@ -123,7 +123,12 @@ the keys, but which coins were spent off-chain is in the store and the server.
   another transaction that is final is `lost`, its note naming the round, and
   a coin paid to the wallet out of a leaf of that round with it; each is the
   wallet's again once every round and board it rests on is final in the chain
-  again. A board
+  again, unless a spend that is no step of its exit (the operator's sweep, or
+  another spend the operator co-signed) has cut its path and is final. The re-check looks at what the chain holds of a coin, checked as of
+  its expiry once that has passed, and leaves the coin's dates to `sync`,
+  which takes it home by them: a round that can never return, or one that
+  returns, is followed whenever the wallet next looks, past the coin's exit
+  date or its expiry as before them. A board
   held as `lost` whose transaction the chain holds is followed again once the
   server reports it credited. Every participation such a round ran, the
   operator runs again, under the same keys and owner nonces, in a round that
@@ -599,6 +604,12 @@ and holding it there, with the reason shown:
   deadline, the participation released and paid out of, and with it down
   past the deadline, the board kept given up, never offered for a payment,
   and brought home whole;
+- a round lost for good, first seen a day past its leaf's exit date: the
+  leaf `lost`, counted nowhere, and the coin given up for it brought home; a
+  lost round that returns, and a coin paid out of its leaf, first seen again
+  past their expiry, before the sweep: each held again and brought home; and
+  a payment's answer lost to a 502 and read again past its input's expiry:
+  the request completes and the change comes home;
 - a batch leaf's forfeit followed past the leaf's expiry, the operator gone
   before its claim: the refund sent at the first sync past the expiry, final,
   and the operator back finding the output spent; the forfeit claimed by the

@@ -1069,12 +1069,16 @@ impl Wallet {
 				changes.push(json!({"participation": pid, "from": state, "to": "released", "round": k, "why": why}));
 			}
 			// Its leaves of the round that stands, the wallet's again; of every
-			// other round, out of the chain.
-			let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+			// other round, out of the chain. A leaf read again past its expiry
+			// is checked as of that expiry: the round that stands holds its
+			// path, and its exit goes on until a sweep is final. One whose
+			// path a final sweep, or another spend, has cut stays lost.
+			let now = self.now()?;
 			for c in leaves.iter().filter(|c| c.state == "lost") {
 				let record = Self::record_of(c)?;
 				let Ok(bases) = self.accepted_bases(&record) else { continue };
-				if record.resolve(&bases, &policy).is_err() {
+				let Ok(valid) = record.resolve(&bases, &self.followed_policy(c.expiry, now)) else { continue };
+				if self.cut_by_final_spend(&valid)? {
 					continue;
 				}
 				let mut fin = true;
@@ -1097,17 +1101,19 @@ impl Wallet {
 		}
 		// A coin paid out of a leaf of a round that went out of the chain is
 		// lost with it; once every round and board it rests on is final in the
-		// chain again and its checks pass, it is the wallet's again.
-		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		// chain again and its checks pass, it is the wallet's again, past its
+		// expiry as before it (checked as of that expiry), unless a final
+		// sweep, or another spend, has cut its path.
+		let now = self.now()?;
 		for c in self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "transfer") {
 			let record = Self::record_of(&c)?;
 			let Ok(bases) = self.accepted_bases(&record) else { continue };
-			let Ok(valid) = record.resolve(&bases, &policy) else { continue };
+			let Ok(valid) = record.resolve(&bases, &self.followed_policy(c.expiry, now)) else { continue };
 			let mut fin = true;
 			for t in &bases {
 				fin &= self.chain.finality(&t.txid())?.is_final();
 			}
-			if !fin || valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).is_err() {
+			if !fin || valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).is_err() || self.cut_by_final_spend(&valid)? {
 				continue;
 			}
 			let why = "every round and board it rests on is final in the chain again".to_string();

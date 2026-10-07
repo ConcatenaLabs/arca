@@ -479,9 +479,11 @@ impl Wallet {
 						}
 					} else {
 						// Not ours: still, the operator must have signed it. Its
-						// dates are its receiver's to judge.
+						// dates are its receiver's to judge, so it is checked as
+						// of its expiry once that has passed (an answer read
+						// again, the request posted again past it).
 						let txs = self.base_txs(&record)?;
-						record.resolve(&txs, &WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) })
+						record.resolve(&txs, &self.followed_policy(first_expiry(&record).unwrap_or(u32::MAX), self.now()?))
 							.map_err(|e| Error::Refused(format!("the server's record of output {}: {}", o["leaf_id"], e)))?;
 					}
 				}

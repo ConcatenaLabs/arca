@@ -1533,7 +1533,6 @@ impl Wallet {
 			_ => false,
 		};
 		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
-		let policy = self.receipt_policy(now);
 		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
 		let mut changes = vec![];
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
@@ -1542,6 +1541,9 @@ impl Wallet {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
+			// What the chain holds of the coin, checked as of its expiry once
+			// that has passed: its dates are what `sync` takes it home by.
+			let policy = self.followed_policy(c.expiry, now);
 			let (state, note) = match self.recheck_one(&c, &record, &policy)? {
 				Checked::Holds(state, note) => (state, note),
 				Checked::Lost(base) => {

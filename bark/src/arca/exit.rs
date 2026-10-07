@@ -615,6 +615,21 @@ impl Wallet {
 		}
 	}
 
+	/// Whether a spend that is no step of `coin`'s exit, and is final, has cut
+	/// its path: the operator's sweep of a batch it rests on
+	/// ([`Self::swept`]), or another spend the operator co-signed of a coin it
+	/// rests on ([`Self::paid_elsewhere`]). While it has, the coin is lost,
+	/// whatever round it rests on stands; a rollback that leaves that spend
+	/// not final makes it the wallet's again.
+	pub(crate) fn cut_by_final_spend(&self, coin: &ValidCoin) -> Result<bool, Error> {
+		for (_, by) in [self.swept(coin)?, self.paid_elsewhere(coin)?].into_iter().flatten() {
+			if self.chain.finality(&by)?.is_final() {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
 	/// Moves on every exit the wallet has started, with the fee asset each was
 	/// started with.
 	pub(crate) fn progress_exits(&mut self) -> Result<Vec<Value>, Error> {
