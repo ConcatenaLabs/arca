@@ -1105,6 +1105,11 @@ holding a later head witnesses. Such an operator is for its own coins.
 
 ## Running
 
+An operator that holds other people's coins follows
+[the operator's procedure](../doc/operator-procedure.md): how it is made,
+what is never done, how its storage is kept and restored, and what its
+holders are told.
+
 ### A new operator with keepers, in order
 
 Every key is 32 random bytes as 64 hex characters, in a file only its owner
