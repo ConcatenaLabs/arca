@@ -8,8 +8,10 @@
 //! restored from an older copy, or started again empty, is a lost keeper and
 //! no answer, while keepers that never held a head answer until one is
 //! acknowledged; with one of two keepers required,
-//! one down holds nothing up, but a start needs both; and what a keeper adds
-//! to a co-signature, on this machine and at 50 ms each way.
+//! one down holds nothing up, but a start needs both; a keeper at its
+//! connection bound says nothing to anyone, and tells a stranger why only
+//! while it has room; and what a keeper adds to a co-signature, on this
+//! machine and at 50 ms each way.
 
 mod common;
 
@@ -1314,4 +1316,58 @@ async fn a_signer_that_cannot_note_what_its_keepers_hold_releases_nothing() {
 		drop(s);
 		let _ = std::fs::remove_dir_all(&t.dir);
 	}
+}
+
+/// What the keeper at `addr` says to a connection from `from` that sends
+/// it a request line: every byte it writes before it closes the
+/// connection, within two seconds.
+async fn said_to(addr: &str, from: &str) -> String {
+	use tokio::io::AsyncReadExt;
+	let sock = tokio::net::TcpSocket::new_v4().unwrap();
+	sock.bind(format!("{}:0", from).parse().unwrap()).unwrap();
+	let mut s = sock.connect(addr.parse().unwrap()).await.unwrap();
+	let _ = s.write_all(format!("{{\"op\":\"latest\",\"nonce\":\"{}\"}}\n", hex(&[7; 32])).as_bytes()).await;
+	let mut out = vec![];
+	let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+	String::from_utf8_lossy(&out).trim().to_string()
+}
+
+/// R7h's second review, H3 turned around. A keeper holding its most
+/// connections (`--max-connections` 2, both from the signer's address)
+/// closes the next at once with nothing said, whoever it comes from: an
+/// address `--allow` does not name included. With room again, a stranger
+/// is told why before the keeper closes it, and the signer's address is
+/// answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_at_its_bound_says_nothing_to_anyone() {
+	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
+	let listen = ["--allow", "127.0.0.1", "--max-connections", "2", "--idle-timeout-ms", "60000"].iter().map(|a| a.to_string()).collect();
+	let keeper = KeeperProcess::start_with(&k, xonly(&t.s), t.genesis, listen, None);
+	// The connection its start was checked over closed first.
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let mut held = vec![];
+	for _ in 0..2 {
+		held.push(tokio::net::TcpStream::connect(&keeper.addr).await.unwrap());
+	}
+	for s in &mut held {
+		assert!(!closed(s, Duration::from_millis(300)).await, "both connections are held: {}", keeper.log());
+	}
+	let stranger = said_to(&keeper.addr, "127.0.0.2").await;
+	let signer = said_to(&keeper.addr, "127.0.0.1").await;
+	println!("H3 two connections held, the most it holds: a stranger is answered {:?}; the signer's address {:?}", stranger, signer);
+	// Room again: the two closed, and the keeper finds them closed.
+	drop(held);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let stranger_after = said_to(&keeper.addr, "127.0.0.2").await;
+	let signer_after = ask_latest(&keeper.addr, Duration::from_secs(3)).await;
+	println!("H3 with room again: a stranger is answered {:?}; the signer's address {}", stranger_after,
+		signer_after.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "none".into()));
+	println!("H3 the keeper's log: {}", keeper.log().lines().filter(|l| l.contains("refused")).collect::<Vec<_>>().join(" / "));
+	assert_eq!(stranger, "", "at its bound the keeper says nothing to a stranger");
+	assert_eq!(signer, "", "nor to the signer's address");
+	assert!(stranger_after.contains("refused: this keeper admits connections only from the addresses its --allow names, and 127.0.0.2 is not one"),
+		"with room, a stranger is told why: {}", stranger_after);
+	assert!(signer_after.is_some_and(|v| v["signature"].is_string()), "with room, the signer's address is answered");
+	let _ = std::fs::remove_dir_all(&t.dir);
 }
