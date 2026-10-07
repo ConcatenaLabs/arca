@@ -26,10 +26,10 @@
 //!    carries the dates of a batch made when it confirmed (`board_status`).
 //!    While the sender's change rests live on the same lineage the watcher
 //!    publishes nothing of it. Past the board's exit deadline the change is
-//!    refused in a transfer and taken into a refresh; with no live coin left
-//!    on the lineage the watcher publishes the board's checkpoint, the
-//!    reassignment and both forfeits at once, before the board's expiry, and
-//!    claims them.
+//!    refused in a transfer and in a refresh, and the watcher still waits
+//!    while it rests live on the lineage; from the board's expiry it
+//!    publishes the board's checkpoint, the reassignment and B's forfeit, and
+//!    claims it.
 //! 5. An anchor-driven reorganisation: the parent orphans the block a round
 //!    and the watcher's answer to a stale exit are anchored to; the node
 //!    disconnects them, the nursery broadcasts them again unchanged, and they
@@ -522,16 +522,16 @@ async fn a_refreshed_coin_paid_from_a_board_waits_for_the_change_and_then_comes_
 	assert_eq!(st["expiry"].as_u64(), Some((confirmed + 28 * 86_400) as u64), "28 days after the median time of its block");
 	assert_eq!(st["exit_deadline"].as_u64(), Some((confirmed + 25 * 86_400) as u64), "three days before");
 	let info = r.http.get("info").ok();
-	assert_eq!(info["boards"], serde_json::json!({"lifetime_seconds": 2_419_200, "exit_deadline_seconds": 259_200, "refresh_until_seconds": 86_400}));
+	assert_eq!(info["boards"], serde_json::json!({"lifetime_seconds": 2_419_200, "exit_deadline_seconds": 259_200, "refresh_until_seconds": 259_200}));
 	let expiry = confirmed + 28 * 86_400;
 
 	// Past the board's exit deadline: A's change is no longer co-signed into
-	// a transfer, and is taken into a refresh.
+	// a transfer, nor taken into a refresh: its owner takes it on the chain.
 	let now = common::rounds::mtp(&r).to_consensus_u32();
 	advance_mtp(&r, expiry - 3 * 86_400 + HOUR - now).await;
 	r.synced().await;
 	let now = common::rounds::mtp(&r).to_consensus_u32();
-	assert!(now > expiry - 3 * 86_400 && now < expiry - 86_400, "between the exit deadline and the last refresh time: {}", now);
+	assert!(now > expiry - 3 * 86_400 && now < expiry, "past the exit deadline, before the expiry: {}", now);
 	let (a3_leaf, _) = new_leaf(&keypair("W6 A, change again"));
 	let refused = r.http.post("cosign_transfer", &transfer_body(&[(&ca2.held, ca2.valid(&r), change - 2_000)],
 		&[(x, change - 4_000, a3_leaf)], s, r.chain));
@@ -539,31 +539,49 @@ async fn a_refreshed_coin_paid_from_a_board_waits_for_the_change_and_then_comes_
 	assert_eq!(refused.refusal().0, "invalid_coin");
 	assert!(refused.refusal().1.contains("exit deadline has passed"), "{:?}", refused.refusal());
 	let a4 = keypair("W6 A, round");
-	let got_a = refresh(&mut r, &[(&ca2, &a4)]).await;
-	println!("A's change refreshed past the exit deadline into round {}", got_a[0].round.txid());
+	let (w, _) = common::client::want_leaf(&a4, x, change);
+	let (body, _) = common::client::participation_body(&[&ca2.held], &[w], &[], None, s, r.chain);
+	let refused = r.http.post("submit_participation", &body);
+	println!("A's refresh of its change past the board's exit deadline: {} {:?}", refused.status, refused.refusal());
+	assert_eq!(refused.status, 422, "{}", refused.json);
+	assert!(refused.refusal().1.contains("rests on a board whose service ends"), "{:?}", refused.refusal());
 
-	// No coin another holder may hold rests on the lineage any more: the
-	// watcher brings it on-chain at once, before the board's expiry, and
-	// claims both forfeits.
+	// A's change rests live on the lineage: the watcher publishes nothing of
+	// it before the board's expiry.
+	let now = common::rounds::mtp(&r).to_consensus_u32();
+	advance_mtp(&r, expiry - HOUR - now).await;
+	for _ in 0..3 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	let l = log(&r).await;
+	assert!(!has(&l, "checkpoint", &ca.held.id.0) && !has(&l, "forfeit", &bid), "nothing before the board's expiry: {:?}",
+		l.iter().map(|w| (&w.kind, &w.detail)).collect::<Vec<_>>());
+	println!("an hour before the board's expiry the watcher has published nothing of the lineage: A's change rests on it");
+
+	// From the board's expiry the watcher brings the lineage on the chain
+	// and claims B's forfeit; A's change comes on the chain as its leaf, A's
+	// to claim.
 	let before = x_balance(&r).await;
-	let a2id = a2_id.0.to_vec();
-	drive(&r, "the lineage of A's board, both coins on it given up", 12, |l| has(l, "claim", &bid) && has(l, "claim", &a2id)).await;
+	advance_mtp(&r, 2 * HOUR).await;
+	drive(&r, "the lineage of A's board past its expiry, B's coin given up", 12, |l| has(l, "claim", &bid)).await;
 	settle(&r).await;
-	assert!(common::rounds::mtp(&r).to_consensus_u32() < expiry, "before the board's expiry");
 	let l = log(&r).await;
 	assert!(final_of(&l, "checkpoint", &ca.held.id.0), "A's board checkpointed from the board output");
 	assert!(final_of(&l, "reassignment", &transfer), "the reassignment published");
 	assert!(final_of(&l, "forfeit", &bid) && final_of(&l, "claim", &bid), "B's forfeit published and claimed");
-	assert!(final_of(&l, "forfeit", &a2id) && final_of(&l, "claim", &a2id), "A's forfeit published and claimed");
+	let a2id = a2_id.0.to_vec();
+	assert!(!has(&l, "forfeit", &a2id), "A gave nothing up: no forfeit of its change");
 	let cp = l.iter().find(|w| w.kind == "checkpoint").unwrap();
 	let cptx: Transaction = elements::encode::deserialize(&cp.tx).unwrap();
 	assert_eq!(cptx.input[0].previous_output, ca.valid(&r).board().unwrap().1, "the checkpoint spends the board output itself");
 	let after = x_balance(&r).await;
-	println!("the wallet holds {} more of X: both coins back, less the fees", after as i64 - before as i64);
-	assert!(after > before + 590_000 + change - 20_000);
+	println!("the wallet holds {} more of X: B's coin back, less the fees", after as i64 - before as i64);
+	assert!(after > before + 590_000);
 	// The coins whose forfeit's claim is final are scanned no more.
 	let left: Vec<String> = r.server.store.forfeited_transfer_coins().await.unwrap().iter()
 		.map(|(l, _)| common::client::hex(l)).collect();
-	println!("forfeited transfer coins still scanned once both claims are final: {:?}", left);
-	assert!(!left.contains(&common::client::hex(&bid)) && !left.contains(&common::client::hex(&a2id)), "{:?}", left);
+	println!("forfeited transfer coins still scanned once B's claim is final: {:?}", left);
+	assert!(!left.contains(&common::client::hex(&bid)), "{:?}", left);
 }

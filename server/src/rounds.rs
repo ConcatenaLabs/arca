@@ -38,19 +38,24 @@
 //! forfeits) and every participation's move to issued are recorded in one
 //! database transaction, and the round goes to the nursery.
 //!
-//! A participation's coins are checked again when a round is built, under a
-//! horizon of one day before their first expiry ([`Params::round_policy`]): a
-//! participation accepted before its coins' exit deadline still runs if a
-//! round takes it by then, and one whose coin has passed it can never run and
-//! is voided, its coins given back.
+//! A participation's coins are checked again when a round is built, and at
+//! every pass over the rounds, under the horizon they were accepted under,
+//! their exit deadline ([`Params::round_policy`]): a pending participation
+//! with a coin past its exit deadline can never run and is voided, its coins
+//! given back, whether a round is being built or not. From that deadline the
+//! coin's owner takes it on the chain.
 //!
 //! The owner of each participation in a round hands over its forfeits once
-//! the round is final, and has a day to ([`Params::FORFEIT_DEADLINE`]): a
-//! participation whose forfeits have not come a day after its round was found
-//! final expires. The coins it gave up are the owner's again (a coin under a
-//! forfeit signed for an earlier, lost round excepted), and its new leaves are
-//! never credited: their preimage never goes out, and the operator sweeps them
-//! with their batch at expiry.
+//! the round is final, and the signer co-signs them, within a day
+//! ([`Params::FORFEIT_DEADLINE`]): a participation not released a day after
+//! its round was found final expires, whether its forfeits never came or
+//! came and were never co-signed (the signer away, or its keepers). Each
+//! forfeit of it without the operator's half is dropped, never to be asked
+//! of the signer again; the coins it gave up are the owner's again (a coin
+//! under a forfeit the operator holds whole, or one signed for an earlier,
+//! lost round, excepted), and its new leaves are never credited: their
+//! preimage never goes out, and the operator sweeps them with their batch at
+//! expiry.
 //!
 //! After a rollback the nursery broadcasts a round again unchanged; while it
 //! is out of the chain its new leaves are uncredited, and they are credited
@@ -320,13 +325,13 @@ impl Rounds {
 		}
 		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
-			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, coins::BoardDates::Within(Params::ROUND_HORIZON)).await {
+			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await {
 				Ok(_) => {},
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
 				Err(coins::CoinError::InvalidCoin {
 					error: arca_covenant::TransferError::Record(arca_covenant::RecordError::ExpiryTooSoon { .. }), ..
 				}) | Err(coins::CoinError::PastBoardDate { .. }) => {
-					let why = format!("coin {} is past the last time a round takes it", LeafId(i.leaf_id));
+					let why = format!("coin {} is past its exit deadline, the last time a round takes it", LeafId(i.leaf_id));
 					let voided = self.store.void_participation(&p.id, &why).await?;
 					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&p.id), why, voided);
 					return Ok(false);
@@ -881,7 +886,8 @@ impl Rounds {
 	/// finality service calls final is marked final, and the new leaves of
 	/// its released participations are credited; one no longer final goes
 	/// back to broadcast, its leaves uncredited. Then every participation
-	/// whose forfeits are overdue expires.
+	/// whose forfeits are overdue expires, and every pending participation
+	/// with a coin past its exit deadline is voided.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
@@ -905,20 +911,40 @@ impl Rounds {
 			self.check_round(&r).await?;
 		}
 		self.expire().await?;
+		self.void_overdue().await?;
 		Ok(())
 	}
 
 	/// Expires every participation whose round was found final more than
-	/// [`Params::FORFEIT_DEADLINE`] ago and whose forfeits have not come.
-	/// Returns them.
+	/// [`Params::FORFEIT_DEADLINE`] ago and that is not released: its
+	/// forfeits never came, or came and were never co-signed. Returns them.
 	pub async fn expire(&self) -> Result<Vec<[u8; 32]>, RoundError> {
 		let now = self.now().await?.to_consensus_u32();
 		let expired = self.store.expire_participations(now.saturating_sub(Params::FORFEIT_DEADLINE)).await?;
 		for id in &expired {
-			log::warn!("participation {} expired: its forfeits did not come within a day of its round being final; \
-				its coins are given back, its new leaves are never credited", crate::signer::hex(id));
+			log::warn!("participation {} expired: it was not released within a day of its round being final (its forfeits did \
+				not come, or were not co-signed); its coins are given back, but one under a forfeit the operator holds whole, and \
+				its new leaves are never credited", crate::signer::hex(id));
 		}
 		Ok(expired)
+	}
+
+	/// Voids every pending participation with a coin past its exit deadline
+	/// ([`Self::still_good`]), whether or not a round is being built: its
+	/// coins are given back, and their owners take them on the chain. Holds
+	/// the round builder's lock, so no round takes a participation this voids.
+	/// Returns how many it voided.
+	pub async fn void_overdue(&self) -> Result<usize, RoundError> {
+		let _one = self.running.lock().await;
+		let now = self.now().await?;
+		let mut voided = 0;
+		for id in self.store.participations_in(ParticipationState::Pending).await? {
+			let Some(row) = self.store.participation(&id).await? else { continue };
+			if !self.still_good(&row, now).await? && self.store.participation(&id).await?.is_some_and(|r| r.state == ParticipationState::Void) {
+				voided += 1;
+			}
+		}
+		Ok(voided)
 	}
 
 	/// Whether the nursery has found the round lost: out of the chain, and a

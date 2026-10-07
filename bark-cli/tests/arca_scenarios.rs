@@ -194,10 +194,12 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 
 	// --- A unilateral exit, from the record alone, the server gone ---
 	r.server.stop();
-	a.refused(&["exit", &a_y], "needs a fee coin");
-	let e = a.ok(&["exit", &a_y, "--fee-asset", &x]);
+	// Y is not taken for fees: the wallet pays each step with a coin of X,
+	// the one asset it holds that the node takes, without being told.
+	let e = a.ok(&["exit", &a_y]);
 	assert_eq!(e["state"], "unrolling", "{}", e);
 	let steps = e["broadcast"].as_array().unwrap();
+	assert!(steps.iter().all(|s| s["fee"].as_array().unwrap().iter().all(|f| f["asset"] == x.as_str())), "every fee in X: {}", e);
 	println!("A's exit of its Y leaf: {} transactions, {} vB in all", steps.len(), steps.iter().map(|s| s["vsize"].as_u64().unwrap()).sum::<u64>());
 	r.produce().await;
 	let e = a.ok(&["exit", &a_y, "--fee-asset", &x]);

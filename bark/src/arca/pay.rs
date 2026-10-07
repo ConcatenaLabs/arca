@@ -15,7 +15,7 @@ use arca_covenant::{CoinRecord, ExplicitOutput, NewLeaf, Pair, RelativeTime, Tra
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::CoinRow;
-use super::wallet::{amount, kind_of, owner_of, sign, Assessed, Wallet};
+use super::wallet::{amount, kind_of, owner_of, sign, Assessed, CoinDates, Wallet};
 use super::{random32, Error};
 
 /// How many times the floor a pre-signed transaction's margin holds: the
@@ -209,8 +209,8 @@ impl Wallet {
 	}
 
 	/// The live coins of `asset`, largest first, each resolved; a coin past
-	/// its exit deadline is not paid on (the operator takes it only into a
-	/// refresh).
+	/// its exit deadline is not paid on (the operator co-signs no spend of it,
+	/// and `sync` takes it on the chain).
 	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
 		let now = self.now()?.to_consensus_u32() as u64;
@@ -506,7 +506,8 @@ impl Wallet {
 	/// must be unspent; and its salt must be one the wallet has never held a
 	/// coin under. A coin past its batch's exit deadline (and before the
 	/// batch's expiry) is kept and exited at once, whatever of its lineage is
-	/// on the chain.
+	/// on the chain, and so is one a day or less from its exit date (D57),
+	/// whose sender may already be taking their shared lineage home.
 	pub(crate) fn accept_coin(&mut self, bytes: &[u8], claimed: &str, source: &str) -> Result<Value, Error> {
 		self.accept_coin_as(bytes, claimed, source, false)
 	}
@@ -575,9 +576,15 @@ impl Wallet {
 		if let Some(c) = self.store.coin_by_salt(&a.valid.leaf.salt)? {
 			return Err(Error::Refused(format!("the coin's salt is that of coin {} the wallet has held: its old pairs would spend it", c.leaf_id)));
 		}
+		// D57: a coin a day or less from its exit date, or past it, goes on
+		// the chain at once from wherever its lineage is: whoever shares that
+		// lineage (its sender's change) may already be taking it home, and
+		// refusing the coin would leave its output on the chain to no one.
+		let due = CoinDates::of(self.service_expiry(&record, &a)?)
+			.is_some_and(|d| now.to_consensus_u32() >= d.home_from);
 		let boards_spent = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).err();
 		if let Some(e) = &boards_spent {
-			if !home {
+			if !home && !late && !due {
 				return Err(Error::Refused(e.to_string()));
 			}
 		}
@@ -585,8 +592,8 @@ impl Wallet {
 		// arrives past its exit deadline (a payment the server recorded
 		// before it and completed when it was asked again) is still the
 		// wallet's, co-signed and checked: refusing it would undo nothing.
-		// It is kept, and shown as a coin the operator takes only into a
-		// refresh, or to exit.
+		// It is kept, and shown as a coin the operator co-signs no spend of
+		// and takes into no refresh: `sync` takes it on the chain.
 		let board_expiry = self.board_expiry(&record, &a.bases)?;
 		let past_deadline = board_expiry.is_some_and(|e| now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64);
 		let lineage: BTreeSet<Script> = a.valid.lineage().into_iter().map(|o| o.output.script_pubkey).collect();
@@ -598,7 +605,7 @@ impl Wallet {
 		// step first: refusing it would only lose it.
 		let on_chain = a.valid.check_lineage(|s| seen.contains(s)).err();
 		if let Some(e) = &on_chain {
-			if !late && !home {
+			if !late && !home && !due {
 				return Err(Error::Refused(e.to_string()));
 			}
 		}
@@ -610,8 +617,8 @@ impl Wallet {
 		}
 		if past_deadline {
 			let e = board_expiry.expect("past a deadline");
-			let why = format!("it rests on a board past its exit deadline: the operator co-signs no spend of it and takes it only into a \
-				refresh, until median time {}; exit it after that", e.saturating_sub(super::wallet::BOARD_REFRESH_UNTIL));
+			let why = format!("it rests on a board past its exit deadline (the board's service ends at median time {}): the operator \
+				co-signs no spend of it and takes it into no refresh, so sync takes it on the chain", e);
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		if late {
@@ -643,16 +650,20 @@ impl Wallet {
 		})?;
 		let mut out = json!({"leaf_id": id, "kind": kind_of(&record), "asset": a.valid.asset.to_string(), "value": a.valid.value.to_string(),
 			"hops": a.valid.hops, "state": state, "note": note, "from": source});
+		// D57: a coin whose exit needs a fee coin the wallet does not hold
+		// says so when it is taken, as on every listing.
+		if let Some(f) = self.exit_fee(&coin, &mut None)? {
+			out["exit_fee"] = f;
+		}
 		if super::wallet::rests_on_board(&record) {
 			out["board"] = match board_expiry {
 				Some(e) if past_deadline => json!({"exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE), "expiry": e,
-					"refresh_until": e.saturating_sub(super::wallet::BOARD_REFRESH_UNTIL),
-					"note": "the coin rests on a board past its exit deadline: it cannot be paid on; the operator takes it only into a \
-					refresh, until a day before its expiry, and it can be exited at any time"}),
+					"note": "the coin rests on a board past its exit deadline: it cannot be paid on or refreshed, and sync takes it on the \
+					chain; it can be exited at any time"}),
 				Some(e) => json!({"exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE), "expiry": e,
 					"note": "the coin rests on a board, which carries the dates of a batch made when it confirmed: pay it on or refresh it \
-					before its exit deadline; after it the operator takes it only into a refresh, until a day before its expiry, and from \
-					the expiry it may bring the coin on the chain"}),
+					before its exit deadline (sync refreshes it in the two days before, and takes it on the chain from a day before unless \
+					refreshed); from the expiry the operator may bring the coin on the chain"}),
 				None => json!({"note": "the coin rests on a board not yet in a block: it carries the dates of a batch made when the board \
 					confirms, shown once it does"}),
 			};
@@ -665,6 +676,18 @@ impl Wallet {
 			out["note"] = json!(why);
 			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
 				"note": "exit the coin, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			if let Some(c) = self.store.coin(&id)? {
+				out["state"] = json!(c.state);
+			}
+		}
+		if due && !late && !home {
+			let why = format!("it arrives a day or less from its exit date{}: the wallet takes it on the chain at once{}{}",
+				CoinDates::of(coin.expiry).map(|d| format!(" (median time {})", d.exit_by)).unwrap_or_default(),
+				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default(),
+				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
+			self.store.set_coin_state(&id, &coin.state, &why)?;
+			out["note"] = json!(why);
+			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string()}));
 			if let Some(c) = self.store.coin(&id)? {
 				out["state"] = json!(c.state);
 			}

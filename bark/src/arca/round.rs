@@ -162,12 +162,13 @@ impl Wallet {
 				return Err(Error::Refused(format!("coin {} is not final: {}", r.leaf_id, a.waiting())));
 			}
 			// A coin resting on a board counts from the board's dates, and is
-			// taken into a refresh until a day before the board's expiry.
+			// taken into a refresh until its exit deadline, three days before
+			// the board's expiry.
 			let (value, expiry) = (a.valid.value, self.service_expiry(&record, &a)?);
 			if let Some(b) = self.board_expiry(&record, &a.bases)? {
-				if now.to_consensus_u32() as u64 + super::wallet::BOARD_REFRESH_UNTIL as u64 >= b as u64 {
+				if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= b as u64 {
 					return Err(Error::Refused(format!("coin {} rests on a board whose service ends at median time {}: the operator takes \
-						it into a refresh only until a day before; exit it", r.leaf_id, b)));
+						it into a refresh only until its exit deadline, three days before; exit it", r.leaf_id, b)));
 				}
 			}
 			let fee = refresh_fee(&info["fees"], value, expiry, now.to_consensus_u32());
@@ -694,8 +695,12 @@ impl Wallet {
 					s.use_nonce(&nonce, &id)
 				})?;
 			}
-			kept.push(json!({"leaf_id": row.leaf_id, "asset": record.asset.to_string(), "value": record.value.to_string(),
-				"expiry": record.schedule.expiries()[0].to_consensus_u32()}));
+			let mut k = json!({"leaf_id": row.leaf_id, "asset": record.asset.to_string(), "value": record.value.to_string(),
+				"expiry": record.schedule.expiries()[0].to_consensus_u32()});
+			if let Some(f) = self.exit_fee(&row, &mut None)? {
+				k["exit_fee"] = f;
+			}
+			kept.push(k);
 		}
 		self.store.atomically(|s| {
 			for l in &given {

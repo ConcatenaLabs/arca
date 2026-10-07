@@ -878,17 +878,22 @@ impl Store {
 	}
 
 	/// Expires every participation issued in a round found final at or
-	/// before median time `cutoff` whose forfeits for that round have not
-	/// come: each becomes expired, its new leaves expired (never credited;
-	/// their preimage never goes out, and the operator sweeps them), and each
-	/// coin it gave up for which no forfeit was ever signed is given back
-	/// ([`give_back`]). Returns the participations expired.
+	/// before median time `cutoff` and not released since: its forfeits for
+	/// that round never came, or came and were never all co-signed. Each
+	/// becomes expired, its new leaves expired (never credited; their
+	/// preimage never goes out, and the operator sweeps them); each of its
+	/// forfeits for that round without the operator's half is dropped, so the
+	/// signer is never asked for it again ([`Store::unsigned_forfeits`]); and
+	/// each coin it gave up under no forfeit left is given back
+	/// ([`give_back`]). A coin under a forfeit the operator holds whole stays
+	/// given up: that forfeit's claim would reveal the preimage, and its
+	/// owner's way home is its refund or its exit. Returns the participations
+	/// expired.
 	pub async fn expire_participations(&self, cutoff: u32) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;
 		let due = conn.query(
 			"SELECT p.participation_id FROM participation p JOIN round r ON r.round_id = p.round_id
 			 WHERE p.state = 'issued' AND r.state = 'final' AND r.final_mtp <= $1
-			   AND NOT EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = p.participation_id AND f.round_id = p.round_id)
 			 ORDER BY p.participation_id",
 			&[&(cutoff as i64)],
 		).await?;
@@ -906,7 +911,8 @@ impl Store {
 	/// [`Store::expire_participations`] for one participation, whole or not
 	/// at all, its row locked first so that a forfeit step in flight either
 	/// completes before it, and the participation does not expire, or finds
-	/// it expired.
+	/// it expired and stores nothing: a co-signature the signer gave it then
+	/// is dropped with the request.
 	async fn expire_participation(&self, id: &[u8; 32], cutoff: u32) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
@@ -920,9 +926,8 @@ impl Store {
 			Some(r) => (r.get(0), r.get(1)),
 			None => return Ok(false),
 		};
-		if t.query_opt("SELECT 1 FROM forfeit WHERE participation_id = $1 AND round_id = $2", &[&&id[..], &round_id]).await?.is_some() {
-			return Ok(false);
-		}
+		t.execute("DELETE FROM forfeit WHERE participation_id = $1 AND round_id = $2 AND operator_sig IS NULL", &[&&id[..], &round_id])
+			.await?;
 		t.execute("UPDATE participation SET state = 'expired', updated_at = now() WHERE participation_id = $1", &[&&id[..]]).await?;
 		t.execute(
 			"UPDATE leaf SET state = 'expired', updated_at = now()

@@ -9,7 +9,14 @@ use serde_json::Value;
 pub struct Arca {
 	pub name: String,
 	pub dir: PathBuf,
+	/// The `--witness-patience` each command is run with, in seconds: a few,
+	/// so that a test whose operator is gone does not wait a minute at each
+	/// `sync`; a test of the patience itself sets the wallet's default.
+	pub patience: std::cell::Cell<u64>,
 }
+
+/// The patience the tests run the wallet with, unless one sets another.
+pub const TEST_PATIENCE: u64 = 3;
 
 /// Every wallet name taken in this process: the tests of one binary run at
 /// once in one process, and two wallets of one name would share, and delete,
@@ -26,14 +33,14 @@ impl Arca {
 		}
 		let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("arca-cli-wallet-{}-{}", std::process::id(), name));
 		let _ = std::fs::remove_dir_all(&dir);
-		Arca { name: name.into(), dir }
+		Arca { name: name.into(), dir, patience: std::cell::Cell::new(TEST_PATIENCE) }
 	}
 
 	/// Runs `arca` with `args`: whether it succeeded, its JSON, and what it
 	/// wrote to its standard error.
 	pub fn run_full(&self, args: &[&str]) -> (bool, Value, String) {
 		let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca"))
-			.arg("--datadir").arg(&self.dir).args(args)
+			.arg("--datadir").arg(&self.dir).arg("--witness-patience").arg(self.patience.get().to_string()).args(args)
 			.env("ARCA_NODE_PASSWORD", "arca").output().expect("run arca"));
 		let json: Value = serde_json::from_slice(&out.stdout)
 			.unwrap_or_else(|e| panic!("{} {:?}: not JSON ({}): {}\n{}", self.name, args, e, String::from_utf8_lossy(&out.stdout),
@@ -44,7 +51,7 @@ impl Arca {
 	/// Runs `arca` with `args`: whether it succeeded, and its JSON.
 	pub fn run(&self, args: &[&str]) -> (bool, Value) {
 		let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca"))
-			.arg("--datadir").arg(&self.dir).args(args)
+			.arg("--datadir").arg(&self.dir).arg("--witness-patience").arg(self.patience.get().to_string()).args(args)
 			.env("ARCA_NODE_PASSWORD", "arca").output().expect("run arca"));
 		let json: Value = serde_json::from_slice(&out.stdout)
 			.unwrap_or_else(|e| panic!("{} {:?}: not JSON ({}): {}\n{}", self.name, args, e, String::from_utf8_lossy(&out.stdout),

@@ -206,8 +206,9 @@ A board, and every coin resting on it, carries the dates of a batch made
 when the board confirmed: its service expiry is 28 days after the median
 time of the block that holds its transaction, and its exit deadline three
 days before that (`board_status`, `info.boards`). Up to the exit deadline the
-server co-signs spends of a coin resting on the board; after it, it takes the
-coin only into a refresh, up to a day before the expiry. Past its expiry a
+server co-signs spends of a coin resting on the board and takes it into a
+refresh, as for a coin resting on a batch; after it, the owner takes the coin
+on the chain. Past its expiry a
 coin resting on the board is the owner's to take on-chain, and the operator
 may bring its lineage on the chain to collect a coin of it that was given up
 (see the watcher). A rollback that moves the board's transaction to another
@@ -231,7 +232,7 @@ asset and a value. The server co-signs only when every rule holds:
   second spend of a leaf is refused, which is the whole of the double-spend
   protection before a round;
 - each input resting on a board is before the board's exit deadline
-  (`invalid_coin` after it: the coin is taken only into a refresh);
+  (`invalid_coin` after it: its owner takes the coin on the chain);
 - nothing of the coin's lineage, its own leaf included, has been seen paid on
   the chain, in a block or in the mempool, and every board it rests on is
   credited and unspent: an Arca leaf on the chain past its exit delay can be
@@ -300,12 +301,10 @@ script to pay). The server accepts it only when:
 - every coin given up passes the same check as a transfer's input: known,
   live, given up nowhere else, its record valid, every board it rests on
   credited and unspent, nothing of its lineage on the chain, and its first
-  expiry at least three days ahead: a coin is taken only up to its exit
-  deadline. A coin resting on a board is taken past the board's exit
-  deadline, until a day before the board's expiry: after the deadline a
-  refresh is the one way it is taken. Its attestation verifies, and an
-  earliest round time asked for lies before the last time every coin is
-  taken;
+  expiry (or the service expiry of a board it rests on, whichever comes
+  first) at least three days ahead: a coin is taken only up to its exit
+  deadline. Its attestation verifies, and an earliest round time asked for
+  lies before every coin's exit deadline;
 - every leaf wanted is within the published bounds, under a key that owns no
   leaf, that no other participation standing wants and that is not the
   operator's `S` (`operator_key`), and its key proof verifies
@@ -360,10 +359,12 @@ the lowest nodes, each leaf behind its participation's hash-locked entry, the
 reserve at four times the node's floor in the batch asset. A batch in an asset
 the node does not accept for fees carries a reserve of one atom on every node
 and every entry, so whoever unrolls it attaches a fee coin in an asset that is
-accepted. A coin is checked again under a horizon of one day before its first
-expiry: a participation accepted before its exit deadline still runs if a
-round takes it by then, and one with a coin past that can never run and is
-voided, its coins given back. A batch holds at most 1,024 leaves; a participation runs whole in one
+accepted. A coin is checked again under the horizon it was taken under, its
+exit deadline, at each round and at every pass over the rounds: a pending
+participation with a coin past its exit deadline can never run and is voided
+then, whether a round is being built or not, its coins given back; from that
+deadline their owner takes them on the chain. A batch holds at most 1,024
+leaves; a participation runs whole in one
 round, its leaves in several assets included. The participations are taken
 against what the operator's wallet can spend of each asset now: per asset,
 what the round pays on their behalf (each batch output, leaves and reserves
@@ -549,14 +550,19 @@ A new leaf is live, and can be paid on out of round, once its participation
 is released and its round final; a coin resting on a leaf of a round that is
 not final is not co-signed (`round_not_final`).
 
-The forfeits are due within a day of the round being found final. A
-participation whose forfeits have not come by then expires: its new leaves
-are never credited (their preimage never goes out, and the operator sweeps
-them with their batch at expiry), and each coin it gave up for which no
-forfeit was signed is given back, live again and free to be given up again. A
-coin under a forfeit signed for an earlier, lost round stays given up. A forfeit step that reaches the server after the expiry, even one in
-flight when it ran, is refused (`not_in_round`) and stores nothing. A round
-that stops being final and becomes final again starts the day again.
+The forfeits are due, and co-signed, within a day of the round being found
+final. A participation not released by then expires, whether its forfeits
+never came or came and were never co-signed (the signer away, or its
+keepers): its new leaves are never credited (their preimage never goes out,
+and the operator sweeps them with their batch at expiry), each of its
+forfeits without the operator's half is dropped, never asked of the signer
+again, and each coin it gave up under no forfeit left is given back, live
+again and free to be given up again. A coin under a forfeit the operator
+holds whole, or under one signed for an earlier, lost round, stays given up:
+its owner's way home is that forfeit's refund or its exit. A forfeit step
+that reaches the server after the expiry, even one in flight when it ran, is
+refused (`not_in_round`) and stores nothing. A round that stops being final
+and becomes final again starts the day again.
 
 `release_leaves` then takes the owner's release of the lowest node of each
 coin it gave up: the owner's signature, with the coin's own key, over
@@ -1394,10 +1400,11 @@ owners have yet to release. A coin paid out of round from a board and then
 refreshed by its receiver waits while the sender's change rests live on the
 same lineage: the board shows its dates, and the watcher publishes nothing.
 Past the board's exit deadline the change is refused in a transfer
-(`invalid_coin`) and taken into a refresh; with no live coin left on the
-lineage the watcher publishes, before the board's expiry, the board's
-checkpoint, the reassignment and both forfeits, and claims them; once the
-claims are final it no longer scans either coin. And an anchor-driven
+(`invalid_coin`) and in a refresh, and the watcher still publishes nothing
+while it rests live on the lineage; from the board's expiry the watcher
+publishes the board's checkpoint, the reassignment and B's forfeit, and
+claims it, the change coming on the chain as its owner's leaf; once the
+claim is final it no longer scans B's coin. And an anchor-driven
 reorganisation: the parent
 chain orphans the block a round and the watcher's answer to a stale exit are
 anchored to and every block above; the node disconnects them all, the server
@@ -1431,13 +1438,16 @@ coin is live again and given up again in a new participation, its new leaf is
 expired, a good forfeit for it is refused and stores nothing, its new leaf's
 key is free again and wanted by the new participation, and a participation of
 the same round whose
-forfeits came is untouched. On batch leaves of a round whose first expiry is
+forfeits came is untouched. So does one whose forfeit came while the signer
+was away and was never co-signed: the forfeit is dropped, the signer is asked
+nothing for it once back, and the coin, live again, runs in a new round and
+completes. On batch leaves of a round whose first expiry is
 `E`: six days before `E` a refresh is charged for the day before the free
 window, and refused one atom short; four days before it is free and runs; a
 round time asked for past the exit deadline is refused; past the exit
 deadline a coin is refused; and a participation accepted before the deadline
-whose coin passes one day before `E` with no round taking it is voided by the
-next round, its coin live again.
+whose coin passes its exit deadline with no round taking it is voided by the
+next pass over the rounds, no round built, its coin live again.
 
 `tests/signer.rs` runs `arca-signer` as its own process: its key, a
 rebindable message, and the spend of a clock's release whose signature verifies

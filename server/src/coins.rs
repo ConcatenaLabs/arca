@@ -13,7 +13,7 @@
 //! A coin resting on a board is taken only within the board's dates
 //! ([`Params::BOARD_LIFETIME`]): the board's service expiry, 28 days after the
 //! median time of the block that confirms it, less a horizon the caller
-//! names (the exit deadline for a transfer, a day for a refresh). A transfer
+//! names (the exit deadline, for a transfer and a refresh alike). A transfer
 //! the server recorded, which was within them then, completes when repeated
 //! whatever they have become since ([`BoardDates`]); so does one of a coin
 //! resting on a batch past that batch's exit deadline, until the batch
@@ -71,7 +71,7 @@ pub enum CoinError {
 	/// It rests on a board whose service ends at `expiry`, less than
 	/// `horizon` seconds ahead.
 	#[error("leaf {leaf} rests on a board whose service ends at median time {expiry}: it is taken here only until {horizon} s before \
-		that (a transfer up to its exit deadline, a refresh up to a day before)")]
+		that, its exit deadline, for a transfer and a refresh alike)")]
 	PastBoardDate { leaf: LeafId, expiry: u32, horizon: u32 },
 	#[error(transparent)]
 	Store(#[from] StoreError),

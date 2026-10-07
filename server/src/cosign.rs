@@ -164,10 +164,10 @@ pub enum CosignError {
 	OpenReassignment(LeafId),
 	#[error("one transaction could satisfy this reassignment and one already co-signed, and give one side's value to whoever broadcast it: {0}")]
 	Mergeable(String),
-	/// A coin resting on a board past its exit deadline: the operator takes
-	/// it only into a refresh.
+	/// A coin resting on a board past its exit deadline: its owner takes it
+	/// on the chain.
 	#[error("leaf {leaf} rests on a board whose exit deadline has passed (its service ends at median time {expiry}): the operator \
-		takes it only into a refresh")]
+		co-signs no spend of it and takes it into no refresh; its owner takes it on the chain")]
 	PastBoardDate { leaf: LeafId, expiry: u32 },
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
