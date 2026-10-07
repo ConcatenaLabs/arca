@@ -555,6 +555,94 @@ pub fn mark_acknowledged(record: &Path, entry: u64, hash: &[u8; 32]) -> Result<(
 	Ok(())
 }
 
+/// Where the signer keeps, beside the record at `record`, what it has seen
+/// each of the record's keepers hold: the highest entry each named or
+/// acknowledged, and whether it is a lost keeper, and why
+/// ([`write_keepers_seen`]). It is read at every start, so a keeper that
+/// answers below what it held, after a restart of the signer, is a lost
+/// keeper, as it is within one run, and a lost keeper stays one.
+pub fn keepers_seen_path(record: &Path) -> PathBuf {
+	let mut p = record.as_os_str().to_owned();
+	p.push(".keepers-seen");
+	PathBuf::from(p)
+}
+
+/// The first line of [`keepers_seen_path`]'s file.
+const KEEPERS_SEEN_MAGIC: &str = "arca-keepers-seen 1";
+
+/// What the signer has seen one keeper hold: the highest entry it named or
+/// acknowledged, and why it is a lost keeper, once it is one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeeperSeen {
+	pub held: Option<u64>,
+	pub lost: Option<String>,
+}
+
+/// What the signer has seen each keeper hold, by the keeper's key, as kept
+/// beside the record at `record`: empty when nothing is kept there yet. A
+/// file that does not read is an error, never taken for empty.
+pub fn read_keepers_seen(record: &Path) -> Result<std::collections::BTreeMap<[u8; 32], KeeperSeen>, String> {
+	let path = keepers_seen_path(record);
+	let text = match std::fs::read_to_string(&path) {
+		Ok(t) => t,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+		Err(e) => return Err(format!("{}: {}", path.display(), e)),
+	};
+	let bad = |l: &str| format!("{}: not a line of what the signer saw its keepers hold: {:?}", path.display(), l);
+	let mut lines = text.lines();
+	if lines.next() != Some(KEEPERS_SEEN_MAGIC) {
+		return Err(format!("{}: it does not start with {:?}", path.display(), KEEPERS_SEEN_MAGIC));
+	}
+	let mut out = std::collections::BTreeMap::new();
+	for l in lines.filter(|l| !l.is_empty()) {
+		let mut f = l.splitn(3, ' ');
+		let (Some(key), Some(held)) = (f.next(), f.next()) else { return Err(bad(l)) };
+		let key = unhex32(key).map_err(|_| bad(l))?;
+		let held = match held {
+			"none" => None,
+			n => Some(n.parse::<u64>().map_err(|_| bad(l))?),
+		};
+		let lost = match f.next() {
+			None => None,
+			Some(rest) => Some(rest.strip_prefix("lost ").ok_or_else(|| bad(l))?.to_string()),
+		};
+		out.insert(key, KeeperSeen { held, lost });
+	}
+	Ok(out)
+}
+
+/// Writes what the signer has seen each keeper hold beside the record at
+/// `record`, whole or not at all: to a new file, synced, then renamed over
+/// the old one, with the directory synced. The signer writes it before it
+/// releases anything that taught it more, and releases nothing it cannot
+/// write it for.
+pub fn write_keepers_seen(record: &Path, seen: &[([u8; 32], KeeperSeen)]) -> Result<(), String> {
+	use std::io::Write;
+	use std::os::unix::fs::OpenOptionsExt;
+	let path = keepers_seen_path(record);
+	let mut tmp = path.as_os_str().to_owned();
+	tmp.push(".new");
+	let tmp = PathBuf::from(tmp);
+	let fail = |p: &Path, e: std::io::Error| format!("{}: {}", p.display(), e);
+	let mut text = format!("{}\n", KEEPERS_SEEN_MAGIC);
+	for (key, s) in seen {
+		text.push_str(&format!("{} {}", hex(key), s.held.map(|n| n.to_string()).unwrap_or_else(|| "none".into())));
+		if let Some(why) = &s.lost {
+			text.push_str(&format!(" lost {}", why.replace('\n', " ")));
+		}
+		text.push('\n');
+	}
+	let _ = std::fs::remove_file(&tmp);
+	let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| fail(&tmp, e))?;
+	f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| fail(&tmp, e))?;
+	drop(f);
+	std::fs::rename(&tmp, &path).map_err(|e| fail(&path, e))?;
+	if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+		std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| fail(dir, e))?;
+	}
+	Ok(())
+}
+
 /// The head a proof of a rollback kept beside the record names, from its
 /// `head <entry> <hash> <signature>` line.
 fn stop_head_of(text: &str) -> Option<WireEntryRef> {
@@ -1561,6 +1649,11 @@ impl SpendRecord {
 				.and_then(|(n, h)| Some((n.parse::<u64>().ok()?, unhex32(h.trim_end_matches(':')).ok()?)))
 				.unwrap_or((base.0, base.1));
 			mark_acknowledged(into, entry, &hash)?;
+		}
+		// And what the signer saw each keeper hold, its lost keepers with it.
+		let seen = read_keepers_seen(from)?;
+		if !seen.is_empty() {
+			write_keepers_seen(into, &seen.into_iter().collect::<Vec<_>>())?;
 		}
 		Ok((carried, dropped, base))
 	}

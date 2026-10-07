@@ -709,6 +709,10 @@ async fn the_record_names_its_keepers_and_the_signer_serves_only_with_them() {
 	// What the keepers acknowledged goes over with it.
 	let said = std::fs::read_to_string(server::signer::acknowledged_path(&compacted)).unwrap();
 	assert_eq!(said, std::fs::read_to_string(server::signer::acknowledged_path(&record)).unwrap());
+	// So does what the signer saw each keeper hold.
+	let seen = server::signer::read_keepers_seen(&compacted).unwrap();
+	println!("what the signer saw its keepers hold, carried over: {:?}", seen);
+	assert!(seen.len() == 2 && seen == server::signer::read_keepers_seen(&record).unwrap(), "{:?}", seen);
 	assert!(header.starts_with(&format!("arca-signer-record 4 {} {} keepers=2:{},{} 3 ", hex(&xonly(&t.s).serialize()), t.genesis, h1, h2)),
 		"{}", header);
 	std::fs::write(&record, text.replacen(&format!("keepers=2:{},{}", h1, h2), &format!("keepers=1:{}", h1), 1)).unwrap();
@@ -1187,4 +1191,127 @@ async fn a_new_operator_with_keepers_is_made_in_the_readmes_order() {
 		let _ = c.wait();
 	}
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R7h F4, KL turned around. Two of three keepers. Entries 1 and 2 are held
+/// by all three; keeper 2 is down while the signer signs entries 3 and 4
+/// (spends of salts 3 and 4 into 9,000), which keepers 0 and 1 acknowledge,
+/// and the signer writes what it saw each keeper hold beside its record
+/// (`<record>.keepers-seen`). Then keeper 0's heads file comes back from its
+/// copy at entry 2, keeper 1 is unreachable, and keeper 2 is back at entry
+/// 2. The signer restarted: keeper 0 names entry 2, below entry 4 the signer
+/// saw it hold before the restart, so it is a lost keeper and no answer; the
+/// start check has one answer of the two it needs, and nothing is released.
+/// Started again, keeper 0 is still lost. The record itself then put back to
+/// a copy taken at entry 2, its side file as the signer wrote it: the second
+/// spends of salts 3 and 4 are released to no one, and once keeper 1
+/// answers, its entry 4, past the record's end, stops the signer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_gone_back_is_lost_across_a_restart_of_the_signer() {
+	let (k0, k1, k2) = (keypair("keeper zero"), keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k0, &k1, &k2], 2);
+	let mut keeper0 = KeeperProcess::start(&k0, xonly(&t.s), t.genesis);
+	let mut keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let mut keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let args = keepers_args(&[keeper0.arg(), keeper1.arg(), keeper2.arg()]);
+	let record = t.dir.join("signer.record");
+	let first = Signer::start(&t.dir, "first", t.genesis, &args);
+	for i in 1..=2u8 {
+		let v = raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k0, &k1, &k2]), "{}", v);
+	}
+	let record_at_2 = std::fs::read(&record).unwrap();
+	let keeper0_at_2 = std::fs::read(keeper0.heads()).unwrap();
+	keeper2.halt();
+	for i in 3..=4u8 {
+		let v = raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string() && acked_by(&v, &t.s, t.genesis, &[&k0, &k1]), "{}", v);
+	}
+	let seen = std::fs::read_to_string(keepers_seen_path(&record)).unwrap_or_default();
+	println!("KL what the signer saw, beside its record:\n{}", seen.trim_end());
+	drop(first);
+	// Keeper 0 back from its copy at entry 2; keeper 1 unreachable; keeper 2
+	// back, at entry 2.
+	keeper0.halt();
+	std::fs::write(keeper0.heads(), &keeper0_at_2).unwrap();
+	keeper0.resume();
+	keeper1.halt();
+	keeper2.resume();
+	println!("KL keeper 0 holds {:?} (gone back), keeper 1 down, keeper 2 holds {:?}", keeper0.held(), keeper2.held());
+	for run in ["restarted", "started again"] {
+		let s = Signer::start(&t.dir, run, t.genesis, &args);
+		let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, [5; 32], t.asset, 9_000)).await;
+		println!("KL the signer {}: a new spend: signed {} | {} | {}", run, v["signature"].is_string(), v["code"],
+			v["error"].as_str().map(|e| &e[..e.len().min(240)]).unwrap_or(""));
+		assert!(v["signature"].is_null(), "{}: released with keepers 0 and 2: {}", run, v);
+		assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+		let e = v["error"].as_str().unwrap();
+		assert!(e.contains("1 of the 3 keepers answered") && e.contains("a lost keeper"), "{}", e);
+		assert!(e.contains(if run == "restarted" { "holds entry 2, below entry 4 it held" } else { "a lost keeper" }), "{}", e);
+		assert!(!s.stopped(), "{}", s.log());
+	}
+	// The record alone back at entry 2, its side file as the signer wrote it.
+	std::fs::write(&record, &record_at_2).unwrap();
+	let s = Signer::start(&t.dir, "record back", t.genesis, &args);
+	for i in 3..=4u8 {
+		let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 8_000)).await;
+		println!("KL the record back at entry 2: the second spend of salt {} (8,000 where 9,000 was signed): signed {} | {} | {}", i,
+			v["signature"].is_string(), v["code"], v["error"].as_str().map(|e| &e[..e.len().min(160)]).unwrap_or(""));
+		assert!(v["signature"].is_null(), "a second spend released: {}", v);
+		assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+	}
+	keeper1.resume();
+	let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, [3; 32], t.asset, 8_000)).await;
+	println!("KL keeper 1 back: salt 3 again: signed {} | {} | stopped {}", v["signature"].is_string(), v["code"], s.stopped());
+	assert!(v["signature"].is_null(), "{}", v);
+	assert!(s.stopped(), "keeper 1's entry 4, past the record's end, stops the signer: {}", s.log());
+	for (k, n) in [(&k0, 4), (&k1, 4), (&k2, 2)] {
+		assert!(seen.lines().any(|l| l == format!("{} {}", hex(&xonly(k).serialize()), n)), "{}", seen);
+	}
+	drop(s);
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// Where the signer keeps what it saw its keepers hold, beside `record`.
+fn keepers_seen_path(record: &std::path::Path) -> std::path::PathBuf {
+	std::path::PathBuf::from(format!("{}.keepers-seen", record.display()))
+}
+
+/// R7h F4. What the signer saw its keepers hold, and the first head they
+/// acknowledged, are noted beside the record before anything is released:
+/// a signer that cannot write beside its record (its directory made
+/// read-only) records the entry, gets the keeper's acknowledgement, and
+/// releases nothing; once it can write again, the same request completes,
+/// as the same entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signer_that_cannot_note_what_its_keepers_hold_releases_nothing() {
+	use std::os::unix::fs::PermissionsExt;
+	for first_head in [true, false] {
+		let k = keypair("keeper one");
+		let t = setup(&[&k], 1);
+		let keeper = KeeperProcess::start(&k, xonly(&t.s), t.genesis);
+		let s = Signer::start(&t.dir, "signer", t.genesis, &keepers_args(&[keeper.arg()]));
+		if !first_head {
+			let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, [1; 32], t.asset, 9_000)).await;
+			assert!(v["signature"].is_string(), "{}", v);
+		}
+		let salt = [7u8; 32];
+		std::fs::set_permissions(&t.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+		let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, salt, t.asset, 9_000)).await;
+		std::fs::set_permissions(&t.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+		let tag = if first_head { "the first head" } else { "a later head" };
+		println!("{}, the record's directory read-only: signed {} | {} | {}", tag, v["signature"].is_string(), v["code"],
+			v["error"].as_str().map(|e| &e[..e.len().min(240)]).unwrap_or(""));
+		assert!(v["signature"].is_null(), "{}: released though nothing could be noted: {}", tag, v);
+		assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+		assert!(v["error"].as_str().unwrap().contains("cannot note beside its record"), "{}", v);
+		let again = raw(&s.socket, &rebind_into(&t.owner, t.genesis, salt, t.asset, 9_000)).await;
+		println!("{}, writable again: signed {} | entry {}", tag, again["signature"].is_string(), again["entry"]["entry"]);
+		assert!(again["signature"].is_string(), "{}", again);
+		assert_eq!(again["entry"]["entry"], if first_head { 1 } else { 2 }, "the same entry: {}", again);
+		assert!(server::signer::acknowledged_path(&t.dir.join("signer.record")).exists());
+		assert!(keepers_seen_path(&t.dir.join("signer.record")).exists());
+		drop(s);
+		let _ = std::fs::remove_dir_all(&t.dir);
+	}
 }
