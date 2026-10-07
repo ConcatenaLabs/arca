@@ -704,7 +704,13 @@ impl Wallet {
 				auths.push((sig, t));
 			}
 			let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
-			let a = self.assess(&coin, &self.receipt_policy(now), Some((&record.owner, &nonce)))?;
+			// The leaf was accepted before any forfeit left the wallet. A
+			// claim publishes the preimage at any time the forfeit's output
+			// lives, and the operator takes the forfeits until the coins' exit
+			// deadline, so the leaf is completed when it is, in its last days
+			// or past its expiry as well: as an exit checks a coin held.
+			let first = record.schedule.expiries()[0].to_consensus_u32();
+			let a = self.assess(&coin, &self.followed_policy(first, now), Some((&record.owner, &nonce)))?;
 			let row = self.row(&coin, &a, if a.all_final() { "live" } else { "pending" }, "")?;
 			if self.store.coin(&row.leaf_id)?.is_none() {
 				let id = row.leaf_id.clone();
@@ -733,9 +739,13 @@ impl Wallet {
 
 impl Wallet {
 	/// The forfeit the wallet signed, as `f` records it, of the coin `row`.
+	/// The coin is checked as of its expiry once that has passed, as an exit
+	/// checks it: a forfeit is followed until a spend of its output is final,
+	/// and the chain can decide it, or undo what it decided, at any time the
+	/// output lives, past the coin's expiry as before it.
 	pub(crate) fn forfeit_of(&self, row: &super::store::CoinRow, f: &ForfeitRow) -> Result<Forfeit, Error> {
 		let record = Self::record_of(row)?;
-		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		let policy = self.followed_policy(row.expiry, self.now()?);
 		let coin = record.resolve(&self.accepted_bases(&record)?, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let round = Txid::from_str(&f.round).map_err(|e| Error::Store(e.to_string()))?;
 		let refund = RelativeTime::from_units(f.refund_units).map_err(|e| Error::Store(e.to_string()))?;
