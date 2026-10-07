@@ -190,13 +190,17 @@ impl Params {
 	}
 
 	/// How long after its round is final a participation's forfeits may come
-	/// and be co-signed, in seconds: one day. A participation not released by
-	/// then expires, whether its forfeits never came or came and were never
-	/// co-signed (the signer away, or its keepers): each forfeit without the
-	/// operator's half is dropped, never to be asked for again, the coins it
-	/// gave up are the owner's again (one under a forfeit the operator holds
-	/// whole excepted), and its new leaves, whose preimage never goes out, are
-	/// swept with their batch.
+	/// and be co-signed at least, in seconds: one day. They are taken until
+	/// the later of that and the exit deadline of the coins the participation
+	/// gave up ([`crate::rounds::Rounds::exit_deadline_of`]), so a refresh
+	/// asked for in a coin's free window completes at any sync before the
+	/// coin's exit date. A participation not released by then expires, whether
+	/// its forfeits never came or came and were never co-signed (the signer
+	/// away, or its keepers): each forfeit without the operator's half is
+	/// dropped, never to be asked for again, the coins it gave up are the
+	/// owner's again (one under a forfeit the operator holds whole excepted),
+	/// and its new leaves, whose preimage never goes out, are swept with their
+	/// batch.
 	pub const FORFEIT_DEADLINE: u32 = 86_400;
 
 	/// The policy the server checks records and coins under, at `now`: its

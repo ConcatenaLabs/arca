@@ -890,17 +890,8 @@ impl Store {
 	/// owner's way home is its refund or its exit. Returns the participations
 	/// expired.
 	pub async fn expire_participations(&self, cutoff: u32) -> Result<Vec<[u8; 32]>, StoreError> {
-		let conn = self.conn().await?;
-		let due = conn.query(
-			"SELECT p.participation_id FROM participation p JOIN round r ON r.round_id = p.round_id
-			 WHERE p.state = 'issued' AND r.state = 'final' AND r.final_mtp <= $1
-			 ORDER BY p.participation_id",
-			&[&(cutoff as i64)],
-		).await?;
-		drop(conn);
 		let mut expired = vec![];
-		for r in due {
-			let id = array32(r.get(0), "participation id")?;
+		for id in self.overdue_participations(cutoff).await? {
 			if self.expire_participation(&id, cutoff).await? {
 				expired.push(id);
 			}
@@ -908,12 +899,26 @@ impl Store {
 		Ok(expired)
 	}
 
+	/// The participations issued in a round found final at or before median
+	/// time `cutoff` and not released since, oldest id first: those
+	/// [`Store::expire_participation`] may expire.
+	pub async fn overdue_participations(&self, cutoff: u32) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let due = conn.query(
+			"SELECT p.participation_id FROM participation p JOIN round r ON r.round_id = p.round_id
+			 WHERE p.state = 'issued' AND r.state = 'final' AND r.final_mtp <= $1
+			 ORDER BY p.participation_id",
+			&[&(cutoff as i64)],
+		).await?;
+		due.iter().map(|r| array32(r.get(0), "participation id")).collect()
+	}
+
 	/// [`Store::expire_participations`] for one participation, whole or not
 	/// at all, its row locked first so that a forfeit step in flight either
 	/// completes before it, and the participation does not expire, or finds
 	/// it expired and stores nothing: a co-signature the signer gave it then
-	/// is dropped with the request.
-	async fn expire_participation(&self, id: &[u8; 32], cutoff: u32) -> Result<bool, StoreError> {
+	/// is dropped with the request. Returns whether it expired.
+	pub async fn expire_participation(&self, id: &[u8; 32], cutoff: u32) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let row = t.query_opt(

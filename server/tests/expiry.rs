@@ -123,15 +123,21 @@ async fn a_participation_whose_forfeits_never_come_expires() {
 	assert!(r.server.rounds.expire().await.unwrap().is_empty(), "nothing is overdue yet");
 	assert_eq!(status(&r, &pa)["state"], "issued");
 
-	// A day after the round was found final, A's participation expires.
-	// (The server's own pass on the new blocks may expire it first.)
+	// A day after the round was found final A's participation still waits:
+	// its forfeits are taken until its coin's exit deadline, which is later.
 	advance_mtp(&r, DAY + 600).await;
 	r.synced().await;
 	r.server.rounds.pass().await.unwrap();
 	let tip = r.server.store.tip_block().await.unwrap().unwrap();
 	assert!(tip.median_time as u32 >= final_at + DAY);
+	assert_eq!(status(&r, &pa)["state"], "issued", "a day on, before its coin's exit deadline");
+	// At its coin's exit deadline it expires. (The server's own pass on the
+	// new blocks may expire it first.)
+	let deadline = board_exit_deadline(&r, &a_board.id).await;
+	to_time(&r, deadline + 600).await;
+	r.server.rounds.pass().await.unwrap();
 	let sa = status(&r, &pa);
-	println!("A after a day: {}", sa);
+	println!("A past its coin's exit deadline ({}): {}", deadline, sa);
 	assert_eq!(sa["state"], "expired");
 	assert_eq!(status(&r, &pb)["state"], "released");
 	assert_eq!(leaf_states(&r, &a), vec!["live"], "A's board is A's again");
@@ -152,14 +158,15 @@ async fn a_participation_whose_forfeits_never_come_expires() {
 		other => panic!("an expired participation completed: {:?}", other.map(|_| ())),
 	}
 	assert_eq!(status(&r, &pa)["state"], "expired");
-	// A's new leaf was never credited: its key is free again, and A's board,
-	// given back by the expiry, is given up again in a new participation that
-	// wants a leaf under that same key.
-	let (ans, pa3, _) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	// A's new leaf was never credited: its key is free again, wanted by a new
+	// participation giving up another board of A's. (A's board, given back
+	// past its exit deadline, is its owner's to take on the chain.)
+	let a_other = keypair("A, another board");
+	let (other, _) = credited_board(&mut r, &a_other, x).await;
+	let (ans, pa3, _) = submit(&r, &other, &a2, VALUE, 0, None);
 	assert_eq!(ans.ok()["state"], "pending");
 	assert_ne!(pa3, pa);
-	assert_eq!(leaf_states(&r, &a), vec!["spent"]);
-	println!("A's board, given back by the expiry, is given up again in {}", hex(&pa3));
+	println!("A's new leaf's key, free again, is wanted in {}", hex(&pa3));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,12 +196,17 @@ async fn a_participation_whose_forfeits_are_never_cosigned_expires() {
 	assert!(r.server.rounds.expire().await.unwrap().is_empty(), "nothing is overdue yet");
 	assert_eq!(status(&r, &pa)["state"], "issued");
 
-	// A day after the round was found final it expires all the same.
+	// A day after the round was found final it waits; at its coin's exit
+	// deadline it expires all the same.
 	advance_mtp(&r, DAY + 600).await;
 	r.synced().await;
 	r.server.rounds.pass().await.unwrap();
+	assert_eq!(status(&r, &pa)["state"], "issued", "a day on, before its coin's exit deadline");
+	let deadline = board_exit_deadline(&r, &a_board.id).await;
+	to_time(&r, deadline + 600).await;
+	r.server.rounds.pass().await.unwrap();
 	let sa = status(&r, &pa);
-	println!("A a day on, its forfeit never co-signed: {}", sa);
+	println!("A past its coin's exit deadline, its forfeit never co-signed: {}", sa);
 	assert_eq!(sa["state"], "expired", "{}", sa);
 	assert_eq!(sa["inputs"][0]["returned"], true, "{}", sa);
 	assert!(r.server.store.unsigned_forfeits().await.unwrap().is_empty(), "the forfeit without the operator's half is dropped");
@@ -202,21 +214,83 @@ async fn a_participation_whose_forfeits_are_never_cosigned_expires() {
 	assert_eq!(leaf_states(&r, &a), vec!["live"], "A's board is A's again");
 	assert_eq!(leaf_states(&r, &a2), vec!["expired"], "A's new leaf is never credited");
 
-	// The signer back: nothing is asked of it for the expired participation,
-	// and A's board, given up again, runs in a new round and completes.
+	// The signer back: nothing is asked of it for the expired participation.
 	let genesis = r.rt.client().genesis_hash().unwrap();
 	r.signer.restart(&r.s, genesis);
 	assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 0);
-	let a3 = keypair("A, again");
-	let (ans, pa3, a3_nonce) = submit(&r, &a_board, &a3, VALUE, 0, None);
+	let _ = a_tx;
+}
+
+/// The exit deadline of the board coin `id`, as the server dates it: its
+/// service expiry, [`Params::BOARD_LIFETIME`] after the median time of the
+/// block holding the board, less the exit deadline.
+async fn board_exit_deadline(r: &Running, id: &LeafId) -> u32 {
+	let b = r.server.store.board(&id.0).await.unwrap().expect("a board");
+	let block = r.server.store.tx_location(&b.txid).await.unwrap().expect("in a block");
+	Params::board_expiry(block.median_time as u32) - Params::PARTICIPATION_HORIZON
+}
+
+/// R7h F2 at the server. A participation's forfeits are taken until the
+/// later of a day after its round was found final and its coins' exit
+/// deadline, so a holder that asked in its coin's free window completes the
+/// refresh at any sync before the coin's exit date. A and B give up boards
+/// in one round. 25 hours after the round was found final neither has
+/// expired, and A's forfeit, handed over then, releases A's. B's, never
+/// handed over, is still issued ten minutes before its coin's exit deadline,
+/// and expires at the first pass after it, its board given back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_forfeits_are_taken_until_the_coins_exit_deadline() {
+	let mut r = start().await;
+	let x = r.x;
+	let (a, b) = (keypair("A"), keypair("B"));
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let (b_board, _) = credited_board(&mut r, &b, x).await;
+	let (a2, b2) = (keypair("A, new"), keypair("B, new"));
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
 	assert_eq!(ans.ok()["state"], "pending");
-	let again = r.server.rounds.run_round().await.unwrap().unwrap();
+	let (ans, pb, _) = submit(&r, &b_board, &b2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	r.produce().await;
 	r.bury().await;
-	round_final(&r, &again.tx.txid()).await;
-	complete(&r, &pa3, &a_board, &a, &a_tx, &a3, &a3_nonce).await;
-	assert_eq!(leaf_states(&r, &a3), vec!["live"]);
-	println!("A's board, given back by the expiry, ran again in round {} and completed", again.tx.txid());
+	round_final(&r, &built.tx.txid()).await;
+	let found = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(built.tx.txid())).await.unwrap().unwrap();
+	let final_at = found.final_mtp.expect("a final round knows when it was found final");
+	let deadline = board_exit_deadline(&r, &b_board.id).await;
+	println!("round {} found final at median time {}; B's board's exit deadline {}", built.tx.txid(), final_at, deadline);
+	// A validates its new leaf now, as its wallet does when it asks.
+	let (a2_valid, a2_record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
+	let st_a = status(&r, &pa);
+
+	advance_mtp(&r, DAY + 3_600).await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let now = mtp(&r).to_consensus_u32();
+	let (sa, sb) = (status(&r, &pa), status(&r, &pb));
+	println!("25 hours on (median time {}, {} s after the round was found final): A {} | B {}", now, now - final_at, sa["state"], sb["state"]);
+	assert!(now >= final_at + DAY + 3_600);
+	assert_eq!(sa["state"], "issued", "A's forfeits are still taken: {}", sa);
+	assert_eq!(sb["state"], "issued", "{}", sb);
+	let a_old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let f = forfeit_for(&a_old, &a2_valid, &round, &st_a);
+	let done = r.http.post("forfeit_leaves", &forfeit_body(&pa, a_board.id, forfeit_sig(&f, &a), auths_json(&a2_valid, &a2,
+		created(&a2_record)))).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	assert_eq!(leaf_states(&r, &a2), vec!["live"], "A's new leaf is credited");
+	println!("A's forfeit, handed over 25 hours after the round was found final, released it");
+
+	to_time(&r, deadline - 600).await;
+	r.server.rounds.pass().await.unwrap();
+	let sb = status(&r, &pb);
+	println!("ten minutes before B's coin's exit deadline: B {}", sb["state"]);
+	assert_eq!(sb["state"], "issued", "{}", sb);
+	to_time(&r, deadline + 600).await;
+	r.server.rounds.pass().await.unwrap();
+	let sb = status(&r, &pb);
+	println!("ten minutes after it: B {}", sb);
+	assert_eq!(sb["state"], "expired", "{}", sb);
+	assert_eq!(leaf_states(&r, &b), vec!["live"], "B's board, under no forfeit, is B's again");
+	assert_eq!(leaf_states(&r, &b2), vec!["expired"], "B's new leaf is never credited");
 }
 
 // ---------------------------------------------------------------------------

@@ -75,7 +75,10 @@ the keys, but which coins were spent off-chain is in the store and the server.
   validated against the round transaction under the wallet's policy before the
   wallet signs anything for it: the five checks on the sweep token and its
   clock, the batch output paid exactly once, the notice, a first expiry at
-  least 27 days ahead, the exit delay within the wallet's bounds, the depth,
+  least 27 days after the median time of the round's block (so a refresh
+  completed a day or two after its round, as the operator allows until the
+  coin's exit date, takes the same leaf), the exit delay within the wallet's
+  bounds, the depth,
   and reserves on every node and on the entry of at least four times the
   node's relay floor in the leaf's asset, so the leaf pays its own way out.
   Where the node does not accept the asset for fees, one atom is the rule (the
@@ -528,10 +531,11 @@ and holding it there, with the reason shown:
   witness and building rounds, co-signing nothing: a batch leaf never
   touched, a batch leaf and a board each in a payment it cannot co-sign, and
   a board in an asset the node does not take for fees whose refresh ran in a
-  round and was never co-signed (the operator expires that participation a
-  day on and gives the board back); one `sync` a day in their last three
-  days: nothing at three days, the refreshes asked for at two days and run
-  in a round nobody co-signs, every coin on the chain at one day, the board
+  round and was never co-signed (the operator takes that participation's
+  forfeits until the board's exit date, so the board stays `forfeited`);
+  one `sync` a day in their last three days: nothing at three days, the
+  refresh of the leaf never touched asked for at two days and run in a round
+  nobody co-signs, every coin on the chain at one day, the board
   in the unaccepted asset paid with a fee coin of another, and every claim
   final days before the first expiry, nothing left for the sweep;
 - a round that never comes: the refresh asked for at two days waits, the

@@ -251,8 +251,9 @@ async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_r
 	assert_eq!(t.status, 200, "{}", t.json);
 
 	// Z's own participation: its key proved, its round run, its forfeit never
-	// handed over; a day after the round is final it expires, and Z's key is
-	// free again.
+	// handed over; past its forfeit deadline (its coin's exit deadline, later
+	// than a day after the round is final) it expires, and Z's key is free
+	// again.
 	let (zb, _) = credited_board(&mut r, &keypair("Z")).await;
 	let z = keypair("Z, new leaf");
 	let (want_z, _) = want_leaf(&z, x, VALUE - fee);
@@ -264,12 +265,13 @@ async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_r
 	round_final(&r, &built.tx.txid()).await;
 	let (p2b, p2tx) = credited_board(&mut r, &keypair("payer 2")).await;
 	refused(pay(&r, &p2b, &p2tx, &z), 409, "key_reused");
-	advance_mtp(&r, 86_400 + 600).await;
-	r.synced().await;
-	r.server.rounds.pass().await.unwrap();
+	common::rounds::past_forfeit_deadline(&r, &zid).await;
 	let st = r.http.post("participation_status", &json!({"participation_id": hex(&zid)})).ok();
 	assert_eq!(st["state"], "expired", "{}", st);
-	let t = pay(&r, &p2b, &p2tx, &z);
+	// A payer's coin made now: the first payer's board is past its own
+	// exit deadline by then.
+	let (pzb, pztx) = credited_board(&mut r, &keypair("payer 2, again")).await;
+	let t = pay(&r, &pzb, &pztx, &z);
 	println!("Z's participation expired, its leaf never credited; a payer pays Z's key: {} {}", t.status,
 		t.json.get("error").cloned().unwrap_or(json!("co-signed")));
 	assert_eq!(t.status, 200, "{}", t.json);

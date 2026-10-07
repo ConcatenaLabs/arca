@@ -88,9 +88,10 @@ pub struct ParticipationsInfo {
 	/// ahead, and a later round time asked for must lie before that point:
 	/// the exit deadline, three days.
 	pub exit_deadline_seconds: u32,
-	/// A participation's forfeits must come within this long of its round
-	/// being found final, one day; otherwise it expires, its coins are the
-	/// owner's again and its new leaves never are.
+	/// A participation's forfeits are taken until the later of this long
+	/// after its round was found final, one day, and the exit deadline of
+	/// the coins it gave up; otherwise it expires, its coins are the owner's
+	/// again and its new leaves never are.
 	pub forfeit_deadline_seconds: u32,
 }
 

@@ -562,8 +562,11 @@ A new leaf is live, and can be paid on out of round, once its participation
 is released and its round final; a coin resting on a leaf of a round that is
 not final is not co-signed (`round_not_final`).
 
-The forfeits are due, and co-signed, within a day of the round being found
-final. A participation not released by then expires, whether its forfeits
+The forfeits are taken, and co-signed, until the later of a day after the
+round was found final and the exit deadline of the coins the participation
+gave up (the earliest of them), so a wallet that asked for a refresh in its
+coin's free window completes it at any sync before the coin's exit date.
+A participation not released by then expires, whether its forfeits
 never came or came and were never co-signed (the signer away, or its
 keepers): its new leaves are never credited (their preimage never goes out,
 and the operator sweeps them with their batch at expiry), each of its
@@ -1497,15 +1500,17 @@ offboards a batch leaf, is paid on-chain and then brings the leaf back
 on-chain is answered by its forfeit and the claim, and its exit is refused.
 
 `tests/expiry.rs` moves the chain's median time on. A participation whose
-forfeits have not come a day after its round was found final expires: its
-coin is live again and given up again in a new participation, its new leaf is
-expired, a good forfeit for it is refused and stores nothing, its new leaf's
-key is free again and wanted by the new participation, and a participation of
-the same round whose
-forfeits came is untouched. So does one whose forfeit came while the signer
-was away and was never co-signed: the forfeit is dropped, the signer is asked
-nothing for it once back, and the coin, live again, runs in a new round and
-completes. On batch leaves of a round whose first expiry is
+forfeits have not come is still issued a day after its round was found final,
+and expires past its coin's exit deadline: its coin is live again, its new
+leaf is expired, a good forfeit for it is refused and stores nothing, its new
+leaf's key is free again and wanted by a new participation, and a
+participation of the same round whose forfeits came is untouched. So does
+one whose forfeit came while the signer was away and was never co-signed:
+the forfeit is dropped, and the signer is asked nothing for it once back.
+Of two participations of one round, one whose forfeit comes 25 hours after
+the round was found final is released, and one whose forfeit never comes is
+still issued ten minutes before its coin's exit deadline and expires ten
+minutes after it. On batch leaves of a round whose first expiry is
 `E`: six days before `E` a refresh is charged for the day before the free
 window, and refused one atom short; four days before it is free and runs; a
 round time asked for past the exit deadline is refused; past the exit

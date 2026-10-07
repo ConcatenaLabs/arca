@@ -167,6 +167,19 @@ pub(crate) const REFUSED_NOTE: &str = "the operator refused the coin's last refr
 	before its exit date), and from home_from (a day before) takes the coin on the chain unless a refresh has completed; \
 	`arca exit` takes it now";
 
+/// What the wallet says of a coin whose refresh expired at the server.
+pub(crate) const EXPIRED_NOTE: &str = "the coin's last refresh expired at the server: its forfeits were not handed over and \
+	co-signed by the later of a day after its round was final and the coin's exit date (the wallet did not sync in that time, or \
+	the operator's signer or its keepers were away), so the new leaf was never released; sync asks again from refresh_from (two \
+	days before its exit date), and from home_from (a day before) takes the coin on the chain unless a refresh has completed; \
+	`arca exit` takes it now";
+
+/// What the wallet says of a coin whose last refresh ended as `p` says
+/// ([`Wallet::refused_refreshes`]): expired, or refused.
+pub(crate) fn refusal_note(p: &str) -> String {
+	format!("{} (participation {})", if p.ends_with(" expired") { EXPIRED_NOTE } else { REFUSED_NOTE }, p)
+}
+
 /// What the wallet says of a coin whose exit needs a fee coin it does not
 /// hold.
 pub(crate) const FEE_COIN_MISSING: &str = "this coin cannot come home until the wallet holds an on-chain coin in an asset the node \
@@ -1085,7 +1098,7 @@ impl Wallet {
 				Home::Stopped => HOME_NOTE.to_string(),
 				Home::Unreachable(w) => format!("{} (as this sync found: {})", UNREACHABLE_NOTE, w),
 				Home::Answering => match refused.get(&c.leaf_id) {
-					Some(p) => format!("{} (participation {})", REFUSED_NOTE, p),
+					Some(p) => refusal_note(p),
 					None => SYNC_NOTE.to_string(),
 				},
 			};
@@ -1105,6 +1118,8 @@ impl Wallet {
 						Home::Unreachable(w) => format!("its refresh has not completed a day before its exit date{}, and the operator \
 							cannot be reached ({})", date, w),
 						Home::Answering => match refused.get(&c.leaf_id) {
+							Some(p) if p.ends_with(" expired") => format!("its refresh has not completed a day before its exit date{}: \
+								it expired at the server, its forfeits not completed by the server's deadline (participation {})", date, p),
 							Some(p) => format!("its refresh has not completed a day before its exit date{}: the operator refused it \
 								(participation {})", date, p),
 							None => format!("its refresh has not completed a day before its exit date{} (it was {})", date, c.state),
@@ -1721,7 +1736,7 @@ impl Wallet {
 				} else if let Some(why) = &unreachable {
 					Some(format!("{} (as the last sync found: {})", UNREACHABLE_NOTE, why))
 				} else {
-					refused.get(&c.leaf_id).map(|p| format!("{} (participation {})", REFUSED_NOTE, p))
+					refused.get(&c.leaf_id).map(|p| refusal_note(p))
 				};
 				if let Some(note) = home {
 					v["home"] = json!(note);
