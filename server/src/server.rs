@@ -712,11 +712,19 @@ impl Server {
 		tasks.push(finality.spawn());
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
+		// Once a minute: the forfeits without the operator's half, and the
+		// keepers the signer names, against the pinned set.
+		let replaced: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+		let pinned_keepers = Arc::new(std::sync::Mutex::new(keepers.clone()));
 		tasks.push({
 			let forfeits = forfeits.clone();
+			let (signer, pinned, replaced) = (cosigner.signer().clone(), pinned_keepers.clone(), replaced.clone());
 			tokio::spawn(async move {
 				loop {
 					tokio::time::sleep(Duration::from_secs(60)).await;
+					if crate::http::keepers_replaced(&signer, &pinned, &replaced).await {
+						continue;
+					}
 					match forfeits.fill_unsigned().await {
 						Ok(0) => {},
 						Ok(n) => log::info!("{} forfeit(s) given the operator's half", n),
@@ -740,6 +748,7 @@ impl Server {
 			floors: tokio::sync::Mutex::new(None),
 			record_head: tokio::sync::Mutex::new(None),
 			keepers: std::sync::Mutex::new(keepers),
+			replaced,
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {

@@ -259,17 +259,22 @@ the keys, but which coins were spent off-chain is in the store and the server.
   it. From `refresh_from`, the coin's free window, `sync` asks for the
   refresh of every live coin by itself, one participation for each, as
   `participate` makes it: nothing is paid there, so a fee asked is refused
-  before anything is signed, and a refresh the operator refuses is asked for
-  again at the next `sync`. From `home_from`, `sync` takes on the chain every
+  before anything is signed, and a refresh the operator refuses, voids or
+  lets expire is asked for again a day after `sync` last asked for it (the
+  schedule does not wake for it sooner). A participation whose coin is on
+  its way home on the chain is not handed over again unless the operator
+  releases it. From `home_from`, `sync` takes on the chain every
   coin whose refresh has not completed, in whatever state (`live`, `sending`,
   `given`, `forfeited`, `offered`) and for whatever reason: the operator does
   not answer, shows no proof, refuses, answers but co-signs nothing (its
   keepers gone), or builds no round. A coin counts as refreshed only once the
-  wallet holds its new leaf, validated. Before `home_from` nothing is taken
+  wallet holds its new leaf, validated, on a round that is final (one whose
+  round is out of the chain does not count). Before `home_from` nothing is taken
   on the chain because the operator fails to answer: the coin is shown with
   its dates and `sync` tries again. One failed witness decides nothing:
   `sync` tries the operator again with back-off for about a minute
-  (`--witness-patience`) before it takes it for unreachable, and a
+  (`--witness-patience`), its last try a second past that, before it takes
+  it for unreachable, and a
   `rate_limited` answer means "ask again later". After a stop of the
   operator's signer every coin goes as above, three days ahead. Past its
   exit date, and past its expiry, the wallet goes on bringing a coin home
@@ -569,6 +574,13 @@ and holding it there, with the reason shown:
   lost, with the sweep, once that is final;
 - holders that sync 25 and 45 hours after `sync` asked for their free
   refresh both complete it, nothing taken on the chain;
+- a witness answered `502` for 6.5 s against a patience of 6 s: reached by
+  the try a second past the patience, nothing taken for unreachable; a
+  participation whose coin goes home posted again only once the operator
+  releases it; a refused refresh not asked for again an hour on, the
+  schedule waking at `home_from`; and a server whose signer is swapped
+  under it for one naming other keepers answering every call
+  `signer_replaced`;
 - a receiver waiting for a payment: its schedule a day ahead at most,
   saying why; paid at that time out of the sender's oldest coin, a day from
   its exit date, it takes the coin home whole; another, away, reads its

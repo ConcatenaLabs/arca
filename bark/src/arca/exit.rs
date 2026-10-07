@@ -633,10 +633,11 @@ impl Wallet {
 	/// patiently: one that fails for want of an answer (none, a timeout, a
 	/// 5xx, `rate_limited`, an answer without the signer's proof) is tried
 	/// again with back-off, from a second and doubling to sixteen, until one
-	/// succeeds or [`Wallet::witness_patience`] has run; a refusal, or a
-	/// rollback proven, is not. One failed witness decides nothing. Returns
-	/// the witness (or its last failure), why `info` fails if it does, and how
-	/// many times it asked.
+	/// succeeds or [`Wallet::witness_patience`] has run, the last try a
+	/// second past it, so a server restarting for that long is reached; a
+	/// refusal, or a rollback proven, is not. One failed witness decides
+	/// nothing. Returns the witness (or its last failure), why `info` fails if
+	/// it does, and how many times it asked.
 	fn reach_operator(&mut self) -> (Result<Value, Error>, Option<Error>, u32) {
 		let start = std::time::Instant::now();
 		let mut wait = std::time::Duration::from_secs(1);
@@ -654,10 +655,12 @@ impl Wallet {
 				Err(Error::Unreachable(_)) => None,
 				Err(_) => return (w, None, tries),
 			};
-			if start.elapsed() + wait > self.witness_patience {
+			let spent = start.elapsed();
+			if spent >= self.witness_patience {
 				return (w, info, tries);
 			}
-			std::thread::sleep(wait);
+			// The last wait ends a second past the patience, never before it.
+			std::thread::sleep(wait.min(self.witness_patience - spent + std::time::Duration::from_secs(1)));
 			wait = (wait * 2).min(std::time::Duration::from_secs(16));
 		}
 	}

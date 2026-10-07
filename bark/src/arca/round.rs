@@ -357,6 +357,15 @@ impl Wallet {
 				_ if state == "withdrawn" => out.push(json!({"participation": pid, "state": "withdrawn",
 					"note": "the wallet is taking a coin of it on-chain, and signs nothing for it"})),
 				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
+				// A coin of it on its way home on the chain: its forfeits are
+				// not handed over again (the server would refuse them, the coin
+				// being on the chain) unless the operator releases the
+				// participation, which it does once it holds them whole or
+				// claims one.
+				"issued" if given.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "exiting")) => {
+					out.push(json!({"participation": pid, "state": "issued", "note": "a coin of it is on its way home on the chain: the \
+						wallet hands its forfeits over again only once the operator releases the participation"}));
+				},
 				"issued" | "released" => {
 					let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
 					match self.complete(&pid, &st, &given, &wanted) {

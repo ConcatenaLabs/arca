@@ -90,6 +90,53 @@ pub struct App {
 	/// head: a signer that names another set since is logged, and `info`
 	/// goes on showing the pinned set, so that no wallet pins another.
 	pub keepers: std::sync::Mutex<api::KeepersInfo>,
+	/// Why the server stopped serving, once it found the signer under it
+	/// naming other keepers than it pinned ([`keepers_replaced`]): from then
+	/// on every call is answered `signer_replaced`, with the reason.
+	pub replaced: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Asks the signer which keepers its record names and compares them with
+/// `pinned`, the set the server pinned at its first start: a signer naming
+/// another set runs on another record than this operator's (swapped under
+/// the running server), so the server stops serving, noting why in
+/// `replaced` and saying so in its log. Returns whether it is stopped.
+pub async fn keepers_replaced(signer: &crate::signer::SignerClient, pinned: &std::sync::Mutex<api::KeepersInfo>,
+	replaced: &std::sync::Mutex<Option<String>>) -> bool
+{
+	if replaced.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+		return true;
+	}
+	match signer.keepers().await {
+		Ok((keys, required)) => {
+			let now = api::KeepersInfo { keys: keys.iter().map(|k| hex(&k.serialize())).collect(), required };
+			let k = pinned.lock().unwrap_or_else(|e| e.into_inner()).clone();
+			if k == now {
+				return false;
+			}
+			let why = format!("the signer's record names the keepers [{}], {} required, where this operator's names [{}], {} required, \
+				as the server pinned them: the signer runs on another record than the one the server started on, so the server serves \
+				nothing more; start the signer on the operator's own record, then the server", now.keys.join(", "), now.required,
+				k.keys.join(", "), k.required);
+			log::error!("{}", why);
+			*replaced.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+			true
+		},
+		Err(e) => {
+			log::warn!("the signer's keepers: {}", e);
+			false
+		},
+	}
+}
+
+/// Answers every call `signer_replaced`, with the reason, once the server
+/// found the signer under it naming other keepers than it pinned.
+async fn serving(State(app): State<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+	let why = app.replaced.lock().unwrap_or_else(|e| e.into_inner()).clone();
+	match why {
+		Some(w) => Refusal::new(StatusCode::SERVICE_UNAVAILABLE, "signer_replaced", w).into_response(),
+		None => next.run(req).await,
+	}
 }
 
 /// How long `info` publishes the floors it read from the node before it reads
@@ -306,7 +353,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-		"signer_unavailable" | "not_synced" => StatusCode::SERVICE_UNAVAILABLE,
+		"signer_unavailable" | "not_synced" | "signer_replaced" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
 	}
@@ -480,20 +527,8 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 		},
 	};
 	// The keepers the record names, as the signer reads them from it,
-	// against the set the server pinned: `info` shows the pinned set.
-	match app.cosigner.signer().keepers().await {
-		Ok((keys, required)) => {
-			let now = api::KeepersInfo { keys: keys.iter().map(|k| hex(&k.serialize())).collect(), required };
-			let k = app.keepers.lock().unwrap_or_else(|e| e.into_inner());
-			if *k != now {
-				log::error!("the signer's record names the keepers {:?}, {} required, where this operator's names {:?}, {} required, \
-					as the server pinned them: the signer runs on another record than the one the server started on; info goes on \
-					showing the pinned set, and the server will not start again against this signer", now.keys, now.required, k.keys,
-					k.required);
-			}
-		},
-		Err(e) => log::warn!("info: the signer's keepers: {}", e),
-	}
+	// against the set the server pinned: another set stops the server.
+	keepers_replaced(app.cosigner.signer(), &app.keepers, &app.replaced).await;
 	if let Some(h) = &head {
 		*cached = Some((Instant::now(), h.clone()));
 	}
@@ -924,6 +959,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
 		.route("/v1/witness", post(witness))
+		.layer(axum::middleware::from_fn_with_state(app.clone(), serving))
 		.layer(DefaultBodyLimit::max(limit))
 		.with_state(app)
 }

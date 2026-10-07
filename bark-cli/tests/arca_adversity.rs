@@ -4527,8 +4527,10 @@ async fn d57_past_its_expiry_a_coin_goes_on_until_the_chain_says_it_is_gone() {
 /// key needed): the signer starts on it without the keeper, every running
 /// hash the one the database knows. `arcad`, which pinned the keeper set in
 /// its database the first time it read it, goes on showing that set in
-/// `info` while it runs, so no wallet made now pins "no keeper"; and a new
-/// start against that signer is refused, naming both sets.
+/// `info` while it runs, so no wallet made now pins "no keeper". Once it reads
+/// the swapped signer's keepers it stops serving, every call answered
+/// `signer_replaced` with the reason; and a new start against that signer is
+/// refused, naming both sets.
 #[tokio::test(flavor = "multi_thread")]
 async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
 	use elements::hashes::{sha256, Hash, HashEngine};
@@ -4579,11 +4581,20 @@ async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
 	tokio::task::block_in_place(|| r.signer.try_resume(genesis)).expect("the edited record opens: its hashes are the database's");
 	println!("PK the signer on it, without a keeper: {}", r.signer.log().lines().last().unwrap_or(""));
 
-	// The running server: info goes on showing the pinned set.
+	// The running server stops serving, with the reason, once it reads the
+	// swapped signer's keepers (at `info`, and once a minute): it never
+	// shows the edited record's set.
 	tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-	let shown = info_of(&r)["keepers"].clone();
-	println!("PK the running server's info, the signer swapped: {}", shown);
-	assert_eq!(shown, pinned, "info shows the pinned keepers, not the edited record's");
+	let first = info_of(&r);
+	println!("PK the running server's info, the signer swapped: keepers {} | error {}", first["keepers"], first["error"]);
+	assert!(first["keepers"] == pinned || first["error"]["code"] == "signer_replaced", "{}", first);
+	let then = info_of(&r);
+	println!("PK the running server, asked again: {}", then);
+	assert_eq!(then["error"]["code"], "signer_replaced", "{}", then);
+	assert!(then["error"]["message"].as_str().unwrap().contains("another record"), "{}", then);
+	let (ok, v) = a.run(&["sync"]);
+	println!("PK A's sync: ok={} witness {} | unreachable {}", ok, v["witness"], v["unreachable"]);
+	assert!(v["unreachable"]["why"].as_str().unwrap_or("").contains("signer_replaced"), "{}", v);
 	// A new start against the signer: refused.
 	r.server.stop();
 	let refused = server::server::Server::start(&r.config).await.err().map(|e| e.to_string())
@@ -5047,4 +5058,126 @@ async fn d58_a_payment_spends_the_coin_furthest_from_its_exit_date() {
 	for w in [&a, &c] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+/// R7h F5. The back-off's last try lands just past the patience: a server
+/// that answers `502` to every witness for 6.5 s, against a wallet whose
+/// patience is 6 s, is reached by the try a second past it (the fourth, at
+/// about 7 s), and nothing is taken for unreachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn f5_the_back_off_reaches_a_server_back_just_past_the_patience() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let proxy = Proxy::start(&url);
+	let a = Arca::new("F5Back");
+	boarded(&mut r, &a, &proxy.url.clone(), &[(x, 1_000_000)]).await;
+	let since = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+	let down = since.clone();
+	proxy.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/witness" && down.lock().unwrap().elapsed() < std::time::Duration::from_millis(6_500) {
+			*v = json!({"error": {"code": "internal", "message": "the server is restarting"}});
+			return Some(502u16);
+		}
+		None
+	})));
+	a.patience.set(6);
+	*since.lock().unwrap() = std::time::Instant::now();
+	let t = std::time::Instant::now();
+	let s = a.ok(&["sync"]);
+	let took = t.elapsed().as_secs_f64();
+	println!("F5B the sync, the witness answered 502 for 6.5 s, patience 6 s: took {:.1} s | witness tries {} | unreachable {}", took,
+		s["witness"]["tries"], s["unreachable"]);
+	assert!(s["unreachable"].is_null(), "{}", s["unreachable"]);
+	assert_eq!(s["witness"]["tries"], 4, "{}", s["witness"]);
+	assert!(took >= 6.5, "the last try came past the patience");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// R7h F5. A participation whose coin is on its way home on the chain is
+/// not posted again at every sync. One keeper. A's board: its refresh asked
+/// for in the free window, the round final, the keeper down; in the coin's
+/// last day A's sync hands over the forfeit (held back) and takes the board
+/// home. Two more syncs post no forfeit; with the keeper back, the server
+/// releases the participation, and the next sync posts the forfeits once
+/// and takes the new leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn f5_a_participation_whose_coin_goes_home_is_not_posted_again() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let proxy = Proxy::start(&url);
+	let a = Arca::new("F5Post");
+	let boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 2_000_000)]).await;
+	let board = boards[0].clone();
+	let by = d57_latest_exit_by(&a, &boards);
+	d57_to(&r, by - 2 * 86_400 + 600).await;
+	let s = a.ok(&["sync"]);
+	let pid = s["refresh"][0]["participation"].as_str().expect("asked").to_string();
+	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+	final_round(&r).await;
+	r.keepers[0].halt();
+	d57_to(&r, by - 86_400 + 600).await;
+	let s = a.ok(&["sync"]);
+	println!("F5P A's sync in the last day, the keeper down: participations {} | board {}", s["participations"], coin_of(&a, &board)["state"]);
+	assert_eq!(coin_of(&a, &board)["state"], "exiting");
+	let posted = proxy.count("/v1/forfeit_leaves");
+	for _ in 0..2 {
+		r.produce().await;
+		let s = a.ok(&["sync"]);
+		println!("F5P A's next sync: participations {}", s["participations"]);
+	}
+	let again = proxy.count("/v1/forfeit_leaves") - posted;
+	println!("F5P forfeits posted again in two syncs while the board goes home: {}", again);
+	assert_eq!(again, 0, "not posted again while the coin goes home and the participation is issued");
+	r.keepers[0].resume();
+	assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 1);
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(r.server.store.participation(&id).await.unwrap().unwrap().state, server::store::ParticipationState::Released);
+	let s = a.ok(&["sync"]);
+	println!("F5P the keeper back, the participation released: A's sync: participations {}", s["participations"]);
+	assert_eq!(proxy.count("/v1/forfeit_leaves") - posted, 1, "posted once the operator released it");
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// R7h F5. A refused refresh is asked for again a day after it was asked,
+/// not at every sync. The operator refuses every refresh of A's board: in
+/// the free window `sync` asks, refused; an hour on it does not ask again,
+/// and its schedule names the coin's `home_from` (a day after the ask), not
+/// the next hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn f5_a_refused_refresh_is_asked_again_a_day_on_not_at_every_sync() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let proxy = Proxy::start(&url);
+	let a = Arca::new("F5Ref");
+	let boards = boarded(&mut r, &a, &proxy.url.clone(), &[(x, 1_000_000)]).await;
+	let board = boards[0].clone();
+	let leaf = board.clone();
+	proxy.rewrite(Some(Arc::new(move |path: &str, req: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/submit_participation" && req.to_string().contains(&leaf) {
+			*v = json!({"error": {"code": "not_accepted", "message": "the operator refuses this refresh"}});
+			return Some(409u16);
+		}
+		None
+	})));
+	let by = d57_latest_exit_by(&a, &boards);
+	d57_to(&r, by - 2 * 86_400 + 600).await;
+	let s = a.ok(&["sync"]);
+	println!("F5R the free window: refresh {}", s["refresh"]);
+	assert!(s["refresh"][0]["error"].as_str().unwrap_or("").contains("refuses"), "{}", s["refresh"]);
+	let asked = proxy.count("/v1/submit_participation");
+	d57_to(&r, by - 2 * 86_400 + 600 + 3_600).await;
+	let s = a.ok(&["sync"]);
+	let now = common::node::median_time(&r.rt);
+	let next = s["schedule"]["next_sync_at"].as_u64().unwrap() as u32;
+	println!("F5R an hour on: refresh {} | asked again {} | next_sync_at {} ({} s ahead; home_from {})", s["refresh"],
+		proxy.count("/v1/submit_participation") - asked, next, next as i64 - now as i64, by - 86_400);
+	assert_eq!(proxy.count("/v1/submit_participation"), asked, "not asked again an hour on");
+	assert!(s["refresh"].is_null() || s["refresh"].as_array().is_some_and(|a| a.is_empty()), "{}", s["refresh"]);
+	assert_eq!(next, by - 86_400, "the schedule wakes at home_from, not every hour");
+	assert!(coin_of(&a, &board)["home"].as_str().unwrap_or("").contains("refused"), "{}", coin_of(&a, &board));
+	let _ = std::fs::remove_dir_all(&a.dir);
 }

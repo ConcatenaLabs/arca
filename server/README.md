@@ -127,9 +127,12 @@ to an older state:
   first time it reads them from the signer (`keepers_pinned`), as a wallet
   pins them, and refuses to start against a signer that names another set,
   naming both: that signer runs on another record than the operator's, made
-  anew or with its first line edited. While the server runs, `info` shows
-  the pinned set whatever the signer names since, and logs the difference,
-  so no wallet made then pins another.
+  anew or with its first line edited. While the server runs it reads the
+  signer's keepers again at `info` and once a minute: a signer that names
+  another set since (swapped under the running server) stops it serving,
+  every call answered `signer_replaced` (503) with both sets named, and the
+  reason in its log; `info` never shows another set, so no wallet made then
+  pins one.
 - The server records every message it asks the signer to sign before it
   asks, in the same transaction as what the signature is for (a transfer,
   a forfeit), and refuses to start on a database that does not know an
@@ -1017,7 +1020,8 @@ over, but there it is covered only by the carried hash, which anyone holding
 the file can compute again without a key: a compacted record's first line,
 edited, still opens, every running hash the one the database knows. What
 refuses it is the server, which pinned the set in its database the first
-time it read it and does not start against a signer naming another; and
+time it read it, does not start against a signer naming another, and stops
+serving when it finds one under it while it runs; and
 every wallet that pinned the set before. Changing the set, replacing a keeper whose machine or key was lost, or
 adding keepers to an operator that had none, is a new operator: a new key
 and a new record. So an operator requires fewer than all of its keepers (two
