@@ -198,6 +198,16 @@ impl Wallet {
 		let nonce = random32();
 		let key = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &key.serialize(), "receive")?;
+		// When it was handed out, by the chain's clock: an unpaid request
+		// holds `sync`'s schedule for the acceptance horizon from then.
+		let now = self.now()?.to_consensus_u32();
+		let pending: Vec<String> = self.store.nonces()?.iter().filter(|n| n.purpose == "receive" && n.state == "pending")
+			.map(|n| hex(&n.nonce)).collect();
+		let mut asked: std::collections::BTreeMap<String, u32> = self.store.meta(super::wallet::RECEIVE_ASKED)?
+			.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		asked.retain(|n, _| pending.contains(n));
+		asked.insert(hex(&nonce), now);
+		self.store.set_meta(super::wallet::RECEIVE_ASKED, &serde_json::to_string(&asked).expect("a map"))?;
 		let mut req = json!({
 			"arca_request": 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"owner": hex(&key.serialize()), "owner_nonce": hex(&nonce),

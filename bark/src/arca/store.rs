@@ -326,6 +326,12 @@ impl Store {
 		t.map(Self::to_nonce).transpose()
 	}
 
+	/// When nonce `nonce` was stored, in seconds since the epoch.
+	pub fn nonce_created_at(&self, nonce: &[u8; 32]) -> Result<Option<i64>, Error> {
+		self.conn.query_row("SELECT created_at FROM nonce WHERE nonce = ?1", params![&nonce[..]], |r| r.get::<_, i64>(0))
+			.optional().map_err(db)
+	}
+
 	pub fn nonces(&self) -> Result<Vec<NonceRow>, Error> {
 		let mut st = self.conn.prepare("SELECT nonce, owner_key, purpose, state, leaf_id FROM nonce ORDER BY created_at").map_err(db)?;
 		let rows = st.query_map([], Self::nonce_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
