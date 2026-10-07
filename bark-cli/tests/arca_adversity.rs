@@ -5784,3 +5784,30 @@ async fn a_payments_answer_read_past_its_inputs_expiry_keeps_the_change() {
 	assert_eq!(state, "exited", "the change comes home");
 	let _ = (std::fs::remove_dir_all(&a.dir), std::fs::remove_dir_all(&b.dir));
 }
+
+/// The re-check past a coin's exit date. A holds a batch leaf L and does
+/// not sync. Past L's exit date the operator co-signs no spend of L and
+/// takes it into no round: the re-check that every command starts with
+/// (here `coins`) takes L on the chain at once, saying it is past its exit
+/// date, and shows it `exiting`, never `live`; L then comes home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_past_its_exit_date_is_taken_home_by_the_next_command() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("RXA");
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let l = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let by = d57_latest_exit_by(&a, std::slice::from_ref(&l));
+	d57_to(&r, by + 600).await;
+	let c = coin_of(&a, &l);
+	let bal = a.ok(&["balance"]);
+	println!("RX 600 s past L's exit date {}, A's first command, `coins`: L {} | {}; balance {}", by, c["state"], c["note"], bal["arca"]);
+	assert_eq!(c["state"], "exiting", "past its exit date L goes on the chain, never shown live: {}", c);
+	assert!(c["note"].as_str().unwrap_or("").contains("past its exit date"), "{}", c);
+	let at = d57_home(&r, &a, std::slice::from_ref(&l)).await;
+	println!("RX L home at median time {}", at);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
