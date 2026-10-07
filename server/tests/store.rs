@@ -29,14 +29,37 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 15);
+	assert_eq!(db.store.schema_version().await.unwrap(), 16);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 15);
+	assert_eq!(again.schema_version().await.unwrap(), 16);
 }
 
-/// A database of schema 13 moves to 15 in place: the table of the keepers'
+/// The keepers are pinned once: the first set the server reads stays, and a
+/// pin of another set returns the first. A database of schema 15 moves to
+/// 16 with no set pinned, pinned at the server's next start.
+#[tokio::test]
+async fn the_keepers_are_pinned_once() {
+	let db = TestDb::new().await;
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	client.batch_execute("DROP TABLE keepers_pinned; DELETE FROM arca_schema WHERE version >= 16;").await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 15);
+	db.store.migrate().await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	assert_eq!(db.store.pinned_keepers().await.unwrap(), None, "nothing pinned before the server reads its signer");
+	let k = vec!["aa".repeat(32), "bb".repeat(32)];
+	assert_eq!(db.store.pin_keepers(&k, 2).await.unwrap(), (k.clone(), 2));
+	assert_eq!(db.store.pin_keepers(&[], 0).await.unwrap(), (k.clone(), 2), "the first set stays");
+	assert_eq!(db.store.pinned_keepers().await.unwrap(), Some((k, 2)));
+	let none = TestDb::new().await;
+	assert_eq!(none.store.pin_keepers(&[], 0).await.unwrap(), (vec![], 0), "an operator with no keeper pins none");
+}
+
+/// A database of schema 13 moves to 16 in place: the table of the keepers'
 /// acknowledgements is made, empty, and what the database held stays.
 #[tokio::test]
 async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
@@ -45,22 +68,22 @@ async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
 	tokio::spawn(async move {
 		let _ = conn.await;
 	});
-	client.batch_execute("DROP TABLE record_head_ack; DROP TABLE round_rerun; DELETE FROM arca_schema WHERE version >= 14;").await.unwrap();
+	client.batch_execute("DROP TABLE record_head_ack; DROP TABLE round_rerun; DROP TABLE keepers_pinned; DELETE FROM arca_schema WHERE version >= 14;").await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 13);
 	db.store.set_signer_head_signed(3, &[3; 32], None).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 15);
+	assert_eq!(db.store.schema_version().await.unwrap(), 16);
 	assert_eq!(db.store.signer_head().await.unwrap(), Some((3, [3; 32])), "what the database held stays");
 	assert!(db.store.head_acks(3, &[3; 32]).await.unwrap().is_empty());
 	let ack = server::keeper::WireAck { key: "11".repeat(32), nonce: "22".repeat(32), signature: "33".repeat(64) };
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	assert_eq!(db.store.head_acks(3, &[3; 32]).await.unwrap(), vec![ack], "kept once");
-	println!("schema 13 -> 15: the keepers' acknowledgements kept by head");
+	println!("schema 13 -> 16: the keepers' acknowledgements kept by head");
 }
 
 /// A database of schema 12, with a participation running again
-/// forfeit-first, moves to 15 in place: the participation is an ordinary
+/// forfeit-first, moves to 16 in place: the participation is an ordinary
 /// re-run, pending, with no reason to be void, and the table of the coins
 /// that keep re-runs apart from their lost rounds is there, empty.
 #[tokio::test]
@@ -77,6 +100,7 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		 ALTER TABLE watcher_tx DROP COLUMN round_id;
 		 DROP TABLE record_head_ack;
 		 DROP TABLE round_rerun;
+		 DROP TABLE keepers_pinned;
 		 DELETE FROM arca_schema WHERE version >= 13;"
 	).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 12);
@@ -87,10 +111,10 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		&[&&id[..], &&[8u8; 32][..], &&[9u8; 32][..]],
 	).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 15);
+	assert_eq!(db.store.schema_version().await.unwrap(), 16);
 	let p = db.store.participation(&id).await.unwrap().unwrap();
 	assert_eq!((p.state, p.attempt, p.void_reason.clone()), (server::store::ParticipationState::Pending, 1, None));
-	println!("schema 12 -> 15: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
+	println!("schema 12 -> 16: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
 	let ties: i64 = client.query_one("SELECT count(*) FROM round_rerun", &[]).await.unwrap().get(0);
 	assert_eq!(ties, 0);
 	let cols: Vec<String> = client.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'participation'", &[])

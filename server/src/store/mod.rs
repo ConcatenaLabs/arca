@@ -7,7 +7,8 @@
 //! `schema/V8__stateless_challenges.sql`, `schema/V9__wanted_keys_freed.sql`,
 //! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
 //! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`,
-//! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`),
+//! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`,
+//! `schema/V16__keepers_pinned.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -82,6 +83,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(13, include_str!("../../schema/V13__reruns_are_ordinary.sql")),
 	(14, include_str!("../../schema/V14__keeper_acks.sql")),
 	(15, include_str!("../../schema/V15__rerun_ties.sql")),
+	(16, include_str!("../../schema/V16__keepers_pinned.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -228,6 +230,30 @@ impl Store {
 		conn.execute("INSERT INTO challenge_key (one, key) VALUES (true, $1) ON CONFLICT (one) DO NOTHING", &[&&fresh[..]]).await?;
 		let row = conn.query_one("SELECT key FROM challenge_key", &[]).await?;
 		array32(row.get(0), "challenge key")
+	}
+
+	/// The keepers the server pinned the first time it read them from its
+	/// signer (their keys, hex, in the record's order, and how many are
+	/// required); `None` before.
+	pub async fn pinned_keepers(&self) -> Result<Option<(Vec<String>, usize)>, StoreError> {
+		let conn = self.conn().await?;
+		let row = conn.query_opt("SELECT keys, required FROM keepers_pinned", &[]).await?;
+		Ok(row.map(|r| {
+			let keys: String = r.get(0);
+			let required: i32 = r.get(1);
+			(keys.split(',').filter(|k| !k.is_empty()).map(str::to_string).collect(), required.max(0) as usize)
+		}))
+	}
+
+	/// Pins `keys` and `required` as the operator's keepers unless a set is
+	/// pinned already; returns the set pinned, whichever it is.
+	pub async fn pin_keepers(&self, keys: &[String], required: usize) -> Result<(Vec<String>, usize), StoreError> {
+		let conn = self.conn().await?;
+		let required = i32::try_from(required).map_err(|_| StoreError::Corrupt(format!("{} keepers required", required)))?;
+		conn.execute("INSERT INTO keepers_pinned (one, keys, required) VALUES (true, $1, $2) ON CONFLICT (one) DO NOTHING",
+			&[&keys.join(","), &required]).await?;
+		drop(conn);
+		self.pinned_keepers().await?.ok_or_else(|| StoreError::Corrupt("the keepers pinned are gone".into()))
 	}
 
 	/// The latest entry of the signer's record the server was given: its

@@ -84,9 +84,11 @@ pub struct App {
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
 	/// The signer's record head `info` last published, signed, and when.
 	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
-	/// The keepers the signer's record names, as `info` publishes them: read
-	/// from the signer at start and again whenever `info` asks it for its
-	/// head, so `info` shows what the record says.
+	/// The keepers the signer's record names, as `info` publishes them: the
+	/// set the server pinned in its database, which the signer named at
+	/// start. Read from the signer again whenever `info` asks it for its
+	/// head: a signer that names another set since is logged, and `info`
+	/// goes on showing the pinned set, so that no wallet pins another.
 	pub keepers: std::sync::Mutex<api::KeepersInfo>,
 }
 
@@ -477,15 +479,17 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 			None
 		},
 	};
-	// The keepers the record names, as the signer reads them from it.
+	// The keepers the record names, as the signer reads them from it,
+	// against the set the server pinned: `info` shows the pinned set.
 	match app.cosigner.signer().keepers().await {
 		Ok((keys, required)) => {
 			let now = api::KeepersInfo { keys: keys.iter().map(|k| hex(&k.serialize())).collect(), required };
-			let mut k = app.keepers.lock().unwrap_or_else(|e| e.into_inner());
+			let k = app.keepers.lock().unwrap_or_else(|e| e.into_inner());
 			if *k != now {
-				log::error!("the signer's record names the keepers {:?}, {} required, where it named {:?}, {} required: the record \
-					is not the one the server started on", now.keys, now.required, k.keys, k.required);
-				*k = now;
+				log::error!("the signer's record names the keepers {:?}, {} required, where this operator's names {:?}, {} required, \
+					as the server pinned them: the signer runs on another record than the one the server started on; info goes on \
+					showing the pinned set, and the server will not start again against this signer", now.keys, now.required, k.keys,
+					k.required);
 			}
 		},
 		Err(e) => log::warn!("info: the signer's keepers: {}", e),
