@@ -63,6 +63,10 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `bip321/` | `bip321` | `bip321` | Payment URI parser |
 | `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
 
+[doc/operator-procedure.md](doc/operator-procedure.md) is the procedure an operator that holds other people's
+coins follows: how it is made, what is never done, how its storage is kept and restored, and what its holders
+are told.
+
 ## Building and testing
 
 You need a stable Rust toolchain. The library's unit tests check every transaction
