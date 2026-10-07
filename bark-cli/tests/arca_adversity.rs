@@ -4587,3 +4587,133 @@ async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A batch leaf's exit at the specification's delays, through `arca`, the
+/// watcher on, the clock driven. G's wallet, made with its defaults, asks
+/// for 36-hour exit delays: its leaf of a round is unrolled (every node and
+/// the entry), the claim refused by the node an hour before the delay has
+/// run from the leaf's confirmation and taken after it, `exited` once final.
+/// And the operator's answer to a stale exit inside that delay: H refreshes
+/// its leaf (released, the new leaf H's), and a copy of H's wallet from
+/// before the refresh unrolls the old leaf; the watcher publishes H's
+/// forfeit and claims it, revealing the preimage, hours before the delay has
+/// run, and the copy's claim after it is refused by the node, the leaf spent
+/// by the forfeit, while H holds its new leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_leafs_exit_and_the_answer_to_a_stale_one_run_at_the_production_delays() {
+	use elements::hashes::Hash;
+	let mut r = Running::start().await;
+	let x = r.x;
+	let hour = 3_600u32;
+	let url = r.url();
+	let spec = |w: &Arca, r: &Running| w.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca"]);
+	let leaf_of = |r: &mut Running, w: &Arca| {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x, 5_000_000);
+	};
+	let (g, h) = (Arca::new("P9G"), Arca::new("P9H"));
+	let created = spec(&g, &r);
+	let delay = created["exit_delay_units"].as_u64().unwrap() as u32 * 512;
+	assert!((36 * hour..=36 * hour + 512).contains(&delay), "{}", created);
+	spec(&h, &r);
+	for w in [&g, &h] {
+		leaf_of(&mut r, w);
+	}
+	r.produce().await;
+	let gb = g.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	let hb = h.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards to be credited", || [&g, &h].iter().all(|w| w.ok(&["boards"])[0]["server"]["state"] == "credited")).await;
+	g.ok(&["sync"]);
+	h.ok(&["sync"]);
+	g.ok(&["participate", "--leaf", &gb]);
+	h.ok(&["participate", "--leaf", &hb]);
+	let round = final_round(&r).await;
+	let gl = g.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("G's leaf").to_string();
+	let hl = h.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("H's leaf").to_string();
+	let CoinRecord::Leaf { record, .. } = record_of(&g, &gl) else { panic!("a batch leaf") };
+	println!("P9 G's leaf {} and H's {} of round {}; G's exit delay {} units ({} s), the notice {} units", &gl[..8], &hl[..8],
+		round.txid(), record.exit_delay.units(), delay, record.schedule.notice.units());
+	assert_eq!(record.exit_delay.seconds() as u32, delay);
+
+	// G's exit: every node and the entry, then the claim at 36 hours.
+	let first = g.ok(&["exit", &gl]);
+	let steps = first["broadcast"].as_array().unwrap().len();
+	println!("P9 G's exit: {} transaction(s) to the leaf: {}", steps, first["state"]);
+	assert!(steps >= 2, "a node and the entry at least: {}", first);
+	r.produce().await;
+	r.bury().await;
+	let w = g.ok(&["exit", &gl]);
+	assert_eq!(w["state"], "waiting", "{}", w);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, delay - hour));
+	let w = g.ok(&["exit", &gl]);
+	println!("P9 an hour before the exit delay has run: {} | {}", w["state"], w["next"]);
+	assert_eq!(w["state"], "waiting", "{}", w);
+	assert!(w["next"].as_str().unwrap_or("").contains("non-BIP68-final"), "{}", w);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 2 * hour));
+	let c = g.ok(&["exit", &gl]);
+	println!("P9 past it: {} {}", c["state"], c["claim"]);
+	assert_eq!(c["state"], "claimed", "{}", c);
+	r.produce().await;
+	r.bury().await;
+	g.ok(&["sync"]);
+	assert_eq!(coin_of(&g, &gl)["state"], "exited", "{}", coin_of(&g, &gl));
+	println!("P9 G's batch leaf exited at 36 hours: {}", coin_of(&g, &gl)["note"]);
+
+	// H refreshes its leaf; a copy of H's wallet from before unrolls it.
+	let stale = copy_wallet(&h, "P9Hstale");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	h.ok(&["participate", "--leaf", &hl]);
+	final_round(&r).await;
+	let s = h.ok(&["sync"]);
+	let h2 = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released" && p["released"][0] == hl.as_str())
+		.map(|p| p["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string()).unwrap_or_else(|| panic!("H's refresh is released: {}", s));
+	assert_eq!(coin_of(&h, &hl)["state"], "spent");
+	let e = stale.ok(&["exit", &hl]);
+	println!("P9 the stale copy unrolls H's old leaf: {} ({} transactions)", e["state"], e["broadcast"].as_array().map(|b| b.len()).unwrap_or(0));
+	assert!(e["error"].is_null() && e["state"] == "unrolling", "{}", e);
+	r.produce().await;
+	let unrolled_at = common::node::median_time(&r.rt);
+	// The watcher answers: the forfeit, then its claim, an hour at a time.
+	let id = hex(&LeafId::from_str(&hl).unwrap().0);
+	let mut answered = None;
+	for i in 0..24 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		let log = r.server.store.watcher_log().await.unwrap();
+		// The forfeit of H's old leaf, and the claim that spends it.
+		let forfeit = log.iter().find(|w| w.kind == "forfeit" && hex(&w.subject) == id).map(|w| elements::Txid::from_byte_array(w.txid));
+		let claim = forfeit.and_then(|f| log.iter().filter(|w| w.kind == "claim").find(|w| {
+			let t: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+			t.input.iter().any(|i| i.previous_output.txid == f)
+		}));
+		if let (Some(f), Some(c)) = (forfeit, claim) {
+			println!("P9 the forfeit {} and its claim {} ({})", f, elements::Txid::from_byte_array(c.txid), c.detail);
+			answered = Some(common::node::median_time(&r.rt));
+			println!("P9 the watcher's forfeit and claim, after {} hour(s)", i);
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, hour));
+	}
+	for w in r.server.store.watcher_log().await.unwrap() {
+		println!("P9 watcher log: {} {} {:?} {}", w.kind, elements::Txid::from_byte_array(w.txid), w.state, w.detail);
+	}
+	let answered = answered.expect("the watcher answers the stale exit with the forfeit and claims it");
+	println!("P9 answered {} s after the stale unroll, {} s inside the exit delay", answered - unrolled_at, delay as i64 - (answered - unrolled_at) as i64);
+	assert!(answered - unrolled_at < delay, "inside the exit delay");
+	// Past the delay, the copy's claim: refused, the leaf spent by the forfeit.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, delay));
+	let c = stale.run(&["exit", &hl]);
+	println!("P9 the stale copy's claim past the delay: ok={} {}", c.0, c.1);
+	assert!(c.1["claim"].is_null(), "no claim of the forfeited leaf: {}", c.1);
+	assert_eq!(coin_of(&h, &h2)["state"], "live", "H holds its new leaf");
+	for w in [&g, &h, &stale] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

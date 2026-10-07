@@ -610,6 +610,13 @@ and holding it there, with the reason shown:
   has run and taken after it, and a forfeit the operator published and
   never claimed refunded only once its 48-hour refund delay has run, each
   coin `exited` once final;
+- a batch leaf's exit at those delays, the watcher on: its node and entry
+  unrolled, its claim refused an hour before the 36-hour exit delay has run
+  from the leaf's confirmation and taken after it, `exited` once final; and
+  a stale exit of a leaf its holder refreshed, from a copy of the wallet
+  taken before the refresh, answered by the operator's forfeit and its claim
+  within the hour, long inside the delay, the copy's own claim refused once
+  the delay has run;
 - the files a fresh wallet writes, readable by their owner alone, the node's
   password in none of the store's, and its balance of one row, 0 BTC; and a
   wallet restored from the mnemonic that finds on-chain coins past the first
