@@ -326,7 +326,15 @@ script to pay). The server accepts it only when:
   (`bad_attestation`); every offboard pays a served
   asset within its bounds to a script that is not an Arca script;
 - per asset, the coins given up hold exactly what the outputs take plus the
-  fee, and the fee covers the schedule.
+  fee, and the fee covers the schedule;
+- the signer's record holds nothing under any coin's salt (the server asks
+  it, `under`): neither a forfeit, which a coin an older server gave back
+  while its forfeit stood in the record carries, nor a spend the database
+  lost. Such a coin is refused (`double_spend`, naming the coin and what the
+  signer holds): its forfeit for this round would stand beside the other, or
+  be refused for good, leaving a participation that is neither released nor
+  expired. One taken before this check that stands so is released once the
+  watcher claims one of its forfeits, like any other.
 
 It then chooses the participation's unlock hash and keeps its preimage,
 draws an operator nonce of its own for every leaf wanted (taken at once, so
@@ -835,6 +843,9 @@ connector's issuance, an offboard's reclaim) and of a taproot output. It signs
 no digest it is handed, no unroll authorisation and no release, and nothing
 by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
 signature it gets back against the message or signature hash it built.
+Beside those it answers reads of its record: its latest head, its entries
+after one, a witness of heads (below), and the entries under a salt
+(`under`), which the server asks before it takes a coin into a refresh.
 
 The signer is the one-spend authority. Before it returns a rebindable
 signature it appends the owner key, the salt, the kind and the message's
@@ -1567,7 +1578,14 @@ step gets no preimage; the owner's claim made final, it never is, the new
 leaf never credited. A payment out of a coin given back while the
 signer held its forfeit (the database put as an older server left it) is
 refused `double_spend` naming the forfeit, twice alike, the transfer's
-record dropped and the coin given back each time.
+record dropped and the coin given back each time. Such a coin offered in a
+participation with another, and a board whose spend the signer holds and the
+database lost, are each refused `double_spend` when offered, naming the coin
+and the entry, nothing recorded. A participation taken before that check
+whose forfeit the signer refuses for good (a spend under the coin's salt)
+while its other forfeit is whole waits past the deadline; once the other
+coin's owner takes its board on the chain and the watcher claims its
+forfeit, the participation is released and its leaf credited.
 Of two participations of one round, one whose forfeit comes 25 hours after
 the round was found final is released, and one whose forfeit never comes is
 still issued ten minutes before its coin's exit deadline and expires ten

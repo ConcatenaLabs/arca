@@ -15,6 +15,9 @@
 //! - `{"op":"head"}` and `{"op":"entries","after":…,"limit":…}`: the record's
 //!   latest entry, signed ([`record_head_digest`]), and its entries after
 //!   one, for the server to check its database against at start;
+//! - `{"op":"under","salt":…}`: the record's entries under a salt, for the
+//!   server to refuse a coin to a refresh whose forfeit the signer could not
+//!   co-sign, or would co-sign beside one it holds already;
 //! - `{"op":"witness","heads":[{"entry":…,"hash":…,"signature":…},…],"nonce":…}`:
 //!   the running hash at each entry named, each signed as a head
 //!   ([`record_head_digest`]); the record's latest entry, signed as a head
@@ -231,6 +234,9 @@ pub enum Request {
 	},
 	/// The entries after entry `after`, at most `limit` of them.
 	Entries { after: u64, limit: u32 },
+	/// The entries under `salt` (32 bytes, hex), whatever their owner: what
+	/// the record holds of a leaf of that salt, a spend or forfeits.
+	Under { salt: String },
 	/// The transaction and each output its inputs spend, in Sequentia's
 	/// encoding as hex; the input signed; the leaf it spends by, as hex.
 	Spend { tx: String, prevouts: Vec<String>, input: u32, leaf: String },
@@ -1282,6 +1288,12 @@ impl SpendRecord {
 		self.head
 	}
 
+	/// The entries under `salt`, whatever their owner, read back from the
+	/// file.
+	pub fn entries_under(&self, salt: &[u8; 32]) -> Result<Vec<Entry>, String> {
+		self.under(salt)
+	}
+
 	/// The entries after entry `after`, at most `limit` of them, read back
 	/// from the file.
 	pub fn entries_after(&self, after: u64, limit: usize) -> Result<Vec<Entry>, String> {
@@ -1850,6 +1862,13 @@ impl SignerClient {
 	/// [`MAX_ENTRIES`].
 	pub async fn entries(&self, after: u64) -> Result<Vec<Entry>, SignerError> {
 		let r = self.ask(&Request::Entries { after, limit: MAX_ENTRIES }).await?;
+		r.entries.unwrap_or_default().iter().map(Entry::from_wire).collect::<Result<_, _>>().map_err(SignerError::Answer)
+	}
+
+	/// The entries of the signer's record under `salt`: what `S` has
+	/// co-signed for a leaf of that salt, a spend or forfeits.
+	pub async fn under(&self, salt: &[u8; 32]) -> Result<Vec<Entry>, SignerError> {
+		let r = self.ask(&Request::Under { salt: hex(salt) }).await?;
 		r.entries.unwrap_or_default().iter().map(Entry::from_wire).collect::<Result<_, _>>().map_err(SignerError::Answer)
 	}
 

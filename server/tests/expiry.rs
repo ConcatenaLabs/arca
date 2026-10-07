@@ -19,6 +19,9 @@
 //!    deadline whose coin passes its exit deadline before any round takes it
 //!    is voided by the next pass over the rounds, no round built, its coin
 //!    given back.
+//! 3. No participation stuck (D59.2): a coin under a forfeit or a spend the
+//!    signer holds is refused when offered; one taken before that check,
+//!    its other forfeit whole, is released on the watcher's claim.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -725,5 +728,163 @@ async fn a_forfeit_completed_after_its_coins_exit_delay_waits_for_the_claim() {
 	println!("A's claim {} final: A {} | A's new leaf {:?}", claim.txid(), sa["state"], leaf_states(&r, &a2));
 	assert_eq!(sa["state"], "issued");
 	assert_eq!(leaf_states(&r, &a2), vec!["pending"], "the new leaf is never credited");
+	r.purse.put(fee_coin);
+}
+
+/// What a database that lost a spend leaves: the operator's signer holds a
+/// spend of `held`'s coin (resting on `base`) under its salt, co-signed at
+/// the owner's request, which the database does not know.
+async fn signer_holds_a_spend(r: &Running, held: &Held, base: &Transaction) {
+	use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+	let c = held.record.resolve(std::slice::from_ref(base), &r.policy()).unwrap();
+	let o = arca_covenant::ExplicitOutput::new(c.asset, c.value - 2_000, elements::Script::from(vec![0x51, 7]));
+	let m = arca_covenant::message::rebind_message(&r.chain.leaf_constant(&c.leaf.salt), c.asset, c.value, std::slice::from_ref(&o)).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&held.key, &m.digest, &[2; 32]);
+	let line = json!({
+		"op": "rebind", "owner": hex(&xonly(&held.key).serialize()), "owner_sig": hex(sig.as_ref()), "salt": hex(&c.leaf.salt),
+		"asset_in": c.asset.to_string(), "value_in": c.value.to_string(), "outputs": [server::signer::WireOutput::from_output(&o)],
+	}).to_string();
+	let mut s = tokio::net::UnixStream::connect(&r.signer.socket).await.unwrap();
+	s.write_all(format!("{}\n", line).as_bytes()).await.unwrap();
+	let mut out = String::new();
+	BufReader::new(s).read_line(&mut out).await.unwrap();
+	let v: Value = serde_json::from_str(&out).unwrap();
+	assert!(v["signature"].is_string(), "the signer co-signs the spend: {}", v);
+}
+
+/// D59.2: no participation can be stuck. A coin under something the
+/// operator's signer already holds under its salt is refused when it is
+/// offered, `double_spend`, the refusal naming the coin and what the signer
+/// holds: (a) a board an older server gave back while its forfeit stood in
+/// the signer's record (the database put as that server's expiry left it),
+/// offered again with another board; (b) a board whose spend the signer
+/// co-signed and the database lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_under_a_forfeit_or_spend_the_signer_holds_is_refused_when_offered() {
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (_, new_valid, _, _) = complete(&r, &pa, &a_board, &a, &a_tx, &a2, &a2_nonce).await;
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	db.execute("UPDATE participation SET state = 'expired' WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("DELETE FROM forfeit WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE participation_input SET active = false WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'live', spent_by = NULL WHERE leaf_id = $1", &[&&a_board.id.0[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'expired' WHERE leaf_id = $1", &[&&new_valid.leaf_id.0[..]]).await.unwrap();
+
+	// (a) The board given back under its forfeit, offered with board C.
+	let c = keypair("A, board C");
+	let (c_board, _) = credited_board(&mut r, &c, x).await;
+	let n = keypair("A, new leaf of both");
+	let (w, _) = want_leaf(&n, x, 2 * VALUE);
+	let (body, pa2) = participation_body(&[&a_board, &c_board], &[w], &[], None, xonly(&r.s), r.chain);
+	let ans = r.http.post("submit_participation", &body);
+	println!("D592 (a) the board given back under its forfeit, offered again with C: {} {}", ans.status, ans.json);
+	let st = r.server.store.participation(&pa2).await.unwrap().map(|p| format!("{:?}", p.state));
+	println!("D592 (a) the participation at the server: {:?}; C at the server {}", st, leaf_state(&r, &c_board.id).await);
+
+	// (b) A board whose spend the signer co-signed and the database lost.
+	let d = keypair("D");
+	let (d_board, d_tx) = credited_board(&mut r, &d, x).await;
+	signer_holds_a_spend(&r, &d_board, &d_tx).await;
+	let d2 = keypair("D, new");
+	let (ans_b, pd, _) = submit(&r, &d_board, &d2, VALUE, 0, None);
+	println!("D592 (b) the board whose spend the signer holds, offered: {} {}", ans_b.status, ans_b.json);
+	let st_b = r.server.store.participation(&pd).await.unwrap().map(|p| format!("{:?}", p.state));
+	println!("D592 (b) the participation at the server: {:?}; D at the server {}", st_b, leaf_state(&r, &d_board.id).await);
+
+	let m = refused(ans, 409, "double_spend");
+	assert!(m.contains(&a_board.id.to_string()) && m.contains("already co-signed the forfeit"), "{}", m);
+	assert!(st.is_none(), "nothing recorded");
+	assert_eq!(leaf_state(&r, &c_board.id).await, "live", "C is not taken");
+	let m = refused(ans_b, 409, "double_spend");
+	assert!(m.contains(&d_board.id.to_string()) && m.contains("already co-signed the spend"), "{}", m);
+	assert!(st_b.is_none(), "nothing recorded");
+}
+
+/// D59.2, a participation stuck from old state is released on the watcher's
+/// claim. A gives up boards A and C for one leaf of both; the round is
+/// final; then the signer is found to hold a spend under A's salt that the
+/// database lost (old state: the participation was taken before any check
+/// asked the signer). A's forfeit step: A's forfeit is refused for good
+/// (`already_signed`), C's is filled in whole by the minute task: neither
+/// released nor expired, past the forfeit deadline too. C's owner takes its
+/// board home; the watcher answers with C's forfeit and claims it, which
+/// puts the preimage out: the next pass releases the participation and
+/// credits its leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participation_stuck_from_old_state_is_released_on_the_watchers_claim() {
+	use arca_covenant::sign::sign_digest;
+	use arca_covenant::spend::FeeSource;
+	let mut r = start().await;
+	let x = r.x;
+	let (a, c) = (keypair("A, stuck"), keypair("C, stuck"));
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let (c_board, c_tx) = credited_board(&mut r, &c, x).await;
+	let n = keypair("A, new leaf of both, stuck");
+	let (w, nonce) = want_leaf(&n, x, 2 * VALUE);
+	let (body, pa) = participation_body(&[&a_board, &c_board], &[w], &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	signer_holds_a_spend(&r, &a_board, &a_tx).await;
+	let (valid, record, round) = validate_new_leaf(&r, &pa, 0, &n, &nonce);
+	let st = status(&r, &pa);
+	let cv = st["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let delay = RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap() as u16).unwrap();
+	let mut forfeits = vec![];
+	for (k, (held, tx, key)) in [(&a_board, &a_tx, &a), (&c_board, &c_tx, &c)].into_iter().enumerate() {
+		let old = held.record.resolve(std::slice::from_ref(tx), &r.policy()).unwrap();
+		let margin: u64 = st["inputs"][k]["margin"].as_str().unwrap().parse().unwrap();
+		let f = Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, &valid, &round, cv, delay, margin).unwrap();
+		forfeits.push(json!({"leaf_id": held.id.to_string(), "signature": forfeit_sig(&f, key)}));
+	}
+	let step = json!({"participation_id": hex(&pa), "forfeits": forfeits, "leaves": [auths_json(&valid, &n, created(&record))]});
+	let ans = r.http.post("forfeit_leaves", &step);
+	println!("D592S A's forfeit step: {} {}", ans.status, ans.json);
+	let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+	common::rounds::past_forfeit_deadline(&r, &pa).await;
+	let _ = r.server.forfeits.fill_unsigned().await;
+	r.server.rounds.pass().await.unwrap();
+	let whole = r.server.store.forfeits(&pa, built.round_id).await.unwrap().len();
+	let unsigned = r.server.store.unsigned_forfeits().await.unwrap().len();
+	let sa = status(&r, &pa);
+	println!("D592S {} filled in; past the forfeit deadline: whole {} | without the operator's half {} | A {} | the new leaf {:?}", filled,
+		whole, unsigned, sa["state"], leaf_states(&r, &n));
+	assert_eq!((whole, unsigned), (1, 1), "C's forfeit whole, A's refused for good");
+	assert_eq!(sa["state"], "issued", "stuck: neither released nor expired");
+
+	// C's owner takes its board home: the conversion in a block.
+	let old_c = c_board.record.resolve(std::slice::from_ref(&c_tx), &r.policy()).unwrap();
+	let (policy, at) = old_c.board().unwrap();
+	let fee_coin = r.purse.take_coin(x);
+	let conv = policy.conversion(at, &FeeSource::Coin { outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 3_000,
+		change: common::node::op_true() }).unwrap();
+	let sig = sign_digest(&c, &conv.sighash(r.chain.genesis_hash()).unwrap(), &common::client::random32());
+	let conv = conv.finish(vec![sig.as_ref().to_vec()]);
+	r.rt.client().send_raw_transaction(&conv.tx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	let cid = c_board.id.0.to_vec();
+	common::flow::drive(&r, "C's forfeit claimed", 12, |l| common::flow::has(l, "claim", &cid)).await;
+	common::flow::settle(&r).await;
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	println!("D592S C's board taken by its forfeit and claimed: A {} | the new leaf {:?}", sa["state"], leaf_states(&r, &n));
+	assert_eq!(sa["state"], "released", "released on the watcher's claim: {}", sa);
+	assert_eq!(leaf_states(&r, &n), vec!["live"], "its leaf credited");
 	r.purse.put(fee_coin);
 }

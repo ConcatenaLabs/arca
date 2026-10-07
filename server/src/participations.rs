@@ -24,7 +24,14 @@
 //!   bounds to a script that is not an Arca script the server knows;
 //! - per asset, the coins given up hold exactly what the outputs take plus
 //!   the fee, and the fee covers the published schedule
-//!   ([`crate::params::FeeSchedule`]).
+//!   ([`crate::params::FeeSchedule`]);
+//! - the operator's signer holds nothing under any coin's salt: no forfeit
+//!   (a coin an older server gave back while its forfeit stood in the
+//!   signer's record, which stays given up, its owner's way home its exit)
+//!   and no spend (one the database lost). Either would leave a forfeit of
+//!   this round beside another, or refused for good, and the participation
+//!   could then be neither released nor expired. The refusal is
+//!   `double_spend`, naming the coin and what the signer holds.
 //!
 //! It then chooses the participation's unlock hash, draws its own operator
 //! nonce for every leaf wanted (taken by this participation at once, so never
@@ -76,6 +83,7 @@ use crate::chain::FinalityService;
 use crate::coins::{self, CoinError};
 use crate::fees;
 use crate::params::Params;
+use crate::signer::{hex, Signed, SignerClient, SignerError};
 use crate::store::{
 	NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, Store, StoreError, WantedKind,
 };
@@ -238,6 +246,11 @@ pub enum ParticipationError {
 	Unknown(String),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	/// The operator's signer holds a forfeit or a spend under a coin's salt.
+	#[error("{0}")]
+	SignedAlready(String),
+	#[error("the signer: {0}")]
+	Signer(SignerError),
 	#[error(transparent)]
 	Store(StoreError),
 	#[error("{0}")]
@@ -268,6 +281,8 @@ impl ParticipationError {
 			Fee(_) => "fee",
 			Unknown(_) => "unknown_participation",
 			NotSynced => "not_synced",
+			SignedAlready(_) => "double_spend",
+			Signer(_) => "signer_unavailable",
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -326,6 +341,7 @@ pub struct Participations {
 	store: Store,
 	finality: Arc<FinalityService>,
 	params: Arc<Params>,
+	signer: SignerClient,
 }
 
 /// A signature of the right length for sizing a transaction.
@@ -365,8 +381,8 @@ pub fn offboard_margin(destination: &ExplicitOutput, operator: XOnlyPublicKey, r
 }
 
 impl Participations {
-	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>) -> Arc<Participations> {
-		Arc::new(Participations { store, finality, params })
+	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient) -> Arc<Participations> {
+		Arc::new(Participations { store, finality, params, signer })
 	}
 
 	async fn now(&self) -> Result<MedianTime, ParticipationError> {
@@ -471,6 +487,22 @@ impl Participations {
 			expiries.push(c.expiry());
 			last_times.push(last);
 			coins.push(c.coin);
+		}
+		// Nothing of any coin in the signer's record: a coin under a forfeit
+		// the signer holds stays given up, and one under a spend was paid on;
+		// either would leave this participation's forfeit beside another, or
+		// refused for good, and the participation stuck.
+		for (c, i) in coins.iter().zip(&req.inputs) {
+			let held = self.signer.under(&c.leaf.salt).await.map_err(ParticipationError::Signer)?;
+			if let Some(e) = held.first() {
+				let (what, why) = match e.kind {
+					Signed::Forfeit(_) => ("the forfeit", "a coin under a forfeit the signer holds stays given up"),
+					Signed::Spend => ("the spend", "the coin was paid on"),
+				};
+				return Err(ParticipationError::SignedAlready(format!(
+					"coin {}: the operator's signer has already co-signed {} {} under salt {} (entry {}): {}, and is refreshed in no \
+					round; its owner's way home is its exit", i.leaf_id, what, hex(&e.digest), hex(&c.leaf.salt), e.n, why)));
+			}
 		}
 		// A coin is taken only up to its exit deadline, and so is a round
 		// asked for later.
