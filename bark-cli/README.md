@@ -124,11 +124,13 @@ the keys, but which coins were spent off-chain is in the store and the server.
   a coin paid to the wallet out of a leaf of that round with it; each is the
   wallet's again once every round and board it rests on is final in the chain
   again, unless a spend that is no step of its exit (the operator's sweep, or
-  another spend the operator co-signed) has cut its path and is final. The re-check looks at what the chain holds of a coin, checked as of
-  its expiry once that has passed, and leaves the coin's dates to `sync`,
-  which takes it home by them: a round that can never return, or one that
-  returns, is followed whenever the wallet next looks, past the coin's exit
-  date or its expiry as before them. A board
+  another spend the operator co-signed) has cut its path and is final. The
+  re-check looks at what the chain holds of a coin as of its expiry once that
+  has passed, so a round that can never return, or one that returns, is
+  followed whenever the wallet next looks, past the coin's exit date or its
+  expiry as before them; and a coin it finds past its exit date (three days
+  before its first expiry) it takes on the chain at once, whatever command
+  started it, since the operator co-signs no spend of it any more. A board
   held as `lost` whose transaction the chain holds is followed again once the
   server reports it credited. Every participation such a round ran, the
   operator runs again, under the same keys and owner nonces, in a round that
@@ -373,7 +375,7 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, each under a fresh key whose own signature proves the wallet holds it, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
 | `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
-| `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks or whose lineage shows on the chain, and reports what changed and whether the tip it last saw was reorganised away |
+| `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
@@ -604,6 +606,8 @@ and holding it there, with the reason shown:
   deadline, the participation released and paid out of, and with it down
   past the deadline, the board kept given up, never offered for a payment,
   and brought home whole;
+- a coin past its exit date, looked at by a command other than `sync`: taken
+  on the chain at once, shown `exiting` and why, and brought home;
 - a round lost for good, first seen a day past its leaf's exit date: the
   leaf `lost`, counted nowhere, and the coin given up for it brought home; a
   lost round that returns, and a coin paid out of its leaf, first seen again

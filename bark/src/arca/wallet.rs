@@ -1542,9 +1542,9 @@ impl Wallet {
 			}
 			let record = Self::record_of(&c)?;
 			// What the chain holds of the coin, checked as of its expiry once
-			// that has passed: its dates are what `sync` takes it home by.
+			// that has passed; its dates are looked at on their own.
 			let policy = self.followed_policy(c.expiry, now);
-			let (state, note) = match self.recheck_one(&c, &record, &policy)? {
+			let (state, note) = match self.recheck_one(&c, &record, &policy, now)? {
 				Checked::Holds(state, note) => (state, note),
 				Checked::Lost(base) => {
 					let why = format!("rests on {}, which is out of the chain while a coin it spends is spent by another transaction that is \
@@ -1657,9 +1657,12 @@ impl Wallet {
 		Ok(changes)
 	}
 
-	/// One coin against the chain: where it stands, or why a base the chain
-	/// holds fails the wallet's checks.
-	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy) -> Result<Checked, Error> {
+	/// One coin against the chain at `now`: where it stands, or why a base
+	/// the chain holds fails the wallet's checks, or that it is past its exit
+	/// date. `policy` checks the coin as of its expiry once that has passed
+	/// ([`Self::followed_policy`]): what the chain holds of it is looked at
+	/// past its expiry as before it.
+	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
 		let txs = match self.base_txs(record) {
 			Ok(t) => t,
 			Err(e @ (Error::Refused(_) | Error::Missing(_) | Error::Parse(_))) => return Ok(Checked::Holds("pending", format!("re-check: {}", e))),
@@ -1701,6 +1704,20 @@ impl Wallet {
 		let expiry = self.service_expiry(record, &a)?;
 		if expiry != c.expiry {
 			self.store.set_coin_expiry(&c.leaf_id, expiry)?;
+		}
+		// Past its exit date, three days before the first expiry of a batch
+		// it rests on, the operator co-signs no spend of the coin and takes
+		// it into no round: the wallet takes it on the chain at once, past
+		// its expiry as before it, and its exit checks it as of the expiry.
+		let first = a.valid.expiry.to_consensus_u32();
+		if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 > first as u64 {
+			let why = format!("past its exit date (median time {}, three days before its first expiry, {}): the operator co-signs no \
+				spend of it and takes it into no round", first.saturating_sub(WalletPolicy::EXIT_DEADLINE), first);
+			return Ok(if a.bases.iter().all(|(_, f)| f.in_chain()) {
+				Checked::Fails(why)
+			} else {
+				Checked::Holds("pending", format!("waiting: {}; {}", waiting, why))
+			});
 		}
 		Ok(if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
 			Checked::Holds("pending", format!("{}{}", e, extra))
