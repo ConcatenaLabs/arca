@@ -224,6 +224,14 @@ pub struct RegisterBoard {
 	pub record: String,
 	/// The board transaction.
 	pub tx: String,
+	/// The key the board is re-served to besides its own: its owner's
+	/// mailbox key, which a wallet restored from its mnemonic derives
+	/// (`leaf_data`), with the board's owner key's signature over the
+	/// binding (`auth::mailbox_binding_digest`). Both or neither.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mailbox: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mailbox_proof: Option<String>,
 }
 
 /// `POST /v1/board_status`.
@@ -344,32 +352,215 @@ pub struct MailboxMessage {
 	pub signer_record: Option<RecordHead>,
 }
 
-/// `POST /v1/leaf_data`: the leaves the authenticated key owns.
+/// `POST /v1/leaf_data`: the leaves served to the authenticated key, after
+/// cursor `after` (decimal), up to `limit`: those it owns, those whose owner
+/// key bound them to it, and the transfer outputs posted to it as a mailbox.
+/// The proof binds the cursor and the page size as a `mailbox_read`'s does;
+/// a request without them reads the first page, its proof over nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafDataRequest {
 	pub auth: Auth,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub after: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafData {
 	pub leaves: Vec<LeafEntry>,
+	/// The cursor of the last leaf served, to ask for the next page after;
+	/// absent when this page holds nothing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub next: Option<String>,
 }
 
+/// A leaf as the server re-serves it: its record, what it rests on, and
+/// every way it was given up, each with the owner's own signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafEntry {
 	pub leaf_id: String,
 	/// `board`, `batch` or `transfer`.
 	pub kind: String,
-	/// `pending`, `live`, `spent` or `lost`.
+	/// `pending`, `live`, `spent`, `lost` or `expired`.
 	pub state: String,
 	pub asset: String,
 	pub value: String,
 	/// The coin record, binary form; empty while a transfer's output waits
-	/// for its signatures.
+	/// for its signatures, and for a round's leaf until its participation's
+	/// preimage went out.
 	pub record: String,
+	/// Where the leaf lies in the order the server learned of leaves: the
+	/// cursor of a next page.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cursor: Option<String>,
+	/// Its owner key, and the owner nonce it was derived from (absent for a
+	/// transfer's output whose record is empty).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner_nonce: Option<String>,
+	/// A round's leaf: its round, its batch and its index in the published
+	/// tree, the participation it was made for, and the head of the signer's
+	/// record when the round was built, with the keepers' acknowledgements.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub batch: Option<LeafBatch>,
+	/// A board: its transaction output and its state there.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub board: Option<LeafBoard>,
+	/// A transfer's output: the transfer, and the head of the signer's
+	/// record its last signature was recorded at, with the keepers'
+	/// acknowledgements.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub made_by: Option<LeafMadeBy>,
+	/// Every way the coin was given up, oldest first.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub given: Vec<LeafGiven>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafBatch {
+	pub round_txid: String,
+	/// `built`, `broadcast`, `final` or `lost`.
+	pub round_state: String,
+	pub batch_vout: u32,
+	pub leaf_index: u32,
+	pub participation_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafBoard {
+	pub txid: String,
+	pub vout: u32,
+	/// `pending`, `credited` or `lost`.
+	pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafMadeBy {
+	pub transfer_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
+}
+
+/// One way a coin was given up: `{"transfer": …}` or `{"participation": …}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LeafGiven {
+	Transfer(GivenTransfer),
+	Participation(GivenParticipation),
+}
+
+/// A transfer the coin is an input of: whether the operator signed it, the
+/// coin's checkpoint value, and the owner's signature over the coin's move
+/// into its checkpoint, which the owner checks is its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GivenTransfer {
+	pub transfer_id: String,
+	/// `recorded` or `signed`.
+	pub state: String,
+	pub checkpoint_value: String,
+	pub checkpoint_sig: String,
+}
+
+/// A participation the coin was given up to: its state, every part its id
+/// is a hash of, so the owner recomputes the id and checks the coin's
+/// attestation over it is its own, whether the coin was given back, and
+/// every forfeit of the coin recorded for it, each with the owner's half.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GivenParticipation {
+	pub participation_id: String,
+	pub state: String,
+	pub attestation: String,
+	pub returned: bool,
+	pub inputs: Vec<String>,
+	pub outputs: Vec<ServedOutput>,
+	pub fees: Vec<FeeAmount>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub not_before: Option<u32>,
+	pub unlock_hash: String,
+	pub refund_delay_units: u16,
+	pub forfeits: Vec<GivenForfeit>,
+}
+
+/// An output a participation wants, as its id covers it, with the leaf the
+/// current attempt's round made of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ServedOutput {
+	Leaf(ServedWantedLeaf),
+	Offboard(WantedOffboard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServedWantedLeaf {
+	pub asset: String,
+	pub value: String,
+	pub template: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub exit_delay_units: u16,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+}
+
+/// A forfeit of the coin, for the round of one attempt: what its output
+/// names and the owner's signature over the coin's move into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GivenForfeit {
+	pub participation_id: String,
+	pub round_txid: String,
+	pub connector_vout: u32,
+	pub unlock_hash: String,
+	pub refund_delay_units: u16,
+	pub margin: String,
+	pub owner_sig: String,
+	/// Whether the operator's half is recorded too.
+	pub cosigned: bool,
+}
+
+/// `POST /v1/bind_mailbox`: binds leaves to their owner's mailbox key, each
+/// with its owner key's signature over the binding: for leaves made before
+/// their wallet named the key when it asked for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindMailbox {
+	pub bindings: Vec<MailboxBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxBinding {
+	pub owner: String,
+	pub mailbox: String,
+	pub proof: String,
+}
+
+/// What each binding came to: the mailbox the key is bound to (an earlier
+/// binding stands), or none for a key the server knows no leaf of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxBound {
+	pub bound: Vec<BoundKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundKey {
+	pub owner: String,
+	pub mailbox: Option<String>,
 }
 
 /// `POST /v1/submit_participation`: the coins given up, each with its
@@ -418,6 +609,14 @@ pub struct WantedLeaf {
 	/// whatever its body lacks (the id does not cover the proofs).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub key_proof: Option<String>,
+	/// The key the leaf is re-served to besides its own: its owner's
+	/// mailbox key, with the owner key's signature over the binding
+	/// (`auth::mailbox_binding_digest`). Both or neither; not covered by the
+	/// participation's id.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mailbox: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mailbox_proof: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

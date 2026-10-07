@@ -15,10 +15,11 @@
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
-//! | `tree` | POST | no: the operator publishes every tree |
+//! | `tree` | POST | no: the operator publishes every tree; at the reads' rate |
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
-//! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]) |
+//! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
+//! | `bind_mailbox` | POST | by each leaf's owner key's signature over its binding; at the reads' rate |
 //! | `witness` | POST | no: the heads it hands over are the signer's, signed, and at most four without a valid signature; answered at a bounded rate of its own, for each source and overall ([`Limiter`]) |
 
 use std::collections::HashMap;
@@ -73,6 +74,10 @@ pub struct App {
 	/// Bounds the witnesses answered: each reads the signer's record under
 	/// its lock.
 	pub witnesses: Limiter,
+	/// Bounds the reads that serve what the server holds for a wallet and
+	/// what it publishes (`leaf_data`, `mailbox_read`, `tree`,
+	/// `bind_mailbox`).
+	pub reads: Limiter,
 	/// The key of every challenge's check ([`crate::auth`]), kept in the
 	/// database, the same for every server on it.
 	pub challenge_key: [u8; 32],
@@ -601,8 +606,28 @@ async fn register_board(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 		.map_err(|e| Refusal::new(StatusCode::BAD_REQUEST, "invalid_record", format!("the board record: {}", e)))?;
 	let tx: Transaction = deserialize(&unhex(&req.tx).map_err(Refusal::malformed)?)
 		.map_err(|e| Refusal::new(StatusCode::BAD_REQUEST, "invalid_transaction", format!("the board transaction: {}", e)))?;
+	let binding = binding(&app, &record.owner, req.mailbox.as_deref(), req.mailbox_proof.as_deref())?;
 	let status = app.boards.register(&record, &tx).await?;
+	if let Some((mailbox, proof)) = binding {
+		app.store.bind_mailbox(&record.owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
+	}
 	Ok(Json(board_status(&status)))
+}
+
+/// A leaf's binding to its owner's mailbox key, as a request names it
+/// (`mailbox` and `mailbox_proof`, both or neither), checked: the proof is
+/// `owner`'s signature over the binding ([`auth::mailbox_binding_digest`]).
+fn binding(app: &App, owner: &XOnlyPublicKey, mailbox: Option<&str>, proof: Option<&str>) -> Result<Option<(XOnlyPublicKey, Signature)>, Refusal> {
+	let (mailbox, proof) = match (mailbox, proof) {
+		(None, None) => return Ok(None),
+		(Some(m), Some(p)) => (key(m)?, sig(p)?),
+		_ => return Err(Refusal::malformed("a mailbox binding names both the mailbox key and its proof")),
+	};
+	if !auth::verify_binding(&app.params.chain, &app.params.operator, owner, &mailbox, &proof) {
+		return Err(Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "bad_signature", format!("the binding of the leaf of key {} to mailbox \
+			{} is not signed by that key", owner, mailbox)));
+	}
+	Ok(Some((mailbox, proof)))
 }
 
 async fn board_status_call(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::BoardStatus>, Refusal> {
@@ -715,11 +740,18 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	}
 	let mut outputs = Vec::with_capacity(req.outputs.len());
 	let mut key_proofs = Vec::with_capacity(req.outputs.len());
+	let mut bindings = vec![];
 	for o in &req.outputs {
 		key_proofs.push(match o {
 			api::WantedOutput::Leaf(l) => l.key_proof.as_deref().map(sig).transpose()?,
 			api::WantedOutput::Offboard(_) => None,
 		});
+		if let api::WantedOutput::Leaf(l) = o {
+			let owner = key(&l.owner)?;
+			if let Some(b) = binding(&app, &owner, l.mailbox.as_deref(), l.mailbox_proof.as_deref())? {
+				bindings.push((owner, b));
+			}
+		}
 		outputs.push(match o {
 			api::WantedOutput::Leaf(l) => part::OutputRequest::Leaf {
 				asset: asset(&l.asset)?,
@@ -744,6 +776,9 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
 	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before }).await?;
+	for (owner, (mailbox, proof)) in bindings {
+		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
+	}
 	Ok(Json(participation_status(&status)))
 }
 
@@ -755,8 +790,11 @@ async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Byt
 	Ok(Json(participation_status(&app.participations.status(&id).await?)))
 }
 
-async fn tree(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::PublishedTree>, Refusal> {
+async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::PublishedTree>, Refusal>
+{
 	let req: api::TreeRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a published tree", app.source(peer.ip(), &headers))?;
 	let txid = elements::Txid::from_str(&req.txid).map_err(|e| Refusal::malformed(format!("txid: {}", e)))?;
 	let t = app.rounds.tree(&txid, req.vout).await?
 		.ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "unknown_batch", format!("no batch is paid by {}:{}", txid, req.vout)))?;
@@ -890,8 +928,11 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 /// The most messages one read returns.
 pub const MAILBOX_PAGE: u32 = 100;
 
-async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Mailbox>, Refusal> {
+async fn mailbox_read(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::Mailbox>, Refusal>
+{
 	let req: api::MailboxRead = parse(body, app.max_request)?;
+	app.reads.refusal("a mailbox read", app.source(peer.ip(), &headers))?;
 	let after: i64 = if req.after == "0" { 0 } else {
 		i64::try_from(amount(&req.after)?).map_err(|_| Refusal::malformed("cursor out of range"))?
 	};
@@ -915,30 +956,206 @@ async fn mailbox_read(State(app): State<Arc<App>>, body: Result<Bytes, BytesReje
 	Ok(Json(api::Mailbox { messages }))
 }
 
-async fn leaf_data(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LeafData>, Refusal> {
+/// The most leaves one `leaf_data` page holds.
+pub const LEAF_PAGE: u32 = 100;
+
+/// The most bytes of records one `leaf_data` page carries, beyond its first
+/// leaf: a page stops before the leaf that would take it past this.
+pub const LEAF_PAGE_BYTES: usize = 1 << 20;
+
+/// The most bindings one `bind_mailbox` takes.
+pub const MAX_BINDINGS: usize = 64;
+
+/// A txid in internal byte order, as RPCs print it.
+fn txid_hex(t: &[u8; 32]) -> String {
+	use elements::hashes::Hash as _;
+	elements::Txid::from_byte_array(*t).to_string()
+}
+
+fn leaf_kind(k: LeafKind) -> &'static str {
+	match k {
+		LeafKind::Board => "board",
+		LeafKind::Batch => "batch",
+		LeafKind::Transfer => "transfer",
+	}
+}
+
+fn leaf_state(s: LeafState) -> &'static str {
+	match s {
+		LeafState::Pending => "pending",
+		LeafState::Live => "live",
+		LeafState::Spent => "spent",
+		LeafState::Lost => "lost",
+		LeafState::Expired => "expired",
+	}
+}
+
+/// Re-serves the leaves of the key the request proves, a page at a time:
+/// every leaf it owns, every leaf whose owner key bound it to it as a
+/// mailbox, every transfer output posted to it, in any state, each with
+/// its record (a round's leaf's only once its participation's preimage went
+/// out), what it rests on with the head of the signer's record and the
+/// keepers' acknowledgements, and every way it was given up with the
+/// owner's own signature (the checkpoint signature of a transfer, the
+/// attestation of a participation with every part of its id, the owner's
+/// half of each forfeit). Nothing of a key the request does not prove.
+async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::LeafData>, Refusal>
+{
 	let req: api::LeafDataRequest = parse(body, app.max_request)?;
-	let k = authenticate(&app, "leaf_data", &req.auth, &[]).await?;
-	let rows = app.store.leaves_by_owner(&k.serialize()).await?;
-	Ok(Json(api::LeafData {
-		leaves: rows.into_iter().map(|r| api::LeafEntry {
-			leaf_id: hex(&r.leaf_id),
-			kind: match r.kind {
-				LeafKind::Board => "board",
-				LeafKind::Batch => "batch",
-				LeafKind::Transfer => "transfer",
-			}.into(),
-			state: match r.state {
-				LeafState::Pending => "pending",
-				LeafState::Live => "live",
-				LeafState::Spent => "spent",
-				LeafState::Lost => "lost",
-				LeafState::Expired => "expired",
-			}.into(),
-			asset: AssetId::from_byte_array(r.asset).to_string(),
-			value: r.value.to_string(),
-			record: hex(&r.record),
-		}).collect(),
-	}))
+	app.reads.refusal("a read of a key's leaves", app.source(peer.ip(), &headers))?;
+	let (after, limit, request) = match (&req.after, req.limit) {
+		(None, None) => (0i64, LEAF_PAGE, vec![]),
+		(after, limit) => {
+			let after: i64 = match after.as_deref() {
+				None | Some("0") => 0,
+				Some(a) => i64::try_from(amount(a)?).map_err(|_| Refusal::malformed("cursor out of range"))?,
+			};
+			let limit = limit.unwrap_or(LEAF_PAGE);
+			(after, limit, auth::mailbox_read_request(after as u64, limit))
+		},
+	};
+	let k = authenticate(&app, "leaf_data", &req.auth, &request).await?;
+	let rows = app.store.served_leaves(&k.serialize(), after, limit.clamp(1, LEAF_PAGE) as i64).await?;
+	let mut leaves = Vec::with_capacity(rows.len());
+	let mut bytes = 0usize;
+	for r in rows {
+		bytes += r.leaf.record.len();
+		if !leaves.is_empty() && bytes > LEAF_PAGE_BYTES {
+			break;
+		}
+		leaves.push(served_entry(&app, r).await?);
+	}
+	let next = leaves.last().and_then(|l: &api::LeafEntry| l.cursor.clone());
+	Ok(Json(api::LeafData { leaves, next }))
+}
+
+/// One leaf as `leaf_data` serves it.
+async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::LeafEntry, Refusal> {
+	let internal = |e: String| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
+	let l = &r.leaf;
+	let owner_nonce = match arca_covenant::CoinRecord::from_bytes(&l.record) {
+		Ok(arca_covenant::CoinRecord::Leaf { record, .. }) => Some(record.owner_nonce),
+		Ok(arca_covenant::CoinRecord::Board(b)) => Some(b.owner_nonce),
+		Ok(arca_covenant::CoinRecord::Transfer(t)) => Some(t.leaf.owner_nonce),
+		Err(_) => r.batch.as_ref().map(|b| b.owner_nonce),
+	};
+	let batch = match &r.batch {
+		Some(b) => Some(api::LeafBatch {
+			round_txid: txid_hex(&b.round_txid),
+			round_state: b.round_state.clone(),
+			batch_vout: b.batch_vout,
+			leaf_index: b.leaf_index,
+			participation_id: hex(&b.participation_id),
+			signer_record: match &b.signer_head {
+				Some((entry, h, sig)) => Some(head_with_acks(app, *entry, h, sig.as_ref()).await?),
+				None => None,
+			},
+		}),
+		None => None,
+	};
+	let made_by = match &r.made_by {
+		Some(m) => Some(api::LeafMadeBy {
+			transfer_id: hex(&m.transfer_id),
+			signer_record: match &m.signer_head {
+				Some((entry, h, sig)) => Some(head_with_acks(app, *entry, h, Some(sig)).await?),
+				None => None,
+			},
+		}),
+		None => None,
+	};
+	let mut given = vec![];
+	for t in &r.transfers {
+		given.push(api::LeafGiven::Transfer(api::GivenTransfer {
+			transfer_id: hex(&t.transfer_id),
+			state: if t.signed { "signed" } else { "recorded" }.into(),
+			checkpoint_value: t.checkpoint_value.to_string(),
+			checkpoint_sig: hex(&t.checkpoint_owner_sig),
+		}));
+	}
+	for p in &r.participations {
+		let mine = p.inputs.iter().find(|i| i.leaf_id == l.leaf_id).ok_or_else(|| internal(format!("participation {} without coin {}",
+			hex(&p.id), hex(&l.leaf_id))))?;
+		given.push(api::LeafGiven::Participation(api::GivenParticipation {
+			participation_id: hex(&p.id),
+			state: p.state.as_str().into(),
+			attestation: hex(&mine.attestation),
+			returned: mine.returned,
+			inputs: p.inputs.iter().map(|i| hex(&i.leaf_id)).collect(),
+			outputs: p.outputs.iter().map(|o| match &o.kind {
+				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
+					asset: AssetId::from_byte_array(o.asset).to_string(),
+					value: o.value.to_string(),
+					template: template.clone(),
+					owner: hex(owner_key),
+					owner_nonce: hex(owner_nonce),
+					exit_delay_units: *exit_delay_units,
+					leaf_id: o.leaf_id.map(|i| hex(&i)),
+				}),
+				WantedKind::Offboard { script, .. } => api::ServedOutput::Offboard(api::WantedOffboard {
+					asset: AssetId::from_byte_array(o.asset).to_string(),
+					value: o.value.to_string(),
+					script: hex(script),
+				}),
+			}).collect(),
+			fees: p.fees.iter().map(|(a, v)| api::FeeAmount { asset: AssetId::from_byte_array(*a).to_string(), amount: v.to_string() }).collect(),
+			not_before: p.not_before,
+			unlock_hash: hex(&p.unlock_hash),
+			refund_delay_units: p.refund_delay_units,
+			forfeits: r.forfeits.iter().filter(|f| f.participation_id == p.id).map(|f| api::GivenForfeit {
+				participation_id: hex(&f.participation_id),
+				round_txid: txid_hex(&f.round_txid),
+				connector_vout: f.connector_vout,
+				unlock_hash: hex(&f.unlock_hash),
+				refund_delay_units: f.refund_delay_units,
+				margin: f.margin.to_string(),
+				owner_sig: hex(&f.owner_sig),
+				cosigned: f.cosigned,
+			}).collect(),
+		}));
+	}
+	Ok(api::LeafEntry {
+		leaf_id: hex(&l.leaf_id),
+		kind: leaf_kind(l.kind).into(),
+		state: leaf_state(l.state).into(),
+		asset: AssetId::from_byte_array(l.asset).to_string(),
+		value: l.value.to_string(),
+		record: hex(&l.record),
+		cursor: Some(r.seq.to_string()),
+		owner: Some(hex(&l.owner_key)),
+		owner_nonce: owner_nonce.map(|n| hex(&n)),
+		batch,
+		board: r.board.as_ref().map(|b| api::LeafBoard { txid: txid_hex(&b.txid), vout: b.vout,
+			state: b.state.clone() }),
+		made_by,
+		given,
+	})
+}
+
+/// Binds leaves to their owner's mailbox key, each binding signed by the
+/// leaf's owner key, for leaves made before their wallet named the key when
+/// it asked for them. A key the server knows no leaf of is bound to
+/// nothing; a key bound before keeps its binding.
+async fn bind_mailbox(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::MailboxBound>, Refusal>
+{
+	let req: api::BindMailbox = parse(body, app.max_request)?;
+	app.reads.refusal("a binding of leaves to a mailbox", app.source(peer.ip(), &headers))?;
+	if req.bindings.len() > MAX_BINDINGS {
+		return Err(Refusal::malformed(format!("{} bindings; one call takes at most {}", req.bindings.len(), MAX_BINDINGS)));
+	}
+	let mut checked = Vec::with_capacity(req.bindings.len());
+	for b in &req.bindings {
+		let owner = key(&b.owner)?;
+		let (mailbox, proof) = binding(&app, &owner, Some(&b.mailbox), Some(&b.proof))?.expect("both named");
+		checked.push((owner, mailbox, proof));
+	}
+	let mut bound = Vec::with_capacity(checked.len());
+	for (owner, mailbox, proof) in checked {
+		let m = app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
+		bound.push(api::BoundKey { owner: hex(&owner.serialize()), mailbox: m.map(|m| hex(&m)) });
+	}
+	Ok(Json(api::MailboxBound { bound }))
 }
 
 /// The server's routes, every body bounded to `app.max_request` bytes.
@@ -958,6 +1175,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/release_leaves", post(release_leaves))
 		.route("/v1/mailbox_read", post(mailbox_read))
 		.route("/v1/leaf_data", post(leaf_data))
+		.route("/v1/bind_mailbox", post(bind_mailbox))
 		.route("/v1/witness", post(witness))
 		.layer(axum::middleware::from_fn_with_state(app.clone(), serving))
 		.layer(DefaultBodyLimit::max(limit))

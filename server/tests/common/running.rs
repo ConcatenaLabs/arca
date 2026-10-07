@@ -89,6 +89,7 @@ impl Running {
 			limits: LimitsSection {
 				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000,
 				witness_per_second: 10_000, witness_burst: 10_000, witness_source_per_second: 10_000, witness_source_burst: 10_000,
+				read_per_second: 10_000, read_burst: 10_000, read_source_per_second: 10_000, read_source_burst: 10_000,
 				..Default::default()
 			},
 			metrics_listen: None,

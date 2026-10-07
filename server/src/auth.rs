@@ -9,8 +9,8 @@
 //!
 //! where `call` names the request it authenticates (`mailbox_read`,
 //! `leaf_data`) and `request` is what that request asks besides its proof
-//! ([`mailbox_read_request`]: the cursor and page size; nothing for
-//! `leaf_data`). The tag keeps the signature apart from everything else a leaf
+//! ([`mailbox_read_request`]: the cursor and page size; nothing for a
+//! `leaf_data` that names neither). The tag keeps the signature apart from everything else a leaf
 //! key signs (rebindable messages, unroll authorisations, releases, exit
 //! claims), whose preimages never begin with `T ‖ T`; the genesis hash keeps
 //! it to one chain, the call and the request to one read, the challenge to a
@@ -38,8 +38,9 @@ use arca_covenant::Chain;
 pub const AUTH_TAG: &[u8] = b"Arca/auth";
 
 /// What a `mailbox_read` asks besides its proof, as the proof binds it: the
-/// cursor (eight bytes) and the page size (four), little-endian. A
-/// `leaf_data` asks nothing more: its request is empty.
+/// cursor (eight bytes) and the page size (four), little-endian. A paged
+/// `leaf_data` asks the same of its cursor and page size; one that names
+/// neither asks nothing more, and its request is empty.
 pub fn mailbox_read_request(after: u64, limit: u32) -> Vec<u8> {
 	let mut b = after.to_le_bytes().to_vec();
 	b.extend(limit.to_le_bytes());
@@ -60,6 +61,34 @@ pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyP
 	e.input(&key.serialize());
 	e.input(sha256::Hash::hash(request).as_byte_array());
 	sha256::Hash::from_engine(e).to_byte_array()
+}
+
+/// The tag of a leaf's binding to its owner's mailbox key.
+pub const MAILBOX_BINDING_TAG: &[u8] = b"Arca/mailbox-of";
+
+/// What a leaf's owner key signs to have the leaf re-served to `mailbox`, its
+/// wallet's mailbox key, besides itself (`leaf_data`):
+/// `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ owner ‖ mailbox)`,
+/// `T = SHA256("Arca/mailbox-of")`. The tag keeps it apart from everything
+/// else a leaf key signs; the genesis hash and `S` keep it to one chain and
+/// one operator. It authorises one thing: that the server serves the leaf's
+/// record, and how it was given up, to whoever proves `mailbox`.
+pub fn mailbox_binding_digest(chain: &Chain, operator: &XOnlyPublicKey, owner: &XOnlyPublicKey, mailbox: &XOnlyPublicKey) -> [u8; 32] {
+	let tag = sha256::Hash::hash(MAILBOX_BINDING_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(&owner.serialize());
+	e.input(&mailbox.serialize());
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
+/// Whether `proof` is `owner`'s signature over its leaf's binding to
+/// `mailbox` ([`mailbox_binding_digest`]).
+pub fn verify_binding(chain: &Chain, operator: &XOnlyPublicKey, owner: &XOnlyPublicKey, mailbox: &XOnlyPublicKey, proof: &Signature) -> bool {
+	verify_digest(proof, &mailbox_binding_digest(chain, operator, owner, mailbox), owner)
 }
 
 /// Whether `sig` authenticates `call` with `key` for `challenge`, asking

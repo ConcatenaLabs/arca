@@ -110,6 +110,17 @@ witness_per_second = 250
 witness_burst = 1000
 witness_source_per_second = 5
 witness_source_burst = 60
+# The reads that serve a wallet what the server holds for it and what it
+# publishes (leaf_data, mailbox_read, tree, bind_mailbox) have a
+# budget of their own: at most read_per_second over every source together,
+# with bursts of up to read_burst, and read_source_per_second to each source,
+# with bursts of up to read_source_burst. A wallet restored from its mnemonic
+# reads a page of its leaves, a page of its mailbox and a tree for each round
+# its leaves rest on.
+read_per_second = 500
+read_burst = 2000
+read_source_per_second = 10
+read_source_burst = 200
 # The reverse proxies in front of the server: a request from one of these
 # addresses is counted against the address its X-Forwarded-For names (the
 # proxy appends the address that connected to it), any other request against

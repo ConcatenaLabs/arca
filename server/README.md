@@ -33,7 +33,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V13__reruns_are_ordinary.sql`](schema/V13__reruns_are_ordinary.sql),
 [`schema/V14__keeper_acks.sql`](schema/V14__keeper_acks.sql),
 [`schema/V15__rerun_ties.sql`](schema/V15__rerun_ties.sql),
-[`schema/V16__keepers_pinned.sql`](schema/V16__keepers_pinned.sql)). `Store::connect` builds it
+[`schema/V16__keepers_pinned.sql`](schema/V16__keepers_pinned.sql),
+[`schema/V17__leaf_reserving.sql`](schema/V17__leaf_reserving.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -45,6 +46,17 @@ requests can race past them:
   an outpoint, with its coin record, from which its lineage and every
   transaction that brings it on-chain follow. A key owns one leaf; a leaf of
   a participation that expired, never credited, owns none.
+- **Mailbox bindings.** A wallet draws a fresh owner nonce, and so a fresh
+  key, for every leaf it asks for, and a wallet restored from its mnemonic
+  knows none of them; it knows its mailbox key, which follows from the
+  mnemonic and the account. So each leaf a wallet asks for names that key,
+  with the leaf's owner key's signature over the binding (below): the server
+  keeps one binding per owner key, the first, and only for a key that owns
+  a leaf or that a participation wants, so a stranger writes no row. A
+  transfer's output is bound to the mailbox it was posted to. `leaf_data`
+  re-serves a leaf to its own key and to the mailbox key it is bound to, and
+  every leaf has a cursor, the order the server learned of it in, that the
+  re-serving pages by.
 - **Arca scripts.** Every leaf, board and checkpoint script the server has
   created or co-signed into appears once: a leaf script is never funded twice,
   across batches, boards and transfers alike. The operator's connector script,
@@ -206,7 +218,12 @@ transaction that does not pay the board output exactly once, a salt it has
 seen before (`salt`), a nonce it never issued or already gave a leaf, a key
 that already owns a leaf or is the operator's own `S` (`operator_key`), a
 script it already knows, and another transaction for a board already
-registered. The
+registered. A registration may bind the board to its owner's mailbox key
+(`mailbox`, with `mailbox_proof`, the board's owner key's BIP340 signature
+over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ owner ‖ mailbox)`,
+`T = SHA256("Arca/mailbox-of")`), so that `leaf_data` serves the board to
+that key; a proof that is not the board key's is refused (`bad_signature`)
+before anything is registered. The
 node must then take the board transaction: it is in a block or the mempool
 already, or `testmempoolaccept` allows it. One the node refuses (an input that
 does not exist, say) is refused with `not_accepted` and the node's reason, so
@@ -310,7 +327,10 @@ most seven days ahead. An output wanted is a leaf (its template, `vtxo-1`, its
 owner key and nonce, its exit delay, asset and value, and its key proof: the
 owner key's BIP340 signature over `SHA256(T ‖ T ‖ id)`,
 `T = SHA256("Arca/participation-key")`, so a participation wants a leaf only
-under a key it holds) or an offboard (an asset, a value and the on-chain
+under a key it holds, and optionally the leaf's binding to its owner's
+mailbox key, `mailbox` with `mailbox_proof`, as a board's: not covered by
+the id, refused with `bad_signature` when the proof is not the leaf key's)
+or an offboard (an asset, a value and the on-chain
 script to pay). The server accepts it only when:
 
 - every coin given up passes the same check as a transfer's input: known,
@@ -755,7 +775,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at |
-| `POST leaf_data` | The leaves a key owns (`pending`, `live`, `spent`, `lost`, `expired`), with their records; a round's leaf is served with an empty record until its participation's preimage went out |
+| `POST leaf_data` | Every leaf served to a key, after a cursor (`after`, `limit`, at most 100 a page and about a megabyte of records beyond its first leaf; `next` names the cursor to read on from): the leaves it owns, those whose owner key bound them to it, and the transfer outputs posted to it, in any state (`pending`, `live`, `spent`, `lost`, `expired`). Each comes with its record (a round's leaf's empty until its participation's preimage went out), its owner key and nonce, what it rests on (`batch`: its round, batch output, index in the published tree and participation, with the head of the signer's record when the round was built; `board`: its transaction output and state; `made_by`: the transfer that made it, with the head its last signature was recorded at; each head with the keepers' acknowledgements), and every way it was given up (`given`), each with its owner's own signature: a transfer, with the coin's checkpoint value and the owner's signature over its move into its checkpoint; a participation, with every part its id is a hash of, the coin's attestation, whether the coin was given back, and each forfeit of the coin recorded for it with the owner's half |
+| `POST bind_mailbox` | Binds leaves made before their wallet named its mailbox key when it asked for them: up to 64 bindings, each an owner key, a mailbox key and the owner key's signature over the binding; answers the mailbox each key is bound to (a binding made before stands), or none for a key the server knows no leaf of |
 | `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`) and a nonce the wallet draws fresh for the call, hands them to the signer, and answers the running hash the record holds at each entry, each signed, its latest entry, signed (`head`), the record's end signed together with the nonce (`end`), and whether the signer is stopped (`stopped`), with its proof (`proof`: the signed head that stopped it and, when the record holds another there, that head, signed) |
 
 `mailbox_read` and `leaf_data` need a proof of the key: a challenge from
@@ -763,7 +784,8 @@ canonical binary form. Every object refuses a field it does not know.
 `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`
 with `T = SHA256("Arca/auth")`, where `request` is what the read asks besides
 its proof: for `mailbox_read` its cursor (eight bytes) and page size (four),
-little-endian; for `leaf_data` nothing. The tag keeps it apart from
+little-endian; for `leaf_data` the same of its cursor and page size, or
+nothing when it names neither (it then reads the first page). The tag keeps it apart from
 everything else a leaf key signs, the genesis hash to one chain, the call and
 the request to one read, the challenge to a short while. A challenge is
 stored nowhere: it is the time it was issued, 12 random bytes, and a keyed
@@ -776,7 +798,8 @@ proxy, a log) learns nothing more than that read. There is no bearer token. `cos
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
-of its request, and `tree` is public. `forfeit_leaves` and `release_leaves`
+of its request, and `tree` is public. `bind_mailbox` is authenticated by
+each leaf's owner key's signature over its binding. `forfeit_leaves` and `release_leaves`
 are authenticated by the owners' signatures over the forfeits and releases
 themselves.
 
@@ -797,7 +820,14 @@ nonces' (`witness_per_second` and `witness_burst` overall,
 `witness_source_per_second` and `witness_source_burst` for each source; 250
 a second with bursts of 1,000, and 5 a second with bursts of 60, at the
 defaults): a wallet makes one each command, and a caller that uses up the
-nonces leaves every wallet its witness. The overall budget is set well
+nonces leaves every wallet its witness. The reads that serve a wallet what
+the server holds for it and what it publishes (`leaf_data`, `mailbox_read`,
+`tree`, `bind_mailbox`) have a budget of their own too
+(`read_per_second` and `read_burst` overall, `read_source_per_second` and
+`read_source_burst` for each source; 500 a second with bursts of 2,000, and
+10 a second with bursts of 200, at the defaults): a wallet restored from its
+mnemonic reads a page of its leaves, a page of its mailbox and a tree for
+each round its leaves rest on. The witness's overall budget is set well
 under what the signer answers: it keeps the signature of every head it made
 or checked and hands that one out again, reads the running hashes a witness
 asks for under its record's lock and signs after releasing it, and answers
@@ -1353,6 +1383,21 @@ is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
+
+`tests/reserving.rs` re-serves a wallet's leaves to its mailbox key. A board
+bound to it, a transfer's change posted to it and a leaf a participation
+wants bound to it are each served to that key, in each state they pass
+through, with what each rests on and each way it was given up: the board's
+checkpoint signature and the change's attestation and forfeit are checked to
+be the owner's own over the messages they sign, the participation's id is
+recomputed from the parts served, and a round's leaf is served without its
+record until its preimage went out. A binding signed by another key, or
+naming a mailbox without its proof, is refused; nothing of a key the request
+does not prove is served; pages of one leaf give the same leaves, and a
+page's proof is good for that page alone; `bind_mailbox` binds a leaf made
+without a binding, keeps the first binding of a key, binds nothing for a key
+the server knows no leaf of, and refuses too many at once. A source past its
+read budget is refused `rate_limited`.
 
 `tests/address.rs` runs `arcad <config> address` beside a running server:
 each run hands out the next index, the address is the node's for the script
