@@ -36,10 +36,12 @@
 //! `sync` keeps the wallet's coins alive by itself (D57): it asks for the
 //! refresh of each coin in the two days before its exit deadline, where the
 //! refresh is free, and from a day before takes on the chain every coin whose
-//! refresh has not completed, whatever stands in the way; it must run at
-//! least once a day in a coin's last three days before its exit deadline.
-//! [`Wallet::sync_schedule`] says when it must run next, for a client on a
-//! timer, and every coin shows its dates ([`CoinDates`]).
+//! refresh has not completed, whatever stands in the way. Run it at least
+//! once a day while the wallet holds a coin off the chain or waits for a
+//! payment (a coin paid to it is read only by `sync`, and may come days from
+//! its exit date). [`Wallet::sync_schedule`] says when it must run next, for
+//! a client on a timer, never more than a day ahead while a receive request
+//! is unpaid, and every coin shows its dates ([`CoinDates`]).
 
 pub mod chain;
 pub mod client;

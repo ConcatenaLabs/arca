@@ -587,7 +587,7 @@ impl Wallet {
 	/// its token waited the notice): why, and that transaction. `None`
 	/// otherwise, and for a coin resting on boards alone (a board has no
 	/// sweep).
-	fn swept(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
+	pub(crate) fn swept(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
 		match &coin.origin {
 			ValidOrigin::Leaf { valid, .. } => {
 				let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
@@ -718,11 +718,11 @@ impl Wallet {
 				(Home::Unreachable(e.clone()), json!({"why": e, "note": if busy {
 					"the server asks the wallet to slow down (rate_limited): nothing is decided on that; the wallet asks again at its next \
 					sync. Nothing is taken on the chain for want of an answer before a coin's home_from (a day before its exit date); run \
-					`arca sync` at least once a day in each coin's last three days before its exit date"
+					`arca sync` at least once a day while the wallet holds a coin off the chain or waits for a payment"
 				} else {
 					"the operator cannot be reached now: nothing is taken on the chain for that before a coin's home_from (a day before its \
 					exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run `arca sync` at least \
-					once a day in each coin's last three days before its exit date"
+					once a day while the wallet holds a coin off the chain or waits for a payment"
 				}}))
 			},
 			(false, None) => {

@@ -132,9 +132,9 @@ pub const REFRESH_FROM: u32 = 2 * 86_400;
 /// unless its refresh has completed, whatever stands in the way: a day.
 pub const HOME_FROM: u32 = 86_400;
 
-/// How long before a coin's exit date `sync` must run at least once a day:
-/// three days. A sync in each of those days finds the coin once in its
-/// refresh window and once in its last day.
+/// How long before a coin's exit date `sync_schedule` wakes the wallet at
+/// least once a day: three days. A sync in each of those days finds the
+/// coin once in its refresh window and once in its last day.
 pub const SYNC_DAILY: u32 = 3 * 86_400;
 
 /// How long `sync` keeps trying to reach the operator, with back-off, before
@@ -146,8 +146,13 @@ pub const WITNESS_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// keeps it alive.
 pub(crate) const SYNC_NOTE: &str = "sync keeps the coin alive by itself: from refresh_from (two days before its exit date, the free \
 	window) it asks for the coin's refresh, and from home_from (a day before) it takes the coin on the chain unless the wallet holds \
-	its new leaf, whatever stands in the way. Run `arca sync` at least once a day from sync_daily_from (three days before the exit \
-	date) to exit_by (median times); `arca exit` takes the coin now";
+	its new leaf, whatever stands in the way. Run `arca sync` at least once a day while the wallet holds a coin off the chain or \
+	waits for a payment, whatever next_sync_at says; `arca exit` takes the coin now";
+
+/// Why the wallet's schedule is a day at most while it waits for a payment.
+pub(crate) const WAITING_NOTE: &str = "the wallet waits for a payment to a receive request it handed out: a coin paid to it is read \
+	only by sync, and its sender may have paid with a coin days from its exit date, so sync runs at least once a day until it \
+	comes";
 
 /// What the wallet says of a coin it still holds off the chain once the
 /// operator's signer is stopped.
@@ -160,7 +165,7 @@ pub(crate) const HOME_NOTE: &str = "the operator's signer is stopped: the coin c
 /// refuses the wallet.
 pub(crate) const UNREACHABLE_NOTE: &str = "the operator cannot be reached now: nothing is taken on the chain for that before the \
 	coin's home_from (a day before its exit date, exit_by, median times); from then sync takes the coin on the chain unless its \
-	refresh has completed. Run `arca sync` at least once a day from sync_daily_from to exit_by; `arca exit` takes it now";
+	refresh has completed. Run `arca sync` at least once a day while the wallet holds a coin off the chain; `arca exit` takes it now";
 
 /// What the wallet says of a coin whose refresh the operator refused.
 pub(crate) const REFUSED_NOTE: &str = "the operator refused the coin's last refresh: sync asks again from refresh_from (two days \
@@ -1158,16 +1163,19 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// D57, for a client that runs `sync` on a timer: when `sync` must next
-	/// run, and the dates of every coin the wallet holds off the chain.
-	/// `next_sync_at` (a median time) is now while `sync` has work that
-	/// cannot wait (a live coin in its refresh window not refused there, a
-	/// coin a day or less from its exit date, or after a stop three days or
+	/// D57 and D58, for a client that runs `sync` on a timer: when `sync`
+	/// must next run, and the dates of every coin the wallet holds off the
+	/// chain. `next_sync_at` (a median time) is now while `sync` has work
+	/// that cannot wait (a live coin in its refresh window not refused there,
+	/// a coin a day or less from its exit date, or after a stop three days or
 	/// less, not yet on its way home), else the coming date of a coin
 	/// (`refresh_from`, then `home_from`), and never more than a day ahead
-	/// while a coin is in its last three days before its exit date; `null`
-	/// when no coin held has a date. `due` says whether it is now. Asks
-	/// nothing of the operator or the node but the tip.
+	/// while a coin is in its last three days before its exit date, or while
+	/// the wallet waits for a payment to a receive request it handed out (a
+	/// coin paid to it is read only by `sync`, and its sender may have paid
+	/// with a coin days from its exit date); `null` when nothing waits.
+	/// `due` says whether it is now; `why` says what holds the time back.
+	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
 		let stopped = self.rolled_back()?.is_some();
@@ -1195,8 +1203,19 @@ impl Wallet {
 			v["state"] = json!(c.state);
 			coins.push(v);
 		}
-		Ok(json!({"now": now, "next_sync_at": next, "due": next.is_some_and(|n| n <= now), "coins": coins,
-			"note": if stopped { HOME_NOTE } else { SYNC_NOTE }}))
+		// D58: a payment the wallet waits for is read only by `sync`, and
+		// may rest on a coin days from its exit date: a day at most.
+		let requests = self.store.nonces()?.iter().filter(|n| n.purpose == "receive" && n.state == "pending").count();
+		let mut out = json!({"now": now, "due": false, "coins": coins, "note": if stopped { HOME_NOTE } else { SYNC_NOTE }});
+		if requests > 0 && !stopped {
+			let day = now.saturating_add(86_400);
+			next = Some(next.map_or(day, |n| n.min(day)));
+			out["receive_requests"] = json!(requests);
+			out["why"] = json!(WAITING_NOTE);
+		}
+		out["next_sync_at"] = json!(next);
+		out["due"] = json!(next.is_some_and(|n| n <= now));
+		Ok(out)
 	}
 
 	/// Whether a coin in `state` is one the wallet may still hold off the
