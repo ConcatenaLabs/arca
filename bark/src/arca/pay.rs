@@ -550,7 +550,8 @@ impl Wallet {
 	/// or less from its exit date (D57), whose sender may already be taking
 	/// their shared lineage home. Past its batch's expiry it is checked as of
 	/// that expiry, and kept and exited at once while the chain still holds
-	/// its path; it is refused once a sweep that cut that path is final (D58).
+	/// its path; it is refused once a sweep that cut that path is final (D58),
+	/// and kept while that sweep is not final yet, its note naming the sweep.
 	pub(crate) fn accept_coin(&mut self, bytes: &[u8], claimed: &str, source: &str) -> Result<Value, Error> {
 		self.accept_coin_as(bytes, claimed, source, false)
 	}
@@ -618,12 +619,19 @@ impl Wallet {
 				},
 			},
 		};
+		// A sweep the exit would find is looked for here too: once it is
+		// final the coin is gone, and refused, counted nowhere; while it is
+		// not, a rollback could still undo it, so the coin is kept and taken
+		// on the chain at once, and says so.
+		let mut sweeping = None;
 		if expired {
 			if let Some((why, by)) = self.swept(&a.valid)? {
-				if self.chain.finality(&by)?.is_final() {
+				let finality = self.chain.finality(&by)?;
+				if finality.is_final() {
 					return Err(Error::Refused(format!("the coin arrives past its batch's expiry, and its path is gone: {}; that spend \
 						is final", why)));
 				}
+				sweeping = Some((by, finality.word()));
 			}
 		}
 		let id = a.valid.id.to_string();
@@ -686,7 +694,11 @@ impl Wallet {
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		if late {
-			let why = if expired {
+			let why = if let Some((by, word)) = &sweeping {
+				format!("it arrives past its batch's expiry (median time {}), and the operator's sweep {} has spent the batch output its \
+					path rests on; that sweep is not final yet ({}): the coin is lost once it is, and the wallet keeps the coin and takes \
+					it on the chain at once should a rollback undo the sweep", a.valid.expiry.to_consensus_u32(), by, word)
+			} else if expired {
 				format!("it arrives past its batch's expiry (median time {}), its path still on the chain: the operator may sweep the \
 					batch once its notice has run, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
 					on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default())
@@ -765,14 +777,21 @@ impl Wallet {
 		if late {
 			let e = a.valid.expiry.to_consensus_u32();
 			out["batch"] = json!({"expiry": e, "exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE),
-				"note": if expired {
-					"the coin arrives past its batch's expiry, its path still on the chain: it cannot be paid on or refreshed, and is \
-					exited at once, before the operator's sweep"
-				} else {
-					"the coin rests on a batch past its exit deadline: it cannot be paid on or refreshed, and is exited at once"
+				"note": match (&sweeping, expired) {
+					(Some((by, word)), _) => format!("the coin arrives past its batch's expiry, and the operator's sweep {} of the batch has \
+						spent the output its path rests on; that sweep is not final yet ({}): the coin is lost once it is, and comes home \
+						only should a rollback undo it", by, word),
+					(None, true) => "the coin arrives past its batch's expiry, its path still on the chain: it cannot be paid on or \
+						refreshed, and is exited at once, before the operator's sweep".to_string(),
+					(None, false) => "the coin rests on a batch past its exit deadline: it cannot be paid on or refreshed, and is exited at \
+						once".to_string(),
 				}});
 			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
-				"note": "exit the coin before its batch expires, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+				"note": if sweeping.is_some() {
+					"the operator's sweep has cut the coin's path: there is nothing to exit while it stands, and sync looks again"
+				} else {
+					"exit the coin before its batch expires, naming an asset the wallet holds on the chain for the fees (--fee-asset)"
+				}}));
 			if let Some(c) = self.store.coin(&id)? {
 				out["state"] = json!(c.state);
 			}

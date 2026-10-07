@@ -5811,3 +5811,104 @@ async fn a_coin_past_its_exit_date_is_taken_home_by_the_next_command() {
 	println!("RX L home at median time {}", at);
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+/// D58.2 at the operator's sweep, R7h's SM shape. A's leaf L of an early
+/// round; B boards ten days later. In L's free window B hands A a receive
+/// request, and A pays B 600,000 out of L. Past L's expiry and notice the
+/// operator's watcher sweeps L's batch, and only then does B read its
+/// mailbox. With the sweep final, B refuses the coin, its note naming the
+/// sweep, and counts it nowhere. With the sweep in a block not yet final,
+/// B keeps the coin and says so, naming the sweep (a rollback could still
+/// undo it), its exit refused naming the sweep, and counts it as exiting;
+/// once the sweep is final the coin is lost, shown with the sweep and
+/// counted nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_final() {
+	for final_first in [true, false] {
+		let tag = if final_first { "D58W the sweep final" } else { "D58W the sweep not yet final" };
+		let n = if final_first { 1 } else { 2 };
+		let mut r = Running::start().await;
+		let url = r.url();
+		let x = r.x;
+		let (a, b) = (Arca::new(&format!("D58WA{}", n)), Arca::new(&format!("D58WB{}", n)));
+		boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+		a.ok(&["participate"]);
+		let ra = final_round(&r).await;
+		let la = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+		let ea = coin_of(&a, &la)["expiry"].as_u64().unwrap() as u32;
+		let CoinRecord::Leaf { record, .. } = record_of(&a, &la) else { panic!("a batch leaf") };
+		let notice = record.schedule.notice.seconds() as u32;
+		let now = common::node::median_time(&r.rt);
+		d57_to(&r, now + 10 * 86_400).await;
+		boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+		let by_a = coin_of(&a, &la)["exit_by"].as_u64().unwrap() as u32;
+		d57_to(&r, by_a - 2 * 86_400 + 3_600).await;
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		let paid = a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+		println!("{}: A pays B 600000 out of L {}: inputs {}", tag, &la[..8], paid["inputs"]);
+		a.ok(&["sync"]);
+		final_round(&r).await;
+		a.ok(&["sync"]);
+
+		// Past L's expiry and notice: the operator's watcher sweeps L's batch.
+		d57_to(&r, ea + notice + 600).await;
+		let batch = record.branch().unwrap().batch_output();
+		let bvout = ra.output.iter().position(|o| arca_covenant::ExplicitOutput::from_txout(o).as_ref() == Some(&batch)).unwrap() as u32;
+		let batch_at = elements::OutPoint::new(ra.txid(), bvout);
+		let mut sweep = None;
+		for _ in 0..24 {
+			let _ = r.server.watcher.pass().await;
+			r.produce().await;
+			r.synced().await;
+			sweep = spender_of(&r, &batch_at);
+			if sweep.is_some() {
+				break;
+			}
+			r.bury().await;
+			tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 6 * 3_600));
+			r.synced().await;
+		}
+		let sweep = sweep.expect("the watcher sweeps L's batch").txid();
+		r.produce().await;
+		if final_first {
+			r.bury().await;
+			r.bury().await;
+		}
+		let in_block = confirmations(&r, &sweep);
+		println!("{}: L's batch output {} swept by {} ({} confirmation(s)), median time {} ({} s past L's expiry and notice)", tag,
+			batch_at, sweep, in_block, common::node::median_time(&r.rt), common::node::median_time(&r.rt) as i64 - (ea + notice) as i64);
+		let s = sync_of(&b);
+		println!("{}: B reads its mailbox: {}", tag, s["mailbox"]);
+		let coins = b.ok(&["coins"]);
+		let got: Vec<Value> = coins.as_array().unwrap().iter().filter(|c| c["value"] == "600000").cloned().collect();
+		let bal = b.ok(&["balance"]);
+		println!("{}: B's coin of 600000: {:?} | B's balance: arca {}", tag, got.iter().map(|c| format!("{} {}", c["state"], c["note"])).collect::<Vec<_>>(),
+			bal["arca"]);
+		if final_first {
+			let refused = s["mailbox"]["refused"].to_string();
+			assert!(s["mailbox"]["accepted"].as_array().is_none_or(|a| a.is_empty()), "the coin is refused: {}", s["mailbox"]);
+			assert!(refused.contains("its path is gone") && refused.contains(&sweep.to_string()), "naming the sweep: {}", refused);
+			assert!(got.is_empty(), "nothing of it held: {:?}", got);
+			assert!(!bal["arca"].to_string().contains("600000"), "counted nowhere: {}", bal["arca"]);
+		} else {
+			let accepted = s["mailbox"]["accepted"].to_string();
+			assert!(accepted.contains(&sweep.to_string()) && accepted.contains("not final"), "kept, the sweep named: {}", accepted);
+			assert!(s["mailbox"]["accepted"][0]["exit"]["error"].as_str().unwrap_or("").contains(&sweep.to_string()),
+				"its exit refused naming the sweep: {}", s["mailbox"]["accepted"][0]["exit"]);
+			assert_eq!(got.len(), 1, "{:?}", got);
+			r.bury().await;
+			r.bury().await;
+			let s = sync_of(&b);
+			let c = coin_of(&b, got[0]["leaf_id"].as_str().unwrap());
+			let bal = b.ok(&["balance"]);
+			println!("{}: the sweep final, B's next sync: exits {} | the coin {} | {} | B's balance: arca {}", tag, s["exits"], c["state"],
+				c["note"], bal["arca"]);
+			assert_eq!(c["state"], "lost");
+			assert!(c["note"].as_str().unwrap_or("").contains(&sweep.to_string()));
+			assert!(!bal["arca"].to_string().contains("600000"), "counted nowhere once lost: {}", bal["arca"]);
+		}
+		for w in [&a, &b] {
+			let _ = std::fs::remove_dir_all(&w.dir);
+		}
+	}
+}
