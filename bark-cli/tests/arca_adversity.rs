@@ -4087,14 +4087,14 @@ async fn d57_home(r: &Running, w: &Arca, leaves: &[String]) -> u32 {
 
 /// D57, R7g's U1, U5 and U6 turned around (F2). The operator loses its one
 /// keeper for good: it answers every witness and `info`, builds rounds, and
-/// co-signs nothing. A holds a batch leaf it never touches (L1), a batch
-/// leaf it paid B from (L2, `sending`), a board it paid B from (bS,
-/// `sending`), and a board in asset Y whose refresh ran in a round its
+/// co-signs nothing. A holds two batch leaves it paid B from (L1 and L2,
+/// `sending`: a payment spends the coins furthest from their exit date
+/// first), a board it never touches (bS), and a board in asset Y whose refresh ran in a round its
 /// forfeit could not be co-signed for (bF, `forfeited`; the operator takes
 /// that participation's forfeits until bF's exit deadline, so it is still
 /// issued). A syncs once a day in its coins' last three days before their
 /// exit date, and no more: at three days nothing moves; at two days `sync`
-/// asks for the refresh of L1, which a round takes and nobody co-signs; at
+/// asks for the refresh of bS, which a round takes and nobody co-signs; at
 /// one day every coin
 /// goes on the chain, each paying what its own reserves cannot with a fee
 /// coin the wallet chooses (Y is not taken for fees: an X coin pays bF's),
@@ -4149,7 +4149,9 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 	let all = vec![l1.clone(), l2.clone(), bs.clone(), bf.clone()];
 	let states = d57_states(&a, &all);
 	println!("D57 L1, L2, bS, bF: {:?}", states);
-	assert_eq!(states, vec!["live", "sending", "sending", "forfeited"]);
+	// A payment spends the coins furthest from their exit date first: the
+	// two batch leaves, younger than the boards. The board bS is untouched.
+	assert_eq!(states, vec!["sending", "sending", "live", "forfeited"]);
 
 	let by = d57_latest_exit_by(&a, &all);
 	let first_expiry = a.ok(&["coins"]).as_array().unwrap().iter().filter(|c| all.contains(&c["leaf_id"].as_str().unwrap_or("").to_string()))
@@ -4168,25 +4170,25 @@ async fn d57_an_operator_that_lost_its_keeper_has_every_coin_brought_home_before
 		assert!(h["refresh_from"].is_u64() && h["home_from"].is_u64() && h["exit_by"].is_u64(), "{}", h);
 	}
 	assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] != "expired"), "{}", s["participations"]);
-	assert_eq!(d57_states(&a, &all), vec!["live", "sending", "sending", "forfeited"]);
-	let c = coin_of(&a, &l1);
-	println!("D57 L1 three days before: {}", c);
+	assert_eq!(d57_states(&a, &all), vec!["sending", "sending", "live", "forfeited"]);
+	let c = coin_of(&a, &bs);
+	println!("D57 bS three days before: {}", c);
 	assert_eq!(c["home_from"].as_u64(), Some(c["exit_by"].as_u64().unwrap() - 86_400));
 	assert!(c["sync"].as_str().unwrap().contains("at least once a day"), "{}", c);
 	assert!(s["schedule"]["due"].is_boolean() && s["schedule"]["next_sync_at"].is_u64(), "{}", s["schedule"]);
 
-	// Two days before: the refresh window. The refresh of L1 is asked for
+	// Two days before: the refresh window. The refresh of bS is asked for
 	// and runs in a round; nobody co-signs its forfeits.
 	d57_to(&r, by - 2 * 86_400 + 600).await;
 	let s = a.ok(&["sync"]);
 	println!("D57 A two days before: refresh {}", s["refresh"]);
-	for l in [&l1] {
+	for l in [&bs] {
 		let asked = s["refresh"].as_array().expect("sync asks for the refreshes").iter().find(|x| x["leaf_id"] == l.as_str()).cloned()
 			.unwrap_or_else(|| panic!("{} is refreshed: {}", l, s));
 		assert_eq!(asked["state"], "pending", "{}", asked);
 		assert_eq!(asked["fees"], json!([]), "free in the window: {}", asked);
 	}
-	assert_eq!(d57_states(&a, &all), vec!["given", "sending", "sending", "forfeited"]);
+	assert_eq!(d57_states(&a, &all), vec!["sending", "sending", "given", "forfeited"]);
 	let r3 = final_round(&r).await;
 	println!("D57 the operator's round {} takes the refreshes", r3.txid());
 
@@ -4927,5 +4929,122 @@ async fn d59_a_coin_whose_forfeit_reached_the_record_is_paid_on_or_given_up() {
 		for w in [&a, &b] {
 			let _ = std::fs::remove_dir_all(&w.dir);
 		}
+	}
+}
+
+/// R7h F1, SM turned around (D58.1, D58.2). A's leaf L of an early round; B
+/// boards ten days later, so its own coin's dates are weeks ahead. In L's
+/// free window B hands A a receive request: B's schedule names a time a day
+/// ahead at most, saying it waits for a payment. A pays B 600,000 out of L,
+/// and D 300,000 out of its change (both coins rest on L), and refreshes
+/// what is left. B syncs when its schedule says, and is paid: read in its
+/// last day, the coin goes home at once, and comes home. D, away, syncs only past
+/// L's expiry, before any sweep: the coin, checked as of its expiry with its
+/// path still on the chain, is kept and taken on the chain at once, and
+/// comes home.
+#[tokio::test(flavor = "multi_thread")]
+async fn d58_a_receiver_on_its_schedule_is_paid_and_a_late_coin_comes_home() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b, d) = (Arca::new("D58SA"), Arca::new("D58SB"), Arca::new("D58SD"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let la = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let ea = coin_of(&a, &la)["expiry"].as_u64().unwrap() as u32;
+	let now = common::node::median_time(&r.rt);
+	d57_to(&r, now + 10 * 86_400).await;
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	d.ok(&create_args(&url, &r.node_url()));
+	let by_a = coin_of(&a, &la)["exit_by"].as_u64().unwrap() as u32;
+
+	// L's free window: B asks to be paid; its schedule.
+	d57_to(&r, by_a - 2 * 86_400 + 3_600).await;
+	b.ok(&["sync"]);
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let req_d = d.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let s = b.ok(&["sync"]);
+	let now = common::node::median_time(&r.rt);
+	let next = s["schedule"]["next_sync_at"].as_u64().expect("a time") as u32;
+	println!("D58S B's schedule, waiting for a payment, at median time {}: next_sync_at {} ({} s ahead) | why {}", now, next, next as i64 - now as i64,
+		s["schedule"]["why"]);
+	assert!(next <= now + 86_400, "a day ahead at most while B waits for a payment: {}", s["schedule"]);
+	assert!(s["schedule"]["why"].as_str().unwrap_or("").contains("waits for a payment"), "{}", s["schedule"]);
+	let paid = a.ok(&["send", &req_b, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("D58S A pays B 600000 out of L: inputs {}", paid["inputs"]);
+	let paid = a.ok(&["send", &req_d, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("D58S A pays D 300000 out of its change: inputs {}", paid["inputs"]);
+	a.ok(&["sync"]);
+	final_round(&r).await;
+	a.ok(&["sync"]);
+
+	// B syncs when its schedule says, and is paid.
+	d57_to(&r, next).await;
+	let s = b.ok(&["sync"]);
+	println!("D58S B's sync at its next_sync_at: mailbox {} | refresh {}", s["mailbox"], s["refresh"]);
+	let got = s["mailbox"]["accepted"].as_array().cloned().unwrap_or_default();
+	assert_eq!(got.len(), 1, "B is paid: {}", s["mailbox"]);
+	assert_eq!(got[0]["value"], "600000");
+	let bl = got[0]["leaf_id"].as_str().unwrap().to_string();
+	// Read a day or less from its exit date, the coin goes home at once.
+	println!("D58S B's coin: {}", coin_of(&b, &bl));
+	assert!(matches!(coin_of(&b, &bl)["state"].as_str(), Some("live") | Some("given") | Some("exiting")), "{}", coin_of(&b, &bl));
+	let at = d57_home(&r, &b, std::slice::from_ref(&bl)).await;
+	println!("D58S B's coin home at median time {}: {}", at, coin_of(&b, &bl)["state"]);
+	assert_eq!(coin_of(&b, &bl)["state"], "exited");
+
+	// D, away, syncs past L's expiry, before any sweep.
+	d57_to(&r, ea + 600).await;
+	let s = d.ok(&["sync"]);
+	println!("D58S D's sync past L's expiry ({}): mailbox {}", ea, s["mailbox"]);
+	let got = s["mailbox"]["accepted"].as_array().cloned().unwrap_or_default();
+	assert_eq!(got.len(), 1, "D keeps the coin past its expiry: {}", s["mailbox"]);
+	let dl = got[0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(got[0]["note"].as_str().unwrap_or("").contains("past its batch's expiry"), "{}", got[0]);
+	let at = d57_home(&r, &d, std::slice::from_ref(&dl)).await;
+	let c = coin_of(&d, &dl);
+	println!("D58S D's coin home at median time {}: {} | {}", at, c["state"], c["note"]);
+	assert_eq!(c["state"], "exited");
+	for w in [&a, &b, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D58.3. A payment spends the coins furthest from their exit date first,
+/// so a receiver gets the longest life the sender can give it: A holds L, a
+/// leaf of an early round, and a board ten days younger and half L's value;
+/// paying C 300,000 takes the board, not L.
+#[tokio::test(flavor = "multi_thread")]
+async fn d58_a_payment_spends_the_coin_furthest_from_its_exit_date() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, c) = (Arca::new("D58PA"), Arca::new("D58PC"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let la = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let now = common::node::median_time(&r.rt);
+	d57_to(&r, now + 10 * 86_400).await;
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 3_000_000);
+	r.produce().await;
+	let young = a.ok(&["board", &x.to_string(), "1000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	c.ok(&create_args(&url, &r.node_url()));
+	println!("D58P L {} exit_by {} value {}; the board {} exit_by {} value {}", &la[..8], coin_of(&a, &la)["exit_by"], coin_of(&a, &la)["value"],
+		&young[..8], coin_of(&a, &young)["exit_by"], coin_of(&a, &young)["value"]);
+	let req = c.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = a.ok(&["send", &req, "--amount", "300000", "--asset", &x.to_string()]);
+	println!("D58P A pays C 300000: inputs {}", paid["inputs"]);
+	assert_eq!(paid["inputs"], json!([young]), "the coin furthest from its exit date, not the largest");
+	assert_eq!(coin_of(&a, &la)["state"], "live");
+	for w in [&a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

@@ -150,6 +150,16 @@ pub(crate) struct In {
 	pub checkpoint_value: u64,
 }
 
+/// The earliest first expiry among the batches `record` rests on, as its
+/// record names them; `None` for a coin resting on boards alone.
+fn first_expiry(record: &CoinRecord) -> Option<u32> {
+	match record {
+		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
+		CoinRecord::Board(_) => None,
+		CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| first_expiry(&i.coin)).min(),
+	}
+}
+
 /// What the wallet says of a coin whose forfeit the operator's signer holds.
 const FORFEIT_HELD_NOTE: &str = "given up: the operator's signer holds a forfeit of this coin, signed in a refresh that did not \
 	complete, so it co-signs no spend of it; the coin is the wallet's on the chain, and sync takes it home from home_from (`arca exit` \
@@ -225,8 +235,10 @@ impl Wallet {
 		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay() })
 	}
 
-	/// The live coins of `asset`, largest first, each resolved; a coin past
-	/// its exit deadline is not paid on (the operator co-signs no spend of it,
+	/// The live coins of `asset`, furthest from their exit date first (D58:
+	/// what a receiver gets has the longest life the wallet can give it), the
+	/// largest first among those of one date, each resolved; a coin past its
+	/// exit deadline is not paid on (the operator co-signs no spend of it,
 	/// and `sync` takes it on the chain).
 	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
@@ -242,7 +254,7 @@ impl Wallet {
 			let v = a.valid.value;
 			out.push(In { row, coin: a.valid, checkpoint_value: v });
 		}
-		out.sort_by_key(|i| std::cmp::Reverse(i.coin.value));
+		out.sort_by_key(|i| (std::cmp::Reverse(i.row.expiry), std::cmp::Reverse(i.coin.value)));
 		Ok(out)
 	}
 
@@ -531,10 +543,12 @@ impl Wallet {
 	/// the bounds on every leaf of the lineage, the depth limit); no leaf or
 	/// checkpoint of its lineage may be on the chain; every board it rests on
 	/// must be unspent; and its salt must be one the wallet has never held a
-	/// coin under. A coin past its batch's exit deadline (and before the
-	/// batch's expiry) is kept and exited at once, whatever of its lineage is
-	/// on the chain, and so is one a day or less from its exit date (D57),
-	/// whose sender may already be taking their shared lineage home.
+	/// coin under. A coin past its batch's exit deadline is kept and exited
+	/// at once, whatever of its lineage is on the chain, and so is one a day
+	/// or less from its exit date (D57), whose sender may already be taking
+	/// their shared lineage home. Past its batch's expiry it is checked as of
+	/// that expiry, and kept and exited at once while the chain still holds
+	/// its path; it is refused once a sweep that cut that path is final (D58).
 	pub(crate) fn accept_coin(&mut self, bytes: &[u8], claimed: &str, source: &str) -> Result<Value, Error> {
 		self.accept_coin_as(bytes, claimed, source, false)
 	}
@@ -577,18 +591,39 @@ impl Wallet {
 		let now = self.now()?;
 		let policy = self.receipt_policy(now);
 		// A coin resting on a batch past its exit deadline (a payment the
-		// server recorded before it and completed when it was asked again) is
-		// still the wallet's, co-signed and checked: refusing it would undo
-		// nothing. It is kept, and taken on the chain at once, since the
-		// operator co-signs no spend of it and takes it into no round, and
-		// the batch's expiry is near. Past the expiry itself it is refused.
-		let (a, late): (Assessed, bool) = match self.assess(&record, &policy, Some((&owner, &nonce))) {
-			Ok(a) => (a, false),
+		// server recorded before it and completed when it was asked again, or
+		// one read late) is still the wallet's, co-signed and checked:
+		// refusing it would undo nothing. It is kept, and taken on the chain
+		// at once, since the operator co-signs no spend of it and takes it
+		// into no round, and the batch's expiry is near. Past the expiry
+		// itself (D58) it is checked as of its expiry, as an exit checks a
+		// coin held, and kept and taken on the chain at once while the chain
+		// still holds its path: the operator sweeps a batch only once its
+		// token has waited the notice. It is refused once the sweep that cut
+		// its path is final.
+		let (a, late, expired): (Assessed, bool, bool) = match self.assess(&record, &policy, Some((&owner, &nonce))) {
+			Ok(a) => (a, false, false),
 			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&owner, &nonce))) {
-				Ok(a) => (a, true),
-				Err(_) => return Err(e),
+				Ok(a) => (a, true, false),
+				Err(_) => {
+					let as_of = first_expiry(&record).filter(|t| *t < now.to_consensus_u32())
+						.and_then(|t| arca_covenant::MedianTime::from_consensus(t).ok());
+					let Some(as_of) = as_of else { return Err(e) };
+					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&owner, &nonce))) {
+						Ok(a) => (a, true, true),
+						Err(_) => return Err(e),
+					}
+				},
 			},
 		};
+		if expired {
+			if let Some((why, by)) = self.swept(&a.valid)? {
+				if self.chain.finality(&by)?.is_final() {
+					return Err(Error::Refused(format!("the coin arrives past its batch's expiry, and its path is gone: {}; that spend \
+						is final", why)));
+				}
+			}
+		}
 		let id = a.valid.id.to_string();
 		if !claimed.is_empty() && claimed != id {
 			return Err(Error::Refused(format!("the server names the coin {}, its record makes it {}", claimed, id)));
@@ -649,9 +684,15 @@ impl Wallet {
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		if late {
-			let why = format!("it rests on a batch past its exit deadline (the batch expires at median time {}): the operator co-signs \
-				no spend of it and takes it into no round, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
-				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default());
+			let why = if expired {
+				format!("it arrives past its batch's expiry (median time {}), its path still on the chain: the operator may sweep the \
+					batch once its notice has run, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
+					on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default())
+			} else {
+				format!("it rests on a batch past its exit deadline (the batch expires at median time {}): the operator co-signs \
+					no spend of it and takes it into no round, so the wallet takes it on the chain at once{}", a.valid.expiry.to_consensus_u32(),
+					on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default())
+			};
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
 		let coin = self.row(&record, &a, state, &note)?;
@@ -722,7 +763,12 @@ impl Wallet {
 		if late {
 			let e = a.valid.expiry.to_consensus_u32();
 			out["batch"] = json!({"expiry": e, "exit_deadline": e.saturating_sub(WalletPolicy::EXIT_DEADLINE),
-				"note": "the coin rests on a batch past its exit deadline: it cannot be paid on or refreshed, and is exited at once"});
+				"note": if expired {
+					"the coin arrives past its batch's expiry, its path still on the chain: it cannot be paid on or refreshed, and is \
+					exited at once, before the operator's sweep"
+				} else {
+					"the coin rests on a batch past its exit deadline: it cannot be paid on or refreshed, and is exited at once"
+				}});
 			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
 				"note": "exit the coin before its batch expires, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
 			if let Some(c) = self.store.coin(&id)? {
