@@ -654,3 +654,76 @@ async fn a_spend_refused_for_a_forfeit_drops_its_record() {
 		assert_eq!(inputs, 0, "the transfer's record is dropped");
 	}
 }
+
+/// R7h F3 (a), and the race it opens: a forfeit completed after its coin's
+/// exit delay ran. A's forfeit is recorded while the signer is away; A takes
+/// its board home, its conversion in a block and its exit delay run. The
+/// signer back, the minute task fills in the operator's half: every forfeit
+/// is whole, but A's coin is on the chain, and A could still claim it, so the
+/// participation is not released and A's forfeit step returns no preimage.
+/// A claims its board; the claim is final: the participation is never
+/// released, A holds its board's value and never the new leaf, and the
+/// operator pays nothing twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forfeit_completed_after_its_coins_exit_delay_waits_for_the_claim() {
+	use arca_covenant::sign::sign_digest;
+	use arca_covenant::spend::FeeSource;
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (valid, record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
+	let st = status(&r, &pa);
+	let old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &valid, &round, &st);
+	let body = forfeit_body(&pa, a_board.id, forfeit_sig(&f, &a), auths_json(&valid, &a2, created(&record)));
+	r.signer.kill();
+	assert_eq!(r.http.post("forfeit_leaves", &body).status, 503);
+
+	// A takes its board home: the conversion in a block, the exit delay run.
+	let (policy, at) = old.board().unwrap();
+	let fee_coin = r.purse.take_coin(x);
+	let conv = policy.conversion(at, &FeeSource::Coin { outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 3_000,
+		change: common::node::op_true() }).unwrap();
+	let sig = sign_digest(&a, &conv.sighash(r.chain.genesis_hash()).unwrap(), &common::client::random32());
+	let conv = conv.finish(vec![sig.as_ref().to_vec()]);
+	r.rt.client().send_raw_transaction(&conv.tx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	let leaf_at = elements::OutPoint::new(conv.tx.txid(), 0);
+	advance_mtp(&r, old.leaf.exit_delay.seconds() as u32 + 600).await;
+	r.synced().await;
+	let claim = common::flow::exit_tx(&r, &old.leaf, leaf_at, x, VALUE, &a);
+	assert_eq!(common::flow::verdict(&r, &claim), Ok(()), "A's exit delay has run: A can claim");
+
+	// The signer back: the forfeit is filled in, whole, but not released.
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	r.signer.restart(&r.s, genesis);
+	assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 1);
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	let again = r.http.post("forfeit_leaves", &body);
+	println!("the forfeit whole, A's board leaf on the chain past its exit delay: A {} | A's step again: {} {}", sa["state"], again.status,
+		again.json);
+	assert_eq!(sa["state"], "issued", "not released while A can still claim its coin: {}", sa);
+	assert!(again.json["preimage"].is_null(), "no preimage handed out: {}", again.json);
+
+	// A claims its board, final: never released.
+	r.rt.client().send_raw_transaction(&claim).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let sa = status(&r, &pa);
+	println!("A's claim {} final: A {} | A's new leaf {:?}", claim.txid(), sa["state"], leaf_states(&r, &a2));
+	assert_eq!(sa["state"], "issued");
+	assert_eq!(leaf_states(&r, &a2), vec!["pending"], "the new leaf is never credited");
+	r.purse.put(fee_coin);
+}

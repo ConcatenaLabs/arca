@@ -573,8 +573,11 @@ A forfeit the operator can claim ends in a release, whoever finishes the
 step. At every pass over the rounds the server releases, itself, a
 participation of a final round one of whose forfeits the watcher has
 claimed (the claim puts the preimage out), or every forfeit of which it
-holds whole while none of its coins went on the chain otherwise than by its
-forfeit (the operator can put the preimage out at will): its new leaves are
+holds whole while every coin it gave up is off the chain (the operator can
+put the preimage out at will). One whose coin is on the chain waits for the
+watcher's answer and its claim: until then the coin's owner may still take
+it by its exit once the exit delay has run, and a preimage handed out then
+would pay for the coin twice. Its new leaves are
 credited as when the owner completes the step, and the owner's step asked
 again returns the preimage. So a forfeit whose operator's half came late
 (the server's minute task fills it in once the signer and its keepers
@@ -1548,7 +1551,10 @@ co-signatures (a gate in front of the signer lets the first through): past
 the deadline the participation waits, no coin given back and the second
 forfeit kept; the gate opened, the second forfeit is filled in, the
 participation released, and the watcher takes both boards by their
-forfeits and claims them. A payment out of a coin given back while the
+forfeits and claims them. A forfeit filled in after its owner took the
+board on the chain and its exit delay ran is not released, and its owner's
+step gets no preimage; the owner's claim made final, it never is, the new
+leaf never credited. A payment out of a coin given back while the
 signer held its forfeit (the database put as an older server left it) is
 refused `double_spend` naming the forfeit, twice alike, the transfer's
 record dropped and the coin given back each time.
