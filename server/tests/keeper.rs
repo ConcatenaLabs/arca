@@ -1080,3 +1080,111 @@ async fn requests_at_once_to_a_signer_restored_with_its_memory_release_nothing()
 		let _ = std::fs::remove_dir_all(&t.dir);
 	}
 }
+
+/// R7g's KC turned around (F6). A signer whose address the keeper's
+/// `--allow` does not name (a signer that moved, or reaches the keeper
+/// through NAT or another address family) is told why by the keeper before
+/// it closes the connection, and says so: at its start, and in its answer
+/// to a request it cannot release.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keeper_tells_a_signer_it_does_not_admit_why() {
+	let k = keypair("keeper one");
+	let t = setup(&[&k], 1);
+	let keeper = KeeperProcess::start_with(&k, xonly(&t.s), t.genesis, vec!["--allow".into(), "10.20.30.40".into()], None);
+	let signer = Signer::start(&t.dir, "moved", t.genesis, &keepers_args(&[keeper.arg()]));
+	let at_start: Vec<String> = signer.log().lines().filter(|l| l.contains("at start")).map(str::to_string).collect();
+	println!("KC the signer's log at start: {}", at_start.join(" / "));
+	let why = "refused: this keeper admits connections only from the addresses its --allow names, and 127.0.0.1 is not one";
+	assert!(at_start.iter().any(|l| l.contains(why)), "{}", signer.log());
+	let v = raw(&signer.socket, &rebind_line(&t.owner, t.genesis, [1; 32], t.asset)).await;
+	println!("KC a rebind: code {} | {}", v["code"], v["error"]);
+	assert_eq!(v["code"], "keepers_unavailable", "{}", v);
+	assert!(v["error"].as_str().unwrap_or("").contains(why), "{}", v);
+	assert!(keeper.log().contains("refused a connection from 127.0.0.1"), "{}", keeper.log());
+	drop(signer);
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// R7g's F6: the README's order for a new operator with keepers, followed as
+/// written, with its own commands: each key made (the test writes 32 random
+/// bytes in hex, as `openssl rand -hex 32` does, mode 0600); `S` read with
+/// `arca-signer --pubkey` before any record exists, and each keeper's key
+/// with `arca-keeper --pubkey`; the record made naming the three keepers,
+/// two required; each keeper's heads file made under `S` and the keeper
+/// started; the signer started with the three. It co-signs, two keepers or
+/// more acknowledging, and the record's first line names the three keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_operator_with_keepers_is_made_in_the_readmes_order() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = signer_dir();
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a new operator"));
+	let write_key = |name: &str| {
+		let path = dir.join(name);
+		let mut b = [0u8; 32];
+		rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+		std::fs::write(&path, format!("{}\n", hex(&b))).unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+		path
+	};
+	let pubkey = |exe: &str, key: &std::path::Path| {
+		let out = Command::new(exe).args(["--key-file", key.to_str().unwrap(), "--pubkey"]).output().unwrap();
+		assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	};
+	// 1. The operator key, and S, before any record exists.
+	let op_key = write_key("operator.key");
+	let s = pubkey(env!("CARGO_BIN_EXE_arca-signer"), &op_key);
+	println!("S = {} (arca-signer --pubkey)", s);
+	assert_eq!(s.len(), 64);
+	// 2. Each keeper's key, and its public half.
+	let kkeys: Vec<std::path::PathBuf> = (0..3).map(|i| write_key(&format!("keeper{}.key", i))).collect();
+	let kpubs: Vec<String> = kkeys.iter().map(|k| pubkey(env!("CARGO_BIN_EXE_arca-keeper"), k)).collect();
+	println!("the keepers' keys (arca-keeper --pubkey): {:?}", kpubs);
+	// 3. The record, naming the three, two required.
+	let record = dir.join("signer.record");
+	let mut create = Command::new(env!("CARGO_BIN_EXE_arca-signer"));
+	create.args(["--key-file", op_key.to_str().unwrap(), "--genesis", &genesis.to_string(), "--record", record.to_str().unwrap(),
+		"--create-record"]);
+	for k in &kpubs {
+		create.args(["--keeper-key", k]);
+	}
+	let made = create.args(["--keepers-required", "2"]).output().unwrap();
+	println!("{}", String::from_utf8_lossy(&made.stderr).trim());
+	assert!(made.status.success());
+	assert!(String::from_utf8_lossy(&made.stderr).contains(&s), "the record is made for S");
+	// 4. Each keeper: its heads file under S, then serving the signer's address.
+	let mut keepers = vec![];
+	for (i, k) in kkeys.iter().enumerate() {
+		let heads = dir.join(format!("keeper{}.heads", i));
+		let base = |c: &mut Command| {
+			c.args(["--key-file", k.to_str().unwrap(), "--operator", &s, "--genesis", &genesis.to_string(), "--heads",
+				heads.to_str().unwrap()]);
+		};
+		let mut c = Command::new(env!("CARGO_BIN_EXE_arca-keeper"));
+		base(&mut c);
+		assert!(c.arg("--create").output().unwrap().status.success());
+		let port = common::keeper::free_port();
+		let mut c = Command::new(env!("CARGO_BIN_EXE_arca-keeper"));
+		base(&mut c);
+		let child = c.args(["--listen", &format!("127.0.0.1:{}", port), "--allow", "127.0.0.1"])
+			.stderr(std::process::Stdio::null()).spawn().unwrap();
+		keepers.push((child, format!("127.0.0.1:{}={}", port, kpubs[i])));
+	}
+	std::thread::sleep(Duration::from_millis(500));
+	// 5. The signer, with where each keeper is reached.
+	let signer = Signer::start(&dir, "new", genesis, &keepers_args(&keepers.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>()));
+	let first = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
+	println!("the record's first line: {}", first);
+	assert!(kpubs.iter().all(|k| first.contains(k.as_str())) && first.contains("keepers=2:"), "{}", first);
+	let owner = keypair("owner");
+	let v = raw(&signer.socket, &rebind_line(&owner, genesis, [1; 32], AssetId::from_slice(&[3; 32]).unwrap())).await;
+	let acks = v["acks"].as_array().map(|a| a.len()).unwrap_or(0);
+	println!("a rebind: signed {} | {} acknowledgement(s)", v["signature"].is_string(), acks);
+	assert!(v["signature"].is_string() && acks >= 2, "{}", v);
+	drop(signer);
+	for (mut c, _) in keepers {
+		let _ = c.kill();
+		let _ = c.wait();
+	}
+	let _ = std::fs::remove_dir_all(&dir);
+}

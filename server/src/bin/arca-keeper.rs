@@ -28,12 +28,18 @@
 //!
 //! A keeper is reached from the signer alone: it admits a connection only
 //! from an address named with `--allow` (the signer's machine; one for
-//! each address it may come from) and closes any other at once, holds at
-//! most `--max-connections` open (16 by default; the signer keeps one), closes
-//! one idle for `--idle-timeout-ms` (60 s by default; the signer opens a new
-//! one when it next needs it), and waits before accepting again after an
-//! accept fails (out of descriptors, say), saying so once in a while rather
-//! than once a try.
+//! each address it may come from), holds at most `--max-connections` open
+//! (16 by default; the signer keeps one), closes one idle for
+//! `--idle-timeout-ms` (60 s by default; the signer opens a new one when it
+//! next needs it), and waits before accepting again after an accept fails
+//! (out of descriptors, say), saying so once in a while rather than once a
+//! try. A connection from an address `--allow` does not name gets one
+//! answer before it is closed, to its first line, within a second: why
+//! (`{"error": "refused: …"}`), so a signer that moved, or reaches the
+//! keeper through NAT or another address family, says why its keeper does
+//! not answer. At most a few such answers are given at once; beyond that,
+//! and past the most connections it holds, a connection is closed with
+//! nothing said.
 
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -105,6 +111,35 @@ fn args() -> Result<Args, String> {
 		}
 	}
 	Ok(a)
+}
+
+/// The most refusals answered at once ([`refuse`]).
+const REFUSING: usize = 8;
+
+/// Answers a connection the keeper does not admit with `why`, then closes
+/// it: reads the peer's first line (within a second; nothing it asks is
+/// done), so that the peer is not reset before it reads the answer, and
+/// writes `{"error": why}`. At most [`REFUSING`] at once; beyond that the
+/// connection is closed with nothing said.
+fn refuse(stream: tokio::net::TcpStream, refusing: &Arc<AtomicUsize>, why: String) {
+	if refusing.fetch_add(1, Ordering::SeqCst) >= REFUSING {
+		refusing.fetch_sub(1, Ordering::SeqCst);
+		drop(stream);
+		return;
+	}
+	let refusing = refusing.clone();
+	tokio::spawn(async move {
+		let _ = tokio::time::timeout(Duration::from_secs(1), async {
+			let (read, mut write) = stream.into_split();
+			let mut line = String::new();
+			let _ = BufReader::new(read).take(MAX_LINE as u64 + 1).read_line(&mut line).await;
+			let mut out = json!({"error": why}).to_string();
+			out.push('\n');
+			let _ = write.write_all(out.as_bytes()).await;
+			let _ = write.shutdown().await;
+		}).await;
+		refusing.fetch_sub(1, Ordering::SeqCst);
+	});
 }
 
 fn load_key(path: &PathBuf) -> Result<Keypair, String> {
@@ -276,6 +311,7 @@ async fn main() {
 			a.allow.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "), a.max_connections, a.idle_timeout.as_millis());
 	}
 	let open = Arc::new(AtomicUsize::new(0));
+	let refusing = Arc::new(AtomicUsize::new(0));
 	let mut said = Said::default();
 	let mut wait = Duration::ZERO;
 	loop {
@@ -294,7 +330,8 @@ async fn main() {
 		let from = peer.ip().to_canonical();
 		if !a.allow.contains(&from) {
 			said.say("refused", format!("refused a connection from {}, which --allow does not name", peer));
-			drop(stream);
+			refuse(stream, &refusing, format!("refused: this keeper admits connections only from the addresses its --allow names, and \
+				{} is not one: name it with --allow on the keeper (and in its firewall)", from));
 			continue;
 		}
 		if open.load(Ordering::SeqCst) >= a.max_connections {
