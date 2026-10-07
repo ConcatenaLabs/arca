@@ -545,13 +545,13 @@ and holding it there, with the reason shown:
   `home_from`, withheld again, nothing goes; from `home_from`, withheld and
   gone, every coin goes on the chain;
 - an operator that has lost its one keeper for good, answering every
-  witness and building rounds, co-signing nothing: two batch leaves each in
-  a payment it cannot co-sign, a board never touched, and
+  witness and building rounds, co-signing nothing: of two batch leaves and
+  a board, two in payments it cannot co-sign and one never touched, and
   a board in an asset the node does not take for fees whose refresh ran in a
   round and was never co-signed (the operator takes that participation's
   forfeits until the board's exit date, so the board stays `forfeited`);
   one `sync` a day in their last three days: nothing at three days, the
-  refresh of the board never touched asked for at two days and run in a round
+  refresh of the coin never touched asked for at two days and run in a round
   nobody co-signs, every coin on the chain at one day, the board
   in the unaccepted asset paid with a fee coin of another, and every claim
   final days before the first expiry, nothing left for the sweep;
