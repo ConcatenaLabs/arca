@@ -101,7 +101,10 @@ the keys, but which coins were spent off-chain is in the store and the server.
   read past its batch's expiry is checked as of that expiry and kept and
   taken on the chain at once while the chain still holds its path (the
   operator sweeps a batch only once its token has waited its notice), and
-  refused once a sweep that cut that path is final. After that, the re-check
+  refused once a sweep that cut that path is final, its reason naming the
+  sweep; while that sweep is not final yet the coin is kept, its note naming
+  the sweep, counted as `exiting`, and shown `lost` once the sweep is final.
+  After that, the re-check
   watches every coin the wallet holds, handed over or not: when a leaf or
   checkpoint it descends from, its own leaf, or a board it rests on spent
   shows on the chain (a sender converting the board it paid from, or exiting
@@ -606,6 +609,10 @@ and holding it there, with the reason shown:
   deadline, the participation released and paid out of, and with it down
   past the deadline, the board kept given up, never offered for a payment,
   and brought home whole;
+- a coin paid to a receiver who reads it only after the operator swept its
+  batch: refused, naming the sweep, and counted nowhere once the sweep is
+  final; kept while the sweep is not final yet, its note naming the sweep,
+  its exit refused for it, and `lost` once the sweep is final;
 - a coin past its exit date, looked at by a command other than `sync`: taken
   on the chain at once, shown `exiting` and why, and brought home;
 - a round lost for good, first seen a day past its leaf's exit date: the
