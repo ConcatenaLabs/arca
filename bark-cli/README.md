@@ -276,8 +276,9 @@ the keys, but which coins were spent off-chain is in the store and the server.
   refresh of every live coin by itself, one participation for each, as
   `participate` makes it: nothing is paid there, so a fee asked is refused
   before anything is signed, and a refresh the operator refuses, voids or
-  lets expire is asked for again a day after `sync` last asked for it (the
-  schedule does not wake for it sooner). A participation whose coin is on
+  lets expire is asked for again six hours after `sync` last asked for it, a
+  quarter of the day-long window, while the coin is still in it (the
+  schedule wakes for it then, and not sooner). A participation whose coin is on
   its way home on the chain is not handed over again; once the operator
   releases it, the wallet takes the new leaves with the preimage the server
   publishes. From `home_from`, `sync` takes on the chain every
@@ -608,8 +609,9 @@ and holding it there, with the reason shown:
 - a witness answered `502` for 6.5 s against a patience of 6 s: reached by
   the try a second past the patience, nothing taken for unreachable; a
   participation whose coin goes home not posted again, and once the
-  operator releases it completed with the preimage the server publishes; a refused refresh not asked for again an hour on, the
-  schedule waking at `home_from`; and a server whose signer is swapped
+  operator releases it completed with the preimage the server publishes; a refused refresh not asked for again an hour on, nor ten
+  minutes short of six hours on, the schedule waking six hours after the
+  ask, and asked for again ten minutes past it; and a server whose signer is swapped
   under it for one naming other keepers answering every call
   `signer_replaced`;
 - a receiver waiting for a payment: its schedule a day ahead at most,
