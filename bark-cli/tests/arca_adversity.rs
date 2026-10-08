@@ -6138,7 +6138,7 @@ async fn w2_a_participation_released_while_the_wallet_was_away_is_completed() {
 	let mut r = Running::start_kept(1, None).await;
 	let url = r.url();
 	let x = r.x;
-	let a = Arca::new("W2A");
+	let a = Arca::new("W2RelA");
 	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
 	let board = boards[0].clone();
 	let p = a.ok(&["participate", "--leaf", &board, "--max-fee-ppm", "1000000"]);
