@@ -1304,6 +1304,12 @@ nothing seen of any keeper yet, and from then on is refused:
 Never pass it for a record whose `<record>.keepers-seen` was lost: put the
 file back from where it lies. Each keeper restarts on its own heads file.
 
+The operator moves before its wallets. A request carries what the revision
+that sends it knows (a wallet names its mailbox key when it registers a board
+or asks for a leaf, and its receiver's lapse when it pays a request), and the
+server refuses a field it does not know (`malformed`), while it takes a
+request from a wallet of an earlier revision as that wallet sent it.
+
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
 address, the database, the signer's socket, the wallet's mnemonic file, the
 node's RPC, the finality rule, the exit-delay bounds, the assets served

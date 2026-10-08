@@ -14,6 +14,7 @@ use std::sync::Arc;
 use elements::{AssetId, Script, Transaction};
 use serde_json::{json, Value};
 
+use arca_covenant::CoinRecord;
 use common::cli::Arca;
 use common::proxy::Proxy;
 use common::running::Running;
@@ -589,6 +590,143 @@ async fn a_restore_takes_the_operators_word_for_nothing_it_can_check() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 	for w in [&a, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Advances the chain's median time to at least `t`, and waits for the
+/// server.
+async fn mtp_to(r: &Running, t: u32) {
+	let now = common::node::median_time(&r.rt);
+	if t > now {
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - now));
+	}
+	r.synced().await;
+}
+
+/// The transaction of the chain or the mempool that spends `op`.
+fn spender_of(r: &Running, op: &elements::OutPoint) -> Option<Transaction> {
+	let spends = |t: &Transaction| t.input.iter().any(|i| i.previous_output == *op);
+	let mempool: Vec<String> = serde_json::from_value(r.rt.client().call::<Value>("getrawmempool", &[]).unwrap()).unwrap();
+	for id in mempool {
+		let t = r.rt.client().raw_transaction(&elements::Txid::from_str(&id).unwrap()).unwrap();
+		if spends(&t) {
+			return Some(t);
+		}
+	}
+	let tip = r.rt.client().blockchain_info().unwrap().blocks;
+	for h in tip.saturating_sub(200)..=tip {
+		let hash = r.rt.client().block_hash(h).unwrap();
+		if let Some(t) = r.rt.client().block(&hash).unwrap().txdata.into_iter().find(|t| spends(t)) {
+			return Some(t);
+		}
+	}
+	None
+}
+
+/// The as-of rule on a restore. A and B each hold a leaf of a batch of its
+/// own round, and are away. Two hours past both leaves' expiry, before the
+/// notice has run: A restored from its mnemonic takes its leaf, checked as of
+/// its expiry (its unroll authorisations, signed again, dated before that
+/// expiry), and at once on the chain, and brings it home before the notice
+/// runs out. Past B's expiry and the notice, the operator's watcher sweeps
+/// B's batch; once the sweep is final, B restored from its mnemonic does not
+/// take the leaf (its path is gone), says so naming the sweep, and counts it
+/// nowhere; the board B gave up for it is spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_restored_past_its_expiry_goes_home_while_its_path_stands() {
+	let mut r = Running::start().await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let (a, b, a2, b2) = (Arca::new("RXPA"), Arca::new("RXPB"), Arca::new("RXPA2"), Arca::new("RXPB2"));
+	let ba = boarded(&mut r, &a, &url, &[(x, 1_000_000)]).await;
+	a.ok(&["participate", "--leaf", &ba[0], "--max-fee-ppm", "1000000"]);
+	final_round(&r).await;
+	let la = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let bb = boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	b.ok(&["participate", "--leaf", &bb[0], "--max-fee-ppm", "1000000"]);
+	let rb = final_round(&r).await;
+	let lb = b.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("B's leaf").to_string();
+	let ea = coin_of(&a, &la)["expiry"].as_u64().unwrap() as u32;
+	let eb = coin_of(&b, &lb)["expiry"].as_u64().unwrap() as u32;
+	let rec = b.ok(&["record", &lb]);
+	let CoinRecord::Leaf { record, .. } = CoinRecord::from_bytes(&unhex(rec["record"].as_str().unwrap())).unwrap() else { panic!("a batch leaf") };
+	let notice = record.schedule.notice.seconds() as u32;
+	println!("RXP A's leaf {} expires at {}; B's {} at {}; the notice {} s", &la[..16], ea, &lb[..16], eb, notice);
+	let words = |w: &Arca| {
+		let m = std::fs::read_to_string(w.dir.join("mnemonic")).unwrap();
+		m.trim().to_string()
+	};
+	let (ma, mb) = (words(&a), words(&b));
+
+	// Two hours past both expiries, the notice not run: A restored.
+	mtp_to(&r, ea.max(eb) + 2 * 3600).await;
+	for _ in 0..2 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.synced().await;
+	}
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &ma]);
+	let made = a2.ok(&args);
+	let out = &made["restore"];
+	println!("RXP A restored past its leaf's expiry (median time {}): restored {} | not recovered {}", common::node::median_time(&r.rt),
+		out["restored"], out["not_recovered"]);
+	assert_eq!(out["not_recovered"], json!([]), "{}", out);
+	let c = coin_of(&a2, &la);
+	println!("RXP A2's leaf: {} | {}", c["state"], c["note"]);
+	assert_eq!(c["state"], "exiting", "taken on the chain at once: {}", c);
+	let mut home = None;
+	for round in 0..8 {
+		r.produce().await;
+		a2.ok(&["sync"]);
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		a2.ok(&["sync"]);
+		let s = coin_of(&a2, &la)["state"].as_str().unwrap_or("").to_string();
+		println!("RXP A2's leaf after {} round(s) of blocks and syncs: {}", round + 1, s);
+		if s == "exited" {
+			home = Some(common::node::median_time(&r.rt));
+			break;
+		}
+	}
+	let at = home.expect("A2's leaf comes home");
+	println!("RXP A2's leaf home at median time {}, {} s past its expiry", at, at - ea);
+
+	// Past the notice from the token's release (at the watcher's first pass
+	// after the expiry, two hours past it): the watcher sweeps B's batch.
+	mtp_to(&r, eb + 2 * 3600 + notice + 3600).await;
+	let batch = record.branch().unwrap().batch_output();
+	let bvout = rb.output.iter().position(|o| arca_covenant::ExplicitOutput::from_txout(o).as_ref() == Some(&batch)).unwrap() as u32;
+	let batch_at = elements::OutPoint::new(rb.txid(), bvout);
+	for _ in 0..30 {
+		let _ = r.server.watcher.pass().await;
+		r.produce().await;
+		r.synced().await;
+		if spender_of(&r, &batch_at).is_some() {
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	let sweep = spender_of(&r, &batch_at).expect("the operator sweeps B's batch");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	println!("RXP B's batch output {} swept by {}", batch_at, sweep.txid());
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mb]);
+	let made = b2.ok(&args);
+	let out = &made["restore"];
+	println!("RXP B restored after the sweep: restored {} | not recovered {}", out["restored"], out["not_recovered"]);
+	let why = out["not_recovered"].as_array().unwrap().iter().find(|n| n["leaf_id"] == lb.as_str())
+		.unwrap_or_else(|| panic!("B's swept leaf is not listed: {}", out));
+	let why = why["why"].as_str().unwrap();
+	assert!(why.contains("path is gone") && why.contains(&sweep.txid().to_string()) && why.contains("final"), "{}", why);
+	assert_eq!(coin_of(&b2, &lb), Value::Null, "counted nowhere");
+	assert_eq!(coin_of(&b2, &bb[0])["state"], "spent", "the board B gave up for it");
+	for w in [&a, &b, &a2, &b2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

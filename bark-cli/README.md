@@ -544,7 +544,11 @@ refused); another wallet's board served to the mailbox key (refused as a leaf
 of another key); the board a payment spent served live and given up nowhere
 (held spent, by the transfer the wallet's change rests on); and every keeper
 acknowledgement stripped, or no keeper named while a keeper's
-acknowledgements are shown (nothing restored).
+acknowledgements are shown (nothing restored). A fourth restores two wallets
+past their batch leaves' expiry: before the operator's sweep, the leaf is
+taken, checked as of its expiry, and brought home at once; once the sweep of
+the other's batch is final, that leaf is refused, the sweep named, and the
+board given up for it is spent.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
