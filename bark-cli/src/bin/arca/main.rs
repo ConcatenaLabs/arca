@@ -248,8 +248,9 @@ fn bitcoin_balance(datadir: &Path) -> Value {
 
 /// One row per holding: BTC first, always, 0 included, as every Sequentia
 /// wallet shows it; then each Sequentia asset the wallet holds anything of,
-/// on-chain or in Arca, with nothing set apart. An asset with nothing in it
-/// has no row.
+/// on-chain or in Arca, with nothing set apart, and its value in the
+/// reference unit where the wallet's node has a rate for it. An asset with
+/// nothing in it has no row. The headline is the balance's `total`.
 fn rows(b: &Value) -> Value {
 	let btc: u64 = b["bitcoin"].as_object().map(|o| o.iter()
 		.filter(|(k, _)| k.ends_with("_sat"))
@@ -267,7 +268,11 @@ fn rows(b: &Value) -> Value {
 	}
 	for (a, total) in per {
 		if total > 0 {
-			rows.push(json!({"asset": a, "total": total.to_string(), "unit": "atom"}));
+			let mut row = json!({"asset": a, "total": total.to_string(), "unit": "atom"});
+			if let Some(v) = b["total"]["values"].get(&a) {
+				row["value"] = v.clone();
+			}
+			rows.push(row);
 		}
 	}
 	Value::Array(rows)

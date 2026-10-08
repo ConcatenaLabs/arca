@@ -283,8 +283,8 @@ impl Wallet {
 	/// coins are refreshed in that asset's rounds. Each pays the fee the quote
 	/// states in its own asset. Not before median time `not_before`, when
 	/// given. Answers each participation (`participations`), one the server
-	/// refused or did not answer with its `error`; it is an error only when
-	/// none was taken.
+	/// refused or did not take now with its `error` (one not taken stands,
+	/// and sync posts it again); it is an error only when none was taken.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
 		let RefreshQuote { info, rows, ids, assets, per, coins } = quote;
 		let mut out = vec![];
@@ -296,8 +296,16 @@ impl Wallet {
 			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before) {
 				Ok(v) => out.push(v),
 				Err(e) => {
-					out.push(json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
-						"error": e.to_string()}));
+					let mut entry = json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
+						"error": e.to_string()});
+					// Not taken now, and not refused: it stands, its coins
+					// given, and sync posts it again. A refusal gives its
+					// coins back. Every other asset's goes on either way.
+					entry["note"] = json!(match e {
+						Error::Unreachable(_) => self.spelling.say("not taken now: it stands, and {sync} posts it again"),
+						_ => "refused: its coins are the wallet's again, live".into(),
+					});
+					out.push(entry);
 					first_error.get_or_insert(e);
 				},
 			}
@@ -366,7 +374,15 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
-		let answer = self.submit(&pid, &body, &given)?;
+		let answer = match self.submit(&pid, &body, &given) {
+			Ok(a) => a,
+			// Not taken now and not refused (the server busy or unreachable,
+			// or taking no new work in the asset while its rate is stale):
+			// the participation stands, its coins given, and sync posts it
+			// again.
+			Err(Error::Unreachable(why)) => return Err(Error::Unreachable(format!("participation {}: {}", pid, why))),
+			Err(e) => return Err(e),
+		};
 		let mut out = json!({"participation": pid, "asset": asset.to_string(), "state": answer["state"], "gives": given, "wants": nonces,
 			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()});
 		if needs_fee_coin {
