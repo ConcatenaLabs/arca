@@ -2233,10 +2233,61 @@ impl Wallet {
 				*onchain.entry(a.to_string()).or_default() += v;
 			}
 		}
+		// Each asset held, Arca and on-chain together: a coin whose exit's
+		// claim is out is counted once, as the claim's output on the chain.
+		let mut held: BTreeMap<String, u128> = BTreeMap::new();
+		for c in self.store.coins()? {
+			if matches!(c.state.as_str(), "spent" | "exited" | "lost") || (c.state == "exiting" && c.note.starts_with("claimed by")) {
+				continue;
+			}
+			*held.entry(c.asset.clone()).or_default() += c.value as u128;
+		}
+		for (a, v) in &onchain {
+			*held.entry(a.clone()).or_default() += *v as u128;
+		}
+		let total = self.total_value(&held);
 		let arca: Value = per.into_iter().map(|(a, m)| (a, json!(m.into_iter().map(|(s, v)| (s, json!(v.to_string()))).collect::<serde_json::Map<_, _>>())))
 			.collect::<serde_json::Map<_, _>>().into();
 		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
-		Ok(json!({"arca": arca, "sequentia_onchain": onchain}))
+		Ok(json!({"total": total, "arca": arca, "sequentia_onchain": onchain}))
+	}
+
+	/// The headline of a balance: what `held` (atoms of each asset) is worth
+	/// together in the reference unit, at the rates of the wallet's own node
+	/// (`getfeeexchangerates`), the only rates it can check; each asset's
+	/// value; and the assets it holds that the node has no rate for, which
+	/// the total leaves out and says so. No asset comes first: the total is
+	/// the headline, every asset counted by its value alone. The operator's
+	/// rates (`info`) price its fees and are not taken for this.
+	pub(crate) fn total_value(&self, held: &BTreeMap<String, u128>) -> Value {
+		let rates = match self.chain.fee_rates() {
+			Ok(r) => r,
+			Err(e) => return json!({"value": null, "note": format!("the node gave no rates: {}", e)}),
+		};
+		let mut sum: u128 = 0;
+		let mut values = serde_json::Map::new();
+		let mut unvalued = vec![];
+		for (a, atoms) in held {
+			if *atoms == 0 {
+				continue;
+			}
+			match AssetId::from_str(a).ok().and_then(|id| rates.get(&id).copied()).filter(|r| *r > 0) {
+				Some(rate) => {
+					let v = atoms * rate as u128 / 100_000_000;
+					sum += v;
+					values.insert(a.clone(), json!(v.to_string()));
+				},
+				None => unvalued.push(a.clone()),
+			}
+		}
+		let mut out = json!({"value": sum.to_string(), "unit": "reference", "values": values,
+			"note": "atoms of the reference unit, at the rates of the wallet's own node; BTC, on its own chain, is shown apart"});
+		if !unvalued.is_empty() {
+			out["unvalued"] = json!(unvalued);
+			out["note"] = json!(format!("atoms of the reference unit, at the rates of the wallet's own node, which has none for {} \
+				asset(s) held, left out of the total; BTC, on its own chain, is shown apart", unvalued.len()));
+		}
+		out
 	}
 
 	/// The wallet's own view: its chain, its operator, its policy, its tip.

@@ -212,11 +212,17 @@ impl Wallet {
 	/// it was handed out): a sender pays it only before then, and the
 	/// wallet's schedule holds at a day until then while it is unpaid. The
 	/// nonce, and both dates, are stored before the request is shown, and a
-	/// second coin to it is refused.
+	/// second coin to it is refused. A request naming an asset is refused
+	/// when the operator does not serve it.
 	pub fn receive(&mut self, asset: Option<AssetId>, value: Option<u64>) -> Result<Value, Error> {
 		if let Some((at, why)) = self.rolled_back()? {
 			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
 				asks for no payment through this operator", at, why)));
+		}
+		// A request naming an asset names one the operator serves: no
+		// payment of another could be made.
+		if let Some(a) = asset {
+			Self::min_leaf(&self.server_info()?, a)?;
 		}
 		let nonce = random32();
 		let key = self.keys.leaf_xonly(&nonce)?;
