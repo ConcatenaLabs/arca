@@ -14,6 +14,8 @@
 //!   derives them.
 //! - [`client`]: the server's JSON interface over HTTP, with challenge
 //!   authentication.
+//! - [`command`]: the commands by name, with JSON arguments and answers, for a
+//!   program that embeds the library (a browser worker, a mobile app's core).
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
 //!   mailbox, take part in a round, swap, exit, re-check every coin after a
 //!   rollback, and restore from the mnemonic alone ([`Wallet::restore`]:
@@ -56,6 +58,7 @@
 
 pub mod chain;
 pub mod client;
+pub mod command;
 pub mod keys;
 pub mod store;
 
