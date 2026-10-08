@@ -658,6 +658,76 @@ async fn a_spend_refused_for_a_forfeit_drops_its_record() {
 	}
 }
 
+/// R7i W1: a coin given back by an older server while its forfeit stood in
+/// the signer's record, given as a later input. A's refresh of board C
+/// completes; the database is then put as an older server's expiry left it.
+/// A payment out of good board G, then C, and a swap of another owner's
+/// board H against C, are each refused `double_spend`, naming C and the
+/// forfeit the signer holds, before the signer signs anything: its record
+/// gains no entry, nothing is under the first input's salt, the transfer's
+/// record is dropped and both coins given back. G, and then H, pay alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_forfeit_at_a_later_input_signs_nothing_of_the_transfer() {
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("W1 A");
+	let (c_board, c_tx) = credited_board(&mut r, &a, x).await;
+	let g_key = keypair("W1 A, good board");
+	let (g_board, g_tx) = credited_board(&mut r, &g_key, x).await;
+	let h_key = keypair("W1 H, the swap's other owner");
+	let (h_board, h_tx) = credited_board(&mut r, &h_key, x).await;
+	let a2 = keypair("W1 A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &c_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (_, new_valid, _, _) = complete(&r, &pa, &c_board, &a, &c_tx, &a2, &a2_nonce).await;
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	db.execute("UPDATE participation SET state = 'expired' WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("DELETE FROM forfeit WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE participation_input SET active = false WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'live', spent_by = NULL WHERE leaf_id = $1", &[&&c_board.id.0[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'expired' WHERE leaf_id = $1", &[&&new_valid.leaf_id.0[..]]).await.unwrap();
+	let old_c = c_board.record.resolve(std::slice::from_ref(&c_tx), &r.policy()).unwrap();
+	let old_g = g_board.record.resolve(std::slice::from_ref(&g_tx), &r.policy()).unwrap();
+	let old_h = h_board.record.resolve(std::slice::from_ref(&h_tx), &r.policy()).unwrap();
+	for (case, first, old_first, first_key) in [("a payment out of G, then C", &g_board, &old_g, "W1 D"), ("a swap of H against C", &h_board, &old_h, "W1 E")] {
+		let before = r.signer_entries().await.len();
+		let (to_first, _) = common::client::new_leaf(&keypair(&format!("{}, to the first owner", first_key)));
+		let (to_a, _) = common::client::new_leaf(&keypair(&format!("{}, to A", first_key)));
+		let body = common::client::transfer_body(&[(first, old_first.clone(), VALUE - 2_000), (&c_board, old_c.clone(), VALUE - 2_000)],
+			&[(x, VALUE - 3_000, to_first), (x, VALUE - 3_000, to_a)], xonly(&r.s), r.chain);
+		let ans = r.http.post("cosign_transfer", &body);
+		let (code, m) = ans.refusal();
+		let after = r.signer_entries().await;
+		let under_first: Vec<String> = after.iter().filter(|e| e.salt == old_first.leaf.salt).map(|e| format!("entry {} {:?}", e.n, e.kind)).collect();
+		let records = db.query("SELECT transfer_id FROM transfer_input WHERE leaf_id = $1 OR leaf_id = $2",
+			&[&&first.id.0[..], &&c_board.id.0[..]]).await.unwrap().len();
+		println!("W1 {}: {} {} | {}", case, ans.status, code, m);
+		println!("W1 {}: the signer's entries {} before, {} after; under the first input's salt {:?} | the first at the server {} | C {} | \
+			transfer records {}", case, before, after.len(), under_first, leaf_state(&r, &first.id).await, leaf_state(&r, &c_board.id).await,
+			records);
+		assert_eq!((ans.status, code.as_str()), (409, "double_spend"), "{}", ans.json);
+		assert!(m.contains(&c_board.id.to_string()) && m.contains("already co-signed the forfeit"), "{}", m);
+		assert!(m.contains(&format!("under salt {} ", hex(&old_c.leaf.salt))), "the refusal names C's salt: {}", m);
+		assert_eq!(after.len(), before, "the signer signed nothing of the transfer");
+		assert!(under_first.is_empty(), "{:?}", under_first);
+		assert_eq!((leaf_state(&r, &first.id).await.as_str(), leaf_state(&r, &c_board.id).await.as_str()), ("live", "live"));
+		assert_eq!(records, 0, "the transfer's record is dropped");
+		// The first coin pays alone.
+		let (to_d, _) = common::client::new_leaf(&keypair(&format!("{}, alone", first_key)));
+		let alone = common::client::transfer_body(&[(first, old_first.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, to_d)], xonly(&r.s), r.chain);
+		let paid = r.http.post("cosign_transfer", &alone);
+		println!("W1 {}: the first coin alone: {} {}", case, paid.status, &paid.json.to_string()[..paid.json.to_string().len().min(160)]);
+		assert_eq!(paid.status, 200, "{}", paid.json);
+	}
+}
+
 /// R7h F3 (a), and the race it opens: a forfeit completed after its coin's
 /// exit delay ran. A's forfeit is recorded while the signer is away; A takes
 /// its board home, its conversion in a block and its exit delay run. The

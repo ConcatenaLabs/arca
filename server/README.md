@@ -302,7 +302,14 @@ asset and a value. The server co-signs only when every rule holds:
 
 The transfer is then recorded, inputs spent, before the operator key signs
 anything, so the server never signs a spend it has not durably recorded and
-two spends racing for one leaf leave exactly one standing. Each new coin's
+two spends racing for one leaf leave exactly one standing. Before the signer
+signs anything of it, the server asks the signer what its record holds under
+each input's salt. When it holds anything there but this transfer's own
+spend (the forfeit of a coin given up in a refresh, or another spend), the
+transfer is refused `double_spend`, naming that coin and what the signer
+holds, with nothing of it signed: its record is dropped and every input
+given back, so the other inputs, a swap's other side's included, stay
+payable and refreshable. Each new coin's
 record is checked by the server as a receiver would check it, stored, and
 posted to the receiver's mailbox (the leaf's key, unless the output names
 another). A request repeated byte for byte gets the same answer; one that
@@ -918,12 +925,14 @@ first to spend takes the salt and the other's holder is refused, and can
 exit, while a second signature, which would also spend the first coin, is
 never given. The server answers such a
 refusal with `double_spend`, and logs that its database has lost a spend.
-When what the signer holds under the salt is a forfeit (a coin given up in
-a refresh and given back while its forfeit stood in the record), nothing of
-the transfer has been signed: the server drops the transfer's record, gives
-its inputs back, answers `double_spend` naming the forfeit, and logs that
-forfeit, not a lost spend. The wallet then shows that coin as given up, and
-takes it home on the chain.
+The server asks the signer what it holds under each input's salt before it
+asks for any signature of a transfer, so whatever the signer holds there
+(another spend, or a forfeit: a coin given up in a refresh and given back
+while its forfeit stood in the record), nothing of the transfer is signed:
+the server drops the transfer's record, gives its inputs back, answers
+`double_spend` naming the coin and what the signer holds, and logs a
+forfeit as a forfeit, not a lost spend. The wallet then shows that coin as
+given up, and takes it home on the chain.
 
 The record cannot be lost, cut back, torn or shared without the signer
 noticing:
@@ -1643,7 +1652,11 @@ step gets no preimage; the owner's claim made final, it never is, the new
 leaf never credited. A payment out of a coin given back while the
 signer held its forfeit (the database put as an older server left it) is
 refused `double_spend` naming the forfeit, twice alike, the transfer's
-record dropped and the coin given back each time. Such a coin offered in a
+record dropped and the coin given back each time; given as the second input
+of a payment out of a good board, and of a swap against another owner's
+board, it is refused before the signer signs anything, its record gaining
+no entry, the transfer's record dropped and both coins given back, and the
+good board pays alone. Such a coin offered in a
 participation with another, and a board whose spend the signer holds and the
 database lost, are each refused `double_spend` when offered, naming the coin
 and the entry, nothing recorded. A participation taken before that check

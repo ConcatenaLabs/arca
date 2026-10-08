@@ -44,7 +44,12 @@
 //! second spend: the signer refuses it, and so does the server
 //! (`double_spend`). Each new coin's
 //! record is checked by the server as a receiver would check it, stored, and
-//! posted to the receiver's mailbox. A request repeated byte for byte gets the
+//! posted to the receiver's mailbox. Before the signer signs anything of a
+//! transfer, the server asks it what it holds under each input's salt: when
+//! it holds anything there but this transfer's own spend (a forfeit of a
+//! coin given up in a refresh, or another spend), the transfer is refused
+//! naming that coin (`double_spend`), with nothing of it signed, and its
+//! record goes, its inputs given back. A request repeated byte for byte gets the
 //! same answer. One recorded and not yet signed (the signer was not reached)
 //! completes when repeated, whatever has changed since: its margins are the
 //! ones the server took when it recorded it, against the floor of that
@@ -481,6 +486,11 @@ impl Cosigner {
 			},
 		}
 
+		// Nothing of it is signed while the signer holds anything else under
+		// an input's salt: it would refuse that input, after signing every
+		// input before it, and leave them spent.
+		self.held_under(&checked, &messages, &transfer).await?;
+
 		// Now S signs, in its own process; each signature is checked against
 		// the message the server built. The latest entry of the record they
 		// were recorded as, signed, goes with the coins.
@@ -659,6 +669,55 @@ impl Cosigner {
 
 	pub fn finality(&self) -> &Arc<FinalityService> {
 		&self.finality
+	}
+
+	/// What the signer holds under the salt of each input of transfer
+	/// `transfer` (`checked`, whose checkpoint messages are the first of each
+	/// pair in `messages`), asked before it signs anything of it. Anything
+	/// there but this transfer's own checkpoint (a forfeit, signed in a
+	/// refresh and still standing, or another spend) refuses the transfer,
+	/// naming the coin and what the signer holds, as the signer would refuse
+	/// that input (`double_spend`). When nothing of the transfer is signed,
+	/// its record is dropped and its inputs given back, so every other input
+	/// stays payable and refreshable; one the signer has already signed part
+	/// of (asked before this check existed) keeps its record.
+	async fn held_under(&self, checked: &[Checked], messages: &[([u8; 32], [u8; 32])], transfer: &[u8; 32]) -> Result<(), CosignError> {
+		let mut other = None;
+		let mut signed_part = false;
+		for (k, c) in checked.iter().enumerate() {
+			for e in self.signer.under(&c.coin.leaf.salt).await? {
+				if e.kind == crate::signer::Signed::Spend && e.digest == messages[k].0 {
+					signed_part = true;
+				} else if other.is_none() {
+					other = Some((k, e));
+				}
+			}
+		}
+		let Some((k, e)) = other else { return Ok(()) };
+		let leaf = checked[k].coin.id;
+		let what = match e.kind {
+			crate::signer::Signed::Spend => "the spend",
+			crate::signer::Signed::Forfeit(_) => "the forfeit",
+		};
+		let refused = SignerError::AlreadySigned(format!(
+			"{}: coin {}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one spend \
+			 under a salt, or its forfeits, one for each round, so it signs nothing of this transfer",
+			crate::signer::ALREADY_SIGNED, leaf, what, crate::signer::hex(&e.digest), crate::signer::hex(&e.salt), e.n,
+			crate::signer::hex(&e.owner)));
+		if signed_part {
+			return Err(lost_spend(refused, &leaf));
+		}
+		match self.store.drop_transfer(transfer).await {
+			Ok(back) => log::warn!("transfer {} refused before anything of it was signed: the signer holds {} of coin {} (entry {}); \
+				the transfer's record is dropped and {} input(s) given back", crate::signer::hex(transfer), what, leaf, e.n, back.len()),
+			Err(d) => log::error!("transfer {} refused before anything of it was signed, for {} of coin {} the signer holds, and its record \
+				could not be dropped: {}", crate::signer::hex(transfer), what, leaf, d),
+		}
+		if e.kind == crate::signer::Signed::Spend {
+			log::error!("the signer holds a spend of coin {} (entry {}) that the database does not: the database has lost a spend the \
+				signer co-signed", leaf, e.n);
+		}
+		Err(CosignError::Signer(refused))
 	}
 
 	/// The signer's refusal of the first message of transfer `transfer`,
