@@ -76,6 +76,14 @@ fn signature(v: &Value) -> Option<Signature> {
 	v.as_str().and_then(|s| unhex(s).ok()).and_then(|b| Signature::from_slice(&b).ok())
 }
 
+/// When the unroll authorisations a restore signs again for a leaf of first
+/// expiry `first` are dated: an hour before the time the leaf is checked as
+/// of (now, or its expiry once that has passed, [`Wallet::followed_policy`]),
+/// so they are usable at once whenever the wallet checks the leaf.
+fn auth_time(first: u32, now: MedianTime) -> Result<MedianTime, String> {
+	MedianTime::from_consensus(first.min(now.to_consensus_u32()).saturating_sub(3600)).map_err(|e| e.to_string())
+}
+
 /// A coin the restore took, with what it rests on and how it was given up,
 /// for the passes after the first.
 struct Taken {
@@ -328,8 +336,7 @@ impl Wallet {
 		let valid = record.validate(&round, &self.followed_policy(first, now), &owner, nonce)
 			.map_err(|e| format!("the leaf in round {} fails the wallet's checks: {}", txid, e))?;
 		let key = self.keys.leaf(nonce).map_err(|e| e.to_string())?;
-		// Unroll authorisations an hour before now: usable at once.
-		let at = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3600)).map_err(|e| e.to_string())?;
+		let at = auth_time(first, now)?;
 		let auths = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(at).digest), at)).collect();
 		Ok((CoinRecord::Leaf { record: record.clone(), preimage, auths }, record))
 	}
@@ -394,22 +401,7 @@ impl Wallet {
 				return Err(format!("{}: the coin is not taken (the mailbox read takes it once its head comes with them)", why));
 			}
 		}
-		let first = super::pay::first_expiry(&record).unwrap_or(u32::MAX);
-		let policy = self.followed_policy(first, now);
-		let a = match self.assess(&record, &policy, Some((&owner, &nonce))) {
-			Ok(a) => a,
-			Err(Error::Missing(m)) => return Err(format!("not on the chain now: {}", m)),
-			Err(e) => return Err(e.to_string()),
-		};
-		// Past its expiry it is the wallet's while the chain holds its path,
-		// and lost once a sweep that cut it is final.
-		if a.valid.expiry < now {
-			if let Some((why, by)) = self.swept(&a.valid).map_err(|e| e.to_string())? {
-				if self.chain.finality(&by).map_err(|e| e.to_string())?.is_final() {
-					return Err(format!("it is past its batch's expiry, and its path is gone: {}; that spend is final", why));
-				}
-			}
-		}
+		let a = self.checked_as_held(&record, &owner, &nonce, now)?;
 		let (state, note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
 		let row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
 		let coin = a.valid.clone();
@@ -429,6 +421,29 @@ impl Wallet {
 			let _ = self.witness_record(&e["batch"]["signer_record"], false);
 		}
 		Ok(Some((state.to_string(), coin)))
+	}
+
+	/// Coin `record` of the wallet's key `owner` of `nonce`, checked against
+	/// the chain as a coin the wallet holds is: as of its expiry once that
+	/// has passed, and refused once a sweep that cut its path is final; while
+	/// the chain still holds its path it is the wallet's.
+	fn checked_as_held(&self, record: &CoinRecord, owner: &XOnlyPublicKey, nonce: &[u8; 32], now: MedianTime)
+		-> Result<super::wallet::Assessed, String>
+	{
+		let first = super::pay::first_expiry(record).unwrap_or(u32::MAX);
+		let a = match self.assess(record, &self.followed_policy(first, now), Some((owner, nonce))) {
+			Ok(a) => a,
+			Err(Error::Missing(m)) => return Err(format!("not on the chain now: {}", m)),
+			Err(e) => return Err(e.to_string()),
+		};
+		if a.valid.expiry < now {
+			if let Some((why, by)) = self.swept(&a.valid).map_err(|e| e.to_string())? {
+				if self.chain.finality(&by).map_err(|e| e.to_string())?.is_final() {
+					return Err(format!("it is past its batch's expiry, and its path is gone: {}; that spend is final", why));
+				}
+			}
+		}
+		Ok(a)
 	}
 
 	/// How coin `id` (`coin`, as the wallet checked it) was given up, as the
@@ -686,7 +701,7 @@ impl Wallet {
 						let valid = record.validate(&round_tx, &self.followed_policy(first, now), &owner, &nonce)
 							.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", rtx, e)))?;
 						let key = self.keys.leaf(&nonce)?;
-						let at = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3600)).map_err(|e| Error::Node(e.to_string()))?;
+						let at = auth_time(first, now).map_err(Error::Node)?;
 						let auths = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(at).digest), at)).collect();
 						(record, auths, None)
 					},
@@ -697,21 +712,41 @@ impl Wallet {
 				if held.is_none() {
 					withheld.push(leaf_id.clone());
 				}
-				news.push(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(&nonce),
-					"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}));
+				news.push((leaf_id.clone(), held.is_some(), nonce, record.clone(), auths.clone(),
+					json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(&nonce),
+					"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()})));
 			}
 			if let Ok(t) = Txid::from_str(&rtx) {
 				if let Some(round_tx) = self.chain.transaction(&t)? {
 					self.store.put_tx(&rtx, &elements::encode::serialize(&round_tx), "round")?;
 				}
 			}
-			self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": news}).to_string())?;
+			let all: Vec<Value> = news.iter().map(|n| n.5.clone()).collect();
+			self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": all}).to_string())?;
 			if !released {
 				notes.push(json!({"participation": pid, "state": "forfeiting", "round": rtx}));
 				continue;
 			}
 			match preimage {
 				Some(p) => {
+					// A new leaf the wallet does not hold yet is checked as any
+					// coin restored is, as of its expiry once that has passed:
+					// one whose path a final sweep cut is not taken. The
+					// participation is completed with the others, its coins
+					// given up spent.
+					let mut kept_news = vec![];
+					for (leaf_id, held, nonce, record, auths, entry) in &news {
+						if !held {
+							let coin = CoinRecord::Leaf { record: record.clone(), preimage: p, auths: auths.clone() };
+							if let Err(why) = self.checked_as_held(&coin, &record.owner, nonce, now) {
+								not_recovered.push(missed(leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
+								withheld.retain(|w| w != leaf_id);
+								continue;
+							}
+						}
+						kept_news.push(entry.clone());
+					}
+					self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": kept_news}).to_string())?;
 					let kept = self.finish(&pid, p, "settled")?;
 					for k in kept {
 						let id = k["leaf_id"].as_str().unwrap_or("").to_string();
