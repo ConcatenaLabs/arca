@@ -95,12 +95,19 @@ async fn each_asset_has_its_own_node_and_info_names_it() {
 	assert_eq!(leg(&i, &y)["receives"], false, "Y's node runs no hold-invoice plugin");
 	assert!(leg(&i, &z).is_null(), "Z has no Lightning leg");
 	match &btc {
-		Some((_, ob, _)) => {
+		Some((_, ob, pb)) => {
 			let b = &i["lightning"]["bitcoin"];
 			assert_eq!((b["node"]["state"].as_str(), b["node"]["node"].as_str()), (Some("up"), Some(ob.id.as_str())), "{}", b);
 			assert_eq!((b["node"]["network"].as_str(), b["node"]["channels"].as_u64()), (Some("regtest"), Some(1)));
 			assert_eq!(b["ark"], "https://ark.example.org");
 			assert!(r.server.gateway.bitcoin_leg().is_ok());
+			// A Bitcoin invoice never goes through an asset's leg: its node
+			// does not take it, so no Sequentia leaf ever pays it.
+			let inv = pb.ok("invoice", serde_json::json!({ "amount_msat": 1_000_000, "label": "btc", "description": "btc" }));
+			let e = server::lightning::send::decode(&r.server.gateway.leg(&x, true).unwrap(), inv["bolt11"].as_str().unwrap()).await
+				.unwrap_err();
+			println!("a Bitcoin invoice at X's leg: {} [{}]", e, e.code());
+			assert_eq!(e.code(), "invoice");
 		},
 		None => assert!(i["lightning"]["bitcoin"].is_null()),
 	}

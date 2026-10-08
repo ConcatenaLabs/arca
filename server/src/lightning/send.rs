@@ -147,6 +147,16 @@ pub async fn decode(leg: &Leg, invoice: &str) -> Result<Decoded, SendError> {
 	if d["valid"].as_bool() != Some(true) || d["type"].as_str() != Some("bolt11 invoice") {
 		return Err(SendError::Invoice(format!("{} does not take the invoice as a valid BOLT11 invoice", leg.name())));
 	}
+	// The node decodes an invoice of any network; it is paid only on the
+	// node's own. A Bitcoin invoice is paid in native BTC, never from a
+	// Sequentia leaf.
+	if let crate::lightning::LegState::Up(view) = leg.state() {
+		let currency = d["currency"].as_str().unwrap_or("");
+		if Some(currency) != currency_of(&view.network) {
+			return Err(SendError::Invoice(format!("the invoice is for currency {:?}, and {} runs on {}: an invoice is paid on its own \
+				network, and a Bitcoin invoice in native BTC, never from a Sequentia leaf", currency, leg.name(), view.network)));
+		}
+	}
 	let payment_hash = d["payment_hash"].as_str().and_then(|h| crate::signer::unhex32(h).ok())
 		.ok_or_else(|| SendError::Invoice("the invoice names no payment hash".into()))?;
 	let amount_msat = d["amount_msat"].as_u64().ok_or_else(|| SendError::Invoice("the invoice names no amount: an invoice paid \
@@ -156,6 +166,16 @@ pub async fn decode(leg: &Leg, invoice: &str) -> Result<Decoded, SendError> {
 		created_at: d["created_at"].as_u64().unwrap_or(0), expiry: d["expiry"].as_u64().unwrap_or(3600),
 		min_final_cltv: d["min_final_cltv_expiry"].as_u64().unwrap_or(18),
 	})
+}
+
+/// The BOLT11 currency of a Sequentia network, as SeqLN writes it.
+pub fn currency_of(network: &str) -> Option<&'static str> {
+	match network {
+		"sequentia" => Some("sqt"),
+		"sequentia-testnet" => Some("tsqt"),
+		"sequentia-regtest" => Some("sqrt"),
+		_ => None,
+	}
 }
 
 /// See the [module documentation](self).

@@ -501,6 +501,18 @@ the operator not co-sign; `exit` takes a `receiving` leaf home by its claim
 with the preimage. The payment is settled when the preimage is handed over.
 A payment the operator failed back is `failed`, with the reason.
 
+Native BTC goes over Lightning on the Bitcoin side, never through a Sequentia
+leaf: `lightning pay` with a Bitcoin invoice, and `lightning receive btc
+SATS`, run Bark's own Lightning leg on the wallet's Bitcoin ark wallet
+(`bitcoin`'s, at `<datadir>/bitcoin`): `bark lightning pay invoice INVOICE
+--wait` and `bark lightning invoice "SATS sats"`, against the Bitcoin ark
+the operator names in its `info` (`lightning.bitcoin.ark`), Bark's server on
+the Bitcoin network the chain anchors to. While the operator names no
+Bitcoin ark, or the wallet has no Bitcoin ark wallet, both are refused with
+the reason and Bark is not run. A Bitcoin invoice with `--asset` naming a
+Sequentia asset is refused before anything is signed. `ARCA_BARK_EXEC`
+names the `bark` binary when it is not the one beside `arca`.
+
 ### Commands
 
 | Command | Does |
@@ -519,7 +531,7 @@ A payment the operator failed back is `failed`, with the reason.
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
 | `lightning payments` | Every payment over Lightning the wallet made, by payment hash: the invoice, asset, amount, fee, the `htlc-1` leaf, its state and its preimage or reason |
-| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it |
+| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it. `btc` for native BTC: `AMOUNT` satoshis, through Bark's Lightning leg on the Bitcoin side |
 | `lightning receives` | Every payment the wallet asked to receive, by payment hash: the invoice, asset, amount, fee, the leaf's value and participation, and its state (`waiting`, `issuing`, `claiming`, `received` or `failed` with the reason); never the preimage |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
@@ -654,6 +666,15 @@ by the asset's next round and claimed by `sync` with the preimage, the
 payment settled at the payer's node only then; in each asset the wallet
 holds the amount less the fee and the claim's margins, and a fee above the
 wallet's bound is refused before anything is asked.
+
+`tests/arca_bitcoin_side.rs` checks the Bitcoin side at its boundary, Bark
+replaced by a stand-in that records what it is asked: with no Bitcoin ark
+wallet, and against an operator that names no Bitcoin ark, a Bitcoin invoice
+and a receive in BTC are refused with the reason and Bark is not run;
+otherwise each is exactly one call of Bark's Lightning leg (`lightning pay
+invoice INVOICE --wait`, `lightning invoice "1000 sats" --description …`) on
+the Bitcoin ark wallet; and a Bitcoin invoice with a Sequentia asset named
+is refused, nothing paid or asked on the Sequentia side.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
