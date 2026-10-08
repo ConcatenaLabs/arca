@@ -311,3 +311,284 @@ async fn an_older_wallets_coins_are_bound_at_its_next_sync_and_then_restored() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// Rewrites every `leaf_data` page with `f`, every published tree with `t`,
+/// `info` and every head with `h`, and every mailbox page with `m`; any of
+/// them may be `None`.
+type Edit = fn(&mut Value, &Ctx);
+
+/// What a case's edits need to know of the wallet's coins.
+#[derive(Clone)]
+struct Ctx {
+	/// A's leaf of a batch, its board refreshed, the board it paid from, and
+	/// the payment to A it has not read.
+	leaf: String,
+	refreshed: String,
+	paid_from: String,
+	unread: String,
+	/// A board of another wallet, M: its id and record, as M holds it.
+	other: String,
+	other_record: String,
+	other_owner: String,
+	other_nonce: String,
+}
+
+fn entry_of<'a>(page: &'a mut Value, leaf: &str) -> Option<&'a mut Value> {
+	page["leaves"].as_array_mut()?.iter_mut().find(|e| e["leaf_id"] == leaf)
+}
+
+fn every_head(v: &mut Value, f: &dyn Fn(&mut Value)) {
+	match v {
+		Value::Object(o) => {
+			if o.contains_key("entry") && o.contains_key("hash") {
+				f(v);
+				return;
+			}
+			for (_, x) in o.iter_mut() {
+				every_head(x, f);
+			}
+		},
+		Value::Array(a) => a.iter_mut().for_each(|x| every_head(x, f)),
+		_ => {},
+	}
+}
+
+/// A record withheld: the payment to A served without its record, and
+/// hidden from the mailbox too.
+fn withhold_payment(page: &mut Value, c: &Ctx) {
+	if let Some(e) = entry_of(page, &c.unread) {
+		e["record"] = json!("");
+	}
+}
+
+fn hide_payment(mailbox: &mut Value, c: &Ctx) {
+	if let Some(m) = mailbox["messages"].as_array_mut() {
+		m.retain(|x| x["leaf_id"] != c.unread.as_str());
+	}
+}
+
+/// A record withheld: the leaf of the batch not served at all.
+fn drop_leaf(page: &mut Value, c: &Ctx) {
+	if let Some(l) = page["leaves"].as_array_mut() {
+		l.retain(|e| e["leaf_id"] != c.leaf.as_str());
+	}
+}
+
+/// The published tree without the preimage it publishes.
+fn no_preimage(t: &mut Value, _: &Ctx) {
+	for l in t["leaves"].as_array_mut().unwrap() {
+		l.as_object_mut().unwrap().remove("preimage");
+	}
+}
+
+/// A wrong tree: its batch output listed one atom more.
+fn one_atom_more(t: &mut Value, _: &Ctx) {
+	let levels = t["nodes"].as_array_mut().unwrap();
+	let last = levels.last_mut().unwrap().as_array_mut().unwrap();
+	let v: u64 = last[0]["value"].as_str().unwrap().parse().unwrap();
+	last[0]["value"] = json!((v + 1).to_string());
+}
+
+/// A leaf of another key: M's board served to A's mailbox key, as a board of
+/// A's would be.
+fn another_keys_leaf(page: &mut Value, c: &Ctx) {
+	let Some(template) = entry_of(page, &c.paid_from).cloned() else { return };
+	let mut e = template;
+	e["leaf_id"] = json!(c.other);
+	e["record"] = json!(c.other_record);
+	e["owner"] = json!(c.other_owner);
+	e["owner_nonce"] = json!(c.other_nonce);
+	e["state"] = json!("live");
+	e["given"] = json!([]);
+	page["leaves"].as_array_mut().unwrap().push(e);
+}
+
+/// An old copy of a leaf: the board A paid from, served as it was before the
+/// payment, live and given up nowhere.
+fn old_copy(page: &mut Value, c: &Ctx) {
+	if let Some(e) = entry_of(page, &c.paid_from) {
+		e["state"] = json!("live");
+		e["given"] = json!([]);
+	}
+}
+
+/// A keeper set not acknowledged: every head shown without the keepers'
+/// acknowledgements.
+fn no_acks(v: &mut Value, _: &Ctx) {
+	every_head(v, &|h: &mut Value| {
+		h.as_object_mut().unwrap().remove("acks");
+	});
+}
+
+/// A keeper set not acknowledged: `info` names no keeper, while the heads it
+/// shows carry a keeper's acknowledgements.
+fn no_keepers_named(v: &mut Value, _: &Ctx) {
+	if v.get("operator").is_some() && v.get("keepers").is_some() {
+		v["keepers"] = json!({"keys": [], "required": 0});
+	}
+}
+
+/// The operator's answer to a forfeit step without the preimage: the
+/// forfeits taken, the preimage held back.
+fn no_forfeit_preimage(v: &mut Value) {
+	if let Some(o) = v.as_object_mut() {
+		o.remove("preimage");
+	}
+}
+
+/// A proxy rewrite applying a case's edits; with `no_forfeit`, the preimage
+/// is held back from the forfeit step's answer too.
+fn case_rewrite(c: &Ctx, page: Option<Edit>, tree: Option<Edit>, info: Option<Edit>, mailbox: Option<Edit>, no_forfeit: bool)
+	-> common::proxy::Rewrite
+{
+	let c = c.clone();
+	Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if status != 200 {
+			return None;
+		}
+		match path {
+			"/v1/leaf_data" => page.into_iter().chain(info).for_each(|f| f(v, &c)),
+			"/v1/tree" => tree.into_iter().chain(info).for_each(|f| f(v, &c)),
+			"/v1/forfeit_leaves" if no_forfeit => no_forfeit_preimage(v),
+			"/v1/info" | "/v1/witness" => info.into_iter().for_each(|f| f(v, &c)),
+			"/v1/mailbox_read" => mailbox.into_iter().chain(info).for_each(|f| f(v, &c)),
+			_ => {},
+		}
+		None
+	})
+}
+
+/// The restore against a server that lies, one way at a time, each on a
+/// wallet created afresh from A's mnemonic through a proxy that rewrites what
+/// the server serves. A holds a leaf of a batch, its change from a payment and
+/// the board that paid it, and a payment to it not yet read; M, another
+/// wallet, holds a board. Each lie is refused with its reason and nothing is
+/// credited on it:
+/// - a record withheld: the payment served without its record and kept from
+///   the mailbox is not recovered, and said so; the leaf of the batch not
+///   served at all is taken from the published tree, which publishes its
+///   preimage, and said so; with the tree withholding that preimage too, it
+///   is not recovered;
+/// - a wrong tree: the leaf of the batch is refused;
+/// - a leaf of another key: M's board served to A's mailbox key is refused;
+/// - an old copy of a leaf: the board A paid from, served live and given up
+///   nowhere, is held spent, by the transfer A's change rests on;
+/// - a keeper set not acknowledged: with every acknowledgement stripped, or
+///   with `info` naming no keeper while the heads carry a keeper's
+///   acknowledgements, nothing is restored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_takes_the_operators_word_for_nothing_it_can_check() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, b, m) = (Arca::new("RXA"), Arca::new("RXB"), Arca::new("RXM"));
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 3_000_000)]).await;
+	let others = boarded(&mut r, &m, &url, &[(x, 2_000_000)]).await;
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "600000", "--asset", &xs]);
+	let paid_from = sent["inputs"][0].as_str().unwrap().to_string();
+	let change = sent["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
+	let refreshed = boards.iter().find(|l| **l != paid_from).unwrap().clone();
+	a.ok(&["participate", "--leaf", &refreshed, "--max-fee-ppm", "1000000"]);
+	final_round(&r).await;
+	let s = a.ok(&["sync"]);
+	let leaf = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = b.ok(&["send", &req_a, "--amount", "500000", "--asset", &xs]);
+	let unread = paid["transfer"]["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string())
+		.find(|o| !paid["transfer"]["kept"].as_array().unwrap().iter().any(|k| k["leaf_id"] == o.as_str())).expect("A's coin");
+	let mrec = m.ok(&["record", &others[0]]);
+	let c = Ctx {
+		leaf: leaf.clone(), refreshed: refreshed.clone(), paid_from: paid_from.clone(), unread: unread.clone(),
+		other: others[0].clone(), other_record: mrec["record"].as_str().unwrap().to_string(),
+		other_owner: mrec["detail"]["owner"].as_str().unwrap().to_string(), other_nonce: mrec["detail"]["owner_nonce"].as_str().unwrap().to_string(),
+	};
+	println!("RX A holds: batch leaf {} (from {}), change {} (from {}), unread payment {}; M's board {}", &leaf[..16], &refreshed[..16],
+		&change[..16], &paid_from[..16], &unread[..16], &others[0][..16]);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let p = Proxy::start(&url);
+	type Check = Box<dyn Fn(&Value, &Arca)>;
+	let cases: Vec<(&str, Option<Edit>, Option<Edit>, Option<Edit>, Option<Edit>, Check)> = vec![
+		("a record withheld: the payment served without its record, kept from the mailbox", Some(withhold_payment), None, None,
+			Some(hide_payment), Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				let why = out["not_recovered"].as_array().unwrap().iter().find(|n| n["leaf_id"] == c.unread.as_str())
+					.unwrap_or_else(|| panic!("the withheld payment is not listed: {}", out));
+				assert!(why["why"].as_str().unwrap().contains("without its record: withheld"), "{}", why);
+				assert_eq!(coin_of(w, &c.unread), Value::Null, "nothing credited");
+			}})),
+		("a record withheld: the leaf of the batch not served, its preimage in the tree", Some(drop_leaf), None, None, None,
+			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				assert!(out["notes"].as_array().unwrap().iter().any(|n| n["leaf_id"] == c.leaf.as_str()
+					&& n["note"].as_str().unwrap_or("").contains("recovered from the published tree")), "{}", out["notes"]);
+				assert_eq!(coin_of(w, &c.leaf)["state"], "live", "taken from the tree and the chain");
+			}})),
+		("a record withheld: the leaf of the batch not served, the tree withholding its preimage", Some(drop_leaf), Some(no_preimage), None, None,
+			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				let why = out["not_recovered"].as_array().unwrap().iter().find(|n| n["leaf_id"] == c.leaf.as_str())
+					.unwrap_or_else(|| panic!("the withheld leaf is not listed: {}", out));
+				assert!(why["why"].as_str().unwrap().contains("its preimage has not gone out"), "{}", why);
+				assert_eq!(coin_of(w, &c.leaf), Value::Null, "nothing credited");
+				// The board given up for it stays given up under its forfeit,
+				// which the wallet follows on the chain.
+				assert_eq!(coin_of(w, &c.refreshed)["state"], "forfeited");
+			}})),
+		("a wrong tree: its batch output one atom more", None, Some(one_atom_more), None, None,
+			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				let why = out["not_recovered"].as_array().unwrap().iter().find(|n| n["leaf_id"] == c.leaf.as_str())
+					.unwrap_or_else(|| panic!("the leaf is not listed: {}", out));
+				assert!(why["why"].as_str().unwrap().contains("the published tree is not the tree its parts build: node 0 of level"), "{}", why);
+				assert_eq!(coin_of(w, &c.leaf), Value::Null, "nothing credited");
+				// The board given up for it stays given up under its forfeit
+				// (A's own attestation and forfeit say so), followed on the
+				// chain: the leaf it was given up for is not taken on a tree
+				// that does not build.
+				assert_eq!(coin_of(w, &c.refreshed)["state"], "forfeited");
+			}})),
+		("a leaf of another key: M's board served to A's mailbox key", Some(another_keys_leaf), None, None, None,
+			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				let why = out["not_recovered"].as_array().unwrap().iter().find(|n| n["leaf_id"] == c.other.as_str())
+					.unwrap_or_else(|| panic!("M's board is not listed: {}", out));
+				assert!(why["why"].as_str().unwrap().contains("a leaf of another key"), "{}", why);
+				assert_eq!(coin_of(w, &c.other), Value::Null, "nothing credited");
+			}})),
+		("an old copy of a leaf: the board A paid from, live and given up nowhere", Some(old_copy), None, None, None,
+			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				assert!(out["notes"].as_array().unwrap().iter().any(|n| n["leaf_id"] == c.paid_from.as_str()
+					&& n["note"].as_str().unwrap_or("").contains("an old copy")), "{}", out["notes"]);
+				let coin = coin_of(w, &c.paid_from);
+				assert_eq!(coin["state"], "spent", "{}", coin);
+				assert!(coin["spent_by"].as_str().unwrap().starts_with("transfer "), "{}", coin);
+			}})),
+		("a keeper set not acknowledged: every acknowledgement stripped", None, None, Some(no_acks), None,
+			Box::new(|out: &Value, w: &Arca| {
+				let why = out["error"]["message"].as_str().unwrap_or_else(|| panic!("not refused: {}", out));
+				assert!(why.contains("no head of its signer's record it shows comes with their acknowledgements"), "{}", why);
+				assert_eq!(w.ok(&["coins"]), json!([]), "nothing credited");
+			})),
+		("a keeper set not acknowledged: no keeper named, a keeper's acknowledgements shown", None, None, Some(no_keepers_named), None,
+			Box::new(|out: &Value, w: &Arca| {
+				let why = out["error"]["message"].as_str().unwrap_or_else(|| panic!("not refused: {}", out));
+				assert!(why.contains("which the operator does not name among its keepers"), "{}", why);
+				assert_eq!(w.ok(&["coins"]), json!([]), "nothing credited");
+			})),
+	];
+	for (k, (what, page, tree, info, mailbox, check)) in cases.into_iter().enumerate() {
+		p.rewrite(Some(case_rewrite(&c, page, tree, info, mailbox, what.contains("withholding its preimage"))));
+		let w = Arca::new(&format!("RXR{}", k));
+		let mut args = create_args(&p.url, &node);
+		args.extend(["--mnemonic", &mnemonic]);
+		let made = w.ok(&args);
+		let out = &made["restore"];
+		println!("RX {}: restored {} | not recovered {} | notes {} | error {}", what,
+			json!(out["restored"].as_array().map(|v| v.iter().map(|x| format!("{} {}", &x["leaf_id"].as_str().unwrap_or("")[..16], x["state"].as_str().unwrap_or(""))).collect::<Vec<_>>())),
+			out["not_recovered"], out["notes"], out["error"]["message"]);
+		check(out, &w);
+		p.rewrite(None);
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+	for w in [&a, &b, &m] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
