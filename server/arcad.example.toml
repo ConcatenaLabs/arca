@@ -242,7 +242,9 @@ retry_seconds = 60
 # receive_window_seconds, in blocks, and the leaf times out at half the time
 # the payment is held for, which leaves its owner the exit delay and the
 # window to claim it. The operator refunds the leaf operator_delay_units
-# after its timeout.
+# after its timeout. With a 36-hour exit delay that lock time is about 5,060
+# blocks: a payer's SeqLN node pays it only with its pay's maxdelay raised
+# from its 2,016 blocks.
 receive_window_seconds = 21600
 invoice_expiry_seconds = 3600
 # The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
