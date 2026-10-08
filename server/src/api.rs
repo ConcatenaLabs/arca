@@ -111,6 +111,26 @@ pub struct LightningInfo {
 	/// The terms of the `htlc-1` leaf a payment out of the tree gives its
 	/// coins up into.
 	pub send: LightningSendInfo,
+	/// The terms of the `htlc-1` leaf a payment into the tree is received
+	/// in.
+	pub receive: LightningReceiveInfo,
+}
+
+/// The operator's terms for a payment into the tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningReceiveInfo {
+	/// The delay on the operator's refund of the leaf, in 512-second units.
+	pub operator_delay_units: u16,
+	/// The time a wallet has, past its leaf's exit delay, to claim it once
+	/// its round is final: the leaf's timeout leaves at least its exit delay
+	/// and this.
+	pub window_seconds: u32,
+	/// How long an invoice is good for.
+	pub invoice_expiry_seconds: u32,
+	/// The chain's block interval, which turns the payment's lock times
+	/// into time.
+	pub block_seconds: u32,
 }
 
 /// The operator's terms for a payment out of the tree.
@@ -460,6 +480,17 @@ pub struct HtlcTermsJson {
 	pub operator_delay_units: u16,
 }
 
+impl HtlcTermsJson {
+	pub fn of(t: &arca_covenant::HtlcTerms) -> HtlcTermsJson {
+		HtlcTermsJson {
+			direction: t.direction.name().into(),
+			payment_hash: crate::signer::hex(&t.payment_hash),
+			timeout: t.timeout.to_consensus_u32(),
+			operator_delay_units: t.operator_delay.units(),
+		}
+	}
+}
+
 /// `POST /v1/lightning_send`: pay `invoice` with the transfer, whose outputs
 /// make one `htlc-1` leaf of the payment and the change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +528,83 @@ pub struct LightningPayment {
 	pub preimage: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<String>,
+}
+
+/// `POST /v1/lightning_receive`: an invoice paid into the tree, under the
+/// wallet's own payment hash, into an `htlc-1` leaf of `owner` in a round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningReceive {
+	pub asset: String,
+	/// What the invoice asks, in the asset's atoms; the leaf holds it less
+	/// the operator's fee.
+	pub amount: String,
+	pub payment_hash: String,
+	/// The key the leaf is asked under, its nonce, and its exit delay.
+	pub owner: String,
+	pub owner_nonce: String,
+	pub exit_delay_units: u16,
+	#[serde(default)]
+	pub description: Option<String>,
+	/// The owner key's BIP340 signature over the request:
+	/// `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ asset ‖ amount ‖ payment_hash ‖
+	/// owner ‖ owner_nonce ‖ exit_delay_units)`, `T =
+	/// SHA256("Arca/lightning-receive")`.
+	pub owner_sig: String,
+}
+
+/// A payment into the tree, as `lightning_receive` and its status answer
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningReceived {
+	pub payment_hash: String,
+	pub asset: String,
+	pub amount: String,
+	pub fee: String,
+	/// What the leaf holds: the amount less the fee.
+	pub value: String,
+	pub invoice: String,
+	/// When the invoice expires (Unix time).
+	pub expires_at: u64,
+	/// `open`, `accepted` (held, the leaf wanted by `participation_id`),
+	/// `claimed` (the preimage handed over) or `cancelled` (failed back).
+	pub state: String,
+	/// Whether the node has settled the payment.
+	pub settled: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub participation_id: Option<String>,
+	/// The leaf's timeout, a median time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeout: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+}
+
+/// `POST /v1/lightning_receive_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningReceiveStatus {
+	pub payment_hash: String,
+}
+
+/// `POST /v1/lightning_receive_claim`: the payment's preimage, and the
+/// transfer of its leaf to a leaf of the owner's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningReceiveClaim {
+	pub payment_hash: String,
+	pub preimage: String,
+	pub inputs: Vec<TransferInput>,
+	pub outputs: Vec<TransferOutput>,
+}
+
+/// The answer to `lightning_receive_claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningClaimed {
+	pub cosigned: Cosigned,
+	pub receive: LightningReceived,
 }
 
 /// `POST /v1/lightning_send_status`.
@@ -725,6 +833,9 @@ pub struct ServedWantedLeaf {
 	pub exit_delay_units: u16,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub leaf_id: Option<String>,
+	/// An `htlc-1` leaf's terms (a payment received over Lightning).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub htlc: Option<HtlcTermsJson>,
 }
 
 /// A forfeit of the coin, for the round of one attempt: what its output
@@ -1147,6 +1258,9 @@ pub struct TreeLeaf {
 	/// chain from the published tree, its mnemonic and the chain.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub preimage: Option<String>,
+	/// An `htlc-1` leaf's terms (a payment received over Lightning).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub htlc: Option<HtlcTermsJson>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each

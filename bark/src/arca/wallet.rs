@@ -392,6 +392,15 @@ pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 	}
 }
 
+/// The direction of a coin's `htlc-1` leaf, when it is one.
+pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirection> {
+	match record {
+		CoinRecord::Leaf { record, .. } => record.htlc.map(|t| t.direction),
+		CoinRecord::Transfer(t) => t.leaf.htlc.map(|t| t.direction),
+		CoinRecord::Board(_) => None,
+	}
+}
+
 /// Every output a coin rests on: the batch output of each batch leaf and each
 /// board output in its record, from the coin up.
 fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> {
@@ -1568,7 +1577,7 @@ impl Wallet {
 	/// Whether a coin in `state` is one the wallet may still hold off the
 	/// chain, and so brings home when it cannot have it refreshed.
 	fn homeward(state: &str) -> bool {
-		matches!(state, "live" | "pending" | "given" | "forfeited" | "offered" | "sending")
+		matches!(state, "live" | "pending" | "given" | "forfeited" | "offered" | "sending" | "paying" | "receiving")
 	}
 
 	/// The coins the wallet holds live whose latest refresh the operator
@@ -1903,7 +1912,7 @@ impl Wallet {
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
 		let mut held = vec![];
 		for c in self.store.coins()? {
-			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending") {
+			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending" | "paying" | "receiving") {
 				continue;
 			}
 			let record = Self::record_of(&c)?;

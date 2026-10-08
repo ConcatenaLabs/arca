@@ -439,6 +439,331 @@ impl Wallet {
 	}
 }
 
+/// Where the wallet keeps its payments received over Lightning: a map from
+/// the payment hash (hex) to what it knows of the payment.
+pub(crate) const RECEIVES: &str = "lightning_receives";
+
+/// The tag of a received payment's preimage, derived from its leaf's key.
+const RECEIVE_PREIMAGE_TAG: &[u8] = b"Arca/lightning-receive-preimage";
+
+/// The `htlc-1` terms a published leaf carries (`htlc`), if any.
+pub(crate) fn htlc_terms_of(v: &Value) -> Result<Option<HtlcTerms>, Error> {
+	if v.is_null() {
+		return Ok(None);
+	}
+	let bad = |why: String| Error::Parse(format!("a leaf's htlc-1 terms: {}", why));
+	let direction = HtlcDirection::from_name(v["direction"].as_str().unwrap_or("")).ok_or_else(|| bad(format!("direction {}", v["direction"])))?;
+	let payment_hash = super::chain::unhex32(v["payment_hash"].as_str().unwrap_or(""))?;
+	let timeout = MedianTime::from_consensus(v["timeout"].as_u64().unwrap_or(0) as u32).map_err(|e| bad(e.to_string()))?;
+	let operator_delay = v["operator_delay_units"].as_u64().and_then(|u| u16::try_from(u).ok())
+		.ok_or_else(|| bad("no operator delay".into()))
+		.and_then(|u| RelativeTime::from_units(u).map_err(|e| bad(e.to_string())))?;
+	Ok(Some(HtlcTerms { direction, payment_hash, timeout, operator_delay }))
+}
+
+impl Wallet {
+	fn receives(&self) -> Result<BTreeMap<String, Value>, Error> {
+		Ok(self.store.meta(RECEIVES)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+	}
+
+	fn set_receive(&self, hash: &str, v: Value) -> Result<(), Error> {
+		let mut m = self.receives()?;
+		m.insert(hash.to_string(), v);
+		self.store.set_meta(RECEIVES, &serde_json::to_string(&m).expect("a map"))
+	}
+
+	/// The preimage of the payment received into the leaf of `nonce`, derived
+	/// from that leaf's key, so the mnemonic and the nonce (which the leaf's
+	/// record carries) give it back: `SHA256("Arca/lightning-receive-preimage"
+	/// ‖ leaf secret key ‖ nonce)`.
+	pub(crate) fn receive_preimage(&self, nonce: &[u8; 32]) -> Result<[u8; 32], Error> {
+		use elements::hashes::{sha256, Hash, HashEngine};
+		let key = self.keys.leaf(nonce)?;
+		let mut e = sha256::Hash::engine();
+		e.input(RECEIVE_PREIMAGE_TAG);
+		e.input(&key.secret_bytes());
+		e.input(nonce);
+		Ok(sha256::Hash::from_engine(e).to_byte_array())
+	}
+
+	/// Asks to receive `amount` of `asset` over Lightning: an invoice the
+	/// operator's node in the asset makes under a payment hash the wallet
+	/// chose, whose preimage it alone holds, paid into an `htlc-1` leaf of the
+	/// wallet's own in the asset's next round. The operator's fee comes out
+	/// of the amount, within the wallet's bound (`max_fee_ppm`). Nothing is
+	/// handed over until the wallet holds the leaf: `sync` then claims it
+	/// with the preimage, which settles the payment.
+	pub fn lightning_receive(&mut self, asset: AssetId, amount: u64, description: Option<&str>, max_fee_ppm: Option<u64>)
+		-> Result<Value, Error>
+	{
+		let info = self.server_info()?;
+		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
+			.map(|a| a["lightning"].clone())
+			.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}", asset)))?;
+		if leg.is_null() {
+			return Err(Error::Refused(format!("the operator runs no Lightning node in asset {}", asset)));
+		}
+		if leg["state"] != "up" {
+			return Err(Error::Refused(format!("the operator's Lightning node in asset {} is down: {}", asset,
+				leg["reason"].as_str().unwrap_or("no reason given"))));
+		}
+		if leg["receives"] != true {
+			return Err(Error::Refused(format!("the operator's Lightning node in asset {} does not receive (it runs no hold-invoice \
+				plugin)", asset)));
+		}
+		let fee = fee_of(&info, asset, amount)?;
+		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
+		if !super::round::fee_within(fee, amount, bound) {
+			return Err(Error::Refused(format!("the operator charges {} of asset {} to receive {}, above the wallet's bound of {} ppm \
+				(--max-fee-ppm raises it for this payment)", fee, asset, amount, bound)));
+		}
+		let value = amount.checked_sub(fee).filter(|v| *v > 0).ok_or_else(|| Error::Refused("the fee takes the whole amount".into()))?;
+		let min = Self::min_leaf(&info, asset)?;
+		if value < min {
+			return Err(Error::Refused(format!("the leaf would hold {} (the {} asked, less the fee of {}), below the operator's smallest \
+				leaf {}", value, amount, fee, min)));
+		}
+		let recv = &info["lightning"]["receive"];
+		let operator_delay = recv["operator_delay_units"].as_u64().unwrap_or(0);
+		let exit_delay = self.exit_delay();
+		if exit_delay.units() as u64 <= operator_delay {
+			return Err(Error::Refused(format!("the wallet's exit delay of {} units is not longer than the operator's delay of {}",
+				exit_delay.units(), operator_delay)));
+		}
+		let nonce = random32();
+		let key = self.keys.leaf(&nonce)?;
+		let owner = key.x_only_public_key().0;
+		self.store.put_nonce(&nonce, &owner.serialize(), "lightning-receive")?;
+		let preimage = self.receive_preimage(&nonce)?;
+		let hash = arca_covenant::script::sha256(&preimage);
+		let digest = super::client::lightning_receive_digest(&self.genesis, &self.operator, &asset, amount, &hash, &owner, &nonce,
+			exit_delay.units());
+		let mut body = json!({
+			"asset": asset.to_string(), "amount": amount.to_string(), "payment_hash": hex(&hash), "owner": hex(&owner.serialize()),
+			"owner_nonce": hex(&nonce), "exit_delay_units": exit_delay.units(),
+			"owner_sig": hex(super::wallet::sign(&key, &digest).as_ref()),
+		});
+		if let Some(d) = description {
+			body["description"] = json!(d);
+		}
+		let hash_hex = hex(&hash);
+		self.set_receive(&hash_hex, json!({"state": "requested", "request": body, "asset": asset.to_string(), "amount": amount.to_string(),
+			"nonce": hex(&nonce), "max_fee_ppm": bound}))?;
+		let r = match self.server.post("lightning_receive", &body) {
+			Ok(r) => r,
+			Err(e @ Error::Server { .. }) => {
+				let mut m = self.receives()?;
+				m.remove(&hash_hex);
+				self.store.set_meta(RECEIVES, &serde_json::to_string(&m).expect("a map"))?;
+				return Err(e);
+			},
+			Err(e) => return Err(e),
+		};
+		let rec = self.receive_answered(&hash_hex, &r)?;
+		Ok(json!({"invoice": rec["invoice"], "payment_hash": hash_hex, "asset": asset.to_string(), "amount": amount.to_string(),
+			"fee": rec["fee"], "value": rec["value"], "expires_at": rec["expires_at"]}))
+	}
+
+	/// The operator's answer to a request to receive, checked against what
+	/// the wallet asked: the hash, asset and amount, a fee within the
+	/// wallet's bound, and an invoice for exactly that, on the operator's
+	/// node's network. Kept, and returned.
+	fn receive_answered(&mut self, hash: &str, r: &Value) -> Result<Value, Error> {
+		let mut rec = self.receives()?.get(hash).cloned().ok_or_else(|| Error::Store(format!("no receive {}", hash)))?;
+		let asset = AssetId::from_str(rec["asset"].as_str().unwrap_or("")).map_err(|e| Error::Store(e.to_string()))?;
+		let amount = amount_of(&rec["amount"])?;
+		if r["payment_hash"].as_str() != Some(hash) || r["asset"].as_str() != Some(&asset.to_string()) || amount_of(&r["amount"])? != amount {
+			return Err(Error::Refused(format!("the operator answers for another payment than the one asked: {}", r)));
+		}
+		let fee = amount_of(&r["fee"])?;
+		let bound = rec["max_fee_ppm"].as_u64().unwrap_or(super::DEFAULT_MAX_FEE_PPM);
+		if fee >= amount || amount_of(&r["value"])? != amount - fee || !super::round::fee_within(fee, amount, bound) {
+			return Err(Error::Refused(format!("the operator's fee of {} for {} is above the wallet's bound of {} ppm, or its leaf is not 				the amount less the fee", fee, amount, bound)));
+		}
+		let invoice = r["invoice"].as_str().unwrap_or("").to_string();
+		let inv = parse_invoice(&invoice)?;
+		if hex(&inv.payment_hash) != hash || inv.asset != Some(asset) || inv.amount_msat != Some(amount * 1000) {
+			return Err(Error::Refused("the operator's invoice is not for the payment the wallet asked for".into()));
+		}
+		rec["state"] = json!("waiting");
+		rec["invoice"] = json!(invoice);
+		rec["fee"] = json!(fee.to_string());
+		rec["value"] = json!((amount - fee).to_string());
+		rec["expires_at"] = r["expires_at"].clone();
+		self.set_receive(hash, rec.clone())?;
+		Ok(rec)
+	}
+
+	/// Moves every payment the wallet asked to receive on: a request the
+	/// operator never answered is asked again; once the payment is held,
+	/// the operator's participation that wants the leaf is followed as the
+	/// wallet's own (its round, the leaf validated from the published tree,
+	/// the unroll authorisations handed over: `sync`'s participations); once
+	/// the wallet holds the leaf, the leaf is claimed with the preimage, into
+	/// a leaf of the wallet's own. A payment the operator failed back is
+	/// `failed`, with its reason.
+	pub(crate) fn progress_receives(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for (hash, rec) in self.receives()? {
+			let state = rec["state"].as_str().unwrap_or("").to_string();
+			let step = match state.as_str() {
+				"requested" => match self.server.post("lightning_receive", &rec["request"]) {
+					Ok(r) => self.receive_answered(&hash, &r).map(|r| json!({"payment_hash": hash, "state": r["state"]})),
+					Err(e) => Err(e),
+				},
+				"waiting" => self.receive_status(&hash),
+				"issuing" | "claiming" => self.claim_received(&hash),
+				_ => continue,
+			};
+			out.push(step.unwrap_or_else(|e| json!({"payment_hash": hash, "state": state, "error": e.to_string()})));
+		}
+		Ok(out)
+	}
+
+	/// Asks the operator how the payment `hash` stands: held, its leaf
+	/// wanted by a participation the wallet then follows as its own.
+	fn receive_status(&mut self, hash: &str) -> Result<Value, Error> {
+		let st = self.server.post("lightning_receive_status", &json!({"payment_hash": hash}))?;
+		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
+		match st["state"].as_str() {
+			Some("accepted") | Some("claimed") => {
+				let pid = st["participation_id"].as_str().ok_or_else(|| Error::Refused("the operator names no participation".into()))?;
+				if *pid != hex(&receive_participation_id(&super::chain::unhex32(hash)?)) {
+					return Err(Error::Refused(format!("the operator names participation {} for the payment, which is not the one its \
+						hash gives", pid)));
+				}
+				if !self.store.participations()?.iter().any(|p| p.0 == pid) {
+					// No coin given up; one leaf wanted, the wallet's.
+					let wanted = json!([{"nonce": rec["nonce"], "asset": rec["asset"], "value": rec["value"]}]);
+					self.store.atomically(|s| {
+						s.put_participation(pid, "{}", "[]", &wanted.to_string())?;
+						s.set_participation(pid, "pending", None, None)
+					})?;
+				}
+				rec["state"] = json!("issuing");
+				rec["participation"] = json!(pid);
+				rec["timeout"] = st["timeout"].clone();
+			},
+			Some("cancelled") => {
+				rec["state"] = json!("failed");
+				rec["reason"] = st["reason"].clone();
+			},
+			_ => {},
+		}
+		self.set_receive(hash, rec.clone())?;
+		Ok(json!({"payment_hash": hash, "state": rec["state"], "operator": st["state"], "reason": rec["reason"]}))
+	}
+
+	/// Claims the leaf of the payment `hash` once the wallet holds it: its
+	/// terms checked (received under the wallet's hash, the operator's delay
+	/// as published, and time enough before its timeout to take it home
+	/// should the operator not co-sign), then the preimage handed over with
+	/// its transfer into a leaf of the wallet's own.
+	fn claim_received(&mut self, hash: &str) -> Result<Value, Error> {
+		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
+		let pid = rec["participation"].as_str().unwrap_or("").to_string();
+		if let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == pid) {
+			if matches!(p.4.as_str(), "void" | "expired" | "refused") {
+				rec["state"] = json!("failed");
+				rec["reason"] = json!(format!("its leaf never came: the participation is {}", p.4));
+				self.set_receive(hash, rec.clone())?;
+				return Ok(json!({"payment_hash": hash, "state": "failed", "reason": rec["reason"]}));
+			}
+		}
+		let nonce = super::chain::unhex32(rec["nonce"].as_str().unwrap_or(""))?;
+		let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) else {
+			return Ok(json!({"payment_hash": hash, "state": rec["state"], "note": "waiting for the leaf's round"}));
+		};
+		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf)))?;
+		match row.state.as_str() {
+			"receiving" => {},
+			"spent" => {
+				rec["state"] = json!("received");
+				self.set_receive(hash, rec.clone())?;
+				return Ok(json!({"payment_hash": hash, "state": "received"}));
+			},
+			other => return Ok(json!({"payment_hash": hash, "state": rec["state"], "note": format!("the leaf is {}", other)})),
+		}
+		let info = self.server_info()?;
+		let (_, a) = self.held(&row)?;
+		let coin = a.valid;
+		let t = coin.leaf.htlc.ok_or_else(|| Error::Refused("the leaf is no htlc-1 leaf".into()))?;
+		let hash_bytes = super::chain::unhex32(hash)?;
+		if t.direction != HtlcDirection::Receive || t.payment_hash != hash_bytes {
+			return Err(Error::Refused("the leaf is not one received under the payment's hash".into()));
+		}
+		if info["lightning"]["receive"]["operator_delay_units"].as_u64() != Some(t.operator_delay.units() as u64) {
+			return Err(Error::Refused(format!("the leaf's operator delay of {} units is not the one the operator publishes",
+				t.operator_delay.units())));
+		}
+		// The preimage is handed over only with time to take the leaf home by
+		// its claim, should the operator not co-sign: to unroll its branch
+		// and enter it (two blocks for each step, at the chain's interval the
+		// operator publishes), then its exit delay, all before the operator's
+		// refund could open.
+		let now = self.now()?.to_consensus_u32() as u64;
+		let refund_from = t.timeout.to_consensus_u32() as u64 + t.operator_delay.seconds();
+		let steps = match &coin.origin {
+			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
+			_ => 2,
+		};
+		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
+		if now + steps * 2 * block + coin.leaf.exit_delay.seconds() > refund_from {
+			rec["state"] = json!("failed");
+			rec["reason"] = json!("the leaf came too late to be claimed safely: its timeout leaves less than its exit delay; the preimage \
+				stays with the wallet and the payment fails back");
+			self.set_receive(hash, rec.clone())?;
+			return Ok(json!({"payment_hash": hash, "state": "failed", "reason": rec["reason"]}));
+		}
+		let preimage = self.receive_preimage(&nonce)?;
+		if arca_covenant::script::sha256(&preimage) != hash_bytes {
+			return Err(Error::Store("the preimage the wallet derives does not open the hash".into()));
+		}
+		let asset = coin.asset;
+		let m = super::pay::Margins::of(&info, asset)?;
+		let cp = self.checkpoint_margin_of(&coin, &m)?;
+		let own = self.own_leaf_for("received")?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let probe = Out { asset, value: 1, leaf: own, mailbox, until: None };
+		let re = self.reassignment_margin_of(&coin, &probe, &m)?;
+		let value = coin.value.checked_sub(cp + re).filter(|v| *v > 0)
+			.ok_or_else(|| Error::Refused(format!("the leaf's {} atoms do not cover its margins", coin.value)))?;
+		let back = Out { value, ..probe };
+		let input = In { row, checkpoint_value: coin.value - cp, coin };
+		rec["state"] = json!("claiming");
+		self.set_receive(hash, rec.clone())?;
+		let answer = self.transfer_claiming(&[input], &[back], hash, &preimage)?;
+		rec["state"] = json!("received");
+		rec["received_by"] = answer["transfer_id"].clone();
+		rec["leaf"] = answer["outputs"][0].clone();
+		self.set_receive(hash, rec)?;
+		Ok(json!({"payment_hash": hash, "state": "received", "transfer": answer}))
+	}
+
+	/// Every payment the wallet asked to receive over Lightning, with what it
+	/// knows. The preimage is never shown: it stays with the wallet until it
+	/// claims.
+	pub fn lightning_receives(&self) -> Result<Value, Error> {
+		let mut m = self.receives()?;
+		for v in m.values_mut() {
+			if let Some(o) = v.as_object_mut() {
+				o.remove("request");
+			}
+		}
+		Ok(json!(m))
+	}
+}
+
+/// The id of the participation the operator records for the leaf of the
+/// payment received under `hash`: `SHA256("Arca/lightning-receive" ‖ hash)`.
+pub fn receive_participation_id(hash: &[u8; 32]) -> [u8; 32] {
+	use elements::hashes::{sha256, Hash, HashEngine};
+	let mut e = sha256::Hash::engine();
+	e.input(super::client::LIGHTNING_RECEIVE_TAG);
+	e.input(hash);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// The explicit output of an [`Out`], from outside `pay`.
 struct ExplicitOutputOf;
 

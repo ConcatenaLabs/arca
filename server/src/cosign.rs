@@ -652,8 +652,25 @@ impl Cosigner {
 					co-signs its spend only once the payment has failed", id, row.state.name()))),
 				None => Err(CosignError::Htlc(format!("coin {} is an htlc-1 leaf of no Lightning payment this operator knows", id))),
 			},
-			arca_covenant::HtlcDirection::Receive => Err(CosignError::Htlc(format!("coin {} is an htlc-1 leaf of a payment received over \
-				Lightning: it is claimed with its preimage (lightning_receive_claim)", id))),
+			// A leaf received over Lightning: only once its owner has handed
+			// over the preimage, which settles the payment it was issued
+			// against.
+			arca_covenant::HtlcDirection::Receive => {
+				let claimed = match self.store.receive(&t.payment_hash).await? {
+					Some(r) if r.state == crate::store::ReceiveState::Claimed => match r.participation_id {
+						Some(p) => self.store.participation(&p).await?
+							.is_some_and(|p| p.outputs.first().and_then(|o| o.leaf_id) == Some(id.0)),
+						None => false,
+					},
+					_ => false,
+				};
+				if claimed {
+					Ok(())
+				} else {
+					Err(CosignError::Htlc(format!("coin {} is an htlc-1 leaf of a payment received over Lightning: the operator co-signs \
+						its spend only with the payment's preimage (lightning_receive_claim)", id)))
+				}
+			},
 		}
 	}
 

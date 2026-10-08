@@ -110,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: The server's tests
-        run: cargo test --locked -p arca-server --test lightning_legs --test lightning_pay -- --nocapture
+        run: cargo test --locked -p arca-server --test lightning_legs --test lightning_pay --test lightning_receive -- --nocapture
 
       # The wallet's scenario runs the operator's signer as its own process.
       - name: The wallet's scenario

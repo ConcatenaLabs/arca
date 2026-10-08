@@ -304,6 +304,23 @@ enum LightningCmd {
 	},
 	/// Every payment over Lightning the wallet made, with where it stands.
 	Payments,
+	/// An invoice for `amount` of `asset`, under a payment hash only the
+	/// wallet can open, paid into a leaf of the wallet's own in the asset's
+	/// next round; `sync` claims the leaf once the wallet holds it, which
+	/// settles the payment. The operator's fee comes out of the amount.
+	Receive {
+		asset: String,
+		amount: u64,
+		#[arg(long)]
+		description: Option<String>,
+		/// Raises the wallet's bound on the operator's fee for this payment,
+		/// in parts per million of the amount.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
+	/// Every payment the wallet asked to receive over Lightning, with where
+	/// it stands.
+	Receives,
 }
 
 fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
@@ -414,6 +431,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			Ok(v)
 		},
 		Cmd::Lightning(LightningCmd::Payments) => w.lightning_payments(),
+		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, max_fee_ppm }) =>
+			w.lightning_receive(asset(&a)?, amount, description.as_deref(), max_fee_ppm),
+		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Restore => w.restore(),
 		Cmd::Participate { leaves, not_before, max_fee_ppm } => {
 			// The fee is shown before anything is signed.

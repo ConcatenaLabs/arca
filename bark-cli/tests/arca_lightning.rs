@@ -10,6 +10,7 @@
 
 mod common;
 
+use elements::hashes::Hash;
 use elements::{AssetId, Script};
 use serde_json::{json, Value};
 
@@ -18,6 +19,7 @@ use server::server::LegSection;
 use common::cli::Arca;
 use common::lightning::{channel_balance, invoice, invoice_status, lightningd, node, settled_balance};
 use common::running::Running;
+use server::store::RoundState;
 
 fn unhex(h: &str) -> Vec<u8> {
 	(0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
@@ -164,6 +166,109 @@ async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
 	// Every payment, as the wallet keeps it.
 	let payments = a.ok(&["lightning", "payments"]);
 	assert_eq!(payments.as_object().unwrap().len(), 3);
+	drop((ox, px, oy, py));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// The payment held at the operator's node for `hash`, as the server says.
+async fn receive_state(r: &Running, hash: &str) -> String {
+	let h: [u8; 32] = unhex(hash).try_into().unwrap();
+	r.server.receives.status(&h).await.unwrap().map(|row| row.state.name().to_string()).unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_receives_in_each_asset_into_its_own_leaves() {
+	let Some(lnd) = lightningd("a_wallet_receives_in_each_asset_into_its_own_leaves") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = PPM;
+		for a in c.assets.iter_mut() {
+			a.lightning_base = Some(BASE.to_string());
+		}
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.receive_window_seconds = 600;
+		c.lightning.poll_seconds = 1;
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let (ox, px, oy, py) = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "ox", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "px", true, x, 1_000_000_000);
+		let oy = node(&r.rt, &mut r.purse, &lnd, "oy", true, y, 2_000_000_000);
+		let py = node(&r.rt, &mut r.purse, &lnd, "py", true, y, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		oy.open_channel(&r.rt, &py, y, 1_000_000_000, 300_000_000);
+		(ox, px, oy, py)
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		let n = if a.asset == x.to_string() { &ox } else { &oy };
+		a.lightning = Some(LegSection { rpc: n.rpc_path() });
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("both legs up", || g.leg(&x, true).is_ok() && g.leg(&y, true).is_ok()).await;
+
+	// A wallet whose leaves exit after four units, longer than the
+	// operator's delay of one.
+	let (url, nurl) = (r.url(), r.node_url());
+	let a = Arca::new("LN2");
+	a.ok(&["create", "--server", &url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1"]);
+	a.ok(&["sync"]);
+
+	// A fee above the wallet's bound: refused before anything is asked.
+	a.refused(&["lightning", "receive", &x.to_string(), "100000", "--max-fee-ppm", "1"], "above the wallet's bound");
+	assert!(a.ok(&["lightning", "receives"]).as_object().unwrap().is_empty());
+
+	for (asset, payer, operator, amount) in [(x, &px, &ox, 100_000u64), (y, &py, &oy, 200_000)] {
+		let held0 = arca_held(&a, &asset);
+		let (o0, p0) = (channel_balance(operator, asset), channel_balance(payer, asset));
+		let inv = a.ok(&["lightning", "receive", &asset.to_string(), &amount.to_string(), "--description", "into the tree"]);
+		assert_eq!((inv["fee"].as_str(), inv["value"].as_str()), (Some(fee(amount).to_string().as_str()),
+			Some((amount - fee(amount)).to_string().as_str())));
+		let hash = inv["payment_hash"].as_str().unwrap().to_string();
+		let (rpc, bolt11) = (payer.rpc_path(), inv["invoice"].as_str().unwrap().to_string());
+		let paying = std::thread::spawn(move || sequentia_ext::lightning::call_at(&rpc, "pay", json!({ "bolt11": bolt11 })));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+		while receive_state(&r, &hash).await != "accepted" {
+			assert!(std::time::Instant::now() < deadline, "the payment was never held");
+			tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		}
+		// The wallet takes up the operator's participation for its leaf; the
+		// next round makes it.
+		a.ok(&["sync"]);
+		let built = r.server.rounds.run_round_of(asset).await.unwrap().expect("a round");
+		r.produce().await;
+		r.bury().await;
+		r.round_state(&built.tx.txid(), RoundState::Final).await;
+		assert!(!paying.is_finished(), "nothing is settled before the wallet holds its leaf");
+		// The wallet validates the leaf, hands over its authorisations, holds
+		// it, and claims it with the preimage.
+		let s = a.ok(&["sync"]);
+		println!("sync: lightning {}", s["lightning"]);
+		let paid = paying.join().unwrap().unwrap();
+		println!("the payer's node: {} {}", paid["status"], paid["amount_sent_msat"]);
+		assert_eq!(paid["status"], "complete");
+		assert_eq!(paid["payment_preimage"].as_str().map(|p| elements::hashes::sha256::Hash::hash(&unhex(p)).to_string()),
+			Some(hash.clone()), "the preimage the wallet handed over opens the hash");
+		let rec = &a.ok(&["lightning", "receives"])[&hash];
+		assert_eq!(rec["state"], "received", "{}", rec);
+		assert!(rec.get("preimage").is_none() && rec.get("request").is_none(), "{}", rec);
+		let (sa, op, pa) = (asset, operator, payer);
+		r.wait("the channels settled", || settled_balance(op, sa) == o0 + amount && settled_balance(pa, sa) == p0 - amount).await;
+		let held1 = arca_held(&a, &asset);
+		println!("books in {}: the payer's channel {} -> {}, the operator's {} -> {}; the wallet held {}, holds {}: {} received, less the \
+			fee {} and {} of the claim's margins", asset, p0, p0 - amount, o0, o0 + amount, held0, held1, amount, fee(amount),
+			amount - fee(amount) - (held1 - held0));
+		assert!(held1 > held0 && held1 - held0 <= amount - fee(amount) && amount - fee(amount) - (held1 - held0) < 2_000);
+		let coins = a.ok(&["coins"]);
+		assert!(coins.as_array().unwrap().iter().all(|c| c["state"] != "receiving"), "the leaf received is claimed");
+	}
 	drop((ox, px, oy, py));
 	let _ = std::fs::remove_dir_all(&a.dir);
 }

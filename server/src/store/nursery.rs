@@ -149,6 +149,15 @@ impl Store {
 		Ok(())
 	}
 
+	/// Records `by` as the transaction spending the watched outpoint
+	/// `txid:vout`, found on the chain after the spend was scanned.
+	pub async fn set_outpoint_spender(&self, txid: &[u8; 32], vout: u32, by: &[u8; 32]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("UPDATE watched_outpoint SET spent_by = $3, spent_at = now() WHERE txid = $1 AND vout = $2 AND spent_by IS NULL",
+			&[&&txid[..], &(vout as i32), &&by[..]]).await?;
+		Ok(())
+	}
+
 	/// The transaction seen spending `txid:vout`, if any.
 	pub async fn outpoint_spender(&self, txid: &[u8; 32], vout: u32) -> Result<Option<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;

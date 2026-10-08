@@ -209,8 +209,22 @@ impl LightningNode {
 
 	/// Calls `method` with `params` (an object).
 	pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-		let mut s = UnixStream::connect(self.rpc_path()).map_err(|e| e.to_string())?;
-		s.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
+		call_at(&self.rpc_path(), method, params)
+	}
+
+	/// [`LightningNode::call`], which must succeed.
+	pub fn ok(&self, method: &str, params: Value) -> Value {
+		self.call(method, params).unwrap_or_else(|e| panic!("{}", e))
+	}
+}
+
+/// Calls `method` with `params` (an object) on the node whose JSON-RPC
+/// socket is `rpc`: a call that blocks (a `pay` the payee holds) can run on a
+/// thread of its own with the path alone.
+pub fn call_at(rpc: &Path, method: &str, params: Value) -> Result<Value, String> {
+	{
+		let mut s = UnixStream::connect(rpc).map_err(|e| e.to_string())?;
+		s.set_read_timeout(Some(Duration::from_secs(300))).map_err(|e| e.to_string())?;
 		let req = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
 		s.write_all(&serde_json::to_vec(&req).expect("JSON")).map_err(|e| e.to_string())?;
 		let mut buf = vec![];
@@ -235,11 +249,9 @@ impl LightningNode {
 			}
 		}
 	}
+}
 
-	/// [`LightningNode::call`], which must succeed.
-	pub fn ok(&self, method: &str, params: Value) -> Value {
-		self.call(method, params).unwrap_or_else(|e| panic!("{}", e))
-	}
+impl LightningNode {
 
 	/// A fresh on-chain address of its wallet, as the script it pays.
 	pub fn receive_script(&self, rt: &Regtest) -> Script {

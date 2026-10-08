@@ -599,6 +599,7 @@ impl Participations {
 					owner_nonce: *owner_nonce,
 					exit_delay_units: exit_delay.units(),
 					operator_nonce: [0; 32],
+					htlc: None,
 				},
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());

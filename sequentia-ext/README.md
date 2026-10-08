@@ -82,7 +82,9 @@ parameters carry, which the harness checks, so SeqLN nodes run on it.
 reaching the node through the `sequentia-cli` beside `SEQUENTIAD_EXEC`, with
 the plugins given (`lightning::hold_plugin` finds the hold-invoice plugin of
 the SeqLN checkout `lightningd` was built in); `call` speaks to its JSON-RPC
-socket, `receive_script` gives an address of its wallet as a script, and
+socket (`lightning::call_at` with the socket's path alone, so a call the
+node holds open, a `pay` a hold-invoice keeps pending, runs on a thread of
+its own), `receive_script` gives an address of its wallet as a script, and
 `open_channel` opens a channel in an asset and produces blocks until both
 sides see it open. It stops, and its directory is deleted, when dropped.
 `lightning::lightningd_from_env` takes `lightningd` from `LIGHTNINGD_EXEC`.
