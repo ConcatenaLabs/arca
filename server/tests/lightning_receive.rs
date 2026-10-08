@@ -235,10 +235,12 @@ async fn receives_in_each_asset_into_leaves_claimed_with_the_preimage() {
 		println!("the payer's node: {} {}, preimage {}", paid["status"], paid["amount_sent_msat"], paid["payment_preimage"]);
 		assert_eq!((paid["status"].as_str(), paid["payment_preimage"].as_str()), (Some("complete"), Some(hex(&w.preimage).as_str())));
 		let (o, p) = if k == 0 { (&g.ox, payer) } else { (&g.oy, payer) };
-		// The channel settles the HTLC a moment after the payer learns the
-		// preimage.
-		let (base, asset) = (books0[k].0, w.asset);
-		g.r.wait("the operator's channel settled", || settled_balance(o, asset) == base + w.amount).await;
+		// Each side of the channel settles the HTLC a moment after the payer
+		// learns the preimage, each on its own commitment.
+		let (base, asset) = (books0[k], w.asset);
+		g.r.wait("the channel settled on both sides", || {
+			settled_balance(o, asset) == base.0 + w.amount && settled_balance(p, asset) == base.1 - w.amount
+		}).await;
 		let (o1, p1) = (channel_balance(o, w.asset), channel_balance(p, w.asset));
 		println!("books in {}: the operator's node {} -> {} (+{}), the payer's {} -> {}; the leaf {} = {} less the fee {}; the new leaf \
 			{} (two margins of {})", w.asset, books0[k].0, o1, o1 - books0[k].0, books0[k].1, p1, w.amount - fee(w.amount), w.amount,
