@@ -5,7 +5,7 @@
 //!
 //!     arca-signer --key-file <file> --pubkey
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
-//!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>]
+//!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
 //!         (--keeper-key <key> … --keepers-required <k> | --no-keepers)
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
@@ -85,7 +85,14 @@
 //! (`server::signer::keepers_seen_path`) before it releases anything that
 //! taught it more, and reads at every start, so a restart changes nothing of
 //! it; it releases nothing it cannot note there, nor before it has noted the
-//! first acknowledged head. Every head it
+//! first acknowledged head. So a record with `<record>.acknowledged` beside
+//! it has `<record>.keepers-seen` too, and the signer refuses to start on
+//! one that has the first and not the second, naming both: the file was
+//! lost, or left beside another name. A record whose signer kept no
+//! `<record>.keepers-seen` (one made before the signer kept it) is started
+//! once with `--start-keepers-seen`, which writes that file, nothing seen of
+//! any keeper yet, and is refused for a record that has the file or no
+//! `<record>.acknowledged`. Every head it
 //! hands out carries the acknowledgements it has of it, and `pubkey` names
 //! the record's keepers.
 
@@ -128,6 +135,9 @@ struct Args {
 	/// With `--create-record`: the keepers the new record names.
 	record_keepers: Option<RecordKeepers>,
 	keeper_timeout: std::time::Duration,
+	/// `--start-keepers-seen`: write `<record>.keepers-seen` at this start,
+	/// for a record whose signer kept none.
+	start_keepers_seen: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -145,6 +155,7 @@ fn args() -> Result<Args, String> {
 	let mut keepers_required = None;
 	let mut keeper_timeout = std::time::Duration::from_secs(5);
 	let mut pubkey = false;
+	let mut start_keepers_seen = false;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -162,6 +173,7 @@ fn args() -> Result<Args, String> {
 			"--keeper-key" => keeper_keys.push(XOnlyPublicKey::from_slice(&unhex(&value()?).map_err(|e| format!("--keeper-key: {}", e))?)
 				.map_err(|e| format!("--keeper-key: {}", e))?),
 			"--no-keepers" => no_keepers = true,
+			"--start-keepers-seen" => start_keepers_seen = true,
 			"--keepers-required" => keepers_required = Some(value()?.parse::<usize>().map_err(|e| format!("--keepers-required: {}", e))?),
 			"--keeper-timeout-ms" => keeper_timeout = std::time::Duration::from_millis(value()?.parse::<u64>()
 				.map_err(|e| format!("--keeper-timeout-ms: {}", e))?),
@@ -177,6 +189,7 @@ fn args() -> Result<Args, String> {
 		return Ok(Args {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
+			start_keepers_seen: false,
 		});
 	}
 	let compact = match (compact_into, drop_salts) {
@@ -186,6 +199,9 @@ fn args() -> Result<Args, String> {
 	};
 	if !create_record && !clear_stopped && compact.is_none() && socket.is_none() {
 		return Err("--socket is required".into());
+	}
+	if start_keepers_seen && socket.is_none() {
+		return Err("--start-keepers-seen goes with a start that serves (--socket): it writes <record>.keepers-seen at that start".into());
 	}
 	// The keepers are the record's, named once, when it is made; a start
 	// says only where each is reached.
@@ -227,6 +243,7 @@ fn args() -> Result<Args, String> {
 		keepers,
 		record_keepers,
 		keeper_timeout,
+		start_keepers_seen,
 	})
 }
 
@@ -549,6 +566,40 @@ impl State {
 		}
 		*acked = Some((head.clone(), acks.clone()));
 		Ok((head, acks))
+	}
+}
+
+/// The rule at start between the two files the signer keeps beside its
+/// record at `record`: a record noted acknowledged (`<record>.acknowledged`)
+/// has what the signer saw its keepers hold (`<record>.keepers-seen`), or
+/// the signer does not start. `start` (`--start-keepers-seen`) writes that
+/// file for a record whose signer kept none, nothing seen of any of the
+/// record's keepers (`named`, reached at `addrs`), once: it is refused where
+/// the file is already there, or where no head was noted acknowledged, or
+/// where the record names no keeper.
+fn keepers_seen_at_start(record: &std::path::Path, named: &RecordKeepers, addrs: &[KeeperAddr], start: bool) -> Result<(), String> {
+	let acknowledged = server::signer::acknowledged_path(record);
+	let seen = server::signer::keepers_seen_path(record);
+	match (acknowledged.exists(), seen.exists(), start) {
+		(true, false, false) => Err(format!("{} says a head of the record was acknowledged by as many keepers as it requires, and {} \
+			is missing: the signer writes what it saw each keeper hold there before it notes the first acknowledged head, so the file \
+			was lost, or left beside another name (a compacted record's files go with it: <new file>.acknowledged and \
+			<new file>.keepers-seen). Put the file back from where it lies; never start without it, which forgets every lost keeper and \
+			every head a keeper was seen to hold. A record whose signer kept no such file (one made before the signer kept it) is started \
+			once with --start-keepers-seen", acknowledged.display(), seen.display())),
+		(_, _, false) => Ok(()),
+		_ if named.is_none() => Err("--start-keepers-seen: the record names no keeper".into()),
+		(_, true, true) => Err(format!("--start-keepers-seen writes {} for a record whose signer kept none, and it is there: it is \
+			never written over", seen.display())),
+		(false, false, true) => Err(format!("--start-keepers-seen writes {} for a record noted acknowledged ({}) whose signer kept \
+			none, and {} is not there: this record starts without it", seen.display(), acknowledged.display(), acknowledged.display())),
+		(true, false, true) => {
+			let none: Vec<([u8; 32], Seen)> = addrs.iter().map(|k| (k.key.serialize(), Seen::default())).collect();
+			server::signer::write_keepers_seen(record, &none)?;
+			eprintln!("arca-signer: wrote {}, nothing seen of any of the record's {} keeper(s) yet, for a record whose signer kept none; \
+				from now on it is kept, and --start-keepers-seen is refused", seen.display(), none.len());
+			Ok(())
+		},
 	}
 }
 
@@ -933,6 +984,14 @@ async fn main() {
 			std::process::exit(2);
 		},
 	};
+	// What the signer saw each keeper hold is written before the first
+	// acknowledged head is noted, so a record noted acknowledged has it: one
+	// missing was lost, or left beside another name, and taken for empty it
+	// would forget a lost keeper and every head a keeper was seen to hold.
+	if let Err(e) = keepers_seen_at_start(&args.record, &named, &addrs, args.start_keepers_seen) {
+		eprintln!("arca-signer: {}", e);
+		std::process::exit(2);
+	}
 	let record = Mutex::new(record);
 	// What the signer saw each keeper hold, before this start as well.
 	let seen = match Keepers::read_seen(&args.record, &addrs) {

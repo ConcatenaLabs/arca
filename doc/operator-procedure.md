@@ -81,7 +81,15 @@ paid twice.
   archived WAL segment to the end.
 - **The record and the files beside it** live on durable storage of their
   own, storage that loses no write (a mirror), and are never restored from
-  a copy.
+  a copy. A compaction moves the new record and its two side files,
+  `<new file>.acknowledged` and `<new file>.keepers-seen`, into the old
+  ones' places together
+  ([The signer](../server/README.md#the-signer)). The signer refuses to
+  start on a record noted acknowledged whose `<record>.keepers-seen` is
+  missing: put the file back from where it lies.
+- **Stop the signer with SIGTERM**, and move `arcad` and the signer to a
+  new revision together
+  ([Moving to a new revision](../server/README.md#moving-to-a-new-revision)).
 - **The signer's machine, when it must be restored, is restored cold**:
   from its disk, started from power-off. A restore with its memory (a
   snapshot of a running machine) is caught by the keepers, but it stops the

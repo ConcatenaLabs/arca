@@ -1371,3 +1371,138 @@ async fn a_keeper_at_its_bound_says_nothing_to_anyone() {
 	assert!(signer_after.is_some_and(|v| v["signature"].is_string()), "with room, the signer's address is answered");
 	let _ = std::fs::remove_dir_all(&t.dir);
 }
+
+/// R7i F2, turned around. `<record>.keepers-seen` is written before the
+/// first acknowledged head is noted, so a record with `<record>.acknowledged`
+/// beside it has it. The KL shape (two of three required; keeper 2 away
+/// while entries 3 and 4 are signed; keeper 0 back from its copy at entry
+/// 2, keeper 1 down, keeper 2 back; the record put back to entry 2) with
+/// the side file lost: the signer refuses to start, naming both files and
+/// the rule, so no second spend of salt 3 is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_noted_acknowledged_without_what_its_keepers_held_does_not_start() {
+	let (k0, k1, k2) = (keypair("keeper zero"), keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k0, &k1, &k2], 2);
+	let mut keeper0 = KeeperProcess::start(&k0, xonly(&t.s), t.genesis);
+	let mut keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let mut keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let args = keepers_args(&[keeper0.arg(), keeper1.arg(), keeper2.arg()]);
+	let record = t.dir.join("signer.record");
+	let seen_path = keepers_seen_path(&record);
+	let acknowledged = std::path::PathBuf::from(format!("{}.acknowledged", record.display()));
+	let first = Signer::start(&t.dir, "first", t.genesis, &args);
+	for i in 1..=2u8 {
+		let v = raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string(), "{}", v);
+	}
+	let record_at_2 = std::fs::read(&record).unwrap();
+	let keeper0_at_2 = std::fs::read(keeper0.heads()).unwrap();
+	keeper2.halt();
+	for i in 3..=4u8 {
+		let v = raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string(), "{}", v);
+	}
+	drop(first);
+	assert!(acknowledged.exists() && seen_path.exists());
+	keeper0.halt();
+	std::fs::write(keeper0.heads(), &keeper0_at_2).unwrap();
+	keeper0.resume();
+	keeper1.halt();
+	keeper2.resume();
+	std::fs::write(&record, &record_at_2).unwrap();
+	std::fs::remove_file(&seen_path).unwrap();
+	match Signer::try_start(&t.dir, "lost", t.genesis, &args) {
+		Ok(s) => {
+			let v = raw(&s.socket, &rebind_into(&t.owner, t.genesis, [3; 32], t.asset, 8_000)).await;
+			panic!("the signer started without what its keepers held: the second spend of salt 3 (8,000 where 9,000 was signed): signed {} \
+				| {} | {}", v["signature"].is_string(), v["code"], s.log());
+		},
+		Err(e) => {
+			println!("F2 the side file lost: the signer does not start: {}", e);
+			assert!(e.starts_with("exit Some(2)"), "{}", e);
+			assert!(e.contains(&acknowledged.display().to_string()) && e.contains(&seen_path.display().to_string()), "both files named: {}", e);
+			assert!(e.contains("is missing") && e.contains("--start-keepers-seen"), "{}", e);
+		},
+	}
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// R7i F2: the upgrade, and a compaction. A record acknowledged by its
+/// keepers whose signer kept no `<record>.keepers-seen` (one made before the
+/// signer kept it) does not start; started once with
+/// `--start-keepers-seen`, the signer writes the file, nothing seen of any
+/// keeper yet, and serves; the flag is then refused, as it is for a record
+/// never acknowledged, and the record starts without it. Compacted, the
+/// record's side files go with the new record, `.keepers-seen` included;
+/// put in the old ones' place, the signer starts on them and serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_from_before_the_keepers_seen_file_starts_once_with_the_flag() {
+	let (k0, k1, k2) = (keypair("keeper zero"), keypair("keeper one"), keypair("keeper two"));
+	let t = setup(&[&k0, &k1, &k2], 2);
+	let keeper0 = KeeperProcess::start(&k0, xonly(&t.s), t.genesis);
+	let keeper1 = KeeperProcess::start(&k1, xonly(&t.s), t.genesis);
+	let keeper2 = KeeperProcess::start(&k2, xonly(&t.s), t.genesis);
+	let args = keepers_args(&[keeper0.arg(), keeper1.arg(), keeper2.arg()]);
+	let mut flagged = args.clone();
+	flagged.push("--start-keepers-seen".into());
+	let record = t.dir.join("signer.record");
+	let seen_path = keepers_seen_path(&record);
+	let acknowledged = std::path::PathBuf::from(format!("{}.acknowledged", record.display()));
+	let e = Signer::try_start(&t.dir, "fresh, flagged", t.genesis, &flagged).err().expect("refused");
+	println!("F2U a record never acknowledged, with --start-keepers-seen: {}", e);
+	assert!(e.contains("is not there: this record starts without it"), "{}", e);
+	let first = Signer::start(&t.dir, "first", t.genesis, &args);
+	for i in 1..=2u8 {
+		let v = raw(&first.socket, &rebind_into(&t.owner, t.genesis, [i; 32], t.asset, 9_000)).await;
+		assert!(v["signature"].is_string(), "{}", v);
+	}
+	drop(first);
+	// As a signer before it kept the file left the record.
+	std::fs::remove_file(&seen_path).unwrap();
+	let e = Signer::try_start(&t.dir, "without", t.genesis, &args).err().expect("refused");
+	println!("F2U acknowledged, no keepers-seen, no flag: {}", &e[..e.len().min(200)]);
+	assert!(e.contains("is missing"), "{}", e);
+	let upgraded = Signer::start(&t.dir, "upgrade", t.genesis, &flagged);
+	let v = raw(&upgraded.socket, &rebind_into(&t.owner, t.genesis, [3; 32], t.asset, 9_000)).await;
+	let written = std::fs::read_to_string(&seen_path).unwrap();
+	println!("F2U started once with --start-keepers-seen: {} | a new spend signed {} | the file:\n{}",
+		upgraded.log().lines().filter(|l| l.contains("keepers-seen")).collect::<Vec<_>>().join(" / "), v["signature"].is_string(),
+		written.trim_end());
+	assert!(upgraded.log().contains("from now on it is kept"), "{}", upgraded.log());
+	assert!(v["signature"].is_string(), "{}", v);
+	for k in [&k0, &k1, &k2] {
+		assert!(written.lines().any(|l| l == format!("{} 3", hex(&xonly(k).serialize()))), "{}", written);
+	}
+	drop(upgraded);
+	let e = Signer::try_start(&t.dir, "flag again", t.genesis, &flagged).err().expect("the flag is refused once the file is there");
+	println!("F2U --start-keepers-seen again: {}", e);
+	assert!(e.contains("it is never written over"), "{}", e);
+	drop(Signer::start(&t.dir, "after the upgrade", t.genesis, &args));
+	let empty = t.dir.join("nothing.salts");
+	std::fs::write(&empty, "").unwrap();
+	let new = t.dir.join("signer.record.new");
+	let out = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+		.args(["--key-file", t.dir.join("operator.key").to_str().unwrap(), "--genesis", &t.genesis.to_string(), "--record",
+			record.to_str().unwrap(), "--compact-into", new.to_str().unwrap(), "--drop-salts", empty.to_str().unwrap()])
+		.output().unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let new_seen = keepers_seen_path(&new);
+	let new_ack = std::path::PathBuf::from(format!("{}.acknowledged", new.display()));
+	println!("F2U compacted: {} | beside the new record: acknowledged {}, keepers-seen {}", String::from_utf8_lossy(&out.stderr).trim(),
+		new_ack.exists(), new_seen.exists());
+	assert!(new_ack.exists() && new_seen.exists(), "a compacted record's side files go with it");
+	let lines = |p: &std::path::Path| -> std::collections::BTreeSet<String> {
+		std::fs::read_to_string(p).unwrap().lines().map(str::to_string).collect()
+	};
+	assert_eq!(lines(&new_seen), lines(&seen_path), "the same lines");
+	for (from, to) in [(&new, &record), (&new_ack, &acknowledged), (&new_seen, &seen_path)] {
+		std::fs::rename(from, to).unwrap();
+	}
+	let compacted = Signer::start(&t.dir, "compacted", t.genesis, &args);
+	let v = raw(&compacted.socket, &rebind_into(&t.owner, t.genesis, [4; 32], t.asset, 9_000)).await;
+	println!("F2U the signer on the compacted record: a new spend signed {} | {}", v["signature"].is_string(),
+		compacted.log().lines().filter(|l| l.contains("agree")).collect::<Vec<_>>().join(" / "));
+	assert!(v["signature"].is_string(), "{}", v);
+	drop(compacted);
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
