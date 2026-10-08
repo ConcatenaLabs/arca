@@ -254,6 +254,7 @@ impl ArcaWallet {
 			},
 			"boards" => w.boards(),
 			"receive" => w.receive(opt_asset(&a["asset"])?, opt_u64(&a["amount"], "the amount")?),
+			"forget_request" => w.forget_request(req_str(&a["owner"], "the request's key")?),
 			"send" => w.send(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?),
 			"mailbox" => w.mailbox(),
 			"quote" => {

@@ -106,8 +106,12 @@ Every holder receives these rules before the operator holds their coins:
   the chain or is waiting for a payment**, whatever `next_sync_at` says.
   `sync` refreshes each coin for free in its last days, and takes a coin
   home on the chain when it cannot have it refreshed. A payment is read
-  only by a `sync`; a receive request waits for one 27 days, after which
-  `next_sync_at` no longer counts it.
+  only by a `sync`. A receive request lasts 27 days and carries the date it
+  lapses at: a sender's wallet refuses to pay it from then, and
+  `next_sync_at` counts it until then. Hand a payer a new request rather
+  than an old one. A request handed out by a wallet before requests
+  carried their lapse holds `next_sync_at` at a day until it is paid or
+  forgotten (`arca forget-request`).
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
   for fees). `arca address` gives an address to pay it to.

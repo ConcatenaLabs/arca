@@ -64,10 +64,10 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 
 `run(command, args)` takes the command line's commands: `info`, `address`,
 `balance`, `coins`, `record {leaf_id}`, `board {asset, amount, fee_asset?}`,
-`boards`, `receive {asset?, amount?}`, `send {request, amount?, asset?}`,
-`mailbox`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?, not_before?,
-max_fee_ppm?, shown}`, `participations`, `sync`, `schedule`, `recheck`, `exit
-{leaf_id, fee_asset?}` and `refusals`. Its answer is `{"result", "start"}`: the
+`boards`, `receive {asset?, amount?}`, `forget_request {owner}`, `send
+{request, amount?, asset?}`, `mailbox`, `quote {leaves?, max_fee_ppm?}`,
+`participate {leaves?, not_before?, max_fee_ppm?, shown}`, `participations`,
+`sync`, `schedule`, `recheck`, `exit {leaf_id, fee_asset?}` and `refusals`. Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is

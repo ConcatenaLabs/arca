@@ -187,9 +187,12 @@ impl Wallet {
 	// -----------------------------------------------------------------------
 
 	/// A single-use receive request: a fresh owner nonce and the key it gives,
-	/// the wallet's mailbox, and the exit delay the wallet asks for. The nonce
-	/// is stored before the request is shown, and a second coin to it is
-	/// refused.
+	/// the wallet's mailbox, the exit delay the wallet asks for, and when it
+	/// lapses (`until`, a median time, [`super::wallet::REQUEST_HOLDS`] after
+	/// it was handed out): a sender pays it only before then, and the
+	/// wallet's schedule holds at a day until then while it is unpaid. The
+	/// nonce, and both dates, are stored before the request is shown, and a
+	/// second coin to it is refused.
 	pub fn receive(&mut self, asset: Option<AssetId>, value: Option<u64>) -> Result<Value, Error> {
 		if let Some((at, why)) = self.rolled_back()? {
 			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
@@ -197,22 +200,26 @@ impl Wallet {
 		}
 		let nonce = random32();
 		let key = self.keys.leaf_xonly(&nonce)?;
-		self.store.put_nonce(&nonce, &key.serialize(), "receive")?;
-		// When it was handed out, by the chain's clock: an unpaid request
-		// holds `sync`'s schedule for the acceptance horizon from then.
+		// When it was handed out, by the chain's clock, and when it lapses.
 		let now = self.now()?.to_consensus_u32();
-		let pending: Vec<String> = self.store.nonces()?.iter().filter(|n| n.purpose == "receive" && n.state == "pending")
-			.map(|n| hex(&n.nonce)).collect();
-		let mut asked: std::collections::BTreeMap<String, u32> = self.store.meta(super::wallet::RECEIVE_ASKED)?
-			.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-		asked.retain(|n, _| pending.contains(n));
-		asked.insert(hex(&nonce), now);
-		self.store.set_meta(super::wallet::RECEIVE_ASKED, &serde_json::to_string(&asked).expect("a map"))?;
+		let until = now.saturating_add(super::wallet::REQUEST_HOLDS);
+		self.store.atomically(|s| {
+			s.put_nonce(&nonce, &key.serialize(), "receive")?;
+			let pending: Vec<String> = s.nonces()?.iter().filter(|n| n.purpose == "receive" && n.state == "pending")
+				.map(|n| hex(&n.nonce)).collect();
+			for (k, t) in [(super::wallet::RECEIVE_ASKED, now), (super::wallet::RECEIVE_UNTIL, until)] {
+				let mut m: std::collections::BTreeMap<String, u32> = s.meta(k)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+				m.retain(|n, _| pending.contains(n));
+				m.insert(hex(&nonce), t);
+				s.set_meta(k, &serde_json::to_string(&m).expect("a map"))?;
+			}
+			Ok(())
+		})?;
 		let mut req = json!({
 			"arca_request": 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"owner": hex(&key.serialize()), "owner_nonce": hex(&nonce),
 			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()),
-			"exit_delay_units": self.cfg.exit_delay_units,
+			"exit_delay_units": self.cfg.exit_delay_units, "until": until,
 		});
 		if let Some(a) = asset {
 			req["asset"] = json!(a.to_string());
@@ -364,10 +371,25 @@ impl Wallet {
 	/// the receiver's leaf and the wallet's change, with the margins left for
 	/// their fees in the asset moved. The server co-signs and posts the coins
 	/// to the mailboxes. No asset is a default: the request or the caller
-	/// names it.
+	/// names it. A request past its lapse (`until`) is refused before
+	/// anything is built or signed.
 	pub fn send(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<Value, Error> {
 		let req = decode(REQUEST_PREFIX, request, "the receive request")?;
 		self.check_chain(&req, "receive request")?;
+		// A receiver waits for a payment to its request until the request
+		// lapses, and reads one paid later only if it happens to sync: a
+		// request past its lapse is paid by nobody. One handed out before
+		// requests carried their lapse names none, and its receiver waits
+		// for it until it is paid or forgotten.
+		if let Some(u) = req.get("until") {
+			let until = u.as_u64().and_then(|t| u32::try_from(t).ok())
+				.ok_or_else(|| Error::Parse(format!("the receive request's lapse {}: not a median time", u)))?;
+			let now = self.now()?.to_consensus_u32();
+			if now >= until {
+				return Err(Error::Refused(format!("the request lapsed at {} (a median time; the chain's is {}): ask the receiver for a \
+					new one", until, now)));
+			}
+		}
 		let req_asset = req.get("asset").map(|a| asset_of(a, "the request's asset")).transpose()?;
 		let asset = match (asset, req_asset) {
 			(Some(a), Some(r)) if a != r => return Err(Error::Refused(format!("the request asks for asset {}, not {}", r, a))),

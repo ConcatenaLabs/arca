@@ -161,9 +161,16 @@ const REFRESH_ASKED: &str = "refresh_asked";
 /// unpaid: `{owner nonce: median time}`.
 pub(crate) const RECEIVE_ASKED: &str = "receive_asked";
 
-/// How long an unpaid receive request holds `sync`'s schedule at a day,
-/// from the median time it was handed out: the acceptance horizon, 27 days.
-/// A coin paid to it later is still read, at the next `sync`.
+/// Where the wallet keeps when each receive request still unpaid lapses, as
+/// the request itself says (`until`): `{owner nonce: median time}`. A request
+/// with no entry was handed out before requests carried their lapse, and
+/// holds the schedule until it is paid or forgotten.
+pub(crate) const RECEIVE_UNTIL: &str = "receive_until";
+
+/// How long a receive request lasts, from the median time it was handed
+/// out: the acceptance horizon, 27 days. The request carries the median time
+/// it lapses at (`until`); a sender refuses to pay it from then, and until
+/// then, while it is unpaid, it holds `sync`'s schedule at a day.
 pub const REQUEST_HOLDS: u32 = WalletPolicy::DEFAULT_HORIZON;
 
 /// How long `sync` keeps trying to reach the operator, with back-off, before
@@ -1249,24 +1256,47 @@ impl Wallet {
 	/// key it names (`owner`), the median time it was handed out
 	/// (`asked_at`; for one handed out before the wallet kept that, the time
 	/// it was stored), and whether it still holds the schedule at a day
-	/// (`waiting`, until `lapses_at`) or no longer does (`lapsed`, since
-	/// `lapsed_at`), [`REQUEST_HOLDS`] after it was handed out.
+	/// (`waiting`, until `lapses_at`, the lapse the request carries) or no
+	/// longer does (`lapsed`, since `lapsed_at`: no sender pays it from
+	/// then). A request handed out before requests carried their lapse is
+	/// `waiting` with `lapses_at` null: its sender is told no lapse, so the
+	/// wallet waits for it until it is paid or forgotten
+	/// ([`Self::forget_request`]).
 	pub(crate) fn receive_requests(&self, now: u32) -> Result<Vec<Value>, Error> {
 		let asked: BTreeMap<String, u32> = self.store.meta(RECEIVE_ASKED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let until: BTreeMap<String, u32> = self.store.meta(RECEIVE_UNTIL)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
 		let mut out = vec![];
 		for n in self.store.nonces()?.into_iter().filter(|n| n.purpose == "receive" && n.state == "pending") {
 			let at = match asked.get(&hex(&n.nonce)) {
 				Some(t) => *t,
 				None => self.store.nonce_created_at(&n.nonce)?.unwrap_or(0).clamp(0, u32::MAX as i64) as u32,
 			};
-			let ends = at.saturating_add(REQUEST_HOLDS);
-			out.push(if now < ends {
-				json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "waiting", "lapses_at": ends})
-			} else {
-				json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "lapsed", "lapsed_at": ends})
+			out.push(match until.get(&hex(&n.nonce)) {
+				Some(&ends) if now < ends => json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "waiting", "lapses_at": ends}),
+				Some(&ends) => json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "lapsed", "lapsed_at": ends,
+					"note": "no sender pays the request from then: a coin paid to it before is read by the next sync"}),
+				None => json!({"owner": hex(&n.owner_key), "asked_at": at, "state": "waiting", "lapses_at": null,
+					"note": "handed out without a lapse date, so a sender may pay it at any time: the wallet waits for it until it is \
+						paid or forgotten"}),
 			});
 		}
 		Ok(out)
+	}
+
+	/// Stops waiting for a payment to the unpaid receive request whose key is
+	/// `owner` (as `receive_requests` names it): it lapses now, and holds the
+	/// schedule no more. A coin paid to it is still read, by any later sync.
+	pub fn forget_request(&mut self, owner: &str) -> Result<Value, Error> {
+		let now = self.now()?.to_consensus_u32();
+		let n = self.store.nonces()?.into_iter()
+			.find(|n| n.purpose == "receive" && n.state == "pending" && hex(&n.owner_key) == owner.to_ascii_lowercase())
+			.ok_or_else(|| Error::Refused(format!("no unpaid receive request of the wallet's names the key {}", owner)))?;
+		let mut until: BTreeMap<String, u32> = self.store.meta(RECEIVE_UNTIL)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let ends = until.get(&hex(&n.nonce)).copied().map_or(now, |t| t.min(now));
+		until.insert(hex(&n.nonce), ends);
+		self.store.set_meta(RECEIVE_UNTIL, &serde_json::to_string(&until).expect("a map"))?;
+		Ok(json!({"owner": owner, "state": "lapsed", "lapsed_at": ends,
+			"note": "the wallet no longer waits for a payment to it: a coin paid to it is still read, by any later sync"}))
 	}
 
 	/// When `sync` last asked for the refresh of each live coin (median
@@ -1329,11 +1359,12 @@ impl Wallet {
 	/// (`refresh_from`, then `home_from`), and never more than a day ahead
 	/// while a coin is in its last three days before its exit date, or while
 	/// the wallet waits for a payment to a receive request it handed out
-	/// less than [`REQUEST_HOLDS`] ago (a coin paid to it is read only by
-	/// `sync`, and its sender may have paid with a coin days from its exit
-	/// date); `null` when nothing waits. `due` says whether it is now; `why`
-	/// says what holds the time back; `receive_requests` lists every unpaid
-	/// request, waiting or lapsed, with its dates
+	/// that has not lapsed (a coin paid to it is read only by `sync`, and its
+	/// sender may have paid with a coin days from its exit date; one handed
+	/// out before requests carried their lapse holds it until it is paid or
+	/// forgotten); `null` when nothing waits. `due` says whether it is now;
+	/// `why` says what holds the time back; `receive_requests` lists every
+	/// unpaid request, waiting or lapsed, with its dates
 	/// ([`Self::receive_requests`]).
 	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
@@ -1371,9 +1402,10 @@ impl Wallet {
 		}
 		// D58: a payment the wallet waits for is read only by `sync`, and
 		// may rest on a coin days from its exit date: a day at most, while
-		// the request counts. One unpaid past the acceptance horizon holds
-		// the schedule no more (a coin paid to it is still read by the next
-		// sync), and is shown lapsed.
+		// the request counts. One past the lapse it carries holds the
+		// schedule no more (no sender pays it from then, and one paid before
+		// is read by the sync the last day's schedule named), and is shown
+		// lapsed.
 		let requests = self.receive_requests(now)?;
 		let mut out = json!({"now": now, "due": false, "coins": coins, "note": if stopped { HOME_NOTE } else { SYNC_NOTE }});
 		if requests.iter().any(|r| r["state"] == "waiting") && !stopped {
@@ -2518,6 +2550,38 @@ mod tests {
 			store.set_meta(k, v).unwrap();
 		}
 		dir
+	}
+
+	/// F1 of R7i: a receive request carries its lapse, and is waiting until
+	/// then and lapsed from then, with both dates; one handed out before
+	/// requests carried their lapse waits until it is paid or forgotten
+	/// (forgetting one is run in `arca_adversity`).
+	#[test]
+	fn a_receive_request_lapses_at_the_date_it_carries_and_an_old_one_waits() {
+		let dir = bare_wallet("request-lapse");
+		let (new, old) = ([5u8; 32], [6u8; 32]);
+		{
+			let store = Store::open(&dir.join(DB_FILE)).unwrap();
+			store.put_nonce(&new, &key(5).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.put_nonce(&old, &key(6).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.set_meta(RECEIVE_ASKED, &json!({hex(&new): 1_000, hex(&old): 1_000}).to_string()).unwrap();
+			store.set_meta(RECEIVE_UNTIL, &json!({hex(&new): 1_000 + REQUEST_HOLDS}).to_string()).unwrap();
+		}
+		let w = Wallet::open(&dir).unwrap();
+		let of = |at: u32| -> BTreeMap<String, Value> {
+			w.receive_requests(at).unwrap().into_iter().map(|r| (r["owner"].as_str().unwrap().to_string(), r)).collect()
+		};
+		let (kn, ko) = (hex(&key(5).x_only_public_key().0.serialize()), hex(&key(6).x_only_public_key().0.serialize()));
+		let before = of(1_000 + REQUEST_HOLDS - 1);
+		assert_eq!((before[&kn]["state"].as_str(), before[&kn]["lapses_at"].as_u64()), (Some("waiting"), Some(1_000 + REQUEST_HOLDS as u64)));
+		let after = of(1_000 + REQUEST_HOLDS);
+		println!("a request at its lapse: {}; one with none, a year on: {}", after[&kn], of(1_000 + 365 * 86_400)[&ko]);
+		assert_eq!((after[&kn]["state"].as_str(), after[&kn]["asked_at"].as_u64(), after[&kn]["lapsed_at"].as_u64()),
+			(Some("lapsed"), Some(1_000), Some(1_000 + REQUEST_HOLDS as u64)));
+		let year = of(1_000 + 365 * 86_400);
+		assert_eq!(year[&ko]["state"], "waiting", "an old request waits until it is paid or forgotten");
+		assert!(year[&ko]["lapses_at"].is_null());
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	/// R7f F9: a second record of a coin the wallet holds, whose checks all
