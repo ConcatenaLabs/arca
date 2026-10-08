@@ -391,8 +391,12 @@ way. A payment is failed back when its invoice expires unpaid or part paid,
 when its leaf never comes (the participation void, expired, or not built
 while its owner would still have its exit delay and half the window), and
 once its timeout and the operator's delay have passed by an hour with no
-preimage; the watcher refunds a leaf of such a payment that reaches the
-chain (`htlc_refund`). `lightning_receive_status` answers a payment by its
+preimage, and its leaf is not on the chain unspent (where its owner could
+still claim it) or the held parts are a dozen blocks from their expiry; the
+watcher refunds a leaf of such a payment that reaches the chain
+(`htlc_refund`). A participation for a leaf that no round took in time is
+voided, and its payment failed back, only if no round has taken it
+meanwhile. `lightning_receive_status` answers a payment by its
 hash: `open`, `accepted` (with its participation and the leaf's timeout),
 `claimed` (and whether the node has settled it) or `cancelled` with the
 reason. `info` publishes the terms (`lightning.receive`:
