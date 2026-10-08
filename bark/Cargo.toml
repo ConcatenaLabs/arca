@@ -79,8 +79,11 @@ path = "src/lib.rs"
 arca-lib = { version = "0.7.1", path = "../lib" }
 arca-common = { version = "0.7.1", path = "../bark-common" }
 arca-runtime = { version = "0.7.1", path = "../bark-runtime" }
+# Its `bdk` module (and with it `bdk_wallet`) comes with `onchain-bdk`, the one
+# feature that uses it, so the Arca wallet alone (`arca-core`) builds beside a
+# program that pins another `bitcoin` than `bdk_wallet` asks for.
 arca-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", default-features = false, features = [
-	"bdk", "rpc",
+	"rpc",
 ]}
 arca-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false }
 bip321 = { version = "0.4.0", path = "../bip321"  }

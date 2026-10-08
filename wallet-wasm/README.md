@@ -66,7 +66,8 @@ const w = ArcaWallet.open(mnemonic, nodePassword)
 const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amount: '2000000' })))
 ```
 
-`run(command, args)` takes the command line's commands: `info`, `address`,
+`run(command, args)` is the library's `bark::arca::command::run`, which every
+program that embeds the library calls, and takes the command line's commands: `info`, `address`,
 `balance`, `coins`, `record {leaf_id}`, `board {asset, amount, fee_asset?}`,
 `boards`, `receive {asset?, amount?}`, `forget_request {owner}`, `send
 {request, amount?, asset?}`, `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`,
