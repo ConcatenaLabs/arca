@@ -30,13 +30,24 @@ rand = ["bitcoin/rand", "bip39/rand"]
 # node's RPC, its SQLite store, its keys from the mnemonic as the Sequentia
 # Wallet Kit derives them, and its client of the Arca server over HTTPS.
 arca = [
+	"arca-core",
 	"sqlite",
+	"arca-sequentia-ext/minreq",
+	"dep:minreq",
+	"dep:rustls",
+]
+# The Arca wallet without a transport of its own: every HTTP request (to the
+# node, to the server) goes through the one a program registers with
+# `sequentia_ext::platform::set_platform`, as a web wallet's worker does when
+# it builds the wallet for `wasm32`. Its store is the same SQLite schema, on
+# whatever `rusqlite` the program links.
+arca-core = [
+	"rusqlite",
 	"dep:arca-covenant",
 	"dep:arca-sequentia-ext",
 	"dep:elements",
 	"dep:lwk_signer",
-	"dep:minreq",
-	"dep:rustls",
+	"dep:web-time",
 ]
 
 # TLS implementations
@@ -74,7 +85,9 @@ arca-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", default-feature
 arca-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false }
 bip321 = { version = "0.4.0", path = "../bip321"  }
 arca-covenant = { path = "../covenant", optional = true }
-arca-sequentia-ext = { path = "../sequentia-ext", optional = true }
+arca-sequentia-ext = { path = "../sequentia-ext", optional = true, default-features = false }
+# The clock of the Arca wallet: `std::time` on a native target, the browser's on `wasm32`.
+web-time = { version = "1.1", optional = true }
 elements = { workspace = true, optional = true }
 lwk_signer = { workspace = true, optional = true }
 minreq = { version = "3", optional = true, features = ["https-rustls"] }

@@ -708,6 +708,15 @@ and holding it there, with the reason shown:
   wallet restored from the mnemonic that finds on-chain coins past the first
   20 unused addresses.
 
+`tests/arca_operator_for_browsers.rs` is not a test that ends: ignored by
+default, it starts the scenarios' server and keeps it running for a wallet
+outside the process (the wallet built for a browser, `wallet-wasm/`), with a
+control address to fund a script, produce and bury blocks, build a round and
+move the chain's median time (`ARCA_OPERATOR_CONTROL`, the file's comment
+lists the calls). It runs until it is told to stop (`POST /quit`):
+
+    ARCA_OPERATOR_CONTROL=127.0.0.1:18640 cargo test -p arca-cli --test arca_operator_for_browsers -- --ignored --nocapture
+
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own, and its list of refusal codes
 against the server's: the wallet takes every code the server answers with a

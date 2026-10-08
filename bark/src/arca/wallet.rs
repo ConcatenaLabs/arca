@@ -40,8 +40,20 @@ fn set_private(path: &Path) -> Result<(), Error> {
 		use std::os::unix::fs::PermissionsExt;
 		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::Io(format!("{}: {}", path.display(), e)))?;
 	}
+	#[cfg(not(unix))]
+	let _ = path;
 	Ok(())
 }
+/// What a new wallet pins from its node and its server.
+struct Pins {
+	genesis: String,
+	chain_name: String,
+	operator: String,
+	keepers: String,
+	tip_height: u64,
+	tip_hash: String,
+}
+
 /// How many unused on-chain scripts past the last one in use the wallet looks at.
 const GAP: u32 = 20;
 
@@ -93,7 +105,7 @@ pub struct Wallet {
 	/// What witnessing the operator's signer's record found, and when
 	/// ([`Wallet::witness`]): once a command, and again after
 	/// [`WITNESS_FOR`] in a process that runs longer.
-	pub(crate) witnessed: std::cell::RefCell<Option<(std::time::Instant, Value)>>,
+	pub(crate) witnessed: std::cell::RefCell<Option<(web_time::Instant, Value)>>,
 	/// How long `sync` keeps trying to reach the operator, with back-off,
 	/// before it takes it for unreachable ([`WITNESS_PATIENCE`] unless set).
 	pub witness_patience: std::time::Duration,
@@ -411,6 +423,40 @@ impl Wallet {
 			Some(m) => bip39::Mnemonic::from_str(m).map_err(|e| Error::Parse(format!("the mnemonic: {}", e)))?,
 			None => bip39::Mnemonic::generate(12).map_err(|e| Error::Keys(e.to_string()))?,
 		};
+		let pins = Self::pins(&cfg)?;
+		write_private(&datadir.join(MNEMONIC_FILE), &mnemonic.to_string())?;
+		if let Some(p) = &cfg.node_password {
+			write_private(&datadir.join(NODE_PASSWORD_FILE), p)?;
+		}
+		let store = Store::open(&datadir.join(DB_FILE))?;
+		set_private(&datadir.join(DB_FILE))?;
+		Self::write_pins(&store, &cfg, pins)?;
+		drop(store);
+		Wallet::open(datadir)
+	}
+
+	/// Creates a wallet in a store the program opened itself, with no
+	/// directory and no file: a browser worker's, whose page holds the
+	/// mnemonic and hands it over on every open ([`Wallet::open_in`]). The
+	/// checks are those of [`Wallet::create`]. The store keeps no mnemonic,
+	/// only the wallet's mailbox key, so that an open with another mnemonic
+	/// is refused.
+	pub fn create_in(store: Store, mnemonic: &str, cfg: Config) -> Result<Wallet, Error> {
+		if store.meta("genesis")?.is_some() {
+			return Err(Error::Refused("this store already holds a wallet".into()));
+		}
+		let mnemonic = bip39::Mnemonic::from_str(mnemonic).map_err(|e| Error::Parse(format!("the mnemonic: {}", e)))?.to_string();
+		let pins = Self::pins(&cfg)?;
+		let coin_type = if pins.chain_name == "sequentia" { 0 } else { 1 };
+		let keys = Keys::new(&mnemonic, cfg.account, coin_type)?;
+		let node_password = cfg.node_password.clone();
+		Self::write_pins(&store, &cfg, pins)?;
+		store.set_meta("mailbox_key", &keys.mailbox()?.x_only_public_key().0.to_string())?;
+		Wallet::open_in(store, &mnemonic, node_password)
+	}
+
+	/// What [`Wallet::create`] pins, read from the node and the server.
+	fn pins(cfg: &Config) -> Result<Pins, Error> {
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
 		if !chain.validates_anchors()? {
 			return Err(Error::Refused("the node does not validate its anchors against the parent chain (-validateanchor): \
@@ -431,28 +477,26 @@ impl Wallet {
 		if !(cfg.min_exit_delay_units..=cfg.max_exit_delay_units).contains(&cfg.exit_delay_units) {
 			return Err(Error::Refused("the exit delay asked for is outside the bounds the wallet accepts".into()));
 		}
-		write_private(&datadir.join(MNEMONIC_FILE), &mnemonic.to_string())?;
-		if let Some(p) = &cfg.node_password {
-			write_private(&datadir.join(NODE_PASSWORD_FILE), p)?;
-		}
-		let store = Store::open(&datadir.join(DB_FILE))?;
-		set_private(&datadir.join(DB_FILE))?;
+		let keepers = Self::keepers_of(&info)?.to_string();
 		let tip = chain.tip()?;
+		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string() })
+	}
+
+	fn write_pins(store: &Store, cfg: &Config, pins: Pins) -> Result<(), Error> {
 		let meta = [
 			("server", cfg.server.clone()), ("node_url", cfg.node_url.clone()),
 			("node_user", cfg.node_user.clone().unwrap_or_default()),
 			("node_cookie", cfg.node_cookie.clone().unwrap_or_default()),
 			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
 			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
-			("genesis", genesis.to_string()), ("chain_name", chain_name), ("operator", operator.to_string()),
-			("keepers", Self::keepers_of(&info)?.to_string()),
-			("birthday", tip.height.to_string()), ("tip_height", tip.height.to_string()), ("tip_hash", tip.hash.to_string()),
+			("genesis", pins.genesis), ("chain_name", pins.chain_name), ("operator", pins.operator),
+			("keepers", pins.keepers),
+			("birthday", pins.tip_height.to_string()), ("tip_height", pins.tip_height.to_string()), ("tip_hash", pins.tip_hash),
 		];
 		for (k, v) in meta {
 			store.set_meta(k, &v)?;
 		}
-		drop(store);
-		Wallet::open(datadir)
+		Ok(())
 	}
 
 	/// Opens the wallet in `datadir`. Contacts neither node nor server.
@@ -463,12 +507,10 @@ impl Wallet {
 		}
 		let store = Store::open(&db)?;
 		set_private(&db)?;
-		let get = |k: &str| -> Result<String, Error> { store.meta(k)?.ok_or_else(|| Error::Store(format!("{} is not set", k))) };
-		let opt = |k: &str| -> Result<Option<String>, Error> { Ok(store.meta(k)?.filter(|v| !v.is_empty())) };
 		// The node's password, from its own file; a store that still holds it
 		// gives it up to that file.
 		let password_file = datadir.join(NODE_PASSWORD_FILE);
-		if let Some(p) = opt("node_password")? {
+		if let Some(p) = store.meta("node_password")?.filter(|v| !v.is_empty()) {
 			write_private(&password_file, &p)?;
 			store.set_meta("node_password", "")?;
 		}
@@ -477,6 +519,32 @@ impl Wallet {
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
 			Err(e) => return Err(Error::Io(format!("{}: {}", password_file.display(), e))),
 		};
+		let mnemonic = std::fs::read_to_string(datadir.join(MNEMONIC_FILE))
+			.map_err(|e| Error::Io(format!("{}: {}", datadir.join(MNEMONIC_FILE).display(), e)))?;
+		Self::assemble(datadir.to_path_buf(), store, mnemonic.trim(), node_password)
+	}
+
+	/// Opens the wallet a store holds ([`Wallet::create_in`]), with the
+	/// mnemonic the program holds and the node's password, if the node needs
+	/// one. Refuses a store that holds no wallet, and a mnemonic whose
+	/// mailbox key is not the one the store was made with. Contacts neither
+	/// node nor server.
+	pub fn open_in(store: Store, mnemonic: &str, node_password: Option<String>) -> Result<Wallet, Error> {
+		if store.meta("genesis")?.is_none() {
+			return Err(Error::Refused("this store holds no wallet; create one first".into()));
+		}
+		let w = Self::assemble(PathBuf::new(), store, mnemonic.trim(), node_password)?;
+		match w.store.meta("mailbox_key")? {
+			Some(k) if k == w.keys.mailbox()?.x_only_public_key().0.to_string() => Ok(w),
+			Some(_) => Err(Error::Refused("this store holds the wallet of another mnemonic".into())),
+			None => Err(Error::Refused("this store names no mailbox key, so it cannot tell whether the mnemonic is its own".into())),
+		}
+	}
+
+	/// The wallet over an open store, its keys from `mnemonic`.
+	fn assemble(datadir: PathBuf, store: Store, mnemonic: &str, node_password: Option<String>) -> Result<Wallet, Error> {
+		let get = |k: &str| -> Result<String, Error> { store.meta(k)?.ok_or_else(|| Error::Store(format!("{} is not set", k))) };
+		let opt = |k: &str| -> Result<Option<String>, Error> { Ok(store.meta(k)?.filter(|v| !v.is_empty())) };
 		let cfg = Config {
 			server: get("server")?, node_url: get("node_url")?,
 			node_user: opt("node_user")?, node_password, node_cookie: opt("node_cookie")?,
@@ -488,12 +556,10 @@ impl Wallet {
 		let genesis = Chain::new(parse("the genesis hash", &get("genesis")?)?);
 		let operator = parse("the operator key", &get("operator")?)?;
 		let coin_type = if get("chain_name")? == "sequentia" { 0 } else { 1 };
-		let mnemonic = std::fs::read_to_string(datadir.join(MNEMONIC_FILE))
-			.map_err(|e| Error::Io(format!("{}: {}", datadir.join(MNEMONIC_FILE).display(), e)))?;
-		let keys = Keys::new(mnemonic.trim(), cfg.account, coin_type)?;
+		let keys = Keys::new(mnemonic, cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
 		let server = ServerClient::new(&cfg.server)?;
-		Ok(Wallet { datadir: datadir.to_path_buf(), store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
+		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default() })
 	}
 
@@ -834,7 +900,7 @@ impl Wallet {
 		if let Some(at) = v["rolled_back"]["at"].as_u64() {
 			let why = v["rolled_back"]["why"].as_str().unwrap_or("").to_string();
 			v["exits"] = json!(self.exit_after(at, &why)?);
-			*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
+			*self.witnessed.borrow_mut() = Some((web_time::Instant::now(), v.clone()));
 		}
 		Ok(v)
 	}
@@ -924,7 +990,7 @@ impl Wallet {
 				self.witness_record(&answer["head"], false)?;
 			}
 			let v = json!({"witnessed": ask.len(), "record": answer["head"]});
-			*self.witnessed.borrow_mut() = Some((std::time::Instant::now(), v.clone()));
+			*self.witnessed.borrow_mut() = Some((web_time::Instant::now(), v.clone()));
 			return Ok(v);
 		}
 		if let Some((at, why)) = judged {
@@ -2328,6 +2394,41 @@ mod tests {
 
 	fn key(i: u8) -> Keypair {
 		Keypair::from_seckey_slice(&Secp256k1::new(), &[i.max(1); 32]).unwrap()
+	}
+
+	/// A wallet in a store the program opened itself: it opens with its own
+	/// mnemonic only, and a store with no wallet, or one that cannot say whose
+	/// it is, is refused. Opening contacts neither node nor server.
+	#[test]
+	fn a_store_opens_with_its_own_mnemonic_only() {
+		const A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+		const B: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+		let store = || Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+		let refused = |r: Result<Wallet, Error>| match r {
+			Err(Error::Refused(why)) => why,
+			Err(e) => panic!("refused for another reason: {}", e),
+			Ok(_) => panic!("opened"),
+		};
+		assert_eq!(refused(Wallet::open_in(store(), A, None)), "this store holds no wallet; create one first");
+
+		let made = || {
+			let s = store();
+			let cfg = Config::spec_delays("https://example.org/arca", "http://127.0.0.1:1/");
+			let pins = Pins { genesis: "00".repeat(32), chain_name: "elementsregtest".into(), operator: key(7).x_only_public_key().0.to_string(),
+				keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32) };
+			Wallet::write_pins(&s, &cfg, pins).unwrap();
+			s
+		};
+		let s = made();
+		s.set_meta("mailbox_key", &Keys::new(A, 0, 1).unwrap().mailbox().unwrap().x_only_public_key().0.to_string()).unwrap();
+		let w = Wallet::open_in(s, A, None).expect("its own mnemonic opens it");
+		assert_eq!(w.cfg.server, "https://example.org/arca");
+
+		let s = made();
+		s.set_meta("mailbox_key", &Keys::new(A, 0, 1).unwrap().mailbox().unwrap().x_only_public_key().0.to_string()).unwrap();
+		assert_eq!(refused(Wallet::open_in(s, B, None)), "this store holds the wallet of another mnemonic");
+
+		assert!(refused(Wallet::open_in(made(), A, None)).contains("names no mailbox key"));
 	}
 
 	/// A 16-leaf tree with one-atom reserves on every node and entry, as the

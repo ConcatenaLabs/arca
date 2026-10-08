@@ -650,7 +650,7 @@ impl Wallet {
 	/// nothing. Returns the witness (or its last failure), why `info` fails if
 	/// it does, and how many times it asked.
 	fn reach_operator(&mut self) -> (Result<Value, Error>, Option<Error>, u32) {
-		let start = std::time::Instant::now();
+		let start = web_time::Instant::now();
 		let mut wait = std::time::Duration::from_secs(1);
 		let mut tries = 0;
 		loop {
@@ -671,7 +671,7 @@ impl Wallet {
 				return (w, info, tries);
 			}
 			// The last wait ends a second past the patience, never before it.
-			std::thread::sleep(wait.min(self.witness_patience - spent + std::time::Duration::from_secs(1)));
+			sequentia_ext::platform::sleep(wait.min(self.witness_patience - spent + std::time::Duration::from_secs(1)));
 			wait = (wait * 2).min(std::time::Duration::from_secs(16));
 		}
 	}

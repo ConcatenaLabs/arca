@@ -11,13 +11,17 @@ publish = false
 name = "sequentia_ext"
 
 [features]
+default = ["minreq"]
 # A throwaway anchored regtest chain for tests (`regtest::Regtest`).
 regtest = []
+# The node client speaks HTTP with `minreq`. Without it, as in a browser, every
+# request goes through the transport a program registers (`platform`).
+minreq = ["dep:minreq"]
 
 [dependencies]
 elements = { workspace = true, features = [ "serde" ] }
 base64 = "0.22"
-minreq = "2.14"
+minreq = { version = "2.14", optional = true }
 serde = { workspace = true, features = [ "derive" ] }
 serde_json.workspace = true
 thiserror.workspace = true

@@ -60,6 +60,7 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `sequentia-ext/` | `arca-sequentia-ext` | `sequentia_ext` | Sequentia chain types (anchored block headers, issuances with a denomination, asset-tagged amounts), a JSON-RPC client for `sequentiad`, and a regtest harness ([sequentia-ext/README.md](sequentia-ext/README.md)) |
 | `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf, the entry, the forfeit, the checkpoint and `htlc-1`, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the board, the forfeit and its connector asset, the release and the reclaim, the offboard, and the transactions that spend a leaf off the tree ([covenant/README.md](covenant/README.md)) |
 | `consensus/` | `arca-consensus` | `arca_consensus` | Script verification under Sequentia's consensus rules for tests, through the node's own interpreter ([consensus/README.md](consensus/README.md)) |
+| `wallet-wasm/` | `arca-wallet-wasm` | `arca_wallet_wasm` | The Arca wallet built for a browser's dedicated worker: the same library, with the worker's HTTP, its pause, and SQLite on the browser's private file system (a separate workspace) ([wallet-wasm/README.md](wallet-wasm/README.md)) |
 | `bip321/` | `bip321` | `bip321` | Payment URI parser |
 | `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
 
@@ -115,6 +116,9 @@ node build.
 [covenant.yml](.github/workflows/covenant.yml) checks that `arca-covenant`
 builds with the Rust version the Sequentia Wallet Kit pins, which is the
 `rust-version` in `covenant/Cargo.toml`.
+[wallet-wasm.yml](.github/workflows/wallet-wasm.yml) builds the wallet for a
+browser (`wallet-wasm/`, its own workspace and lockfile) for
+`wasm32-unknown-unknown`.
 
 ## Security
 
