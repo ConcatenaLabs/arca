@@ -1662,9 +1662,11 @@ impl SpendRecord {
 				.unwrap_or((base.0, base.1));
 			mark_acknowledged(into, entry, &hash)?;
 		}
-		// And what the signer saw each keeper hold, its lost keepers with it.
-		let seen = read_keepers_seen(from)?;
-		if !seen.is_empty() {
+		// And what the signer saw each keeper hold, its lost keepers with it:
+		// whenever the old record has the file, so that the new one has it
+		// beside its `.acknowledged` as the old one did.
+		if keepers_seen_path(from).exists() {
+			let seen = read_keepers_seen(from)?;
 			write_keepers_seen(into, &seen.into_iter().collect::<Vec<_>>())?;
 		}
 		Ok((carried, dropped, base))

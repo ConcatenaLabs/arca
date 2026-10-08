@@ -969,8 +969,12 @@ database knows is still the record's; it carries every other entry's line
 over verbatim, and for every entry it drops a line with that entry's number
 and running hash (about 70 bytes an entry, on disk), with a hash over all of
 them and the keepers in that first line, which the signer checks at start. So the record
-answers the running hash at every one of its entries for its whole life. The
-operator then puts the new file in the record's place and starts the signer
+answers the running hash at every one of its entries for its whole life.
+The compaction also writes the new record's side files beside it,
+`<new file>.acknowledged` and `<new file>.keepers-seen`, carried over from
+the old record's. The operator then moves the new file and those two side
+files into the old ones' places together (`<record>`,
+`<record>.acknowledged`, `<record>.keepers-seen`), and starts the signer
 on it.
 
 ### The signed head, witnessed
@@ -1131,7 +1135,14 @@ What it has seen each keeper hold, and which keepers are lost, it writes
 beside its record (`<record>.keepers-seen`, synced, carried over by a
 compaction) before it releases anything that taught it more, and reads at
 every start, so a keeper that goes back is lost across restarts of the
-signer as within one run; it releases nothing it cannot write there. A
+signer as within one run; it releases nothing it cannot write there. It
+writes that file before it notes the first acknowledged head, so a record
+with `<record>.acknowledged` beside it has `<record>.keepers-seen` too, and
+the signer refuses to start on one that has the first and not the second,
+naming both files: taken for empty, the missing file would forget every
+lost keeper and every head a keeper was seen to hold. A record whose signer
+kept no such file (one made before the signer kept it) is started once with
+`--start-keepers-seen` ([Moving to a new revision](#moving-to-a-new-revision)). A
 restore of the signer's machine, from disk or with its memory, brings that
 file back as old as the record, and a signer so restored cannot tell a
 keeper restored from an older copy from one that lagged, which is why the
@@ -1227,6 +1238,9 @@ While it runs:
     arcad /etc/arca/arcad.toml expired-salts > expired.salts           # what the record no longer needs
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --compact-into /var/lib/arca/signer.record.new --drop-salts expired.salts   # with the signer stopped
+    for f in "" .acknowledged .keepers-seen; do                         # the new record and its side files, together
+        mv /var/lib/arca/signer.record.new$f /var/lib/arca/signer.record$f
+    done
     arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --record /var/lib/arca/signer.record \
         --clear-stopped                    # removes the proof of a rollback, with the signer stopped
 
@@ -1260,7 +1274,26 @@ whose key is lost without a backup cannot be replaced, since the record
 names it for good.
 
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
-send it that signal (systemd's `KillSignal=SIGINT`).
+send it that signal (systemd's `KillSignal=SIGINT`). The signer is stopped
+with SIGTERM: a SIGINT sent from a background shell does not reach it, and a
+second start then finds the record held by the first.
+
+### Moving to a new revision
+
+`arcad` and `arca-signer` speak one protocol to each other, so they move
+together, built from the same revision. Stop `arcad` (SIGINT), then the
+signer (SIGTERM). Start the signer on its record as before, then `arcad`,
+which moves its database to the new schema in place at its start. A record
+with `<record>.acknowledged` beside it and no `<record>.keepers-seen` (one
+made before the signer kept that file) does not start; start it once with
+`--start-keepers-seen` added to its command line, which writes that file,
+nothing seen of any keeper yet, and from then on is refused:
+
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis hash> --socket /run/arca/signer.sock \
+        --record /var/lib/arca/signer.record --keeper … --start-keepers-seen   # once, for such a record
+
+Never pass it for a record whose `<record>.keepers-seen` was lost: put the
+file back from where it lies. Each keeper restarts on its own heads file.
 
 [`arcad.example.toml`](arcad.example.toml) lists every setting: the listen
 address, the database, the signer's socket, the wallet's mnemonic file, the
@@ -1737,7 +1770,12 @@ back to an older copy while another missed the lost window, after a
 restart of the signer, a lost keeper still (from `<record>.keepers-seen`),
 nothing released, and with the record alone put back to an earlier copy no
 second spend released; a signer that cannot write beside its record
-releasing nothing until it can; a new operator
+releasing nothing until it can; that shape with `<record>.keepers-seen`
+lost beside `<record>.acknowledged`, the signer refusing to start, naming
+both files; a record from before the signer kept the file refused, then
+started once with `--start-keepers-seen`, which writes it, the flag then
+refused and the record starting without it, and a compacted record started
+on with its side files moved with it; a new operator
 with three keepers made in the order "Running" gives, every command run,
 `S` read with `arca-signer --pubkey` before its record exists, the signer
 co-signing with the keepers' acknowledgements; and what a keeper adds to a
