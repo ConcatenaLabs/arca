@@ -1,0 +1,34 @@
+name: wallet-wasm
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The Arca wallet built for a browser's dedicated worker (wallet-wasm/, a
+  # workspace of its own with its own lockfile): it keeps building for wasm32
+  # whatever the library gains.
+  build:
+    name: the Arca wallet builds for a browser
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wallet-wasm
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Build
+        working-directory: wallet-wasm
+        run: cargo build --locked --release --target wasm32-unknown-unknown

@@ -377,7 +377,7 @@ pub extern crate lnurl as lnurllib;
 #[macro_use] extern crate async_trait;
 #[macro_use] extern crate serde;
 
-#[cfg(feature = "arca")]
+#[cfg(feature = "arca-core")]
 pub mod arca;
 pub mod actions;
 pub mod chain;

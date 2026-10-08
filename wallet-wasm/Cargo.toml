@@ -1,0 +1,48 @@
+# The Arca wallet (`bark::arca`) built for a browser: a dedicated worker loads
+# this crate's package, registers its HTTP and its pause, installs SQLite's
+# OPFS storage, and drives the wallet through `ArcaWallet`.
+#
+# A workspace of its own, outside the root one: it links SQLite through
+# `rusqlite` 0.40's wasm build, which cannot share one lockfile with the
+# native build's `rusqlite` 0.31 (both link `sqlite3`).
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "arca-wallet-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "The Arca wallet for a browser's dedicated worker"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arca-wallet = { path = "../bark", default-features = false, features = ["arca-core", "wasm-web"] }
+arca-sequentia-ext = { path = "../sequentia-ext", default-features = false }
+rusqlite = "0.31.0"
+sqlite-wasm-rs = { version = "0.5.2", default-features = false }
+sqlite-wasm-vfs = { version = "0.2.0" }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["XmlHttpRequest", "WorkerGlobalScope", "DedicatedWorkerGlobalScope"] }
+# The wallet's nonces come from the system's source: in a browser, `crypto.getRandomValues`.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[patch.crates-io]
+rusqlite = { path = "rusqlite-shim" }
+# As in the root workspace: the kit's crates, and the one Sequentia `elements`.
+elements = { git = "https://github.com/ConcatenaLabs/SWK", rev = "87a9f5e7f98356a2c00712884019079566aacfec" }
+lwk_common = { git = "https://github.com/ConcatenaLabs/SWK", rev = "6f432d9584dff5e4b1226d4b32657c52f3d8457b" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

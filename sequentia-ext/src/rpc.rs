@@ -110,20 +110,42 @@ impl Client {
 		Ok(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(cred)))
 	}
 
-	/// Calls `method` with positional `params`.
-	pub fn call<T: DeserializeOwned>(&self, method: &str, params: &[Json]) -> Result<T, Error> {
-		let body = json!({"jsonrpc": "1.0", "id": "arca", "method": method, "params": params});
+	/// Posts one JSON-RPC body; the HTTP status and the answer's text.
+	#[cfg(feature = "minreq")]
+	fn post(&self, body: &str) -> Result<(i32, String), Error> {
 		let resp = minreq::post(&self.url)
 			.with_header("Authorization", self.auth_header()?)
 			.with_header("Content-Type", "application/json")
-			.with_body(body.to_string())
+			.with_body(body)
 			.with_timeout(self.timeout_secs)
 			.send()
 			.map_err(|e| Error::Transport(e.to_string()))?;
 		let text = resp.as_str().map_err(|e| Error::Json(e.to_string()))?;
-		let reply: Json = match serde_json::from_str(text) {
+		Ok((resp.status_code, text.to_string()))
+	}
+
+	/// Posts one JSON-RPC body through the registered transport
+	/// ([`crate::platform`]); the HTTP status and the answer's text.
+	#[cfg(not(feature = "minreq"))]
+	fn post(&self, body: &str) -> Result<(i32, String), Error> {
+		let request = crate::platform::Request {
+			method: "POST",
+			url: &self.url,
+			headers: vec![("Authorization", self.auth_header()?), ("Content-Type", "application/json".into())],
+			body: Some(body),
+			timeout_secs: self.timeout_secs,
+		};
+		let resp = crate::platform::http(&request).map_err(Error::Transport)?;
+		Ok((resp.status, resp.body))
+	}
+
+	/// Calls `method` with positional `params`.
+	pub fn call<T: DeserializeOwned>(&self, method: &str, params: &[Json]) -> Result<T, Error> {
+		let body = json!({"jsonrpc": "1.0", "id": "arca", "method": method, "params": params});
+		let (status, text) = self.post(&body.to_string())?;
+		let reply: Json = match serde_json::from_str(&text) {
 			Ok(v) => v,
-			Err(_) => return Err(Error::Http { status: resp.status_code, body: text.to_string() }),
+			Err(_) => return Err(Error::Http { status, body: text }),
 		};
 		if !reply["error"].is_null() {
 			return Err(Error::Rpc {

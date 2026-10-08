@@ -259,6 +259,7 @@ impl ServerClient {
 		check_server_url(base)?;
 		// rustls picks no crypto provider by itself when the build enables
 		// more than one; one already installed is kept.
+		#[cfg(feature = "arca")]
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60 })
 	}
@@ -274,29 +275,55 @@ impl ServerClient {
 	/// does not know, a request to slow down) says nothing of what the server
 	/// did, and is [`Error::Unreachable`]: a request that changes something
 	/// stays standing, to be posted again byte for byte.
-	fn answer(call: &str, r: Result<minreq::Response, minreq::Error>) -> Result<Value, Error> {
-		let r = r.map_err(|e| Error::Unreachable(format!("{}: {}", call, e)))?;
-		let text = r.as_str().unwrap_or("");
-		let json: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-		if r.status_code == 200 {
+	fn answer(call: &str, r: Result<(i32, String), String>) -> Result<Value, Error> {
+		let (status, text) = r.map_err(|e| Error::Unreachable(format!("{}: {}", call, e)))?;
+		let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+		if status == 200 {
 			return Ok(json);
 		}
 		let code = json["error"]["code"].as_str().unwrap_or("").to_string();
 		let message = json["error"]["message"].as_str().map(|s| s.to_string()).unwrap_or_else(|| text.to_string());
-		if (400..500).contains(&r.status_code) && REFUSALS.contains(&code.as_str()) {
-			return Err(Error::Server { call: call.to_string(), status: r.status_code as i32, code, message });
+		if (400..500).contains(&status) && REFUSALS.contains(&code.as_str()) {
+			return Err(Error::Server { call: call.to_string(), status, code, message });
 		}
-		Err(Error::Unreachable(format!("{}: the server answered {} {}: {}", call, r.status_code, code, message)))
+		Err(Error::Unreachable(format!("{}: the server answered {} {}: {}", call, status, code, message)))
+	}
+
+	/// The status and text of one request, over `minreq`.
+	#[cfg(feature = "arca")]
+	fn send(&self, _method: &str, call: &str, body: Option<&Value>) -> Result<(i32, String), String> {
+		let url = format!("{}/v1/{}", self.base, call);
+		let request = match body {
+			None => minreq::get(url),
+			Some(b) => minreq::post(url).with_header("Content-Type", "application/json").with_body(b.to_string()),
+		};
+		let r = request.with_timeout(self.timeout).send().map_err(|e| e.to_string())?;
+		Ok((i32::from(r.status_code), r.as_str().unwrap_or("").to_string()))
+	}
+
+	/// The status and text of one request, through the transport the program
+	/// registered (`sequentia_ext::platform`).
+	#[cfg(not(feature = "arca"))]
+	fn send(&self, method: &str, call: &str, body: Option<&Value>) -> Result<(i32, String), String> {
+		let url = format!("{}/v1/{}", self.base, call);
+		let text = body.map(|b| b.to_string());
+		let request = sequentia_ext::platform::Request {
+			method,
+			url: &url,
+			headers: if text.is_some() { vec![("Content-Type", "application/json".into())] } else { vec![] },
+			body: text.as_deref(),
+			timeout_secs: self.timeout,
+		};
+		let r = sequentia_ext::platform::http(&request)?;
+		Ok((r.status, r.body))
 	}
 
 	pub fn get(&self, call: &str) -> Result<Value, Error> {
-		Self::answer(call, minreq::get(format!("{}/v1/{}", self.base, call)).with_timeout(self.timeout).send())
+		Self::answer(call, self.send("GET", call, None))
 	}
 
 	pub fn post(&self, call: &str, body: &Value) -> Result<Value, Error> {
-		Self::answer(call, minreq::post(format!("{}/v1/{}", self.base, call))
-			.with_header("Content-Type", "application/json")
-			.with_body(body.to_string()).with_timeout(self.timeout).send())
+		Self::answer(call, self.send("POST", call, Some(body)))
 	}
 
 	pub fn info(&self) -> Result<Value, Error> {

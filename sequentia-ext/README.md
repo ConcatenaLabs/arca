@@ -41,6 +41,11 @@ with the node's labels resolved) and regtest mining (`generate_to_descriptor`,
 The fee whitelist is the node's own and changes over time: an asset in it now may
 be gone tomorrow, and another node may list different assets.
 
+The client speaks HTTP with `minreq` (the default `minreq` feature). Built
+without it, as for a browser, it sends every request through the transport a
+program registers once with `platform::set_platform`, and refuses to send any
+other way; `platform::sleep` is the pause the wallet's back-off waits with.
+
 ## Regtest harness
 
 With the `regtest` feature, `regtest::Regtest::start` runs a throwaway anchored

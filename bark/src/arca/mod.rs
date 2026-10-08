@@ -18,6 +18,14 @@
 //!   mailbox, take part in a round, swap, exit, and re-check every coin after
 //!   a rollback.
 //!
+//! The module builds in two ways. With the `arca` feature, as the command line
+//! builds it, the node and the server are reached over `minreq` and the store
+//! is a file in the wallet's directory. With `arca-core` alone it has no
+//! transport of its own: every request goes through the one a program
+//! registers with [`sequentia_ext::platform::set_platform`], and the program
+//! opens the store itself ([`Wallet::create_in`], [`Wallet::open_in`]), as the
+//! browser build does (`wallet-wasm/`).
+//!
 //! Every coin is validated with the library's checks under the wallet's own
 //! policy before it is stored: a leaf from a round with the five checks on its
 //! sweep token and clock and the bounds on its path; a coin received out of

@@ -17,6 +17,8 @@ members = [
   "covenant",
   "server",
 ]
+# The wallet's browser build is a workspace of its own (its README says why).
+exclude = ["wallet-wasm"]
 
 resolver = "2"
 

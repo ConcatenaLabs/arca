@@ -15,6 +15,7 @@
 
 pub extern crate elements;
 
+pub mod platform;
 pub mod rpc;
 #[cfg(feature = "regtest")]
 pub mod regtest;

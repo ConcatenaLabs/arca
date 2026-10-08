@@ -194,7 +194,7 @@ fn db(e: rusqlite::Error) -> Error {
 }
 
 fn now() -> i64 {
-	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 fn arr32(v: Vec<u8>) -> Result<[u8; 32], Error> {
@@ -204,7 +204,13 @@ fn arr32(v: Vec<u8>) -> Result<[u8; 32], Error> {
 impl Store {
 	/// Opens (creating if needed) the database at `path`.
 	pub fn open(path: &Path) -> Result<Store, Error> {
-		let conn = Connection::open(path).map_err(db)?;
+		Store::open_connection(Connection::open(path).map_err(db)?)
+	}
+
+	/// Opens the database `conn` holds (creating its tables if needed): a
+	/// program that opens the file itself, as a browser worker does on its
+	/// own storage, hands the connection here.
+	pub fn open_connection(conn: Connection) -> Result<Store, Error> {
 		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;").map_err(db)?;
 		conn.execute_batch(SCHEMA).map_err(db)?;
 		let mut store = Store { conn };

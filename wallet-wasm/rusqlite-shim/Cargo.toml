@@ -1,0 +1,20 @@
+# The Arca wallet names `rusqlite` 0.31, the version its native build links.
+# That version has no `wasm32-unknown-unknown` SQLite; 0.40 has one
+# (`sqlite-wasm-rs`). This crate takes 0.31's name and version inside this
+# workspace alone (`[patch.crates-io]` in ../Cargo.toml) and re-exports 0.40,
+# so the wallet's store is compiled from its own source, unchanged.
+[package]
+name = "rusqlite"
+version = "0.31.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+chrono = ["sqlite/chrono"]
+
+[dependencies]
+sqlite = { package = "rusqlite", version = "0.40.2", default-features = false, features = ["ffi-sqlite-wasm-rs", "fallible_uint"] }
