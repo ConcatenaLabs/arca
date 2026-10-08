@@ -113,6 +113,53 @@ pub struct Wallet {
 	/// block yet: a later exit of the same `sync` pays its fees from it, as
 	/// the steps of one exit do.
 	pub(crate) change_in_flight: std::cell::RefCell<Vec<(OutPoint, TxOut, Keypair)>>,
+	/// How what the wallet says names the client's commands, and the
+	/// prefixes of the texts it hands out ([`Spelling`]).
+	pub(crate) spelling: Spelling,
+}
+
+/// How a client spells, in what the wallet says, its own commands and the
+/// prefixes of the texts the wallet hands out (a receive request, a swap
+/// offer, a swap acceptance). The default names no command: the wallet
+/// says the act ("sync", "an exit", "the wallet's address"), and prefixes
+/// its texts `request:`, `swap-offer:` and `swap-accept:`. A command line
+/// passes its own name ([`Spelling::command_line`]), so that its notes name
+/// its commands (`arca sync`) and its texts carry its prefixes (`arca:`).
+/// Whatever their prefix, every wallet reads every text: it tells a request
+/// from an offer by what the text holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spelling {
+	/// The command line's name, as its commands are run (`arca`); `None`
+	/// for a client without one.
+	pub commands: Option<String>,
+	pub request: String,
+	pub offer: String,
+	pub accept: String,
+}
+
+impl Default for Spelling {
+	fn default() -> Spelling {
+		Spelling { commands: None, request: "request:".into(), offer: "swap-offer:".into(), accept: "swap-accept:".into() }
+	}
+}
+
+impl Spelling {
+	/// A command line named `name`: its commands in every note (`name sync`),
+	/// and texts prefixed `name:`, `name-offer:` and `name-accept:`.
+	pub fn command_line(name: &str) -> Spelling {
+		Spelling { commands: Some(name.to_string()), request: format!("{}:", name), offer: format!("{}-offer:", name),
+			accept: format!("{}-accept:", name) }
+	}
+
+	/// `note` with its slots filled: `{sync}` and `{exit}`, the command or the
+	/// act; `{address}`, where to send the wallet an on-chain coin.
+	pub fn say(&self, note: &str) -> String {
+		let command = |c: &str| self.commands.as_ref().map(|n| format!("`{} {}`", n, c));
+		note.replace("{sync}", &command("sync").unwrap_or_else(|| "sync".into()))
+			.replace("{exit}", &command("exit").unwrap_or_else(|| "an exit".into()))
+			.replace("{address}", &command("address").map(|c| format!("an address of {}", c))
+				.unwrap_or_else(|| "the wallet's address".into()))
+	}
 }
 
 /// How long a witness of the operator's signer's record stands before the
@@ -186,8 +233,8 @@ pub const WITNESS_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// keeps it alive.
 pub(crate) const SYNC_NOTE: &str = "sync keeps the coin alive by itself: from refresh_from (two days before its exit date, the free \
 	window) it asks for the coin's refresh, and from home_from (a day before) it takes the coin on the chain unless the wallet holds \
-	its new leaf, whatever stands in the way. Run `arca sync` at least once a day while the wallet holds a coin off the chain or \
-	waits for a payment, whatever next_sync_at says; `arca exit` takes the coin now";
+	its new leaf, whatever stands in the way. Run {sync} at least once a day while the wallet holds a coin off the chain or waits \
+	for a payment, whatever next_sync_at says; {exit} takes the coin now";
 
 /// Why the wallet's schedule is a day at most while it waits for a payment.
 pub(crate) const WAITING_NOTE: &str = "the wallet waits for a payment to a receive request it handed out: a coin paid to it is read \
@@ -197,38 +244,38 @@ pub(crate) const WAITING_NOTE: &str = "the wallet waits for a payment to a recei
 /// What the wallet says of a coin it still holds off the chain once the
 /// operator's signer is stopped.
 pub(crate) const HOME_NOTE: &str = "the operator's signer is stopped: the coin can no longer be paid on or refreshed, and must be \
-	exited by its exit date (exit_by, a median time); sync takes it on the chain when that date is within three days, and `arca exit` \
-	takes it now";
+	exited by its exit date (exit_by, a median time); sync takes it on the chain when that date is within three days, and {exit} takes \
+	it now";
 
 /// What the wallet says of a coin it holds off the chain while the operator
 /// cannot be reached: its witness fails, or the server does not answer or
 /// refuses the wallet.
 pub(crate) const UNREACHABLE_NOTE: &str = "the operator cannot be reached now: nothing is taken on the chain for that before the \
 	coin's home_from (a day before its exit date, exit_by, median times); from then sync takes the coin on the chain unless its \
-	refresh has completed. Run `arca sync` at least once a day while the wallet holds a coin off the chain; `arca exit` takes it now";
+	refresh has completed. Run {sync} at least once a day while the wallet holds a coin off the chain; {exit} takes it now";
 
 /// What the wallet says of a coin whose refresh the operator refused.
 pub(crate) const REFUSED_NOTE: &str = "the operator refused the coin's last refresh: sync asks again six hours after it last \
 	asked, while the coin is in its refresh window (from refresh_from, two days before its exit date, to home_from, a day before), \
-	and from home_from takes the coin on the chain unless a refresh has completed; `arca exit` takes it now";
+	and from home_from takes the coin on the chain unless a refresh has completed; {exit} takes it now";
 
 /// What the wallet says of a coin whose refresh expired at the server.
 pub(crate) const EXPIRED_NOTE: &str = "the coin's last refresh expired at the server: its forfeits were not handed over and \
 	co-signed by the later of a day after its round was final and the coin's exit date (the wallet did not sync in that time, or \
 	the operator's signer or its keepers were away), so the new leaf was never released; sync asks again six hours after it last \
 	asked, while the coin is in its refresh window (from refresh_from, two days before its exit date, to home_from, a day before), \
-	and from home_from takes the coin on the chain unless a refresh has completed; `arca exit` takes it now";
+	and from home_from takes the coin on the chain unless a refresh has completed; {exit} takes it now";
 
 /// What the wallet says of a coin whose last refresh ended as `p` says
 /// ([`Wallet::refused_refreshes`]): expired, or refused.
-pub(crate) fn refusal_note(p: &str) -> String {
-	format!("{} (participation {})", if p.ends_with(" expired") { EXPIRED_NOTE } else { REFUSED_NOTE }, p)
+pub(crate) fn refusal_note(spelling: &Spelling, p: &str) -> String {
+	format!("{} (participation {})", spelling.say(if p.ends_with(" expired") { EXPIRED_NOTE } else { REFUSED_NOTE }), p)
 }
 
 /// What the wallet says of a coin whose exit needs a fee coin it does not
 /// hold.
 pub(crate) const FEE_COIN_MISSING: &str = "this coin cannot come home until the wallet holds an on-chain coin in an asset the node \
-	accepts for fees (send one to an address of `arca address`): its exit takes a fee coin, which the wallet chooses (the moved asset \
+	accepts for fees (send one to {address}): its exit takes a fee coin, which the wallet chooses (the moved asset \
 	first, where the node takes it)";
 
 /// An asset the node takes for fees that the wallet holds on the chain: its
@@ -571,7 +618,13 @@ impl Wallet {
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
-			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default() })
+			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
+			spelling: Spelling::default() })
+	}
+
+	/// Spells what the wallet says from now on as `s` says ([`Spelling`]).
+	pub fn spell(&mut self, s: Spelling) {
+		self.spelling = s;
 	}
 
 	pub fn mnemonic_path(&self) -> PathBuf {
@@ -1218,11 +1271,11 @@ impl Wallet {
 				continue;
 			}
 			let note = match why {
-				Home::Stopped => HOME_NOTE.to_string(),
-				Home::Unreachable(w) => format!("{} (as this sync found: {})", UNREACHABLE_NOTE, w),
+				Home::Stopped => self.spelling.say(HOME_NOTE),
+				Home::Unreachable(w) => format!("{} (as this sync found: {})", self.spelling.say(UNREACHABLE_NOTE), w),
 				Home::Answering => match refused.get(&c.leaf_id) {
-					Some(p) => refusal_note(p),
-					None => SYNC_NOTE.to_string(),
+					Some(p) => refusal_note(&self.spelling, p),
+					None => self.spelling.say(SYNC_NOTE),
 				},
 			};
 			let mut v = json!({"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
@@ -1413,7 +1466,7 @@ impl Wallet {
 		// is read by the sync the last day's schedule named), and is shown
 		// lapsed.
 		let requests = self.receive_requests(now)?;
-		let mut out = json!({"now": now, "due": false, "coins": coins, "note": if stopped { HOME_NOTE } else { SYNC_NOTE }});
+		let mut out = json!({"now": now, "due": false, "coins": coins, "note": self.spelling.say(if stopped { HOME_NOTE } else { SYNC_NOTE })});
 		if requests.iter().any(|r| r["state"] == "waiting") && !stopped {
 			let day = now.saturating_add(86_400);
 			next = Some(next.map_or(day, |n| n.min(day)));
@@ -1974,16 +2027,16 @@ impl Wallet {
 					v["home_from"] = json!(d.home_from);
 					v["exit_by"] = json!(d.exit_by);
 				}
-				v["sync"] = json!(if stopped { HOME_NOTE } else { SYNC_NOTE });
+				v["sync"] = json!(self.spelling.say(if stopped { HOME_NOTE } else { SYNC_NOTE }));
 				// When the wallet cannot have the coin refreshed now (after a
 				// stop, while the operator cannot be reached, or once it
 				// refused this coin's refresh), why.
 				let home = if stopped {
-					Some(HOME_NOTE.to_string())
+					Some(self.spelling.say(HOME_NOTE))
 				} else if let Some(why) = &unreachable {
-					Some(format!("{} (as the last sync found: {})", UNREACHABLE_NOTE, why))
+					Some(format!("{} (as the last sync found: {})", self.spelling.say(UNREACHABLE_NOTE), why))
 				} else {
-					refused.get(&c.leaf_id).map(|p| refusal_note(p))
+					refused.get(&c.leaf_id).map(|p| refusal_note(&self.spelling, p))
 				};
 				if let Some(note) = home {
 					v["home"] = json!(note);
@@ -2046,7 +2099,7 @@ impl Wallet {
 			let (fa, fb) = (a.largest / a.per_kvb.max(1), b.largest / b.per_kvb.max(1));
 			fa.cmp(&fb).then_with(|| b.asset.cmp(&a.asset))
 		}).map(|h| h.asset).ok_or_else(|| Error::Refused(format!("{}: the wallet holds no on-chain coin in an asset the node accepts for \
-			fees", FEE_COIN_MISSING)))
+			fees", self.spelling.say(FEE_COIN_MISSING))))
 	}
 
 	/// What the exit of coin `c` needs in fees beyond its own reserves: a coin
@@ -2069,7 +2122,7 @@ impl Wallet {
 		Ok(Some(match self.choose_fee_asset(asset, view.as_deref().unwrap_or(&[])) {
 			Ok(a) => json!({"fee_coin": "needed", "asset": a.to_string(), "note": format!("{}: its exit takes a fee coin of the wallet's, in \
 				asset {}", why, a)}),
-			Err(_) => json!({"fee_coin": "missing", "note": format!("{}: {}", why, FEE_COIN_MISSING)}),
+			Err(_) => json!({"fee_coin": "missing", "note": format!("{}: {}", why, self.spelling.say(FEE_COIN_MISSING))}),
 		}))
 	}
 

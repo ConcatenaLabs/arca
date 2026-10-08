@@ -62,7 +62,7 @@ mod round;
 mod wallet;
 
 pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};
-pub use wallet::{CoinDates, Config, Wallet, HOME_FROM, REFRESH_FROM, REQUEST_HOLDS, SYNC_DAILY, WITNESS_PATIENCE};
+pub use wallet::{CoinDates, Config, Spelling, Wallet, HOME_FROM, REFRESH_FROM, REQUEST_HOLDS, SYNC_DAILY, WITNESS_PATIENCE};
 
 pub use arca_covenant;
 pub use elements;

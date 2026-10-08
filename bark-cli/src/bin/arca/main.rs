@@ -14,7 +14,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use bark::arca::elements::AssetId;
-use bark::arca::{Config, Wallet};
+use bark::arca::{Config, Spelling, Wallet};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -292,7 +292,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		if let Some(d) = max_exit_delay_units {
 			cfg.max_exit_delay_units = d;
 		}
-		let w = Wallet::create(&datadir, mnemonic.as_deref(), cfg)?;
+		let mut w = Wallet::create(&datadir, mnemonic.as_deref(), cfg)?;
+		w.spell(Spelling::command_line("arca"));
 		let mut info = w.info()?;
 		info["mnemonic_file"] = json!(w.mnemonic_path().display().to_string());
 		let check = format!("compare the operator key {} with the one the operator publishes through a channel you trust: the wallet \
@@ -302,6 +303,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		return Ok(info);
 	}
 	let mut w = Wallet::open(&datadir)?;
+	// What the wallet says names this command line's commands (`arca sync`),
+	// and its texts carry its prefixes (`arca:`).
+	w.spell(Spelling::command_line("arca"));
 	w.witness_patience = std::time::Duration::from_secs(cli.witness_patience);
 	// The witness of the operator's signer's record runs on every start, so
 	// every wallet that is online witnesses it: a rollback of the record

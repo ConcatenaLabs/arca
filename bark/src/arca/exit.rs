@@ -729,15 +729,15 @@ impl Wallet {
 			(false, Some(e)) => {
 				self.set_unreachable(Some(&e))?;
 				let busy = e.contains("rate_limited");
-				(Home::Unreachable(e.clone()), json!({"why": e, "note": if busy {
+				(Home::Unreachable(e.clone()), json!({"why": e, "note": self.spelling.say(if busy {
 					"the server asks the wallet to slow down (rate_limited): nothing is decided on that; the wallet asks again at its next \
 					sync. Nothing is taken on the chain for want of an answer before a coin's home_from (a day before its exit date); run \
-					`arca sync` at least once a day while the wallet holds a coin off the chain or waits for a payment"
+					{sync} at least once a day while the wallet holds a coin off the chain or waits for a payment"
 				} else {
 					"the operator cannot be reached now: nothing is taken on the chain for that before a coin's home_from (a day before its \
-					exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run `arca sync` at least \
+					exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run {sync} at least \
 					once a day while the wallet holds a coin off the chain or waits for a payment"
-				}}))
+				})}))
 			},
 			(false, None) => {
 				self.set_unreachable(None)?;

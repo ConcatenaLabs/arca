@@ -82,6 +82,12 @@ when it is due.
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
 "message"}}`, with the server's `code` and `status` when the server refused.
 
+The page shows what the library says as it says it. With no command line,
+the library names the act rather than a command ("run sync", "an exit takes
+it now", "send one to the wallet's address"), and prefixes the texts it hands
+out `request:`, `swap-offer:` and `swap-accept:`. It reads a text whatever its
+prefix, the command line's `arca:…` included.
+
 ## Building
 
 Needs the `wasm32-unknown-unknown` target, `wasm-pack`, and `protoc` (the

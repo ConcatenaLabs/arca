@@ -19,6 +19,13 @@ the environment variable `ARCA_NODE_PASSWORD` or from a file
 (`--node-password-file`), once, and keeps it in `node_password`, never in the
 store. The wallet library is `bark::arca` (`bark/src/arca/`, the `arca` feature
 of `arca-wallet`), built on `arca-covenant` for every script, record and check.
+What the library says names the act ("sync", "an exit", "the wallet's
+address") and prefixes the texts it hands out `request:`, `swap-offer:` and
+`swap-accept:`, unless its client gives its own spelling (`Spelling`,
+`Wallet::spell`): `arca` gives its name, so its notes name its commands
+(`arca sync`) and its texts are `arca:…`, `arca-offer:…` and `arca-accept:…`.
+A text is read whatever its prefix, known by what it holds, so wallets of
+every spelling pay one another.
 
 It needs:
 
