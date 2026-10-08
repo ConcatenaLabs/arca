@@ -26,6 +26,7 @@ pub mod keeper;
 pub mod nursery;
 pub mod params;
 pub mod participations;
+pub mod rates;
 pub mod rounds;
 pub mod server;
 pub mod signer;

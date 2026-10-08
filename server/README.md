@@ -206,13 +206,46 @@ a round or a board) and its fee schedule. Every record and coin the server check
 these, with the receipt horizon a receiver uses: a coin's first expiry past
 the exit deadline.
 
-Each asset is served on its own: its boards, its batches and rounds, and its
-pool, the operator's wallet's coins of it. An asset the operator does not
+Each asset is served on its own: its boards, its batches and rounds, its
+pool (the operator's wallet's coins of it) and, when the operator names one,
+its rate source. An asset the operator does not
 serve is refused at every entry, `out_of_bounds` with its id named: a board
 of it, a transfer's output in it or a coin of it given up, and a
 participation's leaf, offboard or fee in it. Adding an asset takes its entry
 in the configuration and coins of it paid to the operator's wallet, and no
 restart: `arcad` takes the assets anew on SIGHUP (see Running).
+
+### Exchange rates
+
+The operator's exchange rate for an asset comes from a source it names for
+that asset (`[assets.rate]`): `node`, the node's own rate for the asset, the
+one it values fees in it at (`-con_any_asset_fees`, read with
+`getfeeexchangerates`), where the node lists the asset; `file`, a file the
+operator's price process writes; or `command`, a program the server runs. A
+file or a command gives one reading, `{"rate": <integer>, "time": <unix
+seconds>}` (the rate as a number or a decimal string) or the same two numbers
+on one line, the time optional: without it a file's reading is as old as the
+file, a command's as its run, and the node's as the server's read. A rate is
+the node's unit: what 10^8 atoms of the asset are worth in atoms of the
+reference unit, the unit the node's fee rates count in, which no asset of the
+chain is. The server reads every source at its start, at a reload and every
+15 seconds; a source that fails leaves the last rate standing, the failure
+beside it. `info` publishes each asset's rate with its source, its time, its
+age and how long it is good for (`max_age_seconds`, an hour by default), and
+whether it is stale.
+
+The rate sets what the operator sets as a value: an asset's smallest leaf
+may be a value in the reference unit (`min_leaf_value`), taken in the
+asset's atoms at its rate, rounded up, and published as such (`min_leaf`)
+beside it. While an asset's rate is stale, or before its source has given
+one, the server takes no new work in that asset: a board or a participation
+of it is refused `rate_stale` (503), naming the asset, the source, the rate
+and its age, and a wallet posts it again later. Work already taken goes on:
+a participation accepted before is answered, built into its round, completed
+and released; a coin of the asset is paid on out of round; the watcher
+answers exits, claims and sweeps; a smallest leaf set as a value takes the
+last rate read. Every other asset goes on as before. An asset that names no
+source has no rate, and nothing of it is priced from one.
 
 ## Boards
 
@@ -806,7 +839,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served with their smallest leaf, exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -1311,8 +1344,9 @@ entry to the configuration, pay the operator's wallet coins of it (`arcad
 `ExecReload=/bin/kill -HUP $MAINPID`). It reads the configuration again and
 from then on serves the asset at every entry, builds its rounds from its pool
 and publishes it in `info`, in the configuration's order; an asset's
-smallest leaf and the assets a round's fee is paid in (`fee_assets`) are
-taken the same way. A configuration that does not read, or that leaves out
+smallest leaf, its rate source and the assets a round's fee is paid in
+(`fee_assets`) are taken the same way, and every rate source is read at
+once. A configuration that does not read, or that leaves out
 an asset served now, is refused whole and logged, and the server runs on as
 it was: an asset stops being served only at a restart, after which the
 server takes no new work in it (a transfer or a refresh of its coins is
@@ -1573,6 +1607,17 @@ go out and every one is claimed.
 participation in Y wants: in one pass X's round takes the participation in
 X, Y's is not built and the one in Y waits and says why, and the next round
 takes it once the wallet is paid more Y.
+
+`tests/rates.rs` prices X by the node's own rate, Y by a file and, in a
+second server, X by a command: `info` shows each rate, its source and its
+age, and a smallest leaf set as a value in atoms at the asset's rate (a board
+below it refused); a file that stops reading keeps the last rate, saying
+why. Once Y's file says a time two hours back, past the hour a rate is good
+for, Y's rate is stale: a board and a participation of Y are refused
+`rate_stale` (503) naming Y, while a participation in X is taken, the
+participation in Y taken before is answered and runs in Y's round beside
+X's, and a coin of Y is paid on; once the file is fresh again a board of Y
+is taken.
 
 `tests/assets.rs` serves X and Y each on its own. Participations in X and Y
 run in rounds of their own: X's round spends X's pool alone and pays X alone,

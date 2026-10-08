@@ -48,7 +48,7 @@ impl Stack {
 		let s = keypair("operator");
 		let chain = Chain::new(rt.client().genesis_hash().unwrap());
 		let params = Arc::new(Params::new(chain, s.x_only_public_key().0,
-			BTreeMap::from([(x, AssetParams { min_leaf: MIN_LEAF })])));
+			BTreeMap::from([(x, AssetParams { min_leaf: MIN_LEAF, ..Default::default() })])));
 		let source = Arc::new(NodeSource::new(rt.client().clone()));
 		let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
 		let rx = finality.subscribe();

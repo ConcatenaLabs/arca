@@ -165,6 +165,25 @@ max_margin_multiple = 25
 # reserve of one atom on every node and every entry, whoever unrolls it
 # attaches a fee coin in an accepted asset, and its rounds pay their fee from
 # the pool of the first of fee_assets the node accepts.
+#
+# min_leaf is in the asset's atoms; min_leaf_value, in its place, is a value
+# in the reference unit, converted at the asset's rate (so it needs a rate
+# source).
+#
+# [assets.rate] names where the asset's rate comes from: "node" (the node's
+# own rate for the asset, as -con_any_asset_fees sets it), "file" (path = a
+# file holding {"rate": <integer>, "time": <unix seconds>}) or "command"
+# (command = [program, arguments…], printing the same). A rate is what 10^8
+# atoms of the asset are worth in atoms of the reference unit. It is read at
+# the start, at a reload and every 15 seconds, and is good for
+# max_age_seconds (an hour by default) from its time; once stale, the server
+# takes no new work in the asset (rate_stale) until it reads a fresh one. An
+# asset with no rate source prices nothing from a rate.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
+# min_leaf_value = "100000"
+# [assets.rate]
+# source = "file"
+# path = "/var/lib/arca/rates/<asset id>.json"
+# max_age_seconds = 3600

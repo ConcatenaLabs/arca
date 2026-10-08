@@ -358,7 +358,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-		"signer_unavailable" | "not_synced" | "signer_replaced" => StatusCode::SERVICE_UNAVAILABLE,
+		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
 	}
@@ -547,7 +547,15 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
 		genesis_hash: p.chain.genesis_hash().to_string(),
-		assets: p.assets.all().iter().map(|(a, ap)| api::AssetInfo { asset: a.to_string(), min_leaf: ap.min_leaf.to_string() }).collect(),
+		assets: p.assets.all().iter().map(|(a, ap)| api::AssetInfo {
+			asset: a.to_string(),
+			min_leaf: p.min_leaf(a).ok().map(|m| m.to_string()),
+			min_leaf_value: ap.min_leaf_value.map(|v| v.to_string()),
+			rate: p.rates.view(a, crate::rates::unix_now()).map(|v| api::RateInfo {
+				source: v.source.into(), rate: v.rate.map(|r| r.to_string()), time: v.time, age_seconds: v.age, max_age_seconds: v.max_age,
+				stale: v.stale, failed: v.failed,
+			}),
+		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
 		finality: api::FinalityInfo {

@@ -11,12 +11,21 @@ use arca_covenant::record::MAX_VALUE;
 use arca_covenant::transfer::DEPTH_LIMIT;
 use arca_covenant::{Chain, MedianTime, RelativeTime, ReserveFloor, WalletPolicy};
 
+use crate::rates::{atoms_of, unix_now, RateConfig, RateError, Rates};
+
 /// What the operator serves for one asset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AssetParams {
 	/// The smallest leaf the operator takes, in the asset's atoms: a leaf
 	/// smaller than its own exit cost is not protected.
 	pub min_leaf: u64,
+	/// The smallest leaf as a value, in atoms of the reference unit, when the
+	/// operator sets it so: converted at the asset's rate, it takes the place
+	/// of `min_leaf` ([`Params::min_leaf`]).
+	pub min_leaf_value: Option<u64>,
+	/// Where the asset's rate comes from ([`crate::rates`]); none when the
+	/// operator prices nothing of the asset from a rate.
+	pub rate: Option<RateConfig>,
 }
 
 /// The assets the operator serves, in the order its configuration lists
@@ -65,7 +74,7 @@ impl Assets {
 
 	/// What the operator serves for `asset`, if it serves it.
 	pub fn get(&self, asset: &AssetId) -> Option<AssetParams> {
-		self.read().map.get(asset).copied()
+		self.read().map.get(asset).cloned()
 	}
 
 	pub fn contains(&self, asset: &AssetId) -> bool {
@@ -81,7 +90,7 @@ impl Assets {
 	/// configuration's order.
 	pub fn all(&self) -> Vec<(AssetId, AssetParams)> {
 		let s = self.read();
-		s.order.iter().map(|a| (*a, s.map[a])).collect()
+		s.order.iter().map(|a| (*a, s.map[a].clone())).collect()
 	}
 
 	/// The assets a round's fee is paid in, in order of preference.
@@ -146,6 +155,9 @@ pub struct Params {
 	/// The assets served, each with its own minimum leaf, and the assets a
 	/// round's fee is paid in: a live table ([`Assets`]).
 	pub assets: Assets,
+	/// The operator's rate for each asset that names a source
+	/// ([`crate::rates`]): shared, as `assets` is.
+	pub rates: Rates,
 	/// The most reassignments a coin may be from a round or a board.
 	pub depth_limit: usize,
 	pub fees: FeeSchedule,
@@ -172,9 +184,12 @@ impl Params {
 	pub fn new(chain: Chain, operator: XOnlyPublicKey, assets: BTreeMap<AssetId, AssetParams>) -> Params {
 		let any_time = MedianTime::from_consensus(arca_covenant::time::LOCKTIME_THRESHOLD).expect("the first time");
 		let spec = WalletPolicy::new(chain, operator, any_time);
+		let rates = Rates::default();
+		rates.configure(&assets.iter().map(|(a, p)| (*a, p.rate.clone())).collect::<Vec<_>>());
 		let assets = Assets::new(assets.into_iter().collect(), None);
 		let mut p = Params {
 			chain, operator,
+			rates,
 			min_exit_delay: spec.min_exit_delay,
 			max_exit_delay: spec.max_exit_delay,
 			assets,
@@ -211,12 +226,44 @@ impl Params {
 		(self.min_exit_delay.units()..=self.max_exit_delay.units()).contains(&delay.units())
 	}
 
+	/// Serves `list` from now on, in its order, with each asset's rate
+	/// source, and pays rounds' fees in `fee_assets` (the served assets, in
+	/// order, when `None`).
+	pub fn serve(&self, list: Vec<(AssetId, AssetParams)>, fee_assets: Option<Vec<AssetId>>) {
+		self.rates.configure(&list.iter().map(|(a, p)| (*a, p.rate.clone())).collect::<Vec<_>>());
+		self.assets.replace(list, fee_assets);
+	}
+
+	/// The smallest leaf of `asset` the operator takes now, in the asset's
+	/// atoms: its `min_leaf`, or its `min_leaf_value` at the asset's last
+	/// rate, rounded up. A rate gone stale still sets it: new work in the
+	/// asset is refused before it is asked ([`Params::fresh_rate`]), and work
+	/// already taken goes on.
+	pub fn min_leaf(&self, asset: &AssetId) -> Result<u64, String> {
+		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
+		match a.min_leaf_value {
+			None => Ok(a.min_leaf),
+			Some(v) => match self.rates.last(asset) {
+				Some(rate) => Ok(atoms_of(v, rate).max(1)),
+				None => Err(format!("asset {}'s smallest leaf is a value of {} in the reference unit, and the operator has no rate for \
+					it yet", asset, v)),
+			},
+		}
+	}
+
+	/// `asset`'s rate for new work now: `None` for an asset with no rate
+	/// source, else its rate while it is fresh, and why the server takes no
+	/// new work in the asset (a board, a participation) otherwise.
+	pub fn fresh_rate(&self, asset: &AssetId) -> Result<Option<u64>, RateError> {
+		self.rates.fresh(asset, unix_now())
+	}
+
 	/// Why a leaf of `asset` and `value` is outside the published bounds, if
 	/// it is.
 	pub fn check_value(&self, asset: AssetId, value: u64) -> Result<(), String> {
-		let a = self.assets.get(&asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
-		if value < a.min_leaf {
-			return Err(format!("{} atoms is below the smallest leaf of asset {}, {}", value, asset, a.min_leaf));
+		let min = self.min_leaf(&asset)?;
+		if value < min {
+			return Err(format!("{} atoms is below the smallest leaf of asset {}, {}", value, asset, min));
 		}
 		if value > MAX_VALUE {
 			return Err(format!("{} atoms is above the largest value a leaf holds, {}", value, MAX_VALUE));

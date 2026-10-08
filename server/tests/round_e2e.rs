@@ -51,7 +51,7 @@ fn short_delay() -> RelativeTime {
 /// funded and final.
 async fn start() -> Running {
 	let mut r = Running::start_with(|c, y| {
-		c.assets.push(AssetSection { asset: y.to_string(), min_leaf: MIN_LEAF.to_string() });
+		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.exit_delay_units = Some((1, 338));
 	}).await;
 	let (x, y) = (r.x, r.y);

@@ -21,6 +21,7 @@ use crate::cosign::Cosigner;
 use crate::http::{router, App, Limiter};
 use crate::nursery::Nursery;
 use crate::params::{AssetParams, FeeSchedule, Params};
+use crate::rates::{RateConfig, RateSource};
 use crate::participations::Participations;
 use crate::forfeits::Forfeits;
 use crate::rounds::{RoundConfig, Rounds};
@@ -392,7 +393,65 @@ pub struct AssetSection {
 	/// The asset id, display order.
 	pub asset: String,
 	/// The smallest leaf, in the asset's atoms, as a decimal string.
-	pub min_leaf: String,
+	#[serde(default)]
+	pub min_leaf: Option<String>,
+	/// Or the smallest leaf as a value, in atoms of the reference unit, as a
+	/// decimal string: converted at the asset's rate, which `rate` must then
+	/// name a source for.
+	#[serde(default)]
+	pub min_leaf_value: Option<String>,
+	/// Where the asset's rate comes from ([`crate::rates`]); none when
+	/// absent.
+	#[serde(default)]
+	pub rate: Option<RateSection>,
+}
+
+impl AssetSection {
+	/// `asset`, its smallest leaf `min_leaf` atoms, and no rate.
+	pub fn new(asset: impl ToString, min_leaf: u64) -> AssetSection {
+		AssetSection { asset: asset.to_string(), min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None }
+	}
+}
+
+/// An asset's rate source ([`crate::rates`]).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RateSection {
+	/// `node` (the node's own rate for the asset), `file` or `command`.
+	pub source: String,
+	/// The file a `file` source reads.
+	#[serde(default)]
+	pub path: Option<PathBuf>,
+	/// The program and its arguments a `command` source runs.
+	#[serde(default)]
+	pub command: Option<Vec<String>>,
+	/// How long a rate is good for, in seconds from its time; an hour when
+	/// absent.
+	#[serde(default = "default_rate_max_age")]
+	pub max_age_seconds: u64,
+}
+
+fn default_rate_max_age() -> u64 {
+	3_600
+}
+
+impl RateSection {
+	/// The source this names, checked.
+	fn config(&self) -> Result<RateConfig, String> {
+		let source = match (self.source.as_str(), &self.path, &self.command) {
+			("node", None, None) => RateSource::Node,
+			("file", Some(p), None) => RateSource::File(p.clone()),
+			("command", None, Some(c)) if !c.is_empty() => RateSource::Command(c.clone()),
+			("node", ..) => return Err("source \"node\" takes neither path nor command".into()),
+			("file", ..) => return Err("source \"file\" takes a path, and no command".into()),
+			("command", ..) => return Err("source \"command\" takes a command, a program and its arguments, and no path".into()),
+			(other, ..) => return Err(format!("source {:?}: node, file or command", other)),
+		};
+		if self.max_age_seconds == 0 {
+			return Err("max_age_seconds is at least 1".into());
+		}
+		Ok(RateConfig { source, max_age: self.max_age_seconds })
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -657,7 +716,15 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 		if list.iter().any(|(b, _)| *b == id) {
 			return Err(StartError(format!("assets: asset {} is listed twice", id)));
 		}
-		list.push((id, AssetParams { min_leaf: parse_amount(&a.min_leaf).map_err(err("assets.min_leaf"))? }));
+		let rate = a.rate.as_ref().map(|r| r.config()).transpose().map_err(|e| StartError(format!("asset {}: rate: {}", id, e)))?;
+		let (min_leaf, min_leaf_value) = match (&a.min_leaf, &a.min_leaf_value) {
+			(Some(m), None) => (parse_amount(m).map_err(err("assets.min_leaf"))?, None),
+			(None, Some(v)) if rate.is_some() => (0, Some(parse_amount(v).map_err(err("assets.min_leaf_value"))?)),
+			(None, Some(_)) => return Err(StartError(format!("asset {}: min_leaf_value is converted at the asset's rate, and the asset \
+				names no rate source", id))),
+			_ => return Err(StartError(format!("asset {}: min_leaf, in atoms, or min_leaf_value, in the reference unit: one of them", id))),
+		};
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -732,7 +799,9 @@ impl Server {
 
 		let (list, fee_assets) = assets_of(config)?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
-		params.assets.replace(list, fee_assets);
+		params.serve(list, fee_assets);
+		// Every rate source read before anything is served.
+		params.rates.read_all(&finality).await;
 		params.fees = FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm };
 		if let Some(m) = config.fees.max_margin_multiple {
 			if m < 1 {
@@ -791,7 +860,7 @@ impl Server {
 		}
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
-		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval)];
+		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone())];
 		if config.watcher.enabled {
 			tasks.push(watcher.spawn());
 		}
@@ -868,8 +937,9 @@ impl Server {
 			config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
-	/// Takes the assets `config` serves, and the assets a round's fee is
-	/// paid in, without a restart: an asset added is served by every entry,
+	/// Takes the assets `config` serves, each with its smallest leaf and its
+	/// rate source, and the assets a round's fee is paid in, without a
+	/// restart, and reads every rate source: an asset added is served by every entry,
 	/// every round and the watcher from now on (its pool is the wallet's
 	/// coins of it, so it is funded by paying the wallet), and an asset whose
 	/// settings changed is served under its new ones. Nothing is taken when
@@ -878,7 +948,7 @@ impl Server {
 	/// new work in it and its holders take their coins on the chain. Any
 	/// other setting that changed takes a restart; the reload leaves it as
 	/// it was and says so.
-	pub fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
+	pub async fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
 		let (list, fee_assets) = assets_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();
@@ -886,27 +956,31 @@ impl Server {
 			return Err(StartError(format!("the configuration leaves out asset(s) {} that the server serves: an asset stops being \
 				served only at a restart (its holders then take their coins on the chain), so nothing was reloaded", removed.join(", "))));
 		}
-		let mut current = self.config.lock().unwrap_or_else(|e| e.into_inner());
-		let mut out = Reloaded::default();
-		for (a, p) in &list {
-			match before.iter().find(|(b, _)| b == a) {
-				None => out.added.push(*a),
-				Some((_, q)) if q != p => out.changed.push(*a),
-				Some(_) => {},
+		let out = {
+			let mut current = self.config.lock().unwrap_or_else(|e| e.into_inner());
+			let mut out = Reloaded::default();
+			for (a, p) in &list {
+				match before.iter().find(|(b, _)| b == a) {
+					None => out.added.push(*a),
+					Some((_, q)) if q != p => out.changed.push(*a),
+					Some(_) => {},
+				}
 			}
-		}
-		out.fee_assets = self.params.assets.fee_assets() != fee_assets.clone().unwrap_or_else(|| list.iter().map(|(a, _)| *a).collect());
-		// What a reload takes, laid over the configuration the server runs
-		// with: whatever else differs takes a restart.
-		let mut taken = current.clone();
-		taken.assets = config.assets.clone();
-		taken.fee_assets = config.fee_assets.clone();
-		if taken != *config {
-			out.needs_restart = restart_only(&taken, config);
-			log::warn!("reload: {} changed and take(s) a restart; left as they were", out.needs_restart.join(", "));
-		}
-		self.params.assets.replace(list, fee_assets);
-		*current = taken;
+			out.fee_assets = self.params.assets.fee_assets() != fee_assets.clone().unwrap_or_else(|| list.iter().map(|(a, _)| *a).collect());
+			// What a reload takes, laid over the configuration the server
+			// runs with: whatever else differs takes a restart.
+			let mut taken = current.clone();
+			taken.assets = config.assets.clone();
+			taken.fee_assets = config.fee_assets.clone();
+			if taken != *config {
+				out.needs_restart = restart_only(&taken, config);
+				log::warn!("reload: {} changed and take(s) a restart; left as they were", out.needs_restart.join(", "));
+			}
+			self.params.serve(list, fee_assets);
+			*current = taken;
+			out
+		};
+		self.params.rates.read_all(&self.finality).await;
 		log::info!("reload: the server serves {}; added {:?}, changed {:?}{}",
 			self.params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
 			out.added.iter().map(|a| a.to_string()).collect::<Vec<_>>(), out.changed.iter().map(|a| a.to_string()).collect::<Vec<_>>(),

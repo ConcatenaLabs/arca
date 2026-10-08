@@ -34,7 +34,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"double_spend", "fee", "forfeit_set", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record",
 	"invalid_transaction", "key_reused", "leaf_set", "malformed", "margin", "merge", "no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "out_of_bounds", "rate_limited", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
+	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
 	"unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
@@ -117,7 +117,42 @@ pub struct BoardsInfo {
 #[serde(deny_unknown_fields)]
 pub struct AssetInfo {
 	pub asset: String,
-	pub min_leaf: String,
+	/// The smallest leaf taken now, in the asset's atoms; absent while it is
+	/// a value the operator has no rate to convert yet.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub min_leaf: Option<String>,
+	/// The smallest leaf as the operator sets it when it sets it as a value,
+	/// in atoms of the reference unit: `min_leaf` is that at `rate`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub min_leaf_value: Option<String>,
+	/// The operator's rate for the asset, when it names a source for one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rate: Option<RateInfo>,
+}
+
+/// The operator's rate for an asset ([`crate::rates`]): what 10^8 atoms of
+/// the asset are worth in atoms of the reference unit, where it comes from,
+/// and how old it is. While it is `stale` the server takes no new work in
+/// the asset (`rate_stale`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateInfo {
+	/// `node`, `file` or `command`.
+	pub source: String,
+	/// The last rate read; absent before the first.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rate: Option<String>,
+	/// When its price was taken, in unix seconds, and how long ago.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub time: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub age_seconds: Option<u64>,
+	/// How long a rate is good for.
+	pub max_age_seconds: u64,
+	pub stale: bool,
+	/// Why the last read of the source failed, when it did.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub failed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

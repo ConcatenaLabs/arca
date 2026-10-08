@@ -1614,12 +1614,17 @@ impl Wallet {
 	}
 
 	/// The smallest leaf the server takes in `asset`, or a refusal when it
-	/// does not serve `asset`.
+	/// does not serve `asset`, or publishes no smallest leaf for it (one set
+	/// as a value, before the operator has a rate to convert it at).
 	pub(crate) fn min_leaf(info: &Value, asset: AssetId) -> Result<u64, Error> {
-		info["assets"].as_array().into_iter().flatten()
+		let a = info["assets"].as_array().into_iter().flatten()
 			.find(|a| a["asset"].as_str() == Some(&asset.to_string()))
-			.map(|a| amount(&a["min_leaf"], "min_leaf"))
-			.unwrap_or_else(|| Err(Error::Refused(format!("the server does not serve asset {}", asset))))
+			.ok_or_else(|| Error::Refused(format!("the server does not serve asset {}", asset)))?;
+		if a["min_leaf"].is_null() {
+			return Err(Error::Refused(format!("the server publishes no smallest leaf for asset {} now: it sets it as a value of {} in \
+				the reference unit and has no rate for the asset yet ({})", asset, a["min_leaf_value"], a["rate"])));
+		}
+		amount(&a["min_leaf"], "min_leaf")
 	}
 
 	// -----------------------------------------------------------------------

@@ -70,7 +70,7 @@ fn send(r: &Running, what: &str, tx: &Transaction) -> Txid {
 /// it follows the chain.
 async fn start_watching() -> Running {
 	let mut r = Running::start_with(|c, y| {
-		c.assets.push(server::server::AssetSection { asset: y.to_string(), min_leaf: common::running::MIN_LEAF.to_string() });
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
 		c.watcher.enabled = true;
 	}).await;
 	let (x, y) = (r.x, r.y);

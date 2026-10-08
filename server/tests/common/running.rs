@@ -78,7 +78,7 @@ impl Running {
 			},
 			finality: FinalitySection { poll_interval_ms: 200, ..Default::default() },
 			exit_delay_units: None,
-			assets: vec![AssetSection { asset: x.to_string(), min_leaf: MIN_LEAF.to_string() }],
+			assets: vec![AssetSection::new(x, MIN_LEAF)],
 			fee_assets: None,
 			fees: Default::default(),
 			// The tests before the watcher's drive every step by hand; a test
