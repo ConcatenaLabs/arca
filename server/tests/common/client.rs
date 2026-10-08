@@ -187,10 +187,19 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 		let re: Signature = sign_digest(&h.key, &plan.reassignment_message(k).unwrap().digest, &random32());
 		json!({"leaf_id": h.id.to_string(), "checkpoint_value": v.to_string(), "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())})
 	}).collect();
-	let outs: Vec<Value> = outputs.iter().map(|(a, v, l)| json!({
-		"asset": a.to_string(), "value": v.to_string(), "owner": hex(&l.owner.serialize()),
-		"owner_nonce": hex(&l.owner_nonce), "creator_nonce": hex(&l.creator_nonce), "exit_delay_units": l.exit_delay.units(),
-	})).collect();
+	let outs: Vec<Value> = outputs.iter().map(|(a, v, l)| {
+		let mut o = json!({
+			"asset": a.to_string(), "value": v.to_string(), "owner": hex(&l.owner.serialize()),
+			"owner_nonce": hex(&l.owner_nonce), "creator_nonce": hex(&l.creator_nonce), "exit_delay_units": l.exit_delay.units(),
+		});
+		if let Some(h) = &l.htlc {
+			o["htlc"] = json!({
+				"direction": h.direction.name(), "payment_hash": hex(&h.payment_hash),
+				"timeout": h.timeout.to_consensus_u32(), "operator_delay_units": h.operator_delay.units(),
+			});
+		}
+		o
+	}).collect();
 	json!({"inputs": inputs, "outputs": outs})
 }
 

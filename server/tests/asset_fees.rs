@@ -93,9 +93,10 @@ async fn each_asset_charges_its_own_schedule() {
 	let (fx, fy) = (info_of(&r.http, x)["fees"].clone(), info_of(&r.http, y)["fees"].clone());
 	println!("info.fees: {}\nX's fees: {}\nY's fees: {}", info["fees"], fx, fy);
 	assert_eq!((info["fees"]["refresh_ppm"].as_u64(), info["fees"]["offboard_ppm"].as_u64()), (Some(1_000), Some(2_000)));
-	assert_eq!(fx, json!({"refresh_ppm": 5_000, "refresh_base": "200", "offboard_ppm": 2_000, "offboard_base": "300"}));
+	assert_eq!(fx, json!({"refresh_ppm": 5_000, "refresh_base": "200", "offboard_ppm": 2_000, "offboard_base": "300",
+		"lightning_ppm": 0, "lightning_base": "0"}));
 	assert_eq!(fy, json!({"refresh_ppm": 1_000, "refresh_base": "400", "refresh_base_value": "1000", "offboard_ppm": 2_000,
-		"offboard_base": "0"}));
+		"offboard_base": "0", "lightning_ppm": 0, "lightning_base": "0"}));
 
 	// A refresh in each asset pays its asset's schedule, to the atom.
 	for (asset, label, (ppm, base, offboard_ppm, offboard_base)) in [(x, "X", (5_000, 200, 2_000, 300)), (y, "Y", (1_000, 400, 2_000, 0))] {

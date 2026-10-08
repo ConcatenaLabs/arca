@@ -18,6 +18,7 @@
 //! refused at every entry with the reason ([`LegRefusal`]).
 
 pub mod cln;
+pub mod send;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -58,6 +58,10 @@ pub struct AssetFees {
 	pub offboard_ppm: u64,
 	pub refresh_base: Amount,
 	pub offboard_base: Amount,
+	/// A payment over Lightning, either way: parts per million of what it
+	/// moves, and a fixed part.
+	pub lightning_ppm: u64,
+	pub lightning_base: Amount,
 }
 
 /// What the operator serves for one asset.
@@ -186,6 +190,10 @@ pub struct FeeSchedule {
 	pub refresh_base: u64,
 	/// The fixed part of an offboard, in atoms.
 	pub offboard_base: u64,
+	/// A payment over Lightning, either way: parts per million of what it
+	/// moves, and a fixed part in atoms.
+	pub lightning_ppm: u64,
+	pub lightning_base: u64,
 }
 
 impl FeeSchedule {
@@ -203,6 +211,13 @@ impl FeeSchedule {
 		let charged = left.min(Self::FULL_AFTER) as u128;
 		let full = value as u128 * self.refresh_ppm as u128 + self.refresh_base as u128 * 1_000_000;
 		let fee = (full * charged).div_ceil(Self::FULL_AFTER as u128 * 1_000_000);
+		fee.min(u64::MAX as u128) as u64
+	}
+
+	/// The fee for a payment over Lightning of `amount`, either way: its
+	/// parts per million, rounded up, and the fixed part.
+	pub fn lightning(&self, amount: u64) -> u64 {
+		let fee = (amount as u128 * self.lightning_ppm as u128).div_ceil(1_000_000) + self.lightning_base as u128;
 		fee.min(u64::MAX as u128) as u64
 	}
 
@@ -334,6 +349,8 @@ impl Params {
 			offboard_ppm: a.fees.offboard_ppm,
 			refresh_base: atoms("refresh_base", a.fees.refresh_base)?,
 			offboard_base: atoms("offboard_base", a.fees.offboard_base)?,
+			lightning_ppm: a.fees.lightning_ppm,
+			lightning_base: atoms("lightning_base", a.fees.lightning_base)?,
 		})
 	}
 

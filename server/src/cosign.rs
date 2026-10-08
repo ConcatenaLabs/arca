@@ -187,6 +187,10 @@ pub enum CosignError {
 	#[error("the receive request output {output} pays lapsed at median time {until} (the chain's is {now}): its receiver no longer \
 		waits for a payment to it, so the server records none; ask the receiver for a new request")]
 	RequestLapsed { output: usize, until: u32, now: u32 },
+	/// A rule of `htlc-1` coins: one made here only by a payment over
+	/// Lightning, and given up only once that payment failed.
+	#[error("{0}")]
+	Htlc(String),
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error("the server has not followed the chain yet")]
@@ -222,6 +226,7 @@ impl CosignError {
 			OpenReassignment(_) => "open_reassignment",
 			Mergeable(_) => "merge",
 			RequestLapsed { .. } => "request_lapsed",
+			Htlc(_) => "htlc",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
@@ -285,6 +290,23 @@ impl TransferRequest {
 			e.input(&o.leaf.exit_delay.units().to_le_bytes());
 			e.input(&o.mailbox.unwrap_or(o.leaf.owner).serialize());
 		}
+		// The terms of each htlc-1 leaf, after every output's fixed fields:
+		// a flag for each output, and the terms after a set one. A request of
+		// vtxo-1 leaves alone hashes as it always did.
+		if self.outputs.iter().any(|o| o.leaf.htlc.is_some()) {
+			e.input(&[0xfe]);
+			for o in &self.outputs {
+				match &o.leaf.htlc {
+					None => e.input(&[0]),
+					Some(t) => {
+						e.input(&[1, t.direction.byte()]);
+						e.input(&t.payment_hash);
+						e.input(&t.timeout.to_consensus_u32().to_le_bytes());
+						e.input(&t.operator_delay.units().to_le_bytes());
+					},
+				}
+			}
+		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
 }
@@ -315,8 +337,22 @@ impl Cosigner {
 		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 
-	/// Co-signs `req`: see the [module documentation](self).
+	/// Co-signs `req`: see the [module documentation](self). An output of the
+	/// `htlc-1` template is refused: one is made only by a payment over
+	/// Lightning ([`Cosigner::cosign_htlc`]).
 	pub async fn cosign(&self, req: &TransferRequest) -> Result<Cosigned, CosignError> {
+		self.cosign_with(req, false).await
+	}
+
+	/// [`Cosigner::cosign`] for a payment out of the tree over Lightning:
+	/// its outputs may include `htlc-1` leaves of a payment out of the tree,
+	/// which the caller ([`crate::lightning::send`]) has checked against the
+	/// invoice.
+	pub async fn cosign_htlc(&self, req: &TransferRequest) -> Result<Cosigned, CosignError> {
+		self.cosign_with(req, true).await
+	}
+
+	async fn cosign_with(&self, req: &TransferRequest, htlc_outputs: bool) -> Result<Cosigned, CosignError> {
 		let n = req.inputs.len();
 		if n == 0 || n > MAX_INPUTS {
 			return Err(CosignError::Malformed(format!("{} inputs; a transfer takes 1 to {}", n, MAX_INPUTS)));
@@ -342,6 +378,14 @@ impl Cosigner {
 		let mut outputs = Vec::with_capacity(m);
 		let mut keys = HashSet::new();
 		for o in &req.outputs {
+			match &o.leaf.htlc {
+				Some(_) if !htlc_outputs => return Err(CosignError::Htlc("an htlc-1 leaf is made only by a payment over Lightning \
+					(lightning_send), or by a round for one received".into())),
+				Some(t) if t.direction != arca_covenant::HtlcDirection::Send => return Err(CosignError::Htlc(
+					"an htlc-1 leaf a transfer makes is one the operator claims (direction send)".into())),
+				Some(t) => t.check(o.leaf.exit_delay).map_err(|e| CosignError::OutOfBounds(e.to_string()))?,
+				None => {},
+			}
 			if !self.params.exit_delay_ok(o.leaf.exit_delay) {
 				return Err(CosignError::OutOfBounds(format!(
 					"an exit delay of {} units; the operator takes {} to {}", o.leaf.exit_delay.units(),
@@ -397,6 +441,7 @@ impl Cosigner {
 				return Err(CosignError::NotServed(format!("coin {} is of asset {}, which is not served by this operator now: its \
 					owner takes it on the chain", i.leaf_id, c.coin.asset)));
 			}
+			self.check_htlc_input(&i.leaf_id, &c.coin).await?;
 			checked.push(c);
 		}
 		let hops = 1 + checked.iter().map(|c| c.coin.hops).max().expect("an input");
@@ -590,6 +635,26 @@ impl Cosigner {
 		log::info!("co-signed transfer {} of {} input(s) into {} new leaf/leaves",
 			crate::signer::hex(&transfer), n, m);
 		self.answer(&transfer).await
+	}
+
+	/// An `htlc-1` coin is given up only once its payment is decided against
+	/// its owner's claim on the operator: one paid out of the tree, only
+	/// once the payment failed (the operator never paid, and never will);
+	/// one received, only through its claim, the preimage handed over
+	/// (`lightning_receive_claim`). A coin the operator could claim with a
+	/// preimage it holds is never co-signed back to its owner.
+	async fn check_htlc_input(&self, id: &LeafId, coin: &arca_covenant::ValidCoin) -> Result<(), CosignError> {
+		let Some(t) = &coin.leaf.htlc else { return Ok(()) };
+		match t.direction {
+			arca_covenant::HtlcDirection::Send => match self.store.send(&t.payment_hash).await? {
+				Some(row) if row.state == crate::store::SendState::Failed && row.htlc_leaf_id == id.0 => Ok(()),
+				Some(row) => Err(CosignError::Htlc(format!("coin {} is the htlc-1 leaf of a Lightning payment that is {}: the operator \
+					co-signs its spend only once the payment has failed", id, row.state.name()))),
+				None => Err(CosignError::Htlc(format!("coin {} is an htlc-1 leaf of no Lightning payment this operator knows", id))),
+			},
+			arca_covenant::HtlcDirection::Receive => Err(CosignError::Htlc(format!("coin {} is an htlc-1 leaf of a payment received over \
+				Lightning: it is claimed with its preimage (lightning_receive_claim)", id))),
+		}
 	}
 
 	/// The least margin of a transaction of `vsize` vbytes in `asset`: four
@@ -865,4 +930,68 @@ fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
 		return Err(bad());
 	}
 	Ok(out)
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+	use arca_covenant::{HtlcDirection, HtlcTerms, MedianTime, NewLeaf, RelativeTime};
+	use elements::secp256k1_zkp::{Keypair, Secp256k1};
+
+	fn output(seed: u8, htlc: Option<HtlcTerms>) -> OutputRequest {
+		let key = Keypair::from_seckey_slice(&Secp256k1::new(), &[seed; 32]).unwrap();
+		OutputRequest {
+			asset: AssetId::from_byte_array([0xff; 32]),
+			value: 1_000,
+			leaf: NewLeaf {
+				owner: key.x_only_public_key().0, owner_nonce: [seed; 32], creator_nonce: [seed; 32],
+				exit_delay: RelativeTime::from_units(254).unwrap(), htlc,
+			},
+			mailbox: None,
+			until: None,
+		}
+	}
+
+	#[test]
+	fn an_htlc_leaf_s_terms_and_place_are_in_the_request_hash() {
+		let input = InputRequest {
+			leaf_id: LeafId([1; 32]), checkpoint_value: 900, checkpoint_sig: Signature::from_slice(&[2; 64]).unwrap(),
+			reassignment_sig: Signature::from_slice(&[3; 64]).unwrap(),
+		};
+		let t = HtlcTerms {
+			direction: HtlcDirection::Send, payment_hash: [9; 32], timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),
+			operator_delay: RelativeTime::from_units(36).unwrap(),
+		};
+		let req = |o: Vec<OutputRequest>| TransferRequest { inputs: vec![input.clone()], outputs: o }.hash();
+		let plain = req(vec![output(4, None), output(5, None)]);
+		let first = req(vec![output(4, Some(t)), output(5, None)]);
+		let second = req(vec![output(4, None), output(5, Some(t))]);
+		let other = req(vec![output(4, Some(HtlcTerms { payment_hash: [8; 32], ..t })), output(5, None)]);
+		let all = [plain, first, second, other];
+		for i in 0..all.len() {
+			for j in i + 1..all.len() {
+				assert_ne!(all[i], all[j], "requests {} and {} hash alike", i, j);
+			}
+		}
+		// A request of vtxo-1 leaves alone hashes as it did before htlc-1
+		// leaves existed: its transfers, recorded then, are answered again.
+		let mut e = sha256::Hash::engine();
+		e.input(REQUEST_TAG);
+		e.input(&[1]);
+		e.input(&[1; 32]);
+		e.input(&900u64.to_le_bytes());
+		e.input(&[2; 64]);
+		e.input(&[3; 64]);
+		e.input(&[2]);
+		for o in [output(4, None), output(5, None)] {
+			e.input(&o.asset.into_inner().to_byte_array());
+			e.input(&o.value.to_le_bytes());
+			e.input(&o.leaf.owner.serialize());
+			e.input(&o.leaf.owner_nonce);
+			e.input(&o.leaf.creator_nonce);
+			e.input(&o.leaf.exit_delay.units().to_le_bytes());
+			e.input(&o.leaf.owner.serialize());
+		}
+		assert_eq!(plain, sha256::Hash::from_engine(e).to_byte_array());
+	}
 }

@@ -13,6 +13,8 @@
 //! | `challenge` | POST | no: stored nowhere, and not limited ([`crate::auth`]) |
 //! | `register_board`, `board_status` | POST | no |
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
+//! | `lightning_send` | POST | by the owners' signatures over the transfer that pays the invoice |
+//! | `lightning_send_status` | POST | no: the payment hash names it, and a preimage proves only a payment |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
@@ -101,6 +103,8 @@ pub struct App {
 	pub replaced: Arc<std::sync::Mutex<Option<String>>>,
 	/// The Lightning gateway's nodes ([`crate::lightning`]).
 	pub gateway: Arc<crate::lightning::Gateway>,
+	/// Payments out of the tree over Lightning.
+	pub sends: Arc<crate::lightning::send::Sends>,
 }
 
 /// Asks the signer which keepers its record names and compares them with
@@ -356,7 +360,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"unknown_participation" | "unknown_batch" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
@@ -383,6 +387,22 @@ impl From<CosignError> for Refusal {
 			log::error!("cosign_transfer: {}", e);
 		}
 		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+impl From<crate::lightning::send::SendError> for Refusal {
+	fn from(e: crate::lightning::send::SendError) -> Refusal {
+		let code = e.code();
+		if code == "internal" {
+			log::error!("lightning_send: {}", e);
+		}
+		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+impl From<crate::lightning::LegRefusal> for Refusal {
+	fn from(e: crate::lightning::LegRefusal) -> Refusal {
+		Refusal::new(status_of(e.code()), e.code(), e.to_string())
 	}
 }
 
@@ -562,6 +582,8 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				refresh_base_value: ap.fees.refresh_base.value().map(|v| v.to_string()),
 				offboard_ppm: f.offboard_ppm, offboard_base: f.offboard_base.to_string(),
 				offboard_base_value: ap.fees.offboard_base.value().map(|v| v.to_string()),
+				lightning_ppm: f.lightning_ppm, lightning_base: f.lightning_base.to_string(),
+				lightning_base_value: ap.fees.lightning_base.value().map(|v| v.to_string()),
 			}),
 			lightning: app.gateway.asset_info(a),
 		}).collect(),
@@ -581,6 +603,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			free_window_seconds: FeeSchedule::FREE_FROM,
 			full_after_seconds: FeeSchedule::FULL_AFTER,
 			offboard_ppm: p.assets.default_fees().offboard_ppm,
+			lightning_ppm: p.assets.default_fees().lightning_ppm,
 			margin_multiple: crate::fees::MULTIPLE,
 			max_margin_multiple: p.max_margin_multiple,
 			floors,
@@ -597,7 +620,14 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		signer_record,
 		keepers: app.keepers.lock().unwrap_or_else(|e| e.into_inner()).clone(),
 		max_request_bytes: app.max_request as u64,
-		lightning: api::LightningInfo { bitcoin: app.gateway.bitcoin_info() },
+		lightning: api::LightningInfo {
+			bitcoin: app.gateway.bitcoin_info(),
+			send: api::LightningSendInfo {
+				operator_delay_units: app.sends.config().operator_delay.units(),
+				owner_delay_units: app.sends.config().owner_delay.units(),
+				timeout_seconds: app.sends.config().timeout_seconds,
+			},
+		},
 	})
 }
 
@@ -657,19 +687,30 @@ async fn board_status_call(State(app): State<Arc<App>>, body: Result<Bytes, Byte
 	}
 }
 
-async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Cosigned>, Refusal> {
-	let req: api::CosignTransfer = parse(body, app.max_request)?;
-	let mut inputs = Vec::with_capacity(req.inputs.len());
-	for i in &req.inputs {
-		inputs.push(InputRequest {
+/// A transfer request as the interface carries it, parsed.
+fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput]) -> Result<TransferRequest, Refusal> {
+	let mut ins = Vec::with_capacity(inputs.len());
+	for i in inputs {
+		ins.push(InputRequest {
 			leaf_id: leaf_id(&i.leaf_id)?,
 			checkpoint_value: amount(&i.checkpoint_value)?,
 			checkpoint_sig: sig(&i.checkpoint_sig)?,
 			reassignment_sig: sig(&i.reassignment_sig)?,
 		});
 	}
-	let mut outputs = Vec::with_capacity(req.outputs.len());
-	for o in &req.outputs {
+	let mut outputs = Vec::with_capacity(outs.len());
+	for o in outs {
+		let htlc = match &o.htlc {
+			None => None,
+			Some(h) => Some(arca_covenant::HtlcTerms {
+				direction: arca_covenant::HtlcDirection::from_name(&h.direction)
+					.ok_or_else(|| Refusal::malformed(format!("htlc direction {:?}: send or receive", h.direction)))?,
+				payment_hash: unhex32(&h.payment_hash).map_err(Refusal::malformed)?,
+				timeout: MedianTime::from_consensus(h.timeout).map_err(|e| Refusal::malformed(format!("htlc timeout: {}", e)))?,
+				operator_delay: RelativeTime::from_units(h.operator_delay_units)
+					.map_err(|e| Refusal::malformed(format!("htlc operator delay: {}", e)))?,
+			}),
+		};
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
@@ -679,14 +720,17 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
-				htlc: None,
+				htlc,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,
 		});
 	}
-	let done = app.cosigner.cosign(&TransferRequest { inputs, outputs }).await?;
-	Ok(Json(api::Cosigned {
+	Ok(TransferRequest { inputs: ins, outputs })
+}
+
+async fn cosigned_json(app: &App, done: &crate::cosign::Cosigned) -> Result<api::Cosigned, Refusal> {
+	Ok(api::Cosigned {
 		transfer_id: hex(&done.transfer_id),
 		signatures: done.signatures.iter().map(|(cp, re)| api::OperatorSignatures {
 			checkpoint: hex(cp.as_ref()), reassignment: hex(re.as_ref()),
@@ -696,10 +740,38 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 			record: hex(&r.to_bytes().map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?),
 		})).collect::<Result<_, Refusal>>()?,
 		signer_record: match done.signer_head {
-			Some((entry, h, s)) => Some(head_with_acks(&app, entry, &h, Some(&s)).await?),
+			Some((entry, h, s)) => Some(head_with_acks(app, entry, &h, Some(&s)).await?),
 			None => None,
 		},
-	}))
+	})
+}
+
+async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Cosigned>, Refusal> {
+	let req: api::CosignTransfer = parse(body, app.max_request)?;
+	let done = app.cosigner.cosign(&transfer_request(&req.inputs, &req.outputs)?).await?;
+	Ok(Json(cosigned_json(&app, &done).await?))
+}
+
+fn payment(r: &crate::store::SendRow) -> api::LightningPayment {
+	serde_json::from_value(crate::lightning::send::payment_json(r)).expect("the payment's JSON")
+}
+
+async fn lightning_send(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LightningSent>, Refusal> {
+	let req: api::LightningSend = parse(body, app.max_request)?;
+	let transfer = transfer_request(&req.inputs, &req.outputs)?;
+	let sent = app.sends.send(&crate::lightning::send::SendRequest { invoice: req.invoice, transfer }).await?;
+	Ok(Json(api::LightningSent { cosigned: cosigned_json(&app, &sent.cosigned).await?, payment: payment(&sent.payment) }))
+}
+
+async fn lightning_send_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningPayment>, Refusal>
+{
+	let req: api::LightningSendStatus = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	match app.sends.status(&hash).await? {
+		Some(r) => Ok(Json(payment(&r))),
+		None => Err(Refusal::new(StatusCode::NOT_FOUND, "unknown_payment", format!("no payment for hash {} is known", req.payment_hash))),
+	}
 }
 
 fn participation_status(s: &Status) -> api::ParticipationStatus {
@@ -1229,6 +1301,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/register_board", post(register_board))
 		.route("/v1/board_status", post(board_status_call))
 		.route("/v1/cosign_transfer", post(cosign_transfer))
+		.route("/v1/lightning_send", post(lightning_send))
+		.route("/v1/lightning_send_status", post(lightning_send_status))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/tree", post(tree))

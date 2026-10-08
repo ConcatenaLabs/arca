@@ -120,9 +120,9 @@ builds with the Rust version the Sequentia Wallet Kit pins, which is the
 browser (`wallet-wasm/`, its own workspace and lockfile) for
 `wasm32-unknown-unknown`.
 [lightning.yml](.github/workflows/lightning.yml) builds SeqLN at the commit it
-pins and runs the server's Lightning tests against SeqLN nodes on the chain
-SeqLN's `sequentia-regtest` network assumes, with Bitcoin Core for the
-operator's Lightning node on Bitcoin.
+pins and runs the server's Lightning tests and the wallet's Lightning
+scenario against SeqLN nodes on the chain SeqLN's `sequentia-regtest` network
+assumes, with Bitcoin Core for the operator's Lightning node on Bitcoin.
 
 ## Security
 

@@ -309,6 +309,7 @@ impl Watcher {
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
+		self.claim_paid_htlcs().await?;
 		self.claim_forfeits().await?;
 		self.recover_boards(now).await?;
 		self.recover_board_transfers(now).await?;
@@ -323,6 +324,7 @@ impl Watcher {
 	pub async fn urgent(&self) -> Result<(), WatcherError> {
 		let _one = self.running.lock().await;
 		self.answer_stale_exits().await?;
+		self.claim_paid_htlcs().await?;
 		self.claim_forfeits().await
 	}
 
@@ -675,6 +677,51 @@ impl Watcher {
 				ScriptKind::Board | ScriptKind::Connector => Ok(()),
 			};
 			Self::item(&format!("the {:?} of coin {} at {}", kind, hex(&leaf_id), op), r)?;
+		}
+		Ok(())
+	}
+
+	/// The `htlc-1` coin of every payment over Lightning the operator paid,
+	/// on the chain unspent: claimed with the preimage once the operator's
+	/// delay has run since it confirmed, which is before the owner's refund
+	/// can open (the coin's exit delay, longer). The coin comes on-chain
+	/// when its owner takes the coin it gave up home: the stale exit is
+	/// answered by its checkpoint and reassignment, which make it.
+	async fn claim_paid_htlcs(&self) -> Result<(), WatcherError> {
+		for s in self.store.sends_paid().await? {
+			let r = self.claim_htlc(&s).await;
+			Self::item(&format!("the htlc-1 coin {} of a paid payment", hex(&s.htlc_leaf_id)), r)?;
+		}
+		Ok(())
+	}
+
+	async fn claim_htlc(&self, s: &crate::store::SendRow) -> Result<(), WatcherError> {
+		let preimage = s.preimage.ok_or_else(|| WatcherError::Build("a paid payment without its preimage".into()))?;
+		let coin = self.coin(&s.htlc_leaf_id).await?;
+		let Some(terms) = coin.leaf.htlc else { return Ok(()) };
+		let spk = coin.leaf.script_pubkey();
+		for (txid, vout) in self.store.sightings_of(spk.as_bytes()).await? {
+			let op = OutPoint::new(txid_of(&txid), vout);
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
+				continue;
+			}
+			if !self.waited(op.txid, terms.claim_delay(coin.leaf.exit_delay)).await? {
+				continue;
+			}
+			let (leaf, asset, value) = (coin.leaf, coin.asset, coin.value);
+			let pay = self.payout(asset, value, &[], |outs, fee| {
+				let ks = leaf.claim_tx(op, asset, value, outs, fee).map_err(|e| e.to_string())?;
+				let t = ks.clone().finish(arca_covenant::HtlcTerms::claim_items(&dummy_sig(), &preimage)).tx;
+				Ok((ks, t))
+			}).await?;
+			let ks = pay.made;
+			let sig = self.operator_sig(&ks.tx, &ks.prevouts, 0, &ks.script).await?;
+			let n = ks.tx.input.len();
+			let u = ks.finish(arca_covenant::HtlcTerms::claim_items(&sig, &preimage));
+			let wallet = pay.fee_coin.map(|c| (n - 1, c)).into_iter().collect();
+			self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "htlc_claim", s.htlc_leaf_id.to_vec(),
+				format!("the htlc-1 coin {} of the payment of hash {}, paid, claimed with its preimage at {}", hex(&s.htlc_leaf_id),
+					hex(&s.payment_hash), op)).await?;
 		}
 		Ok(())
 	}

@@ -64,9 +64,22 @@ impl Running {
 		Self::start_tuned(keepers, required, |_, _, _| {}).await
 	}
 
+	/// [`Running::start_with`] on the chain SeqLN's `sequentia-regtest`
+	/// network assumes, for scenarios with Lightning nodes.
+	pub async fn start_seqln<F: FnOnce(&mut Config, AssetId, AssetId)>(tune: F) -> Running {
+		let rt = tokio::task::block_in_place(node::start_seqln);
+		Self::start_at(rt, 0, None, tune).await
+	}
+
 	async fn start_tuned<F: FnOnce(&mut Config, AssetId, AssetId)>(keepers: usize, required: Option<usize>, tune: F) -> Running {
-		let db = TestDb::new().await;
 		let rt = tokio::task::block_in_place(node::start);
+		Self::start_at(rt, keepers, required, tune).await
+	}
+
+	async fn start_at<F: FnOnce(&mut Config, AssetId, AssetId)>(rt: Regtest, keepers: usize, required: Option<usize>, tune: F)
+		-> Running
+	{
+		let db = TestDb::new().await;
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
 		let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));
 		let y = tokio::task::block_in_place(|| purse.issue(&rt, "asset Y", 100_000_000_000));
