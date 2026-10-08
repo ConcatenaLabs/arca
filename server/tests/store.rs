@@ -26,19 +26,60 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 	}
 }
 
+/// The newest schema.
+const SCHEMA: i32 = 17;
+
+/// What V17 adds, taken away again: with it, a test makes a database of an
+/// older schema from a new one, as a server before V17 left it.
+const UNDO_V17: &str = "DROP TABLE leaf_mailbox; DROP INDEX transfer_output_by_mailbox; DROP INDEX leaf_by_owner;
+	ALTER TABLE leaf DROP COLUMN seq;";
+
 #[tokio::test]
 async fn schema_from_nothing() {
 	let db = TestDb::new().await;
-	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	assert_eq!(db.store.schema_version().await.unwrap(), SCHEMA);
 	// Migrating again changes nothing.
 	db.store.migrate().await.unwrap();
 	let again = server::Store::connect(&db.url).await.unwrap();
-	assert_eq!(again.schema_version().await.unwrap(), 16);
+	assert_eq!(again.schema_version().await.unwrap(), SCHEMA);
+}
+
+/// A database of schema 16 moves to 17 in place: every leaf it holds is
+/// numbered for `leaf_data`'s cursor, in the order the leaves lie, and no
+/// leaf is bound to a mailbox key.
+#[tokio::test]
+async fn a_schema_16_database_moves_in_place_numbering_its_leaves() {
+	let db = TestDb::new().await;
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	client.batch_execute(&format!("{} DELETE FROM arca_schema WHERE version >= 17;", UNDO_V17)).await.unwrap();
+	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	let s = &db.store;
+	for n in 1..=3u8 {
+		let nonce = s.issue_nonce().await.unwrap();
+		s.insert_coins(&[coin(n, nonce)]).await.unwrap();
+	}
+	s.migrate().await.unwrap();
+	assert_eq!(s.schema_version().await.unwrap(), SCHEMA);
+	let rows = client.query("SELECT seq FROM leaf ORDER BY seq", &[]).await.unwrap();
+	let seqs: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+	assert_eq!(seqs.len(), 3, "every leaf numbered");
+	assert!(seqs.windows(2).all(|w| w[0] < w[1]), "each number its own: {:?}", seqs);
+	let bound: i64 = client.query_one("SELECT count(*) FROM leaf_mailbox", &[]).await.unwrap().get(0);
+	assert_eq!(bound, 0);
+	// A leaf the server learns of after the move is numbered after them.
+	let nonce = s.issue_nonce().await.unwrap();
+	s.insert_coins(&[coin(4, nonce)]).await.unwrap();
+	let last: i64 = client.query_one("SELECT seq FROM leaf WHERE leaf_id = $1", &[&&[4u8; 32][..]]).await.unwrap().get(0);
+	assert!(last > *seqs.last().unwrap(), "{} after {:?}", last, seqs);
+	println!("schema 16 -> 17: the leaves numbered {:?}, the next {}", seqs, last);
 }
 
 /// The keepers are pinned once: the first set the server reads stays, and a
 /// pin of another set returns the first. A database of schema 15 moves to
-/// 16 with no set pinned, pinned at the server's next start.
+/// the newest with no set pinned, pinned at the server's next start.
 #[tokio::test]
 async fn the_keepers_are_pinned_once() {
 	let db = TestDb::new().await;
@@ -46,10 +87,10 @@ async fn the_keepers_are_pinned_once() {
 	tokio::spawn(async move {
 		let _ = conn.await;
 	});
-	client.batch_execute("DROP TABLE keepers_pinned; DELETE FROM arca_schema WHERE version >= 16;").await.unwrap();
+	client.batch_execute(&format!("{} DROP TABLE keepers_pinned; DELETE FROM arca_schema WHERE version >= 16;", UNDO_V17)).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 15);
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	assert_eq!(db.store.schema_version().await.unwrap(), SCHEMA);
 	assert_eq!(db.store.pinned_keepers().await.unwrap(), None, "nothing pinned before the server reads its signer");
 	let k = vec!["aa".repeat(32), "bb".repeat(32)];
 	assert_eq!(db.store.pin_keepers(&k, 2).await.unwrap(), (k.clone(), 2));
@@ -59,8 +100,9 @@ async fn the_keepers_are_pinned_once() {
 	assert_eq!(none.store.pin_keepers(&[], 0).await.unwrap(), (vec![], 0), "an operator with no keeper pins none");
 }
 
-/// A database of schema 13 moves to 16 in place: the table of the keepers'
-/// acknowledgements is made, empty, and what the database held stays.
+/// A database of schema 13 moves to the newest in place: the table of the
+/// keepers' acknowledgements is made, empty, and what the database held
+/// stays.
 #[tokio::test]
 async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
 	let db = TestDb::new().await;
@@ -68,22 +110,23 @@ async fn a_schema_13_database_moves_in_place_to_keep_the_keepers_acks() {
 	tokio::spawn(async move {
 		let _ = conn.await;
 	});
-	client.batch_execute("DROP TABLE record_head_ack; DROP TABLE round_rerun; DROP TABLE keepers_pinned; DELETE FROM arca_schema WHERE version >= 14;").await.unwrap();
+	client.batch_execute(&format!("{} DROP TABLE record_head_ack; DROP TABLE round_rerun; DROP TABLE keepers_pinned; \
+		DELETE FROM arca_schema WHERE version >= 14;", UNDO_V17)).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 13);
 	db.store.set_signer_head_signed(3, &[3; 32], None).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	assert_eq!(db.store.schema_version().await.unwrap(), SCHEMA);
 	assert_eq!(db.store.signer_head().await.unwrap(), Some((3, [3; 32])), "what the database held stays");
 	assert!(db.store.head_acks(3, &[3; 32]).await.unwrap().is_empty());
 	let ack = server::keeper::WireAck { key: "11".repeat(32), nonce: "22".repeat(32), signature: "33".repeat(64) };
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	db.store.put_head_acks(3, &[3; 32], std::slice::from_ref(&ack)).await.unwrap();
 	assert_eq!(db.store.head_acks(3, &[3; 32]).await.unwrap(), vec![ack], "kept once");
-	println!("schema 13 -> 16: the keepers' acknowledgements kept by head");
+	println!("schema 13 -> {}: the keepers' acknowledgements kept by head", SCHEMA);
 }
 
 /// A database of schema 12, with a participation running again
-/// forfeit-first, moves to 16 in place: the participation is an ordinary
+/// forfeit-first, moves to the newest in place: the participation is an ordinary
 /// re-run, pending, with no reason to be void, and the table of the coins
 /// that keep re-runs apart from their lost rounds is there, empty.
 #[tokio::test]
@@ -94,15 +137,15 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		let _ = conn.await;
 	});
 	// Schema 12 as a server before it left it.
-	client.batch_execute(
-		"ALTER TABLE participation ADD COLUMN forfeit_first BOOLEAN NOT NULL DEFAULT false;
+	client.batch_execute(&format!(
+		"{} ALTER TABLE participation ADD COLUMN forfeit_first BOOLEAN NOT NULL DEFAULT false;
 		 ALTER TABLE participation DROP COLUMN void_reason;
 		 ALTER TABLE watcher_tx DROP COLUMN round_id;
 		 DROP TABLE record_head_ack;
 		 DROP TABLE round_rerun;
 		 DROP TABLE keepers_pinned;
-		 DELETE FROM arca_schema WHERE version >= 13;"
-	).await.unwrap();
+		 DELETE FROM arca_schema WHERE version >= 13;", UNDO_V17
+	)).await.unwrap();
 	assert_eq!(db.store.schema_version().await.unwrap(), 12);
 	let id = [7u8; 32];
 	client.execute(
@@ -111,10 +154,10 @@ async fn a_schema_12_database_with_a_forfeit_first_run_moves_in_place() {
 		&[&&id[..], &&[8u8; 32][..], &&[9u8; 32][..]],
 	).await.unwrap();
 	db.store.migrate().await.unwrap();
-	assert_eq!(db.store.schema_version().await.unwrap(), 16);
+	assert_eq!(db.store.schema_version().await.unwrap(), SCHEMA);
 	let p = db.store.participation(&id).await.unwrap().unwrap();
 	assert_eq!((p.state, p.attempt, p.void_reason.clone()), (server::store::ParticipationState::Pending, 1, None));
-	println!("schema 12 -> 16: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", p.state, p.attempt, p.void_reason);
+	println!("schema 12 -> {}: the forfeit-first run is now {:?} at attempt {}, void_reason {:?}", SCHEMA, p.state, p.attempt, p.void_reason);
 	let ties: i64 = client.query_one("SELECT count(*) FROM round_rerun", &[]).await.unwrap().get(0);
 	assert_eq!(ties, 0);
 	let cols: Vec<String> = client.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'participation'", &[])
