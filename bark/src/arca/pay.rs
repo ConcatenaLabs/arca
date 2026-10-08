@@ -82,18 +82,30 @@ fn leaf_probe() -> Script {
 	Script::from(b)
 }
 
-const REQUEST_PREFIX: &str = "arca:";
-const OFFER_PREFIX: &str = "arca-offer:";
-const ACCEPT_PREFIX: &str = "arca-accept:";
+/// What each text the wallet hands out holds, by which another wallet knows
+/// it, whatever its prefix ([`super::wallet::Spelling`]).
+const REQUEST_KIND: &str = "arca_request";
+const OFFER_KIND: &str = "arca_swap_offer";
+const ACCEPT_KIND: &str = "arca_swap_accept";
 
 fn encode(prefix: &str, v: &Value) -> String {
 	format!("{}{}", prefix, hex(v.to_string().as_bytes()))
 }
 
-fn decode(prefix: &str, s: &str, what: &str) -> Result<Value, Error> {
-	let h = s.trim().strip_prefix(prefix).ok_or_else(|| Error::Parse(format!("{}: it does not start with {}", what, prefix)))?;
+/// The text `s` the wallet was handed, `what` (a receive request, an offer,
+/// an acceptance): a prefix, any word and a colon, as the wallet that made
+/// it spells it, then the hex of its JSON, which names its `kind`.
+fn decode(kind: &str, s: &str, what: &str) -> Result<Value, Error> {
+	let (prefix, h) = s.trim().split_once(':').ok_or_else(|| Error::Parse(format!("{}: it has no prefix", what)))?;
+	if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+		return Err(Error::Parse(format!("{}: its prefix {:?} is not a word", what, prefix)));
+	}
 	let bytes = unhex(h)?;
-	serde_json::from_slice(&bytes).map_err(|e| Error::Parse(format!("{}: {}", what, e)))
+	let v: Value = serde_json::from_slice(&bytes).map_err(|e| Error::Parse(format!("{}: {}", what, e)))?;
+	if v.get(kind).is_none() {
+		return Err(Error::Parse(format!("{}: the text is not one", what)));
+	}
+	Ok(v)
 }
 
 fn xonly(s: &str) -> Result<XOnlyPublicKey, Error> {
@@ -162,7 +174,7 @@ fn first_expiry(record: &CoinRecord) -> Option<u32> {
 
 /// What the wallet says of a coin whose forfeit the operator's signer holds.
 const FORFEIT_HELD_NOTE: &str = "given up: the operator's signer holds a forfeit of this coin, signed in a refresh that did not \
-	complete, so it co-signs no spend of it; the coin is the wallet's on the chain, and sync takes it home from home_from (`arca exit` \
+	complete, so it co-signs no spend of it; the coin is the wallet's on the chain, and sync takes it home from home_from ({exit} \
 	takes it now)";
 
 /// The salt under which the operator's signer holds a forfeit, when `e` is
@@ -216,7 +228,7 @@ impl Wallet {
 			Ok(())
 		})?;
 		let mut req = json!({
-			"arca_request": 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
+			(REQUEST_KIND): 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"owner": hex(&key.serialize()), "owner_nonce": hex(&nonce),
 			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()),
 			"exit_delay_units": self.cfg.exit_delay_units, "until": until,
@@ -227,7 +239,7 @@ impl Wallet {
 		if let Some(v) = value {
 			req["value"] = json!(v.to_string());
 		}
-		Ok(json!({"request": encode(REQUEST_PREFIX, &req), "details": req}))
+		Ok(json!({"request": encode(&self.spelling.request, &req), "details": req}))
 	}
 
 	fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
@@ -374,7 +386,7 @@ impl Wallet {
 	/// names it. A request past its lapse (`until`) is refused before
 	/// anything is built or signed.
 	pub fn send(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<Value, Error> {
-		let req = decode(REQUEST_PREFIX, request, "the receive request")?;
+		let req = decode(REQUEST_KIND, request, "the receive request")?;
 		self.check_chain(&req, "receive request")?;
 		// A receiver waits for a payment to its request until the request
 		// lapses, and reads one paid later only if it happens to sync: a
@@ -535,10 +547,11 @@ impl Wallet {
 				let forfeited = forfeit_held(&e).and_then(|salt| mine.iter().find(|l| {
 					self.store.coin(l).ok().flatten().is_some_and(|c| c.salt == salt)
 				}).cloned());
+				let held_note = self.spelling.say(FORFEIT_HELD_NOTE);
 				self.store.atomically(|s| {
 					for l in mine {
 						if Some(l) == forfeited.as_ref() {
-							s.set_coin_state(l, "forfeited", FORFEIT_HELD_NOTE)?;
+							s.set_coin_state(l, "forfeited", &held_note)?;
 						} else {
 							s.set_coin_state(l, "live", "")?;
 						}
@@ -979,7 +992,7 @@ impl Wallet {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox });
 		}
 		let offer = json!({
-			"arca_swap_offer": 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
+			(OFFER_KIND): 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"give": {"asset": give_asset.to_string(), "value": give.to_string()},
 			"want": {"asset": want_asset.to_string(), "value": want.to_string()},
 			"margin": margin.to_string(),
@@ -995,7 +1008,7 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
-		Ok(json!({"swap": id, "offer": encode(OFFER_PREFIX, &offer), "details": offer}))
+		Ok(json!({"swap": id, "offer": encode(&self.spelling.offer, &offer), "details": offer}))
 	}
 
 	/// Checks an offer's coins as a receiver checks a coin, and their values.
@@ -1040,7 +1053,7 @@ impl Wallet {
 	/// exit deadline is less than [`SWAP_DEADLINE_MARGIN`] away, unless
 	/// `near_deadline` says to take it anyway.
 	pub fn swap_accept(&mut self, offer_text: &str, near_deadline: bool) -> Result<Value, Error> {
-		let offer = decode(OFFER_PREFIX, offer_text, "the offer")?;
+		let offer = decode(OFFER_KIND, offer_text, "the offer")?;
 		self.check_chain(&offer, "offer")?;
 		let id = hex(&sha256::Hash::hash(offer.to_string().as_bytes()).to_byte_array());
 		let give_asset = asset_of(&offer["give"]["asset"], "give")?;
@@ -1095,7 +1108,7 @@ impl Wallet {
 			sigs.push(json!({"input": k, "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
 		}
 		let accept = json!({
-			"arca_swap_accept": 1, "swap": id,
+			(ACCEPT_KIND): 1, "swap": id,
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
 			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
@@ -1113,7 +1126,7 @@ impl Wallet {
 		if change > 0 {
 			gets.push(json!({"asset": want_asset.to_string(), "value": change.to_string(), "change": true, "dates": dates}));
 		}
-		Ok(json!({"swap": id, "accept": encode(ACCEPT_PREFIX, &accept), "gets": {"asset": give_asset.to_string(), "value": give.to_string()},
+		Ok(json!({"swap": id, "accept": encode(&self.spelling.accept, &accept), "gets": {"asset": give_asset.to_string(), "value": give.to_string()},
 			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "coins": gets, "dates": dates}))
 	}
 
@@ -1150,7 +1163,7 @@ impl Wallet {
 	/// included: their dates are shown, and checked as [`Wallet::swap_accept`]
 	/// checks the taker's, before the maker signs anything.
 	pub fn swap_complete(&mut self, accept_text: &str, near_deadline: bool) -> Result<Value, Error> {
-		let accept = decode(ACCEPT_PREFIX, accept_text, "the acceptance")?;
+		let accept = decode(ACCEPT_KIND, accept_text, "the acceptance")?;
 		let id = accept["swap"].as_str().unwrap_or("").to_string();
 		let (role, offer, _, state) = self.store.swap(&id)?.ok_or_else(|| Error::Refused(format!("no swap {} offered by this wallet", id)))?;
 		if role != "maker" || state != "open" {
@@ -1312,5 +1325,76 @@ mod tests {
 		assert_eq!(forfeit_held(&refusal("double_spend", "the spend")), None);
 		assert_eq!(forfeit_held(&refusal("in_use", "the forfeit")), None);
 		assert_eq!(forfeit_held(&Error::Refused("already co-signed the forfeit under salt 00".into())), None);
+	}
+
+	/// W2.1's finding: what the library says names no command of the command
+	/// line (`arca sync`, `arca exit`, `arca address`): a client without one
+	/// shows it as it is. Every line of the library's code, comments and
+	/// tests aside, is read for one.
+	#[test]
+	fn the_library_says_the_act_not_the_command() {
+		let command = format!("`{} ", "arca");
+		let mut found = vec![];
+		for (file, text) in [("wallet.rs", include_str!("wallet.rs")), ("pay.rs", include_str!("pay.rs")), ("exit.rs", include_str!("exit.rs")),
+			("round.rs", include_str!("round.rs")), ("chain.rs", include_str!("chain.rs")), ("store.rs", include_str!("store.rs"))]
+		{
+			let code = text.split("#[cfg(test)]").next().unwrap_or("");
+			for (n, l) in code.lines().enumerate() {
+				if !l.trim_start().starts_with("//") && l.contains(&command) {
+					found.push(format!("{}:{}: {}", file, n + 1, l.trim()));
+				}
+			}
+		}
+		println!("lines of the library's code naming a command of the command line: {}", found.len());
+		for l in &found {
+			println!("  {}", l);
+		}
+		assert!(found.is_empty(), "{} line(s)", found.len());
+	}
+
+	/// A spelling with no command line says the act; the command line's says
+	/// its commands, as the wallet always did; every slot of every note is
+	/// filled either way.
+	#[test]
+	fn a_spelling_names_the_command_line_or_the_act() {
+		use super::super::wallet::{Spelling, SYNC_NOTE, HOME_NOTE, UNREACHABLE_NOTE, REFUSED_NOTE, EXPIRED_NOTE, FEE_COIN_MISSING};
+		let (neutral, cli) = (Spelling::default(), Spelling::command_line("arca"));
+		for note in [SYNC_NOTE, HOME_NOTE, UNREACHABLE_NOTE, REFUSED_NOTE, EXPIRED_NOTE, FEE_COIN_MISSING, FORFEIT_HELD_NOTE] {
+			for s in [&neutral, &cli] {
+				assert!(!s.say(note).contains('{'), "a slot left: {}", s.say(note));
+			}
+			assert!(!neutral.say(note).contains("arca"), "{}", neutral.say(note));
+		}
+		println!("SYNC_NOTE, no command line: {}", neutral.say(SYNC_NOTE));
+		println!("SYNC_NOTE, the command line: {}", cli.say(SYNC_NOTE));
+		println!("FEE_COIN_MISSING, no command line: {}", neutral.say(FEE_COIN_MISSING));
+		assert!(neutral.say(SYNC_NOTE).ends_with("Run sync at least once a day while the wallet holds a coin off the chain or waits for a \
+			payment, whatever next_sync_at says; an exit takes the coin now"));
+		assert!(cli.say(SYNC_NOTE).ends_with("Run `arca sync` at least once a day while the wallet holds a coin off the chain or waits \
+			for a payment, whatever next_sync_at says; `arca exit` takes the coin now"));
+		assert!(neutral.say(FEE_COIN_MISSING).contains("(send one to the wallet's address)"));
+		assert!(cli.say(FEE_COIN_MISSING).contains("(send one to an address of `arca address`)"));
+		assert!(neutral.say(FORFEIT_HELD_NOTE).ends_with("(an exit takes it now)"));
+		assert_eq!((neutral.request.as_str(), neutral.offer.as_str(), neutral.accept.as_str()), ("request:", "swap-offer:", "swap-accept:"));
+		assert_eq!((cli.request.as_str(), cli.offer.as_str(), cli.accept.as_str()), ("arca:", "arca-offer:", "arca-accept:"));
+	}
+
+	/// A text the wallet is handed is read whatever its prefix, and known by
+	/// what it holds: a request made under any spelling, an older wallet's
+	/// included, is a request; an offer is not one, nor a text without a
+	/// prefix.
+	#[test]
+	fn a_text_is_read_whatever_its_prefix_and_known_by_what_it_holds() {
+		let request = json!({(REQUEST_KIND): 1, "owner": "00"});
+		let offer = json!({(OFFER_KIND): 1});
+		for prefix in ["arca:", "request:", "leaf-pay:"] {
+			assert_eq!(decode(REQUEST_KIND, &encode(prefix, &request), "the receive request").unwrap(), request);
+		}
+		let e = decode(REQUEST_KIND, &encode("request:", &offer), "the receive request").unwrap_err();
+		assert!(e.to_string().contains("the receive request: the text is not one"), "{}", e);
+		let e = decode(REQUEST_KIND, &hex(request.to_string().as_bytes()), "the receive request").unwrap_err();
+		assert!(e.to_string().contains("it has no prefix"), "{}", e);
+		let e = decode(REQUEST_KIND, &encode("a b:", &request), "the receive request").unwrap_err();
+		assert!(e.to_string().contains("is not a word"), "{}", e);
 	}
 }
