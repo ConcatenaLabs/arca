@@ -59,6 +59,10 @@ pub enum BoardError {
 	SaltReused(String),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	/// The operator's rate for the board's asset is stale, or missing: no
+	/// new work in the asset.
+	#[error(transparent)]
+	Rate(#[from] crate::rates::RateError),
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
@@ -83,6 +87,7 @@ impl BoardError {
 			BoardError::OperatorKey => "operator_key",
 			BoardError::SaltReused(_) | BoardError::Store(StoreError::SaltReused(_)) => "salt",
 			BoardError::NotSynced => "not_synced",
+			BoardError::Rate(_) => "rate_stale",
 			BoardError::Store(StoreError::NonceUnknown) => "nonce_unknown",
 			BoardError::Store(StoreError::NonceUsed) => "nonce_used",
 			BoardError::Store(StoreError::ScriptReused) => "script_reused",
@@ -150,6 +155,9 @@ impl Boards {
 			}
 			return Err(BoardError::Exists);
 		}
+		// A new board is new work in its asset: its rate, if the operator
+		// prices the asset from one, must be fresh.
+		self.params.fresh_rate(&record.asset)?;
 		// The salt, then the nonce, before anything is asked of the node.
 		if let Some(known) = self.store.known_salts(&[record.salt()]).await?.first() {
 			return Err(BoardError::SaltReused(crate::signer::hex(known)));

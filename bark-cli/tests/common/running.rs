@@ -104,8 +104,8 @@ impl Running {
 			finality: FinalitySection { poll_interval_ms: 200, ..Default::default() },
 			exit_delay_units: Some((1, 338)),
 			assets: vec![
-				AssetSection { asset: x.to_string(), min_leaf: MIN_LEAF.to_string() },
-				AssetSection { asset: y.to_string(), min_leaf: MIN_LEAF.to_string() },
+				AssetSection::new(x, MIN_LEAF),
+				AssetSection::new(y, MIN_LEAF),
 			],
 			fee_assets: None,
 			fees: Default::default(),

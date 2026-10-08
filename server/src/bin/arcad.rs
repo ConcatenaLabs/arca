@@ -20,7 +20,8 @@
 //! alone.
 //!
 //! Running, it reads its configuration again on SIGHUP and takes the assets
-//! it serves, and the assets a round's fee is paid in, without a restart
+//! it serves, with their smallest leaves and rate sources, and the assets a
+//! round's fee is paid in, without a restart
 //! (`server::server::Server::reload`): an asset added is served from then
 //! on. A configuration that does not read, or that leaves out an asset
 //! served now, is refused whole and the server runs on as it was; any other
@@ -100,7 +101,7 @@ async fn main() {
 	loop {
 		tokio::select! {
 			_ = tokio::signal::ctrl_c() => break,
-			_ = hangup.recv() => reload(&server, &path),
+			_ = hangup.recv() => reload(&server, &path).await,
 		}
 	}
 	server.stop();
@@ -108,7 +109,7 @@ async fn main() {
 
 /// Reads the configuration at `path` again and hands it to the running
 /// server, logging what it took.
-fn reload(server: &Server, path: &str) {
+async fn reload(server: &Server, path: &str) {
 	let config: Config = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| toml::from_str(&t).map_err(|e| e.to_string())) {
 		Ok(c) => c,
 		Err(e) => {
@@ -116,7 +117,7 @@ fn reload(server: &Server, path: &str) {
 			return;
 		},
 	};
-	match server.reload(&config) {
+	match server.reload(&config).await {
 		Ok(r) => log::info!("reload: {}: {} asset(s) added, {} changed{}", path, r.added.len(), r.changed.len(),
 			if r.needs_restart.is_empty() { String::new() } else { format!("; take a restart: {}", r.needs_restart.join(", ")) }),
 		Err(e) => log::error!("reload: {}: {}", path, e),

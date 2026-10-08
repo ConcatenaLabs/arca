@@ -258,6 +258,10 @@ pub enum ParticipationError {
 	SignedAlready(String),
 	#[error("the signer: {0}")]
 	Signer(SignerError),
+	/// The operator's rate for the participation's asset is stale, or
+	/// missing: no new work in the asset.
+	#[error(transparent)]
+	Rate(crate::rates::RateError),
 	#[error(transparent)]
 	Store(StoreError),
 	#[error("{0}")]
@@ -290,6 +294,7 @@ impl ParticipationError {
 			NotSynced => "not_synced",
 			SignedAlready(_) => "double_spend",
 			Signer(_) => "signer_unavailable",
+			Rate(_) => "rate_stale",
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -494,6 +499,10 @@ impl Participations {
 		if !others.is_empty() {
 			return Err(ParticipationError::Assets(one_asset(asset, &others)));
 		}
+		// New work in the asset: its rate, if the operator prices the asset
+		// from one, must be fresh. A participation taken before is answered
+		// above whatever the rate.
+		p.fresh_rate(&asset).map_err(ParticipationError::Rate)?;
 
 		// The coins given up, each checked, each attested by its owner, up to
 		// its exit deadline: three days before its first expiry, or before the

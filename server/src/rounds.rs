@@ -660,7 +660,7 @@ impl Rounds {
 				.map_err(|e| RoundError::Internal(e.to_string()))?;
 			let params = TreeParams {
 				asset, chain: self.params.chain, schedule, burn: false, radix: self.config.radix, reserve,
-				min_leaf: self.params.assets.get(&asset).map(|a| a.min_leaf).unwrap_or(1),
+				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
 			let tree = Tree::build(params, &specs).map_err(|e| RoundError::Internal(format!("the tree of asset {}: {}", asset, e)))?;
 			*pays.entry(asset).or_default() += tree.batch_output().value;
@@ -692,6 +692,16 @@ impl Rounds {
 			}
 		}
 		Ok(taken)
+	}
+
+	/// The smallest leaf a batch of `asset` holding `specs` publishes: the
+	/// operator's smallest leaf now, or the smallest of `specs` when that is
+	/// less. Each leaf was within the bounds when its participation was
+	/// taken; a smallest leaf set as a value moves with the asset's rate
+	/// since, and the builder refuses a leaf below the batch's smallest.
+	fn tree_min_leaf(params: &Params, asset: &AssetId, specs: &[LeafSpec]) -> u64 {
+		let least = specs.iter().map(|l| l.value).min().unwrap_or(1);
+		params.min_leaf(asset).unwrap_or(1).min(least).max(1)
 	}
 
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
@@ -798,11 +808,11 @@ impl Rounds {
 			let mut trees = vec![];
 			for ((asset, leaves), token) in groups.iter().zip(tokens) {
 				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
+				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
 				let params = TreeParams {
 					asset: *asset, chain, schedule, burn: false, radix, reserve: reserves[asset],
-					min_leaf: p.assets.get(asset).map(|a| a.min_leaf).unwrap_or(1),
+					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
-				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
 				let tree = Tree::build(params, &specs).map_err(|e| format!("the tree of asset {}: {}", asset, e))?;
 				outputs.push(tree.batch_output());
 				outputs.push(ExplicitOutput::new(*token, 1, tree.clock0_script_pubkey()));

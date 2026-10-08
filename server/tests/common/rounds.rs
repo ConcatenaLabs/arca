@@ -24,7 +24,7 @@ pub const VALUE: u64 = 1_000_000;
 /// all final.
 pub async fn start() -> Running {
 	let mut r = Running::start_with(|c, y| {
-		c.assets.push(AssetSection { asset: y.to_string(), min_leaf: MIN_LEAF.to_string() });
+		c.assets.push(AssetSection::new(y, MIN_LEAF));
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;

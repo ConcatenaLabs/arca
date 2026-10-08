@@ -153,7 +153,7 @@ async fn two_fee_coins_serve_eight_forfeits_of_an_unlisted_asset() {
 	let d = RelativeTime::from_units(8).unwrap();
 	let mut r = Running::start_with(|c, y| {
 		c.exit_delay_units = Some((8, 8));
-		c.assets.push(server::server::AssetSection { asset: y.to_string(), min_leaf: common::running::MIN_LEAF.to_string() });
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;
@@ -179,7 +179,7 @@ async fn no_forfeit_goes_out_unfunded() {
 	let d = RelativeTime::from_units(8).unwrap();
 	let mut r = Running::start_with(|c, y| {
 		c.exit_delay_units = Some((8, 8));
-		c.assets.push(server::server::AssetSection { asset: y.to_string(), min_leaf: common::running::MIN_LEAF.to_string() });
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
 		// Fees a thousand times the floor: a small pool covers few of them.
 		c.fee_multiple = 1_000;
 		c.metrics_listen = Some("127.0.0.1:0".into());
