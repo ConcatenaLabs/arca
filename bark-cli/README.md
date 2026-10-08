@@ -300,14 +300,20 @@ the keys, but which coins were spent off-chain is in the store and the server.
   is read only by `sync` too, and its sender may have paid with a coin days
   from its exit date. So run `sync` at least once a day while the wallet
   holds a coin off the chain or waits for a payment, whatever `next_sync_at`
-  says. `sync`'s `schedule` says when it must run next (`next_sync_at`), and
-  never more than a day ahead while a receive request the wallet handed out
-  is unpaid, saying so (`why`), for 27 days from when it was handed out (the
-  acceptance horizon, `REQUEST_HOLDS`); `receive_requests` lists every
-  unpaid request with the median time it was handed out at, `waiting` until
-  `lapses_at` and `lapsed` from then, when it no longer holds the schedule
-  (a coin paid to it later is still read by the next `sync`). A program
-  built on the library gets the same
+  says. A receive request lasts 27 days from when it was handed out (the
+  acceptance horizon, `REQUEST_HOLDS`) and carries the median time it lapses
+  at (`until`): `send` refuses a request past it before anything is built
+  or signed ("the request lapsed at …: ask the receiver for a new one").
+  `sync`'s `schedule` says when it must run next (`next_sync_at`), and never
+  more than a day ahead while a receive request the wallet handed out is
+  unpaid and has not lapsed, saying so (`why`); `receive_requests` lists
+  every unpaid request with the median time it was handed out at, `waiting`
+  until `lapses_at` and `lapsed` from then (`lapsed_at`), when it no longer
+  holds the schedule. A request handed out before requests carried their
+  lapse is `waiting` with `lapses_at` null, since its sender may pay it at
+  any time: it holds the schedule until it is paid or forgotten
+  (`forget-request`). A coin paid to a lapsed or forgotten request is still
+  read, by any later `sync`. A program built on the library gets the same
   from `Wallet::sync_schedule`, which it can call on a timer, and runs
   `Wallet::sync` when it says so. A payment spends the coins furthest from
   their exit date first, so a receiver gets the longest life the wallet can
@@ -379,8 +385,9 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
-| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for |
-| `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
+| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, and the median time it lapses at (`until`, 27 days on) |
+| `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync` |
+| `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, each under a fresh key whose own signature proves the wallet holds it, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
@@ -611,6 +618,11 @@ and holding it there, with the reason shown:
   a payment out of a wallet holding an old leaf and a younger board takes
   the board; and a request never paid holds the schedule at a day until it
   lapses 27 days after it was handed out, and no longer the day after;
+  paid the day after its lapse, the payment refused before anything is
+  signed, the payer's coins as they were; paid on day 26, read at the
+  receiver's next scheduled wake; and a request handed out without a lapse
+  holding the schedule past 27 days, paid on day 28 and read, and another
+  holding it until it is forgotten;
 - a forfeit whose operator's half came ten minutes late, after the wallet
   took its board home in the coin's last day: the server releases the
   participation, the watcher answers the exit with the forfeit, and the

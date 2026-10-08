@@ -111,7 +111,12 @@ enum Cmd {
 		#[arg(long)]
 		amount: Option<u64>,
 	},
-	/// Pays a receive request out of round.
+	/// Stops waiting for a payment to an unpaid receive request, by the key
+	/// it names (`owner`, as `sync`'s `schedule.receive_requests` lists
+	/// it): it no longer holds the schedule at a day. A coin paid to it is
+	/// still read, by any later sync.
+	ForgetRequest { owner: String },
+	/// Pays a receive request out of round; one past its lapse is refused.
 	Send {
 		request: String,
 		#[arg(long)]
@@ -347,6 +352,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Board { asset: a, amount, fee_asset } => w.board(asset(&a)?, amount, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Boards => w.boards(),
 		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
+		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
 		Cmd::Participate { leaves, not_before, max_fee_ppm } => {

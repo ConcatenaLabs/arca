@@ -5954,3 +5954,166 @@ async fn d58_a_receive_request_no_longer_holds_the_schedule_once_it_lapses() {
 	assert_eq!(req["lapsed_at"].as_u64(), Some(at + horizon as u64));
 	let _ = std::fs::remove_dir_all(&b.dir);
 }
+
+// ---------------------------------------------------------------------------
+// A receive request carries its lapse
+// ---------------------------------------------------------------------------
+
+/// A receive request as a wallet handed it out before requests carried
+/// their lapse: `req` without `until`.
+fn without_lapse(details: &Value) -> String {
+	let mut d = details.clone();
+	d.as_object_mut().unwrap().remove("until");
+	let text = d.to_string();
+	format!("arca:{}", text.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
+/// Takes the requests of `owners` out of `w`'s record of when each request
+/// lapses, as a wallet that kept none left them.
+fn as_kept_without_lapse(w: &Arca, nonces: &[&str]) {
+	let db = rusqlite::Connection::open(w.dir.join("arca.sqlite")).unwrap();
+	let kept: Option<String> = db.query_row("SELECT value FROM meta WHERE key = 'receive_until'", [], |row| row.get(0)).ok();
+	if let Some(kept) = kept {
+		let mut m: serde_json::Map<String, Value> = serde_json::from_str(&kept).unwrap();
+		for n in nonces {
+			m.remove(*n);
+		}
+		db.execute("UPDATE meta SET value = ?1 WHERE key = 'receive_until'", [serde_json::to_string(&m).unwrap()]).unwrap();
+	}
+}
+
+/// R7i F1, turned around. B holds nothing and hands out one receive request,
+/// which carries its lapse, 27 days on. A day after the lapse A tries to pay
+/// it out of a board: `send` refuses it before anything is built or signed,
+/// naming the lapse, and A's coin is as it was, payable elsewhere; B's
+/// schedule shows the request lapsed, with both dates.
+#[tokio::test(flavor = "multi_thread")]
+async fn f1_a_request_past_its_lapse_is_refused_before_anything_is_signed() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b, c) = (Arca::new("F1LA"), Arca::new("F1LB"), Arca::new("F1LC"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let asked_req = b.ok(&["receive"]);
+	let req = asked_req["request"].as_str().unwrap().to_string();
+	let asked = common::node::median_time(&r.rt);
+	let until = asked_req["details"]["until"].as_u64();
+	println!("F1L the request handed out at median time {}: until {:?}", asked, until);
+	d57_to(&r, asked + 28 * 86_400).await;
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let before = (coin_of(&a, &boards[0]), a.ok(&["balance"])["arca"].clone());
+	let (paid, out) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let after = (coin_of(&a, &boards[0]), a.ok(&["balance"])["arca"].clone());
+	println!("F1L A pays the request at median time {} (a day past its lapse): ok={} | {}", common::node::median_time(&r.rt), paid,
+		out["error"]["message"]);
+	println!("F1L A's coin before {} {} | after {} {} | balance before {} | after {}", before.0["state"], before.0["value"], after.0["state"],
+		after.0["value"], before.1, after.1);
+	assert!(!paid, "a request past its lapse is refused: {}", out);
+	let m = out["error"]["message"].as_str().unwrap_or("");
+	assert!(m.contains(&format!("the request lapsed at {}", until.unwrap())) && m.contains("ask the receiver for a new one"), "{}", m);
+	assert_eq!(before, after, "nothing of A's changed");
+	assert_eq!(after.0["state"], "live");
+	// Nothing of it went to the server: the coin is payable elsewhere.
+	c.ok(&create_args(&url, &r.node_url()));
+	let fresh = c.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let elsewhere = a.ok(&["send", &fresh, "--amount", "600000", "--asset", &x.to_string()]);
+	assert_eq!(elsewhere["inputs"][0], boards[0].as_str(), "{}", elsewhere);
+	let s = b.ok(&["sync"])["schedule"].clone();
+	println!("F1L B's schedule: next_sync_at {} | receive_requests {}", s["next_sync_at"], s["receive_requests"]);
+	let shown = &s["receive_requests"][0];
+	assert_eq!(shown["state"], "lapsed", "{}", s);
+	assert_eq!(shown["lapsed_at"].as_u64(), until, "{}", s);
+	assert!(shown["asked_at"].as_u64().is_some_and(|t| t.abs_diff(asked as u64) <= 600), "{}", s);
+	assert!(s["next_sync_at"].is_null(), "{}", s);
+	for w in [&a, &b, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7i F1's other side, kept: a request paid on day 26, before its lapse,
+/// is read at the receiver's next scheduled wake, by a client that syncs
+/// only when `sync_schedule` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn f1_a_request_paid_on_day_26_is_read_at_the_next_scheduled_wake() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("F1DA"), Arca::new("F1DB"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let asked = common::node::median_time(&r.rt);
+	let mut s = b.ok(&["sync"]);
+	while let Some(next) = s["schedule"]["next_sync_at"].as_u64() {
+		if next as u32 >= asked + 26 * 86_400 {
+			break;
+		}
+		d57_to(&r, next as u32).await;
+		s = b.ok(&["sync"]);
+	}
+	d57_to(&r, asked + 26 * 86_400).await;
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let paid_at = common::node::median_time(&r.rt);
+	let next = s["schedule"]["next_sync_at"].as_u64().expect("B's schedule names a time");
+	d57_to(&r, next as u32).await;
+	let s = b.ok(&["sync"]);
+	let got = s["mailbox"]["accepted"].clone();
+	println!("F1D paid at median time {} (day {:.2}); B wakes at {} ({} s later): accepted {}", paid_at,
+		(paid_at - asked) as f64 / 86_400.0, next, next as i64 - paid_at as i64, got);
+	assert_eq!(got.as_array().map(|v| v.len()), Some(1), "{}", s);
+	assert_eq!(got[0]["value"], "600000", "{}", got);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// R7i F1: a request handed out before requests carried their lapse names
+/// none, so its sender may pay it at any time; the wallet waits for it
+/// until it is paid or forgotten. B holds two such requests; 28 days on its
+/// schedule is still a day ahead at most, both waiting with no lapse. B
+/// forgets one: it is lapsed from then, and the other still holds the
+/// schedule. A pays the other on day 28, and B reads it at its next wake.
+#[tokio::test(flavor = "multi_thread")]
+async fn f1_a_request_without_a_lapse_holds_the_schedule_until_paid_or_forgotten() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("F1OA"), Arca::new("F1OB"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let (r1, r2) = (b.ok(&["receive"]), b.ok(&["receive"]));
+	let asked = common::node::median_time(&r.rt);
+	let nonce = |v: &Value| v["details"]["owner_nonce"].as_str().unwrap().to_string();
+	as_kept_without_lapse(&b, &[&nonce(&r1), &nonce(&r2)]);
+	let old1 = without_lapse(&r1["details"]);
+	d57_to(&r, asked + 28 * 86_400).await;
+	let s = b.ok(&["sync"])["schedule"].clone();
+	let now = common::node::median_time(&r.rt);
+	println!("F1O 28 days on (median time {}): next_sync_at {} | why {} | receive_requests {}", now, s["next_sync_at"], s["why"],
+		s["receive_requests"]);
+	assert!(s["next_sync_at"].as_u64().is_some_and(|t| t <= now as u64 + 86_400), "an old request holds the schedule: {}", s);
+	for q in s["receive_requests"].as_array().unwrap() {
+		assert_eq!((q["state"].as_str(), q["lapses_at"].is_null()), (Some("waiting"), true), "{}", s);
+	}
+	let owner2 = r2["details"]["owner"].as_str().unwrap();
+	let forgot = b.ok(&["forget-request", owner2]);
+	assert_eq!(forgot["state"], "lapsed");
+	let s = b.ok(&["sync"])["schedule"].clone();
+	println!("F1O one forgotten: next_sync_at {} | receive_requests {}", s["next_sync_at"], s["receive_requests"]);
+	let by: std::collections::BTreeMap<String, Value> = s["receive_requests"].as_array().unwrap().iter()
+		.map(|q| (q["owner"].as_str().unwrap().to_string(), q.clone())).collect();
+	assert_eq!(by[owner2]["state"], "lapsed", "{}", s);
+	assert_eq!(by[r1["details"]["owner"].as_str().unwrap()]["state"], "waiting", "{}", s);
+	let next = s["next_sync_at"].as_u64().expect("the other still holds the schedule");
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["send", &old1, "--amount", "600000", "--asset", &x.to_string()]);
+	d57_to(&r, next as u32).await;
+	let s = b.ok(&["sync"]);
+	println!("F1O A paid the old request on day 28; B's next wake: accepted {} | receive_requests {}", s["mailbox"]["accepted"],
+		s["schedule"]["receive_requests"]);
+	assert_eq!(s["mailbox"]["accepted"][0]["value"], "600000", "{}", s);
+	// A request paid is no longer one to forget.
+	b.refused(&["forget-request", r1["details"]["owner"].as_str().unwrap()], "no unpaid receive request");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
