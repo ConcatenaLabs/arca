@@ -34,7 +34,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"double_spend", "fee", "forfeit_set", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record",
 	"invalid_transaction", "key_reused", "leaf_set", "malformed", "margin", "merge", "no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "out_of_bounds", "rate_limited", "release_early", "request_too_large", "round_not_final", "salt",
+	"operator_key", "out_of_bounds", "rate_limited", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
 	"unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
@@ -292,6 +292,14 @@ pub struct TransferOutput {
 	/// The mailbox the new coin goes to; the owner key when absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mailbox: Option<String>,
+	/// When the receive request this output pays lapses, as the request
+	/// carries it (`until`, a median time): its receiver waits for a payment
+	/// to it until then. The server records no transfer once the chain's
+	/// median time has reached it (`request_lapsed`); a transfer it recorded
+	/// before completes. Absent for the sender's own change, and from a
+	/// sender that does not name it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub until: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -663,6 +663,7 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
+			until: o.until,
 		});
 	}
 	let done = app.cosigner.cosign(&TransferRequest { inputs, outputs }).await?;

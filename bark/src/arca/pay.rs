@@ -117,22 +117,29 @@ fn asset_of(v: &Value, what: &str) -> Result<AssetId, Error> {
 }
 
 /// One output of a transfer: its asset and value, its leaf, the mailbox it
-/// is posted to.
+/// is posted to, and, for a payment to a receive request, when that request
+/// lapses (`until`), which the server checks too: it records no payment to a
+/// request past its lapse.
 #[derive(Debug, Clone)]
 pub(crate) struct Out {
 	pub asset: AssetId,
 	pub value: u64,
 	pub leaf: NewLeaf,
 	pub mailbox: XOnlyPublicKey,
+	pub until: Option<u32>,
 }
 
 impl Out {
 	fn json(&self) -> Value {
-		json!({
+		let mut v = json!({
 			"asset": self.asset.to_string(), "value": self.value.to_string(), "owner": hex(&self.leaf.owner.serialize()),
 			"owner_nonce": hex(&self.leaf.owner_nonce), "creator_nonce": hex(&self.leaf.creator_nonce),
 			"exit_delay_units": self.leaf.exit_delay.units(), "mailbox": hex(&self.mailbox.serialize()),
-		})
+		});
+		if let Some(u) = self.until {
+			v["until"] = json!(u);
+		}
+		v
 	}
 
 	fn from_json(v: &Value) -> Result<Out, Error> {
@@ -147,6 +154,7 @@ impl Out {
 					.map_err(|e| Error::Parse(e.to_string()))?,
 			},
 			mailbox: XOnlyPublicKey::from_slice(&unhex(v["mailbox"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
+			until: v["until"].as_u64().map(|u| u32::try_from(u).map_err(|_| Error::Parse(format!("an output's lapse {}", u)))).transpose()?,
 		})
 	}
 
@@ -393,9 +401,12 @@ impl Wallet {
 		// request past its lapse is paid by nobody. One handed out before
 		// requests carried their lapse names none, and its receiver waits
 		// for it until it is paid or forgotten.
-		if let Some(u) = req.get("until") {
-			let until = u.as_u64().and_then(|t| u32::try_from(t).ok())
-				.ok_or_else(|| Error::Parse(format!("the receive request's lapse {}: not a median time", u)))?;
+		let until = match req.get("until") {
+			Some(u) => Some(u.as_u64().and_then(|t| u32::try_from(t).ok())
+				.ok_or_else(|| Error::Parse(format!("the receive request's lapse {}: not a median time", u)))?),
+			None => None,
+		};
+		if let Some(until) = until {
 			let now = self.now()?.to_consensus_u32();
 			if now >= until {
 				return Err(Error::Refused(format!("the request lapsed at {} (a median time; the chain's is {}): ask the receiver for a \
@@ -430,13 +441,16 @@ impl Wallet {
 					.map_err(|e| Error::Parse(e.to_string()))?,
 			},
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
+			// The server records no payment to the request past its lapse,
+			// whenever this payment reaches it (a post held, and sent again).
+			until,
 		};
 		let to_out = to.explicit(self);
 		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0)?;
 		let mut outs = vec![to];
 		if change > 0 {
 			let leaf = self.own_leaf("change")?;
-			outs.push(Out { asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0 });
+			outs.push(Out { asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0, until: None });
 		}
 		let answer = self.transfer(&inputs, &outs, &[])?;
 		Ok(json!({
@@ -981,7 +995,7 @@ impl Wallet {
 		}
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let want_leaf = self.own_leaf("swap")?;
-		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox };
+		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox, until: None };
 		// The taker's leaf of `give`, and its change, are not known yet: size
 		// with probes of the same shape.
 		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
@@ -989,7 +1003,7 @@ impl Wallet {
 		let (inputs, margin, change) = self.choose(&info, give_asset, give, &others, true, min_give, 1)?;
 		let mut outs = vec![wanted];
 		if change > 0 {
-			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox });
+			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox, until: None });
 		}
 		let offer = json!({
 			(OFFER_KIND): 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
@@ -1079,12 +1093,12 @@ impl Wallet {
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let mut outs = maker_outs.clone();
-		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox });
+		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		let (mine, _, change) = self.choose(&info, want_asset, want, &others, false, min_want, 0)?;
 		if change > 0 {
-			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf("change")?, mailbox });
+			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf("change")?, mailbox, until: None });
 		}
 		if outs.len() > arca_covenant::leaf::MAX_OUTPUTS as usize {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outs.len(),
@@ -1285,13 +1299,13 @@ impl Wallet {
 		}
 		let leaf = self.own_leaf("cancel")?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox };
+		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox, until: None };
 		let all: Vec<&ValidCoin> = inputs.iter().map(|i| &i.coin).collect();
 		let margin = self.reassignment_margin(&all, &[probe.explicit(self)], &margins)?;
 		let kept: u64 = inputs.iter().map(|i| i.checkpoint_value).sum();
 		let value = kept.checked_sub(margin).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused("the coins do not cover the margins of a transfer to the wallet itself".into()))?;
-		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox }], &[])
+		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
 	}
 }
 

@@ -312,7 +312,11 @@ the keys, but which coins were spent off-chain is in the store and the server.
   says. A receive request lasts 27 days from when it was handed out (the
   acceptance horizon, `REQUEST_HOLDS`) and carries the median time it lapses
   at (`until`): `send` refuses a request past it before anything is built
-  or signed ("the request lapsed at …: ask the receiver for a new one").
+  or signed ("the request lapsed at …: ask the receiver for a new one"),
+  and the payment names it to the server, which records no payment to a
+  request past it however late the payment reaches it (a post held, and
+  sent again by a later `sync`): the server refuses it (`request_lapsed`),
+  and the payer's coins are live again.
   `sync`'s `schedule` says when it must run next (`next_sync_at`), and never
   more than a day ahead while a receive request the wallet handed out is
   unpaid and has not lapsed, saying so (`why`); `receive_requests` lists
@@ -632,7 +636,10 @@ and holding it there, with the reason shown:
   signed, the payer's coins as they were; paid on day 26, read at the
   receiver's next scheduled wake; and a request handed out without a lapse
   holding the schedule past 27 days, paid on day 28 and read, and another
-  holding it until it is forgotten;
+  holding it until it is forgotten; and a payment held on its way and sent
+  again past the lapse, refused by the server (`request_lapsed`) and the
+  payer's coin live again, while one the server recorded before the lapse
+  completes and is read;
 - a forfeit whose operator's half came ten minutes late, after the wallet
   took its board home in the coin's last day: the server releases the
   participation, the watcher answers the exit with the forfeit, and the

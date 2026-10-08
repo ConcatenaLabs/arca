@@ -150,6 +150,11 @@ impl Proxy {
 		self.hold.lock().unwrap().push(path.to_string());
 	}
 
+	/// Holds calls to `path` no more: the next is forwarded.
+	pub fn release(&self, path: &str) {
+		self.hold.lock().unwrap().retain(|p| p != path);
+	}
+
 	/// Every call so far.
 	pub fn calls(&self) -> Vec<Logged> {
 		self.log.lock().unwrap().clone()
