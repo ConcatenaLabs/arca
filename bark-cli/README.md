@@ -499,7 +499,11 @@ transfer of the leaf into a leaf of its own, and only while the leaf's
 timeout leaves it time to unroll the leaf and wait its exit delay should
 the operator not co-sign; `exit` takes a `receiving` leaf home by its claim
 with the preimage. The payment is settled when the preimage is handed over.
-A payment the operator failed back is `failed`, with the reason.
+A payment the operator failed back is `failed`, with the reason. The
+invoice locks the payment for twice the leaf's exit delay and the
+operator's window, about 5,060 blocks with a 36-hour exit delay: a payer
+whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016
+blocks.
 
 Native BTC goes over Lightning on the Bitcoin side, never through a Sequentia
 leaf: `lightning pay` with a Bitcoin invoice, and `lightning receive btc

@@ -359,7 +359,14 @@ features, as the node makes any invoice), deletes it unpaid, swaps the
 wallet's hash into it, and has the node sign the result (`signinvoice`). It
 registers the hash with the node's hold-invoice plugin and answers the
 invoice. The invoice's final lock time is twice the leaf's exit delay and
-`receive_window_seconds`, in blocks at `block_seconds`.
+`receive_window_seconds`, in blocks at `block_seconds`: with a 36-hour exit
+delay and the default window, about 5,060 blocks. SeqLN accepts lock times
+up to 20,160 blocks on a Sequentia network, but its `pay` adds up to 2,016
+unless the payer raises it (`maxdelay`), so a payer's node needs `maxdelay`
+at least the invoice's final lock time and the route's. A payment from
+another leaf over Lightning is held to half the time to its own leaf's
+timeout, so it pays such an invoice only with a `send_timeout_seconds` of
+about a week or more.
 
 The hold plugin holds the payment when it arrives instead of settling it.
 Once the parts held, in A, add up to the amount and are locked for that
