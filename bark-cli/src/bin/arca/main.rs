@@ -224,9 +224,45 @@ fn asset(s: &str) -> Result<AssetId, bark::arca::Error> {
 	AssetId::from_str(s).map_err(|e| bark::arca::Error::Parse(format!("asset {:?}: {}", s, e)))
 }
 
-/// Bark's binary, beside this one.
+/// Bark's binary: the one `ARCA_BARK_EXEC` names, else the one beside this
+/// one.
 fn bark_exe() -> PathBuf {
+	if let Some(p) = std::env::var_os("ARCA_BARK_EXEC") {
+		return PathBuf::from(p);
+	}
 	std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("bark"))).unwrap_or_else(|| PathBuf::from("bark"))
+}
+
+/// Whether `a` names native BTC rather than a Sequentia asset.
+fn is_btc(a: &str) -> bool {
+	a.eq_ignore_ascii_case("btc")
+}
+
+/// The Bitcoin side of `lightning pay` and `lightning receive`. Native BTC
+/// goes over Lightning through Bark's own Lightning leg, on the wallet's
+/// Bitcoin ark wallet (`<datadir>/bitcoin`, as `bitcoin` runs it), joined to
+/// the Bitcoin ark the operator names (`info`'s `lightning.bitcoin.ark`), and
+/// never through a Sequentia leaf. `args` are Bark's: `lightning pay
+/// invoice INVOICE --wait`, `lightning invoice "N sats"`. Refused, with the
+/// reason and nothing run, while the operator names no Bitcoin ark or the
+/// wallet has no Bitcoin ark wallet.
+fn bitcoin_lightning(datadir: &Path, server_info: &Value, args: &[String]) -> Result<Value, bark::arca::Error> {
+	let refused = |why: String| bark::arca::Error::Refused(why);
+	let ark = server_info["lightning"]["bitcoin"]["ark"].as_str().ok_or_else(|| refused("the operator names no Bitcoin ark \
+		(info's lightning.bitcoin.ark): native BTC goes over Lightning through Bark's Lightning leg on that ark, and none runs \
+		for this operator yet; nothing is signed, and no Sequentia leaf ever pays or receives it".into()))?;
+	let dir = datadir.join("bitcoin");
+	if !dir.exists() {
+		return Err(refused(format!("the wallet has no Bitcoin ark wallet: create one joined to {} with `arca bitcoin create …`; \
+			nothing is signed", ark)));
+	}
+	let out = Command::new(bark_exe()).arg("--datadir").arg(&dir).arg("--quiet").args(args).output()
+		.map_err(|e| bark::arca::Error::Io(format!("cannot run Bark ({}): {}", bark_exe().display(), e)))?;
+	if !out.status.success() {
+		return Err(refused(format!("Bark refused it: {}", String::from_utf8_lossy(&out.stderr).trim())));
+	}
+	let bark: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&out.stdout)}));
+	Ok(json!({"side": "bitcoin", "ark": ark, "node": server_info["lightning"]["bitcoin"]["node"], "bark": bark}))
 }
 
 fn bitcoin(datadir: &Path, args: &[String]) -> Result<Value, bark::arca::Error> {
@@ -285,9 +321,11 @@ fn rows(b: &Value) -> Value {
 enum LightningCmd {
 	/// Pays a BOLT11 invoice out of the wallet's coins of the asset it names:
 	/// they go into an htlc-1 leaf the operator claims with the preimage once
-	/// it has paid, and the change. A Bitcoin invoice, one in no asset, or
-	/// one in another asset than `--asset` is refused before anything is
-	/// signed.
+	/// it has paid, and the change. An invoice in no asset, or in another
+	/// asset than `--asset`, is refused before anything is signed. A Bitcoin
+	/// invoice is paid in native BTC through Bark's Lightning leg on the
+	/// wallet's Bitcoin ark wallet, against the Bitcoin ark the operator
+	/// names, never from a Sequentia leaf.
 	Pay {
 		invoice: String,
 		/// The asset of the coins to pay with: it must be the invoice's.
@@ -308,6 +346,8 @@ enum LightningCmd {
 	/// wallet can open, paid into a leaf of the wallet's own in the asset's
 	/// next round; `sync` claims the leaf once the wallet holds it, which
 	/// settles the payment. The operator's fee comes out of the amount.
+	/// `btc` for native BTC: `amount` satoshis, through Bark's Lightning leg on
+	/// the wallet's Bitcoin ark wallet.
 	Receive {
 		asset: String,
 		amount: u64,
@@ -425,12 +465,33 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
 		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, wait }) => {
+			// A Bitcoin invoice is paid in native BTC on the Bitcoin side.
+			let currency = bark::arca::lightning::parse_invoice(&invoice).ok().map(|i| i.currency);
+			if let Some((net, false)) = currency.as_deref().and_then(bark::arca::lightning::network_of) {
+				if let Some(a) = a.as_deref().filter(|a| !is_btc(a)) {
+					return Err(bark::arca::Error::Refused(format!("the invoice is a Bitcoin invoice ({}), paid in native BTC: coins of asset \
+						{} never pay it; nothing is signed", net, a)));
+				}
+				let info = w.info()?;
+				return bitcoin_lightning(&datadir, &info["server_info"], &["lightning".into(), "pay".into(), "invoice".into(), invoice,
+					"--wait".into()]);
+			}
 			let mut v = w.lightning_pay(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm)?;
 			let hash = v["paying"]["payment_hash"].as_str().unwrap_or("").to_string();
 			v["payment"] = w.lightning_follow(&hash, std::time::Duration::from_secs(wait))?;
 			Ok(v)
 		},
 		Cmd::Lightning(LightningCmd::Payments) => w.lightning_payments(),
+		// Native BTC is received on the Bitcoin side, in satoshis.
+		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, .. }) if is_btc(&a) => {
+			let info = w.info()?;
+			let mut args: Vec<String> = vec!["lightning".into(), "invoice".into(), format!("{} sats", amount)];
+			if let Some(d) = description {
+				args.push("--description".into());
+				args.push(d);
+			}
+			bitcoin_lightning(&datadir, &info["server_info"], &args)
+		},
 		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, max_fee_ppm }) =>
 			w.lightning_receive(asset(&a)?, amount, description.as_deref(), max_fee_ppm),
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),

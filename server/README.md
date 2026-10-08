@@ -295,8 +295,9 @@ The operator co-signs only when:
   every coin given up: a coin in one asset never pays an invoice in another
   (`invoice`), and the payment goes through A's node and no other;
 - A's node is up (`no_lightning`, `lightning_unavailable` otherwise) and
-  decodes the invoice as a valid BOLT11 invoice for an amount, unexpired a
-  minute from now (`invoice`);
+  decodes the invoice as a valid BOLT11 invoice of its own network (a
+  Bitcoin invoice is paid in native BTC, never from a Sequentia leaf), for
+  an amount, unexpired a minute from now (`invoice`);
 - the leaf is locked to the invoice's payment hash, its operator delay is the
   operator's (`[lightning] operator_delay_units`), its exit delay at least
   `owner_delay_units`, and its timeout between `send_timeout_seconds` and
@@ -1685,8 +1686,9 @@ is refused `no_lightning`, an asset not served `out_of_bounds`, receiving in Y
 (whose node runs no hold-invoice plugin) `no_lightning`; with Y's node
 stopped its leg is down with the reason and refused `lightning_unavailable`
 while X's goes on; and Y named, by a reload, a node whose channels are in X
-is down, the reason naming the assets its channels are in.
-`tests/lightning_pay.rs` pays an invoice in X from a coin in X and one in Y
+is down, the reason naming the assets its channels are in; and an invoice of
+the Bitcoin node's is refused at X's leg (`invoice`), its network not the
+leg's. `tests/lightning_pay.rs` pays an invoice in X from a coin in X and one in Y
 from a coin in Y: each is paid at the payee's node, its preimage the hash's,
 and the books hold to the atom (the leaf holds the amount the operator's node
 paid and the operator's fee; the payee's channel gained the amount). A paid
