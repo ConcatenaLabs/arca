@@ -141,6 +141,22 @@ pub struct LimitsSection {
 	pub witness_source_per_second: u32,
 	#[serde(default = "default_witness_source_burst")]
 	pub witness_source_burst: u32,
+	/// The reads that serve a wallet what the server holds for it and what
+	/// it publishes (`leaf_data`, `mailbox_read`, `tree`, `bind_mailbox`)
+	/// answered per second at most, over every source
+	/// together, and how many at once: each reads the database and may carry
+	/// a page of records.
+	#[serde(default = "default_read_per_second")]
+	pub read_per_second: u32,
+	#[serde(default = "default_read_burst")]
+	pub read_burst: u32,
+	/// Those reads answered to each source per second at most, and how many
+	/// at once: a restore reads a page of leaves, a page of its mailbox and
+	/// a tree for each round its leaves rest on.
+	#[serde(default = "default_read_source_per_second")]
+	pub read_source_per_second: u32,
+	#[serde(default = "default_read_source_burst")]
+	pub read_source_burst: u32,
 }
 
 impl Default for LimitsSection {
@@ -153,8 +169,26 @@ impl Default for LimitsSection {
 			cleanup_interval_seconds: default_cleanup_interval(),
 			witness_per_second: default_witness_per_second(), witness_burst: default_witness_burst(),
 			witness_source_per_second: default_witness_source_per_second(), witness_source_burst: default_witness_source_burst(),
+			read_per_second: default_read_per_second(), read_burst: default_read_burst(),
+			read_source_per_second: default_read_source_per_second(), read_source_burst: default_read_source_burst(),
 		}
 	}
+}
+
+fn default_read_per_second() -> u32 {
+	500
+}
+
+fn default_read_burst() -> u32 {
+	2_000
+}
+
+fn default_read_source_per_second() -> u32 {
+	10
+}
+
+fn default_read_source_burst() -> u32 {
+	200
 }
 
 fn default_witness_per_second() -> u32 {
@@ -742,6 +776,8 @@ impl Server {
 				config.limits.source_burst),
 			witnesses: Limiter::new(config.limits.witness_per_second, config.limits.witness_burst, config.limits.witness_source_per_second,
 				config.limits.witness_source_burst),
+			reads: Limiter::new(config.limits.read_per_second, config.limits.read_burst, config.limits.read_source_per_second,
+				config.limits.read_source_burst),
 			challenge_key: store.challenge_key().await.map_err(err("the database"))?,
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
