@@ -41,7 +41,7 @@ fn every_refusal_code_is_listed() {
 	let mut found = BTreeSet::new();
 	for src in [
 		include_str!("../src/boards.rs"), include_str!("../src/cosign.rs"), include_str!("../src/forfeits.rs"),
-		include_str!("../src/participations.rs"),
+		include_str!("../src/participations.rs"), include_str!("../src/lightning/mod.rs"),
 	] {
 		found.extend(codes_of(src));
 	}
@@ -64,7 +64,8 @@ fn every_refusal_code_is_listed() {
 	// of what was done.
 	for code in server::api::REFUSAL_CODES {
 		let status = server::http::status_of(code).as_u16();
-		let retry = ["internal", "signer_unavailable", "signer_replaced", "not_synced", "rate_limited", "rate_stale"].contains(code);
+		let retry = ["internal", "signer_unavailable", "signer_replaced", "not_synced", "rate_limited", "rate_stale", "lightning_unavailable"]
+			.contains(code);
 		assert_eq!((400..500).contains(&status) && *code != "rate_limited", !retry, "{} is answered {}", code, status);
 	}
 }
