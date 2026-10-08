@@ -14,7 +14,8 @@
 //! (the rate as a number or a decimal string), or the same two numbers on
 //! one line, the time optional. Its time is when the price was taken: from
 //! the reading when it carries one, else the file's modification time, or
-//! when the command ran. A rate is the node's unit: what 10^8 atoms of the
+//! when the command ran; a reading dated more than [`AHEAD`] ahead of the
+//! server's clock is not taken. A rate is the node's unit: what 10^8 atoms of the
 //! asset are worth in atoms of the reference unit, so `a` atoms are worth
 //! `a × rate / 10^8` of it ([`value_of`], [`atoms_of`]). The reference unit is
 //! the one the node's fee rates count in, which no asset of the chain is.
@@ -47,6 +48,12 @@ pub const READ_EVERY: Duration = Duration::from_secs(15);
 /// How long a command source may run before it is stopped and its reading
 /// counted as failed.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How far ahead of the server's clock a reading's time may lie, in
+/// seconds: room for two clocks that disagree a little. A reading dated
+/// further ahead is not taken, since its age would read nothing until that
+/// time and its rate never go stale.
+pub const AHEAD: u64 = 300;
 
 /// Where an asset's rate comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +297,11 @@ impl Rates {
 			if e.config.as_ref() != Some(&config) {
 				continue;
 			}
+			let got = got.and_then(|(rate, time)| match time.checked_sub(now) {
+				Some(ahead) if ahead > AHEAD => Err(format!("a reading dated {} s ahead of the server's clock (time {}): a rate is taken at a \
+					time that has come, or its age would read nothing and it would never go stale", ahead, time)),
+				_ => Ok((rate, time)),
+			});
 			match got {
 				Ok((rate, time)) => {
 					e.last = Some(Reading { rate, time, read_at: now });

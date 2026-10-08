@@ -214,3 +214,28 @@ async fn a_rate_comes_from_a_file_a_command_or_the_node() {
 	assert_eq!(iy["rate"]["rate"], "50000000");
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_dated_ahead_of_the_clock_is_not_taken() {
+	// A price process whose reading says a day ahead would never go stale:
+	// its age would read 0 until that day. The server takes no such reading.
+	let dir = std::env::temp_dir().join(format!("arca-rates-ahead-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let y_rate = dir.join("y.rate");
+	write_rate(&y_rate, now() + 86_400);
+	let file = y_rate.clone();
+	let r = Running::start_with(move |c, y| {
+		c.assets.push(section(&format!("asset = \"{}\"\nmin_leaf = \"1000\"\n[rate]\nsource = \"file\"\npath = {:?}\nmax_age_seconds = 600\n",
+			y, file.display().to_string())));
+	}).await;
+	let iy = info_of(&r.http, r.y);
+	println!("info, Y, its file dated a day ahead: {}", iy["rate"]);
+	assert_eq!(iy["rate"]["stale"], true, "no rate taken: {}", iy);
+	assert!(iy["rate"].get("rate").is_none(), "{}", iy);
+	assert!(iy["rate"]["failed"].as_str().unwrap_or("").contains("ahead of the server's clock"), "{}", iy);
+	// Dated now, it is taken.
+	write_rate(&y_rate, now());
+	let iy = rate_is(&r, r.y, false).await;
+	println!("info, Y, its file dated now: {}", iy["rate"]);
+	let _ = std::fs::remove_dir_all(&dir);
+}

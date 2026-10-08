@@ -225,7 +225,9 @@ operator's price process writes; or `command`, a program the server runs. A
 file or a command gives one reading, `{"rate": <integer>, "time": <unix
 seconds>}` (the rate as a number or a decimal string) or the same two numbers
 on one line, the time optional: without it a file's reading is as old as the
-file, a command's as its run, and the node's as the server's read. A rate is
+file, a command's as its run, and the node's as the server's read; a
+reading dated more than five minutes ahead of the server's clock is not taken,
+since its age would read nothing until then. A rate is
 the node's unit: what 10^8 atoms of the asset are worth in atoms of the
 reference unit, the unit the node's fee rates count in, which no asset of the
 chain is. The server reads every source at its start, at a reload and every
@@ -1626,7 +1628,7 @@ for, Y's rate is stale: a board and a participation of Y are refused
 `rate_stale` (503) naming Y, while a participation in X is taken, the
 participation in Y taken before is answered and runs in Y's round beside
 X's, and a coin of Y is paid on; once the file is fresh again a board of Y
-is taken.
+is taken. A file dated a day ahead is not taken: no rate, the failure saying why, until it is dated now.
 
 `tests/asset_fees.rs` sets a schedule per asset: X its own parts per
 million and fixed parts in X's atoms, Y the defaults and a fixed part as a
