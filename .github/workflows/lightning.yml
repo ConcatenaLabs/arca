@@ -87,7 +87,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq autoconf automake build-essential libtool libsqlite3-dev libffi-dev \
-            python3 python3-mako net-tools zlib1g-dev libsodium-dev gettext lowdown
+            python3 python3-mako net-tools zlib1g-dev libsodium-dev gettext lowdown protobuf-compiler
 
       - name: Build SeqLN
         if: steps.seqln-cache.outputs.cache-hit != 'true'
@@ -109,5 +109,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Tests
-        run: cargo test --locked -p arca-server --test lightning_legs -- --nocapture
+      - name: The server's tests
+        run: cargo test --locked -p arca-server --test lightning_legs --test lightning_pay -- --nocapture
+
+      # The wallet's scenario runs the operator's signer as its own process.
+      - name: The wallet's scenario
+        run: |
+          cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
+          cargo test --locked -p arca-cli --test arca_lightning -- --nocapture

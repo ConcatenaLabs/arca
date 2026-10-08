@@ -233,6 +233,9 @@ pub enum ParticipationError {
 	BadKeyProof(usize),
 	#[error("output {0}: template {1} is not one a round builds")]
 	Template(usize, String),
+	#[error("input {0}: coin {1} is an htlc-1 leaf, which no refresh takes: it is claimed, refunded, or spent back by its \
+		collaborative path once its payment over Lightning is decided")]
+	HtlcInput(usize, LeafId),
 	#[error("an output is outside the operator's published bounds: {0}")]
 	OutOfBounds(String),
 	/// It carries several assets, or pays a fee in one the operator does not
@@ -283,7 +286,7 @@ impl ParticipationError {
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
-			Template(..) => "template",
+			Template(..) | HtlcInput(..) => "template",
 			OutOfBounds(_) | Assets(_) => "out_of_bounds",
 			KeyReused => "key_reused",
 			OperatorKey(_) => "operator_key",
@@ -513,6 +516,9 @@ impl Participations {
 		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
 			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			if c.coin.leaf.htlc.is_some() {
+				return Err(ParticipationError::HtlcInput(k, i.leaf_id));
+			}
 			if c.coin.asset != asset {
 				return Err(ParticipationError::Assets(one_asset(asset, &BTreeSet::from([c.coin.asset]))));
 			}

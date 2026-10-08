@@ -139,6 +139,10 @@ impl Out {
 		if let Some(u) = self.until {
 			v["until"] = json!(u);
 		}
+		if let Some(t) = &self.leaf.htlc {
+			v["htlc"] = json!({"direction": t.direction.name(), "payment_hash": hex(&t.payment_hash),
+				"timeout": t.timeout.to_consensus_u32(), "operator_delay_units": t.operator_delay.units()});
+		}
 		v
 	}
 
@@ -277,6 +281,34 @@ impl Wallet {
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
 		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None })
+	}
+
+	/// [`Self::own_leaf`], for the other modules.
+	pub(crate) fn own_leaf_for(&self, purpose: &str) -> Result<NewLeaf, Error> {
+		self.own_leaf(purpose)
+	}
+
+	/// Coins of `asset` to pay `paid` into `out` (and change): see
+	/// [`Self::choose`].
+	pub(crate) fn choose_coins(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64)
+		-> Result<(Vec<In>, u64, u64), Error>
+	{
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0)
+	}
+
+	/// The checkpoint margin of `coin` ([`Self::checkpoint_margin`]).
+	pub(crate) fn checkpoint_margin_of(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
+		self.checkpoint_margin(coin, m)
+	}
+
+	/// The reassignment margin of `coin` alone into `out`.
+	pub(crate) fn reassignment_margin_of(&self, coin: &ValidCoin, out: &Out, m: &Margins) -> Result<u64, Error> {
+		self.reassignment_margin(&[coin], &[out.explicit(self)], m)
+	}
+
+	/// Transfers `inputs`, all the wallet's own, into `outs`.
+	pub(crate) fn transfer_back(&mut self, inputs: &[In], outs: &[Out]) -> Result<Value, Error> {
+		self.transfer(inputs, outs, &[])
 	}
 
 	/// The live coins of `asset`, furthest from their exit date first (D58:
@@ -475,6 +507,18 @@ impl Wallet {
 	/// the server to co-sign the whole transfer, and takes the answer. `theirs`
 	/// carries the signatures of inputs another owner signed, by index.
 	fn transfer(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)]) -> Result<Value, Error> {
+		self.transfer_with(inputs, outs, theirs, None)
+	}
+
+	/// [`Self::transfer`] paying `invoice` over Lightning: its outputs make
+	/// the `htlc-1` leaf of the payment, and it goes to `lightning_send`.
+	pub(crate) fn transfer_paying(&mut self, inputs: &[In], outs: &[Out], invoice: &str) -> Result<Value, Error> {
+		self.transfer_with(inputs, outs, &[], Some(invoice))
+	}
+
+	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)], invoice: Option<&str>)
+		-> Result<Value, Error>
+	{
 		// Nothing is signed for the operator without a witness of its
 		// signer's record, whatever entry point led here.
 		self.witnessed_now()?;
@@ -498,7 +542,10 @@ impl Wallet {
 			ins.push(json!({"leaf_id": i.coin.id.to_string(), "checkpoint_value": i.checkpoint_value.to_string(),
 				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
 		}
-		let body = json!({"inputs": ins, "outputs": outs.iter().map(|o| { let mut j = o.json(); j["mailbox"] = json!(hex(&o.mailbox.serialize())); j }).collect::<Vec<_>>()});
+		let mut body = json!({"inputs": ins, "outputs": outs.iter().map(|o| { let mut j = o.json(); j["mailbox"] = json!(hex(&o.mailbox.serialize())); j }).collect::<Vec<_>>()});
+		if let Some(inv) = invoice {
+			body["invoice"] = json!(inv);
+		}
 		let id = self.store.atomically(|s| {
 			let id = s.put_transfer(&body.to_string(), &serde_json::to_string(&mine).expect("strings"))?;
 			for l in &mine {
@@ -517,7 +564,26 @@ impl Wallet {
 	/// `sync`: the server answers a request repeated byte for byte as it did
 	/// the first time.
 	fn post_transfer(&mut self, id: i64, body: &Value, mine: &[String]) -> Result<Value, Error> {
-		match self.server.post("cosign_transfer", body) {
+		// A payment over Lightning goes to lightning_send, which answers the
+		// co-signed transfer and the payment.
+		let paying = body.get("invoice").is_some();
+		let answered = self.server.post(if paying { "lightning_send" } else { "cosign_transfer" }, body);
+		let payment = answered.as_ref().ok().map(|a| a["payment"].clone());
+		let answered = answered.map(|a| if paying { a["cosigned"].clone() } else { a });
+		let out = self.take_transfer_answer(id, answered, mine)?;
+		Ok(match payment {
+			Some(p) if paying => {
+				self.payment_answered(&p)?;
+				let mut o = out;
+				o["payment"] = p;
+				o
+			},
+			_ => out,
+		})
+	}
+
+	fn take_transfer_answer(&mut self, id: i64, answered: Result<Value, Error>, mine: &[String]) -> Result<Value, Error> {
+		match answered {
 			// A co-signature whose head is not held outside the operator's
 			// machine as the wallet requires is taken as no answer: the
 			// request stands, and is posted again.

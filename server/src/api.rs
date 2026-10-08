@@ -31,13 +31,13 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
-	"double_spend", "fee", "forfeit_set", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record",
+	"double_spend", "fee", "forfeit_set", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
 	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/info`.
@@ -108,6 +108,22 @@ pub struct LightningInfo {
 	/// when it runs none.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub bitcoin: Option<BitcoinLightningInfo>,
+	/// The terms of the `htlc-1` leaf a payment out of the tree gives its
+	/// coins up into.
+	pub send: LightningSendInfo,
+}
+
+/// The operator's terms for a payment out of the tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSendInfo {
+	/// The delay on the operator's claim, in 512-second units.
+	pub operator_delay_units: u16,
+	/// The least exit delay the leaf takes, the owner's refund delay.
+	pub owner_delay_units: u16,
+	/// The leaf's timeout lies at least this far past the chain's median
+	/// time, and at most twice as far.
+	pub timeout_seconds: u32,
 }
 
 /// The Bitcoin side: native BTC, on Bitcoin, never in a Sequentia leaf.
@@ -209,6 +225,12 @@ pub struct AssetFeesInfo {
 	pub offboard_base: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub offboard_base_value: Option<String>,
+	/// A payment over Lightning, either way: `lightning_ppm` of what it moves,
+	/// rounded up, plus `lightning_base` atoms.
+	pub lightning_ppm: u64,
+	pub lightning_base: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lightning_base_value: Option<String>,
 }
 
 /// The operator's rate for an asset ([`crate::rates`]): what 10^8 atoms of
@@ -279,6 +301,9 @@ pub struct FeesInfo {
 	/// The offboard fee, in parts per million of what it pays out, on top of
 	/// the margin the round's output holds for its unlock.
 	pub offboard_ppm: u64,
+	/// What a payment over Lightning costs, either way, where an asset sets
+	/// none of its own (`assets[].fees.lightning_ppm`).
+	pub lightning_ppm: u64,
 	/// The least margin a transfer's checkpoint and reassignment leave for
 	/// their fee, as a multiple of the node's floor in an asset it accepts
 	/// for fees (one atom in one it does not), and the most, as a multiple of
@@ -417,6 +442,68 @@ pub struct TransferOutput {
 	/// sender that does not name it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub until: Option<u32>,
+	/// The terms of an `htlc-1` leaf: only in a payment over Lightning
+	/// (`lightning_send`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub htlc: Option<HtlcTermsJson>,
+}
+
+/// An `htlc-1` leaf's terms beside its owner's key, nonces and exit delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HtlcTermsJson {
+	/// `send`: the operator claims with the preimage, the owner refunds.
+	pub direction: String,
+	pub payment_hash: String,
+	/// The median time from which the refund opens.
+	pub timeout: u32,
+	pub operator_delay_units: u16,
+}
+
+/// `POST /v1/lightning_send`: pay `invoice` with the transfer, whose outputs
+/// make one `htlc-1` leaf of the payment and the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSend {
+	pub invoice: String,
+	pub inputs: Vec<TransferInput>,
+	pub outputs: Vec<TransferOutput>,
+}
+
+/// The answer to `lightning_send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSent {
+	pub cosigned: Cosigned,
+	pub payment: LightningPayment,
+}
+
+/// A payment out of the tree, as `lightning_send` and `lightning_send_status`
+/// answer it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningPayment {
+	pub payment_hash: String,
+	pub asset: String,
+	/// What the invoice asks, and the operator's fee, in the asset's atoms.
+	pub amount: String,
+	pub fee: String,
+	/// The `htlc-1` coin the payment gave up.
+	pub htlc_leaf_id: String,
+	/// `paying`, `paid` (with the preimage) or `failed` (with the reason):
+	/// once failed, the operator co-signs the coin back to its owner.
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+}
+
+/// `POST /v1/lightning_send_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSendStatus {
+	pub payment_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

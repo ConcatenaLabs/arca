@@ -18,6 +18,15 @@ pub fn start() -> Regtest {
 	Regtest::pos_from_env(&dir, &["-par=1"])
 }
 
+/// The chain SeqLN's `sequentia-regtest` network assumes, so SeqLN nodes run
+/// on it ([`sequentia_ext::lightning`]).
+pub fn start_seqln() -> Regtest {
+	static N: AtomicUsize = AtomicUsize::new(0);
+	let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+		.join(format!("csl-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+	Regtest::seqln_from_env(&dir, &["-par=1"])
+}
+
 pub fn op_true() -> Script {
 	Script::from(vec![0x51])
 }

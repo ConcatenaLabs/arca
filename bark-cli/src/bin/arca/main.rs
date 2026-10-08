@@ -129,6 +129,9 @@ enum Cmd {
 	},
 	/// Reads the mailbox and validates every coin in it.
 	Mailbox,
+	/// Payments over Lightning, through the operator's node in each asset.
+	#[command(subcommand)]
+	Lightning(LightningCmd),
 	/// Restores the wallet from its mnemonic: every leaf the server serves to
 	/// its mailbox key, each checked against the chain, the published tree
 	/// and its owner's own signatures, then the mailbox and a sync. Run
@@ -278,6 +281,31 @@ fn rows(b: &Value) -> Value {
 	Value::Array(rows)
 }
 
+#[derive(Subcommand)]
+enum LightningCmd {
+	/// Pays a BOLT11 invoice out of the wallet's coins of the asset it names:
+	/// they go into an htlc-1 leaf the operator claims with the preimage once
+	/// it has paid, and the change. A Bitcoin invoice, one in no asset, or
+	/// one in another asset than `--asset` is refused before anything is
+	/// signed.
+	Pay {
+		invoice: String,
+		/// The asset of the coins to pay with: it must be the invoice's.
+		#[arg(long)]
+		asset: Option<String>,
+		/// Raises the wallet's bound on the operator's fee for this payment,
+		/// in parts per million of what it pays.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// How long to wait for the operator to say how the payment went, in
+		/// seconds; `sync` follows it after that.
+		#[arg(long, default_value_t = 60)]
+		wait: u64,
+	},
+	/// Every payment over Lightning the wallet made, with where it stands.
+	Payments,
+}
+
 fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	let datadir = PathBuf::from(&cli.datadir);
 	if let Cmd::Bitcoin { args } = &cli.command {
@@ -379,6 +407,13 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
+		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, wait }) => {
+			let mut v = w.lightning_pay(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm)?;
+			let hash = v["paying"]["payment_hash"].as_str().unwrap_or("").to_string();
+			v["payment"] = w.lightning_follow(&hash, std::time::Duration::from_secs(wait))?;
+			Ok(v)
+		},
+		Cmd::Lightning(LightningCmd::Payments) => w.lightning_payments(),
 		Cmd::Restore => w.restore(),
 		Cmd::Participate { leaves, not_before, max_fee_ppm } => {
 			// The fee is shown before anything is signed.

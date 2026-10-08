@@ -54,7 +54,8 @@ async fn board_transfer_mailbox_and_rules() {
 	assert_eq!(info["operator"], hex(&s.serialize()));
 	assert_eq!(info["genesis_hash"], r.chain.genesis_hash().to_string());
 	assert_eq!(info["assets"], json!([{"asset": r.x.to_string(), "min_leaf": MIN_LEAF.to_string(),
-		"fees": {"refresh_ppm": 0, "refresh_base": "0", "offboard_ppm": 0, "offboard_base": "0"}}]));
+		"fees": {"refresh_ppm": 0, "refresh_base": "0", "offboard_ppm": 0, "offboard_base": "0", "lightning_ppm": 0,
+			"lightning_base": "0"}}]));
 	assert_eq!(info["depth_limit"], 5);
 	assert_eq!(info["finality"], json!({"certification": "required", "anchor_depth": 2}));
 	println!("info: {}", info);

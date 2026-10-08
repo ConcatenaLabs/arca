@@ -294,7 +294,7 @@ impl Wallet {
 		// A coin handed over to a participation or a transfer is the wallet's
 		// until the chain shows otherwise: one taken by a round or a
 		// co-signed spend is `spent`, and is not exited.
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending") {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		let record = Self::record_of(&row)?;
@@ -410,7 +410,12 @@ impl Wallet {
 				},
 				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
 			};
-			leaf.exit_tx(leaf_at, asset, value, &[out], f).map_err(|e| Error::Refused(e.to_string()))
+			match leaf.htlc {
+				// An htlc-1 leaf of a payment out of the tree comes home by its
+				// refund: after its timeout, and its exit delay on the chain.
+				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
+				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
+			}.map_err(|e| Error::Refused(e.to_string()))
 		});
 		let claim = match claim {
 			Ok(c) => c,
@@ -703,6 +708,10 @@ impl Wallet {
 		let boards = if talk { self.retry_boards()? } else { vec![] };
 		let recheck = self.recheck()?;
 		let transfers = if talk { self.retry_transfers()? } else { vec![] };
+		// Payments over Lightning the operator has not decided: a paid one
+		// closed with its preimage, a failed one taken back.
+		let lightning = if talk { self.progress_lightning().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
@@ -754,6 +763,9 @@ impl Wallet {
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
+		}
+		if lightning.as_array().is_none_or(|l| !l.is_empty()) {
+			out["lightning"] = lightning;
 		}
 		if !matches!(why, Home::Answering) || home.as_array().is_none_or(|h| !h.is_empty()) {
 			out["home"] = home;

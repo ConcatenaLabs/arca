@@ -60,6 +60,7 @@ pub mod keys;
 pub mod store;
 
 mod exit;
+pub mod lightning;
 mod pay;
 mod restore;
 mod round;

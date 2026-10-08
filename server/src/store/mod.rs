@@ -8,7 +8,8 @@
 //! `schema/V10__round_signer_head.sql`, `schema/V11__signed_record_heads.sql`,
 //! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`,
 //! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`,
-//! `schema/V16__keepers_pinned.sql`, `schema/V17__leaf_reserving.sql`),
+//! `schema/V16__keepers_pinned.sql`, `schema/V17__leaf_reserving.sql`,
+//! `schema/V18__lightning_send.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -39,6 +40,7 @@ use tokio_postgres::NoTls;
 mod boards;
 mod chain;
 mod coins;
+mod lightning;
 mod mailbox;
 mod nursery;
 mod participations;
@@ -51,6 +53,7 @@ mod watcher;
 pub use boards::{BoardRow, BoardState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
+pub use lightning::{SendRow, SendState};
 pub use mailbox::MailboxMessage;
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
 pub use nursery::{NurseryRow, NurseryState};
@@ -87,6 +90,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(15, include_str!("../../schema/V15__rerun_ties.sql")),
 	(16, include_str!("../../schema/V16__keepers_pinned.sql")),
 	(17, include_str!("../../schema/V17__leaf_reserving.sql")),
+	(18, include_str!("../../schema/V18__lightning_send.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

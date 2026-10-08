@@ -108,12 +108,55 @@ pub struct LightningSection {
 	/// absent.
 	#[serde(default)]
 	pub bitcoin: Option<BitcoinLightningSection>,
+	/// The delay on the operator's claim of an `htlc-1` leaf, in 512-second
+	/// units: the owner's refund waits longer.
+	#[serde(default = "default_operator_delay")]
+	pub operator_delay_units: u16,
+	/// The least exit delay an `htlc-1` leaf of a payment out of the tree
+	/// takes: the owner's refund delay, the operator's time to claim first.
+	#[serde(default = "default_owner_delay")]
+	pub owner_delay_units: u16,
+	/// How far past the chain's median time the leaf's timeout lies, at
+	/// least (at most twice that): longer than any payment takes to resolve.
+	#[serde(default = "default_send_timeout")]
+	pub send_timeout_seconds: u32,
+	/// The chain's block interval, in seconds, which bounds a payment's lock
+	/// times.
+	#[serde(default = "default_block_seconds")]
+	pub block_seconds: u32,
+	/// How long one payment attempt runs, in seconds.
+	#[serde(default = "default_retry_seconds")]
+	pub retry_seconds: u32,
 }
 
 impl Default for LightningSection {
 	fn default() -> LightningSection {
-		LightningSection { poll_seconds: default_lightning_poll(), bitcoin: None }
+		LightningSection {
+			poll_seconds: default_lightning_poll(), bitcoin: None, operator_delay_units: default_operator_delay(),
+			owner_delay_units: default_owner_delay(), send_timeout_seconds: default_send_timeout(), block_seconds: default_block_seconds(),
+			retry_seconds: default_retry_seconds(),
+		}
 	}
+}
+
+fn default_operator_delay() -> u16 {
+	36
+}
+
+fn default_owner_delay() -> u16 {
+	72
+}
+
+fn default_send_timeout() -> u32 {
+	86_400
+}
+
+fn default_block_seconds() -> u32 {
+	60
+}
+
+fn default_retry_seconds() -> u32 {
+	60
 }
 
 fn default_lightning_poll() -> u64 {
@@ -365,6 +408,10 @@ pub struct FeesSection {
 	/// top of the margin of its output.
 	#[serde(default)]
 	pub offboard_ppm: u64,
+	/// What a payment over Lightning costs, either way, in parts per million
+	/// of what it moves.
+	#[serde(default)]
+	pub lightning_ppm: u64,
 	/// The most margin a co-signed transfer may leave for a fee, as a
 	/// multiple of the least (four times the node's floor in an asset it
 	/// accepts for fees, one atom in one it does not); 25 when absent.
@@ -460,6 +507,15 @@ pub struct AssetSection {
 	pub offboard_base: Option<String>,
 	#[serde(default)]
 	pub offboard_base_value: Option<String>,
+	/// What a payment over Lightning costs in the asset, either way: parts
+	/// per million of what it moves (`[fees]`' when absent), and a fixed part,
+	/// in atoms or as a value, as the other fixed parts.
+	#[serde(default)]
+	pub lightning_ppm: Option<u64>,
+	#[serde(default)]
+	pub lightning_base: Option<String>,
+	#[serde(default)]
+	pub lightning_base_value: Option<String>,
 	/// The smallest leaf, in the asset's atoms, as a decimal string.
 	#[serde(default)]
 	pub min_leaf: Option<String>,
@@ -484,7 +540,7 @@ impl AssetSection {
 		AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
-			lightning: None,
+			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None,
 		}
 	}
 }
@@ -728,7 +784,10 @@ async fn check_signer_entries(store: &Store, signer: &SignerClient) -> Result<()
 
 /// The schedule an asset takes where it sets none of its own: `[fees]`.
 fn default_fees(config: &Config) -> FeeSchedule {
-	FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm, ..Default::default() }
+	FeeSchedule {
+		refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm, lightning_ppm: config.fees.lightning_ppm,
+		..Default::default()
+	}
 }
 
 /// The top-level settings of `a` and `b` that differ, by name.
@@ -771,6 +830,7 @@ pub struct Server {
 	pub forfeits: Arc<Forfeits>,
 	pub watcher: Arc<Watcher>,
 	pub gateway: Arc<Gateway>,
+	pub sends: Arc<crate::lightning::send::Sends>,
 	/// The configuration the server runs with, as last loaded.
 	config: std::sync::Mutex<Config>,
 	tasks: Vec<JoinHandle<()>>,
@@ -824,6 +884,8 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			offboard_ppm: a.offboard_ppm.unwrap_or(config.fees.offboard_ppm),
 			refresh_base: amount("refresh_base", &a.refresh_base, &a.refresh_base_value)?,
 			offboard_base: amount("offboard_base", &a.offboard_base, &a.offboard_base_value)?,
+			lightning_ppm: a.lightning_ppm.unwrap_or(config.fees.lightning_ppm),
+			lightning_base: amount("lightning_base", &a.lightning_base, &a.lightning_base_value)?,
 		};
 		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees }));
 	}
@@ -984,9 +1046,21 @@ impl Server {
 			policy_asset,
 		});
 		gateway.check().await;
+		let l = &config.lightning;
+		if l.operator_delay_units == 0 || l.owner_delay_units <= l.operator_delay_units {
+			return Err(StartError("lightning: operator_delay_units is at least 1 and below owner_delay_units".into()));
+		}
+		let sends = crate::lightning::send::Sends::new(store.clone(), params.clone(), gateway.clone(), cosigner.clone(),
+			crate::lightning::send::SendConfig {
+				operator_delay: RelativeTime::from_units(l.operator_delay_units).map_err(err("lightning.operator_delay_units"))?,
+				owner_delay: RelativeTime::from_units(l.owner_delay_units).map_err(err("lightning.owner_delay_units"))?,
+				timeout_seconds: l.send_timeout_seconds.max(60),
+				block_seconds: l.block_seconds.max(1),
+				retry_seconds: l.retry_seconds.max(5),
+			});
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
-		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn()];
+		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn(), sends.spawn()];
 		if config.watcher.enabled {
 			tasks.push(watcher.spawn());
 		}
@@ -1033,6 +1107,7 @@ impl Server {
 			keepers: std::sync::Mutex::new(keepers),
 			replaced,
 			gateway: gateway.clone(),
+			sends: sends.clone(),
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {
@@ -1061,7 +1136,7 @@ impl Server {
 		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
 			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
 		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher,
-			gateway, config: std::sync::Mutex::new(config.clone()), tasks })
+			gateway, sends, config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
 	/// Takes the assets `config` serves, each with its smallest leaf, its
@@ -1105,6 +1180,7 @@ impl Server {
 			taken.fee_assets = config.fee_assets.clone();
 			taken.fees.refresh_ppm = config.fees.refresh_ppm;
 			taken.fees.offboard_ppm = config.fees.offboard_ppm;
+			taken.fees.lightning_ppm = config.fees.lightning_ppm;
 			if taken != *config {
 				out.needs_restart = restart_only(&taken, config);
 				log::warn!("reload: {} changed and take(s) a restart; left as they were", out.needs_restart.join(", "));

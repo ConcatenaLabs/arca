@@ -152,6 +152,9 @@ refresh_ppm = 0
 # What an offboard costs, in parts per million of what it pays out, on top of
 # the margin its on-chain output holds for its unlock.
 offboard_ppm = 0
+# What a payment over Lightning costs, either way, in parts per million of
+# what it moves, rounded up.
+lightning_ppm = 0
 # The most margin a co-signed transfer may leave for its checkpoint's and its
 # reassignment's fees, as a multiple of the least it must leave: four times
 # the node's floor in an asset the node accepts for fees, one atom in one it
@@ -187,7 +190,9 @@ max_margin_multiple = 25
 # (refresh_base, falling to nothing in the free window as the parts per million
 # do), and of an offboard (offboard_base), in the asset's atoms, or as values in
 # the reference unit converted at the asset's rate (refresh_base_value,
-# offboard_base_value). Nothing fixed when absent.
+# offboard_base_value). Nothing fixed when absent. A payment over Lightning
+# in the asset costs lightning_ppm of what it moves and lightning_base
+# (lightning_base_value), the same way.
 #
 # [assets.lightning] names the operator's SeqLN node in the asset, its
 # Lightning leg, by the node's JSON-RPC socket: payments between a leaf of the
@@ -205,6 +210,8 @@ min_leaf = "1000"
 # offboard_ppm = 0
 # refresh_base = "0"
 # offboard_base = "0"
+# lightning_ppm = 0
+# lightning_base = "0"
 # min_leaf_value = "100000"
 # [assets.rate]
 # source = "file"
@@ -217,6 +224,19 @@ min_leaf = "1000"
 [lightning]
 # How often every Lightning node is checked, in seconds.
 poll_seconds = 10
+# The htlc-1 leaf of a payment out of the tree: the operator claims it with
+# the preimage operator_delay_units after it is on-chain; its owner refunds it
+# once its timeout has passed and then its exit delay, at least
+# owner_delay_units (512-second units). Its timeout lies send_timeout_seconds
+# to twice that past the chain's median time, and a payment's lock times add
+# up to at most half the time left to it, in blocks of block_seconds: SeqLN's
+# final lock time on a Sequentia network is 180 blocks and each hop adds 270,
+# so a day leaves a payment 720 blocks. One attempt to pay runs retry_seconds.
+operator_delay_units = 36
+owner_delay_units = 72
+send_timeout_seconds = 86400
+block_seconds = 60
+retry_seconds = 60
 # The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
 # socket, and the Bitcoin ark it runs, which wallets join with Bark. Native
 # BTC never enters a Sequentia leaf: its payments go over this node and the
