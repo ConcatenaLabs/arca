@@ -1637,6 +1637,11 @@ fee is taken; so is an offboard of X with its coin's refresh; a new rate
 moves Y's fixed part in atoms; and a reload takes X's new schedule and the
 new defaults Y takes.
 
+`tests/asset_sweep.rs` lists X and Y for fees, X the first fee asset, and
+takes a batch of Y through its expiry: its token's release pays its fee from
+Y's pool and the sweep from the Y it sweeps, and nothing of X's pool moves
+for Y's batch.
+
 `tests/assets.rs` serves X and Y each on its own. Participations in X and Y
 run in rounds of their own: X's round spends X's pool alone and pays X alone,
 Y's (Y not accepted for fees) pays Y's batch from Y's pool and its fee from
