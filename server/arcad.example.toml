@@ -137,6 +137,8 @@ board_unconfirmed_seconds = 21600
 # How often expired nonces are deleted.
 cleanup_interval_seconds = 60
 
+# What the operator charges, in the asset moved. The parts per million here
+# are what every asset takes where its [[assets]] entry sets none of its own.
 [fees]
 # The most a refresh costs, in parts per million of the coin's value: due in
 # full for a coin 28 days or more from its first expiry, falling to nothing in
@@ -179,9 +181,20 @@ max_margin_multiple = 25
 # max_age_seconds (an hour by default) from its time; once stale, the server
 # takes no new work in the asset (rate_stale) until it reads a fresh one. An
 # asset with no rate source prices nothing from a rate.
+#
+# Each asset may set its own fee schedule: refresh_ppm and offboard_ppm in
+# place of [fees]', and a fixed part of a refresh, for each coin given up
+# (refresh_base, falling to nothing in the free window as the parts per million
+# do), and of an offboard (offboard_base), in the asset's atoms, or as values in
+# the reference unit converted at the asset's rate (refresh_base_value,
+# offboard_base_value). Nothing fixed when absent.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
+# refresh_ppm = 0
+# offboard_ppm = 0
+# refresh_base = "0"
+# offboard_base = "0"
 # min_leaf_value = "100000"
 # [assets.rate]
 # source = "file"

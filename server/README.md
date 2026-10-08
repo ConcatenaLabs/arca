@@ -235,9 +235,10 @@ age and how long it is good for (`max_age_seconds`, an hour by default), and
 whether it is stale.
 
 The rate sets what the operator sets as a value: an asset's smallest leaf
-may be a value in the reference unit (`min_leaf_value`), taken in the
-asset's atoms at its rate, rounded up, and published as such (`min_leaf`)
-beside it. While an asset's rate is stale, or before its source has given
+(`min_leaf_value`) and the fixed parts of its fee schedule
+(`refresh_base_value`, `offboard_base_value`) may be values in the reference
+unit, each taken in the asset's atoms at its rate, rounded up, and published
+in atoms beside it. While an asset's rate is stale, or before its source has given
 one, the server takes no new work in that asset: a board or a participation
 of it is refused `rate_stale` (503), naming the asset, the source, the rate
 and its age, and a wallet posts it again later. Work already taken goes on:
@@ -428,15 +429,22 @@ earliest round time (the layout is in `participations.rs`). The tag keeps the
 attestation apart from everything else a leaf key signs, the genesis hash and
 `S` to one chain and one operator.
 
-The fee schedule is published by `info`. Transfers are free. A refresh, or an
-offboard, costs nothing in the free window, the two days before a coin's exit
-deadline (from five days before its first expiry to three days before it, when
-the server stops taking it), and rises with the time left beyond the window to
-`refresh_ppm` parts per million of the coin's value for a coin 23 days or more
-beyond it; a coin resting on a board counts from the board's service expiry
-when that comes first (see Boards). An
-offboard adds `offboard_ppm` of what it pays out and the margin its on-chain
-output holds for its unlock.
+Each asset has its own fee schedule, charged in that asset and published by
+`info` with the asset (`assets[].fees`); an asset that sets none takes
+`[fees]`' parts per million, which `info` also publishes at the top of its
+`fees`. Transfers are free. A refresh, or an offboard, costs nothing in the
+free window, the two days before a coin's exit deadline (from five days before
+its first expiry to three days before it, when the server stops taking it),
+and rises with the time left beyond the window to `refresh_ppm` parts per
+million of the coin's value plus `refresh_base` atoms for each coin given up,
+for a coin 23 days or more beyond it; a coin resting on a board counts from
+the board's service expiry when that comes first (see Boards). An offboard
+adds `offboard_ppm` of what it pays out, `offboard_base` atoms and the margin
+its on-chain output holds for its unlock. The fixed parts are set in the
+asset's atoms or as a value in the reference unit (`refresh_base_value`,
+`offboard_base_value`), taken in atoms at the asset's rate (see Exchange
+rates) and published both ways. A fee short of the asset's schedule is
+refused (`fee`), naming the asset and its schedule.
 
 Each forfeit carries the refund delay the server publishes with the
 participation (the longest exit delay), and leaves uncommitted the margin the
@@ -1344,7 +1352,8 @@ entry to the configuration, pay the operator's wallet coins of it (`arcad
 `ExecReload=/bin/kill -HUP $MAINPID`). It reads the configuration again and
 from then on serves the asset at every entry, builds its rounds from its pool
 and publishes it in `info`, in the configuration's order; an asset's
-smallest leaf, its rate source and the assets a round's fee is paid in
+smallest leaf, its fee schedule and its rate source, `[fees]`'
+`refresh_ppm` and `offboard_ppm`, and the assets a round's fee is paid in
 (`fee_assets`) are taken the same way, and every rate source is read at
 once. A configuration that does not read, or that leaves out
 an asset served now, is refused whole and logged, and the server runs on as
@@ -1618,6 +1627,15 @@ for, Y's rate is stale: a board and a participation of Y are refused
 participation in Y taken before is answered and runs in Y's round beside
 X's, and a coin of Y is paid on; once the file is fresh again a board of Y
 is taken.
+
+`tests/asset_fees.rs` sets a schedule per asset: X its own parts per
+million and fixed parts in X's atoms, Y the defaults and a fixed part as a
+value, taken at Y's rate from a file. `info` publishes each asset's schedule
+and the defaults at its top; a refresh in each asset one atom short of its
+schedule is refused `fee`, naming the asset and its schedule, and the exact
+fee is taken; so is an offboard of X with its coin's refresh; a new rate
+moves Y's fixed part in atoms; and a reload takes X's new schedule and the
+new defaults Y takes.
 
 `tests/assets.rs` serves X and Y each on its own. Participations in X and Y
 run in rounds of their own: X's round spends X's pool alone and pays X alone,

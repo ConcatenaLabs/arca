@@ -441,12 +441,20 @@ margin the operator prices; the wallet takes one only up to four times the
 operator's published floor over 1,000 vbytes, or one atom where the
 operator's node does not accept the asset.
 
-The operator's refresh fee is bounded by the wallet, not by what the server
-publishes: a fee above 10,000 millionths of a coin, or any fee for a coin in
-its free window (the two days before its exit deadline, five days before its
-first expiry), is refused before anything is signed, unless the user raises
-the bound for that one command (`participate --max-fee-ppm N`). Every fee is
-printed, coin by coin, before the wallet signs anything for the refresh.
+The operator charges each asset by that asset's own schedule (`info`'s
+`assets[].fees`: parts per million of a coin and a fixed part a coin, in the
+asset's atoms; an operator that publishes none for an asset is read at the top
+of `fees`), and the wallet prices each coin of a refresh by its asset's. The
+fee is bounded by the wallet, not by what the server publishes: a fee above
+10,000 millionths of a coin, or any fee for a coin in its free window (the two
+days before its exit deadline, five days before its first expiry), is refused
+before anything is signed, unless the user raises the bound for that one
+command (`participate --max-fee-ppm N`); a fixed part makes a small coin's fee
+a larger share of it. Every fee is printed, coin by coin, with the schedule it
+was priced by (`quote[].schedule`), before the wallet signs anything for the
+refresh, and a schedule that changed since it was shown is not taken: the
+server refuses a fee short of the asset's schedule (`fee`), and the browser
+wallet submits only the fees it showed.
 
 ### Commands
 
@@ -549,6 +557,16 @@ past their batch leaves' expiry: before the operator's sweep, the leaf is
 taken, checked as of its expiry, and brought home at once; once the sweep of
 the other's batch is final, that leaf is refused, the sweep named, and the
 board given up for it is spent.
+
+`tests/arca_assets.rs` runs the same way, a wallet holding X (listed for
+fees) and Y (not listed). Its coins of both are refreshed in one
+participation per asset, each in its asset's own round, and each new leaf
+rests on its own round. With X charging 5,000 millionths of a coin and Y
+1,000 and 400 atoms a coin, `participate` prices each coin by its asset's
+schedule: a refresh of every coin is refused before anything is signed for the
+coin of Y the fixed part takes past the wallet's bound; X's is paid, printed
+first; Y's is paid with the bound raised for the command; and each new leaf
+holds its coin less its own asset's fee.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test

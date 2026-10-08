@@ -575,13 +575,14 @@ impl Participations {
 			}
 		}
 
-		// The margins, and the fee the schedule asks.
+		// The margins, and the fee the asset's schedule asks.
+		let schedule = p.fees(&asset).map_err(ParticipationError::Assets)?;
 		let refund_delay = p.refund_delay;
 		let mut margins = Vec::with_capacity(n);
 		let mut due: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for (c, expiry) in coins.iter().zip(&expiries) {
 			margins.push(forfeit_margin(c, refund_delay, self.floor(c.asset).await?));
-			*due.entry(c.asset).or_default() += p.fees.refresh(c.value, *expiry, now);
+			*due.entry(c.asset).or_default() += schedule.refresh(c.value, *expiry, now);
 		}
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {
@@ -596,7 +597,7 @@ impl Participations {
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());
 					let margin = offboard_margin(&destination, p.operator, p.offboard_reclaim_delay, self.floor(*asset).await?);
-					*due.entry(*asset).or_default() += p.fees.offboard(*value, margin);
+					*due.entry(*asset).or_default() += schedule.offboard(*value, margin);
 					WantedKind::Offboard { script: script.to_bytes(), margin, reclaim_delay_units: p.offboard_reclaim_delay.units() }
 				},
 			};
@@ -607,7 +608,9 @@ impl Participations {
 		for (a, d) in &due {
 			let f = paid.get(a).copied().unwrap_or(0);
 			if f < *d {
-				return Err(ParticipationError::Fee(format!("a fee of {} in asset {}; the schedule asks {}", f, a, d)));
+				return Err(ParticipationError::Fee(format!("a fee of {} in asset {}; the asset's schedule asks {} (refresh {} ppm and {} \
+					a coin, offboard {} ppm and {})", f, a, d, schedule.refresh_ppm, schedule.refresh_base, schedule.offboard_ppm,
+					schedule.offboard_base)));
 			}
 		}
 

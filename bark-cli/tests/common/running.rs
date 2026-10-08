@@ -52,9 +52,19 @@ impl Running {
 		Self::start_kept(0, None).await
 	}
 
+	/// [`Running::start`], with the server's configuration changed by `tune`
+	/// first; `tune` is given the configuration and assets X and Y.
+	pub async fn start_with<F: FnOnce(&mut Config, AssetId, AssetId)>(tune: F) -> Running {
+		Self::start_tuned(0, None, tune).await
+	}
+
 	/// The server, its signer handing every head to `keepers` keepers of its
 	/// own, `required` of them (all, unless named) to hold each.
 	pub async fn start_kept(keepers: usize, required: Option<usize>) -> Running {
+		Self::start_tuned(keepers, required, |_, _, _| {}).await
+	}
+
+	async fn start_tuned<F: FnOnce(&mut Config, AssetId, AssetId)>(keepers: usize, required: Option<usize>, tune: F) -> Running {
 		let db = TestDb::new().await;
 		let rt = tokio::task::block_in_place(node::start);
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
@@ -87,7 +97,7 @@ impl Running {
 		let signer = tokio::task::block_in_place(|| SignerProcess::start_with(&s, genesis, create, extra));
 		let mnemonic = signer.dir.join("wallet.mnemonic");
 		std::fs::write(&mnemonic, MNEMONIC).unwrap();
-		let config = Config {
+		let mut config = Config {
 			listen: "127.0.0.1:0".into(),
 			database: db.url.clone(),
 			signer_socket: signer.socket.clone(),
@@ -122,6 +132,7 @@ impl Running {
 			},
 			metrics_listen: None,
 		};
+		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();
 		let mut r = Running { server, config, rt, purse, x, y, signer, db, keepers };
 		r.fund_server(x, 50_000_000).await;
