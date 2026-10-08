@@ -490,6 +490,41 @@ impl Store {
 		rows.iter().map(batch_leaf_row).collect()
 	}
 
+	/// The preimage of each leaf of the batch paid by output `vout` of round
+	/// `round_id`, in tree order, once it went out: the participation the
+	/// leaf was made for released at the attempt that made it (now, or at an
+	/// earlier attempt kept when a round it was in was lost). `None` for a
+	/// leaf whose preimage never went out.
+	pub async fn released_preimages(&self, round_id: i64, vout: u32) -> Result<Vec<Option<[u8; 32]>>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT CASE WHEN p.attempt = b.attempt AND p.state = 'released' THEN p.preimage
+			             WHEN a.released THEN a.preimage END
+			 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
+			 LEFT JOIN participation_attempt a ON a.participation_id = b.participation_id AND a.attempt = b.attempt
+			 WHERE b.round_id = $1 AND b.vout = $2 ORDER BY b.idx",
+			&[&round_id, &(vout as i32)],
+		).await?;
+		rows.iter().map(|r| r.get::<_, Option<Vec<u8>>>(0).map(|p| super::array32(p, "preimage")).transpose()).collect()
+	}
+
+	/// Up to `limit` rounds after `after` (a round's number), oldest first,
+	/// each with its txid, its state and the outputs of its batches: what
+	/// the operator publishes, so a mirror can copy every tree.
+	pub async fn rounds_page(&self, after: i64, limit: i64) -> Result<Vec<(i64, [u8; 32], RoundState, Vec<u32>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT r.round_id, r.txid, r.state,
+			        COALESCE((SELECT array_agg(b.vout ORDER BY b.vout) FROM batch b WHERE b.round_id = r.round_id), '{}')
+			 FROM round r WHERE r.round_id > $1 ORDER BY r.round_id LIMIT $2",
+			&[&after, &limit],
+		).await?;
+		rows.iter().map(|r| {
+			let vouts: Vec<i32> = r.get(3);
+			Ok((r.get(0), super::array32(r.get(1), "txid")?, RoundState::parse(r.get(2))?, vouts.into_iter().map(|v| v as u32).collect()))
+		}).collect()
+	}
+
 	/// Where the outputs of participation `id` are in the round of its
 	/// attempt `attempt`.
 	pub async fn placement(&self, id: &[u8; 32], attempt: u32) -> Result<Placement, StoreError> {

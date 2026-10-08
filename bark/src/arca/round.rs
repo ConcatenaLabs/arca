@@ -125,7 +125,59 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
 		});
 	}
-	Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))
+	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;
+	check_published(t, &tree)?;
+	Ok(tree)
+}
+
+/// What a published tree says beyond the parts it is built from, against
+/// the tree the wallet built from those parts: every node it lists (its
+/// value, reserve, script and children, level by level), each leaf's id and
+/// script, and each preimage it publishes, which must open its leaf's
+/// unlock hash. The wallet takes the operator's word for none of it: a tree
+/// that says one thing and builds to another is refused.
+fn check_published(t: &Value, tree: &Tree) -> Result<(), Error> {
+	let wrong = |what: String| Error::Refused(format!("the published tree is not the tree its parts build: {}", what));
+	if let Some(levels) = t["nodes"].as_array() {
+		if levels.len() != tree.levels().len() {
+			return Err(wrong(format!("it lists {} levels of nodes, its parts build {}", levels.len(), tree.levels().len())));
+		}
+		for (k, (shown, built)) in levels.iter().zip(tree.levels()).enumerate() {
+			let shown = shown.as_array().cloned().unwrap_or_default();
+			if shown.len() != built.len() {
+				return Err(wrong(format!("level {} lists {} nodes, its parts build {}", k, shown.len(), built.len())));
+			}
+			for (j, (n, b)) in shown.iter().zip(built).enumerate() {
+				let same = n["value"].as_str() == Some(&b.value.to_string()) && n["reserve"].as_str() == Some(&b.reserve.to_string())
+					&& n["script_pubkey"].as_str() == Some(&hex(b.output().script_pubkey.as_bytes()))
+					&& n["children"] == json!([b.children.start, b.children.end]);
+				if !same {
+					return Err(wrong(format!("node {} of level {} is listed as {}", j, k, n)));
+				}
+			}
+		}
+	}
+	let shown = t["leaves"].as_array().cloned().unwrap_or_default();
+	for (i, (l, r)) in shown.iter().zip(tree.records()).enumerate() {
+		if let Some(id) = l["leaf_id"].as_str() {
+			let built = r.leaf_id().map_err(|e| Error::Refused(e.to_string()))?;
+			if id != built.to_string() {
+				return Err(wrong(format!("leaf {} is named {}, its parts make it {}", i, id, built)));
+			}
+		}
+		if let Some(spk) = l["script_pubkey"].as_str() {
+			if spk != hex(tree.leaves()[i].leaf.script_pubkey().as_bytes()) {
+				return Err(wrong(format!("leaf {}'s script is listed as {}", i, spk)));
+			}
+		}
+		if let Some(p) = l["preimage"].as_str() {
+			let p = unhex32(p)?;
+			if sha256::Hash::hash(&p).to_byte_array() != r.unlock_hash {
+				return Err(wrong(format!("the preimage published for leaf {} does not open its unlock hash", i)));
+			}
+		}
+	}
+	Ok(())
 }
 
 impl Wallet {

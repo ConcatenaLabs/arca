@@ -227,10 +227,17 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 	let _ = std::fs::remove_dir_all(&b.dir);
 }
 
-/// The leaf's value, one atom more.
+/// The leaf's value, one atom more, the tree published without the nodes
+/// and ids its parts give (as a tree that lists none): what is left to
+/// refuse it is the round, which pays another batch output.
 fn more_value(t: &mut Value) {
 	let v: u64 = t["leaves"][0]["value"].as_str().unwrap().parse().unwrap();
 	t["leaves"][0]["value"] = json!((v + 1).to_string());
+	t.as_object_mut().unwrap().remove("nodes");
+	for l in t["leaves"].as_array_mut().unwrap() {
+		l.as_object_mut().unwrap().remove("leaf_id");
+		l.as_object_mut().unwrap().remove("script_pubkey");
+	}
 }
 
 /// The schedule with its last expiry one second later.
@@ -259,6 +266,24 @@ fn backwards_clock(t: &mut Value) {
 	e[1] = MedianTime::from_consensus(e[0].to_consensus_u32() - 1).unwrap();
 	let s = ClockSchedule::new_unchecked(s.token, s.operator, s.notice, e).unwrap();
 	t["schedule"] = json!(hex(&s.encode()));
+}
+
+/// The batch output's value, as the published nodes list it, one atom more.
+fn a_node_one_atom_more(t: &mut Value) {
+	let levels = t["nodes"].as_array_mut().unwrap();
+	let last = levels.last_mut().unwrap().as_array_mut().unwrap();
+	let v: u64 = last[0]["value"].as_str().unwrap().parse().unwrap();
+	last[0]["value"] = json!((v + 1).to_string());
+}
+
+/// The first leaf named by another id.
+fn another_leaf_id(t: &mut Value) {
+	t["leaves"][0]["leaf_id"] = json!(hex(&[7u8; 32]));
+}
+
+/// A preimage published for the first leaf that does not open it.
+fn a_wrong_preimage(t: &mut Value) {
+	t["leaves"][0]["preimage"] = json!(hex(&[9u8; 32]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -290,6 +315,9 @@ async fn a_dishonest_published_tree_is_refused_before_anything_is_signed() {
 		("a leaf's value changed", more_value as common::proxy::Tamper, "fails the wallet's checks"),
 		("the last expiry one second later", later_last_expiry, "check 5"),
 		("a clock that runs backwards", backwards_clock, "backwards"),
+		("a node listed one atom more", a_node_one_atom_more, "is not the tree its parts build: node 0 of level"),
+		("a leaf named by another id", another_leaf_id, "is not the tree its parts build: leaf 0 is named"),
+		("a preimage that does not open its leaf", a_wrong_preimage, "does not open its unlock hash"),
 	] {
 		proxy.set(Some(t));
 		let s = c.ok(&["sync"]);

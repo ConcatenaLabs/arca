@@ -111,7 +111,7 @@ witness_burst = 1000
 witness_source_per_second = 5
 witness_source_burst = 60
 # The reads that serve a wallet what the server holds for it and what it
-# publishes (leaf_data, mailbox_read, tree, bind_mailbox) have a
+# publishes (leaf_data, mailbox_read, tree, rounds, bind_mailbox) have a
 # budget of their own: at most read_per_second over every source together,
 # with bursts of up to read_burst, and read_source_per_second to each source,
 # with bursts of up to read_source_burst. A wallet restored from its mnemonic

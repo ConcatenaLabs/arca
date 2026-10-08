@@ -759,6 +759,60 @@ pub struct PublishedTree {
 	/// The latest entry of the signer's record when the round was built.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub signer_record: Option<RecordHead>,
+	/// Where the round stands: `built`, `broadcast`, `final` or `lost`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_state: Option<String>,
+	/// Every node of the tree as the server built it, level by level, the
+	/// lowest nodes first; the last level holds the batch output alone. A
+	/// reader rebuilds the tree from the leaves and the parameters and
+	/// refuses one whose nodes differ from what it rebuilt.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub nodes: Vec<Vec<PublishedNode>>,
+}
+
+/// A node of a published tree: its output (its value, the reserve in it,
+/// its script) and its children, `[start, end)` in the level below (the
+/// leaves' entries, for a lowest node).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedNode {
+	pub value: String,
+	pub reserve: String,
+	pub script_pubkey: String,
+	pub children: [u32; 2],
+}
+
+/// `POST /v1/rounds`: the rounds after `after` (a round's number,
+/// decimal), up to `limit`, oldest first: what a mirror copies every
+/// published tree by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundsRequest {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub after: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rounds {
+	pub rounds: Vec<RoundEntry>,
+	/// The cursor of the last round listed, to ask for the next page after;
+	/// absent when this page holds nothing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub next: Option<String>,
+}
+
+/// A round: its number (the cursor), its transaction, where it stands, and
+/// the outputs of its batches, each a published tree (`tree`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundEntry {
+	pub cursor: String,
+	pub txid: String,
+	pub state: String,
+	pub batches: Vec<u32>,
 }
 
 /// An entry of the signer's record: its number and running hash, with `S`'s
@@ -869,6 +923,18 @@ pub struct TreeLeaf {
 	pub exit_delay_units: u16,
 	pub value: String,
 	pub unlock_hash: String,
+	/// The leaf's id, and its output's script, as the tree gives them.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub script_pubkey: Option<String>,
+	/// The preimage of the leaf's unlock hash, once its participation's
+	/// preimage went out: it opens the leaf's entry, which pays the leaf's
+	/// own script and nothing else, so it moves nothing but into the
+	/// leaf, and lets an owner whose record is gone take the leaf on the
+	/// chain from the published tree, its mnemonic and the chain.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each
