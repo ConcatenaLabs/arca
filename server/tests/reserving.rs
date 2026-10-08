@@ -315,3 +315,83 @@ async fn reads_are_answered_at_a_bounded_rate_for_each_source() {
 	tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
 	assert_eq!(r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &k, &r.chain)})).status, 200, "one more a second later");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_published_tree_lists_every_node_and_each_preimage_once_it_went_out() {
+	let mut r = common::rounds::start().await;
+	let s = xonly(&r.s);
+	let (a, b) = (keypair("A's board for the tree"), keypair("B's board for the tree"));
+	let x = r.x;
+	let (a_coin, a_tx) = common::rounds::credited_board(&mut r, &a, x).await;
+	let (b_coin, b_tx) = common::rounds::credited_board(&mut r, &b, x).await;
+	let (a_new, b_new) = (keypair("A's leaf in the tree"), keypair("B's leaf in the tree"));
+	let (wa, na) = want_leaf(&a_new, r.x, VALUE);
+	let (wb, nb) = want_leaf(&b_new, r.x, VALUE);
+	let (pa, ida) = participation_body(&[&a_coin], &[wa], &[], None, s, r.chain);
+	let (pb, idb) = participation_body(&[&b_coin], &[wb], &[], None, s, r.chain);
+	r.http.post("submit_participation", &pa).ok();
+	r.http.post("submit_participation", &pb).ok();
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+
+	// rounds lists the round with its batch; a page of one, then nothing.
+	let list = r.http.post("rounds", &json!({})).ok();
+	let mine: Vec<&Value> = list["rounds"].as_array().unwrap().iter().filter(|x| x["txid"] == built.tx.txid().to_string()).collect();
+	assert_eq!(mine.len(), 1, "{}", list);
+	assert_eq!(mine[0]["state"], "final");
+	let vout = mine[0]["batches"][0].as_u64().unwrap();
+	let after = mine[0]["cursor"].as_str().unwrap().to_string();
+	let rest = r.http.post("rounds", &json!({"after": after, "limit": 1})).ok();
+	assert_eq!(rest["rounds"], json!([]));
+	assert!(rest["next"].is_null());
+
+	let published = r.http.post("tree", &json!({"txid": built.tx.txid().to_string(), "vout": vout})).ok();
+	assert_eq!(published["round_state"], "final");
+	let tree = common::client::rebuild(&published);
+	// Every node as the tree builds it, level by level.
+	let levels = published["nodes"].as_array().unwrap();
+	assert_eq!(levels.len(), tree.levels().len());
+	for (shown, built_level) in levels.iter().zip(tree.levels()) {
+		for (n, b) in shown.as_array().unwrap().iter().zip(built_level) {
+			assert_eq!(n["value"], b.value.to_string());
+			assert_eq!(n["reserve"], b.reserve.to_string());
+			assert_eq!(n["script_pubkey"], hex(b.output().script_pubkey.as_bytes()));
+			assert_eq!(n["children"], json!([b.children.start, b.children.end]));
+		}
+	}
+	assert_eq!(levels.last().unwrap()[0]["script_pubkey"], hex(built.tx.output[vout as usize].script_pubkey.as_bytes()),
+		"the last level is the batch output the round pays");
+	// Each leaf's id and script; no preimage before any went out.
+	for (l, rec) in published["leaves"].as_array().unwrap().iter().zip(tree.records()) {
+		assert_eq!(l["leaf_id"], rec.leaf_id().unwrap().to_string());
+		assert!(l["preimage"].is_null(), "no preimage before its participation's went out: {}", l);
+	}
+	// A hands over its forfeit: its leaf's preimage is published, B's is not.
+	let st = status(&r, &ida);
+	let (va, ra, round) = validate_new_leaf(&r, &ida, 0, &a_new, &na);
+	let old = a_coin.record.resolve(&[a_tx.clone()], &r.policy()).unwrap();
+	let f = forfeit_for(&old, &va, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&ida),
+		"forfeits": [{"leaf_id": a_coin.id.to_string(), "signature": forfeit_sig(&f, &a)}],
+		"leaves": [auths_json(&va, &a_new, created(&ra))]})).ok();
+	assert_eq!(done["state"], "released");
+	let published = r.http.post("tree", &json!({"txid": built.tx.txid().to_string(), "vout": vout})).ok();
+	let ia = st["outputs"][0]["leaf_index"].as_u64().unwrap() as usize;
+	let ib = status(&r, &idb)["outputs"][0]["leaf_index"].as_u64().unwrap() as usize;
+	assert_eq!(published["leaves"][ia]["preimage"], done["preimage"]);
+	assert!(published["leaves"][ib]["preimage"].is_null(), "B's forfeit has not come: its preimage stays the operator's");
+	// From the published tree alone, A's leaf: the record the tree gives, the
+	// preimage it publishes, A's own authorisations made again; it validates
+	// against the round as the leaf A first took.
+	let record = common::client::rebuild(&published).record(ia);
+	let preimage: [u8; 32] = unhex(published["leaves"][ia]["preimage"].as_str().unwrap()).try_into().unwrap();
+	let auths: Vec<_> = va.branch.nodes.iter().map(|n| (sign_digest(&a_new, &n.unroll_authorisation(created(&record)).digest, &random32()),
+		created(&record))).collect();
+	let coin = CoinRecord::Leaf { record, preimage, auths };
+	let v = coin.validate(&[round.clone()], &r.policy(), &xonly(&a_new), &na).unwrap();
+	assert_eq!(v.id, va.leaf_id);
+	let _ = (b_tx, nb);
+	println!("published tree of {}:{}: {} levels of nodes; A's preimage out, B's not", built.tx.txid(), vout, levels.len());
+}

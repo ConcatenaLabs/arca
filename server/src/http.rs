@@ -15,7 +15,7 @@
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
-//! | `tree` | POST | no: the operator publishes every tree; at the reads' rate |
+//! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
@@ -75,7 +75,7 @@ pub struct App {
 	/// its lock.
 	pub witnesses: Limiter,
 	/// Bounds the reads that serve what the server holds for a wallet and
-	/// what it publishes (`leaf_data`, `mailbox_read`, `tree`,
+	/// what it publishes (`leaf_data`, `mailbox_read`, `tree`, `rounds`,
 	/// `bind_mailbox`).
 	pub reads: Limiter,
 	/// The key of every challenge's check ([`crate::auth`]), kept in the
@@ -799,6 +799,13 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 	let t = app.rounds.tree(&txid, req.vout).await?
 		.ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "unknown_batch", format!("no batch is paid by {}:{}", txid, req.vout)))?;
 	use arca_covenant::encode::Encoding;
+	// The tree as the server built it: every node, and each leaf's id and
+	// script, for a reader to compare with what it rebuilds.
+	let built = arca_covenant::tree::Tree::build(t.params.clone(), &t.leaves)
+		.map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("the batch's own tree does not build: {}", e)))?;
+	let records: Vec<(LeafId, elements::Script)> = built.records().iter().zip(built.leaves()).map(|(r, l)| {
+		r.leaf_id().map(|id| (id, l.leaf.script_pubkey()))
+	}).collect::<Result<_, _>>().map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
 	Ok(Json(api::PublishedTree {
 		round_txid: t.round_txid.to_string(),
 		batch_vout: t.batch_vout,
@@ -822,7 +829,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			Some((entry, h, sig)) => Some(head_with_acks(&app, entry, &h, sig.as_ref()).await?),
 			None => None,
 		},
-		leaves: t.leaves.iter().map(|l| api::TreeLeaf {
+		leaves: t.leaves.iter().zip(&records).zip(&t.preimages).map(|((l, r), p)| api::TreeLeaf {
 			template: l.template.to_string(),
 			owner: hex(&l.owner.serialize()),
 			owner_nonce: hex(&l.owner_nonce),
@@ -830,9 +837,43 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			exit_delay_units: l.exit_delay.units(),
 			value: l.value.to_string(),
 			unlock_hash: hex(&l.unlock_hash),
+			leaf_id: Some(r.0.to_string()),
+			script_pubkey: Some(hex(r.1.as_bytes())),
+			preimage: p.map(|p| hex(&p)),
 		}).collect(),
+		round_state: Some(t.round_state.as_str().into()),
+		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
+			value: n.value.to_string(),
+			reserve: n.reserve.to_string(),
+			script_pubkey: hex(n.output().script_pubkey.as_bytes()),
+			children: [n.children.start as u32, n.children.end as u32],
+		}).collect()).collect(),
 	}))
 }
+
+/// The rounds after a cursor, oldest first, each with its transaction, its
+/// state and the outputs of its batches: what a mirror copies every
+/// published tree by. Public, at the reads' rate.
+async fn rounds(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::Rounds>, Refusal>
+{
+	let req: api::RoundsRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a list of rounds", app.source(peer.ip(), &headers))?;
+	let after: i64 = match req.after.as_deref() {
+		None | Some("0") => 0,
+		Some(a) => i64::try_from(amount(a)?).map_err(|_| Refusal::malformed("cursor out of range"))?,
+	};
+	let limit = req.limit.unwrap_or(ROUNDS_PAGE).clamp(1, ROUNDS_PAGE);
+	let rows = app.store.rounds_page(after, limit as i64).await?;
+	let rounds: Vec<api::RoundEntry> = rows.into_iter().map(|(id, txid, state, batches)| api::RoundEntry {
+		cursor: id.to_string(), txid: txid_hex(&txid), state: state.as_str().into(), batches,
+	}).collect();
+	let next = rounds.last().map(|r| r.cursor.clone());
+	Ok(Json(api::Rounds { rounds, next }))
+}
+
+/// The most rounds one `rounds` page lists.
+pub const ROUNDS_PAGE: u32 = 100;
 
 async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Forfeited>, Refusal> {
 	let req: api::ForfeitLeaves = parse(body, app.max_request)?;
@@ -1171,6 +1212,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/tree", post(tree))
+		.route("/v1/rounds", post(rounds))
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))
 		.route("/v1/release_leaves", post(release_leaves))
 		.route("/v1/mailbox_read", post(mailbox_read))

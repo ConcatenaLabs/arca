@@ -452,7 +452,20 @@ reserve rule and the smallest leaf, every leaf as the builder took it
 hash), and the latest entry of the signer's record, with its running hash,
 when the round was built (`signer_record`). From that alone a wallet, an explorer or any mirror rebuilds every
 script of the tree with `Tree::build` and checks the leaf it cares about
-against the round transaction with `LeafRecord::validate`.
+against the round transaction with `LeafRecord::validate`. The tree as the
+server built it comes with it, for a reader to compare with what it rebuilds:
+every node, level by level from the lowest to the batch output (its value,
+the reserve in it, its script and its children), each leaf's id and script,
+and where the round stands (`round_state`). Once a leaf's participation's
+preimage went out, the tree publishes that preimage beside the leaf
+(`preimage`). It opens the leaf's entry, whose only spend pays the leaf's own
+script, so it lets nobody move anything but into the leaf; and with it an
+owner whose own record is gone takes the leaf on the chain from the published
+tree, its mnemonic (which signs its unroll authorisations again) and the
+chain. Before the preimage went out the owner's forfeit is not in, and the
+preimage stays the operator's. `rounds` lists every round after a cursor,
+oldest first, with its transaction, its state and the outputs of its
+batches, so a mirror copies every published tree.
 
 ### Rollbacks
 
@@ -771,7 +784,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins, with the signed head of the signer's record its last signature was recorded at (`signer_record`) |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), and once void or expired whether each coin it gave up is its owner's again off the chain (`returned`) |
-| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed |
+| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script, each leaf's preimage once its participation's went out, and the round's state |
+| `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
 | `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at |
@@ -798,7 +812,7 @@ proxy, a log) learns nothing more than that read. There is no bearer token. `cos
 authenticated by the owners' signatures over the transfer itself, and
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
-of its request, and `tree` is public. `bind_mailbox` is authenticated by
+of its request, and `tree` and `rounds` are public. `bind_mailbox` is authenticated by
 each leaf's owner key's signature over its binding. `forfeit_leaves` and `release_leaves`
 are authenticated by the owners' signatures over the forfeits and releases
 themselves.
@@ -822,7 +836,7 @@ a second with bursts of 1,000, and 5 a second with bursts of 60, at the
 defaults): a wallet makes one each command, and a caller that uses up the
 nonces leaves every wallet its witness. The reads that serve a wallet what
 the server holds for it and what it publishes (`leaf_data`, `mailbox_read`,
-`tree`, `bind_mailbox`) have a budget of their own too
+`tree`, `rounds`, `bind_mailbox`) have a budget of their own too
 (`read_per_second` and `read_burst` overall, `read_source_per_second` and
 `read_source_burst` for each source; 500 a second with bursts of 2,000, and
 10 a second with bursts of 200, at the defaults): a wallet restored from its
@@ -1397,7 +1411,13 @@ does not prove is served; pages of one leaf give the same leaves, and a
 page's proof is good for that page alone; `bind_mailbox` binds a leaf made
 without a binding, keeps the first binding of a key, binds nothing for a key
 the server knows no leaf of, and refuses too many at once. A source past its
-read budget is refused `rate_limited`.
+read budget is refused `rate_limited`. The published tree lists every node,
+level by level, as a rebuild gives it, the last level the batch output the
+round pays, and each leaf's id; a leaf's preimage is published once its
+participation's went out and not before, and from the published tree
+alone, a preimage it publishes and authorisations its owner signs again,
+the leaf validates against the round as the leaf its owner first took.
+`rounds` lists the round with its batch and pages on.
 
 `tests/address.rs` runs `arcad <config> address` beside a running server:
 each run hands out the next index, the address is the node's for the script

@@ -233,6 +233,13 @@ pub struct PublishedTree {
 	/// signer's signature over them, when the round was built: a witness of
 	/// the record every wallet reading the tree keeps.
 	pub signer_head: Option<(u64, [u8; 32], Option<[u8; 64]>)>,
+	/// Where the round stands.
+	pub round_state: RoundState,
+	/// Each leaf's preimage, in tree order, once its participation's
+	/// preimage went out: it opens the leaf's entry, which pays the leaf's
+	/// own script and nothing else, so it lets an owner whose record is gone
+	/// take the leaf on the chain from the published tree alone.
+	pub preimages: Vec<Option<[u8; 32]>>,
 }
 
 /// One leaf the round builds: the participation, the output, the spec.
@@ -1475,9 +1482,10 @@ impl Rounds {
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;
+		let preimages = self.store.released_preimages(b.round_id, b.vout).await?;
 		Ok(Some(PublishedTree {
 			round_txid: *txid, batch_vout: b.vout, token_vout: b.token_vout, connector_vout: round.connector_vout, params, leaves: specs,
-			signer_head,
+			signer_head, round_state: round.state, preimages,
 		}))
 	}
 

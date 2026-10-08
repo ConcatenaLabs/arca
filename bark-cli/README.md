@@ -73,7 +73,9 @@ the keys, but which coins were spent off-chain is in the store and the server.
 
 - **A leaf from a round** is rebuilt from the tree the operator publishes and
   validated against the round transaction under the wallet's policy before the
-  wallet signs anything for it: the five checks on the sweep token and its
+  wallet signs anything for it. A tree that lists a node, a leaf's id or
+  script other than its parts build, or a preimage that does not open its
+  leaf's unlock hash, is refused before anything else is looked at. Then: the five checks on the sweep token and its
   clock, the batch output paid exactly once, the notice, a first expiry at
   least 27 days after the median time of the round's block (so a refresh
   completed a day or two after its round, as the operator allows until the
@@ -428,7 +430,9 @@ stopped, through its unroll, its checkpoints, its reassignment and its claim,
 a fee coin the wallet chooses (the one asset it holds that the node takes)
 paying where its asset is not accepted for fees. A second test puts
 a proxy between a wallet and the server that rewrites the published tree (a
-leaf's value, the last expiry, a clock running backwards): the wallet refuses
+leaf's value, the last expiry, a clock running backwards, a node listed one
+atom more, a leaf named by another id, a preimage that does not open its
+leaf): the wallet refuses
 each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
