@@ -40,10 +40,10 @@ round_interval_seconds = 60
 # address. None are served when absent.
 # metrics_listen = "127.0.0.1:3536"
 
-# The assets a round's fee is paid in, in order of preference. A round pays in
-# the first of its own batches' assets the node accepts for fees, else in the
-# first of these it accepts, and never in any other. The served assets, in the
-# order listed below, when absent.
+# The assets a round's fee is paid in, in order of preference. A round carries
+# one asset and pays its fee in it when the node accepts it for fees and it is
+# listed here, else in the first of these the node accepts, and never in any
+# other. The served assets, in the order listed below, when absent.
 # fee_assets = ["<asset id>"]
 
 [node]
@@ -157,10 +157,14 @@ offboard_ppm = 0
 # and returns the rest to the operator's wallet.
 max_margin_multiple = 25
 
-# Each asset served, with the smallest leaf taken, in the asset's atoms. An
-# asset served need not be one the node accepts for fees: a batch in such an
-# asset carries a reserve of one atom on every node and every entry, and
-# whoever unrolls it attaches a fee coin in an accepted asset.
+# Each asset served, with the smallest leaf taken, in the asset's atoms. Each
+# has its own boards, rounds and pool (the wallet's coins of it); an asset not
+# listed is refused at every entry. An asset is added without a restart: list
+# it, pay the wallet coins of it, and send arcad SIGHUP. An asset served need
+# not be one the node accepts for fees: a batch in such an asset carries a
+# reserve of one atom on every node and every entry, whoever unrolls it
+# attaches a fee coin in an accepted asset, and its rounds pay their fee from
+# the pool of the first of fee_assets the node accepts.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"

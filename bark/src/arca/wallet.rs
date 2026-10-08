@@ -1477,7 +1477,14 @@ impl Wallet {
 			self.store.set_meta(REFRESH_ASKED, &serde_json::to_string(&asked_at).expect("a map"))?;
 			let asked = self.refresh_quote(std::slice::from_ref(&c.leaf_id), None).and_then(|q| self.participate(q, None));
 			out.push(match asked {
-				Ok(v) => json!({"leaf_id": c.leaf_id, "participation": v["participation"], "state": v["state"], "fees": v["fees"]}),
+				Ok(v) => {
+					let p = &v["participations"][0];
+					match p.get("error") {
+						None => json!({"leaf_id": c.leaf_id, "participation": p["participation"], "state": p["state"], "fees": p["fees"]}),
+						Some(e) => json!({"leaf_id": c.leaf_id, "error": e,
+							"note": "the coin stays live: sync asks for its refresh again, and takes it on the chain from home_from"}),
+					}
+				},
 				Err(e) => json!({"leaf_id": c.leaf_id, "error": e.to_string(),
 					"note": "the coin stays live: sync asks for its refresh again, and takes it on the chain from home_from"}),
 			});

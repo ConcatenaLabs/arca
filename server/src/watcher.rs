@@ -59,8 +59,10 @@
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
 //! transaction needs, the rest of a large margin back to the wallet);
-//! otherwise by a coin of the wallet's in the first asset of the operator's
-//! `fee_assets` the node accepts. No asset is assumed, the policy asset included. Every
+//! otherwise by a coin of the wallet's: of the asset the transaction works in
+//! (a batch's, for its token's release) when the node accepts it and the
+//! wallet holds one, else in the first asset of the operator's `fee_assets`
+//! the node accepts. No asset is assumed, the policy asset included. Every
 //! transaction goes to the nursery, which broadcasts it again unchanged after
 //! a rollback, however deep: an anchor-driven reorganisation that takes out a
 //! round and the watcher's answers puts them back in the order they were
@@ -421,7 +423,7 @@ impl Watcher {
 	/// operator's fee assets.
 	fn fee_assets(&self, prefer: AssetId) -> Vec<AssetId> {
 		let mut v = vec![prefer];
-		v.extend(self.params.fee_assets.iter().copied().filter(|a| *a != prefer));
+		v.extend(self.params.fee_assets().into_iter().filter(|a| *a != prefer));
 		v
 	}
 
@@ -962,7 +964,7 @@ impl Watcher {
 				pools.entry(fa).or_insert((0, 0)).1 += claim;
 			}
 		}
-		for fa in self.params.fee_assets.clone() {
+		for fa in self.params.fee_assets() {
 			if self.accepted(fa).await?.is_some() {
 				let pool = self.wallet.fee_pool(fa).await?;
 				pools.entry(fa).or_insert((0, 0)).0 = pool;
@@ -1468,7 +1470,7 @@ impl Watcher {
 				if now.to_consensus_u32() < e.to_consensus_u32() || self.unspent(at).await?.is_none() || self.spending(&at).await? {
 					return Ok(());
 				}
-				let (ks, coin, fee) = self.wallet.with_fee_coin(&self.params.fee_assets, |src| {
+				let (ks, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets(AssetId::from_byte_array(b.asset)), |src| {
 					let ks = schedule.release_tx(j, at, src).map_err(|e| e.to_string())?;
 					let t = ks.clone().finish(Clock::witness_items(&dummy_sig())).tx;
 					let w: Vec<usize> = fee_input(&t, src).into_iter().collect();

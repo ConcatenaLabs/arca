@@ -30,7 +30,7 @@ use crate::wallet::{SpendFrom, Wallet, WalletConfig};
 use crate::watcher::{Watcher, WatcherConfig};
 
 /// The server's configuration, as `arcad` reads it from a TOML file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
 	/// Where the HTTP interface listens, `127.0.0.1:3535`. A reverse proxy in
@@ -62,12 +62,14 @@ pub struct Config {
 	/// 48 hours when absent.
 	#[serde(default)]
 	pub exit_delay_units: Option<(u16, u16)>,
-	/// The assets served.
+	/// The assets served, in the order `info` lists them; taken anew,
+	/// without a restart, by [`Server::reload`].
 	pub assets: Vec<AssetSection>,
 	/// The assets a round's fee is paid in, in order of preference (display
 	/// order ids); the served assets, in the order listed, when absent. A
-	/// round pays in the first of its own batches' assets the node accepts
-	/// for fees, else in the first of these it accepts.
+	/// round carries one asset and pays in it when the node accepts it for
+	/// fees and it is listed here, else in the first of these the node
+	/// accepts.
 	#[serde(default)]
 	pub fee_assets: Option<Vec<String>>,
 	/// What the operator charges for a refresh and an offboard; nothing when
@@ -88,7 +90,7 @@ pub struct Config {
 	pub metrics_listen: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
 	/// Operator nonces handed out per second at most, over every source
@@ -239,7 +241,7 @@ fn default_cleanup_interval() -> u64 {
 	60
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WatcherSection {
 	/// Whether the watcher acts on its own, following the chain. Off, it acts
@@ -302,7 +304,7 @@ fn default_block_interval() -> u64 {
 	WatcherConfig::default().block_interval.as_secs()
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FeesSection {
 	/// The most a refresh costs, in parts per million of the coin's value.
@@ -335,7 +337,7 @@ fn default_round_interval() -> u64 {
 	60
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
 	/// `http://host:port/`
@@ -349,7 +351,7 @@ pub struct NodeConfig {
 	pub rpc_password: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FinalitySection {
 	#[serde(default = "default_anchor_depth")]
@@ -384,7 +386,7 @@ fn default_poll_ms() -> u64 {
 	1000
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AssetSection {
 	/// The asset id, display order.
@@ -589,6 +591,28 @@ async fn check_signer_entries(store: &Store, signer: &SignerClient) -> Result<()
 	Ok(())
 }
 
+/// The top-level settings of `a` and `b` that differ, by name.
+fn restart_only(a: &Config, b: &Config) -> Vec<String> {
+	let mut out = vec![];
+	let mut differ = |name: &str, same: bool| if !same { out.push(name.to_string()) };
+	differ("listen", a.listen == b.listen);
+	differ("database", a.database == b.database);
+	differ("signer_socket", a.signer_socket == b.signer_socket);
+	differ("wallet_mnemonic_file", a.wallet_mnemonic_file == b.wallet_mnemonic_file);
+	differ("fee_multiple", a.fee_multiple == b.fee_multiple);
+	differ("max_request_bytes", a.max_request_bytes == b.max_request_bytes);
+	differ("challenge_ttl_seconds", a.challenge_ttl_seconds == b.challenge_ttl_seconds);
+	differ("round_interval_seconds", a.round_interval_seconds == b.round_interval_seconds);
+	differ("node", a.node == b.node);
+	differ("finality", a.finality == b.finality);
+	differ("exit_delay_units", a.exit_delay_units == b.exit_delay_units);
+	differ("fees", a.fees == b.fees);
+	differ("watcher", a.watcher == b.watcher);
+	differ("limits", a.limits == b.limits);
+	differ("metrics_listen", a.metrics_listen == b.metrics_listen);
+	out
+}
+
 /// A running server.
 pub struct Server {
 	pub addr: SocketAddr,
@@ -605,7 +629,44 @@ pub struct Server {
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub watcher: Arc<Watcher>,
+	/// The configuration the server runs with, as last loaded.
+	config: std::sync::Mutex<Config>,
 	tasks: Vec<JoinHandle<()>>,
+}
+
+/// What a reload of the configuration changed ([`Server::reload`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reloaded {
+	/// Assets served from now on that were not served before.
+	pub added: Vec<AssetId>,
+	/// Assets served before whose settings changed.
+	pub changed: Vec<AssetId>,
+	/// Whether the assets a round's fee is paid in changed.
+	pub fee_assets: bool,
+	/// The settings that changed and take a restart, which the reload left
+	/// as they were.
+	pub needs_restart: Vec<String>,
+}
+
+/// The assets `config` serves, in its order, each once, and the assets a
+/// round's fee is paid in when it names them.
+fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec<AssetId>>), StartError> {
+	let mut list: Vec<(AssetId, AssetParams)> = vec![];
+	for a in &config.assets {
+		let id = AssetId::from_str(&a.asset).map_err(err("assets.asset"))?;
+		if list.iter().any(|(b, _)| *b == id) {
+			return Err(StartError(format!("assets: asset {} is listed twice", id)));
+		}
+		list.push((id, AssetParams { min_leaf: parse_amount(&a.min_leaf).map_err(err("assets.min_leaf"))? }));
+	}
+	if list.is_empty() {
+		return Err(StartError("assets: the server serves at least one asset".into()));
+	}
+	let fee_assets = match &config.fee_assets {
+		Some(l) => Some(l.iter().map(|a| AssetId::from_str(a)).collect::<Result<Vec<_>, _>>().map_err(err("fee_assets"))?),
+		None => None,
+	};
+	Ok((list, fee_assets))
 }
 
 impl Server {
@@ -669,18 +730,9 @@ impl Server {
 			},
 		}
 
-		let mut assets = BTreeMap::new();
-		let mut order = vec![];
-		for a in &config.assets {
-			let id = AssetId::from_str(&a.asset).map_err(err("assets.asset"))?;
-			assets.insert(id, AssetParams { min_leaf: parse_amount(&a.min_leaf).map_err(err("assets.min_leaf"))? });
-			order.push(id);
-		}
-		let mut params = Params::new(Chain::new(genesis), operator, assets);
-		params.fee_assets = match &config.fee_assets {
-			Some(list) => list.iter().map(|a| AssetId::from_str(a)).collect::<Result<_, _>>().map_err(err("fee_assets"))?,
-			None => order,
-		};
+		let (list, fee_assets) = assets_of(config)?;
+		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
+		params.assets.replace(list, fee_assets);
 		params.fees = FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm };
 		if let Some(m) = config.fees.max_margin_multiple {
 			if m < 1 {
@@ -810,8 +862,61 @@ impl Server {
 				log::error!("the HTTP listener stopped: {}", e);
 			}
 		}));
-		log::info!("arca server on {}: operator {}, genesis {}", addr, crate::signer::hex(&operator.serialize()), genesis);
-		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher, tasks })
+		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
+			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
+		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher,
+			config: std::sync::Mutex::new(config.clone()), tasks })
+	}
+
+	/// Takes the assets `config` serves, and the assets a round's fee is
+	/// paid in, without a restart: an asset added is served by every entry,
+	/// every round and the watcher from now on (its pool is the wallet's
+	/// coins of it, so it is funded by paying the wallet), and an asset whose
+	/// settings changed is served under its new ones. Nothing is taken when
+	/// `config` does not read, or leaves out an asset served now: an asset
+	/// stops being served only at a restart, after which the server takes no
+	/// new work in it and its holders take their coins on the chain. Any
+	/// other setting that changed takes a restart; the reload leaves it as
+	/// it was and says so.
+	pub fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
+		let (list, fee_assets) = assets_of(config)?;
+		let before = self.params.assets.all();
+		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();
+		if !removed.is_empty() {
+			return Err(StartError(format!("the configuration leaves out asset(s) {} that the server serves: an asset stops being \
+				served only at a restart (its holders then take their coins on the chain), so nothing was reloaded", removed.join(", "))));
+		}
+		let mut current = self.config.lock().unwrap_or_else(|e| e.into_inner());
+		let mut out = Reloaded::default();
+		for (a, p) in &list {
+			match before.iter().find(|(b, _)| b == a) {
+				None => out.added.push(*a),
+				Some((_, q)) if q != p => out.changed.push(*a),
+				Some(_) => {},
+			}
+		}
+		out.fee_assets = self.params.assets.fee_assets() != fee_assets.clone().unwrap_or_else(|| list.iter().map(|(a, _)| *a).collect());
+		// What a reload takes, laid over the configuration the server runs
+		// with: whatever else differs takes a restart.
+		let mut taken = current.clone();
+		taken.assets = config.assets.clone();
+		taken.fee_assets = config.fee_assets.clone();
+		if taken != *config {
+			out.needs_restart = restart_only(&taken, config);
+			log::warn!("reload: {} changed and take(s) a restart; left as they were", out.needs_restart.join(", "));
+		}
+		self.params.assets.replace(list, fee_assets);
+		*current = taken;
+		log::info!("reload: the server serves {}; added {:?}, changed {:?}{}",
+			self.params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+			out.added.iter().map(|a| a.to_string()).collect::<Vec<_>>(), out.changed.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+			if out.fee_assets { "; the fee assets changed" } else { "" });
+		Ok(out)
+	}
+
+	/// The configuration the server runs with, as last loaded.
+	pub fn config(&self) -> Config {
+		self.config.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	/// Stops every task.

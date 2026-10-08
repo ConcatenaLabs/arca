@@ -158,8 +158,8 @@ async fn floors(app: &App) -> Option<Vec<api::FloorInfo>> {
 		}
 	}
 	let mut out = vec![];
-	for asset in app.params.assets.keys() {
-		match crate::fees::floor_per_kvb(app.cosigner.finality(), *asset).await {
+	for asset in app.params.assets.ids() {
+		match crate::fees::floor_per_kvb(app.cosigner.finality(), asset).await {
 			Ok(f) => out.push(api::FloorInfo { asset: asset.to_string(), floor_per_kvb: f.map(|f| f.to_string()) }),
 			Err(e) => {
 				log::warn!("info: the node's floor in asset {}: {}", asset, e);
@@ -547,7 +547,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
 		genesis_hash: p.chain.genesis_hash().to_string(),
-		assets: p.assets.iter().map(|(a, ap)| api::AssetInfo { asset: a.to_string(), min_leaf: ap.min_leaf.to_string() }).collect(),
+		assets: p.assets.all().iter().map(|(a, ap)| api::AssetInfo { asset: a.to_string(), min_leaf: ap.min_leaf.to_string() }).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
 		finality: api::FinalityInfo {

@@ -2,6 +2,7 @@
 //! bounds every leaf it takes part in must keep.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::AssetId;
@@ -16,6 +17,78 @@ pub struct AssetParams {
 	/// The smallest leaf the operator takes, in the asset's atoms: a leaf
 	/// smaller than its own exit cost is not protected.
 	pub min_leaf: u64,
+}
+
+/// The assets the operator serves, in the order its configuration lists
+/// them, and the assets a round's fee is paid in. Every component reads
+/// them through one shared handle, so an asset added to the configuration
+/// is served by every entry, every round and the watcher at once when the
+/// server reloads its configuration ([`crate::server::Server::reload`]),
+/// without a restart. Each asset has a pool of its own: the operator's
+/// wallet's coins of that asset, which fund that asset's batches and
+/// nothing else, and its own rounds, which carry that asset alone.
+#[derive(Debug, Clone, Default)]
+pub struct Assets(Arc<RwLock<Served>>);
+
+#[derive(Debug, Clone, Default)]
+struct Served {
+	order: Vec<AssetId>,
+	map: BTreeMap<AssetId, AssetParams>,
+	/// The assets a round's fee is paid in, as configured; the served assets,
+	/// in their order, when the configuration names none.
+	fee_assets: Option<Vec<AssetId>>,
+}
+
+impl Assets {
+	/// `list`, in its order, each asset once.
+	pub fn new(list: Vec<(AssetId, AssetParams)>, fee_assets: Option<Vec<AssetId>>) -> Assets {
+		let a = Assets::default();
+		a.replace(list, fee_assets);
+		a
+	}
+
+	/// Serves `list` from now on, in its order, and pays rounds' fees in
+	/// `fee_assets` (the served assets, in order, when `None`).
+	pub fn replace(&self, list: Vec<(AssetId, AssetParams)>, fee_assets: Option<Vec<AssetId>>) {
+		let mut served = Served { fee_assets, ..Default::default() };
+		for (a, p) in list {
+			if served.map.insert(a, p).is_none() {
+				served.order.push(a);
+			}
+		}
+		*self.0.write().unwrap_or_else(|e| e.into_inner()) = served;
+	}
+
+	fn read(&self) -> std::sync::RwLockReadGuard<'_, Served> {
+		self.0.read().unwrap_or_else(|e| e.into_inner())
+	}
+
+	/// What the operator serves for `asset`, if it serves it.
+	pub fn get(&self, asset: &AssetId) -> Option<AssetParams> {
+		self.read().map.get(asset).copied()
+	}
+
+	pub fn contains(&self, asset: &AssetId) -> bool {
+		self.read().map.contains_key(asset)
+	}
+
+	/// The assets served, in the configuration's order.
+	pub fn ids(&self) -> Vec<AssetId> {
+		self.read().order.clone()
+	}
+
+	/// The assets served with what is served of each, in the
+	/// configuration's order.
+	pub fn all(&self) -> Vec<(AssetId, AssetParams)> {
+		let s = self.read();
+		s.order.iter().map(|a| (*a, s.map[a])).collect()
+	}
+
+	/// The assets a round's fee is paid in, in order of preference.
+	pub fn fee_assets(&self) -> Vec<AssetId> {
+		let s = self.read();
+		s.fee_assets.clone().unwrap_or_else(|| s.order.clone())
+	}
 }
 
 /// What the operator charges, in the asset moved. Transfers inside the tree
@@ -70,15 +143,11 @@ pub struct Params {
 	/// The bounds on every leaf's exit delay.
 	pub min_exit_delay: RelativeTime,
 	pub max_exit_delay: RelativeTime,
-	/// The assets served, each with its own minimum leaf.
-	pub assets: BTreeMap<AssetId, AssetParams>,
+	/// The assets served, each with its own minimum leaf, and the assets a
+	/// round's fee is paid in: a live table ([`Assets`]).
+	pub assets: Assets,
 	/// The most reassignments a coin may be from a round or a board.
 	pub depth_limit: usize,
-	/// The assets the operator pays a round's fee in, in order of preference:
-	/// a round pays in the first of its own batches' assets the node accepts
-	/// for fees, or else in the first of these it accepts. Never an asset
-	/// outside this list, and never one the node does not accept.
-	pub fee_assets: Vec<AssetId>,
 	pub fees: FeeSchedule,
 	/// The delay after which the owner of a leaf given up may take its
 	/// forfeit back: long enough for the operator to claim it, and well
@@ -103,14 +172,13 @@ impl Params {
 	pub fn new(chain: Chain, operator: XOnlyPublicKey, assets: BTreeMap<AssetId, AssetParams>) -> Params {
 		let any_time = MedianTime::from_consensus(arca_covenant::time::LOCKTIME_THRESHOLD).expect("the first time");
 		let spec = WalletPolicy::new(chain, operator, any_time);
-		let fee_assets = assets.keys().copied().collect();
+		let assets = Assets::new(assets.into_iter().collect(), None);
 		let mut p = Params {
 			chain, operator,
 			min_exit_delay: spec.min_exit_delay,
 			max_exit_delay: spec.max_exit_delay,
 			assets,
 			depth_limit: DEPTH_LIMIT,
-			fee_assets,
 			fees: FeeSchedule::default(),
 			refund_delay: spec.max_exit_delay,
 			offboard_reclaim_delay: spec.max_exit_delay,
@@ -128,6 +196,15 @@ impl Params {
 		self.refund_delay = self.max_exit_delay;
 		let units = 2 * self.max_exit_delay.units() as u32 + (2 * 86_400u32).div_ceil(512);
 		self.offboard_reclaim_delay = RelativeTime::from_units(units.min(u16::MAX as u32) as u16).expect("a relative time");
+	}
+
+	/// The assets the operator pays a round's fee in, in order of
+	/// preference: a round pays in its own asset when the node accepts it for
+	/// fees and it is on this list, or else in the first of these the node
+	/// accepts. Never an asset outside this list, and never one the node does
+	/// not accept.
+	pub fn fee_assets(&self) -> Vec<AssetId> {
+		self.assets.fee_assets()
 	}
 
 	pub fn exit_delay_ok(&self, delay: RelativeTime) -> bool {

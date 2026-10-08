@@ -1,10 +1,10 @@
 //! Rounds, against a whole server on an anchored proof-of-stake regtest
-//! chain: participations in two assets turned into one round transaction,
-//! with a batch and a sweep token per asset, an offboard and the connector;
-//! the round final; each batch published; and a wallet validating its new
-//! leaf from the published tree alone, the five checks on the token and its
-//! clock among them, while a published tree changed in any part is refused.
-//! The server's wallet holds no policy asset at any point.
+//! chain: participations in two assets turned into a round transaction for
+//! each asset, each with its batch and sweep token and the connector, one
+//! with an offboard; the rounds final; each batch published; and a wallet
+//! validating its new leaf from the published tree alone, the five checks on
+//! the token and its clock among them, while a published tree changed in any
+//! part is refused. The server's wallet holds no policy asset at any point.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -49,57 +49,66 @@ async fn a_round_in_two_assets_published_and_validated() {
 		assert_eq!(r.http.post("submit_participation", p).ok()["state"], "pending");
 	}
 
-	// The round.
-	let built = r.server.rounds.run_round().await.unwrap().expect("participations wait");
-	let tx = built.tx.clone();
-	println!("round {}: {} vB, {} inputs, {} outputs, {:?}, broadcast: {}", tx.txid(), tx.vsize(), tx.input.len(),
-		tx.output.len(), built.batches, built.broadcast);
-	assert_eq!(built.broadcast, "accepted");
-	// One batch per asset, in asset id order, each followed by its token.
-	let mut expect = [(x, 2), (y, 1)];
-	expect.sort_by_key(|(a, _)| *a);
-	assert_eq!(built.batches, vec![(expect[0].0, 0, expect[0].1), (expect[1].0, 2, expect[1].1)]);
-	assert_eq!((built.offboards, built.participations, built.connector_vout), (1, 3, 5));
-	assert_eq!(tx.lock_time, elements::LockTime::ZERO, "nLockTime 0, so it returns after a rollback");
-	// The operator's coins only, two of them issuing the tokens.
-	let wallet_coins: Vec<(Txid, u32)> = r.server.store.wallet_coins(None).await.unwrap().iter().map(|c| (Txid::from_byte_array(c.txid), c.vout)).collect();
-	let spent: Vec<_> = tx.input.iter().map(|i| (i.previous_output.txid, i.previous_output.vout)).collect();
-	assert!(spent.iter().all(|o| !wallet_coins.contains(o)), "every input is a wallet coin, now taken by the round");
-	assert_eq!(tx.input.iter().filter(|i| i.has_issuance()).count(), 2, "one token per batch");
-	// The fee: one output, in X, never in the policy asset.
-	let fees: Vec<_> = tx.output.iter().filter(|o| o.is_fee()).collect();
-	assert_eq!(fees.len(), 1);
-	assert_eq!(fees[0].asset.explicit(), Some(x));
-	assert!(tx.output.iter().all(|o| o.asset.explicit() != Some(policy_asset)));
-	// Nothing can be swept or refreshed twice: a second round finds nothing.
+	// The rounds: X's (A, and B with its offboard) and Y's (C), in one pass.
+	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(rounds.len(), 2, "a round for each asset");
+	let (bx, by) = (&rounds[0], &rounds[1]);
+	for b in &rounds {
+		let tx = &b.tx;
+		println!("round {}: {} vB, {} inputs, {} outputs, {:?}, broadcast: {}", tx.txid(), tx.vsize(), tx.input.len(),
+			tx.output.len(), b.batches, b.broadcast);
+		assert_eq!(b.broadcast, "accepted");
+		assert_eq!(tx.lock_time, elements::LockTime::ZERO, "nLockTime 0, so it returns after a rollback");
+		// The operator's coins only, one of them issuing the token.
+		let wallet_coins: Vec<(Txid, u32)> = r.server.store.wallet_coins(None).await.unwrap().iter()
+			.map(|c| (Txid::from_byte_array(c.txid), c.vout)).collect();
+		let spent: Vec<_> = tx.input.iter().map(|i| (i.previous_output.txid, i.previous_output.vout)).collect();
+		assert!(spent.iter().all(|o| !wallet_coins.contains(o)), "every input is a wallet coin, now taken by the round");
+		assert_eq!(tx.input.iter().filter(|i| i.has_issuance()).count(), 1, "one token for its batch");
+		// The fee: one output, in X, never in the policy asset.
+		let fees: Vec<_> = tx.output.iter().filter(|o| o.is_fee()).collect();
+		assert_eq!(fees.len(), 1);
+		assert_eq!(fees[0].asset.explicit(), Some(x));
+		assert!(tx.output.iter().all(|o| o.asset.explicit() != Some(policy_asset)));
+	}
+	// One batch each, followed by its token; X's offboard, then the connector.
+	assert_eq!(bx.batches, vec![(x, 0, 2)]);
+	assert_eq!((bx.offboards, bx.participations, bx.connector_vout), (1, 2, 3));
+	assert_eq!(by.batches, vec![(y, 0, 1)]);
+	assert_eq!((by.offboards, by.participations, by.connector_vout), (0, 1, 2));
+	// Nothing can be swept or refreshed twice: a second pass finds nothing.
 	assert!(r.server.rounds.run_round().await.unwrap().is_none());
 
-	// The participations are issued in it.
+	// The participations are issued in their asset's round.
 	let st = r.http.post("participation_status", &json!({"participation_id": hex(&ida)})).ok();
 	assert_eq!(st["state"], "issued");
-	assert_eq!(st["round"]["txid"], tx.txid().to_string());
-	assert_eq!(st["round"]["connector_vout"], 5);
-	let x_vout = if expect[0].0 == x { 0 } else { 2 };
-	assert_eq!(st["outputs"][0]["batch_vout"], x_vout);
+	assert_eq!(st["round"]["txid"], bx.tx.txid().to_string());
+	assert_eq!(st["round"]["connector_vout"], 3);
+	assert_eq!(st["outputs"][0]["batch_vout"], 0);
 	let stb = r.http.post("participation_status", &json!({"participation_id": hex(&idb)})).ok();
-	assert_eq!(stb["outputs"][1]["offboard_vout"], 4);
+	assert_eq!(stb["outputs"][1]["offboard_vout"], 2);
 	let stc = r.http.post("participation_status", &json!({"participation_id": hex(&idc)})).ok();
-	assert_eq!(stc["outputs"][0]["batch_vout"], 2 - x_vout);
+	assert_eq!(stc["round"]["txid"], by.tx.txid().to_string());
+	assert_eq!(stc["outputs"][0]["batch_vout"], 0);
 	println!("A's status: {}", st);
 
 	// Final.
 	r.produce().await;
 	r.bury().await;
-	round_final(&r, &tx.txid()).await;
-	let onchain: Transaction = deserialize(&elements::encode::serialize(&r.rt.client().raw_transaction(&tx.txid()).unwrap())).unwrap();
-	assert_eq!(onchain, tx);
+	for b in &rounds {
+		round_final(&r, &b.tx.txid()).await;
+		let onchain: Transaction = deserialize(&elements::encode::serialize(&r.rt.client().raw_transaction(&b.tx.txid()).unwrap())).unwrap();
+		assert_eq!(onchain, b.tx);
+	}
 
 	// A validates its new leaf from the published tree alone.
 	let policy = accept_policy(&r);
 	for (status, key, nonce, label) in [(&st, &a2, &a2_nonce, "A"), (&stc, &c2, &c2_nonce, "C")] {
 		let vout = status["outputs"][0]["batch_vout"].as_u64().unwrap() as u32;
 		let index = status["outputs"][0]["leaf_index"].as_u64().unwrap() as usize;
-		let published = r.http.post("tree", &json!({"txid": tx.txid().to_string(), "vout": vout})).ok();
+		let rtx = txid(status["round"]["txid"].as_str().unwrap());
+		let published = r.http.post("tree", &json!({"txid": rtx.to_string(), "vout": vout})).ok();
 		let tree = rebuild(&published);
 		let round = r.rt.client().raw_transaction(&txid(published["round_txid"].as_str().unwrap())).unwrap();
 		let record = tree.record(index);
@@ -110,7 +119,7 @@ async fn a_round_in_two_assets_published_and_validated() {
 		assert_eq!(record.unlock_hash.to_vec(), common::client::unhex(status["unlock_hash"].as_str().unwrap()));
 		assert_eq!(published["token_vout"], vout + 1);
 		println!("{} validated leaf {} from the published tree of {}:{}: {} levels, expiries {:?}, reserve {}",
-			label, valid.leaf_id, tx.txid(), vout, record.levels(), record.schedule.expiries(), published["reserve"]);
+			label, valid.leaf_id, rtx, vout, record.levels(), record.schedule.expiries(), published["reserve"]);
 
 		// The same tree changed in any part is refused: what the server
 		// publishes is checked, not trusted.
@@ -144,7 +153,7 @@ async fn a_round_in_two_assets_published_and_validated() {
 		refuse(&bad, &round, &policy, key, nonce, index, "the reserve rule");
 	}
 	// A tree for an output that pays no batch.
-	let a = r.http.post("tree", &json!({"txid": tx.txid().to_string(), "vout": 1}));
+	let a = r.http.post("tree", &json!({"txid": bx.tx.txid().to_string(), "vout": 1}));
 	assert_eq!((a.status, a.refusal().0.as_str()), (404, "unknown_batch"));
 }
 

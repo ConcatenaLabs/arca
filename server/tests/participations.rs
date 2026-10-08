@@ -112,13 +112,16 @@ async fn participation_accepted_and_refused() {
 	bad["inputs"][0]["attestation"] = b3_body["inputs"][0]["attestation"].clone();
 	refused(r.http.post("submit_participation", &bad), 422, "bad_attestation");
 
-	// Unbalanced: one atom too many out, one atom too few out, the fee in another asset.
+	// Unbalanced: one atom too many out, one atom too few out. The fee in
+	// another asset is refused before the amounts are weighed: in an asset
+	// the operator does not serve, or, were it served, as a second asset in
+	// a participation, which carries one.
 	let (w, _) = want_leaf(&b2, x, VALUE - fee + 1);
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(x, fee)], None, s, chain).0), 422, "unbalanced");
 	let (w, _) = want_leaf(&b2, x, VALUE - fee - 1);
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(x, fee)], None, s, chain).0), 422, "unbalanced");
 	let (w, _) = want_leaf(&b2, x, VALUE - fee);
-	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(r.y, fee)], None, s, chain).0), 422, "unbalanced");
+	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(r.y, fee)], None, s, chain).0), 422, "out_of_bounds");
 	// The fee one atom short of the schedule, balanced.
 	let (w, _) = want_leaf(&b2, x, VALUE - fee + 1);
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(x, fee - 1)], None, s, chain).0), 422, "fee");

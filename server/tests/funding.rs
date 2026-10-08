@@ -1,5 +1,7 @@
 //! A participation the operator's wallet cannot fund in its asset waits, and
-//! delays no other: review R7's P2 turned around.
+//! delays no other: review R7's P2 turned around. Each asset has its own
+//! rounds and its own pool, so Y's pool running short holds back no round of
+//! X built in the same pass.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -35,7 +37,10 @@ async fn an_unfundable_participation_delays_no_other() {
 	let (body_a, id_a) = participation_body(&[&a_held], &[wa], &[], None, xonly(&r.s), r.chain);
 	assert_eq!(r.http.post("submit_participation", &body_a).ok()["state"], "pending");
 
-	let built = r.server.rounds.run_round().await.unwrap().expect("a round, with A");
+	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(rounds.len(), 1, "X's round alone: Y's pool cannot fund B");
+	let built = &rounds[0];
 	println!("round {}: {} participation(s), batches {:?}", built.tx.txid(), built.participations, built.batches);
 	assert_eq!(built.participations, 1);
 	assert_eq!(built.batches.iter().map(|b| b.0).collect::<Vec<_>>(), vec![x], "one batch, in X");
