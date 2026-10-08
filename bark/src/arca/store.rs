@@ -217,6 +217,7 @@ impl Store {
 		store.add_column("participation", "news", "TEXT")?;
 		store.add_column("signer_seen", "signature", "TEXT")?;
 		store.add_column("mailbox_retry", "head", "TEXT")?;
+		store.add_column("coin", "bound", "INTEGER")?;
 		store.follow_lost_participations()?;
 		Ok(store)
 	}
@@ -365,10 +366,15 @@ impl Store {
 
 	// --- coins ---
 
+	/// Keeps a coin. Every coin the wallet keeps is bound to its mailbox key
+	/// at the server when it is made (a board's registration and a refresh
+	/// name the key; a coin paid out of round is posted to it), so it is
+	/// marked bound; one kept before wallets named the key is not, and
+	/// `sync` binds it ([`Store::unbound_coins`]).
 	pub fn put_coin(&self, c: &CoinRow) -> Result<(), Error> {
 		self.conn.execute(
-			"INSERT INTO coin (leaf_id, owner_nonce, kind, asset, value, record, salt, state, note, expiry, bases, spent_by, created_at)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+			"INSERT INTO coin (leaf_id, owner_nonce, kind, asset, value, record, salt, state, note, expiry, bases, spent_by, created_at, bound)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
 			params![c.leaf_id, &c.owner_nonce[..], c.kind, c.asset, c.value as i64, c.record, &c.salt[..], c.state, c.note,
 				c.expiry as i64, serde_json::to_string(&c.bases).expect("strings"), c.spent_by, now()],
 		).map_err(|e| Error::Store(format!("cannot keep coin {}: {}", c.leaf_id, e)))?;
@@ -412,6 +418,23 @@ impl Store {
 		let mut st = self.conn.prepare(&format!("SELECT {} FROM coin ORDER BY created_at, leaf_id", Self::COIN_COLS)).map_err(db)?;
 		let rows = st.query_map([], Self::coin_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	/// The coins not known to be bound to the wallet's mailbox key at the
+	/// server: kept before the wallet named the key.
+	pub fn unbound_coins(&self) -> Result<Vec<CoinRow>, Error> {
+		let mut st = self.conn.prepare(&format!("SELECT {} FROM coin WHERE bound IS NULL ORDER BY created_at, leaf_id", Self::COIN_COLS))
+			.map_err(db)?;
+		let rows = st.query_map([], Self::coin_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// Marks coin `leaf_id` bound (`true`: the server re-serves it to the
+	/// wallet's mailbox key) or not to be bound (`false`: the server knows no
+	/// leaf of its key, or it is bound elsewhere).
+	pub fn set_bound(&self, leaf_id: &str, bound: bool) -> Result<(), Error> {
+		self.conn.execute("UPDATE coin SET bound = ?2 WHERE leaf_id = ?1", params![leaf_id, bound as i64]).map_err(db)?;
+		Ok(())
 	}
 
 	pub fn coins_in(&self, state: &str) -> Result<Vec<CoinRow>, Error> {

@@ -116,6 +116,10 @@ pub struct Wallet {
 	/// How what the wallet says names the client's commands, and the
 	/// prefixes of the texts it hands out ([`Spelling`]).
 	pub(crate) spelling: Spelling,
+	/// While a restore reads the mailbox ([`Wallet::restore`]): a coin for an
+	/// owner nonce the store does not hold is taken when its key is the one
+	/// the mnemonic derives from that nonce, as the lost store would have.
+	pub(crate) adopting: std::cell::Cell<bool>,
 }
 
 /// How a client spells, in what the wallet says, its own commands and the
@@ -619,7 +623,63 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default() })
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false) })
+	}
+
+	/// The binding of the leaf whose key is `key` to the wallet's mailbox
+	/// key: the mailbox key, and `key`'s signature over the binding
+	/// ([`super::client::mailbox_binding_digest`]), each hex. The server
+	/// re-serves a bound leaf, with every way it was given up, to whoever
+	/// proves the mailbox key: what a wallet restored from its mnemonic reads
+	/// ([`Wallet::restore`]). It authorises nothing else.
+	pub(crate) fn binding(&self, key: &Keypair) -> Result<(String, String), Error> {
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let owner = key.x_only_public_key().0;
+		let proof = sign(key, &super::client::mailbox_binding_digest(&self.genesis, &self.operator, &owner, &mailbox));
+		Ok((hex(&mailbox.serialize()), hex(proof.as_ref())))
+	}
+
+	/// Binds every coin the wallet holds or held that is not known to be
+	/// bound to its mailbox key (one kept before the wallet named the key), so
+	/// that a restore from the mnemonic finds it: a few calls of at most
+	/// [`super::client::MAX_BINDINGS`]. What the server answers for each key
+	/// is kept: bound to the wallet's key, or not to be bound (the server
+	/// knows no leaf of the key, or it is bound to another mailbox, which is
+	/// recorded as a refusal). Returns how many were bound.
+	pub(crate) fn bind_unbound(&mut self) -> Result<Value, Error> {
+		let coins = self.store.unbound_coins()?;
+		let mine = hex(&self.keys.mailbox()?.x_only_public_key().0.serialize());
+		let (mut bound, mut unknown) = (0, vec![]);
+		for chunk in coins.chunks(super::client::MAX_BINDINGS) {
+			let mut bindings = vec![];
+			for c in chunk {
+				let key = self.keys.leaf(&c.owner_nonce)?;
+				let (mailbox, proof) = self.binding(&key)?;
+				bindings.push(json!({"owner": hex(&key.x_only_public_key().0.serialize()), "mailbox": mailbox, "proof": proof}));
+			}
+			let answer = self.server.bind_mailbox(&bindings)?;
+			let shown = answer["bound"].as_array().cloned().unwrap_or_default();
+			for (c, b) in chunk.iter().zip(bindings.iter()) {
+				let at = shown.iter().find(|x| x["owner"] == b["owner"]).map(|x| x["mailbox"].clone()).unwrap_or(Value::Null);
+				match at.as_str() {
+					Some(m) if m == mine => {
+						self.store.set_bound(&c.leaf_id, true)?;
+						bound += 1;
+					},
+					Some(other) => {
+						self.store.set_bound(&c.leaf_id, false)?;
+						self.store.refused(&format!("the binding of coin {}", c.leaf_id), &format!("the server holds the key of coin {} bound to \
+							mailbox {}, not this wallet's: a restore from the mnemonic does not find it there", c.leaf_id, other))?;
+						unknown.push(c.leaf_id.clone());
+					},
+					None => {
+						self.store.set_bound(&c.leaf_id, false)?;
+						unknown.push(c.leaf_id.clone());
+					},
+				}
+			}
+		}
+		Ok(json!({"bound": bound, "not_bound": unknown}))
 	}
 
 	/// Spells what the wallet says from now on as `s` says ([`Spelling`]).
@@ -1337,6 +1397,13 @@ impl Wallet {
 						paid or forgotten"}),
 			});
 		}
+		// After a restore from the mnemonic, the requests the lost store
+		// handed out, which no one else knew: one may be paid until the
+		// latest of them could lapse.
+		if let Some(until) = self.store.meta(super::restore::RESTORED_UNTIL)?.and_then(|v| v.parse::<u32>().ok()).filter(|u| now < *u) {
+			out.push(json!({"owner": "restored", "asked_at": until.saturating_sub(REQUEST_HOLDS), "state": "waiting", "lapses_at": until,
+				"note": self.spelling.say(super::restore::RESTORED_NOTE)}));
+		}
 		Ok(out)
 	}
 
@@ -1345,6 +1412,16 @@ impl Wallet {
 	/// schedule no more. A coin paid to it is still read, by any later sync.
 	pub fn forget_request(&mut self, owner: &str) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
+		// The requests a restore could not know of: the user says none was
+		// outstanding.
+		if owner == "restored" {
+			let held = self.store.meta(super::restore::RESTORED_UNTIL)?.and_then(|v| v.parse::<u32>().ok()).filter(|u| now < *u)
+				.ok_or_else(|| Error::Refused("the wallet holds its schedule for no request handed out before a restore".into()))?;
+			self.store.set_meta(super::restore::RESTORED_UNTIL, &now.to_string())?;
+			return Ok(json!({"owner": "restored", "state": "lapsed", "lapsed_at": now, "was_until": held,
+				"note": "the wallet no longer waits for a payment to a request handed out before its restore: a coin paid to one is still \
+					read, by any later sync"}));
+		}
 		let n = self.store.nonces()?.into_iter()
 			.find(|n| n.purpose == "receive" && n.state == "pending" && hex(&n.owner_key) == owner.to_ascii_lowercase())
 			.ok_or_else(|| Error::Refused(format!("no unpaid receive request of the wallet's names the key {}", owner)))?;
@@ -1470,7 +1547,8 @@ impl Wallet {
 		if requests.iter().any(|r| r["state"] == "waiting") && !stopped {
 			let day = now.saturating_add(86_400);
 			next = Some(next.map_or(day, |n| n.min(day)));
-			out["why"] = json!(WAITING_NOTE);
+			let only_restored = requests.iter().filter(|r| r["state"] == "waiting").all(|r| r["owner"] == "restored");
+			out["why"] = if only_restored { json!(self.spelling.say(super::restore::RESTORED_NOTE)) } else { json!(WAITING_NOTE) };
 		}
 		if !requests.is_empty() {
 			out["receive_requests"] = json!(requests);
@@ -2354,9 +2432,13 @@ impl Wallet {
 			note: "board registered; waiting for its transaction to be final".into(), expiry: u32::MAX,
 			bases: vec![tx.txid().to_string()], spent_by: None,
 		};
+		// The board is re-served to the wallet's mailbox key, which a wallet
+		// restored from the mnemonic reads with.
+		let (mailbox, proof) = self.binding(&key)?;
 		let body = json!({
 			"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?),
 			"tx": hex(&elements::encode::serialize(&tx)),
+			"mailbox": mailbox, "mailbox_proof": proof,
 		});
 		self.store.atomically(|s| {
 			s.put_tx(&tx.txid().to_string(), &elements::encode::serialize(&tx), "base")?;

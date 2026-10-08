@@ -63,7 +63,9 @@ enum Cmd {
 		/// The node's cookie file, instead of a user and password.
 		#[arg(long)]
 		node_cookie: Option<String>,
-		/// Restore from this mnemonic instead of drawing a new one.
+		/// Restore from this mnemonic instead of drawing a new one: the wallet
+		/// is created, then restored from what the server serves to its
+		/// mailbox key, every record checked (`restore`).
 		#[arg(long)]
 		mnemonic: Option<String>,
 		/// The account of the leaf keys, m/6'/account'/….
@@ -127,6 +129,11 @@ enum Cmd {
 	},
 	/// Reads the mailbox and validates every coin in it.
 	Mailbox,
+	/// Restores the wallet from its mnemonic: every leaf the server serves to
+	/// its mailbox key, each checked against the chain, the published tree
+	/// and its owner's own signatures, then the mailbox and a sync. Run
+	/// again, it takes only what the wallet does not hold.
+	Restore,
 	/// Takes part in the next round with the coins named (every live coin
 	/// when none is), for one new leaf per asset.
 	#[command(alias = "refresh")]
@@ -292,14 +299,22 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		if let Some(d) = max_exit_delay_units {
 			cfg.max_exit_delay_units = d;
 		}
+		let restoring = mnemonic.is_some();
 		let mut w = Wallet::create(&datadir, mnemonic.as_deref(), cfg)?;
 		w.spell(Spelling::command_line("arca"));
+		w.witness_patience = std::time::Duration::from_secs(cli.witness_patience);
 		let mut info = w.info()?;
 		info["mnemonic_file"] = json!(w.mnemonic_path().display().to_string());
 		let check = format!("compare the operator key {} with the one the operator publishes through a channel you trust: the wallet \
 			has pinned it, and refuses any server that names another", info["operator"].as_str().unwrap_or(""));
 		eprintln!("arca: {}", check);
 		info["operator_key_check"] = json!(check);
+		// A mnemonic given may have held coins: they are restored from what
+		// the server serves to the wallet's mailbox key, every record checked.
+		if restoring {
+			info["restore"] = w.restore().unwrap_or_else(|e| json!({"error": {"kind": e.kind(), "message": e.to_string(),
+				"note": "nothing was restored: run `arca restore` once the cause is gone"}}));
+		}
 		return Ok(info);
 	}
 	let mut w = Wallet::open(&datadir)?;
@@ -359,6 +374,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
+		Cmd::Restore => w.restore(),
 		Cmd::Participate { leaves, not_before, max_fee_ppm } => {
 			// The fee is shown before anything is signed.
 			let quote = w.refresh_quote(&leaves, max_fee_ppm)?;
