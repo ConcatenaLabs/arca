@@ -34,6 +34,22 @@ pub const CHAIN_ARGS: &[&str] = &[
 	"-evbparams=simplicity:-1:::",
 ];
 
+/// What SeqLN's `sequentia-regtest` network assumes of the chain besides its
+/// name: addresses that share the Bitcoin regtest prefixes, the genesis
+/// block's coins counted by a node wallet, and no block subsidy. With
+/// [`CHAIN_ARGS`] and a committee they make the genesis block
+/// [`SEQLN_GENESIS`], which SeqLN's chain parameters carry.
+pub const SEQLN_CHAIN_ARGS: &[&str] = &[
+	"-anyonecanspendaremine=1",
+	"-con_blocksubsidy=0",
+	"-bech32_hrp=bcrt",
+	"-pubkeyprefix=111",
+	"-scriptprefix=196",
+];
+
+/// The genesis block of SeqLN's `sequentia-regtest` network, display order.
+pub const SEQLN_GENESIS: &str = "48471cda14077e1e1a530e3ae6e90a1cd8b1ae4fa2d2ee326687f2e479972505";
+
 /// One running `sequentiad`.
 pub struct Daemon {
 	child: Child,
@@ -220,23 +236,43 @@ impl Regtest {
 	/// which is deleted on drop; `extra` goes to the Sequentia node after
 	/// [`CHAIN_ARGS`].
 	pub fn start(exe: &Path, workdir: &Path, extra: &[&str]) -> Result<Regtest, String> {
-		Regtest::start_with(exe, workdir, extra, None)
+		Regtest::start_with(exe, workdir, extra, None, "elementsregtest", &[])
 	}
 
 	/// Starts the chain under proof of stake ([`POS_ARGS`]), certified by a
 	/// committee of three test stakers. Blocks come from
 	/// [`Regtest::produce_block`].
 	pub fn start_pos(exe: &Path, workdir: &Path, extra: &[&str]) -> Result<Regtest, String> {
-		Regtest::start_with(exe, workdir, extra, Some(Committee::new()))
+		Regtest::start_with(exe, workdir, extra, Some(Committee::new()), "elementsregtest", &[])
 	}
 
-	fn start_with(exe: &Path, workdir: &Path, extra: &[&str], committee: Option<Committee>) -> Result<Regtest, String> {
+	/// The proof-of-stake chain under the name and the arguments SeqLN's
+	/// `sequentia-regtest` network assumes ([`SEQLN_CHAIN_ARGS`]), so that
+	/// SeqLN nodes run on it ([`crate::lightning`]). Refuses to go on when the
+	/// genesis block is not the one SeqLN expects.
+	pub fn start_seqln(exe: &Path, workdir: &Path, extra: &[&str]) -> Result<Regtest, String> {
+		let rt = Regtest::start_with(exe, workdir, extra, Some(Committee::new()), "sequentia-regtest", SEQLN_CHAIN_ARGS)?;
+		let genesis = rt.client().genesis_hash().map_err(|e| e.to_string())?.to_string();
+		if genesis != SEQLN_GENESIS {
+			return Err(format!("the chain's genesis block is {}, and SeqLN's sequentia-regtest expects {}", genesis, SEQLN_GENESIS));
+		}
+		Ok(rt)
+	}
+
+	/// [`Regtest::start_seqln`] with the binary named by `SEQUENTIAD_EXEC`.
+	pub fn seqln_from_env(workdir: &Path, extra: &[&str]) -> Regtest {
+		Regtest::start_seqln(&exe_from_env(), workdir, extra).unwrap_or_else(|e| panic!("{}", e))
+	}
+
+	fn start_with(exe: &Path, workdir: &Path, extra: &[&str], committee: Option<Committee>, chain: &str, chain_args: &[&str])
+		-> Result<Regtest, String>
+	{
 		let parent = Daemon::start(exe, workdir.join("parent"), &["-chain=regtest".to_string()])?;
 		// An anchor is a parent block: give the parent a few.
 		parent.client.generate_to_descriptor(10, OP_TRUE_DESCRIPTOR).map_err(|e| e.to_string())?;
 		let parent_genesis = parent.client.genesis_hash().map_err(|e| e.to_string())?;
 		let mut args: Vec<String> = vec![
-			"-chain=elementsregtest".into(),
+			format!("-chain={}", chain),
 			"-con_bitcoin_anchor=1".into(),
 			"-validateanchor=1".into(),
 			"-mainchainrpchost=127.0.0.1".into(),
@@ -246,6 +282,7 @@ impl Regtest {
 			format!("-parentgenesisblockhash={}", parent_genesis),
 		];
 		args.extend(CHAIN_ARGS.iter().map(|s| s.to_string()));
+		args.extend(chain_args.iter().map(|s| s.to_string()));
 		if let Some(c) = &committee {
 			args.extend(POS_ARGS.iter().map(|s| s.to_string()));
 			args.extend(c.args());
@@ -354,5 +391,10 @@ impl Regtest {
 	/// The Sequentia node's client.
 	pub fn client(&self) -> &Client {
 		&self.node.client
+	}
+
+	/// The `-chain` the Sequentia node runs.
+	pub fn chain_name(&self) -> String {
+		self.node.args.iter().find_map(|a| a.strip_prefix("-chain=")).unwrap_or("elementsregtest").to_string()
 	}
 }

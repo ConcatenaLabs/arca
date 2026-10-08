@@ -1,0 +1,113 @@
+name: lightning
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# The Lightning gateway against SeqLN nodes: SeqLN built at the commit below,
+# its lightningd on the chain SeqLN's sequentia-regtest network assumes, and
+# Bitcoin Core for the operator's node on Bitcoin.
+env:
+  SEQLN_COMMIT: 6e527da5f83aac332fe89e0faeb0023a512bcb3f
+  BITCOIN_VERSION: "28.0"
+  BITCOIN_SHA256: 7fe294b02b25b51acb8e8e0a0eb5af6bbafa7cd0c5b0e5fcbb61263104a82fbc
+
+jobs:
+  # The newest node master commit whose Build-dev workflow passed and
+  # published a Linux build, as the node workflow finds it.
+  node-build:
+    name: find the node build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      run: ${{ steps.node.outputs.run }}
+    steps:
+      - name: Find the node build
+        id: node
+        run: |
+          run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&per_page=50" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | sort_by(.created_at) | last | .id')
+          if [ -z "$run" ] || [ "$run" = null ]; then
+            echo "no successful node build on master"; exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  lightning-tests:
+    name: the Lightning gateway against SeqLN nodes
+    needs: node-build
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: arca
+          POSTGRES_PASSWORD: arca
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arca"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ARCA_TEST_POSTGRES: postgres://arca:arca@127.0.0.1:5432/postgres
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sequentiad
+        run: |
+          gh run download ${{ needs.node-build.outputs.run }} -R ConcatenaLabs/Sequentia \
+            -n sequentia-dev-x86_64-pc-linux-gnu -D "$RUNNER_TEMP/node"
+          tar -xf "$RUNNER_TEMP/node/sequentia-dev-linux.tar" -C "$RUNNER_TEMP/node"
+          echo "SEQUENTIAD_EXEC=$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" >> "$GITHUB_ENV"
+          ls "$RUNNER_TEMP/node/sequentia-dev-linux/bin/"
+
+      - name: Download Bitcoin Core
+        run: |
+          f=bitcoin-$BITCOIN_VERSION-x86_64-linux-gnu.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/$f" "https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$f"
+          echo "$BITCOIN_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP"
+          echo "BITCOIND_EXEC=$RUNNER_TEMP/bitcoin-$BITCOIN_VERSION/bin/bitcoind" >> "$GITHUB_ENV"
+
+      - name: SeqLN build cache
+        id: seqln-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/seqln
+          key: seqln-${{ env.SEQLN_COMMIT }}-ubuntu-24.04
+
+      # What lightningd builds and runs with, a cached build included.
+      - name: SeqLN's dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq autoconf automake build-essential libtool libsqlite3-dev libffi-dev \
+            python3 python3-mako net-tools zlib1g-dev libsodium-dev gettext lowdown
+
+      - name: Build SeqLN
+        if: steps.seqln-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/seqln"
+          cd "$RUNNER_TEMP/seqln"
+          git fetch -q --depth 1 https://github.com/ConcatenaLabs/seqln.git "$SEQLN_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update -q --init --recursive
+          ./configure --disable-rust --disable-valgrind
+          make -j4 all-programs PYTHON=python3
+
+      - name: SeqLN
+        run: |
+          echo "LIGHTNINGD_EXEC=$RUNNER_TEMP/seqln/lightningd/lightningd" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/seqln/lightningd/lightningd" --version
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --locked -p arca-server --test lightning_legs -- --nocapture

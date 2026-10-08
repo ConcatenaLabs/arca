@@ -131,6 +131,7 @@ impl Running {
 				..Default::default()
 			},
 			metrics_listen: None,
+			lightning: Default::default(),
 		};
 		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();

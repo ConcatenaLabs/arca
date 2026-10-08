@@ -24,6 +24,7 @@ use crate::params::{Amount, AssetFees, AssetParams, FeeSchedule, Params};
 use crate::rates::{RateConfig, RateSource};
 use crate::participations::Participations;
 use crate::forfeits::Forfeits;
+use crate::lightning::{BitcoinLegConfig, Gateway, GatewayConfig};
 use crate::rounds::{RoundConfig, Rounds};
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
@@ -89,6 +90,55 @@ pub struct Config {
 	/// None are served when absent.
 	#[serde(default)]
 	pub metrics_listen: Option<String>,
+	/// The Lightning gateway beyond each asset's own node
+	/// (`[assets.lightning]`): its Bitcoin node and how often the nodes are
+	/// checked ([`crate::lightning`]).
+	#[serde(default)]
+	pub lightning: LightningSection,
+}
+
+/// The gateway's settings beside the assets' own nodes.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSection {
+	/// How often every Lightning node is checked, in seconds.
+	#[serde(default = "default_lightning_poll")]
+	pub poll_seconds: u64,
+	/// The operator's Lightning node on Bitcoin, for native BTC; none when
+	/// absent.
+	#[serde(default)]
+	pub bitcoin: Option<BitcoinLightningSection>,
+}
+
+impl Default for LightningSection {
+	fn default() -> LightningSection {
+		LightningSection { poll_seconds: default_lightning_poll(), bitcoin: None }
+	}
+}
+
+fn default_lightning_poll() -> u64 {
+	10
+}
+
+/// A Lightning node, by its JSON-RPC socket.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LegSection {
+	/// The node's `lightning-rpc` socket.
+	pub rpc: PathBuf,
+}
+
+/// The Bitcoin side: the Lightning node on Bitcoin, and the Bitcoin ark the
+/// operator runs for native BTC.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinLightningSection {
+	/// The node's `lightning-rpc` socket.
+	pub rpc: PathBuf,
+	/// The URL of the Bitcoin ark wallets join with Bark; none when the
+	/// operator runs none.
+	#[serde(default)]
+	pub ark: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -422,6 +472,10 @@ pub struct AssetSection {
 	/// absent.
 	#[serde(default)]
 	pub rate: Option<RateSection>,
+	/// The operator's SeqLN node in the asset, its Lightning leg; none when
+	/// absent, and then nothing in the asset goes over Lightning here.
+	#[serde(default)]
+	pub lightning: Option<LegSection>,
 }
 
 impl AssetSection {
@@ -430,6 +484,7 @@ impl AssetSection {
 		AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
+			lightning: None,
 		}
 	}
 }
@@ -695,6 +750,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	differ("watcher", a.watcher == b.watcher);
 	differ("limits", a.limits == b.limits);
 	differ("metrics_listen", a.metrics_listen == b.metrics_listen);
+	differ("lightning", a.lightning == b.lightning);
 	out
 }
 
@@ -714,6 +770,7 @@ pub struct Server {
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub watcher: Arc<Watcher>,
+	pub gateway: Arc<Gateway>,
 	/// The configuration the server runs with, as last loaded.
 	config: std::sync::Mutex<Config>,
 	tasks: Vec<JoinHandle<()>>,
@@ -778,6 +835,17 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 		None => None,
 	};
 	Ok((list, fee_assets))
+}
+
+/// Each served asset's Lightning node, as `config` names it.
+fn legs_of(config: &Config) -> Result<Vec<(AssetId, PathBuf)>, StartError> {
+	let mut out = vec![];
+	for a in &config.assets {
+		if let Some(l) = &a.lightning {
+			out.push((AssetId::from_str(&a.asset).map_err(err("assets.asset"))?, l.rpc.clone()));
+		}
+	}
+	Ok(out)
 }
 
 impl Server {
@@ -902,9 +970,23 @@ impl Server {
 			Ok(n) => log::info!("{} forfeit(s) given the operator's half at start", n),
 			Err(e) => log::warn!("forfeits without the operator's half: {}", e),
 		}
+		// The Lightning gateway's nodes, checked before anything is served.
+		let policy_asset = {
+			let client = node_client(config)?;
+			tokio::task::spawn_blocking(move || client.call::<serde_json::Value>("getsidechaininfo", &[])).await
+				.map_err(err("the node"))?.ok()
+				.and_then(|v| v["pegged_asset"].as_str().and_then(|a| AssetId::from_str(a).ok()))
+		};
+		let gateway = Gateway::new(&GatewayConfig {
+			legs: legs_of(config)?,
+			bitcoin: config.lightning.bitcoin.as_ref().map(|b| BitcoinLegConfig { rpc: b.rpc.clone(), ark: b.ark.clone() }),
+			poll: Duration::from_secs(config.lightning.poll_seconds.max(1)),
+			policy_asset,
+		});
+		gateway.check().await;
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
-		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone())];
+		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn()];
 		if config.watcher.enabled {
 			tasks.push(watcher.spawn());
 		}
@@ -950,6 +1032,7 @@ impl Server {
 			record_head: tokio::sync::Mutex::new(None),
 			keepers: std::sync::Mutex::new(keepers),
 			replaced,
+			gateway: gateway.clone(),
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {
@@ -978,11 +1061,11 @@ impl Server {
 		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
 			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
 		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher,
-			config: std::sync::Mutex::new(config.clone()), tasks })
+			gateway, config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
 	/// Takes the assets `config` serves, each with its smallest leaf, its
-	/// fee schedule and its rate source, the schedule an asset takes where it
+	/// fee schedule, its rate source and its Lightning node, the schedule an asset takes where it
 	/// sets none (`[fees]`' refresh and offboard parts), and the assets a
 	/// round's fee is paid in, without a
 	/// restart, and reads every rate source: an asset added is served by every entry,
@@ -996,6 +1079,7 @@ impl Server {
 	/// it was and says so.
 	pub async fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
 		let (list, fee_assets) = assets_of(config)?;
+		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();
 		if !removed.is_empty() {
@@ -1006,9 +1090,10 @@ impl Server {
 			let mut current = self.config.lock().unwrap_or_else(|e| e.into_inner());
 			let mut out = Reloaded::default();
 			for (a, p) in &list {
+				let section = |c: &Config| c.assets.iter().find(|s| AssetId::from_str(&s.asset).ok() == Some(*a)).and_then(|s| s.lightning.clone());
 				match before.iter().find(|(b, _)| b == a) {
 					None => out.added.push(*a),
-					Some((_, q)) if q != p => out.changed.push(*a),
+					Some((_, q)) if q != p || section(&current) != section(config) => out.changed.push(*a),
 					Some(_) => {},
 				}
 			}
@@ -1030,6 +1115,7 @@ impl Server {
 			out
 		};
 		self.params.rates.read_all(&self.finality).await;
+		self.gateway.reconfigure(&legs).await;
 		log::info!("reload: the server serves {}; added {:?}, changed {:?}{}",
 			self.params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
 			out.added.iter().map(|a| a.to_string()).collect::<Vec<_>>(), out.changed.iter().map(|a| a.to_string()).collect::<Vec<_>>(),

@@ -8,6 +8,7 @@ pub mod fake;
 pub mod flow;
 pub mod keeper;
 pub mod keys;
+pub mod lightning;
 pub mod node;
 pub mod rounds;
 pub mod running;
