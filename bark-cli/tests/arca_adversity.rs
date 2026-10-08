@@ -5114,8 +5114,8 @@ async fn f5_the_back_off_reaches_a_server_back_just_past_the_patience() {
 /// for in the free window, the round final, the keeper down; in the coin's
 /// last day A's sync hands over the forfeit (held back) and takes the board
 /// home. Two more syncs post no forfeit; with the keeper back, the server
-/// releases the participation, and the next sync posts the forfeits once
-/// and takes the new leaf.
+/// releases the participation, and the next sync takes the new leaf with
+/// the preimage the server publishes, posting no forfeit again.
 #[tokio::test(flavor = "multi_thread")]
 async fn f5_a_participation_whose_coin_goes_home_is_not_posted_again() {
 	let mut r = Running::start_kept(1, None).await;
@@ -5162,8 +5162,10 @@ async fn f5_a_participation_whose_coin_goes_home_is_not_posted_again() {
 	assert_eq!(r.server.store.participation(&id).await.unwrap().unwrap().state, server::store::ParticipationState::Released);
 	let s = a.ok(&["sync"]);
 	println!("F5P the keeper back, the participation released: A's sync: participations {}", s["participations"]);
-	assert_eq!(proxy.count("/v1/forfeit_leaves") - posted, 1, "posted once the operator released it");
+	assert_eq!(proxy.count("/v1/forfeit_leaves") - posted, 0, "nothing signed or posted again once the operator released it");
 	assert_eq!(s["participations"][0]["state"], "released", "{}", s["participations"]);
+	let leaf = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("the new leaf");
+	assert!(!coin_of(&a, leaf).is_null(), "the wallet holds its new leaf");
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
@@ -6116,4 +6118,58 @@ async fn f1_a_request_without_a_lapse_holds_the_schedule_until_paid_or_forgotten
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// A participation the server released while the wallet was away
+// ---------------------------------------------------------------------------
+
+/// R7i W2, turned around. A refreshes its board; at the forfeit step the
+/// keeper is down, so the server records A's forfeit without the operator's
+/// half and A's participation stands `forfeiting`. The keeper back, the
+/// server's minute task completes the forfeit and its pass releases the
+/// participation. A next syncs 25 days after the round, when the forfeits'
+/// refund delay would end after the new leaf's exit deadline: the wallet
+/// signs nothing again and makes none of the checks it makes before
+/// signing; it takes the preimage the server publishes with the tree, and
+/// holds its new leaf. The board is spent by the refresh, never taken home.
+#[tokio::test(flavor = "multi_thread")]
+async fn w2_a_participation_released_while_the_wallet_was_away_is_completed() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("W2RelA");
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let board = boards[0].clone();
+	let p = a.ok(&["participate", "--leaf", &board, "--max-fee-ppm", "1000000"]);
+	let pid = p["participation"].as_str().unwrap().to_string();
+	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+	final_round(&r).await;
+	let round_at = common::node::median_time(&r.rt);
+	r.keepers[0].halt();
+	let s = a.ok(&["sync"]);
+	println!("W2 A's sync, the keeper down: participations {}", s["participations"]);
+	assert_eq!(r.server.store.unsigned_forfeits().await.unwrap().len(), 1, "the forfeit is recorded, held back");
+	r.keepers[0].resume();
+	let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let st = r.server.store.participation(&id).await.unwrap().unwrap().state;
+	println!("W2 the keeper back: {} filled in; at the server {:?}", filled, st);
+	assert_eq!(st, server::store::ParticipationState::Released);
+	d57_to(&r, round_at + 25 * 86_400).await;
+	let s = a.ok(&["sync"]);
+	let ours = s["participations"].as_array().unwrap().iter().find(|q| q["participation"] == pid.as_str()).cloned().unwrap_or(Value::Null);
+	let c = coin_of(&a, &board);
+	println!("W2 A's sync 25 days after the round (median time {}): participation {} | home {} | the board {} {}",
+		common::node::median_time(&r.rt), ours, s["home"], c["state"], c["note"]);
+	assert!(ours["refused"].is_null(), "nothing refused: {}", ours);
+	assert_eq!(ours["state"], "released", "{}", ours);
+	let leaf = ours["new_leaves"][0]["leaf_id"].as_str().expect("the new leaf").to_string();
+	let held = coin_of(&a, &leaf);
+	println!("W2 the new leaf {}: {} {}", &leaf[..16], held["state"], held["value"]);
+	assert!(matches!(held["state"].as_str(), Some("live") | Some("exiting")), "the wallet holds its new leaf: {}", held);
+	assert_eq!(c["state"], "spent", "the board was given up in the refresh, never taken home: {}", c);
+	let mine = a.ok(&["participations"]);
+	assert!(mine.as_array().unwrap().iter().any(|q| q["participation"] == pid.as_str() && q["released"] == true), "{}", mine);
+	let _ = std::fs::remove_dir_all(&a.dir);
 }
