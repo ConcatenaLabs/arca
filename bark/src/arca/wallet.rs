@@ -150,8 +150,12 @@ pub const HOME_FROM: u32 = 86_400;
 pub const SYNC_DAILY: u32 = 3 * 86_400;
 
 /// How long after `sync` last asked for a coin's refresh it asks again,
-/// once the operator refused, voided or let expire that refresh: a day.
-pub const REFUSED_AGAIN: u32 = 86_400;
+/// once the operator refused, voided or let expire that refresh: six hours,
+/// a quarter of the refresh window (from [`REFRESH_FROM`] to [`HOME_FROM`]
+/// before the exit date), so that a refusal early in the window is asked
+/// again in it, while the refresh is still free, before the coin goes home
+/// at a cost of its exit's fees.
+pub const REFUSED_AGAIN: u32 = (REFRESH_FROM - HOME_FROM) / 4;
 
 /// Where the wallet keeps when `sync` last asked for each live coin's
 /// refresh: `{leaf id: median time}`.
@@ -204,16 +208,16 @@ pub(crate) const UNREACHABLE_NOTE: &str = "the operator cannot be reached now: n
 	refresh has completed. Run `arca sync` at least once a day while the wallet holds a coin off the chain; `arca exit` takes it now";
 
 /// What the wallet says of a coin whose refresh the operator refused.
-pub(crate) const REFUSED_NOTE: &str = "the operator refused the coin's last refresh: sync asks again from refresh_from (two days \
-	before its exit date), and from home_from (a day before) takes the coin on the chain unless a refresh has completed; \
-	`arca exit` takes it now";
+pub(crate) const REFUSED_NOTE: &str = "the operator refused the coin's last refresh: sync asks again six hours after it last \
+	asked, while the coin is in its refresh window (from refresh_from, two days before its exit date, to home_from, a day before), \
+	and from home_from takes the coin on the chain unless a refresh has completed; `arca exit` takes it now";
 
 /// What the wallet says of a coin whose refresh expired at the server.
 pub(crate) const EXPIRED_NOTE: &str = "the coin's last refresh expired at the server: its forfeits were not handed over and \
 	co-signed by the later of a day after its round was final and the coin's exit date (the wallet did not sync in that time, or \
-	the operator's signer or its keepers were away), so the new leaf was never released; sync asks again from refresh_from (two \
-	days before its exit date), and from home_from (a day before) takes the coin on the chain unless a refresh has completed; \
-	`arca exit` takes it now";
+	the operator's signer or its keepers were away), so the new leaf was never released; sync asks again six hours after it last \
+	asked, while the coin is in its refresh window (from refresh_from, two days before its exit date, to home_from, a day before), \
+	and from home_from takes the coin on the chain unless a refresh has completed; `arca exit` takes it now";
 
 /// What the wallet says of a coin whose last refresh ended as `p` says
 /// ([`Wallet::refused_refreshes`]): expired, or refused.
@@ -1318,7 +1322,8 @@ impl Wallet {
 	/// free there, so a fee the operator asks is refused before anything is
 	/// signed, and the coin stays live, asked for again at the next `sync`.
 	/// A coin whose refresh the operator refused, voided or let expire is
-	/// asked for again a day ([`REFUSED_AGAIN`]) after it was last asked for.
+	/// asked for again six hours ([`REFUSED_AGAIN`]) after it was last asked
+	/// for, while it is still in its refresh window.
 	/// From a day before its exit date, a coin not refreshed goes home
 	/// ([`Self::home`]).
 	pub(crate) fn refresh_due(&mut self) -> Result<Vec<Value>, Error> {
@@ -1331,8 +1336,8 @@ impl Wallet {
 			if now < d.refresh_from || now >= d.home_from {
 				continue;
 			}
-			// A refresh the operator refused is asked for again a day after
-			// it was asked, not at every sync.
+			// A refresh the operator refused is asked for again six hours
+			// after it was asked, not at every sync.
 			if let (Some(_), Some(t)) = (refused.get(&c.leaf_id), asked_at.get(&c.leaf_id)) {
 				if now < t.saturating_add(REFUSED_AGAIN) {
 					continue;
@@ -1386,7 +1391,8 @@ impl Wallet {
 			} else if now >= d.refresh_from {
 				match (c.state.as_str(), refused.contains_key(&c.leaf_id)) {
 					("live", false) => now,
-					// Refused: asked for again a day after it was last asked.
+					// Refused: asked for again six hours after it was last
+					// asked, or gone home from home_from.
 					("live", true) => d.home_from.min(asked_at.get(&c.leaf_id).map_or(now, |t| t.saturating_add(REFUSED_AGAIN)).max(now)),
 					_ => d.home_from.min(now.saturating_add(3600)),
 				}

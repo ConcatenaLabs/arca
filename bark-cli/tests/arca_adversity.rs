@@ -5169,13 +5169,15 @@ async fn f5_a_participation_whose_coin_goes_home_is_not_posted_again() {
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
-/// R7h F5. A refused refresh is asked for again a day after it was asked,
-/// not at every sync. The operator refuses every refresh of A's board: in
-/// the free window `sync` asks, refused; an hour on it does not ask again,
-/// and its schedule names the coin's `home_from` (a day after the ask), not
-/// the next hour.
+/// R7h F5 and R7i Q1. A refused refresh is asked for again six hours after
+/// it was asked, a quarter of the day-long refresh window, not at every
+/// sync. The operator refuses every refresh of A's board: in the free
+/// window `sync` asks, refused; an hour on, and ten minutes short of six
+/// hours on, it does not ask again, and its schedule names six hours after
+/// the ask, not the next hour; ten minutes past six hours on it asks again,
+/// still in the window, before `home_from`.
 #[tokio::test(flavor = "multi_thread")]
-async fn f5_a_refused_refresh_is_asked_again_a_day_on_not_at_every_sync() {
+async fn f5_a_refused_refresh_is_asked_again_six_hours_on_not_at_every_sync() {
 	let mut r = Running::start().await;
 	let url = r.url();
 	let x = r.x;
@@ -5193,20 +5195,34 @@ async fn f5_a_refused_refresh_is_asked_again_a_day_on_not_at_every_sync() {
 	})));
 	let by = d57_latest_exit_by(&a, &boards);
 	d57_to(&r, by - 2 * 86_400 + 600).await;
+	let asked_at = common::node::median_time(&r.rt);
 	let s = a.ok(&["sync"]);
-	println!("F5R the free window: refresh {}", s["refresh"]);
+	println!("F5R the free window (median time {}, refresh_from {}, home_from {}): refresh {}", asked_at, by - 2 * 86_400, by - 86_400,
+		s["refresh"]);
 	assert!(s["refresh"][0]["error"].as_str().unwrap_or("").contains("refuses"), "{}", s["refresh"]);
 	let asked = proxy.count("/v1/submit_participation");
-	d57_to(&r, by - 2 * 86_400 + 600 + 3_600).await;
+	let again = 6 * 3_600;
+	for (label, t) in [("an hour on", asked_at + 3_600), ("ten minutes short of six hours on", asked_at + again - 600)] {
+		d57_to(&r, t).await;
+		let s = a.ok(&["sync"]);
+		let now = common::node::median_time(&r.rt);
+		let next = s["schedule"]["next_sync_at"].as_u64().unwrap() as u32;
+		println!("F5R {} (median time {}): refresh {} | asked again {} | next_sync_at {} ({} s ahead; home_from {})", label, now,
+			s["refresh"], proxy.count("/v1/submit_participation") - asked, next, next as i64 - now as i64, by - 86_400);
+		assert_eq!(proxy.count("/v1/submit_participation"), asked, "not asked again {}", label);
+		assert!(s["refresh"].is_null() || s["refresh"].as_array().is_some_and(|a| a.is_empty()), "{}", s["refresh"]);
+		assert_eq!(next, asked_at + again, "the schedule wakes six hours after the ask, not every hour");
+		assert!(coin_of(&a, &board)["home"].as_str().unwrap_or("").contains("refused"), "{}", coin_of(&a, &board));
+	}
+	d57_to(&r, asked_at + again + 600).await;
 	let s = a.ok(&["sync"]);
 	let now = common::node::median_time(&r.rt);
-	let next = s["schedule"]["next_sync_at"].as_u64().unwrap() as u32;
-	println!("F5R an hour on: refresh {} | asked again {} | next_sync_at {} ({} s ahead; home_from {})", s["refresh"],
-		proxy.count("/v1/submit_participation") - asked, next, next as i64 - now as i64, by - 86_400);
-	assert_eq!(proxy.count("/v1/submit_participation"), asked, "not asked again an hour on");
-	assert!(s["refresh"].is_null() || s["refresh"].as_array().is_some_and(|a| a.is_empty()), "{}", s["refresh"]);
-	assert_eq!(next, by - 86_400, "the schedule wakes at home_from, not every hour");
-	assert!(coin_of(&a, &board)["home"].as_str().unwrap_or("").contains("refused"), "{}", coin_of(&a, &board));
+	println!("F5R ten minutes past six hours on (median time {}, home_from {}): refresh {} | asked so far {} | the coin {}", now, by - 86_400,
+		s["refresh"], proxy.count("/v1/submit_participation"), coin_of(&a, &board)["state"]);
+	assert!(now < by - 86_400, "still in the refresh window");
+	assert_eq!(proxy.count("/v1/submit_participation"), asked + 1, "asked again in the window");
+	assert!(s["refresh"][0]["error"].as_str().unwrap_or("").contains("refuses"), "{}", s["refresh"]);
+	assert_eq!(coin_of(&a, &board)["state"], "live", "the coin stays live until home_from");
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
