@@ -23,7 +23,7 @@ units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused.
 | `forfeit` | The forfeit output, bound to the leaf given up and to its round | The operator's claim with the preimage and the round's connector asset; the owner's refund after the delay |
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
-| `htlc` | `htlc-1`, for a payment out of the tree or into it | Claim, claim with both signatures, refund after the timeout, refund with both signatures |
+| `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 
@@ -62,7 +62,8 @@ tx.input[i].witness.script_witness = w;
 
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
-It names the leaf's template and version (`vtxo-1`), the owner's key, the two
+It names the leaf's template and version (`vtxo-1`, or `htlc-1` with its
+payment hash, timeout, direction and operator delay), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
 clock schedule

@@ -14,10 +14,12 @@
 //!   rests at once released, the chain of clocks built last one first, and the
 //!   operator's release and roll of the token; and the sweep transaction
 //!   ([`sweep::sweep_tx`]) that takes a batch's outputs behind the token;
-//! - the leaf ([`leaf`]): the rebindable collaborative path and the exit;
+//! - the leaf ([`leaf`]): the rebindable collaborative path and the exit,
+//!   or, for `htlc-1` ([`htlc`]), a claim with a preimage and a refund after a
+//!   timeout in place of the exit;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
-//!   checkpoint ([`checkpoint`]), `htlc-1` ([`htlc`]), the offboard output
+//!   checkpoint ([`checkpoint`]), the offboard output
 //!   ([`offboard`]) and the round's connector output, which only the issuance
 //!   of the round's connector asset spends ([`forfeit::ConnectorPolicy`]);
 //! - the five checks a wallet runs on a round transaction and its published
@@ -86,7 +88,7 @@ pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
-pub use htlc::{HtlcDirection, HtlcPolicy, HtlcSalts};
+pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
 pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
@@ -132,4 +134,10 @@ pub enum Error {
 	Sighash(String),
 	#[error(transparent)]
 	Time(#[from] time::TimeError),
+	#[error("an htlc-1 leaf's operator delay of {operator} units is not shorter than its owner's delay of {owner}")]
+	HtlcDelays { operator: u16, owner: u16 },
+	#[error("an htlc-1 leaf has no exit: it is spent by its claim, its refund or its collaborative path")]
+	HtlcHasNoExit,
+	#[error("a vtxo-1 leaf has no {0} path")]
+	NotAnHtlc(&'static str),
 }

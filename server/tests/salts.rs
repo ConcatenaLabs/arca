@@ -75,7 +75,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let (a_held, a_tx) = credited_board(&mut r, &keypair("attacker board"), x).await;
 	let a_valid = a_held.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
 	let kept = a_valid.value - MARGIN;
-	let copy = NewLeaf { owner: xonly(&keypair("attacker copy")), owner_nonce: v_on, creator_nonce: v_op, exit_delay: exit_delay() };
+	let copy = NewLeaf { owner: xonly(&keypair("attacker copy")), owner_nonce: v_on, creator_nonce: v_op, exit_delay: exit_delay(), htlc: None };
 	assert_eq!(copy.salt(), v_salt);
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&a_held, a_valid.clone(), kept)], &[(x, kept - MARGIN, copy)], s, r.chain));
 	refused_salt(&t, &v_salt, "a transfer to a leaf of the attacker's under V's salt (a batch leaf's)");
@@ -94,7 +94,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	// that same pair. The board is refused for its salt, before its nonce
 	// (which is unused) is looked at.
 	let n = r.http.operator_nonce();
-	let mine = NewLeaf { owner: xonly(&keypair("attacker own")), owner_nonce: random32(), creator_nonce: n, exit_delay: exit_delay() };
+	let mine = NewLeaf { owner: xonly(&keypair("attacker own")), owner_nonce: random32(), creator_nonce: n, exit_delay: exit_delay(), htlc: None };
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&a_held, a_valid.clone(), kept)], &[(x, kept - MARGIN, mine)], s, r.chain));
 	assert_eq!(t.status, 200, "{}", t.json);
 	let board_key = keypair("attacker board under a transfer's salt");
@@ -123,7 +123,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let (b2, b2_tx) = credited_board(&mut r, &keypair("attacker board 2"), x).await;
 	let b2v = b2.record.resolve(std::slice::from_ref(&b2_tx), &r.policy()).unwrap();
 	let k2 = b2v.value - MARGIN;
-	let early = NewLeaf { owner: xonly(&keypair("attacker early")), owner_nonce: u_nonce, creator_nonce: op, exit_delay: exit_delay() };
+	let early = NewLeaf { owner: xonly(&keypair("attacker early")), owner_nonce: u_nonce, creator_nonce: op, exit_delay: exit_delay(), htlc: None };
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b2, b2v.clone(), k2)], &[(x, k2 - MARGIN, early)], s, r.chain));
 	refused_salt(&t, &promised, "a transfer to a leaf under a salt promised to a participation");
 
@@ -161,7 +161,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let b4v = b4.record.resolve(std::slice::from_ref(&b4_tx), &r.policy()).unwrap();
 	let k4 = b4v.value - MARGIN;
 	let a5 = keypair("attacker leaf L1");
-	let l1_leaf = NewLeaf { owner: xonly(&a5), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay() };
+	let l1_leaf = NewLeaf { owner: xonly(&a5), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay(), htlc: None };
 	let (l1_on, l1_op) = (l1_leaf.owner_nonce, l1_leaf.creator_nonce);
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b4, b4v, k4)], &[(x, k4 - MARGIN, l1_leaf)], s, r.chain)).ok();
 	let rec = CoinRecord::from_bytes(&unhex(t["outputs"][0]["record"].as_str().unwrap())).unwrap();
@@ -180,7 +180,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let k5 = b5v.value - MARGIN;
 	assert_eq!(k5 - MARGIN, l1_value, "L2 holds what L1 held: one message would spend either");
 	let a6 = keypair("attacker leaf L2");
-	let l2_leaf = NewLeaf { owner: xonly(&a6), owner_nonce: l1_on, creator_nonce: l1_op, exit_delay: exit_delay() };
+	let l2_leaf = NewLeaf { owner: xonly(&a6), owner_nonce: l1_on, creator_nonce: l1_op, exit_delay: exit_delay(), htlc: None };
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b5, b5v, k5)], &[(x, k5 - MARGIN, l2_leaf)], s, r.chain)).ok();
 	let rec = CoinRecord::from_bytes(&unhex(t["outputs"][0]["record"].as_str().unwrap())).unwrap();
 	let l2 = Held { key: a6, nonce: l1_on, id: t["outputs"][0]["leaf_id"].as_str().unwrap().parse().unwrap(), record: rec };
@@ -203,7 +203,7 @@ async fn no_leaf_takes_a_salt_the_server_has_seen() {
 	let b3v = b3.record.resolve(std::slice::from_ref(&b3_tx), &r.policy()).unwrap();
 	let k3 = b3v.value - MARGIN;
 	let a4 = keypair("attacker copy of W");
-	let copy_w = NewLeaf { owner: xonly(&a4), owner_nonce: w_on, creator_nonce: w_op, exit_delay: exit_delay() };
+	let copy_w = NewLeaf { owner: xonly(&a4), owner_nonce: w_on, creator_nonce: w_op, exit_delay: exit_delay(), htlc: None };
 	let t = r.http.post("cosign_transfer", &transfer_body(&[(&b3, b3v, k3)], &[(x, k3 - MARGIN, copy_w)], s, r.chain)).ok();
 	println!("with W's salt forgotten by the database, the attacker's leaf under it is co-signed");
 	let rec = CoinRecord::from_bytes(&unhex(t["outputs"][0]["record"].as_str().unwrap())).unwrap();

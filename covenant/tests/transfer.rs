@@ -571,3 +571,101 @@ fn the_lineage_lists_every_leaf_and_checkpoint() {
 	// A batch leaf received as it is has no lineage before it.
 	assert!(f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap().lineage().is_empty());
 }
+
+/// A payment out of the tree: A's leaf into an `htlc-1` coin the operator
+/// claims with the preimage, beside A's change. The coin's record carries the
+/// terms (tag 3), round-trips, and validates for the key A gave the payment;
+/// every transaction that brings it on-chain verifies, and so do the
+/// operator's claim and A's refund from there. The payment failing, the
+/// operator and A return the coin into a new leaf of A's by the coin's own
+/// collaborative path, through a checkpoint and a reassignment, and that
+/// coin is brought on-chain too. Terms whose operator delay is not shorter
+/// than the owner's are refused.
+#[test]
+fn an_htlc_1_coin_paid_out_and_returned() {
+	let f = fx();
+	let s = &f.b.s;
+	let chain = f.policy.chain;
+	let genesis = chain.genesis_hash();
+	let delay = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
+	let a_coin = f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap();
+	let x = a_coin.asset;
+	let preimage = label32("htlc payment");
+	let terms = HtlcTerms {
+		direction: HtlcDirection::Send, payment_hash: arca_covenant::script::sha256(&preimage),
+		timeout: MedianTime::from_consensus(CREATED + 2 * 86_400).unwrap(),
+		operator_delay: RelativeTime::from_units(delay.units() / 3).unwrap(),
+	};
+	let htlc_key = keypair("htlc payer key");
+	let htlc = NewLeaf {
+		owner: xonly(&htlc_key), owner_nonce: label32("htlc owner nonce"), creator_nonce: label32("htlc creator nonce"),
+		exit_delay: delay, htlc: Some(terms),
+	};
+	let change = Party::new("htlc change", delay);
+	let pay = 3_000_000;
+	let outputs = vec![
+		ExplicitOutput::new(x, pay, htlc.policy(xonly(s), chain).script_pubkey()),
+		ExplicitOutput::new(x, a_coin.value - pay - 2 * MARGIN, change.leaf.policy(xonly(s), chain).script_pubkey()),
+	];
+	let plan = TransferPlan { inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)], outputs };
+	let pairs = sign_plan(&plan, &[&f.b.a], s);
+	let rec = record_for(&plan, &[&f.hops.a_base], &pairs, 0, htlc);
+	let bytes = rec.to_bytes().unwrap();
+	assert_eq!(bytes[1], 3, "a coin whose leaf is htlc-1 has tag 3");
+	assert_eq!(CoinRecord::from_bytes(&bytes).unwrap(), rec);
+	let coin = rec.validate(&f.rounds, &f.policy, &htlc.owner, &htlc.owner_nonce).unwrap();
+	assert_eq!(coin.leaf.htlc, Some(terms));
+	assert_eq!(coin.leaf.template(), Template::Htlc1);
+	let mut txs = vec![];
+	let at = bring(&coin, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+		println!("{:<90} {:>4} vB, verifies", name, u.tx.vsize());
+	}
+	let to_s = [ExplicitOutput::new(x, pay - 1_500, op_true().script_pubkey())];
+	let ks = coin.leaf.claim_tx(at, x, pay, &to_s, &FeeSource::Reserve).unwrap();
+	assert_eq!(ks.tx.input[0].sequence.0, terms.operator_delay.to_sequence());
+	let sg = sig(s, &ks.sighash(genesis).unwrap());
+	let claim = ks.finish(HtlcTerms::claim_items(&sg, &preimage));
+	f.consensus.verify_tx(&claim.prevouts, &claim.tx).unwrap();
+	println!("the operator's claim with the preimage: {} vB, verifies", claim.tx.vsize());
+	let ks = coin.leaf.refund_tx(at, x, pay, &to_s, &FeeSource::Reserve).unwrap();
+	assert_eq!(ks.tx.lock_time.to_consensus_u32(), terms.timeout.to_consensus_u32());
+	assert_eq!(ks.tx.input[0].sequence.0, delay.to_sequence());
+	let sg = sig(&htlc_key, &ks.sighash(genesis).unwrap());
+	let refund = ks.finish(vec![sg.as_ref().to_vec()]);
+	f.consensus.verify_tx(&refund.prevouts, &refund.tx).unwrap();
+	println!("the owner's refund: {} vB, verifies", refund.tx.vsize());
+	assert!(coin.leaf.exit_tx(at, x, pay, &to_s, &FeeSource::Reserve).is_err(), "htlc-1 has no exit");
+
+	// The payment failed: back into a new leaf of A's, by both.
+	let back = Party::new("htlc returned", delay);
+	let plan = TransferPlan {
+		inputs: vec![(coin.clone(), coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, coin.value - 2 * MARGIN, back.leaf.policy(xonly(s), chain).script_pubkey())],
+	};
+	let pairs = sign_plan(&plan, &[&htlc_key], s);
+	let returned = record_for(&plan, &[&rec], &pairs, 0, back.leaf);
+	let coin2 = CoinRecord::from_bytes(&returned.to_bytes().unwrap()).unwrap()
+		.validate(&f.rounds, &f.policy, &back.leaf.owner, &back.leaf.owner_nonce).unwrap();
+	assert_eq!((coin2.hops, coin2.value, coin2.leaf.htlc), (2, pay - 2 * MARGIN, None));
+	let mut txs = vec![];
+	bring(&coin2, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+	}
+	let (name, u) = txs.iter().rev().nth(1).unwrap();
+	println!("{}: {} vB; the returned coin is brought on-chain in {} transactions, each verifies", name, u.tx.vsize(), txs.len());
+
+	// Terms the leaf cannot carry.
+	let bad = NewLeaf { htlc: Some(HtlcTerms { operator_delay: delay, ..terms }), ..htlc };
+	let plan = TransferPlan {
+		inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, bad.policy(xonly(s), chain).script_pubkey())],
+	};
+	let pairs = sign_plan(&plan, &[&f.b.a], s);
+	let rec = record_for(&plan, &[&f.hops.a_base], &pairs, 0, bad);
+	let e = rec.validate(&f.rounds, &f.policy, &bad.owner, &bad.owner_nonce).unwrap_err();
+	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::HtlcDelays { .. }))), "{}", e);
+	assert!(matches!(CoinRecord::from_bytes(&rec.to_bytes().unwrap()), Err(TransferError::Decode(_))));
+}

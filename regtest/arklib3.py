@@ -598,32 +598,33 @@ def checkpoint_taptree(a_x, s_x, salt, ctag, sweep):
     return tap, {"collab": collab, "sweep": sweep}
 
 
-def rebind_one_ops(ctag, salt):
-    """The frozen message for m = 1, built in script: leaves
-    SHA256(K || asset_in || 01 || 01 || value_in || 0x01 || SHA256(record 0))."""
-    return ([leaf_const(ctag, salt, fold=True)] + input_record_ops() + [OP_CAT, OP_1, OP_CAT]
-            + record_ops(0) + [OP_SHA256, OP_CAT, OP_SHA256])
+def htlc_taptree(a_x, s_x, salt, ctag, h, timeout, exit_delay, operator_delay, receive=False):
+    """htlc-1: a leaf whose exit is replaced by a hash-locked pair.
 
+      collab  the leaf's collaborative path, the very script vtxo-1 carries
+              under this leaf's own salt          <sig_S> <sig_A> <m>
+      claim   <delay> CSV DROP, a 32-byte preimage of h, the claimer's
+              signature                           <sig> <preimage>
+      refund  <timeout> CLTV DROP <delay> CSV DROP, the refunder's
+              signature                           <sig>
 
-def htlc1_taptree(owner_x, s_x, h, timeout, salts, ctag, claimer_x=None, refunder_x=None):
-    """htlc-1 on the frozen message. Four paths, each rebindable one committing
-    to output 0 with its own salt:
-      claim       preimage + the claimer's signature          <sig> <preimage>
-      claim_both  preimage + owner and operator signatures    <sig_S> <sig_A> <preimage>
-      refund      after `timeout` (median time), the refunder's ordinary signature
-      refund_both after `timeout`, owner and operator signatures   <sig_S> <sig_A>
-    By default the operator claims and the owner refunds (a payment out of the
-    tree); a payment into the tree swaps the two."""
-    claimer_x = claimer_x or s_x
-    refunder_x = refunder_x or owner_x
-    claim = CScript(hash_gate(h) + rebind_one_ops(ctag, salts["claim"]) + [claimer_x, OP_CHECKSIGFROMSTACK])
-    claim_both = CScript(hash_gate(h) + rebind_one_ops(ctag, salts["claim_both"]) + _csfs_2of2(owner_x, s_x))
-    refund = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP, refunder_x, OP_CHECKSIG])
-    refund_both = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP] + rebind_one_ops(ctag, salts["refund_both"])
-                          + _csfs_2of2(owner_x, s_x))
-    tap = taproot_construct(NUMS, [[("claim", claim), ("claim_both", claim_both)],
-                                   [("refund", refund), ("refund_both", refund_both)]])
-    return tap, {"claim": claim, "claim_both": claim_both, "refund": refund, "refund_both": refund_both}
+    A payment out of the tree (receive=False): the operator claims after
+    `operator_delay`, the owner refunds after the timeout and `exit_delay`.
+    A payment into it (receive=True): the owner claims after `exit_delay`,
+    the operator refunds after the timeout and `operator_delay`. Either way
+    the operator's path waits less than the owner's, so the side that holds
+    the preimage, or that waited out the timeout, always has the time between
+    the two delays to answer once the output is on-chain; and the
+    collaborative path, which waits for nothing, answers both. Delays are
+    CSV operands (rel_time); the timeout is a median time."""
+    collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
+    claimer, claim_delay = (a_x, exit_delay) if receive else (s_x, operator_delay)
+    refunder, refund_delay = (s_x, operator_delay) if receive else (a_x, exit_delay)
+    claim = CScript([claim_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP] + hash_gate(h) + [claimer, OP_CHECKSIG])
+    refund = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP, refund_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                      refunder, OP_CHECKSIG])
+    tap = taproot_construct(NUMS, [("collab", collab), [("claim", claim), ("refund", refund)]])
+    return tap, {"collab": collab, "claim": claim, "refund": refund}
 
 
 def node_taptree3(unroll, sweep, reclaim=None):

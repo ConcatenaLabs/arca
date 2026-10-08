@@ -9,6 +9,8 @@
 //! owner_nonce        hex
 //! operator_nonce     hex
 //! exit_delay_units   512-second units
+//! htlc               htlc-1 only: {"direction": "send" or "receive", "payment_hash": hex,
+//!                    "timeout": median time, "operator_delay_units": 512-second units}
 //! asset              hex, display order
 //! value              decimal string
 //! unlock_hash        hex
@@ -48,6 +50,7 @@ use serde_json::{Map, Value};
 
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::gate::{MemberProof, MAX_DEPTH};
+use crate::htlc::{HtlcDirection, HtlcTerms};
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
 use crate::record::{
@@ -108,6 +111,14 @@ impl LeafRecord {
 		m.insert("owner_nonce".into(), Value::String(hex(&self.owner_nonce)));
 		m.insert("operator_nonce".into(), Value::String(hex(&self.operator_nonce)));
 		m.insert("exit_delay_units".into(), self.exit_delay.units().into());
+		if let Some(t) = &self.htlc {
+			let mut h = Map::new();
+			h.insert("direction".into(), Value::String(t.direction.name().into()));
+			h.insert("payment_hash".into(), Value::String(hex(&t.payment_hash)));
+			h.insert("timeout".into(), t.timeout.to_consensus_u32().into());
+			h.insert("operator_delay_units".into(), t.operator_delay.units().into());
+			m.insert("htlc".into(), Value::Object(h));
+		}
 		m.insert("asset".into(), Value::String(display(asset_bytes(self.asset))));
 		m.insert("value".into(), Value::String(self.value.to_string()));
 		m.insert("unlock_hash".into(), Value::String(hex(&self.unlock_hash)));
@@ -135,10 +146,17 @@ impl LeafRecord {
 
 	/// Reads the JSON form.
 	pub fn from_json(v: &Value) -> Result<LeafRecord, RecordError> {
-		let m = object(v, "record", &[
+		// An htlc-1 record has one field more; the template says which.
+		let named = v.as_object().and_then(|o| o.get("template")).and_then(|t| t.as_str())
+			.map(|t| t.parse::<Template>()).transpose()?;
+		let mut fields = vec![
 			"version", "template", "owner", "owner_nonce", "operator_nonce", "exit_delay_units", "asset", "value",
 			"unlock_hash", "entry_reserve", "genesis_hash", "operator", "token", "notice_units", "burn", "expiries", "path",
-		])?;
+		];
+		if named == Some(Template::Htlc1) {
+			fields.push("htlc");
+		}
+		let m = object(v, "record", &fields)?;
 		let version = int(m, "version", u64::MAX)?;
 		if version != RECORD_VERSION as u64 {
 			return Err(RecordError::Version(version));
@@ -148,6 +166,21 @@ impl LeafRecord {
 		let owner_nonce = bytes32(m, "owner_nonce")?;
 		let operator_nonce = bytes32(m, "operator_nonce")?;
 		let exit_delay = units(m, "exit_delay_units")?;
+		let htlc = match m.get("htlc") {
+			None => None,
+			Some(h) => {
+				let h = object(h, "htlc", &["direction", "payment_hash", "timeout", "operator_delay_units"])?;
+				let direction = HtlcDirection::from_name(string(h, "direction")?)
+					.ok_or_else(|| RecordError::Type("htlc.direction".into()))?;
+				let t = int(h, "timeout", u32::MAX as u64)?;
+				Some(HtlcTerms {
+					direction,
+					payment_hash: bytes32(h, "payment_hash")?,
+					timeout: MedianTime::from_consensus(t as u32).map_err(crate::encode::DecodeError::from)?,
+					operator_delay: units(h, "operator_delay_units")?,
+				})
+			},
+		};
 		let asset = AssetId::from_byte_array(display32(m, "asset")?);
 		let value = amount(m, "value")?;
 		let unlock_hash = bytes32(m, "unlock_hash")?;
@@ -191,7 +224,7 @@ impl LeafRecord {
 			owners.push(XOnlyPublicKey::from_slice(&b).map_err(|_| RecordError::Key(format!("{}.owners", ctx)))?);
 		}
 		let record = LeafRecord {
-			template, owner, owner_nonce, operator_nonce, exit_delay, asset, value, unlock_hash, entry_reserve, chain,
+			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, asset, value, unlock_hash, entry_reserve, chain,
 			schedule, burn,
 			upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};

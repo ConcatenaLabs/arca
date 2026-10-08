@@ -134,7 +134,7 @@
 //!              its owner's unroll authorisation for each node, from the batch output down
 //!   u8  2, a board:
 //!         u16  length L, then L bytes: its BoardRecord, binary form
-//!   u8  1, an output of a reassignment:
+//!   u8  1, an output of a reassignment whose leaf is vtxo-1, or 3, one whose leaf is htlc-1:
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
@@ -143,7 +143,15 @@
 //!                [32] asset, u64 value, compact size and the scriptPubKey (at most 10,000 bytes)
 //!         u8   the coin's index, below m
 //!         [32] owner key, [32] owner nonce, [32] creator nonce (the sender's), u16 exit delay units
+//!         for tag 3 only: u8 direction (0 send, 1 receive), [32] payment hash, u32 timeout,
+//!                         u16 operator delay units
 //! ```
+//!
+//! A reassignment may create an `htlc-1` leaf ([`crate::htlc`]): a payment
+//! out of the tree over Lightning, the operator claiming with the preimage.
+//! Its coin is the coin of any other leaf a reassignment creates, with the
+//! terms its leaf carries; it is spent by the same collaborative path, through
+//! a checkpoint and a reassignment.
 //!
 //! Reassignments nest at most [`MAX_HOPS`] deep along any path of the record.
 //! A reader refuses an unknown version or tag and anything that does not encode
@@ -162,7 +170,8 @@ use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxOut};
 use crate::board::{BoardPolicy, BoardRecord, ValidBoard};
 use crate::checkpoint::CheckpointPolicy;
 use crate::clock::ClockSchedule;
-use crate::encode::{write_compact_size, DecodeError, Reader};
+use crate::encode::{write_compact_size, DecodeError, Encoding, Reader};
+use crate::htlc::HtlcTerms;
 use crate::leaf::{leaf_salt, LeafPolicy, MAX_OUTPUTS};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::MAX_DESTINATION;
@@ -213,8 +222,8 @@ pub fn checkpoint_salt(leaf_salt: &[u8; 32]) -> [u8; 32] {
 }
 
 /// A new leaf a reassignment creates: its owner's key and nonce, as the
-/// receiver publishes them, the creator nonce the sender draws for it, and
-/// the exit delay.
+/// receiver publishes them, the creator nonce the sender draws for it, the
+/// exit delay, and for an `htlc-1` leaf its terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NewLeaf {
 	pub owner: XOnlyPublicKey,
@@ -225,13 +234,15 @@ pub struct NewLeaf {
 	/// never commit to the same output (see the [module documentation](self)).
 	pub creator_nonce: [u8; 32],
 	pub exit_delay: RelativeTime,
+	/// `htlc-1`'s terms; `None` for a `vtxo-1` leaf.
+	pub htlc: Option<HtlcTerms>,
 }
 
 impl NewLeaf {
 	/// The leaf, for `operator` on `chain`.
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
-			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay,
+			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
 		}
 	}
 
@@ -938,6 +949,9 @@ impl CoinRecord {
 						max: policy.max_exit_delay.units(),
 					});
 				}
+				if let Some(terms) = &t.leaf.htlc {
+					terms.check(t.leaf.exit_delay).map_err(SpendError::from)?;
+				}
 				let first = &inputs[0].coin;
 				let leaf = t.leaf.policy(first.leaf.operator, first.leaf.chain);
 				let mine = &t.outputs[t.index as usize];
@@ -997,7 +1011,7 @@ impl CoinRecord {
 				if t.outputs.is_empty() || t.outputs.len() > MAX_OUTPUTS as usize {
 					return Err(TransferError::Outputs(t.outputs.len()));
 				}
-				w.push(1);
+				w.push(if t.leaf.htlc.is_some() { 3 } else { 1 });
 				w.push(t.inputs.len() as u8);
 				for i in &t.inputs {
 					i.coin.write(w, depth + 1)?;
@@ -1022,6 +1036,9 @@ impl CoinRecord {
 				w.extend(t.leaf.owner_nonce);
 				w.extend(t.leaf.creator_nonce);
 				w.extend(t.leaf.exit_delay.units().to_le_bytes());
+				if let Some(terms) = &t.leaf.htlc {
+					terms.encode_to(w);
+				}
 			},
 		}
 		Ok(())
@@ -1058,7 +1075,7 @@ impl CoinRecord {
 				}
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
-			1 => {
+			tag @ (1 | 3) => {
 				let n = r.u8()? as usize;
 				if n == 0 || n > MAX_INPUTS {
 					return Err(TransferError::Inputs(n));
@@ -1094,7 +1111,14 @@ impl CoinRecord {
 				if index as usize >= m {
 					return Err(TransferError::Index { index: index as usize, count: m });
 				}
-				let leaf = NewLeaf { owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()? };
+				let mut leaf = NewLeaf {
+					owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
+				};
+				if tag == 3 {
+					let terms = HtlcTerms::decode_from(r)?;
+					terms.check(leaf.exit_delay).map_err(DecodeError::from)?;
+					leaf.htlc = Some(terms);
+				}
 				Ok(CoinRecord::Transfer(Box::new(Transfer { inputs, outputs, index, leaf })))
 			},
 			2 => {

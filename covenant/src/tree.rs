@@ -51,6 +51,7 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn,
 
 use crate::clock::ClockSchedule;
 use crate::gate::{Members, MAX_OWNERS};
+use crate::htlc::HtlcTerms;
 use crate::leaf::leaf_salt;
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
@@ -131,6 +132,8 @@ pub struct LeafSpec {
 	pub exit_delay: RelativeTime,
 	/// The entry's unlock hash `h`.
 	pub unlock_hash: [u8; 32],
+	/// `htlc-1`'s terms, present exactly when the template is `htlc-1`.
+	pub htlc: Option<HtlcTerms>,
 }
 
 impl LeafSpec {
@@ -203,7 +206,7 @@ pub enum TreeError {
 	Radix(usize),
 	#[error("leaf {leaf} holds {value}, outside {min} to {max}", max = MAX_VALUE)]
 	LeafValue { leaf: usize, value: u64, min: u64 },
-	#[error("leaf {leaf} has a template this builder does not build")]
+	#[error("leaf {leaf} has a template this builder does not build, or htlc-1 terms that do not fit it")]
 	Template { leaf: usize },
 	/// Two leaves with one script. With distinct operator nonces this takes a
 	/// SHA256 collision; the check stays as a guard.
@@ -296,14 +299,17 @@ impl Tree {
 			if let Some(first) = keys.insert(spec.owner, i) {
 				return Err(TreeError::DuplicateOwner { first, second: i });
 			}
-			if spec.template != Template::Vtxo1 {
-				return Err(TreeError::Template { leaf: i });
+			match (spec.template, &spec.htlc) {
+				(Template::Vtxo1, None) => {},
+				(Template::Htlc1, Some(t)) if t.check(spec.exit_delay).is_ok() => {},
+				_ => return Err(TreeError::Template { leaf: i }),
 			}
 			if spec.value < min || spec.value > MAX_VALUE {
 				return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 			}
 			let leaf = LeafPolicy {
 				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
+				htlc: spec.htlc,
 			};
 			let program = leaf.program();
 			if let Some(first) = seen.insert(program, i) {
@@ -448,6 +454,7 @@ impl Tree {
 			owner_nonce: l.spec.owner_nonce,
 			operator_nonce: l.spec.operator_nonce,
 			exit_delay: l.spec.exit_delay,
+			htlc: l.spec.htlc,
 			asset: self.params.asset,
 			value: l.spec.value,
 			unlock_hash: l.spec.unlock_hash,

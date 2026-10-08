@@ -355,8 +355,20 @@ impl KeySpend {
 		outputs: &[ExplicitOutput],
 		fee: &FeeSource,
 	) -> Result<KeySpend, SpendError> {
+		KeySpend::build_at(LockTime::ZERO, tap, script, inputs, outputs, fee)
+	}
+
+	/// [`KeySpend::build`] with a lock time, for a path that checks one.
+	pub(crate) fn build_at(
+		lock_time: LockTime,
+		tap: TapOutput,
+		script: Script,
+		inputs: Vec<(OutPoint, TxOut, Sequence)>,
+		outputs: &[ExplicitOutput],
+		fee: &FeeSource,
+	) -> Result<KeySpend, SpendError> {
 		let coin_sequence = if inputs[0].2 == FINAL { FINAL } else { FEE_COIN_SEQUENCE };
-		let u = assemble(LockTime::ZERO, inputs, outputs, fee, coin_sequence)?;
+		let u = assemble(lock_time, inputs, outputs, fee, coin_sequence)?;
 		Ok(KeySpend { tx: u.tx, prevouts: u.prevouts, script, tap })
 	}
 
@@ -388,8 +400,38 @@ impl LeafPolicy {
 	pub fn exit_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
 		-> Result<KeySpend, SpendError>
 	{
+		if self.htlc.is_some() {
+			return Err(Error::HtlcHasNoExit.into());
+		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
 		KeySpend::build(self.taproot(), self.exit_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee)
+	}
+
+	/// The claim of `coin`, this `htlc-1` leaf on-chain holding `value` of
+	/// `asset`, into `outputs`: input 0's sequence is the claim's delay. The
+	/// claimer signs [`KeySpend::sighash`] and finishes it with its signature
+	/// and the preimage ([`crate::HtlcTerms::claim_items`]).
+	pub fn claim_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
+		-> Result<KeySpend, SpendError>
+	{
+		let t = self.htlc.ok_or(Error::NotAnHtlc("claim"))?;
+		let spent = explicit_txout(asset, value, self.script_pubkey());
+		let seq = Sequence(t.claim_delay(self.exit_delay).to_sequence());
+		KeySpend::build(self.taproot(), self.claim_script()?, vec![(coin, spent, seq)], outputs, fee)
+	}
+
+	/// The refund of `coin`, this `htlc-1` leaf on-chain holding `value` of
+	/// `asset`, into `outputs`: its lock time is the timeout and input 0's
+	/// sequence the refund's delay. The refunder signs
+	/// [`KeySpend::sighash`] and finishes it with its signature.
+	pub fn refund_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
+		-> Result<KeySpend, SpendError>
+	{
+		let t = self.htlc.ok_or(Error::NotAnHtlc("refund"))?;
+		let spent = explicit_txout(asset, value, self.script_pubkey());
+		let seq = Sequence(t.refund_delay(self.exit_delay).to_sequence());
+		let lock = LockTime::from_consensus(t.timeout.to_consensus_u32());
+		KeySpend::build_at(lock, self.taproot(), self.refund_script()?, vec![(coin, spent, seq)], outputs, fee)
 	}
 }
 

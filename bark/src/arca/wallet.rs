@@ -2680,6 +2680,7 @@ mod tests {
 		let leaves: Vec<LeafSpec> = (0..16u8).map(|i| LeafSpec {
 			template: Template::Vtxo1, owner: key(i + 1).x_only_public_key().0, value: 1_000_000,
 			owner_nonce: [i; 32], operator_nonce: [i + 100; 32], exit_delay: w, unlock_hash: [i + 50; 32],
+			htlc: None,
 		}).collect();
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();

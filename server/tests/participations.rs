@@ -184,7 +184,7 @@ async fn participation_accepted_and_refused() {
 
 	// A transfer paying a key a participation wants: the key is promised.
 	let b_valid = b_coin.record.resolve(std::slice::from_ref(&b_tx), &r.policy()).unwrap();
-	let promised = arca_covenant::NewLeaf { owner: xonly(&a2), owner_nonce: random32(), creator_nonce: random32(), exit_delay: common::client::exit_delay() };
+	let promised = arca_covenant::NewLeaf { owner: xonly(&a2), owner_nonce: random32(), creator_nonce: random32(), exit_delay: common::client::exit_delay(), htlc: None };
 	let body = common::client::transfer_body(&[(&b_coin, b_valid, VALUE - 2_000)], &[(x, VALUE - 4_000, promised)], s, chain);
 	refused(r.http.post("cosign_transfer", &body), 409, "key_reused");
 
@@ -229,7 +229,7 @@ async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_r
 	let pay = |r: &Running, from: &Held, tx: &Transaction, to: &elements::secp256k1_zkp::Keypair| {
 		let v = from.record.resolve(std::slice::from_ref(tx), &r.policy()).unwrap();
 		let kept = v.value - MARGIN;
-		let leaf = NewLeaf { owner: xonly(to), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay() };
+		let leaf = NewLeaf { owner: xonly(to), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay(), htlc: None };
 		r.http.post("cosign_transfer", &transfer_body(&[(from, v, kept)], &[(x, kept - MARGIN, leaf)], s, chain))
 	};
 

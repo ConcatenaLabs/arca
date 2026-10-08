@@ -64,6 +64,7 @@ W = rel_time(W_SECONDS)                    # sweep notice, 512-second units
 DELAY = rel_time(36 * H)                   # exit and forfeit-refund delay
 T_WATCH = EXPIRIES[0] - 3 * DAY            # a watch service's authorisation time
 HTLC_TIMEOUT = CREATED + 2 * DAY
+HTLC_OPERATOR_DELAY = rel_time(12 * H)       # the operator's side of htlc-1
 
 RADIX = 4
 NLEAVES = 64
@@ -106,7 +107,8 @@ SALTS = {i: label_hash("salt", "leaf%d" % i) for i in range(NLEAVES)}
 SALT_CHECKPOINT = label_hash("salt", "checkpoint")
 SALT_RECV = label_hash("salt", "receiver leaf")
 SALT_CHANGE = label_hash("salt", "change leaf")
-SALT_HTLC = {k: label_hash("salt", "htlc " + k) for k in ("claim", "claim_both", "refund_both")}
+SALT_HTLC = label_hash("salt", "htlc")
+SALT_HTLC_RECEIVE = label_hash("salt", "htlc receive")
 SALT_BOARD = label_hash("salt", "board")
 PREIMAGES = {i: label_hash("preimage", "entry%d" % i) for i in range(NLEAVES)}
 FORFEIT_PREIMAGE = label_hash("preimage", "forfeit")
@@ -432,21 +434,24 @@ def generate():
         "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT),
         "K": hx(leaf_const(CTAG, SALT_CHECKPOINT, fold=True)), "token": hx(T_ID), "r_program": hx(R_PROG),
         "notice": W}, ctap, [("collab", 1), ("sweep", 1)])
-    htap, hlv = htlc1_taptree(A.x, S.x, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, SALT_HTLC, CTAG)
-    outputs["htlc"] = output_json("htlc-1", {
-        "owner": hx(A.x), "operator": hx(S.x), "claimer": hx(S.x), "refunder": hx(A.x),
-        "payment_hash": hx(sha256(PAYMENT_PREIMAGE)), "timeout": HTLC_TIMEOUT,
-        "salts": {k: hx(v) for k, v in SALT_HTLC.items()},
-        "K": {k: hx(leaf_const(CTAG, v, fold=True)) for k, v in SALT_HTLC.items()}},
-        htap, [("claim", 2), ("claim_both", 2), ("refund", 2), ("refund_both", 2)])
-    htap_r, _ = htlc1_taptree(A.x, S.x, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, SALT_HTLC, CTAG,
-                              claimer_x=A.x, refunder_x=S.x)
+    htap, hlv = htlc_taptree(A.x, S.x, SALT_HTLC, CTAG, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, DELAY,
+                             HTLC_OPERATOR_DELAY)
+    outputs["htlc"] = output_json("htlc-1, payment out of the tree", {
+        "owner": hx(A.x), "operator": hx(S.x), "direction": "send", "claimer": hx(S.x), "refunder": hx(A.x),
+        "salt": hx(SALT_HTLC), "chain_tag": hx(CTAG), "K": hx(leaf_const(CTAG, SALT_HTLC, fold=True)),
+        "payment_hash": hx(sha256(PAYMENT_PREIMAGE)), "timeout": HTLC_TIMEOUT, "exit_delay": DELAY,
+        "operator_delay": HTLC_OPERATOR_DELAY, "claim_delay": HTLC_OPERATOR_DELAY, "refund_delay": DELAY,
+        "max_outputs": M_MAX},
+        htap, [("collab", 1), ("claim", 2), ("refund", 2)])
+    htap_r, _ = htlc_taptree(A.x, S.x, SALT_HTLC_RECEIVE, CTAG, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, DELAY,
+                             HTLC_OPERATOR_DELAY, receive=True)
     outputs["htlc_receive"] = output_json("htlc-1, payment into the tree", {
-        "owner": hx(A.x), "operator": hx(S.x), "claimer": hx(A.x), "refunder": hx(S.x),
-        "payment_hash": hx(sha256(PAYMENT_PREIMAGE)), "timeout": HTLC_TIMEOUT,
-        "salts": {k: hx(v) for k, v in SALT_HTLC.items()},
-        "K": {k: hx(leaf_const(CTAG, v, fold=True)) for k, v in SALT_HTLC.items()}},
-        htap_r, [("claim", 2), ("claim_both", 2), ("refund", 2), ("refund_both", 2)])
+        "owner": hx(A.x), "operator": hx(S.x), "direction": "receive", "claimer": hx(A.x), "refunder": hx(S.x),
+        "salt": hx(SALT_HTLC_RECEIVE), "chain_tag": hx(CTAG), "K": hx(leaf_const(CTAG, SALT_HTLC_RECEIVE, fold=True)),
+        "payment_hash": hx(sha256(PAYMENT_PREIMAGE)), "timeout": HTLC_TIMEOUT, "exit_delay": DELAY,
+        "operator_delay": HTLC_OPERATOR_DELAY, "claim_delay": DELAY, "refund_delay": HTLC_OPERATOR_DELAY,
+        "max_outputs": M_MAX},
+        htap_r, [("collab", 1), ("claim", 2), ("refund", 2)])
 
     # ---- spends: the tree ---------------------------------------------
     spends.append(unroll_spend(root, "batch_output/unroll by an owner, reserve fee", A, CREATED, True))
@@ -613,22 +618,31 @@ def generate():
                                txout(LEAF_VALUE, btap.scriptPubKey), [(X_ID, LEAF_VALUE - 600, OPERATOR_SPK)], [S, A]))
 
     # ---- spends: htlc-1 -----------------------------------------------
+    # Out of the tree: the operator claims with the preimage after its delay;
+    # the owner refunds after the timeout and its exit delay; the two
+    # together spend it at any time, here back into a leaf of the owner's.
     h_spent = txout(LEAF_VALUE, htap.scriptPubKey)
-    h_out = [(X_ID, LEAF_VALUE - 500, OPERATOR_SPK)]
-    d = rebind_spend("htlc/claim", "htlc", "claim", htap, CTAG, SALT_HTLC["claim"], h_spent, h_out, [S],
-                     m_item=False, extra=[PAYMENT_PREIMAGE])
+    sp = Spend([("htlc/claim", h_spent, HTLC_OPERATOR_DELAY)], [txout(LEAF_VALUE - 500, OPERATOR_SPK), fee_out(500)])
+    d = checksig_spend("htlc/claim", "htlc", "claim", htap, sp, 0, S, below_after=[PAYMENT_PREIMAGE])
     d["preimage"] = hx(PAYMENT_PREIMAGE)
     spends.append(d)
-    d = rebind_spend("htlc/claim_both", "htlc", "claim_both", htap, CTAG, SALT_HTLC["claim_both"], h_spent, h_out,
-                     [S, A], m_item=False, extra=[PAYMENT_PREIMAGE])
-    d["preimage"] = hx(PAYMENT_PREIMAGE)
-    spends.append(d)
-    back = [(X_ID, LEAF_VALUE - 500, bytes(leaf_tap(0, key=A, salt=SALT_CHANGE)[0].scriptPubKey))]
-    spends.append(rebind_spend("htlc/refund_both", "htlc", "refund_both", htap, CTAG, SALT_HTLC["refund_both"],
-                               h_spent, back, [S, A], m_item=False, locktime=HTLC_TIMEOUT, seq=0xfffffffe))
-    sp = Spend([("htlc/refund", h_spent, 0xfffffffe)], [txout(LEAF_VALUE - 500, bytes(taproot_construct(A.x).scriptPubKey)),
-                                                        fee_out(500)], locktime=HTLC_TIMEOUT)
+    sp = Spend([("htlc/refund", h_spent, DELAY)], [txout(LEAF_VALUE - 500, bytes(taproot_construct(A.x).scriptPubKey)),
+                                                   fee_out(500)], locktime=HTLC_TIMEOUT)
     spends.append(checksig_spend("htlc/refund", "htlc", "refund", htap, sp, 0, A))
+    back = [(X_ID, LEAF_VALUE - 500, bytes(leaf_tap(0, key=A, salt=SALT_CHANGE)[0].scriptPubKey))]
+    spends.append(rebind_spend("htlc/collab m=1, back to the owner", "htlc", "collab", htap, CTAG, SALT_HTLC,
+                               h_spent, back, [S, A]))
+    # Into the tree: the owner claims with the preimage after its exit delay;
+    # the operator refunds after the timeout and its delay.
+    r_spent = txout(LEAF_VALUE, htap_r.scriptPubKey)
+    sp = Spend([("htlc_receive/claim", r_spent, DELAY)],
+               [txout(LEAF_VALUE - 500, bytes(taproot_construct(A.x).scriptPubKey)), fee_out(500)])
+    d = checksig_spend("htlc_receive/claim", "htlc_receive", "claim", htap_r, sp, 0, A, below_after=[PAYMENT_PREIMAGE])
+    d["preimage"] = hx(PAYMENT_PREIMAGE)
+    spends.append(d)
+    sp = Spend([("htlc_receive/refund", r_spent, HTLC_OPERATOR_DELAY)], [txout(LEAF_VALUE - 500, OPERATOR_SPK), fee_out(500)],
+               locktime=HTLC_TIMEOUT)
+    spends.append(checksig_spend("htlc_receive/refund", "htlc_receive", "refund", htap_r, sp, 0, S))
 
     return {
         "about": "Golden vectors for the frozen Arca scripts. Generated by regtest/vectors.py; do not edit.",
@@ -651,12 +665,13 @@ def generate():
             "assets": {"X": hx(X_ID), "T": hx(T_ID), "Y": hx(OTHER_ID)},
             "created": CREATED, "expiries": EXPIRIES, "notice": W, "notice_seconds": W_SECONDS,
             "exit_delay": DELAY, "watch_service_time": T_WATCH, "htlc_timeout": HTLC_TIMEOUT,
+            "htlc_operator_delay": HTLC_OPERATOR_DELAY,
             "radix": RADIX, "leaves": NLEAVES, "leaf_value": LEAF_VALUE, "entry_reserve": ENTRY_RESERVE,
             "node_reserve": NODE_RESERVE, "path_leaf": PATH_LEAF,
             "salts": dict([("leaf%d" % j, hx(SALTS[j])) for j in range(NLEAVES)]
                           + [("checkpoint", hx(SALT_CHECKPOINT)), ("receiver leaf", hx(SALT_RECV)),
                              ("change leaf", hx(SALT_CHANGE)), ("board", hx(SALT_BOARD))]
-                          + [("htlc " + k, hx(v)) for k, v in SALT_HTLC.items()]),
+                          + [("htlc", hx(SALT_HTLC)), ("htlc receive", hx(SALT_HTLC_RECEIVE))]),
             "preimages": dict([("entry%d" % j, hx(PREIMAGES[j])) for j in range(NLEAVES)]
                               + [("forfeit", hx(FORFEIT_PREIMAGE)), ("payment", hx(PAYMENT_PREIMAGE))]),
             "fee_coin_script_pubkey": hx(FEE_COIN_TAP.scriptPubKey),

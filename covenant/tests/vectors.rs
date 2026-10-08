@@ -20,7 +20,6 @@ use elements::{AssetId, BlockHash, Script, Transaction, TxOut, Txid};
 use serde_json::Value;
 
 use arca_consensus::Verifier;
-use arca_covenant::htlc::HtlcPath;
 use arca_covenant::script::{record, sha256};
 use arca_covenant::sign::{script_spend_sighash, sign_digest};
 use arca_covenant::*;
@@ -147,6 +146,7 @@ impl Ctx {
 			salt: h32(&p["salt"]),
 			chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
+			htlc: None,
 		};
 		assert_eq!(leaf.leaf_constant(), h32(&p["K"]));
 		leaf
@@ -157,6 +157,7 @@ impl Ctx {
 		let leaf = LeafPolicy {
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
+			htlc: None,
 		};
 		assert_eq!(leaf.program(), h32(&p["leaf_program"]));
 		BoardPolicy { leaf, asset: AssetId::from_byte_array(h32(&p["asset"])), value: p["value"].as_u64().unwrap() }
@@ -202,28 +203,26 @@ impl Ctx {
 		cp
 	}
 
-	fn htlc(&self, name: &str) -> HtlcPolicy {
+	fn htlc(&self, name: &str) -> LeafPolicy {
 		let p = &self.output(name)["params"];
-		let owner = key(&p["owner"]);
-		let direction = if key(&p["claimer"]) == owner { HtlcDirection::Receive } else { HtlcDirection::Send };
-		let h = HtlcPolicy {
-			owner,
-			operator: key(&p["operator"]),
+		let direction = HtlcDirection::from_name(p["direction"].as_str().unwrap()).unwrap();
+		let exit_delay = rel(&p["exit_delay"]);
+		let terms = HtlcTerms {
 			direction,
 			payment_hash: h32(&p["payment_hash"]),
 			timeout: time(&p["timeout"]),
-			salts: HtlcSalts {
-				claim: h32(&p["salts"]["claim"]),
-				claim_both: h32(&p["salts"]["claim_both"]),
-				refund_both: h32(&p["salts"]["refund_both"]),
-			},
-			chain: self.chain,
+			operator_delay: rel(&p["operator_delay"]),
 		};
-		assert_eq!(h.claimer(), key(&p["claimer"]));
-		assert_eq!(h.refunder(), key(&p["refunder"]));
-		for (path, name) in [(HtlcPath::Claim, "claim"), (HtlcPath::ClaimBoth, "claim_both"), (HtlcPath::RefundBoth, "refund_both")] {
-			assert_eq!(h.leaf_constant(path).unwrap(), h32(&p["K"][name]));
-		}
+		let h = LeafPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
+			htlc: Some(terms),
+		};
+		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
+		assert_eq!(h.leaf_constant(), h32(&p["K"]));
+		assert_eq!(terms.claimer(h.owner, h.operator), key(&p["claimer"]));
+		assert_eq!(terms.refunder(h.owner, h.operator), key(&p["refunder"]));
+		assert_eq!(terms.claim_delay(exit_delay), rel(&p["claim_delay"]));
+		assert_eq!(terms.refund_delay(exit_delay), rel(&p["refund_delay"]));
 		h
 	}
 
@@ -276,10 +275,9 @@ impl Ctx {
 			"htlc" | "htlc_receive" => {
 				let h = self.htlc(name);
 				(h.taproot(), BTreeMap::from([
-					("claim", h.script(HtlcPath::Claim)),
-					("claim_both", h.script(HtlcPath::ClaimBoth)),
-					("refund", h.script(HtlcPath::Refund)),
-					("refund_both", h.script(HtlcPath::RefundBoth)),
+					("collab", h.collab_script()),
+					("claim", h.claim_script().unwrap()),
+					("refund", h.refund_script().unwrap()),
 				]))
 			},
 			other => panic!("no builder for vector output {}", other),
@@ -331,7 +329,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 31);
+	assert_eq!(spends.len(), 32);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -458,24 +456,20 @@ fn every_spend_matches_its_vector_and_verifies() {
 				let owner = ctx.label_of(&ctx.forfeit().owner).to_string();
 				ctx.forfeit().refund_witness(&checksig(&owner))
 			},
-			("htlc", path) => {
-				let h = ctx.htlc("htlc");
-				let owner = ctx.label_of(&h.owner).to_string();
-				let out = committed(1).remove(0);
+			(h @ ("htlc" | "htlc_receive"), path) => {
+				let h = ctx.htlc(h);
+				let terms = h.htlc.unwrap();
+				let claimer = ctx.label_of(&terms.claimer(h.owner, h.operator)).to_string();
+				let refunder = ctx.label_of(&terms.refunder(h.owner, h.operator)).to_string();
 				match path {
-					"claim" => {
-						let msg = h.message(HtlcPath::Claim, asset_in, value_in, &out).unwrap();
-						h.claim_witness(&csfs(&msg, "S"), &h32(&s["preimage"]))
+					"claim" => h.claim_witness(&checksig(&claimer), &h32(&s["preimage"])).unwrap(),
+					"refund" => h.refund_witness(&checksig(&refunder)).unwrap(),
+					"collab" => {
+						let owner = ctx.label_of(&h.owner).to_string();
+						let outs = committed(s["m"].as_u64().unwrap() as usize);
+						let msg = h.collab_message(asset_in, value_in, &outs).unwrap();
+						h.collab_witness(&csfs(&msg, "S"), &csfs(&msg, &owner), outs.len() as u8)
 					},
-					"claim_both" => {
-						let msg = h.message(HtlcPath::ClaimBoth, asset_in, value_in, &out).unwrap();
-						h.claim_both_witness(&csfs(&msg, "S"), &csfs(&msg, &owner), &h32(&s["preimage"]))
-					},
-					"refund_both" => {
-						let msg = h.message(HtlcPath::RefundBoth, asset_in, value_in, &out).unwrap();
-						h.refund_both_witness(&csfs(&msg, "S"), &csfs(&msg, &owner))
-					},
-					"refund" => h.refund_witness(&checksig(&owner)),
 					p => panic!("unknown htlc path {}", p),
 				}
 			},

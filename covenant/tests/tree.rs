@@ -65,14 +65,23 @@ fn the_builder_rebuilds_every_record_vector() {
 			reserve: ReserveRule::Fixed { node: inp["node_reserve"].as_u64().unwrap(), entry: inp["entry_reserve"].as_u64().unwrap() },
 			min_leaf: 1,
 		};
-		let leaves: Vec<LeafSpec> = inp["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
-			template: Template::Vtxo1,
-			owner: key_of(&l["owner"]),
-			value: l["value"].as_u64().unwrap(),
-			owner_nonce: h32(&l["owner_nonce"]),
-			operator_nonce: h32(&l["operator_nonce"]),
-			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
-			unlock_hash: h32(&l["unlock_hash"]),
+		let leaves: Vec<LeafSpec> = inp["leaves"].as_array().unwrap().iter().map(|l| {
+			let htlc = l.get("htlc").map(|h| HtlcTerms {
+				direction: HtlcDirection::from_name(h["direction"].as_str().unwrap()).unwrap(),
+				payment_hash: h32(&h["payment_hash"]),
+				timeout: MedianTime::from_consensus(h["timeout"].as_u64().unwrap() as u32).unwrap(),
+				operator_delay: RelativeTime::from_units(h["operator_delay_units"].as_u64().unwrap() as u16).unwrap(),
+			});
+			LeafSpec {
+				template: if htlc.is_some() { Template::Htlc1 } else { Template::Vtxo1 },
+				owner: key_of(&l["owner"]),
+				value: l["value"].as_u64().unwrap(),
+				owner_nonce: h32(&l["owner_nonce"]),
+				operator_nonce: h32(&l["operator_nonce"]),
+				exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+				unlock_hash: h32(&l["unlock_hash"]),
+				htlc,
+			}
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
 
@@ -162,6 +171,7 @@ impl Fx {
 			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
 			exit_delay: w, unlock_hash: sha256(&preimages[i]),
+			htlc: None,
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
 		let round = self.round(&tree, issuer);

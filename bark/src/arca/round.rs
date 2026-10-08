@@ -146,6 +146,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			operator_nonce: unhex32(l["operator_nonce"].as_str().unwrap_or(""))?,
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?,
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
+			htlc: None,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;

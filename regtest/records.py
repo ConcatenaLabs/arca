@@ -39,11 +39,17 @@ All integers are little-endian. Asset ids and the genesis hash are in internal
 byte order.
 
     u8    format version, 2
-    u8    template, 1 (vtxo)          u8  template version, 1
+    u8    template, 1 (vtxo) or 3 (htlc)   u8  template version, 1
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
     [32]  operator nonce
     u16   exit delay, 512-second units
+          htlc-1 only (a leaf whose exit is a claim with a preimage and a
+          refund after a timeout, arklib3.htlc_taptree):
+    u8    direction, 0 send (the operator claims) or 1 receive (the owner claims)
+    [32]  payment hash
+    u32   timeout, a median time
+    u16   operator delay, 512-second units; shorter than the exit delay
     [32]  asset                       the leaf and its entry
     u64   value
     [32]  unlock hash h
@@ -72,7 +78,9 @@ The leaf id is the BIP340 tagged hash, tag "Arca/leaf-id", of
     ‖ each level's child index (u8), from the batch output down
     ‖ the leaf's witness program (32)
 
-The JSON form has the same fields; its canonical text has its keys sorted and
+The JSON form has the same fields; an htlc-1 record's terms are one object,
+`htlc`: {"direction": "send" or "receive", "payment_hash", "timeout",
+"operator_delay_units"}. Its canonical text has its keys sorted and
 no whitespace. Asset ids, the token and the genesis hash are hex in display
 order (the order the node's RPCs print), every other byte string hex in its
 own order, lower case. Amounts are decimal strings, so that no reader rounds
@@ -86,9 +94,11 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
                                      CAssetIssuance, uint256_from_str)
 
 FORMAT_VERSION = 2
-TEMPLATES = {"vtxo": 1, "board": 2}        # name -> template id; a leaf record names vtxo, a board record board
+TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3}   # name -> template id; a leaf record names vtxo or htlc, a board record board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
+TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
+DIRECTIONS = {"send": 0, "receive": 1}
 LEAF_ID_TAG = b"Arca/leaf-id"
 SALT_TAG = b"Arca/salt"
 
@@ -194,7 +204,8 @@ class Batch:
     p: genesis (internal), asset (internal), operator (x-only), token
     (internal), notice (units), expiries, burn, radix, node_reserve,
     entry_reserve. leaves: [{owner, owner_nonce, operator_nonce, value,
-    exit_delay, unlock_hash}]."""
+    exit_delay, unlock_hash}], an htlc-1 leaf also with htlc: {direction,
+    payment_hash, timeout, operator_delay}."""
 
     def __init__(self, p, leaves):
         self.p, self.leaves = p, leaves
@@ -217,7 +228,14 @@ class Batch:
         level = []
         for i, lf in enumerate(leaves):
             salt = leaf_salt(lf["owner_nonce"], lf["operator_nonce"])
-            tap, _ = leaf3_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], fold=True)
+            h = lf.get("htlc")
+            if h is None:
+                tap, _ = leaf3_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], fold=True)
+            else:
+                assert h["operator_delay"] < lf["exit_delay"], "an htlc-1 operator delay is shorter than the exit delay"
+                tap, _ = htlc_taptree(lf["owner"], S, salt, ctag, h["payment_hash"], h["timeout"],
+                                      SEQ_TIME | lf["exit_delay"], SEQ_TIME | h["operator_delay"],
+                                      receive=h["direction"] == "receive")
             self.leaf_taps.append(tap)
             etap, _ = entry_taptree(lf["unlock_hash"], p["asset"], lf["value"], bytes(tap.scriptPubKey)[2:],
                                     sweep(False))
@@ -274,8 +292,10 @@ class Batch:
             levels.append(level)
             idx = j
         levels.reverse()                   # from the batch output down
+        h = lf.get("htlc")
         return {
-            "template": ("vtxo", TEMPLATE_VTXO_VERSION),
+            "template": ("htlc", TEMPLATE_HTLC_VERSION) if h else ("vtxo", TEMPLATE_VTXO_VERSION),
+            "htlc": h,
             "owner": lf["owner"], "owner_nonce": lf["owner_nonce"], "operator_nonce": lf["operator_nonce"],
             "exit_delay": lf["exit_delay"],
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
@@ -294,6 +314,9 @@ def encode(rec):
     name, ver = rec["template"]
     b = bytes([FORMAT_VERSION, TEMPLATES[name], ver])
     b += rec["owner"] + rec["owner_nonce"] + rec["operator_nonce"] + le16(rec["exit_delay"])
+    if name == "htlc":
+        h = rec["htlc"]
+        b += bytes([DIRECTIONS[h["direction"]]]) + h["payment_hash"] + le32(h["timeout"]) + le16(h["operator_delay"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
     b += bytes([1 if rec["burn"] else 0])
@@ -322,7 +345,7 @@ def to_json(rec):
             o["member_index"] = lv["member_index"]
             o["member_path"] = [s.hex() for s in lv["member_path"]]
         path.append(o)
-    return {
+    o = {
         "version": FORMAT_VERSION, "template": "%s-%d" % (name, ver),
         "owner": rec["owner"].hex(), "owner_nonce": rec["owner_nonce"].hex(),
         "operator_nonce": rec["operator_nonce"].hex(), "exit_delay_units": rec["exit_delay"],
@@ -332,6 +355,11 @@ def to_json(rec):
         "notice_units": rec["notice"], "burn": rec["burn"], "expiries": rec["expiries"],
         "path": path,
     }
+    if name == "htlc":
+        h = rec["htlc"]
+        o["htlc"] = {"direction": h["direction"], "payment_hash": h["payment_hash"].hex(), "timeout": h["timeout"],
+                     "operator_delay_units": h["operator_delay"]}
+    return o
 
 
 def json_text(obj):
@@ -375,7 +403,7 @@ def txout(asset, value, spk):
 
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
-                 expiries=(28, 56, 84), odd_delay=None):
+                 expiries=(28, 56, 84), odd_delay=None, htlc=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -393,6 +421,10 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
             "exit_delay": odd_delay if (odd_delay and i == n - 1) else EXIT_DELAY,
             "unlock_hash": sha256(label_hash("preimage", "%s entry %d" % (name, i))),
         })
+    # htlc: {leaf index: direction}; each such leaf is an htlc-1 leaf.
+    for i, direction in (htlc or {}).items():
+        leaves[i]["htlc"] = {"direction": direction, "payment_hash": sha256(label_hash("preimage", "%s payment %d" % (name, i))),
+                             "timeout": CREATED + 2 * DAY, "operator_delay": EXIT_DELAY // 3}
     b = Batch(p, leaves)
 
     # The round: the issuing input, the batch output at 0, the token's atom in
@@ -431,9 +463,13 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
             "radix": radix, "burn": burn, "node_reserve": node_reserve, "entry_reserve": entry_reserve,
             "token_issuer": {"txid": display(issuer_txid), "vout": 0, "contract_hash": bytes(32).hex()},
             "token": display(token), "notice_units": NOTICE, "expiries": p["expiries"],
-            "leaves": [{"owner": lf["owner"].hex(), "owner_nonce": lf["owner_nonce"].hex(),
-                        "operator_nonce": lf["operator_nonce"].hex(), "value": lf["value"],
-                        "exit_delay_units": lf["exit_delay"], "unlock_hash": lf["unlock_hash"].hex()}
+            "leaves": [dict({"owner": lf["owner"].hex(), "owner_nonce": lf["owner_nonce"].hex(),
+                             "operator_nonce": lf["operator_nonce"].hex(), "value": lf["value"],
+                             "exit_delay_units": lf["exit_delay"], "unlock_hash": lf["unlock_hash"].hex()},
+                            **({"htlc": {"direction": lf["htlc"]["direction"],
+                                         "payment_hash": lf["htlc"]["payment_hash"].hex(),
+                                         "timeout": lf["htlc"]["timeout"],
+                                         "operator_delay_units": lf["htlc"]["operator_delay"]}} if "htlc" in lf else {}))
                        for lf in leaves],
         },
         "levels": [len(lv) for lv in b.levels],
@@ -512,6 +548,39 @@ def invalid_vectors(valid_binary, valid_json):
     return vectors, [{"name": n, "json": t, "kind": k} for n, t, k in jbad]
 
 
+def invalid_htlc_vectors(valid_binary, valid_json):
+    """htlc-1 records a decoder must refuse."""
+    v = bytes.fromhex(valid_binary)
+    DIR = 3 + 32 + 32 + 32 + 2
+    OPD = DIR + 1 + 32 + 4
+    EXIT = 99
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [
+        ("htlc-1: direction 2", put(DIR, b"\x02"), "flag"),
+        ("htlc-1: a timeout that is a height", put(DIR + 33, le32(499_999_999)), "time"),
+        ("htlc-1: an operator delay of zero", put(OPD, le16(0)), "time"),
+        ("htlc-1: the operator's delay as long as the exit delay", put(OPD, v[EXIT:EXIT + 2]), "htlc"),
+        ("htlc-1 named vtxo-1: its terms are read as what follows the exit delay", put(1, b"\x01"), "flag"),
+    ]
+
+    def edit(f):
+        o = json.loads(valid_json)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("htlc-1 without its terms", edit(lambda o: o.pop("htlc")), "field"),
+        ("htlc-1 terms on a vtxo-1 record", edit(lambda o: o.update({"template": "vtxo-1"})), "field"),
+        ("htlc-1: direction sideways", edit(lambda o: o["htlc"].update({"direction": "sideways"})), "type"),
+        ("htlc-1: an unknown field in its terms", edit(lambda o: o["htlc"].update({"extra": 1})), "field"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
 def generate():
     batches = [
         batch_vector("one leaf", 1, 4),
@@ -521,9 +590,14 @@ def generate():
         batch_vector("ten leaves at radix 3", 10, 3, expiries=(28,)),
         batch_vector("seven leaves at radix 6", 7, 6, node_reserve=0, entry_reserve=0),
         batch_vector("sixty-four leaves", 64, 4, export=[0, 5, 21, 42, 63]),
+        batch_vector("five leaves, two of them htlc-1", 5, 4, htlc={1: "receive", 3: "send"}),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
+    h = batches[-1]["records"][1]
+    hi, hj = invalid_htlc_vectors(h["binary"], h["json"])
+    invalid += hi
+    invalid_json += hj
     return {
         "about": "Golden vectors for Arca's leaf record, its id and its encodings. Generated by "
                  "regtest/vectors.py from regtest/records.py; do not edit.",
