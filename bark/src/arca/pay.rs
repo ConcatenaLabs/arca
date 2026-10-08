@@ -172,7 +172,7 @@ pub(crate) struct In {
 
 /// The earliest first expiry among the batches `record` rests on, as its
 /// record names them; `None` for a coin resting on boards alone.
-fn first_expiry(record: &CoinRecord) -> Option<u32> {
+pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
 		CoinRecord::Board(_) => None,
@@ -645,8 +645,16 @@ impl Wallet {
 	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| Error::Refused(format!("the record does not decode: {}", e)))?;
 		let (owner, nonce) = owner_of(&record);
-		let row = self.store.nonce(&nonce)?
-			.ok_or_else(|| Error::Refused(format!("a coin for owner nonce {}, which this wallet never drew", hex(&nonce))))?;
+		let row = match self.store.nonce(&nonce)? {
+			Some(row) => row,
+			// A restore takes a coin paid to a key of the mnemonic that the
+			// lost store had drawn; one key, one coin, as ever.
+			None if self.adopting.get() && self.keys.leaf_xonly(&nonce)? == owner => {
+				self.store.put_nonce(&nonce, &owner.serialize(), "restored")?;
+				self.store.nonce(&nonce)?.ok_or_else(|| Error::Store("a nonce just kept is gone".into()))?
+			},
+			None => return Err(Error::Refused(format!("a coin for owner nonce {}, which this wallet never drew", hex(&nonce)))),
+		};
 		if row.owner_key != owner.serialize() || self.keys.leaf_xonly(&nonce)? != owner {
 			return Err(Error::Refused("the record's owner key is not the key this wallet derives from its nonce".into()));
 		}

@@ -205,7 +205,7 @@ impl ArcaWallet {
 	///
 	/// Commands: `info`, `address`, `balance`, `coins`, `record {leaf_id}`,
 	/// `board {asset, amount, fee_asset?}`, `boards`, `receive {asset?,
-	/// amount?}`, `send {request, amount?, asset?}`, `mailbox`, `quote
+	/// amount?}`, `send {request, amount?, asset?}`, `mailbox`, `restore`, `quote
 	/// {leaves?, max_fee_ppm?}`, `participate {leaves?, not_before?,
 	/// max_fee_ppm?, shown}`, `participations`, `sync`, `schedule`,
 	/// `recheck`, `exit {leaf_id, fee_asset?}`, `refusals`.
@@ -257,6 +257,7 @@ impl ArcaWallet {
 			"forget_request" => w.forget_request(req_str(&a["owner"], "the request's key")?),
 			"send" => w.send(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?),
 			"mailbox" => w.mailbox(),
+			"restore" => w.restore(),
 			"quote" => {
 				let quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
 				Ok(json!({"coins": quote.coins()}))

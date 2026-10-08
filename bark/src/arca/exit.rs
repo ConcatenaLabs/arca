@@ -704,6 +704,9 @@ impl Wallet {
 		let recheck = self.recheck()?;
 		let transfers = if talk { self.retry_transfers()? } else { vec![] };
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
+		// Every coin kept before the wallet named its mailbox key is bound to
+		// it, so that a restore from the mnemonic finds it.
+		let bound = if talk { self.bind_unbound().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
@@ -757,6 +760,11 @@ impl Wallet {
 		}
 		if !unreachable.is_null() {
 			out["unreachable"] = unreachable;
+		}
+		if !bound["error"].is_null() || bound["bound"].as_u64().is_some_and(|n| n > 0)
+			|| bound["not_bound"].as_array().is_some_and(|a| !a.is_empty())
+		{
+			out["bound"] = bound;
 		}
 		Ok(out)
 	}

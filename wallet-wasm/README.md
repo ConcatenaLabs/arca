@@ -30,9 +30,13 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   The store keeps no mnemonic: the page hands it over on every open, and an open
   with another mnemonic than the store's is refused.
 
-The store holds what the mnemonic cannot rebuild (which coins were spent off the
-chain, the forfeits signed, the heads of the operator's signer's record), as
-`arca`'s directory does. Clearing a site's data loses it.
+The store holds what the mnemonic cannot rebuild on its own (which coins were
+spent off the chain, the forfeits signed, the heads of the operator's signer's
+record), as `arca`'s directory does. A wallet whose store is gone (a site's
+data cleared, another browser) is created again from its mnemonic with
+`ArcaWallet.create` and restored with `run('restore')`, which rebuilds what
+the server and the chain hold of it, every record checked, as `arca create
+--mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic).
 
 ## Why a workspace of its own
 
@@ -65,7 +69,7 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 `run(command, args)` takes the command line's commands: `info`, `address`,
 `balance`, `coins`, `record {leaf_id}`, `board {asset, amount, fee_asset?}`,
 `boards`, `receive {asset?, amount?}`, `forget_request {owner}`, `send
-{request, amount?, asset?}`, `mailbox`, `quote {leaves?, max_fee_ppm?}`,
+{request, amount?, asset?}`, `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`,
 `participate {leaves?, not_before?, max_fee_ppm?, shown}`, `participations`,
 `sync`, `schedule`, `recheck`, `exit {leaf_id, fee_asset?}` and `refusals`. Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the

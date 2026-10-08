@@ -294,6 +294,12 @@ impl Wallet {
 			let key = self.keys.leaf(owner_nonce)?;
 			let mut j = w.json();
 			j["leaf"]["key_proof"] = json!(hex(sign(&key, &key_proof_digest(&id)).as_ref()));
+			// The new leaf is re-served to the wallet's mailbox key, which a
+			// wallet restored from the mnemonic reads with; the binding is not
+			// part of the participation's id.
+			let (mailbox, proof) = self.binding(&key)?;
+			j["leaf"]["mailbox"] = json!(mailbox);
+			j["leaf"]["mailbox_proof"] = json!(proof);
 			outputs.push(j);
 		}
 		let mut body = json!({

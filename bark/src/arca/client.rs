@@ -137,6 +137,26 @@ pub fn auth_digest(chain: &Chain, call: &str, challenge: &[u8; 32], key: &XOnlyP
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of a leaf's binding to its owner's mailbox key.
+pub const MAILBOX_BINDING_TAG: &[u8] = b"Arca/mailbox-of";
+
+/// What a leaf's owner key signs to have the server re-serve the leaf, and
+/// how it was given up, to `mailbox` (`leaf_data`), the key a wallet
+/// restored from its mnemonic reads with: `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖
+/// owner ‖ mailbox)`, `T = SHA256("Arca/mailbox-of")`. The server's
+/// (`server::auth::mailbox_binding_digest`).
+pub fn mailbox_binding_digest(chain: &Chain, operator: &XOnlyPublicKey, owner: &XOnlyPublicKey, mailbox: &XOnlyPublicKey) -> [u8; 32] {
+	let tag = sha256::Hash::hash(MAILBOX_BINDING_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(&owner.serialize());
+	e.input(&mailbox.serialize());
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// An output a participation wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wanted {
@@ -244,6 +264,12 @@ pub const REFUSALS: &[&str] = &[
 	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "value", "wrong_chain", "wrong_operator",
 	"wrong_round",
 ];
+
+/// The most bindings one `bind_mailbox` takes: the server's bound.
+pub const MAX_BINDINGS: usize = 64;
+
+/// The most leaves one `leaf_data` page holds: the server's bound.
+pub const LEAF_PAGE: u32 = 100;
 
 /// The server, at its base URL.
 #[derive(Debug, Clone)]
@@ -359,10 +385,20 @@ impl ServerClient {
 		self.post("mailbox_read", &json!({"auth": auth, "after": after.to_string(), "limit": limit}))
 	}
 
-	/// The leaves `key` owns, as the server holds them.
-	pub fn leaf_data(&self, key: &Keypair, chain: &Chain) -> Result<Value, Error> {
-		let auth = self.auth("leaf_data", key, chain, &[])?;
-		self.post("leaf_data", &json!({"auth": auth}))
+	/// A page of the leaves the server serves to `key`, after cursor `after`,
+	/// up to `limit`: those it owns, those whose owner keys bound them to it,
+	/// and the transfer outputs posted to it; `next` names the cursor to read
+	/// on from.
+	pub fn leaf_data(&self, key: &Keypair, chain: &Chain, after: i64, limit: u32) -> Result<Value, Error> {
+		let auth = self.auth("leaf_data", key, chain, &mailbox_read_request(after.max(0) as u64, limit))?;
+		self.post("leaf_data", &json!({"auth": auth, "after": after.max(0).to_string(), "limit": limit}))
+	}
+
+	/// Binds each leaf of `bindings` (`{owner, mailbox, proof}`, at most
+	/// [`MAX_BINDINGS`]) to the mailbox key its owner key signed it to: the
+	/// server answers the mailbox each key is bound to.
+	pub fn bind_mailbox(&self, bindings: &[Value]) -> Result<Value, Error> {
+		self.post("bind_mailbox", &json!({"bindings": bindings}))
 	}
 }
 

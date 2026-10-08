@@ -15,8 +15,11 @@
 //! - [`client`]: the server's JSON interface over HTTP, with challenge
 //!   authentication.
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
-//!   mailbox, take part in a round, swap, exit, and re-check every coin after
-//!   a rollback.
+//!   mailbox, take part in a round, swap, exit, re-check every coin after a
+//!   rollback, and restore from the mnemonic alone ([`Wallet::restore`]:
+//!   every leaf the server serves to the wallet's mailbox key, to which the
+//!   wallet binds each leaf it makes, checked against the chain, the
+//!   published tree and its owner's own signatures).
 //!
 //! The module builds in two ways. With the `arca` feature, as the command line
 //! builds it, the node and the server are reached over `minreq` and the store
@@ -58,6 +61,7 @@ pub mod store;
 
 mod exit;
 mod pay;
+mod restore;
 mod round;
 mod wallet;
 

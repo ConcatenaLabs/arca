@@ -73,8 +73,66 @@ one mnemonic serves both:
 The store keeps every owner nonce the wallet has ever drawn, with its key,
 written before the key is handed out or signs anything, and never deleted. It
 keeps every coin it holds or has held, with its coin record, and refuses a coin
-at a salt it has held a coin under. Back the directory up: the mnemonic restores
-the keys, but which coins were spent off-chain is in the store and the server.
+at a salt it has held a coin under. Back the directory up: the mnemonic
+restores the wallet from the server and the chain (below), all but what only
+the store knew.
+
+### Restoring from the mnemonic
+
+A leaf's key comes from a random nonce, so a mnemonic alone names no leaf. It
+names the mailbox key, and every leaf the wallet makes is bound to it at the
+server: a board's registration and each leaf a refresh asks for carry the
+mailbox key and the leaf key's signature over the binding
+(`SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ owner ‖ mailbox)`,
+`T = SHA256("Arca/mailbox-of")`), which authorises the server to serve that
+leaf to whoever proves the mailbox key and nothing else. A coin paid out of
+round is posted to the mailbox key already. A coin a wallet kept before it
+bound its leaves is bound by its next `sync` (`bind_mailbox`), each binding
+signed by the coin's own key.
+
+`create --mnemonic` restores a wallet from its mnemonic, and `restore` runs
+the restore again (it takes only what the wallet does not hold). It reads
+every leaf the server serves to the mailbox key (`leaf_data`, a page at a
+time) and takes the operator's word for nothing it can check:
+
+- the keeper set the operator names is pinned only when a head of its
+  signer's record that it shows comes with the acknowledgements of as many of
+  its keepers as must hold one, and no head it shows is acknowledged by a key
+  outside that set; otherwise nothing is restored;
+- each coin's owner key must be the key the mnemonic derives from the owner
+  nonce its record names (a leaf of another key is refused); its record is
+  checked against the chain as a coin held is, as of its expiry once that has
+  passed (kept while the chain still holds its path, refused once a sweep that
+  cut it is final); a round's leaf is rebuilt from the round's published tree,
+  compared with the record the server serves, and its unroll authorisations
+  are signed again from the mnemonic, so its exit needs nothing of the
+  server's copy; a coin paid out of round is taken only on a head of the
+  signer's record its keepers acknowledged;
+- a coin is spent, given or forfeited only on its owner's own signature,
+  which the wallet checks: a transfer's checkpoint signature, the attestation
+  over a participation's id (recomputed from every part of it), the owner's
+  half of a forfeit. The server's word on a coin's state is never taken: a
+  coin a held coin's record spends was spent by that transfer, which the
+  operator co-signed, whatever the server says of it (an old copy), and a coin
+  whose forfeit its owner signed is never live;
+- a participation in its forfeit step gets back the new leaves the wallet
+  validated before it signed, from the published tree; a released one's new
+  leaf the server does not serve is taken from the published tree, with the
+  preimage published there;
+- the mailbox is read from its start: a coin paid to a key of the mnemonic and
+  never read is taken, checked as ever; then a `sync` re-checks every coin,
+  follows every forfeit and completes every participation.
+
+What it cannot recover it lists with the reason (`not_recovered`): a record
+the server withholds that the published tree does not hold, a coin that fails
+a check, a transfer the server recorded and never co-signed (the request to
+post again was in the lost store). Receive requests handed out and never paid
+were known to the lost store alone: a payment to one is still read, but
+since it is read only by `sync`, the restored wallet's schedule holds at a
+day until the latest such a request could lapse, 27 days on
+(`receive_requests` shows it as `owner: "restored"`); `forget-request
+restored` ends that hold once no request was outstanding. An open swap offer,
+and a board whose registration never reached the server, are not recovered.
 
 ### What it checks
 
@@ -391,7 +449,8 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 
 | Command | Does |
 |---|---|
-| `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default) |
+| `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M]` | Creates the wallet: a new mnemonic (or the one given), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
+| `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
 | `balance` | One row per holding, BTC first and always, 0 included, then each Sequentia asset the wallet holds anything of; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
@@ -399,12 +458,12 @@ printed, coin by coin, before the wallet signs anything for the refresh.
 | `board ASSET AMOUNT [--fee-asset A]` | Brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, and the median time it lapses at (`until`, 27 days on) |
-| `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync` |
+| `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for one new leaf per asset in the next round, each under a fresh key whose own signature proves the wallet holds it, paying the operator's refresh fee in each coin's own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
-| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
+| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, or in a transfer the server never answered: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's. Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
@@ -457,6 +516,21 @@ each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
 refusal is asserted by its reason.
+
+`tests/arca_restore.rs` runs the same way. A wallet holds a leaf of a batch,
+a board, its change from a payment out of round, a payment to it not yet
+read, a board given up in a refresh whose forfeit is signed and not
+co-signed (the keeper down), a board in a block not yet final, and coins it
+spent in a payment and a refresh; its device is lost, and a wallet created
+from its mnemonic alone restores every one of them and holds no other: after a
+sync each, its `coins` (every field of every coin), `balance` and schedule are
+the lost wallet's, but for the hold for requests it cannot know, which
+`forget-request restored` ends. The refresh then completes in both, and with
+the server stopped the restored wallet exits its batch leaf from the published
+tree, its authorisations signed again from the mnemonic. A second test
+restores a wallet whose board was registered without the binding, as an
+older wallet registered it: a restore finds nothing until the wallet's next
+`sync` binds it, and then finds the board.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
