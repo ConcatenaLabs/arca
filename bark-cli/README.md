@@ -116,9 +116,12 @@ time) and takes the operator's word for nothing it can check:
   operator co-signed, whatever the server says of it (an old copy), and a coin
   whose forfeit its owner signed is never live;
 - a participation in its forfeit step gets back the new leaves the wallet
-  validated before it signed, from the published tree; a released one's new
-  leaf the server does not serve is taken from the published tree, with the
-  preimage published there;
+  validated before it signed, from the published tree. One the operator
+  released is completed once the preimage of its new leaves is in hand, from
+  the record of a new leaf the server serves or from the published tree (a
+  new leaf the server does not serve is then taken from the tree); without
+  it, the coin given up stays under its forfeit, followed on the chain, and
+  `sync` completes the leaf once the preimage is out;
 - the mailbox is read from its start: a coin paid to a key of the mnemonic and
   never read is taken, checked as ever; then a `sync` re-checks every coin,
   follows every forfeit and completes every participation.
@@ -530,7 +533,18 @@ the server stopped the restored wallet exits its batch leaf from the published
 tree, its authorisations signed again from the mnemonic. A second test
 restores a wallet whose board was registered without the binding, as an
 older wallet registered it: a restore finds nothing until the wallet's next
-`sync` binds it, and then finds the board.
+`sync` binds it, and then finds the board. A third restores a wallet through a
+proxy that lies one way at a time, each refused with its reason and nothing
+credited on it: a payment served without its record and kept from the
+mailbox (not recovered); a leaf of a batch not served (taken from the
+published tree with the preimage published there, and, with the tree and the
+forfeit step holding the preimage back, not recovered, its board held under
+its forfeit); a tree listing its batch output one atom more (the leaf
+refused); another wallet's board served to the mailbox key (refused as a leaf
+of another key); the board a payment spent served live and given up nowhere
+(held spent, by the transfer the wallet's change rests on); and every keeper
+acknowledgement stripped, or no keeper named while a keeper's
+acknowledgements are shown (nothing restored).
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
