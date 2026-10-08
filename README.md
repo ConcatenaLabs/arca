@@ -55,7 +55,7 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `bark-cli/` | `arca-cli` | `bark_cli` | The `arca` command-line wallet, dual-chain: Arca coins on Sequentia, and Bitcoin arks through Bark's `bark` wallet and `barkd` daemon ([bark-cli/README.md](bark-cli/README.md)) |
 | `bark-json/`, `bark-rest/`, `bark-rest-client/` | `arca-json`, `arca-rest`, `arca-rest-client` | `bark_json`, `bark_rest`, `bark_rest_client` | JSON types, the daemon's REST server and its generated client |
 | `bark-common/`, `bark-runtime/` | `arca-common`, `arca-runtime` | `bark_common`, `bark_runtime` | Helpers shared by the wallet and the server; the async runtime abstraction |
-| `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL, the finality service, the on-chain wallet on the Sequentia Wallet Kit, the nursery, boards, transfer co-signing, rounds with their participations, published trees, forfeits and releases, the watcher that acts on the chain for the operator (answers to stale exits, claims, the release and sweep of expired batches, reclaims, offboards), and the JSON interface (`arcad`), the signer holding the operator key (`arca-signer`), and the keeper that holds the signer's record's heads on another machine (`arca-keeper`) ([server/README.md](server/README.md)) |
+| `server/` | `arca-server` | `server` | The operator's server on Sequentia: its state in PostgreSQL, the finality service, the on-chain wallet on the Sequentia Wallet Kit, the nursery, boards, transfer co-signing, rounds with their participations, published trees, forfeits and releases, the watcher that acts on the chain for the operator (answers to stale exits, claims, the release and sweep of expired batches, reclaims, offboards), the Lightning gateway's nodes (one SeqLN node per asset served over Lightning, one Lightning node on Bitcoin), and the JSON interface (`arcad`), the signer holding the operator key (`arca-signer`), and the keeper that holds the signer's record's heads on another machine (`arca-keeper`) ([server/README.md](server/README.md)) |
 | `server-rpc/` | `arca-server-rpc` | `server_rpc` | The gRPC protocol of Bark's server, which the Bark wallet speaks |
 | `sequentia-ext/` | `arca-sequentia-ext` | `sequentia_ext` | Sequentia chain types (anchored block headers, issuances with a denomination, asset-tagged amounts), a JSON-RPC client for `sequentiad`, and a regtest harness ([sequentia-ext/README.md](sequentia-ext/README.md)) |
 | `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf (`vtxo-1`, and `htlc-1`, whose exit is a hash-locked pair), the entry, the forfeit, the checkpoint, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the board, the forfeit and its connector asset, the release and the reclaim, the offboard, and the transactions that spend a leaf off the tree ([covenant/README.md](covenant/README.md)) |
@@ -119,6 +119,10 @@ builds with the Rust version the Sequentia Wallet Kit pins, which is the
 [wallet-wasm.yml](.github/workflows/wallet-wasm.yml) builds the wallet for a
 browser (`wallet-wasm/`, its own workspace and lockfile) for
 `wasm32-unknown-unknown`.
+[lightning.yml](.github/workflows/lightning.yml) builds SeqLN at the commit it
+pins and runs the server's Lightning tests against SeqLN nodes on the chain
+SeqLN's `sequentia-regtest` network assumes, with Bitcoin Core for the
+operator's Lightning node on Bitcoin.
 
 ## Security
 

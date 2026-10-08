@@ -11,7 +11,7 @@
 //! explicit-output helpers ([`TxOutExt`]), the header's anchor
 //! ([`BitcoinAnchor`]), and a node client ([`rpc::Client`]). With the
 //! `regtest` feature, [`regtest::Regtest`] runs a throwaway anchored chain for
-//! tests.
+//! tests, and [`lightning::LightningNode`] a SeqLN node on it.
 
 pub extern crate elements;
 
@@ -19,6 +19,8 @@ pub mod platform;
 pub mod rpc;
 #[cfg(feature = "regtest")]
 pub mod regtest;
+#[cfg(feature = "regtest")]
+pub mod lightning;
 
 pub use elements::{
 	AssetId, AssetIssuance, Block, BlockHash, BlockHeader, OutPoint, Script, Transaction, TxIn,

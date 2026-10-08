@@ -32,7 +32,8 @@ pub struct ErrorDetail {
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
 	"double_spend", "fee", "forfeit_set", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record",
-	"invalid_transaction", "key_reused", "leaf_set", "malformed", "margin", "merge", "no_lowest_node", "nonce_unknown",
+	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
+	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
 	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
@@ -67,6 +68,57 @@ pub struct Info {
 	pub keepers: KeepersInfo,
 	/// The largest request body the server reads.
 	pub max_request_bytes: u64,
+	/// The Lightning side beyond the assets' own legs (`assets[].lightning`).
+	pub lightning: LightningInfo,
+}
+
+/// An asset's Lightning leg: the operator's SeqLN node in that asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningLegInfo {
+	/// `up`: the node answered at the last check, on a network of the right
+	/// chain, with at least one open channel in the asset; `down` otherwise,
+	/// with the reason. A request over a leg that is down is refused
+	/// `lightning_unavailable`.
+	pub state: String,
+	/// The node's id, while up.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub node: Option<String>,
+	/// Its network, while up.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub network: Option<String>,
+	/// Its open channels in the asset.
+	pub channels: u32,
+	/// What it can send and receive over them, in the asset's atoms.
+	pub spendable: String,
+	pub receivable: String,
+	/// Whether it can take a payment into a leaf: it runs the hold-invoice
+	/// plugin.
+	pub receives: bool,
+	/// Why it is down.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+}
+
+/// The Lightning side `info` shows beside the assets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningInfo {
+	/// The operator's Lightning node on Bitcoin, for native BTC; absent
+	/// when it runs none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bitcoin: Option<BitcoinLightningInfo>,
+}
+
+/// The Bitcoin side: native BTC, on Bitcoin, never in a Sequentia leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinLightningInfo {
+	pub node: LightningLegInfo,
+	/// The Bitcoin ark the operator runs, which wallets join with Bark for
+	/// native BTC; absent when it runs none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ark: Option<String>,
 }
 
 /// The keepers of the signer's record ([`crate::keeper`]).
@@ -132,6 +184,10 @@ pub struct AssetInfo {
 	/// a part set as a value has no rate to convert it at.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub fees: Option<AssetFeesInfo>,
+	/// The asset's Lightning leg; absent when the operator runs no Lightning
+	/// node in it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lightning: Option<LightningLegInfo>,
 }
 
 /// What the operator charges in one asset: a refresh, falling to nothing in

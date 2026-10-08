@@ -73,6 +73,20 @@ follows Bitcoin, with the disconnected transactions back in the mempool.
 `Daemon::restart` stops a node and starts it again on its data; with
 `-persistmempool=0` it comes back with an empty mempool.
 
+`Regtest::start_seqln` (or `seqln_from_env`) runs the proof-of-stake chain
+under the name and arguments SeqLN's `sequentia-regtest` network assumes:
+the chain `sequentia-regtest`, addresses with the Bitcoin regtest prefixes
+(`bcrt`), no block subsidy. Its genesis block is then the one SeqLN's chain
+parameters carry, which the harness checks, so SeqLN nodes run on it.
+`lightning::LightningNode::start` runs SeqLN's `lightningd` on such a chain,
+reaching the node through the `sequentia-cli` beside `SEQUENTIAD_EXEC`, with
+the plugins given (`lightning::hold_plugin` finds the hold-invoice plugin of
+the SeqLN checkout `lightningd` was built in); `call` speaks to its JSON-RPC
+socket, `receive_script` gives an address of its wallet as a script, and
+`open_channel` opens a channel in an asset and produces blocks until both
+sides see it open. It stops, and its directory is deleted, when dropped.
+`lightning::lightningd_from_env` takes `lightningd` from `LIGHTNINGD_EXEC`.
+
 ## Testing
 
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-sequentia-ext

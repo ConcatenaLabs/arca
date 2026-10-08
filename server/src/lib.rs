@@ -23,6 +23,7 @@ pub mod fees;
 pub mod forfeits;
 pub mod http;
 pub mod keeper;
+pub mod lightning;
 pub mod nursery;
 pub mod params;
 pub mod participations;

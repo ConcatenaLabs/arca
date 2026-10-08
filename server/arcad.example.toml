@@ -188,6 +188,16 @@ max_margin_multiple = 25
 # do), and of an offboard (offboard_base), in the asset's atoms, or as values in
 # the reference unit converted at the asset's rate (refresh_base_value,
 # offboard_base_value). Nothing fixed when absent.
+#
+# [assets.lightning] names the operator's SeqLN node in the asset, its
+# Lightning leg, by the node's JSON-RPC socket: payments between a leaf of the
+# asset and Lightning go through it, and through no other node. A node runs on
+# a Sequentia network and holds open channels in the asset; receiving also
+# needs SeqLN's hold-invoice plugin (contrib/holdinvoice-seq). Without this
+# section nothing in the asset goes over Lightning here, and a request to is
+# refused no_lightning. The node is checked every [lightning] poll_seconds;
+# while it does not answer, or holds no open channel in the asset, info shows
+# its leg down with the reason and a request is refused lightning_unavailable.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
@@ -200,3 +210,17 @@ min_leaf = "1000"
 # source = "file"
 # path = "/var/lib/arca/rates/<asset id>.json"
 # max_age_seconds = 3600
+# [assets.lightning]
+# rpc = "/var/lib/seqln/<asset id>/sequentia/lightning-rpc"
+
+# The Lightning gateway beside each asset's own node.
+[lightning]
+# How often every Lightning node is checked, in seconds.
+poll_seconds = 10
+# The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
+# socket, and the Bitcoin ark it runs, which wallets join with Bark. Native
+# BTC never enters a Sequentia leaf: its payments go over this node and the
+# Bitcoin ark. info names both; neither when absent.
+# [lightning.bitcoin]
+# rpc = "/var/lib/lightning/bitcoin/lightning-rpc"
+# ark = "https://ark.example.org"

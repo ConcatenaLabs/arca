@@ -250,6 +250,35 @@ answers exits, claims and sweeps; a smallest leaf set as a value takes the
 last rate read. Every other asset goes on as before. An asset that names no
 source has no rate, and nothing of it is priced from one.
 
+### The Lightning gateway's nodes
+
+The operator runs one SeqLN node for each asset it serves over Lightning, and
+one Lightning node on Bitcoin for native BTC. An asset's node is named beside
+the asset's pool, rate and fees, by its JSON-RPC socket (`[assets.lightning]
+rpc`); the Bitcoin node, and the Bitcoin ark wallets join with Bark for
+native BTC, under `[lightning.bitcoin]`. The server speaks to each node as
+`lightning-cli` does, one JSON-RPC request on its socket; SeqLN's gRPC
+bindings carry no asset. A payment between a leaf and Lightning goes through
+the node of the leaf's asset and no other, so no asset leans on another's
+node, and native BTC never enters a Sequentia leaf.
+
+The server checks every node at its start, at a reload and every
+`[lightning] poll_seconds` (10 by default): the node answers, runs on a
+Sequentia network (Bitcoin for the Bitcoin node), and holds at least one open
+channel in its asset; whether it runs SeqLN's hold-invoice plugin
+(`contrib/holdinvoice-seq`), which receiving needs, is noted. `info` names
+each asset's leg (`assets[].lightning`: `up` with the node's id, network,
+open channels, what it can send and receive in the asset's atoms and whether
+it receives; or `down` with the reason) and the Bitcoin side
+(`lightning.bitcoin`: its node and the ark). A request to move value over
+Lightning is refused at every entry, with the reason: in an asset the operator
+does not serve, `out_of_bounds`; in one it serves with no node, or whose node
+runs no hold-invoice plugin when the request receives, `no_lightning`; and
+while the asset's node is down (it does not answer, or its channels are all in
+other assets), `lightning_unavailable`, a 503, since the request may be taken
+once the node is back. A reload (SIGHUP) takes each asset's node anew; one
+whose socket changed is checked at once.
+
 ## Boards
 
 An owner brings its own coins in with a board (`board-1`). It asks the server
@@ -1505,6 +1534,22 @@ with `strace`, which must be on the `PATH`.
 
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
+
+The Lightning tests (`tests/lightning_*.rs`) also run SeqLN nodes beside the
+server: `LIGHTNINGD_EXEC` names a SeqLN `lightningd` (`make all-programs` in a
+SeqLN checkout), whose hold-invoice plugin is taken from the same checkout,
+and `sequentia-cli` is taken beside `SEQUENTIAD_EXEC`. They run on the chain
+SeqLN's `sequentia-regtest` network assumes
+(`sequentia_ext::regtest::Regtest::start_seqln`), with nodes started and
+spoken to by `sequentia_ext::lightning`. Without `LIGHTNINGD_EXEC` each says
+it is skipped and passes. `tests/lightning_legs.rs` starts an operator node in
+asset X and one in Y, each with a channel to a node of its own, and serves Z
+with none: `info` shows X's and Y's legs up with their nodes, Z with none; Z
+is refused `no_lightning`, an asset not served `out_of_bounds`, receiving in Y
+(whose node runs no hold-invoice plugin) `no_lightning`; with Y's node
+stopped its leg is down with the reason and refused `lightning_unavailable`
+while X's goes on; and Y named, by a reload, a node whose channels are in X
+is down, the reason naming the assets its channels are in.
 
 `tests/e2e.rs` runs the server as an operator runs it: `arca-signer` in its own
 process holding the operator key, `Server::start` with its tasks and its HTTP

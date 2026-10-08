@@ -99,6 +99,8 @@ pub struct App {
 	/// naming other keepers than it pinned ([`keepers_replaced`]): from then
 	/// on every call is answered `signer_replaced`, with the reason.
 	pub replaced: Arc<std::sync::Mutex<Option<String>>>,
+	/// The Lightning gateway's nodes ([`crate::lightning`]).
+	pub gateway: Arc<crate::lightning::Gateway>,
 }
 
 /// Asks the signer which keepers its record names and compares them with
@@ -358,7 +360,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" => StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" => StatusCode::SERVICE_UNAVAILABLE,
+		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" | "lightning_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
 	}
@@ -561,6 +563,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				offboard_ppm: f.offboard_ppm, offboard_base: f.offboard_base.to_string(),
 				offboard_base_value: ap.fees.offboard_base.value().map(|v| v.to_string()),
 			}),
+			lightning: app.gateway.asset_info(a),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -594,6 +597,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		signer_record,
 		keepers: app.keepers.lock().unwrap_or_else(|e| e.into_inner()).clone(),
 		max_request_bytes: app.max_request as u64,
+		lightning: api::LightningInfo { bitcoin: app.gateway.bitcoin_info() },
 	})
 }
 
