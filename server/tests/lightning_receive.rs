@@ -297,14 +297,18 @@ async fn a_leaf_never_claimed_is_refunded_and_its_payment_failed_back() {
 	let at = OutPoint::new(entry.tx.txid(), 0);
 	println!("the leaf on-chain at {}", at);
 
-	// Before its timeout: no refund. Past it and the operator's delay: the
-	// watcher refunds it.
+	// Before its timeout: no refund. Past it, the operator's delay and the
+	// hour after, the payment still stands while the leaf lies unspent on
+	// the chain, where its owner could yet claim it; the watcher refunds it.
 	g.r.server.watcher.pass().await.unwrap();
 	assert!(g.r.server.store.watcher_txs("htlc_refund", &held.id.0).await.unwrap().is_empty(), "not before the timeout");
 	let timeout = status(&g, &w.hash)["timeout"].as_u64().unwrap() as u32;
-	let ahead = timeout.saturating_sub(mtp(&g.r).to_consensus_u32()) + 600;
+	let ahead = timeout.saturating_sub(mtp(&g.r).to_consensus_u32()) + 600 + 3_700;
 	advance_mtp(&g.r, ahead).await;
 	g.r.synced().await;
+	tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+	assert_eq!(status(&g, &w.hash)["state"], "accepted", "not failed back while the leaf can still be claimed on the chain");
+	println!("past the time to claim, the leaf unspent on the chain: the payment stands");
 	g.r.server.watcher.pass().await.unwrap();
 	let refunds = g.r.server.store.watcher_txs("htlc_refund", &held.id.0).await.unwrap();
 	assert_eq!(refunds.len(), 1, "the operator's refund");
@@ -313,9 +317,7 @@ async fn a_leaf_never_claimed_is_refunded_and_its_payment_failed_back() {
 	g.r.synced().await;
 	assert!(!g.r.unspent(&at), "the refund spent the leaf");
 
-	// The time to claim over, the payment is failed back to the payer.
-	advance_mtp(&g.r, 3_700).await;
-	g.r.synced().await;
+	// The leaf refunded, the payment is failed back to the payer.
 	let (http, h) = (g.r.http.clone(), hex(&w.hash));
 	g.r.wait("the payment failed back", || http.post("lightning_receive_status", &json!({"payment_hash": h})).json["state"] == "cancelled")
 		.await;

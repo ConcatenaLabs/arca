@@ -35,8 +35,9 @@
 //! held is locked for too short a time, when its leaf never comes (the
 //! participation void, expired, or not built in time), and once the time to
 //! claim has passed with no preimage: the leaf's timeout and the operator's
-//! delay. A leaf of such a payment that reaches the chain is the operator's
-//! to refund (the watcher's `htlc_refund`).
+//! delay, while the leaf is not on the chain unspent, where its owner could
+//! still claim it. A leaf of such a payment that reaches the chain is the
+//! operator's to refund (the watcher's `htlc_refund`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -450,10 +451,14 @@ impl Receives {
 			},
 			// Built too late, the leaf would leave its owner less than its
 			// exit delay and half its window to claim.
+			// A round that took it meanwhile issues its leaf: then it is not
+			// void, and the payment stands.
 			ParticipationState::Pending if now + exit.seconds() + self.config.window_seconds as u64 / 2 > timeout => {
 				let why = "no round took its leaf in time";
-				self.store.void_participation(&id, why).await?;
-				return self.cancel(r, why).await;
+				if self.store.void_participation(&id, why).await? {
+					return self.cancel(r, why).await;
+				}
+				return Ok(());
 			},
 			_ => {},
 		}
@@ -467,10 +472,36 @@ impl Receives {
 			}
 		}
 		// The time to claim is over: the leaf is the operator's to refund.
+		// One on the chain and still unspent could yet be claimed there, so
+		// the payment stands until the watcher's refund takes it, or until
+		// the held parts are a dozen blocks from their expiry.
 		if now > timeout + self.config.operator_delay.seconds() + 3600 {
+			let height = self.store.tip_block().await?.map(|b| b.height).unwrap_or(0);
+			let near = height + 12 >= r.htlc_expiry.unwrap_or(0) as u64;
+			if !near {
+				if let Some(leaf) = self.leaf_of(r).await? {
+					if self.unspent_on_chain(&leaf).await? {
+						return Ok(());
+					}
+				}
+			}
 			return self.cancel(r, "its leaf was not claimed in time").await;
 		}
 		Ok(())
+	}
+
+	/// Whether an output of the leaf `leaf` is on the chain, unspent.
+	async fn unspent_on_chain(&self, leaf: &[u8; 32]) -> Result<bool, ReceiveError> {
+		let Some(row) = self.store.leaf(leaf).await? else { return Ok(false) };
+		for (txid, vout) in self.store.sightings_of(&row.script_pubkey).await? {
+			let at = OutPoint::new(Txid::from_byte_array(txid), vout);
+			let unspent = self.finality.call(move |c| c.unspent(&at, true)).await
+				.map_err(|e| ReceiveError::Malformed(format!("the chain: {}", e)))?;
+			if unspent.is_some() {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// The preimage the claim of the leaf `leaf` on the chain revealed, if
