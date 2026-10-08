@@ -302,7 +302,14 @@ asset and a value. The server co-signs only when every rule holds:
 
 The transfer is then recorded, inputs spent, before the operator key signs
 anything, so the server never signs a spend it has not durably recorded and
-two spends racing for one leaf leave exactly one standing. Each new coin's
+two spends racing for one leaf leave exactly one standing. Before the signer
+signs anything of it, the server asks the signer what its record holds under
+each input's salt. When it holds anything there but this transfer's own
+spend (the forfeit of a coin given up in a refresh, or another spend), the
+transfer is refused `double_spend`, naming that coin and what the signer
+holds, with nothing of it signed: its record is dropped and every input
+given back, so the other inputs, a swap's other side's included, stay
+payable and refreshable. Each new coin's
 record is checked by the server as a receiver would check it, stored, and
 posted to the receiver's mailbox (the leaf's key, unless the output names
 another). A request repeated byte for byte gets the same answer; one that
