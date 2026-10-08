@@ -152,6 +152,7 @@ impl Out {
 				creator_nonce: unhex32(v["creator_nonce"].as_str().unwrap_or(""))?,
 				exit_delay: RelativeTime::from_units(v["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
+				htlc: None,
 			},
 			mailbox: XOnlyPublicKey::from_slice(&unhex(v["mailbox"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 			until: v["until"].as_u64().map(|u| u32::try_from(u).map_err(|_| Error::Parse(format!("an output's lapse {}", u)))).transpose()?,
@@ -275,7 +276,7 @@ impl Wallet {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
-		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay() })
+		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None })
 	}
 
 	/// The live coins of `asset`, furthest from their exit date first (D58:
@@ -445,6 +446,7 @@ impl Wallet {
 				creator_nonce: random32(),
 				exit_delay: RelativeTime::from_units(req["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
+				htlc: None,
 			},
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
 			// The server records no payment to the request past its lapse,

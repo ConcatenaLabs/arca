@@ -221,6 +221,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 		owner: key(&inp["owner"]), operator: key(&inp["operator"]),
 		salt: arca_covenant::leaf::leaf_salt(&h32(&inp["owner_nonce"]), &h32(&inp["operator_nonce"])),
 		chain, exit_delay: RelativeTime::from_units(inp["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+		htlc: None,
 	};
 	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&f["leaf_script_pubkey"])[..]);
 	let p = leaf.program();

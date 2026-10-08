@@ -13,7 +13,8 @@
 //! 1. the checkpoint and reassignment chain, signed before the round exists,
 //!    on the frozen message, with reserve fees and with outside fee coins;
 //! 2. the forfeit and the entry it releases, and the abort path;
-//! 3. `htlc-1`'s four paths, and the receiving direction;
+//! 3. `htlc-1`'s claim, refund and collaborative paths, out of the tree and
+//!    into it, each lock refused before it is reached;
 //! 4. the swap of two leaves in two assets in one transaction;
 //! 5. the hash-locked entry's sweep behind the token and the notice;
 //! 6. the burn-only sweep behind the token;
@@ -36,7 +37,6 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{AssetIssuance, OutPoint, Script, Transaction, TxOut, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::htlc::HtlcPath;
 use arca_covenant::script::sha256;
 use arca_covenant::witness::find_preimage;
 use arca_covenant::*;
@@ -500,68 +500,62 @@ fn htlc(net: &mut Net) {
 	let a = keypair("htlc owner");
 	let preimage = label32("htlc payment");
 	let timeout = net.now() + 6 * H as u64;
-	let mk = |direction| HtlcPolicy {
-		owner: xonly(&a), operator: xonly(&s_key), direction, payment_hash: sha256(&preimage), timeout: mt(timeout),
-		salts: HtlcSalts { claim: label32("htlc claim"), claim_both: label32("htlc both"), refund_both: label32("htlc refund") },
-		chain: net.chain,
+	let operator_delay = RelativeTime::from_units(delay().units() / 3).unwrap();
+	let mk = |direction, salt: &str| LeafPolicy {
+		owner: xonly(&a), operator: xonly(&s_key), salt: label32(salt), chain: net.chain, exit_delay: delay(),
+		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout: mt(timeout), operator_delay }),
 	};
-	let send = mk(HtlcDirection::Send);
-	let recv = mk(HtlcDirection::Receive);
+	let (claimed, refunded, together) = (mk(HtlcDirection::Send, "htlc claimed"), mk(HtlcDirection::Send, "htlc refunded"),
+		mk(HtlcDirection::Send, "htlc together"));
+	let (recv, recv_refunded) = (mk(HtlcDirection::Receive, "htlc received"), mk(HtlcDirection::Receive, "htlc unclaimed"));
 	let coins = net.fund(vec![
-		explicit(net.x, LEAF, send.script_pubkey()), explicit(net.x, LEAF, send.script_pubkey()),
-		explicit(net.x, LEAF, send.script_pubkey()), explicit(net.x, LEAF, send.script_pubkey()),
-		explicit(net.x, LEAF, recv.script_pubkey()),
+		explicit(net.x, LEAF, claimed.script_pubkey()), explicit(net.x, LEAF, refunded.script_pubkey()),
+		explicit(net.x, LEAF, together.script_pubkey()), explicit(net.x, LEAF, recv.script_pubkey()),
+		explicit(net.x, LEAF, recv_refunded.script_pubkey()),
 	]);
+	let funding = coins[0].outpoint.txid;
 	let to = ExplicitOutput::new(net.x, LEAF - FEE, op_true_spk());
 	let back = ExplicitOutput::new(net.x, LEAF - FEE, net.leaf(&a, &s_key, "htlc back").script_pubkey());
-	let x = net.x;
-	let tx = |coin: &Coin, lock: u32, seq: u32, out: &ExplicitOutput, w: Vec<Vec<u8>>| {
-		let mut s = spend(lock).coin(coin, seq).outputs(vec![out.txout(), fee(x, LEAF - out.value)]);
-		s.witness(0, w);
-		s.tx
+	let genesis = net.genesis;
+	let claim = |h: &LeafPolicy, coin: &Coin, key: &Keypair, pre: &[u8; 32]| {
+		let ks = h.claim_tx(coin.outpoint, coin.txout.asset.explicit().unwrap(), LEAF, std::slice::from_ref(&to), &FeeSource::Reserve).unwrap();
+		let sg = sig(key, &ks.sighash(genesis).unwrap());
+		ks.finish(HtlcTerms::claim_items(&sg, pre)).tx
 	};
-	let m_claim = send.message(HtlcPath::Claim, net.x, LEAF, &to).unwrap();
-	let m_both = send.message(HtlcPath::ClaimBoth, net.x, LEAF, &to).unwrap();
-	let m_rb = send.message(HtlcPath::RefundBoth, net.x, LEAF, &back).unwrap();
-
-	let w = send.claim_witness(&sig(&s_key, &m_claim.digest), &label32("wrong"));
-	net.refuse("htlc/neg claim with a wrong preimage", &tx(&coins[0], 0, 0xffff_ffff, &to, w), "Script failed an OP_EQUALVERIFY operation");
-	let w = send.claim_witness(&sig(&s_key, &m_claim.digest), &preimage);
-	net.refuse("htlc/neg claim into an output not committed", &tx(&coins[0], 0, 0xffff_ffff, &back, w), "Invalid Schnorr signature");
-	let w = send.claim_witness(&sig(&a, &m_claim.digest), &preimage);
-	net.refuse("htlc/neg claim signed by the owner", &tx(&coins[0], 0, 0xffff_ffff, &to, w), "Invalid Schnorr signature");
-	let w = send.claim_witness(&sig(&s_key, &m_claim.digest), &preimage);
-	net.pass("htlc/claim: the preimage and the operator's signature", &tx(&coins[0], 0, 0xffff_ffff, &to, w));
-	let mut w = send.claim_both_witness(&sig(&s_key, &m_both.digest), &sig(&a, &m_both.digest), &preimage);
-	w[1] = vec![];
-	net.refuse("htlc/neg claim_both without the owner", &tx(&coins[1], 0, 0xffff_ffff, &to, w), "Script failed an OP_CHECKSIGVERIFY operation");
-	let w = send.claim_both_witness(&sig(&s_key, &m_both.digest), &sig(&a, &m_both.digest), &preimage);
-	net.pass("htlc/claim_both: the preimage and both signatures", &tx(&coins[1], 0, 0xffff_ffff, &to, w));
-
-	let refund = |net: &Net, lock: u32, key: &Keypair| {
-		let mut s = spend(lock).coin(&coins[2], 0xffff_fffe).outputs(vec![back.txout(), fee(net.x, FEE)]);
-		let sg = s.sign(key, 0, &send.script(HtlcPath::Refund), net.genesis);
-		s.witness(0, send.refund_witness(&sg));
-		s.tx
+	let refund = |h: &LeafPolicy, coin: &Coin, key: &Keypair| {
+		let ks = h.refund_tx(coin.outpoint, coin.txout.asset.explicit().unwrap(), LEAF, std::slice::from_ref(&back), &FeeSource::Reserve).unwrap();
+		let sg = sig(key, &ks.sighash(genesis).unwrap());
+		ks.finish(vec![sg.as_ref().to_vec()]).tx
 	};
-	let rb = |lock: u32| tx(&coins[3], lock, 0xffff_fffe, &back, send.refund_both_witness(&sig(&s_key, &m_rb.digest), &sig(&a, &m_rb.digest)));
-	let t = timeout as u32;
-	net.refuse("htlc/neg refund before the timeout", &refund(net, t, &a), "non-final");
-	net.refuse("htlc/neg refund_both before the timeout", &rb(t), "non-final");
+
+	// Out of the tree, paid: the operator claims with the preimage once its
+	// delay has passed since the output confirmed, and not before.
+	net.refuse("htlc/neg the operator's claim before its delay", &claim(&claimed, &coins[0], &s_key, &preimage), "non-BIP68-final");
+	// The collaborative path waits for nothing: a failed payment goes back to
+	// its owner at once.
+	let m = together.collab_message(net.x, LEAF, std::slice::from_ref(&back)).unwrap();
+	let pair = Pair { operator: sig(&s_key, &m.digest), owner: sig(&a, &m.digest) };
+	let tx = collab_tx(&together, coins[2].outpoint, net.x, LEAF, std::slice::from_ref(&back), &pair, &FeeSource::Reserve).unwrap().tx;
+	net.pass("htlc/back to the owner by both signatures, at once", &tx);
+	// The owner's refund: not before the timeout, nor before its exit delay.
+	net.refuse("htlc/neg the owner's refund before the timeout", &refund(&refunded, &coins[1], &a), "non-final");
+	net.wait_csv(&funding, operator_delay);
+	net.refuse("htlc/neg the operator's claim with a wrong preimage", &claim(&claimed, &coins[0], &s_key, &label32("wrong")),
+		"Script failed an OP_EQUALVERIFY operation");
+	net.refuse("htlc/neg a claim signed by the owner", &claim(&claimed, &coins[0], &a, &preimage), "Invalid Schnorr signature");
+	net.pass("htlc/the operator's claim with the preimage after its delay", &claim(&claimed, &coins[0], &s_key, &preimage));
 	net.mtp_past(timeout);
-	net.refuse("htlc/neg refund with a lock time below the timeout", &refund(net, t - 1, &a), "Locktime requirement not satisfied");
-	net.refuse("htlc/neg refund signed by the operator", &refund(net, t, &s_key), "Invalid Schnorr signature");
-	net.refuse("htlc/neg refund_both with a lock time below the timeout", &rb(t - 1), "Locktime requirement not satisfied");
-	net.pass("htlc/refund: the owner after the timeout", &refund(net, t, &a));
-	net.pass("htlc/refund_both: both signatures after the timeout", &rb(t));
+	net.refuse("htlc/neg the owner's refund past the timeout, before its exit delay", &refund(&refunded, &coins[1], &a), "non-BIP68-final");
 
-	// A payment into the tree: the owner claims.
-	let mine = ExplicitOutput::new(net.x, LEAF - FEE, net.leaf(&a, &s_key, "htlc received").script_pubkey());
-	let m = recv.message(HtlcPath::Claim, net.x, LEAF, &mine).unwrap();
-	let w = recv.claim_witness(&sig(&s_key, &m.digest), &preimage);
-	net.refuse("htlc/neg receive: the operator claims", &tx(&coins[4], 0, 0xffff_ffff, &mine, w), "Invalid Schnorr signature");
-	let w = recv.claim_witness(&sig(&a, &m.digest), &preimage);
-	net.pass("htlc/receive: the owner claims with the preimage", &tx(&coins[4], 0, 0xffff_ffff, &mine, w));
+	// Into the tree: the operator refunds after the timeout and its own delay,
+	// which have both passed; the owner claims only after its exit delay.
+	net.refuse("htlc/neg receive: the owner's claim before its exit delay", &claim(&recv, &coins[3], &a, &preimage), "non-BIP68-final");
+	net.refuse("htlc/neg receive: a refund signed by the owner", &refund(&recv_refunded, &coins[4], &a), "Invalid Schnorr signature");
+	net.pass("htlc/receive: the operator's refund past the timeout and its delay", &refund(&recv_refunded, &coins[4], &s_key));
+	net.wait_csv(&funding, delay());
+	net.refuse("htlc/neg receive: a claim signed by the operator", &claim(&recv, &coins[3], &s_key, &preimage), "Invalid Schnorr signature");
+	net.pass("htlc/receive: the owner's claim with the preimage after its exit delay", &claim(&recv, &coins[3], &a, &preimage));
+	net.pass("htlc/the owner's refund past the timeout and its exit delay", &refund(&refunded, &coins[1], &a));
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +870,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 		owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 		operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
 		exit_delay: delay(), unlock_hash: sha256(&preimages[i]),
+		htlc: None,
 	}).collect();
 	let params = TreeParams {
 		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
@@ -1080,6 +1075,7 @@ fn probes_turned_around(net: &mut Net) {
 		owner_nonce: label32(&format!("probe B owner nonce {}", i)),
 		operator_nonce: label32(&format!("probe B operator nonce {}", i)),
 		exit_delay: delay(), unlock_hash: sha256(&label32(&format!("probe B preimage {}", i))),
+		htlc: None,
 	}).collect();
 	let params = TreeParams {
 		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
@@ -1089,7 +1085,7 @@ fn probes_turned_around(net: &mut Net) {
 	// By hand: the four entries under one node, gated to [S, A, A, B, C],
 	// whose RECLAIM names A twice.
 	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
-		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay() };
+		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None };
 		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
 			sweep: sched.sweep(true, false) };
 		(leaf, entry)
@@ -1112,6 +1108,7 @@ fn probes_turned_around(net: &mut Net) {
 				siblings: others.iter().map(|j| arca_covenant::record::Sibling { value: children[*j].value, program: children[*j].program }).collect(),
 				owners: others.iter().map(|j| specs[*j].owner).collect(),
 			},
+			htlc: None,
 		};
 		let r = rec.validate(&round, &policy, &specs[i].owner, &specs[i].owner_nonce);
 		if i < 2 {
@@ -1139,6 +1136,7 @@ fn probes_turned_around(net: &mut Net) {
 	let replayed = LeafSpec {
 		template: Template::Vtxo1, owner: xonly(&owner), value: LEAF, owner_nonce: old_nonce, operator_nonce: old_op,
 		exit_delay: delay(), unlock_hash: sha256(&label32("probe F new entry preimage")),
+		htlc: None,
 	};
 	let tree = Tree::build(TreeParams { schedule: sched.clone(), ..params.clone() }, &[replayed]).unwrap();
 	let (_, round) = plain_round(net, "probe F turned around / round with a replayed salt", &issuer, &sched, &tree.batch_output());

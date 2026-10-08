@@ -715,6 +715,7 @@ impl Rounds {
 				operator_nonce: *operator_nonce,
 				exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: row.unlock_hash,
+				htlc: None,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -1579,6 +1580,7 @@ impl Rounds {
 				operator_nonce: l.operator_nonce,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: l.unlock_hash,
+				htlc: None,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

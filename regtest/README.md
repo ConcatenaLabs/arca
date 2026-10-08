@@ -59,7 +59,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T12 | The checkpoint and reassignment chain, signed before the tree exists, with reserve and outside fees |
 | T13 | The gate with an authorisation signed in advance and usable by anyone who holds it |
 | T14 | A node with a pinned fee output, which cannot relay once its asset is delisted |
-| T15 | The `htlc-1` leaf's four paths |
+| T15 | The `htlc-1` leaf: the operator's claim with the preimage and the owner's refund after the timeout out of the tree, the owner's claim and the operator's refund into it, each refused before its relative delay, and past the timeout in the block that creates the output; the collaborative path at once |
 | T16 | The rebindable message bound to the spent coin's asset and amount and to the chain's genesis hash, with the folded 32-byte constant |
 | T17 | A gate that takes an unchecked key from the witness is spendable with a one-byte signature (mined); the hardened gate and the timed authorisation |
 | T18 | The token-gated sweep and its clock; the attacks consensus accepts and the client checks that catch them |
@@ -85,8 +85,7 @@ sample spend of every path:
   round's connector output), the round's connector output (spent only by the
   operator's issuance of that asset), the board output (`board-1`: the leaf's
   collaborative path and the owner's conversion), the checkpoint output and
-  `htlc-1` in both
-  directions): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
+  `htlc-1` in both directions): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
   times, children), each script leaf with its opcodes, depth, leaf hash and
   control block, the merkle root, the output key and the scriptPubKey;
 - for each spend: a transaction, the outputs it spends, the signature hash or the
@@ -97,7 +96,8 @@ sample spend of every path:
 `records.py`: the reference for the tree rules, the record's binary and JSON
 forms and the leaf id, which its docstring states in full. For each of seven
 batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
-3; seven at radix 6 with no reserves; sixty-four) it holds the inputs, the
+3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
+second and fourth leaves are `htlc-1`, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds

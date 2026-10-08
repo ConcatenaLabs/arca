@@ -65,11 +65,16 @@
 //!
 //! ```text
 //! u8    format version, 2
-//! u8    template, 1 (vtxo)            u8   template version, 1
+//! u8    template, 1 (vtxo) or 3 (htlc)  u8   template version, 1
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
 //! u16   exit delay, 512-second units
+//!       for htlc-1 only:
+//! u8    direction, 0 send or 1 receive
+//! [32]  payment hash
+//! u32   timeout, a median time
+//! u16   operator delay, 512-second units
 //! [32]  asset                         the leaf and its entry
 //! u64   value
 //! [32]  unlock hash h
@@ -122,7 +127,8 @@ use elements::{AssetId, Script, Transaction, TxOut, Txid};
 
 use crate::checks::{check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
-use crate::encode::{DecodeError, Reader};
+use crate::encode::{DecodeError, Encoding, Reader};
+use crate::htlc::HtlcTerms;
 use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
 use crate::leaf::leaf_salt;
 use crate::message::{release_message, unroll_authorisation, Chain, CsfsMessage};
@@ -163,6 +169,9 @@ pub enum Template {
 	/// them into a `vtxo-1` leaf ([`crate::board::BoardPolicy`]). A board
 	/// record names it; a leaf record never does.
 	Board1,
+	/// `htlc-1`, a leaf whose exit is a hash-locked pair: a claim with a
+	/// preimage and a refund after a timeout ([`crate::htlc`]).
+	Htlc1,
 }
 
 impl Template {
@@ -170,19 +179,22 @@ impl Template {
 	pub const VTXO: u8 = 1;
 	/// The template id of `board`.
 	pub const BOARD: u8 = 2;
+	/// The template id of `htlc`.
+	pub const HTLC: u8 = 3;
 
 	/// Its id in the binary form.
 	pub fn id(self) -> u8 {
 		match self {
 			Template::Vtxo1 => Template::VTXO,
 			Template::Board1 => Template::BOARD,
+			Template::Htlc1 => Template::HTLC,
 		}
 	}
 
 	/// Its version.
 	pub fn version(self) -> u8 {
 		match self {
-			Template::Vtxo1 | Template::Board1 => 1,
+			Template::Vtxo1 | Template::Board1 | Template::Htlc1 => 1,
 		}
 	}
 
@@ -191,6 +203,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 => "vtxo",
 			Template::Board1 => "board",
+			Template::Htlc1 => "htlc",
 		}
 	}
 
@@ -199,8 +212,10 @@ impl Template {
 		match (id, version) {
 			(Template::VTXO, 1) => Ok(Template::Vtxo1),
 			(Template::BOARD, 1) => Ok(Template::Board1),
+			(Template::HTLC, 1) => Ok(Template::Htlc1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
 			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
+			(Template::HTLC, v) => Err(RecordError::TemplateVersion { template: "htlc".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -226,6 +241,7 @@ impl FromStr for Template {
 		let known = match name {
 			"vtxo" => Template::Vtxo1,
 			"board" => Template::Board1,
+			"htlc" => Template::Htlc1,
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
@@ -280,6 +296,8 @@ pub struct LeafRecord {
 	/// The operator's contribution to the leaf's salt.
 	pub operator_nonce: [u8; 32],
 	pub exit_delay: RelativeTime,
+	/// `htlc-1`'s terms: present exactly when the template is `htlc-1`.
+	pub htlc: Option<HtlcTerms>,
 	/// The batch's asset.
 	pub asset: AssetId,
 	/// The leaf's value.
@@ -413,6 +431,8 @@ pub enum RecordError {
 	EntryReserve { reserve: u64, min: u64 },
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
+	#[error("the htlc-1 terms: {0}")]
+	Htlc(crate::Error),
 	#[error("not JSON: {0}")]
 	Json(String),
 	#[error("JSON field {0}: missing, unknown or misplaced")]
@@ -460,6 +480,7 @@ impl RecordError {
 			TemplateVersion { .. } => "template_version",
 			Value(_) | ValueSum | Amount(_) => "value",
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",
+			Htlc(_) => "htlc",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
 			NotOwner | OwnerNonce | OwnKeyTwice => "owner",
@@ -523,8 +544,12 @@ impl LeafRecord {
 	/// Checks the record's shape: counts, indices and value bounds. Every
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
-		if self.template != Template::Vtxo1 {
-			return Err(RecordError::Template(self.template.to_string()));
+		match (self.template, &self.htlc) {
+			(Template::Vtxo1, None) => {},
+			(Template::Htlc1, Some(t)) => t.check(self.exit_delay).map_err(RecordError::Htlc)?,
+			(Template::Htlc1, None) => return Err(RecordError::Template("htlc-1 without its terms".into())),
+			(Template::Vtxo1, Some(_)) => return Err(RecordError::Template("vtxo-1 with htlc-1 terms".into())),
+			(t, _) => return Err(RecordError::Template(t.to_string())),
 		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
@@ -578,6 +603,7 @@ impl LeafRecord {
 			salt: self.salt(),
 			chain: self.chain,
 			exit_delay: self.exit_delay,
+			htlc: self.htlc,
 		}
 	}
 
@@ -730,6 +756,9 @@ impl LeafRecord {
 		w.extend(self.owner_nonce);
 		w.extend(self.operator_nonce);
 		w.extend(self.exit_delay.units().to_le_bytes());
+		if let Some(t) = &self.htlc {
+			t.encode_to(&mut w);
+		}
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
 		w.extend(self.unlock_hash);
@@ -781,6 +810,10 @@ impl LeafRecord {
 		let owner_nonce = r.array32()?;
 		let operator_nonce = r.array32()?;
 		let exit_delay = r.relative_time()?;
+		let htlc = match template {
+			Template::Htlc1 => Some(HtlcTerms::decode_from(&mut r)?),
+			_ => None,
+		};
 		let asset = r.asset()?;
 		let value = r.u64()?;
 		let unlock_hash = r.array32()?;
@@ -845,7 +878,7 @@ impl LeafRecord {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
 		}
 		let record = LeafRecord {
-			template, owner, owner_nonce, operator_nonce, exit_delay, asset, value, unlock_hash, entry_reserve, chain,
+			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, asset, value, unlock_hash, entry_reserve, chain,
 			schedule, burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;

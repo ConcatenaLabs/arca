@@ -675,6 +675,7 @@ async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesR
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
+				htlc: None,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,

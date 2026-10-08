@@ -1,38 +1,58 @@
-//! `htlc-1`: the hash-locked leaf for Lightning and cross-chain legs.
+//! `htlc-1`: the hash-locked leaf of the Lightning legs.
 //!
-//! Four paths. Each rebindable one has its own salt and commits to output 0
-//! with the rebindable message at `m = 1`:
+//! An `htlc-1` leaf is a leaf ([`crate::LeafPolicy`]) whose exit is replaced
+//! by a hash-locked pair. It keeps the leaf's collaborative path, the very
+//! script `vtxo-1` carries under the leaf's own salt, and in place of the
+//! exit it has two paths, each behind a relative delay on the output's
+//! confirmation:
 //!
 //! ```text
-//! claim:        OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <h> OP_EQUALVERIFY
-//!               <K_claim> <this input's asset and value> OP_CAT OP_1 OP_CAT
-//!               <record 0> OP_SHA256 OP_CAT OP_SHA256 <claimer> OP_CHECKSIGFROMSTACK
-//! claim_both:   the same hash gate and message with K_claim_both, then
-//!               OP_TUCK <A> OP_CHECKSIGFROMSTACKVERIFY <S> OP_CHECKSIGFROMSTACK
-//! refund:       <timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <refunder> OP_CHECKSIG
-//! refund_both:  <timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP, the message with K_refund_both,
-//!               then both signatures
+//! collab:  the leaf's collaborative path                                          # <sig_S> <sig_A> <m>
+//! claim:   <claim delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+//!          OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <h> OP_EQUALVERIFY
+//!          <claimer> OP_CHECKSIG                                                  # <sig> <preimage>
+//! refund:  <timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP
+//!          <refund delay> OP_CHECKSEQUENCEVERIFY OP_DROP <refunder> OP_CHECKSIG   # <sig>
 //! ```
 //!
-//! The tree is `[[claim, claim_both], [refund, refund_both]]`. For a payment
-//! out of the tree the operator claims and the owner refunds; for a payment
-//! into it the owner claims and the operator refunds.
+//! The tree is `[collab, [claim, refund]]`.
 //!
-//! Witnesses, bottom to top: claim `<sig> <preimage>`; claim_both
-//! `<sig_S> <sig_A> <preimage>`; refund `<sig>`; refund_both `<sig_S> <sig_A>`.
+//! | Direction | Claims with the preimage | Refunds after the timeout |
+//! |---|---|---|
+//! | [`HtlcDirection::Send`], a payment out of the tree | the operator, after the operator's delay | the owner, after the leaf's exit delay |
+//! | [`HtlcDirection::Receive`], a payment into it | the owner, after the leaf's exit delay | the operator, after the operator's delay |
+//!
+//! The operator's delay is the shorter ([`HtlcTerms::check`]). Two things
+//! follow, and they are why the delays are there.
+//!
+//! - **The side holding the preimage, or the one that waited out the timeout,
+//!   always has time to answer.** Out of the tree, once the operator has paid
+//!   the invoice and learned the preimage, an owner who puts the output
+//!   on-chain past the timeout cannot refund it in the block that creates it:
+//!   the operator claims first, in the gap between the two delays. Into the
+//!   tree, an owner who never claimed cannot take the output once the
+//!   operator's Lightning payment has been failed back: past the timeout the
+//!   operator's refund opens before the owner's claim.
+//! - **The collaborative path waits for nothing**, so it answers both unilateral
+//!   paths. A failed payment goes back to its owner at once, as a new leaf
+//!   spent by this path through a checkpoint and a reassignment; a payment
+//!   into the tree is claimed the same way once the owner has handed over the
+//!   preimage. Whoever then holds that new leaf publishes the spend the moment
+//!   the output appears on-chain, before either unilateral path opens.
+//!
+//! The leaf's owner key and salt are its own, as for every leaf: an `htlc-1`
+//! leaf is never funded twice, and a pair made for it fits no other leaf.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Script};
+use elements::Script;
 
 use crate::entry::hash_gate;
-use crate::leaf::TwoPartyCsfs;
-use crate::message::{rebind_message, Chain, CsfsMessage};
-use crate::script::{BuilderExt, ExplicitOutput};
-use crate::taptree::TapOutput;
-use crate::time::MedianTime;
+use crate::script::BuilderExt;
+use crate::time::{MedianTime, RelativeTime};
+use crate::Error;
 
 /// Which way the payment runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,129 +65,125 @@ pub enum HtlcDirection {
 	Receive,
 }
 
-/// One salt per rebindable path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HtlcSalts {
-	pub claim: [u8; 32],
-	pub claim_both: [u8; 32],
-	pub refund_both: [u8; 32],
+impl HtlcDirection {
+	/// Its byte in the encodings: 0 send, 1 receive.
+	pub fn byte(self) -> u8 {
+		match self {
+			HtlcDirection::Send => 0,
+			HtlcDirection::Receive => 1,
+		}
+	}
+
+	/// The direction of a byte.
+	pub fn from_byte(b: u8) -> Option<HtlcDirection> {
+		match b {
+			0 => Some(HtlcDirection::Send),
+			1 => Some(HtlcDirection::Receive),
+			_ => None,
+		}
+	}
+
+	/// Its name: `send` or `receive`.
+	pub fn name(self) -> &'static str {
+		match self {
+			HtlcDirection::Send => "send",
+			HtlcDirection::Receive => "receive",
+		}
+	}
+
+	/// The direction of a name.
+	pub fn from_name(s: &str) -> Option<HtlcDirection> {
+		match s {
+			"send" => Some(HtlcDirection::Send),
+			"receive" => Some(HtlcDirection::Receive),
+			_ => None,
+		}
+	}
 }
 
-/// The paths of `htlc-1`.
+/// The paths of an `htlc-1` leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HtlcPath {
+	Collab,
 	Claim,
-	ClaimBoth,
 	Refund,
-	RefundBoth,
 }
 
-/// An `htlc-1` output's policy.
+/// What an `htlc-1` leaf adds to a leaf: the hash it is locked to, the
+/// timeout, and the operator's delay. The owner's delay is the leaf's exit
+/// delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HtlcPolicy {
-	pub owner: XOnlyPublicKey,
-	pub operator: XOnlyPublicKey,
+pub struct HtlcTerms {
 	pub direction: HtlcDirection,
+	/// `h`: the payment hash, `SHA256(preimage)`.
 	pub payment_hash: [u8; 32],
-	/// The median time after which the refund paths open.
+	/// The median time from which the refund path opens.
 	pub timeout: MedianTime,
-	pub salts: HtlcSalts,
-	pub chain: Chain,
+	/// The relative delay on the operator's path: its claim out of the tree,
+	/// its refund into it. Shorter than the owner's.
+	pub operator_delay: RelativeTime,
 }
 
-/// The rebindable message at `m = 1`, built in script.
-fn one_output_message(b: Builder, k: &[u8; 32]) -> Builder {
-	b.push_slice(k).current_input_record().push_opcode(OP_CAT).push_int(1).push_opcode(OP_CAT)
-		.output_record(0).ops(&[OP_SHA256, OP_CAT, OP_SHA256])
-}
+impl HtlcTerms {
+	/// Refuses terms the leaf cannot carry: the operator's delay must be
+	/// shorter than the owner's, which is `exit_delay`. Without that the side
+	/// that should answer could be answered instead.
+	pub fn check(&self, exit_delay: RelativeTime) -> Result<(), Error> {
+		if self.operator_delay >= exit_delay {
+			return Err(Error::HtlcDelays { operator: self.operator_delay.units(), owner: exit_delay.units() });
+		}
+		Ok(())
+	}
 
-impl HtlcPolicy {
-	/// The key that claims alone.
-	pub fn claimer(&self) -> XOnlyPublicKey {
+	/// The key that claims with the preimage.
+	pub fn claimer(&self, owner: XOnlyPublicKey, operator: XOnlyPublicKey) -> XOnlyPublicKey {
 		match self.direction {
-			HtlcDirection::Send => self.operator,
-			HtlcDirection::Receive => self.owner,
+			HtlcDirection::Send => operator,
+			HtlcDirection::Receive => owner,
 		}
 	}
 
-	/// The key that refunds alone.
-	pub fn refunder(&self) -> XOnlyPublicKey {
+	/// The key that refunds after the timeout.
+	pub fn refunder(&self, owner: XOnlyPublicKey, operator: XOnlyPublicKey) -> XOnlyPublicKey {
 		match self.direction {
-			HtlcDirection::Send => self.owner,
-			HtlcDirection::Receive => self.operator,
+			HtlcDirection::Send => owner,
+			HtlcDirection::Receive => operator,
 		}
 	}
 
-	/// `K` of a rebindable path; `None` for the plain refund.
-	pub fn leaf_constant(&self, path: HtlcPath) -> Option<[u8; 32]> {
-		let salt = match path {
-			HtlcPath::Claim => &self.salts.claim,
-			HtlcPath::ClaimBoth => &self.salts.claim_both,
-			HtlcPath::RefundBoth => &self.salts.refund_both,
-			HtlcPath::Refund => return None,
-		};
-		Some(self.chain.leaf_constant(salt))
-	}
-
-	fn k(&self, path: HtlcPath) -> [u8; 32] {
-		self.leaf_constant(path).expect("a rebindable path")
-	}
-
-	pub fn script(&self, path: HtlcPath) -> Script {
-		let timeout = |b: Builder| b.push_int(self.timeout.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP]);
-		match path {
-			HtlcPath::Claim => one_output_message(hash_gate(Builder::new(), &self.payment_hash), &self.k(path))
-				.push_slice(&self.claimer().serialize()).push_opcode(OP_CHECKSIGFROMSTACK).into_script(),
-			HtlcPath::ClaimBoth => one_output_message(hash_gate(Builder::new(), &self.payment_hash), &self.k(path))
-				.two_party_csfs(&self.owner, &self.operator).into_script(),
-			HtlcPath::Refund => timeout(Builder::new())
-				.push_slice(&self.refunder().serialize()).push_opcode(OP_CHECKSIG).into_script(),
-			HtlcPath::RefundBoth => one_output_message(timeout(Builder::new()), &self.k(path))
-				.two_party_csfs(&self.owner, &self.operator).into_script(),
+	/// The claim's relative delay, for a leaf of exit delay `exit_delay`.
+	pub fn claim_delay(&self, exit_delay: RelativeTime) -> RelativeTime {
+		match self.direction {
+			HtlcDirection::Send => self.operator_delay,
+			HtlcDirection::Receive => exit_delay,
 		}
 	}
 
-	/// `[[claim, claim_both], [refund, refund_both]]`, all at depth 2.
-	pub fn taproot(&self) -> TapOutput {
-		TapOutput::new(vec![
-			(2, self.script(HtlcPath::Claim)),
-			(2, self.script(HtlcPath::ClaimBoth)),
-			(2, self.script(HtlcPath::Refund)),
-			(2, self.script(HtlcPath::RefundBoth)),
-		])
+	/// The refund's relative delay, for a leaf of exit delay `exit_delay`.
+	pub fn refund_delay(&self, exit_delay: RelativeTime) -> RelativeTime {
+		match self.direction {
+			HtlcDirection::Send => exit_delay,
+			HtlcDirection::Receive => self.operator_delay,
+		}
 	}
 
-	pub fn script_pubkey(&self) -> Script {
-		self.taproot().script_pubkey()
+	/// `<delay> CSV DROP`, the hash gate, `<claimer> CHECKSIG`.
+	pub(crate) fn claim_script(&self, owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, exit_delay: RelativeTime) -> Script {
+		let b = Builder::new().push_int(self.claim_delay(exit_delay).to_sequence() as i64).ops(&[OP_CSV, OP_DROP]);
+		hash_gate(b, &self.payment_hash).push_slice(&self.claimer(*owner, *operator).serialize())
+			.push_opcode(OP_CHECKSIG).into_script()
 	}
 
-	/// The message a rebindable path signs, for a coin of `value_in` of
-	/// `asset_in` spent into `output` at index 0; `None` for the plain refund.
-	pub fn message(&self, path: HtlcPath, asset_in: AssetId, value_in: u64, output: &ExplicitOutput) -> Option<CsfsMessage> {
-		let k = self.leaf_constant(path)?;
-		Some(rebind_message(&k, asset_in, value_in, std::slice::from_ref(output)).expect("one output"))
+	/// `<timeout> CLTV DROP <delay> CSV DROP <refunder> CHECKSIG`.
+	pub(crate) fn refund_script(&self, owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, exit_delay: RelativeTime) -> Script {
+		Builder::new().push_int(self.timeout.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP])
+			.push_int(self.refund_delay(exit_delay).to_sequence() as i64).ops(&[OP_CSV, OP_DROP])
+			.push_slice(&self.refunder(*owner, *operator).serialize()).push_opcode(OP_CHECKSIG).into_script()
 	}
 
-	/// The full claim witness: the claimer's signature and the preimage.
-	pub fn claim_witness(&self, sig: &Signature, preimage: &[u8; 32]) -> Vec<Vec<u8>> {
-		let s = self.script(HtlcPath::Claim);
-		self.taproot().witness(&s, vec![sig.as_ref().to_vec(), preimage.to_vec()])
-	}
-
-	pub fn claim_both_witness(&self, operator_sig: &Signature, owner_sig: &Signature, preimage: &[u8; 32]) -> Vec<Vec<u8>> {
-		let s = self.script(HtlcPath::ClaimBoth);
-		self.taproot().witness(&s, vec![operator_sig.as_ref().to_vec(), owner_sig.as_ref().to_vec(), preimage.to_vec()])
-	}
-
-	/// The full refund witness: the refunder's signature over a transaction
-	/// with `nLockTime` at least the timeout and a non-final sequence.
-	pub fn refund_witness(&self, sig: &Signature) -> Vec<Vec<u8>> {
-		let s = self.script(HtlcPath::Refund);
-		self.taproot().witness(&s, vec![sig.as_ref().to_vec()])
-	}
-
-	pub fn refund_both_witness(&self, operator_sig: &Signature, owner_sig: &Signature) -> Vec<Vec<u8>> {
-		let s = self.script(HtlcPath::RefundBoth);
-		self.taproot().witness(&s, vec![operator_sig.as_ref().to_vec(), owner_sig.as_ref().to_vec()])
+	/// The items below the claim script: the claimer's signature and the
+	/// preimage.
+	pub fn claim_items(sig: &Signature, preimage: &[u8; 32]) -> Vec<Vec<u8>> {
+		vec![sig.as_ref().to_vec(), preimage.to_vec()]
 	}
 }

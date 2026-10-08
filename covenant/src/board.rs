@@ -217,6 +217,7 @@ impl BoardRecord {
 	pub fn leaf(&self) -> LeafPolicy {
 		LeafPolicy {
 			owner: self.owner, operator: self.operator, salt: self.salt(), chain: self.chain, exit_delay: self.exit_delay,
+			htlc: None,
 		}
 	}
 

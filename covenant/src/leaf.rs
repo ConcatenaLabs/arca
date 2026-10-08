@@ -1,7 +1,7 @@
 //! The leaf: a per-user output at the bottom of the tree.
 //!
-//! Two script leaves and no operator path. The leaf is spent by owner and
-//! operator together, or by the owner alone after the exit delay:
+//! Two script leaves and no operator path. The leaf (`vtxo-1`) is spent by
+//! owner and operator together, or by the owner alone after the exit delay:
 //!
 //! ```text
 //! collab:  <A> and <S>, each a rebindable signature over the coin spent and the outputs they authorise
@@ -36,6 +36,11 @@
 //! ([`crate::transfer`]). A wallet that never repeats a nonce is never given
 //! the same leaf script twice, and neither is a creator that never repeats its
 //! own. The script itself takes the salt as an opaque 32 bytes.
+//!
+//! An `htlc-1` leaf ([`crate::htlc`]) has the same collaborative path and, in
+//! place of the exit, a claim with a preimage and a refund after a timeout,
+//! each behind a relative delay: `[collab, [claim, refund]]`. Its owner's
+//! delay is the exit delay; the operator's is in its [`HtlcTerms`].
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -43,6 +48,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
+use crate::htlc::{HtlcPath, HtlcTerms};
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
 use crate::taptree::TapOutput;
@@ -113,7 +119,7 @@ pub(crate) fn two_party_items(operator_sig: &Signature, owner_sig: &Signature, m
 	vec![operator_sig.as_ref().to_vec(), owner_sig.as_ref().to_vec(), vec![m]]
 }
 
-/// A leaf's policy (`vtxo-1`).
+/// A leaf's policy: `vtxo-1`, or `htlc-1` when it carries [`HtlcTerms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafPolicy {
 	/// The owner's key `A`.
@@ -123,7 +129,11 @@ pub struct LeafPolicy {
 	/// Unique to this leaf instance.
 	pub salt: [u8; 32],
 	pub chain: Chain,
+	/// The owner's delay: its exit, or for `htlc-1` its own unilateral path
+	/// (the refund out of the tree, the claim into it).
 	pub exit_delay: RelativeTime,
+	/// `htlc-1`'s hash-locked pair, in place of the exit; `None` for `vtxo-1`.
+	pub htlc: Option<HtlcTerms>,
 }
 
 impl LeafPolicy {
@@ -136,13 +146,49 @@ impl LeafPolicy {
 		rebindable_two_party(&self.owner, &self.operator, &self.leaf_constant())
 	}
 
+	/// The exit of a `vtxo-1` leaf. An `htlc-1` leaf has none: its tree
+	/// does not carry this script.
 	pub fn exit_script(&self) -> Script {
 		exit_script(&self.owner, self.exit_delay)
 	}
 
-	/// `[collab, exit]`, both at depth 1.
+	/// The claim of an `htlc-1` leaf.
+	pub fn claim_script(&self) -> Result<Script, Error> {
+		let t = self.htlc.ok_or(Error::NotAnHtlc("claim"))?;
+		Ok(t.claim_script(&self.owner, &self.operator, self.exit_delay))
+	}
+
+	/// The refund of an `htlc-1` leaf.
+	pub fn refund_script(&self) -> Result<Script, Error> {
+		let t = self.htlc.ok_or(Error::NotAnHtlc("refund"))?;
+		Ok(t.refund_script(&self.owner, &self.operator, self.exit_delay))
+	}
+
+	/// The script of an `htlc-1` path.
+	pub fn htlc_script(&self, path: HtlcPath) -> Result<Script, Error> {
+		match path {
+			HtlcPath::Collab => Ok(self.collab_script()),
+			HtlcPath::Claim => self.claim_script(),
+			HtlcPath::Refund => self.refund_script(),
+		}
+	}
+
+	/// `vtxo-1`: `[collab, exit]`, both at depth 1. `htlc-1`: `[collab,
+	/// [claim, refund]]`.
 	pub fn taproot(&self) -> TapOutput {
-		TapOutput::new(vec![(1, self.collab_script()), (1, self.exit_script())])
+		match self.htlc {
+			None => TapOutput::new(vec![(1, self.collab_script()), (1, self.exit_script())]),
+			Some(t) => TapOutput::new(vec![
+				(1, self.collab_script()),
+				(2, t.claim_script(&self.owner, &self.operator, self.exit_delay)),
+				(2, t.refund_script(&self.owner, &self.operator, self.exit_delay)),
+			]),
+		}
+	}
+
+	/// The template it follows: `vtxo-1`, or `htlc-1`.
+	pub fn template(&self) -> crate::Template {
+		if self.htlc.is_some() { crate::Template::Htlc1 } else { crate::Template::Vtxo1 }
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -168,6 +214,20 @@ impl LeafPolicy {
 	/// version 2 transaction whose input sequence is the exit delay.
 	pub fn exit_witness(&self, owner_sig: &Signature) -> Vec<Vec<u8>> {
 		self.taproot().witness(&self.exit_script(), vec![owner_sig.as_ref().to_vec()])
+	}
+
+	/// The full claim witness of an `htlc-1` leaf: the claimer's signature
+	/// and the preimage, over a version 2 transaction whose input sequence is
+	/// the claim's delay.
+	pub fn claim_witness(&self, sig: &Signature, preimage: &[u8; 32]) -> Result<Vec<Vec<u8>>, Error> {
+		Ok(self.taproot().witness(&self.claim_script()?, HtlcTerms::claim_items(sig, preimage)))
+	}
+
+	/// The full refund witness of an `htlc-1` leaf: the refunder's signature
+	/// over a version 2 transaction whose lock time is at least the timeout
+	/// and whose input sequence is the refund's delay.
+	pub fn refund_witness(&self, sig: &Signature) -> Result<Vec<Vec<u8>>, Error> {
+		Ok(self.taproot().witness(&self.refund_script()?, vec![sig.as_ref().to_vec()]))
 	}
 }
 

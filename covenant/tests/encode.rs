@@ -8,7 +8,6 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{BlockHash, Script};
 
 use arca_covenant::encode::{DecodeError, Encoding, Policy};
-use arca_covenant::htlc::HtlcPath;
 use arca_covenant::script::sha256;
 use arca_covenant::witness::{find_preimage, ScriptPath, UnrollWitness};
 use arca_covenant::*;
@@ -29,7 +28,7 @@ fn policies() -> Vec<Policy> {
 	let s = xonly(&keypair("S"));
 	let a = xonly(&keypair("A"));
 	let sch = schedule();
-	let leaf = LeafPolicy { owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice };
+	let leaf = LeafPolicy { owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None };
 	let owners: Vec<XOnlyPublicKey> = (0..5).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
@@ -43,10 +42,12 @@ fn policies() -> Vec<Policy> {
 			leaf_id: LeafId(label32("leaf id")), connector: asset("connector"),
 		}),
 		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: sch.sweep(true, false) }),
-		Policy::Htlc(HtlcPolicy {
-			owner: a, operator: s, direction: HtlcDirection::Receive, payment_hash: label32("p"),
-			timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),
-			salts: HtlcSalts { claim: label32("1"), claim_both: label32("2"), refund_both: label32("3") }, chain: chain(),
+		Policy::Leaf(LeafPolicy {
+			htlc: Some(HtlcTerms {
+				direction: HtlcDirection::Receive, payment_hash: label32("p"),
+				timeout: MedianTime::from_consensus(1_800_000_000).unwrap(), operator_delay: RelativeTime::from_units(1).unwrap(),
+			}),
+			..leaf
 		}),
 		Policy::Offboard(OffboardPolicy {
 			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
@@ -99,15 +100,25 @@ fn malformed_encodings_are_refused() {
 	let n = b.len();
 	b[n - 2..].copy_from_slice(&[0, 0]);
 	assert!(matches!(Policy::decode(&b), Err(DecodeError::Time(_))));
-	// an htlc timeout that is a height
+	// an htlc-1 leaf: its direction, its timeout, and its operator's delay,
+	// which must be shorter than its owner's
 	let htlc = p[7].encode();
+	assert_eq!(htlc[1], 6);
+	let dir = 2 + 4 * 32 + 2;
 	let mut b = htlc.clone();
-	let at = 2 + 32 + 32 + 1 + 32;
+	b[dir] = 2;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::Flag(2)));
+	let mut b = htlc.clone();
+	let at = dir + 1 + 32;
 	b[at..at + 4].copy_from_slice(&100u32.to_le_bytes());
 	assert!(matches!(Policy::decode(&b), Err(DecodeError::Time(_))));
 	let mut b = htlc.clone();
-	b[2 + 64] = 2;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::Flag(2)));
+	let n = b.len();
+	b[n - 2..].copy_from_slice(&leaf[leaf.len() - 2..]);
+	assert!(matches!(Policy::decode(&b), Err(DecodeError::Policy(Error::HtlcDelays { .. }))));
+	let mut b = htlc.clone();
+	b[1] = 1;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::TrailingBytes(39)));
 	// node: no child, seven children, an owner count larger than the data
 	let node = p[1].encode();
 	let mut b = node.clone();
@@ -202,12 +213,14 @@ fn witness_readers() {
 	let w = forfeit.claim_witness(&sig(&s, &label32("any")), &pre, 1);
 	assert_eq!(find_preimage(&w, &forfeit.unlock_hash), Some(pre));
 	assert_eq!(find_preimage(&w, &label32("other")), None);
-	let h = HtlcPolicy {
-		owner: xonly(&a), operator: xonly(&s), direction: HtlcDirection::Send, payment_hash: sha256(&pre),
-		timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),
-		salts: HtlcSalts { claim: label32("1"), claim_both: label32("2"), refund_both: label32("3") }, chain: chain(),
+	let terms = HtlcTerms {
+		direction: HtlcDirection::Send, payment_hash: sha256(&pre),
+		timeout: MedianTime::from_consensus(1_800_000_000).unwrap(), operator_delay: RelativeTime::from_units(1).unwrap(),
 	};
-	let w = h.claim_both_witness(&sig(&s, &label32("x")), &sig(&a, &label32("x")), &pre);
-	assert_eq!(find_preimage(&w, &h.payment_hash), Some(pre));
-	assert!(h.leaf_constant(HtlcPath::Refund).is_none());
+	let h = LeafPolicy {
+		owner: xonly(&a), operator: xonly(&s), salt: label32("htlc"), chain: chain(), exit_delay: sch.notice, htlc: Some(terms),
+	};
+	let w = h.claim_witness(&sig(&s, &label32("x")), &pre).unwrap();
+	assert_eq!(find_preimage(&w, &terms.payment_hash), Some(pre));
+	assert!(LeafPolicy { htlc: None, ..h }.claim_script().is_err());
 }

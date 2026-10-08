@@ -17,7 +17,6 @@ use elements::sighash::{Prevouts, SighashCache};
 use elements::{AssetId, BlockHash, OutPoint, SchnorrSighashType, Script, TxOut, Txid};
 
 use arca_consensus::Verifier;
-use arca_covenant::htlc::HtlcPath;
 use arca_covenant::message::rebind_message;
 use arca_covenant::script::{record, sha256};
 use arca_covenant::sign::sign_digest;
@@ -137,7 +136,7 @@ impl F {
 	}
 
 	fn leaf(&self, owner: &Keypair, salt: &str) -> LeafPolicy {
-		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay }
+		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None }
 	}
 
 	fn r_coin(&self) -> TxOut {
@@ -1217,85 +1216,77 @@ fn claim_batch_cases(f: &F, book: &mut Book) {
 fn htlc_cases(f: &F, book: &mut Book) {
 	let preimage = label32("payment");
 	let timeout = MedianTime::from_consensus(f.created.to_consensus_u32() + 2 * 86_400).unwrap();
-	let salts = HtlcSalts { claim: label32("hc"), claim_both: label32("hb"), refund_both: label32("hr") };
-	let mk = |direction| HtlcPolicy {
-		owner: xonly(&f.a), operator: xonly(&f.s), direction, payment_hash: sha256(&preimage), timeout, salts, chain: f.chain,
+	let lt = timeout.to_consensus_u32();
+	let opd = RelativeTime::from_units(f.delay.units() / 3).unwrap();
+	let mk = |direction, salt: &str| LeafPolicy {
+		owner: xonly(&f.a), operator: xonly(&f.s), salt: label32(salt), chain: f.chain, exit_delay: f.delay,
+		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout, operator_delay: opd }),
 	};
-	let send = mk(HtlcDirection::Send);
-	let coin = explicit(f.x, LEAF, send.script_pubkey());
-	let to = ExplicitOutput::new(f.x, LEAF - FEE, f.operator_spk());
-	let tx = |h: &HtlcPolicy, lock: u32, seq: u32, outs: Vec<TxOut>| {
-		let c = explicit(f.x, LEAF, h.script_pubkey());
-		Spend::new(lock).fake_input("htlc", c, seq).outputs(outs)
+	let tx = |h: &LeafPolicy, lock: u32, seq: u32, outs: Vec<TxOut>| {
+		Spend::new(lock).fake_input("htlc", explicit(f.x, LEAF, h.script_pubkey()), seq).outputs(outs)
 	};
 	let paid = |o: &ExplicitOutput| vec![o.txout(), fee(f.x, LEAF - o.value)];
-	let m_claim = send.message(HtlcPath::Claim, f.x, LEAF, &to).unwrap();
-	let m_both = send.message(HtlcPath::ClaimBoth, f.x, LEAF, &to).unwrap();
-
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_witness(&sig(&f.s, &m_claim.digest), &preimage));
-	book.pass("htlc/claim by the operator with the preimage", &s);
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_witness(&sig(&f.s, &m_claim.digest), &label32("wrong")));
-	book.fail("htlc/neg claim with a wrong preimage", &s, 0, EQUALVERIFY);
-	let other = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&f.a, "elsewhere").script_pubkey());
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&other));
-	s.witness(0, send.claim_witness(&sig(&f.s, &m_claim.digest), &preimage));
-	book.fail("htlc/neg claim into an output not committed", &s, 0, BAD_SIG);
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_witness(&sig(&f.a, &m_claim.digest), &preimage));
-	book.fail("htlc/neg claim signed by the owner", &s, 0, BAD_SIG);
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_both_witness(&sig(&f.s, &m_both.digest), &sig(&f.a, &m_both.digest), &preimage));
-	book.pass("htlc/claim with the preimage and both signatures", &s);
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_both_witness(&sig(&f.s, &m_both.digest), &sig(&f.a, &m_both.digest), &label32("wrong")));
-	book.fail("htlc/neg claim_both with a wrong preimage", &s, 0, EQUALVERIFY);
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	let mut w = send.claim_both_witness(&sig(&f.s, &m_both.digest), &sig(&f.a, &m_both.digest), &preimage);
-	w[1] = vec![];
-	s.witness(0, w);
-	book.fail("htlc/neg claim_both without the owner", &s, 0, "OP_CHECKSIGVERIFY");
-	// The claim signature does not fit the both-signature path (another salt).
-	let mut s = tx(&send, 0, 0xffff_ffff, paid(&to));
-	s.witness(0, send.claim_both_witness(&sig(&f.s, &m_claim.digest), &sig(&f.a, &m_claim.digest), &preimage));
-	book.fail("htlc/neg claim_both with signatures made for the claim path", &s, 0, BAD_SIG);
-
-	let back = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&f.a, "back").script_pubkey());
-	let lt = timeout.to_consensus_u32();
-	let refund = |lock: u32, key: &Keypair| {
-		let mut s = tx(&send, lock, 0xffff_fffe, paid(&back));
-		let sg = s.sign(key, 0, &send.script(HtlcPath::Refund), f.genesis);
-		s.witness(0, send.refund_witness(&sg));
+	let to_s = ExplicitOutput::new(f.x, LEAF - FEE, f.operator_spk());
+	let to_a = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&f.a, "htlc back").script_pubkey());
+	let claim = |h: &LeafPolicy, key: &Keypair, pre: &[u8; 32], seq: u32, to: &ExplicitOutput| {
+		let mut s = tx(h, 0, seq, paid(to));
+		let sg = s.sign(key, 0, &h.claim_script().unwrap(), f.genesis);
+		s.witness(0, h.claim_witness(&sg, pre).unwrap());
 		s
 	};
-	book.pass("htlc/refund by the owner after the timeout", &refund(lt, &f.a));
-	book.fail("htlc/neg refund one second before the timeout", &refund(lt - 1, &f.a), 0, LOCKTIME);
-	book.fail("htlc/neg refund signed by the operator", &refund(lt, &f.s), 0, BAD_SIG);
-	let m_rb = send.message(HtlcPath::RefundBoth, f.x, LEAF, &back).unwrap();
-	let refund_both = |lock: u32| {
-		let mut s = tx(&send, lock, 0xffff_fffe, paid(&back));
-		s.witness(0, send.refund_both_witness(&sig(&f.s, &m_rb.digest), &sig(&f.a, &m_rb.digest)));
+	let refund = |h: &LeafPolicy, key: &Keypair, lock: u32, seq: u32, to: &ExplicitOutput| {
+		let mut s = tx(h, lock, seq, paid(to));
+		let sg = s.sign(key, 0, &h.refund_script().unwrap(), f.genesis);
+		s.witness(0, h.refund_witness(&sg).unwrap());
 		s
 	};
-	book.pass("htlc/refund with both signatures after the timeout", &refund_both(lt));
-	book.fail("htlc/neg refund_both one second before the timeout", &refund_both(lt - 1), 0, LOCKTIME);
+	let (od, ed) = (opd.to_sequence(), f.delay.to_sequence());
 
-	// A payment into the tree: the owner claims, the operator refunds.
-	let recv = mk(HtlcDirection::Receive);
-	let mine = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&f.a, "received").script_pubkey());
-	let m = recv.message(HtlcPath::Claim, f.x, LEAF, &mine).unwrap();
-	let mut s = tx(&recv, 0, 0xffff_ffff, paid(&mine));
-	s.witness(0, recv.claim_witness(&sig(&f.a, &m.digest), &preimage));
-	book.pass("htlc/receive: the owner claims with the preimage", &s);
-	let mut s = tx(&recv, 0, 0xffff_ffff, paid(&mine));
-	s.witness(0, recv.claim_witness(&sig(&f.s, &m.digest), &preimage));
-	book.fail("htlc/neg receive: the operator cannot claim", &s, 0, BAD_SIG);
-	let mut s = tx(&recv, lt, 0xffff_fffe, paid(&to));
-	let sg = s.sign(&f.s, 0, &recv.script(HtlcPath::Refund), f.genesis);
-	s.witness(0, recv.refund_witness(&sg));
-	book.pass("htlc/receive: the operator refunds after the timeout", &s);
-	let _ = coin;
+	// Out of the tree: the operator claims with the preimage after its own
+	// delay; the owner refunds after the timeout and its exit delay.
+	let send = mk(HtlcDirection::Send, "htlc send");
+	book.pass("htlc/send: the operator claims with the preimage after its delay", &claim(&send, &f.s, &preimage, od, &to_s));
+	book.fail("htlc/neg send: a claim one unit before the operator's delay", &claim(&send, &f.s, &preimage, od - 1, &to_s), 0, LOCKTIME);
+	book.fail("htlc/neg send: a claim with a wrong preimage", &claim(&send, &f.s, &label32("wrong"), od, &to_s), 0, EQUALVERIFY);
+	book.fail("htlc/neg send: a claim signed by the owner", &claim(&send, &f.a, &preimage, od, &to_s), 0, BAD_SIG);
+	book.pass("htlc/send: the owner refunds after the timeout and its exit delay", &refund(&send, &f.a, lt, ed, &to_a));
+	book.fail("htlc/neg send: a refund with a lock time below the timeout", &refund(&send, &f.a, lt - 1, ed, &to_a), 0, LOCKTIME);
+	book.fail("htlc/neg send: a refund one unit before the exit delay", &refund(&send, &f.a, lt, ed - 1, &to_a), 0, LOCKTIME);
+	book.fail("htlc/neg send: a refund at the operator's delay", &refund(&send, &f.a, lt, od, &to_a), 0, LOCKTIME);
+	book.fail("htlc/neg send: a refund signed by the operator", &refund(&send, &f.s, lt, ed, &to_a), 0, BAD_SIG);
+
+	// The collaborative path, at once, with no lock: a failed payment back
+	// into a leaf of the owner's.
+	let m = send.collab_message(f.x, LEAF, std::slice::from_ref(&to_a)).unwrap();
+	let both = |ss: &Signature, sa: &Signature| {
+		let mut s = tx(&send, 0, 0xffff_ffff, paid(&to_a));
+		s.witness(0, send.collab_witness(ss, sa, 1));
+		s
+	};
+	book.pass("htlc/send: back to the owner by both signatures, at once", &both(&sig(&f.s, &m.digest), &sig(&f.a, &m.digest)));
+	book.fail("htlc/neg send: the collaborative path with the owner's signature twice", &both(&sig(&f.a, &m.digest), &sig(&f.a, &m.digest)), 0, BAD_SIG);
+	let other = mk(HtlcDirection::Send, "another htlc");
+	let mo = other.collab_message(f.x, LEAF, std::slice::from_ref(&to_a)).unwrap();
+	book.fail("htlc/neg send: a pair made for another htlc's salt", &both(&sig(&f.s, &mo.digest), &sig(&f.a, &mo.digest)), 0, BAD_SIG);
+
+	// Into the tree: the owner claims after its exit delay; the operator
+	// refunds after the timeout and its own delay.
+	let recv = mk(HtlcDirection::Receive, "htlc receive");
+	book.pass("htlc/receive: the owner claims with the preimage after its exit delay", &claim(&recv, &f.a, &preimage, ed, &to_a));
+	book.fail("htlc/neg receive: a claim at the operator's delay", &claim(&recv, &f.a, &preimage, od, &to_a), 0, LOCKTIME);
+	book.fail("htlc/neg receive: a claim signed by the operator", &claim(&recv, &f.s, &preimage, ed, &to_s), 0, BAD_SIG);
+	book.pass("htlc/receive: the operator refunds after the timeout and its delay", &refund(&recv, &f.s, lt, od, &to_s));
+	book.fail("htlc/neg receive: a refund before the timeout", &refund(&recv, &f.s, lt - 1, od, &to_s), 0, LOCKTIME);
+	book.fail("htlc/neg receive: a refund one unit before the operator's delay", &refund(&recv, &f.s, lt, od - 1, &to_s), 0, LOCKTIME);
+	book.fail("htlc/neg receive: a refund signed by the owner", &refund(&recv, &f.a, lt, od, &to_a), 0, BAD_SIG);
+
+	// An htlc-1 leaf has no exit: the exit script is not in its tree.
+	let mut s = tx(&send, 0, ed, paid(&to_a));
+	let sg = s.sign(&f.a, 0, &send.exit_script(), f.genesis);
+	let vtxo = LeafPolicy { htlc: None, ..send };
+	s.witness(0, vtxo.exit_witness(&sg));
+	book.fail("htlc/neg the owner's exit, as a vtxo-1 leaf of the same key and salt has it", &s, 0, "Witness program hash mismatch");
+	assert!(send.exit_tx(fake_outpoint("htlc"), f.x, LEAF, &[to_a.clone()], &FeeSource::Reserve).is_err());
 }
 
 #[test]

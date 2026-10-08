@@ -39,6 +39,7 @@ impl Party {
 			leaf: NewLeaf {
 				owner: xonly(&key), owner_nonce: label32(&format!("chain {} owner nonce", label)),
 				creator_nonce: label32(&format!("chain {} creator nonce", label)), exit_delay: delay,
+				htlc: None,
 			},
 			key,
 		}
@@ -76,6 +77,7 @@ pub fn batches(chain: Chain, x: AssetId, y: AssetId, s: Keypair, sched1: ClockSc
 			owner_nonce: label32(&format!("chain {} owner nonce {}", label, i)),
 			operator_nonce: label32(&format!("chain {} operator nonce {}", label, i)),
 			exit_delay: delay, unlock_hash: sha256(&preimages[i]),
+			htlc: None,
 		}).collect();
 		let tree = Tree::build(TreeParams { asset, chain, schedule: sched, burn: false, radix: 4, reserve, min_leaf: 1 }, &leaves).unwrap();
 		(tree, preimages)
@@ -115,7 +117,7 @@ pub struct Hops {
 
 /// Signs the plan's two messages for each input with the input owner's key
 /// and the operator's.
-fn sign_plan(plan: &TransferPlan, owners: &[&Keypair], s: &Keypair) -> Vec<(Pair, Pair)> {
+pub fn sign_plan(plan: &TransferPlan, owners: &[&Keypair], s: &Keypair) -> Vec<(Pair, Pair)> {
 	(0..plan.inputs.len()).map(|i| {
 		let cp = plan.checkpoint_message(i).unwrap().digest;
 		let re = plan.reassignment_message(i).unwrap().digest;
@@ -123,7 +125,7 @@ fn sign_plan(plan: &TransferPlan, owners: &[&Keypair], s: &Keypair) -> Vec<(Pair
 	}).collect()
 }
 
-fn record_for(plan: &TransferPlan, records: &[&CoinRecord], pairs: &[(Pair, Pair)], index: u8, leaf: NewLeaf) -> CoinRecord {
+pub fn record_for(plan: &TransferPlan, records: &[&CoinRecord], pairs: &[(Pair, Pair)], index: u8, leaf: NewLeaf) -> CoinRecord {
 	CoinRecord::Transfer(Box::new(Transfer {
 		inputs: records.iter().zip(pairs).zip(&plan.inputs).map(|((r, (cp, re)), (_, v))| TransferInput {
 			coin: (*r).clone(), checkpoint_value: *v, checkpoint: *cp, reassignment: *re,
