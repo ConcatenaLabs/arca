@@ -411,14 +411,30 @@ impl Wallet {
 				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
 				// A coin of it on its way home on the chain: its forfeits are
 				// not handed over again (the server would refuse them, the coin
-				// being on the chain) unless the operator releases the
+				// being on the chain). Once the operator releases the
 				// participation, which it does once it holds them whole or
-				// claims one.
+				// claims one, the wallet takes the published preimage.
 				"issued" if given.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "exiting")) => {
 					out.push(json!({"participation": pid, "state": "issued", "note": "a coin of it is on its way home on the chain: the \
-						wallet hands its forfeits over again only once the operator releases the participation"}));
+						wallet hands its forfeits over no more, and takes the new leaves once the operator releases the participation"}));
 				},
 				"issued" | "released" => {
+					// Released by the server once it held the forfeits the wallet
+					// handed over before: nothing is signed for it again.
+					if st["state"] == "released" {
+						match self.take_released(&pid, &st, &given) {
+							Ok(Some(v)) => {
+								out.push(v);
+								continue;
+							},
+							Ok(None) => {},
+							Err(e) => {
+								self.store.refused(&format!("participation {}", pid), &e.to_string())?;
+								out.push(json!({"participation": pid, "state": st["state"], "refused": e.to_string()}));
+								continue;
+							},
+						}
+					}
 					let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
 					match self.complete(&pid, &st, &given, &wanted) {
 						Ok(v) => out.push(v),
@@ -726,6 +742,61 @@ impl Wallet {
 			out["exit_needs_fee_coin"] = json!({"assets": needs_fee_coin, "note": FEE_COIN_NOTE});
 		}
 		Ok(out)
+	}
+
+	/// Participation `pid`, which the server answers `released` (status
+	/// `st`), when the wallet already signed and recorded the forfeit of every
+	/// coin it gave up (`given`) and the new leaves it validated before
+	/// signing them: the server released it on those forfeits, so the wallet
+	/// signs nothing for it again, and the checks it makes before signing,
+	/// dated now, are not made again (they guard a forfeit about to leave the
+	/// wallet, and these left it long ago). It takes the preimage from the
+	/// published tree of the round it recorded, and completes the new leaves
+	/// it validated then ([`Self::finish`], which checks the preimage opens
+	/// them). `None` when the wallet holds no such forfeits, or the server
+	/// publishes no preimage there: the participation is then completed as
+	/// one not yet released.
+	fn take_released(&mut self, pid: &str, st: &Value, given: &[String]) -> Result<Option<Value>, Error> {
+		let Some(news) = self.store.participation_news(pid)? else { return Ok(None) };
+		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+		let round = news["round"].as_str().unwrap_or("").to_string();
+		for l in given {
+			if !self.store.forfeits_of(l)?.iter().any(|f| f.participation == pid && f.round == round) {
+				return Ok(None);
+			}
+		}
+		if st["round"]["txid"].as_str() != Some(round.as_str()) {
+			return Err(Error::Refused(format!("the server says participation {} was released in round {}; the wallet signed its \
+				forfeits for round {}", pid, st["round"]["txid"], round)));
+		}
+		// The unlock hash the wallet's new leaves carry, as it validated them.
+		let mut unlock = None;
+		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
+			unlock = Some(record.unlock_hash);
+		}
+		let Some(unlock) = unlock else { return Ok(None) };
+		let mut preimage = None;
+		for o in st["outputs"].as_array().cloned().unwrap_or_default() {
+			let tree = self.server.post("tree", &json!({"txid": round, "vout": o["batch_vout"]}))?;
+			if tree["round_txid"].as_str() != Some(round.as_str()) {
+				return Err(Error::Refused("the server published the tree of another round".into()));
+			}
+			for l in tree["leaves"].as_array().cloned().unwrap_or_default() {
+				let Some(p) = l["preimage"].as_str().and_then(|p| unhex32(p).ok()) else { continue };
+				if sha256::Hash::hash(&p).to_byte_array() == unlock {
+					preimage = Some(p);
+				}
+			}
+			if preimage.is_some() {
+				break;
+			}
+		}
+		let Some(preimage) = preimage else { return Ok(None) };
+		let kept = self.finish(pid, preimage, "settled")?;
+		Ok(Some(json!({"participation": pid, "state": "released", "round": round, "new_leaves": kept,
+			"note": "released by the server on the forfeits the wallet handed over before: the preimage taken from the published tree, \
+				nothing signed again"})))
 	}
 
 	/// Completes participation `pid` with `preimage`: its new leaves, as the
