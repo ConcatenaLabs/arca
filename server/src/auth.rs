@@ -171,3 +171,31 @@ mod tests {
 		assert_ne!(issue_challenge(&key, 1_800_000_000, [2; 12]), c, "the random part makes each one its own");
 	}
 }
+
+/// The tag of a request to receive over Lightning.
+pub const LIGHTNING_RECEIVE_TAG: &[u8] = b"Arca/lightning-receive";
+
+/// What the key a wallet wants its received leaf under signs to ask for it
+/// (`lightning_receive`): `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ asset ‖ amount
+/// ‖ payment_hash ‖ owner ‖ owner_nonce ‖ exit_delay_units)`, amount eight
+/// bytes and the exit delay two, little-endian, `T =
+/// SHA256("Arca/lightning-receive")`. It proves the leaf's key is the
+/// requester's, so no one asks for a leaf under a key that is not theirs.
+#[allow(clippy::too_many_arguments)]
+pub fn lightning_receive_digest(chain: &Chain, operator: &XOnlyPublicKey, asset: &elements::AssetId, amount: u64, payment_hash: &[u8; 32],
+	owner: &XOnlyPublicKey, owner_nonce: &[u8; 32], exit_delay_units: u16) -> [u8; 32]
+{
+	let tag = sha256::Hash::hash(LIGHTNING_RECEIVE_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(&asset.into_inner().to_byte_array());
+	e.input(&amount.to_le_bytes());
+	e.input(payment_hash);
+	e.input(&owner.serialize());
+	e.input(owner_nonce);
+	e.input(&exit_delay_units.to_le_bytes());
+	sha256::Hash::from_engine(e).to_byte_array()
+}

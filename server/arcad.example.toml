@@ -237,6 +237,14 @@ owner_delay_units = 72
 send_timeout_seconds = 86400
 block_seconds = 60
 retry_seconds = 60
+# A payment into the tree: the invoice is good for invoice_expiry_seconds;
+# its final lock time is twice the leaf's exit delay and
+# receive_window_seconds, in blocks, and the leaf times out at half the time
+# the payment is held for, which leaves its owner the exit delay and the
+# window to claim it. The operator refunds the leaf operator_delay_units
+# after its timeout.
+receive_window_seconds = 21600
+invoice_expiry_seconds = 3600
 # The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
 # socket, and the Bitcoin ark it runs, which wallets join with Bark. Native
 # BTC never enters a Sequentia leaf: its payments go over this node and the

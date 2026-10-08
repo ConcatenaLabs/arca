@@ -15,6 +15,9 @@
 //! | `cosign_transfer` | POST | by the owners' signatures over the transfer itself |
 //! | `lightning_send` | POST | by the owners' signatures over the transfer that pays the invoice |
 //! | `lightning_send_status` | POST | no: the payment hash names it, and a preimage proves only a payment |
+//! | `lightning_receive` | POST | by the signature of the key the leaf is asked under; at the nonces' rate |
+//! | `lightning_receive_status` | POST | no: the payment hash names it |
+//! | `lightning_receive_claim` | POST | by the preimage, and the owners' signatures over the transfer of the leaf |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
@@ -105,6 +108,7 @@ pub struct App {
 	pub gateway: Arc<crate::lightning::Gateway>,
 	/// Payments out of the tree over Lightning.
 	pub sends: Arc<crate::lightning::send::Sends>,
+	pub receives: Arc<crate::lightning::receive::Receives>,
 }
 
 /// Asks the signer which keepers its record names and compares them with
@@ -400,6 +404,16 @@ impl From<crate::lightning::send::SendError> for Refusal {
 	}
 }
 
+impl From<crate::lightning::receive::ReceiveError> for Refusal {
+	fn from(e: crate::lightning::receive::ReceiveError) -> Refusal {
+		let code = e.code();
+		if code == "internal" {
+			log::error!("lightning_receive: {}", e);
+		}
+		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
 impl From<crate::lightning::LegRefusal> for Refusal {
 	fn from(e: crate::lightning::LegRefusal) -> Refusal {
 		Refusal::new(status_of(e.code()), e.code(), e.to_string())
@@ -627,6 +641,12 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				owner_delay_units: app.sends.config().owner_delay.units(),
 				timeout_seconds: app.sends.config().timeout_seconds,
 			},
+			receive: api::LightningReceiveInfo {
+				operator_delay_units: app.receives.config().operator_delay.units(),
+				window_seconds: app.receives.config().window_seconds,
+				invoice_expiry_seconds: app.receives.config().invoice_expiry_seconds,
+				block_seconds: app.receives.config().block_seconds,
+			},
 		},
 	})
 }
@@ -761,6 +781,56 @@ async fn lightning_send(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	let transfer = transfer_request(&req.inputs, &req.outputs)?;
 	let sent = app.sends.send(&crate::lightning::send::SendRequest { invoice: req.invoice, transfer }).await?;
 	Ok(Json(api::LightningSent { cosigned: cosigned_json(&app, &sent.cosigned).await?, payment: payment(&sent.payment) }))
+}
+
+fn received(r: &crate::store::ReceiveRow) -> api::LightningReceived {
+	serde_json::from_value(crate::lightning::receive::receive_json(r)).expect("the receive's JSON")
+}
+
+async fn lightning_receive(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::LightningReceived>, Refusal>
+{
+	let req: api::LightningReceive = parse(body, app.max_request)?;
+	// It has the node make an invoice and the store keep a row: rationed as
+	// an operator nonce is.
+	app.nonces.refusal("a payment into the tree", app.source(peer.ip(), &headers))?;
+	let asset = AssetId::from_str(&req.asset).map_err(|e| Refusal::malformed(format!("asset: {}", e)))?;
+	let amount: u64 = req.amount.parse().map_err(|_| Refusal::malformed("amount: a decimal number of atoms"))?;
+	let owner = XOnlyPublicKey::from_slice(&unhex(&req.owner).map_err(Refusal::malformed)?)
+		.map_err(|e| Refusal::malformed(format!("owner: {}", e)))?;
+	let exit_delay = RelativeTime::from_units(req.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?;
+	let owner_sig = Signature::from_slice(&unhex(&req.owner_sig).map_err(Refusal::malformed)?)
+		.map_err(|e| Refusal::malformed(format!("owner_sig: {}", e)))?;
+	let r = app.receives.receive(&crate::lightning::receive::ReceiveRequest {
+		asset, amount, owner, exit_delay, owner_sig,
+		payment_hash: unhex32(&req.payment_hash).map_err(Refusal::malformed)?,
+		owner_nonce: unhex32(&req.owner_nonce).map_err(Refusal::malformed)?,
+		description: req.description.unwrap_or_default(),
+	}).await?;
+	Ok(Json(received(&r)))
+}
+
+async fn lightning_receive_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningReceived>, Refusal>
+{
+	let req: api::LightningReceiveStatus = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	match app.receives.status(&hash).await? {
+		Some(r) => Ok(Json(received(&r))),
+		None => Err(Refusal::new(StatusCode::NOT_FOUND, "unknown_payment", format!("no payment into the tree is known for hash {}",
+			req.payment_hash))),
+	}
+}
+
+async fn lightning_receive_claim(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningClaimed>, Refusal>
+{
+	let req: api::LightningReceiveClaim = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	let preimage = unhex32(&req.preimage).map_err(Refusal::malformed)?;
+	let transfer = transfer_request(&req.inputs, &req.outputs)?;
+	let c = app.receives.claim(&hash, &preimage, &transfer).await?;
+	Ok(Json(api::LightningClaimed { cosigned: cosigned_json(&app, &c.cosigned).await?, receive: received(&c.receive) }))
 }
 
 async fn lightning_send_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
@@ -932,6 +1002,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			leaf_id: Some(r.0.to_string()),
 			script_pubkey: Some(hex(r.1.as_bytes())),
 			preimage: p.map(|p| hex(&p)),
+			htlc: l.htlc.as_ref().map(api::HtlcTermsJson::of),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
 		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
@@ -1216,7 +1287,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			returned: mine.returned,
 			inputs: p.inputs.iter().map(|i| hex(&i.leaf_id)).collect(),
 			outputs: p.outputs.iter().map(|o| match &o.kind {
-				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
+				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
 					value: o.value.to_string(),
 					template: template.clone(),
@@ -1224,6 +1295,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 					owner_nonce: hex(owner_nonce),
 					exit_delay_units: *exit_delay_units,
 					leaf_id: o.leaf_id.map(|i| hex(&i)),
+					htlc: htlc.as_ref().map(api::HtlcTermsJson::of),
 				}),
 				WantedKind::Offboard { script, .. } => api::ServedOutput::Offboard(api::WantedOffboard {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
@@ -1303,6 +1375,9 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/cosign_transfer", post(cosign_transfer))
 		.route("/v1/lightning_send", post(lightning_send))
 		.route("/v1/lightning_send_status", post(lightning_send_status))
+		.route("/v1/lightning_receive", post(lightning_receive))
+		.route("/v1/lightning_receive_status", post(lightning_receive_status))
+		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/tree", post(tree))

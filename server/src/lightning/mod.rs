@@ -17,7 +17,9 @@
 //! serve, in a served asset with no node, or in one whose node is down is
 //! refused at every entry with the reason ([`LegRefusal`]).
 
+pub mod bolt11;
 pub mod cln;
+pub mod receive;
 pub mod send;
 
 use std::collections::BTreeMap;
@@ -300,6 +302,12 @@ impl Gateway {
 			LegState::Down(reason) => Err(LegRefusal::Down { leg: leg.name(), reason }),
 			LegState::Unknown => Err(LegRefusal::Down { leg: leg.name(), reason: "it has not been checked yet".into() }),
 		}
+	}
+
+	/// The leg of `asset`, whatever its state: to resolve what its node
+	/// already holds.
+	pub fn any_leg(&self, asset: &AssetId) -> Option<Arc<Leg>> {
+		self.legs.read().unwrap_or_else(|e| e.into_inner()).get(asset).cloned()
 	}
 
 	/// The leg of `asset` for a receive: [`Gateway::leg`], and its node runs

@@ -127,6 +127,13 @@ pub struct LightningSection {
 	/// How long one payment attempt runs, in seconds.
 	#[serde(default = "default_retry_seconds")]
 	pub retry_seconds: u32,
+	/// The time a wallet has to claim a leaf received over Lightning, past
+	/// the leaf's exit delay, once its round is final.
+	#[serde(default = "default_receive_window")]
+	pub receive_window_seconds: u32,
+	/// How long an invoice to receive over Lightning is good for.
+	#[serde(default = "default_invoice_expiry")]
+	pub invoice_expiry_seconds: u32,
 }
 
 impl Default for LightningSection {
@@ -134,7 +141,8 @@ impl Default for LightningSection {
 		LightningSection {
 			poll_seconds: default_lightning_poll(), bitcoin: None, operator_delay_units: default_operator_delay(),
 			owner_delay_units: default_owner_delay(), send_timeout_seconds: default_send_timeout(), block_seconds: default_block_seconds(),
-			retry_seconds: default_retry_seconds(),
+			retry_seconds: default_retry_seconds(), receive_window_seconds: default_receive_window(),
+			invoice_expiry_seconds: default_invoice_expiry(),
 		}
 	}
 }
@@ -157,6 +165,14 @@ fn default_block_seconds() -> u32 {
 
 fn default_retry_seconds() -> u32 {
 	60
+}
+
+fn default_receive_window() -> u32 {
+	6 * 3600
+}
+
+fn default_invoice_expiry() -> u32 {
+	3600
 }
 
 fn default_lightning_poll() -> u64 {
@@ -831,6 +847,7 @@ pub struct Server {
 	pub watcher: Arc<Watcher>,
 	pub gateway: Arc<Gateway>,
 	pub sends: Arc<crate::lightning::send::Sends>,
+	pub receives: Arc<crate::lightning::receive::Receives>,
 	/// The configuration the server runs with, as last loaded.
 	config: std::sync::Mutex<Config>,
 	tasks: Vec<JoinHandle<()>>,
@@ -1058,9 +1075,17 @@ impl Server {
 				block_seconds: l.block_seconds.max(1),
 				retry_seconds: l.retry_seconds.max(5),
 			});
+		let receives = crate::lightning::receive::Receives::new(store.clone(), params.clone(), gateway.clone(), cosigner.clone(),
+			finality.clone(), crate::lightning::receive::ReceiveConfig {
+				operator_delay: RelativeTime::from_units(l.operator_delay_units).map_err(err("lightning.operator_delay_units"))?,
+				window_seconds: l.receive_window_seconds.max(60),
+				invoice_expiry_seconds: l.invoice_expiry_seconds.max(60),
+				block_seconds: l.block_seconds.max(1),
+			});
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
-		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn(), sends.spawn()];
+		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn(), sends.spawn(),
+			receives.spawn()];
 		if config.watcher.enabled {
 			tasks.push(watcher.spawn());
 		}
@@ -1108,6 +1133,7 @@ impl Server {
 			replaced,
 			gateway: gateway.clone(),
 			sends: sends.clone(),
+			receives: receives.clone(),
 		});
 		let mut metrics_addr = None;
 		if let Some(at) = &config.metrics_listen {
@@ -1136,7 +1162,7 @@ impl Server {
 		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
 			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
 		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher,
-			gateway, sends, config: std::sync::Mutex::new(config.clone()), tasks })
+			gateway, sends, receives, config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
 	/// Takes the assets `config` serves, each with its smallest leaf, its

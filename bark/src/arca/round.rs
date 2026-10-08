@@ -146,7 +146,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			operator_nonce: unhex32(l["operator_nonce"].as_str().unwrap_or(""))?,
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?,
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
-			htlc: None,
+			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;
@@ -908,7 +908,10 @@ impl Wallet {
 			// or past its expiry as well: as an exit checks a coin held.
 			let first = record.schedule.expiries()[0].to_consensus_u32();
 			let a = self.assess(&coin, &self.followed_policy(first, now), Some((&record.owner, &nonce)))?;
-			let row = self.row(&coin, &a, if a.all_final() { "live" } else { "pending" }, "")?;
+			// A leaf received over Lightning is held apart until its owner
+			// claims it with the payment's preimage (`lightning`).
+			let state = if record.htlc.is_some() { "receiving" } else if a.all_final() { "live" } else { "pending" };
+			let row = self.row(&coin, &a, state, "")?;
 			if self.store.coin(&row.leaf_id)?.is_none() {
 				let id = row.leaf_id.clone();
 				self.store.atomically(|s| {

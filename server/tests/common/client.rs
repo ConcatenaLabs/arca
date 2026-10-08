@@ -328,9 +328,22 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		operator_nonce: unhex(l["operator_nonce"].as_str().unwrap()).try_into().unwrap(),
 		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
-		htlc: None,
+		htlc: htlc_of(&l["htlc"]),
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
+}
+
+/// The `htlc-1` terms a published leaf carries, if any.
+pub fn htlc_of(v: &Value) -> Option<arca_covenant::HtlcTerms> {
+	if v.is_null() {
+		return None;
+	}
+	Some(arca_covenant::HtlcTerms {
+		direction: arca_covenant::HtlcDirection::from_name(v["direction"].as_str().unwrap()).unwrap(),
+		payment_hash: unhex(v["payment_hash"].as_str().unwrap()).try_into().unwrap(),
+		timeout: arca_covenant::MedianTime::from_consensus(v["timeout"].as_u64().unwrap() as u32).unwrap(),
+		operator_delay: RelativeTime::from_units(v["operator_delay_units"].as_u64().unwrap() as u16).unwrap(),
+	})
 }
 
 // ---------------------------------------------------------------------------

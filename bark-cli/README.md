@@ -456,7 +456,7 @@ refresh, and a schedule that changed since it was shown is not taken: the
 server refuses a fee short of the asset's schedule (`fee`), and the browser
 wallet submits only the fees it showed.
 
-### Paying over Lightning
+### Paying and receiving over Lightning
 
 `lightning pay INVOICE` pays a BOLT11 invoice out of the wallet's coins in the
 asset the invoice names, through the operator's Lightning node in that asset.
@@ -482,6 +482,25 @@ decide, `exit` takes it home by its refund path, once its timeout and its exit
 delay have passed. An invoice is paid once through the operator: a payment
 that failed is not tried again with the same invoice.
 
+`lightning receive ASSET AMOUNT` asks for an invoice for `AMOUNT` of `ASSET`
+paid into a leaf of the wallet's own, refused before anything is asked when
+the asset has no Lightning node at the operator that receives, the
+operator's fee (out of the amount) is above the wallet's bound
+(`--max-fee-ppm` raises it), or the leaf would be below the operator's
+smallest. The invoice is under a payment hash whose preimage the wallet
+derives from the leaf's key, so its mnemonic gives it back; the wallet
+checks the invoice is for that hash, asset and amount. Once the payment is
+held at the operator's node, `sync` takes up the operator's participation
+for the leaf as its own: once the leaf's round is final it validates the
+leaf from the published tree (an `htlc-1` leaf received under its hash, of
+the amount less the fee), hands over its unroll authorisations, and holds
+the leaf, `receiving`. Only then does it hand over the preimage, with the
+transfer of the leaf into a leaf of its own, and only while the leaf's
+timeout leaves it time to unroll the leaf and wait its exit delay should
+the operator not co-sign; `exit` takes a `receiving` leaf home by its claim
+with the preimage. The payment is settled when the preimage is handed over.
+A payment the operator failed back is `failed`, with the reason.
+
 ### Commands
 
 | Command | Does |
@@ -498,13 +517,17 @@ that failed is not tried again with the same invoice.
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
-| `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
+| `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
 | `lightning payments` | Every payment over Lightning the wallet made, by payment hash: the invoice, asset, amount, fee, the `htlc-1` leaf, its state and its preimage or reason |
+| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it |
+| `lightning receives` | Every payment the wallet asked to receive, by payment hash: the invoice, asset, amount, fee, the leaf's value and participation, and its state (`waiting`, `issuing`, `claiming`, `received` or `failed` with the reason); never the preimage |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
 | `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, follows
 every payment over Lightning the operator has not decided (a paid one closed
-with its preimage, a failed one's leaf taken back), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
+with its preimage, a failed one's leaf taken back), moves every payment it
+asked to receive on (the operator's participation for its leaf taken up,
+the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A]` | Takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
@@ -517,8 +540,9 @@ A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 (held for a swap), `sending` (in a transfer the server has not answered),
 `given` (in a participation, no forfeit signed), `forfeited` (a forfeit of it
 signed, the preimage not in hand), `paying` (the `htlc-1` leaf of a payment
-over Lightning the operator has not decided), `spent`, `exiting`, `exited` and
-`lost`.
+over Lightning the operator has not decided), `receiving` (the `htlc-1` leaf
+of a payment received over Lightning, not yet claimed), `spent`, `exiting`,
+`exited` and `lost`.
 `coins` and `balance` show a live coin that rests on a reassignment, one
 received out of round and not yet refreshed into a round, as
 `operator-confirmed`: it relies on the operator and its sender not colluding,
@@ -624,7 +648,12 @@ the transfer's margins less, while the operator's channel paid the amount and
 the payee's gained it. Asked to pay Y's invoice from X, the wallet refuses
 before anything is signed and nothing moves; an invoice paid already is
 refused; and a payment to an invoice the payee dropped fails, its leaf back
-in the wallet less only the margins.
+in the wallet less only the margins. A second scenario has a wallet receive
+in X and in Y: its invoice paid by the payer's node and held, the leaf made
+by the asset's next round and claimed by `sync` with the preimage, the
+payment settled at the payer's node only then; in each asset the wallet
+holds the amount less the fee and the claim's margins, and a fee above the
+wallet's bound is refused before anything is asked.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test

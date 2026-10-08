@@ -338,6 +338,73 @@ asset's Lightning fees (`assets[].fees.lightning_ppm`, `lightning_base`) and
 the terms of the leaf (`lightning.send`: `operator_delay_units`,
 `owner_delay_units`, `timeout_seconds`).
 
+### Receiving into the tree
+
+A wallet asks to receive `amount` of asset A (`lightning_receive`) under a
+payment hash it chose, whose preimage only it knows, into an `htlc-1` leaf
+of a key of its own, its exit delay longer than the operator's delay; it
+signs the request with that key. The operator refuses a request not signed
+by the key (`bad_signature`), in an asset it does not serve (`out_of_bounds`)
+or serves with no node or with a node that runs no hold-invoice plugin
+(`no_lightning`), under a key that owns a leaf or is asked for already
+(`key_reused`), under a hash asked for, paid or used as an unlock hash
+(`in_use`), or whose leaf, the operator's fee out (`lightning_ppm` and
+`lightning_base`, as a payment), is below the smallest leaf
+(`out_of_bounds`). A node makes invoices only for preimages it holds, so the
+operator has the asset's node make one for the payment under a preimage of
+its own (the amount, the asset in SeqLN's `a` field, the description, the
+expiry `invoice_expiry_seconds`, the payment secret, route hints and
+features, as the node makes any invoice), deletes it unpaid, swaps the
+wallet's hash into it, and has the node sign the result (`signinvoice`). It
+registers the hash with the node's hold-invoice plugin and answers the
+invoice. The invoice's final lock time is twice the leaf's exit delay and
+`receive_window_seconds`, in blocks at `block_seconds`.
+
+The hold plugin holds the payment when it arrives instead of settling it.
+Once the parts held, in A, add up to the amount and are locked for that
+long, the operator wants the leaf in A's next round: a participation that
+gives up no coin and wants one output, the `htlc-1` leaf of the amount less
+the fee (direction `receive`: its owner claims it with the preimage once its
+exit delay has run; the operator refunds it once its timeout has passed and
+then `operator_delay_units`), funded by the operator's pool against the
+payment its node holds. The leaf's timeout is half the time the held parts
+are locked for, at the published block interval, so the payment outlives
+any claim the owner can make: its exit delay and the window lie before the
+timeout. A payment locked for less is failed back. The wallet completes the
+participation as any other (`forfeit_leaves` with no forfeit and its unroll
+authorisations for the leaf) and receives the leaf's record and its
+entry's preimage.
+
+Only then does the wallet hand over the payment's preimage
+(`lightning_receive_claim`), with a transfer of the leaf into a leaf of its
+own. The operator checks the preimage opens the hash (`htlc`), that the leaf
+is the owner's (its participation released) and that the time to claim is
+not over, records the preimage, has its node settle the payment with it,
+and co-signs the transfer; no spend of a received leaf is co-signed
+otherwise (`htlc`). The payment is never settled before the wallet holds its
+leaf. A wallet that takes the leaf home on the chain claims it there with
+the preimage; the server watches each output of a received leaf seen on the
+chain, reads the preimage from its claim (looking for a spend made before
+the output was watched on the chain itself) and settles the payment the same
+way. A payment is failed back when its invoice expires unpaid or part paid,
+when its leaf never comes (the participation void, expired, or not built
+while its owner would still have its exit delay and half the window), and
+once its timeout and the operator's delay have passed by an hour with no
+preimage; the watcher refunds a leaf of such a payment that reaches the
+chain (`htlc_refund`). `lightning_receive_status` answers a payment by its
+hash: `open`, `accepted` (with its participation and the leaf's timeout),
+`claimed` (and whether the node has settled it) or `cancelled` with the
+reason. `info` publishes the terms (`lightning.receive`:
+`operator_delay_units`, `window_seconds`, `invoice_expiry_seconds`,
+`block_seconds`).
+
+A leaf's timeout is computed at the block interval the operator publishes:
+a chain running twice as fast would let a claim on the chain come after the
+payment's lock time. A payment held and never claimed keeps its leaf's value
+in the operator's batch until the batch expires, or until the operator
+takes the leaf on-chain and refunds it, while the payer's money is
+returned.
+
 ## Boards
 
 An owner brings its own coins in with a board (`board-1`). It asks the server
@@ -945,9 +1012,12 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins, with the signed head of the signer's record its last signature was recorded at (`signer_record`). An output that pays a receive request names when the request lapses (`until`, a median time, as the request carries it): once the chain's median time has reached it, the server records no transfer paying it and answers `request_lapsed` (422), naming that time, since its receiver no longer waits for the payment; a transfer recorded before it completes when it is asked again. An output without `until` is taken as before |
 | `POST lightning_send` | Pays a BOLT11 invoice out of the tree (see Paying an invoice out of the tree): co-signs the transfer into the payment's `htlc-1` leaf and the change, as `cosign_transfer` answers it (`cosigned`), and answers the payment (`payment`: its hash, asset, amount, fee, `htlc_leaf_id` and state) |
 | `POST lightning_send_status` | A payment out of the tree by its payment hash: `paying`, `paid` with its preimage, or `failed` with the reason |
+| `POST lightning_receive` | An invoice paid into the tree under the wallet's own payment hash (see Receiving into the tree), and the payment (`open`) |
+| `POST lightning_receive_status` | A payment into the tree by its payment hash: `open`, `accepted` with its participation and the leaf's timeout, `claimed` and whether the node has settled it, or `cancelled` with the reason |
+| `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), and once void or expired whether each coin it gave up is its owner's again off the chain (`returned`) |
-| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script, each leaf's preimage once its participation's went out, and the round's state |
+| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
@@ -973,8 +1043,11 @@ its own across a restart), taken within its lifetime
 it repeats only the very read it was signed for, so whoever sees one (a
 proxy, a log) learns nothing more than that read. There is no bearer token. `cosign_transfer` is
 authenticated by the owners' signatures over the transfer itself, and so is
-`lightning_send`; `lightning_send_status` needs only the payment hash, and a
-preimage proves only a payment;
+`lightning_send`; `lightning_send_status` and `lightning_receive_status` need
+only the payment hash, and a preimage proves only a payment;
+`lightning_receive` by the signature of the key the leaf is asked under,
+issued at the operator nonces' rate; `lightning_receive_claim` by the
+preimage and the owners' signatures over the transfer;
 `submit_participation` by each owner's attestation over the participation;
 `participation_status` needs only the participation's id, which is a hash
 of its request, and `tree` and `rounds` are public. `bind_mailbox` is authenticated by
@@ -1631,6 +1704,21 @@ while a paid request repeated then is answered as before. A payment to an
 invoice its payee dropped fails, and its leaf goes back whole into a new leaf.
 The paid leaf in Y, taken on-chain by its owner, is claimed by the watcher
 with the preimage once the operator's delay has run, and not before.
+`tests/lightning_receive.rs` receives in X and in Y: each invoice, read by
+the payer's node, is valid, under the wallet's hash and in its asset; each
+payment is held, its leaf made by the asset's next round, validated by its
+owner from the published tree and completed with no forfeit; the payment is
+settled at the payer's node only once the owner hands over the preimage with
+its claim, and the books hold to the atom. Refused, nothing made: a request
+signed by another key, an exit delay not past the operator's delay, an
+amount whose leaf is below the smallest, an asset not served, another
+request under a hash or a key asked for, a claim before the leaf is the
+owner's, with another preimage, the leaf spent by a plain transfer, and a
+request in Y with Y served by no node. A leaf taken on-chain and never
+claimed is refunded by the watcher once its timeout has passed, not before,
+and its payment failed back to the payer, a late claim refused; a leaf
+claimed on the chain by its owner settles its payment from the preimage the
+claim reveals.
 
 `tests/e2e.rs` runs the server as an operator runs it: `arca-signer` in its own
 process holding the operator key, `Server::start` with its tasks and its HTTP

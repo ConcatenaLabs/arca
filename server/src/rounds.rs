@@ -707,7 +707,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc } => Ok(LeafSpec {
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -715,7 +715,7 @@ impl Rounds {
 				operator_nonce: *operator_nonce,
 				exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: row.unlock_hash,
-				htlc: None,
+				htlc: *htlc,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -1580,7 +1580,8 @@ impl Rounds {
 				operator_nonce: l.operator_nonce,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: l.unlock_hash,
-				htlc: None,
+				// An htlc-1 leaf's terms, from the record the builder gave it.
+				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

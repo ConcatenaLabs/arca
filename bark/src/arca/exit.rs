@@ -177,11 +177,21 @@ impl Wallet {
 	/// A spend ending in the owner's key: built with the fee as `with_fee`
 	/// chooses, signed by `key`.
 	pub(crate) fn key_spend(&self, payer: &mut Payer, key: &Keypair, build: &dyn Fn(&FeeSource) -> Result<KeySpend, Error>) -> Result<UnrollTx, Error> {
+		self.key_spend_with(payer, key, &[], build)
+	}
+
+	/// [`Self::key_spend`], its witness taking `after` past the signature: an
+	/// `htlc-1` claim's preimage.
+	pub(crate) fn key_spend_with(&self, payer: &mut Payer, key: &Keypair, after: &[Vec<u8>],
+		build: &dyn Fn(&FeeSource) -> Result<KeySpend, Error>) -> Result<UnrollTx, Error>
+	{
 		let genesis = self.genesis.genesis_hash();
 		self.with_fee(payer, &|f| {
 			let ks = build(f)?;
 			let sighash = ks.sighash(genesis).map_err(|e| Error::Refused(e.to_string()))?;
-			Ok(ks.finish(vec![sign(key, &sighash).as_ref().to_vec()]))
+			let mut below = vec![sign(key, &sighash).as_ref().to_vec()];
+			below.extend(after.iter().cloned());
+			Ok(ks.finish(below))
 		})
 	}
 
@@ -294,7 +304,7 @@ impl Wallet {
 		// A coin handed over to a participation or a transfer is the wallet's
 		// until the chain shows otherwise: one taken by a round or a
 		// co-signed spend is `spent`, and is not exited.
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying") {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		let record = Self::record_of(&row)?;
@@ -397,7 +407,13 @@ impl Wallet {
 		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
 		let (asset, value) = (coin.asset, coin.value);
 		let leaf = coin.leaf;
-		let claim = self.key_spend(&mut payer, &key, &|f| {
+		// A leaf received over Lightning comes home by its owner's claim, with
+		// the payment's preimage (which the operator then reads there).
+		let after = match leaf.htlc {
+			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.receive_preimage(&row.owner_nonce)?.to_vec()],
+			_ => vec![],
+		};
+		let claim = self.key_spend_with(&mut payer, &key, &after, &|f| {
 			// The leaf's own value pays the claim's fee unless a fee coin
 			// does; the wallet never splits its own claim.
 			let out = match f {
@@ -414,6 +430,7 @@ impl Wallet {
 				// An htlc-1 leaf of a payment out of the tree comes home by its
 				// refund: after its timeout, and its exit delay on the chain.
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
+				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
 				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
 			}.map_err(|e| Error::Refused(e.to_string()))
 		});
@@ -710,8 +727,16 @@ impl Wallet {
 		let transfers = if talk { self.retry_transfers()? } else { vec![] };
 		// Payments over Lightning the operator has not decided: a paid one
 		// closed with its preimage, a failed one taken back.
-		let lightning = if talk { self.progress_lightning().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+		let mut lightning = if talk { self.progress_lightning().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		// Payments received over Lightning: a held one's participation taken
+		// up as the wallet's own, a leaf the wallet holds claimed.
+		if talk {
+			match self.progress_receives() {
+				Ok(v) => if let Some(a) = lightning.as_array_mut() { a.extend(v) },
+				Err(e) => lightning = json!({"error": e.to_string()}),
+			}
+		}
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
@@ -719,6 +744,13 @@ impl Wallet {
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
+		// A leaf received over Lightning that those participations brought
+		// in is claimed at once.
+		if talk {
+			if let (Ok(v), Some(a)) = (self.progress_receives(), lightning.as_array_mut()) {
+				a.extend(v.into_iter().filter(|s| s["state"] == "received" || s["state"] == "failed"));
+			}
+		}
 		// D57: the refresh of every live coin in its refresh window, asked for
 		// by the wallet itself.
 		let refresh = if talk && info_failed.is_none() {

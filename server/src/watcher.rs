@@ -310,6 +310,7 @@ impl Watcher {
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
 		self.claim_paid_htlcs().await?;
+		self.refund_unclaimed_receives(now).await?;
 		self.claim_forfeits().await?;
 		self.recover_boards(now).await?;
 		self.recover_board_transfers(now).await?;
@@ -691,6 +692,59 @@ impl Watcher {
 		for s in self.store.sends_paid().await? {
 			let r = self.claim_htlc(&s).await;
 			Self::item(&format!("the htlc-1 coin {} of a paid payment", hex(&s.htlc_leaf_id)), r)?;
+		}
+		Ok(())
+	}
+
+	/// Refunds each received `htlc-1` leaf on the chain whose owner never
+	/// handed over or revealed the preimage: once its timeout has passed and
+	/// the operator's delay has run since the leaf confirmed. The payment it
+	/// was issued against is failed back, or is to be.
+	async fn refund_unclaimed_receives(&self, now: MedianTime) -> Result<(), WatcherError> {
+		let mut rows = self.store.receives_in(crate::store::ReceiveState::Accepted).await?;
+		rows.extend(self.store.receives_in(crate::store::ReceiveState::Cancelled).await?);
+		for r in rows {
+			let Some(id) = r.participation_id else { continue };
+			let Some(leaf) = self.store.participation(&id).await?.and_then(|p| p.outputs.first().and_then(|o| o.leaf_id)) else { continue };
+			let ready = self.store.leaf(&leaf).await?.is_some_and(|l| !l.record.is_empty());
+			if !ready {
+				continue;
+			}
+			let res = self.refund_receive(&leaf, now).await;
+			Self::item(&format!("the received htlc-1 coin {}", hex(&leaf)), res)?;
+		}
+		Ok(())
+	}
+
+	async fn refund_receive(&self, leaf_id: &[u8; 32], now: MedianTime) -> Result<(), WatcherError> {
+		let coin = self.coin(leaf_id).await?;
+		let Some(terms) = coin.leaf.htlc else { return Ok(()) };
+		if terms.direction != arca_covenant::HtlcDirection::Receive || now <= terms.timeout {
+			return Ok(());
+		}
+		let spk = coin.leaf.script_pubkey();
+		for (txid, vout) in self.store.sightings_of(spk.as_bytes()).await? {
+			let op = OutPoint::new(txid_of(&txid), vout);
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
+				continue;
+			}
+			if !self.waited(op.txid, terms.refund_delay(coin.leaf.exit_delay)).await? {
+				continue;
+			}
+			let (leaf, asset, value) = (coin.leaf, coin.asset, coin.value);
+			let pay = self.payout(asset, value, &[], |outs, fee| {
+				let ks = leaf.refund_tx(op, asset, value, outs, fee).map_err(|e| e.to_string())?;
+				let t = ks.clone().finish(vec![dummy_sig().as_ref().to_vec()]).tx;
+				Ok((ks, t))
+			}).await?;
+			let ks = pay.made;
+			let sig = self.operator_sig(&ks.tx, &ks.prevouts, 0, &ks.script).await?;
+			let n = ks.tx.input.len();
+			let u = ks.finish(vec![sig.as_ref().to_vec()]);
+			let wallet = pay.fee_coin.map(|c| (n - 1, c)).into_iter().collect();
+			self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "htlc_refund", leaf_id.to_vec(),
+				format!("the htlc-1 coin {} received under hash {}, never claimed, refunded at {}", hex(leaf_id),
+					hex(&terms.payment_hash), op)).await?;
 		}
 		Ok(())
 	}

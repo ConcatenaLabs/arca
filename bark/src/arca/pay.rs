@@ -15,7 +15,7 @@ use arca_covenant::{CoinRecord, ExplicitOutput, NewLeaf, Pair, RelativeTime, Tra
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::CoinRow;
-use super::wallet::{amount, kind_of, owner_of, sign, Assessed, CoinDates, Wallet};
+use super::wallet::{amount, htlc_of, kind_of, owner_of, sign, Assessed, CoinDates, Wallet};
 use super::{random32, Error};
 
 /// How many times the floor a pre-signed transaction's margin holds: the
@@ -513,10 +513,16 @@ impl Wallet {
 	/// [`Self::transfer`] paying `invoice` over Lightning: its outputs make
 	/// the `htlc-1` leaf of the payment, and it goes to `lightning_send`.
 	pub(crate) fn transfer_paying(&mut self, inputs: &[In], outs: &[Out], invoice: &str) -> Result<Value, Error> {
-		self.transfer_with(inputs, outs, &[], Some(invoice))
+		self.transfer_with(inputs, outs, &[], Some(json!({"invoice": invoice})))
 	}
 
-	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)], invoice: Option<&str>)
+	/// [`Self::transfer`] claiming a leaf received over Lightning: the
+	/// payment's preimage goes with it, to `lightning_receive_claim`.
+	pub(crate) fn transfer_claiming(&mut self, inputs: &[In], outs: &[Out], hash: &str, preimage: &[u8; 32]) -> Result<Value, Error> {
+		self.transfer_with(inputs, outs, &[], Some(json!({"payment_hash": hash, "preimage": hex(preimage)})))
+	}
+
+	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)], extra: Option<Value>)
 		-> Result<Value, Error>
 	{
 		// Nothing is signed for the operator without a witness of its
@@ -543,8 +549,8 @@ impl Wallet {
 				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
 		}
 		let mut body = json!({"inputs": ins, "outputs": outs.iter().map(|o| { let mut j = o.json(); j["mailbox"] = json!(hex(&o.mailbox.serialize())); j }).collect::<Vec<_>>()});
-		if let Some(inv) = invoice {
-			body["invoice"] = json!(inv);
+		for (k, v) in extra.as_ref().and_then(|e| e.as_object()).into_iter().flatten() {
+			body[k] = v.clone();
 		}
 		let id = self.store.atomically(|s| {
 			let id = s.put_transfer(&body.to_string(), &serde_json::to_string(&mine).expect("strings"))?;
@@ -565,17 +571,26 @@ impl Wallet {
 	/// the first time.
 	fn post_transfer(&mut self, id: i64, body: &Value, mine: &[String]) -> Result<Value, Error> {
 		// A payment over Lightning goes to lightning_send, which answers the
-		// co-signed transfer and the payment.
+		// co-signed transfer and the payment; the claim of a leaf received
+		// over Lightning to lightning_receive_claim, which answers the
+		// co-signed transfer and the payment received.
 		let paying = body.get("invoice").is_some();
-		let answered = self.server.post(if paying { "lightning_send" } else { "cosign_transfer" }, body);
-		let payment = answered.as_ref().ok().map(|a| a["payment"].clone());
-		let answered = answered.map(|a| if paying { a["cosigned"].clone() } else { a });
+		let claiming = body.get("preimage").is_some();
+		let call = if paying { "lightning_send" } else if claiming { "lightning_receive_claim" } else { "cosign_transfer" };
+		let answered = self.server.post(call, body);
+		let payment = answered.as_ref().ok().map(|a| if paying { a["payment"].clone() } else { a["receive"].clone() });
+		let answered = answered.map(|a| if paying || claiming { a["cosigned"].clone() } else { a });
 		let out = self.take_transfer_answer(id, answered, mine)?;
 		Ok(match payment {
 			Some(p) if paying => {
 				self.payment_answered(&p)?;
 				let mut o = out;
 				o["payment"] = p;
+				o
+			},
+			Some(p) if claiming => {
+				let mut o = out;
+				o["receive"] = p;
 				o
 			},
 			_ => out,
@@ -641,7 +656,15 @@ impl Wallet {
 						if Some(l) == forfeited.as_ref() {
 							s.set_coin_state(l, "forfeited", &held_note)?;
 						} else {
-							s.set_coin_state(l, "live", "")?;
+							// An htlc-1 coin goes back to where it stood: the
+							// leaf of a payment out of the tree to `paying`,
+							// one received to `receiving`.
+							let back = match s.coin(l)?.and_then(|c| Self::record_of(&c).ok()).and_then(|r| htlc_of(&r)) {
+								Some(arca_covenant::HtlcDirection::Send) => "paying",
+								Some(arca_covenant::HtlcDirection::Receive) => "receiving",
+								None => "live",
+							};
+							s.set_coin_state(l, back, "")?;
 						}
 					}
 					s.set_transfer(id, "refused", &e.to_string())?;
