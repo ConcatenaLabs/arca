@@ -1,11 +1,19 @@
 //! The round: what turns pending participations into batches on-chain.
 //!
-//! At each round the runner gathers the pending participations whose
-//! earliest round time has come, checks their coins again, takes those the
-//! operator's wallet can fund in each asset (what the round pays for them,
-//! batch outputs with their reserves and offboard outputs, then its own fee
-//! and connector; one that does not fit waits, saying why, and delays no
-//! other), and builds one tree per asset with `arca-covenant`'s builder ([`Tree::build`]): balanced
+//! A round carries one asset. Each asset the operator serves has rounds of
+//! its own and a pool of its own, the operator's wallet's coins of that
+//! asset, which fund its batches; a participation carries one asset too
+//! (every coin it gives up, every output it wants and every fee it pays),
+//! so the round builder never mixes assets, and one asset's round that
+//! cannot be built (its pool short, the node refusing it) holds back no
+//! other's. At each round interval the runner builds a round for every asset
+//! whose participations wait ([`Rounds::run_rounds`]): it gathers that
+//! asset's pending participations whose earliest round time has come,
+//! checks their coins again, takes those the operator's wallet can fund
+//! (what the round pays for them, the batch output with its reserves and
+//! offboard outputs, then its own fee and connector; one that does not fit
+//! waits, saying why, and delays no other), and builds the asset's tree
+//! with `arca-covenant`'s builder ([`Tree::build`]): balanced
 //! at radix 4, every node gated, RECLAIM on the lowest nodes, each leaf
 //! behind its participation's hash-locked entry, the reserve at four times the
 //! node's floor in the batch asset (one atom where the node does not accept
@@ -25,9 +33,11 @@
 //! broadcasts it again unchanged after a rollback and it returns with its
 //! txid, every forfeit signed for it still good.
 //!
-//! The fee is paid in one asset: the first of the round's own batch assets,
-//! in the operator's order of preference, that the node accepts for fees now,
-//! else the first asset of that list it accepts. Never another.
+//! The fee is paid in one asset: the round's own, when the node accepts it
+//! for fees now and it is among the operator's fee assets, else the first of
+//! those the node accepts. Never another. A round in an asset the node does
+//! not accept for fees therefore draws its fee, and its connector, from the
+//! pool of the first fee asset the node accepts.
 //!
 //! Before anything is recorded the runner checks its own work as a wallet
 //! would: every leaf's record validates against the transaction under the
@@ -362,30 +372,110 @@ impl Rounds {
 		Ok(true)
 	}
 
-	/// Builds the next round from the pending participations, if any: see
-	/// the [module documentation](self). Returns `None` when nothing waits.
-	pub async fn run_round(&self) -> Result<Option<Built>, RoundError> {
-		let _one = self.running.lock().await;
-		let now = self.now().await?;
+	/// The one asset `row` carries: that of every coin it gives up, every
+	/// output it wants and every fee it pays. `None` for a participation that
+	/// carries several, which only a server from before a round carried one
+	/// asset took.
+	pub fn asset_of(row: &ParticipationRow) -> Option<AssetId> {
+		let mut all = row.inputs.iter().map(|i| i.asset).chain(row.outputs.iter().map(|o| o.asset)).chain(row.fees.iter().map(|f| f.0));
+		let first = all.next()?;
+		all.all(|a| a == first).then(|| AssetId::from_byte_array(first))
+	}
 
-		// The participations, whole, within the batch size.
-		let mut chosen: Vec<ParticipationRow> = vec![];
-		let mut counts: BTreeMap<AssetId, usize> = BTreeMap::new();
+	/// The assets with a pending participation, in the order the operator
+	/// serves them. A pending participation that carries several assets
+	/// (taken by a server from before a round carried one asset) can never
+	/// run and is voided, its coins given back; one in an asset the operator
+	/// no longer serves waits, saying why.
+	async fn assets_waiting(&self) -> Result<Vec<AssetId>, RoundError> {
+		let served = self.params.assets.ids();
+		let mut waiting: BTreeSet<AssetId> = BTreeSet::new();
 		for id in self.store.participations_in(ParticipationState::Pending).await? {
 			let row = match self.store.participation(&id).await? {
 				Some(r) => r,
 				None => continue,
 			};
+			match Self::asset_of(&row) {
+				Some(a) if served.contains(&a) => {
+					waiting.insert(a);
+				},
+				Some(a) => {
+					let why = format!("asset {} is not served by this operator now; it runs once it is", a);
+					if row.waiting.as_deref() != Some(why.as_str()) {
+						log::warn!("participation {} waits: {}", crate::signer::hex(&row.id), why);
+						self.store.set_waiting(&row.id, Some(&why)).await?;
+					}
+				},
+				None => {
+					let why = "it carries several assets, and a round carries one: its coins are given back, to be refreshed one asset \
+						at a time";
+					let voided = self.store.void_participation(&row.id, why).await?;
+					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&row.id), why, voided);
+				},
+			}
+		}
+		Ok(served.into_iter().filter(|a| waiting.contains(a)).collect())
+	}
+
+	/// Builds a round for each asset whose participations wait, each its
+	/// own: see the [module documentation](self). One asset's round that
+	/// cannot be built (its pool short, no fee asset accepted, the node
+	/// refusing it) holds back no other's; its error is logged and returned
+	/// beside the rounds built.
+	pub async fn run_rounds(&self) -> Result<(Vec<Built>, Vec<(AssetId, RoundError)>), RoundError> {
+		let mut built = vec![];
+		let mut failed = vec![];
+		for asset in self.assets_waiting().await? {
+			match self.run_round_of(asset).await {
+				Ok(Some(b)) => built.push(b),
+				Ok(None) => {},
+				Err(e) => {
+					log::warn!("rounds: the round of asset {}: {}", asset, e);
+					failed.push((asset, e));
+				},
+			}
+		}
+		Ok((built, failed))
+	}
+
+	/// Builds the next round: that of the first asset, in the order the
+	/// operator serves them, whose participations wait and can run. Returns
+	/// `None` when nothing waits.
+	pub async fn run_round(&self) -> Result<Option<Built>, RoundError> {
+		for asset in self.assets_waiting().await? {
+			if let Some(b) = self.run_round_of(asset).await? {
+				return Ok(Some(b));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Builds the next round of `asset` from its pending participations, if
+	/// any: see the [module documentation](self). The round carries `asset`
+	/// alone. Returns `None` when nothing of it waits.
+	pub async fn run_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		let _one = self.running.lock().await;
+		let now = self.now().await?;
+		if !self.params.assets.contains(&asset) {
+			return Ok(None);
+		}
+
+		// The participations of the asset, whole, within the batch size.
+		let mut chosen: Vec<ParticipationRow> = vec![];
+		let mut count = 0usize;
+		for id in self.store.participations_in(ParticipationState::Pending).await? {
+			let row = match self.store.participation(&id).await? {
+				Some(r) => r,
+				None => continue,
+			};
+			if Self::asset_of(&row) != Some(asset) {
+				continue;
+			}
 			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {
 				continue;
 			}
-			let mut adds: BTreeMap<AssetId, usize> = BTreeMap::new();
-			for o in &row.outputs {
-				if matches!(o.kind, WantedKind::Leaf { .. }) {
-					*adds.entry(AssetId::from_byte_array(o.asset)).or_default() += 1;
-				}
-			}
-			if adds.iter().any(|(a, n)| counts.get(a).copied().unwrap_or(0) + n > self.config.max_batch_leaves) {
+			let adds = row.outputs.iter().filter(|o| matches!(o.kind, WantedKind::Leaf { .. })).count();
+			if count + adds > self.config.max_batch_leaves {
 				continue;
 			}
 			if !self.still_good(&row, now).await? {
@@ -406,9 +496,7 @@ impl Rounds {
 				log::warn!("participation {} cannot run: a key it wants owns a leaf (voided: {})", crate::signer::hex(&row.id), voided);
 				continue;
 			}
-			for (a, n) in adds {
-				*counts.entry(a).or_default() += n;
-			}
+			count += adds;
 			chosen.push(row);
 		}
 		// What the wallet can fund: a participation whose outputs do not fit
@@ -424,14 +512,13 @@ impl Rounds {
 			match self.build_from(&chosen, now, &ties).await {
 				// Short of an asset once the round's own fee and connector are
 				// counted: the last participation wanting that asset waits.
-				Err(RoundError::Wallet(WalletError::Insufficient { asset, need, have })) => {
-					let a = asset.into_inner().to_byte_array();
-					let i = match chosen.iter().rposition(|r| r.outputs.iter().any(|o| o.asset == a)) {
-						Some(i) => i,
-						None => return Err(RoundError::Wallet(WalletError::Insufficient { asset, need, have })),
-					};
+				// The fee asset may be another than the round's: then every
+				// participation of the round waits on it, the last first.
+				Err(RoundError::Wallet(WalletError::Insufficient { asset: short, need, have })) => {
+					let a = short.into_inner().to_byte_array();
+					let i = chosen.iter().rposition(|r| r.outputs.iter().any(|o| o.asset == a)).unwrap_or(chosen.len() - 1);
 					let row = chosen.remove(i);
-					self.wait(&row, asset, need, have).await?;
+					self.wait(&row, short, need, have).await?;
 				},
 				other => return other,
 			}
@@ -660,20 +747,23 @@ impl Rounds {
 			}
 		}
 
-		// The fee asset: the round's own first, in the operator's order.
+		// The fee asset: the round's own, when the node accepts it and it is
+		// one of the operator's fee assets, else the first of those the node
+		// accepts.
+		let fee_assets = p.fee_assets();
 		let mut floors: BTreeMap<AssetId, Option<u64>> = BTreeMap::new();
 		let round_assets: Vec<AssetId> = groups.keys().copied().chain(offboards.iter().map(|o| o.policy.destination.asset)).collect();
-		for a in round_assets.iter().chain(p.fee_assets.iter()) {
+		for a in round_assets.iter().chain(fee_assets.iter()) {
 			if !floors.contains_key(a) {
 				let f = self.floor(*a).await?;
 				floors.insert(*a, f);
 			}
 		}
 		let accepted = |a: &AssetId| floors.get(a).copied().flatten().is_some();
-		let fee_asset = p.fee_assets.iter().find(|a| round_assets.contains(a) && accepted(a))
-			.or_else(|| p.fee_assets.iter().find(|a| accepted(a)))
+		let fee_asset = fee_assets.iter().find(|a| round_assets.contains(a) && accepted(a))
+			.or_else(|| fee_assets.iter().find(|a| accepted(a)))
 			.copied()
-			.ok_or_else(|| RoundError::NoFeeAsset(format!("{} batch asset(s), fee assets {:?}", groups.len(), p.fee_assets)))?;
+			.ok_or_else(|| RoundError::NoFeeAsset(format!("asset(s) {:?}, fee assets {:?}", round_assets, fee_assets)))?;
 		let fee_floor = floors[&fee_asset].expect("accepted");
 		let connector = AssetAmount::new(fee_asset, fees::atoms_for(fee_floor, issuance_vsize(s, fee_asset), fees::MULTIPLE).max(1));
 
@@ -1505,7 +1595,7 @@ impl Rounds {
 						Err(broadcast::error::RecvError::Closed) => return,
 					},
 					_ = async { match tick.as_mut() { Some(t) => { t.tick().await; }, None => std::future::pending::<()>().await } } => {
-						match me.run_round().await {
+						match me.run_rounds().await {
 							Ok(_) => me.pass().await,
 							Err(e) => Err(e),
 						}

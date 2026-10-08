@@ -10,6 +10,9 @@
 //!
 //! The server accepts a participation only when:
 //!
+//! - it carries one asset, as the round it runs in does: every coin it gives
+//!   up, every output it wants and every fee it pays is in that asset
+//!   (`out_of_bounds` otherwise, naming the assets);
 //! - every coin given up passes the check of [`crate::coins`]: known, live,
 //!   held by nothing else, its record valid, its boards credited and unspent,
 //!   nothing of its lineage on-chain, and its first expiry (or the service
@@ -22,8 +25,8 @@
 //!   delay within the bounds), under a key that owns no leaf, is wanted by no
 //!   other participation and is not the operator's `S`; every offboard pays a served asset within its
 //!   bounds to a script that is not an Arca script the server knows;
-//! - per asset, the coins given up hold exactly what the outputs take plus
-//!   the fee, and the fee covers the published schedule
+//! - the coins given up hold exactly what the outputs take plus the fee,
+//!   and the fee covers the published schedule
 //!   ([`crate::params::FeeSchedule`]);
 //! - the operator's signer holds nothing under any coin's salt: no forfeit
 //!   (a coin an older server gave back while its forfeit stood in the
@@ -62,7 +65,7 @@
 //! order. The tag keeps the attestation apart from everything else a leaf key
 //! signs; the genesis hash and `S` keep it to one chain and one operator.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use elements::hashes::{sha256, Hash, HashEngine};
@@ -232,6 +235,10 @@ pub enum ParticipationError {
 	Template(usize, String),
 	#[error("an output is outside the operator's published bounds: {0}")]
 	OutOfBounds(String),
+	/// It carries several assets, or pays a fee in one the operator does not
+	/// serve.
+	#[error("{0}")]
+	Assets(String),
 	#[error("an output's key already owns a leaf or is wanted by another participation: every leaf has a key of its own")]
 	KeyReused,
 	#[error("output {0}: the leaf's key is the operator's own key S: a leaf has its owner's key, never the operator's")]
@@ -273,7 +280,7 @@ impl ParticipationError {
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
 			Template(..) => "template",
-			OutOfBounds(_) => "out_of_bounds",
+			OutOfBounds(_) | Assets(_) => "out_of_bounds",
 			KeyReused => "key_reused",
 			OperatorKey(_) => "operator_key",
 			ScriptReused => "script_reused",
@@ -380,6 +387,12 @@ pub fn offboard_margin(destination: &ExplicitOutput, operator: XOnlyPublicKey, r
 		.unwrap_or(0)
 }
 
+/// Why a participation that carries `asset` and `others` too is refused.
+fn one_asset(asset: AssetId, others: &BTreeSet<AssetId>) -> String {
+	format!("a participation carries one asset, as the round it runs in does, and this one carries asset {} and {}: submit one \
+		participation per asset", asset, others.iter().map(|a| format!("asset {}", a)).collect::<Vec<_>>().join(" and "))
+}
+
 impl Participations {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient) -> Arc<Participations> {
 		Arc::new(Participations { store, finality, params, signer })
@@ -468,6 +481,20 @@ impl Participations {
 			}
 		}
 
+		for (a, _) in &req.fees {
+			if !p.assets.contains(a) {
+				return Err(ParticipationError::Assets(format!("a fee in asset {}, which is not served by this operator", a)));
+			}
+		}
+		// One asset: a round carries one, and the participation runs whole in
+		// one round. Every asset it names is served, checked above.
+		let asset = req.outputs[0].asset();
+		let others: BTreeSet<AssetId> = req.outputs.iter().map(|o| o.asset()).chain(req.fees.iter().map(|f| f.0))
+			.filter(|a| *a != asset).collect();
+		if !others.is_empty() {
+			return Err(ParticipationError::Assets(one_asset(asset, &others)));
+		}
+
 		// The coins given up, each checked, each attested by its owner, up to
 		// its exit deadline: three days before its first expiry, or before the
 		// service expiry of a board it rests on, whichever comes first.
@@ -477,6 +504,9 @@ impl Participations {
 		let policy = p.participation_policy(now);
 		for (k, i) in req.inputs.iter().enumerate() {
 			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			if c.coin.asset != asset {
+				return Err(ParticipationError::Assets(one_asset(asset, &BTreeSet::from([c.coin.asset]))));
+			}
 			if !verify_digest(&i.attestation, &id, &c.coin.leaf.owner) {
 				return Err(ParticipationError::BadAttestation(k));
 			}

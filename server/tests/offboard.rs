@@ -1,7 +1,8 @@
 //! Offboards, against a whole server on an anchored proof-of-stake regtest
 //! chain, the watcher driven a pass at a time, a block between passes:
 //!
-//! 1. Offboards in X (listed for fees) and in Y (not listed): once each
+//! 1. Offboards in X (listed for fees) and in Y (not listed), each in its
+//!    asset's round: once each
 //!    owner hands over its forfeit, the watcher unlocks each output to its
 //!    destination with the preimage, the output's margin paying in X and a
 //!    wallet coin of X paying for Y's; the boards given up come back to the
@@ -123,16 +124,24 @@ async fn offboards_in_either_asset_are_unlocked_by_the_watcher() {
 	let cy = board_coin(&mut r, &oy, y).await;
 	let (dx, dy) = (destination(&keypair("O1 X, on-chain")), destination(&keypair("O1 Y, on-chain")));
 	let (px, py) = (offboard(&r, &cx, &dx), offboard(&r, &cy, &dy));
-	let built = r.server.rounds.run_round().await.unwrap().unwrap();
-	println!("round {}: {} vB, {} offboard(s), {} batch(es)", built.tx.txid(), built.tx.vsize(), built.offboards, built.batches.len());
-	assert_eq!(built.offboards, 2);
+	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(rounds.len(), 2, "a round for each asset");
+	for b in &rounds {
+		println!("round {}: {} vB, {} offboard(s), {} batch(es)", b.tx.txid(), b.tx.vsize(), b.offboards, b.batches.len());
+		assert_eq!(b.offboards, 1);
+	}
 	r.produce().await;
 	r.bury().await;
-	round_final(&r, &built.tx.txid()).await;
+	for b in &rounds {
+		round_final(&r, &b.tx.txid()).await;
+	}
 	let (ax, ay) = (offboard_at(&r, &px), offboard_at(&r, &py));
-	println!("offboard outputs: X at {} holding {:?}, Y at {} holding {:?}", ax, built.tx.output[ax.vout as usize].value.explicit(),
-		ay, built.tx.output[ay.vout as usize].value.explicit());
-	assert_eq!(built.tx.output[ay.vout as usize].value.explicit(), Some(PAID), "Y is not listed: no margin, a fee coin pays its unlock");
+	let (rx, ry) = (&rounds[0].tx, &rounds[1].tx);
+	assert_eq!((ax.txid, ay.txid), (rx.txid(), ry.txid()), "X's offboard in X's round, Y's in Y's");
+	println!("offboard outputs: X at {} holding {:?}, Y at {} holding {:?}", ax, rx.output[ax.vout as usize].value.explicit(),
+		ay, ry.output[ay.vout as usize].value.explicit());
+	assert_eq!(ry.output[ay.vout as usize].value.explicit(), Some(PAID), "Y is not listed: no margin, a fee coin pays its unlock");
 
 	// Before the forfeits: nothing to unlock.
 	r.server.watcher.pass().await.unwrap();

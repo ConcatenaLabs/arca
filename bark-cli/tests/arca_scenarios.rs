@@ -131,6 +131,7 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 	// --- A refresh through a round ---
 	let live_x: u64 = coins(&a, "live", &x).iter().map(value).sum();
 	let p = a.ok(&["participate"]);
+	let p = &p["participations"][0];
 	let pid = p["participation"].as_str().unwrap().to_string();
 	assert_eq!(p["state"], "pending");
 	assert_eq!(a.ok(&["sync"])["participations"][0]["state"], "pending");

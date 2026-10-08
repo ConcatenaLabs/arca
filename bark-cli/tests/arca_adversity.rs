@@ -88,35 +88,34 @@ async fn final_round(r: &Running) -> Transaction {
 // The refresh: the status's leaves
 // ---------------------------------------------------------------------------
 
-/// A refresh of coins in two assets. The operator's status names one new
-/// leaf of the two asked for, and then another unlock hash than the leaves
-/// carry: the wallet signs no forfeit for either, and both coins stay its
+/// A refresh of two coins of one asset, for one new leaf. The operator's
+/// status names no new leaf, and then another unlock hash than the leaf
+/// carries: the wallet signs no forfeit for either coin, and both stay its
 /// own. With the honest status each coin's forfeit is built against the new
-/// leaf of its own asset, under the participation's one unlock hash.
+/// leaf, under the participation's one unlock hash.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_status_that_hides_a_new_leaf_is_refused_before_any_forfeit() {
 	let mut r = Running::start().await;
-	common::node::list_fee_asset(&r.rt, r.y, 100_000_000);
 	let proxy = Proxy::start(&r.url());
 	let c = Arca::new("F1");
-	let (x, y) = (r.x, r.y);
-	let boards = boarded(&mut r, &c, &proxy.url.clone(), &[(x, 2_000_000), (y, 2_000_000)]).await;
+	let x = r.x;
+	let boards = boarded(&mut r, &c, &proxy.url.clone(), &[(x, 2_000_000), (x, 1_000_000)]).await;
 	let p = c.ok(&["participate"]);
-	assert_eq!(p["wants"].as_array().unwrap().len(), 2, "one new leaf per asset: {}", p);
+	let p = &p["participations"][0];
+	assert_eq!((p["gives"].as_array().unwrap().len(), p["wants"].as_array().unwrap().len()), (2, 1), "one new leaf: {}", p);
 	let round = final_round(&r).await;
 
-	// The status names only the first new leaf.
+	// The status names no new leaf.
 	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
 		if path == "/v1/participation_status" && status == 200 {
-			let first = v["outputs"].as_array().unwrap()[..1].to_vec();
-			v["outputs"] = Value::Array(first);
+			v["outputs"] = json!([]);
 		}
 		None
 	})));
 	let s = c.ok(&["sync"]);
 	let why = s["participations"][0]["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
-	println!("F1 a status naming 1 of 2 new leaves: REFUSED: {}", why);
-	assert!(why.contains("asked for 2"), "{}", why);
+	println!("F1 a status naming none of the new leaves: REFUSED: {}", why);
+	assert!(why.contains("asked for 1"), "{}", why);
 	// Another unlock hash than the leaves carry.
 	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
 		if path == "/v1/participation_status" && status == 200 {
@@ -139,7 +138,7 @@ async fn a_status_that_hides_a_new_leaf_is_refused_before_any_forfeit() {
 	let s = c.ok(&["sync"]);
 	let done = &s["participations"][0];
 	assert_eq!(done["state"], "released", "{}", s);
-	assert_eq!(done["new_leaves"].as_array().unwrap().len(), 2, "{}", s);
+	assert_eq!(done["new_leaves"].as_array().unwrap().len(), 1, "{}", s);
 	let (req, _, _) = proxy.last("/v1/forfeit_leaves").unwrap();
 	let (_, _, st) = proxy.last("/v1/participation_status").unwrap();
 	let h: [u8; 32] = unhex(st["unlock_hash"].as_str().unwrap()).try_into().unwrap();
@@ -157,9 +156,7 @@ async fn a_status_that_hides_a_new_leaf_is_refused_before_any_forfeit() {
 		assert_eq!(coin_of(&c, b)["state"], "spent");
 	}
 	let bal = c.ok(&["balance"]);
-	for a in [x, y] {
-		assert!(bal["arca"][a.to_string()]["live"].is_string(), "a new leaf in each asset: {}", bal);
-	}
+	assert!(bal["arca"][x.to_string()]["live"].is_string(), "the new leaf: {}", bal);
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -386,7 +383,7 @@ async fn a_given_coin_comes_back_when_its_participation_expires_and_can_be_exite
 	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
 	let board = &boards[0];
 	let p = c.ok(&["participate"]);
-	let pid = p["participation"].as_str().unwrap().to_string();
+	let pid = p["participations"][0]["participation"].as_str().unwrap().to_string();
 	assert_eq!(coin_of(&c, board)["state"], "given");
 	final_round(&r).await;
 	// The wallet is away for the forfeit day: the participation expires.
@@ -558,7 +555,7 @@ async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	// Round R: the two other boards and the leaf.
 	let mut pids = vec![];
 	for l in [&boards[1], &boards[2], &leaf] {
-		pids.push(c.ok(&["participate", "--leaf", l])["participation"].as_str().unwrap().to_string());
+		pids.push(c.ok(&["participate", "--leaf", l])["participations"][0]["participation"].as_str().unwrap().to_string());
 	}
 	let r1 = final_round(&r).await;
 	let s = c.ok(&["sync"]);
@@ -698,7 +695,7 @@ async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rer
 	};
 
 	// Round R, alone in a parent block of its own; the wallet takes its leaf.
-	let pid = c.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let pid = c.ok(&["participate", "--leaf", &leaf0])["participations"][0]["participation"].as_str().unwrap().to_string();
 	let p_r = own_anchor(&r).await;
 	let rtx = final_round(&r).await;
 	let s = c.ok(&["sync"]);
@@ -786,7 +783,7 @@ async fn a_coin_paid_out_of_a_lost_rounds_leaf_is_as_final_as_that_round() {
 	final_round(&r).await;
 	let s = b.ok(&["sync"]);
 	let leaf0 = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	let pid = b.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let pid = b.ok(&["participate", "--leaf", &leaf0])["participations"][0]["participation"].as_str().unwrap().to_string();
 	let p_r = own_anchor(&r).await;
 	let rtx = final_round(&r).await;
 	b.ok(&["sync"]);
@@ -884,8 +881,8 @@ async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
 	println!("F4 with the bound raised: stderr {:?}; {}", err.trim(), p);
 	assert!(ok, "{}", p);
 	assert!(err.contains(&format!("refresh fee for coin {}: 1000000 of asset {}", boards[0], x)), "the fee is printed: {}", err);
-	assert_eq!(p["fees"][0]["amount"], "1000000");
-	assert_eq!(p["wants"][0]["value"], "1000000");
+	assert_eq!(p["participations"][0]["fees"][0]["amount"], "1000000");
+	assert_eq!(p["participations"][0]["wants"][0]["value"], "1000000");
 	proxy.rewrite(None);
 
 	// A batch leaf in its free window: the operator publishes a fee and no
@@ -923,7 +920,7 @@ async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
 	assert_eq!(proxy.count("/v1/submit_participation"), submitted, "nothing was submitted");
 	proxy.rewrite(None);
 	let p = c.ok(&["participate", "--leaf", &leaf]);
-	assert_eq!(p["fees"], json!([]), "the honest schedule asks nothing in the free window: {}", p);
+	assert_eq!(p["participations"][0]["fees"], json!([]), "the honest schedule asks nothing in the free window: {}", p);
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -1544,6 +1541,7 @@ async fn a_tree_whose_reserves_cannot_pay_its_exit_is_refused() {
 	r.wait("the board to be credited", || c.ok(&["boards"])[0]["server"]["state"] == "credited").await;
 	c.ok(&["sync"]);
 	let p = c.ok(&["participate", "--leaf", &board]);
+	let p = &p["participations"][0];
 	println!("F11 participate in Y, which the node does not take for fees: {}", p["exit_needs_fee_coin"]);
 	assert_eq!(p["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "stated before the coin is given up: {}", p);
 	let round = final_round(&r).await;
@@ -1905,7 +1903,7 @@ async fn forfeit_left_unclaimed(r: &mut Running, proxy: &Proxy, c: &Arca) -> (St
 	use elements::hashes::Hash;
 	let x = r.x;
 	let board = boarded(r, c, &proxy.url.clone(), &[(x, 2_000_000)]).await.remove(0);
-	let pid = c.ok(&["participate"])["participation"].as_str().unwrap().to_string();
+	let pid = c.ok(&["participate"])["participations"][0]["participation"].as_str().unwrap().to_string();
 	final_round(r).await;
 	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
 		if path == "/v1/forfeit_leaves" && status == 200 {
@@ -3730,7 +3728,7 @@ async fn a_wallet_lists_its_participations_with_their_round_and_new_leaves() {
 	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
 	assert_eq!(c.ok(&["participations"]), json!([]));
 	let p = c.ok(&["participate"]);
-	let pid = p["participation"].as_str().unwrap().to_string();
+	let pid = p["participations"][0]["participation"].as_str().unwrap().to_string();
 	let listed = c.ok(&["participations"]);
 	println!("PL before the round: {}", listed);
 	assert_eq!(listed[0]["participation"].as_str(), Some(pid.as_str()));
@@ -3981,7 +3979,7 @@ async fn an_exit_and_a_refund_run_at_the_production_delays() {
 	r.synced().await;
 	r.wait("the board to be credited", || f.ok(&["boards"])[0]["server"]["state"] == "credited").await;
 	f.ok(&["sync"]);
-	let pid = f.ok(&["participate"])["participation"].as_str().unwrap().to_string();
+	let pid = f.ok(&["participate"])["participations"][0]["participation"].as_str().unwrap().to_string();
 	final_round(&r).await;
 	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
 		if path == "/v1/forfeit_leaves" && status == 200 {
@@ -4908,7 +4906,7 @@ async fn d59_a_coin_whose_forfeit_reached_the_record_is_paid_on_or_given_up() {
 		b.ok(&create_args(&url, &r.node_url()));
 		let board = boards[0].clone();
 		let p = a.ok(&["participate", "--leaf", &board, "--max-fee-ppm", "1000000"]);
-		let pid = p["participation"].as_str().unwrap().to_string();
+		let pid = p["participations"][0]["participation"].as_str().unwrap().to_string();
 		let id: [u8; 32] = unhex(&pid).try_into().unwrap();
 		final_round(&r).await;
 		r.keepers[0].halt();
@@ -5591,7 +5589,7 @@ async fn round_of_its_own(r: &mut Running, c: &Arca) -> (String, String, Transac
 	final_round(r).await;
 	let s = c.ok(&["sync"]);
 	let leaf0 = s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	let pid = c.ok(&["participate", "--leaf", &leaf0])["participation"].as_str().unwrap().to_string();
+	let pid = c.ok(&["participate", "--leaf", &leaf0])["participations"][0]["participation"].as_str().unwrap().to_string();
 	let p_r = own_anchor(r).await;
 	let rtx = final_round(r).await;
 	let s = c.ok(&["sync"]);
@@ -6224,7 +6222,7 @@ async fn w2_a_participation_released_while_the_wallet_was_away_is_completed() {
 	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
 	let board = boards[0].clone();
 	let p = a.ok(&["participate", "--leaf", &board, "--max-fee-ppm", "1000000"]);
-	let pid = p["participation"].as_str().unwrap().to_string();
+	let pid = p["participations"][0]["participation"].as_str().unwrap().to_string();
 	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
 	final_round(&r).await;
 	let round_at = common::node::median_time(&r.rt);

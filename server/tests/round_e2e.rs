@@ -2,10 +2,11 @@
 //! regtest chain, with the minimal client:
 //!
 //! 1. Several participants in two assets, X (listed for fees) and Y (not),
-//!    one giving up coins of both for leaves of both, one leaving half on-chain
-//!    by an offboard: one round, every forfeit in, every preimage out, every
-//!    new leaf live, and the offboard's output unlocked to its owner's script
-//!    with the preimage alone. The server's wallet holds no policy asset.
+//!    one refreshing coins of both in a participation for each, one leaving
+//!    half on-chain by an offboard: a round for each asset, every forfeit
+//!    in, every preimage out, every new leaf live, and the offboard's output
+//!    unlocked to its owner's script with the preimage alone. The server's
+//!    wallet holds no policy asset.
 //! 2. A leaf unrolled from the published tree and exited by its owner alone:
 //!    each node by the owner's own unroll authorisation with its reserve as the
 //!    fee, the entry with the preimage, the exit after the exit delay with the
@@ -131,8 +132,8 @@ async fn several_participants_in_two_assets() {
 	let policy_asset = r.purse.policy;
 	assert!(!r.server.wallet.balance().await.unwrap().contains_key(&policy_asset));
 
-	// Four refresh in X, two in Y, one gives up X and Y for X and Y, one
-	// leaves half on-chain.
+	// Four refresh in X, two in Y, one refreshes X and Y in a participation
+	// for each, one leaves half on-chain.
 	let mut ps: Vec<Participant> = vec![];
 	for (i, asset) in [x, x, x, x, y, y].iter().enumerate() {
 		let k = keypair(&format!("P{}", i));
@@ -149,9 +150,12 @@ async fn several_participants_in_two_assets() {
 	let (hy, tx_y) = credited_board(&mut r, &m2, y).await;
 	let (wx, nx) = want(&mx, x, VALUE);
 	let (wy, ny) = want(&my, y, VALUE);
-	let (body, id) = participation_body(&[&hx, &hy], &[wx, wy], &[], None, s, chain);
+	let (body, id) = participation_body(&[&hx], &[wx], &[], None, s, chain);
 	r.http.post("submit_participation", &body).ok();
-	ps.push(Participant { label: "M".into(), given: vec![(m, hx, tx_x), (m2, hy, tx_y)], wanted: vec![(mx, nx, 0), (my, ny, 1)], id });
+	ps.push(Participant { label: "M in X".into(), given: vec![(m, hx, tx_x)], wanted: vec![(mx, nx, 0)], id });
+	let (body, id) = participation_body(&[&hy], &[wy], &[], None, s, chain);
+	r.http.post("submit_participation", &body).ok();
+	ps.push(Participant { label: "M in Y".into(), given: vec![(m2, hy, tx_y)], wanted: vec![(my, ny, 0)], id });
 	let (o, o2) = (keypair("O"), keypair("O, new"));
 	let (ho, tx_o) = credited_board(&mut r, &o, x).await;
 	let (wo, no) = want(&o2, x, 500_000);
@@ -161,16 +165,23 @@ async fn several_participants_in_two_assets() {
 	let st_o = r.http.post("submit_participation", &body).ok();
 	ps.push(Participant { label: "O".into(), given: vec![(o, ho, tx_o)], wanted: vec![(o2, no, 0)], id });
 
-	let built = r.server.rounds.run_round().await.unwrap().unwrap();
-	println!("round {}: {} vB, batches {:?}, {} offboard(s), {} participations", built.tx.txid(), built.tx.vsize(), built.batches,
-		built.offboards, built.participations);
-	assert_eq!(built.participations, 8);
-	let leaves: usize = built.batches.iter().map(|b| b.2).sum();
-	assert_eq!(leaves, 9);
-	assert!(built.tx.output.iter().all(|o| o.asset.explicit() != Some(policy_asset)));
+	// A round for each asset, in one pass.
+	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(rounds.len(), 2);
+	for b in &rounds {
+		println!("round {}: {} vB, batches {:?}, {} offboard(s), {} participations", b.tx.txid(), b.tx.vsize(), b.batches,
+			b.offboards, b.participations);
+		assert!(b.tx.output.iter().all(|o| o.asset.explicit() != Some(policy_asset)));
+	}
+	assert_eq!(rounds.iter().map(|b| (b.batches[0].0, b.batches.len(), b.batches[0].2, b.participations)).collect::<Vec<_>>(),
+		vec![(x, 1, 6, 6), (y, 1, 3, 3)], "X's round: P0-P3, M's X and O; Y's: P4, P5 and M's Y");
+	let built = rounds[0].clone();
 	r.produce().await;
 	r.bury().await;
-	round_final(&r, &built.tx.txid()).await;
+	for b in &rounds {
+		round_final(&r, &b.tx.txid()).await;
+	}
 
 	// Every participant completes; every new leaf is live.
 	let mut preimages = vec![];
@@ -185,7 +196,7 @@ async fn several_participants_in_two_assets() {
 	}
 
 	// O unlocks its offboard with the preimage alone, to its own script.
-	let st = status(&r, &ps[7].id);
+	let st = status(&r, &ps[8].id);
 	let vout = st["outputs"][1]["offboard_vout"].as_u64().unwrap() as u32;
 	let reclaim = RelativeTime::from_units(st_o["outputs"][1]["reclaim_delay_units"].as_u64().unwrap() as u16).unwrap();
 	let policy = OffboardPolicy {
@@ -196,7 +207,7 @@ async fn several_participants_in_two_assets() {
 	};
 	assert_eq!(policy.find(&built.tx).unwrap(), vout);
 	let held = built.tx.output[vout as usize].value.explicit().unwrap();
-	let unlock = policy.unlock_tx(OutPoint::new(built.tx.txid(), vout), held, &preimages[7], &FeeSource::Reserve).unwrap();
+	let unlock = policy.unlock_tx(OutPoint::new(built.tx.txid(), vout), held, &preimages[8], &FeeSource::Reserve).unwrap();
 	let u = send(&r, "O's offboard unlocked with the preimage", &unlock.tx);
 	r.produce().await;
 	let got = r.rt.client().raw_transaction(&u).unwrap();

@@ -1,8 +1,10 @@
 //! Taking part in a round: the refresh.
 //!
-//! One request, never interactive: the coins given up, each attested by its
-//! key, the leaves wanted (one per asset, under a fresh key each) and the fee
-//! the operator's schedule asks, in each coin's own asset. Then, once the
+//! One request per asset, never interactive: a round carries one asset, so
+//! the wallet refreshes each asset's coins in that asset's rounds. A request
+//! names the coins given up, each attested by its key, the leaf wanted (under
+//! a fresh key) and the fee the operator's schedule asks, in the coins' own
+//! asset. Then, once the
 //! round holding the participation is final, the wallet rebuilds each new
 //! leaf from the published tree, validates it against the round transaction
 //! with the five checks on its sweep token and clock and every bound of its
@@ -81,6 +83,8 @@ pub struct RefreshQuote {
 	info: Value,
 	rows: Vec<super::store::CoinRow>,
 	ids: Vec<arca_covenant::LeafId>,
+	/// The asset of each coin of `rows`.
+	assets: Vec<AssetId>,
 	per: BTreeMap<AssetId, (u64, u64)>,
 	coins: Vec<Value>,
 }
@@ -207,6 +211,7 @@ impl Wallet {
 		}
 		let mut per: BTreeMap<AssetId, (u64, u64)> = BTreeMap::new();
 		let mut ids = vec![];
+		let mut assets = vec![];
 		let mut coins = vec![];
 		for r in &rows {
 			let (record, a) = self.held(r)?;
@@ -237,6 +242,7 @@ impl Wallet {
 			e.0 = e.0.checked_add(value).ok_or_else(|| Error::Refused("the coins' values overflow".into()))?;
 			e.1 = e.1.checked_add(fee).ok_or_else(|| Error::Refused("the fees overflow".into()))?;
 			ids.push(a.valid.id);
+			assets.push(a.valid.asset);
 			coins.push(json!({"leaf_id": r.leaf_id, "asset": a.valid.asset.to_string(), "value": value.to_string(), "fee": fee.to_string(),
 				"ppm": ppm_of(fee, value), "free_window": free, "bound_ppm": bound}));
 		}
@@ -248,42 +254,63 @@ impl Wallet {
 				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 			}
 		}
-		Ok(RefreshQuote { info, rows, ids, per, coins })
+		Ok(RefreshQuote { info, rows, ids, assets, per, coins })
 	}
 
-	/// Gives up the coins of `quote` for one new leaf per asset in a round,
-	/// paying the fees it states in each coin's own asset. Not before median
-	/// time `not_before`, when given.
+	/// Gives up the coins of `quote` for a new leaf in each asset, in one
+	/// participation per asset: a round carries one asset, so each asset's
+	/// coins are refreshed in that asset's rounds. Each pays the fee the quote
+	/// states in its own asset. Not before median time `not_before`, when
+	/// given. Answers each participation (`participations`), one the server
+	/// refused or did not answer with its `error`; it is an error only when
+	/// none was taken.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
-		let RefreshQuote { info, rows, ids, per, coins } = quote;
-		let mut needs_fee_coin = vec![];
-		for asset in per.keys() {
-			if self.chain.floor_per_kvb(*asset)?.is_none() {
-				needs_fee_coin.push(asset.to_string());
-			}
-		}
-		let mut wanted = vec![];
-		let mut nonces = vec![];
-		let mut fees = vec![];
+		let RefreshQuote { info, rows, ids, assets, per, coins } = quote;
+		let mut out = vec![];
+		let mut first_error = None;
 		for (asset, (total, fee)) in &per {
-			let value = total.checked_sub(*fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
-			let min = Self::min_leaf(&info, *asset)?;
-			if value < min {
-				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
-			}
-			let nonce = super::random32();
-			let owner = self.keys.leaf_xonly(&nonce)?;
-			self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
-			wanted.push(Wanted::Leaf { asset: *asset, value, template: Template::Vtxo1, owner, owner_nonce: nonce, exit_delay: self.exit_delay() });
-			nonces.push(json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()}));
-			if *fee > 0 {
-				fees.push((*asset, *fee));
+			let mine: Vec<usize> = (0..rows.len()).filter(|k| assets[*k] == *asset).collect();
+			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
+			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
+			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before) {
+				Ok(v) => out.push(v),
+				Err(e) => {
+					out.push(json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
+						"error": e.to_string()}));
+					first_error.get_or_insert(e);
+				},
 			}
 		}
+		if let Some(e) = first_error {
+			if out.iter().all(|p| p.get("error").is_some()) {
+				return Err(e);
+			}
+		}
+		Ok(json!({"participations": out, "quote": coins}))
+	}
+
+	/// Gives up `rows`, all of `asset` and worth `total`, for one new leaf of
+	/// `asset` in a round, paying `fee` of it.
+	#[allow(clippy::too_many_arguments)]
+	fn participate_in(&mut self, info: &Value, asset: AssetId, total: u64, fee: u64, rows: &[&super::store::CoinRow],
+		ids: &[arca_covenant::LeafId], not_before: Option<u32>) -> Result<Value, Error>
+	{
+		let needs_fee_coin = self.chain.floor_per_kvb(asset)?.is_none();
+		let value = total.checked_sub(fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
+		let min = Self::min_leaf(info, asset)?;
+		if value < min {
+			return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
+		}
+		let nonce = super::random32();
+		let owner = self.keys.leaf_xonly(&nonce)?;
+		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
+		let wanted = vec![Wanted::Leaf { asset, value, template: Template::Vtxo1, owner, owner_nonce: nonce, exit_delay: self.exit_delay() }];
+		let nonces = vec![json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()})];
+		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
 		let nb = not_before.map(MedianTime::from_consensus).transpose().map_err(|e| Error::Refused(e.to_string()))?;
-		let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, nb);
+		let id = participation_id(&self.genesis, &self.operator, ids, &wanted, &fees, nb);
 		let mut inputs = vec![];
-		for r in &rows {
+		for r in rows {
 			let key = self.keys.leaf(&r.owner_nonce)?;
 			inputs.push(json!({"leaf_id": r.leaf_id, "attestation": hex(sign(&key, &id).as_ref())}));
 		}
@@ -319,10 +346,10 @@ impl Wallet {
 			Ok(())
 		})?;
 		let answer = self.submit(&pid, &body, &given)?;
-		let mut out = json!({"participation": pid, "state": answer["state"], "gives": given, "wants": nonces,
-			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(), "quote": coins});
-		if !needs_fee_coin.is_empty() {
-			out["exit_needs_fee_coin"] = json!({"assets": needs_fee_coin, "note": FEE_COIN_NOTE});
+		let mut out = json!({"participation": pid, "asset": asset.to_string(), "state": answer["state"], "gives": given, "wants": nonces,
+			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()});
+		if needs_fee_coin {
+			out["exit_needs_fee_coin"] = json!({"assets": [asset.to_string()], "note": FEE_COIN_NOTE});
 		}
 		Ok(out)
 	}

@@ -154,6 +154,9 @@ pub enum CosignError {
 	DepthLimit { hops: usize, limit: usize },
 	#[error("an output is outside the operator's published bounds: {0}")]
 	OutOfBounds(String),
+	/// A coin given up is of an asset the operator does not serve now.
+	#[error("{0}")]
+	NotServed(String),
 	#[error("the values do not add up: {0}")]
 	Value(String),
 	#[error("a margin is outside the bounds: {0}")]
@@ -207,7 +210,7 @@ impl CosignError {
 			RoundNotFinal(_) => "round_not_final",
 			OnChain { .. } => "on_chain",
 			DepthLimit { .. } => "depth_limit",
-			OutOfBounds(_) => "out_of_bounds",
+			OutOfBounds(_) | NotServed(_) => "out_of_bounds",
 			Value(_) => "value",
 			Margin(_) => "margin",
 			BadSignature { .. } => "bad_signature",
@@ -387,7 +390,14 @@ impl Cosigner {
 		// The inputs, each checked.
 		let mut checked = Vec::with_capacity(n);
 		for i in &req.inputs {
-			checked.push(self.check_input(&i.leaf_id, &transfer, now).await?);
+			let c = self.check_input(&i.leaf_id, &transfer, now).await?;
+			// A coin of an asset the operator stopped serving is its owner's
+			// to take on the chain: the server takes no new work in it.
+			if !self.params.assets.contains(&c.coin.asset) {
+				return Err(CosignError::NotServed(format!("coin {} is of asset {}, which is not served by this operator now: its \
+					owner takes it on the chain", i.leaf_id, c.coin.asset)));
+			}
+			checked.push(c);
 		}
 		let hops = 1 + checked.iter().map(|c| c.coin.hops).max().expect("an input");
 		if hops > self.params.depth_limit {

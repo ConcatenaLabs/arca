@@ -206,6 +206,14 @@ a round or a board) and its fee schedule. Every record and coin the server check
 these, with the receipt horizon a receiver uses: a coin's first expiry past
 the exit deadline.
 
+Each asset is served on its own: its boards, its batches and rounds, and its
+pool, the operator's wallet's coins of it. An asset the operator does not
+serve is refused at every entry, `out_of_bounds` with its id named: a board
+of it, a transfer's output in it or a coin of it given up, and a
+participation's leaf, offboard or fee in it. Adding an asset takes its entry
+in the configuration and coins of it paid to the operator's wallet, and no
+restart: `arcad` takes the assets anew on SIGHUP (see Running).
+
 ## Boards
 
 An owner brings its own coins in with a board (`board-1`). It asks the server
@@ -328,8 +336,8 @@ open out-of-round reassignment (`Cosigner::check_release`).
 An owner takes part in a round with one request, and is never asked for
 anything while the round runs: the participation names the coins it gives up,
 each with an attestation (its owner key's BIP340 signature over the
-participation's id), the outputs it wants for them, the fee it pays in each
-asset, and optionally the earliest median time of a round it may run in, at
+participation's id), the outputs it wants for them, the fee it pays, and
+optionally the earliest median time of a round it may run in, at
 most seven days ahead. An output wanted is a leaf (its template, `vtxo-1`, its
 owner key and nonce, its exit delay, asset and value, and its key proof: the
 owner key's BIP340 signature over `SHA256(T ‖ T ‖ id)`,
@@ -340,6 +348,11 @@ the id, refused with `bad_signature` when the proof is not the leaf key's)
 or an offboard (an asset, a value and the on-chain
 script to pay). The server accepts it only when:
 
+- it carries one asset, as the round it runs in does: every coin it gives
+  up, every output it wants and every fee it pays is in that asset, which
+  the operator serves. One that carries two is refused (`out_of_bounds`,
+  naming both): a wallet refreshing coins of several assets submits one
+  participation for each;
 - every coin given up passes the same check as a transfer's input: known,
   live, given up nowhere else, its record valid, every board it rests on
   credited and unspent, nothing of its lineage on the chain, and its first
@@ -352,8 +365,8 @@ script to pay). The server accepts it only when:
   operator's `S` (`operator_key`), and its key proof verifies
   (`bad_attestation`); every offboard pays a served
   asset within its bounds to a script that is not an Arca script;
-- per asset, the coins given up hold exactly what the outputs take plus the
-  fee, and the fee covers the schedule;
+- the coins given up hold exactly what the outputs take plus the fee, and
+  the fee covers the schedule;
 - the signer's record holds nothing under any coin's salt (the server asks
   it, `under`): neither a forfeit, which a coin an older server gave back
   while its forfeit stood in the record carries, nor a spend the database
@@ -401,10 +414,15 @@ unrolling the coin given up, its exit delay, the refund delay and a margin.
 
 ## Rounds
 
-At each round (every `round_interval_seconds` while participations wait) the
-runner gathers the pending participations whose earliest round time has
-come, checks each coin they give up again, and builds one tree per asset with
-`arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
+A round carries one asset. Each asset the operator serves has rounds of its
+own and a pool of its own, the operator's wallet's coins of that asset,
+which fund its batches and nothing else. At each round interval (every
+`round_interval_seconds` while participations wait) the runner builds a
+round for each asset whose participations wait, each its own transaction:
+one asset's round that cannot be built (its pool short, the node refusing
+it) holds back no other's. For an asset, it gathers that asset's pending
+participations whose earliest round time has come, checks each coin they give
+up again, and builds the asset's tree with `arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
 the lowest nodes, each leaf behind its participation's hash-locked entry, the
 reserve at four times the node's floor in the batch asset. A batch in an asset
 the node does not accept for fees carries a reserve of one atom on every node
@@ -414,21 +432,22 @@ exit deadline, at each round and at every pass over the rounds: a pending
 participation with a coin past its exit deadline can never run and is voided
 then, whether a round is being built or not, its coins given back; from that
 deadline their owner takes them on the chain. A batch holds at most 1,024
-leaves; a participation runs whole in one
-round, its leaves in several assets included. The participations are taken
-against what the operator's wallet can spend of each asset now: per asset,
-what the round pays on their behalf (each batch output, leaves and reserves
-as the builder makes it, and each offboard output) must fit, and the round's
-own fee and connector after it. A participation that does not fit waits,
-in order, and the ones after it still run if they fit: one asset the
-operator is short of delays no participation in another. A participation
-that waits says why in its status (`waiting`), and runs once the wallet can
-fund it. Each batch has its own sweep
+leaves; a participation runs whole in one round. The participations are
+taken against what the operator's wallet can spend of the asset now: what
+the round pays on their behalf (the batch output, leaves and reserves as the
+builder makes it, and each offboard output) must fit, and the round's own
+fee and connector after it. A participation that does not fit waits, in
+order, and the ones after it still run if they fit. A participation that
+waits says why in its status (`waiting`), and runs once the wallet can fund
+it. A pending participation in an asset the operator no longer serves waits,
+saying so; one that carries several assets, which only a server from before
+a round carried one asset took, is voided, its coins given back. Each batch
+has its own sweep
 token, one explicit atom with no reissuance token, issued by one of the
 operator's coins, and a clock schedule of three steps, 28, 56 and 84 days
 after the round's median time, with a notice of 36 hours.
 
-The round transaction pays each batch output followed by its token's atom at
+The round transaction pays the batch output followed by its token's atom at
 the batch's first clock, then every offboard output, then the connector
 output, then change per asset and the one fee output. It spends the
 operator's coins only: a round that carries forfeits takes no input of a
@@ -436,9 +455,11 @@ third party, which could be spent elsewhere and keep the round from
 returning after a rollback. Its lock time is 0 and every input final, and it
 is kept byte for byte, so the nursery broadcasts it again unchanged and it
 returns with its txid, every forfeit signed for it still good. Its fee is
-paid in one asset: the first of its own batches' assets, in the order of
-`fee_assets`, that the node accepts for fees now, else the first asset of
-`fee_assets` it accepts; never another, and never one the node refuses.
+paid in one asset: its own, when the node accepts it for fees now and it is
+among `fee_assets`, else the first asset of `fee_assets` the node accepts;
+never another, and never one the node refuses. A round in an asset the node
+does not accept for fees so draws its fee and its connector from the pool
+of that fee asset, and waits, saying so, while that pool cannot pay them.
 
 Before it records anything the runner checks its work as a wallet would:
 every leaf's record validates against the transaction under the acceptance
@@ -749,9 +770,11 @@ signers left, when the node accepts that asset for fees now and it covers the
 node's floor. A margin of more than twice the fee the wallet pays for the
 transaction pays that fee and the rest goes to the wallet, after the outputs
 the signers committed to: paid whole, a large margin would be a fee the node
-refuses (`max-fee-exceeded`). Otherwise a coin of the wallet's pays, in the
-first asset of `fee_assets` the node accepts, and the margin goes to the
-wallet's change. No
+refuses (`max-fee-exceeded`). Otherwise a coin of the wallet's pays: from
+the pool of the asset the transaction works in (the batch's, for a token's
+release; the coin's, for a claim or an answer) when the node accepts it for
+fees and the wallet holds a coin of it, else in the first asset of
+`fee_assets` the node accepts; the margin goes to the wallet's change. No
 asset is assumed, the policy asset included. The watcher spends the change of
 its own transactions the nursery still holds as pending, in a block or not,
 as long as fewer than twenty of its transactions waiting for a block lie
@@ -1282,6 +1305,21 @@ is, for one case: a key file lost while its heads file survives. A keeper
 whose key is lost without a backup cannot be replaced, since the record
 names it for good.
 
+`arcad` serves another asset without a restart: add its `[[assets]]`
+entry to the configuration, pay the operator's wallet coins of it (`arcad
+<config> address`), and send `arcad` SIGHUP (`systemctl reload`, with
+`ExecReload=/bin/kill -HUP $MAINPID`). It reads the configuration again and
+from then on serves the asset at every entry, builds its rounds from its pool
+and publishes it in `info`, in the configuration's order; an asset's
+smallest leaf and the assets a round's fee is paid in (`fee_assets`) are
+taken the same way. A configuration that does not read, or that leaves out
+an asset served now, is refused whole and logged, and the server runs on as
+it was: an asset stops being served only at a restart, after which the
+server takes no new work in it (a transfer or a refresh of its coins is
+refused, a participation of it waits) and its holders take their coins on
+the chain. Any other setting that changed takes a restart; the log names
+it, and the reload leaves it as it was.
+
 `arcad` stops its tasks and exits on SIGINT, so a service manager is set to
 send it that signal (systemd's `KillSignal=SIGINT`). The signer is stopped
 with SIGTERM: a SIGINT sent from a background shell does not reach it, and a
@@ -1473,8 +1511,9 @@ printed, the server's own next script is another, a coin paid to it is the
 wallet's and spendable once final, and the index goes on after a restart.
 
 `tests/round_e2e.rs` runs rounds as wallets meet them. Eight participants in
-two assets, one giving up coins of both for leaves of both and one leaving half
-on-chain, share one round; each validates its leaves from the published trees,
+two assets, one refreshing coins of both in a participation for each and one
+leaving half on-chain, share a round for each asset, built in one pass; each
+validates its leaves from the published trees,
 hands over its forfeits and gets its preimage, every new leaf is live, and the
 offboard's output is unlocked to its owner's script with the preimage alone.
 Then a leaf is unrolled from its published tree and exited by its owner alone:
@@ -1488,9 +1527,10 @@ is refused by the mempool; the covenant's own suite forces each into a block on
 a chain that can.
 
 `tests/rounds.rs` turns participations in two assets, X listed for fees and
-Y not, into one round: a batch and a token per asset, an offboard, the
-connector, nLockTime 0, the operator's coins only, the fee in X, the wallet
-holding no policy asset. Once the round is final, each owner validates its
+Y not, into a round for each asset in one pass: a batch and a token in each,
+an offboard in X's, the connector, nLockTime 0, the operator's coins only,
+the fee in X, the wallet holding no policy asset. Once the rounds are final,
+each owner validates its
 new leaf from the published tree alone, and a published tree with a leaf's
 value or unlock hash, the last expiry, the clock's order or the reserve rule
 changed is refused. It also builds rounds of 1, 4 and 16 leaves and prints
@@ -1530,9 +1570,21 @@ log and the metrics say so, and once the wallet is paid more of X the rest
 go out and every one is claimed.
 
 `tests/funding.rs` gives the operator's wallet less of Y than a
-participation in Y wants: the round takes the participation in X, the one in
-Y waits and says why, and the next round takes it once the wallet is paid
-more Y.
+participation in Y wants: in one pass X's round takes the participation in
+X, Y's is not built and the one in Y waits and says why, and the next round
+takes it once the wallet is paid more Y.
+
+`tests/assets.rs` serves X and Y each on its own. Participations in X and Y
+run in rounds of their own: X's round spends X's pool alone and pays X alone,
+Y's (Y not accepted for fees) pays Y's batch from Y's pool and its fee from
+X's, and each owner validates its leaf from its round's tree. A participation
+carrying both assets, or a Y coin for an X leaf, is refused `out_of_bounds`
+naming both. An asset not served (Z) is refused at every entry, its id named:
+a board, a transfer's output, a participation's leaf, offboard and fee. And
+`arcad`, run as a process serving X, refuses a board of Y; once Y is added to
+its configuration, its pool paid and SIGHUP sent, the same process serves Y
+(the board is credited and refreshed in a round of Y), and a configuration
+leaving out X is refused whole.
 
 `tests/forfeits.rs` runs a refresh end to end: a board, its participation,
 the round final, the new leaf validated from the published tree, the forfeit
@@ -1659,7 +1711,8 @@ compares them with `api::REFUSAL_CODES`, both ways; a code is answered with a
 4xx exactly when the request was not taken.
 
 `tests/offboard.rs` runs offboards. In X, which the node accepts for fees, and
-in Y, which it does not: nothing is unlocked before the owner's forfeit; then
+in Y, which it does not, each in its asset's round, both built in one pass:
+nothing is unlocked before the owner's forfeit; then
 the watcher unlocks each output to its destination, the margin paying in X and
 a coin of X paying for Y, and the boards given up come back, Y's forfeit and
 claim paid by coins of X. An offboard whose owner never hands over its forfeit
@@ -1867,8 +1920,8 @@ the third is refused while nonces go on.
 `tests/participations.rs` takes a participation over HTTP (its status, the
 same request again) and refuses, each by its code: a coin given up already,
 in a participation and in a transfer; an attestation by another key or for
-another participation; amounts one atom off either way and a fee in another
-asset; a fee one atom short of the schedule; a key wanted twice, wanted
+another participation; amounts one atom off either way; a fee in an asset
+not served (`out_of_bounds`); a fee one atom short of the schedule; a key wanted twice, wanted
 already, or owning a board; a template a round does not build; an exit
 delay, an asset, a leaf value or a round time outside the bounds; an offboard
 to an Arca script; an unknown coin, a board not yet final, a stray field, a
