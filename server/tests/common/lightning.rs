@@ -124,3 +124,16 @@ pub fn channel_balance(node: &LightningNode, asset: AssetId) -> u64 {
 		.filter(|c| c["channel_asset"].as_str() == Some(&asset.to_string()) && c["state"] == "CHANNELD_NORMAL")
 		.map(|c| c["to_us_msat"].as_u64().unwrap_or(0) / 1000).sum()
 }
+
+/// What `node` holds on its side of its open channels in `asset` once no
+/// HTLC is in flight on them; zero while one is. A payment completes for its
+/// payer a moment before its channels settle the HTLC.
+pub fn settled_balance(node: &LightningNode, asset: AssetId) -> u64 {
+	let v = node.ok("listpeerchannels", serde_json::json!({}));
+	let chans: Vec<&serde_json::Value> = v["channels"].as_array().unwrap().iter()
+		.filter(|c| c["channel_asset"].as_str() == Some(&asset.to_string()) && c["state"] == "CHANNELD_NORMAL").collect();
+	if chans.iter().any(|c| c["htlcs"].as_array().is_some_and(|h| !h.is_empty())) {
+		return 0;
+	}
+	chans.iter().map(|c| c["to_us_msat"].as_u64().unwrap_or(0) / 1000).sum()
+}

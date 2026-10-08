@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use server::server::LegSection;
 
 use common::cli::Arca;
-use common::lightning::{channel_balance, invoice, invoice_status, lightningd, node};
+use common::lightning::{channel_balance, invoice, invoice_status, lightningd, node, settled_balance};
 use common::running::Running;
 
 fn unhex(h: &str) -> Vec<u8> {
@@ -130,7 +130,11 @@ async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
 		println!("books in {}: the wallet held {}, holds {}: {} paid + {} the operator's fee + {} the transactions' margins", asset,
 			held0, held1, amount, fee(amount), margins);
 		assert_eq!(held0 - held1, amount + fee(amount) + margins);
-		let (o1, p1) = (channel_balance(if k == 0 { &ox } else { &oy }, asset), channel_balance(payee, asset));
+		let o = if k == 0 { &ox } else { &oy };
+		// The channel settles the HTLC a moment after the payment completes.
+		let (base, a) = (channels0[k], asset);
+		r.wait("the channels settled", || settled_balance(o, a) == base.0 - amount && settled_balance(payee, a) == base.1 + amount).await;
+		let (o1, p1) = (channel_balance(o, asset), channel_balance(payee, asset));
 		println!("channels in {}: the operator's node {} -> {}, the payee's {} -> {}", asset, channels0[k].0, o1, channels0[k].1, p1);
 		assert_eq!((channels0[k].0 - o1, p1 - channels0[k].1), (amount, amount));
 	}

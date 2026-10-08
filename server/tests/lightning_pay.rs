@@ -19,7 +19,7 @@ use server::server::LegSection;
 
 use common::client::{hex, new_leaf, random32, transfer_body, unhex, Answer, Held};
 use common::keys::xonly;
-use common::lightning::{channel_balance, gateway, invoice, Gateway};
+use common::lightning::{channel_balance, gateway, invoice, settled_balance, Gateway};
 use common::rounds::{advance_mtp, credited_board, mtp};
 
 const MARGIN: u64 = 2_000;
@@ -173,6 +173,12 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 		let (held, valid) = htlc_coin(&g, c, &p, &answer);
 		assert_eq!((valid.asset, valid.value), (asset, amount + fee(amount)));
 		paid.push((asset, c.clone(), held, valid, h, amount, p.body));
+	}
+	// Each channel settles its HTLC a moment after the payment completes.
+	for (k, (asset, o, p)) in [(x, &g.ox, &g.px), (y, &g.oy, &g.py)].into_iter().enumerate() {
+		let (amount, base) = (paid[k].5, books0[k]);
+		g.r.wait("the channels settled", || settled_balance(o, asset) == base.0 - amount && settled_balance(p, asset) == base.1 + amount)
+			.await;
 	}
 	let books1 = [(channel_balance(&g.ox, x), channel_balance(&g.px, x)), (channel_balance(&g.oy, y), channel_balance(&g.py, y))];
 	println!("channels after: X operator {} payee {}; Y operator {} payee {}", books1[0].0, books1[0].1, books1[1].0, books1[1].1);
