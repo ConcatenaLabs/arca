@@ -1,10 +1,11 @@
-//! Paying over Lightning, as the `arca` wallet does it: a wallet holding
-//! leaves in X and Y pays an invoice in X from its X leaf and one in Y from
-//! its Y leaf, through the operator's node in each asset, against a whole
-//! Arca server and SeqLN nodes on the chain SeqLN's `sequentia-regtest`
-//! network assumes. An invoice in Y is refused before anything is signed when
-//! the wallet is asked to pay it from X, and a payment that fails comes back
-//! to the wallet. Every balance is accounted for.
+//! Paying and receiving over Lightning, as the `arca` wallet does it: a
+//! wallet holding leaves in X and Y pays an invoice in X from its X leaf and
+//! one in Y from its Y leaf, through the operator's node in each asset, then
+//! receives in X and in Y into leaves of its own, against a whole Arca server
+//! and SeqLN nodes on the chain SeqLN's `sequentia-regtest` network assumes.
+//! An invoice in Y is refused before anything is signed when the wallet is
+//! asked to pay it from X, and a payment that fails comes back to the wallet.
+//! Every balance, in both assets and on every node, is accounted for.
 //!
 //! Needs what the other scenarios need, and `LIGHTNINGD_EXEC`.
 
@@ -44,8 +45,8 @@ fn arca_held(w: &Arca, asset: &AssetId) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
-	let Some(lnd) = lightningd("a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it") else { return };
+async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it() {
+	let Some(lnd) = lightningd("a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it") else { return };
 	let mut r = Running::start_seqln(|c, _, _| {
 		c.fees.lightning_ppm = PPM;
 		for a in c.assets.iter_mut() {
@@ -58,6 +59,7 @@ async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
 		c.lightning.send_timeout_seconds = 8 * 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	common::node::list_fee_asset(&r.rt, y, 100_000_000);
@@ -88,7 +90,9 @@ async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
 	// A wallet with a leaf in X and a leaf in Y.
 	let (url, nurl) = (r.url(), r.node_url());
 	let a = Arca::new("LN1");
-	a.ok(&["create", "--server", &url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "1",
+	// Its leaves exit after four units, longer than the operator's delay of
+	// one, as a leaf received over Lightning needs.
+	a.ok(&["create", "--server", &url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "4",
 		"--min-exit-delay-units", "1"]);
 	for (asset, v) in [(x, 10_000_000), (x, 1_000_000), (y, 10_000_000)] {
 		let s = script(&a.ok(&["address"]));
@@ -166,61 +170,9 @@ async fn a_wallet_pays_invoices_in_each_asset_from_its_leaves_in_it() {
 	// Every payment, as the wallet keeps it.
 	let payments = a.ok(&["lightning", "payments"]);
 	assert_eq!(payments.as_object().unwrap().len(), 3);
-	drop((ox, px, oy, py));
-	let _ = std::fs::remove_dir_all(&a.dir);
-}
 
-/// The payment held at the operator's node for `hash`, as the server says.
-async fn receive_state(r: &Running, hash: &str) -> String {
-	let h: [u8; 32] = unhex(hash).try_into().unwrap();
-	r.server.receives.status(&h).await.unwrap().map(|row| row.state.name().to_string()).unwrap_or_default()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_wallet_receives_in_each_asset_into_its_own_leaves() {
-	let Some(lnd) = lightningd("a_wallet_receives_in_each_asset_into_its_own_leaves") else { return };
-	let mut r = Running::start_seqln(|c, _, _| {
-		c.fees.lightning_ppm = PPM;
-		for a in c.assets.iter_mut() {
-			a.lightning_base = Some(BASE.to_string());
-		}
-		c.lightning.operator_delay_units = 1;
-		c.lightning.owner_delay_units = 2;
-		c.lightning.receive_window_seconds = 600;
-		c.lightning.poll_seconds = 1;
-	}).await;
-	let (x, y) = (r.x, r.y);
-	common::node::list_fee_asset(&r.rt, y, 100_000_000);
-	let (ox, px, oy, py) = tokio::task::block_in_place(|| {
-		let ox = node(&r.rt, &mut r.purse, &lnd, "ox", true, x, 2_000_000_000);
-		let px = node(&r.rt, &mut r.purse, &lnd, "px", true, x, 1_000_000_000);
-		let oy = node(&r.rt, &mut r.purse, &lnd, "oy", true, y, 2_000_000_000);
-		let py = node(&r.rt, &mut r.purse, &lnd, "py", true, y, 1_000_000_000);
-		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
-		oy.open_channel(&r.rt, &py, y, 1_000_000_000, 300_000_000);
-		(ox, px, oy, py)
-	});
-	r.produce().await;
-	r.bury().await;
-	r.synced().await;
-	let mut config = r.config.clone();
-	for a in config.assets.iter_mut() {
-		let n = if a.asset == x.to_string() { &ox } else { &oy };
-		a.lightning = Some(LegSection { rpc: n.rpc_path() });
-	}
-	r.server.reload(&config).await.unwrap();
-	r.config = config;
-	let g = r.server.gateway.clone();
-	r.wait("both legs up", || g.leg(&x, true).is_ok() && g.leg(&y, true).is_ok()).await;
-
-	// A wallet whose leaves exit after four units, longer than the
-	// operator's delay of one.
-	let (url, nurl) = (r.url(), r.node_url());
-	let a = Arca::new("LN2");
-	a.ok(&["create", "--server", &url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "4",
-		"--min-exit-delay-units", "1"]);
-	a.ok(&["sync"]);
-
+	// The same wallet receives in X and in Y: each invoice its own, paid by
+	// the payer's node, held until the wallet holds its leaf and claims it.
 	// A fee above the wallet's bound: refused before anything is asked.
 	a.refused(&["lightning", "receive", &x.to_string(), "100000", "--max-fee-ppm", "1"], "above the wallet's bound");
 	assert!(a.ok(&["lightning", "receives"]).as_object().unwrap().is_empty());
@@ -271,4 +223,10 @@ async fn a_wallet_receives_in_each_asset_into_its_own_leaves() {
 	}
 	drop((ox, px, oy, py));
 	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// The payment held at the operator's node for `hash`, as the server says.
+async fn receive_state(r: &Running, hash: &str) -> String {
+	let h: [u8; 32] = unhex(hash).try_into().unwrap();
+	r.server.receives.status(&h).await.unwrap().map(|row| row.state.name().to_string()).unwrap_or_default()
 }

@@ -660,12 +660,12 @@ the transfer's margins less, while the operator's channel paid the amount and
 the payee's gained it. Asked to pay Y's invoice from X, the wallet refuses
 before anything is signed and nothing moves; an invoice paid already is
 refused; and a payment to an invoice the payee dropped fails, its leaf back
-in the wallet less only the margins. A second scenario has a wallet receive
-in X and in Y: its invoice paid by the payer's node and held, the leaf made
-by the asset's next round and claimed by `sync` with the preimage, the
-payment settled at the payer's node only then; in each asset the wallet
-holds the amount less the fee and the claim's margins, and a fee above the
-wallet's bound is refused before anything is asked.
+in the wallet less only the margins. The same wallet then receives in X and
+in Y: its invoice paid by the payer's node and held, the leaf made by the
+asset's next round and claimed by `sync` with the preimage, the payment
+settled at the payer's node only then; in each asset the wallet holds the
+amount less the fee and the claim's margins, and a fee above the wallet's
+bound is refused before anything is asked.
 
 `tests/arca_bitcoin_side.rs` checks the Bitcoin side at its boundary, Bark
 replaced by a stand-in that records what it is asked: with no Bitcoin ark
