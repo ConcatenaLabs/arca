@@ -37,14 +37,33 @@ use super::wallet::{amount, sign, Wallet};
 use super::Error;
 
 /// The operator's refresh fee for a coin of `value` whose earliest expiry is
-/// `expiry`, at `now`, by the schedule `info` publishes.
+/// `expiry`, at `now`, by the schedule `fees` ([`schedule_of`]): its parts
+/// per million of the coin and its fixed part a coin, both falling to
+/// nothing in the free window.
 pub fn refresh_fee(fees: &Value, value: u64, expiry: u32, now: u32) -> u64 {
 	let ppm = fees["refresh_ppm"].as_u64().unwrap_or(0) as u128;
+	let base = fees["refresh_base"].as_str().and_then(|b| b.parse::<u64>().ok()).unwrap_or(0) as u128;
 	let free = fees["free_window_seconds"].as_u64().unwrap_or(0) as u32;
 	let full = fees["full_after_seconds"].as_u64().unwrap_or(1).max(1) as u32;
 	let left = expiry.saturating_sub(now).saturating_sub(free);
 	let charged = left.min(full) as u128;
-	((value as u128 * ppm * charged).div_ceil(full as u128 * 1_000_000)).min(u64::MAX as u128) as u64
+	((value as u128 * ppm + base * 1_000_000) * charged).div_ceil(full as u128 * 1_000_000).min(u64::MAX as u128) as u64
+}
+
+/// The schedule the operator charges in `asset` by what `info` publishes:
+/// the asset's own (`assets[].fees`), with the free window `fees` states,
+/// or, from an operator that publishes none for the asset, the one at the
+/// top of `fees`.
+pub fn schedule_of(info: &Value, asset: AssetId) -> Value {
+	let mut s = info["fees"].clone();
+	let own = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
+		.map(|a| a["fees"].clone()).unwrap_or(Value::Null);
+	if let Some(o) = own.as_object() {
+		for (k, v) in o {
+			s[k] = v.clone();
+		}
+	}
+	s
 }
 
 /// The most a refresh may cost, in millionths of a coin's value, unless the
@@ -228,7 +247,8 @@ impl Wallet {
 						it into a refresh only until its exit deadline, three days before; exit it", r.leaf_id, b)));
 				}
 			}
-			let fee = refresh_fee(&info["fees"], value, expiry, now.to_consensus_u32());
+			let schedule = schedule_of(&info, a.valid.asset);
+			let fee = refresh_fee(&schedule, value, expiry, now.to_consensus_u32());
 			let free = in_free_window(expiry, now.to_consensus_u32());
 			let bound = max_fee_ppm.unwrap_or(if free { 0 } else { DEFAULT_MAX_FEE_PPM });
 			if !fee_within(fee, value, bound) {
@@ -244,7 +264,8 @@ impl Wallet {
 			ids.push(a.valid.id);
 			assets.push(a.valid.asset);
 			coins.push(json!({"leaf_id": r.leaf_id, "asset": a.valid.asset.to_string(), "value": value.to_string(), "fee": fee.to_string(),
-				"ppm": ppm_of(fee, value), "free_window": free, "bound_ppm": bound}));
+				"ppm": ppm_of(fee, value), "free_window": free, "bound_ppm": bound,
+				"schedule": {"refresh_ppm": schedule["refresh_ppm"], "refresh_base": schedule["refresh_base"]}}));
 		}
 		for (asset, (total, fee)) in &per {
 			let value = total.checked_sub(*fee).ok_or_else(|| Error::Refused(format!("the refresh fee of {} in asset {} is more than the \

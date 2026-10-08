@@ -20,7 +20,7 @@ use crate::chain::{Certification, ChainSource, FinalityConfig, FinalityService, 
 use crate::cosign::Cosigner;
 use crate::http::{router, App, Limiter};
 use crate::nursery::Nursery;
-use crate::params::{AssetParams, FeeSchedule, Params};
+use crate::params::{Amount, AssetFees, AssetParams, FeeSchedule, Params};
 use crate::rates::{RateConfig, RateSource};
 use crate::participations::Participations;
 use crate::forfeits::Forfeits;
@@ -392,6 +392,24 @@ fn default_poll_ms() -> u64 {
 pub struct AssetSection {
 	/// The asset id, display order.
 	pub asset: String,
+	/// What a refresh and an offboard cost in the asset, in parts per
+	/// million; `[fees]`' when absent.
+	#[serde(default)]
+	pub refresh_ppm: Option<u64>,
+	#[serde(default)]
+	pub offboard_ppm: Option<u64>,
+	/// The fixed part of a refresh, for each coin given up, and of an
+	/// offboard: in the asset's atoms, or (`_value`) as a value in atoms of
+	/// the reference unit, converted at the asset's rate, which `rate` must
+	/// then name a source for; nothing when absent. Decimal strings.
+	#[serde(default)]
+	pub refresh_base: Option<String>,
+	#[serde(default)]
+	pub refresh_base_value: Option<String>,
+	#[serde(default)]
+	pub offboard_base: Option<String>,
+	#[serde(default)]
+	pub offboard_base_value: Option<String>,
 	/// The smallest leaf, in the asset's atoms, as a decimal string.
 	#[serde(default)]
 	pub min_leaf: Option<String>,
@@ -409,7 +427,10 @@ pub struct AssetSection {
 impl AssetSection {
 	/// `asset`, its smallest leaf `min_leaf` atoms, and no rate.
 	pub fn new(asset: impl ToString, min_leaf: u64) -> AssetSection {
-		AssetSection { asset: asset.to_string(), min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None }
+		AssetSection {
+			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
+			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
+		}
 	}
 }
 
@@ -650,6 +671,11 @@ async fn check_signer_entries(store: &Store, signer: &SignerClient) -> Result<()
 	Ok(())
 }
 
+/// The schedule an asset takes where it sets none of its own: `[fees]`.
+fn default_fees(config: &Config) -> FeeSchedule {
+	FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm, ..Default::default() }
+}
+
 /// The top-level settings of `a` and `b` that differ, by name.
 fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	let mut out = vec![];
@@ -665,7 +691,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	differ("node", a.node == b.node);
 	differ("finality", a.finality == b.finality);
 	differ("exit_delay_units", a.exit_delay_units == b.exit_delay_units);
-	differ("fees", a.fees == b.fees);
+	differ("fees.max_margin_multiple", a.fees.max_margin_multiple == b.fees.max_margin_multiple);
 	differ("watcher", a.watcher == b.watcher);
 	differ("limits", a.limits == b.limits);
 	differ("metrics_listen", a.metrics_listen == b.metrics_listen);
@@ -724,7 +750,25 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 				names no rate source", id))),
 			_ => return Err(StartError(format!("asset {}: min_leaf, in atoms, or min_leaf_value, in the reference unit: one of them", id))),
 		};
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate }));
+		let amount = |what: &str, atoms: &Option<String>, value: &Option<String>| -> Result<Amount, StartError> {
+			match (atoms, value) {
+				(None, None) => Ok(Amount::Atoms(0)),
+				(Some(a), None) => Ok(Amount::Atoms(parse_amount(a).map_err(|e| StartError(format!("asset {}: {}: {}", id, what, e)))?)),
+				(None, Some(v)) if rate.is_some() => Ok(Amount::Value(parse_amount(v)
+					.map_err(|e| StartError(format!("asset {}: {}_value: {}", id, what, e)))?)),
+				(None, Some(_)) => Err(StartError(format!("asset {}: {}_value is converted at the asset's rate, and the asset names no \
+					rate source", id, what))),
+				(Some(_), Some(_)) => Err(StartError(format!("asset {}: {}, in atoms, or {}_value, in the reference unit: not both", id, what,
+					what))),
+			}
+		};
+		let fees = AssetFees {
+			refresh_ppm: a.refresh_ppm.unwrap_or(config.fees.refresh_ppm),
+			offboard_ppm: a.offboard_ppm.unwrap_or(config.fees.offboard_ppm),
+			refresh_base: amount("refresh_base", &a.refresh_base, &a.refresh_base_value)?,
+			offboard_base: amount("offboard_base", &a.offboard_base, &a.offboard_base_value)?,
+		};
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -799,10 +843,10 @@ impl Server {
 
 		let (list, fee_assets) = assets_of(config)?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
+		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
 		// Every rate source read before anything is served.
 		params.rates.read_all(&finality).await;
-		params.fees = FeeSchedule { refresh_ppm: config.fees.refresh_ppm, offboard_ppm: config.fees.offboard_ppm };
 		if let Some(m) = config.fees.max_margin_multiple {
 			if m < 1 {
 				return Err(StartError("fees.max_margin_multiple is at least 1".into()));
@@ -937,8 +981,10 @@ impl Server {
 			config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
-	/// Takes the assets `config` serves, each with its smallest leaf and its
-	/// rate source, and the assets a round's fee is paid in, without a
+	/// Takes the assets `config` serves, each with its smallest leaf, its
+	/// fee schedule and its rate source, the schedule an asset takes where it
+	/// sets none (`[fees]`' refresh and offboard parts), and the assets a
+	/// round's fee is paid in, without a
 	/// restart, and reads every rate source: an asset added is served by every entry,
 	/// every round and the watcher from now on (its pool is the wallet's
 	/// coins of it, so it is funded by paying the wallet), and an asset whose
@@ -972,10 +1018,13 @@ impl Server {
 			let mut taken = current.clone();
 			taken.assets = config.assets.clone();
 			taken.fee_assets = config.fee_assets.clone();
+			taken.fees.refresh_ppm = config.fees.refresh_ppm;
+			taken.fees.offboard_ppm = config.fees.offboard_ppm;
 			if taken != *config {
 				out.needs_restart = restart_only(&taken, config);
 				log::warn!("reload: {} changed and take(s) a restart; left as they were", out.needs_restart.join(", "));
 			}
+			self.params.assets.set_default_fees(default_fees(config));
 			self.params.serve(list, fee_assets);
 			*current = taken;
 			out

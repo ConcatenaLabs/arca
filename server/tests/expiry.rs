@@ -335,7 +335,7 @@ async fn to_time(r: &Running, t: u32) {
 async fn the_refresh_window_and_the_exit_deadline() {
 	let mut r = start_charging().await;
 	let x = r.x;
-	let fees = FeeSchedule { refresh_ppm: 23_000, offboard_ppm: 0 };
+	let fees = FeeSchedule { refresh_ppm: 23_000, ..Default::default() };
 
 	// Three batch leaves of one round, from boards: A, B and C. A board just
 	// confirmed has its whole service ahead of it and pays the whole fee.

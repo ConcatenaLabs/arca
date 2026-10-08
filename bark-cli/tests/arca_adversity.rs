@@ -868,6 +868,9 @@ async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
 	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
 		if path == "/v1/info" && status == 200 {
 			v["fees"]["refresh_ppm"] = json!(500_000);
+			for a in v["assets"].as_array_mut().unwrap() {
+				a["fees"]["refresh_ppm"] = json!(500_000);
+			}
 		}
 		None
 	})));
@@ -901,6 +904,9 @@ async fn a_refresh_fee_above_the_bound_is_refused_before_anything_is_signed() {
 		if path == "/v1/info" && status == 200 {
 			v["fees"]["refresh_ppm"] = json!(5_000);
 			v["fees"]["free_window_seconds"] = json!(0);
+			for a in v["assets"].as_array_mut().unwrap() {
+				a["fees"]["refresh_ppm"] = json!(5_000);
+			}
 		}
 		None
 	})));

@@ -128,6 +128,31 @@ pub struct AssetInfo {
 	/// The operator's rate for the asset, when it names a source for one.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rate: Option<RateInfo>,
+	/// What the operator charges in the asset, in its atoms now; absent while
+	/// a part set as a value has no rate to convert it at.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fees: Option<AssetFeesInfo>,
+}
+
+/// What the operator charges in one asset: a refresh, falling to nothing in
+/// the free window (`fees.free_window_seconds`, `fees.full_after_seconds`),
+/// `refresh_ppm` of each coin given up plus `refresh_base` atoms a coin at
+/// most; an offboard, `offboard_ppm` of what it pays out plus
+/// `offboard_base` atoms and its output's margin. A fixed part the operator
+/// sets as a value in the reference unit is shown as such beside it
+/// (`refresh_base_value`, `offboard_base_value`), taken in atoms at the
+/// asset's `rate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetFeesInfo {
+	pub refresh_ppm: u64,
+	pub refresh_base: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refresh_base_value: Option<String>,
+	pub offboard_ppm: u64,
+	pub offboard_base: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub offboard_base_value: Option<String>,
 }
 
 /// The operator's rate for an asset ([`crate::rates`]): what 10^8 atoms of
@@ -184,7 +209,8 @@ pub struct FeesInfo {
 	/// What the operator charges for an out-of-round transfer, in the asset
 	/// moved.
 	pub transfer: String,
-	/// The refresh fee, in parts per million of a coin's value, for a coin
+	/// The refresh fee an asset takes where it sets none of its own (each
+	/// asset's own is `assets[].fees`), in parts per million of a coin's value, for a coin
 	/// whose expiry is `full_after_seconds` or more beyond the free window; it
 	/// falls in proportion to the time left beyond the window, to nothing
 	/// within it. A coin resting on a board counts from the board's service

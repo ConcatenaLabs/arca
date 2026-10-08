@@ -13,6 +13,53 @@ use arca_covenant::{Chain, MedianTime, RelativeTime, ReserveFloor, WalletPolicy}
 
 use crate::rates::{atoms_of, unix_now, RateConfig, RateError, Rates};
 
+/// An amount the operator sets: in the asset's atoms, or as a value in
+/// atoms of the reference unit, taken in the asset's atoms at its rate
+/// ([`crate::rates`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Amount {
+	Atoms(u64),
+	Value(u64),
+}
+
+impl Default for Amount {
+	fn default() -> Amount {
+		Amount::Atoms(0)
+	}
+}
+
+impl Amount {
+	/// The amount in the asset's atoms at `rate`, rounded up; `None` for a
+	/// value with no rate to take it at.
+	pub fn atoms(&self, rate: Option<u64>) -> Option<u64> {
+		match self {
+			Amount::Atoms(a) => Some(*a),
+			Amount::Value(0) => Some(0),
+			Amount::Value(v) => rate.map(|r| atoms_of(*v, r)),
+		}
+	}
+
+	/// The value set, when the amount is one.
+	pub fn value(&self) -> Option<u64> {
+		match self {
+			Amount::Atoms(_) => None,
+			Amount::Value(v) => Some(*v),
+		}
+	}
+}
+
+/// What the operator charges in one asset, as it sets it: the parts per
+/// million of a refresh and of an offboard, and a fixed part of each, in the
+/// asset's atoms or as a value ([`Amount`]). Taken in atoms at the asset's
+/// rate, it is the asset's [`FeeSchedule`] ([`Params::fees`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssetFees {
+	pub refresh_ppm: u64,
+	pub offboard_ppm: u64,
+	pub refresh_base: Amount,
+	pub offboard_base: Amount,
+}
+
 /// What the operator serves for one asset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AssetParams {
@@ -26,6 +73,8 @@ pub struct AssetParams {
 	/// Where the asset's rate comes from ([`crate::rates`]); none when the
 	/// operator prices nothing of the asset from a rate.
 	pub rate: Option<RateConfig>,
+	/// What the operator charges in the asset.
+	pub fees: AssetFees,
 }
 
 /// The assets the operator serves, in the order its configuration lists
@@ -46,6 +95,9 @@ struct Served {
 	/// The assets a round's fee is paid in, as configured; the served assets,
 	/// in their order, when the configuration names none.
 	fee_assets: Option<Vec<AssetId>>,
+	/// The schedule an asset takes where it sets none of its own, as
+	/// `[fees]` sets it.
+	default_fees: FeeSchedule,
 }
 
 impl Assets {
@@ -59,7 +111,8 @@ impl Assets {
 	/// Serves `list` from now on, in its order, and pays rounds' fees in
 	/// `fee_assets` (the served assets, in order, when `None`).
 	pub fn replace(&self, list: Vec<(AssetId, AssetParams)>, fee_assets: Option<Vec<AssetId>>) {
-		let mut served = Served { fee_assets, ..Default::default() };
+		let default_fees = self.read().default_fees;
+		let mut served = Served { fee_assets, default_fees, ..Default::default() };
 		for (a, p) in list {
 			if served.map.insert(a, p).is_none() {
 				served.order.push(a);
@@ -93,6 +146,17 @@ impl Assets {
 		s.order.iter().map(|a| (*a, s.map[a].clone())).collect()
 	}
 
+	/// The schedule an asset takes where it sets none of its own (`[fees]`),
+	/// published at the top of `info` for wallets that read no asset's own.
+	pub fn default_fees(&self) -> FeeSchedule {
+		self.read().default_fees
+	}
+
+	/// Sets [`Assets::default_fees`].
+	pub fn set_default_fees(&self, fees: FeeSchedule) {
+		self.0.write().unwrap_or_else(|e| e.into_inner()).default_fees = fees;
+	}
+
 	/// The assets a round's fee is paid in, in order of preference.
 	pub fn fee_assets(&self) -> Vec<AssetId> {
 		let s = self.read();
@@ -100,8 +164,8 @@ impl Assets {
 	}
 }
 
-/// What the operator charges, in the asset moved. Transfers inside the tree
-/// are free. A refresh, or an offboard, costs nothing in the free window, the
+/// What the operator charges in one asset, in that asset's atoms. Transfers
+/// inside the tree are free. A refresh, or an offboard, costs nothing in the free window, the
 /// two days before a coin's exit deadline: from [`FeeSchedule::FREE_FROM`]
 /// (five days) before its first expiry to three days before it, where the
 /// operator stops taking it ([`Params::participation_policy`]). Before the
@@ -109,12 +173,19 @@ impl Assets {
 /// per million of the coin's value for a coin [`FeeSchedule::FULL_AFTER`] or
 /// more from the window. A coin resting on a board takes the board's service
 /// expiry for its first expiry, when that comes first ([`Params::BOARD_LIFETIME`]).
-/// An offboard adds `offboard_ppm` of what it pays out, and the
-/// margin of the output the round pays, which the unlock spends as its fee.
+/// The fixed part of a refresh, `refresh_base` for each coin given up, is
+/// charged as its proportional part is: in full 23 days or more before the
+/// window, falling to nothing in it. An offboard adds `offboard_ppm` of what
+/// it pays out, `offboard_base`, and the margin of the output the round
+/// pays, which the unlock spends as its fee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FeeSchedule {
 	pub refresh_ppm: u64,
 	pub offboard_ppm: u64,
+	/// The fixed part of a refresh for each coin given up, in atoms.
+	pub refresh_base: u64,
+	/// The fixed part of an offboard, in atoms.
+	pub offboard_base: u64,
 }
 
 impl FeeSchedule {
@@ -130,14 +201,15 @@ impl FeeSchedule {
 	pub fn refresh(&self, value: u64, expiry: MedianTime, now: MedianTime) -> u64 {
 		let left = expiry.to_consensus_u32().saturating_sub(now.to_consensus_u32()).saturating_sub(Self::FREE_FROM);
 		let charged = left.min(Self::FULL_AFTER) as u128;
-		let fee = (value as u128 * self.refresh_ppm as u128 * charged).div_ceil(Self::FULL_AFTER as u128 * 1_000_000);
+		let full = value as u128 * self.refresh_ppm as u128 + self.refresh_base as u128 * 1_000_000;
+		let fee = (full * charged).div_ceil(Self::FULL_AFTER as u128 * 1_000_000);
 		fee.min(u64::MAX as u128) as u64
 	}
 
 	/// The offboard fee for paying out `value`, the round's output holding
 	/// `margin` more for its unlock.
 	pub fn offboard(&self, value: u64, margin: u64) -> u64 {
-		let fee = (value as u128 * self.offboard_ppm as u128).div_ceil(1_000_000) + margin as u128;
+		let fee = (value as u128 * self.offboard_ppm as u128).div_ceil(1_000_000) + self.offboard_base as u128 + margin as u128;
 		fee.min(u64::MAX as u128) as u64
 	}
 }
@@ -160,7 +232,6 @@ pub struct Params {
 	pub rates: Rates,
 	/// The most reassignments a coin may be from a round or a board.
 	pub depth_limit: usize,
-	pub fees: FeeSchedule,
 	/// The delay after which the owner of a leaf given up may take its
 	/// forfeit back: long enough for the operator to claim it, and well
 	/// before a new batch's exit deadline.
@@ -194,7 +265,6 @@ impl Params {
 			max_exit_delay: spec.max_exit_delay,
 			assets,
 			depth_limit: DEPTH_LIMIT,
-			fees: FeeSchedule::default(),
 			refund_delay: spec.max_exit_delay,
 			offboard_reclaim_delay: spec.max_exit_delay,
 			max_margin_multiple: MAX_MARGIN_MULTIPLE,
@@ -249,6 +319,22 @@ impl Params {
 					it yet", asset, v)),
 			},
 		}
+	}
+
+	/// What the operator charges in `asset` now, in its atoms: its
+	/// [`AssetFees`], a value taken at the asset's last rate. A rate gone
+	/// stale still sets it, as for [`Params::min_leaf`].
+	pub fn fees(&self, asset: &AssetId) -> Result<FeeSchedule, String> {
+		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
+		let rate = self.rates.last(asset);
+		let atoms = |what: &str, x: Amount| x.atoms(rate).ok_or_else(|| format!("asset {}'s {} is a value of {} in the reference unit, \
+			and the operator has no rate for it yet", asset, what, x.value().unwrap_or(0)));
+		Ok(FeeSchedule {
+			refresh_ppm: a.fees.refresh_ppm,
+			offboard_ppm: a.fees.offboard_ppm,
+			refresh_base: atoms("refresh_base", a.fees.refresh_base)?,
+			offboard_base: atoms("offboard_base", a.fees.offboard_base)?,
+		})
 	}
 
 	/// `asset`'s rate for new work now: `None` for an asset with no rate
@@ -351,7 +437,7 @@ mod tests {
 	#[test]
 	fn a_refresh_is_free_in_the_two_days_before_the_exit_deadline() {
 		const DAY: u32 = 86_400;
-		let f = FeeSchedule { refresh_ppm: 23_000, offboard_ppm: 0 };
+		let f = FeeSchedule { refresh_ppm: 23_000, ..Default::default() };
 		let e = 1_800_000_000;
 		let value = 1_000_000;
 		// 23,000 ppm of a million atoms is 23,000 atoms for 23 days or more
@@ -363,6 +449,31 @@ mod tests {
 		assert_eq!(f.refresh(value, t(e), t(e - 4 * DAY)), 0);
 		assert_eq!(f.refresh(value, t(e), t(e - 3 * DAY)), 0, "free up to the exit deadline");
 		assert_eq!(FeeSchedule::FREE_FROM - Params::PARTICIPATION_HORIZON, 2 * DAY, "the window is two days");
+	}
+
+	#[test]
+	fn a_fixed_part_falls_with_the_proportional_one() {
+		const DAY: u32 = 86_400;
+		let e = 1_800_000_000;
+		// 2,300 atoms a coin and nothing in proportion: 100 atoms a day
+		// before the window.
+		let f = FeeSchedule { refresh_base: 2_300, ..Default::default() };
+		assert_eq!(f.refresh(1_000_000, t(e), t(e - 28 * DAY)), 2_300);
+		assert_eq!(f.refresh(5, t(e), t(e - 6 * DAY)), 100, "whatever the coin's value");
+		assert_eq!(f.refresh(1_000_000, t(e), t(e - 5 * DAY)), 0, "nothing in the free window");
+		// Both parts together are charged as one.
+		let g = FeeSchedule { refresh_ppm: 23_000, refresh_base: 2_300, ..Default::default() };
+		assert_eq!(g.refresh(1_000_000, t(e), t(e - 28 * DAY)), 23_000 + 2_300);
+		let o = FeeSchedule { offboard_ppm: 1_000, offboard_base: 500, ..Default::default() };
+		assert_eq!(o.offboard(1_000_000, 70), 1_000 + 500 + 70);
+	}
+
+	#[test]
+	fn an_amount_set_as_a_value_is_taken_at_the_rate() {
+		assert_eq!(Amount::Atoms(7).atoms(None), Some(7));
+		assert_eq!(Amount::Value(1_000).atoms(None), None);
+		assert_eq!(Amount::Value(0).atoms(None), Some(0));
+		assert_eq!(Amount::Value(1_000).atoms(Some(250_000_000)), Some(400));
 	}
 
 	#[test]
