@@ -105,6 +105,11 @@ pub struct OutputRequest {
 	/// The mailbox the new coin's record goes to; the leaf's owner key when
 	/// `None`.
 	pub mailbox: Option<XOnlyPublicKey>,
+	/// When the receive request the output pays lapses (a median time), as
+	/// the sender names it: no transfer is recorded from then. Not part of
+	/// the request's hash, so a request posted again with it, or without it,
+	/// is the same transfer.
+	pub until: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +179,11 @@ pub enum CosignError {
 	#[error("leaf {leaf} rests on a board whose exit deadline has passed (its service ends at median time {expiry}): the operator \
 		co-signs no spend of it and takes it into no refresh; its owner takes it on the chain")]
 	PastBoardDate { leaf: LeafId, expiry: u32 },
+	/// A payment to a receive request past its lapse: its receiver no longer
+	/// waits for it, and would read it only by chance.
+	#[error("the receive request output {output} pays lapsed at median time {until} (the chain's is {now}): its receiver no longer \
+		waits for a payment to it, so the server records none; ask the receiver for a new request")]
+	RequestLapsed { output: usize, until: u32, now: u32 },
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error("the server has not followed the chain yet")]
@@ -208,6 +218,7 @@ impl CosignError {
 			SaltReused(_) => "salt",
 			OpenReassignment(_) => "open_reassignment",
 			Mergeable(_) => "merge",
+			RequestLapsed { .. } => "request_lapsed",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
@@ -358,6 +369,16 @@ impl Cosigner {
 		}
 		let recorded = self.store.transfer(&transfer).await?.is_some();
 		if !recorded {
+			// A payment to a request past its lapse lands in a mailbox nobody
+			// waits on: none is recorded from then. One recorded before
+			// completes, as it was within the lapse when it was recorded.
+			for (j, o) in req.outputs.iter().enumerate() {
+				if let Some(until) = o.until {
+					if now.to_consensus_u32() >= until {
+						return Err(CosignError::RequestLapsed { output: j, until, now: now.to_consensus_u32() });
+					}
+				}
+			}
 			if let Some(known) = self.store.known_salts(&salts).await?.first() {
 				return Err(CosignError::SaltReused(crate::signer::hex(known)));
 			}

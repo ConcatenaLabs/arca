@@ -6136,6 +6136,72 @@ async fn f1_a_request_without_a_lapse_holds_the_schedule_until_paid_or_forgotten
 	}
 }
 
+/// A1.24's residue, turned around: the server knows the lapse. B hands out
+/// two requests. Three hours before their lapse A pays the first, its post
+/// held on the way (the server never sees it), and then the second with the
+/// operator's signer away (the server records it, unsigned). A day past the
+/// lapse A's sync posts both again: the first, which the server never
+/// recorded, is refused (`request_lapsed`, naming the lapse), nothing is
+/// signed and A's coin is live again; the second, recorded before the lapse,
+/// completes, and B reads its coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn f1_a_payment_held_past_the_lapse_is_refused_by_the_server_and_one_recorded_before_completes() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let (a, b) = (Arca::new("F1SA"), Arca::new("F1SB"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let (q1, q2) = (b.ok(&["receive"]), b.ok(&["receive"]));
+	let until = q1["details"]["until"].as_u64().unwrap() as u32;
+	d57_to(&r, until - 86_400).await;
+	let boards = boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000), (x, 2_000_000)]).await;
+	d57_to(&r, until - 3 * 3_600).await;
+	// The first payment's post never reaches the server.
+	p.hold("/v1/cosign_transfer");
+	let (ok, v) = a.run(&["send", q1["request"].as_str().unwrap(), "--amount", "600000", "--asset", &x.to_string()]);
+	p.release("/v1/cosign_transfer");
+	println!("F1S A pays the first request at median time {} ({} s before its lapse {}), the post held: ok={} | {}",
+		common::node::median_time(&r.rt), until as i64 - common::node::median_time(&r.rt) as i64, until, ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	let first: Vec<String> = boards.iter().filter(|l| coin_of(&a, l)["state"] == "sending").cloned().collect();
+	assert_eq!(first.len(), 1, "one coin is in the held payment");
+	let other = boards.iter().find(|l| **l != first[0]).unwrap().clone();
+	// The second reaches the server, which records it; the signer is away.
+	signer_goes_away_at_the_payment(&p, &r);
+	let (ok, v) = a.run(&["send", q2["request"].as_str().unwrap(), "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
+	println!("F1S A pays the second request with the signer away: ok={} | {}", ok, v["error"]["message"]);
+	assert!(!ok);
+	let id: LeafId = other.parse().unwrap();
+	assert_eq!(r.server.store.leaf(&id.0).await.unwrap().unwrap().state, server::store::LeafState::Spent, "the server recorded it");
+	// A day past the lapse, the signer back, A syncs.
+	d57_to(&r, until + 86_400).await;
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let s = a.ok(&["sync"]);
+	println!("F1S A's sync a day past the lapse (median time {}): transfers {}", common::node::median_time(&r.rt), s["transfers"]);
+	let ts = s["transfers"].as_array().unwrap();
+	let refused: Vec<&Value> = ts.iter().filter(|t| t["error"].is_string()).collect();
+	let done: Vec<&Value> = ts.iter().filter(|t| t["transfer_id"].is_string()).collect();
+	assert_eq!((refused.len(), done.len()), (1, 1), "{}", s["transfers"]);
+	let why = refused[0]["error"].as_str().unwrap();
+	assert!(why.contains("request_lapsed") && why.contains(&format!("lapsed at median time {}", until)), "{}", why);
+	let c = coin_of(&a, &first[0]);
+	println!("F1S the held payment's coin: {} {} | the recorded payment's coin: {}", c["state"], c["value"], coin_of(&a, &other)["state"]);
+	assert_eq!((c["state"].as_str(), c["value"].as_str()), (Some("live"), Some("2000000")), "nothing of it was signed: {}", c);
+	assert_eq!(coin_of(&a, &other)["state"], "spent", "the payment recorded before the lapse completed");
+	let refusals = a.ok(&["refusals"]);
+	assert!(refusals.as_array().unwrap().iter().any(|f| f["reason"].as_str().is_some_and(|m| m.contains("request_lapsed"))), "{}", refusals);
+	let m = b.ok(&["sync"])["mailbox"].clone();
+	println!("F1S B's sync: mailbox {}", m);
+	assert_eq!(m["accepted"].as_array().map(|v| v.len()), Some(1), "B reads the coin recorded before the lapse: {}", m);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // A participation the server released while the wallet was away
 // ---------------------------------------------------------------------------
