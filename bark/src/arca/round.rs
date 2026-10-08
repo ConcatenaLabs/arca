@@ -753,9 +753,10 @@ impl Wallet {
 	/// wallet, and these left it long ago). It takes the preimage from the
 	/// published tree of the round it recorded, and completes the new leaves
 	/// it validated then ([`Self::finish`], which checks the preimage opens
-	/// them). `None` when the wallet holds no such forfeits, or the server
-	/// publishes no preimage there: the participation is then completed as
-	/// one not yet released.
+	/// them). `None` when the wallet holds no such forfeits, the server says
+	/// it was released in another round, or the server publishes no
+	/// preimage there: the participation is then completed as one not yet
+	/// released.
 	fn take_released(&mut self, pid: &str, st: &Value, given: &[String]) -> Result<Option<Value>, Error> {
 		let Some(news) = self.store.participation_news(pid)? else { return Ok(None) };
 		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
@@ -765,9 +766,11 @@ impl Wallet {
 				return Ok(None);
 			}
 		}
+		// Released in another round than the one the wallet signed for: the
+		// participation is completed as one not yet released, every check
+		// made.
 		if st["round"]["txid"].as_str() != Some(round.as_str()) {
-			return Err(Error::Refused(format!("the server says participation {} was released in round {}; the wallet signed its \
-				forfeits for round {}", pid, st["round"]["txid"], round)));
+			return Ok(None);
 		}
 		// The unlock hash the wallet's new leaves carry, as it validated them.
 		let mut unlock = None;
