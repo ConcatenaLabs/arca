@@ -22,10 +22,10 @@ use super::keys::Keys;
 use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
-pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board {asset, amount, fee_asset?}, boards, \
-	receive {asset?, amount?}, forget_request {owner}, send {request, amount?, asset?}, mailbox, restore, quote {leaves?, \
-	max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, participations, sync, schedule, recheck, \
-	exit {leaf_id, fee_asset?}, refusals";
+pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
+	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
+	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
+	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -76,7 +76,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
-	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "schedule");
+	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -103,7 +103,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"record" => w.record(req_str(&a["leaf_id"], "the coin")?),
 		"board" => {
 			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
-			w.board(asset(req_str(&a["asset"], "the asset")?)?, amount, opt_asset(&a["fee_asset"])?)
+			// With `shown`, the board goes ahead only on the fee the program
+			// showed (a `board_quote`'s `fee`).
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.board_shown(asset(req_str(&a["asset"], "the asset")?)?, amount, opt_asset(&a["fee_asset"])?, shown)
+		},
+		"board_quote" => {
+			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
+			w.board_quote(asset(req_str(&a["asset"], "the asset")?)?, amount, opt_asset(&a["fee_asset"])?)
 		},
 		"boards" => w.boards(),
 		"receive" => w.receive(opt_asset(&a["asset"])?, opt_u64(&a["amount"], "the amount")?),
@@ -132,7 +139,13 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"sync" => w.sync(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),
-		"exit" => w.exit(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?),
+		"exit" => {
+			// With `shown`, the path is broadcast only on the fees the program
+			// showed (an `exit_quote`'s `unroll`).
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.exit_shown(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?, shown)
+		},
+		"exit_quote" => w.exit_quote(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?),
 		"refusals" => w.refusals(),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}

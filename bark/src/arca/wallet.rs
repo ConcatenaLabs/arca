@@ -2442,6 +2442,17 @@ impl Wallet {
 	/// transaction, and `sync` posts the same registration again until the
 	/// server answers it ([`Self::retry_boards`]).
 	pub fn board(&mut self, asset: AssetId, value: u64, fee_asset: Option<AssetId>) -> Result<Value, Error> {
+		self.board_shown(asset, value, fee_asset, None)
+	}
+
+	/// What a board of `value` of `asset` would pay now, before anything is
+	/// signed, asked of the server or written: the fee in `fee_asset` (the
+	/// boarded asset unless another is named), the transaction's size and
+	/// the coins it would spend, chosen as [`Self::board`] chooses them. A
+	/// program shows it, then boards with the fee it showed
+	/// ([`Self::board_shown`]), so a board is never signed on a fee the user
+	/// did not see. Refuses what the board would refuse for the same reason.
+	pub fn board_quote(&mut self, asset: AssetId, value: u64, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let fee_asset = fee_asset.unwrap_or(asset);
 		self.fee_for(fee_asset, 1)?;
 		let info = self.server_info()?;
@@ -2449,10 +2460,41 @@ impl Wallet {
 		if value < min {
 			return Err(Error::Refused(format!("a board of {} is below the server's smallest leaf in asset {}, {}", value, asset, min)));
 		}
-		// The coins to spend: the boarded asset's, then the fee asset's.
-		let coins = self.onchain_coins()?;
-		let mut chosen: Vec<(OutPoint, TxOut, Keypair)> = vec![];
-		let mut fee = self.fee_for(fee_asset, 300)?;
+		// The board's shape without its nonces or a change index: the sizes
+		// are those of the board itself, every key being 32 bytes.
+		let dummy = self.keys.onchain(CHANGE, 0)?;
+		let change = p2wpkh(&dummy);
+		let record = BoardRecord {
+			template: Template::Board1, owner: dummy.x_only_public_key().0, owner_nonce: [1; 32], operator_nonce: [2; 32],
+			exit_delay: self.exit_delay(), asset, value, chain: self.genesis, operator: self.operator,
+		};
+		let (tx, fee, inputs) = self.board_tx(&record, fee_asset, &change, false)?;
+		Ok(json!({
+			"asset": asset.to_string(), "value": value.to_string(),
+			"fee": {"asset": fee_asset.to_string(), "amount": fee.to_string()},
+			"vsize": tx.vsize(), "inputs": inputs,
+			"note": "the fee at the node's floor now, in the fee asset's own atoms; the board goes ahead only on this fee",
+		}))
+	}
+
+	/// [`Self::board`], going ahead only when its fee is `shown` (a
+	/// [`Self::board_quote`]'s `fee`, `{asset, amount}`), when given; else a
+	/// refusal naming the fee now, before anything is asked of the server,
+	/// written or signed.
+	pub fn board_shown(&mut self, asset: AssetId, value: u64, fee_asset: Option<AssetId>, shown: Option<&Value>) -> Result<Value, Error> {
+		let fee_asset = fee_asset.unwrap_or(asset);
+		self.fee_for(fee_asset, 1)?;
+		let info = self.server_info()?;
+		let min = Self::min_leaf(&info, asset)?;
+		if value < min {
+			return Err(Error::Refused(format!("a board of {} is below the server's smallest leaf in asset {}, {}", value, asset, min)));
+		}
+		if let Some(shown) = shown {
+			let quote = self.board_quote(asset, value, Some(fee_asset))?;
+			if quote["fee"] != *shown {
+				return Err(Error::Refused(format!("the board's fee changed since it was shown; it is now {}", quote["fee"])));
+			}
+		}
 		let change = self.new_script(CHANGE)?;
 		let operator_nonce = self.server.operator_nonce()?;
 		let owner_nonce = random32();
@@ -2463,6 +2505,27 @@ impl Wallet {
 			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
 			asset, value, chain: self.genesis, operator: self.operator,
 		};
+		let (tx, fee, _) = self.board_tx(&record, fee_asset, &change, true)?;
+		// The coins could have moved between the two: the fee signed is the
+		// fee shown, or nothing is registered.
+		if let Some(shown) = shown {
+			let now = json!({"asset": fee_asset.to_string(), "amount": fee.to_string()});
+			if now != *shown {
+				return Err(Error::Refused(format!("the board's fee changed since it was shown; it is now {}", now)));
+			}
+		}
+		self.board_record(record, key, tx, fee_asset, fee)
+	}
+
+	/// The board transaction of `record`: the boarded asset's coins, then the
+	/// fee asset's, largest first, until both are covered, the fee at the
+	/// node's floor for the transaction once signed; signed when `sign`.
+	/// Answers it, its fee and the number of coins it spends.
+	fn board_tx(&self, record: &BoardRecord, fee_asset: AssetId, change: &Script, sign: bool) -> Result<(Transaction, u64, usize), Error> {
+		let (asset, value) = (record.asset, record.value);
+		let coins = self.onchain_coins()?;
+		let mut chosen: Vec<(OutPoint, TxOut, Keypair)> = vec![];
+		let mut fee = self.fee_for(fee_asset, 300)?;
 		let tx = loop {
 			chosen.clear();
 			let mut need: BTreeMap<AssetId, u64> = BTreeMap::new();
@@ -2484,17 +2547,27 @@ impl Wallet {
 				}
 			}
 			let pairs: Vec<(OutPoint, TxOut)> = chosen.iter().map(|(op, o, _)| (*op, o.clone())).collect();
-			let mut tx = record.tx(&pairs, fee_asset, fee, &change).map_err(|e| Error::Refused(e.to_string()))?.tx;
+			let mut tx = record.tx(&pairs, fee_asset, fee, change).map_err(|e| Error::Refused(e.to_string()))?.tx;
 			let all: Vec<usize> = (0..tx.input.len()).collect();
 			let needed = self.fee_for(fee_asset, Self::signed_vsize(&tx, &all))?;
 			if needed <= fee {
 				for (i, (_, o, k)) in chosen.iter().enumerate() {
-					self.sign_p2wpkh(&mut tx, i, o, k);
+					if sign {
+						self.sign_p2wpkh(&mut tx, i, o, k);
+					} else {
+						tx.input[i].witness.script_witness = vec![vec![0; 72], vec![0; 33]];
+					}
 				}
 				break tx;
 			}
 			fee = needed;
 		};
+		Ok((tx, fee, chosen.len()))
+	}
+
+	/// Keeps and registers board `record`, its transaction `tx` signed.
+	fn board_record(&mut self, record: BoardRecord, key: Keypair, tx: Transaction, fee_asset: AssetId, fee: u64) -> Result<Value, Error> {
+		let (asset, value, owner_nonce) = (record.asset, record.value, record.owner_nonce);
 		let valid = record.validate(&tx, &self.accept_policy(self.now()?)).map_err(|e| Error::Refused(e.to_string()))?;
 		let leaf_id = valid.leaf_id.to_string();
 		let coin = CoinRecord::Board(record);
