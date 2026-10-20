@@ -199,10 +199,15 @@ pub struct ReceiveRow {
 	pub settled: bool,
 	pub failed_back: bool,
 	pub reason: Option<String>,
+	/// Whether the payment is held by a payment out of the tree at this
+	/// operator, its `htlc-1` send leaf, rather than at the node.
+	pub held_by_send: bool,
+	/// The timeout of that send leaf, by which the payment is decided.
+	pub send_timeout: Option<u32>,
 }
 
 const RECEIVE_COLUMNS: &str = "payment_hash, asset, amount, fee, invoice, expires_at, owner_key, owner_nonce, exit_delay_units, state, \
-	participation_id, timeout, htlc_expiry, preimage, settled, failed_back, reason";
+	participation_id, timeout, htlc_expiry, preimage, settled, failed_back, reason, held_by_send, send_timeout";
 
 fn receive_of(r: &tokio_postgres::Row) -> Result<ReceiveRow, StoreError> {
 	Ok(ReceiveRow {
@@ -225,6 +230,8 @@ fn receive_of(r: &tokio_postgres::Row) -> Result<ReceiveRow, StoreError> {
 		settled: r.get(14),
 		failed_back: r.get(15),
 		reason: r.get(16),
+		held_by_send: r.get(17),
+		send_timeout: r.get::<_, Option<i64>>(18).map(|t| t as u32),
 	})
 }
 
@@ -302,6 +309,22 @@ impl Store {
 			"UPDATE lightning_receive SET state = 'accepted', participation_id = $2, timeout = $3, htlc_expiry = $4, updated_at = now()
 			 WHERE payment_hash = $1 AND state = 'open'",
 			&[&&payment_hash[..], &&participation_id[..], &(timeout as i64), &(htlc_expiry as i64)],
+		).await?;
+		Ok(n == 1)
+	}
+
+	/// Moves an `open` payment to `accepted`, held by the payment out of the
+	/// tree whose send leaf times out at `send_timeout`: its leaf wanted by
+	/// the participation `participation_id`, timing out at `timeout`.
+	/// Returns whether this call moved it.
+	pub async fn accept_receive_held_by_send(&self, payment_hash: &[u8; 32], participation_id: &[u8; 32], timeout: u32,
+		send_timeout: u32) -> Result<bool, StoreError>
+	{
+		let conn = self.conn().await?;
+		let n = conn.execute(
+			"UPDATE lightning_receive SET state = 'accepted', participation_id = $2, timeout = $3, held_by_send = true, send_timeout = $4,
+			 updated_at = now() WHERE payment_hash = $1 AND state = 'open'",
+			&[&&payment_hash[..], &&participation_id[..], &(timeout as i64), &(send_timeout as i64)],
 		).await?;
 		Ok(n == 1)
 	}

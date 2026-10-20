@@ -39,7 +39,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V19__lightning_receive.sql`](schema/V19__lightning_receive.sql),
 [`schema/V20__pending_coins.sql`](schema/V20__pending_coins.sql),
 [`schema/V21__takes.sql`](schema/V21__takes.sql),
-[`schema/V22__round_fills.sql`](schema/V22__round_fills.sql)). `Store::connect` builds it
+[`schema/V22__round_fills.sql`](schema/V22__round_fills.sql),
+[`schema/V23__lightning_internal.sql`](schema/V23__lightning_internal.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -415,9 +416,10 @@ window, 48 hours, about 5,770 blocks. SeqLN accepts lock times
 up to 20,160 blocks on a Sequentia network, but its `pay` adds up to 2,016
 unless the payer raises it (`maxdelay`), so a payer's node needs `maxdelay`
 at least the invoice's final lock time and the route's. A payment from
-another leaf over Lightning is held to half the time to its own leaf's
-timeout, so it pays such an invoice only with a `send_timeout_seconds` of
-about a week or more.
+a leaf of another operator over Lightning is held to half the time to its
+own leaf's timeout, so it pays such an invoice only with a
+`send_timeout_seconds` of about a week or more. A payment from a leaf of this
+operator is settled inside it, with no lock time on any channel (below).
 
 The hold plugin holds the payment when it arrives instead of settling it.
 Once the parts held, in A, add up to the amount and are locked for that
@@ -467,9 +469,39 @@ voided, and its payment failed back, only if no round has taken it
 meanwhile. `lightning_receive_status` answers a payment by its
 hash: `open`, `accepted` (with its participation and the leaf's timeout),
 `claimed` (and whether the node has settled it) or `cancelled` with the
-reason. `info` publishes the terms (`lightning.receive`:
-`operator_delay_units`, `window_seconds`, `invoice_expiry_seconds`,
-`block_seconds`).
+reason; the leaf's exit delay (`exit_delay_units`); once held, what holds it
+(`held_by`: `node`, or `send` with that send leaf's timeout, `send_timeout`);
+and the preimage once the operator knows it. `info` publishes the terms
+(`lightning.receive`: `operator_delay_units`, `window_seconds`,
+`invoice_expiry_seconds`, `block_seconds`, and `internal_gap_seconds`, below).
+
+### A payment between two wallets of this operator
+
+A payment out of the tree (`lightning_send`) whose invoice is exactly the
+invoice the operator made for an open payment into its tree is settled
+inside the operator. The operator's node in the asset cannot pay its own
+invoice: SeqLN's self-payment looks the hash up in the node's own invoice
+table, and a receive's hash lives only in the hold-invoice plugin, so the
+node answers `Unknown invoice`. Instead the payer's `htlc-1` send leaf is the
+held payment. Before it signs anything the operator checks that the receive
+is open and that its leaf, which times out a gap before the send leaf (the
+receive's `operator_delay_units`, the send's `send_stall_margin_seconds` and
+an hour, published as `lightning.receive.internal_gap_seconds`), keeps the receive's least lock, eight sevenths of its exit delay
+and the window (`htlc`); an invoice an outside payer's payment already holds
+at the node is refused (`in_use`). Then it cancels the hold invoice on the
+node, so no outside payer can pay the same invoice, and wants the receiver's
+leaf in the asset's next round as for any held payment. The gap leaves the
+operator the preimage before the payer's refund can open: the latest a claim
+of the receiver's leaf on the chain can reveal it is that leaf's timeout and
+the operator's refund delay. The receive decides the send: paid with the
+preimage the receiver hands over with its claim, a claim on the chain
+reveals, or anyone posts (`lightning_preimage`); failed, and co-signed back
+to its owner, when the receive is failed back. The node is never settled for
+such a payment, and nothing crosses its channels. `lightning_preimage`
+takes a preimage for a payment into the tree whose leaf is its owner's and
+whose time to claim is not over, from anyone who has it: the payment is
+`claimed` with it, its status serves it, and its owner can still claim the
+leaf.
 
 A leaf's timeout is computed at the block interval the operator publishes:
 a chain running twice as fast would let a claim on the chain come after the
@@ -1956,6 +1988,21 @@ claimed is refunded by the watcher once its timeout has passed, not before,
 and its payment failed back to the payer, a late claim refused; a leaf
 claimed on the chain by its owner settles its payment from the preimage the
 claim reveals.
+
+`tests/lightning_internal.rs` pays a receive's invoice from a leaf of the same
+operator: the payment is held by the send leaf (`held_by: send`), the node's
+hold invoice is cancelled and an outside payer of the same invoice fails, the
+receiver's claim with its preimage decides the send `paid` with the channels'
+balances unchanged, and the paid leaf is refused back to its payer. Refused
+before anything is signed: a send leaf whose timeout leaves the receiver's
+leaf less than its least lock (`htlc`), and an invoice an outside payer's
+payment already holds at the node (`in_use`). A receiver's leaf never
+claimed fails the receive back and the send with it, the payer's leaf
+co-signed back to it and a late claim refused. A preimage posted to
+`lightning_preimage` is refused with nothing held, before the leaf is its
+owner's, for another hash (`htlc`) and for a hash nobody receives under
+(`unknown_payment`); posted once the leaf is its owner's, it decides the send
+`paid` and the owner still claims.
 
 `tests/e2e.rs` runs the server as an operator runs it: `arca-signer` in its own
 process holding the operator key, `Server::start` with its tasks and its HTTP

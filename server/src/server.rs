@@ -1164,7 +1164,9 @@ impl Server {
 				invoice_expiry_seconds: l.invoice_expiry_seconds.max(60),
 				block_seconds: l.block_seconds.max(1),
 				cap_ppm: l.receive_cap_ppm.min(1_000_000),
+				stall_seconds: l.send_stall_margin_seconds,
 			});
+		sends.set_receives(receives.clone());
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;
 		let mut tasks = vec![nursery.spawn(), boards.spawn(), rounds.spawn(interval), params.rates.spawn(finality.clone()), gateway.spawn(), sends.spawn(),

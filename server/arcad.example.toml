@@ -250,7 +250,13 @@ poll_seconds = 10
 # The lock times also end send_stall_margin_seconds before that, so a
 # payment resolves before the leaf's timeout through a chain stall that long
 # (the median time leaps a stall in a few blocks); it is below
-# send_timeout_seconds.
+# send_timeout_seconds. A payment of this operator's own invoice, for a
+# payment into its tree, is settled inside it: the receiver's leaf times out
+# operator_delay_units, the stall margin and an hour before the payer's leaf,
+# and needs eight sevenths of its exit delay and receive_window_seconds
+# before that, so with a 36-hour exit delay and the delays below such a
+# payment needs a timeout about two and a half days out, past the two days
+# the default allows: raise send_timeout_seconds to serve those.
 operator_delay_units = 36
 owner_delay_units = 72
 send_timeout_seconds = 86400

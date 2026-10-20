@@ -21,6 +21,11 @@
 //!   the chain's median time;
 //! - and every rule of a transfer holds ([`crate::cosign`]).
 //!
+//! An invoice the operator made itself, for a payment into its tree, is paid
+//! inside the operator instead ([`crate::lightning::receive::Receives::take_internal`]):
+//! the leaf's timeout must leave the receiver's leaf its least lock, the gap
+//! before it, and the payment into the tree decides the payment out of it.
+//!
 //! It then records the payment, `paying`, and pays the invoice through A's
 //! node, spending on routing at most its fee, and resolving before the
 //! leaf's timeout. The node's answer decides it: `paid` with the preimage,
@@ -205,6 +210,9 @@ pub struct Sends {
 	/// Held from the look for a payment of a hash to its record, so two
 	/// transfers locked to one hash are never both co-signed.
 	gate: Mutex<()>,
+	/// The payments into the tree, which settle a payment of the operator's
+	/// own invoice inside the operator.
+	receives: std::sync::OnceLock<Arc<crate::lightning::receive::Receives>>,
 }
 
 fn unix_now() -> u64 {
@@ -213,7 +221,22 @@ fn unix_now() -> u64 {
 
 impl Sends {
 	pub fn new(store: Store, params: Arc<Params>, gateway: Arc<Gateway>, cosigner: Arc<Cosigner>, config: SendConfig) -> Arc<Sends> {
-		Arc::new(Sends { store, params, gateway, cosigner, config, running: Mutex::new(HashSet::new()), gate: Mutex::new(()) })
+		Arc::new(Sends { store, params, gateway, cosigner, config, running: Mutex::new(HashSet::new()), gate: Mutex::new(()),
+			receives: std::sync::OnceLock::new() })
+	}
+
+	/// Names the payments into the tree, once both are made.
+	pub fn set_receives(&self, receives: Arc<crate::lightning::receive::Receives>) {
+		let _ = self.receives.set(receives);
+	}
+
+	/// The payment into the tree whose invoice is `invoice`, if the operator
+	/// made it: paid inside the operator.
+	async fn own(&self, invoice: &str, hash: &[u8; 32]) -> Result<Option<crate::store::ReceiveRow>, StoreError> {
+		match self.receives.get() {
+			Some(r) => r.own_invoice(invoice, hash).await,
+			None => Ok(None),
+		}
 	}
 
 	pub fn config(&self) -> &SendConfig {
@@ -308,10 +331,27 @@ impl Sends {
 				if t < lo || t > hi {
 					return Err(SendError::Htlc(format!("the htlc-1 leaf's timeout {} is not between {} and {} (median times)", t, lo, hi)));
 				}
-				let room = lock_bound(t, now, self.config.block_seconds, self.config.stall_margin_seconds);
-				if inv.min_final_cltv > room as u64 {
-					return Err(SendError::Invoice(format!("the invoice takes a final lock time of {} blocks; a payment whose leaf times out at \
-						{} locks for at most {} blocks", inv.min_final_cltv, t, room)));
+				// The operator's own invoice is paid inside the operator, with
+				// no lock time on any channel: its receive must take it.
+				match self.own(&req.invoice, &terms.payment_hash).await? {
+					Some(r) => {
+						let receives = self.receives.get().expect("set with the receive");
+						if let Err((code, why)) = receives.check_internal(&r, t).await {
+							return Err(match code {
+								"in_use" => SendError::InUse(why),
+								"invoice" => SendError::Invoice(why),
+								"not_synced" => SendError::NotSynced,
+								_ => SendError::Htlc(why),
+							});
+						}
+					},
+					None => {
+						let room = lock_bound(t, now, self.config.block_seconds, self.config.stall_margin_seconds);
+						if inv.min_final_cltv > room as u64 {
+							return Err(SendError::Invoice(format!("the invoice takes a final lock time of {} blocks; a payment whose leaf times \
+								out at {} locks for at most {} blocks", inv.min_final_cltv, t, room)));
+						}
+					},
 				}
 				if self.store.is_unlock_hash(&terms.payment_hash).await? {
 					return Err(SendError::Htlc("the payment hash is an unlock hash of the operator's: a payment never takes one".into()));
@@ -399,6 +439,23 @@ impl Sends {
 			.and_then(|r| match r { arca_covenant::CoinRecord::Transfer(t) => t.leaf.htlc.map(|h| h.timeout.to_consensus_u32()), _ => None })
 			.ok_or("the htlc-1 coin of the payment is not known")?;
 		let now = self.now().await.map_err(|e| e.to_string())?.to_consensus_u32();
+		// The operator's own invoice: held by its payment into the tree, which
+		// decides it; never paid through the node.
+		if let Some(r) = self.own(&row.invoice, &hash).await.map_err(|e| e.to_string())? {
+			if r.held_by_send {
+				return Ok(());
+			}
+			let receives = self.receives.get().expect("set with the receive");
+			return match receives.take_internal(row, t).await.map_err(|e| e.to_string())? {
+				crate::lightning::receive::Internal::Taken => Ok(()),
+				crate::lightning::receive::Internal::Wait(why) if now.saturating_add(self.config.stall_margin_seconds) >= t => {
+					self.decide(&hash, None, Some(&format!("the leaf's timeout is within the operator's stall margin and the payment into \
+						the tree it pays is not held: {}", why))).await
+				},
+				crate::lightning::receive::Internal::Wait(why) => Err(why),
+				crate::lightning::receive::Internal::Refused { why, .. } => self.decide(&hash, None, Some(&why)).await,
+			};
+		}
 		// Within the stall margin of the leaf's timeout the payment is decided
 		// as soon as the node can say: claimed with the preimage at once, or
 		// failed without waiting for an earlier `pay` to try another route,

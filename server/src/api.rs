@@ -151,6 +151,10 @@ pub struct LightningReceiveInfo {
 	/// The chain's block interval, which turns the payment's lock times
 	/// into time.
 	pub block_seconds: u32,
+	/// How long before the timeout of a payer's send leaf the leaf of a
+	/// payment settled inside the operator times out: a payment out of the
+	/// tree that pays this operator's own invoice.
+	pub internal_gap_seconds: u64,
 }
 
 /// The operator's terms for a payment out of the tree.
@@ -607,6 +611,28 @@ pub struct LightningReceived {
 	pub timeout: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<String>,
+	/// The exit delay of the leaf asked for, in 512-second units.
+	#[serde(default)]
+	pub exit_delay_units: u16,
+	/// What holds the payment once it is held: `node`, a Lightning payment
+	/// held at the operator's node, or `send`, a payment out of the tree at
+	/// this operator that pays the invoice, settled inside the operator.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub held_by: Option<String>,
+	/// For a payment held by a send: that send leaf's timeout, a median time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub send_timeout: Option<u32>,
+	/// The preimage, once the operator knows it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+}
+
+/// `POST /v1/lightning_preimage`: the preimage of a payment into the tree,
+/// from anyone who has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightningPreimage {
+	pub payment_hash: String,
+	pub preimage: String,
 }
 
 /// `POST /v1/lightning_receive_status`.
