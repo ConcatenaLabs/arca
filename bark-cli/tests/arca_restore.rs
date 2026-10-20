@@ -963,3 +963,38 @@ async fn an_exits_quote_with_its_claim_out_answers_the_claim() {
 	exit_until(&r, &a, &leaf, "exited").await;
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+/// W2.5: a leaf the wallet took home (its claim final) before its device was
+/// lost is restored `exited`, never `live`: the restored wallet's balance
+/// off the chain is the lost wallet's, the leaf not counted beside the
+/// on-chain coin its claim paid, and it stays so through a sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaf_exited_before_the_device_was_lost_is_restored_exited() {
+	let mut r = Running::start().await;
+	let a = Arca::new("RXA");
+	let leaf = batch_leaf(&mut r, &a, 2_000_000).await;
+	exit_until(&r, &a, &leaf, "exited").await;
+	for _ in 0..3 {
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	let bal_a = a.ok(&["balance"]);
+	println!("RX the lost wallet: the leaf {} | balance {}", coin_of(&a, &leaf)["state"], bal_a);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("RXA2");
+	let (url, node) = (r.url(), r.node_url());
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	println!("RX the restore: restored {} | not_recovered {}", made["restore"]["restored"], made["restore"]["not_recovered"]);
+	a2.ok(&["sync"]);
+	let c = coin_of(&a2, &leaf);
+	let bal_b = a2.ok(&["balance"]);
+	println!("RX the restored wallet: the leaf {} | balance {}", c, bal_b);
+	assert!(!matches!(c["state"].as_str(), Some("live") | Some("pending")), "the exited leaf is restored live: {}", c);
+	assert_eq!(bal_b["arca"], bal_a["arca"], "the restored balance off the chain is the lost wallet's");
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

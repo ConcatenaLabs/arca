@@ -118,6 +118,10 @@ that serves pages without end is read no further, and the restore says so in
   coin a held coin's record spends was spent by that transfer, which the
   operator co-signed, whatever the server says of it (an old copy), and a coin
   whose forfeit its owner signed is never live;
+- a coin whose leaf the lost wallet took home (its own output on the chain)
+  is followed as its exit: `exited` once its claim, paying one of the
+  mnemonic's receive addresses, is final, `exiting` while it is not or the
+  leaf waits for its claim, never held live beside the coin its claim paid;
 - a coin that went over Lightning and was not given up on its owner's
   signature stands as its payment does: the leaf of a payment out of the
   tree that the operator reports paid, with a preimage that opens the leaf's
