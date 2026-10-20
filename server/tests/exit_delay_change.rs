@@ -13,6 +13,8 @@
 //!    why, rather than failing to build.
 //! 4. A board registered before the change is credited after it, and its
 //!    registration posted again gets its status, not a refusal.
+//! 5. A batch made before the change is released at its expiry and swept
+//!    after the notice, as before the change.
 //!
 //! Every coin here is made at the specification's 254 units; the server is
 //! then restarted taking 1 to 2, so each of them lies outside its new bounds.
@@ -27,9 +29,9 @@ use serde_json::json;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::ValidOrigin;
 use common::client::{auths_json, forfeit_sig, hex, participation_body, want_leaf};
-use common::flow::{claim_of, drive, final_of, forfeit_for, has, held_by, log, refresh, settle, Coin};
+use common::flow::{claim_of, claimed, drive, final_of, forfeit_for, has, held_by, log, of_kind, refresh, settle, Coin};
 use common::keys::{keypair, xonly};
-use common::rounds::{created, credited_board, round_final, start, status, validate_new_leaf};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, status, validate_new_leaf};
 use common::running::Running;
 
 fn send(r: &Running, what: &str, tx: &Transaction) -> Txid {
@@ -173,4 +175,40 @@ async fn a_board_registered_before_the_change_is_credited_after_it() {
 		st["state"] == "credited"
 	}).await;
 	println!("D's board, registered at 254 units, credited by a server taking 1 to 2");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_made_before_the_change_is_swept_at_its_expiry() {
+	let mut r = start().await;
+	let mut coins = vec![];
+	let mut keys = vec![];
+	for i in 0..2 {
+		let (held, tx) = { let x = r.x; credited_board(&mut r, &keypair(&format!("E{}, board", i)), x).await };
+		coins.push(Coin { held, bases: vec![tx] });
+		keys.push(keypair(&format!("E{}, round 1", i)));
+	}
+	let pairs: Vec<(&Coin, &elements::secp256k1_zkp::Keypair)> = coins.iter().zip(&keys).collect();
+	let got = refresh(&mut r, &pairs).await;
+	drive(&r, "the two boards given up", 12, |l| claimed(l) == 2).await;
+	settle(&r).await;
+	let schedule = got[0].new_valid.branch.nodes[0].sweep;
+	let e0 = match &got[0].new.held.record {
+		arca_covenant::CoinRecord::Leaf { record, .. } => record.schedule.expiries()[0].to_consensus_u32(),
+		_ => unreachable!(),
+	};
+	println!("a batch of two leaves at 254 units, expiring at {}", e0);
+
+	narrow_bounds(&mut r).await;
+
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, e0.saturating_sub(now) + 3_600).await;
+	let token = schedule.token.into_inner().to_byte_array().to_vec();
+	drive(&r, "the release at the expiry", 4, |l| has(l, "release", &token)).await;
+	settle(&r).await;
+	advance_mtp(&r, 37 * 3_600).await;
+	drive(&r, "the sweep after the notice", 4, |l| has(l, "sweep", &token)).await;
+	settle(&r).await;
+	let sw = of_kind(&r, "sweep").await;
+	assert_eq!(sw.len(), 1, "one sweep");
+	println!("the batch made at 254 units swept by a server taking 1 to 2: {}", common::flow::txid(&sw[0]));
 }
