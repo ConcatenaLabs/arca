@@ -146,6 +146,11 @@ async fn btc_boards_pays_receives_refreshes_and_exits_in_a_bitcoin_ark() {
 	ark(&["btc", "-rpcwallet=miner", "sendtoaddress", &addr, "0.01"]);
 	mine(1);
 	until(&a, 60, "the on-chain funding", || bark(&a, &["onchain", "balance"])["confirmed_sat"].as_u64().unwrap() >= 1_000_000);
+	// A board outside the server's bounds is refused before Bark builds
+	// anything: Bark would keep a refused board's funding as spent.
+	a.refused(&["bitcoin", "--quiet", "board", "5000 sats"], "below the least the Bitcoin ark's server takes");
+	a.refused(&["bitcoin", "--quiet", "board", "6000000 sats"], "above the most a leaf");
+	assert_eq!(bark(&a, &["onchain", "balance"])["confirmed_sat"].as_u64().unwrap(), 1_000_000, "nothing was spent");
 	let board = bark(&a, &["board", "300000 sats"]);
 	println!("board: {}", board);
 	until(&a, 120, "the board", || spendable(&a) > 0);

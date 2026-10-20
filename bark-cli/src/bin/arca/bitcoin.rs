@@ -26,6 +26,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use bark::arca::Error;
@@ -245,6 +246,37 @@ pub fn claim(datadir: &Path, invoice: &str, wait: Duration) -> Result<Value, Err
 			Ok(fresh)
 		},
 	}
+}
+
+/// Refuses a board the Bitcoin ark's server would refuse by the bounds it
+/// publishes (`ark-info`: `min_board_amount_sat`, and `max_vtxo_amount`, the
+/// most a board's leaf may hold), before Bark builds anything. Bark builds
+/// and signs a board's funding transaction before it asks the server, and
+/// when the server refuses it, Bark's on-chain wallet keeps that transaction
+/// as spent though it was never broadcast: the coins it spends read as
+/// pending, and the next board spends the change of a transaction no node
+/// knows and is never relayed. `args` are Bark's, after `bitcoin`.
+pub fn board_guard(datadir: &Path, args: &[String]) -> Result<(), Error> {
+	let mut rest = args.iter().filter(|a| !a.starts_with('-'));
+	if rest.next().map(|s| s.as_str()) != Some("board") || args.iter().any(|a| a == "--all") {
+		return Ok(());
+	}
+	let Some(amount) = rest.next() else { return Ok(()) };
+	let Ok(amount) = bitcoin::Amount::from_str(amount) else { return Ok(()) };
+	if !has_wallet(datadir) {
+		return Ok(());
+	}
+	let info = bark_json(datadir, &["ark-info"])?;
+	let sat = amount.to_sat();
+	if let Some(min) = info["min_board_amount_sat"].as_u64().filter(|m| sat < *m) {
+		return Err(Error::Refused(format!("a board of {} sat is below the least the Bitcoin ark's server takes, {} sat: nothing was \
+			built or signed", sat, min)));
+	}
+	if let Some(max) = info["max_vtxo_amount"].as_u64().filter(|m| sat > *m) {
+		return Err(Error::Refused(format!("a board of {} sat is above the most a leaf of the Bitcoin ark's server holds, {} sat: \
+			nothing was built or signed", sat, max)));
+	}
+	Ok(())
 }
 
 /// The options of `arca bitcoin create`.
