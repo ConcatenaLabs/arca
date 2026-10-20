@@ -132,7 +132,13 @@ that serves pages without end is read no further, and the restore says so in
   held `receiving` with its payment rebuilt from its terms and its nonce (the
   preimage derives from them), taken as handed over (the lost wallet may have
   handed the preimage over already), so `sync` claims it and, should the
-  operator not co-sign, takes it home by its claim at its home date. A restore
+  operator not co-sign, takes it home by its claim at its home date. So is
+  one whose claim the server recorded and has not co-signed, and one whose
+  claim the server says it co-signed while the restore holds no coin that
+  claim made, checked: a received leaf is spent by its claim only once the
+  wallet holds the claim's coin. A restore past the leaf's home date or its
+  timeout says on the coin that it came too late to be sure its claim
+  wins, and `sync` takes the leaf home at once. A restore
   never credits a leaf the operator may claim with a preimage it has. A leaf
   received over Lightning is bound to the mailbox key when it is made (the
   request names the key), so the restore finds it before it is claimed;

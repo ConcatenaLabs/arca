@@ -841,6 +841,14 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// What a restore said of the received leaf of owner nonce `nonce`, when
+	/// it came too late to be sure the leaf's claim wins (past its home date
+	/// or its timeout).
+	pub(crate) fn receive_late(&self, nonce: &[u8; 32]) -> Result<Option<String>, Error> {
+		Ok(self.receives()?.values().find(|r| r["nonce"].as_str() == Some(&hex(nonce)))
+			.and_then(|r| r["late"].as_str().map(str::to_string)))
+	}
+
 	/// When `sync` must run next for the payments over Lightning the wallet
 	/// follows, at the latest: a receive asked for, held, or its leaf
 	/// wanted, within a quarter of the operator's window (the leaf must be
