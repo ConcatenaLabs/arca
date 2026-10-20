@@ -564,23 +564,21 @@ impl Wallet {
 				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": format!("a payment over Lightning out of the tree: {}", note)}))
 			},
 			arca_covenant::HtlcDirection::Receive => {
-				let nonce = self.store.coin(id)?.ok_or_else(|| Error::Store(format!("no coin {}", id)))?.owner_nonce;
+				let row = self.store.coin(id)?.ok_or_else(|| Error::Store(format!("no coin {}", id)))?;
+				let nonce = row.owner_nonce;
 				if hex(&arca_covenant::script::sha256(&self.receive_preimage(&nonce)?)) != hash {
 					return Err(Error::Refused(format!("coin {} is an htlc-1 leaf received under hash {}, which the preimage the wallet derives \
 						from its key does not open", id, hash)));
 				}
 				let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
-				let steps = match &coin.origin {
-					ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
-					_ => 2,
-				};
 				let timeout = h.timeout.to_consensus_u32() as u64;
-				let home_by = steps * 2 * block + coin.leaf.exit_delay.seconds() + super::lightning::CLAIM_MARGIN_BLOCKS * block;
+				let (_, a) = self.held(&row)?;
+				let (home_at, margin) = self.receive_home(coin, &a.bases, timeout, block)?;
 				self.store.set_coin_state(id, "receiving", &format!("the leaf of the payment received over Lightning under hash {}, restored: \
 					sync claims it", hash))?;
 				self.set_receive(&hash, json!({"state": "claiming", "nonce": hex(&nonce), "asset": coin.asset.to_string(),
 					"value": coin.value.to_string(), "participation": hex(&super::lightning::receive_participation_id(&h.payment_hash)),
-					"timeout": timeout, "home_at": timeout.saturating_sub(home_by), "restored": true,
+					"timeout": timeout, "home_at": home_at, "margin": margin, "restored": true,
 					"window": info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600)}))?;
 				let _ = now;
 				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": "a leaf received over Lightning, restored receiving: sync claims it, and \

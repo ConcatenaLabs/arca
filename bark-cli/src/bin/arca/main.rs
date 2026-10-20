@@ -216,11 +216,19 @@ enum Cmd {
 	/// stands, its round, the coins it gave up and its new leaves.
 	Participations,
 	/// Re-checks every coin against the chain, retries what the server never
-	/// answered, reads the mailbox and moves every participation on.
-	Sync,
-	/// When `sync` must next run, and the dates of every coin held off the
-	/// chain, asking nothing of the operator: for a program that runs `sync`
-	/// on a timer.
+	/// answered, reads the mailbox and moves every participation on. Every
+	/// exit step whose date has come (a received leaf's home date, an exit's
+	/// next step) is taken first, before the operator is asked anything.
+	Sync {
+		/// Takes only the exit steps whose date has come, asking the operator
+		/// nothing: for a program woken by the schedule's `next_exit_at`.
+		#[arg(long)]
+		exits_only: bool,
+	},
+	/// When `sync` must next run (`next_sync_at`), when the next exit step
+	/// is due (`next_exit_at`, which `sync --exits-only` takes), and the
+	/// dates of every coin held off the chain, asking nothing of the
+	/// operator: for a program that runs `sync` on a timer.
 	Schedule,
 	/// Re-checks every coin against the chain as it is now.
 	Recheck,
@@ -599,8 +607,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// needs nothing of the operator) do not wait on the server. The library
 	// witnesses again in every entry point that takes a coin or signs a
 	// spend through the operator, and refuses while no witness succeeds.
+	// `sync` takes the exit steps whose date has come before it asks the
+	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. } | Cmd::Schedule)
+		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. })
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -612,7 +622,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// The re-check runs on every start: a rollback since the last command
 	// un-credits what it took out before anything is spent or shown.
 	let startup = match &cli.command {
-		Cmd::Recheck | Cmd::Sync | Cmd::Schedule => None,
+		Cmd::Recheck | Cmd::Sync { .. } | Cmd::Schedule => None,
 		_ => match w.recheck() {
 			Ok(v) => Some(v),
 			Err(e) => {
@@ -686,7 +696,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			}
 			w.participate(quote, not_before)
 		},
-		Cmd::Sync => w.sync(),
+		Cmd::Sync { exits_only: false } => w.sync(),
+		Cmd::Sync { exits_only: true } => w.sync_exits(),
 		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
 		Cmd::Exit { leaf_id, fee_asset, quote: true, .. } => w.exit_quote(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),

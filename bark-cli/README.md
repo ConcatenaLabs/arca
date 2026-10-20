@@ -403,7 +403,8 @@ and a board whose registration never reached the server, are not recovered.
   names relative to now counts from the last `sync`, so it stands between
   syncs, and `due` turns true once it passes): a coin given to a refresh an
   hour after the last sync, an exit under way at its next step (two blocks on while it unrolls, when its
-  claim's delay ends, within half an hour while its claim becomes final),
+  claim's delay ends, two blocks on while its claim is not yet mined, within
+  half an hour while its claim becomes final),
   and never
   more than a day ahead while a receive request the wallet handed out is
   unpaid and has not lapsed, saying so (`why`); `receive_requests` lists
@@ -422,7 +423,19 @@ and a board whose registration never reached the server, are not recovered.
   (`mailbox.withdrawn`, with the operator's reason). A program built on the
   library gets the same from `Wallet::sync_schedule`, which it can call on a
   timer (a program that runs `arca` asks `arca schedule`), and runs
-  `Wallet::sync` when it says so. A payment spends the coins furthest from
+  `Wallet::sync` when it says so.
+  `sync` re-checks its coins against the chain and takes every exit step
+  whose date has come before it asks the operator anything (a received
+  leaf's home date first, then every exit under way: an unroll, a claim
+  once its delay has run, a claim broadcast again at every sync until it is
+  mined and replaced by one paying the node's floor when the floor rose
+  above what it pays), and again whenever one comes while it is asking, so
+  an operator that answers slowly holds back no claim. A coin whose refresh
+  has not completed by its home date goes home after the operator is
+  asked, so a refresh or payment completed in the same `sync` keeps it. The schedule names those dates on
+  their own too (`next_exit_at`, and `exit_due`): `sync --exits-only`
+  (`Wallet::sync_exits`) takes those steps alone and asks the operator
+  nothing. A payment spends the coins furthest from
   their exit date first, so a receiver gets the longest life the wallet can
   give it.
 
@@ -530,21 +543,26 @@ the amount less the fee), hands over its unroll authorisations, and holds
 the leaf, `receiving`. Only then does it hand over the preimage, with the
 transfer of the leaf into a leaf of its own, and only while the leaf's
 timeout leaves it time to unroll the leaf, wait its exit delay and claim it
-a few blocks before the timeout, when the operator's refund of the leaf
-opens (the refund's two locks, the timeout and the operator's delay, run at
-once). Later than that the wallet keeps the preimage: the payment is failed
-back to its payer and the leaf is the operator's. Once the preimage has gone
-out the payment is never called failed: if the operator does not answer the
-claim with its co-signature, the leaf comes home by its claim at its home
-date (the timeout less the exit delay, the unroll and the margin), which
-`sync` takes it home at whatever the operator does, and which `sync`'s
-schedule names. While a payment is asked for, held or claimed, the schedule
+a margin before the timeout, when the operator's refund of the leaf opens
+(the refund's two locks, the timeout and the operator's delay, run at
+once). The margin is the larger of three blocks and an eighth of the leaf's
+lock, from its round's confirmation to its timeout: a client that wakes
+that much late for the leaf's home date still claims it first. Later than
+that the wallet keeps the preimage: the payment is failed back to its payer
+and the leaf is the operator's. Once the preimage has gone out the payment
+is never called failed: if the operator does not answer the claim with its
+co-signature, the leaf comes home by its claim at its home date (the
+timeout less the exit delay, the unroll and the margin), which `sync` takes
+it home at, before it asks the operator anything, whatever the operator
+does, and which `sync`'s schedule names (`next_sync_at` and
+`next_exit_at`). While a payment is asked for, held or claimed, the schedule
 wakes the wallet within a quarter of the operator's window; `exit` takes a
 `receiving` leaf home by its claim with the preimage. The payment is settled
 when the preimage is handed over. A payment the operator failed back is
 `failed`, with the reason. The
-invoice locks the payment for twice the leaf's exit delay and the
-operator's window, about 5,060 blocks with a 36-hour exit delay: a payer
+invoice locks the payment for twice the leaf's lock, eight sevenths of its
+exit delay and the operator's window (so the window survives the margin),
+about 5,770 blocks with a 36-hour exit delay and a six-hour window: a payer
 whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016
 blocks.
 
@@ -707,8 +725,8 @@ registry for both commands.
 every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
-the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment |
-| `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), what holds it back (`why`), the dates of every coin held off the chain and the unpaid receive requests, asking nothing of the operator: for a program that runs `sync` on a timer |
+the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
+| `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain and the unpaid receive requests, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |

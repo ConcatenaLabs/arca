@@ -124,6 +124,11 @@ pub struct Wallet {
 	/// owner nonce the store does not hold is taken when its key is the one
 	/// the mnemonic derives from that nonce, as the lost store would have.
 	pub(crate) adopting: std::cell::Cell<bool>,
+	/// While `sync` asks the operator: the median time the exit steps were
+	/// last taken at, so one whose date comes meanwhile is taken at once
+	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
+	pub(crate) exit_watch: std::cell::RefCell<Option<u32>>,
+	pub(crate) exits_done: std::cell::RefCell<(Vec<Value>, Vec<Value>)>,
 }
 
 /// How a client spells, in what the wallet says, its own commands and the
@@ -232,9 +237,15 @@ pub(crate) const RECEIVE_UNTIL: &str = "receive_until";
 pub(crate) const LAST_SYNC: &str = "last_sync";
 
 /// How long after a step of an exit (its unroll broadcast, a claim
-/// refused for its delay with no date known) `sync_schedule` wakes the
-/// wallet for the next: two blocks at Sequentia's minute.
+/// refused for its delay with no date known, a claim not yet mined)
+/// `sync_schedule` wakes the wallet for the next: two blocks at Sequentia's
+/// minute.
 pub const EXIT_STEP: u32 = 120;
+
+/// Where the wallet keeps the median time it last took the exit steps whose
+/// date had come, in `sync` or alone ([`Wallet::sync_exits`]): the steps of
+/// an exit under way are timed from it.
+pub(crate) const LAST_EXITS: &str = "last_exits";
 
 /// Where the wallet keeps the coins the mailbox says are pending for it
 /// (D61): `{leaf id: {transfer_id, asset, value, seen_at, until}}`, each
@@ -664,7 +675,8 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false) })
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
+			exits_done: Default::default() })
 	}
 
 	/// The binding of the leaf whose key is `key` to the wallet's mailbox
@@ -1348,6 +1360,17 @@ impl Wallet {
 	/// user's word); the fee coin an exit needs is the wallet's choice
 	/// ([`Self::choose_fee_asset`]).
 	pub(crate) fn home(&mut self, exit: bool, why: &Home) -> Result<Vec<Value>, Error> {
+		self.home_where(exit, why, false)
+	}
+
+	/// D67: the leaves received over Lightning whose claim has had no
+	/// co-signed answer by their home date, taken home by their claim, and
+	/// no other coin: what `sync` takes before it asks the operator anything.
+	pub(crate) fn home_received(&mut self) -> Result<Vec<Value>, Error> {
+		self.home_where(true, &Home::Answering, true)
+	}
+
+	fn home_where(&mut self, exit: bool, why: &Home, received_only: bool) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32() as u64;
 		let refused = self.refused_refreshes()?;
 		let window = match why {
@@ -1357,15 +1380,21 @@ impl Wallet {
 		let mut out = vec![];
 		// D62: a leaf received over Lightning whose claim went out with its
 		// preimage, and has no co-signed answer, goes home by its claim at
-		// its home date, whatever the operator does.
+		// its home date, whatever the operator does: those first (D67), as
+		// the operator's refund follows them closest.
 		let claims = self.receive_home_dates()?;
-		for c in self.store.coins()? {
+		let mut coins = self.store.coins()?;
+		coins.sort_by_key(|c| !claims.get(&c.leaf_id).is_some_and(|h| now >= *h as u64));
+		for c in coins {
 			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
 				continue;
 			}
 			let dates = CoinDates::of(c.expiry);
 			let by = dates.map(|d| d.exit_by);
 			let claim_home = claims.get(&c.leaf_id).filter(|h| now >= **h as u64).copied();
+			if received_only && claim_home.is_none() {
+				continue;
+			}
 			// A coin with no date yet (a board not in a block) goes only after
 			// a stop, as every coin then.
 			let due = claim_home.is_some() || match by {
@@ -1561,7 +1590,12 @@ impl Wallet {
 	/// `why` says what holds the time back; `receive_requests` lists every
 	/// unpaid request, waiting or lapsed, with its dates
 	/// ([`Self::receive_requests`]), and `pending_coins` every coin pending
-	/// for the wallet, counted nowhere.
+	/// for the wallet, counted nowhere. `next_exit_at` (and `exit_due`) is
+	/// the next date of an exit step alone (D67): a leaf received over
+	/// Lightning whose claim has had no co-signed answer at its home date, an
+	/// exit's next step; [`Self::sync_exits`] takes those steps and asks the
+	/// operator nothing, and `sync` takes them before it asks the operator
+	/// anything.
 	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
@@ -1569,7 +1603,14 @@ impl Wallet {
 		// stand between syncs, so a client that syncs only when the schedule
 		// is due finds them due once they pass.
 		let base = self.store.meta(LAST_SYNC)?.and_then(|v| v.parse::<u32>().ok()).filter(|b| *b <= now).unwrap_or(now);
+		// The steps of an exit under way count from when the exit steps were
+		// last taken, in a sync or alone.
+		let exit_base = self.store.meta(LAST_EXITS)?.and_then(|v| v.parse::<u32>().ok()).filter(|b| *b <= now).map_or(base, |e| e.max(base));
 		let stopped = self.rolled_back()?.is_some();
+		// D67: the exit-only wake, the next date of an exit step (a received
+		// leaf's home date, an exit's next step), for a sync that asks nothing
+		// of the operator.
+		let mut next_exit: Option<u32> = None;
 		let refused = self.refused_refreshes()?;
 		let asked_at = self.refresh_asked()?;
 		let mut next: Option<u32> = None;
@@ -1625,8 +1666,15 @@ impl Wallet {
 				next = Some(next.map_or(t, |n| n.min(t)));
 			}
 		}
-		if let Some(t) = self.exit_wakes(base)? {
+		if let Some(t) = self.exit_wakes(exit_base)? {
 			next = Some(next.map_or(t, |n| n.min(t)));
+			next_exit = Some(next_exit.map_or(t, |n| n.min(t)));
+		}
+		for (leaf, at) in self.receive_home_dates()? {
+			if self.store.coin(&leaf)?.is_some_and(|c| Self::homeward(&c.state)) {
+				let at = at.max(now);
+				next_exit = Some(next_exit.map_or(at, |n| n.min(at)));
+			}
 		}
 		// D61: a coin pending for the wallet is read only by `sync` once its
 		// transfer completes, whenever that is: a day at most, until it
@@ -1642,20 +1690,27 @@ impl Wallet {
 		}
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));
+		out["next_exit_at"] = json!(next_exit);
+		out["exit_due"] = json!(next_exit.is_some_and(|n| n <= now));
 		Ok(out)
 	}
 
-	/// When `sync` must run next for the exits the wallet has started: one
-	/// whose claim waits for its delay, when the delay ends; one still
-	/// unrolling, two blocks on; one claimed, within half an hour, to follow
-	/// the claim until it is final.
+	/// When `sync` must run next for the exits the wallet has started, `base`
+	/// the median time their steps were last taken at: one whose claim waits
+	/// for its delay, when the delay ends; one still unrolling, two blocks
+	/// on; one whose claim is not yet mined, two blocks on, to broadcast it
+	/// again (raised when the node's floor rose); one whose claim is mined,
+	/// within half an hour, to follow it until it is final.
 	pub(crate) fn exit_wakes(&self, base: u32) -> Result<Option<u32>, Error> {
 		let mut next: Option<u32> = None;
 		for c in self.store.coins_in("exiting")? {
 			let at = match self.store.exit(&c.leaf_id)? {
 				Some((state, j, _)) if state == "waiting" => serde_json::from_str::<Value>(&j).ok()
 					.and_then(|v| v["claim_from"].as_u64()).map_or(base.saturating_add(EXIT_STEP), |t| t.min(u32::MAX as u64) as u32),
-				Some((state, _, _)) if state == "claimed" => base.saturating_add(1800),
+				Some((state, j, _)) if state == "claimed" => {
+					let mined = serde_json::from_str::<Value>(&j).ok().is_some_and(|v| v["mined"] == json!(true));
+					base.saturating_add(if mined { 1800 } else { EXIT_STEP })
+				},
 				_ => base.saturating_add(EXIT_STEP),
 			};
 			next = Some(next.map_or(at, |n| n.min(at)));

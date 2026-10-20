@@ -6675,3 +6675,55 @@ async fn a_client_that_syncs_only_when_due_completes_a_refresh() {
 	assert!(now <= round_at.unwrap() + 2 * 3600, "the refresh completed more than two hours after its round");
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+/// D67: a claim broadcast and not yet mined is broadcast again at every
+/// sync, and replaced by one paying the node's floor when the floor rose
+/// above what it pays. A exits its batch leaf; its claim is in the mempool
+/// when the node's rate for X falls tenfold, so its floor in X's atoms
+/// rises tenfold. A's next sync replaces the claim with one that pays the
+/// new floor and outbids the old one; the node takes the replacement, and
+/// once it is mined and final the coin is exited.
+#[tokio::test(flavor = "multi_thread")]
+async fn d67_a_claim_not_mined_is_raised_when_the_floor_rises() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("D67F");
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let leaf = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let e = a.ok(&["exit", &leaf]);
+	println!("D67F the unroll: {}", e["state"]);
+	r.produce().await;
+	let e = a.ok(&["exit", &leaf]);
+	assert_eq!(e["state"], "waiting", "the claim waits out the exit delay: {}", e);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let e = a.ok(&["exit", &leaf]);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	let old = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+	let fee_of = |t: &Transaction| t.output.iter().filter(|o| o.is_fee()).map(|o| o.value.explicit().unwrap()).sum::<u64>();
+	let old_tx = r.rt.client().raw_transaction(&old).unwrap();
+	println!("D67F the claim {} in the mempool, its fee {} of X for {} vB", old, fee_of(&old_tx), old_tx.vsize());
+	// The node's rate for X falls tenfold: its floor in X's atoms rises
+	// tenfold, above what the claim pays.
+	common::node::list_fee_asset(&r.rt, x, 10_000_000);
+	let s = a.ok(&["sync"]);
+	let ex = s["exits"].as_array().unwrap().iter().find(|v| v["leaf_id"] == leaf.as_str()).cloned().unwrap_or(Value::Null);
+	println!("D67F A's sync after the floor rose: exit {}", ex);
+	assert_eq!(ex["claim"]["replaced"], old.to_string(), "the claim is replaced: {}", ex);
+	let new = elements::Txid::from_str(ex["claim"]["txid"].as_str().unwrap()).unwrap();
+	let new_tx = r.rt.client().raw_transaction(&new).unwrap();
+	let floor: Value = r.rt.client().call("getmempoolinfo", &[]).unwrap();
+	println!("D67F the replacement {} pays {} of X for {} vB (the old one {}); the node's mempool {}", new, fee_of(&new_tx), new_tx.vsize(),
+		fee_of(&old_tx), floor);
+	assert!(fee_of(&new_tx) >= fee_of(&old_tx) * 10, "the replacement pays the new floor");
+	let in_mempool: Result<Value, _> = r.rt.client().call("getmempoolentry", &[json!(old.to_string())]);
+	assert!(in_mempool.is_err(), "the old claim left the mempool");
+	r.produce().await;
+	assert!(confirmations(&r, &new) >= 1, "the replacement is mined");
+	r.bury().await;
+	a.ok(&["sync"]);
+	assert_eq!(coin_of(&a, &leaf)["state"], "exited", "once its claim is final");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}

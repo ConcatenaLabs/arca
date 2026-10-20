@@ -446,10 +446,17 @@ pub(crate) const RECEIVES: &str = "lightning_receives";
 /// The tag of a received payment's preimage, derived from its leaf's key.
 const RECEIVE_PREIMAGE_TAG: &[u8] = b"Arca/lightning-receive-preimage";
 
-/// The blocks a received leaf's claim keeps in hand before the leaf's
-/// timeout, at the chain's interval, beyond its unroll and its exit delay:
-/// time for the claim to be mined before the operator's refund can be.
+/// The blocks a received leaf's claim keeps in hand at least before the
+/// leaf's timeout, at the chain's interval, beyond its unroll and its exit
+/// delay: time for the claim to be mined before the operator's refund can
+/// be.
 pub(crate) const CLAIM_MARGIN_BLOCKS: u64 = 3;
+
+/// The share of a received leaf's lock, from its round's confirmation to its
+/// timeout, that its claim keeps in hand when that is more than
+/// [`CLAIM_MARGIN_BLOCKS`]: an eighth, so a client that wakes that much
+/// late for the leaf's home date still claims it first.
+pub(crate) const CLAIM_MARGIN_SHARE: u64 = 8;
 
 /// The receive window the wallet assumes of an operator that publishes none.
 const DEFAULT_WINDOW: u64 = 6 * 3600;
@@ -676,14 +683,16 @@ impl Wallet {
 	/// confirmation, run at once, so for a leaf confirmed an operator's delay
 	/// before its timeout the refund opens at the timeout itself. The
 	/// preimage is handed over only while the wallet could still unroll the
-	/// leaf, wait out its exit delay and claim it a few blocks before then
-	/// ([`CLAIM_MARGIN_BLOCKS`]); later, the wallet keeps the preimage, the
+	/// leaf, wait out its exit delay and claim it a margin before then (the
+	/// larger of [`CLAIM_MARGIN_BLOCKS`] and an eighth of the leaf's lock,
+	/// [`Wallet::receive_home`]); later, the wallet keeps the preimage, the
 	/// payment is failed back to its payer, and the leaf is the operator's.
 	/// Once the preimage has gone out the payment is never called failed:
 	/// should the operator not answer the claim with its co-signature, the
 	/// leaf has a home date (`home_at`, the timeout less its exit delay, its
 	/// unroll and the margin), at which `sync` takes it home by its claim
-	/// ([`Wallet::receive_home_dates`]).
+	/// ([`Wallet::receive_home_dates`]), before it asks the operator
+	/// anything.
 	fn claim_received(&mut self, hash: &str) -> Result<Value, Error> {
 		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
 		let handed = rec["state"] == "claiming";
@@ -743,17 +752,13 @@ impl Wallet {
 		// blocks, all before the operator's refund could open, at the leaf's
 		// timeout.
 		let refund_from = t.timeout.to_consensus_u32() as u64;
-		let steps = match &coin.origin {
-			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
-			_ => 2,
-		};
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
-		let home_by = steps * 2 * block + coin.leaf.exit_delay.seconds() + CLAIM_MARGIN_BLOCKS * block;
-		if !handed && now + home_by > refund_from {
+		let (home_at, margin) = self.receive_home(&coin, &a.bases, refund_from, block)?;
+		if !handed && now > home_at {
 			rec["state"] = json!("failed");
 			rec["reason"] = json!(format!("the leaf came too late to be claimed safely: the operator's refund opens at its timeout (median \
-				time {}), and its unroll, its exit delay and a margin of {} blocks would end after it; the preimage stays with the wallet, \
-				the payment fails back to its payer, and the leaf is the operator's", refund_from, CLAIM_MARGIN_BLOCKS));
+				time {}), and its unroll, its exit delay and a margin of {} s would end after it; the preimage stays with the wallet, \
+				the payment fails back to its payer, and the leaf is the operator's", refund_from, margin));
 			self.set_receive(hash, rec.clone())?;
 			self.store.set_coin_spent(&leaf, &format!("the operator's: the payment of hash {} is failed back to its payer, its preimage \
 				never handed over", hash))?;
@@ -779,7 +784,8 @@ impl Wallet {
 		// operator co-signs.
 		rec["state"] = json!("claiming");
 		if rec["home_at"].is_null() {
-			rec["home_at"] = json!(refund_from.saturating_sub(home_by));
+			rec["home_at"] = json!(home_at);
+			rec["margin"] = json!(margin);
 			rec["handed_over_at"] = json!(now);
 		}
 		self.set_receive(hash, rec.clone())?;
@@ -789,6 +795,32 @@ impl Wallet {
 		rec["leaf"] = answer["outputs"][0].clone();
 		self.set_receive(hash, rec)?;
 		Ok(json!({"payment_hash": hash, "state": "received", "transfer": answer}))
+	}
+
+	/// When the received leaf `coin`, resting on `bases` (its round, as
+	/// [`Wallet::assess`] finds it) and timing out at `timeout`, must start
+	/// home by its claim, and the margin that date keeps: the timeout less
+	/// its exit delay, its unroll (two blocks of `block` seconds for each step
+	/// of its branch and its entry) and the margin, the larger of
+	/// [`CLAIM_MARGIN_BLOCKS`] and an eighth of the leaf's lock from its
+	/// round's confirmation to its timeout ([`CLAIM_MARGIN_SHARE`]). A client
+	/// that wakes late for that date by less than the margin still claims the
+	/// leaf before the operator's refund opens.
+	pub(crate) fn receive_home(&self, coin: &arca_covenant::ValidCoin, bases: &[(elements::Transaction, super::chain::Finality)],
+		timeout: u64, block: u64) -> Result<(u64, u64), Error>
+	{
+		let steps = match &coin.origin {
+			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
+			_ => 2,
+		};
+		let confirmed = match bases.iter().filter_map(|(_, f)| f.height()).min() {
+			Some(h) => self.chain.median_time_at(h)?.map(u64::from),
+			None => None,
+		};
+		let lock = confirmed.map_or(0, |c| timeout.saturating_sub(c));
+		let margin = (CLAIM_MARGIN_BLOCKS * block).max(lock / CLAIM_MARGIN_SHARE);
+		let home_by = steps * 2 * block + coin.leaf.exit_delay.seconds() + margin;
+		Ok((timeout.saturating_sub(home_by), margin))
 	}
 
 	/// The home date of every leaf received over Lightning whose claim has
