@@ -12,7 +12,12 @@
 //! serves them. The maker's process is then stopped. Two takers holding Y
 //! fill the order in part, one after the other, through the operator's fill
 //! rounds (`arca take`), each round crediting the maker at `2k` and resting
-//! the rest at `2k+1` under the identical script. A wallet made from the
+//! the rest at `2k+1` under the identical script. With `SEQOB_RELAY_EXEC`
+//! and `SEQOB_RELAYCLI_EXEC` naming SeqDEX's `seqobd` and `seqob-relaycli`,
+//! the order is listed on SeqDEX's relay as a maker lists one that already
+//! rests on the chain: `seqob-relaycli post` signs and posts the offer the
+//! wallet hands out, and each taker reads the order from the relay's book,
+//! the second at the outpoint the relay re-points it to. A wallet made from the
 //! maker's mnemonic alone finds the credits at the order's key and the coin
 //! it gave up as spent. The maker comes back: `arca orders` reads both fills
 //! from the chain, and the maker boards its credits from the order's key. Its
@@ -123,6 +128,99 @@ fn spawn(w: &Arca, args: Vec<String>) -> std::thread::JoinHandle<(bool, Value)> 
 			String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
 		(out.status.success(), v)
 	})
+}
+
+/// SeqDEX's relay (`seqobd`, named by `SEQOB_RELAY_EXEC`) watching the
+/// regtest node, and its scripting client (`seqob-relaycli`, named by
+/// `SEQOB_RELAYCLI_EXEC`): the maker's offer is posted as the wallet hands
+/// it out, and takers read the order from the relay's book. `None` when
+/// either is not named; the test then serves the order itself.
+struct Relay {
+	child: std::process::Child,
+	url: String,
+	cli: std::path::PathBuf,
+}
+
+impl Drop for Relay {
+	fn drop(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+	}
+}
+
+impl Relay {
+	fn start(r: &Running) -> Option<Relay> {
+		let (Ok(exe), Ok(cli)) = (std::env::var("SEQOB_RELAY_EXEC"), std::env::var("SEQOB_RELAYCLI_EXEC")) else {
+			println!("SeqDEX's relay: not run (SEQOB_RELAY_EXEC and SEQOB_RELAYCLI_EXEC name no seqobd and seqob-relaycli); the test serves \
+				the order itself");
+			return None;
+		};
+		let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+		let child = std::process::Command::new(exe).args(["-listen", &format!("127.0.0.1:{}", port),
+			"-node-rpc", &format!("127.0.0.1:{}", r.rt.node.rpc_port()), "-node-rpc-user", "arca", "-node-rpc-pass", "arca",
+			"-arca-operator", &r.url(), "-watch-interval", "1s"])
+			.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("start seqobd");
+		println!("SeqDEX's relay: pid {} on port {}", child.id(), port);
+		let relay = Relay { child, url: format!("http://127.0.0.1:{}", port), cli: cli.into() };
+		let start = Instant::now();
+		while relay.get("/v1/markets").is_none() {
+			assert!(start.elapsed() < Duration::from_secs(30), "the relay did not start");
+			std::thread::sleep(Duration::from_millis(200));
+		}
+		Some(relay)
+	}
+
+	/// The body of `GET path`, when the relay answers 200.
+	fn get(&self, path: &str) -> Option<Value> {
+		use std::io::{Read, Write};
+		let addr = self.url.trim_start_matches("http://");
+		let mut c = std::net::TcpStream::connect(addr).ok()?;
+		write!(c, "GET {} HTTP/1.0\r\nHost: {}\r\n\r\n", path, addr).ok()?;
+		let mut out = String::new();
+		c.read_to_string(&mut out).ok()?;
+		let (head, body) = out.split_once("\r\n\r\n")?;
+		if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+			return None;
+		}
+		serde_json::from_str(body).ok()
+	}
+
+	/// Posts `offer` with `seqob-relaycli post`, signed by the maker's relay
+	/// key `key`.
+	fn post(&self, offer: &Value, key: &elements::secp256k1_zkp::Keypair) -> Value {
+		let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("offer-{}.json", std::process::id()));
+		std::fs::write(&path, offer.to_string()).unwrap();
+		let out = std::process::Command::new(&self.cli).args(["post", "--http", &self.url, "--priv", &hex(&key.secret_bytes()),
+			"--offer-file", path.to_str().unwrap()]).output().expect("run seqob-relaycli");
+		assert!(out.status.success(), "seqob-relaycli post: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+		let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+		println!("$ seqob-relaycli post --http {} --priv … --offer-file offer.json\n{}", self.url, v);
+		v
+	}
+
+	/// The relay's book of `a` for `b`, waiting until it holds an offer
+	/// whose covenant rests at `at`: that offer, as the relay serves it.
+	fn order_at(&self, a: AssetId, b: AssetId, at: &OutPoint) -> Value {
+		let start = Instant::now();
+		loop {
+			let book = self.get(&format!("/v1/market/{}/{}/orderbook", a, b));
+			let found = book.as_ref().and_then(|v| v["offers"].as_array().cloned()).unwrap_or_default().into_iter()
+				.find(|o| o["covenant"]["covenant_txid"] == json!(at.txid.to_string()) && o["covenant"]["covenant_vout"].as_u64().unwrap_or(0) == at.vout as u64);
+			if let Some(o) = found {
+				println!("the relay's book serves the order at {}: {}", at, o);
+				return o;
+			}
+			assert!(start.elapsed() < Duration::from_secs(60), "the relay's book never served the order at {}: {:?}", at, book);
+			std::thread::sleep(Duration::from_millis(500));
+		}
+	}
+}
+
+/// The order a relay serves, in a file for `arca take @FILE`.
+fn served_offer(name: &str, offer: &Value) -> String {
+	let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("offer-{}-{}.json", std::process::id(), name));
+	std::fs::write(&path, offer.to_string()).unwrap();
+	format!("@{}", path.display())
 }
 
 /// One fill round of the operator's, its takes' forfeits handed over by
@@ -252,10 +350,24 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	assert!(maker.ok(&["coins"]).as_array().unwrap().iter().any(|c| c["leaf_id"] == json!(coin_id) && c["state"] == "spent"));
 	println!("the order rests at {} under {}; the maker's process stops here", at, terms.script_pubkey());
 
+	// Listed on SeqDEX's relay, when it runs: the offer as the wallet hands
+	// it out, signed and posted by `seqob-relaycli post` with the maker's own
+	// relay key, the outpoint outside what the key signs.
+	let book = Relay::start(&r);
+	let first = match &book {
+		Some(b) => {
+			let offer = &rests["offer"];
+			assert_eq!((offer["offer_amount"].as_str(), offer["want_amount"].as_str()), (Some("1000000"), Some("1500000")));
+			b.post(offer, &common::running::keypair("OM relay key"));
+			served_offer("o-1", &b.order_at(x, y, &at))
+		},
+		None => served("o-1", &relay),
+	};
+
 	// Two takers holding Y fill it in part, one after the other.
 	let t1 = leaves_only(&mut r, "OT1", y, 900_000).await;
 	let t2 = leaves_only(&mut r, "OT2", y, 700_000).await;
-	let k1 = t1.ok(&["take", &served("o-1", &relay), "--amount", "400000"]);
+	let k1 = t1.ok(&["take", &first, "--amount", "400000"]);
 	assert_eq!((k1["price"].as_str(), k1["remainder"].as_str()), (Some("600000"), Some("600000")));
 	let r1 = fill_round(&mut r, &[&t1]).await;
 	assert_eq!(r1.input[0].previous_output, at, "the order at input 0");
@@ -264,7 +376,12 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	assert_eq!(ExplicitOutput::from_txout(&r1.output[1]).unwrap(), ExplicitOutput::new(x, 600_000, terms.script_pubkey()),
 		"the rest at 1, under the identical script");
 	let again = OutPoint::new(r1.txid(), 1);
-	let k2 = t2.ok(&["take", &served("o-2", &terms.to_relay(&again)), "--amount", "300000"]);
+	// The relay re-points the order to the rest at the round's output 1.
+	let second = match &book {
+		Some(b) => served_offer("o-2", &b.order_at(x, y, &again)),
+		None => served("o-2", &terms.to_relay(&again)),
+	};
+	let k2 = t2.ok(&["take", &second, "--amount", "300000"]);
 	assert_eq!(k2["price"].as_str(), Some("450000"));
 	let r2 = fill_round(&mut r, &[&t2]).await;
 	assert_eq!(r2.input[0].previous_output, again);
