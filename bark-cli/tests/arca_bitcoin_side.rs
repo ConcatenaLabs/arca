@@ -125,6 +125,12 @@ async fn native_btc_goes_through_barks_leg_on_the_wallets_bitcoin_ark() {
 	let b = a.ok(&["balance"]);
 	assert_eq!(b["rows"][0]["total"], "1320");
 	assert_eq!(asked(&log).unwrap(), calls(&[&["balance"], &["onchain", "balance"]]));
+	// Left out for a program that reads it on its own: Bark not run, BTC's
+	// row still first, with no total.
+	let b = a.ok(&["balance", "--without-bitcoin"]);
+	assert_eq!((&b["rows"][0]["asset"], &b["rows"][0]["total"]), (&serde_json::json!("BTC"), &serde_json::Value::Null));
+	assert_eq!(b["bitcoin"]["left_out"], true);
+	assert_eq!(asked(&log), None);
 
 	// A Bitcoin invoice is never paid from a Sequentia leaf: asked to, the
 	// wallet refuses before anything is signed, and Bark is not run.

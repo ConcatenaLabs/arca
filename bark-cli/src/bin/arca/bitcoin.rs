@@ -120,6 +120,9 @@ pub fn balance(datadir: &Path) -> Value {
 /// either way) and the on-chain wallet's total. `None` when it could not be
 /// read.
 pub fn total_sat(b: &Value) -> Option<u64> {
+	if b["left_out"] == json!(true) {
+		return None;
+	}
 	if b["wallet"].is_null() && b["error"].is_null() {
 		return Some(0);
 	}

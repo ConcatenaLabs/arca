@@ -119,7 +119,14 @@ enum Cmd {
 	Address,
 	/// What the wallet holds, per asset: Arca coins by state, on-chain coins,
 	/// and the Bitcoin side.
-	Balance,
+	Balance {
+		/// Leaves the Bitcoin side out, Bark not run: for a program that
+		/// reads it on its own, one Bark run at a time (Bark lets one
+		/// process at a time open its wallet). BTC's row is still first,
+		/// with no total.
+		#[arg(long)]
+		without_bitcoin: bool,
+	},
 	/// Every coin the wallet holds or held.
 	Coins,
 	/// One coin's record.
@@ -391,6 +398,8 @@ fn bitcoin(datadir: &Path, args: &[String]) -> Result<Value, bark::arca::Error> 
 fn rows(b: &Value) -> Value {
 	let mut rows = vec![match bitcoin::total_sat(&b["bitcoin"]) {
 		Some(btc) => json!({"asset": "BTC", "total": btc.to_string(), "unit": "sat"}),
+		None if b["bitcoin"]["left_out"] == json!(true) => json!({"asset": "BTC", "total": null, "unit": "sat",
+			"note": b["bitcoin"]["note"].clone()}),
 		None => json!({"asset": "BTC", "total": null, "unit": "sat", "note": format!("the Bitcoin side could not be read: {}",
 			b["bitcoin"]["error"].as_str().unwrap_or(""))}),
 	}];
@@ -590,7 +599,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// needs nothing of the operator) do not wait on the server. The library
 	// witnesses again in every entry point that takes a coin or signs a
 	// spend through the operator, and refuses while no witness succeeds.
-	if !matches!(cli.command, Cmd::Address | Cmd::Balance | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
+	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::Schedule)
 	{
 		match w.witness() {
@@ -621,9 +630,14 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Address => w.address(),
-		Cmd::Balance => {
+		Cmd::Balance { without_bitcoin } => {
 			let mut b = w.balance()?;
-			b["bitcoin"] = bitcoin::balance(&datadir);
+			b["bitcoin"] = if without_bitcoin {
+				json!({"left_out": true, "note": "the Bitcoin side is left out (--without-bitcoin): read it with `arca bitcoin balance` \
+					and `arca bitcoin onchain balance`"})
+			} else {
+				bitcoin::balance(&datadir)
+			};
 			b["rows"] = rows(&b);
 			Ok(b)
 		},
