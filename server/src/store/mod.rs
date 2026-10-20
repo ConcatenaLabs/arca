@@ -10,7 +10,7 @@
 //! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`,
 //! `schema/V16__keepers_pinned.sql`, `schema/V17__leaf_reserving.sql`,
 //! `schema/V18__lightning_send.sql`, `schema/V19__lightning_receive.sql`,
-//! `schema/V20__pending_coins.sql`),
+//! `schema/V20__pending_coins.sql`, `schema/V21__takes.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -59,8 +59,8 @@ pub use mailbox::MailboxMessage;
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
-	AttemptRow, ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState,
-	ReleaseRow, Restored, WantedKind,
+	AttemptRow, FillRow, ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow,
+	ParticipationState, ReleaseRow, Restored, WantedKind,
 };
 pub use rounds::{
 	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRerun, NewRound, OffboardRow, Placement, RoundRow, RoundState,
@@ -94,6 +94,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(18, include_str!("../../schema/V18__lightning_send.sql")),
 	(19, include_str!("../../schema/V19__lightning_receive.sql")),
 	(20, include_str!("../../schema/V20__pending_coins.sql")),
+	(21, include_str!("../../schema/V21__takes.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -154,6 +155,9 @@ pub enum StoreError {
 	Mergeable(String),
 	#[error("a participation with this id is already recorded")]
 	ParticipationExists,
+	/// Another pending or issued participation takes the same order.
+	#[error("order {0} is taken by participation {1}, which is pending or in a round: an order is taken by one participation at a time")]
+	OrderTaken(String, String),
 	/// The participation is no longer in its round's forfeit step.
 	#[error("the participation is {0}")]
 	NotInRound(&'static str),

@@ -35,7 +35,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
+	"operator_key", "order", "order_expiring", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
 	"unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator", "wrong_round",
@@ -71,6 +71,20 @@ pub struct Info {
 	pub max_request_bytes: u64,
 	/// The Lightning side beyond the assets' own legs (`assets[].lightning`).
 	pub lightning: LightningInfo,
+	/// How takes of on-chain orders are bounded (`take_order`).
+	pub fills: FillsInfo,
+}
+
+/// How takes of on-chain orders are bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillsInfo {
+	/// No order is taken, or filled in a round, whose maker can refund it
+	/// within this many seconds.
+	pub order_margin_seconds: u32,
+	/// The seconds a block is counted at for an order whose REFUND is locked
+	/// to a height.
+	pub block_seconds: u32,
 }
 
 /// An asset's Lightning leg: the operator's SeqLN node in that asset.
@@ -1014,6 +1028,48 @@ pub struct FeeAmount {
 	pub amount: String,
 }
 
+/// `POST /v1/take_order`: a take of the on-chain order the relay serves as
+/// `order`, by `filled` atoms of the asset it sells, giving up `inputs` in
+/// the asset it is paid in for the one leaf `leaf`, and paying `fee` in that
+/// asset. Its id is `arca_covenant::Take::id`, which each input's
+/// attestation signs and the leaf's key proof covers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TakeOrder {
+	/// The order's `CovenantTerms`, in the relay's JSON form, or an offer
+	/// whose settlement is one.
+	pub order: serde_json::Value,
+	/// What the order holds at its outpoint, in atoms, as the taker read it.
+	pub locked: String,
+	pub filled: String,
+	pub inputs: Vec<ParticipationInput>,
+	pub leaf: WantedLeaf,
+	pub fee: FeeAmount,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub not_before: Option<u32>,
+}
+
+/// The order a take takes, in its status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillStatus {
+	/// `txid:vout`.
+	pub order: String,
+	/// The asset it sells, and the one it is paid in.
+	pub asset_a: String,
+	pub asset_b: String,
+	pub locked: String,
+	pub filled: String,
+	/// What rests again after the fill; 0 for a full fill.
+	pub remainder: String,
+	/// The maker's credit: the price of the fill, in `asset_b`.
+	pub price: String,
+	/// The maker's program, which the credit pays (`OP_1 <program>`).
+	pub maker_script: String,
+	/// The order's scriptPubKey.
+	pub script: String,
+}
+
 /// `POST /v1/participation_status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1049,6 +1105,9 @@ pub struct ParticipationStatus {
 	/// round that could not return the operator published, say).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub void_reason: Option<String>,
+	/// For a take, the order it takes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fill: Option<FillStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

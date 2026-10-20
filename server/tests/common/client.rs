@@ -287,6 +287,41 @@ pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(A
 	(body, id)
 }
 
+/// A take's request body and its id: `coins` given up, each attested by its
+/// owner's key over the take, for the leaf `leaf` (its key proved when the
+/// tests hold it), taking `filled` of the order `terms` at `order`, which
+/// holds `locked`, and paying `fee`.
+#[allow(clippy::too_many_arguments)]
+pub fn take_body(coins: &[&Held], order: OutPoint, terms: &arca_covenant::FillOrder, locked: u64, filled: u64, leaf: &OutputRequest,
+	fee: (AssetId, u64), operator: XOnlyPublicKey, chain: Chain) -> (Value, [u8; 32])
+{
+	let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } = leaf else { panic!("a take wants a leaf") };
+	let take = arca_covenant::Take {
+		order, terms: terms.clone(), locked, filled,
+		inputs: coins.iter().map(|h| h.id).collect(),
+		leaf: arca_covenant::TakeLeaf { asset: *asset, value: *value, template: *template, owner: *owner, owner_nonce: *owner_nonce,
+			exit_delay: *exit_delay },
+		fee,
+		not_before: None,
+	};
+	let id = take.id(&chain, &operator);
+	let inputs: Vec<Value> = coins.iter().map(|h| json!({
+		"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref()),
+	})).collect();
+	let mut l = output_json(leaf)["leaf"].clone();
+	if let Some(k) = held_key(owner) {
+		l["key_proof"] = json!(hex(sign_digest(&k, &server::participations::key_proof_digest(&id), &random32()).as_ref()));
+	}
+	(json!({
+		"order": terms.to_relay(&order),
+		"locked": locked.to_string(),
+		"filled": filled.to_string(),
+		"inputs": inputs,
+		"leaf": l,
+		"fee": {"asset": fee.0.to_string(), "amount": fee.1.to_string()},
+	}), id)
+}
+
 // ---------------------------------------------------------------------------
 // Published trees
 // ---------------------------------------------------------------------------

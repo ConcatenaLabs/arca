@@ -34,7 +34,11 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V14__keeper_acks.sql`](schema/V14__keeper_acks.sql),
 [`schema/V15__rerun_ties.sql`](schema/V15__rerun_ties.sql),
 [`schema/V16__keepers_pinned.sql`](schema/V16__keepers_pinned.sql),
-[`schema/V17__leaf_reserving.sql`](schema/V17__leaf_reserving.sql)). `Store::connect` builds it
+[`schema/V17__leaf_reserving.sql`](schema/V17__leaf_reserving.sql),
+[`schema/V18__lightning_send.sql`](schema/V18__lightning_send.sql),
+[`schema/V19__lightning_receive.sql`](schema/V19__lightning_receive.sql),
+[`schema/V20__pending_coins.sql`](schema/V20__pending_coins.sql),
+[`schema/V21__takes.sql`](schema/V21__takes.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -679,6 +683,64 @@ coin's asset, or one atom when the node does not accept that asset for fees.
 An offboard's output may be reclaimed by the operator after a delay longer than
 unrolling the coin given up, its exit delay, the refund delay and a margin.
 
+### Takes of on-chain orders
+
+A take asks the operator's round to fill an order resting on the chain under
+SeqDEX's fill covenant (`arca_covenant::fill`), for a holder who pays for it
+with leaves. The order sells one asset (`asset_a`) and is paid in another
+(`asset_b`); the take gives up coins in `asset_b` worth the order's price for
+the fill and the operator's fee, and wants one leaf, in `asset_a`, of what it
+fills. Its round spends the order and pays the maker its credit on the chain,
+from the operator's coins of `asset_b`; the coins the take gave up are the
+operator's once its forfeits are in, as a refresh's are.
+
+`take_order` names the order as the relay serves it (its `CovenantTerms`, or
+an offer whose settlement is one), what it holds (`locked`), the fill
+(`filled`), the coins given up, each with its attestation over the take's id,
+the leaf wanted with its key proof, and the fee. The server takes it only
+when:
+
+- the order's terms are ones a resting order can have (an internal key other
+  than NUMS is a maker's key path and is refused), and the fill is one the
+  order's FILL leaf takes: at least `min_lot`, at most what it holds,
+  leaving nothing or at least `min_lot` resting, within the leaf's
+  arithmetic (`order`, naming what is wrong);
+- the operator's node holds, at the order's outpoint, an explicit output of
+  `locked` of `asset_a` paying the script the terms make (`order` otherwise),
+  unspent in a block and in its mempool (`order_spent`), in a transaction
+  that is final (`order_not_final`: a round spends only what a rollback
+  cannot take away);
+- its maker cannot refund it within `[fills] order_margin_seconds` (six
+  hours unless set; an order locked to a height counted at `[fills]
+  block_seconds` a block): such an order is a race a round can lose after
+  it is built (`order_expiring`);
+- the leaf wanted holds exactly `filled` of `asset_a`, within the published
+  bounds, under a key the take proves it holds, as a participation's leaf;
+- both assets are served and their rates fresh;
+- every coin given up is in `asset_b` and passes the checks a
+  participation's coins pass;
+- the coins hold exactly the price and the fee, and the fee, in `asset_b`,
+  covers that asset's schedule for an offboard of the price: the maker's
+  credit is an on-chain output the operator pays, as an offboard is;
+- no other pending or issued participation takes the same order
+  (`order_taken`, a 409, naming that participation), checked
+  under a lock on the order so two takes racing each other cannot both be
+  taken.
+
+A take is a participation of its own, carrying the two assets its nature
+asks: it is never taken into a refresh round, and its status
+(`participation_status`) shows its order (`fill`: the outpoint, both assets,
+what it holds, what is filled and what rests again, the price, the maker's
+script and the order's). The same request again is answered with its
+status.
+
+The take's id is `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body)`,
+`T = SHA256("Arca/take")`, over the order's outpoint and script (which commits
+to every term), what it holds, the fill and its price, the coins given up,
+the leaf wanted, the fee and the earliest round time
+(`arca_covenant::Take::id` spells the layout). Its tag is its own, so no
+attestation of a take is one of a refresh.
+
 ## Rounds
 
 A round carries one asset. Each asset the operator serves has rounds of its
@@ -1077,7 +1139,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -1089,7 +1151,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST lightning_receive_status` | A payment into the tree by its payment hash: `open`, `accepted` with its participation and the leaf's timeout, `claimed` and whether the node has settled it, or `cancelled` with the reason |
 | `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
 | `POST submit_participation` | Accepts a participation in a round |
-| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), and once void or expired whether each coin it gave up is its owner's again off the chain (`returned`) |
+| `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`) |
+| `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
@@ -1640,8 +1703,10 @@ acts on its own, early reclaims, the most outputs a sweep takes, how often its
 recovery work runs), and the limits on what the unauthenticated calls leave
 behind (`[limits]`: the rate of nonces, and the witness's own, for each source and overall, the
 proxies trusted to name a request's source, a nonce's lifetime,
-how long a board may stay out of every block), and where the operator's
-metrics are served (`metrics_listen`, a loopback address). The node must run with `-txindex` and `-validateanchor`.
+how long a board may stay out of every block), where the operator's
+metrics are served (`metrics_listen`, a loopback address), and how takes of
+on-chain orders are bounded (`[fills]`: how long before its refund an order is
+no longer taken). The node must run with `-txindex` and `-validateanchor`.
 
 An asset served need not be accepted for fees by the node. A batch in such an
 asset carries a reserve of one atom on every node and every entry, on every

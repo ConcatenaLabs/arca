@@ -95,6 +95,37 @@ pub struct Config {
 	/// checked ([`crate::lightning`]).
 	#[serde(default)]
 	pub lightning: LightningSection,
+	/// How takes of on-chain orders are bounded; the defaults when absent.
+	#[serde(default)]
+	pub fills: FillsSection,
+}
+
+/// How takes of on-chain orders are bounded.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FillsSection {
+	/// No order is taken, or filled in a round, whose maker can refund it
+	/// within this many seconds: 21,600 (six hours) when absent.
+	#[serde(default = "default_order_margin")]
+	pub order_margin_seconds: u32,
+	/// The seconds a block is counted at for an order whose REFUND is locked
+	/// to a height: 60 when absent.
+	#[serde(default = "default_order_block")]
+	pub block_seconds: u32,
+}
+
+impl Default for FillsSection {
+	fn default() -> FillsSection {
+		FillsSection { order_margin_seconds: default_order_margin(), block_seconds: default_order_block() }
+	}
+}
+
+fn default_order_margin() -> u32 {
+	crate::params::ORDER_MARGIN_SECONDS
+}
+
+fn default_order_block() -> u32 {
+	crate::params::ORDER_BLOCK_SECONDS
 }
 
 /// The gateway's settings beside the assets' own nodes.
@@ -845,6 +876,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	differ("limits", a.limits == b.limits);
 	differ("metrics_listen", a.metrics_listen == b.metrics_listen);
 	differ("lightning", a.lightning == b.lightning);
+	differ("fills", a.fills == b.fills);
 	out
 }
 
@@ -1019,6 +1051,11 @@ impl Server {
 			}
 			params.max_margin_multiple = m;
 		}
+		if config.fills.block_seconds == 0 {
+			return Err(StartError("fills.block_seconds is at least 1".into()));
+		}
+		params.order_margin_seconds = config.fills.order_margin_seconds;
+		params.order_block_seconds = config.fills.block_seconds;
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
