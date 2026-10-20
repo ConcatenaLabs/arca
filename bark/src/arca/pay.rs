@@ -1050,7 +1050,11 @@ impl Wallet {
 	/// kept or refused for good. A notice of a coin pending for the wallet,
 	/// or withdrawn, is taken as [`Self::take_notice`] says: the coins still
 	/// pending are listed (`pending`), counted nowhere, and those withdrawn
-	/// in this read with their reasons (`withdrawn`). The cursor moves past all of them but one
+	/// in this read with their reasons (`withdrawn`). The cursor of a
+	/// mailbox never moves back: a message at or before it is not read
+	/// again, a page with nothing past it ends the read, and one read takes
+	/// at most [`super::client::MAILBOX_PAGES`] pages of a key, each with a
+	/// note (`note`). The cursor moves past all of them but one
 	/// whose head of the operator's signer's record comes without the
 	/// acknowledgements of the keepers the wallet pinned: that coin is not
 	/// taken, and its message is read again on the next read.
@@ -1104,19 +1108,36 @@ impl Wallet {
 		}
 		let now = self.now()?.to_consensus_u32();
 		let mut withdrawn = vec![];
+		let mut notes: Vec<String> = vec![];
 		for key in keys {
 			let k = key.x_only_public_key().0.serialize();
 			let mut read_again: Option<i64> = None;
+			let start = self.store.cursor(&k)?;
+			let mut pages = 0;
 			loop {
 				let after = self.store.cursor(&k)?;
+				if pages >= super::client::MAILBOX_PAGES {
+					notes.push(format!("the mailbox of key {} holds more than {} pages after what the wallet has read: the rest is read by the \
+						next sync", hex(&k), super::client::MAILBOX_PAGES));
+					break;
+				}
+				pages += 1;
 				let v = self.server.mailbox_read(&key, &self.genesis, after, 100)?;
 				let msgs = v["messages"].as_array().cloned().unwrap_or_default();
 				if msgs.is_empty() {
 					break;
 				}
+				let mut progress = false;
 				for m in &msgs {
 					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
 					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
+					// The cursor never moves back: a message at or before the
+					// one the wallet has read was read already, whatever the
+					// server serves again.
+					if cursor <= self.store.cursor(&k)? {
+						continue;
+					}
+					progress = true;
 					// A notice of a coin pending or withdrawn (D61).
 					if m["kind"].as_str().is_some_and(|k| k != "coin") {
 						if let Some(w) = self.take_notice(m, now)? {
@@ -1159,9 +1180,19 @@ impl Wallet {
 					}
 					self.store.set_cursor(&k, cursor)?;
 				}
+				// A page with nothing past what the wallet has read: the server
+				// serves again what was read, and the read ends.
+				if !progress {
+					notes.push(format!("the server served the mailbox of key {} from before what the wallet has read (cursor {}) again: the \
+						read ends there", hex(&k), after));
+					break;
+				}
 			}
+			// A coin waiting for its keepers' acknowledgements is read again
+			// next time: the wallet's own step back, never before where this
+			// read began.
 			if let Some(c) = read_again {
-				self.store.set_cursor(&k, c)?;
+				self.store.set_cursor(&k, c.max(start))?;
 			}
 		}
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
@@ -1174,6 +1205,9 @@ impl Wallet {
 		}
 		if !withdrawn.is_empty() {
 			out["withdrawn"] = json!(withdrawn);
+		}
+		if !notes.is_empty() {
+			out["note"] = json!(notes.join("; "));
 		}
 		if let Some((at, why)) = home {
 			out["witness"] = witness;
