@@ -20,6 +20,7 @@
 //! | `lightning_receive_claim` | POST | by the preimage, and the owners' signatures over the transfer of the leaf |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
+//! | `take_order` | POST | by each owner's attestation over the take ([`arca_covenant::Take::id`]) |
 //! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
@@ -365,7 +366,8 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"unknown_participation" | "unknown_batch" | "unknown_payment" => StatusCode::NOT_FOUND,
-		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap" =>
+		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
+			| "order_taken" =>
 			StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
@@ -649,6 +651,10 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				block_seconds: app.receives.config().block_seconds,
 			},
 		},
+		fills: api::FillsInfo {
+			order_margin_seconds: app.params.order_margin_seconds,
+			block_seconds: app.params.order_block_seconds,
+		},
 	})
 }
 
@@ -895,6 +901,20 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 		fees: r.fees.iter().map(|(a, v)| api::FeeAmount { asset: AssetId::from_byte_array(*a).to_string(), amount: v.to_string() }).collect(),
 		waiting: r.waiting.clone().filter(|_| r.state == crate::store::ParticipationState::Pending),
 		void_reason: r.void_reason.clone().filter(|_| r.state == crate::store::ParticipationState::Void),
+		fill: r.fill.as_ref().and_then(|f| {
+			let order = f.order().ok()?;
+			Some(api::FillStatus {
+				order: part::outpoint_text(&f.outpoint()),
+				asset_a: order.asset_a.to_string(),
+				asset_b: order.asset_b.to_string(),
+				locked: f.locked.to_string(),
+				filled: f.filled.to_string(),
+				remainder: (f.locked - f.filled).to_string(),
+				price: f.price.to_string(),
+				maker_script: hex(order.maker_script_pubkey().as_bytes()),
+				script: hex(&f.script_pubkey),
+			})
+		}),
 	}
 }
 
@@ -945,6 +965,45 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 		.transpose()?;
 	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before }).await?;
 	for (owner, (mailbox, proof)) in bindings {
+		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
+	}
+	Ok(Json(participation_status(&status)))
+}
+
+async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ParticipationStatus>, Refusal> {
+	let req: api::TakeOrder = parse(body, app.max_request)?;
+	let (order, terms) = arca_covenant::FillOrder::from_relay(&req.order)
+		.map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "order", e.to_string()))?;
+	let mut inputs = Vec::with_capacity(req.inputs.len());
+	for i in &req.inputs {
+		inputs.push(part::InputRequest { leaf_id: leaf_id(&i.leaf_id)?, attestation: sig(&i.attestation)? });
+	}
+	let l = &req.leaf;
+	let owner = key(&l.owner)?;
+	let bound = binding(&app, &owner, l.mailbox.as_deref(), l.mailbox_proof.as_deref())?;
+	let leaf = part::OutputRequest::Leaf {
+		asset: asset(&l.asset)?,
+		value: amount(&l.value)?,
+		template: l.template.parse().map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "template",
+			format!("template {:?}: {}", l.template, e)))?,
+		owner,
+		owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
+		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
+	};
+	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
+		.transpose()?;
+	let status = app.participations.take(&part::TakeRequest {
+		order,
+		terms,
+		locked: amount(&req.locked)?,
+		filled: amount(&req.filled)?,
+		inputs,
+		leaf,
+		key_proof: l.key_proof.as_deref().map(sig).transpose()?,
+		fee: (asset(&req.fee.asset)?, amount(&req.fee.amount)?),
+		not_before,
+	}).await?;
+	if let Some((mailbox, proof)) = bound {
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
 	}
 	Ok(Json(participation_status(&status)))
@@ -1415,6 +1474,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
+		.route("/v1/take_order", post(take_order))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))

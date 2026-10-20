@@ -27,12 +27,13 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 20;
+const SCHEMA: i32 = 21;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_notice_has_no_leaf;
+const UNDO_V17: &str = "DROP TABLE participation_fill;
+	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_notice_has_no_leaf;
 	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_kind_check;
 	ALTER TABLE mailbox_message ADD CONSTRAINT mailbox_message_kind_check CHECK (kind IN ('coin'));
 	DROP TABLE lightning_receive;

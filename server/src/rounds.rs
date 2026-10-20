@@ -395,6 +395,11 @@ impl Rounds {
 				Some(r) => r,
 				None => continue,
 			};
+			// A take carries two assets by its nature, and runs in a round
+			// of its own.
+			if row.fill.is_some() {
+				continue;
+			}
 			match Self::asset_of(&row) {
 				Some(a) if served.contains(&a) => {
 					waiting.insert(a);
@@ -468,7 +473,7 @@ impl Rounds {
 				Some(r) => r,
 				None => continue,
 			};
-			if Self::asset_of(&row) != Some(asset) {
+			if row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
 				continue;
 			}
 			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {

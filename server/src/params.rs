@@ -259,7 +259,21 @@ pub struct Params {
 	/// least: four times the node's floor in an asset it accepts for fees,
 	/// one atom in one it does not.
 	pub max_margin_multiple: u64,
+	/// A take is refused, and a round fills no order, whose maker can
+	/// refund it within this many seconds: the order would otherwise be a
+	/// race a round can lose after it is built. Six hours, the time the
+	/// specification gives an anchor to be buried while the parent chain is
+	/// contested.
+	pub order_margin_seconds: u32,
+	/// The seconds a block is counted at for an order whose REFUND is locked
+	/// to a height.
+	pub order_block_seconds: u32,
 }
+
+/// The default [`Params::order_margin_seconds`].
+pub const ORDER_MARGIN_SECONDS: u32 = 6 * 3_600;
+/// The default [`Params::order_block_seconds`]: Sequentia's block spacing.
+pub const ORDER_BLOCK_SECONDS: u32 = 60;
 
 /// The default cap on a transfer's margins, as a multiple of the least.
 pub const MAX_MARGIN_MULTIPLE: u64 = 25;
@@ -283,6 +297,8 @@ impl Params {
 			refund_delay: spec.max_exit_delay,
 			offboard_reclaim_delay: spec.max_exit_delay,
 			max_margin_multiple: MAX_MARGIN_MULTIPLE,
+			order_margin_seconds: ORDER_MARGIN_SECONDS,
+			order_block_seconds: ORDER_BLOCK_SECONDS,
 		};
 		p.set_delays();
 		p

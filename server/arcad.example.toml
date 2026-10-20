@@ -220,6 +220,13 @@ min_leaf = "1000"
 # [assets.lightning]
 # rpc = "/var/lib/seqln/<asset id>/sequentia/lightning-rpc"
 
+# Takes of on-chain orders (take_order): no order is taken, or filled in a
+# round, whose maker can refund it within order_margin_seconds, an order
+# locked to a height counted at block_seconds a block.
+[fills]
+order_margin_seconds = 21600
+block_seconds = 60
+
 # The Lightning gateway beside each asset's own node.
 [lightning]
 # How often every Lightning node is checked, in seconds.

@@ -90,6 +90,36 @@ pub struct NewParticipation {
 	pub inputs: Vec<ParticipationInput>,
 	pub outputs: Vec<ParticipationOutput>,
 	pub fees: Vec<([u8; 32], u64)>,
+	/// For a take, the order it takes.
+	pub fill: Option<FillRow>,
+}
+
+/// The on-chain order a take takes, as its id covers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillRow {
+	pub order_txid: [u8; 32],
+	pub order_vout: u32,
+	/// The order's terms as the relay serves them
+	/// ([`arca_covenant::FillOrder::to_relay`]).
+	pub terms: String,
+	pub script_pubkey: Vec<u8>,
+	pub locked: u64,
+	pub filled: u64,
+	pub price: u64,
+}
+
+impl FillRow {
+	/// The order's terms.
+	pub fn order(&self) -> Result<arca_covenant::FillOrder, StoreError> {
+		let v: serde_json::Value = serde_json::from_str(&self.terms).map_err(|e| StoreError::Corrupt(format!("a take's terms: {}", e)))?;
+		let (_, o) = arca_covenant::FillOrder::from_relay(&v).map_err(|e| StoreError::Corrupt(format!("a take's terms: {}", e)))?;
+		Ok(o)
+	}
+
+	pub fn outpoint(&self) -> elements::OutPoint {
+		use elements::hashes::Hash;
+		elements::OutPoint::new(elements::Txid::from_byte_array(self.order_txid), self.order_vout)
+	}
 }
 
 /// A forfeit to record: the coin given up, both signatures over its move into
@@ -172,6 +202,8 @@ pub struct ParticipationRow {
 	pub waiting: Option<String>,
 	/// Why it will never run, once void.
 	pub void_reason: Option<String>,
+	/// For a take, the order it takes.
+	pub fill: Option<FillRow>,
 }
 
 fn u64_of(v: i64, what: &str) -> Result<u64, StoreError> {
@@ -242,6 +274,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 		fees: vec![],
 		waiting: r.get(9),
 		void_reason: r.get(6),
+		fill: None,
 	};
 	for r in c.query(
 		"SELECT leaf_id, asset, value, margin, attestation, active FROM participation_input WHERE participation_id = $1 ORDER BY idx",
@@ -293,6 +326,20 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	for r in c.query("SELECT asset, amount FROM participation_fee WHERE participation_id = $1 ORDER BY asset", &[&&id[..]]).await? {
 		row.fees.push((array32(r.get(0), "asset")?, u64_of(r.get(1), "fee")?));
 	}
+	if let Some(r) = c.query_opt(
+		"SELECT order_txid, order_vout, terms, script_pubkey, locked, filled, price FROM participation_fill WHERE participation_id = $1",
+		&[&&id[..]],
+	).await? {
+		row.fill = Some(FillRow {
+			order_txid: array32(r.get(0), "order txid")?,
+			order_vout: r.get::<_, i32>(1) as u32,
+			terms: r.get(2),
+			script_pubkey: r.get(3),
+			locked: u64_of(r.get(4), "locked")?,
+			filled: u64_of(r.get(5), "filled")?,
+			price: u64_of(r.get(6), "price")?,
+		});
+	}
 	Ok(Some(row))
 }
 
@@ -316,6 +363,28 @@ impl Store {
 				return Err(StoreError::ParticipationExists);
 			}
 			return Err(e.into());
+		}
+		if let Some(f) = &p.fill {
+			// One take of an order at a time, checked under a lock on the
+			// order: two takes of it racing each other wait for one another.
+			let key = i64::from_le_bytes(arca_covenant::script::sha256(&[&f.order_txid[..], &f.order_vout.to_le_bytes()].concat())[..8]
+				.try_into().expect("8 bytes"));
+			t.execute("SELECT pg_advisory_xact_lock($1)", &[&key]).await?;
+			if let Some(r) = t.query_opt(
+				"SELECT f.participation_id FROM participation_fill f JOIN participation q USING (participation_id)
+				 WHERE f.order_txid = $1 AND f.order_vout = $2 AND q.state IN ('pending', 'issued')",
+				&[&&f.order_txid[..], &(f.order_vout as i32)],
+			).await? {
+				let by: Vec<u8> = r.get(0);
+				let op = f.outpoint();
+				return Err(StoreError::OrderTaken(format!("{}:{}", op.txid, op.vout), hex(&by)));
+			}
+			t.execute(
+				"INSERT INTO participation_fill (participation_id, order_txid, order_vout, terms, script_pubkey, locked, filled, price)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+				&[&&p.id[..], &&f.order_txid[..], &(f.order_vout as i32), &f.terms, &f.script_pubkey, &i64_of(f.locked)?,
+					&i64_of(f.filled)?, &i64_of(f.price)?],
+			).await?;
 		}
 		for (k, i) in p.inputs.iter().enumerate() {
 			let r = t.query_opt(

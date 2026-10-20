@@ -475,6 +475,7 @@ impl Receives {
 				},
 				leaf_id: None,
 			}],
+			fill: None,
 		};
 		match self.store.insert_participation(&p).await {
 			Ok(()) | Err(StoreError::ParticipationExists) => {},

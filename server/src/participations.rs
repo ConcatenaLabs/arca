@@ -64,6 +64,12 @@
 //! counts as one byte, integers little-endian, asset ids in internal byte
 //! order. The tag keeps the attestation apart from everything else a leaf key
 //! signs; the genesis hash and `S` keep it to one chain and one operator.
+//!
+//! A take ([`Participations::take`]) is a participation that asks the round
+//! to fill an on-chain order for its owner: it gives up coins in the asset the
+//! order is paid in and wants one leaf of what it fills, in the asset the
+//! order sells, so it carries those two assets and runs in no refresh round.
+//! Its id is [`arca_covenant::Take::id`], under its own tag.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -79,7 +85,8 @@ use arca_covenant::script::sha256 as sha256_bytes;
 use arca_covenant::sign::verify_digest;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::{
-	connector_asset, Chain, ExplicitOutput, Forfeit, LeafId, MedianTime, OffboardPolicy, Pair, RelativeTime, Template, ValidCoin,
+	connector_asset, Chain, ExplicitOutput, FillError, FillOrder, Forfeit, LeafId, MedianTime, OffboardPolicy, Pair, RefundLock,
+	RelativeTime, Take, TakeLeaf, Template, ValidCoin,
 };
 
 use crate::chain::FinalityService;
@@ -88,7 +95,7 @@ use crate::fees;
 use crate::params::Params;
 use crate::signer::{hex, Signed, SignerClient, SignerError};
 use crate::store::{
-	NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, Store, StoreError, WantedKind,
+	FillRow, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow, Store, StoreError, WantedKind,
 };
 
 /// The most coins one participation gives up.
@@ -165,6 +172,46 @@ impl ParticipationRequest {
 	/// The participation's id: see the [module documentation](self).
 	pub fn id(&self, chain: &Chain, operator: &XOnlyPublicKey) -> [u8; 32] {
 		participation_id(chain, operator, &self.inputs.iter().map(|i| i.leaf_id).collect::<Vec<_>>(), &self.outputs, &self.fees, self.not_before)
+	}
+}
+
+/// A take: a holder asks the round to fill the on-chain order at `order`,
+/// whose terms are `terms`, by `filled` atoms, giving up `inputs` (coins in
+/// the asset the order is paid in, worth its price and the fee) for one leaf
+/// of `filled` in the asset it sells. Its id is [`Take::id`], which every
+/// coin's owner attests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeRequest {
+	pub order: OutPoint,
+	pub terms: FillOrder,
+	/// What the order holds on the chain, as the taker read it.
+	pub locked: u64,
+	pub filled: u64,
+	pub inputs: Vec<InputRequest>,
+	/// The leaf wanted ([`OutputRequest::Leaf`]).
+	pub leaf: OutputRequest,
+	/// The proof of the leaf's key ([`key_proof_digest`] of the take's id).
+	pub key_proof: Option<Signature>,
+	/// The operator's fee, in the asset the order is paid in.
+	pub fee: (AssetId, u64),
+	pub not_before: Option<MedianTime>,
+}
+
+impl TakeRequest {
+	/// The take its id covers; `None` when the leaf wanted is not a leaf.
+	pub fn take(&self) -> Option<Take> {
+		let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } = &self.leaf else { return None };
+		Some(Take {
+			order: self.order,
+			terms: self.terms.clone(),
+			locked: self.locked,
+			filled: self.filled,
+			inputs: self.inputs.iter().map(|i| i.leaf_id).collect(),
+			leaf: TakeLeaf { asset: *asset, value: *value, template: *template, owner: *owner, owner_nonce: *owner_nonce,
+				exit_delay: *exit_delay },
+			fee: self.fee,
+			not_before: self.not_before,
+		})
 	}
 }
 
@@ -265,6 +312,22 @@ pub enum ParticipationError {
 	/// missing: no new work in the asset.
 	#[error(transparent)]
 	Rate(crate::rates::RateError),
+	/// A take's order: its terms, the fill asked of it, or what the chain
+	/// holds at its outpoint.
+	#[error("{0}")]
+	Order(String),
+	/// A take's order is spent, on the chain or in the node's mempool.
+	#[error("{0}")]
+	OrderSpent(String),
+	/// A take's order is on the chain, not yet final.
+	#[error("{0}")]
+	OrderNotFinal(String),
+	/// Another participation takes the same order.
+	#[error("{0}")]
+	OrderTaken(String),
+	/// A take's order can be refunded by its maker too soon.
+	#[error("{0}")]
+	OrderExpiring(String),
 	#[error(transparent)]
 	Store(StoreError),
 	#[error("{0}")]
@@ -298,6 +361,11 @@ impl ParticipationError {
 			SignedAlready(_) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			Rate(_) => "rate_stale",
+			Order(_) => "order",
+			OrderSpent(_) => "order_spent",
+			OrderNotFinal(_) => "order_not_final",
+			OrderTaken(_) => "order_taken",
+			OrderExpiring(_) => "order_expiring",
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -308,6 +376,9 @@ impl From<StoreError> for ParticipationError {
 		match e {
 			StoreError::KeyReused => ParticipationError::KeyReused,
 			StoreError::ScriptReused => ParticipationError::ScriptReused,
+			StoreError::OrderTaken(order, by) => ParticipationError::OrderTaken(format!("order {} is taken by participation {}, \
+				which is pending or in a round: an order is taken by one participation at a time, and a take of it waits until that one \
+				is done", order, by)),
 			other => ParticipationError::Store(other),
 		}
 	}
@@ -399,6 +470,59 @@ pub fn offboard_margin(destination: &ExplicitOutput, operator: XOnlyPublicKey, r
 fn one_asset(asset: AssetId, others: &BTreeSet<AssetId>) -> String {
 	format!("a participation carries one asset, as the round it runs in does, and this one carries asset {} and {}: submit one \
 		participation per asset", asset, others.iter().map(|a| format!("asset {}", a)).collect::<Vec<_>>().join(" and "))
+}
+
+/// An outpoint as `txid:vout`.
+pub fn outpoint_text(op: &OutPoint) -> String {
+	format!("{}:{}", op.txid, op.vout)
+}
+
+/// Why the REFUND of `terms` opens too soon for a round to fill the order
+/// now, at a tip of `height` and median time `mtp`: within
+/// [`Params::order_margin_seconds`], a height counted at
+/// [`Params::order_block_seconds`] a block. `None` when it does not.
+pub fn refund_too_soon(terms: &FillOrder, p: &Params, height: u64, mtp: u32) -> Option<String> {
+	let margin = p.order_margin_seconds;
+	match terms.refund_lock() {
+		RefundLock::Height(h) => {
+			let blocks = margin.div_ceil(p.order_block_seconds.max(1)) as u64;
+			(h as u64 <= height + blocks).then(|| format!("its maker can refund it from height {}, and the chain is at {}: a round fills \
+				only an order its maker cannot take back for {} more blocks ({} s at {} s a block)", h, height, blocks, margin,
+				p.order_block_seconds))
+		},
+		RefundLock::Time(t) => (t as u64 <= mtp as u64 + margin as u64).then(|| format!("its maker can refund it from median time {}, \
+			and the chain is at {}: a round fills only an order its maker cannot take back for {} s more", t, mtp, margin)),
+	}
+}
+
+/// [`Participations::order_on_chain`], for the round builder as well.
+pub async fn order_on_chain(finality: &FinalityService, order: &OutPoint, terms: &FillOrder, locked: u64) -> Result<(), ParticipationError> {
+	let op = *order;
+	let at = outpoint_text(order);
+	let tx = finality.call(move |n| n.transaction(&op.txid)).await.map_err(|e| ParticipationError::Internal(e.to_string()))?
+		.ok_or_else(|| ParticipationError::Order(format!("the operator's node knows no transaction {}", order.txid)))?;
+	let out = tx.output.get(order.vout as usize)
+		.ok_or_else(|| ParticipationError::Order(format!("transaction {} has no output {}", order.txid, order.vout)))?;
+	let shown = ExplicitOutput::from_txout(out)
+		.ok_or_else(|| ParticipationError::Order(format!("output {} hides its asset or value: an order rests explicitly", at)))?;
+	if shown.script_pubkey != terms.script_pubkey() {
+		return Err(ParticipationError::Order(format!("the terms do not make the script at {}: they are not that order's terms", at)));
+	}
+	if shown.asset != terms.asset_a || shown.value != locked {
+		return Err(ParticipationError::Order(format!("output {} holds {} of asset {}, and the take names {} of asset {}", at,
+			shown.value, shown.asset, locked, terms.asset_a)));
+	}
+	let unspent = finality.call(move |n| n.unspent(&op, true)).await.map_err(|e| ParticipationError::Internal(e.to_string()))?;
+	if unspent.is_none() {
+		return Err(ParticipationError::OrderSpent(format!("order {} is spent, in a block or in the node's mempool: it was filled or \
+			refunded before this take", at)));
+	}
+	let finality_of = finality.watch(order.txid, "order").await.map_err(|e| ParticipationError::Internal(e.to_string()))?;
+	if !finality_of.is_final() {
+		return Err(ParticipationError::OrderNotFinal(format!("order {} is {}: a round spends only what a rollback cannot take away, so \
+			it takes the order once its block is certified and its anchor buried", at, finality_of.name())));
+	}
+	Ok(())
 }
 
 impl Participations {
@@ -640,6 +764,7 @@ impl Participations {
 			}).collect(),
 			outputs: wanted,
 			fees: req.fees.iter().map(|(a, v)| (a.into_inner().to_byte_array(), *v)).collect(),
+			fill: None,
 		};
 		match self.store.insert_participation(&new).await {
 			Ok(()) => {},
@@ -650,6 +775,239 @@ impl Participations {
 		}
 		log::info!("participation {} accepted: {} coin(s) given up for {} output(s)", crate::signer::hex(&id), n, m);
 		self.status(&id).await
+	}
+
+	/// Takes the on-chain order `req` names, for a leaf of what it fills:
+	/// see [`crate::participations`]. The take is a participation of its
+	/// own, carrying two assets: the coins it gives up and its fee are in the
+	/// asset the order is paid in, `asset_b`, and the leaf it wants is in the
+	/// asset the order sells, `asset_a`, in whose round it runs. It is
+	/// accepted only when:
+	///
+	/// - the order's terms are ones a resting order can have, and the fill
+	///   asked of them is one its FILL leaf takes ([`FillOrder::plan`]);
+	/// - the node holds, at the order's outpoint and unspent (in its mempool
+	///   too), an explicit output of `locked` atoms of `asset_a` paying the
+	///   script the terms make; its transaction is final, so no rollback can
+	///   take the order out from under a round; and the order's REFUND does not
+	///   open within [`Params::order_margin_seconds`] (a height counted at
+	///   [`Params::order_block_seconds`] a block);
+	/// - the leaf wanted holds exactly `filled` of `asset_a`, as a refresh's
+	///   leaf is bounded, under a key the take proves it holds;
+	/// - both assets are served, their rates fresh;
+	/// - every coin given up is in `asset_b` and passes what a refresh's
+	///   coins pass, attested over the take's id;
+	/// - the coins hold exactly the order's price for the fill and the fee,
+	///   and the fee covers `asset_b`'s schedule for an offboard of the price
+	///   (the maker's credit is an on-chain output the operator pays in
+	///   `asset_b`, as it pays an offboard);
+	/// - no other pending or issued participation takes the order.
+	///
+	/// A take submitted again is answered with its status.
+	pub async fn take(&self, req: &TakeRequest) -> Result<Status, ParticipationError> {
+		let n = req.inputs.len();
+		if n == 0 || n > MAX_INPUTS {
+			return Err(ParticipationError::Malformed(format!("{} coins given up; a take gives up 1 to {}", n, MAX_INPUTS)));
+		}
+		if req.inputs.iter().map(|i| i.leaf_id).collect::<HashSet<_>>().len() != n {
+			return Err(ParticipationError::Malformed("a coin is given up twice".into()));
+		}
+		let take = req.take().ok_or_else(|| ParticipationError::Malformed("a take wants one leaf, and no offboard".into()))?;
+		let p = &self.params;
+		let id = take.id(&p.chain, &p.operator);
+		if self.store.participation(&id).await?.is_some() {
+			return self.status(&id).await;
+		}
+		let now = self.now().await?;
+		if let Some(t) = req.not_before {
+			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
+				return Err(ParticipationError::OutOfBounds(format!(
+					"the earliest round time is more than {} days ahead", MAX_DEFER / 86_400)));
+			}
+		}
+
+		// The order's terms, and the fill asked of them.
+		let terms = &req.terms;
+		let order_text = outpoint_text(&req.order);
+		let fill_error = |e: FillError| ParticipationError::Order(format!("order {}: {}", order_text, e));
+		let plan = terms.plan(req.locked, req.filled).map_err(fill_error)?;
+		let (asset_a, asset_b) = (terms.asset_a, terms.asset_b);
+		let price = plan.credit.value;
+
+		// The leaf: what the take fills, in the asset the order sells, under
+		// a key the take proves it holds.
+		let leaf = &take.leaf;
+		if leaf.asset != asset_a || leaf.value != req.filled {
+			return Err(ParticipationError::Order(format!("order {}: the leaf a take wants holds what it fills, {} of asset {}, and this \
+				one asks {} of asset {}", order_text, req.filled, asset_a, leaf.value, leaf.asset)));
+		}
+		if leaf.template != Template::Vtxo1 {
+			return Err(ParticipationError::Template(0, leaf.template.to_string()));
+		}
+		if !p.exit_delay_ok(leaf.exit_delay) {
+			return Err(ParticipationError::OutOfBounds(format!(
+				"an exit delay of {} units; the operator takes {} to {}", leaf.exit_delay.units(), p.min_exit_delay.units(),
+				p.max_exit_delay.units())));
+		}
+		if leaf.owner == p.operator {
+			return Err(ParticipationError::OperatorKey(0));
+		}
+		match &req.key_proof {
+			Some(proof) if verify_digest(proof, &key_proof_digest(&id), &leaf.owner) => {},
+			_ => return Err(ParticipationError::BadKeyProof(0)),
+		}
+		for a in [asset_a, asset_b] {
+			if !p.assets.contains(&a) {
+				return Err(ParticipationError::Assets(format!("the order {} asset {}, which is not served by this operator", if a == asset_a {
+					"sells" } else { "is paid in" }, a)));
+			}
+		}
+		if req.fee.0 != asset_b {
+			return Err(ParticipationError::Assets(format!("a take pays its fee in the asset the order is paid in, {}, not in {}", asset_b,
+				req.fee.0)));
+		}
+		p.check_value(asset_a, req.filled).map_err(ParticipationError::OutOfBounds)?;
+		p.fresh_rate(&asset_a).map_err(ParticipationError::Rate)?;
+		p.fresh_rate(&asset_b).map_err(ParticipationError::Rate)?;
+
+		// The order on the chain: what its outpoint holds, unspent, final, and
+		// not about to be refunded.
+		self.order_on_chain(&req.order, terms, req.locked).await?;
+		let tip = self.store.tip_block().await?.ok_or(ParticipationError::NotSynced)?;
+		if let Some(why) = refund_too_soon(terms, &p, tip.height, tip.median_time as u32) {
+			return Err(ParticipationError::OrderExpiring(format!("order {}: {}", order_text, why)));
+		}
+
+		// The coins given up, each checked as a refresh's are, all in the
+		// asset the order is paid in.
+		let (coins, _) = self.coins_given_up(&req.inputs, &id, now, &|c: &ValidCoin, k: usize| (c.asset != asset_b).then(|| {
+			ParticipationError::Assets(format!("a take gives up coins in the asset the order is paid in, {}, and coin {} (input {}) is \
+				in asset {}", asset_b, req.inputs[k].leaf_id, k, c.asset))
+		})).await?;
+
+		// The amounts: the coins hold the price and the fee, exactly, and the
+		// fee covers the schedule for an offboard of the price.
+		let held: u128 = coins.iter().map(|c| c.value as u128).sum();
+		if held != price as u128 + req.fee.1 as u128 {
+			return Err(ParticipationError::Unbalanced(format!("the coins given up hold {} of asset {}; the order's price for {} atoms is \
+				{} and the fee {}, which take {}", held, asset_b, req.filled, price, req.fee.1, price as u128 + req.fee.1 as u128)));
+		}
+		let schedule = p.fees(&asset_b).map_err(ParticipationError::Assets)?;
+		let due = schedule.offboard(price, 0);
+		if req.fee.1 < due {
+			return Err(ParticipationError::Fee(format!("a fee of {} in asset {}; a take pays the asset's schedule for an offboard of \
+				the order's price, {}: {} (offboard {} ppm and {})", req.fee.1, asset_b, price, due, schedule.offboard_ppm,
+				schedule.offboard_base)));
+		}
+		let mut margins = Vec::with_capacity(n);
+		for c in &coins {
+			margins.push(forfeit_margin(c, p.refund_delay, self.floor(c.asset).await?));
+		}
+
+		// The unlock hash, and the record.
+		let mut preimage = [0u8; 32];
+		rand::rngs::OsRng.fill_bytes(&mut preimage);
+		let new = NewParticipation {
+			id,
+			unlock_hash: sha256_bytes(&preimage),
+			preimage,
+			not_before: req.not_before.map(|t| t.to_consensus_u32()),
+			refund_delay_units: p.refund_delay.units(),
+			inputs: req.inputs.iter().zip(&coins).zip(&margins).map(|((i, c), margin)| ParticipationInput {
+				leaf_id: i.leaf_id.0,
+				asset: c.asset.into_inner().to_byte_array(),
+				value: c.value,
+				margin: *margin,
+				attestation: *i.attestation.as_ref(),
+				returned: false,
+			}).collect(),
+			outputs: vec![ParticipationOutput {
+				asset: asset_a.into_inner().to_byte_array(),
+				value: req.filled,
+				kind: WantedKind::Leaf {
+					template: leaf.template.to_string(),
+					owner_key: leaf.owner.serialize(),
+					owner_nonce: leaf.owner_nonce,
+					exit_delay_units: leaf.exit_delay.units(),
+					operator_nonce: [0; 32],
+					htlc: None,
+				},
+				leaf_id: None,
+			}],
+			fees: vec![(asset_b.into_inner().to_byte_array(), req.fee.1)],
+			fill: Some(FillRow {
+				order_txid: req.order.txid.to_byte_array(),
+				order_vout: req.order.vout,
+				terms: terms.to_relay(&req.order).to_string(),
+				script_pubkey: terms.script_pubkey().to_bytes(),
+				locked: req.locked,
+				filled: req.filled,
+				price,
+			}),
+		};
+		match self.store.insert_participation(&new).await {
+			Ok(()) => {},
+			Err(StoreError::ParticipationExists) => return self.status(&id).await,
+			Err(StoreError::LeafSpent(l)) => return Err(CoinError::Spent(l.parse().unwrap_or(req.inputs[0].leaf_id)).into()),
+			Err(StoreError::LeafNotLive(l, s)) => return Err(CoinError::NotLive(l.parse().unwrap_or(req.inputs[0].leaf_id), s).into()),
+			Err(e) => return Err(e.into()),
+		}
+		log::info!("take {} accepted: order {} filled by {} of asset {} for {} of asset {}, {} coin(s) given up", crate::signer::hex(&id),
+			order_text, req.filled, asset_a, price, asset_b, n);
+		self.status(&id).await
+	}
+
+	/// Checks the order a take names against the node: an explicit output of
+	/// `locked` of the order's asset at `order`, paying the script its terms
+	/// make, unspent in the chain and the mempool, in a transaction that is
+	/// final.
+	pub async fn order_on_chain(&self, order: &OutPoint, terms: &FillOrder, locked: u64) -> Result<(), ParticipationError> {
+		order_on_chain(&self.finality, order, terms, locked).await
+	}
+
+	/// The coins of `inputs`, given up for the participation `id`: each
+	/// passes the coin check up to its exit deadline, is no `htlc-1` leaf,
+	/// is attested by its owner over `id`, and has nothing under its salt in
+	/// the signer's record; `other` refuses a coin of an asset the
+	/// participation does not give up. Returns the coins, and the last time a
+	/// round takes each.
+	async fn coins_given_up(&self, inputs: &[InputRequest], id: &[u8; 32], now: MedianTime,
+		other: &(dyn Fn(&ValidCoin, usize) -> Option<ParticipationError> + Sync)) -> Result<(Vec<ValidCoin>, Vec<u32>), ParticipationError>
+	{
+		let mut coins = Vec::with_capacity(inputs.len());
+		let mut last_times = Vec::with_capacity(inputs.len());
+		let policy = self.params.participation_policy(now);
+		for (k, i) in inputs.iter().enumerate() {
+			let c = coins::check(&self.store, &policy, &i.leaf_id, id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			if c.coin.leaf.htlc.is_some() {
+				return Err(ParticipationError::HtlcInput(k, i.leaf_id));
+			}
+			if let Some(e) = other(&c.coin, k) {
+				return Err(e);
+			}
+			if !verify_digest(&i.attestation, id, &c.coin.leaf.owner) {
+				return Err(ParticipationError::BadAttestation(k));
+			}
+			let mut last = c.coin.expiry.to_consensus_u32().saturating_sub(Params::PARTICIPATION_HORIZON);
+			if let Some(b) = c.board_expiry {
+				last = last.min(b.saturating_sub(Params::PARTICIPATION_HORIZON));
+			}
+			last_times.push(last);
+			coins.push(c.coin);
+		}
+		for (c, i) in coins.iter().zip(inputs) {
+			let held = self.signer.under(&c.leaf.salt).await.map_err(ParticipationError::Signer)?;
+			if let Some(e) = held.first() {
+				let (what, why) = match e.kind {
+					Signed::Forfeit(_) => ("the forfeit", "a coin under a forfeit the signer holds stays given up"),
+					Signed::Spend => ("the spend", "the coin was paid on"),
+				};
+				return Err(ParticipationError::SignedAlready(format!(
+					"coin {}: the operator's signer has already co-signed {} {} under salt {} (entry {}): {}, and is refreshed in no \
+					round; its owner's way home is its exit", i.leaf_id, what, hex(&e.digest), hex(&c.leaf.salt), e.n, why)));
+			}
+		}
+		Ok((coins, last_times))
 	}
 
 	/// The participation `id` and where it stands.
