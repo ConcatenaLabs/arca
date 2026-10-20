@@ -695,7 +695,27 @@ impl Wallet {
 				amount(&f["amount"], "a fee").map_err(|e| e.to_string())?));
 		}
 		let not_before = p["not_before"].as_u64().map(|t| MedianTime::from_consensus(t as u32)).transpose().map_err(|e| e.to_string())?;
-		let computed = participation_id(&self.genesis, &self.operator, &inputs, &wanted, &fees, not_before);
+		// A take's id covers its order besides these parts.
+		let fill = p.get("fill").filter(|f| f.is_object());
+		let computed = match fill {
+			None => participation_id(&self.genesis, &self.operator, &inputs, &wanted, &fees, not_before),
+			Some(f) => {
+				let (order, terms) = arca_covenant::FillOrder::from_relay(&f["order"]).map_err(|e| format!("take {}: {}", pid, e))?;
+				let (Some(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay }), Some(fee), 1, 1) =
+					(wanted.first().cloned(), fees.first().copied(), wanted.len(), fees.len()) else {
+					return Err(format!("take {} is served with {} leaves and {} fees: a take wants one leaf and pays one fee", pid,
+						wanted.len(), fees.len()));
+				};
+				arca_covenant::Take {
+					order, terms,
+					locked: amount(&f["locked"], "what the order holds").map_err(|e| e.to_string())?,
+					filled: amount(&f["filled"], "the fill").map_err(|e| e.to_string())?,
+					inputs: inputs.clone(),
+					leaf: arca_covenant::TakeLeaf { asset, value, template, owner, owner_nonce, exit_delay },
+					fee, not_before,
+				}.id(&self.genesis, &self.operator)
+			},
+		};
 		if hex(&computed) != pid {
 			return Err(format!("the server names participation {}, and the parts it serves make {}: the wallet takes coin {} as not given \
 				up to it", pid, hex(&computed), id));
@@ -730,7 +750,12 @@ impl Wallet {
 		let given: Vec<String> = inputs.iter().map(|l| l.to_string()).collect();
 		let wanted_json: Vec<Value> = nonces.iter().map(|(n, _, a, v)| json!({"nonce": hex(n), "asset": a.to_string(), "value": v.to_string()}))
 			.collect();
-		let body = json!({"restored": true, "inputs": given, "outputs": p["outputs"], "fees": p["fees"], "not_before": p["not_before"]});
+		let mut body = json!({"restored": true, "inputs": given, "outputs": p["outputs"], "fees": p["fees"], "not_before": p["not_before"]});
+		if let Some(f) = fill {
+			body["order"] = f["order"].clone();
+			body["locked"] = f["locked"].clone();
+			body["filled"] = f["filled"].clone();
+		}
 		let s = &self.store;
 		let held = s.participations().map_err(|e| e.to_string())?.into_iter().any(|q| q.0 == pid);
 		if !held {

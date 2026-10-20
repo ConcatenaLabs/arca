@@ -25,7 +25,8 @@ use super::{Config, Error, Wallet};
 pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
-	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals";
+	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
+	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -171,6 +172,15 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"exit_quote" => w.exit_quote(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?),
 		"refusals" => w.refusals(),
+		// The order as the relay serves it: its JSON, as text or as an
+		// object.
+		"take_quote" => w.take_quote(&order(a)?, opt_u64(&a["amount"], "the amount")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"take" => {
+			// With `shown`, the take goes ahead only on the fill, price and
+			// fee the program showed (a `take_quote`'s).
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.take(&order(a)?, opt_u64(&a["amount"], "the amount")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
+		},
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
 }
@@ -200,6 +210,15 @@ fn req_str<'a>(v: &'a Value, what: &str) -> Result<&'a str, Error> {
 	v.as_str().filter(|s| !s.is_empty()).ok_or_else(|| Error::Parse(format!("{} is missing", what)))
 }
 
+/// The order a take names: the relay's JSON of it, as text or as an object.
+fn order(a: &Value) -> Result<String, Error> {
+	match &a["order"] {
+		Value::String(s) if !s.is_empty() => Ok(s.clone()),
+		Value::Object(_) => Ok(a["order"].to_string()),
+		_ => Err(Error::Parse("the order is missing".into())),
+	}
+}
+
 fn leaves(a: &Value) -> Result<Vec<String>, Error> {
 	match &a["leaves"] {
 		Value::Null => Ok(vec![]),
@@ -223,6 +242,10 @@ mod test {
 		assert_eq!(leaves(&json!({"leaves": ["a", "b"]})).unwrap(), vec!["a".to_string(), "b".to_string()]);
 		assert!(leaves(&json!({"leaves": [1]})).is_err());
 		assert!(opt_asset(&json!("zz")).is_err());
+		// A take's order: the relay's JSON, as text or as an object.
+		assert_eq!(order(&json!({"order": "{\"covenant_txid\": \"a\"}"})).unwrap(), "{\"covenant_txid\": \"a\"}");
+		assert_eq!(order(&json!({"order": {"covenant_txid": "a"}})).unwrap(), "{\"covenant_txid\":\"a\"}");
+		assert_eq!(order(&json!({})).unwrap_err().to_string(), "cannot parse the order is missing");
 	}
 
 	#[test]

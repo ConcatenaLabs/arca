@@ -232,6 +232,33 @@ enum Cmd {
 		#[arg(long)]
 		shown: Option<String>,
 	},
+	/// Takes an on-chain order in the operator's round: a fill of an order
+	/// resting on the chain under SeqDEX's fill covenant, paid with the
+	/// wallet's coins of the asset it is paid in, for a leaf of what it fills.
+	/// `sync` hands over the forfeits once the round is built and takes the
+	/// leaf once it is final.
+	Take {
+		/// The order as the relay serves it: its `CovenantTerms` JSON (or an
+		/// offer whose settlement is one), `@FILE` to read it from a file, or
+		/// `-` to read it from standard input.
+		order: String,
+		/// How much of the asset the order sells to take, in its atoms; all
+		/// of it when not named.
+		#[arg(long)]
+		amount: Option<u64>,
+		/// The most the operator's fee may take of the price, in millionths:
+		/// 10,000 unless raised.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what the take would cost (the fill, the price, the fee,
+		/// what the coins given up hold), signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The take shown to the user, as `--quote` answered it: the take
+		/// goes ahead only on that very fill, price and fee.
+		#[arg(long)]
+		shown: Option<String>,
+	},
 	/// An in-tree swap of two assets with another wallet.
 	#[command(subcommand)]
 	Swap(SwapCmd),
@@ -630,12 +657,36 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				.map_err(|e| bark::arca::Error::Parse(format!("the fees shown: {}", e)))).transpose()?;
 			w.exit_shown(&leaf_id, fee_asset.as_deref().map(asset).transpose()?, shown.as_ref())
 		},
+		Cmd::Take { order, amount, max_fee_ppm, quote, shown } => {
+			let order = read_order(&order)?;
+			if quote {
+				w.take_quote(&order, amount, max_fee_ppm)
+			} else {
+				let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+					.map_err(|e| bark::arca::Error::Parse(format!("the take shown: {}", e)))).transpose()?;
+				w.take(&order, amount, max_fee_ppm, shown.as_ref())
+			}
+		},
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
+	}
+}
+
+/// The order a take names: the JSON itself, `@FILE`, or `-` for standard
+/// input.
+fn read_order(arg: &str) -> Result<String, bark::arca::Error> {
+	if arg == "-" {
+		let mut s = String::new();
+		std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| bark::arca::Error::Io(format!("the order: {}", e)))?;
+		return Ok(s);
+	}
+	match arg.strip_prefix('@') {
+		Some(path) => std::fs::read_to_string(path).map_err(|e| bark::arca::Error::Io(format!("the order {}: {}", path, e))),
+		None => Ok(arg.to_string()),
 	}
 }
 
