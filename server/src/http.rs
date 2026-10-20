@@ -20,6 +20,7 @@
 //! | `lightning_receive_claim` | POST | by the preimage, and the owners' signatures over the transfer of the leaf |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
+//! | `transfer_status` | POST | no: the transfer's id names it; at the reads' rate |
 //! | `take_order` | POST | by each owner's attestation over the take ([`arca_covenant::Take::id`]) |
 //! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
@@ -1016,6 +1017,33 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 	Ok(Json(participation_status(&status)))
 }
 
+/// How a transfer stands, by its id: `recorded`, `signed` or `unknown`, and
+/// the output asked for when it is one of the transfer's (D69).
+async fn transfer_status(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::TransferStatus>, Refusal>
+{
+	let req: api::TransferStatusRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a transfer's status", app.source(peer.ip(), &headers))?;
+	let id = unhex32(&req.transfer_id).map_err(Refusal::malformed)?;
+	let leaf = req.leaf_id.as_deref().map(unhex32).transpose().map_err(Refusal::malformed)?;
+	let (state, output) = match app.store.transfer(&id).await? {
+		None => ("unknown", None),
+		Some(t) => {
+			let output = match leaf {
+				Some(l) if t.outputs.iter().any(|(o, _)| *o == l) => app.store.leaf(&l).await?.map(|row| api::TransferOutputStatus {
+					leaf_id: hex(&row.leaf_id),
+					owner: hex(&row.owner_key),
+					asset: AssetId::from_byte_array(row.asset).to_string(),
+					value: row.value.to_string(),
+				}),
+				_ => None,
+			};
+			(if t.signed { "signed" } else { "recorded" }, output)
+		},
+	};
+	Ok(Json(api::TransferStatus { transfer_id: hex(&id), state: state.into(), output }))
+}
+
 async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
 	-> Result<Json<api::ParticipationStatus>, Refusal>
 {
@@ -1509,6 +1537,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
+		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))

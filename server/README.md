@@ -598,7 +598,10 @@ no longer complete (the earliest expiry of a batch its coins rest on). A
 receiver that reads it keeps reading its mailbox until the coin comes,
 whatever happens between the record and the signature (the signer not
 reached, its keepers not acknowledging); a transfer dropped before it is
-signed withdraws its notices there, naming why. Each new coin's
+signed withdraws its notices there, naming why. A notice is the operator's
+statement, not a payment: the receiver holds for it only while
+`transfer_status` shows its transfer recorded with that output, asking when
+it reads the notice and at every sync after. Each new coin's
 record is checked by the server as a receiver would check it, stored, and
 posted to the same mailbox. A request repeated byte for byte gets the same answer; one that
 found the signer unreachable completes when repeated, whatever has changed
@@ -1225,6 +1228,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
+| `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
