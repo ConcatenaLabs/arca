@@ -118,6 +118,42 @@ paid twice.
   holder runs `arca sync` at once, takes its coins home on the chain, and
   boards them with the new operator.
 
+## Turning on receives over Lightning
+
+An asset receives over Lightning once its `[assets.lightning]` names a node
+that runs SeqLN's hold-invoice plugin. Leave that off for every asset until
+both of these hold:
+
+- **The operator runs a revision whose server answers `transfer_status`.**
+  `arcad` and the signer move to it together
+  ([Moving to a new revision](../server/README.md#moving-to-a-new-revision));
+  at its first start the server posts a pending notice for every transfer
+  recorded before and not yet co-signed. Such a server sizes a receive's lock
+  so that the holder keeps its window to claim the leaf, and serves a
+  receive held and not yet claimed to a holder restoring from its mnemonic
+  ([Receiving into the tree](../server/README.md#receiving-into-the-tree)).
+- **Every holder who will receive runs a wallet of the same revision**:
+  one whose `arca schedule` names `next_exit_at`. Such a wallet takes a
+  received leaf home by its claim, should the operator not co-sign it,
+  before it asks the operator anything, with a margin of an eighth of the
+  leaf's lock; an older one asks the operator first, and an operator that
+  answers slowly can then take the leaf by its refund.
+
+Then, for each asset that receives:
+
+- **`[assets.lightning] rpc`** names the asset's own SeqLN node's JSON-RPC
+  socket. The node runs on the Sequentia network, holds at least one open
+  channel in the asset with room to receive, and runs the hold-invoice
+  plugin (`contrib/holdinvoice-seq`). Check `info`: the asset's
+  `assets[].lightning` is `up`, and `receives` is `true`.
+- **`[lightning]`** keeps `operator_delay_units` below `owner_delay_units`;
+  `block_seconds` at the chain's block interval (60); `receive_window_seconds`
+  at its default (six hours) or longer, the time a holder has to claim its
+  leaf once its round is final; and `receive_cap_ppm` as above.
+- **Payers are told** that the invoice's final lock time is twice the leaf's
+  lock, about 5,770 blocks with a 36-hour exit delay and the default window:
+  a payer whose node pays with SeqLN's `pay` raises its `maxdelay` to that.
+
 ## What holders are told
 
 Every holder receives these rules before the operator holds their coins:
@@ -135,9 +171,11 @@ Every holder receives these rules before the operator holds their coins:
   than an old one. A request handed out by a wallet before requests
   carried their lapse holds `next_sync_at` at a day until it is paid or
   forgotten (`arca forget-request`). A payment the operator has recorded
-  and not yet completed shows as pending (`sync`'s `mailbox.pending`), and
-  holds `next_sync_at` at a day until it comes, whatever the request's
-  lapse.
+  and not yet completed shows as announced by the operator (`sync`'s
+  `mailbox.pending`), and holds `next_sync_at` at a day until it comes,
+  whatever the request's lapse, for as long as the server shows its
+  transfer recorded. An announcement is the operator's statement, not a
+  payment: the coin counts only once it comes.
 - **When a payment answers `unreachable`, run `arca sync` again that
   day.** The next `sync` posts the payment again, and its receiver reads it
   once it completes.
@@ -145,7 +183,11 @@ Every holder receives these rules before the operator holds their coins:
   lightning receive`, `sync` must run within the operator's window once
   the payer has paid, to take up the leaf and claim it; `next_sync_at`
   wakes the wallet for it, and for the leaf's way home by its claim should
-  the operator not answer. A payer whose node pays with SeqLN's `pay`
+  the operator not answer. That way home is an exit step, which `sync`
+  takes before it asks the operator anything; `next_exit_at` names it on
+  its own, and `arca sync --exits-only` takes it without asking the
+  operator. A wallet that wakes late for it by up to an eighth of the
+  leaf's lock still claims first. A payer whose node pays with SeqLN's `pay`
   raises its `maxdelay` to the invoice's final lock time.
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
