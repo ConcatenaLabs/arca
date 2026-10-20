@@ -98,6 +98,10 @@ paid twice.
   its record, and a new record cannot take its place: make a new operator
   (new key, new record, new keepers' heads files) and move the holders to
   it.
+- **Take no payment into the tree over Lightning.** Run each asset's
+  Lightning node without the hold-invoice plugin (`info` then shows its
+  leg with `receives: false`), so no wallet asks to receive into the tree.
+  Payments out of the tree over Lightning stay on.
 - **When the operator stops or moves, tell the holders.** Say which
   operator ends, from which time, and which operator replaces it, so each
   holder runs `arca sync` at once, takes its coins home on the chain, and
@@ -120,6 +124,12 @@ Every holder receives these rules before the operator holds their coins:
   than an old one. A request handed out by a wallet before requests
   carried their lapse holds `next_sync_at` at a day until it is paid or
   forgotten (`arca forget-request`).
+- **Keep running `arca sync` daily for two days after a receive request
+  lapses.** A payment recorded by the operator just before the lapse can
+  complete after it, and is read only by a `sync`.
+- **When a payment answers `unreachable`, run `arca sync` again that
+  day.** The next `sync` posts the payment again, and the receiver reads it
+  only once it completes.
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
   for fees). `arca address` gives an address to pay it to.
