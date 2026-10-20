@@ -277,7 +277,8 @@ enum Cmd {
 		shown: Option<String>,
 	},
 	/// Orders on the chain under SeqDEX's fill covenant: placed from the
-	/// wallet's leaves, refunded once their time has passed.
+	/// wallet's leaves, filled in the operator's round, refunded once their
+	/// time has passed.
 	#[command(subcommand)]
 	Order(OrderCmd),
 	/// Every order the wallet placed, as the chain shows it now: where it
@@ -357,6 +358,27 @@ enum OrderCmd {
 		/// participation, and `sync` and `orders` take it on.
 		#[arg(long, default_value_t = 3600)]
 		wait: u64,
+	},
+	/// Fills an order resting on the chain under SeqDEX's fill covenant in
+	/// the operator's round: `take`, by the name the order's side goes by.
+	Fill {
+		/// The order as the relay serves it: its `CovenantTerms` JSON (or an
+		/// offer whose settlement is one), `@FILE`, or `-` for standard input.
+		order: String,
+		/// How much of the asset the order sells to take, in its atoms; all
+		/// of it when not named.
+		#[arg(long)]
+		amount: Option<u64>,
+		/// The most the operator's fee may take of the price, in millionths:
+		/// 10,000 unless raised.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what the fill would cost, signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The fill shown to the user, as `--quote` answered it.
+		#[arg(long)]
+		shown: Option<String>,
 	},
 	/// Takes back what an order holds where it rests, by its REFUND, once
 	/// the chain's median time has passed its expiry: to an address of the
@@ -787,7 +809,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				.map_err(|e| bark::arca::Error::Parse(format!("the fees shown: {}", e)))).transpose()?;
 			w.exit_shown(&leaf_id, fee_asset.as_deref().map(asset).transpose()?, shown.as_ref())
 		},
-		Cmd::Take { order, amount, max_fee_ppm, quote, shown } => {
+		Cmd::Take { order, amount, max_fee_ppm, quote, shown } | Cmd::Order(OrderCmd::Fill { order, amount, max_fee_ppm, quote, shown }) => {
 			let order = read_order(&order)?;
 			if quote {
 				w.take_quote(&order, amount, max_fee_ppm)

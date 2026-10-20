@@ -381,7 +381,8 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 		Some(b) => served_offer("o-2", &b.order_at(x, y, &again)),
 		None => served("o-2", &terms.to_relay(&again)),
 	};
-	let k2 = t2.ok(&["take", &second, "--amount", "300000"]);
+	// `order fill` is `take`.
+	let k2 = t2.ok(&["order", "fill", &second, "--amount", "300000"]);
 	assert_eq!(k2["price"].as_str(), Some("450000"));
 	let r2 = fill_round(&mut r, &[&t2]).await;
 	assert_eq!(r2.input[0].previous_output, again);
