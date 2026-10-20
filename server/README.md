@@ -520,10 +520,17 @@ spend (the forfeit of a coin given up in a refresh, or another spend), the
 transfer is refused `double_spend`, naming that coin and what the signer
 holds, with nothing of it signed: its record is dropped and every input
 given back, so the other inputs, a swap's other side's included, stay
-payable and refreshable. Each new coin's
+payable and refreshable. When the transfer is recorded, each of its outputs
+is posted to the receiver's mailbox (the leaf's key, unless the output names
+another) as a notice that the coin is pending: its leaf, transfer, asset,
+value, owner key and nonce, and the median time from which the transfer can
+no longer complete (the earliest expiry of a batch its coins rest on). A
+receiver that reads it keeps reading its mailbox until the coin comes,
+whatever happens between the record and the signature (the signer not
+reached, its keepers not acknowledging); a transfer dropped before it is
+signed withdraws its notices there, naming why. Each new coin's
 record is checked by the server as a receiver would check it, stored, and
-posted to the receiver's mailbox (the leaf's key, unless the output names
-another). A request repeated byte for byte gets the same answer; one that
+posted to the same mailbox. A request repeated byte for byte gets the same answer; one that
 found the signer unreachable completes when repeated, whatever has changed
 since it was recorded: its margins are judged as they were then, against
 the floor of that moment, and the dates of the boards and batches its coins
@@ -1033,7 +1040,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
-| `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at |
+| `POST mailbox_read` | The coin records in a key's mailbox after a cursor, each a transfer made with the signed head of the signer's record that transfer was recorded at; with `notices`, the notices of coins pending (a transfer recorded and not yet signed) and withdrawn (that transfer dropped, with the reason) among them, in the same order (`kind` `pending` or `withdrawn`, `notice`), which a reader that does not ask for them is not served |
 | `POST leaf_data` | Every leaf served to a key, after a cursor (`after`, `limit`, at most 100 a page and about a megabyte of records beyond its first leaf; `next` names the cursor to read on from): the leaves it owns, those whose owner key bound them to it, and the transfer outputs posted to it, in any state (`pending`, `live`, `spent`, `lost`, `expired`). Each comes with its record (a round's leaf's empty until its participation's preimage went out), its owner key and nonce, what it rests on (`batch`: its round, batch output, index in the published tree and participation, with the head of the signer's record when the round was built; `board`: its transaction output and state; `made_by`: the transfer that made it, with the head its last signature was recorded at; each head with the keepers' acknowledgements), and every way it was given up (`given`), each with its owner's own signature: a transfer, with the coin's checkpoint value and the owner's signature over its move into its checkpoint; a participation, with every part its id is a hash of, the coin's attestation, whether the coin was given back, and each forfeit of the coin recorded for it with the owner's half |
 | `POST bind_mailbox` | Binds leaves made before their wallet named its mailbox key when it asked for them: up to 64 bindings, each an owner key, a mailbox key and the owner key's signature over the binding; answers the mailbox each key is bound to (a binding made before stands), or none for a key the server knows no leaf of |
 | `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`) and a nonce the wallet draws fresh for the call, hands them to the signer, and answers the running hash the record holds at each entry, each signed, its latest entry, signed (`head`), the record's end signed together with the nonce (`end`), and whether the signer is stopped (`stopped`), with its proof (`proof`: the signed head that stopped it and, when the record holds another there, that head, signed) |

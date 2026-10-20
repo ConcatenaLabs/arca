@@ -1142,9 +1142,22 @@ async fn mailbox_read(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 	};
 	let k = authenticate(&app, "mailbox_read", &req.auth, &auth::mailbox_read_request(after as u64, req.limit)).await?;
 	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
-	let msgs = app.store.mailbox_read(&k.serialize(), after, limit).await?;
+	let msgs = app.store.mailbox_read(&k.serialize(), after, limit, req.notices).await?;
 	let mut messages = Vec::with_capacity(msgs.len());
 	for m in msgs {
+		if m.kind != "coin" {
+			let notice: api::MailboxNotice = serde_json::from_slice(&m.payload)
+				.map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("a stored notice: {}", e)))?;
+			messages.push(api::MailboxMessage {
+				cursor: m.cursor.to_string(),
+				kind: m.kind,
+				leaf_id: notice.leaf_id.clone(),
+				record: String::new(),
+				signer_record: None,
+				notice: Some(notice),
+			});
+			continue;
+		}
 		let signer_record = match m.signer_head {
 			Some((entry, h, s)) => Some(head_with_acks(&app, entry, &h, Some(&s)).await?),
 			None => None,
@@ -1155,6 +1168,7 @@ async fn mailbox_read(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 			leaf_id: m.leaf_id.map(|l| hex(&l)).unwrap_or_default(),
 			record: hex(&m.payload),
 			signer_record,
+			notice: None,
 		});
 	}
 	Ok(Json(api::Mailbox { messages }))

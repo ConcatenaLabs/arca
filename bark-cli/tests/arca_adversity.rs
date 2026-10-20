@@ -6259,3 +6259,231 @@ async fn w2_a_participation_released_while_the_wallet_was_away_is_completed() {
 	assert!(mine.as_array().unwrap().iter().any(|q| q["participation"] == pid.as_str() && q["released"] == true), "{}", mine);
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+// ---------------------------------------------------------------------------
+// D61: a payment recorded and not completed is pending for its receiver
+// ---------------------------------------------------------------------------
+
+/// Wakes the wallets `ws` on their own schedules, one `sync` at a time in the
+/// order of the times their last `sync` named (`next`, one for each), until
+/// `done` holds or no wallet names a time; `wakes` syncs at most. Returns
+/// each sync: the wallet's name, the median time, and its answer.
+async fn d61_on_schedule(r: &Running, ws: &[&Arca], mut next: Vec<Option<u32>>, wakes: usize, mut done: impl FnMut() -> bool)
+	-> Vec<(String, u32, Value)>
+{
+	let mut log = vec![];
+	for _ in 0..wakes {
+		if done() {
+			break;
+		}
+		let Some((k, t)) = next.iter().enumerate().filter_map(|(k, t)| t.map(|t| (k, t))).min_by_key(|(_, t)| *t) else { break };
+		d57_to(r, t).await;
+		let s = ws[k].ok(&["sync"]);
+		let now = common::node::median_time(&r.rt);
+		next[k] = s["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+		println!("D61 {} wakes at {}: next_sync_at {} | why {} | mailbox {} | transfers {}", ws[k].name, now, s["schedule"]["next_sync_at"],
+			s["schedule"]["why"], s["mailbox"], s["transfers"]);
+		log.push((ws[k].name.clone(), now, s));
+	}
+	log
+}
+
+/// The coin of `value` `w` holds, if any.
+fn d61_coin_of_value(w: &Arca, value: &str) -> Option<Value> {
+	w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["value"] == value).cloned()
+}
+
+/// R7j F1, turned around (D61). B holds nothing and hands out one receive
+/// request. A pays it two hours before it lapses, out of a batch leaf; the
+/// operator's signer goes away as the payment reaches the server, which
+/// records it and cannot have it signed. From then on each wallet syncs only
+/// when its own schedule says. The server posted the payment's outputs to
+/// their mailboxes as pending when it recorded it: B's schedule holds at a
+/// day while the coin is pending for it, past the request's lapse, so B's
+/// next wake after A's own (whose sync posts the payment again, the signer
+/// back) takes the coin. While pending the coin is counted nowhere and
+/// spendable nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn d61_a_payment_recorded_before_the_lapse_and_cosigned_after_is_read_on_the_schedule() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let (a, b) = (Arca::new("D61PA"), Arca::new("D61PB"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let mut s = b.ok(&["sync"]);
+	let until = s["schedule"]["receive_requests"][0]["lapses_at"].as_u64().expect("the request's lapse") as u32;
+	// B wakes on its schedule until a day and a half before the lapse.
+	while let Some(next) = s["schedule"]["next_sync_at"].as_u64() {
+		if next as u32 > until - 36 * 3600 {
+			break;
+		}
+		d57_to(&r, next as u32).await;
+		s = b.ok(&["sync"]);
+	}
+	// A: a batch leaf, a day and a half before the lapse.
+	d57_to(&r, until - 36 * 3600).await;
+	boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let sa = a.ok(&["sync"]);
+	let la = sa["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	let next_a = sa["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+	let mut next_b = s["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+	while let Some(n) = next_b {
+		if n > until - 2 * 3600 {
+			break;
+		}
+		d57_to(&r, n).await;
+		next_b = b.ok(&["sync"])["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+	}
+	// Two hours before the lapse A pays; the signer goes away as the post
+	// reaches the server, and is back a moment later.
+	d57_to(&r, until - 2 * 3600).await;
+	signer_goes_away_at_the_payment(&p, &r);
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
+	let paid_at = common::node::median_time(&r.rt);
+	println!("D61 A pays at {} ({} s before the lapse {}), the signer away at the post: ok={} {}", paid_at, until - paid_at, until, ok,
+		v["error"]["message"]);
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	assert_eq!(coin_of(&a, &la)["state"], "sending");
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	// Each wallet wakes on its own schedule from now on.
+	let log = d61_on_schedule(&r, &[&a, &b], vec![next_a, next_b], 80, || d61_coin_of_value(&b, "600000").is_some()).await;
+	let b_wakes: Vec<u32> = log.iter().filter(|(w, _, _)| w == "D61PB").map(|(_, t, _)| *t).collect();
+	let got = d61_coin_of_value(&b, "600000");
+	println!("D61 B woke {} times after the payment, the last at {} ({} s past the lapse); B's coin: {:?}", b_wakes.len(),
+		b_wakes.last().copied().unwrap_or(0), b_wakes.last().map(|t| *t as i64 - until as i64).unwrap_or(0), got);
+	let coin = got.unwrap_or_else(|| panic!("B's schedule never woke B to read the coin recorded before the lapse; B's last wakes: {:?}",
+		log.iter().filter(|(w, _, _)| w == "D61PB").map(|(_, t, s)| (*t, s["schedule"]["next_sync_at"].clone())).collect::<Vec<_>>()));
+	// Held: live, or given at once to its refresh, its window open.
+	assert!(matches!(coin["state"].as_str(), Some("live") | Some("pending") | Some("given") | Some("exiting")), "{}", coin);
+	let expiry = coin_of(&a, &la)["expiry"].as_u64().unwrap_or(u64::MAX);
+	assert!((common::node::median_time(&r.rt) as u64) < expiry, "B took the coin before its batch's expiry");
+	// While the payment was pending B's syncs showed it, counted nowhere, and
+	// held B's schedule at a day past the request's lapse.
+	let pending: Vec<&(String, u32, Value)> = log.iter().filter(|(w, _, s)| w == "D61PB"
+		&& s["mailbox"]["pending"].as_array().is_some_and(|p| !p.is_empty())).collect();
+	assert!(!pending.is_empty(), "B's sync shows the coin pending: {:?}", log.iter().map(|(_, _, s)| s["mailbox"].clone()).collect::<Vec<_>>());
+	let shown = &pending[0].2["mailbox"]["pending"][0];
+	assert_eq!((shown["value"].as_str(), shown["asset"].as_str()), (Some("600000"), Some(x.to_string().as_str())), "{}", shown);
+	// Held no later than its batch's expiry, from which the transfer can no
+	// longer complete.
+	assert!(shown["until"].as_u64().is_some_and(|u| u <= expiry), "{} | the batch expires at {}", shown, expiry);
+	for (_, t, s) in log.iter().filter(|(w, t, _)| w == "D61PB" && *t > until) {
+		if s["mailbox"]["accepted"].as_array().is_some_and(|a| !a.is_empty()) {
+			break;
+		}
+		let n = s["schedule"]["next_sync_at"].as_u64().unwrap_or_else(|| panic!("B's schedule went quiet at {} with the coin pending: {}", t, s));
+		assert!(n <= *t as u64 + 86_400, "a day at most while a coin is pending: {}", s["schedule"]);
+	}
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D61: while a payment is pending its coin is counted nowhere and spendable
+/// nowhere, and the operator's dropping of the transfer withdraws it. B
+/// hands out a request and forgets it once A has paid it, so only the
+/// pending coin holds B's schedule. A pays with the signer away; B's sync
+/// shows the coin pending, its balance and coins without it, a payment of
+/// it refused, and its schedule a day ahead. The operator then drops the
+/// transfer (as it does a transfer the signer refuses before signing any of
+/// it), naming why: B's next sync shows the pending coin withdrawn with that
+/// reason, and nothing holds B's schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn d61_a_pending_coin_is_counted_nowhere_and_a_dropped_transfer_withdraws_it() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let (a, b, c) = (Arca::new("D61DA"), Arca::new("D61DB"), Arca::new("D61DC"));
+	let boards = boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let asked = b.ok(&["receive"]);
+	let req = asked["request"].as_str().unwrap().to_string();
+	signer_goes_away_at_the_payment(&p, &r);
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	b.ok(&["forget-request", asked["details"]["owner"].as_str().unwrap()]);
+	let s = b.ok(&["sync"]);
+	let now = common::node::median_time(&r.rt);
+	println!("D61D B's sync with the payment recorded: mailbox {} | schedule {}", s["mailbox"], s["schedule"]);
+	let pending = s["mailbox"]["pending"].clone();
+	assert_eq!(pending.as_array().map(|p| p.len()), Some(1), "the coin is shown pending: {}", s["mailbox"]);
+	assert_eq!(pending[0]["value"], "600000", "{}", pending);
+	let leaf = pending[0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(s["schedule"]["next_sync_at"].as_u64().is_some_and(|t| t <= now as u64 + 86_400), "{}", s["schedule"]);
+	assert_eq!(s["schedule"]["pending_coins"][0]["leaf_id"], leaf.as_str(), "{}", s["schedule"]);
+	// Counted nowhere, spendable nowhere.
+	println!("D61D B's balance {} | coins {}", b.ok(&["balance"])["arca"], b.ok(&["coins"]));
+	assert_eq!(b.ok(&["balance"])["arca"], json!({}), "nothing counted");
+	assert!(b.ok(&["coins"]).as_array().unwrap().is_empty(), "no coin held");
+	c.ok(&create_args(&url, &r.node_url()));
+	let to_c = c.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	b.refused(&["send", &to_c, "--amount", "1000", "--asset", &x.to_string()], "");
+	// The operator drops the transfer, naming why.
+	let id: LeafId = boards[0].parse().unwrap();
+	let t = r.server.store.spent_by_transfer(&id.0).await.unwrap().expect("the transfer recorded");
+	let back = r.server.store.drop_transfer(&t, "double_spend: the signer refused it before signing any of it").await.unwrap();
+	println!("D61D the operator drops the transfer: {} input(s) given back", back.len());
+	let s = b.ok(&["sync"]);
+	println!("D61D B's sync after the drop: mailbox {} | schedule {}", s["mailbox"], s["schedule"]);
+	let w = &s["mailbox"]["withdrawn"][0];
+	assert_eq!(w["leaf_id"], leaf.as_str(), "the pending coin is withdrawn: {}", s["mailbox"]);
+	assert!(w["reason"].as_str().is_some_and(|m| m.contains("the signer refused it before signing any of it")), "with the reason: {}", w);
+	assert!(s["schedule"]["next_sync_at"].is_null(), "nothing holds the schedule: {}", s["schedule"]);
+	assert_eq!(b.ok(&["balance"])["arca"], json!({}));
+	for w in [&a, &b, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D61, the other way a transfer is recorded and not completed: the
+/// operator's one keeper does not acknowledge. The signer has recorded the
+/// entry and answers `keepers_unavailable`, so the record cannot simply be
+/// dropped; A pays B's request two hours before it lapses. The keeper back,
+/// each wallet wakes on its own schedule: B's holds at a day while the coin
+/// is pending, past the lapse, and its wake after A's (which posts the
+/// payment again, completing it) takes the coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn d61_a_payment_held_up_by_the_keepers_is_read_on_the_schedule() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("D61KA"), Arca::new("D61KB"));
+	b.ok(&create_args(&url, &r.node_url()));
+	let asked = b.ok(&["receive"]);
+	let req = asked["request"].as_str().unwrap().to_string();
+	let until = asked["details"]["until"].as_u64().unwrap() as u32;
+	d57_to(&r, until - 2 * 86_400).await;
+	let next_b = b.ok(&["sync"])["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+	d57_to(&r, until - 3 * 3600).await;
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let next_a = a.ok(&["sync"])["schedule"]["next_sync_at"].as_u64().map(|n| n as u32);
+	r.keepers[0].halt();
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("D61K A pays B at {} ({} s before the lapse) with the keeper down: ok={} {}", common::node::median_time(&r.rt),
+		until as i64 - common::node::median_time(&r.rt) as i64, ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["message"].as_str().unwrap_or("").contains("keepers_unavailable"), "{}", v);
+	r.keepers[0].resume();
+	let log = d61_on_schedule(&r, &[&a, &b], vec![next_a, next_b], 80, || d61_coin_of_value(&b, "600000").is_some()).await;
+	let b_last = log.iter().filter(|(w, _, _)| w == "D61KB").map(|(_, t, _)| *t).last().unwrap_or(0);
+	let got = d61_coin_of_value(&b, "600000");
+	println!("D61K B's last wake at {} ({} s past the lapse): coin {:?}", b_last, b_last as i64 - until as i64, got);
+	let coin = got.expect("B's schedule wakes B to read the coin the keepers held up");
+	assert!(matches!(coin["state"].as_str(), Some("live") | Some("pending") | Some("given") | Some("exiting")), "{}", coin);
+	assert!(log.iter().any(|(w, _, s)| w == "D61KB" && s["mailbox"]["pending"].as_array().is_some_and(|p| !p.is_empty())),
+		"B saw the coin pending");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

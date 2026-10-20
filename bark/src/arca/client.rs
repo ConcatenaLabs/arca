@@ -406,10 +406,11 @@ impl ServerClient {
 		self.post("witness", &json!({"heads": heads, "nonce": hex(nonce)}))
 	}
 
-	/// The coin records in `key`'s mailbox after `after`.
+	/// The messages in `key`'s mailbox after `after`: coin records, and the
+	/// notices of coins pending and withdrawn.
 	pub fn mailbox_read(&self, key: &Keypair, chain: &Chain, after: i64, limit: u32) -> Result<Value, Error> {
 		let auth = self.auth("mailbox_read", key, chain, &mailbox_read_request(after.max(0) as u64, limit))?;
-		self.post("mailbox_read", &json!({"auth": auth, "after": after.to_string(), "limit": limit}))
+		self.post("mailbox_read", &json!({"auth": auth, "after": after.to_string(), "limit": limit, "notices": true}))
 	}
 
 	/// A page of the leaves the server serves to `key`, after cursor `after`,

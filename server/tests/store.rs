@@ -27,12 +27,15 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 19;
+const SCHEMA: i32 = 20;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "DROP TABLE lightning_receive;
+const UNDO_V17: &str = "ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_notice_has_no_leaf;
+	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_kind_check;
+	ALTER TABLE mailbox_message ADD CONSTRAINT mailbox_message_kind_check CHECK (kind IN ('coin'));
+	DROP TABLE lightning_receive;
 	ALTER TABLE participation_output DROP COLUMN htlc;
 	ALTER TABLE watched_outpoint DROP CONSTRAINT watched_outpoint_kind_check;
 	ALTER TABLE watched_outpoint ADD CONSTRAINT watched_outpoint_kind_check CHECK (kind IN ('board', 'nursery'));
@@ -282,15 +285,15 @@ async fn mailbox_by_cursor() {
 	let c1 = s.mailbox_post(&[9; 32], &[1; 32], b"one").await.unwrap();
 	let _other = s.mailbox_post(&[8; 32], &[2; 32], b"elsewhere").await.unwrap();
 	let c2 = s.mailbox_post(&[9; 32], &[2; 32], b"two").await.unwrap();
-	let all = s.mailbox_read(&[9; 32], 0, 10).await.unwrap();
+	let all = s.mailbox_read(&[9; 32], 0, 10, false).await.unwrap();
 	assert_eq!(all.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(), vec![b"one".to_vec(), b"two".to_vec()]);
 	assert_eq!(all[0].cursor, c1);
-	let rest = s.mailbox_read(&[9; 32], c1, 10).await.unwrap();
+	let rest = s.mailbox_read(&[9; 32], c1, 10, false).await.unwrap();
 	assert_eq!(rest.len(), 1);
 	assert_eq!(rest[0].cursor, c2);
 	assert_eq!(rest[0].leaf_id, Some([2; 32]));
-	assert!(s.mailbox_read(&[9; 32], c2, 10).await.unwrap().is_empty());
-	assert_eq!(s.mailbox_read(&[9; 32], 0, 1).await.unwrap().len(), 1);
+	assert!(s.mailbox_read(&[9; 32], c2, 10, false).await.unwrap().is_empty());
+	assert_eq!(s.mailbox_read(&[9; 32], 0, 1, false).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
