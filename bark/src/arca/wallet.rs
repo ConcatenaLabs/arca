@@ -226,6 +226,11 @@ pub(crate) const RECEIVE_ASKED: &str = "receive_asked";
 /// holds the schedule until it is paid or forgotten.
 pub(crate) const RECEIVE_UNTIL: &str = "receive_until";
 
+/// Where the wallet keeps the median time its last `sync` ran at: every
+/// time the schedule names relative to now is relative to it, so the time
+/// stands between syncs and comes due once it passes.
+pub(crate) const LAST_SYNC: &str = "last_sync";
+
 /// How long after a step of an exit (its unroll broadcast, a claim
 /// refused for its delay with no date known) `sync_schedule` wakes the
 /// wallet for the next: two blocks at Sequentia's minute.
@@ -1560,6 +1565,10 @@ impl Wallet {
 	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
+		// The times named relative to now are relative to the last sync: they
+		// stand between syncs, so a client that syncs only when the schedule
+		// is due finds them due once they pass.
+		let base = self.store.meta(LAST_SYNC)?.and_then(|v| v.parse::<u32>().ok()).filter(|b| *b <= now).unwrap_or(now);
 		let stopped = self.rolled_back()?.is_some();
 		let refused = self.refused_refreshes()?;
 		let asked_at = self.refresh_asked()?;
@@ -1580,12 +1589,12 @@ impl Wallet {
 					// Refused: asked for again six hours after it was last
 					// asked, or gone home from home_from.
 					("live", true) => d.home_from.min(asked_at.get(&c.leaf_id).map_or(now, |t| t.saturating_add(REFUSED_AGAIN)).max(now)),
-					_ => d.home_from.min(now.saturating_add(3600)),
+					_ => d.home_from.min(base.saturating_add(3600)),
 				}
 			} else {
 				d.refresh_from
 			};
-			let at = if now >= d.sync_daily_from { at.min(now.saturating_add(86_400)) } else { at };
+			let at = if now >= d.sync_daily_from { at.min(base.saturating_add(86_400)) } else { at };
 			next = Some(next.map_or(at, |n| n.min(at)));
 			let mut v = d.json();
 			v["leaf_id"] = json!(c.leaf_id);
@@ -1601,7 +1610,7 @@ impl Wallet {
 		let requests = self.receive_requests(now)?;
 		let mut out = json!({"now": now, "due": false, "coins": coins, "note": self.spelling.say(if stopped { HOME_NOTE } else { SYNC_NOTE })});
 		if requests.iter().any(|r| r["state"] == "waiting") && !stopped {
-			let day = now.saturating_add(86_400);
+			let day = base.saturating_add(86_400);
 			next = Some(next.map_or(day, |n| n.min(day)));
 			let only_restored = requests.iter().filter(|r| r["state"] == "waiting").all(|r| r["owner"] == "restored");
 			out["why"] = if only_restored { json!(self.spelling.say(super::restore::RESTORED_NOTE)) } else { json!(WAITING_NOTE) };
@@ -1612,11 +1621,11 @@ impl Wallet {
 		// D62: the payments over Lightning the wallet follows, and every exit
 		// it has started, each by its own next step.
 		if !stopped {
-			if let Some(t) = self.lightning_wakes(now)? {
+			if let Some(t) = self.lightning_wakes(now, base)? {
 				next = Some(next.map_or(t, |n| n.min(t)));
 			}
 		}
-		if let Some(t) = self.exit_wakes(now)? {
+		if let Some(t) = self.exit_wakes(base)? {
 			next = Some(next.map_or(t, |n| n.min(t)));
 		}
 		// D61: a coin pending for the wallet is read only by `sync` once its
@@ -1624,7 +1633,7 @@ impl Wallet {
 		// comes or is withdrawn.
 		let pending = self.pending_coins(now)?;
 		if !pending.is_empty() && !stopped {
-			let day = now.saturating_add(86_400);
+			let day = base.saturating_add(86_400);
 			next = Some(next.map_or(day, |n| n.min(day)));
 			out["why"] = json!(PENDING_NOTE);
 		}
@@ -1640,14 +1649,14 @@ impl Wallet {
 	/// whose claim waits for its delay, when the delay ends; one still
 	/// unrolling, two blocks on; one claimed, within half an hour, to follow
 	/// the claim until it is final.
-	pub(crate) fn exit_wakes(&self, now: u32) -> Result<Option<u32>, Error> {
+	pub(crate) fn exit_wakes(&self, base: u32) -> Result<Option<u32>, Error> {
 		let mut next: Option<u32> = None;
 		for c in self.store.coins_in("exiting")? {
 			let at = match self.store.exit(&c.leaf_id)? {
 				Some((state, j, _)) if state == "waiting" => serde_json::from_str::<Value>(&j).ok()
-					.and_then(|v| v["claim_from"].as_u64()).map_or(now.saturating_add(EXIT_STEP), |t| (t.min(u32::MAX as u64) as u32).max(now)),
-				Some((state, _, _)) if state == "claimed" => now.saturating_add(1800),
-				_ => now.saturating_add(EXIT_STEP),
+					.and_then(|v| v["claim_from"].as_u64()).map_or(base.saturating_add(EXIT_STEP), |t| t.min(u32::MAX as u64) as u32),
+				Some((state, _, _)) if state == "claimed" => base.saturating_add(1800),
+				_ => base.saturating_add(EXIT_STEP),
 			};
 			next = Some(next.map_or(at, |n| n.min(at)));
 		}

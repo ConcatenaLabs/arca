@@ -6625,3 +6625,53 @@ async fn a_text_a_wallet_hands_out_names_what_it_is_and_no_product() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+// ---------------------------------------------------------------------------
+// A client that syncs only when the schedule says it is due
+// ---------------------------------------------------------------------------
+
+/// W2.5: a client that syncs only when `schedule` says it is due completes a
+/// refresh. A boards; once its coin's refresh window opens a sync gives the
+/// coin to a refresh, and the operator builds the round half an hour later.
+/// The client reads `schedule` every ten minutes and syncs only when `due`:
+/// the time the schedule names stands between syncs, so it comes due, and
+/// the refresh completes within two hours of the round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_syncs_only_when_due_completes_a_refresh() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let a = Arca::new("DUEA");
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	let refresh_from = coin_of(&a, &boards[0])["refresh_from"].as_u64().expect("the coin's dates") as u32;
+	d57_to(&r, refresh_from + 60).await;
+	a.ok(&["sync"]);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "given", "the sync gives the coin to a refresh");
+	let mut round_at = None;
+	let mut syncs = vec![];
+	let mut reads = vec![];
+	for k in 0..30 {
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.synced().await;
+		if k == 2 {
+			final_round(&r).await;
+			round_at = Some(common::node::median_time(&r.rt));
+		}
+		let sc = a.ok(&["schedule"]);
+		let now = common::node::median_time(&r.rt);
+		reads.push((now, sc["next_sync_at"].clone(), sc["due"].clone()));
+		if sc["due"] == true {
+			a.ok(&["sync"]);
+			syncs.push(now);
+		}
+		if coin_of(&a, &boards[0])["state"] == "spent" {
+			break;
+		}
+	}
+	let done = coin_of(&a, &boards[0]);
+	let now = common::node::median_time(&r.rt);
+	println!("DUE reads (median time, next_sync_at, due): {:?}", reads);
+	println!("DUE the round at {:?}; the client synced at {:?}; the coin now {} (median time {})", round_at, syncs, done["state"], now);
+	assert_eq!(done["state"], "spent", "the client never completed the refresh: it synced at {:?}", syncs);
+	assert!(now <= round_at.unwrap() + 2 * 3600, "the refresh completed more than two hours after its round");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}

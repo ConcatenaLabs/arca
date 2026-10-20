@@ -814,14 +814,14 @@ impl Wallet {
 	/// wanted, within a quarter of the operator's window (the leaf must be
 	/// taken up and claimed within it); a claim unanswered, by its home date;
 	/// a payment out of the tree undecided, within an hour.
-	pub(crate) fn lightning_wakes(&self, now: u32) -> Result<Option<u32>, Error> {
+	pub(crate) fn lightning_wakes(&self, now: u32, base: u32) -> Result<Option<u32>, Error> {
 		let mut next: Option<u32> = None;
 		let mut at = |t: u32| next = Some(next.map_or(t, |n| n.min(t)));
 		let homes = self.receive_home_dates()?;
 		for rec in self.receives()?.values() {
 			let quarter = (rec["window"].as_u64().unwrap_or(DEFAULT_WINDOW) / 4).max(60) as u32;
 			match rec["state"].as_str() {
-				Some("requested") | Some("waiting") | Some("issuing") => at(now.saturating_add(quarter)),
+				Some("requested") | Some("waiting") | Some("issuing") => at(base.saturating_add(quarter)),
 				Some("claiming") => {
 					let leaf = super::chain::unhex32(rec["nonce"].as_str().unwrap_or("")).ok()
 						.and_then(|n| self.store.nonce(&n).ok().flatten()).and_then(|n| n.leaf_id);
@@ -829,7 +829,7 @@ impl Wallet {
 						.is_some_and(|c| matches!(c.state.as_str(), "receiving" | "sending"));
 					if held {
 						let home = leaf.as_ref().and_then(|l| homes.get(l).copied()).unwrap_or(now);
-						at(home.max(now).min(now.saturating_add(quarter)));
+						at(home.min(base.saturating_add(quarter)));
 					}
 				},
 				_ => {},
@@ -837,7 +837,7 @@ impl Wallet {
 		}
 		for rec in self.sends()?.values() {
 			if matches!(rec["state"].as_str(), Some("paying") | Some("failed")) {
-				at(now.saturating_add(3600));
+				at(base.saturating_add(3600));
 			}
 		}
 		Ok(next)

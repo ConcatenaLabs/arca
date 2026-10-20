@@ -862,6 +862,8 @@ impl Wallet {
 		// signer's record the wallet does only what it does on the chain, and
 		// while no witness succeeds it takes no coin and signs no spend
 		// through the operator: it does only what it does on the chain.
+		// The schedule's relative times count from this sync.
+		self.store.set_meta(super::wallet::LAST_SYNC, &self.now()?.to_consensus_u32().to_string())?;
 		let (witness, info_failed, tries) = self.reach_operator();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
