@@ -26,7 +26,9 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
-	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}";
+	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
+	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
+	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -101,7 +103,8 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
-	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule");
+	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
+		| "orders" | "order_refund");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -181,6 +184,17 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
 			w.take(&order(a)?, opt_u64(&a["amount"], "the amount")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
 		},
+		// An order placed on the chain from the wallet's leaves: its terms as
+		// an object (`super::order::ask_of`).
+		"order_quote" => w.order_quote(&super::order::ask_of(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"order_place" => {
+			// With `shown`, the order is placed only on the fee and the coins
+			// the program showed (an `order_quote`'s).
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.order_place(&super::order::ask_of(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
+		},
+		"orders" => w.orders(),
+		"order_refund" => w.order_refund(req_str(&a["order"], "the order")?, opt_asset(&a["fee_asset"])?),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
 }

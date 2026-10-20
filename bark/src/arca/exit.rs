@@ -1088,6 +1088,10 @@ impl Wallet {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
 		self.exits_meanwhile();
+		// Each order placed on the chain: its offboard recorded once released,
+		// and unlocked by the wallet when the operator has not.
+		let orders = self.progress_orders().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		self.exits_meanwhile();
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
 		if talk {
@@ -1147,6 +1151,9 @@ impl Wallet {
 		}
 		if lightning.as_array().is_none_or(|l| !l.is_empty()) {
 			out["lightning"] = lightning;
+		}
+		if orders.as_array().is_none_or(|o| !o.is_empty()) {
+			out["orders"] = orders;
 		}
 		if !matches!(why, Home::Answering) || home.as_array().is_none_or(|h| !h.is_empty()) {
 			out["home"] = home;

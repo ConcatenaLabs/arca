@@ -276,6 +276,14 @@ enum Cmd {
 		#[arg(long)]
 		shown: Option<String>,
 	},
+	/// Orders on the chain under SeqDEX's fill covenant: placed from the
+	/// wallet's leaves, refunded once their time has passed.
+	#[command(subcommand)]
+	Order(OrderCmd),
+	/// Every order the wallet placed, as the chain shows it now: where it
+	/// rests (and its terms as SeqDEX's relay serves them), each fill and
+	/// what it credited, and the credits at its key. Asks the node only.
+	Orders,
 	/// An in-tree swap of two assets with another wallet.
 	#[command(subcommand)]
 	Swap(SwapCmd),
@@ -288,6 +296,78 @@ enum Cmd {
 	Bitcoin {
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
 		args: Vec<String>,
+	},
+}
+
+#[derive(Subcommand)]
+enum OrderCmd {
+	/// Places an order on the chain from the wallet's leaves: sells
+	/// `--amount` of `--sell` for `--for` at `--rate-num` atoms of it for
+	/// every `--rate-den` atoms sold, by offboarding exactly that amount into
+	/// the address SeqDEX's fill covenant makes for those terms. The fee
+	/// (each coin's refresh fee, the offboard's fee and its unlock margin) is
+	/// shown before anything is signed (`--quote`, then `--shown`). Waits for
+	/// the operator's round, hands over the forfeits, and answers where the
+	/// order rests, with its terms as SeqDEX's relay serves them; the maker
+	/// may then go offline. Fills credit the order's own key, which `board`
+	/// spends.
+	Place {
+		/// The asset the order sells.
+		#[arg(long)]
+		sell: String,
+		/// How much of it, in its atoms: exactly what the order holds.
+		#[arg(long)]
+		amount: u64,
+		/// The asset it is paid in.
+		#[arg(long = "for")]
+		want: String,
+		#[arg(long)]
+		rate_num: u64,
+		#[arg(long)]
+		rate_den: u64,
+		/// The least a fill takes and a remainder holds; the whole amount
+		/// when not named.
+		#[arg(long)]
+		min_lot: Option<u64>,
+		/// The median time from which the maker may refund it.
+		#[arg(long, required_unless_present = "expires_in_hours", conflicts_with = "expires_in_hours")]
+		expires: Option<u32>,
+		/// The same, as hours from the chain's median time now.
+		#[arg(long)]
+		expires_in_hours: Option<u32>,
+		/// The 32-byte version 1 program every fill credits, in hex, in
+		/// place of the order's own key: a plain key's, never an Arca
+		/// script's, which the wallet refuses.
+		#[arg(long)]
+		maker_prog: Option<String>,
+		/// The most the fee may take of the amount, in millionths: 10,000
+		/// unless raised.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what placing the order would cost (the coins, the fee,
+		/// the change), signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The quote shown to the user, as `--quote` answered it: the order
+		/// is placed only on that very fee and those coins.
+		#[arg(long)]
+		shown: Option<String>,
+		/// How long to wait, in seconds, for the order to rest on the chain,
+		/// final, syncing meanwhile; 0 answers once the operator has the
+		/// participation, and `sync` and `orders` take it on.
+		#[arg(long, default_value_t = 3600)]
+		wait: u64,
+	},
+	/// Takes back what an order holds where it rests, by its REFUND, once
+	/// the chain's median time has passed its expiry: to an address of the
+	/// wallet's.
+	Refund {
+		/// The order, as `order place` and `orders` name it.
+		order: String,
+		/// The asset to pay the fee in where the node does not take the
+		/// order's own asset for fees.
+		#[arg(long)]
+		fee_asset: Option<String>,
 	},
 }
 
@@ -611,7 +691,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. })
+		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }))
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -717,12 +797,65 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				w.take(&order, amount, max_fee_ppm, shown.as_ref())
 			}
 		},
+		Cmd::Order(OrderCmd::Place { sell, amount, want, rate_num, rate_den, min_lot, expires, expires_in_hours, maker_prog, max_fee_ppm,
+			quote, shown, wait }) =>
+		{
+			let expiry = match (expires, expires_in_hours) {
+				(Some(t), _) => t,
+				(None, Some(h)) => w.expiry_in(h.saturating_mul(3600))?,
+				(None, None) => unreachable!("clap requires one"),
+			};
+			let ask = bark::arca::order::ask_of(&json!({"sell": sell, "amount": amount, "want": want, "rate_num": rate_num,
+				"rate_den": rate_den, "min_lot": min_lot, "expiry": expiry, "maker_prog": maker_prog}))?;
+			if quote {
+				return w.order_quote(&ask, max_fee_ppm);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the order shown: {}", e)))).transpose()?;
+			let placed = w.order_place(&ask, max_fee_ppm, shown.as_ref())?;
+			wait_for_order(&mut w, placed, wait)
+		},
+		Cmd::Order(OrderCmd::Refund { order, fee_asset }) => w.order_refund(&order, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Orders => w.orders(),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
+	}
+}
+
+/// Waits up to `wait` seconds for the order `placed` names to rest on the
+/// chain, final, syncing every few seconds meanwhile (the forfeits go over
+/// once its round is final): answers the placement with where it rests, or
+/// where it stands when the wait ends.
+fn wait_for_order(w: &mut Wallet, placed: Value, wait: u64) -> Result<Value, bark::arca::Error> {
+	if wait == 0 {
+		return Ok(placed);
+	}
+	let id = placed["order"].as_str().unwrap_or("").to_string();
+	let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+	loop {
+		std::thread::sleep(std::time::Duration::from_secs(2));
+		if let Err(e) = w.sync() {
+			eprintln!("arca: a sync while waiting for order {}: {}", id, e);
+		}
+		let orders = w.orders()?;
+		let now = orders.as_array().and_then(|a| a.iter().find(|o| o["order"] == json!(id))).cloned().unwrap_or(Value::Null);
+		let mut out = placed.clone();
+		out["placed"] = now.clone();
+		if now["state"] == "not_placed" {
+			return Err(bark::arca::Error::Refused(format!("order {} was not placed: {}", id, now["note"].as_str().unwrap_or(""))));
+		}
+		if now["state"] == "resting" && now["final"] == json!(true) {
+			return Ok(out);
+		}
+		if std::time::Instant::now() >= until {
+			out["note"] = json!(format!("still {} after {} s: `arca sync` takes it on, and `arca orders` says where it rests",
+				now["state"].as_str().unwrap_or("waiting"), wait));
+			return Ok(out);
+		}
 	}
 }
 

@@ -70,7 +70,14 @@ one mnemonic serves both:
   its on-chain coins gap by gap, and it never hands out an index it found in
   use. Each index is taken in one statement of the store, so two processes on
   one directory never hand out the same address; each exit claims to one
-  address, however often it is run.
+  address, however often it is run;
+- order keys are `m/86'/1'/0'/0/<index>` (`0'` instead of `1'` on the main
+  chain), one for each order the wallet places on the chain (see Placing an
+  order on the chain): the key is the order's REFUND key, and its key-path
+  output, tweaked with no script tree under the Elements tags, is the plain
+  program every fill pays the maker's credit to. The wallet looks at them as
+  at its on-chain keys, gap by gap, counts the credits there in `balance` and
+  boards them with an ordinary key-path signature.
 
 The store keeps every owner nonce the wallet has ever drawn, with its key,
 written before the key is handed out or signs anything, and never deleted. It
@@ -661,6 +668,60 @@ While the wallet has no Bitcoin ark wallet, each of these is refused with the
 reason and Bark is not run. `ARCA_BARK_EXEC` and `ARCA_BARKD_EXEC` name the
 `bark` and `barkd` binaries when they are not the ones beside `arca`.
 
+### Placing an order on the chain
+
+A maker who holds only leaves places an ordinary SeqDEX order: `arca order
+place` offboards exactly the order's amount into the address SeqDEX's fill
+covenant makes for its terms (two leaves under the NUMS point: FILL, which
+anyone fills who pays the maker its price, and REFUND, the maker's once the
+order's time has passed). The order sells `--amount` of `--sell` for `--for`,
+`--rate-num` atoms of it for every `--rate-den` atoms sold, each fill's price
+rounded up, in fills of at least `--min-lot` (the whole amount unless named),
+and is refundable once the chain's median time passes `--expires` (or
+`--expires-in-hours` from now). Fills credit the order's own key (see Keys);
+`--maker-prog` names another plain program, and the wallet refuses one that is
+the script of any coin it holds or held, of a board, a checkpoint or a forfeit
+of one: a pair of rebindable signatures over one credit there would spend every
+other credit of the same value, and whoever fills chooses each credit's value.
+
+The participation gives up coins of the asset sold and wants one offboard
+output, and a change leaf where the coins hold more. Its fee is each coin's
+refresh fee, the offboard's fee by the asset's schedule, and the margin the
+round's offboard output holds to pay its unlock, priced as the operator prices
+it; `--quote` shows it, the coins and the change before anything is signed, and
+`--shown` places the order only on that very fee and those coins. The wallet
+refuses an expiry that is a height, one within the operator's order margin
+(`info.fills.order_margin_seconds`) and an hour of now, since a take of such an
+order would be refused, and an amount whose full price is no whole number of
+atoms, which SeqDEX's relay does not list.
+
+`order place` then waits (`--wait`, an hour unless named, 0 not at all),
+syncing every few seconds: once the operator's round is final the wallet
+hands over its forfeits and takes the preimage; the operator unlocks the
+round's offboard output into the order's address, and the wallet unlocks it
+itself when the operator has not within ten minutes of median time. It
+answers where the order rests (the unlock's output 0, holding exactly the
+amount) once that is final, with its terms in the relay's JSON form
+(`placed.relay`). The maker may then go offline: anyone fills the order on the
+chain, a holder of leaves through the operator's round (`take`), each fill
+crediting the maker at `2k` and resting the rest at `2k+1` under the same
+script. `arca orders` reads from the chain, each time, where each order rests,
+every fill and what it credited, and the credits at its key, so an
+anchor-driven rollback that undoes a fill undoes it here too. `arca board`
+brings the credits into Arca. `arca order refund` takes what rests home once
+the order's time has passed, to an address of the wallet's.
+
+    arca order place --sell X --amount 1000000 --for Y --rate-num 3 --rate-den 2 \
+      --min-lot 100000 --expires-in-hours 48 --quote          # coins, fee, change
+    arca order place … --shown '<the quote>'                  # rests on the chain
+    arca orders                                               # fills, credits, where it rests
+    arca board Y 1049000                                      # the credits, into Arca
+    arca order refund ORDER                                   # once its time has passed
+
+A wallet restored from the mnemonic finds the coins it gave up for its orders
+as spent and the credits at its order keys, but not the orders themselves:
+their terms are on the relay and in the order's script.
+
 ### Taking an on-chain order
 
 An order resting on the chain under SeqDEX's fill covenant sells one asset
@@ -732,9 +793,9 @@ registry for both commands.
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
-| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
+| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
 | `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
-| `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
+| `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
@@ -757,6 +818,9 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
+| `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
+| `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
+| `order refund ORDER [--fee-asset A]` | Takes what order `ORDER` holds where it rests home by its REFUND, once the chain's median time has passed its expiry, to an address of the wallet's; the fee from the order's own value where the node takes its asset for fees, else from an on-chain coin in `A` |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -823,6 +887,22 @@ outpoint in a round where it sits at input 1; and each refusal (an order not
 final, a fill leaving less than a lot, a fee over the bound, a maker's key
 path, terms not the order's, an order another take holds, an order spent) is
 printed as the wallet words it.
+
+`tests/arca_orders.rs` runs the same way: a maker that holds only leaves of
+X places an order selling them for Y with `arca order place`, each refusal
+printed (an Arca script of its own as the credit program, a height as the
+expiry, an expiry within the operator's margin, a price the relay cannot
+list, a fee over the bound, more than it holds), the fee quoted and shown, and
+waits while the operator's round runs; the order rests at the unlock's output
+0 under SeqDEX's own script holding exactly its amount, final. Two wallets
+holding Y fill it in part with `arca take`, one round after the other, each
+crediting the maker at output 0 and resting the rest at output 1 under the
+same script. A wallet made from the maker's mnemonic finds the coin given up
+spent and the credits at the order key. The maker reads both fills with `arca
+orders`, boards its credits from the order key, and its REFUND is refused by
+the wallet and by the node before the expiry and mined after it. A second
+test runs an operator whose watcher never unlocks the order: the maker's
+`sync` unlocks it itself once the ten minutes have passed.
 
 `tests/arca_restore.rs` runs the same way. A wallet holds a leaf of a batch,
 a board, its change from a payment out of round, a payment to it not yet

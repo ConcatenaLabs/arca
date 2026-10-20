@@ -53,7 +53,7 @@ struct Order {
 
 /// The fee the operator's schedule in `asset` asks for an offboard of
 /// `value`: its parts per million, rounded up, and its fixed part.
-fn offboard_fee(schedule: &Value, value: u64) -> u64 {
+pub(crate) fn offboard_fee(schedule: &Value, value: u64) -> u64 {
 	let ppm = schedule["offboard_ppm"].as_u64().unwrap_or(0) as u128;
 	let base = schedule["offboard_base"].as_str().and_then(|b| b.parse::<u64>().ok()).unwrap_or(0) as u128;
 	((value as u128 * ppm).div_ceil(1_000_000) + base).min(u64::MAX as u128) as u64
