@@ -65,6 +65,7 @@ pub async fn gateway<F: FnOnce(&mut server::server::Config, AssetId)>(test: &str
 		// SeqLN's final lock time on a Sequentia network is 180 blocks:
 		// eight hours leave a payment 240.
 		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
 		tune(c, y);

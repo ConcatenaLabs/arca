@@ -344,8 +344,16 @@ The operator co-signs only when:
 
 The operator then records the payment, `paying`, and pays the invoice through
 A's node (`pay`), spending on routing at most its fee, with the payment's lock
-times within half the time left to the leaf's timeout, so that the payment
-resolves well before the owner's refund could open. The node's answer decides
+times within half the time left to the leaf's timeout less
+`send_stall_margin_seconds` (six hours unless set, and below
+`send_timeout_seconds`), so that the payment resolves before the owner's
+refund could open through a stall of the chain up to that long, the chain at
+half its pace besides: the leaf times out in median time and the lock times
+count blocks, and the first blocks after a stall carry the clock, so the
+median time leaps the whole stall in a few blocks. Within that margin of the
+leaf's timeout a payment is decided as soon as the node can say: claimed
+with the preimage at once, failed without waiting for an earlier `pay` to try
+another route, and one not started is failed. The node's answer decides
 it: `paid`, with the preimage, which proves the payment and makes the leaf the
 operator's; or `failed`, once no part of the payment is pending on the node.
 A payment whose answer is not known is asked about again every few seconds,
@@ -719,6 +727,10 @@ among `fee_assets`, else the first asset of `fee_assets` the node accepts;
 never another, and never one the node refuses. A round in an asset the node
 does not accept for fees so draws its fee and its connector from the pool
 of that fee asset, and waits, saying so, while that pool cannot pay them.
+A round spends only final coins, so an operator serving an asset the node
+does not accept for fees keeps several final coins of the first fee asset:
+a round of that asset built while the other rounds' change is not yet final
+otherwise waits for their confirmations.
 
 Before it records anything the runner checks its work as a wallet would:
 every leaf's record validates against the transaction under the acceptance

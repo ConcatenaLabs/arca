@@ -393,3 +393,57 @@ async fn a_leaf_claimed_on_the_chain_settles_its_payment() {
 	assert_eq!((paid["status"].as_str(), paid["payment_preimage"].as_str()), (Some("complete"), Some(hex(&w.preimage).as_str())));
 	g.r.wait("the operator's node received the payment", || settled_balance(&g.ox, x) == o0 + w.amount).await;
 }
+/// R7j F6: a receive is new work in its asset, so a stale rate refuses it as
+/// it refuses a board (A2.1's rule). Y's rate comes from a file, which goes
+/// two hours stale: a request to receive in Y is refused `rate_stale`
+/// naming Y, nothing asked of the node; one in X, whose rate is the node's,
+/// is taken. The file fresh again, Y receives too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_in_an_asset_whose_rate_is_stale_is_refused() {
+	let dir = std::env::temp_dir().join(format!("arca-receive-rate-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let y_rate = dir.join("y.rate");
+	let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	let write = |t: u64| std::fs::write(&y_rate, json!({"rate": "100000000", "time": t}).to_string()).unwrap();
+	write(now());
+	let file = y_rate.display().to_string();
+	let Some(g) = gateway("a_receive_in_an_asset_whose_rate_is_stale_is_refused", move |c, y| {
+		tune(c, y);
+		let i = c.assets.iter().position(|a| a.asset == y.to_string()).unwrap();
+		c.assets[i] = toml::from_str(&format!("asset = \"{}\"\nmin_leaf = \"1000\"\nlightning_base = \"{}\"\n[rate]\nsource = \"file\"\n\
+			path = {:?}\nmax_age_seconds = 600\n", y, BASE, file)).unwrap();
+	}).await else { return };
+	let (x, y) = (g.r.x, g.r.y);
+	write(now() - 7_200);
+	let start = std::time::Instant::now();
+	loop {
+		let info = g.r.http.get("info").ok();
+		let a = info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == y.to_string()).cloned().unwrap();
+		if a["rate"]["stale"] == true {
+			println!("Y's rate, stale: {}", a["rate"]);
+			break;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(40), "Y's rate never went stale: {}", a);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	let wy = Receiving::new(y, 100_000);
+	let a = wy.ask(&g);
+	println!("a receive in Y, its rate stale: {} {}", a.status, a.json);
+	assert_eq!(a.status, 503, "{}", a.json);
+	let m = refused("a receive in Y, its rate stale", a, "rate_stale");
+	assert!(m.contains(&y.to_string()), "the refusal names the asset: {}", m);
+	let wx = Receiving::new(x, 100_000);
+	let a = wx.ask(&g);
+	assert_eq!(a.status, 200, "X's rate is fresh: {}", a.json);
+	write(now());
+	let start = std::time::Instant::now();
+	loop {
+		let a = wy.ask(&g);
+		if a.status == 200 {
+			break;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(40), "Y never received again: {}", a.json);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	let _ = std::fs::remove_dir_all(&dir);
+}

@@ -229,12 +229,19 @@ poll_seconds = 10
 # once its timeout has passed and then its exit delay, at least
 # owner_delay_units (512-second units). Its timeout lies send_timeout_seconds
 # to twice that past the chain's median time, and a payment's lock times add
-# up to at most half the time left to it, in blocks of block_seconds: SeqLN's
+# up to at most half the time left to it less the stall margin, in blocks of
+# block_seconds: SeqLN's
 # final lock time on a Sequentia network is 180 blocks and each hop adds 270,
-# so a day leaves a payment 720 blocks. One attempt to pay runs retry_seconds.
+# so a day, less the stall margin below, leaves a payment 540 blocks. One
+# attempt to pay runs retry_seconds.
+# The lock times also end send_stall_margin_seconds before that, so a
+# payment resolves before the leaf's timeout through a chain stall that long
+# (the median time leaps a stall in a few blocks); it is below
+# send_timeout_seconds.
 operator_delay_units = 36
 owner_delay_units = 72
 send_timeout_seconds = 86400
+send_stall_margin_seconds = 21600
 block_seconds = 60
 retry_seconds = 60
 # A payment into the tree: the invoice is good for invoice_expiry_seconds;
