@@ -6487,3 +6487,61 @@ async fn d61_a_payment_held_up_by_the_keepers_is_read_on_the_schedule() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+/// D66, with D57: a coin due home goes home in the sync whose mailbox read
+/// the server keeps going without end. B holds a coin paid out of A's board;
+/// its home date comes; the server serves B's coin's message again on every
+/// page under a new cursor, as if each were new. The read stops at its page
+/// cap with a note, and the same sync takes the coin home.
+#[tokio::test(flavor = "multi_thread")]
+async fn d66_a_coin_due_home_goes_home_while_the_mailbox_is_served_without_end() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let (a, b) = (Arca::new("D66HA"), Arca::new("D66HB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&p.url, &r.node_url()));
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let s = b.ok(&["sync"]);
+	let leaf = s["mailbox"]["accepted"][0]["leaf_id"].as_str().expect("B takes the coin").to_string();
+	let home_from = coin_of(&b, &leaf)["home_from"].as_u64().expect("the coin's home date") as u32;
+	d57_to(&r, home_from + 60).await;
+	let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let seen: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
+	let (rc, sc) = (reads.clone(), seen.clone());
+	p.rewrite(Some(Arc::new(move |path: &str, req: &Value, status: u16, v: &mut Value| {
+		if path != "/v1/mailbox_read" || status != 200 {
+			return None;
+		}
+		if let Some(first) = v["messages"].as_array().and_then(|m| m.first()).cloned() {
+			*sc.lock().unwrap() = Some(first);
+		}
+		if rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3_000 {
+			if let Some(mut m) = sc.lock().unwrap().clone() {
+				let after = req["after"].as_str().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
+				m["cursor"] = json!((after + 1).to_string());
+				v["messages"] = json!([m]);
+			}
+		}
+		None
+	})));
+	// The proxy learns the coin's message from a read from the start.
+	let db = rusqlite::Connection::open(b.dir.join("arca.sqlite")).unwrap();
+	db.execute("DELETE FROM mailbox", []).unwrap();
+	drop(db);
+	reads.store(3_000, std::sync::atomic::Ordering::SeqCst);
+	b.ok(&["mailbox"]);
+	reads.store(0, std::sync::atomic::Ordering::SeqCst);
+	let s = b.ok(&["sync"]);
+	let n = reads.load(std::sync::atomic::Ordering::SeqCst);
+	println!("D66H B's sync past the coin's home date, its mailbox served without end: {} reads | mailbox note {} | home {} | the coin {}",
+		n, s["mailbox"]["note"], s["home"], coin_of(&b, &leaf)["state"]);
+	assert!(n < 3_000, "the mailbox read ran on: {} reads", n);
+	assert!(s["mailbox"]["note"].is_string(), "{}", s["mailbox"]);
+	assert_eq!(coin_of(&b, &leaf)["state"], "exiting", "the coin goes home in the same sync: {}", s["home"]);
+	p.rewrite(None);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

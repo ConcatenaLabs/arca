@@ -299,6 +299,14 @@ pub const MAX_BINDINGS: usize = 64;
 /// The most leaves one `leaf_data` page holds: the server's bound.
 pub const LEAF_PAGE: u32 = 100;
 
+/// The most pages of `leaf_data` one restore reads: a hundred thousand
+/// leaves. A server that names pages without end is read no further.
+pub const LEAF_DATA_PAGES: usize = 1_000;
+
+/// The most pages of a mailbox one read takes, for each key it reads: ten
+/// thousand messages. The rest is read by the next.
+pub const MAILBOX_PAGES: usize = 100;
+
 /// The server, at its base URL.
 #[derive(Debug, Clone)]
 pub struct ServerClient {

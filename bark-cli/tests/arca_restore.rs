@@ -730,3 +730,182 @@ async fn a_coin_restored_past_its_expiry_goes_home_while_its_path_stands() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+// ---------------------------------------------------------------------------
+// D66: the mailbox cursor never moves back, and every read is bounded
+// ---------------------------------------------------------------------------
+
+/// Pays `w`'s only live coin whole to `request`: walking down from the
+/// coin's value, the first amount the wallet takes leaves no change.
+fn pay_whole(w: &Arca, request: &str, asset: &str, value: u64) -> Value {
+	for v in (value.saturating_sub(4_000)..value).rev() {
+		let (ok, out) = w.run(&["send", request, "--amount", &v.to_string(), "--asset", asset]);
+		if ok {
+			assert!(out["transfer"]["kept"].as_array().unwrap().is_empty(), "paid with change: {}", out);
+			return out;
+		}
+	}
+	panic!("no amount just below {} was taken whole", value);
+}
+
+/// The second review's F1, turned around (D66), its first half. A server that
+/// names another page of `leaf_data` without end: first as the review's
+/// probe did (the next cursor one past the last, the same leaves served
+/// again), then as a server that keeps its pages consistent (every leaf
+/// served again under a new cursor, each page's next its last). The restore
+/// ends either way, with a note: at once for the first, at the page cap for
+/// the second, and the coin in the mailbox is restored.
+#[tokio::test(flavor = "multi_thread")]
+async fn d66_a_restore_reads_leaf_data_to_an_end_whatever_the_server_serves() {
+	let mut r = Running::start_kept(0, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, b) = (Arca::new("D66A"), Arca::new("D66B"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &node));
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "500000", "--asset", &xs]);
+	let unread = sent["transfer"]["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string())
+		.find(|o| !sent["transfer"]["kept"].as_array().unwrap().iter().any(|k| k["leaf_id"] == o.as_str())).expect("B's coin");
+	let mnemonic_b = std::fs::read_to_string(b.dir.join("mnemonic")).unwrap().trim().to_string();
+	let p = Proxy::start(&url);
+	let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	// (a) The review's probe: the same leaves again, the next cursor one
+	// past the last asked; given up by the proxy after 2,000 pages.
+	for (case, consistent) in [("the review's", false), ("a consistent", true)] {
+		calls.store(0, std::sync::atomic::Ordering::SeqCst);
+		let first: Arc<std::sync::Mutex<Value>> = Arc::new(std::sync::Mutex::new(json!([])));
+		let (cc, ff) = (calls.clone(), first.clone());
+		p.rewrite(Some(Arc::new(move |path: &str, req: &Value, status: u16, v: &mut Value| {
+			if path != "/v1/leaf_data" || status != 200 {
+				return None;
+			}
+			let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			let after = req["after"].as_str().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
+			if n >= 2_000 {
+				*v = json!({"leaves": [], "next": null});
+				return None;
+			}
+			if n == 0 {
+				*ff.lock().unwrap() = v["leaves"].clone();
+			}
+			if v["leaves"].as_array().unwrap().is_empty() {
+				v["leaves"] = ff.lock().unwrap().clone();
+			}
+			if consistent {
+				for l in v["leaves"].as_array_mut().unwrap() {
+					l["cursor"] = json!((after + 1).to_string());
+				}
+			}
+			v["next"] = json!((after + 1).to_string());
+			None
+		})));
+		let b2 = Arca::new(if consistent { "D66B3" } else { "D66B2" });
+		let mut args = create_args(&p.url, &node);
+		args.extend(["--mnemonic", &mnemonic_b]);
+		let made = b2.ok(&args);
+		let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+		println!("D66 {} server, leaf_data without end: {} pages read | restore note {} | the coin {}", case, n, made["restore"]["note"],
+			coin_of(&b2, &unread)["state"]);
+		assert!(n < 2_000, "the restore read every page the server named: {}", n);
+		assert!(made["restore"]["note"].is_string(), "the restore says why it stopped reading: {}", made["restore"]);
+		assert_eq!(coin_of(&b2, &unread)["state"], "live", "{}", made["restore"]);
+		let _ = std::fs::remove_dir_all(&b2.dir);
+	}
+	p.rewrite(None);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The second review's F1, turned around (D66), its second half: the
+/// mailbox. B2, restored, pays the first coin away whole; a second payment
+/// takes its cursor past that message. The spent coin's message served
+/// again, once, does not take the cursor back (the message after it is not
+/// read again), and served again on every page the read ends with a note
+/// instead of running on. Nothing is credited twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn d66_a_mailbox_replayed_takes_no_cursor_back_and_ends() {
+	let mut r = Running::start_kept(0, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, b) = (Arca::new("D66MA"), Arca::new("D66MB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &node));
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "500000", "--asset", &xs]);
+	let unread = sent["transfer"]["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string())
+		.find(|o| !sent["transfer"]["kept"].as_array().unwrap().iter().any(|k| k["leaf_id"] == o.as_str())).expect("B's coin");
+	let mnemonic_b = std::fs::read_to_string(b.dir.join("mnemonic")).unwrap().trim().to_string();
+	let p = Proxy::start(&url);
+	// The proxy keeps every mailbox message it passes on, from the restore's
+	// read on.
+	let msgs: Arc<std::sync::Mutex<BTreeMap<String, Value>>> = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+	let mm = msgs.clone();
+	p.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/mailbox_read" && status == 200 {
+			for m in v["messages"].as_array().into_iter().flatten() {
+				if let Some(l) = m["leaf_id"].as_str() {
+					mm.lock().unwrap().insert(l.to_string(), m.clone());
+				}
+			}
+		}
+		None
+	})));
+	let b2 = Arca::new("D66MB2");
+	let mut args = create_args(&p.url, &node);
+	args.extend(["--mnemonic", &mnemonic_b]);
+	b2.ok(&args);
+	b2.ok(&["sync"]);
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	pay_whole(&b2, &req_a, &xs, 500_000);
+	assert_eq!(coin_of(&b2, &unread)["state"], "spent");
+	let req_b2 = b2.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent2 = a.ok(&["send", &req_b2, "--amount", "100000", "--asset", &xs]);
+	let coin2 = sent2["transfer"]["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string())
+		.find(|o| !sent2["transfer"]["kept"].as_array().unwrap().iter().any(|k| k["leaf_id"] == o.as_str())).expect("B2's second coin");
+	let s = b2.ok(&["sync"]);
+	assert!(s["mailbox"]["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == coin2.as_str()), "{}", s["mailbox"]);
+	let before = b2.ok(&["balance"]);
+	let m0 = msgs.lock().unwrap().get(&unread).cloned().expect("the first coin's message, seen by the proxy");
+	// Served again once.
+	let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let (oc, m0c) = (once.clone(), m0.clone());
+	p.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/mailbox_read" && status == 200 && !oc.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			if let Some(m) = v["messages"].as_array_mut() {
+				m.push(m0c.clone());
+			}
+		}
+		None
+	})));
+	let s = b2.ok(&["sync"]);
+	println!("D66 a sync with the spent coin's message served again once: mailbox {}", s["mailbox"]);
+	let held = s["mailbox"]["already_held"].as_array().cloned().unwrap_or_default();
+	assert!(!held.iter().any(|c| c["leaf_id"] == coin2.as_str()), "the cursor went back: the message after the old one was read again: {}",
+		s["mailbox"]);
+	assert_eq!(coin_of(&b2, &unread)["state"], "spent");
+	assert_eq!(b2.ok(&["balance"]), before);
+	// Served again on every page; the proxy gives up after 500 reads.
+	let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let (rc, m0c) = (reads.clone(), m0.clone());
+	p.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/mailbox_read" && status == 200 && rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 500 {
+			if let Some(m) = v["messages"].as_array_mut() {
+				m.push(m0c.clone());
+			}
+		}
+		None
+	})));
+	let s = b2.ok(&["sync"]);
+	let n = reads.load(std::sync::atomic::Ordering::SeqCst);
+	println!("D66 a sync with the spent coin's message served on every page: {} reads | mailbox {}", n, s["mailbox"]);
+	assert!(n < 10, "the read ran on while the server served the old message on every page: {} reads", n);
+	assert!(s["mailbox"]["note"].is_string(), "the read says why it ended: {}", s["mailbox"]);
+	assert_eq!(b2.ok(&["balance"]), before, "nothing credited twice");
+	p.rewrite(None);
+	for w in [&a, &b, &b2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

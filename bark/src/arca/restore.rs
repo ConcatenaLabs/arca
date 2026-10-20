@@ -51,7 +51,7 @@ use arca_covenant::tree::Tree;
 use arca_covenant::{connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
 
 use super::chain::{hex, unhex, unhex32};
-use super::client::{participation_id, Wanted, LEAF_PAGE};
+use super::client::{participation_id, Wanted, LEAF_DATA_PAGES, LEAF_PAGE};
 use super::store::ForfeitRow;
 use super::wallet::{amount, kind_of, owner_of, sign, Wallet};
 use super::Error;
@@ -102,16 +102,39 @@ impl Wallet {
 		let mailbox = self.keys.mailbox()?;
 		let mut entries: Vec<Value> = vec![];
 		let mut after = 0i64;
+		let mut read_note: Option<String> = None;
+		let mut pages = 0;
 		loop {
+			if pages >= LEAF_DATA_PAGES {
+				read_note = Some(format!("the server names more than {} pages of leaves: the restore reads no further, and takes what it read",
+					LEAF_DATA_PAGES));
+				break;
+			}
+			pages += 1;
 			let page = self.server.leaf_data(&mailbox, &self.genesis, after, LEAF_PAGE)?;
 			let leaves = page["leaves"].as_array().cloned().unwrap_or_default();
 			if leaves.is_empty() {
 				break;
 			}
+			// Every leaf of a page lies past the cursor asked, and the next
+			// cursor past every one: a page that serves again what was read,
+			// or names a next that does not advance past it, ends the read.
+			let cursors: Vec<i64> = leaves.iter().filter_map(|l| l["cursor"].as_str().and_then(|c| c.parse::<i64>().ok())).collect();
+			if cursors.iter().any(|c| *c <= after) {
+				read_note = Some(format!("the server serves leaves at or before the cursor asked ({}) again: the restore reads no further, \
+					and takes what it read", after));
+				break;
+			}
 			entries.extend(leaves);
+			let last = cursors.iter().copied().max().unwrap_or(after);
 			match page["next"].as_str().and_then(|n| n.parse::<i64>().ok()) {
-				Some(n) if n > after => after = n,
-				_ => break,
+				Some(n) if n > after && n >= last => after = n,
+				Some(n) => {
+					read_note = Some(format!("the server names a next page at cursor {}, not past the page it served (to {}): the restore reads \
+						no further, and takes what it read", n, last));
+					break;
+				},
+				None => break,
 			}
 		}
 		self.keepers_acknowledged(&info, &entries)?;
@@ -233,11 +256,15 @@ impl Wallet {
 			}
 		}
 		let sync = self.sync()?;
-		Ok(json!({
+		let mut out = json!({
 			"served": entries.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes, "mailbox": mailbox_read,
 			"requests": {"lapses_at": until.max(held_until), "note": self.spelling.say(RESTORED_NOTE)},
 			"sync": sync,
-		}))
+		});
+		if let Some(n) = read_note {
+			out["note"] = json!(n);
+		}
+		Ok(out)
 	}
 
 	/// The keeper set the wallet pinned from `info` (when it was created) is
