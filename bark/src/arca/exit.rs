@@ -324,6 +324,17 @@ impl Wallet {
 		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
+		// An exit whose claim is out has nothing left to pay: `exit` follows
+		// the claim until it is final.
+		if let Some((state, _, Some(claim))) = self.store.exit(leaf_id)? {
+			if state == "claimed" {
+				return Ok(json!({
+					"leaf_id": leaf_id, "asset": row.asset, "value": row.value.to_string(), "state": "claimed",
+					"claim": {"txid": claim}, "steps": [], "unroll": {},
+					"note": "the exit's claim is out: nothing is left to pay, and the exit follows the claim until it is final",
+				}));
+			}
+		}
 		let record = Self::record_of(&row)?;
 		let now = self.now()?;
 		let policy = self.followed_policy(row.expiry, now);

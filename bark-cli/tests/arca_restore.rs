@@ -909,3 +909,57 @@ async fn d66_a_mailbox_replayed_takes_no_cursor_back_and_ends() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A leaf the wallet takes home
+// ---------------------------------------------------------------------------
+
+/// `w`'s batch leaf of a board of `value` of X refreshed in a final round.
+async fn batch_leaf(r: &mut Running, w: &Arca, value: u64) -> String {
+	let x = r.x;
+	let url = r.url();
+	boarded(r, w, &url, &[(x, value)]).await;
+	w.ok(&["participate"]);
+	final_round(r).await;
+	let s = w.ok(&["sync"]);
+	s["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("the new leaf").to_string()
+}
+
+/// Runs `w`'s `exit` of `leaf`, with blocks and its exit delay waited out,
+/// until it answers `until` (`claimed`: the claim broadcast; `exited`: the
+/// claim final). Returns the answer.
+async fn exit_until(r: &Running, w: &Arca, leaf: &str, until: &str) -> Value {
+	for k in 0..30 {
+		let e = w.ok(&["exit", leaf]);
+		println!("EXIT {} #{}: {} {}", &leaf[..16], k, e["state"], e["next"].as_str().or(e["error"].as_str()).unwrap_or(""));
+		if e["state"] == until {
+			return e;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.bury().await;
+		r.synced().await;
+	}
+	panic!("the exit of {} never reached {}", leaf, until);
+}
+
+/// W2.5: `exit --quote` on a coin whose claim is already out answers the
+/// claim in flight, nothing left to pay, as `exit` follows it to `exited`,
+/// instead of refusing that nothing of the leaf's path is unspent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exits_quote_with_its_claim_out_answers_the_claim() {
+	let mut r = Running::start().await;
+	let a = Arca::new("EQA");
+	let leaf = batch_leaf(&mut r, &a, 2_000_000).await;
+	let claimed = exit_until(&r, &a, &leaf, "claimed").await;
+	let (ok, q) = a.run(&["exit", &leaf, "--quote"]);
+	println!("EQ the quote with the claim {} out: ok={} {}", claimed["claim"]["txid"], ok, q);
+	assert!(ok, "the quote answers the claim in flight: {}", q);
+	assert_eq!(q["state"], "claimed", "{}", q);
+	assert_eq!(q["claim"]["txid"], claimed["claim"]["txid"], "{}", q);
+	assert_eq!(q["unroll"], json!({}), "nothing left to pay: {}", q);
+	let shown = a.ok(&["exit", &leaf, "--shown", &q["unroll"].to_string()]);
+	println!("EQ the exit on the quote's fees: {}", shown);
+	exit_until(&r, &a, &leaf, "exited").await;
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
