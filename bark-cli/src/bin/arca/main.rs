@@ -66,8 +66,14 @@ enum Cmd {
 		/// Restore from this mnemonic instead of drawing a new one: the wallet
 		/// is created, then restored from what the server serves to its
 		/// mailbox key, every record checked (`restore`).
-		#[arg(long)]
+		#[arg(long, conflicts_with = "mnemonic_file")]
 		mnemonic: Option<String>,
+		/// The same, the mnemonic read once from this file (`/dev/stdin`
+		/// reads it from the standard input): a program that runs `arca`
+		/// keeps it off the command line, which other users of the machine
+		/// can read.
+		#[arg(long)]
+		mnemonic_file: Option<PathBuf>,
 		/// The account of the leaf keys, m/6'/account'/….
 		#[arg(long, default_value_t = 0)]
 		account: u32,
@@ -137,6 +143,15 @@ enum Cmd {
 	/// and its owner's own signatures, then the mailbox and a sync. Run
 	/// again, it takes only what the wallet does not hold.
 	Restore,
+	/// The refresh fee of each coin a participation would give up (every
+	/// live coin when none is named), priced by its asset's schedule, before
+	/// anything is signed: what `participate --shown` takes.
+	Quote {
+		#[arg(long = "leaf")]
+		leaves: Vec<String>,
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
 	/// Takes part in the next round with the coins named (every live coin
 	/// when none is), for one new leaf per asset.
 	#[command(alias = "refresh")]
@@ -151,6 +166,11 @@ enum Cmd {
 		/// coin's free window.
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// The fees shown to the user, as `quote` answered them (its
+		/// `coins`): the participation goes ahead only on these very fees,
+		/// and is refused before anything is signed when they changed.
+		#[arg(long)]
+		shown: Option<String>,
 	},
 	/// Every participation the wallet made, from its own store: where it
 	/// stands, its round, the coins it gave up and its new leaves.
@@ -158,6 +178,10 @@ enum Cmd {
 	/// Re-checks every coin against the chain, retries what the server never
 	/// answered, reads the mailbox and moves every participation on.
 	Sync,
+	/// When `sync` must next run, and the dates of every coin held off the
+	/// chain, asking nothing of the operator: for a program that runs `sync`
+	/// on a timer.
+	Schedule,
 	/// Re-checks every coin against the chain as it is now.
 	Recheck,
 	/// Takes a coin on-chain from its record alone and claims it after its
@@ -368,9 +392,14 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if let Cmd::Bitcoin { args } = &cli.command {
 		return bitcoin(&datadir, args);
 	}
-	if let Cmd::Create { server, node_url, node_user, node_password_file, node_cookie, mnemonic, account, exit_delay_units,
-		min_exit_delay_units, max_exit_delay_units } = cli.command
+	if let Cmd::Create { server, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file, account,
+		exit_delay_units, min_exit_delay_units, max_exit_delay_units } = cli.command
 	{
+		let mnemonic = match mnemonic_file {
+			Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?
+				.split_whitespace().collect::<Vec<_>>().join(" ")),
+			None => mnemonic,
+		};
 		let mut cfg = Config::spec_delays(&server, &node_url);
 		cfg.node_user = node_user;
 		cfg.node_password = match node_password_file {
@@ -420,7 +449,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// witnesses again in every entry point that takes a coin or signs a
 	// spend through the operator, and refuses while no witness succeeds.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. })
+		| Cmd::Exit { .. } | Cmd::Schedule)
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -432,7 +461,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// The re-check runs on every start: a rollback since the last command
 	// un-credits what it took out before anything is spent or shown.
 	let startup = match &cli.command {
-		Cmd::Recheck | Cmd::Sync => None,
+		Cmd::Recheck | Cmd::Sync | Cmd::Schedule => None,
 		_ => match w.recheck() {
 			Ok(v) => Some(v),
 			Err(e) => {
@@ -496,9 +525,20 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.lightning_receive(asset(&a)?, amount, description.as_deref(), max_fee_ppm),
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Restore => w.restore(),
-		Cmd::Participate { leaves, not_before, max_fee_ppm } => {
+		Cmd::Quote { leaves, max_fee_ppm } => Ok(json!({"coins": w.refresh_quote(&leaves, max_fee_ppm)?.coins()})),
+		Cmd::Participate { leaves, not_before, max_fee_ppm, shown } => {
 			// The fee is shown before anything is signed.
 			let quote = w.refresh_quote(&leaves, max_fee_ppm)?;
+			// A program that showed the fees (`quote`) goes ahead only on
+			// the very fees it showed.
+			if let Some(shown) = shown {
+				let shown: Value = serde_json::from_str(&shown)
+					.map_err(|e| bark::arca::Error::Parse(format!("the fees shown: {}", e)))?;
+				let now = json!(quote.coins());
+				if shown != now {
+					return Err(bark::arca::Error::Refused(format!("the refresh fees changed since they were shown; they are now {}", now)));
+				}
+			}
 			for c in quote.coins() {
 				eprintln!("arca: refresh fee for coin {}: {} of asset {} ({} ppm of its {}; the wallet's bound {} ppm)", c["leaf_id"].as_str().unwrap_or(""),
 					c["fee"].as_str().unwrap_or(""), c["asset"].as_str().unwrap_or(""), c["ppm"], c["value"].as_str().unwrap_or(""), c["bound_ppm"]);
@@ -506,6 +546,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.participate(quote, not_before)
 		},
 		Cmd::Sync => w.sync(),
+		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
 		Cmd::Exit { leaf_id, fee_asset } => w.exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
