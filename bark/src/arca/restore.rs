@@ -177,6 +177,17 @@ impl Wallet {
 			notes.extend(self.restore_given(id, &t.entry, &t.coin, now)?);
 		}
 
+		// A leaf the lost wallet took home: its own output on the chain, found
+		// and followed as an exit would (its claim, a forfeit or a checkpoint
+		// that took it, or the exit to go on), never held live.
+		for (id, t) in &taken {
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				if let Some(n) = self.restore_on_chain(id, &t.coin)? {
+					notes.push(n);
+				}
+			}
+		}
+
 		// A leaf that went over Lightning and is not given up on its owner's
 		// signature: as the payment stands.
 		for (id, t) in &taken {
@@ -457,6 +468,44 @@ impl Wallet {
 			let _ = self.witness_record(&e["batch"]["signer_record"], false);
 		}
 		Ok(Some((state.to_string(), coin)))
+	}
+
+	/// The coin `id` (`coin`), restored live, whose own output the chain
+	/// holds: the lost wallet unrolled it. Its exit is taken up where the chain
+	/// has it, the wallet's own claim recognised by the address it pays (one
+	/// of the mnemonic's receive addresses): `exited` once that claim is
+	/// final, `exiting` while it is not or the leaf waits for its claim, and
+	/// as a forfeit or a co-signed checkpoint that took it says otherwise.
+	/// `None` for a coin whose output is not on the chain.
+	fn restore_on_chain(&mut self, id: &str, coin: &ValidCoin) -> Result<Option<Value>, Error> {
+		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+		let out = coin.output().txout();
+		let Some((tx, h)) = self.chain.find_payment(&out, from)? else { return Ok(None) };
+		let vout = tx.output.iter().position(|o| *o == out).expect("pays it") as u32;
+		let leaf = elements::OutPoint::new(tx.txid(), vout);
+		let mut prior = json!({"txs": [], "leaf": leaf.to_string()});
+		let mut claim = None;
+		if let Some((sp, _)) = self.chain.spender(&leaf, h)? {
+			// The mnemonic's receive addresses, as far as the wallet has used
+			// them and a gap beyond.
+			let _ = self.onchain_coins()?;
+			let end = self.store.indices(super::keys::RECEIVE)? + 20;
+			for i in 0..end {
+				let to = self.keys.onchain_script(super::keys::RECEIVE, i)?;
+				if sp.output.iter().any(|o| o.script_pubkey == to) {
+					prior["claim_index"] = json!(i);
+					claim = Some(sp.txid().to_string());
+					break;
+				}
+			}
+		}
+		self.store.set_exit(id, if claim.is_some() { "claimed" } else { "unrolling" }, &prior.to_string(), claim.as_deref())?;
+		self.store.set_coin_state(id, "exiting", "its leaf is on the chain, taken home before the restore: the exit is followed where the \
+			chain has it")?;
+		let followed = self.exit(id, None).unwrap_or_else(|e| json!({"leaf_id": id, "error": e.to_string()}));
+		let state = self.store.coin(id)?.map(|c| c.state).unwrap_or_default();
+		Ok(Some(json!({"leaf_id": id, "state": state, "note": format!("its leaf {} is on the chain: the lost wallet took it home; {}", leaf,
+			followed)})))
 	}
 
 	/// D63: the `htlc-1` coin `id` (`coin`, of terms `h`), restored live, as its
