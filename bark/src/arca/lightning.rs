@@ -446,6 +446,14 @@ pub(crate) const RECEIVES: &str = "lightning_receives";
 /// The tag of a received payment's preimage, derived from its leaf's key.
 const RECEIVE_PREIMAGE_TAG: &[u8] = b"Arca/lightning-receive-preimage";
 
+/// The blocks a received leaf's claim keeps in hand before the leaf's
+/// timeout, at the chain's interval, beyond its unroll and its exit delay:
+/// time for the claim to be mined before the operator's refund can be.
+pub(crate) const CLAIM_MARGIN_BLOCKS: u64 = 3;
+
+/// The receive window the wallet assumes of an operator that publishes none.
+const DEFAULT_WINDOW: u64 = 6 * 3600;
+
 /// The `htlc-1` terms a published leaf carries (`htlc`), if any.
 pub(crate) fn htlc_terms_of(v: &Value) -> Result<Option<HtlcTerms>, Error> {
 	if v.is_null() {
@@ -548,7 +556,7 @@ impl Wallet {
 		}
 		let hash_hex = hex(&hash);
 		self.set_receive(&hash_hex, json!({"state": "requested", "request": body, "asset": asset.to_string(), "amount": amount.to_string(),
-			"nonce": hex(&nonce), "max_fee_ppm": bound}))?;
+			"nonce": hex(&nonce), "max_fee_ppm": bound, "window": recv["window_seconds"].as_u64().unwrap_or(DEFAULT_WINDOW)}))?;
 		let r = match self.server.post("lightning_receive", &body) {
 			Ok(r) => r,
 			Err(e @ Error::Server { .. }) => {
@@ -659,10 +667,25 @@ impl Wallet {
 	/// as published, and time enough before its timeout to take it home
 	/// should the operator not co-sign), then the preimage handed over with
 	/// its transfer into a leaf of the wallet's own.
+	///
+	/// The operator's refund of the leaf opens at its timeout: the refund's
+	/// two locks, the timeout and the operator's delay from the leaf's
+	/// confirmation, run at once, so for a leaf confirmed an operator's delay
+	/// before its timeout the refund opens at the timeout itself. The
+	/// preimage is handed over only while the wallet could still unroll the
+	/// leaf, wait out its exit delay and claim it a few blocks before then
+	/// ([`CLAIM_MARGIN_BLOCKS`]); later, the wallet keeps the preimage, the
+	/// payment is failed back to its payer, and the leaf is the operator's.
+	/// Once the preimage has gone out the payment is never called failed:
+	/// should the operator not answer the claim with its co-signature, the
+	/// leaf has a home date (`home_at`, the timeout less its exit delay, its
+	/// unroll and the margin), at which `sync` takes it home by its claim
+	/// ([`Wallet::receive_home_dates`]).
 	fn claim_received(&mut self, hash: &str) -> Result<Value, Error> {
 		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
+		let handed = rec["state"] == "claiming";
 		let pid = rec["participation"].as_str().unwrap_or("").to_string();
-		if let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == pid) {
+		if let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == pid).filter(|_| !handed) {
 			if matches!(p.4.as_str(), "void" | "expired" | "refused") {
 				rec["state"] = json!("failed");
 				rec["reason"] = json!(format!("its leaf never came: the participation is {}", p.4));
@@ -682,7 +705,21 @@ impl Wallet {
 				self.set_receive(hash, rec.clone())?;
 				return Ok(json!({"payment_hash": hash, "state": "received"}));
 			},
+			"exited" => {
+				rec["state"] = json!("received");
+				rec["note"] = json!("claimed on the chain, with the payment's preimage");
+				self.set_receive(hash, rec.clone())?;
+				return Ok(json!({"payment_hash": hash, "state": "received", "note": rec["note"]}));
+			},
 			other => return Ok(json!({"payment_hash": hash, "state": rec["state"], "note": format!("the leaf is {}", other)})),
+		}
+		// A preimage handed over and answered by no co-signature: past the
+		// leaf's home date `sync` takes it home by its claim, and no claim is
+		// posted again.
+		let now = self.now()?.to_consensus_u32() as u64;
+		if handed && rec["home_at"].as_u64().is_some_and(|h| now >= h) {
+			return Ok(json!({"payment_hash": hash, "state": "claiming", "note": "the operator has not co-signed the claim, and the leaf's \
+				home date has come: sync takes it home by its claim"}));
 		}
 		let info = self.server_info()?;
 		let (_, a) = self.held(&row)?;
@@ -699,20 +736,24 @@ impl Wallet {
 		// The preimage is handed over only with time to take the leaf home by
 		// its claim, should the operator not co-sign: to unroll its branch
 		// and enter it (two blocks for each step, at the chain's interval the
-		// operator publishes), then its exit delay, all before the operator's
-		// refund could open.
-		let now = self.now()?.to_consensus_u32() as u64;
-		let refund_from = t.timeout.to_consensus_u32() as u64 + t.operator_delay.seconds();
+		// operator publishes), then its exit delay and a margin of a few
+		// blocks, all before the operator's refund could open, at the leaf's
+		// timeout.
+		let refund_from = t.timeout.to_consensus_u32() as u64;
 		let steps = match &coin.origin {
 			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
 			_ => 2,
 		};
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
-		if now + steps * 2 * block + coin.leaf.exit_delay.seconds() > refund_from {
+		let home_by = steps * 2 * block + coin.leaf.exit_delay.seconds() + CLAIM_MARGIN_BLOCKS * block;
+		if !handed && now + home_by > refund_from {
 			rec["state"] = json!("failed");
-			rec["reason"] = json!("the leaf came too late to be claimed safely: its timeout leaves less than its exit delay; the preimage \
-				stays with the wallet and the payment fails back");
+			rec["reason"] = json!(format!("the leaf came too late to be claimed safely: the operator's refund opens at its timeout (median \
+				time {}), and its unroll, its exit delay and a margin of {} blocks would end after it; the preimage stays with the wallet, \
+				the payment fails back to its payer, and the leaf is the operator's", refund_from, CLAIM_MARGIN_BLOCKS));
 			self.set_receive(hash, rec.clone())?;
+			self.store.set_coin_spent(&leaf, &format!("the operator's: the payment of hash {} is failed back to its payer, its preimage \
+				never handed over", hash))?;
 			return Ok(json!({"payment_hash": hash, "state": "failed", "reason": rec["reason"]}));
 		}
 		let preimage = self.receive_preimage(&nonce)?;
@@ -730,7 +771,14 @@ impl Wallet {
 			.ok_or_else(|| Error::Refused(format!("the leaf's {} atoms do not cover its margins", coin.value)))?;
 		let back = Out { value, ..probe };
 		let input = In { row, checkpoint_value: coin.value - cp, coin };
+		// From here the preimage may be out: the payment is never failed,
+		// and the leaf comes home by its claim at its home date unless the
+		// operator co-signs.
 		rec["state"] = json!("claiming");
+		if rec["home_at"].is_null() {
+			rec["home_at"] = json!(refund_from.saturating_sub(home_by));
+			rec["handed_over_at"] = json!(now);
+		}
 		self.set_receive(hash, rec.clone())?;
 		let answer = self.transfer_claiming(&[input], &[back], hash, &preimage)?;
 		rec["state"] = json!("received");
@@ -738,6 +786,58 @@ impl Wallet {
 		rec["leaf"] = answer["outputs"][0].clone();
 		self.set_receive(hash, rec)?;
 		Ok(json!({"payment_hash": hash, "state": "received", "transfer": answer}))
+	}
+
+	/// The home date of every leaf received over Lightning whose claim has
+	/// gone out (its preimage with it) and has no co-signed answer, by leaf
+	/// id: from then `sync` takes it home by its claim, whatever the
+	/// operator does.
+	pub(crate) fn receive_home_dates(&self) -> Result<BTreeMap<String, u32>, Error> {
+		let mut out = BTreeMap::new();
+		for rec in self.receives()?.values() {
+			if rec["state"] != "claiming" {
+				continue;
+			}
+			let (Some(at), Ok(nonce)) = (rec["home_at"].as_u64(), super::chain::unhex32(rec["nonce"].as_str().unwrap_or(""))) else { continue };
+			if let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) {
+				out.insert(leaf, at.min(u32::MAX as u64) as u32);
+			}
+		}
+		Ok(out)
+	}
+
+	/// When `sync` must run next for the payments over Lightning the wallet
+	/// follows, at the latest: a receive asked for, held, or its leaf
+	/// wanted, within a quarter of the operator's window (the leaf must be
+	/// taken up and claimed within it); a claim unanswered, by its home date;
+	/// a payment out of the tree undecided, within an hour.
+	pub(crate) fn lightning_wakes(&self, now: u32) -> Result<Option<u32>, Error> {
+		let mut next: Option<u32> = None;
+		let mut at = |t: u32| next = Some(next.map_or(t, |n| n.min(t)));
+		let homes = self.receive_home_dates()?;
+		for rec in self.receives()?.values() {
+			let quarter = (rec["window"].as_u64().unwrap_or(DEFAULT_WINDOW) / 4).max(60) as u32;
+			match rec["state"].as_str() {
+				Some("requested") | Some("waiting") | Some("issuing") => at(now.saturating_add(quarter)),
+				Some("claiming") => {
+					let leaf = super::chain::unhex32(rec["nonce"].as_str().unwrap_or("")).ok()
+						.and_then(|n| self.store.nonce(&n).ok().flatten()).and_then(|n| n.leaf_id);
+					let held = leaf.as_ref().and_then(|l| self.store.coin(l).ok().flatten())
+						.is_some_and(|c| matches!(c.state.as_str(), "receiving" | "sending"));
+					if held {
+						let home = leaf.as_ref().and_then(|l| homes.get(l).copied()).unwrap_or(now);
+						at(home.max(now).min(now.saturating_add(quarter)));
+					}
+				},
+				_ => {},
+			}
+		}
+		for rec in self.sends()?.values() {
+			if matches!(rec["state"].as_str(), Some("paying") | Some("failed")) {
+				at(now.saturating_add(3600));
+			}
+		}
+		Ok(next)
 	}
 
 	/// Every payment the wallet asked to receive over Lightning, with what it

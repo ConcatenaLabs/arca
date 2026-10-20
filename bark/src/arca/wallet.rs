@@ -222,6 +222,11 @@ pub(crate) const RECEIVE_ASKED: &str = "receive_asked";
 /// holds the schedule until it is paid or forgotten.
 pub(crate) const RECEIVE_UNTIL: &str = "receive_until";
 
+/// How long after a step of an exit (its unroll broadcast, a claim
+/// refused for its delay with no date known) `sync_schedule` wakes the
+/// wallet for the next: two blocks at Sequentia's minute.
+pub const EXIT_STEP: u32 = 120;
+
 /// Where the wallet keeps the coins the mailbox says are pending for it
 /// (D61): `{leaf id: {transfer_id, asset, value, seen_at, until}}`, each
 /// until it comes, is withdrawn, or its transfer can no longer complete.
@@ -1334,15 +1339,20 @@ impl Wallet {
 			_ => HOME_FROM,
 		};
 		let mut out = vec![];
+		// D62: a leaf received over Lightning whose claim went out with its
+		// preimage, and has no co-signed answer, goes home by its claim at
+		// its home date, whatever the operator does.
+		let claims = self.receive_home_dates()?;
 		for c in self.store.coins()? {
 			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
 				continue;
 			}
 			let dates = CoinDates::of(c.expiry);
 			let by = dates.map(|d| d.exit_by);
+			let claim_home = claims.get(&c.leaf_id).filter(|h| now >= **h as u64).copied();
 			// A coin with no date yet (a board not in a block) goes only after
 			// a stop, as every coin then.
-			let due = match by {
+			let due = claim_home.is_some() || match by {
 				Some(b) => now + window as u64 >= b as u64,
 				None => matches!(why, Home::Stopped),
 			};
@@ -1369,7 +1379,10 @@ impl Wallet {
 				v["exit"] = self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"error": e.to_string()}));
 				if let Some(row) = self.store.coin(&c.leaf_id)?.filter(|r| r.state == "exiting") {
 					let date = by.map(|b| format!(" (median time {})", b)).unwrap_or_default();
-					let because = match why {
+					let because = match (claim_home, why) {
+						(Some(h), _) => format!("its claim with the payment's preimage has had no co-signed answer, and its home date (median \
+							time {}) has come: it comes home by its claim before the operator's refund can open", h),
+						(None, why) => match why {
 						Home::Stopped => format!("the operator's signer is stopped, and the coin's exit date{} is within three days", date),
 						Home::Unreachable(w) => format!("its refresh has not completed a day before its exit date{}, and the operator \
 							cannot be reached ({})", date, w),
@@ -1379,6 +1392,7 @@ impl Wallet {
 							Some(p) => format!("its refresh has not completed a day before its exit date{}: the operator refused it \
 								(participation {})", date, p),
 							None => format!("its refresh has not completed a day before its exit date{} (it was {})", date, c.state),
+						},
 						},
 					};
 					self.store.set_coin_state(&row.leaf_id, "exiting", &format!("taken on the chain: {}", because))?;
@@ -1584,6 +1598,16 @@ impl Wallet {
 		if !requests.is_empty() {
 			out["receive_requests"] = json!(requests);
 		}
+		// D62: the payments over Lightning the wallet follows, and every exit
+		// it has started, each by its own next step.
+		if !stopped {
+			if let Some(t) = self.lightning_wakes(now)? {
+				next = Some(next.map_or(t, |n| n.min(t)));
+			}
+		}
+		if let Some(t) = self.exit_wakes(now)? {
+			next = Some(next.map_or(t, |n| n.min(t)));
+		}
 		// D61: a coin pending for the wallet is read only by `sync` once its
 		// transfer completes, whenever that is: a day at most, until it
 		// comes or is withdrawn.
@@ -1599,6 +1623,24 @@ impl Wallet {
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));
 		Ok(out)
+	}
+
+	/// When `sync` must run next for the exits the wallet has started: one
+	/// whose claim waits for its delay, when the delay ends; one still
+	/// unrolling, two blocks on; one claimed, within half an hour, to follow
+	/// the claim until it is final.
+	pub(crate) fn exit_wakes(&self, now: u32) -> Result<Option<u32>, Error> {
+		let mut next: Option<u32> = None;
+		for c in self.store.coins_in("exiting")? {
+			let at = match self.store.exit(&c.leaf_id)? {
+				Some((state, j, _)) if state == "waiting" => serde_json::from_str::<Value>(&j).ok()
+					.and_then(|v| v["claim_from"].as_u64()).map_or(now.saturating_add(EXIT_STEP), |t| (t.min(u32::MAX as u64) as u32).max(now)),
+				Some((state, _, _)) if state == "claimed" => now.saturating_add(1800),
+				_ => now.saturating_add(EXIT_STEP),
+			};
+			next = Some(next.map_or(at, |n| n.min(at)));
+		}
+		Ok(next)
 	}
 
 	/// Whether a coin in `state` is one the wallet may still hold off the

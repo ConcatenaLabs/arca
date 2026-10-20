@@ -92,6 +92,13 @@ fn txs_fee(tx: &Transaction) -> Vec<(AssetId, u64)> {
 	tx.output.iter().filter(|o| o.is_fee()).filter_map(|o| Some((o.asset.explicit()?, o.value.explicit()?))).collect()
 }
 
+/// The vsize a claim of `leaf` pays its own fee for: a plain leaf's exit is
+/// about 220 vbytes; an `htlc-1` leaf's claim or refund, its longer script
+/// and a received leaf's preimage in its witness, about 250, priced at 300.
+fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
+	if leaf.htlc.is_some() { 300 } else { 220 }
+}
+
 impl Wallet {
 	fn change_key(&self) -> Result<(Script, Keypair), Error> {
 		let i = self.store.take_index(CHANGE)?;
@@ -366,7 +373,7 @@ impl Wallet {
 		let claim = self.key_spend_with(&mut payer, &key, &after, &|f| {
 			let out = match f {
 				FeeSource::Reserve | FeeSource::Split { .. } => {
-					let fee = self.fee_for(asset, 220)?;
+					let fee = self.fee_for(asset, claim_vsize(&leaf))?;
 					if fee >= value {
 						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
 					}
@@ -535,7 +542,7 @@ impl Wallet {
 			// does; the wallet never splits its own claim.
 			let out = match f {
 				FeeSource::Reserve | FeeSource::Split { .. } => {
-					let fee = self.fee_for(asset, 220)?;
+					let fee = self.fee_for(asset, claim_vsize(&leaf))?;
 					if fee >= value {
 						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
 					}
@@ -569,6 +576,22 @@ impl Wallet {
 			},
 			Err(e) if e.to_string().contains("non-BIP68-final") => {
 				record_exit("waiting", payer.asset, self)?;
+				// When the claim's delay ends, from the leaf's block, for the
+				// schedule (`claim_from`); a refund of a payment out of the tree
+				// waits for its timeout too.
+				if let Some(h) = leaf_f.height() {
+					if let Some(mtp) = self.chain.median_time_at(h)? {
+						let mut from = mtp as u64 + leaf.exit_delay.seconds();
+						if let Some(t) = leaf.htlc.filter(|t| t.direction == arca_covenant::HtlcDirection::Send) {
+							from = from.max(t.timeout.to_consensus_u32() as u64);
+						}
+						if let Some((st, j, c)) = self.store.exit(leaf_id)? {
+							let mut v: Value = serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?;
+							v["claim_from"] = json!(from);
+							self.store.set_exit(leaf_id, &st, &v.to_string(), c.as_deref())?;
+						}
+					}
+				}
 				Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps,
 					"next": format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
 						leaf.exit_delay.seconds(), e)}))
