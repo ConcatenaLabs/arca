@@ -886,6 +886,20 @@ pub struct GivenParticipation {
 	pub unlock_hash: String,
 	pub refund_delay_units: u16,
 	pub forfeits: Vec<GivenForfeit>,
+	/// For a take, the order its id covers besides these parts:
+	/// `arca_covenant::Take::id` is recomputed from them.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fill: Option<GivenFill>,
+}
+
+/// The order a take that gave a coin up takes, as its id covers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GivenFill {
+	/// The order's terms in the relay's form, its outpoint among them.
+	pub order: serde_json::Value,
+	pub locked: String,
+	pub filled: String,
 }
 
 /// An output a participation wants, as its id covers it, with the leaf the

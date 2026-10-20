@@ -20,7 +20,8 @@
 //! - [`command`]: the commands by name, with JSON arguments and answers, for a
 //!   program that embeds the library (a browser worker, a mobile app's core).
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
-//!   mailbox, take part in a round, swap, exit, re-check every coin after a
+//!   mailbox, take part in a round, take an on-chain order in a round
+//!   ([`Wallet::take`]), swap, exit, re-check every coin after a
 //!   rollback, and restore from the mnemonic alone ([`Wallet::restore`]:
 //!   every leaf the server serves to the wallet's mailbox key, to which the
 //!   wallet binds each leaf it makes, checked against the chain, the
@@ -71,6 +72,7 @@ pub mod lightning;
 mod pay;
 mod restore;
 mod round;
+mod take;
 mod wallet;
 
 pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};

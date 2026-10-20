@@ -1403,6 +1403,11 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 				owner_sig: hex(&f.owner_sig),
 				cosigned: f.cosigned,
 			}).collect(),
+			fill: p.fill.as_ref().map(|f| api::GivenFill {
+				order: serde_json::from_str(&f.terms).unwrap_or(serde_json::Value::Null),
+				locked: f.locked.to_string(),
+				filled: f.filled.to_string(),
+			}),
 		}));
 	}
 	// The htlc-1 leaf of a payment out of the tree that is paid is the

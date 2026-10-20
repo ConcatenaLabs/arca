@@ -426,8 +426,14 @@ impl Wallet {
 		Ok(Value::Array(out))
 	}
 
+	/// Posts the participation `pid` of `body`, a take's to `take_order`.
+	pub(crate) fn submit_participation_body(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
+		self.submit(pid, body, given)
+	}
+
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
-		match self.server.post("submit_participation", body) {
+		let call = if Self::is_take(body) { "take_order" } else { "submit_participation" };
+		match self.server.post(call, body) {
 			Ok(a) => {
 				self.store.set_participation(pid, a["state"].as_str().unwrap_or("pending"), None, None)?;
 				Ok(a)
@@ -507,7 +513,8 @@ impl Wallet {
 						}
 					}
 					let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
-					match self.complete(&pid, &st, &given, &wanted) {
+					let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+					match self.complete(&pid, &st, &given, &wanted, &body) {
 						Ok(v) => out.push(v),
 						Err(e) => {
 							self.store.refused(&format!("participation {}", pid), &e.to_string())?;
@@ -616,27 +623,53 @@ impl Wallet {
 	/// participation's one unlock hash, and the coins given up are exactly
 	/// the participation's. Each coin's forfeit and release is then built
 	/// against the new leaf of the coin's own asset.
-	fn complete(&mut self, pid: &str, st: &Value, given: &[String], wanted: &Value) -> Result<Value, Error> {
+	fn complete(&mut self, pid: &str, st: &Value, given: &[String], wanted: &Value, body: &Value) -> Result<Value, Error> {
 		if st["participation_id"].as_str() != Some(pid) {
 			return Err(Error::Refused(format!("the server answers for participation {}, not {}", st["participation_id"], pid)));
 		}
 		let round_txid = Txid::from_str(st["round"]["txid"].as_str().unwrap_or("")).map_err(|e| Error::Parse(e.to_string()))?;
-		let finality = self.chain.finality(&round_txid)?;
-		if !finality.is_final() {
-			return Ok(json!({"participation": pid, "state": "issued", "round": round_txid.to_string(),
-				"note": format!("the round is {}; the wallet signs nothing for it before it is final", finality.word())}));
-		}
-		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
-		let now = self.now()?;
-		// The acceptance horizon counts from the round's block, not from this
-		// sync: the server takes the forfeits until the later of a day after
-		// the round is final and the coins' exit date, and a leaf completed
-		// then is as long-lived as one completed at once. The operator cannot
-		// date the block.
-		let as_of = match finality.height() {
-			Some(h) => self.chain.median_time_at(h)?.and_then(|t| MedianTime::from_consensus(t).ok()).map_or(now, |t| t.min(now)),
-			None => now,
+		let take = Self::is_take(body);
+		// A take's round fills an on-chain order and is broadcast only once
+		// every take in it has handed over its forfeits: until then its status
+		// serves the transaction without its witnesses, its txid the round's,
+		// which the wallet checks and validates its new leaf against.
+		let unbroadcast = match st["round"]["tx"].as_str() {
+			Some(t) if take => {
+				let tx: Transaction = elements::encode::deserialize(&unhex(t)?).map_err(|e| Error::Parse(format!("the round: {}", e)))?;
+				if tx.txid() != round_txid {
+					return Err(Error::Refused(format!("the server serves a transaction {} for round {}", tx.txid(), round_txid)));
+				}
+				Some(tx)
+			},
+			_ => None,
 		};
+		let now = self.now()?;
+		let (round, as_of, finality) = match unbroadcast {
+			Some(tx) => (tx, now, None),
+			None => {
+				let finality = self.chain.finality(&round_txid)?;
+				if !finality.is_final() {
+					return Ok(json!({"participation": pid, "state": "issued", "round": round_txid.to_string(),
+						"note": format!("the round is {}; the wallet signs nothing for it before it is final", finality.word())}));
+				}
+				let round = self.chain.transaction(&round_txid)?
+					.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
+				// The acceptance horizon counts from the round's block, not from
+				// this sync: the server takes the forfeits until the later of a
+				// day after the round is final and the coins' exit date, and a
+				// leaf completed then is as long-lived as one completed at once.
+				// The operator cannot date the block.
+				let as_of = match finality.height() {
+					Some(h) => self.chain.median_time_at(h)?.and_then(|t| MedianTime::from_consensus(t).ok()).map_or(now, |t| t.min(now)),
+					None => now,
+				};
+				(round, as_of, Some(finality))
+			},
+		};
+		// A take signs for no round that does not fill its order as it asked.
+		if take {
+			self.check_take_round(body, st, &round)?;
+		}
 		let info = self.server_info()?;
 		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
@@ -719,8 +752,10 @@ impl Wallet {
 			let old = &a.valid;
 			let input = inputs.iter().find(|i| i["leaf_id"].as_str() == Some(l.as_str())).expect("checked above");
 			let margin = amount(&input["margin"], "a forfeit's margin")?;
-			// The new leaf of the coin's own asset.
-			let new = &news.iter().find(|(_, r, _)| r.asset == old.asset)
+			// The new leaf of the coin's own asset; a take's one leaf, in the
+			// asset its order sells, for the coins it gives up in the asset the
+			// order is paid in.
+			let new = &news.iter().find(|(_, r, _)| r.asset == old.asset || take)
 				.ok_or_else(|| Error::Refused(format!("the participation has no new leaf in the asset of coin {}", l)))?.0;
 			// The margin is the fee of a forfeit someone broadcasts: a few
 			// times the floor, or one atom where the operator's node does not
@@ -770,7 +805,10 @@ impl Wallet {
 			Ok(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(nonce),
 				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))
 		}).collect::<Result<Vec<_>, Error>>()?});
-		let from_height = finality.height().unwrap_or(0).saturating_sub(100);
+		let from_height = match &finality {
+			Some(f) => f.height().unwrap_or(0).saturating_sub(100),
+			None => self.chain.tip()?.height.saturating_sub(100),
+		};
 		self.store.put_tx(&round_txid.to_string(), &elements::encode::serialize(&round), "round")?;
 		self.store.atomically(|s| {
 			for (l, margin) in &signed {
@@ -792,6 +830,11 @@ impl Wallet {
 				"note": "the forfeits may have reached the server: the wallet follows each one's output on the chain"})),
 		};
 		let Some(pre) = done["preimage"].as_str() else {
+			if finality.is_none() {
+				return Ok(json!({"participation": pid, "state": "forfeiting", "round": round_txid.to_string(),
+					"note": "the take's forfeits are in before its round is broadcast: the round goes out once every take in it has \
+					handed over its own, and the preimage comes once it is final"}));
+			}
 			return Ok(json!({"participation": pid, "state": "forfeiting",
 				"note": "forfeits in; the preimage is not out yet: the wallet follows each forfeit's output on the chain, takes the preimage \
 				from a claim of it, and takes the refund when its delay passes with no claim"}));

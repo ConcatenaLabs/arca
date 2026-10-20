@@ -304,6 +304,11 @@ impl Wallet {
 		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0)
 	}
 
+	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
+	pub(crate) fn spendable_coins(&self, asset: AssetId) -> Result<Vec<In>, Error> {
+		self.spendable(asset)
+	}
+
 	/// The checkpoint margin of `coin` ([`Self::checkpoint_margin`]).
 	pub(crate) fn checkpoint_margin_of(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
 		self.checkpoint_margin(coin, m)

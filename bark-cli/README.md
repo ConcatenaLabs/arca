@@ -558,6 +558,43 @@ the reason and Bark is not run. A Bitcoin invoice with `--asset` naming a
 Sequentia asset is refused before anything is signed. `ARCA_BARK_EXEC`
 names the `bark` binary when it is not the one beside `arca`.
 
+### Taking an on-chain order
+
+An order resting on the chain under SeqDEX's fill covenant sells one asset
+and is paid in another; anyone may fill it who pays its maker its price.
+`arca take` has the operator's round fill it for the wallet: the wallet gives
+up coins of the asset the order is paid in, worth the order's price for the
+fill and the operator's fee, and gets a leaf of what it fills in the asset
+the order sells. The operator's round credits the maker on the chain.
+
+The wallet takes nothing on the relay's word. It rebuilds the order's script
+from the terms as the relay serves them, finds it on its own node at the
+order's outpoint, unspent and final, holding what the take names, and prices
+the fill by the covenant's own arithmetic, refusing a fill the covenant would
+refuse (below the order's lot, or leaving less than a lot resting) and an
+order whose maker could spend it by a key path. The operator's fee is what its
+schedule asks for an offboard of the price, in the asset the order is paid
+in, within the wallet's bound (`--max-fee-ppm` raises it). The coins given up
+hold exactly the price and the fee: where no live coin holds that much, the
+wallet first pays itself a coin of that much out of round from its coins of
+the asset.
+
+A take asks the wallet for something once more before its round runs. A
+round that fills orders pays their makers from the operator's coins, so the
+operator broadcasts it only once every take in it has handed over its
+forfeits, and voids a take whose forfeits have not come within ten minutes
+(the operator's `info.fills.forfeit_window_seconds`) of the round being
+built. `sync` hands them over: it validates the new leaf against the round's
+transaction as the take's status serves it, checks that the round fills the
+order as the take asked, and signs the forfeit of each coin given up. A
+later `sync`, once the round is final, takes the leaf. Run `sync` within that
+window of `take`, or on a timer.
+
+    arca take @order.json --amount 600000 --quote # price, fee, what it gives up
+    arca take @order.json --amount 600000         # taken: waits for a round
+    arca sync                                     # forfeits in, once the round is built
+    arca sync                                     # the leaf, once the round is final
+
 ### Finding an operator in the registry
 
 An operator publishes a record of itself in the Sequentia registry: its
@@ -607,7 +644,7 @@ registry for both commands.
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
-| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, follows
+| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, follows
 every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
@@ -615,6 +652,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), what holds it back (`why`), the dates of every coin held off the chain and the unpaid receive requests, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
+| `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -668,6 +706,18 @@ each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
 refusal is asserted by its reason.
+
+`tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
+covenant (their scripts derived by SeqDEX's own `seqob-covenant` when
+`SEQOB_COVENANT_EXEC` names it) sell one asset for another; two wallets take
+them with `arca take`, one paying itself a coin of the price and the fee
+first, hand over their forfeits at `sync` once the operator's round is built,
+and hold their leaves once it is final, the makers credited on the chain at
+`2k`; the part of the first order left resting is taken again from its new
+outpoint in a round where it sits at input 1; and each refusal (an order not
+final, a fill leaving less than a lot, a fee over the bound, a maker's key
+path, terms not the order's, an order another take holds, an order spent) is
+printed as the wallet words it.
 
 `tests/arca_restore.rs` runs the same way. A wallet holds a leaf of a batch,
 a board, its change from a payment out of round, a payment to it not yet
