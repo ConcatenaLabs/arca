@@ -171,10 +171,23 @@ impl Wallet {
 			}
 		}
 
+		// The coins a coin taken spends, by the transfer that made it: a
+		// received leaf is spent by its claim only once the wallet holds a coin
+		// the claim made, checked.
+		let mut spent_by_held: BTreeMap<String, String> = BTreeMap::new();
+		for t in taken.values() {
+			if let ValidOrigin::Transfer { inputs, .. } = &t.coin.origin {
+				let tid = t.entry["made_by"]["transfer_id"].as_str().unwrap_or("").to_string();
+				for i in inputs {
+					spent_by_held.insert(i.coin.id.to_string(), tid.clone());
+				}
+			}
+		}
+
 		// How each was given up, on its owner's own signatures.
 		let mut notes: Vec<Value> = vec![];
 		for (id, t) in &taken {
-			notes.extend(self.restore_given(id, &t.entry, &t.coin, now)?);
+			notes.extend(self.restore_given(id, &t.entry, &t.coin, now, &spent_by_held)?);
 		}
 
 		// A leaf the lost wallet took home: its own output on the chain, found
@@ -189,10 +202,15 @@ impl Wallet {
 		}
 
 		// A leaf that went over Lightning and is not given up on its owner's
-		// signature: as the payment stands.
+		// signature: as the payment stands. A received leaf whose claim the
+		// server recorded and has not co-signed (`sending`) is held as
+		// handed over too, with its home date (D68): the transfer the lost
+		// wallet posted is not the restored wallet's to post again, and the
+		// leaf comes home by its claim unless the operator co-signs one.
 		for (id, t) in &taken {
 			let Some(h) = t.coin.leaf.htlc else { continue };
-			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+			let receive = h.direction == arca_covenant::HtlcDirection::Receive;
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending") || (receive && c.state == "sending")) {
 				notes.push(self.restore_htlc(id, &t.coin, h, &info, now)?);
 			}
 		}
@@ -519,7 +537,10 @@ impl Wallet {
 	/// taken as handed over, so the payment is never called failed, `sync`
 	/// claims it, and should the operator not co-sign it goes home by its
 	/// claim at its home date. A restore never credits a leaf the operator
-	/// may claim with a preimage it has.
+	/// may claim with a preimage it has. A restore past the received leaf's
+	/// home date, or its timeout, cannot be sure to win the race with the
+	/// operator's refund: it says so on the coin, and `sync` takes the leaf
+	/// home at once.
 	fn restore_htlc(&mut self, id: &str, coin: &ValidCoin, h: arca_covenant::HtlcTerms, info: &Value, now: MedianTime) -> Result<Value, Error> {
 		let hash = hex(&h.payment_hash);
 		match h.direction {
@@ -574,15 +595,32 @@ impl Wallet {
 				let timeout = h.timeout.to_consensus_u32() as u64;
 				let (_, a) = self.held(&row)?;
 				let (home_at, margin) = self.receive_home(coin, &a.bases, timeout, block)?;
-				self.store.set_coin_state(id, "receiving", &format!("the leaf of the payment received over Lightning under hash {}, restored: \
-					sync claims it", hash))?;
-				self.set_receive(&hash, json!({"state": "claiming", "nonce": hex(&nonce), "asset": coin.asset.to_string(),
+				let at = now.to_consensus_u32() as u64;
+				let late = if at >= timeout {
+					Some(format!("restored too late to win: past the leaf's timeout (median time {}), when the operator's refund opens; sync \
+						takes it home by its claim at once, which the operator's refund may take first", timeout))
+				} else if at >= home_at {
+					Some(format!("restored too late to be sure to win: past the leaf's home date (median time {}), {} s before its timeout \
+						(median time {}), when the operator's refund opens; sync takes it home by its claim at once, which may come after \
+						the refund opens", home_at, timeout - at, timeout))
+				} else {
+					None
+				};
+				let note = match &late {
+					Some(l) => format!("the leaf of the payment received over Lightning under hash {}, {}", hash, l),
+					None => format!("the leaf of the payment received over Lightning under hash {}, restored: sync claims it, and takes it home \
+						by its claim at its home date (median time {}) should the operator not co-sign", hash, home_at),
+				};
+				self.store.set_coin_state(id, "receiving", &note)?;
+				let mut rec = json!({"state": "claiming", "nonce": hex(&nonce), "asset": coin.asset.to_string(),
 					"value": coin.value.to_string(), "participation": hex(&super::lightning::receive_participation_id(&h.payment_hash)),
 					"timeout": timeout, "home_at": home_at, "margin": margin, "restored": true,
-					"window": info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600)}))?;
-				let _ = now;
-				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": "a leaf received over Lightning, restored receiving: sync claims it, and \
-					takes it home by its claim at its home date should the operator not co-sign"}))
+					"window": info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600)});
+				if let Some(l) = &late {
+					rec["late"] = json!(l);
+				}
+				self.set_receive(&hash, rec)?;
+				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": note}))
 			},
 		}
 	}
@@ -617,7 +655,17 @@ impl Wallet {
 	/// Whatever carries no such signature is not taken, and said. The latest
 	/// way decides the coin's state; every participation is kept, with its
 	/// forfeits, as the wallet kept them.
-	fn restore_given(&mut self, id: &str, e: &Value, coin: &ValidCoin, now: MedianTime) -> Result<Vec<Value>, Error> {
+	///
+	/// A leaf received over Lightning is given up only to its claim, which
+	/// carries its preimage: one whose claim the server recorded and has not
+	/// co-signed is left to [`Self::restore_htlc`], held as handed over with
+	/// its home date; and one whose claim the server says it co-signed is
+	/// spent only when the wallet holds a coin that claim made, checked
+	/// (`spent_by_held`, by the coins it spends), since the server may say
+	/// so of a claim it never co-signed.
+	fn restore_given(&mut self, id: &str, e: &Value, coin: &ValidCoin, now: MedianTime, spent_by_held: &BTreeMap<String, String>)
+		-> Result<Vec<Value>, Error>
+	{
 		let mut notes = vec![];
 		let owner = coin.leaf.owner;
 		// Participations first, oldest first, then transfers: a coin given up
@@ -637,6 +685,26 @@ impl Wallet {
 						the wallet holds the coin as its own", id, tid);
 					self.store.refused(&format!("restore of coin {}", id), &why)?;
 					notes.push(json!({"leaf_id": id, "note": why}));
+					continue;
+				}
+				let received = coin.leaf.htlc.is_some_and(|h| h.direction == arca_covenant::HtlcDirection::Receive);
+				if received {
+					// D68: a received leaf's claim, held as handed over unless a
+					// coin it made is held.
+					if t["state"] == "signed" && spent_by_held.get(id).is_some_and(|h| h == tid) {
+						self.store.set_coin_spent(id, &format!("transfer {}", tid))?;
+					} else {
+						let why = if t["state"] == "signed" {
+							format!("the server says the claim of received leaf {} (transfer {}) is co-signed, and serves no coin it made that \
+								the wallet can check: the leaf is held as not spent, and taken home by its claim unless a claim of it is \
+								co-signed", id, tid)
+						} else {
+							format!("the claim of received leaf {} (transfer {}) is recorded at the server and not co-signed: the leaf is held as \
+								handed over, and taken home by its claim at its home date unless a claim of it is co-signed", id, tid)
+						};
+						self.store.set_coin_state(id, "sending", &why)?;
+						notes.push(json!({"leaf_id": id, "note": why}));
+					}
 					continue;
 				}
 				if t["state"] == "signed" {

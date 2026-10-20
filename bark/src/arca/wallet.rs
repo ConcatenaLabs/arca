@@ -1424,9 +1424,11 @@ impl Wallet {
 				v["exit"] = self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"error": e.to_string()}));
 				if let Some(row) = self.store.coin(&c.leaf_id)?.filter(|r| r.state == "exiting") {
 					let date = by.map(|b| format!(" (median time {})", b)).unwrap_or_default();
+					let late = if claim_home.is_some() { self.receive_late(&c.owner_nonce)? } else { None };
 					let because = match (claim_home, why) {
 						(Some(h), _) => format!("its claim with the payment's preimage has had no co-signed answer, and its home date (median \
-							time {}) has come: it comes home by its claim before the operator's refund can open", h),
+							time {}) has come: it comes home by its claim before the operator's refund can open{}", h,
+							late.map(|l| format!(" ({})", l)).unwrap_or_default()),
 						(None, why) => match why {
 						Home::Stopped => format!("the operator's signer is stopped, and the coin's exit date{} is within three days", date),
 						Home::Unreachable(w) => format!("its refresh has not completed a day before its exit date{}, and the operator \
