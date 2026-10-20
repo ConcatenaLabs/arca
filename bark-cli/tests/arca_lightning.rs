@@ -850,3 +850,336 @@ async fn d64_unclaimed_receives_are_capped_and_a_refresh_runs() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A received leaf's way home against an operator that answers slowly, a
+// client that wakes late, a restore that meets a claim the server recorded
+// or a payment still held, and a wallet that has never synced
+// ---------------------------------------------------------------------------
+
+/// The committee's keys, as `sequentia-ext`'s regtest draws them.
+fn stakers() -> Vec<String> {
+	use elements::bitcoin::hashes::{sha256, Hash};
+	(0..3).map(|i| {
+		let seed = sha256::Hash::hash(format!("sequentia-ext regtest staker {}", i).as_bytes());
+		let key = elements::bitcoin::secp256k1::SecretKey::from_slice(seed.as_byte_array()).unwrap();
+		elements::bitcoin::PrivateKey::new(key, elements::bitcoin::NetworkKind::Test).to_wif()
+	}).collect()
+}
+
+/// One block, a minute after the tip's: the chain at its pace.
+fn block_a_minute(c: &sequentia_ext::rpc::Client, wifs: &[String]) {
+	let h: Value = c.call("getblockheader", &[json!(c.best_block_hash().unwrap().to_string())]).unwrap();
+	let t = h["time"].as_u64().unwrap() + 60;
+	let _: Value = c.call("setmocktime", &[json!(t)]).unwrap();
+	for _ in 0..40 {
+		for w in wifs {
+			if c.call::<Value>("generateposblock", &[json!(w), json!(wifs)]).is_ok() {
+				return;
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_millis(250));
+	}
+	panic!("no block");
+}
+
+/// The output paying `spk` in a block of the last `back`, and the median time
+/// of its block.
+fn output_on_chain(r: &Running, spk: &Script, back: u64) -> Option<(elements::OutPoint, u32)> {
+	let c = r.rt.client();
+	let tip = c.blockchain_info().unwrap().blocks;
+	for h in tip.saturating_sub(back)..=tip {
+		let b = c.block(&c.block_hash(h).unwrap()).unwrap();
+		for t in &b.txdata {
+			for (v, o) in t.output.iter().enumerate() {
+				if o.script_pubkey == *spk {
+					let header: Value = c.call("getblockheader", &[json!(c.block_hash(h).unwrap().to_string())]).unwrap();
+					return Some((elements::OutPoint::new(t.txid(), v as u32), header["mediantime"].as_u64().unwrap() as u32));
+				}
+			}
+		}
+	}
+	None
+}
+
+/// Whether `t` spends `op` with the preimage of `hash` in its witness: the
+/// owner's claim, not the operator's refund.
+fn claims_with_preimage(t: &elements::Transaction, op: &elements::OutPoint, hash: &str) -> bool {
+	t.input.iter().any(|i| i.previous_output == *op && i.witness.script_witness.iter().any(|w| w.len() == 32
+		&& elements::hashes::sha256::Hash::hash(w).to_string() == hash))
+}
+
+/// The median time of the block holding `txid`.
+fn block_time_of(r: &Running, txid: &elements::Txid) -> u32 {
+	let c = r.rt.client();
+	let v: Value = c.call("getrawtransaction", &[json!(txid.to_string()), json!(true)]).unwrap();
+	let header: Value = c.call("getblockheader", &[v["blockhash"].clone()]).unwrap();
+	header["mediantime"].as_u64().unwrap() as u32
+}
+
+/// An operator that takes a received payment's preimage and co-signs
+/// nothing: every claim reaches it with its transfer's first signature
+/// spoiled (so it records no transfer), and is answered 500.
+fn spoiled_claims(path: &str, body: &mut Value) {
+	if path == "/v1/lightning_receive_claim" {
+		if let Some(s) = body["inputs"][0]["checkpoint_sig"].as_str() {
+			let mut t = s.to_string();
+			let last = if t.ends_with('0') { "1" } else { "0" };
+			t.replace_range(t.len() - 1.., last);
+			body["inputs"][0]["checkpoint_sig"] = json!(t);
+		}
+	}
+}
+
+/// The eleventh review's F2, turned around (D67). D62's operator takes a
+/// received payment's preimage, settles the payment and co-signs nothing;
+/// this one is slow besides. From the leaf's home date on, it answers every
+/// request of the wallet's a block late (inside the wallet's 60-s timeout),
+/// the chain running a block a minute, and in each sync serves `pages`
+/// mailbox pages, each a notice of nothing past the wallet's cursor, before
+/// an empty one; once the leaf is on the chain it tries its own refund at
+/// every block. The wallet wakes only when its schedule says. Its sync takes
+/// every exit step whose date has come before it asks the operator anything,
+/// and again whenever one comes while it asks: the leaf's claim, with the
+/// preimage, is in a block before the leaf's timeout, and no refund of the
+/// operator's is ever taken.
+async fn a_slow_operator_with_a_long_mailbox(test: &str, pages: usize) {
+	let Some(lnd) = lightningd(test) else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let (ox, px) = leg_in_x(&lnd, &mut r, &format!("slow{}", pages)).await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let a = wallet_at(&format!("SLOW{}", pages), &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let refund_hex: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+	let refunds: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+	let calls_log: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+	let client = r.rt.client().clone();
+	let wifs = stakers();
+	{
+		let (slow, refund_hex, refunds, calls_log, wifs) = (slow.clone(), refund_hex.clone(), refunds.clone(), calls_log.clone(), wifs.clone());
+		p.rewrite_request(Some(std::sync::Arc::new(move |path: &str, body: &mut Value| {
+			spoiled_claims(path, body);
+			if slow.load(std::sync::atomic::Ordering::SeqCst) {
+				block_a_minute(&client, &wifs);
+				let m = client.blockchain_info().unwrap().median_time;
+				calls_log.lock().unwrap().push(format!("{} at median time {} ({} s from the timeout)", path, m, m as i64 - timeout as i64));
+				let hx = refund_hex.lock().unwrap().clone();
+				if let Some(hx) = hx {
+					if let Ok(v) = client.call::<Value>("sendrawtransaction", &[json!(hx)]) {
+						refunds.lock().unwrap().push(format!("{} at median time {}: {}", path, m, v));
+					}
+				}
+			}
+		})));
+	}
+	{
+		let (slow, served) = (slow.clone(), served.clone());
+		p.rewrite(Some(std::sync::Arc::new(move |path: &str, req: &Value, _status: u16, v: &mut Value| {
+			if path == "/v1/lightning_receive_claim" {
+				*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+				return Some(500);
+			}
+			if path == "/v1/mailbox_read" {
+				let mut msgs = vec![];
+				if slow.load(std::sync::atomic::Ordering::SeqCst) && served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % (pages + 1) < pages {
+					let after = req["after"].as_str().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
+					let k = served.load(std::sync::atomic::Ordering::SeqCst);
+					let h = |s: &str| elements::hashes::sha256::Hash::hash(format!("nothing {} {}", s, k).as_bytes()).to_string();
+					msgs.push(json!({"cursor": (after + 1).to_string(), "kind": "pending", "leaf_id": h("leaf"), "record": "",
+						"notice": {"transfer_id": h("transfer"), "leaf_id": h("leaf"), "owner": h("owner"), "owner_nonce": h("nonce"),
+							"asset": "00", "value": "1"}}));
+				}
+				v["messages"] = json!(msgs);
+			}
+			None
+		})));
+	}
+	// The sync that hands the preimage over, its claim unanswered.
+	let mut s = a.run(&["sync"]).1;
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete", "the operator settled with the preimage it took");
+	let leaf_id = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").map(|c| c["leaf_id"].as_str().unwrap().to_string())
+		.expect("the htlc-1 leaf");
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	let home_at = a.ok(&["lightning", "receives"])[&hash]["home_at"].as_u64().expect("a home date once the claim went out") as u32;
+	println!("SLOW{} the claim handed over at {}: the leaf's home date {} ({} s before the timeout {})", pages, mtp(&r), home_at,
+		timeout as i64 - home_at as i64, timeout);
+	let mut wakes = 0;
+	let mut on_chain = false;
+	while let Some(n) = s["schedule"]["next_sync_at"].as_u64().map(|n| n as u32) {
+		if wakes >= 80 || coin_of(&a, &leaf_id)["state"] == "exited" || mtp(&r) > timeout + 1800 {
+			break;
+		}
+		if !on_chain {
+			if let Some((op, m)) = output_on_chain(&r, &rec.0, 300) {
+				on_chain = true;
+				*refund_hex.lock().unwrap() = Some(elements::encode::serialize_hex(&rec.refund(&r, op, x)));
+				println!("SLOW{} the leaf's output {} in a block of median time {} ({} s before the timeout)", pages, op, m, timeout as i64 - m as i64);
+			}
+		}
+		// Before the home date the chain moves at once; from it, a block a
+		// minute.
+		if n + 600 < home_at {
+			advance(&r, n.max(mtp(&r) + 60) - mtp(&r)).await;
+		} else {
+			while mtp(&r) < n {
+				tokio::task::block_in_place(|| block_a_minute(r.rt.client(), &wifs));
+			}
+			r.synced().await;
+		}
+		let at = mtp(&r);
+		if at >= home_at {
+			slow.store(true, std::sync::atomic::Ordering::SeqCst);
+		}
+		let before = p.calls().len();
+		s = a.run(&["sync"]).1;
+		slow.store(false, std::sync::atomic::Ordering::SeqCst);
+		tokio::task::block_in_place(|| block_a_minute(r.rt.client(), &wifs));
+		if let Some(hx) = refund_hex.lock().unwrap().clone() {
+			if let Ok(v) = r.rt.client().call::<Value>("sendrawtransaction", &[json!(hx)]) {
+				refunds.lock().unwrap().push(format!("after the sync at {}: {}", mtp(&r), v));
+			}
+		}
+		wakes += 1;
+		println!("SLOW{} wake {} at {} -> {} ({} s from the timeout){}: coin {} | home {} | exits {} | next {} | calls {}", pages, wakes, at, mtp(&r),
+			mtp(&r) as i64 - timeout as i64, if at >= home_at { " slow" } else { "" }, coin_of(&a, &leaf_id)["state"], s["home"], s["exits"],
+			s["schedule"]["next_sync_at"], p.calls().len() - before);
+	}
+	let log = calls_log.lock().unwrap().clone();
+	println!("SLOW{} {} slow answers, {} mailbox pages served; first {:?}; last {:?}", pages, log.len(), served.load(std::sync::atomic::Ordering::SeqCst),
+		log.first(), log.last());
+	let refunds = refunds.lock().unwrap().clone();
+	let spent = spent_on_chain(&r, &rec.0, 2000);
+	println!("SLOW{} the leaf's spend: {:?} | the operator's refunds taken: {:?}", pages, spent.as_ref().map(|(o, t, m)| (o.to_string(),
+		t.txid().to_string(), *m, claims_with_preimage(t, o, &hash))), refunds);
+	let (op, t, m) = spent.unwrap_or_else(|| panic!("the leaf was never spent on the chain: coin {}", coin_of(&a, &leaf_id)));
+	assert!(claims_with_preimage(&t, &op, &hash), "the leaf's spend {} is the operator's refund, not the wallet's claim", t.txid());
+	assert!(m < timeout, "the claim is in a block before the timeout ({} >= {})", m, timeout);
+	assert!(refunds.is_empty(), "the operator's refund was taken: {:?}", refunds);
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn d67_a_slow_operator_with_no_mailbox_does_not_take_the_received_leaf() {
+	a_slow_operator_with_a_long_mailbox("d67_a_slow_operator_with_no_mailbox_does_not_take_the_received_leaf", 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn d67_a_slow_operator_with_two_mailbox_pages_does_not_take_the_received_leaf() {
+	a_slow_operator_with_a_long_mailbox("d67_a_slow_operator_with_two_mailbox_pages_does_not_take_the_received_leaf", 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn d67_a_slow_operator_with_thirty_mailbox_pages_does_not_take_the_received_leaf() {
+	a_slow_operator_with_a_long_mailbox("d67_a_slow_operator_with_thirty_mailbox_pages_does_not_take_the_received_leaf", 30).await;
+}
+
+/// D67: a client that wakes late. The operator takes the preimage and
+/// co-signs nothing, and tries its refund at every block once the leaf is on
+/// the chain. The wallet's first sync after its claim comes three quarters
+/// of the leaf's margin (the larger of three blocks and an eighth of the
+/// time from the leaf's round to its timeout) past the leaf's home date
+/// (its timeout less its exit delay, two blocks for each step of its
+/// unroll, and the margin), the receive window two hours so that the margin
+/// is wide; from then it wakes when its schedule says, the chain a block a
+/// minute. Its claim is in a block before the timeout, and the operator's
+/// refund is never taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn d67_a_client_that_wakes_late_by_most_of_the_margin_still_claims_first() {
+	let Some(lnd) = lightningd("d67_a_client_that_wakes_late_by_most_of_the_margin_still_claims_first") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 7200;
+	}).await;
+	let x = r.x;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "late").await;
+	let p = common::proxy::Proxy::start(&r.url());
+	p.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+			return Some(500);
+		}
+		None
+	})));
+	p.rewrite_request(Some(std::sync::Arc::new(spoiled_claims)));
+	let a = wallet_at("LATE", &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	let built = r.server.rounds.run_round_of(x).await.unwrap().expect("a round");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	a.run(&["sync"]);
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete", "the operator settled with the preimage it took");
+	let leaf_id = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").map(|c| c["leaf_id"].as_str().unwrap().to_string())
+		.expect("the htlc-1 leaf");
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	// The leaf's margin, from the chain (an eighth of its lock from its
+	// round's confirmation to its timeout), and the home date the wallet
+	// gave it: the wallet wakes three quarters of that margin past it.
+	let confirmed = block_time_of(&r, &built.tx.txid());
+	let margin = 180u32.max((timeout - confirmed) / 8);
+	let receive = a.ok(&["lightning", "receives"])[&hash].clone();
+	let home = receive["home_at"].as_u64().expect("a home date once the claim went out") as u32;
+	let late = home + margin * 3 / 4;
+	println!("LATE the leaf confirmed at {}, its timeout {}: margin {} s; the wallet's home date {} ({} s before the timeout); it wakes \
+		at {} ({} s late, {} s before the timeout) | the receive {}", confirmed, timeout, margin, home, timeout - home, late, late - home,
+		timeout as i64 - late as i64, receive);
+	if mtp(&r) < late {
+		advance(&r, late - mtp(&r)).await;
+	}
+	let wifs = stakers();
+	let mut s = a.run(&["sync"]).1;
+	let mut refunds = vec![];
+	let mut refund_hex: Option<String> = None;
+	let mut wakes = 1;
+	println!("LATE wake 1 at {} ({} s before the timeout): coin {} | home {} | next {}", mtp(&r), timeout as i64 - mtp(&r) as i64,
+		coin_of(&a, &leaf_id)["state"], s["home"], s["schedule"]["next_sync_at"]);
+	while mtp(&r) < timeout + 1200 && wakes < 200 {
+		tokio::task::block_in_place(|| block_a_minute(r.rt.client(), &wifs));
+		if refund_hex.is_none() {
+			if let Some((op, m)) = output_on_chain(&r, &rec.0, 300) {
+				refund_hex = Some(elements::encode::serialize_hex(&rec.refund(&r, op, x)));
+				println!("LATE the leaf's output {} in a block of median time {} ({} s before the timeout)", op, m, timeout as i64 - m as i64);
+			}
+		}
+		if let Some(hx) = &refund_hex {
+			if let Ok(v) = r.rt.client().call::<Value>("sendrawtransaction", &[json!(hx)]) {
+				refunds.push(format!("at {}: {}", mtp(&r), v));
+			}
+		}
+		if spent_on_chain(&r, &rec.0, 300).is_some() {
+			break;
+		}
+		let due = a.ok(&["schedule"])["due"] == true;
+		if due {
+			r.synced().await;
+			s = a.run(&["sync"]).1;
+			wakes += 1;
+			println!("LATE wake {} at {} ({} s before the timeout): coin {} | exits {} | next {}", wakes, mtp(&r), timeout as i64 - mtp(&r) as i64,
+				coin_of(&a, &leaf_id)["state"], s["exits"], s["schedule"]["next_sync_at"]);
+		}
+	}
+	let spent = spent_on_chain(&r, &rec.0, 2000);
+	println!("LATE the leaf's spend: {:?} | the operator's refunds taken: {:?}", spent.as_ref().map(|(o, t, m)| (o.to_string(), t.txid().to_string(),
+		*m, claims_with_preimage(t, o, &hash))), refunds);
+	let (op, t, m) = spent.unwrap_or_else(|| panic!("the leaf was never spent on the chain: coin {}", coin_of(&a, &leaf_id)));
+	assert!(claims_with_preimage(&t, &op, &hash), "the leaf's spend {} is the operator's refund, not the wallet's claim", t.txid());
+	assert!(m < timeout, "the claim is in a block before the timeout ({} >= {})", m, timeout);
+	assert!(refunds.is_empty(), "the operator's refund was taken: {:?}", refunds);
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}

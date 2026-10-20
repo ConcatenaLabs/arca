@@ -79,12 +79,15 @@ pub(crate) struct Payer {
 	change: Option<(Script, Keypair)>,
 	/// Coins the exit has already taken.
 	used: Vec<OutPoint>,
+	/// The least fee the next transaction pays, in the asset it pays in: a
+	/// replacement's, which outbids the transaction it replaces.
+	min_fee: u64,
 }
 
 impl Payer {
 	/// A payer of fees in `asset`, when named.
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
-		Payer { asset, moved: None, coin: None, change: None, used: vec![] }
+		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0 }
 	}
 }
 
@@ -158,7 +161,7 @@ impl Wallet {
 			payer.change = Some(self.change_key()?);
 		}
 		let (change, change_key) = payer.change.clone().expect("set");
-		let mut fee = self.fee_for(asset, 400)?;
+		let mut fee = self.fee_for(asset, 400)?.max(payer.min_fee);
 		loop {
 			let src = FeeSource::Coin { outpoint: op, coin: coin.clone(), fee, change: change.clone() };
 			let mut u = build(&src)?;
@@ -200,6 +203,106 @@ impl Wallet {
 			below.extend(after.iter().cloned());
 			Ok(ks.finish(below))
 		})
+	}
+
+	/// What a claim of `coin`'s leaf carries past its owner's signature: a
+	/// leaf received over Lightning comes home by its owner's claim with the
+	/// payment's preimage (which the operator then reads there).
+	fn claim_witness(&self, coin: &ValidCoin, nonce: &[u8; 32]) -> Result<Vec<Vec<u8>>, Error> {
+		Ok(match coin.leaf.htlc {
+			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.receive_preimage(nonce)?.to_vec()],
+			_ => vec![],
+		})
+	}
+
+	/// The owner's claim of `coin`'s leaf at `leaf_at` to `to`, signed by
+	/// `key` and carrying `after`: the leaf's own value pays the claim's fee,
+	/// at least `payer.min_fee`, unless a fee coin of `payer`'s does; the
+	/// wallet never splits its own claim. An `htlc-1` leaf of a payment out
+	/// of the tree comes home by its refund, after its timeout and its exit
+	/// delay on the chain.
+	fn claim_tx(&self, payer: &mut Payer, key: &Keypair, coin: &ValidCoin, leaf_at: OutPoint, to: &Script, after: &[Vec<u8>])
+		-> Result<UnrollTx, Error>
+	{
+		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
+		let min_fee = payer.min_fee;
+		self.key_spend_with(payer, key, after, &|f| {
+			let out = match f {
+				FeeSource::Reserve | FeeSource::Split { .. } => {
+					let fee = self.fee_for(asset, claim_vsize(&leaf))?.max(min_fee);
+					if fee >= value {
+						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
+					}
+					ExplicitOutput::new(asset, value - fee, to.clone())
+				},
+				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
+			};
+			match leaf.htlc {
+				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
+				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
+				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
+			}.map_err(|e| Error::Refused(e.to_string()))
+		})
+	}
+
+	/// The wallet's own claim `old` of coin `leaf_id`'s leaf at `leaf_at`,
+	/// to receive address `claim_index`, in the mempool and in no block:
+	/// broadcast again, and replaced by one that pays the node's floor now
+	/// when the floor rose above what it pays (the replacement outbids it by
+	/// the floor on its size, as the node asks of a replacement). Says what
+	/// it did; `None` when the claim still pays the floor.
+	fn raise_claim(&mut self, leaf_id: &str, coin: &ValidCoin, old: &Transaction, leaf_at: OutPoint, prior: &Value, claim_index: u32)
+		-> Result<Option<Value>, Error>
+	{
+		if self.pays_floor(old)? {
+			// Broadcast again: a node that dropped it takes it back.
+			let _ = self.chain.broadcast(old);
+			return Ok(None);
+		}
+		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
+		let key = self.keys.leaf(&row.owner_nonce)?;
+		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
+		let after = self.claim_witness(coin, &row.owner_nonce)?;
+		let fee_asset = prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?;
+		let paid = txs_fee(old);
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0 };
+		// Outbid in the asset it paid in (the leaf's own, unless a fee
+		// coin's): the node values the old fee as it did when it took it, and
+		// asks the replacement for that and the floor on its size more, at the
+		// asset's rate now.
+		let in_asset = paid.first().map(|(a, _)| *a).unwrap_or(coin.asset);
+		let rate = self.chain.fee_rates()?.get(&in_asset).copied().filter(|r| *r > 0);
+		if let (Some(floor), Some(rate)) = (self.chain.floor_per_kvb(in_asset)?, rate) {
+			let old_fee = paid.iter().filter(|(a, _)| *a == in_asset).map(|(_, v)| *v).sum::<u64>();
+			let valued = self.chain.mempool_fee_value(&old.txid())?.unwrap_or(0);
+			let old_now = ((valued as u128 * 100_000_000).div_ceil(rate as u128)).min(u64::MAX as u128) as u64;
+			let size = (old.vsize() as u64).max(claim_vsize(&coin.leaf));
+			payer.min_fee = old_fee.max(old_now).saturating_add(size.saturating_mul(floor).div_ceil(1000)).saturating_add(1);
+		}
+		let new = match self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after) {
+			Ok(c) => c,
+			Err(e) => {
+				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than the node's floor now, and \
+					no replacement could be built: {}", old.txid(), e))?;
+				return Ok(None);
+			},
+		};
+		match self.chain.broadcast(&new.tx) {
+			Ok(txid) => {
+				let txs = self.store.exit(leaf_id)?.map(|e| e.1).unwrap_or_else(|| prior.to_string());
+				self.store.set_exit(leaf_id, "claimed", &txs, Some(&txid.to_string()))?;
+				let why = format!("claimed by {}, which replaced {}: the node's floor rose above what that paid; the wallet follows the \
+					claim until it is final", txid, old.txid());
+				self.store.set_coin_state(leaf_id, "exiting", &why)?;
+				Ok(Some(json!({"leaf_id": leaf_id, "state": "claimed", "claim": {"txid": txid.to_string(), "replaced": old.txid().to_string(),
+					"fee": txs_fee(&new.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()}})))
+			},
+			Err(e) => {
+				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than the node's floor now, and \
+					the node refused its replacement {}: {}", old.txid(), new.tx.txid(), e))?;
+				Ok(None)
+			},
+		}
 	}
 
 	/// Every output on the way from the chain to `coin`'s leaf, the leaf's
@@ -353,7 +456,7 @@ impl Wallet {
 		// that of every P2WPKH change.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None,
-			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![] };
+			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0 };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -381,23 +484,7 @@ impl Wallet {
 			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
 			_ => vec![],
 		};
-		let claim = self.key_spend_with(&mut payer, &key, &after, &|f| {
-			let out = match f {
-				FeeSource::Reserve | FeeSource::Split { .. } => {
-					let fee = self.fee_for(asset, claim_vsize(&leaf))?;
-					if fee >= value {
-						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
-					}
-					ExplicitOutput::new(asset, value - fee, to.clone())
-				},
-				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
-			};
-			match leaf.htlc {
-				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
-				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
-				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
-			}.map_err(|e| Error::Refused(e.to_string()))
-		});
+		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		self.change_in_flight.borrow_mut().truncate(in_flight);
 		let claim = match claim {
 			Ok(c) => json!({"vsize": c.tx.vsize(), "fee": txs_fee(&c.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()}))
@@ -456,7 +543,7 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![] };
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0 };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -540,35 +627,9 @@ impl Wallet {
 				"next": "the leaf's transaction is not in a block yet; run exit again once it is"}));
 		}
 		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
-		let (asset, value) = (coin.asset, coin.value);
 		let leaf = coin.leaf;
-		// A leaf received over Lightning comes home by its owner's claim, with
-		// the payment's preimage (which the operator then reads there).
-		let after = match leaf.htlc {
-			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.receive_preimage(&row.owner_nonce)?.to_vec()],
-			_ => vec![],
-		};
-		let claim = self.key_spend_with(&mut payer, &key, &after, &|f| {
-			// The leaf's own value pays the claim's fee unless a fee coin
-			// does; the wallet never splits its own claim.
-			let out = match f {
-				FeeSource::Reserve | FeeSource::Split { .. } => {
-					let fee = self.fee_for(asset, claim_vsize(&leaf))?;
-					if fee >= value {
-						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
-					}
-					ExplicitOutput::new(asset, value - fee, to.clone())
-				},
-				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
-			};
-			match leaf.htlc {
-				// An htlc-1 leaf of a payment out of the tree comes home by its
-				// refund: after its timeout, and its exit delay on the chain.
-				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
-				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
-				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
-			}.map_err(|e| Error::Refused(e.to_string()))
-		});
+		let after = self.claim_witness(&coin, &row.owner_nonce)?;
+		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		let claim = match claim {
 			Ok(c) => c,
 			Err(e) => return Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "error": e.to_string()})),
@@ -690,6 +751,18 @@ impl Wallet {
 					if f.is_final() {
 						self.store.set_coin_state(leaf_id, "exited", &format!("claimed by {}, final", txid))?;
 						return Ok(Some(json!({"leaf_id": leaf_id, "state": "exited", "claim": txid})));
+					}
+					if f.in_chain() {
+						// Mined: the schedule follows it at its finality's pace.
+						if let Some((st, j, c)) = self.store.exit(leaf_id)? {
+							let mut v: Value = serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?;
+							if v["mined"] != json!(true) {
+								v["mined"] = json!(true);
+								self.store.set_exit(leaf_id, &st, &v.to_string(), c.as_deref())?;
+							}
+						}
+					} else if let Some(v) = self.raise_claim(leaf_id, coin, &sp, at, prior, i as u32)? {
+						return Ok(Some(v));
 					}
 					self.store.set_coin_state(leaf_id, "exiting", &format!("claimed by {}, which is {}; the wallet follows the claim until \
 						it is final", txid, f.word()))?;
@@ -849,22 +922,134 @@ impl Wallet {
 		}
 	}
 
-	/// Everything the wallet does on its own: the re-check of every coin
-	/// against the chain, board registrations and transfer requests the
-	/// server never answered, the mailbox, every participation as far as it
-	/// can go, the refresh of every coin in its refresh window, every forfeit
-	/// it signed without the preimage in hand, followed on the chain, every
-	/// coin it cannot have refreshed in time taken home, and every exit it
-	/// started (D57). What it says includes `schedule`
+	/// The exit steps whose date has come, asking nothing of the operator
+	/// (D67): every leaf received over Lightning whose claim has had no
+	/// co-signed answer by its home date taken home by its claim
+	/// ([`Self::home_received`]), then every exit under way moved on
+	/// ([`Self::progress_exits`]): an unroll broadcast again, a claim made
+	/// once its delay has run, a claim broadcast again until it is mined,
+	/// raised when the node's floor rose. A coin whose refresh has not
+	/// completed by its home date (D57) goes home after the operator is
+	/// asked, so a refresh or payment it completes in the same `sync` keeps
+	/// it. Returns the coins taken home and the exits moved on.
+	fn exit_steps(&mut self) -> (Vec<Value>, Vec<Value>) {
+		let home = self.home_received().map(|h| h.into_iter().filter(|v| !v["exit"].is_null()).collect())
+			.unwrap_or_else(|e| vec![json!({"error": e.to_string()})]);
+		let exits = self.progress_exits().unwrap_or_else(|e| vec![json!({"error": e.to_string()})]);
+		if let Ok(now) = self.now() {
+			let _ = self.store.set_meta(super::wallet::LAST_EXITS, &now.to_consensus_u32().to_string());
+		}
+		(home, exits)
+	}
+
+	/// Whether an exit step's date came after median time `since` and by
+	/// `now`: a received leaf's home date, an exit's claim once its delay has
+	/// run, or, two blocks after `since`, an unroll not yet in a block or a
+	/// claim not yet mined. Asks nothing of the operator.
+	fn exit_date_between(&self, since: u32, now: u32) -> Result<bool, Error> {
+		let came = |t: u32| t > since && t <= now;
+		for (_, at) in self.receive_home_dates()? {
+			if came(at) {
+				return Ok(true);
+			}
+		}
+		for c in self.store.coins_in("exiting")? {
+			let Some((state, j, _)) = self.store.exit(&c.leaf_id)? else { continue };
+			let v: Value = serde_json::from_str(&j).unwrap_or(Value::Null);
+			let due = match state.as_str() {
+				"waiting" => v["claim_from"].as_u64().is_some_and(|t| came(t.min(u32::MAX as u64) as u32)),
+				"claimed" => v["mined"] != json!(true) && now >= since.saturating_add(super::wallet::EXIT_STEP),
+				_ => now >= since.saturating_add(super::wallet::EXIT_STEP),
+			};
+			if due {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// While `sync` asks the operator: the exit steps whose date came since
+	/// they were last taken, taken at once, so an operator that answers
+	/// slowly holds back no claim. A step of `sync`, and of each page of its
+	/// mailbox read.
+	pub(crate) fn exits_meanwhile(&mut self) {
+		let Some(since) = *self.exit_watch.borrow() else { return };
+		let Ok(now) = self.now().map(|n| n.to_consensus_u32()) else { return };
+		if !self.exit_date_between(since, now).unwrap_or(false) {
+			return;
+		}
+		let (home, exits) = self.exit_steps();
+		*self.exit_watch.borrow_mut() = Some(now);
+		let mut done = self.exits_done.borrow_mut();
+		done.0.extend(home);
+		done.1.extend(exits);
+	}
+
+	/// The exit steps whose date has come, and nothing else: no call to the
+	/// operator (D67). For a client woken by its schedule's `next_exit_at`,
+	/// which `sync` would also meet; `sync` takes the same steps before it
+	/// asks the operator anything. What it says includes `schedule`.
+	pub fn sync_exits(&mut self) -> Result<Value, Error> {
+		let _ = self.recheck()?;
+		let (home, exits) = self.exit_steps();
+		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
+		Ok(json!({"home": home, "exits": exits, "schedule": schedule}))
+	}
+
+	/// Everything the wallet does on its own: first, before it asks the
+	/// operator anything, the re-check of every coin against the chain and
+	/// every exit step whose date has come ([`Self::sync_exits`]); then
+	/// board registrations and transfer requests the server never
+	/// answered, the mailbox, every participation as far as it can go, the
+	/// refresh of every coin in its refresh window, every forfeit it signed
+	/// without the preimage in hand, followed on the chain, every coin it
+	/// cannot have refreshed in time taken home, and every exit it started
+	/// (D57), moved on again. While it asks the operator, an exit step whose
+	/// date comes is taken at once. What it says includes `schedule`
 	/// ([`Wallet::sync_schedule`]): when it must run next.
 	pub fn sync(&mut self) -> Result<Value, Error> {
+		// The schedule's relative times count from this sync.
+		let start = self.now()?.to_consensus_u32();
+		self.store.set_meta(super::wallet::LAST_SYNC, &start.to_string())?;
+		// D67: the re-check against the chain, then the exit steps whose date
+		// has come, before the operator is asked anything, and the steps again
+		// whenever one comes while it is.
+		let recheck = self.recheck()?;
+		let (mut early_home, mut early_exits) = self.exit_steps();
+		*self.exit_watch.borrow_mut() = Some(start);
+		*self.exits_done.borrow_mut() = (vec![], vec![]);
+		let out = self.sync_asking(recheck);
+		*self.exit_watch.borrow_mut() = None;
+		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
+		early_home.extend(h);
+		early_exits.extend(e);
+		let mut out = out?;
+		if !early_home.is_empty() {
+			let mut all = Value::Array(early_home);
+			if let (Some(a), Some(later)) = (all.as_array_mut(), out.get("home").and_then(|h| h.as_array())) {
+				a.extend(later.iter().cloned());
+			}
+			out["home"] = all;
+		}
+		if !early_exits.is_empty() {
+			let mut all = Value::Array(early_exits);
+			if let (Some(a), Some(later)) = (all.as_array_mut(), out["exits"].as_array()) {
+				a.extend(later.iter().cloned());
+			}
+			out["exits"] = all;
+		}
+		Ok(out)
+	}
+
+	/// The part of [`Self::sync`] that asks the operator, with every exit step
+	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
+	fn sync_asking(&mut self, recheck: Value) -> Result<Value, Error> {
 		// The witness first, patiently: after a rollback of the operator's
 		// signer's record the wallet does only what it does on the chain, and
 		// while no witness succeeds it takes no coin and signs no spend
 		// through the operator: it does only what it does on the chain.
-		// The schedule's relative times count from this sync.
-		self.store.set_meta(super::wallet::LAST_SYNC, &self.now()?.to_consensus_u32().to_string())?;
 		let (witness, info_failed, tries) = self.reach_operator();
+		self.exits_meanwhile();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
 		let mut witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
@@ -876,12 +1061,14 @@ impl Wallet {
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});
 		let boards = if talk { self.retry_boards()? } else { vec![] };
-		let recheck = self.recheck()?;
+		self.exits_meanwhile();
 		let transfers = if talk { self.retry_transfers()? } else { vec![] };
+		self.exits_meanwhile();
 		// Payments over Lightning the operator has not decided: a paid one
 		// closed with its preimage, a failed one taken back.
 		let mut lightning = if talk { self.progress_lightning().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		self.exits_meanwhile();
 		// Payments received over Lightning: a held one's participation taken
 		// up as the wallet's own, a leaf the wallet holds claimed.
 		if talk {
@@ -890,13 +1077,17 @@ impl Wallet {
 				Err(e) => lightning = json!({"error": e.to_string()}),
 			}
 		}
+		self.exits_meanwhile();
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
+		self.exits_meanwhile();
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
 		let bound = if talk { self.bind_unbound().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
+		self.exits_meanwhile();
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
+		self.exits_meanwhile();
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
 		if talk {
@@ -906,9 +1097,11 @@ impl Wallet {
 		}
 		// D57: the refresh of every live coin in its refresh window, asked for
 		// by the wallet itself.
+		self.exits_meanwhile();
 		let refresh = if talk && info_failed.is_none() {
 			self.refresh_due().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Array(vec![]) };
+		self.exits_meanwhile();
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		// D57: a coin the wallet cannot have refreshed goes home before its
 		// date, whatever the reason: every coin whose refresh has not
@@ -943,6 +1136,9 @@ impl Wallet {
 		};
 		let home = self.home(true, &why).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		if let Ok(now) = self.now() {
+			self.store.set_meta(super::wallet::LAST_EXITS, &now.to_consensus_u32().to_string())?;
+		}
 		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
