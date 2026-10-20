@@ -415,7 +415,9 @@ and a board whose registration never reached the server, are not recovered.
   and the payer's coins are live again.
   `sync`'s `schedule` says when it must run next (`next_sync_at`; a time it
   names relative to now counts from the last `sync`, so it stands between
-  syncs, and `due` turns true once it passes): a coin given to a refresh an
+  syncs, and `due` turns true once it passes; a wallet that has never synced
+  is due at once, so a program that syncs only when `due` syncs on its first
+  look): a coin given to a refresh an
   hour after the last sync, an exit under way at its next step (two blocks on while it unrolls, when its
   claim's delay ends, two blocks on while its claim is not yet mined, within
   half an hour while its claim becomes final),

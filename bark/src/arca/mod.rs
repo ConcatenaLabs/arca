@@ -58,12 +58,13 @@
 //! payment (a coin paid to it is read only by `sync`, and may come days from
 //! its exit date). [`Wallet::sync_schedule`] says when it must run next, for
 //! a client on a timer, never more than a day ahead while a receive request
-//! is unpaid, and every coin shows its dates ([`CoinDates`]). `sync` takes
-//! every exit step whose date has come (a received leaf's home date, an
-//! exit's next step) before it asks the operator anything, so an operator
-//! that answers slowly holds back no claim; the schedule names those dates
-//! on their own (`next_exit_at`), for [`Wallet::sync_exits`], which takes
-//! them and asks the operator nothing.
+//! is unpaid, and due at once for a wallet that has never synced, and every
+//! coin shows its dates ([`CoinDates`]). `sync` takes every exit step whose
+//! date has come (a received leaf's home date, an exit's next step) before it
+//! asks the operator anything, so an operator that answers slowly holds back
+//! no claim; the schedule names those dates on their own (`next_exit_at`),
+//! for [`Wallet::sync_exits`], which takes them and asks the operator
+//! nothing.
 
 pub mod chain;
 pub mod client;
