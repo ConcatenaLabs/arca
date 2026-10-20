@@ -755,6 +755,34 @@ pub struct LeafData {
 	/// absent when this page holds nothing.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub next: Option<String>,
+	/// On the first page: every payment into the tree asked under a key
+	/// bound to the authenticated key and not yet claimed or failed back
+	/// (`open` or `accepted`), with the operator's participation for its
+	/// leaf once held, so a wallet restored from its mnemonic takes the leaf
+	/// up (D70).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub receives: Vec<ServedReceive>,
+}
+
+/// A payment into the tree as `leaf_data` serves it to the mailbox key its
+/// leaf's key is bound to: what was asked, the invoice, and how it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServedReceive {
+	pub payment_hash: String,
+	pub asset: String,
+	pub amount: String,
+	pub fee: String,
+	pub invoice: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub exit_delay_units: u16,
+	/// `open` or `accepted`.
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub participation_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeout: Option<u32>,
 }
 
 /// A leaf as the server re-serves it: its record, what it rests on, and

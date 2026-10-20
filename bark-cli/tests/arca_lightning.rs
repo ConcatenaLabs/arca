@@ -1351,3 +1351,67 @@ async fn d68_a_restore_too_late_to_win_says_so() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// The eleventh review's F4, turned around (D70). G and H each ask to
+/// receive 50,000; each payment is held and each wallet's sync takes up the
+/// operator's participation for its leaf. G's device is lost before the
+/// leaf's round; H's after the round and before H released its leaf. A
+/// wallet restored from each mnemonic is served the receive asked under its
+/// mailbox key and the operator's participation for it, rebuilds both, takes
+/// the leaf up and claims it: each payer's pay completes, and each restored
+/// wallet holds the leaf's value.
+#[tokio::test(flavor = "multi_thread")]
+async fn d70_restores_meet_payments_held_and_leaves_not_yet_released() {
+	let Some(lnd) = lightningd("d70_restores_meet_payments_held_and_leaves_not_yet_released") else { return };
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d70").await;
+	let url = r.url();
+	let restore = |w: &Arca, name: &str| -> (Arca, Value) {
+		let mn = std::fs::read_to_string(w.dir.join("mnemonic")).unwrap().trim().to_string();
+		let w2 = Arca::new(name);
+		let made = w2.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+			"--min-exit-delay-units", "1", "--mnemonic", &mn]);
+		(w2, made)
+	};
+	let g = wallet_at("D70G", &url, &r);
+	let h = wallet_at("D70H", &url, &r);
+	let (hg, pay_g) = held(&r, &g, &px, 50_000).await;
+	let (hh, pay_h) = held(&r, &h, &px, 50_000).await;
+	for (w, name) in [(&g, "G"), (&h, "H")] {
+		let s = w.ok(&["sync"]);
+		println!("D70 {}'s receive held, the participation taken up: lightning {} | participations {}", name, s["lightning"], s["participations"]);
+	}
+	// G is lost before the leaf's round.
+	let (g2, made) = restore(&g, "D70G2");
+	println!("D70 G restored before the round: served {} | restored {} | notes {} | receives {} | participations {}", made["restore"]["served"],
+		made["restore"]["restored"], made["restore"]["notes"], g2.ok(&["lightning", "receives"]), g2.ok(&["participations"]));
+	assert!(!g2.ok(&["lightning", "receives"])[&hg].is_null(), "the receive G asked for is rebuilt");
+	leaf_round(&r).await;
+	// H is lost after the round, its leaf not yet released.
+	let (h2, made) = restore(&h, "D70H2");
+	println!("D70 H restored after the round, its leaf not released: served {} | restored {} | notes {} | receives {}", made["restore"]["served"],
+		made["restore"]["restored"], made["restore"]["notes"], h2.ok(&["lightning", "receives"]));
+	for k in 0..4 {
+		for (w, name) in [(&g2, "G2"), (&h2, "H2")] {
+			let s = w.ok(&["sync"]);
+			println!("D70 {} sync {}: lightning {} | participations {}", name, k, s["lightning"], s["participations"]);
+		}
+		r.produce().await;
+		if g2.ok(&["lightning", "receives"])[&hg]["state"] == "received" && h2.ok(&["lightning", "receives"])[&hh]["state"] == "received" {
+			break;
+		}
+	}
+	let (pg, ph) = (pay_g.join().unwrap(), pay_h.join().unwrap());
+	println!("D70 the payers: G's {:?} | H's {:?}", pg.as_ref().map(|v| v["status"].clone()), ph.as_ref().map(|v| v["status"].clone()));
+	for (w, hash, paid, name) in [(&g2, &hg, &pg, "G2"), (&h2, &hh, &ph, "H2")] {
+		let rec = w.ok(&["lightning", "receives"])[hash].clone();
+		println!("D70 {}'s receive {} | balance {}", name, rec, w.ok(&["balance"])["arca"]);
+		assert_eq!(paid.as_ref().map(|v| v["status"].clone()).ok(), Some(json!("complete")), "{}'s payer is paid", name);
+		assert_eq!(rec["state"], "received", "{} claimed the leaf: {}", name, rec);
+		assert!(arca_held(w, &r.x) > 45_000, "{} holds the leaf's value", name);
+	}
+	drop((ox, px));
+	for w in [&g, &h, &g2, &h2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
