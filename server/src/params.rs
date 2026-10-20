@@ -466,6 +466,21 @@ impl Params {
 			..WalletPolicy::new(self.chain, self.operator, now).receipt()
 		}
 	}
+
+	/// The policy the server reads a coin it has already taken under, at
+	/// `now`: [`Params::policy`] with any exit delay. The bounds are what the
+	/// operator takes for the leaves it makes from now on. A restart can
+	/// change them while coins made under the old ones are live, and those
+	/// coins are still the server's to answer when they come on-chain, to
+	/// complete the work they were given up in, to date and to sweep, each
+	/// by the delays its own records carry.
+	pub fn taken_policy(&self, now: MedianTime) -> WalletPolicy {
+		WalletPolicy {
+			min_exit_delay: RelativeTime::from_units(1).expect("a relative time"),
+			max_exit_delay: RelativeTime::from_units(u16::MAX).expect("a relative time"),
+			..self.policy(now)
+		}
+	}
 }
 
 #[cfg(test)]

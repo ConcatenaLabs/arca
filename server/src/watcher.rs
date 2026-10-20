@@ -613,7 +613,9 @@ impl Watcher {
 	/// A coin record resolved for building its transactions, at any time
 	/// after it was taken: under the server's policy as at the latest unroll
 	/// authorisation in the record (every honest record was usable then, and
-	/// every batch in it unexpired), with no horizon.
+	/// every batch in it unexpired), with no horizon, and with any exit delay
+	/// ([`Params::taken_policy`]): a coin taken under bounds the operator has
+	/// changed since is answered all the same.
 	fn resolve(&self, record: &CoinRecord, bases: &[Transaction]) -> Result<ValidCoin, WatcherError> {
 		fn latest(r: &CoinRecord) -> u32 {
 			match r {
@@ -623,7 +625,7 @@ impl Watcher {
 			}
 		}
 		let at = MedianTime::from_consensus(latest(record).max(arca_covenant::time::LOCKTIME_THRESHOLD)).map_err(build("a time"))?;
-		let policy = WalletPolicy { horizon: 0, now: at, ..self.params.policy(at) };
+		let policy = WalletPolicy { horizon: 0, now: at, ..self.params.taken_policy(at) };
 		record.resolve(bases, &policy).map_err(build("the coin record"))
 	}
 

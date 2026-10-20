@@ -142,17 +142,21 @@ impl Boards {
 	pub async fn register(&self, record: &BoardRecord, tx: &Transaction) -> Result<BoardStatus, BoardError> {
 		let policy = self.params.policy(self.now().await?);
 		record.check()?;
+		// The same board again gets its status, whatever the bounds and the
+		// smallest leaf are now: it was taken under those of the time.
+		let record_bytes = record.to_bytes()?;
+		if let Some(b) = self.store.board(&record.leaf_id().0).await? {
+			if b.record == record_bytes && b.txid == tx.txid().to_byte_array() {
+				return self.status(&record.leaf_id()).await?.ok_or(BoardError::Internal("a board vanished".into()));
+			}
+		}
 		if record.owner == self.params.operator {
 			return Err(BoardError::OperatorKey);
 		}
 		self.params.check_value(record.asset, record.value).map_err(BoardError::OutOfBounds)?;
 		let valid = record.validate(tx, &policy)?;
 		let leaf_id = valid.leaf_id;
-		let record_bytes = record.to_bytes()?;
-		if let Some(b) = self.store.board(&leaf_id.0).await? {
-			if b.record == record_bytes && b.txid == valid.txid.to_byte_array() {
-				return self.status(&leaf_id).await?.ok_or(BoardError::Internal("a board vanished".into()));
-			}
+		if self.store.board(&leaf_id.0).await?.is_some() {
 			return Err(BoardError::Exists);
 		}
 		// A new board is new work in its asset: its rate, if the operator

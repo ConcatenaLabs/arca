@@ -1791,6 +1791,21 @@ on-chain orders are bounded (`[fills]`: how long before its refund an order is
 no longer taken, and how long a round that fills orders waits for its takes'
 forfeits). The node must run with `-txindex` and `-validateanchor`.
 
+The exit-delay bounds (`exit_delay_units`) change only with a restart, and
+they govern the leaves the operator makes from then on: a board, a refresh's
+new leaves and a transfer's outputs outside them are refused (`out_of_bounds`),
+and so is a coin given up whose leaf or lineage lies outside them
+(`invalid_coin`, "… an exit delay of N units; the wallet accepts MIN to MAX"),
+so a coin made under other bounds is refreshed, offboarded or paid on by no
+round or transfer of this operator: its owner takes it home by its exit, which
+needs no operator. Everything the server took before the change is still its
+to finish, under the delays its own records carry: the watcher answers such a
+coin on the chain with its forfeit or checkpoint and sweeps its batch at the
+expiry, a round built before the change takes its forfeits after it, and a
+board registered before it is credited. A participation still pending that
+wants a leaf, or gives up a coin, outside the new bounds can never run and is
+voided, saying why, its coins given back.
+
 An asset served need not be accepted for fees by the node. A batch in such an
 asset carries a reserve of one atom on every node and every entry, on every
 operator's server alike: nobody can pay a fee in it, so whoever unrolls the
