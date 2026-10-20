@@ -448,7 +448,16 @@ a chain running twice as fast would let a claim on the chain come after the
 payment's lock time. A payment held and never claimed keeps its leaf's value
 in the operator's batch until the batch expires, or until the operator
 takes the leaf on-chain and refunds it, while the payer's money is
-returned.
+returned, and its fee is never charged: whoever asks to receive and never
+claims pays nothing for it. The leaves of payments held and not yet claimed
+are therefore capped in each asset: together they hold at most
+`[lightning] receive_cap_ppm` (a tenth unless set) of the operator's pool in
+the asset, the pool counted with their values back in it. A request whose
+leaf would take them past the cap is refused (`receive_cap`, 409, naming the
+cap), and an invoice asked for within it whose payment would take them past
+it once held is failed back with the same reason, so the pool keeps funding
+the asset's rounds. The cap and the batch's expiry are what bound an
+unclaimed receive.
 
 ## Boards
 

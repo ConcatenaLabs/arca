@@ -776,3 +776,74 @@ async fn d62_d63_a_restored_wallet_claims_a_leaf_whose_preimage_the_operator_too
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+/// R7j F4, with the cap (D64). M asks to receive 45,000,000 of X and pays
+/// it from its own node; the payment is held. M asks again for as much: the
+/// operator's cap on receive leaves held and not yet claimed (here half its
+/// pool in X) refuses it, naming the cap. M takes up its leaf, which the
+/// next round makes, and never claims it; H boards 30,000,000 of X and asks
+/// to refresh it: the pool still funds it, and H's refresh runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn d64_unclaimed_receives_are_capped_and_a_refresh_runs() {
+	let Some(lnd) = lightningd("d64_unclaimed_receives_are_capped_and_a_refresh_runs") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+		// Half the operator's pool in X: one receive of 45,000,000 is
+		// within it, a second is not.
+		c.lightning.receive_cap_ppm = 500_000;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d64").await;
+	let pool0 = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	println!("D64 the operator's pool in X: {}", pool0);
+	let url = r.url();
+	let m = wallet_at("D64M", &url, &r);
+	let first = m.ok(&["lightning", "receive", &xs, "45000000", "--max-fee-ppm", "10000"]);
+	let hash = first["payment_hash"].as_str().unwrap().to_string();
+	let (rpc, bolt11) = (px.rpc_path(), first["invoice"].as_str().unwrap().to_string());
+	let paying = std::thread::spawn(move || sequentia_ext::lightning::call_at(&rpc, "pay", json!({ "bolt11": bolt11 })));
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+	while !receive_row(&r, &hash).await.is_some_and(|x| x.state.name() == "accepted") {
+		assert!(std::time::Instant::now() < deadline, "the payment was never held");
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+	let (ok, v) = m.run(&["lightning", "receive", &xs, "45000000", "--max-fee-ppm", "10000"]);
+	println!("D64 M asks to receive 45,000,000 again: ok={} {}", ok, if ok { v.clone() } else { v["error"].clone() });
+	assert!(!ok, "a receive beyond the cap is refused: {}", v);
+	assert!(v["error"]["message"].as_str().unwrap_or("").contains("cap"), "the refusal names the cap: {}", v);
+	m.ok(&["sync"]);
+	leaf_round(&r).await;
+	let pool1 = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	println!("D64 M's leaf made; the pool in X: {} (was {})", pool1, pool0);
+	let h = wallet_at("D64H", &url, &r);
+	let s = script(&h.ok(&["address"]));
+	r.pay_to(s, x, 33_000_000);
+	r.produce().await;
+	h.ok(&["board", &xs, "30000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("H's board credited", || h.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	h.ok(&["sync"]);
+	h.ok(&["participate"]);
+	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
+	println!("D64 a pass: rounds {} failed {:?}", rounds.len(), failed.iter().map(|(a, e)| format!("{} {}", a, e)).collect::<Vec<_>>());
+	let mut waiting = vec![];
+	for id in r.server.store.participations_in(server::store::ParticipationState::Pending).await.unwrap() {
+		let row = r.server.store.participation(&id).await.unwrap().unwrap();
+		waiting.push(row.waiting.clone());
+	}
+	println!("D64 pending participations after the pass: {:?}", waiting);
+	assert!(waiting.is_empty() && rounds.len() == 1, "H's refresh runs: {:?}", waiting);
+	drop(paying);
+	drop((ox, px));
+	for w in [&m, &h] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

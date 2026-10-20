@@ -134,6 +134,11 @@ pub struct LightningSection {
 	/// How long an invoice to receive over Lightning is good for.
 	#[serde(default = "default_invoice_expiry")]
 	pub invoice_expiry_seconds: u32,
+	/// The most the leaves of payments received over Lightning and not yet
+	/// claimed may hold in an asset, as a share of the operator's pool in
+	/// it, in parts per million: a request beyond it is refused.
+	#[serde(default = "default_receive_cap_ppm")]
+	pub receive_cap_ppm: u32,
 }
 
 impl Default for LightningSection {
@@ -142,7 +147,7 @@ impl Default for LightningSection {
 			poll_seconds: default_lightning_poll(), bitcoin: None, operator_delay_units: default_operator_delay(),
 			owner_delay_units: default_owner_delay(), send_timeout_seconds: default_send_timeout(), block_seconds: default_block_seconds(),
 			retry_seconds: default_retry_seconds(), receive_window_seconds: default_receive_window(),
-			invoice_expiry_seconds: default_invoice_expiry(),
+			invoice_expiry_seconds: default_invoice_expiry(), receive_cap_ppm: default_receive_cap_ppm(),
 		}
 	}
 }
@@ -169,6 +174,10 @@ fn default_retry_seconds() -> u32 {
 
 fn default_receive_window() -> u32 {
 	6 * 3600
+}
+
+fn default_receive_cap_ppm() -> u32 {
+	100_000
 }
 
 fn default_invoice_expiry() -> u32 {
@@ -1076,11 +1085,12 @@ impl Server {
 				retry_seconds: l.retry_seconds.max(5),
 			});
 		let receives = crate::lightning::receive::Receives::new(store.clone(), params.clone(), gateway.clone(), cosigner.clone(),
-			finality.clone(), crate::lightning::receive::ReceiveConfig {
+			finality.clone(), wallet.clone(), crate::lightning::receive::ReceiveConfig {
 				operator_delay: RelativeTime::from_units(l.operator_delay_units).map_err(err("lightning.operator_delay_units"))?,
 				window_seconds: l.receive_window_seconds.max(60),
 				invoice_expiry_seconds: l.invoice_expiry_seconds.max(60),
 				block_seconds: l.block_seconds.max(1),
+				cap_ppm: l.receive_cap_ppm.min(1_000_000),
 			});
 		let interval = (config.round_interval_seconds > 0).then(|| Duration::from_secs(config.round_interval_seconds));
 		rounds.pass().await.map_err(err("the first pass over the rounds"))?;

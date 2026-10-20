@@ -247,6 +247,10 @@ retry_seconds = 60
 # from its 2,016 blocks.
 receive_window_seconds = 21600
 invoice_expiry_seconds = 3600
+# The leaves of payments held and not yet claimed hold at most this share of
+# the operator's pool in their asset, in parts per million: a request beyond
+# it is refused (receive_cap). A tenth unless set.
+receive_cap_ppm = 100000
 # The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
 # socket, and the Bitcoin ark it runs, which wallets join with Bark. Native
 # BTC never enters a Sequentia leaf: its payments go over this node and the
