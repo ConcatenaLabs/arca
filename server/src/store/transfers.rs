@@ -276,6 +276,28 @@ impl Store {
 		back.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
+	/// Every transfer recorded and not yet signed, oldest first.
+	pub async fn recorded_transfers(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT transfer_id FROM transfer WHERE state = 'recorded' ORDER BY created_at", &[]).await?;
+		rows.iter().map(|r| array32(r.get(0), "transfer id")).collect()
+	}
+
+	/// Posts `notice` to `mailbox` as pending for the coin `leaf_id` unless a
+	/// notice of that coin, pending or withdrawn, is in the mailbox already.
+	/// Returns whether it posted one.
+	pub async fn post_notice_once(&self, mailbox: &[u8; 32], leaf_id: &[u8; 32], notice: &[u8]) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let n = conn.execute(
+			"INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload)
+			 SELECT $1, 'pending', NULL, $3 WHERE NOT EXISTS (
+			     SELECT 1 FROM mailbox_message WHERE mailbox_key = $1
+			     AND CASE WHEN kind IN ('pending', 'withdrawn') THEN convert_from(payload, 'UTF8')::jsonb->>'leaf_id' END = $2)",
+			&[&&mailbox[..], &super::hex(leaf_id), &notice],
+		).await?;
+		Ok(n == 1)
+	}
+
 	/// Which of `scripts` have been seen paid by an output, in the mempool or a
 	/// block.
 	pub async fn sighted(&self, scripts: &[Vec<u8>]) -> Result<HashSet<Vec<u8>>, StoreError> {
