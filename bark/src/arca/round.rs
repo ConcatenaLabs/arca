@@ -912,10 +912,17 @@ impl Wallet {
 			// claims it with the payment's preimage (`lightning`).
 			let state = if record.htlc.is_some() { "receiving" } else if a.all_final() { "live" } else { "pending" };
 			let row = self.row(&coin, &a, state, "")?;
+			// Bound to the mailbox key when the act that wanted it named the
+			// key: a refresh does; a receive over Lightning does when it was
+			// asked for with the key.
+			let bound = match record.htlc {
+				Some(t) => self.receives()?.get(&hex(&t.payment_hash)).is_some_and(|r| !r["request"]["mailbox"].is_null()),
+				None => true,
+			};
 			if self.store.coin(&row.leaf_id)?.is_none() {
 				let id = row.leaf_id.clone();
 				self.store.atomically(|s| {
-					s.put_coin(&row)?;
+					s.put_coin_bound(&row, bound)?;
 					s.use_nonce(&nonce, &id)
 				})?;
 			}

@@ -194,11 +194,11 @@ fn amount_of(v: &Value) -> Result<u64, Error> {
 }
 
 impl Wallet {
-	fn sends(&self) -> Result<BTreeMap<String, Value>, Error> {
+	pub(crate) fn sends(&self) -> Result<BTreeMap<String, Value>, Error> {
 		Ok(self.store.meta(SENDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
 	}
 
-	fn set_send(&self, hash: &str, v: Value) -> Result<(), Error> {
+	pub(crate) fn set_send(&self, hash: &str, v: Value) -> Result<(), Error> {
 		let mut m = self.sends()?;
 		m.insert(hash.to_string(), v);
 		self.store.set_meta(SENDS, &serde_json::to_string(&m).expect("a map"))
@@ -470,11 +470,11 @@ pub(crate) fn htlc_terms_of(v: &Value) -> Result<Option<HtlcTerms>, Error> {
 }
 
 impl Wallet {
-	fn receives(&self) -> Result<BTreeMap<String, Value>, Error> {
+	pub(crate) fn receives(&self) -> Result<BTreeMap<String, Value>, Error> {
 		Ok(self.store.meta(RECEIVES)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
 	}
 
-	fn set_receive(&self, hash: &str, v: Value) -> Result<(), Error> {
+	pub(crate) fn set_receive(&self, hash: &str, v: Value) -> Result<(), Error> {
 		let mut m = self.receives()?;
 		m.insert(hash.to_string(), v);
 		self.store.set_meta(RECEIVES, &serde_json::to_string(&m).expect("a map"))
@@ -546,10 +546,13 @@ impl Wallet {
 		let hash = arca_covenant::script::sha256(&preimage);
 		let digest = super::client::lightning_receive_digest(&self.genesis, &self.operator, &asset, amount, &hash, &owner, &nonce,
 			exit_delay.units());
+		// The leaf is bound to the wallet's mailbox key when it is made, so a
+		// restore from the mnemonic finds it before it is claimed.
+		let (mailbox, mailbox_proof) = self.binding(&key)?;
 		let mut body = json!({
 			"asset": asset.to_string(), "amount": amount.to_string(), "payment_hash": hex(&hash), "owner": hex(&owner.serialize()),
 			"owner_nonce": hex(&nonce), "exit_delay_units": exit_delay.units(),
-			"owner_sig": hex(super::wallet::sign(&key, &digest).as_ref()),
+			"owner_sig": hex(super::wallet::sign(&key, &digest).as_ref()), "mailbox": mailbox, "mailbox_proof": mailbox_proof,
 		});
 		if let Some(d) = description {
 			body["description"] = json!(d);

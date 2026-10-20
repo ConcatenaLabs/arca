@@ -801,12 +801,17 @@ async fn lightning_receive(State(app): State<Arc<App>>, ConnectInfo(peer): Conne
 	let exit_delay = RelativeTime::from_units(req.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?;
 	let owner_sig = Signature::from_slice(&unhex(&req.owner_sig).map_err(Refusal::malformed)?)
 		.map_err(|e| Refusal::malformed(format!("owner_sig: {}", e)))?;
+	let bound = binding(&app, &owner, req.mailbox.as_deref(), req.mailbox_proof.as_deref())?;
 	let r = app.receives.receive(&crate::lightning::receive::ReceiveRequest {
 		asset, amount, owner, exit_delay, owner_sig,
 		payment_hash: unhex32(&req.payment_hash).map_err(Refusal::malformed)?,
 		owner_nonce: unhex32(&req.owner_nonce).map_err(Refusal::malformed)?,
 		description: req.description.unwrap_or_default(),
 	}).await?;
+	// The leaf is served to the mailbox key from when it is made.
+	if let Some((mailbox, proof)) = bound {
+		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
+	}
 	Ok(Json(received(&r)))
 }
 
@@ -1333,10 +1338,25 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			}).collect(),
 		}));
 	}
+	// The htlc-1 leaf of a payment out of the tree that is paid is the
+	// operator's: served spent, with the preimage that proves it.
+	let mut state = leaf_state(l.state);
+	if let Ok(arca_covenant::CoinRecord::Transfer(t)) = arca_covenant::CoinRecord::from_bytes(&l.record) {
+		if let Some(h) = t.leaf.htlc.filter(|h| h.direction == arca_covenant::HtlcDirection::Send) {
+			if let Some(s) = app.store.send(&h.payment_hash).await? {
+				if let (crate::store::SendState::Paid, Some(pre), true) = (s.state, s.preimage, s.htlc_leaf_id == l.leaf_id) {
+					state = "spent";
+					given.push(api::LeafGiven::Payment(api::GivenPayment {
+						payment_hash: hex(&h.payment_hash), state: "paid".into(), preimage: hex(&pre),
+					}));
+				}
+			}
+		}
+	}
 	Ok(api::LeafEntry {
 		leaf_id: hex(&l.leaf_id),
 		kind: leaf_kind(l.kind).into(),
-		state: leaf_state(l.state).into(),
+		state: state.into(),
 		asset: AssetId::from_byte_array(l.asset).to_string(),
 		value: l.value.to_string(),
 		record: hex(&l.record),

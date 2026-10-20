@@ -115,6 +115,18 @@ time) and takes the operator's word for nothing it can check:
   coin a held coin's record spends was spent by that transfer, which the
   operator co-signed, whatever the server says of it (an old copy), and a coin
   whose forfeit its owner signed is never live;
+- a coin that went over Lightning and was not given up on its owner's
+  signature stands as its payment does: the leaf of a payment out of the
+  tree that the operator reports paid, with a preimage that opens the leaf's
+  hash, is spent by the payment, one reported paying is followed, and one
+  failed is taken back by the next `sync`; a leaf received over Lightning is
+  held `receiving` with its payment rebuilt from its terms and its nonce (the
+  preimage derives from them), taken as handed over (the lost wallet may have
+  handed the preimage over already), so `sync` claims it and, should the
+  operator not co-sign, takes it home by its claim at its home date. A restore
+  never credits a leaf the operator may claim with a preimage it has. A leaf
+  received over Lightning is bound to the mailbox key when it is made (the
+  request names the key), so the restore finds it before it is claimed;
 - a participation in its forfeit step gets back the new leaves the wallet
   validated before it signed, from the published tree. One the operator
   released is completed once the preimage of its new leaves is in hand, from

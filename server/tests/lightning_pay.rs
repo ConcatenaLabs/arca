@@ -172,6 +172,15 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 		assert_eq!(on_payee["amount_received_msat"].as_u64(), Some(amount * 1000));
 		let (held, valid) = htlc_coin(&g, c, &p, &answer);
 		assert_eq!((valid.asset, valid.value), (asset, amount + fee(amount)));
+		// D63: leaf_data serves the paid leaf spent, with the preimage that
+		// proves it, to its owner's key.
+		let ld = g.r.http.post("leaf_data", &json!({"auth": g.r.http.auth("leaf_data", &p.key, &g.r.chain)})).ok();
+		let served = ld["leaves"].as_array().unwrap().iter().find(|l| l["leaf_id"] == json!(valid.id.to_string())).cloned()
+			.unwrap_or_else(|| panic!("the paid leaf is served: {}", ld));
+		println!("{}: the paid leaf as leaf_data serves it: state {} given {}", label, served["state"], served["given"]);
+		assert_eq!(served["state"], "spent", "{}", served);
+		assert!(served["given"].as_array().unwrap().iter().any(|g| g["payment"]["preimage"] == st["preimage"]
+			&& g["payment"]["payment_hash"] == json!(hex(&h))), "{}", served);
 		paid.push((asset, c.clone(), held, valid, h, amount, p.body));
 	}
 	// Each channel settles its HTLC a moment after the payment completes.

@@ -570,3 +570,209 @@ async fn d62_the_schedule_wakes_the_wallet_for_a_payment_held_until_it_is_claime
 	drop((ox, px));
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+/// What `w` holds off the chain in `asset`, by standing, summed.
+fn held_in(w: &Arca, asset: &AssetId) -> u64 {
+	arca_held(w, asset)
+}
+
+/// R7j F3, turned around (D63). A wallet pays an invoice over Lightning
+/// (paid: its htlc-1 leaf the operator's), has one fail (its leaf returned),
+/// and receives one (claimed). Its device is lost and a wallet is restored
+/// from its mnemonic: its balance is the lost wallet's, the paid leaf is
+/// held spent by the payment, and a payment of the whole balance goes
+/// through.
+#[tokio::test(flavor = "multi_thread")]
+async fn d63_a_restore_meets_leaves_that_went_over_lightning() {
+	let Some(lnd) = lightningd("d63_a_restore_meets_leaves_that_went_over_lightning") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d63a").await;
+	let url = r.url();
+	let a = wallet_at("D63A", &url, &r);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &xs, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let (inv, _) = invoice(&px, x, 100_000, "d63-paid");
+	let paid = a.ok(&["lightning", "pay", &inv]);
+	let htlc_paid = paid["payment"]["htlc_leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(paid["payment"]["state"], "paid");
+	let (inv_f, _) = invoice(&px, x, 30_000, "d63-fails");
+	px.ok("delinvoice", json!({ "label": "d63-fails", "status": "unpaid" }));
+	assert_eq!(a.ok(&["lightning", "pay", &inv_f])["payment"]["state"], "returned");
+	let (hash, paying) = held(&r, &a, &px, 60_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	a.ok(&["sync"]);
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
+	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	a.ok(&["sync"]);
+	let bal_a = held_in(&a, &x);
+	println!("D63A the wallet's balance in X: {} | the paid leaf {}", bal_a, coin_of(&a, &htlc_paid));
+
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let a2 = Arca::new("D63A2");
+	let made = a2.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", mnemonic.trim()]);
+	println!("D63A restore: served {} restored {} not_recovered {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["not_recovered"]);
+	a2.ok(&["sync"]);
+	let bal_b = held_in(&a2, &x);
+	let leaf_b = coin_of(&a2, &htlc_paid);
+	println!("D63A the restored wallet's balance in X: {} | the paid leaf {} | payments {}", bal_b, leaf_b, a2.ok(&["lightning", "payments"]));
+	assert_eq!(bal_b, bal_a, "the restored balance is the lost wallet's");
+	assert!(matches!(leaf_b["state"].as_str(), Some("spent") | None), "the paid leaf is not held: {}", leaf_b);
+	let b = wallet_at("D63B", &url, &r);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let (ok, v) = a2.run(&["send", &req, "--amount", &(bal_b.saturating_sub(20_000)).to_string(), "--asset", &xs]);
+	println!("D63A the restored wallet pays its balance less 20,000: ok={} {}", ok, if ok { v["inputs"].clone() } else { v["error"].clone() });
+	assert!(ok, "{}", v);
+	drop((ox, px));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The second review's F2, turned around (D63, D65). A asks to receive over
+/// Lightning; the payment is held, its leaf made in a round and taken up,
+/// and the wallet's claim never reaches the operator. The device is lost.
+/// A wallet restored from the mnemonic is served the leaf (bound to its
+/// mailbox key when the leaf was made), holds it `receiving` with the
+/// payment rebuilt from its terms and the nonce, and its sync claims it:
+/// the payment settles, and the payer's pay completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn d63_a_restore_meets_a_received_leaf_not_yet_claimed() {
+	let Some(lnd) = lightningd("d63_a_restore_meets_a_received_leaf_not_yet_claimed") else { return };
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d63b").await;
+	let url = r.url();
+	let p = common::proxy::Proxy::start(&url);
+	let a = wallet_at("D63R", &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	// The wallet's claim never reaches the operator.
+	p.hold("/v1/lightning_receive_claim");
+	a.run(&["sync"]);
+	let leaf = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).expect("the received leaf, held, unclaimed");
+	assert!(receive_row(&r, &hash).await.unwrap().preimage.is_none(), "the claim never reached the operator");
+	assert!(!paying.is_finished(), "nothing settled before the claim");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("D63R2");
+	let made = a2.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	println!("D63R the restore: served {} | restored {} | not_recovered {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["not_recovered"]);
+	let c = coin_of(&a2, &leaf);
+	println!("D63R the leaf in the restored wallet: {} | its receives {}", c, a2.ok(&["lightning", "receives"]));
+	assert!(!c.is_null(), "the unclaimed received leaf is served to the restore");
+	let s = a2.ok(&["sync"]);
+	println!("D63R the restored wallet's sync: lightning {}", s["lightning"]);
+	let paid = paying.join().unwrap().unwrap();
+	println!("D63R the payer's node: {}", paid["status"]);
+	assert_eq!(paid["status"], "complete");
+	assert_eq!(a2.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	assert!(a2.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "receiving"), "the leaf is claimed");
+	drop((ox, px));
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D62 and D63 together. The operator takes a received payment's preimage,
+/// settles the payment and co-signs nothing (its claim's transfer spoiled on
+/// the way, every claim answered 500, the mailbox empty); the wallet's
+/// device is lost right after its claim. A wallet restored from the
+/// mnemonic, against the same operator, finds the leaf, holds it
+/// `receiving`, and, its own claim unanswered too, takes the leaf home by
+/// its claim on the schedule's date: the claim is in a block before the
+/// leaf's timeout, so the operator's refund finds the leaf claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn d62_d63_a_restored_wallet_claims_a_leaf_whose_preimage_the_operator_took() {
+	let Some(lnd) = lightningd("d62_d63_a_restored_wallet_claims_a_leaf_whose_preimage_the_operator_took") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d6263").await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let a = wallet_at("D6263A", &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	p.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+			return Some(500);
+		}
+		if path == "/v1/mailbox_read" {
+			if let Some(m) = v.get_mut("messages") {
+				*m = json!([]);
+			}
+		}
+		None
+	})));
+	p.rewrite_request(Some(std::sync::Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			if let Some(s) = body["inputs"][0]["checkpoint_sig"].as_str() {
+				let mut t = s.to_string();
+				let last = if t.ends_with('0') { "1" } else { "0" };
+				t.replace_range(t.len() - 1.., last);
+				body["inputs"][0]["checkpoint_sig"] = json!(t);
+			}
+		}
+	})));
+	a.run(&["sync"]);
+	let leaf_id = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).expect("the htlc-1 leaf");
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete", "the operator settled with the preimage it took");
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("D6263A2");
+	let made = a2.ok(&["create", "--server", &p.url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	println!("D6263 the restore: served {} | restored {} | not_recovered {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["not_recovered"]);
+	let c = coin_of(&a2, &leaf_id);
+	println!("D6263 the leaf in the restored wallet: {} | receives {}", c, a2.ok(&["lightning", "receives"]));
+	assert!(!c.is_null(), "the restored wallet finds the leaf");
+	let mut s = a2.run(&["sync"]).1;
+	let mut wakes = 0;
+	while let Some(n) = s["schedule"]["next_sync_at"].as_u64().map(|n| n as u32) {
+		if n >= timeout || wakes >= 60 || coin_of(&a2, &leaf_id)["state"] == "exited" {
+			break;
+		}
+		if n > mtp(&r) {
+			advance(&r, n - mtp(&r)).await;
+		} else {
+			advance(&r, 60).await;
+		}
+		s = a2.run(&["sync"]).1;
+		r.produce().await;
+		wakes += 1;
+		println!("D6263 wake {} at {} ({} s before the timeout): coin {} | next {}", wakes, mtp(&r), timeout as i64 - mtp(&r) as i64,
+			coin_of(&a2, &leaf_id)["state"], s["schedule"]["next_sync_at"]);
+	}
+	let claimed = spent_on_chain(&r, &rec.0, 1500);
+	let (op, claim, at) = claimed.unwrap_or_else(|| panic!("the restored wallet did not take the leaf home before its timeout {}: coin {} \
+		| schedule {}", timeout, coin_of(&a2, &leaf_id), s["schedule"]));
+	println!("D6263 the claim {} in a block at {} ({} s before the timeout)", claim.txid(), at, timeout as i64 - at as i64);
+	assert!(at < timeout, "the claim is in a block before the timeout");
+	if mtp(&r) < timeout + 600 {
+		advance(&r, timeout + 600 - mtp(&r)).await;
+	}
+	let refund = rec.refund(&r, op, x);
+	let sent: Result<Value, _> = r.rt.client().call("sendrawtransaction", &[json!(elements::encode::serialize_hex(&refund))]);
+	println!("D6263 the operator's refund past the timeout: {:?}", sent);
+	assert!(sent.is_err(), "the operator's refund finds the leaf claimed");
+	drop((ox, px));
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

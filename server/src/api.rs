@@ -551,6 +551,14 @@ pub struct LightningReceive {
 	/// owner ‖ owner_nonce ‖ exit_delay_units)`, `T =
 	/// SHA256("Arca/lightning-receive")`.
 	pub owner_sig: String,
+	/// The mailbox key the leaf is bound to when it is made, and the owner
+	/// key's signature over the binding (as a refresh's wanted leaves name
+	/// it), both or neither: a restore from the mnemonic is then served the
+	/// leaf before it is claimed.
+	#[serde(default)]
+	pub mailbox: Option<String>,
+	#[serde(default)]
+	pub mailbox_proof: Option<String>,
 }
 
 /// A payment into the tree, as `lightning_receive` and its status answer
@@ -803,12 +811,27 @@ pub struct LeafMadeBy {
 	pub signer_record: Option<RecordHead>,
 }
 
-/// One way a coin was given up: `{"transfer": …}` or `{"participation": …}`.
+/// One way a coin was given up: `{"transfer": …}`, `{"participation": …}`,
+/// or, for the `htlc-1` leaf of a payment out of the tree that is paid,
+/// `{"payment": …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LeafGiven {
 	Transfer(GivenTransfer),
 	Participation(GivenParticipation),
+	Payment(GivenPayment),
+}
+
+/// A payment over Lightning out of the tree that paid with the coin, its
+/// `htlc-1` leaf: its hash and the preimage that proves it paid, which its
+/// owner checks opens the leaf's hash. The leaf is then the operator's,
+/// which claims it with that preimage should it come on the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GivenPayment {
+	pub payment_hash: String,
+	pub state: String,
+	pub preimage: String,
 }
 
 /// A transfer the coin is an input of: whether the operator signed it, the
