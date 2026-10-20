@@ -6,7 +6,9 @@ The command-line wallets of this workspace:
   Arca coins against an Arca server, and whose Bitcoin side is Bark's wallet
   for Bitcoin arks.
 - `bark` and `barkd`, Bark's own command-line wallet and daemon for Bitcoin
-  arks, which `arca bitcoin …` runs.
+  arks. `arca bitcoin …` runs a `bark` as Bark ships it, and the Arca client
+  carries one built from Bark's release with testnet4 added
+  (`ConcatenaLabs/arca-client`, `build/make-bark-bundle.sh`).
 
 ## The `arca` wallet
 
@@ -491,9 +493,9 @@ wallet submits only the fees it showed.
 
 `lightning pay INVOICE` pays a BOLT11 invoice out of the wallet's coins in the
 asset the invoice names, through the operator's Lightning node in that asset.
-Before anything is signed the wallet reads the invoice itself and refuses: a
-Bitcoin invoice (native BTC is paid on Bitcoin, over the Bitcoin side, never
-from a Sequentia leaf); an invoice that names no asset (SeqLN's field `a`),
+Before anything is signed the wallet reads the invoice itself: a Bitcoin
+invoice is paid in native BTC on the Bitcoin side, never from a Sequentia leaf
+(see The Bitcoin side). It refuses: an invoice that names no asset (SeqLN's field `a`),
 or one in another asset than `--asset` names, since a coin in one asset never
 pays an invoice in another; one for no amount, or expiring within a minute;
 one it is paying or has paid already; an asset the operator does not serve,
@@ -546,17 +548,73 @@ operator's window, about 5,060 blocks with a 36-hour exit delay: a payer
 whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016
 blocks.
 
-Native BTC goes over Lightning on the Bitcoin side, never through a Sequentia
-leaf: `lightning pay` with a Bitcoin invoice, and `lightning receive btc
-SATS`, run Bark's own Lightning leg on the wallet's Bitcoin ark wallet
-(`bitcoin`'s, at `<datadir>/bitcoin`): `bark lightning pay invoice INVOICE
---wait` and `bark lightning invoice "SATS sats"`, against the Bitcoin ark
-the operator names in its `info` (`lightning.bitcoin.ark`), Bark's server on
-the Bitcoin network the chain anchors to. While the operator names no
-Bitcoin ark, or the wallet has no Bitcoin ark wallet, both are refused with
-the reason and Bark is not run. A Bitcoin invoice with `--asset` naming a
-Sequentia asset is refused before anything is signed. `ARCA_BARK_EXEC`
-names the `bark` binary when it is not the one beside `arca`.
+### The Bitcoin side
+
+Every Arca wallet is dual-chain. Its Bitcoin side holds native BTC in a
+Bitcoin ark, Bark's server (`captaind`) on a Bitcoin network, through Bark's
+own wallet in `<datadir>/bitcoin`, which `arca bitcoin …` runs. It is Bark as
+upstream ships it, so the wallet joins any Bark ark; an operator may name its
+own (`info`'s `lightning.bitcoin.ark`), which a program can offer as the
+default. BTC is never a Sequentia leaf.
+
+`arca bitcoin create` makes the Bitcoin ark wallet from the Arca wallet's own
+mnemonic, so one mnemonic restores both sides. Bark keeps its keys on paths
+of its own (`m/350'/…` for its leaves, BIP86 on-chain), apart from the Arca
+wallet's (`m/6'/…`, `m/84'/…`), so no key signs on both sides. Bark's command
+line takes a mnemonic only as an argument, which other users of the machine
+can read, so `create` runs Bark's daemon, `barkd`, on a loopback port for as
+long as the create takes, hands it the mnemonic in a request body under the
+token `barkd` writes in that directory, then stops it and deletes the token.
+
+    arca bitcoin create --testnet4 --ark https://ark.example.org \
+        --bitcoind http://127.0.0.1:48332 --bitcoind-cookie ~/.bitcoin/testnet4/.cookie
+    arca bitcoin create --testnet4 --ark https://ark.example.org --esplora https://esplora.example.org/testnet4/api
+
+The network is one of `--testnet4` (the network the Sequentia testnet anchors
+to), `--mainnet`, `--signet`, `--mutinynet` and `--regtest`. The chain source
+is a Bitcoin Core node of version 29 or later, with `-txindex`, named by its
+RPC address and its cookie (or `--bitcoind-user`, the password in
+`ARCA_BITCOIND_PASSWORD`, never on the command line), or an Esplora server. An
+older node is refused before anything is made. A wallet made with a node scans
+Bitcoin from the node's tip; to restore a mnemonic that held bitcoin before,
+give the height to scan from (`--birthday-height`). Leaves held in the ark are
+recovered from the server whatever the height. Every other `arca bitcoin
+ARGS…` is Bark's command, run with `--datadir <datadir>/bitcoin`: `board`,
+`send`, `address`, `balance`, `vtxos`, `refresh`, `exit`, `onchain …`,
+`maintain`. Bark wants `maintain` run now and then, which refreshes leaves
+before they expire.
+
+Native BTC goes over Lightning on the Bitcoin side, through Bark's own
+Lightning leg on the Bitcoin ark wallet, never through a Sequentia leaf, and
+needs nothing of the Arca operator:
+
+- `lightning pay INVOICE` with a Bitcoin invoice runs `bark lightning pay
+  invoice INVOICE --wait`, which prints nothing, then reads the payment back
+  with `bark lightning pay status INVOICE` (`paid` with its preimage). A
+  Bitcoin invoice with `--asset` naming a Sequentia asset is refused before
+  anything is signed.
+- `lightning receive btc SATS` makes an invoice (`bark lightning invoice "SATS
+  sats"`). Bark's server holds a payment to it only until the wallet claims
+  it, and fails it back to the payer otherwise, so the wallet must claim while
+  the payer pays: `lightning claim INVOICE [--wait SECONDS]` runs `bark
+  lightning claim INVOICE --wait` for up to that long (300 seconds by default)
+  and answers `claimed`, or `waiting` when no payment came (claim again while
+  the payer may still pay).
+- A payment the claim can no longer take answers `reissued`, with a fresh
+  invoice of the same amount and description for the payer to pay instead
+  (`invoice`, and the one it replaces): the claim asks the server for an HTLC
+  expiring the invoice's final CLTV delta less the server's
+  `htlc_expiry_delta` after the tip, and the server wants that delta again
+  below the payment's expiry, so blocks found between the payment's arrival
+  and the claim leave the claim too close to the payment's expiry. Bark
+  refuses such a claim ("Requested HTLC recv expiry too close to inbound HTLC
+  expiry"), or, once it has given the receive up, finds none to claim ("no
+  pending lightning receive found for this payment hash"); either way the
+  payment goes back to the payer.
+
+While the wallet has no Bitcoin ark wallet, each of these is refused with the
+reason and Bark is not run. `ARCA_BARK_EXEC` and `ARCA_BARKD_EXEC` name the
+`bark` and `barkd` binaries when they are not the ones beside `arca`.
 
 ### Taking an on-chain order
 
@@ -629,7 +687,7 @@ registry for both commands.
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
-| `balance` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side |
+| `balance` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins, and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read) |
 | `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
@@ -639,7 +697,8 @@ registry for both commands.
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; the read's cursor never moves back (a message at or before what was read is not read again, a page with nothing past it ends the read, and one read takes at most a hundred pages of a key, `MAILBOX_PAGES`, the rest left to the next, each said in `note`); a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
 | `lightning payments` | Every payment over Lightning the wallet made, by payment hash: the invoice, asset, amount, fee, the `htlc-1` leaf, its state and its preimage or reason |
-| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it. `btc` for native BTC: `AMOUNT` satoshis, through Bark's Lightning leg on the Bitcoin side |
+| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it. `btc` for native BTC: an invoice for `AMOUNT` satoshis on the Bitcoin ark wallet, which `lightning claim` then claims (see The Bitcoin side) |
+| `lightning claim INVOICE [--wait S]` | Claims a payment to a Bitcoin invoice of the wallet's while the payer pays, waiting up to `S` seconds (300): `claimed`, `waiting`, or `reissued` with a fresh invoice when the payment can no longer be claimed (see The Bitcoin side) |
 | `lightning receives` | Every payment the wallet asked to receive, by payment hash: the invoice, asset, amount, fee, the leaf's value and participation, and its state (`waiting`, `issuing`, `claiming`, `received` or `failed` with the reason); never the preimage |
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
@@ -657,6 +716,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
 | `refusals` | Every refusal the wallet made, with its reason |
+| `bitcoin create (--testnet4 \| --mainnet \| --signet \| --mutinynet \| --regtest) --ark URL (--bitcoind URL (--bitcoind-cookie F \| --bitcoind-user U) \| --esplora URL) [--birthday-height H]` | Makes the wallet's Bitcoin ark wallet from its own mnemonic, through Bark's daemon (see The Bitcoin side): the network, the ark, the chain source (no password), the height it scans from and what the ark's server says of itself |
 | `bitcoin [--] ARGS…` | Runs Bark's `bark` with `--datadir <datadir>/bitcoin` and the arguments given: the wallet's Bitcoin side. Put `--` before an argument `arca` would read itself, such as `--help` |
 
 A coin's states: `pending` (what it rests on is not final), `live`, `offered`
@@ -802,12 +862,28 @@ window as the next sync.
 
 `tests/arca_bitcoin_side.rs` checks the Bitcoin side at its boundary, Bark
 replaced by a stand-in that records what it is asked: with no Bitcoin ark
-wallet, and against an operator that names no Bitcoin ark, a Bitcoin invoice
-and a receive in BTC are refused with the reason and Bark is not run;
-otherwise each is exactly one call of Bark's Lightning leg (`lightning pay
-invoice INVOICE --wait`, `lightning invoice "1000 sats" --description …`) on
-the Bitcoin ark wallet; and a Bitcoin invoice with a Sequentia asset named
-is refused, nothing paid or asked on the Sequentia side.
+wallet, a Bitcoin invoice, a receive in BTC and a claim are refused with the
+reason and Bark is not run; otherwise a payment is `lightning pay invoice
+INVOICE --wait` then `lightning pay status INVOICE --no-sync`, a receive
+`lightning invoice "1000 sats" --description …`, a claim `lightning claim
+INVOICE --wait` then `lightning receive status INVOICE --no-sync`, and BTC's
+row counts Bark's ark balance and its on-chain wallet; a Bitcoin invoice with
+a Sequentia asset named is refused, nothing paid or asked on the Sequentia
+side; and an operator that names no Bitcoin ark changes nothing of it.
+
+`tests/arca_bitcoin_ark.rs` runs the Bitcoin side against a real Bitcoin ark
+on regtest, `contrib/bitcoin-ark-regtest/` (Bark's server at the release the
+wallet bundles, its Lightning gateway with the hold plugin, and a peer node):
+`bitcoin create` from the wallet's own mnemonic, and refused without one or a
+second time; a board; a Lightning payment out, its preimage the payee's; a
+payment in, claimed as the payer pays; a claim with no payment `waiting`, then
+claimed; blocks found between a payment's arrival and the claim, counted from
+the held payment's expiry, give `reissued`, the first payment failed back and
+the fresh invoice paid and claimed; a second wallet restored from the same
+mnemonic holds the same; a refresh; and an exit alone, its leaves claimed to
+the on-chain wallet. It needs the harness running (`ARCA_TEST_BITCOIN_ARK`,
+the harness script with its environment) and the patched `bark` and `barkd`
+(`ARCA_BARK_EXEC`, `ARCA_BARKD_EXEC`), and is skipped without them.
 
 `tests/arca_quotes.rs` runs the same way: a board's quote and an exit's quote
 (`--quote`, and the library's `board_quote` and `exit_quote`) sign, ask,

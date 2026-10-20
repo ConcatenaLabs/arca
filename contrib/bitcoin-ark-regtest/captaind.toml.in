@@ -1,0 +1,124 @@
+data_dir = "@H@/captaind"
+network = "regtest"
+vtxo_lifetime = 432
+vtxo_exit_delta = 12
+max_vtxo_amount = "5000000 sat"
+min_board_amount = "10000 sat"
+max_board_amount = "5000000 sat"
+max_offboard_amount = "5000000 sat"
+max_arkoor_amount = "5000000 sat"
+max_vtxo_exit_depth = 50
+max_arkoor_fanout = 4
+required_board_confirmations = 2
+min_trusted_confs = 1
+rpc_rich_errors = true
+sync_manager_block_poll_interval = "1s"
+nursery_confirm_target_blocks = 6
+otel_deployment_name = "arca-bitcoin-ark-regtest"
+max_read_mailbox_items = 100
+round_interval = "10s"
+round_submit_time = "3s"
+round_sign_time = "3s"
+nb_round_nonces = 8
+round_forfeit_nonces_timeout = "30s"
+offboard_session_timeout = "30s"
+offboard_check_interval = "1s"
+offboard_acceptable_fee_rate_duration = "15m"
+cln_reconnect_interval = "10s"
+invoice_check_interval = "3s"
+cln_xpay_timeout = "60s"
+invoice_check_base_delay = "2s"
+max_invoice_check_delay = "10s"
+invoice_poll_interval = "10s"
+htlc_settlement_poll_interval = "5s"
+track_all_base_delay = "1s"
+max_track_all_delay = "60s"
+htlc_expiry_delta = 40
+htlc_send_expiry_delta = 258
+max_user_invoice_cltv_delta = 250
+invoice_expiry = "1h"
+receive_htlc_forward_timeout = "60s"
+ln_receive_anti_dos_required = false
+max_ln_receive_amount = "1000000 sat"
+max_ln_send_amount = "1000000 sat"
+ln_max_fee_ppm = 900000
+
+[[cln_array]]
+uri = "https://localhost:@GW_GRPC@"
+priority = 1
+server_cert_path = "@H@/gw/regtest/ca.pem"
+client_cert_path = "@H@/gw/regtest/client.pem"
+client_key_path = "@H@/gw/regtest/client-key.pem"
+hold_invoice.uri = "https://localhost:@HOLD_GRPC@"
+hold_invoice.server_cert_path = "@H@/gw/regtest/hold/ca.pem"
+hold_invoice.client_cert_path = "@H@/gw/regtest/hold/client.pem"
+hold_invoice.client_key_path = "@H@/gw/regtest/hold/client-key.pem"
+
+[fees.board]
+min_fee_sat = 330
+base_fee_sat = 100
+ppm = 1000
+
+[fees.offboard]
+base_fee_sat = 200
+fixed_additional_vb = 221
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[fees.refresh]
+base_fee_sat = 150
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[fees.lightning_receive]
+base_fee_sat = 100
+ppm = 2000
+
+[fees.lightning_send]
+min_fee_sat = 10
+base_fee_sat = 75
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[vtxopool]
+vtxo_targets = [ "1000sat:5", "10000sat:5" ]
+vtxo_target_issue_threshold = 80
+vtxo_lifetime = 200
+vtxo_pre_expiry = 12
+max_vtxo_exit_depth = 3
+
+[fee_estimator]
+update_interval = "1m"
+history_duration = "60m"
+fallback_fee_rate_fast = "5sat/vb"
+fallback_fee_rate_regular = "3sat/vb"
+fallback_fee_rate_slow = "2sat/vb"
+max_fee_rate = "100sat/vb"
+
+[rpc]
+public_address = "127.0.0.1:@ARK_PORT@"
+admin_address = "127.0.0.1:@ADMIN_PORT@"
+integration_address = "127.0.0.1:@INTEGRATION_PORT@"
+
+[postgres]
+host = "127.0.0.1"
+port = @PG_PORT@
+name = "bark_captaind"
+user = "bark"
+max_connections = 10
+
+[bitcoind]
+url = "http://127.0.0.1:@BTC_RPC@"
+cookie = "@H@/btc/regtest/.cookie"
