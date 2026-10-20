@@ -18,6 +18,7 @@
 //! | `lightning_receive` | POST | by the signature of the key the leaf is asked under; at the nonces' rate |
 //! | `lightning_receive_status` | POST | no: the payment hash names it |
 //! | `lightning_receive_claim` | POST | by the preimage, and the owners' signatures over the transfer of the leaf |
+//! | `lightning_preimage` | POST | by the preimage, which opens the hash |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `transfer_status` | POST | no: the transfer's id names it; at the reads' rate |
@@ -650,6 +651,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				window_seconds: app.receives.config().window_seconds,
 				invoice_expiry_seconds: app.receives.config().invoice_expiry_seconds,
 				block_seconds: app.receives.config().block_seconds,
+				internal_gap_seconds: app.receives.config().internal_gap(),
 			},
 		},
 		fills: api::FillsInfo {
@@ -845,6 +847,16 @@ async fn lightning_receive_claim(State(app): State<Arc<App>>, body: Result<Bytes
 	let transfer = transfer_request(&req.inputs, &req.outputs)?;
 	let c = app.receives.claim(&hash, &preimage, &transfer).await?;
 	Ok(Json(api::LightningClaimed { cosigned: cosigned_json(&app, &c.cosigned).await?, receive: received(&c.receive) }))
+}
+
+async fn lightning_preimage(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningReceived>, Refusal>
+{
+	let req: api::LightningPreimage = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	let preimage = unhex32(&req.preimage).map_err(Refusal::malformed)?;
+	let r = app.receives.post_preimage(&hash, &preimage).await?;
+	Ok(Json(received(&r)))
 }
 
 async fn lightning_send_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
@@ -1535,6 +1547,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_receive", post(lightning_receive))
 		.route("/v1/lightning_receive_status", post(lightning_receive_status))
 		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
+		.route("/v1/lightning_preimage", post(lightning_preimage))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/transfer_status", post(transfer_status))

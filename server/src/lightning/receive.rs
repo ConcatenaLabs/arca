@@ -31,6 +31,21 @@
 //! reveals the preimage there; the server reads it from the claim and
 //! settles the payment the same way.
 //!
+//! A payment out of the tree that pays the very invoice the operator made for
+//! a payment into its tree is settled inside the operator
+//! ([`Receives::take_internal`]): the operator's node would be paying its
+//! own invoice, which it cannot, since its self-payment looks the hash up in
+//! its own invoice table and a receive's hash is held by the hold-invoice
+//! plugin. The payer's `htlc-1` send leaf is the held payment instead: the
+//! hold invoice is cancelled on the node first, so no outside payer can pay
+//! the same invoice, and the receiver's leaf times out a gap
+//! ([`ReceiveConfig::internal_gap`]) before the send leaf does, so the
+//! operator holds the preimage before the payer's refund can open. The
+//! receive decides the send: paid with the preimage the receiver hands over,
+//! a claim on the chain reveals, or anyone posts ([`Receives::post_preimage`]);
+//! failed when the receive is failed back. The node is never settled for
+//! such a payment.
+//!
 //! A payment is failed back when the invoice expires unpaid, when what is
 //! held is locked for too short a time, when its leaf never comes (the
 //! participation void, expired, or not built in time), and once the time to
@@ -83,9 +98,32 @@ pub struct ReceiveConfig {
 	/// an asset, as a share of the operator's pool in it, in parts per
 	/// million.
 	pub cap_ppm: u32,
+	/// The longest stall of the chain a payment held inside the operator is
+	/// safe through: the stall margin of a payment out of the tree.
+	pub stall_seconds: u32,
 }
 
 impl ReceiveConfig {
+	/// The least time a received leaf of exit delay `exit` is locked for,
+	/// from when it is wanted to its timeout: eight sevenths of the exit
+	/// delay and the window, so that an eighth of the lock kept in hand
+	/// before the timeout (the claim's margin, D67) still leaves the owner
+	/// its exit delay and the window to claim it.
+	pub fn needed_lock_seconds(&self, exit: RelativeTime) -> u64 {
+		((exit.seconds() + self.window_seconds as u64) * 8).div_ceil(7)
+	}
+
+	/// How long before the timeout of a payer's send leaf a leaf received
+	/// inside the operator times out: the operator's refund delay (the
+	/// latest a claim of the leaf on the chain can reveal the preimage is
+	/// its timeout and that delay), the stall margin (median time leaps a
+	/// stall in a few blocks) and an hour, so the operator holds the
+	/// preimage before the payer's refund can open at its send leaf's
+	/// timeout.
+	pub fn internal_gap(&self) -> u64 {
+		self.operator_delay.seconds() + self.stall_seconds as u64 + 3600
+	}
+
 	/// The blocks the held payment must stay locked for a leaf of exit delay
 	/// `exit`: twice the leaf's lock, in blocks, so that the leaf's timeout,
 	/// half that time, leaves the lock. The lock is eight sevenths of the
@@ -93,7 +131,7 @@ impl ReceiveConfig {
 	/// lock in hand before its timeout (the claim's margin, D67), so the
 	/// window is still the wallet's to claim the leaf in.
 	pub fn needed_blocks(&self, exit: RelativeTime) -> u32 {
-		let lock = ((exit.seconds() + self.window_seconds as u64) * 8).div_ceil(7);
+		let lock = self.needed_lock_seconds(exit);
 		(2 * lock).div_ceil(self.block_seconds.max(1) as u64).min(u32::MAX as u64) as u32
 	}
 }
@@ -196,6 +234,18 @@ fn unix_now() -> u64 {
 
 fn hex(b: &[u8]) -> String {
 	crate::signer::hex(b)
+}
+
+/// What [`Receives::take_internal`] made of a payment out of the tree that
+/// pays the invoice of a payment into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Internal {
+	/// Held by the send: its leaf wanted in the next round.
+	Taken,
+	/// Not now (the node did not answer): asked again at the next pass.
+	Wait(String),
+	/// Never: the send is failed back, with the code and the reason.
+	Refused { code: &'static str, why: String },
 }
 
 /// See the [module documentation](self).
@@ -452,6 +502,21 @@ impl Receives {
 		let now = self.now().await?.to_consensus_u32() as u64;
 		let timeout = now + left * self.config.block_seconds as u64 / 2;
 		let timeout = u32::try_from(timeout).map_err(|_| ReceiveError::Malformed("a timeout past 2106".into()))?;
+		let Some(id) = self.want_leaf(r, timeout).await? else { return Ok(()) };
+		if self.store.accept_receive(&hash, &id, timeout, expiry as u32).await? {
+			log::info!("lightning: the payment of hash {} is held ({} atoms, locked {} blocks): its leaf, timing out at {}, is wanted \
+				in the next round (participation {})", hex(&hash), received, left, timeout, hex(&id));
+		}
+		Ok(())
+	}
+
+	/// Wants the leaf of the held payment `r`, timing out at `timeout`, in
+	/// its asset's next round: a participation that gives up no coin. The
+	/// participation's id, or `None` when the payment was failed back
+	/// instead (beyond the cap, or the key owning a leaf now).
+	async fn want_leaf(&self, r: &ReceiveRow, timeout: u32) -> Result<Option<[u8; 32]>, ReceiveError> {
+		let hash = r.new.payment_hash;
+		let exit = RelativeTime::from_units(r.new.exit_delay_units).map_err(|e| ReceiveError::Malformed(e.to_string()))?;
 		let terms = HtlcTerms {
 			direction: HtlcDirection::Receive,
 			payment_hash: hash,
@@ -461,7 +526,8 @@ impl Receives {
 		terms.check(exit).map_err(|e| ReceiveError::Htlc(e.to_string()))?;
 		// Held invoices asked for together are funded within the cap too.
 		if let Err(ReceiveError::Cap(why)) = self.within_cap(&r.new.asset, r.new.amount - r.new.fee, Some(&hash)).await {
-			return self.cancel(r, &why).await;
+			self.cancel(r, &why).await?;
+			return Ok(None);
 		}
 		let id = participation_id(&hash);
 		let mut preimage = [0u8; 32];
@@ -482,14 +548,143 @@ impl Receives {
 		};
 		match self.store.insert_participation(&p).await {
 			Ok(()) | Err(StoreError::ParticipationExists) => {},
-			Err(StoreError::KeyReused) => return self.cancel(r, "the key the leaf is asked under owns a leaf now").await,
+			Err(StoreError::KeyReused) => {
+				self.cancel(r, "the key the leaf is asked under owns a leaf now").await?;
+				return Ok(None);
+			},
 			Err(e) => return Err(e.into()),
 		}
-		if self.store.accept_receive(&hash, &id, timeout, expiry as u32).await? {
-			log::info!("lightning: the payment of hash {} is held ({} atoms, locked {} blocks): its leaf, timing out at {}, is wanted \
-				in the next round (participation {})", hex(&hash), received, left, timeout, hex(&id));
+		Ok(Some(id))
+	}
+
+	/// The payment into the tree whose invoice is `invoice`, under `hash`:
+	/// one the operator made, which a payment out of the tree pays.
+	pub async fn own_invoice(&self, invoice: &str, hash: &[u8; 32]) -> Result<Option<ReceiveRow>, StoreError> {
+		Ok(self.store.receive(hash).await?.filter(|r| r.new.invoice == invoice))
+	}
+
+	/// The timeout of the leaf of a payment held inside the operator by a
+	/// send leaf timing out at `send_timeout`: the gap before it.
+	pub fn internal_timeout(&self, send_timeout: u32) -> u32 {
+		(send_timeout as u64).saturating_sub(self.config.internal_gap()) as u32
+	}
+
+	/// Whether a payment out of the tree whose send leaf times out at
+	/// `send_timeout` can be held inside the operator by the payment into
+	/// it `r`, asked before the operator signs anything of it: `r` open, and
+	/// its leaf, timing out the gap before the send leaf, locked for at
+	/// least the receive's least lock. The code and the reason otherwise.
+	pub async fn check_internal(&self, r: &ReceiveRow, send_timeout: u32) -> Result<(), (&'static str, String)> {
+		let hash = hex(&r.new.payment_hash);
+		match r.state {
+			ReceiveState::Open => {},
+			ReceiveState::Accepted if r.held_by_send => return Err(("in_use", format!("the payment into the tree under hash {} is \
+				held by another payment already", hash))),
+			ReceiveState::Accepted | ReceiveState::Claimed => return Err(("in_use", format!("the invoice of hash {} is being paid \
+				already, over Lightning", hash))),
+			ReceiveState::Cancelled => return Err(("invoice", format!("the payment into the tree under hash {} was failed back: {}", hash,
+				r.reason.as_deref().unwrap_or("")))),
+		}
+		let now = self.now().await.map_err(|e| ("not_synced", e.to_string()))?.to_consensus_u32() as u64;
+		let exit = RelativeTime::from_units(r.new.exit_delay_units).map_err(|e| ("malformed", e.to_string()))?;
+		let timeout = self.internal_timeout(send_timeout) as u64;
+		let least = self.config.needed_lock_seconds(exit);
+		if timeout < now + least {
+			return Err(("htlc", format!("the invoice is the operator's own, for a payment into its tree, and is paid inside the operator: \
+				the receiver's leaf would time out at {} (the send leaf's timeout {} less {} s), and it needs {} s past the chain's median \
+				time {} at least; a later send timeout pays it", timeout, send_timeout, self.config.internal_gap(), least, now)));
 		}
 		Ok(())
+	}
+
+	/// Holds the payment into the tree whose invoice `send` pays, by the send
+	/// leaf, timing out at `send_timeout`: see the [module
+	/// documentation](self). The hold invoice on the node is cancelled first,
+	/// and one an outside payer's payment holds already is not taken.
+	pub async fn take_internal(&self, send: &crate::store::SendRow, send_timeout: u32) -> Result<Internal, ReceiveError> {
+		let hash = send.payment_hash;
+		let _gate = self.gate.lock().await;
+		let Some(r) = self.own_invoice(&send.invoice, &hash).await? else {
+			return Ok(Internal::Refused { code: "invoice", why: "the invoice is no payment into the tree of this operator's".into() });
+		};
+		if r.held_by_send {
+			return Ok(Internal::Taken);
+		}
+		if let Err((code, why)) = self.check_internal(&r, send_timeout).await {
+			return Ok(Internal::Refused { code, why });
+		}
+		if unix_now() > r.new.expires_at {
+			return Ok(Internal::Refused { code: "invoice", why: "the invoice expired".into() });
+		}
+		let Some(leg) = self.leg_of(&r) else {
+			return Ok(Internal::Wait("the asset's node is not known".into()));
+		};
+		// The node's hold invoice is cancelled before the payment is held by
+		// the send, so no outside payer can pay the same invoice; one whose
+		// payment the node holds already is the receive's payer.
+		let t = Duration::from_secs(10);
+		let looked = match leg.cln.call("holdinvoicelookup", json!({ "payment_hash": hex(&hash) }), t).await {
+			Ok(h) => h,
+			Err(e) => return Ok(Internal::Wait(crate::lightning::node_error(&leg, &e).to_string())),
+		};
+		if looked["state"] == "accepted" && looked["received_msat"].as_u64().unwrap_or(0) > 0 {
+			return Ok(Internal::Refused { code: "in_use", why: format!("the invoice of hash {} is being paid already, over Lightning",
+				hex(&hash)) });
+		}
+		if !matches!(looked["state"].as_str(), Some("cancelled") | Some("unknown")) {
+			if let Err(e) = leg.cln.call("holdinvoicecancel", json!({ "payment_hash": hex(&hash) }), t).await {
+				return Ok(Internal::Wait(crate::lightning::node_error(&leg, &e).to_string()));
+			}
+		}
+		let timeout = self.internal_timeout(send_timeout);
+		let Some(id) = self.want_leaf(&r, timeout).await? else {
+			let why = self.store.receive(&hash).await?.and_then(|r| r.reason).unwrap_or_default();
+			return Ok(Internal::Refused { code: "receive_cap", why });
+		};
+		if self.store.accept_receive_held_by_send(&hash, &id, timeout, send_timeout).await? {
+			log::info!("lightning: the payment of hash {} is held inside the operator by the payment out of its tree (send leaf {}, timing \
+				out at {}): its leaf, timing out at {}, is wanted in the next round (participation {})", hex(&hash), hex(&send.htlc_leaf_id),
+				send_timeout, timeout, hex(&id));
+		}
+		Ok(Internal::Taken)
+	}
+
+	/// Takes the preimage of the payment `hash` from anyone who has it: a
+	/// payment held whose leaf is its owner's is `claimed` with it, and a
+	/// payment held inside the operator is decided by it. Its status serves
+	/// it from then on. Asked again, answered as before.
+	pub async fn post_preimage(&self, hash: &[u8; 32], preimage: &[u8; 32]) -> Result<ReceiveRow, ReceiveError> {
+		let _gate = self.gate.lock().await;
+		let r = self.store.receive(hash).await?.ok_or_else(|| ReceiveError::Unknown(hex(hash)))?;
+		if arca_covenant::script::sha256(preimage) != *hash {
+			return Err(ReceiveError::Htlc("the preimage does not open the payment hash".into()));
+		}
+		match r.state {
+			ReceiveState::Claimed => return Ok(r),
+			ReceiveState::Accepted => {},
+			ReceiveState::Open => return Err(ReceiveError::Htlc("nothing is held under the hash yet".into())),
+			ReceiveState::Cancelled => return Err(ReceiveError::Htlc(format!("the payment was failed back: {}",
+				r.reason.as_deref().unwrap_or("")))),
+		}
+		let id = r.participation_id.ok_or_else(|| ReceiveError::Malformed("an accepted payment without its participation".into()))?;
+		let p = self.store.participation(&id).await?.ok_or_else(|| ReceiveError::Malformed("its participation is gone".into()))?;
+		if p.state != ParticipationState::Released {
+			return Err(ReceiveError::Htlc(format!("the leaf is not its owner's yet (its participation is {})", p.state.as_str())));
+		}
+		let now = self.now().await?.to_consensus_u32() as u64;
+		if now >= r.timeout.unwrap_or(0) as u64 + self.config.operator_delay.seconds() {
+			return Err(ReceiveError::Htlc("the time to claim the leaf is over".into()));
+		}
+		if self.store.claim_receive(hash, preimage).await? {
+			log::info!("lightning: the payment of hash {}: its preimage was handed to the operator", hex(hash));
+		}
+		drop(_gate);
+		if let Some(r) = self.store.receive(hash).await? {
+			if let Err(e) = self.resolve(&r).await {
+				log::warn!("lightning: deciding the payment of hash {}: {}", hex(hash), e);
+			}
+		}
+		self.store.receive(hash).await?.ok_or_else(|| ReceiveError::Unknown(hex(hash)))
 	}
 
 	/// The leaf of the payment `r`, once its round made it.
@@ -537,8 +732,16 @@ impl Receives {
 		// the payment stands until the watcher's refund takes it, or until
 		// the held parts are a dozen blocks from their expiry.
 		if now > timeout + self.config.operator_delay.seconds() + 3600 {
-			let height = self.store.tip_block().await?.map(|b| b.height).unwrap_or(0);
-			let near = height + 12 >= r.htlc_expiry.unwrap_or(0) as u64;
+			// Near the end of what holds the payment: the held parts' expiry
+			// at the node, or the send leaf's timeout, less the stall margin,
+			// for a payment held inside the operator.
+			let near = match (r.held_by_send, r.send_timeout) {
+				(true, Some(t)) => now + self.config.stall_seconds as u64 >= t as u64,
+				_ => {
+					let height = self.store.tip_block().await?.map(|b| b.height).unwrap_or(0);
+					height + 12 >= r.htlc_expiry.unwrap_or(0) as u64
+				},
+			};
 			if !near {
 				if let Some(leaf) = self.leaf_of(r).await? {
 					if self.unspent_on_chain(&leaf).await? {
@@ -609,6 +812,27 @@ impl Receives {
 	/// back.
 	async fn resolve(&self, r: &ReceiveRow) -> Result<(), ReceiveError> {
 		let hash = r.new.payment_hash;
+		// Held inside the operator: the send it holds is decided, and the
+		// node is never settled.
+		if r.held_by_send {
+			match (r.state, r.preimage) {
+				(ReceiveState::Claimed, Some(pre)) => {
+					if self.store.decide_send(&hash, Some(&pre), None).await? {
+						log::info!("lightning: the payment of hash {}, held inside the operator, is paid", hex(&hash));
+					}
+					self.store.set_receive_settled(&hash).await?;
+				},
+				(ReceiveState::Cancelled, _) => {
+					let why = format!("the payment into the tree it pays was failed back: {}", r.reason.as_deref().unwrap_or(""));
+					if self.store.decide_send(&hash, None, Some(&why)).await? {
+						log::info!("lightning: the payment of hash {}, held inside the operator, failed: {}", hex(&hash), why);
+					}
+					self.store.set_receive_failed_back(&hash).await?;
+				},
+				_ => {},
+			}
+			return Ok(());
+		}
 		let Some(leg) = self.leg_of(r) else { return Ok(()) };
 		let t = Duration::from_secs(30);
 		let node = |e: ClnError| ReceiveError::Leg(crate::lightning::node_error(&leg, &e));
@@ -729,6 +953,18 @@ pub fn receive_json(r: &ReceiveRow) -> Value {
 	}
 	if let Some(why) = &r.reason {
 		v["reason"] = json!(why);
+	}
+	v["exit_delay_units"] = json!(n.exit_delay_units);
+	if matches!(r.state, ReceiveState::Accepted | ReceiveState::Claimed) || r.held_by_send {
+		v["held_by"] = json!(if r.held_by_send { "send" } else { "node" });
+	}
+	if let Some(t) = r.send_timeout {
+		v["send_timeout"] = json!(t);
+	}
+	// Known to the operator once claimed, and to whoever handed it over: it
+	// opens nothing that is not its owner's or the operator's to spend.
+	if let Some(p) = &r.preimage {
+		v["preimage"] = json!(hex(p));
 	}
 	v
 }
