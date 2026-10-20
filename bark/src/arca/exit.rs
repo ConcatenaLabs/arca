@@ -300,6 +300,117 @@ impl Wallet {
 	/// cannot, and is remembered for the exit's later steps. The claim goes to
 	/// one address of the wallet's, chosen when the exit starts.
 	pub fn exit(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
+		self.exit_shown(leaf_id, fee_asset, None)
+	}
+
+	/// What a run of [`Self::exit`] of `leaf_id` would broadcast now, before
+	/// anything is signed for the chain, broadcast or written: each
+	/// transaction of the path still missing, its size and its fee (from its
+	/// own reserve or from a fee coin of the wallet's, in `fee_asset` or the
+	/// asset the wallet would choose), their fees by asset (`unroll`), and the
+	/// claim's fee at the node's floor now, which the claim pays once the
+	/// leaf is in a block and its exit delay has run. A program shows it,
+	/// then runs the exit with the `unroll` it showed ([`Self::exit_shown`]).
+	/// Refuses what the exit would refuse for the same reason.
+	pub fn exit_quote(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
+		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
+			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
+		}
+		let record = Self::record_of(&row)?;
+		let now = self.now()?;
+		let policy = self.followed_policy(row.expiry, now);
+		let txs = self.accepted_bases(&record)?;
+		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
+		let key = self.keys.leaf(&row.owner_nonce)?;
+		let prior: Value = match self.store.exit(leaf_id)? {
+			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,
+			None => json!({}),
+		};
+		let fee_asset = match fee_asset {
+			Some(a) => Some(a),
+			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
+		};
+		// No change index is taken for a quote: the change script's size is
+		// that of every P2WPKH change.
+		let dummy = self.keys.onchain(CHANGE, 0)?;
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None,
+			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![] };
+		let mut path = vec![];
+		Self::path_outputs(&coin, &mut path);
+		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
+		let in_flight = self.change_in_flight.borrow().len();
+		let mut built = vec![];
+		let planned = self.bring(&coin, &mut payer, &mut built, &here);
+		let leaf_at = match planned {
+			Ok(at) => at,
+			Err(e) => {
+				self.change_in_flight.borrow_mut().truncate(in_flight);
+				return Err(e);
+			},
+		};
+		let steps: Vec<Value> = built.iter().map(|u| {
+			let by_coin = u.tx.input.iter().any(|i| payer.used.contains(&i.previous_output));
+			json!({"vsize": u.tx.vsize(), "fee": txs_fee(&u.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()}))
+				.collect::<Vec<_>>(), "paid_by": if by_coin { "a fee coin of the wallet's" } else { "its own reserve" }})
+		}).collect();
+		let unroll = Self::fees_by_asset(&built);
+		// The claim as it would be built now (a receive leaf's preimage is
+		// 32 bytes, whatever it is).
+		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
+		let to = Script::from(vec![0u8; 22]);
+		let after = match leaf.htlc {
+			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
+			_ => vec![],
+		};
+		let claim = self.key_spend_with(&mut payer, &key, &after, &|f| {
+			let out = match f {
+				FeeSource::Reserve | FeeSource::Split { .. } => {
+					let fee = self.fee_for(asset, 220)?;
+					if fee >= value {
+						return Err(Error::Refused(format!("the leaf's {} atoms do not cover its own claim's fee", value)));
+					}
+					ExplicitOutput::new(asset, value - fee, to.clone())
+				},
+				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
+			};
+			match leaf.htlc {
+				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
+				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
+				_ => leaf.exit_tx(leaf_at, asset, value, &[out], f),
+			}.map_err(|e| Error::Refused(e.to_string()))
+		});
+		self.change_in_flight.borrow_mut().truncate(in_flight);
+		let claim = match claim {
+			Ok(c) => json!({"vsize": c.tx.vsize(), "fee": txs_fee(&c.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()}))
+				.collect::<Vec<_>>(), "pays": c.tx.output[0].value.explicit().map(|v| v.to_string())}),
+			Err(e) => json!({"error": e.to_string()}),
+		};
+		Ok(json!({
+			"leaf_id": leaf_id, "asset": asset.to_string(), "value": value.to_string(),
+			"fee_asset": payer.asset.map(|a| a.to_string()), "steps": steps, "unroll": unroll, "claim": claim,
+			"exit_delay_seconds": leaf.exit_delay.seconds(),
+			"note": "the fees at the node's floor now, each in its asset's own atoms; the unroll is broadcast only on the fees shown, \
+				and the claim pays the floor when it is made, once the leaf is in a block and its exit delay has run",
+		}))
+	}
+
+	/// Every fee the transactions pay, by asset: `{asset: atoms}`.
+	fn fees_by_asset(built: &[UnrollTx]) -> Value {
+		let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+		for u in built {
+			for (a, v) in txs_fee(&u.tx) {
+				*by.entry(a.to_string()).or_default() += v;
+			}
+		}
+		Value::Object(by.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect())
+	}
+
+	/// [`Self::exit`], broadcasting the path's transactions only when their
+	/// fees by asset are `shown` (an [`Self::exit_quote`]'s `unroll`), when
+	/// given; else a refusal naming the fees now, before anything is
+	/// broadcast or the coin's state changed.
+	pub fn exit_shown(&mut self, leaf_id: &str, fee_asset: Option<AssetId>, shown: Option<&Value>) -> Result<Value, Error> {
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
 		// A coin handed over to a participation or a transfer is the wallet's
 		// until the chain shows otherwise: one taken by a round or a
@@ -369,6 +480,12 @@ impl Wallet {
 				});
 			},
 		};
+		if let Some(shown) = shown {
+			let now = Self::fees_by_asset(&built);
+			if now != *shown {
+				return Err(Error::Refused(format!("the exit's fees changed since they were shown; they are now {}", now)));
+			}
+		}
 		self.let_go(leaf_id, &row.state)?;
 		// One claim address for the exit, however many times it is run.
 		let claim_index = match prior["claim_index"].as_u64() {

@@ -68,11 +68,13 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 
 `run(command, args)` is the library's `bark::arca::command::run`, which every
 program that embeds the library calls, and takes the command line's commands: `info`, `address`,
-`balance`, `coins`, `record {leaf_id}`, `board {asset, amount, fee_asset?}`,
-`boards`, `receive {asset?, amount?}`, `forget_request {owner}`, `send
-{request, amount?, asset?}`, `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`,
-`participate {leaves?, not_before?, max_fee_ppm?, shown}`, `participations`,
-`sync`, `schedule`, `recheck`, `exit {leaf_id, fee_asset?}` and `refusals`. Its answer is `{"result", "start"}`: the
+`balance`, `coins`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
+`board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
+amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
+`mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
+not_before?, max_fee_ppm?, shown}`, `participations`, `sync`, `schedule`,
+`recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
+shown?}` and `refusals`. Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
@@ -80,7 +82,15 @@ node) and the re-check of every coin against the chain (unless the command is
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it
-quotes again, so nothing is signed on a fee the user did not see. `schedule` is
+quotes again, so nothing is signed on a fee the user did not see. A board and
+an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
+amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
+only on it; `exit_quote` is each transaction an exit would broadcast now, with
+its size, its fee and what pays it, their fees by asset (`unroll`) and the
+claim's fee at the floor now, and `exit` with `shown` set to that `unroll`
+broadcasts only on those fees. A quote signs, asks and broadcasts nothing, and a
+`shown` that no longer holds is refused before anything is written or
+broadcast. `schedule` is
 `Wallet::sync_schedule`: when `sync` must run next and why. A page runs `sync`
 when it is due.
 

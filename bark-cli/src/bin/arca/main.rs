@@ -108,6 +108,15 @@ enum Cmd {
 		/// unless named.
 		#[arg(long)]
 		fee_asset: Option<String>,
+		/// Only says what the board would pay now (its fee, its size, the
+		/// coins it spends), signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The fee shown to the user, as `--quote` answered it (its `fee`):
+		/// the board goes ahead only on this very fee, and is refused before
+		/// anything is registered or signed when it changed.
+		#[arg(long)]
+		shown: Option<String>,
 	},
 	/// Where each board stands.
 	Boards,
@@ -191,6 +200,15 @@ enum Cmd {
 		/// The asset to pay fees in where the coin's own reserves cannot.
 		#[arg(long)]
 		fee_asset: Option<String>,
+		/// Only says what this run would broadcast (each transaction's size
+		/// and fee) and the claim's fee now, broadcasting nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The fees shown to the user, as `--quote` answered them (its
+		/// `unroll`): the path is broadcast only on these very fees, and
+		/// nothing is broadcast when they changed.
+		#[arg(long)]
+		shown: Option<String>,
 	},
 	/// An in-tree swap of two assets with another wallet.
 	#[command(subcommand)]
@@ -487,7 +505,12 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Coins => w.coins(),
 		Cmd::Record { leaf_id } => w.record(&leaf_id),
-		Cmd::Board { asset: a, amount, fee_asset } => w.board(asset(&a)?, amount, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Board { asset: a, amount, fee_asset, quote: true, .. } => w.board_quote(asset(&a)?, amount, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Board { asset: a, amount, fee_asset, quote: false, shown } => {
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the fee shown: {}", e)))).transpose()?;
+			w.board_shown(asset(&a)?, amount, fee_asset.as_deref().map(asset).transpose()?, shown.as_ref())
+		},
 		Cmd::Boards => w.boards(),
 		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
@@ -548,7 +571,12 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Sync => w.sync(),
 		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
-		Cmd::Exit { leaf_id, fee_asset } => w.exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Exit { leaf_id, fee_asset, quote: true, .. } => w.exit_quote(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Exit { leaf_id, fee_asset, quote: false, shown } => {
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the fees shown: {}", e)))).transpose()?;
+			w.exit_shown(&leaf_id, fee_asset.as_deref().map(asset).transpose()?, shown.as_ref())
+		},
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
