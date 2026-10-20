@@ -582,7 +582,12 @@ recovered from the server whatever the height. Every other `arca bitcoin
 ARGS…` is Bark's command, run with `--datadir <datadir>/bitcoin`: `board`,
 `send`, `address`, `balance`, `vtxos`, `refresh`, `exit`, `onchain …`,
 `maintain`. Bark wants `maintain` run now and then, which refreshes leaves
-before they expire.
+before they expire. A `board` of an amount outside the bounds the ark's
+server publishes (`ark-info`'s `min_board_amount_sat`, and `max_vtxo_amount`,
+the most a leaf holds) is refused before Bark runs: Bark builds and signs a
+board's funding transaction before it asks the server, and keeps a refused
+one in its on-chain wallet as spent, though it was never broadcast, so the
+next board would spend coins no node knows.
 
 Native BTC goes over Lightning on the Bitcoin side, through Bark's own
 Lightning leg on the Bitcoin ark wallet, never through a Sequentia leaf, and
@@ -875,7 +880,8 @@ side; and an operator that names no Bitcoin ark changes nothing of it.
 on regtest, `contrib/bitcoin-ark-regtest/` (Bark's server at the release the
 wallet bundles, its Lightning gateway with the hold plugin, and a peer node):
 `bitcoin create` from the wallet's own mnemonic, and refused without one or a
-second time; a board; a Lightning payment out, its preimage the payee's; a
+second time; boards under and over the server's bounds refused with nothing
+spent, then a board; a Lightning payment out, its preimage the payee's; a
 payment in, claimed as the payer pays; a claim with no payment `waiting`, then
 claimed; blocks found between a payment's arrival and the claim, counted from
 the held payment's expiry, give `reissued`, the first payment failed back and

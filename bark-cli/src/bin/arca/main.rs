@@ -385,6 +385,7 @@ fn bitcoin(datadir: &Path, args: &[String]) -> Result<Value, bark::arca::Error> 
 			bitcoind_password: std::env::var("ARCA_BITCOIND_PASSWORD").ok(), esplora: c.esplora, birthday_height: c.birthday_height,
 		});
 	}
+	bitcoin::board_guard(datadir, args)?;
 	let status = Command::new(bitcoin::bark_exe()).arg("--datadir").arg(bitcoin::dir(datadir)).args(args).status()
 		.map_err(|e| bark::arca::Error::Io(format!("cannot run Bark ({}): {}", bitcoin::bark_exe().display(), e)))?;
 	std::process::exit(status.code().unwrap_or(1));
