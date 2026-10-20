@@ -127,6 +127,11 @@ pub struct LightningSection {
 	/// How long one payment attempt runs, in seconds.
 	#[serde(default = "default_retry_seconds")]
 	pub retry_seconds: u32,
+	/// The longest stall of the chain a payment out of the tree is safe
+	/// through, in seconds: its lock times end this long, and half the rest,
+	/// before its leaf's timeout. Below `send_timeout_seconds`.
+	#[serde(default = "default_send_stall_margin")]
+	pub send_stall_margin_seconds: u32,
 	/// The time a wallet has to claim a leaf received over Lightning, past
 	/// the leaf's exit delay, once its round is final.
 	#[serde(default = "default_receive_window")]
@@ -146,6 +151,7 @@ impl Default for LightningSection {
 		LightningSection {
 			poll_seconds: default_lightning_poll(), bitcoin: None, operator_delay_units: default_operator_delay(),
 			owner_delay_units: default_owner_delay(), send_timeout_seconds: default_send_timeout(), block_seconds: default_block_seconds(),
+			send_stall_margin_seconds: default_send_stall_margin(),
 			retry_seconds: default_retry_seconds(), receive_window_seconds: default_receive_window(),
 			invoice_expiry_seconds: default_invoice_expiry(), receive_cap_ppm: default_receive_cap_ppm(),
 		}
@@ -162,6 +168,10 @@ fn default_owner_delay() -> u16 {
 
 fn default_send_timeout() -> u32 {
 	86_400
+}
+
+fn default_send_stall_margin() -> u32 {
+	6 * 3600
 }
 
 fn default_block_seconds() -> u32 {
@@ -1076,6 +1086,10 @@ impl Server {
 		if l.operator_delay_units == 0 || l.owner_delay_units <= l.operator_delay_units {
 			return Err(StartError("lightning: operator_delay_units is at least 1 and below owner_delay_units".into()));
 		}
+		if l.send_stall_margin_seconds >= l.send_timeout_seconds.max(60) {
+			return Err(StartError("lightning: send_stall_margin_seconds is below send_timeout_seconds, which leaves a payment's lock \
+				times the rest".into()));
+		}
 		let sends = crate::lightning::send::Sends::new(store.clone(), params.clone(), gateway.clone(), cosigner.clone(),
 			crate::lightning::send::SendConfig {
 				operator_delay: RelativeTime::from_units(l.operator_delay_units).map_err(err("lightning.operator_delay_units"))?,
@@ -1083,6 +1097,7 @@ impl Server {
 				timeout_seconds: l.send_timeout_seconds.max(60),
 				block_seconds: l.block_seconds.max(1),
 				retry_seconds: l.retry_seconds.max(5),
+				stall_margin_seconds: l.send_stall_margin_seconds,
 			});
 		let receives = crate::lightning::receive::Receives::new(store.clone(), params.clone(), gateway.clone(), cosigner.clone(),
 			finality.clone(), wallet.clone(), crate::lightning::receive::ReceiveConfig {

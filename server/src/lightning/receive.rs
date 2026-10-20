@@ -141,6 +141,9 @@ pub enum ReceiveError {
 	Store(#[from] StoreError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	/// The asset's rate is stale: the operator takes no new work in it.
+	#[error(transparent)]
+	Rate(#[from] crate::rates::RateError),
 	/// Beyond the operator's cap on what the leaves of payments held and
 	/// not yet claimed may hold in the asset.
 	#[error("{0}")]
@@ -163,6 +166,7 @@ impl ReceiveError {
 			ReceiveError::Cosign(c) => c.code(),
 			ReceiveError::Store(_) => "internal",
 			ReceiveError::NotSynced => "not_synced",
+			ReceiveError::Rate(_) => "rate_stale",
 			ReceiveError::Cap(_) => "receive_cap",
 		}
 	}
@@ -279,6 +283,10 @@ impl Receives {
 			return Err(ReceiveError::InUse(format!("a payment into the tree under hash {} is asked for already", hex(&req.payment_hash))));
 		}
 		let leg = self.gateway.receiving_leg(&req.asset, p.assets.contains(&req.asset))?;
+		// A payment into the tree is new work in its asset (the operator funds
+		// its leaf from the asset's pool and prices its fee at the asset's
+		// rate): refused while the rate is stale, as a board is.
+		p.fresh_rate(&req.asset)?;
 		if req.owner == p.operator {
 			return Err(ReceiveError::OperatorKey);
 		}

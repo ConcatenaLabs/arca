@@ -66,6 +66,21 @@ pub struct SendConfig {
 	pub block_seconds: u32,
 	/// How long one payment attempt runs.
 	pub retry_seconds: u32,
+	/// The longest stall of the chain a payment is safe through, in seconds.
+	pub stall_margin_seconds: u32,
+}
+
+/// The most blocks a payment's lock times may add up to when its leaf times
+/// out at `t` (a median time) and the chain's median time is `now`: the time
+/// left less `margin`, halved, in blocks of `block` seconds. The leaf times
+/// out in median time and the lock times count blocks, which a stall
+/// separates: while no block comes neither moves, and the first blocks after
+/// it carry the clock, so the median time leaps the whole stall in a few
+/// blocks. With the bound, the payment resolves before the leaf's timeout
+/// through a stall of up to `margin`, the chain running at half its pace
+/// besides.
+pub fn lock_bound(t: u32, now: u32, block: u32, margin: u32) -> u32 {
+	t.saturating_sub(now).saturating_sub(margin) / 2 / block.max(1)
 }
 
 /// A request to pay `invoice` with `transfer`, whose outputs make the
@@ -293,7 +308,7 @@ impl Sends {
 				if t < lo || t > hi {
 					return Err(SendError::Htlc(format!("the htlc-1 leaf's timeout {} is not between {} and {} (median times)", t, lo, hi)));
 				}
-				let room = self.max_delay(t, now);
+				let room = lock_bound(t, now, self.config.block_seconds, self.config.stall_margin_seconds);
 				if inv.min_final_cltv > room as u64 {
 					return Err(SendError::Invoice(format!("the invoice takes a final lock time of {} blocks; a payment whose leaf times out at \
 						{} locks for at most {} blocks", inv.min_final_cltv, t, room)));
@@ -377,15 +392,6 @@ impl Sends {
 		let asset = AssetId::from_byte_array(row.asset);
 		let leg = self.gateway.leg(&asset, true).map_err(|e| e.to_string())?;
 		let hash = row.payment_hash;
-		match self.on_node(&leg, &hash).await.map_err(|e| e.to_string())? {
-			NodeView::Complete(pre) => return self.decide(&hash, Some(&pre), None).await,
-			NodeView::Pending => return Ok(()),
-			// A `pay` an earlier run started may still try another route
-			// until its time runs out: failed only once it has.
-			NodeView::Failed(started) if unix_now() < started + self.config.retry_seconds as u64 + 120 => return Ok(()),
-			NodeView::Failed(_) => return self.decide(&hash, None, Some("the node failed every part of the payment")).await,
-			NodeView::Never => {},
-		}
 		// The leaf's timeout bounds the payment's lock times: it resolves,
 		// one way or the other, well before the owner's refund could open.
 		let t = self.store.leaf(&row.htlc_leaf_id).await.map_err(|e| e.to_string())?
@@ -393,7 +399,24 @@ impl Sends {
 			.and_then(|r| match r { arca_covenant::CoinRecord::Transfer(t) => t.leaf.htlc.map(|h| h.timeout.to_consensus_u32()), _ => None })
 			.ok_or("the htlc-1 coin of the payment is not known")?;
 		let now = self.now().await.map_err(|e| e.to_string())?.to_consensus_u32();
-		let maxdelay = self.max_delay(t, now).max(1);
+		// Within the stall margin of the leaf's timeout the payment is decided
+		// as soon as the node can say: claimed with the preimage at once, or
+		// failed without waiting for an earlier `pay` to try another route,
+		// so the leaf goes back to its owner, or is the operator's, before the
+		// owner's refund could open.
+		let near = now.saturating_add(self.config.stall_margin_seconds) >= t;
+		match self.on_node(&leg, &hash).await.map_err(|e| e.to_string())? {
+			NodeView::Complete(pre) => return self.decide(&hash, Some(&pre), None).await,
+			NodeView::Pending => return Ok(()),
+			// A `pay` an earlier run started may still try another route
+			// until its time runs out: failed only once it has.
+			NodeView::Failed(started) if !near && unix_now() < started + self.config.retry_seconds as u64 + 120 => return Ok(()),
+			NodeView::Failed(_) => return self.decide(&hash, None, Some("the node failed every part of the payment")).await,
+			NodeView::Never if near => return self.decide(&hash, None, Some("the leaf's timeout is within the operator's stall margin: \
+				the payment is not started")).await,
+			NodeView::Never => {},
+		}
+		let maxdelay = lock_bound(t, now, self.config.block_seconds, self.config.stall_margin_seconds).max(1);
 		let params = json!({
 			"bolt11": row.invoice,
 			"maxfee": row.fee.saturating_mul(1000),
@@ -421,14 +444,6 @@ impl Sends {
 				}
 			},
 		}
-	}
-
-	/// The most blocks a payment's lock times may add up to when its leaf
-	/// times out at `t` and the chain's median time is `now`: half the time
-	/// left, in blocks at the chain's interval, so that the payment resolves
-	/// well before the owner's refund could open, at half the chain's pace.
-	fn max_delay(&self, t: u32, now: u32) -> u32 {
-		t.saturating_sub(now) / 2 / self.config.block_seconds.max(1)
 	}
 
 	async fn decide(&self, hash: &[u8; 32], preimage: Option<&[u8; 32]>, reason: Option<&str>) -> Result<(), String> {
@@ -472,4 +487,31 @@ pub fn payment_json(r: &SendRow) -> Value {
 		v["reason"] = json!(why);
 	}
 	v
+}
+
+#[cfg(test)]
+mod test {
+	use super::lock_bound;
+
+	/// R7j F7, read from the bound alone: a payment whose lock times add up
+	/// to the bound resolves before its leaf's timeout through a stall of up
+	/// to the margin, the chain at half its pace besides; without the
+	/// margin, the same stall takes it past the timeout.
+	#[test]
+	fn a_payments_lock_bound_keeps_a_margin_for_a_stall() {
+		let (block, margin) = (60u32, 6 * 3600u32);
+		let now = 1_800_000_000u32;
+		for timeout in [86_400 + 600, 2 * 86_400, 8 * 3600 + 600] {
+			let t = now + timeout;
+			let blocks = lock_bound(t, now, block, margin) as u64;
+			// The last block of the lock comes after a stall of `margin` and
+			// every block at twice the published interval.
+			let resolved = now as u64 + margin as u64 + blocks * 2 * block as u64;
+			println!("timeout {} s: {} blocks; resolved by {} at the latest, the leaf times out at {}", timeout, blocks, resolved, t);
+			assert!(resolved <= t as u64, "a stall of {} s takes a payment of {} blocks past the timeout", margin, blocks);
+			let unguarded = lock_bound(t, now, block, 0) as u64;
+			assert!(now as u64 + margin as u64 + unguarded * 2 * block as u64 > t as u64, "without the margin the stall breaks it");
+		}
+		assert_eq!(lock_bound(now + 100, now, block, margin), 0, "no room left: no lock time");
+	}
 }

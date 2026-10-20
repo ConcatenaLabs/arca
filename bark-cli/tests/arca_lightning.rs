@@ -57,6 +57,7 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 		// SeqLN's final lock time on a Sequentia network is 180 blocks:
 		// eight hours leave a payment 240.
 		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
 		c.lightning.receive_window_seconds = 600;
@@ -263,6 +264,7 @@ async fn short_delays() -> Running {
 		c.lightning.operator_delay_units = 1;
 		c.lightning.owner_delay_units = 2;
 		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
 		c.lightning.receive_window_seconds = 600;
@@ -790,6 +792,7 @@ async fn d64_unclaimed_receives_are_capped_and_a_refresh_runs() {
 		c.lightning.operator_delay_units = 1;
 		c.lightning.owner_delay_units = 2;
 		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
 		c.lightning.receive_window_seconds = 600;
