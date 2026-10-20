@@ -53,6 +53,17 @@ impl Running {
 		Running::start_at(rt, tune).await
 	}
 
+	/// [`Running::start_with`] on an anchored chain without proof of stake
+	/// ([`node::start_plain`]), its finality the anchor alone, for a test
+	/// that forces a transaction into a block with `generateblock`.
+	pub async fn start_plain<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {
+		let rt = tokio::task::block_in_place(|| node::start_plain(&[]));
+		Running::start_at(rt, |c, y| {
+			c.finality.certification = "none".into();
+			tune(c, y);
+		}).await
+	}
+
 	/// [`Running::start_with`] on the chain SeqLN's `sequentia-regtest`
 	/// network assumes, for tests with Lightning nodes.
 	pub async fn start_seqln<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {

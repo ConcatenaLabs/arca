@@ -192,11 +192,14 @@ async fn a_take_is_checked_against_the_chain_and_its_terms() {
 	let (body2, _) = take_body(&[&c2], order, &terms, 600_000, filled, &leaf_of("t2 new", filled), (y, fee), s, chain);
 	refused(&r, "the order taken by a second taker meanwhile", &body2, "order_taken", "is taken by participation");
 
-	// A round of X does not take a take into a refresh, and does not void it
-	// as one carrying two assets.
+	// The runner takes a take into no refresh round, and does not void it as
+	// one carrying two assets: it builds a round of its own that fills the
+	// order.
 	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
-	assert!(built.is_empty() && failed.is_empty(), "{:?} {:?}", built.len(), failed);
-	assert_eq!(status(&r, &id1)["state"], "pending");
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(built.len(), 1);
+	assert_eq!((built[0].fills.clone(), built[0].participations), (vec![order], 1));
+	assert_eq!(status(&r, &id1)["state"], "issued");
 
 	// An order its maker can refund within six hours: 300 blocks at 60 s.
 	let soon = order_terms(&r, height(&r) + 300, "maker of a short order");

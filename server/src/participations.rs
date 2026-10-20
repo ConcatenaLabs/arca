@@ -399,6 +399,9 @@ pub struct RoundRef {
 	pub txid: elements::Txid,
 	/// The round's connector output, whose asset every forfeit names.
 	pub connector_vout: u32,
+	/// For a round that fills on-chain orders and is not broadcast yet, the
+	/// transaction without its witnesses.
+	pub unbroadcast: Option<elements::Transaction>,
 }
 
 /// Where one output wanted stands in the participation's round.
@@ -420,6 +423,9 @@ pub struct Status {
 	pub round: Option<RoundRef>,
 	/// For each output wanted, in order.
 	pub placed: Vec<Placed>,
+	/// For a take in a round: the input its order is at, `k`, credited at
+	/// `2k` and resting again, or holding another asset, at `2k+1`.
+	pub fill_at: Option<u32>,
 }
 
 /// See the [module documentation](self).
@@ -1029,11 +1035,24 @@ impl Participations {
 						p.offboard_vout = Some(vout);
 					}
 				}
-				Some(RoundRef { txid: elements::Txid::from_byte_array(r.txid), connector_vout: r.connector_vout })
+				let unbroadcast = if r.state == crate::store::RoundState::Built && !self.store.round_fills(round_id).await?.is_empty() {
+					let mut tx: elements::Transaction = elements::encode::deserialize(&r.tx).map_err(|e| ParticipationError::Internal(e.to_string()))?;
+					for i in &mut tx.input {
+						i.witness = Default::default();
+					}
+					Some(tx)
+				} else {
+					None
+				};
+				Some(RoundRef { txid: elements::Txid::from_byte_array(r.txid), connector_vout: r.connector_vout, unbroadcast })
 			},
 			None => None,
 		};
-		Ok(Status { row, round, placed })
+		let fill_at = match (&row.fill, row.round_id) {
+			(Some(_), Some(round_id)) => self.store.fill_in_round(id, row.attempt).await?.filter(|(r, _)| *r == round_id).map(|(_, k)| k),
+			_ => None,
+		};
+		Ok(Status { row, round, placed, fill_at })
 	}
 }
 

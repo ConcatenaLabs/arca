@@ -507,8 +507,10 @@ impl Store {
 	pub async fn unsigned_forfeits(&self) -> Result<Vec<ForfeitRow>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT leaf_id, owner_sig, refund_delay_units, margin, unlock_hash, connector_asset, round_id, participation_id, attempt
-			 FROM forfeit WHERE operator_sig IS NULL ORDER BY created_at, leaf_id",
+			"SELECT f.leaf_id, f.owner_sig, f.refund_delay_units, f.margin, f.unlock_hash, f.connector_asset, f.round_id, f.participation_id,
+			        f.attempt
+			 FROM forfeit f JOIN round r ON r.round_id = f.round_id
+			 WHERE f.operator_sig IS NULL AND r.state <> 'built' ORDER BY f.created_at, f.leaf_id",
 			&[],
 		).await?;
 		rows.iter().map(|r| {
@@ -689,6 +691,29 @@ impl Store {
 	/// lock orders this against [`Store::insert_watcher_tx`]: a forfeit naming
 	/// the round is logged before it is lost, or never. Returns the
 	/// participations that run again.
+	/// Drops the round `round_id`, built and never broadcast, whole or not
+	/// at all: a round that fills on-chain orders whose takes did not all
+	/// hand over their forfeits in time. Every forfeit recorded for it (each
+	/// an owner's half only: the signer is asked for nothing before a round
+	/// is broadcast) is deleted, and the round retired as
+	/// [`Store::retire_round`] retires one, its participations running again.
+	/// Returns them; `None` when the round is not built.
+	pub async fn drop_unbroadcast_round(&self, round_id: i64) -> Result<Option<Vec<[u8; 32]>>, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let built = t.query_opt("SELECT 1 FROM round WHERE round_id = $1 AND state = 'built' FOR UPDATE", &[&round_id]).await?;
+		if built.is_none() {
+			return Ok(None);
+		}
+		if t.query_opt("SELECT 1 FROM forfeit WHERE round_id = $1 AND operator_sig IS NOT NULL", &[&round_id]).await?.is_some() {
+			return Err(StoreError::Corrupt(format!("round {} is built and unbroadcast, and a forfeit for it is whole", round_id)));
+		}
+		t.execute("DELETE FROM forfeit WHERE round_id = $1", &[&round_id]).await?;
+		let again = retire_in(&t, round_id, &std::collections::HashSet::new()).await?.unwrap_or_default();
+		t.commit().await?;
+		Ok(Some(again))
+	}
+
 	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;

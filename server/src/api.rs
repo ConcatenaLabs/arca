@@ -85,6 +85,11 @@ pub struct FillsInfo {
 	/// The seconds a block is counted at for an order whose REFUND is locked
 	/// to a height.
 	pub block_seconds: u32,
+	/// A round that fills orders goes out once every take in it has handed
+	/// over its forfeits; one whose forfeits do not come within this many
+	/// seconds of the round being built (by the chain's median time) is
+	/// voided, and the round is built again without it.
+	pub forfeit_window_seconds: u32,
 }
 
 /// An asset's Lightning leg: the operator's SeqLN node in that asset.
@@ -1068,6 +1073,15 @@ pub struct FillStatus {
 	pub maker_script: String,
 	/// The order's scriptPubKey.
 	pub script: String,
+	/// Once in a round: the order's input `k`, the maker's credit at `2k`,
+	/// and at `2k+1` the order resting again, or, filled whole, an output of
+	/// another asset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub input: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub credit_vout: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub remainder_vout: Option<u32>,
 }
 
 /// `POST /v1/participation_status`.
@@ -1116,6 +1130,12 @@ pub struct RoundRef {
 	pub txid: String,
 	/// The round's connector output, whose asset every forfeit of the round names.
 	pub connector_vout: u32,
+	/// For a round that fills on-chain orders and is not broadcast yet: the
+	/// transaction without its witnesses (its txid the round's), which a
+	/// take validates its new leaf against before it hands over its forfeits;
+	/// nobody but the operator can broadcast it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tx: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1419,7 +1439,10 @@ pub struct UnrollAuth {
 pub struct Forfeited {
 	pub participation_id: String,
 	pub state: String,
-	pub preimage: String,
+	/// Absent for a take whose forfeits came before its round was
+	/// broadcast: it goes out once the round is final.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
 }
 
 /// `POST /v1/release_leaves`: the owner's release of the lowest node of each

@@ -112,12 +112,24 @@ pub struct FillsSection {
 	/// to a height: 60 when absent.
 	#[serde(default = "default_order_block")]
 	pub block_seconds: u32,
+	/// How long a round that fills orders waits, from when it was built, for
+	/// every take in it to hand over its forfeits before it is broadcast:
+	/// 600 (ten minutes) when absent.
+	#[serde(default = "default_fill_forfeit_window")]
+	pub forfeit_window_seconds: u32,
 }
 
 impl Default for FillsSection {
 	fn default() -> FillsSection {
-		FillsSection { order_margin_seconds: default_order_margin(), block_seconds: default_order_block() }
+		FillsSection {
+			order_margin_seconds: default_order_margin(), block_seconds: default_order_block(),
+			forfeit_window_seconds: default_fill_forfeit_window(),
+		}
 	}
+}
+
+fn default_fill_forfeit_window() -> u32 {
+	crate::params::FILL_FORFEIT_WINDOW_SECONDS
 }
 
 fn default_order_margin() -> u32 {
@@ -1056,6 +1068,7 @@ impl Server {
 		}
 		params.order_margin_seconds = config.fills.order_margin_seconds;
 		params.order_block_seconds = config.fills.block_seconds;
+		params.fill_forfeit_window_seconds = config.fills.forfeit_window_seconds;
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;

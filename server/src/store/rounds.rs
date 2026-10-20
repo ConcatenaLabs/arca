@@ -169,6 +169,17 @@ pub struct NewRound {
 	/// Each lost round whose participations it runs again, and the coin it
 	/// spends that keeps the two apart.
 	pub reruns: Vec<NewRerun>,
+	/// Each on-chain order it fills, at its input.
+	pub fills: Vec<NewRoundFill>,
+}
+
+/// An on-chain order a round fills: the covenant at input `k`, for the take
+/// `participation_id` at `attempt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewRoundFill {
+	pub k: u32,
+	pub participation_id: [u8; 32],
+	pub attempt: u32,
 }
 
 /// A lost round a round runs participations of again, and the coin of the
@@ -359,8 +370,35 @@ impl Store {
 				&[&round_id, &x.replaces, &&x.tie.0[..], &(x.tie.1 as i32), &x.via.map(|v| v.to_vec())],
 			).await?;
 		}
+		for f in &r.fills {
+			t.execute(
+				"INSERT INTO round_fill (round_id, k, participation_id, attempt) VALUES ($1, $2, $3, $4)",
+				&[&round_id, &(f.k as i32), &&f.participation_id[..], &(f.attempt as i32)],
+			).await?;
+		}
 		t.commit().await?;
 		Ok(round_id)
+	}
+
+	/// Where the take `id` fills its order in a round, at `attempt`: the
+	/// round and the covenant's input `k`.
+	pub async fn fill_in_round(&self, id: &[u8; 32], attempt: u32) -> Result<Option<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT round_id, k FROM round_fill WHERE participation_id = $1 AND attempt = $2 ORDER BY round_id DESC LIMIT 1",
+			&[&&id[..], &(attempt as i32)]).await?;
+		Ok(r.map(|r| (r.get(0), r.get::<_, i32>(1) as u32)))
+	}
+
+	/// Every order the round `round_id` fills: each covenant's input and the
+	/// take it fills, in input order.
+	pub async fn round_fills(&self, round_id: i64) -> Result<Vec<NewRoundFill>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT k, participation_id, attempt FROM round_fill WHERE round_id = $1 ORDER BY k", &[&round_id]).await?;
+		rows.iter().map(|r| Ok(NewRoundFill {
+			k: r.get::<_, i32>(0) as u32,
+			participation_id: array32(r.get(1), "participation id")?,
+			attempt: r.get::<_, i32>(2) as u32,
+		})).collect()
 	}
 
 	/// The lost rounds round `round_id` runs participations of again, each
