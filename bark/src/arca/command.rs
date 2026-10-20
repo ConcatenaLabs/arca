@@ -28,7 +28,8 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
-	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}";
+	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
+	by the name an order's side goes by)";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -177,8 +178,8 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"refusals" => w.refusals(),
 		// The order as the relay serves it: its JSON, as text or as an
 		// object.
-		"take_quote" => w.take_quote(&order(a)?, opt_u64(&a["amount"], "the amount")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
-		"take" => {
+		"take_quote" | "order_fill_quote" => w.take_quote(&order(a)?, opt_u64(&a["amount"], "the amount")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"take" | "order_fill" => {
 			// With `shown`, the take goes ahead only on the fill, price and
 			// fee the program showed (a `take_quote`'s).
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
