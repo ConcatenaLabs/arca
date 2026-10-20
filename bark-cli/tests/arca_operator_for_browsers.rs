@@ -16,17 +16,21 @@
 //! with `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` as for the
 //! scenarios (`tests/common/mod.rs`). It writes nothing a browser must read:
 //! `GET /state` on the control address answers with the server's URL, the
-//! node's RPC URL and credentials, and the two assets. The control address
+//! node's RPC URL and credentials, the two assets, the chain's genesis hash,
+//! and the file of the test operator key (for `arca-signer
+//! --sign-operator-record`). The control address
 //! takes, each a `POST` whose body is a JSON object:
 //!
 //! | Path | Does |
 //! |---|---|
 //! | `/fund {script, asset, amount}` | Pays `amount` of `asset` to the script (hex) from the test's coins, broadcast |
+//! | `/fund_server {asset, amount}` | Pays `amount` of `asset` to the operator's own wallet, which funds its rounds, from the test's coins, broadcast |
 //! | `/produce` | Produces one block |
 //! | `/bury` | Buries the chain two Bitcoin blocks deep and waits for the server to follow |
 //! | `/round` | Builds a round of whatever participations stand, mines it, buries it and waits for it to be final; its txid, or `null` when none stood |
 //! | `/advance {seconds}` | Moves the chain's median time at least that far on |
 //! | `/rpc {method, params}` | One call to the node, its result |
+//! | `/fees {asset, refresh_ppm}` | Sets the asset's refresh fee and reloads the server's configuration, as an operator's SIGHUP does |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
 
 mod common;
@@ -95,13 +99,28 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 		"/state" => Ok(json!({
 			"server": r.url(), "node_url": r.node_url(), "node_user": "arca", "node_password": "arca",
 			"x": r.x.to_string(), "y": r.y.to_string(),
+			// The test operator key's file, for `arca-signer --key-file …
+			// --sign-operator-record`, and the chain it signs for.
+			"signer_key_file": r.signer.dir.join("operator.key").display().to_string(),
+			"genesis_hash": r.rt.client().call::<String>("getblockhash", &[json!(0)]).map_err(|e| e.to_string())?,
 			"tip": r.rt.client().blockchain_info().map_err(|e| e.to_string())?.blocks,
 		})),
 		"/fund" => {
 			let s = script(b["script"].as_str().ok_or("no script")?)?;
+			// The purse pays whatever it is given: an empty script or more than
+			// it holds would end the test, and the chain with it.
+			if s.is_empty() {
+				return Err("an empty script".into());
+			}
 			let asset = AssetId::from_str(b["asset"].as_str().ok_or("no asset")?).map_err(|e| e.to_string())?;
 			let amount = b["amount"].as_u64().or_else(|| b["amount"].as_str().and_then(|a| a.parse().ok())).ok_or("no amount")?;
 			let tx = r.pay_to(s, asset, amount);
+			Ok(json!({"txid": tx.txid().to_string()}))
+		},
+		"/fund_server" => {
+			let asset = AssetId::from_str(b["asset"].as_str().ok_or("no asset")?).map_err(|e| e.to_string())?;
+			let amount = b["amount"].as_u64().ok_or("no amount")?;
+			let tx = r.fund_server(asset, amount).await;
 			Ok(json!({"txid": tx.txid().to_string()}))
 		},
 		"/produce" => {
@@ -133,6 +152,16 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 			let method = b["method"].as_str().ok_or("no method")?;
 			let params: Vec<Value> = b["params"].as_array().cloned().unwrap_or_default();
 			r.rt.client().call::<Value>(method, &params).map_err(|e| e.to_string())
+		},
+		"/fees" => {
+			let asset = b["asset"].as_str().ok_or("no asset")?;
+			let ppm = b["refresh_ppm"].as_u64().ok_or("no refresh_ppm")?;
+			let mut config = r.config.clone();
+			let a = config.assets.iter_mut().find(|a| a.asset == asset).ok_or("the server does not serve that asset")?;
+			a.refresh_ppm = Some(ppm);
+			let reloaded = r.server.reload(&config).await.map_err(|e| e.to_string())?;
+			r.config = config;
+			Ok(json!({"changed": reloaded.changed.iter().map(|a| a.to_string()).collect::<Vec<_>>()}))
 		},
 		other => Err(format!("no path {}", other)),
 	}

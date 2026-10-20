@@ -187,7 +187,9 @@ impl Running {
 		format!("http://127.0.0.1:{}/", self.rt.node.rpc_port())
 	}
 
-	async fn fund_server(&mut self, asset: AssetId, amount: u64) -> Transaction {
+	/// Pays `amount` of `asset` to the operator's on-chain wallet from the
+	/// purse, broadcast: what the operator funds its rounds from.
+	pub async fn fund_server(&mut self, asset: AssetId, amount: u64) -> Transaction {
 		let to = self.server.wallet.receive_script().await.unwrap();
 		tokio::task::block_in_place(|| self.purse.pay(&self.rt, vec![explicit_txout(AssetAmount::new(asset, amount), to)]))
 	}

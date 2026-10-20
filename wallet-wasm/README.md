@@ -79,6 +79,17 @@ if (!arcaWalletExists(mnemonic)) {
   }))
 }
 const w = ArcaWallet.open(mnemonic, nodePassword)
+```
+
+In place of `server`, `from_registry: '<operator key>', registry:
+'https://host/registry'` joins the operator the Sequentia registry lists
+under that key: the library reads its record, checks the operator's
+signature over it, takes the server's address from it, and creates the
+wallet only when that server shows the record's operator key, chain and
+keepers (`bark::arca::registry`). The registry must be reachable through the
+page's transport, as the server and node are.
+
+```js
 const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amount: '2000000' })))
 ```
 

@@ -175,6 +175,10 @@ pub enum Template {
 }
 
 impl Template {
+	/// Every template this crate knows, in the order of their ids: the
+	/// operator's published list (`info.templates`).
+	pub const ALL: [Template; 3] = [Template::Vtxo1, Template::Board1, Template::Htlc1];
+
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
 	/// The template id of `board`.

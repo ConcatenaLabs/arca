@@ -215,6 +215,36 @@ participation's leaf, offboard or fee in it. Adding an asset takes its entry
 in the configuration and coins of it paid to the operator's wallet, and no
 restart: `arcad` takes the assets anew on SIGHUP (see Running).
 
+### Listing the operator in the registry
+
+Wallets find an operator in the Sequentia registry
+([sequentia-registry](https://github.com/ConcatenaLabs/sequentia-registry),
+its operator records): a record of the operator key, the chain's genesis, the
+API's public address, the assets served with their rate sources and fee
+schedules, the keepers, the exit delays and expiry, the template list and a
+contact, signed with `S`. The registry lists it only when the signature
+verifies and the server's `GET info` says what the record says, and checks it
+again on a schedule: a record whose server says something else is marked
+`mismatched`, so a changed fee schedule, an asset added or a keeper set
+changed takes a new record. A wallet checks the signature itself
+(`arca operators`, `arca join --from-registry`).
+
+The record is written from the server's own `info` by the registry's
+`tools/operator-record.js`, and signed by the signer, which holds `S`, on its
+machine:
+
+    node tools/operator-record.js --info http://127.0.0.1:3535 --api https://example.org/arca \
+      --contact-name "Example" --contact-domain example.org > record.json
+    arca-signer --key-file /etc/arca/operator.key --genesis <genesis> --sign-operator-record record.json > signed.json
+    curl -s -X POST -H 'content-type: application/json' --data @signed.json https://<registry>/operators
+
+`--sign-operator-record` reads the key file and the record and nothing else,
+so it runs beside a signer that is serving. It signs only a record that names
+`S` and the chain of `--genesis`, under the record's own tag
+(`sequentia-registry/arca-operator/v1`, `arca_covenant::operator_record`),
+which nothing else `S` signs uses: the signature vouches for that record and
+can be taken for no spend, head or witness.
+
 ### Exchange rates
 
 The operator's exchange rate for an asset comes from a source it names for
@@ -1023,7 +1053,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version, the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
