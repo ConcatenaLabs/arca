@@ -1135,6 +1135,9 @@ impl Wallet {
 					break;
 				}
 				pages += 1;
+				// D67: an exit step whose date comes while the operator serves
+				// page after page is taken at once.
+				self.exits_meanwhile();
 				let v = self.server.mailbox_read(&key, &self.genesis, after, 100)?;
 				let msgs = v["messages"].as_array().cloned().unwrap_or_default();
 				if msgs.is_empty() {

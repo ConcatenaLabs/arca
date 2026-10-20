@@ -87,11 +87,14 @@ pub struct ReceiveConfig {
 
 impl ReceiveConfig {
 	/// The blocks the held payment must stay locked for a leaf of exit delay
-	/// `exit`: twice its exit delay and the window, in blocks, so that the
-	/// leaf's timeout, half that time, leaves both.
+	/// `exit`: twice the leaf's lock, in blocks, so that the leaf's timeout,
+	/// half that time, leaves the lock. The lock is eight sevenths of the
+	/// exit delay and the window: the wallet keeps an eighth of the leaf's
+	/// lock in hand before its timeout (the claim's margin, D67), so the
+	/// window is still the wallet's to claim the leaf in.
 	pub fn needed_blocks(&self, exit: RelativeTime) -> u32 {
-		let seconds = exit.seconds() + self.window_seconds as u64;
-		(2 * seconds).div_ceil(self.block_seconds.max(1) as u64).min(u32::MAX as u64) as u32
+		let lock = ((exit.seconds() + self.window_seconds as u64) * 8).div_ceil(7);
+		(2 * lock).div_ceil(self.block_seconds.max(1) as u64).min(u32::MAX as u64) as u32
 	}
 }
 

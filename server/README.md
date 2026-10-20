@@ -404,9 +404,12 @@ expiry `invoice_expiry_seconds`, the payment secret, route hints and
 features, as the node makes any invoice), deletes it unpaid, swaps the
 wallet's hash into it, and has the node sign the result (`signinvoice`). It
 registers the hash with the node's hold-invoice plugin and answers the
-invoice. The invoice's final lock time is twice the leaf's exit delay and
-`receive_window_seconds`, in blocks at `block_seconds`: with a 36-hour exit
-delay and the default window, about 5,060 blocks. SeqLN accepts lock times
+invoice. The invoice's final lock time is twice the leaf's lock, in blocks at
+`block_seconds`; the lock is eight sevenths of the leaf's exit delay and
+`receive_window_seconds`, since the wallet keeps an eighth of the lock in
+hand before the leaf's timeout (the claim's margin) and the window stays
+the wallet's to claim the leaf in: with a 36-hour exit delay and the default
+window, 48 hours, about 5,770 blocks. SeqLN accepts lock times
 up to 20,160 blocks on a Sequentia network, but its `pay` adds up to 2,016
 unless the payer raises it (`maxdelay`), so a payer's node needs `maxdelay`
 at least the invoice's final lock time and the route's. A payment from
@@ -423,8 +426,8 @@ exit delay has run; the operator refunds it once its timeout has passed and
 then `operator_delay_units`), funded by the operator's pool against the
 payment its node holds. The leaf's timeout is half the time the held parts
 are locked for, at the published block interval, so the payment outlives
-any claim the owner can make: its exit delay and the window lie before the
-timeout. A payment locked for less is failed back. The wallet completes the
+any claim the owner can make: its exit delay, the window and the wallet's
+margin lie before the timeout. A payment locked for less is failed back. The wallet completes the
 participation as any other (`forfeit_leaves` with no forfeit and its unroll
 authorisations for the leaf) and receives the leaf's record and its
 entry's preimage.
@@ -436,7 +439,17 @@ is the owner's (its participation released) and that the time to claim is
 not over, records the preimage, has its node settle the payment with it,
 and co-signs the transfer; no spend of a received leaf is co-signed
 otherwise (`htlc`). The payment is never settled before the wallet holds its
-leaf. A wallet that takes the leaf home on the chain claims it there with
+leaf. The wallet hands the preimage over only while it could still take the
+leaf home by its claim a margin before the timeout (the larger of three
+blocks and an eighth of the leaf's lock, from its round's confirmation to
+its timeout); once it has, a claim this server does not co-sign leaves the
+leaf a home date at which the wallet takes it home on the chain, and the
+wallet takes that step, and every other exit step whose date has come,
+before it asks the server anything in a `sync`, and again whenever one
+comes while it asks. Its schedule names those dates on their own
+(`next_exit_at`), for a sync that asks the server nothing (`sync
+--exits-only`): an operator that answers slowly holds back no claim. A
+wallet that takes the leaf home on the chain claims it there with
 the preimage; the server watches each output of a received leaf seen on the
 chain, reads the preimage from its claim (looking for a spend made before
 the output was watched on the chain itself) and settles the payment the same

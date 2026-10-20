@@ -271,6 +271,18 @@ impl ChainSource {
 		Ok(Some((floor * 100_000_000).div_ceil(rate).max(1).min(u64::MAX as u128) as u64))
 	}
 
+	/// The fee `txid` pays as the node valued it when its mempool took it, in
+	/// atoms of the node's reference unit (`getmempoolentry`'s `fees.base`);
+	/// `None` when it is not in the mempool. A replacement outbids it on
+	/// that value, whatever the fee asset's rate is now.
+	pub fn mempool_fee_value(&self, txid: &Txid) -> Result<Option<u64>, Error> {
+		match self.client.call::<Value>("getmempoolentry", &[json!(txid.to_string())]) {
+			Ok(v) => Ok(v["fees"]["base"].as_f64().map(|f| (f * 100_000_000.0).round().max(0.0) as u64)),
+			Err(e) if not_found(&e) => Ok(None),
+			Err(e) => Err(node(e)),
+		}
+	}
+
 	/// Whether `outpoint` is unspent, the mempool's spends included.
 	pub fn unspent(&self, outpoint: &OutPoint) -> Result<bool, Error> {
 		let v: Value = self.client.call("gettxout", &[json!(outpoint.txid.to_string()), json!(outpoint.vout), json!(true)])
