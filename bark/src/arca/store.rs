@@ -372,11 +372,19 @@ impl Store {
 	/// marked bound; one kept before wallets named the key is not, and
 	/// `sync` binds it ([`Store::unbound_coins`]).
 	pub fn put_coin(&self, c: &CoinRow) -> Result<(), Error> {
+		self.put_coin_bound(c, true)
+	}
+
+	/// Keeps coin `c`, marked bound to the wallet's mailbox key only when the
+	/// act that made it named the key (`bound`): one that did not (a leaf
+	/// received over Lightning asked for before receives named the key) is
+	/// bound by the next `sync`.
+	pub fn put_coin_bound(&self, c: &CoinRow, bound: bool) -> Result<(), Error> {
 		self.conn.execute(
 			"INSERT INTO coin (leaf_id, owner_nonce, kind, asset, value, record, salt, state, note, expiry, bases, spent_by, created_at, bound)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
 			params![c.leaf_id, &c.owner_nonce[..], c.kind, c.asset, c.value as i64, c.record, &c.salt[..], c.state, c.note,
-				c.expiry as i64, serde_json::to_string(&c.bases).expect("strings"), c.spent_by, now()],
+				c.expiry as i64, serde_json::to_string(&c.bases).expect("strings"), c.spent_by, now(), if bound { Some(1i64) } else { None }],
 		).map_err(|e| Error::Store(format!("cannot keep coin {}: {}", c.leaf_id, e)))?;
 		Ok(())
 	}

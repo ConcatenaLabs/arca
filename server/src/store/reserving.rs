@@ -84,8 +84,9 @@ pub struct ServedLeaf {
 
 impl Store {
 	/// Binds the leaf of `owner` to `mailbox`, the owner key's `proof`
-	/// checked by the caller: kept only for a key that owns a leaf or is
-	/// wanted by a participation, so a stranger writes no row. A key bound
+	/// checked by the caller: kept only for a key that owns a leaf, is
+	/// wanted by a participation, or is asked for by a payment into the tree,
+	/// so a stranger writes no row. A key bound
 	/// before keeps its binding. Returns the mailbox the key is bound to, or
 	/// `None` for a key the server knows no leaf of.
 	pub async fn bind_mailbox(&self, owner: &[u8; 32], mailbox: &[u8; 32], proof: &[u8; 64]) -> Result<Option<[u8; 32]>, StoreError> {
@@ -94,6 +95,7 @@ impl Store {
 			"INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof)
 			 SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM leaf WHERE owner_key = $1)
 			     OR EXISTS (SELECT 1 FROM participation_output WHERE owner_key = $1 AND kind = 'leaf')
+			     OR EXISTS (SELECT 1 FROM lightning_receive WHERE owner_key = $1)
 			 ON CONFLICT (owner_key) DO NOTHING",
 			&[&&owner[..], &&mailbox[..], &&proof[..]],
 		).await?;

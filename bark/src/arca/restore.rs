@@ -154,6 +154,15 @@ impl Wallet {
 			notes.extend(self.restore_given(id, &t.entry, &t.coin, now)?);
 		}
 
+		// A leaf that went over Lightning and is not given up on its owner's
+		// signature: as the payment stands.
+		for (id, t) in &taken {
+			let Some(h) = t.coin.leaf.htlc else { continue };
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				notes.push(self.restore_htlc(id, &t.coin, h, &info, now)?);
+			}
+		}
+
 		// What the wallet's own records say, whatever the server says of the
 		// coins they rest on: every coin a held coin's record spends was
 		// spent by the transfer that made it, which the operator co-signed.
@@ -421,6 +430,87 @@ impl Wallet {
 			let _ = self.witness_record(&e["batch"]["signer_record"], false);
 		}
 		Ok(Some((state.to_string(), coin)))
+	}
+
+	/// D63: the `htlc-1` coin `id` (`coin`, of terms `h`), restored live, as its
+	/// payment stands. A payment out of the tree the operator reports paid,
+	/// with a preimage that opens the leaf's hash, is the operator's: the
+	/// coin is spent by it. One it reports paying is followed (`paying`);
+	/// one failed is taken back by the next `sync`, as the lost wallet would.
+	/// A leaf received over Lightning is held `receiving` with its payment
+	/// rebuilt from its terms and its nonce (the preimage derives from them):
+	/// as the lost wallet may have handed its preimage over already, it is
+	/// taken as handed over, so the payment is never called failed, `sync`
+	/// claims it, and should the operator not co-sign it goes home by its
+	/// claim at its home date. A restore never credits a leaf the operator
+	/// may claim with a preimage it has.
+	fn restore_htlc(&mut self, id: &str, coin: &ValidCoin, h: arca_covenant::HtlcTerms, info: &Value, now: MedianTime) -> Result<Value, Error> {
+		let hash = hex(&h.payment_hash);
+		match h.direction {
+			arca_covenant::HtlcDirection::Send => {
+				let p = self.server.post("lightning_send_status", &json!({"payment_hash": hash}));
+				let state = p.as_ref().ok().and_then(|p| p["state"].as_str().map(str::to_string)).unwrap_or_default();
+				let pre = p.as_ref().ok().and_then(|p| p["preimage"].as_str().and_then(|x| unhex32(x).ok()));
+				let opens = pre.is_some_and(|x| arca_covenant::script::sha256(&x) == h.payment_hash);
+				let mut rec = json!({"htlc_leaf_id": id, "asset": coin.asset.to_string(), "restored": true});
+				if let Ok(p) = &p {
+					for k in ["amount", "fee"] {
+						rec[k] = p[k].clone();
+					}
+				}
+				let note = match (state.as_str(), opens) {
+					("paid", true) => {
+						let pre = hex(&pre.expect("checked"));
+						self.store.set_coin_spent(id, &format!("the payment over Lightning of hash {}, paid (preimage {})", hash, pre))?;
+						rec["state"] = json!("paid");
+						rec["preimage"] = json!(pre);
+						"paid: the operator's, its preimage checked against the leaf's hash".to_string()
+					},
+					("failed", _) => {
+						self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: failed, taken back by sync", hash))?;
+						rec["state"] = json!("failed");
+						rec["reason"] = p.as_ref().map(|p| p["reason"].clone()).unwrap_or(Value::Null);
+						"failed: sync takes the leaf back".to_string()
+					},
+					(s, _) => {
+						self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: the operator is paying the \
+							invoice", hash))?;
+						rec["state"] = json!("paying");
+						match p {
+							Err(e) => format!("the operator does not say how it stands ({}): followed as paying", e),
+							Ok(_) if s == "paid" => "the operator says paid with a preimage that does not open the leaf's hash: followed as paying"
+								.to_string(),
+							Ok(_) => "paying: followed by sync".to_string(),
+						}
+					},
+				};
+				self.set_send(&hash, rec)?;
+				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": format!("a payment over Lightning out of the tree: {}", note)}))
+			},
+			arca_covenant::HtlcDirection::Receive => {
+				let nonce = self.store.coin(id)?.ok_or_else(|| Error::Store(format!("no coin {}", id)))?.owner_nonce;
+				if hex(&arca_covenant::script::sha256(&self.receive_preimage(&nonce)?)) != hash {
+					return Err(Error::Refused(format!("coin {} is an htlc-1 leaf received under hash {}, which the preimage the wallet derives \
+						from its key does not open", id, hash)));
+				}
+				let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
+				let steps = match &coin.origin {
+					ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
+					_ => 2,
+				};
+				let timeout = h.timeout.to_consensus_u32() as u64;
+				let home_by = steps * 2 * block + coin.leaf.exit_delay.seconds() + super::lightning::CLAIM_MARGIN_BLOCKS * block;
+				self.store.set_coin_state(id, "receiving", &format!("the leaf of the payment received over Lightning under hash {}, restored: \
+					sync claims it", hash))?;
+				self.set_receive(&hash, json!({"state": "claiming", "nonce": hex(&nonce), "asset": coin.asset.to_string(),
+					"value": coin.value.to_string(), "participation": hex(&super::lightning::receive_participation_id(&h.payment_hash)),
+					"timeout": timeout, "home_at": timeout.saturating_sub(home_by), "restored": true,
+					"window": info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600)}))?;
+				let _ = now;
+				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": "a leaf received over Lightning, restored receiving: sync claims it, and \
+					takes it home by its claim at its home date should the operator not co-sign"}))
+			},
+		}
 	}
 
 	/// Coin `record` of the wallet's key `owner` of `nonce`, checked against
