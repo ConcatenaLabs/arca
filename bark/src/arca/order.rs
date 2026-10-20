@@ -64,6 +64,15 @@ pub const PLACE_MARGIN_SECONDS: u32 = 3_600;
 /// it leaves the unlock to the operator, by the chain's median time.
 pub const UNLOCK_GRACE_SECONDS: u32 = 600;
 
+/// How long an offer the wallet hands out for SeqDEX's relay lasts at most:
+/// six days, within the relay's seven.
+pub const RELAY_OFFER_SECONDS: u64 = 6 * 86_400;
+
+/// The operator's order margin a relay offer ends before the REFUND opens,
+/// unless the operator publishes another (`info.fills`): six hours, as a
+/// take of the order is refused within it.
+const ORDER_MARGIN_SECONDS: u64 = 21_600;
+
 /// The least `expiry_locktime` read as a median time; below it a lock is a
 /// height, which an order the wallet places never carries.
 const TIME_LOCKS_FROM: u32 = 500_000_000;
@@ -481,6 +490,35 @@ impl Wallet {
 		}
 	}
 
+	/// The order resting at `at` holding `held`, as an offer on SeqDEX's
+	/// relay, unsigned: what `seqob-relaycli post` signs with the maker's own
+	/// relay key and posts. Its amounts are what the order holds there and
+	/// its full price; it lasts until the earlier of six days from now and
+	/// the operator's order margin before the REFUND opens. `None` when its
+	/// full price is no whole number of atoms, which the relay does not list,
+	/// or when it would expire within a minute.
+	fn relay_offer(id: &str, t: &FillOrder, at: &OutPoint, held: u64, margin_s: u64) -> Option<Value> {
+		let want = held as u128 * t.rate_num as u128;
+		if want % t.rate_den as u128 != 0 {
+			return None;
+		}
+		let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let expires = (now + RELAY_OFFER_SECONDS).min((t.expiry_locktime as u64).saturating_sub(margin_s));
+		if expires < now + 60 {
+			return None;
+		}
+		Some(json!({
+			"offer_id": format!("arca-{}", &id[..id.len().min(16)]), "schema_version": 1,
+			"pair": {"base_asset": t.asset_a.to_string(), "quote_asset": t.asset_b.to_string()},
+			"trade_dir": "TRADE_DIR_SELL",
+			"base_amount": held.to_string(), "offer_amount": held.to_string(), "offer_asset": t.asset_a.to_string(),
+			"want_amount": ((want / t.rate_den as u128) as u64).to_string(), "want_asset": t.asset_b.to_string(),
+			"allow_partial": true, "min_fill": t.min_lot.to_string(),
+			"created_at_unix": now.to_string(), "expires_at_unix": expires.to_string(),
+			"covenant": t.to_relay(at),
+		}))
+	}
+
 	/// The chain's median time `seconds` from now: an order's expiry named
 	/// as a delay.
 	pub fn expiry_in(&self, seconds: u32) -> Result<u32, Error> {
@@ -490,7 +528,8 @@ impl Wallet {
 	/// Every order the wallet placed, as the chain shows it now: its state
 	/// (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`,
 	/// `refunded`, or `not_placed`), where it rests and what it holds there
-	/// with its terms as SeqDEX's relay serves them (`relay`), each fill with
+	/// with its terms as SeqDEX's relay serves them (`relay`) and as an offer
+	/// for it to post (`offer`, unsigned), each fill with
 	/// what it credited, the credits unspent at its credit program, and
 	/// when its REFUND opens. Asks the node only.
 	pub fn orders(&self) -> Result<Value, Error> {
@@ -514,6 +553,11 @@ impl Wallet {
 				if s.state == "resting" {
 					v["relay"] = t.to_relay(&at);
 					v["final"] = json!(self.chain.finality(&at.txid)?.is_final());
+					v["offer"] = match Self::relay_offer(&id, &t, &at, held, ORDER_MARGIN_SECONDS) {
+						Some(o) => o,
+						None => json!({"note": "not listable on SeqDEX's relay as it rests: its full price is no whole number of atoms, \
+							or its REFUND opens within the operator's order margin"}),
+					};
 				}
 			}
 			if let Some(n) = s.note {
@@ -648,6 +692,29 @@ mod test {
 		assert!(ask_of(&w).is_err());
 		w["expiry"] = json!(1u64 << 33);
 		assert!(ask_of(&w).is_err());
+	}
+
+	#[test]
+	fn the_relay_offer_sells_what_rests_at_its_full_price() {
+		let a = AssetId::from_slice(&[1; 32]).unwrap();
+		let b = AssetId::from_slice(&[2; 32]).unwrap();
+		let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as u32;
+		let t = FillOrder { asset_a: a, asset_b: b, rate_num: 3, rate_den: 2, maker_prog: [3; 32], min_lot: 100_000,
+			expiry_locktime: now + 48 * 3600, maker_x: [4; 32] };
+		let at = OutPoint::new(Txid::from_str(&"ab".repeat(32)).unwrap(), 1);
+		let o = Wallet::relay_offer(&"cd".repeat(32), &t, &at, 600_000, 21_600).unwrap();
+		assert_eq!((o["offer_amount"].as_str(), o["want_amount"].as_str(), o["base_amount"].as_str()), (Some("600000"), Some("900000"),
+			Some("600000")));
+		assert_eq!((o["trade_dir"].as_str(), o["offer_asset"].as_str(), o["want_asset"].as_str()), (Some("TRADE_DIR_SELL"),
+			Some(a.to_string().as_str()), Some(b.to_string().as_str())));
+		assert_eq!(o["covenant"], t.to_relay(&at));
+		assert_eq!(o["offer_id"], json!(format!("arca-{}", "cd".repeat(8))));
+		// It ends six hours before the REFUND, inside the relay's seven days.
+		assert_eq!(o["expires_at_unix"], json!((now as u64 + 42 * 3600).to_string()));
+		// No whole price, or a REFUND inside the margin: not listable.
+		assert!(Wallet::relay_offer("x", &t, &at, 600_001, 21_600).is_none());
+		let soon = FillOrder { expiry_locktime: now + 3600, ..t.clone() };
+		assert!(Wallet::relay_offer("x", &soon, &at, 600_000, 21_600).is_none());
 	}
 
 	#[test]

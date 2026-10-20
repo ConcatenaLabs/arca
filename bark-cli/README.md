@@ -722,6 +722,28 @@ A wallet restored from the mnemonic finds the coins it gave up for its orders
 as spent and the credits at its order keys, but not the orders themselves:
 their terms are on the relay and in the order's script.
 
+#### Listing the order on SeqDEX's relay
+
+The order rests on the chain before anything is posted, so it goes onto
+SeqDEX's relay in a second step, as any order that already rests there does.
+`order place` and `orders` hand out the offer for it (`offer`): a sell of what
+the order holds where it rests, at its full price, with its terms and outpoint
+as the covenant settlement, unsigned. SeqDEX's scripting client signs it with
+the maker's own relay key (a key of the maker's choosing, the offer's
+`maker_pubkey`; not a key of the wallet's) and posts it:
+
+    arca orders | jq '.[0].offer' > offer.json
+    seqob-relaycli post --http https://relay.example --priv "$MAKER_RELAY_KEY" --offer-file offer.json
+
+The relay checks the outpoint against its node (unspent, paying the script
+the terms make, holding the offer's amount of the asset sold) and lists the
+order; the outpoint is outside what the key signs, so after each partial fill
+the relay moves the offer to the rest at `2k+1` with no new signature. A taker
+gives the relay's offer to `arca take` as it is. The relay keeps its book in
+memory and an offer lasts at most seven days (the wallet's lasts six, and ends
+before the operator's margin ahead of the REFUND): post the offer `orders`
+hands out again after a relay restart or before it expires.
+
 ### Taking an on-chain order
 
 An order resting on the chain under SeqDEX's fill covenant sells one asset
@@ -819,7 +841,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
-| `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
+| `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
 | `order refund ORDER [--fee-asset A]` | Takes what order `ORDER` holds where it rests home by its REFUND, once the chain's median time has passed its expiry, to an address of the wallet's; the fee from the order's own value where the node takes its asset for fees, else from an on-chain coin in `A` |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
@@ -897,7 +919,11 @@ waits while the operator's round runs; the order rests at the unlock's output
 0 under SeqDEX's own script holding exactly its amount, final. Two wallets
 holding Y fill it in part with `arca take`, one round after the other, each
 crediting the maker at output 0 and resting the rest at output 1 under the
-same script. A wallet made from the maker's mnemonic finds the coin given up
+same script; with `SEQOB_RELAY_EXEC` and `SEQOB_RELAYCLI_EXEC` naming
+SeqDEX's `seqobd` and `seqob-relaycli`, the order is posted to a relay
+watching the node with `seqob-relaycli post` from the offer the wallet hands
+out, and each taker reads it from the relay's book, the second at the
+outpoint the relay moved it to. A wallet made from the maker's mnemonic finds the coin given up
 spent and the credits at the order key. The maker reads both fills with `arca
 orders`, boards its credits from the order key, and its REFUND is refused by
 the wallet and by the node before the expiry and mined after it. A second
