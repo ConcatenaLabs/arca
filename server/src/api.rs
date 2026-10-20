@@ -35,7 +35,8 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt",
+	"operator_key", "out_of_bounds", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
+	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
 	"unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];

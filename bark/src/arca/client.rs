@@ -287,7 +287,8 @@ pub const REFUSALS: &[&str] = &[
 	"double_spend", "fee", "forfeit_set", "htlc", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
 	"not_in_round", "not_live", "not_participating", "on_chain", "open_reassignment", "operator_key", "out_of_bounds",
-	"release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template", "unauthenticated", "unbalanced",
+	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
+	"unauthenticated", "unbalanced",
 	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator",
 	"wrong_round",
 ];

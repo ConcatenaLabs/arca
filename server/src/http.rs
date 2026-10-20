@@ -365,7 +365,8 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"unknown_participation" | "unknown_batch" | "unknown_payment" => StatusCode::NOT_FOUND,
-		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" => StatusCode::CONFLICT,
+		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap" =>
+			StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
 		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" | "lightning_unavailable" => StatusCode::SERVICE_UNAVAILABLE,

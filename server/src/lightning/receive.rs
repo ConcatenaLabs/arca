@@ -79,6 +79,10 @@ pub struct ReceiveConfig {
 	pub invoice_expiry_seconds: u32,
 	/// The chain's block interval, to turn lock times into time.
 	pub block_seconds: u32,
+	/// The most the leaves of payments held and not yet claimed may hold in
+	/// an asset, as a share of the operator's pool in it, in parts per
+	/// million.
+	pub cap_ppm: u32,
 }
 
 impl ReceiveConfig {
@@ -137,6 +141,10 @@ pub enum ReceiveError {
 	Store(#[from] StoreError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	/// Beyond the operator's cap on what the leaves of payments held and
+	/// not yet claimed may hold in the asset.
+	#[error("{0}")]
+	Cap(String),
 }
 
 impl ReceiveError {
@@ -155,6 +163,7 @@ impl ReceiveError {
 			ReceiveError::Cosign(c) => c.code(),
 			ReceiveError::Store(_) => "internal",
 			ReceiveError::NotSynced => "not_synced",
+			ReceiveError::Cap(_) => "receive_cap",
 		}
 	}
 }
@@ -189,6 +198,8 @@ pub struct Receives {
 	gateway: Arc<Gateway>,
 	cosigner: Arc<Cosigner>,
 	finality: Arc<FinalityService>,
+	/// The operator's on-chain wallet: the pool a leaf is funded from.
+	wallet: Arc<crate::wallet::Wallet>,
 	config: ReceiveConfig,
 	/// Held by every step that decides a payment: a request, a pass, a
 	/// claim. A preimage is never recorded while the payment is being failed
@@ -198,9 +209,40 @@ pub struct Receives {
 
 impl Receives {
 	pub fn new(store: Store, params: Arc<Params>, gateway: Arc<Gateway>, cosigner: Arc<Cosigner>, finality: Arc<FinalityService>,
-		config: ReceiveConfig) -> Arc<Receives>
+		wallet: Arc<crate::wallet::Wallet>, config: ReceiveConfig) -> Arc<Receives>
 	{
-		Arc::new(Receives { store, params, gateway, cosigner, finality, config, gate: Mutex::new(()) })
+		Arc::new(Receives { store, params, gateway, cosigner, finality, wallet, config, gate: Mutex::new(()) })
+	}
+
+	/// The operator's cap on the leaves of payments into the tree held and
+	/// not yet claimed in `asset` (D64): `cap_ppm` of its pool in the asset,
+	/// the pool counted with those leaves' values back in it. Refuses a leaf
+	/// of `value` that would take them beyond it, naming the cap; `except` is
+	/// a payment already counted (the one being held).
+	async fn within_cap(&self, asset: &[u8; 32], value: u64, except: Option<&[u8; 32]>) -> Result<(), ReceiveError> {
+		let mut held = 0u128;
+		let mut issued = 0u128;
+		for r in self.store.receives_in(ReceiveState::Accepted).await? {
+			if r.new.asset != *asset || Some(&r.new.payment_hash) == except {
+				continue;
+			}
+			let v = (r.new.amount - r.new.fee) as u128;
+			held += v;
+			if self.leaf_of(&r).await?.is_some() {
+				issued += v;
+			}
+		}
+		let a = AssetId::from_byte_array(*asset);
+		let balance = self.wallet.balance().await.map_err(|e| ReceiveError::Malformed(format!("the operator's wallet: {}", e)))?
+			.get(&a).copied().unwrap_or(0) as u128;
+		let pool = balance + issued;
+		let cap = pool * self.config.cap_ppm as u128 / 1_000_000;
+		if held + value as u128 > cap {
+			return Err(ReceiveError::Cap(format!("the operator's cap on payments into the tree held and not yet claimed in asset {} is {} \
+				({} ppm of its pool of {}): {} is held, and a leaf of {} would take it past the cap; ask again once those are claimed",
+				a, cap, self.config.cap_ppm, pool, held, value)));
+		}
+		Ok(())
 	}
 
 	pub fn config(&self) -> &ReceiveConfig {
@@ -263,6 +305,9 @@ impl Receives {
 		if req.description.len() > 256 {
 			return Err(ReceiveError::Malformed("a description of more than 256 bytes".into()));
 		}
+		// The leaves of payments held and not yet claimed are funded from the
+		// operator's pool for a batch's life: bounded per asset (D64).
+		self.within_cap(&req.asset.into_inner().to_byte_array(), value, None).await?;
 		let invoice = self.make_invoice(&leg, req).await?;
 		let row = self.store.insert_receive(&NewReceive {
 			payment_hash: req.payment_hash, asset: req.asset.into_inner().to_byte_array(), amount: req.amount, fee, invoice,
@@ -403,6 +448,10 @@ impl Receives {
 			operator_delay: self.config.operator_delay,
 		};
 		terms.check(exit).map_err(|e| ReceiveError::Htlc(e.to_string()))?;
+		// Held invoices asked for together are funded within the cap too.
+		if let Err(ReceiveError::Cap(why)) = self.within_cap(&r.new.asset, r.new.amount - r.new.fee, Some(&hash)).await {
+			return self.cancel(r, &why).await;
+		}
 		let id = participation_id(&hash);
 		let mut preimage = [0u8; 32];
 		rand::rngs::OsRng.fill_bytes(&mut preimage);
