@@ -39,13 +39,17 @@
 //! order's terms as the `CovenantTerms` message of `offer.proto` in its JSON
 //! form, which [`FillOrder::from_relay`] reads (with the `json` feature).
 
-use elements::hashes::Hash;
+use elements::hashes::{sha256, Hash, HashEngine};
 use elements::opcodes::all::*;
 use elements::script::Builder;
+use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, OutPoint, Script, Transaction};
 
+use crate::message::Chain;
+use crate::record::{LeafId, Template};
 use crate::script::{asset_bytes, witness_program, ExplicitOutput};
 use crate::taptree::{leaf_hash, TapOutput, NUMS};
+use crate::time::{MedianTime, RelativeTime};
 
 /// Why an order's terms, a fill of it, or a transaction spending it do not
 /// hold.
@@ -349,6 +353,100 @@ impl FillOrder {
 				self.asset_b, filled, price)));
 		}
 		Ok(Filled { filled, remainder, price, credited })
+	}
+}
+
+/// The tag of a take's id.
+pub const TAKE_TAG: &[u8] = b"Arca/take";
+
+/// The leaf a take wants: the order's asset, what it fills, under a key of
+/// the taker's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeLeaf {
+	pub asset: AssetId,
+	pub value: u64,
+	pub template: Template,
+	pub owner: XOnlyPublicKey,
+	pub owner_nonce: [u8; 32],
+	pub exit_delay: RelativeTime,
+}
+
+/// A take: a holder's request that the operator's round fill an on-chain
+/// order for it. It gives up coins in the asset the order is paid in, worth
+/// the order's price for the fill and the operator's fee, and wants a leaf of
+/// what it fills in the asset the order sells. The owner of each coin given
+/// up attests [`Take::id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Take {
+	pub order: OutPoint,
+	pub terms: FillOrder,
+	/// What the order holds on the chain.
+	pub locked: u64,
+	pub filled: u64,
+	pub inputs: Vec<LeafId>,
+	pub leaf: TakeLeaf,
+	/// The operator's fee, in the asset the order is paid in.
+	pub fee: (AssetId, u64),
+	/// The earliest median time of a round it may run in.
+	pub not_before: Option<MedianTime>,
+}
+
+impl Take {
+	/// The id a take is attested by:
+	///
+	/// ```text
+	/// SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body),   T = SHA256("Arca/take")
+	/// body = the order's txid (internal order) ‖ its vout (u32)
+	///      ‖ its scriptPubKey's length (u16) ‖ the scriptPubKey     (which commits to every term)
+	///      ‖ locked (u64) ‖ filled (u64) ‖ the price (u64, 0 where the leaf cannot compute it)
+	///      ‖ n, each leaf id given up
+	///      ‖ the leaf wanted: asset, value (u64), template id, template version, owner key, owner nonce,
+	///        exit delay units (u16)
+	///      ‖ the fee: asset, amount (u64)
+	///      ‖ 0, or 1 and the earliest round time (u32)
+	/// ```
+	///
+	/// Counts are one byte, integers little-endian, asset ids in internal
+	/// byte order. Its tag is its own, so no attestation of a take is one of
+	/// a refresh, or of anything else a leaf key signs; the genesis hash and
+	/// `S` keep it to one chain and one operator; the order's outpoint and
+	/// script, the fill and its price keep it to one fill of one order.
+	pub fn id(&self, chain: &Chain, operator: &XOnlyPublicKey) -> [u8; 32] {
+		let tag = sha256::Hash::hash(TAKE_TAG);
+		let mut e = sha256::Hash::engine();
+		e.input(tag.as_byte_array());
+		e.input(tag.as_byte_array());
+		e.input(&chain.genesis_bytes());
+		e.input(&operator.serialize());
+		e.input(&self.order.txid.to_byte_array());
+		e.input(&self.order.vout.to_le_bytes());
+		let spk = self.terms.script_pubkey();
+		e.input(&(spk.len() as u16).to_le_bytes());
+		e.input(spk.as_bytes());
+		e.input(&self.locked.to_le_bytes());
+		e.input(&self.filled.to_le_bytes());
+		e.input(&self.terms.price(self.filled).unwrap_or(0).to_le_bytes());
+		e.input(&[self.inputs.len() as u8]);
+		for i in &self.inputs {
+			e.input(&i.0);
+		}
+		let l = &self.leaf;
+		e.input(&asset_bytes(l.asset));
+		e.input(&l.value.to_le_bytes());
+		e.input(&[l.template.id(), l.template.version()]);
+		e.input(&l.owner.serialize());
+		e.input(&l.owner_nonce);
+		e.input(&l.exit_delay.units().to_le_bytes());
+		e.input(&asset_bytes(self.fee.0));
+		e.input(&self.fee.1.to_le_bytes());
+		match self.not_before {
+			Some(t) => {
+				e.input(&[1]);
+				e.input(&t.to_consensus_u32().to_le_bytes());
+			},
+			None => e.input(&[0]),
+		}
+		sha256::Hash::from_engine(e).to_byte_array()
 	}
 }
 

@@ -28,7 +28,7 @@ it: its REFUND lock may be a height, and Arca only reads it.
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
-| `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock |
+| `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
@@ -549,7 +549,9 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   round-shaped transactions (covenant inputs first, credits at `2k`, remainders
   at `2k+1`, the batch after them) the node's interpreter and
   `FillOrder::check` agree on every case, each negative refused with the node's
-  error. `--nocapture` prints the table.
+  error; and the id a take of an order is attested by covers every part of
+  it, and is the body its documentation spells under its own tag.
+  `--nocapture` prints the table.
 - `tests/checks.rs`: the five client checks accept an honest round and refuse
   each attack that consensus accepts, naming the check.
 - `tests/encode.rs`: the encodings round-trip and refuse malformed bytes; the

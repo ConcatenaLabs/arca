@@ -348,3 +348,75 @@ fn the_node_and_the_check_agree_on_round_shaped_fills() {
 	println!("{} valid, {} refused by the node's interpreter, the check agreeing on each", valid, refused);
 	assert_eq!((valid, refused), (4, 9));
 }
+
+#[test]
+fn a_take_id_covers_every_part_and_no_other_message() {
+	use arca_covenant::{Chain, LeafId, MedianTime, RelativeTime, Take, TakeLeaf, Template};
+	let o = golden_order();
+	let base = Take {
+		order: OutPoint::new(Txid::from_byte_array([7; 32]), 3),
+		terms: o.clone(),
+		locked: 2_000_000_000,
+		filled: 1_000_000_000,
+		inputs: vec![LeafId([1; 32]), LeafId([2; 32])],
+		leaf: TakeLeaf { asset: o.asset_a, value: 1_000_000_000, template: Template::Vtxo1, owner: xonly(&keypair("taker")),
+			owner_nonce: [3; 32], exit_delay: RelativeTime::from_units(338).unwrap() },
+		fee: (o.asset_b, 1_234),
+		not_before: None,
+	};
+	let chain = Chain::new(BlockHash::from_byte_array([9; 32]));
+	let s = xonly(&keypair("operator"));
+	let id = base.id(&chain, &s);
+	// The body as the documentation spells it, assembled by hand.
+	let mut body: Vec<u8> = vec![];
+	body.extend([7u8; 32]);
+	body.extend(3u32.to_le_bytes());
+	let spk = o.script_pubkey();
+	body.extend((spk.len() as u16).to_le_bytes());
+	body.extend(spk.as_bytes());
+	body.extend(2_000_000_000u64.to_le_bytes());
+	body.extend(1_000_000_000u64.to_le_bytes());
+	body.extend(428_571_429u64.to_le_bytes());
+	body.push(2);
+	body.extend([1u8; 32]);
+	body.extend([2u8; 32]);
+	body.extend(asset_bytes(o.asset_a));
+	body.extend(1_000_000_000u64.to_le_bytes());
+	body.extend([Template::Vtxo1.id(), Template::Vtxo1.version()]);
+	body.extend(xonly(&keypair("taker")).serialize());
+	body.extend([3u8; 32]);
+	body.extend(338u16.to_le_bytes());
+	body.extend(asset_bytes(o.asset_b));
+	body.extend(1_234u64.to_le_bytes());
+	body.push(0);
+	let tag = arca_covenant::script::sha256(b"Arca/take");
+	let mut pre = vec![];
+	pre.extend(tag);
+	pre.extend(tag);
+	pre.extend([9u8; 32]);
+	pre.extend(s.serialize());
+	pre.extend(body);
+	assert_eq!(id, arca_covenant::script::sha256(&pre), "the id is the documented body under its tag");
+	assert_eq!(o.price(1_000_000_000), Some(428_571_429));
+	let mut changed: Vec<Take> = vec![];
+	let with = |f: &dyn Fn(&mut Take)| { let mut t = base.clone(); f(&mut t); t };
+	changed.push(with(&|t| t.order.vout = 4));
+	changed.push(with(&|t| t.order.txid = Txid::from_byte_array([8; 32])));
+	changed.push(with(&|t| t.terms.rate_num = 4));
+	changed.push(with(&|t| t.terms.maker_prog = [0x12; 32]));
+	changed.push(with(&|t| t.locked += 1));
+	changed.push(with(&|t| t.filled -= 1));
+	changed.push(with(&|t| t.inputs.reverse()));
+	changed.push(with(&|t| { t.inputs.pop(); }));
+	changed.push(with(&|t| t.leaf.value -= 1));
+	changed.push(with(&|t| t.leaf.owner = xonly(&keypair("thief"))));
+	changed.push(with(&|t| t.leaf.owner_nonce = [4; 32]));
+	changed.push(with(&|t| t.leaf.exit_delay = RelativeTime::from_units(339).unwrap()));
+	changed.push(with(&|t| t.fee.1 += 1));
+	changed.push(with(&|t| t.not_before = Some(MedianTime::from_consensus(1_800_000_000).unwrap())));
+	for (n, t) in changed.iter().enumerate() {
+		assert_ne!(t.id(&chain, &s), id, "change {} leaves the id", n);
+	}
+	assert_ne!(base.id(&Chain::new(BlockHash::from_byte_array([10; 32])), &s), id, "another chain");
+	assert_ne!(base.id(&chain, &xonly(&keypair("another operator"))), id, "another operator");
+}
