@@ -865,6 +865,46 @@ impl Cosigner {
 	}
 }
 
+impl Cosigner {
+	/// D61 for a transfer recorded before its server posted notices (an
+	/// operator moved from an older version with a transfer in flight): every
+	/// output of a transfer recorded and not yet signed with no notice in its
+	/// mailbox is posted one as pending, naming its leaf, transfer, asset,
+	/// value and owner key, and the earliest first expiry of the batches the
+	/// transfer's inputs rest on. The owner's nonce of a recorded output is
+	/// not kept, so it names none: the receiving wallet finds it by the owner
+	/// key. Run at every start; posts nothing twice. Returns how many it
+	/// posted.
+	pub async fn post_missing_notices(&self) -> Result<usize, StoreError> {
+		let mut posted = 0;
+		for id in self.store.recorded_transfers().await? {
+			let Some(t) = self.store.transfer(&id).await? else { continue };
+			if t.signed {
+				continue;
+			}
+			let mut until: Option<u32> = None;
+			for (leaf, _, _) in &t.inputs {
+				let Some(row) = self.store.leaf(leaf).await? else { continue };
+				if let Some(e) = CoinRecord::from_bytes(&row.record).ok().as_ref().and_then(first_expiry) {
+					until = Some(until.map_or(e, |u| u.min(e)));
+				}
+			}
+			for (leaf, mailbox) in &t.outputs {
+				let Some(row) = self.store.leaf(leaf).await? else { continue };
+				let notice = serde_json::to_vec(&crate::api::MailboxNotice {
+					transfer_id: crate::signer::hex(&id), leaf_id: crate::signer::hex(leaf),
+					asset: Some(AssetId::from_byte_array(row.asset).to_string()), value: Some(row.value.to_string()),
+					owner: Some(crate::signer::hex(&row.owner_key)), owner_nonce: None, until, reason: None,
+				}).expect("a notice");
+				if self.store.post_notice_once(mailbox, leaf, &notice).await? {
+					posted += 1;
+				}
+			}
+		}
+		Ok(posted)
+	}
+}
+
 /// The earliest first expiry among the batches `record` rests on, as its
 /// record names them; `None` for a coin resting on boards alone.
 fn first_expiry(record: &CoinRecord) -> Option<u32> {

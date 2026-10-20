@@ -1118,6 +1118,14 @@ impl Server {
 			Ok(n) => log::info!("{} forfeit(s) given the operator's half at start", n),
 			Err(e) => log::warn!("forfeits without the operator's half: {}", e),
 		}
+		// D61 for a transfer recorded before this server posted notices (an
+		// operator moved from an older version with one in flight): each of
+		// its outputs posted as pending, once, before anything is served.
+		match cosigner.post_missing_notices().await {
+			Ok(0) => {},
+			Ok(n) => log::info!("{} pending notice(s) posted at start for transfers recorded before notices were posted", n),
+			Err(e) => log::warn!("the pending notices of transfers recorded before notices were posted: {}", e),
+		}
 		// The Lightning gateway's nodes, checked before anything is served.
 		let policy_asset = {
 			let client = node_client(config)?;

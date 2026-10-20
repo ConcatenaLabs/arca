@@ -992,7 +992,16 @@ impl Wallet {
 				if self.store.coin(&leaf)?.is_some() {
 					return Ok(None);
 				}
-				let nonce = unhex32(n["owner_nonce"].as_str().unwrap_or(""))?;
+				// A notice the server posted for a transfer recorded before it
+				// posted notices names no nonce: the wallet finds it by the
+				// owner key, among the nonces it holds.
+				let nonce = match n["owner_nonce"].as_str() {
+					Some(h) => unhex32(h)?,
+					None => match self.store.nonces()?.into_iter().find(|x| n["owner"].as_str() == Some(&hex(&x.owner_key))) {
+						Some(x) => x.nonce,
+						None => [0u8; 32],
+					},
+				};
 				let ours = self.store.nonce(&nonce)?.is_some()
 					&& n["owner"].as_str() == Some(&hex(&self.keys.leaf_xonly(&nonce)?.serialize()));
 				if !ours {

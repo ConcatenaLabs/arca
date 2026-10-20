@@ -260,6 +260,10 @@ pub(crate) const PENDING_NOTE: &str = "a coin is announced by the operator as pe
 	its transfer recorded, whatever the request it pays says. An announcement is the operator's statement, not a payment: the coin \
 	is counted nowhere until it comes";
 
+/// Set once the leaves received under requests that named no mailbox key
+/// were marked for binding ([`Wallet::unbind_old_receives`]).
+pub(crate) const RECEIVES_REBOUND: &str = "receives_rebound";
+
 /// Why the schedule of a wallet that has never synced is due at once.
 pub(crate) const NEVER_SYNCED_NOTE: &str = "the wallet has never synced: what is waiting for it (a payment to a request it handed \
 	out, a coin pending for it, a coin it holds) is read only by sync, so sync runs now";
@@ -706,6 +710,7 @@ impl Wallet {
 	/// knows no leaf of the key, or it is bound to another mailbox, which is
 	/// recorded as a refusal). Returns how many were bound.
 	pub(crate) fn bind_unbound(&mut self) -> Result<Value, Error> {
+		self.unbind_old_receives()?;
 		let coins = self.store.unbound_coins()?;
 		let mine = hex(&self.keys.mailbox()?.x_only_public_key().0.serialize());
 		let (mut bound, mut unknown) = (0, vec![]);
@@ -739,6 +744,28 @@ impl Wallet {
 			}
 		}
 		Ok(json!({"bound": bound, "not_bound": unknown}))
+	}
+
+	/// Once per store: every leaf received over Lightning under a request
+	/// that named no mailbox key is marked not known to be bound, so the next
+	/// `bind_unbound` binds it. A store kept by an older wallet marked every
+	/// coin it kept bound, that leaf included, though its request named no
+	/// mailbox and the server never bound it; unbound, a restore from the
+	/// mnemonic would not find it before its claim.
+	fn unbind_old_receives(&self) -> Result<(), Error> {
+		if self.store.meta(RECEIVES_REBOUND)?.is_some() {
+			return Ok(());
+		}
+		for rec in self.receives()?.values() {
+			if rec["request"].is_null() || !rec["request"]["mailbox"].is_null() {
+				continue;
+			}
+			let Ok(nonce) = unhex32(rec["nonce"].as_str().unwrap_or("")) else { continue };
+			if let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) {
+				self.store.clear_bound(&leaf)?;
+			}
+		}
+		self.store.set_meta(RECEIVES_REBOUND, "1")
 	}
 
 	/// Spells what the wallet says from now on as `s` says ([`Spelling`]).

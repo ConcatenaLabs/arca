@@ -437,6 +437,13 @@ impl Store {
 		Ok(rows)
 	}
 
+	/// Marks coin `leaf_id` not known to be bound to the wallet's mailbox key,
+	/// so `sync` binds it.
+	pub fn clear_bound(&self, leaf_id: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE coin SET bound = NULL WHERE leaf_id = ?1", params![leaf_id]).map_err(db)?;
+		Ok(())
+	}
+
 	/// Marks coin `leaf_id` bound (`true`: the server re-serves it to the
 	/// wallet's mailbox key) or not to be bound (`false`: the server knows no
 	/// leaf of its key, or it is bound elsewhere).

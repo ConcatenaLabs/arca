@@ -598,7 +598,12 @@ no longer complete (the earliest expiry of a batch its coins rest on). A
 receiver that reads it keeps reading its mailbox until the coin comes,
 whatever happens between the record and the signature (the signer not
 reached, its keepers not acknowledging); a transfer dropped before it is
-signed withdraws its notices there, naming why. A notice is the operator's
+signed withdraws its notices there, naming why. A transfer recorded by a
+server that posted no notices (an operator moved with a transfer in flight)
+gets them at this server's next start: each output with no notice in its
+mailbox is posted one, naming the owner key but not its nonce, which the
+server never kept for a recorded output; the receiver finds the nonce by the
+key. A notice is the operator's
 statement, not a payment: the receiver holds for it only while
 `transfer_status` shows its transfer recorded with that output, asking when
 it reads the notice and at every sync after. Each new coin's

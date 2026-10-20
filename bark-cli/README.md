@@ -89,7 +89,8 @@ mailbox key and the leaf key's signature over the binding
 `T = SHA256("Arca/mailbox-of")`), which authorises the server to serve that
 leaf to whoever proves the mailbox key and nothing else. A coin paid out of
 round is posted to the mailbox key already. A coin a wallet kept before it
-bound its leaves is bound by its next `sync` (`bind_mailbox`), each binding
+bound its leaves is bound by its next `sync` (`bind_mailbox`), as is a leaf
+received over Lightning under a request that named no mailbox key, each binding
 signed by the coin's own key.
 
 `create --mnemonic` restores a wallet from its mnemonic, and `restore` runs
