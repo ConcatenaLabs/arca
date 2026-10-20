@@ -30,7 +30,11 @@
 //! | `/round` | Builds a round of whatever participations stand, mines it, buries it and waits for it to be final; its txid, or `null` when none stood |
 //! | `/advance {seconds}` | Moves the chain's median time at least that far on |
 //! | `/rpc {method, params}` | One call to the node, its result |
-//! | `/fees {asset, refresh_ppm}` | Sets the asset's refresh fee and reloads the server's configuration, as an operator's SIGHUP does |
+//! | `/fees {asset, refresh_ppm?, offboard_base?}` | Sets the asset's refresh fee, or the fixed part of its offboard fee (what a take pays), and reloads the server's configuration, as an operator's SIGHUP does |
+//! | `/build` | Builds the rounds of whatever participations stand, and broadcasts none that waits on a take's forfeits: their txids, sizes and the orders each fills |
+//! | `/pass` | One pass over the rounds: a round held for takes' forfeits goes out once every one is in |
+//! | `/round_state {txid}` | Where the server says the round stands: built, broadcast, final or lost |
+//! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
 
 mod common;
@@ -153,12 +157,44 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 			let params: Vec<Value> = b["params"].as_array().cloned().unwrap_or_default();
 			r.rt.client().call::<Value>(method, &params).map_err(|e| e.to_string())
 		},
+		"/build" => {
+			let (built, failed) = r.server.rounds.run_rounds().await.map_err(|e| e.to_string())?;
+			Ok(json!({
+				"rounds": built.iter().map(|b| json!({"txid": b.tx.txid().to_string(), "vsize": b.tx.vsize(),
+					"fills": b.fills.iter().map(|o| format!("{}:{}", o.txid, o.vout)).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+				"failed": failed.iter().map(|(a, e)| json!({"asset": a.to_string(), "error": e.to_string()})).collect::<Vec<_>>(),
+			}))
+		},
+		"/pass" => {
+			r.server.rounds.pass().await.map_err(|e| e.to_string())?;
+			Ok(json!({"passed": true}))
+		},
+		"/round_state" => {
+			use elements::hashes::Hash;
+			let txid = elements::Txid::from_str(b["txid"].as_str().ok_or("no txid")?).map_err(|e| e.to_string())?;
+			let st = r.server.store.round_by_txid(&txid.to_byte_array()).await.map_err(|e| e.to_string())?;
+			Ok(json!({"state": st.map(|x| x.state.as_str())}))
+		},
+		"/orphan" => {
+			let height = b["height"].as_u64().ok_or("no height")?;
+			let gone = tokio::task::block_in_place(|| r.rt.orphan_parent_from(height))?;
+			Ok(json!({"orphaned": gone.len()}))
+		},
 		"/fees" => {
 			let asset = b["asset"].as_str().ok_or("no asset")?;
-			let ppm = b["refresh_ppm"].as_u64().ok_or("no refresh_ppm")?;
+			let ppm = b["refresh_ppm"].as_u64();
+			let offboard_base = b["offboard_base"].as_u64();
+			if ppm.is_none() && offboard_base.is_none() {
+				return Err("name refresh_ppm or offboard_base".into());
+			}
 			let mut config = r.config.clone();
 			let a = config.assets.iter_mut().find(|a| a.asset == asset).ok_or("the server does not serve that asset")?;
-			a.refresh_ppm = Some(ppm);
+			if let Some(p) = ppm {
+				a.refresh_ppm = Some(p);
+			}
+			if let Some(base) = offboard_base {
+				a.offboard_base = Some(base.to_string());
+			}
 			let reloaded = r.server.reload(&config).await.map_err(|e| e.to_string())?;
 			r.config = config;
 			Ok(json!({"changed": reloaded.changed.iter().map(|a| a.to_string()).collect::<Vec<_>>()}))
