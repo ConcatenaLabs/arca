@@ -33,6 +33,10 @@
 //! - the out-of-round transfer ([`transfer`]): the checkpoint and the
 //!   reassignment, for one or several coins and owners, and the coin record a
 //!   receiver validates back to the batches and boards it came from;
+//! - an on-chain order a round fills ([`fill`]): SeqDEX's fill covenant, its
+//!   terms as the relay serves them, the credit at `2k` and remainder at
+//!   `2k+1` its FILL leaf reads, that leaf's judgement of a transaction, and
+//!   the id a holder's take of an order is attested by;
 //! - the board (`board-1`: the leaf's collaborative path and the owner's
 //!   conversion into the leaf) and its record ([`board`]), and the
 //!   transactions that spend a leaf outside the unroll ([`spend`]): its exit,
@@ -62,6 +66,7 @@ pub mod checks;
 pub mod clock;
 pub mod encode;
 pub mod entry;
+pub mod fill;
 pub mod forfeit;
 pub mod gate;
 pub mod htlc;
@@ -91,6 +96,7 @@ pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
 pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
+pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLeaf};
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
