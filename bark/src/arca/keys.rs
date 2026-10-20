@@ -22,6 +22,13 @@
 //!   main chain and 1 elsewhere), each an unblinded P2WPKH script: the same
 //!   key is a Bitcoin address and a Sequentia address, as on every Sequentia
 //!   wallet.
+//! - **Order keys**, `m/86'/coin'/0'/0/<index>`, one for each order the
+//!   wallet places on the chain: the key itself is the order's REFUND key
+//!   (`maker_x`), and its key-path output, tweaked with no script tree (the
+//!   Elements tags), is the plain program every fill pays the maker's credit
+//!   to (`maker_prog`). A credit there is spent by an ordinary signature over
+//!   its own outpoint, never by a pair of rebindable signatures, so no
+//!   signature made for one credit spends another of the same value.
 
 use elements::bitcoin::bip32::{ChildNumber, DerivationPath};
 use elements::hashes::{hash160, sha256, Hash};
@@ -49,6 +56,8 @@ pub fn mailbox_nonce() -> [u8; 32] {
 /// The on-chain chains: scripts handed out to be paid, and change.
 pub const RECEIVE: u32 = 0;
 pub const CHANGE: u32 = 1;
+/// The order keys' counter in the store ([`Keys::order`]).
+pub const ORDERS: u32 = 86;
 
 /// The four 31-bit chunks of `SHA256("Arca/key" ‖ owner_nonce)` that name a
 /// leaf key's path, most significant bit first.
@@ -125,6 +134,32 @@ impl Keys {
 	pub fn onchain_script(&self, chain: u32, index: u32) -> Result<Script, Error> {
 		Ok(p2wpkh(&self.onchain(chain, index)?))
 	}
+
+	/// The order key at `index`, `m/86'/coin'/0'/0/index`: an order's REFUND
+	/// key, untweaked.
+	pub fn order(&self, index: u32) -> Result<Keypair, Error> {
+		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
+		let path = DerivationPath::from(vec![hardened(86)?, hardened(self.coin_type)?, hardened(0)?, normal(0)?, normal(index)?]);
+		self.keypair_at(&path)
+	}
+
+	/// The key that signs a key-path spend of the order key's output: the
+	/// order key tweaked with no script tree.
+	pub fn order_spend_key(&self, index: u32) -> Result<Keypair, Error> {
+		use elements::schnorr::TapTweak;
+		Ok(self.order(index)?.tap_tweak(&self.secp, None).to_inner())
+	}
+
+	/// The program an order's credits are paid to: the order key's key-path
+	/// output, `OP_1 <program>`.
+	pub fn order_program(&self, index: u32) -> Result<[u8; 32], Error> {
+		Ok(self.order_spend_key(index)?.x_only_public_key().0.serialize())
+	}
+
+	/// `OP_1 <program>` of the order key at `index`.
+	pub fn order_script(&self, index: u32) -> Result<Script, Error> {
+		Ok(elements::script::Builder::new().push_int(1).push_slice(&self.order_program(index)?).into_script())
+	}
 }
 
 /// The compressed public key of `key`.
@@ -183,6 +218,23 @@ mod tests {
 		assert_eq!(keys.mailbox().unwrap().x_only_public_key().0.serialize(), kit.serialize());
 		assert_eq!(path.to_string().matches('/').count(), 5, "six hardened steps, as every Arca key of the kit: {}", path);
 		assert_ne!(Keys::new(MNEMONIC, 1, 1).unwrap().mailbox().unwrap().x_only_public_key().0, kit, "per account");
+	}
+
+	#[test]
+	fn the_order_key_is_bip86s_tweaked_by_the_elements_tags() {
+		// BIP86's test vector for this mnemonic, m/86'/0'/0'/0/0: the internal
+		// key. The output key is Elements' tweak of it, which the node checks
+		// a key-path spend against, and is another than Bitcoin's.
+		let keys = Keys::new(MNEMONIC, 0, 0).unwrap();
+		let internal = keys.order(0).unwrap().x_only_public_key().0;
+		assert_eq!(internal.to_string(), "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115");
+		let secp = Secp256k1::verification_only();
+		let elements_spk = Script::new_v1_p2tr(&secp, internal, None);
+		assert_eq!(keys.order_script(0).unwrap(), elements_spk);
+		assert_ne!(keys.order_program(0).unwrap().iter().map(|b| format!("{:02x}", b)).collect::<String>(), "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+			"Bitcoin's BIP86 output key: Elements tags its tweak otherwise");
+		assert_ne!(keys.order(1).unwrap().x_only_public_key().0, internal);
+		assert_ne!(Keys::new(MNEMONIC, 0, 1).unwrap().order(0).unwrap().x_only_public_key().0, internal, "per coin type");
 	}
 
 	#[test]

@@ -188,6 +188,9 @@ pub fn lightning_receive_digest(chain: &Chain, operator: &XOnlyPublicKey, asset:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wanted {
 	Leaf { asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime },
+	/// An on-chain output the round pays, hash-locked, and its unlock moves to
+	/// `script` with exactly `value` of `asset`.
+	Offboard { asset: AssetId, value: u64, script: elements::Script },
 }
 
 impl Wanted {
@@ -196,6 +199,9 @@ impl Wanted {
 			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => json!({"leaf": {
 				"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
 				"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
+			}}),
+			Wanted::Offboard { asset, value, script } => json!({"offboard": {
+				"asset": asset.to_string(), "value": value.to_string(), "script": hex(script.as_bytes()),
 			}}),
 		}
 	}
@@ -227,6 +233,13 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 				e.input(&owner.serialize());
 				e.input(owner_nonce);
 				e.input(&exit_delay.units().to_le_bytes());
+			},
+			Wanted::Offboard { asset, value, script } => {
+				e.input(&[1]);
+				e.input(&asset.into_inner().to_byte_array());
+				e.input(&value.to_le_bytes());
+				e.input(&(script.len() as u16).to_le_bytes());
+				e.input(script.as_bytes());
 			},
 		}
 	}

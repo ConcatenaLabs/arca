@@ -14,7 +14,7 @@ use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, RelativeTime, Te
 
 use super::chain::{hex, unhex, unhex32, ChainSource, Finality};
 use super::client::ServerClient;
-use super::keys::{p2wpkh, Keys, CHANGE, RECEIVE};
+use super::keys::{p2wpkh, Keys, CHANGE, ORDERS, RECEIVE};
 use super::store::{CoinRow, Store};
 use super::{random32, Error};
 
@@ -172,6 +172,7 @@ impl Spelling {
 			.replace("{exit}", &command("exit").unwrap_or_else(|| "an exit".into()))
 			.replace("{address}", &command("address").map(|c| format!("an address of {}", c))
 				.unwrap_or_else(|| "the wallet's address".into()))
+			.replace("{orders}", &command("orders").unwrap_or_else(|| "the reading of the wallet's orders".into()))
 	}
 }
 
@@ -2427,7 +2428,8 @@ impl Wallet {
 			*per.entry(c.asset.clone()).or_default().entry(Self::standing(&c).to_string()).or_default() += c.value;
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
-		for (_, o, _, _) in self.onchain_coins()? {
+		// Its on-chain coins and its orders' credits at their keys alike.
+		for (_, o, _, _) in self.onchain_coins()?.into_iter().chain(self.order_coins()?) {
 			if let (Some(a), Some(v)) = (o.asset.explicit(), o.value.explicit()) {
 				*onchain.entry(a.to_string()).or_default() += v;
 			}
@@ -2578,6 +2580,47 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// The wallet's unspent coins at its order keys' programs: the credits
+	/// of the orders it placed, each with the key that signs its key-path
+	/// spend, and its height. The programs looked at run to a gap of [`GAP`]
+	/// past the last order key in use, as after a restore.
+	pub(crate) fn order_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
+		let mut out = vec![];
+		let mut from = 0u32;
+		let mut end = self.store.indices(ORDERS)? + GAP;
+		while from < end {
+			let window: Vec<(u32, Script)> = (from..end).map(|i| Ok((i, self.keys.order_script(i)?))).collect::<Result<_, Error>>()?;
+			let scripts: Vec<Script> = window.iter().map(|(_, s)| s.clone()).collect();
+			let mut last_used = None;
+			for (op, o, h) in self.chain.coins_at(&scripts)? {
+				let Some((i, _)) = window.iter().find(|(_, s)| *s == o.script_pubkey) else { continue };
+				last_used = last_used.max(Some(*i));
+				if self.chain.unspent(&op)? {
+					out.push((op, o, self.keys.order_spend_key(*i)?, h));
+				}
+			}
+			from = end;
+			if let Some(i) = last_used {
+				self.store.bump_index(ORDERS, i + 1)?;
+				end = end.max(i + 1 + GAP);
+			}
+		}
+		Ok(out)
+	}
+
+	/// Signs input `i` of `tx`, a key-path coin of the order key whose spend
+	/// key is `key` (tweaked), over every output `prevouts` the inputs spend.
+	pub(crate) fn sign_key_path(&self, tx: &mut Transaction, i: usize, prevouts: &[TxOut], key: &Keypair) -> Result<(), Error> {
+		use elements::hashes::Hash as _;
+		let h = elements::sighash::SighashCache::new(&*tx)
+			.taproot_key_spend_signature_hash(i, &elements::sighash::Prevouts::All(prevouts), elements::SchnorrSighashType::Default,
+				self.genesis.genesis_hash())
+			.map_err(|e| Error::Refused(format!("the signature hash of input {}: {}", i, e)))?;
+		let sig = arca_covenant::sign::sign_digest(key, &h.to_byte_array(), &random32());
+		tx.input[i].witness.script_witness = vec![sig.as_ref().to_vec()];
+		Ok(())
+	}
+
 	/// Signs input `i` of `tx`, a P2WPKH coin `prev` of `key`.
 	pub(crate) fn sign_p2wpkh(&self, tx: &mut Transaction, i: usize, prev: &TxOut, key: &Keypair) {
 		let pk = key.public_key();
@@ -2607,9 +2650,17 @@ impl Wallet {
 	/// The vsize `tx` will have once each of its P2WPKH inputs is signed
 	/// (inputs at `p2wpkh`), the others as they are.
 	pub(crate) fn signed_vsize(tx: &Transaction, p2wpkh: &[usize]) -> u64 {
+		Self::signed_vsize_with(tx, p2wpkh, &[])
+	}
+
+	/// [`Self::signed_vsize`], with key-path inputs at `key_path` signed too.
+	pub(crate) fn signed_vsize_with(tx: &Transaction, p2wpkh: &[usize], key_path: &[usize]) -> u64 {
 		let mut t = tx.clone();
 		for &i in p2wpkh {
 			t.input[i].witness.script_witness = vec![vec![0; 72], vec![0; 33]];
+		}
+		for &i in key_path {
+			t.input[i].witness.script_witness = vec![vec![0; 64]];
 		}
 		(t.weight() as u64).div_ceil(4)
 	}
@@ -2713,7 +2764,11 @@ impl Wallet {
 	/// Answers it, its fee and the number of coins it spends.
 	fn board_tx(&self, record: &BoardRecord, fee_asset: AssetId, change: &Script, sign: bool) -> Result<(Transaction, u64, usize), Error> {
 		let (asset, value) = (record.asset, record.value);
-		let coins = self.onchain_coins()?;
+		// Its P2WPKH coins, then the credits of its orders at their keys,
+		// which a key-path signature spends.
+		let order_coins = self.order_coins()?;
+		let key_path: Vec<OutPoint> = order_coins.iter().map(|c| c.0).collect();
+		let coins: Vec<(OutPoint, TxOut, Keypair, u64)> = self.onchain_coins()?.into_iter().chain(order_coins).collect();
 		let mut chosen: Vec<(OutPoint, TxOut, Keypair)> = vec![];
 		let mut fee = self.fee_for(fee_asset, 300)?;
 		let tx = loop {
@@ -2737,15 +2792,18 @@ impl Wallet {
 				}
 			}
 			let pairs: Vec<(OutPoint, TxOut)> = chosen.iter().map(|(op, o, _)| (*op, o.clone())).collect();
-			let mut tx = record.tx(&pairs, fee_asset, fee, change).map_err(|e| Error::Refused(e.to_string()))?.tx;
-			let all: Vec<usize> = (0..tx.input.len()).collect();
-			let needed = self.fee_for(fee_asset, Self::signed_vsize(&tx, &all))?;
+			let u = record.tx(&pairs, fee_asset, fee, change).map_err(|e| Error::Refused(e.to_string()))?;
+			let (mut tx, prevouts) = (u.tx, u.prevouts);
+			let tr: Vec<usize> = (0..chosen.len()).filter(|i| key_path.contains(&chosen[*i].0)).collect();
+			let wpkh: Vec<usize> = (0..chosen.len()).filter(|i| !tr.contains(i)).collect();
+			let needed = self.fee_for(fee_asset, Self::signed_vsize_with(&tx, &wpkh, &tr))?;
 			if needed <= fee {
 				for (i, (_, o, k)) in chosen.iter().enumerate() {
-					if sign {
-						self.sign_p2wpkh(&mut tx, i, o, k);
-					} else {
-						tx.input[i].witness.script_witness = vec![vec![0; 72], vec![0; 33]];
+					match (sign, tr.contains(&i)) {
+						(true, true) => self.sign_key_path(&mut tx, i, &prevouts, k)?,
+						(true, false) => self.sign_p2wpkh(&mut tx, i, o, k),
+						(false, true) => tx.input[i].witness.script_witness = vec![vec![0; 64]],
+						(false, false) => tx.input[i].witness.script_witness = vec![vec![0; 72], vec![0; 33]],
 					}
 				}
 				break tx;

@@ -809,10 +809,21 @@ impl Wallet {
 		}
 		let mut wanted = vec![];
 		let mut nonces = vec![];
+		// What the wallet keeps of each output wanted, in order: a leaf by its
+		// nonce, an offboard by its destination (an order the wallet placed).
+		let mut wanted_json = vec![];
 		for o in p["outputs"].as_array().cloned().unwrap_or_default() {
+			if let Some(off) = o.get("offboard") {
+				let asset = AssetId::from_str(off["asset"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+				let value = amount(&off["value"], "an offboard's value").map_err(|e| e.to_string())?;
+				let script = unhex(off["script"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+				wanted.push(Wanted::Offboard { asset, value, script: elements::Script::from(script.clone()) });
+				wanted_json.push(json!({"offboard": {"asset": asset.to_string(), "value": value.to_string(), "script": hex(&script)}}));
+				continue;
+			}
 			let Some(l) = o.get("leaf") else {
-				return Err(format!("participation {} wants an output that is no leaf: the wallet makes none, and takes the coin as not given up \
-					to it", pid));
+				return Err(format!("participation {} wants an output that is neither a leaf nor an offboard: the wallet makes none, and takes \
+					the coin as not given up to it", pid));
 			};
 			let asset = AssetId::from_str(l["asset"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
 			let value = amount(&l["value"], "a leaf's value").map_err(|e| e.to_string())?;
@@ -822,6 +833,7 @@ impl Wallet {
 			let exit_delay = RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| e.to_string())?;
 			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay });
 			nonces.push((owner_nonce, owner, asset, value));
+			wanted_json.push(json!({"nonce": hex(&owner_nonce), "asset": asset.to_string(), "value": value.to_string()}));
 		}
 		let mut fees = vec![];
 		for f in p["fees"].as_array().cloned().unwrap_or_default() {
@@ -882,8 +894,6 @@ impl Wallet {
 		let unlock = p["unlock_hash"].as_str().unwrap_or("").to_string();
 		let current: Vec<&(ForfeitRow, bool)> = forfeits.iter().filter(|(f, _)| f.unlock_hash == unlock).collect();
 		let given: Vec<String> = inputs.iter().map(|l| l.to_string()).collect();
-		let wanted_json: Vec<Value> = nonces.iter().map(|(n, _, a, v)| json!({"nonce": hex(n), "asset": a.to_string(), "value": v.to_string()}))
-			.collect();
 		let mut body = json!({"restored": true, "inputs": given, "outputs": p["outputs"], "fees": p["fees"], "not_before": p["not_before"]});
 		if let Some(f) = fill {
 			body["order"] = f["order"].clone();

@@ -19,9 +19,13 @@
 //!   a record must show before it is pinned.
 //! - [`command`]: the commands by name, with JSON arguments and answers, for a
 //!   program that embeds the library (a browser worker, a mobile app's core).
+//! - [`order`]: an order placed on the chain from the wallet's leaves, by an
+//!   offboard into the address SeqDEX's fill covenant makes for its terms;
+//!   where it rests and what filled it, read from the chain; its REFUND.
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
 //!   mailbox, take part in a round, take an on-chain order in a round
-//!   ([`Wallet::take`]), swap, exit, re-check every coin after a
+//!   ([`Wallet::take`]), place one ([`Wallet::order_place`]), swap, exit,
+//!   re-check every coin after a
 //!   rollback, and restore from the mnemonic alone ([`Wallet::restore`]:
 //!   every leaf the server serves to the wallet's mailbox key, to which the
 //!   wallet binds each leaf it makes, checked against the chain, the
@@ -75,6 +79,7 @@ pub mod store;
 
 mod exit;
 pub mod lightning;
+pub mod order;
 mod pay;
 mod restore;
 mod round;

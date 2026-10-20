@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::{margin_for, FeeSource};
 use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
-use arca_covenant::{connector_asset, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit, LeafRecord, MedianTime, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
+use arca_covenant::{connector_asset, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit, LeafRecord, MedianTime, OffboardPolicy, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::ForfeitRow;
@@ -204,7 +204,40 @@ fn check_published(t: &Value, tree: &Tree) -> Result<(), Error> {
 	Ok(())
 }
 
+/// What the wallet counts, beyond a coin's exit delay and its forfeit's
+/// refund delay, for bringing a coin it gave up for an offboard on the
+/// chain should the operator withhold the preimage: a day.
+pub const OFFBOARD_UNROLL_SECONDS: u64 = 86_400;
+
 impl Wallet {
+	/// The offboard the status's output `j` (`o`) shows for the wallet's
+	/// wanted offboard `w` (`{asset, value, script}`): its policy rebuilt with
+	/// the participation's unlock hash and the reclaim delay the status names,
+	/// and found in `round` exactly once, at the index the status names,
+	/// holding at least the destination's value.
+	fn offboard_shown(&self, j: usize, o: &Value, w: &Value, unlock_hash: &[u8; 32], round: &Transaction)
+		-> Result<(OffboardPolicy, u32), Error>
+	{
+		if o["kind"].as_str() != Some("offboard") || o["asset"] != w["asset"] || o["value"] != w["value"] {
+			return Err(Error::Refused(format!("the status's output {} is {} {} of {}; the wallet asked for an offboard of {} of {}", j,
+				o["kind"], o["value"], o["asset"], w["value"], w["asset"])));
+		}
+		let asset = AssetId::from_str(w["asset"].as_str().unwrap_or("")).map_err(|e| Error::Store(e.to_string()))?;
+		let value = amount(&w["value"], "an offboard's value")?;
+		let script = elements::Script::from(unhex(w["script"].as_str().unwrap_or(""))?);
+		let units = o["reclaim_delay_units"].as_u64().and_then(|u| u16::try_from(u).ok())
+			.ok_or_else(|| Error::Refused(format!("the status's offboard {} names no reclaim delay", j)))?;
+		let policy = OffboardPolicy { unlock_hash: *unlock_hash, destination: ExplicitOutput::new(asset, value, script), operator: self.operator,
+			reclaim_delay: RelativeTime::from_units(units).map_err(|e| Error::Refused(e.to_string()))? };
+		let vout = policy.find(round).map_err(|e| Error::Refused(format!("round {}: the offboard of {} of asset {}: {}", round.txid(), value,
+			asset, e)))?;
+		if o["offboard_vout"].as_u64() != Some(vout as u64) {
+			return Err(Error::Refused(format!("the status names output {} of round {} for the offboard, which the round pays at {}",
+				o["offboard_vout"], round.txid(), vout)));
+		}
+		Ok((policy, vout))
+	}
+
 	/// What a refresh of `leaf_ids` (every live coin when empty) costs, coin by
 	/// coin, by the schedule the server's `info` publishes, checked against
 	/// the wallet's bound before anything is signed: a fee above
@@ -347,7 +380,7 @@ impl Wallet {
 		// Each leaf wanted under a key the wallet holds, and proves it holds.
 		let mut outputs = vec![];
 		for w in &wanted {
-			let Wanted::Leaf { owner_nonce, .. } = w;
+			let Wanted::Leaf { owner_nonce, .. } = w else { continue };
 			let key = self.keys.leaf(owner_nonce)?;
 			let mut j = w.json();
 			j["leaf"]["key_proof"] = json!(hex(sign(&key, &key_proof_digest(&id)).as_ref()));
@@ -690,7 +723,15 @@ impl Wallet {
 			return Err(Error::Refused(format!("the status shows {} new leaf/leaves and the wallet asked for {}: it signs nothing \
 				until every leaf it asked for is shown and checked", outputs.len(), wanted.len())));
 		}
+		// Each offboard, found in the round where the status says, paying its
+		// destination exactly under the participation's unlock hash.
+		let mut offboards: Vec<(OffboardPolicy, u32)> = vec![];
 		for (j, (o, w)) in outputs.iter().zip(&wanted).enumerate() {
+			if let Some(ow) = w.get("offboard") {
+				let policy = self.offboard_shown(j, o, ow, &unlock_hash, &round)?;
+				offboards.push(policy);
+				continue;
+			}
 			if o["kind"].as_str() != Some("leaf") || o["asset"] != w["asset"] || o["value"] != w["value"] {
 				return Err(Error::Refused(format!("the status's output {} is {} {} of {}; the wallet asked for a leaf of {} of {}", j,
 					o["kind"], o["value"], o["asset"], w["value"], w["asset"])));
@@ -731,16 +772,36 @@ impl Wallet {
 			}
 			news.push((valid, record, nonce));
 		}
-		if news.is_empty() {
+		if news.is_empty() && offboards.is_empty() {
 			return Err(Error::Refused("the participation has no new leaf".into()));
 		}
 		// Every forfeit's refund must run out before the new leaves' exit
 		// deadline, or withholding the preimage strands the owner.
 		let refund = RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?;
-		let deadline = news.iter().map(|(_, r, _)| r.schedule.expiries()[0].to_consensus_u32()).min().unwrap_or(0)
-			.saturating_sub(WalletPolicy::EXIT_DEADLINE);
-		if now.to_consensus_u32() as u64 + refund.seconds() >= deadline as u64 {
-			return Err(Error::Refused(format!("the forfeits' refund delay of {} s would end after the new leaves' exit deadline", refund.seconds())));
+		if !news.is_empty() {
+			let deadline = news.iter().map(|(_, r, _)| r.schedule.expiries()[0].to_consensus_u32()).min().unwrap_or(0)
+				.saturating_sub(WalletPolicy::EXIT_DEADLINE);
+			if now.to_consensus_u32() as u64 + refund.seconds() >= deadline as u64 {
+				return Err(Error::Refused(format!("the forfeits' refund delay of {} s would end after the new leaves' exit deadline", refund.seconds())));
+			}
+		}
+		// An offboard's reclaim must wait out what the owner needs if the
+		// operator withholds the preimage: a day to bring the coin it gave up
+		// on the chain, that coin's exit delay, and the forfeit's refund delay.
+		// Otherwise the operator could reclaim the output and claim the
+		// forfeit too.
+		if !offboards.is_empty() {
+			let mut longest = 0u64;
+			for l in given {
+				let row = self.store.coin(l)?.ok_or_else(|| Error::Store(format!("coin {} is gone", l)))?;
+				longest = longest.max(self.held(&row)?.1.valid.leaf.exit_delay.seconds());
+			}
+			for (p, _) in &offboards {
+				let need = longest + refund.seconds() + OFFBOARD_UNROLL_SECONDS;
+				if p.reclaim_delay.seconds() < need {
+					return Err(Error::Refused(format!("the operator may reclaim the offboard {} s after its round, and the wallet needs at 						least {} s (a day to bring the coin it gives up on the chain, its exit delay of {} s and the forfeit's refund delay of 						{} s) before a reclaim cannot take the output from under it", p.reclaim_delay.seconds(), need, longest, refund.seconds())));
+				}
+			}
 		}
 		let c = st["round"]["connector_vout"].as_u64().ok_or_else(|| Error::Parse("no connector_vout".into()))? as u32;
 		let mut forfeits = vec![];
@@ -755,8 +816,11 @@ impl Wallet {
 			// The new leaf of the coin's own asset; a take's one leaf, in the
 			// asset its order sells, for the coins it gives up in the asset the
 			// order is paid in.
-			let new = &news.iter().find(|(_, r, _)| r.asset == old.asset || take)
-				.ok_or_else(|| Error::Refused(format!("the participation has no new leaf in the asset of coin {}", l)))?.0;
+			let new = news.iter().find(|(_, r, _)| r.asset == old.asset || take).map(|n| &n.0);
+			let offboard = offboards.iter().find(|(p, _)| p.destination.asset == old.asset).map(|o| &o.0);
+			if new.is_none() && offboard.is_none() {
+				return Err(Error::Refused(format!("the participation has no new leaf and no offboard in the asset of coin {}", l)));
+			}
 			// The margin is the fee of a forfeit someone broadcasts: a few
 			// times the floor, or one atom where the operator's node does not
 			// take the asset for fees, priced from the floor the operator
@@ -770,8 +834,13 @@ impl Wallet {
 			if margin > ceiling {
 				return Err(Error::Refused(format!("the forfeit of {} would leave {} atoms uncommitted; the wallet leaves at most {}", l, margin, ceiling)));
 			}
-			let f = Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, refund, margin)
-				.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
+			// Against the new leaf of the coin's asset, or its offboard: one
+			// unlock hash opens both.
+			let f = match (new, offboard) {
+				(Some(new), _) => Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, refund, margin),
+				(None, Some(p)) => Forfeit::for_offboard(old.leaf, (old.asset, old.value), old.id, p, &round, c, refund, margin),
+				(None, None) => unreachable!("refused above"),
+			}.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
 			let key = self.keys.leaf(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
 			signed.push((l.clone(), margin));
@@ -780,8 +849,11 @@ impl Wallet {
 			// round leaves the chain.
 			if let (CoinRecord::Leaf { .. }, arca_covenant::ValidOrigin::Leaf { valid, .. }) = (&record, &old.origin) {
 				if valid.branch.nodes.last().is_some_and(|n| n.reclaim.is_some()) {
-					let rel = Release::for_refresh(valid, new, &round, c)
-						.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
+					let rel = match (new, offboard) {
+						(Some(new), _) => Release::for_refresh(valid, new, &round, c),
+						(None, Some(p)) => Release::for_offboard(valid, p, &round, c),
+						(None, None) => unreachable!("refused above"),
+					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
 			}
@@ -801,10 +873,16 @@ impl Wallet {
 		// round it is bound to, and the new leaves it validated, so that it
 		// can follow every forfeit on the chain and complete the leaves with a
 		// preimage the chain publishes, whatever the server does next.
-		let news_json = json!({"round": round_txid.to_string(), "leaves": news.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
+		let mut news_json = json!({"round": round_txid.to_string(), "leaves": news.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
 			Ok(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(nonce),
 				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))
 		}).collect::<Result<Vec<_>, Error>>()?});
+		if !offboards.is_empty() {
+			news_json["offboards"] = json!(offboards.iter().map(|(p, vout)| json!({
+				"vout": vout, "asset": p.destination.asset.to_string(), "value": p.destination.value.to_string(),
+				"script": hex(p.destination.script_pubkey.as_bytes()), "reclaim_units": p.reclaim_delay.units(),
+			})).collect::<Vec<_>>());
+		}
 		let from_height = match &finality {
 			Some(f) => f.height().unwrap_or(0).saturating_sub(100),
 			None => self.chain.tip()?.height.saturating_sub(100),

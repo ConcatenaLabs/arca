@@ -27,7 +27,13 @@
 //!   with the new leaves it validated for them, its board registrations and
 //!   transfer requests, each kept until the server answers it, its
 //!   swaps, its mailbox cursor, its exits, the refusals it made, and its
-//!   on-chain derivation indices.
+//!   on-chain derivation indices;
+//! - **every order it places on the chain**, by the participation that
+//!   offboards it: its terms, the index of its order key, its amount, and
+//!   once its round's offboard output is known, that output. Where the order
+//!   rests and what filled it are read from the chain each time, never kept,
+//!   so a rollback undoes a fill in what the wallet says as it does on the
+//!   chain.
 //!
 //! The mnemonic is not here; it is the `mnemonic` file beside the database.
 
@@ -116,6 +122,15 @@ CREATE TABLE IF NOT EXISTS forfeit (
 CREATE TABLE IF NOT EXISTS refusal (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, what TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS signer_seen (entry INTEGER PRIMARY KEY, hash TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS coin_entry (leaf_id TEXT PRIMARY KEY, entry INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS maker_order (
+	id TEXT PRIMARY KEY,
+	terms TEXT NOT NULL,
+	key_index INTEGER NOT NULL,
+	amount INTEGER NOT NULL,
+	placed_at TEXT,
+	unlock_after INTEGER,
+	created_at INTEGER NOT NULL
+);
 ";
 
 /// A coin as the store holds it.
@@ -509,6 +524,36 @@ impl Store {
 		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
 			.map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	// --- orders placed ---
+
+	/// Records an order placed by participation `id`: its terms (the relay's
+	/// form, without an outpoint), the index of its order key, its amount.
+	pub fn put_order(&self, id: &str, terms: &str, key_index: u32, amount: u64) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO maker_order (id, terms, key_index, amount, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+			params![id, terms, key_index, amount as i64, now()]).map_err(db)?;
+		Ok(())
+	}
+
+	/// `(id, terms, key_index, amount, placed_at, unlock_after)` of every
+	/// order placed, oldest first.
+	#[allow(clippy::type_complexity)]
+	pub fn orders(&self) -> Result<Vec<(String, String, u32, u64, Option<String>, Option<u32>)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, terms, key_index, amount, placed_at, unlock_after FROM maker_order ORDER BY created_at")
+			.map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32,
+			r.get::<_, i64>(3)? as u64, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?.map(|v| v as u32))))
+			.map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The offboard output order `id` was paid to (`txid:vout`), and the
+	/// median time after which the wallet unlocks it itself.
+	pub fn set_order_offboard(&self, id: &str, at: &str, unlock_after: u32) -> Result<(), Error> {
+		self.conn.execute("UPDATE maker_order SET placed_at = ?2, unlock_after = ?3 WHERE id = ?1", params![id, at, unlock_after as i64])
+			.map_err(db)?;
+		Ok(())
 	}
 
 	pub fn set_participation(&self, id: &str, state: &str, preimage: Option<&str>, round: Option<&str>) -> Result<(), Error> {
