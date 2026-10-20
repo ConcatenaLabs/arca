@@ -430,11 +430,16 @@ and a board whose registration never reached the server, are not recovered.
   (`forget-request`). A coin paid to a lapsed or forgotten request is still
   read, by any later `sync`. A payment the operator has recorded and not
   completed (its sender's post waits for the operator's signer or its
-  keepers) is a coin pending for the wallet: `sync` reads the operator's
-  notice of it and lists it (`mailbox.pending`, and `schedule.pending_coins`)
-  without counting it or spending it, and the schedule holds at a day until
-  it comes, whatever the lapse of the request it pays, or is withdrawn
-  (`mailbox.withdrawn`, with the operator's reason). A program built on the
+  keepers) is a coin announced by the operator as pending for the wallet:
+  `sync` reads the operator's notice of it and lists it (`mailbox.pending`,
+  and `schedule.pending_coins`) without counting it or spending it, and the
+  schedule holds at a day until it comes, whatever the lapse of the request
+  it pays, or is withdrawn (`mailbox.withdrawn`, with the operator's
+  reason). An announcement is the operator's statement, not a payment: the
+  wallet asks the server for the transfer it names (`transfer_status`) when
+  it reads the notice and at every `sync` after, and one whose transfer the
+  server does not show recorded with that coin is dropped with a note
+  (`mailbox.dropped`, and `refusals`) and holds nothing. A program built on the
   library gets the same from `Wallet::sync_schedule`, which it can call on a
   timer (a program that runs `arca` asks `arca schedule`), and runs
   `Wallet::sync` when it says so.

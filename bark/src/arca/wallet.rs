@@ -254,9 +254,11 @@ pub(crate) const PENDING_COINS: &str = "pending_coins";
 
 /// Why the wallet's schedule is a day at most while a coin is pending for
 /// it.
-pub(crate) const PENDING_NOTE: &str = "a coin is pending for the wallet: the operator recorded a transfer that pays it and has not \
-	completed it yet (its sender's post waits for the operator's signer or its keepers), and the coin is read only by sync once it \
-	does, so sync runs at least once a day until it comes or is withdrawn, whatever the request it pays says";
+pub(crate) const PENDING_NOTE: &str = "a coin is announced by the operator as pending for the wallet: the server shows a transfer \
+	that pays it recorded and not yet completed (its sender's post waits for the operator's signer or its keepers), and the coin is \
+	read only by sync once it completes, so sync runs at least once a day until it comes, is withdrawn, or the server no longer shows \
+	its transfer recorded, whatever the request it pays says. An announcement is the operator's statement, not a payment: the coin \
+	is counted nowhere until it comes";
 
 /// How long a receive request lasts, from the median time it was handed
 /// out: the acceptance horizon, 27 days. The request carries the median time

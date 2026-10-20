@@ -1002,8 +1002,8 @@ impl Wallet {
 				}
 				let hold = now.saturating_add(super::wallet::REQUEST_HOLDS);
 				let until = n["until"].as_u64().map(|u| (u.min(u32::MAX as u64) as u32).min(hold)).unwrap_or(hold);
-				let v = json!({"leaf_id": leaf, "transfer_id": n["transfer_id"], "asset": n["asset"], "value": n["value"], "seen_at": now,
-					"until": until});
+				let v = json!({"leaf_id": leaf, "transfer_id": n["transfer_id"], "asset": n["asset"], "value": n["value"], "owner": n["owner"],
+					"seen_at": now, "until": until});
 				book.insert(leaf, v.clone());
 				self.set_pending_book(&book)?;
 				Ok(Some(v))
@@ -1020,6 +1020,65 @@ impl Wallet {
 			},
 			_ => Ok(None),
 		}
+	}
+
+	/// D69: every coin pending for the wallet, checked with the server: a
+	/// notice is the operator's statement, not a payment, and holds the
+	/// wallet only while the server shows its transfer recorded with that
+	/// coin among its outputs, of the owner key, asset and value the notice
+	/// named (`transfer_status`). One it does not show so is dropped, with a
+	/// note, and holds nothing: a transfer unknown or dropped, another coin,
+	/// or one whose transfer is co-signed (its coin comes by the mailbox, and
+	/// one waiting there for its keepers stays pending). One the server shows
+	/// recorded once and then does not answer for stays until it answers.
+	/// Returns those dropped.
+	fn check_pending(&mut self) -> Result<Vec<Value>, Error> {
+		let mut book = self.pending_book()?;
+		let retry: Vec<String> = self.store.kept_for_retry()?.into_iter().map(|(l, _, _)| l).collect();
+		let mut dropped = vec![];
+		let mut changed = false;
+		for (leaf, v) in book.clone() {
+			let tid = v["transfer_id"].as_str().unwrap_or("").to_string();
+			let st = self.server.post("transfer_status", &json!({"transfer_id": tid, "leaf_id": leaf}));
+			let why = match &st {
+				Ok(st) if st["state"] == "recorded" => {
+					let o = &st["output"];
+					let same = o["leaf_id"].as_str() == Some(leaf.as_str()) && o["asset"] == v["asset"] && o["value"] == v["value"]
+						&& (v["owner"].is_null() || o["owner"] == v["owner"]);
+					if same {
+						if v["checked_at"].is_null() {
+							let mut w = v.clone();
+							w["checked_at"] = json!(self.now()?.to_consensus_u32());
+							book.insert(leaf.clone(), w);
+							changed = true;
+						}
+						continue;
+					}
+					format!("the server shows transfer {} recorded, and not with this coin of the owner key, asset and value the notice \
+						named", tid)
+				},
+				Ok(st) if st["state"] == "signed" => {
+					if retry.contains(&leaf) {
+						continue;
+					}
+					format!("its transfer {} is co-signed: the coin itself comes by the mailbox", tid)
+				},
+				Ok(st) => format!("the server does not show its transfer {} recorded (it says {})", tid, st["state"]),
+				// Shown recorded before: asked again at the next sync.
+				Err(Error::Unreachable(_)) if !v["checked_at"].is_null() => continue,
+				Err(e) => format!("the server does not show its transfer {} recorded ({})", tid, e),
+			};
+			book.remove(&leaf);
+			changed = true;
+			let note = format!("dropped: {}; a notice is the operator's statement, not a payment, and holds the wallet only while its \
+				transfer stands recorded", why);
+			self.store.refused(&format!("the notice of pending coin {}", leaf), &note)?;
+			dropped.push(json!({"leaf_id": leaf, "transfer_id": tid, "reason": note}));
+		}
+		if changed {
+			self.set_pending_book(&book)?;
+		}
+		Ok(dropped)
 	}
 
 	/// The coins pending for the wallet, by leaf id, as the mailbox's notices
@@ -1062,8 +1121,13 @@ impl Wallet {
 	/// answering) is kept aside and checked again on every read until it is
 	/// kept or refused for good. A notice of a coin pending for the wallet,
 	/// or withdrawn, is taken as [`Self::take_notice`] says: the coins still
-	/// pending are listed (`pending`), counted nowhere, and those withdrawn
-	/// in this read with their reasons (`withdrawn`). The cursor of a
+	/// pending are listed (`pending`), counted nowhere, those withdrawn in
+	/// this read with their reasons (`withdrawn`), and those whose transfer
+	/// the server no longer shows recorded, dropped (`dropped`,
+	/// [`Self::check_pending`]). A pending coin is the operator's statement,
+	/// not a payment: it is announced by the operator, never counted or
+	/// spent, and holds the wallet only while its transfer stands recorded.
+	/// The cursor of a
 	/// mailbox never moves back: a message at or before it is not read
 	/// again, a page with nothing past it ends the read, and one read takes
 	/// at most [`super::client::MAILBOX_PAGES`] pages of a key, each with a
@@ -1214,6 +1278,12 @@ impl Wallet {
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
 		if !held.is_empty() {
 			out["already_held"] = json!(held);
+		}
+		// D69: a notice holds only while the server shows its transfer
+		// recorded, asked when the wallet reads it and at every sync after.
+		let dropped = self.check_pending()?;
+		if !dropped.is_empty() {
+			out["dropped"] = json!(dropped);
 		}
 		let pending = self.pending_coins(now)?;
 		if !pending.is_empty() {

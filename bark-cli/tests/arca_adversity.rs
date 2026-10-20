@@ -6727,3 +6727,107 @@ async fn d67_a_claim_not_mined_is_raised_when_the_floor_rises() {
 	assert_eq!(coin_of(&a, &leaf)["state"], "exited", "once its claim is final");
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+// ---------------------------------------------------------------------------
+// D69: a pending notice holds only while its transfer stands recorded; a
+// wallet that has never synced is due at once
+// ---------------------------------------------------------------------------
+
+/// Runs `stmt` with `params` on the server's database.
+async fn on_the_database(r: &Running, stmt: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> u64 {
+	let (c, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	c.execute(stmt, params).await.unwrap()
+}
+
+/// The eleventh review's F3, turned around (D69). B holds nothing; it
+/// handed out one request, which it forgets. The operator posts to B's
+/// mailbox a notice of a coin pending for B, naming the owner key and nonce
+/// of that request (which it was shown), a made-up leaf and transfer, and
+/// 1,000,000 of X, and again with another leaf and transfer a day later. B
+/// asks the server for the transfer each names: none is recorded, so each
+/// notice is dropped with a note, holds nothing, and B's schedule names no
+/// time.
+#[tokio::test(flavor = "multi_thread")]
+async fn d69_a_notice_no_recorded_transfer_stands_behind_holds_nothing() {
+	let r = Running::start().await;
+	let url = r.url();
+	let b = Arca::new("D69B");
+	b.ok(&create_args(&url, &r.node_url()));
+	let asked = b.ok(&["receive"]);
+	let req = inside(asked["request"].as_str().unwrap());
+	b.ok(&["forget-request", asked["details"]["owner"].as_str().unwrap()]);
+	let s = b.ok(&["sync"]);
+	println!("D69B B holds nothing, its request forgotten: next_sync_at {}", s["schedule"]["next_sync_at"]);
+	assert!(s["schedule"]["next_sync_at"].is_null(), "{}", s["schedule"]);
+	let mailbox = unhex(req["mailbox"].as_str().unwrap());
+	for k in 1..=2u64 {
+		let notice = json!({"transfer_id": format!("{:064x}", 0xfeed_0000u64 + k), "leaf_id": format!("{:064x}", 0xbeef_0000u64 + k),
+			"asset": r.x.to_string(), "value": "1000000", "owner": req["owner"], "owner_nonce": req["owner_nonce"]});
+		let n = on_the_database(&r, "INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload) VALUES ($1, 'pending', NULL, $2)",
+			&[&mailbox, &notice.to_string().into_bytes()]).await;
+		assert_eq!(n, 1);
+		let s = b.ok(&["sync"]);
+		let refusals = b.ok(&["refusals"]);
+		println!("D69B the operator's notice {}: B's sync: mailbox {} | schedule {} | refusals {}", k, s["mailbox"], s["schedule"], refusals);
+		assert!(s["mailbox"]["pending"].as_array().is_none_or(|p| p.is_empty()), "a notice no transfer stands behind is pending: {}",
+			s["mailbox"]);
+		assert!(s["schedule"]["next_sync_at"].is_null(), "the notice holds the schedule: {}", s["schedule"]);
+		assert!(s["schedule"]["pending_coins"].is_null(), "{}", s["schedule"]);
+		let leaf = format!("{:064x}", 0xbeef_0000u64 + k);
+		assert!(refusals.to_string().contains(&leaf), "the notice is dropped with a note naming it: {}", refusals);
+		assert_eq!(b.ok(&["balance"])["arca"], json!({}), "nothing counted");
+		d57_to(&r, common::node::median_time(&r.rt) + 86_400).await;
+	}
+	let _ = std::fs::remove_dir_all(&b.dir);
+}
+
+/// D69, at a wake the notice holds: A pays B with the signer away, so the
+/// transfer is recorded and B reads its notice; the coin is pending and
+/// holds B's schedule. The operator then removes the transfer's record and
+/// posts no withdrawal. At its next wake B asks the server for the
+/// transfer, finds it no longer recorded, and drops the notice with a note:
+/// nothing holds B's schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn d69_a_notice_whose_transfer_is_gone_holds_no_more_at_the_next_wake() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let (a, b) = (Arca::new("D69WA"), Arca::new("D69WB"));
+	let boards = boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
+	b.ok(&create_args(&url, &r.node_url()));
+	let asked = b.ok(&["receive"]);
+	let req = asked["request"].as_str().unwrap().to_string();
+	signer_goes_away_at_the_payment(&p, &r);
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	p.rewrite_request(None);
+	r.signer.halt();
+	assert!(!ok && v["error"]["kind"] == "unreachable", "{}", v);
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	b.ok(&["forget-request", asked["details"]["owner"].as_str().unwrap()]);
+	let s = b.ok(&["sync"]);
+	println!("D69W B's sync with the payment recorded: mailbox {} | schedule {}", s["mailbox"], s["schedule"]);
+	assert_eq!(s["mailbox"]["pending"].as_array().map(|p| p.len()), Some(1), "the recorded transfer's coin is pending: {}", s["mailbox"]);
+	let leaf = s["mailbox"]["pending"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(s["schedule"]["next_sync_at"].is_u64(), "the pending coin holds the schedule: {}", s["schedule"]);
+	// The operator removes the transfer's record and withdraws nothing.
+	let id: LeafId = boards[0].parse().unwrap();
+	let t = r.server.store.spent_by_transfer(&id.0).await.unwrap().expect("the transfer recorded");
+	r.server.store.drop_transfer(&t, "removed").await.unwrap();
+	let gone = on_the_database(&r, "DELETE FROM mailbox_message WHERE kind = 'withdrawn'", &[]).await;
+	println!("D69W the operator removed the transfer's record and {} withdrawal(s)", gone);
+	d57_to(&r, common::node::median_time(&r.rt) + 3_600).await;
+	let s = b.ok(&["sync"]);
+	let refusals = b.ok(&["refusals"]);
+	println!("D69W B's next wake: mailbox {} | schedule {} | refusals {}", s["mailbox"], s["schedule"], refusals);
+	assert!(s["schedule"]["pending_coins"].is_null(), "the notice holds on: {}", s["schedule"]);
+	assert!(s["schedule"]["next_sync_at"].is_null(), "nothing holds the schedule: {}", s["schedule"]);
+	assert!(refusals.to_string().contains(&leaf), "the notice is dropped with a note naming it: {}", refusals);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+

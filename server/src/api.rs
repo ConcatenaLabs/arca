@@ -1126,6 +1126,39 @@ pub struct FillStatus {
 	pub remainder_vout: Option<u32>,
 }
 
+/// `POST /v1/transfer_status`: how the transfer `transfer_id` stands, and
+/// the output `leaf_id` of it, when it has one: what a wallet holding a
+/// notice that the coin is pending for it (D61) checks the notice by (D69).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferStatusRequest {
+	pub transfer_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+}
+
+/// A transfer: `recorded` (not yet co-signed), `signed`, or `unknown` (never
+/// recorded, or dropped), and the output asked for when it is one of its
+/// outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferStatus {
+	pub transfer_id: String,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output: Option<TransferOutputStatus>,
+}
+
+/// An output of a transfer, as the server holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferOutputStatus {
+	pub leaf_id: String,
+	pub owner: String,
+	pub asset: String,
+	pub value: String,
+}
+
 /// `POST /v1/participation_status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
