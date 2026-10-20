@@ -107,6 +107,11 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 		})),
 		"/fund" => {
 			let s = script(b["script"].as_str().ok_or("no script")?)?;
+			// The purse pays whatever it is given: an empty script or more than
+			// it holds would end the test, and the chain with it.
+			if s.is_empty() {
+				return Err("an empty script".into());
+			}
 			let asset = AssetId::from_str(b["asset"].as_str().ok_or("no asset")?).map_err(|e| e.to_string())?;
 			let amount = b["amount"].as_u64().or_else(|| b["amount"].as_str().and_then(|a| a.parse().ok())).ok_or("no amount")?;
 			let tx = r.pay_to(s, asset, amount);
