@@ -6545,3 +6545,83 @@ async fn d66_a_coin_due_home_goes_home_while_the_mailbox_is_served_without_end()
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+// ---------------------------------------------------------------------------
+// The texts a wallet hands out name no product
+// ---------------------------------------------------------------------------
+
+/// The JSON inside a text a wallet hands out: the hex after its prefix.
+fn inside(text: &str) -> Value {
+	let (_, h) = text.split_once(':').unwrap();
+	serde_json::from_slice(&unhex(h)).unwrap()
+}
+
+/// Every key of `v`, at any depth.
+fn keys_of(v: &Value, out: &mut Vec<String>) {
+	match v {
+		Value::Object(o) => for (k, x) in o {
+			out.push(k.clone());
+			keys_of(x, out);
+		},
+		Value::Array(a) => a.iter().for_each(|x| keys_of(x, out)),
+		_ => {},
+	}
+}
+
+/// A receive request, a swap offer and its acceptance, decoded by anyone,
+/// say what they are (`kind`) and name no product. A text an older wallet
+/// made, with the older keys, is still read: a request paid, an offer
+/// accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_a_wallet_hands_out_names_what_it_is_and_no_product() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let (a, b) = (Arca::new("TXA"), Arca::new("TXB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(y, 2_000_000)]).await;
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want",
+		"400000"])["offer"].as_str().unwrap().to_string();
+	for (what, text, kind) in [("a receive request", &req, "request"), ("a swap offer", &offer, "swap-offer")] {
+		let v = inside(text);
+		let mut keys = vec![];
+		keys_of(&v, &mut keys);
+		println!("TX {}: kind {} | keys {:?}", what, v["kind"], keys);
+		assert!(!keys.iter().any(|k| k.contains("arca")), "{} names the product: {:?}", what, keys);
+		assert_eq!(v["kind"], kind, "{}", v);
+	}
+	let acc = b.ok(&["swap", "accept", &offer])["accept"].as_str().unwrap().to_string();
+	let v = inside(&acc);
+	let mut keys = vec![];
+	keys_of(&v, &mut keys);
+	println!("TX a swap acceptance: kind {} | keys {:?}", v["kind"], keys);
+	assert!(!keys.iter().any(|k| k.contains("arca")), "{:?}", keys);
+	assert_eq!(v["kind"], "swap-accept", "{}", v);
+	a.ok(&["swap", "complete", &acc]);
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	// Texts with the older keys, as an older wallet hands them out.
+	let older = |text: &str, old: &str| {
+		let mut v = inside(text);
+		let o = v.as_object_mut().unwrap();
+		o.remove("kind");
+		o.insert(old.to_string(), json!(1));
+		format!("arca:{}", hex(v.to_string().as_bytes()))
+	};
+	let req2 = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = a.ok(&["send", &older(&req2, "arca_request"), "--amount", "100000", "--asset", &x.to_string()]);
+	println!("TX an older request paid: {}", paid["transfer"]["transfer_id"]);
+	// An older offer is read too: its taker signs it (its id is the hash of
+	// the text as its maker made it, which the unit tests of the wallet's
+	// texts cover with the older keys).
+	let offer2 = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "200000", "--want-asset", &y.to_string(), "--want",
+		"300000"])["offer"].as_str().unwrap().to_string();
+	let acc2 = b.ok(&["swap", "accept", &older(&offer2, "arca_swap_offer")]);
+	println!("TX an older offer read and accepted: {}", acc2["swap"]);
+	assert!(acc2["accept"].is_string(), "{}", acc2);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
