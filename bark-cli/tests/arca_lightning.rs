@@ -1183,3 +1183,171 @@ async fn d67_a_client_that_wakes_late_by_most_of_the_margin_still_claims_first()
 	drop((ox, px));
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+/// A received payment whose claim the server recorded and did not co-sign,
+/// as the server itself leaves one when its signer is away at the claim:
+/// the claim reaches the server (the signer is killed as it does, then
+/// started again), which records the preimage, settles the payer and
+/// records the claim's transfer, then cannot co-sign it. Returns the server,
+/// the lost wallet, the payment's hash, the leaf, its timeout, its record
+/// and the two Lightning nodes.
+async fn a_claim_the_server_recorded(lnd: &std::path::Path, tag: &str)
+	-> (Running, Arca, String, String, u32, CoinRecordOf, sequentia_ext::lightning::LightningNode, sequentia_ext::lightning::LightningNode)
+{
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd.to_path_buf(), &mut r, &tag.to_lowercase()).await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let a = wallet_at(tag, &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let pid = r.signer.pid().to_string();
+	p.rewrite_request(Some(std::sync::Arc::new(move |path: &str, _: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+		}
+	})));
+	let (_, s) = a.run(&["sync"]);
+	p.rewrite_request(None);
+	r.signer.halt();
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	println!("{} the claim with the signer killed: lightning {} | the server's answer {:?}", tag, s["lightning"],
+		p.last("/v1/lightning_receive_claim").map(|(_, st, v)| (st, v)));
+	let row = receive_row(&r, &hash).await.unwrap();
+	assert!(row.preimage.is_some(), "the server recorded the preimage");
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete", "the payer's payment settled");
+	let leaf = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").cloned().expect("the htlc-1 leaf");
+	let leaf_id = leaf["leaf_id"].as_str().unwrap().to_string();
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	(r, a, hash, leaf_id, timeout, rec, ox, px)
+}
+
+/// Wakes `w` when its schedule says until its received leaf `leaf` is
+/// spent on the chain or the timeout is long past, then checks the spend is
+/// its claim, in a block before `timeout`, and that the operator's refund
+/// past the timeout finds the leaf claimed.
+async fn claims_home_before_the_refund(r: &Running, w: &Arca, tag: &str, hash: &str, leaf: &str, timeout: u32, rec: &CoinRecordOf) {
+	let mut s = w.ok(&["schedule"]);
+	let mut wakes = 0;
+	while let Some(n) = s["next_sync_at"].as_u64().map(|n| n as u32) {
+		if wakes >= 90 || n >= timeout + 3600 || spent_on_chain(r, &rec.0, 300).is_some() {
+			break;
+		}
+		if n > mtp(r) {
+			advance(r, n - mtp(r)).await;
+		}
+		let (_, v) = w.run(&["sync"]);
+		r.produce().await;
+		wakes += 1;
+		s = v["schedule"].clone();
+		println!("{} wake {} at {} ({} s before the timeout): coin {} | home {} | exits {} | next {}", tag, wakes, mtp(r), timeout as i64 - mtp(r) as i64,
+			coin_of(w, leaf)["state"], v["home"], v["exits"], s["next_sync_at"]);
+	}
+	let spent = spent_on_chain(r, &rec.0, 2000);
+	println!("{} the leaf's spend: {:?}", tag, spent.as_ref().map(|(o, t, m)| (o.to_string(), t.txid().to_string(), *m, claims_with_preimage(t, o, hash))));
+	let (op, t, m) = spent.unwrap_or_else(|| panic!("the restored wallet never took the leaf home: coin {} | its receives {} | schedule {}",
+		coin_of(w, leaf), w.ok(&["lightning", "receives"]), s));
+	assert!(claims_with_preimage(&t, &op, hash), "the leaf's spend {} is not the wallet's claim", t.txid());
+	assert!(m < timeout, "the claim is in a block before the timeout ({} >= {})", m, timeout);
+	if mtp(r) < timeout + 600 {
+		advance(r, timeout + 600 - mtp(r)).await;
+	}
+	let refund = rec.refund(r, op, r.x);
+	let sent: Result<Value, _> = r.rt.client().call("sendrawtransaction", &[json!(elements::encode::serialize_hex(&refund))]);
+	println!("{} the operator's refund past the timeout: {:?}", tag, sent);
+	assert!(sent.is_err(), "the operator's refund finds the leaf claimed");
+}
+
+/// The eleventh review's F1, turned around (D68). A restore meets a
+/// received leaf whose claim the server recorded and did not co-sign: the
+/// leaf is held `receiving`, its payment rebuilt as handed over with its
+/// home date, and the restored wallet, waking only when its schedule says,
+/// takes it home by its claim before the operator's refund opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn d68_a_restore_meets_a_claim_the_server_recorded() {
+	let Some(lnd) = lightningd("d68_a_restore_meets_a_claim_the_server_recorded") else { return };
+	let (r, a, hash, leaf_id, timeout, rec, ox, px) = a_claim_the_server_recorded(&lnd, "D68A").await;
+	println!("D68A the leaf at the server: {:?}", r.server.store.leaf(&leaf_id.parse::<arca_covenant::LeafId>().unwrap().0).await.unwrap()
+		.map(|l| l.state));
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("D68A2");
+	let made = a2.ok(&["create", "--server", &r.url(), "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	println!("D68A restore: served {} | restored {} | not_recovered {} | notes {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["not_recovered"], made["restore"]["notes"]);
+	let c = coin_of(&a2, &leaf_id);
+	let rv = a2.ok(&["lightning", "receives"])[&hash].clone();
+	println!("D68A the restored leaf: {} | its receive {}", c, rv);
+	assert_eq!(c["state"], "receiving", "the restored leaf is held receiving: {}", c);
+	assert_eq!(rv["state"], "claiming", "the payment is rebuilt as handed over: {}", rv);
+	assert!(rv["home_at"].as_u64().is_some_and(|h| h < timeout as u64), "the receive has its home date: {}", rv);
+	claims_home_before_the_refund(&r, &a2, "D68A", &hash, &leaf_id, timeout, &rec).await;
+	drop((ox, px));
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D68, the served-as-signed lie: the operator serves the claim it recorded
+/// and never co-signed as signed. The restored wallet holds no coin the
+/// claim made, so it takes the leaf as not spent, holds it `receiving` with
+/// its home date, and takes it home by its claim before the refund opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn d68_a_claim_served_as_signed_is_not_taken_without_its_coin() {
+	let Some(lnd) = lightningd("d68_a_claim_served_as_signed_is_not_taken_without_its_coin") else { return };
+	let (r, a, hash, leaf_id, timeout, rec, ox, px) = a_claim_the_server_recorded(&lnd, "D68B").await;
+	let lie = common::proxy::Proxy::start(&r.url());
+	lie.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				for g in l["given"].as_array_mut().into_iter().flatten() {
+					if g["transfer"]["state"] == "recorded" {
+						g["transfer"]["state"] = json!("signed");
+					}
+				}
+			}
+		}
+		None
+	})));
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("D68B2");
+	let made = a2.ok(&["create", "--server", &lie.url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	println!("D68B restore against the lie: served {} | restored {} | not_recovered {} | notes {}", made["restore"]["served"],
+		made["restore"]["restored"], made["restore"]["not_recovered"], made["restore"]["notes"]);
+	let c = coin_of(&a2, &leaf_id);
+	let rv = a2.ok(&["lightning", "receives"])[&hash].clone();
+	println!("D68B the restored leaf: {} | its receive {}", c, rv);
+	assert_ne!(c["state"], "spent", "a claim served as signed is not taken without the coin it made: {}", c);
+	assert_eq!(rv["state"], "claiming", "the payment is rebuilt as handed over: {}", rv);
+	claims_home_before_the_refund(&r, &a2, "D68B", &hash, &leaf_id, timeout, &rec).await;
+	drop((ox, px));
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D68: a restore that comes too late to win, past the received leaf's
+/// timeout, says so on the coin rather than holding it quietly.
+#[tokio::test(flavor = "multi_thread")]
+async fn d68_a_restore_too_late_to_win_says_so() {
+	let Some(lnd) = lightningd("d68_a_restore_too_late_to_win_says_so") else { return };
+	let (r, a, hash, leaf_id, timeout, _rec, ox, px) = a_claim_the_server_recorded(&lnd, "D68C").await;
+	if mtp(&r) < timeout + 60 {
+		advance(&r, timeout + 60 - mtp(&r)).await;
+	}
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("D68C2");
+	let made = a2.ok(&["create", "--server", &r.url(), "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	let c = coin_of(&a2, &leaf_id);
+	println!("D68C restored past the timeout: notes {} | the coin {} | its receive {}", made["restore"]["notes"], c,
+		a2.ok(&["lightning", "receives"])[&hash]);
+	assert!(c["note"].as_str().is_some_and(|n| n.contains("too late")), "the coin says the restore came too late: {}", c);
+	drop((ox, px));
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
