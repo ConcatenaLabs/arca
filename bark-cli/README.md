@@ -378,7 +378,10 @@ and a board whose registration never reached the server, are not recovered.
   request past it however late the payment reaches it (a post held, and
   sent again by a later `sync`): the server refuses it (`request_lapsed`),
   and the payer's coins are live again.
-  `sync`'s `schedule` says when it must run next (`next_sync_at`), and never
+  `sync`'s `schedule` says when it must run next (`next_sync_at`): an exit
+  under way at its next step (two blocks on while it unrolls, when its
+  claim's delay ends, within half an hour while its claim becomes final),
+  and never
   more than a day ahead while a receive request the wallet handed out is
   unpaid and has not lapsed, saying so (`why`); `receive_requests` lists
   every unpaid request with the median time it was handed out at, `waiting`
@@ -503,10 +506,20 @@ leaf from the published tree (an `htlc-1` leaf received under its hash, of
 the amount less the fee), hands over its unroll authorisations, and holds
 the leaf, `receiving`. Only then does it hand over the preimage, with the
 transfer of the leaf into a leaf of its own, and only while the leaf's
-timeout leaves it time to unroll the leaf and wait its exit delay should
-the operator not co-sign; `exit` takes a `receiving` leaf home by its claim
-with the preimage. The payment is settled when the preimage is handed over.
-A payment the operator failed back is `failed`, with the reason. The
+timeout leaves it time to unroll the leaf, wait its exit delay and claim it
+a few blocks before the timeout, when the operator's refund of the leaf
+opens (the refund's two locks, the timeout and the operator's delay, run at
+once). Later than that the wallet keeps the preimage: the payment is failed
+back to its payer and the leaf is the operator's. Once the preimage has gone
+out the payment is never called failed: if the operator does not answer the
+claim with its co-signature, the leaf comes home by its claim at its home
+date (the timeout less the exit delay, the unroll and the margin), which
+`sync` takes it home at whatever the operator does, and which `sync`'s
+schedule names. While a payment is asked for, held or claimed, the schedule
+wakes the wallet within a quarter of the operator's window; `exit` takes a
+`receiving` leaf home by its claim with the preimage. The payment is settled
+when the preimage is handed over. A payment the operator failed back is
+`failed`, with the reason. The
 invoice locks the payment for twice the leaf's exit delay and the
 operator's window, about 5,060 blocks with a 36-hour exit delay: a payer
 whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016

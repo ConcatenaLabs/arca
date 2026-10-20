@@ -18,6 +18,16 @@ by the mempool and again when forced into a block:
   by the other side's key;
 - the collaborative path with one signature, or with a pair made for another
   salt. It needs no wait, which is what returns a failed payment at once.
+
+Into the tree, the refund's two locks run at once, so the operator's refund
+of a leaf confirmed an operator's delay or more before its timeout opens at
+the timeout itself. The band case shows it: a leaf confirmed less than its
+exit delay before its timeout is refunded at the timeout, and the owner's
+claim after its delay finds the output gone; one confirmed its exit delay
+and a margin before its timeout is claimed first, and the refund at the
+timeout finds the output gone. A wallet hands a payment's preimage over only
+while it could still unroll the leaf, wait its exit delay and claim it a few
+blocks before the timeout.
 """
 from arklib3 import *
 import os as _os
@@ -53,6 +63,7 @@ class T15(Ark3, ArkBase, BitcoinTestFramework):
         self.send_returned_together()
         self.receive_claimed()
         self.receive_refunded()
+        self.receive_band()
 
     # -- helpers -----------------------------------------------------------
     def htlc(self, label, timeout, receive=False):
@@ -195,6 +206,42 @@ class T15(Ark3, ArkBase, BitcoinTestFramework):
         self.reject(refund(key=self.a_sec), "receive/neg refund signed by the owner")
         self.send(refund(), "receive/refund by the operator after the timeout and its delay")
         self.send(early, "receive/refund of the earlier output, now past the timeout")
+
+    def receive_band(self):
+        """The refund's locks run at once: it opens at the timeout for a leaf
+        confirmed an operator's delay before it. Confirmed less than its exit
+        delay before the timeout, the leaf is the operator's at the timeout,
+        before the owner's claim opens; confirmed its exit delay and a margin
+        before, it is the owner's by its claim first."""
+        # In the band: the claim would open half an operator's delay past
+        # the timeout; the refund opens at the timeout.
+        timeout = self.mtp() + EXIT_S - OPD_S // 2
+        tap, lv, _ = self.htlc("receive_band", timeout, receive=True)
+        u = self.fund(tap.scriptPubKey, V, self.X)
+        claim = self.path_tx(u, tap, lv, "claim", [], self.owner_spk(), EXIT, key=self.a_sec, after=[self.pre])
+        refund = self.path_tx(u, tap, lv, "refund", [], self.operator_spk(), OPD, locktime=timeout, key=self.s_sec)
+        self.rec("band", {"timeout": timeout, "claim_opens": self.csv_ready_at(u.txid, EXIT_S),
+                          "refund_opens": max(timeout, self.csv_ready_at(u.txid, OPD_S))})
+        self.mtp_past(timeout)
+        self.reject(claim, "receive/band neg the owner's claim at the timeout, before its exit delay")
+        self.send(refund, "receive/band the operator's refund at the timeout, the owner's claim not yet open")
+        self.wait_csv(u.txid, EXIT_S)
+        self.reject(claim, "receive/band neg the owner's claim after its exit delay, the output refunded",
+                    block="bad-txns-inputs-missingorspent")
+        # A margin of three ten-minute blocks before the timeout: the owner's
+        # claim opens first and is mined; the refund at the timeout finds the
+        # output gone.
+        timeout = self.mtp() + EXIT_S + 3 * 600
+        tap, lv, _ = self.htlc("receive_safe", timeout, receive=True)
+        u = self.fund(tap.scriptPubKey, V, self.X)
+        claim = self.path_tx(u, tap, lv, "claim", [], self.owner_spk(), EXIT, key=self.a_sec, after=[self.pre])
+        refund = self.path_tx(u, tap, lv, "refund", [], self.operator_spk(), OPD, locktime=timeout, key=self.s_sec)
+        self.wait_csv(u.txid, EXIT_S)
+        assert self.mtp() < timeout, "the claim opens before the timeout"
+        self.send(claim, "receive/safe the owner's claim after its exit delay, before the timeout")
+        self.mtp_past(timeout)
+        self.reject(refund, "receive/safe neg the operator's refund at the timeout, the output claimed",
+                    block="bad-txns-inputs-missingorspent")
 
 
 if __name__ == "__main__":

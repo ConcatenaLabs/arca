@@ -230,3 +230,343 @@ async fn receive_state(r: &Running, hash: &str) -> String {
 	let h: [u8; 32] = unhex(hash).try_into().unwrap();
 	r.server.receives.status(&h).await.unwrap().map(|row| row.state.name().to_string()).unwrap_or_default()
 }
+
+// ---------------------------------------------------------------------------
+// Receiving into the tree against an operator that does not answer, a
+// restore from the mnemonic, and the operator's cap on what it holds out
+// ---------------------------------------------------------------------------
+
+
+fn mtp(r: &Running) -> u32 {
+	common::node::median_time(&r.rt)
+}
+
+async fn advance(r: &Running, s: u32) {
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, s));
+	r.synced().await;
+}
+
+async fn receive_row(r: &Running, hash: &str) -> Option<server::store::ReceiveRow> {
+	let h: [u8; 32] = unhex(hash).try_into().unwrap();
+	r.server.receives.status(&h).await.unwrap()
+}
+
+fn coin_of(w: &Arca, leaf: &str) -> Value {
+	w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf).cloned().unwrap_or(Value::Null)
+}
+
+/// A server whose Lightning delays a test can wait out: the operator's
+/// delay one unit, the owner's least two, a receive's window ten minutes.
+async fn short_delays() -> Running {
+	Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await
+}
+
+/// The operator's node in X, holding invoices, and a payer with a channel
+/// to it; X's leg configured and up.
+async fn leg_in_x(lnd: &std::path::PathBuf, r: &mut Running, tag: &str)
+	-> (sequentia_ext::lightning::LightningNode, sequentia_ext::lightning::LightningNode)
+{
+	let x = r.x;
+	let (ox, px) = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, lnd, &format!("{}o", tag), true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, lnd, &format!("{}p", tag), true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		(ox, px)
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == x.to_string() {
+			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	(ox, px)
+}
+
+fn wallet_at(name: &str, server: &str, r: &Running) -> Arca {
+	let a = Arca::new(name);
+	a.ok(&["create", "--server", server, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1"]);
+	a
+}
+
+/// `a` asks to receive `amount` of X and `payer` pays the invoice (in a
+/// thread) until the operator holds the payment. Returns the hash and the
+/// payer's thread.
+async fn held(r: &Running, a: &Arca, payer: &sequentia_ext::lightning::LightningNode, amount: u64)
+	-> (String, std::thread::JoinHandle<Result<Value, String>>)
+{
+	let inv = a.ok(&["lightning", "receive", &r.x.to_string(), &amount.to_string()]);
+	let hash = inv["payment_hash"].as_str().unwrap().to_string();
+	let (rpc, bolt11) = (payer.rpc_path(), inv["invoice"].as_str().unwrap().to_string());
+	let paying = std::thread::spawn(move || sequentia_ext::lightning::call_at(&rpc, "pay", json!({ "bolt11": bolt11 })));
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+	while !receive_row(r, &hash).await.is_some_and(|x| x.state.name() == "accepted") {
+		assert!(std::time::Instant::now() < deadline, "the payment was never held");
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+	(hash, paying)
+}
+
+/// The round of X that makes the leaf the operator wants, mined and final.
+async fn leaf_round(r: &Running) {
+	let built = r.server.rounds.run_round_of(r.x).await.unwrap().expect("a round");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+}
+
+/// The transaction spending `spk`'s output on the chain, if one is in a block
+/// of the last `back` and spends an output paying `spk`: the output, the
+/// spender, and the median time of the spender's block.
+fn spent_on_chain(r: &Running, spk: &Script, back: u64) -> Option<(elements::OutPoint, elements::Transaction, u32)> {
+	let c = r.rt.client();
+	let tip = c.blockchain_info().unwrap().blocks;
+	let mut outs = vec![];
+	for h in tip.saturating_sub(back)..=tip {
+		let b = c.block(&c.block_hash(h).unwrap()).unwrap();
+		for t in &b.txdata {
+			for (v, o) in t.output.iter().enumerate() {
+				if o.script_pubkey == *spk {
+					outs.push(elements::OutPoint::new(t.txid(), v as u32));
+				}
+			}
+		}
+		for t in &b.txdata {
+			if let Some(i) = t.input.iter().find(|i| outs.contains(&i.previous_output)) {
+				let header: Value = c.call("getblockheader", &[json!(c.block_hash(h).unwrap().to_string())]).unwrap();
+				return Some((i.previous_output, t.clone(), header["mediantime"].as_u64().unwrap() as u32));
+			}
+		}
+	}
+	None
+}
+
+/// R7j F2 (part 1), turned around (D62). The operator takes the preimage of a
+/// payment received into the tree, settles the payment, and co-signs
+/// nothing: the claim reaches it with its transfer's first signature
+/// spoiled, and every claim is answered 500, the mailbox empty. The wallet
+/// syncs only when its schedule says. Once its claim has gone out
+/// unanswered, its schedule names the leaf's home date (the timeout less its
+/// exit delay, the unroll and a margin), and the sync then takes the leaf
+/// home by its claim: the claim is in a block before the leaf's timeout,
+/// when the operator's refund could first open, so the operator's refund is
+/// refused, and the operator ends with the payment it settled and not the
+/// leaf it funded. The wallet never says the payment failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn d62_a_preimage_taken_and_unanswered_is_claimed_on_the_chain_before_the_refund_opens() {
+	let Some(lnd) = lightningd("d62_a_preimage_taken_and_unanswered_is_claimed_on_the_chain_before_the_refund_opens") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d62a").await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let a = wallet_at("D62A", &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	p.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+			return Some(500);
+		}
+		if path == "/v1/mailbox_read" {
+			if let Some(m) = v.get_mut("messages") {
+				*m = json!([]);
+			}
+		}
+		None
+	})));
+	p.rewrite_request(Some(std::sync::Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			if let Some(s) = body["inputs"][0]["checkpoint_sig"].as_str() {
+				let mut t = s.to_string();
+				let last = if t.ends_with('0') { "1" } else { "0" };
+				t.replace_range(t.len() - 1.., last);
+				body["inputs"][0]["checkpoint_sig"] = json!(t);
+			}
+		}
+	})));
+	// The sync that hands the preimage over, its claim unanswered.
+	let mut s = a.run(&["sync"]).1;
+	println!("D62A the claim at {} ({} s before the timeout {}): lightning {} | schedule next {}", mtp(&r), timeout as i64 - mtp(&r) as i64,
+		timeout, s["lightning"], s["schedule"]["next_sync_at"]);
+	assert!(p.count("/v1/lightning_receive_claim") >= 1, "the wallet claimed");
+	let paid = paying.join().unwrap().unwrap();
+	println!("D62A the payer's node: {} (the operator settled with the preimage it took)", paid["status"]);
+	assert_eq!(paid["status"], "complete");
+	let leaf = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").cloned().expect("the htlc-1 leaf");
+	let leaf_id = leaf["leaf_id"].as_str().unwrap().to_string();
+	// The wallet wakes only when its schedule says, until the timeout.
+	let mut wakes = 0;
+	while let Some(n) = s["schedule"]["next_sync_at"].as_u64().map(|n| n as u32) {
+		if n >= timeout || wakes >= 60 {
+			break;
+		}
+		if n > mtp(&r) {
+			advance(&r, n - mtp(&r)).await;
+		} else {
+			advance(&r, 60).await;
+		}
+		s = a.run(&["sync"]).1;
+		// The chain goes on: what the sync broadcast is mined.
+		r.produce().await;
+		wakes += 1;
+		println!("D62A wake {} at {} ({} s before the timeout): coin {} | lightning {} | home {} | exits {} | next {}", wakes, mtp(&r),
+			timeout as i64 - mtp(&r) as i64, coin_of(&a, &leaf_id)["state"], s["lightning"], s["home"], s["exits"],
+			s["schedule"]["next_sync_at"]);
+		if coin_of(&a, &leaf_id)["state"] == "exited" {
+			break;
+		}
+	}
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	let claimed = spent_on_chain(&r, &rec.0, 1500);
+	println!("D62A the leaf on the chain and its spend: {:?}", claimed.as_ref().map(|(o, t, m)| (o.to_string(), t.txid().to_string(), *m)));
+	let (op, claim, at) = claimed.unwrap_or_else(|| panic!("the wallet did not take the leaf home before its timeout {}: coin {} | its \
+		schedule {} | the receive {}", timeout, coin_of(&a, &leaf_id), s["schedule"], a.ok(&["lightning", "receives"])[&hash]));
+	assert!(at < timeout, "the claim is in a block before the timeout ({} >= {})", at, timeout);
+	assert!(claim.input.iter().any(|i| i.previous_output == op && i.witness.script_witness.iter().any(|w| w.len() == 32
+		&& elements::hashes::sha256::Hash::hash(w).to_string() == hash)), "the leaf comes home by its claim, with the preimage");
+	// The operator's refund, once it could open: the output is spent.
+	if mtp(&r) < timeout + 600 {
+		advance(&r, timeout + 600 - mtp(&r)).await;
+	}
+	let refund = rec.refund(&r, op, x);
+	let sent: Result<Value, _> = r.rt.client().call("sendrawtransaction", &[json!(elements::encode::serialize_hex(&refund))]);
+	println!("D62A the operator's refund past the timeout: {:?}", sent);
+	assert!(sent.is_err(), "the operator's refund finds the leaf claimed");
+	let rec_w = a.ok(&["lightning", "receives"])[&hash].clone();
+	println!("D62A the wallet's receive: {} | balance {}", rec_w, a.ok(&["balance"]));
+	assert_ne!(rec_w["state"], "failed", "the payment's preimage went out: never failed");
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// A received leaf's record in a wallet, as the operator would build its
+/// refund: its script and policy.
+struct CoinRecordOf(Script, arca_covenant::LeafPolicy);
+
+impl CoinRecordOf {
+	fn of(w: &Arca, leaf: &str) -> CoinRecordOf {
+		let rec = arca_covenant::CoinRecord::from_bytes(&unhex(w.ok(&["record", leaf])["record"].as_str().unwrap())).unwrap();
+		let arca_covenant::CoinRecord::Leaf { record, .. } = rec else { panic!("a round's leaf") };
+		let s = common::running::keypair("operator");
+		let policy = arca_covenant::LeafPolicy { owner: record.owner, operator: s.x_only_public_key().0, salt: record.salt(),
+			chain: record.chain, exit_delay: record.exit_delay, htlc: record.htlc };
+		CoinRecordOf(policy.script_pubkey(), policy)
+	}
+
+	/// The operator's refund of the leaf's output `op`, signed.
+	fn refund(&self, r: &Running, op: elements::OutPoint, x: AssetId) -> elements::Transaction {
+		let tx = r.rt.client().raw_transaction(&op.txid).unwrap();
+		let value = tx.output[op.vout as usize].value.explicit().unwrap();
+		let to = arca_covenant::ExplicitOutput::new(x, value - 5_000, Script::from([0u8, 20].into_iter().chain([7u8; 20]).collect::<Vec<u8>>()));
+		let ks = self.1.refund_tx(op, x, value, &[to], &arca_covenant::FeeSource::Reserve).unwrap();
+		let sighash = ks.sighash(r.rt.client().genesis_hash().unwrap()).unwrap();
+		let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &sighash, &[7u8; 32]);
+		ks.finish(vec![sig.as_ref().to_vec()]).tx
+	}
+}
+
+/// R7j F2 (part 2), turned around (D62): an honest operator, and a wallet
+/// that syncs in the band of one operator's delay before the timeout, where
+/// the operator's refund (both its locks run at once) opens before the
+/// wallet could take the leaf home by its claim. The wallet does not hand
+/// the preimage over: the payment is failed back to its payer, and the leaf
+/// is the operator's, held by the wallet nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn d62_in_the_band_before_the_timeout_the_wallet_keeps_the_preimage() {
+	let Some(lnd) = lightningd("d62_in_the_band_before_the_timeout_the_wallet_keeps_the_preimage") else { return };
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d62b").await;
+	let a = wallet_at("D62B", &r.url(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	// Three steps of two 60-s blocks and the exit delay of 2,048 s end 120 s
+	// past the timeout: inside the old rule's band (up to the operator's
+	// delay past it), outside the safe one.
+	let target = timeout - 2048 - 3 * 120 + 120;
+	if mtp(&r) < target {
+		advance(&r, target - mtp(&r)).await;
+	}
+	let s = a.ok(&["sync"]);
+	let rec = a.ok(&["lightning", "receives"])[&hash].clone();
+	let row = receive_row(&r, &hash).await.unwrap();
+	println!("D62B the wallet's sync at {} ({} s before the timeout {}): lightning {} | the receive {} | the server knows the preimage: {}",
+		mtp(&r), timeout as i64 - mtp(&r) as i64, timeout, s["lightning"], rec, row.preimage.is_some());
+	assert!(row.preimage.is_none(), "the wallet handed the preimage over in the band: the operator's refund opens first");
+	assert_eq!(rec["state"], "failed", "{}", rec);
+	// Past the time to claim the payment is failed back to its payer.
+	while mtp(&r) < timeout + 512 + 3600 + 300 {
+		advance(&r, 1200).await;
+	}
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+	while !receive_row(&r, &hash).await.is_some_and(|x| x.state.name() == "cancelled") {
+		assert!(std::time::Instant::now() < deadline, "the payment was never failed back");
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	let paid = paying.join().unwrap();
+	println!("D62B the payer's node: {:?}", paid.as_ref().map(|v| v["status"].clone()));
+	assert!(paid.is_err() || paid.as_ref().unwrap()["status"] != "complete", "the payer is repaid");
+	let leaf = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").cloned().unwrap_or(Value::Null);
+	println!("D62B the leaf at the wallet: {} | balance {}", leaf, a.ok(&["balance"])["arca"]);
+	assert!(!matches!(leaf["state"].as_str(), Some("receiving") | Some("live")), "the leaf is not the wallet's: {}", leaf);
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// D62: the schedule knows the Lightning states. A wallet that asks to
+/// receive syncs only when its schedule says: while the invoice waits to be
+/// paid, while the payment is held and its leaf wanted in a round, and once
+/// the leaf is its own, the schedule names a time within the operator's
+/// window, so the wallet takes the leaf up and claims it, and the payment
+/// completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn d62_the_schedule_wakes_the_wallet_for_a_payment_held_until_it_is_claimed() {
+	let Some(lnd) = lightningd("d62_the_schedule_wakes_the_wallet_for_a_payment_held_until_it_is_claimed") else { return };
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d62c").await;
+	let a = wallet_at("D62C", &r.url(), &r);
+	let window = 600u64;
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	let s = a.ok(&["sync"]);
+	let now = mtp(&r) as u64;
+	println!("D62C the payment held, the leaf wanted in the next round: schedule {}", s["schedule"]);
+	let next = s["schedule"]["next_sync_at"].as_u64();
+	assert!(next.is_some_and(|n| n <= now + window / 2), "the schedule wakes the wallet within the window: {}", s["schedule"]);
+	leaf_round(&r).await;
+	// The wallet wakes when its schedule says, until the payment completes.
+	let mut s = s;
+	for k in 0..8 {
+		let n = s["schedule"]["next_sync_at"].as_u64().unwrap_or_else(|| panic!("the schedule names no time with the payment held: {}",
+			s["schedule"])) as u32;
+		if n > mtp(&r) {
+			advance(&r, n - mtp(&r)).await;
+		}
+		s = a.ok(&["sync"]);
+		println!("D62C wake {} at {}: lightning {} | next {}", k, mtp(&r), s["lightning"], s["schedule"]["next_sync_at"]);
+		if a.ok(&["lightning", "receives"])[&hash]["state"] == "received" {
+			break;
+		}
+	}
+	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
