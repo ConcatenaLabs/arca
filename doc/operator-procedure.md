@@ -98,10 +98,21 @@ paid twice.
   its record, and a new record cannot take its place: make a new operator
   (new key, new record, new keepers' heads files) and move the holders to
   it.
-- **Take no payment into the tree over Lightning.** Run each asset's
-  Lightning node without the hold-invoice plugin (`info` then shows its
-  leg with `receives: false`), so no wallet asks to receive into the tree.
-  Payments out of the tree over Lightning stay on.
+- **Bound what Lightning puts on the operator's pools.** A payment held
+  for a receive and never claimed keeps its leaf's value in the batch until
+  the batch expires, and costs whoever asked for it nothing: keep
+  `[lightning] receive_cap_ppm` at its default (a tenth of each asset's
+  pool) or lower, so unclaimed receives never stop that asset's rounds.
+  Keep `send_stall_margin_seconds` at its default (six hours) or longer, and
+  `send_timeout_seconds` well above it (a day): a payment out of the tree
+  then resolves before its leaf's timeout through a chain stall that long
+  ([Paying an invoice out of the tree](../server/README.md#paying-an-invoice-out-of-the-tree)).
+- **Keep several final coins of the first fee asset** when the operator
+  serves an asset the node does not accept for fees. That asset's rounds
+  pay their fee and connector from the first fee asset's pool, and a round
+  spends only final coins: with one such coin, a round of that asset built
+  while the other rounds' change is not yet final waits for their
+  confirmations.
 - **When the operator stops or moves, tell the holders.** Say which
   operator ends, from which time, and which operator replaces it, so each
   holder runs `arca sync` at once, takes its coins home on the chain, and
@@ -123,13 +134,19 @@ Every holder receives these rules before the operator holds their coins:
   `next_sync_at` counts it until then. Hand a payer a new request rather
   than an old one. A request handed out by a wallet before requests
   carried their lapse holds `next_sync_at` at a day until it is paid or
-  forgotten (`arca forget-request`).
-- **Keep running `arca sync` daily for two days after a receive request
-  lapses.** A payment recorded by the operator just before the lapse can
-  complete after it, and is read only by a `sync`.
+  forgotten (`arca forget-request`). A payment the operator has recorded
+  and not yet completed shows as pending (`sync`'s `mailbox.pending`), and
+  holds `next_sync_at` at a day until it comes, whatever the request's
+  lapse.
 - **When a payment answers `unreachable`, run `arca sync` again that
-  day.** The next `sync` posts the payment again, and the receiver reads it
-  only once it completes.
+  day.** The next `sync` posts the payment again, and its receiver reads it
+  once it completes.
+- **When receiving over Lightning, follow `next_sync_at`.** After `arca
+  lightning receive`, `sync` must run within the operator's window once
+  the payer has paid, to take up the leaf and claim it; `next_sync_at`
+  wakes the wallet for it, and for the leaf's way home by its claim should
+  the operator not answer. A payer whose node pays with SeqLN's `pay`
+  raises its `maxdelay` to the invoice's final lock time.
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
   for fees). `arca address` gives an address to pay it to.
