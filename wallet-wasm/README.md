@@ -18,6 +18,22 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   before anything else runs; the library builds without a transport of its own
   (the `arca-core` feature of `arca-wallet`), so every request goes through it.
   A server or node on another origin than the page must answer CORS.
+- **The node** is any `sequentiad` with `-txindex` and `-validateanchor`, and
+  the library makes these JSON-RPC calls of it and no other:
+  `getblockchaininfo`, `getblockhash`, `getblockheader`, `getblock` (verbosity
+  0, the raw block), `getrawtransaction`, `gettxout`, `getrawmempool` (txids
+  only), `getmempoolentry`, `getmempoolinfo`, `scantxoutset` (`start`, with
+  `raw()` descriptors), `decodescript`, `getanchorstatus`,
+  `getfeeexchangerates` with `dumpassetlabels` (the node keys its rates by
+  label), and `sendrawtransaction`, the one that writes. A page
+  holds no node credential worth having, so a site serves its wallets a proxy
+  that allows exactly these calls, adds the node's credential itself and
+  limits each caller, and the wallet is created with `node_url` alone.
+  `scantxoutset` reads the whole UTXO set, and a command makes one for each
+  window of on-chain scripts and each output it looks for (three, among some
+  thirty calls, for a wallet with one coin on the chain): a limit that lets a
+  caller make a few dozen in a row, then about one a second, keeps the wallet
+  working.
 - **The pause** waits on the clock: a worker blocked in the library has nothing
   else to do, and `Atomics.wait` needs a cross-origin-isolated page.
 - **The store** is the same SQLite schema, on SQLite's OPFS storage
