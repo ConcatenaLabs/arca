@@ -65,6 +65,8 @@ tokio-util.workspace = true
 
 dialoguer = "0.12"
 home = "=0.5.9"
+# `arca bitcoin create` speaks to Bark's daemon and to Bitcoin Core over HTTP.
+minreq = "2.14"
 
 
 # The scenario tests run the `arca` binary against a whole Arca server on an
@@ -75,6 +77,5 @@ arca-covenant = { path = "../covenant" }
 arca-sequentia-ext = { path = "../sequentia-ext", features = [ "regtest" ] }
 elements.workspace = true
 tokio-postgres = "0.7"
-minreq = "2.14"
 rusqlite = "0.31.0"
 tokio = { workspace = true, features = [ "time" ] }
