@@ -268,7 +268,15 @@ pub struct Params {
 	/// The seconds a block is counted at for an order whose REFUND is locked
 	/// to a height.
 	pub order_block_seconds: u32,
+	/// How long a round that fills orders waits, from when it was built (the
+	/// chain's median time), for every take in it to hand over its forfeits
+	/// before it is broadcast; a take whose forfeits do not come is voided,
+	/// and the round built again without it.
+	pub fill_forfeit_window_seconds: u32,
 }
+
+/// The default [`Params::fill_forfeit_window_seconds`]: ten minutes.
+pub const FILL_FORFEIT_WINDOW_SECONDS: u32 = 600;
 
 /// The default [`Params::order_margin_seconds`].
 pub const ORDER_MARGIN_SECONDS: u32 = 6 * 3_600;
@@ -299,6 +307,7 @@ impl Params {
 			max_margin_multiple: MAX_MARGIN_MULTIPLE,
 			order_margin_seconds: ORDER_MARGIN_SECONDS,
 			order_block_seconds: ORDER_BLOCK_SECONDS,
+			fill_forfeit_window_seconds: FILL_FORFEIT_WINDOW_SECONDS,
 		};
 		p.set_delays();
 		p

@@ -69,10 +69,15 @@
 //! but has another txid would void them all: every owner would take the old
 //! coin back through the refund and keep the new leaf too. So a round with
 //! another txid is always a new round, with a new tree and new unlock hashes,
-//! and its participations run again; and a round whose forfeits matter takes
-//! no input of a third party (a covenant fill, say), which could be spent
-//! elsewhere and force a replacement. Fills go in their own round
-//! transactions.
+//! and its participations run again; and a round of refreshes takes no input
+//! of a third party (a covenant fill, say), which could be spent elsewhere
+//! and force a replacement. Fills go in round transactions of their own,
+//! which carry only the takes that fill them: if a third party spends an
+//! order first, only those takes run again or are void. Such a round pays its
+//! orders' makers on the chain from the operator's coins, so it is broadcast
+//! only once the operator holds every take's forfeits (the owner's half of
+//! each, signed against the round's txid before it is broadcast, which binds
+//! them to that round's `M` as any forfeit is).
 //!
 //! A round out of the chain whose input another transaction took leaves
 //! every owner who gave up a leaf for it a forfeit no claim can answer while

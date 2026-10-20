@@ -222,10 +222,14 @@ min_leaf = "1000"
 
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order
-# locked to a height counted at block_seconds a block.
+# locked to a height counted at block_seconds a block. A round that fills
+# orders is broadcast once every take in it has handed over its forfeits; a
+# take whose forfeits do not come within forfeit_window_seconds of its round
+# being built is voided, and the round built again without it.
 [fills]
 order_margin_seconds = 21600
 block_seconds = 60
+forfeit_window_seconds = 600
 
 # The Lightning gateway beside each asset's own node.
 [lightning]

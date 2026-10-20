@@ -36,6 +36,18 @@ pub fn start_with(extra: &[&str]) -> Regtest {
 	Regtest::pos_from_env(&dir, &args)
 }
 
+/// An anchored chain without proof of stake, under its own directory: its
+/// blocks are mined, and `generateblock` forces a transaction the mempool
+/// would refuse into one, which no proof-of-stake chain takes.
+pub fn start_plain(extra: &[&str]) -> Regtest {
+	static N: AtomicUsize = AtomicUsize::new(0);
+	let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+		.join(format!("server-plain-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+	let mut args = vec!["-par=1"];
+	args.extend_from_slice(extra);
+	Regtest::from_env(&dir, &args)
+}
+
 /// A bare `OP_TRUE`: anyone spends it with an empty witness, through the
 /// mempool on a chain started with `-acceptnonstdtxn`.
 pub fn op_true() -> Script {

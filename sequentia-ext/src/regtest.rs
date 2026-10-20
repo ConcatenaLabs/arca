@@ -303,11 +303,16 @@ impl Regtest {
 		Regtest::start_pos(&exe_from_env(), workdir, extra).unwrap_or_else(|e| panic!("{}", e))
 	}
 
-	/// Builds one block from the mempool on a proof-of-stake chain, certified
-	/// by the whole committee, and returns its hash. Each staker is tried as
-	/// the leader in turn until one is eligible for the current slot.
+	/// Builds one block from the mempool and returns its hash: on a
+	/// proof-of-stake chain certified by the whole committee, each staker
+	/// tried as the leader in turn until one is eligible for the current
+	/// slot; on a chain started without one ([`Regtest::start`]), mined to
+	/// [`OP_TRUE_DESCRIPTOR`].
 	pub fn produce_block(&self) -> Result<BlockHash, String> {
-		let committee = self.committee.as_ref().ok_or("not a proof-of-stake chain")?;
+		let Some(committee) = self.committee.as_ref() else {
+			let mut made = self.client().generate_to_descriptor(1, OP_TRUE_DESCRIPTOR).map_err(|e| e.to_string())?;
+			return made.pop().ok_or_else(|| "generatetodescriptor made no block".to_string());
+		};
 		let all = serde_json::json!(committee.wifs);
 		let start = Instant::now();
 		loop {

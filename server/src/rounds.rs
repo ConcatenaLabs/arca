@@ -22,13 +22,15 @@
 //! token by one of the operator's coins, and a clock schedule of three steps
 //! (28, 56 and 84 days after the round) with a notice of 36 hours.
 //!
-//! The round transaction pays, in order: each batch output followed by its
+//! The round transaction pays, in order (after the orders' outputs in a round
+//! that fills on-chain orders, below): each batch output followed by its
 //! token's atom to the batch's first clock, then every offboard output, then
 //! the connector output (`arca_covenant::ConnectorPolicy`), whose only spend
 //! issues the round's connector asset, then change per asset and the one fee
-//! output. It spends the operator's own coins and nothing else: a round that
-//! carries forfeits takes no input of a third party, which could be spent
-//! elsewhere and keep the round from returning after a rollback. It has
+//! output. A round of refreshes spends the operator's own coins and nothing
+//! else: it takes no input of a third party, which could be spent elsewhere
+//! and keep the round from returning after a rollback. Only a round of its
+//! own that fills on-chain orders (below) spends one. A round has
 //! `nLockTime` 0 and final inputs, and is kept byte for byte, so the nursery
 //! broadcasts it again unchanged after a rollback and it returns with its
 //! txid, every forfeit signed for it still good.
@@ -128,6 +130,48 @@
 //! once if its owner exits). Nothing goes on the chain for a re-run that an
 //! ordinary participation would not put there.
 //!
+//! # Rounds that fill on-chain orders
+//!
+//! A take ([`crate::participations::Participations::take`]) runs in a round
+//! of its own kind, beside the refresh rounds: a fill round of the asset its
+//! orders sell ([`Rounds::run_fill_round_of`]), which carries takes and
+//! nothing else, so that an input a third party can spend first (an order
+//! anyone may fill) never stands in a round that carries refreshes. It is
+//! built under the rule every SeqDEX fill covenant reads: the order at input
+//! `k`, its maker's credit at output `2k` (the price, in the asset the order
+//! is paid in, to the maker's program, paid from the operator's coins of that
+//! asset) and at `2k+1` the order resting again with its identical script, or,
+//! for a full fill, an output to the operator in the asset the order is paid
+//! in ([`gap_value`]); the orders at inputs `0..n-1`, so outputs `0..2n-1` are
+//! theirs, and the batch, its token, the connector, change and the fee after
+//! them. The orders' own value pays the takers' leaves; the operator's pool of
+//! the asset pays the batch's reserves. Before anything is recorded the
+//! builder follows each order's FILL leaf over the transaction
+//! ([`arca_covenant::FillOrder::check`]), and the node is asked whether it
+//! would take it.
+//!
+//! Each take's order is checked again when its round is built: one spent by
+//! another transaction (in a block or the node's mempool), or whose maker can
+//! refund it too soon, drops out, its take voided with the reason, and the
+//! round is built without it; so is one the node finds spent when the round is
+//! put to it. A round that goes out of the chain because an order of it was
+//! taken by another transaction that is final is lost like any round: its
+//! takes run again, each order checked again, the one taken voided.
+//!
+//! A fill round pays its makers on the chain from the operator's coins, and
+//! what the operator gets for that is each take's forfeits. So it is held,
+//! built and unbroadcast, until every take in it has handed over its forfeits
+//! (the owner's half of each, which is all the operator needs to complete
+//! them; the signer is asked for its half once the round is broadcast), and
+//! only then broadcast ([`Rounds::pass`]). A take sees its round, the
+//! transaction without its witnesses, in its status, validates its new leaf
+//! against it, and signs. A take whose forfeits have not come
+//! [`Params::fill_forfeit_window_seconds`] after its round was built (by the
+//! chain's median time) is voided, the round dropped unbroadcast and its
+//! coins freed, and the takes that did hand theirs over run again in the
+//! round built after it. Its preimage goes out once the round is final, as
+//! any participation's.
+//!
 //! Each batch is published ([`Rounds::tree`]): its round, its output, its
 //! token's output, the round's connector output, its asset, schedule, radix,
 //! reserve rule and smallest leaf, and every leaf as the builder took it, so
@@ -147,8 +191,8 @@ use arca_covenant::encode::Encoding;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
 use arca_covenant::{
-	connector_asset, ClockSchedule, ConnectorPolicy, ExplicitOutput, LeafId, MedianTime, OffboardPolicy, RelativeTime, Template,
-	WalletPolicy,
+	connector_asset, ClockSchedule, ConnectorPolicy, ExplicitOutput, FillOrder, FillPlan, LeafId, MedianTime, OffboardPolicy, RelativeTime,
+	Template, WalletPolicy,
 };
 use sequentia_ext::AssetAmount;
 
@@ -158,11 +202,12 @@ use crate::fees;
 use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{
-	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewScript, NewTreeScript,
+	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewRoundFill, NewScript, NewTreeScript,
 	ParticipationRow, NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, TreeScriptKind,
 	WalletCoin, WantedKind,
 };
-use crate::wallet::{Wallet, WalletError};
+use crate::participations::{order_on_chain, outpoint_text, refund_too_soon, ParticipationError};
+use crate::wallet::{Foreign, Wallet, WalletError};
 
 /// How the runner builds its trees and clocks.
 #[derive(Debug, Clone)]
@@ -225,6 +270,9 @@ pub struct Built {
 	pub offboards: usize,
 	pub participations: usize,
 	pub connector_vout: u32,
+	/// Each on-chain order the round fills: its outpoint, at input `k`, in
+	/// input order.
+	pub fills: Vec<OutPoint>,
 	/// What the nursery heard from the node.
 	pub broadcast: String,
 }
@@ -265,6 +313,30 @@ struct PlannedOffboard {
 	output: u16,
 	policy: OffboardPolicy,
 	margin: u64,
+}
+
+/// An on-chain order a fill round fills: the take that asks for it (its
+/// index among the round's participations), the order's outpoint, terms and
+/// what it holds, and the fill.
+struct PlannedFill {
+	participation: usize,
+	order: OutPoint,
+	terms: FillOrder,
+	locked: u64,
+	plan: FillPlan,
+}
+
+/// The most orders one round fills.
+pub const MAX_FILLS: usize = 16;
+
+/// The value of the output a full fill puts at its `2k+1`, which the FILL
+/// leaf reads only for its asset, an explicit one other than the order's:
+/// one atom of the asset the order is paid in, to the operator, or, where
+/// that asset pays the round's fee, a value well above the node's dust
+/// threshold for such an output in its fee asset (399 atoms at the default
+/// dust relay fee).
+pub fn gap_value(asset: AssetId, fee_asset: AssetId) -> u64 {
+	if asset == fee_asset { 1_000 } else { 1 }
 }
 
 /// A coin a round spends to keep it apart from a lost round whose
@@ -440,7 +512,210 @@ impl Rounds {
 				},
 			}
 		}
+		for asset in self.takes_waiting().await? {
+			match self.run_fill_round_of(asset).await {
+				Ok(Some(b)) => built.push(b),
+				Ok(None) => {},
+				Err(e) => {
+					log::warn!("rounds: the fill round of asset {}: {}", asset, e);
+					failed.push((asset, e));
+				},
+			}
+		}
 		Ok((built, failed))
+	}
+
+	/// The assets with a pending take, by the asset of the leaf it wants (the
+	/// asset its order sells), in the order the operator serves them. A take
+	/// of an asset the operator no longer serves waits, saying why.
+	async fn takes_waiting(&self) -> Result<Vec<AssetId>, RoundError> {
+		let served = self.params.assets.ids();
+		let mut waiting: BTreeSet<AssetId> = BTreeSet::new();
+		for id in self.store.participations_in(ParticipationState::Pending).await? {
+			let Some(row) = self.store.participation(&id).await? else { continue };
+			if row.fill.is_none() {
+				continue;
+			}
+			let Some(a) = row.outputs.first().map(|o| AssetId::from_byte_array(o.asset)) else { continue };
+			if served.contains(&a) {
+				waiting.insert(a);
+			} else {
+				let why = format!("asset {} is not served by this operator now; the take runs once it is", a);
+				if row.waiting.as_deref() != Some(why.as_str()) {
+					self.store.set_waiting(&row.id, Some(&why)).await?;
+				}
+			}
+		}
+		Ok(served.into_iter().filter(|a| waiting.contains(a)).collect())
+	}
+
+	/// Why the take `row`'s order cannot be filled by a round now, if it
+	/// cannot: `Some((true, why))` when it never can (the order spent, its
+	/// refund too near), and the take is voided; `Some((false, why))` when
+	/// it waits (the order's transaction out of finality after a rollback).
+	async fn order_unfit(&self, row: &ParticipationRow) -> Result<Option<(bool, String)>, RoundError> {
+		let Some(f) = &row.fill else { return Ok(None) };
+		let terms = f.order().map_err(RoundError::Store)?;
+		let op = f.outpoint();
+		match order_on_chain(&self.finality, &op, &terms, f.locked).await {
+			Ok(()) => {},
+			Err(ParticipationError::OrderSpent(m)) => return Ok(Some((true, format!("{}; a round fills an order only while it rests \
+				unspent, so the take is void", m)))),
+			Err(ParticipationError::OrderNotFinal(m)) => return Ok(Some((false, m))),
+			Err(ParticipationError::Order(m)) => return Ok(Some((true, m))),
+			Err(e) => return Err(RoundError::Chain(e.to_string())),
+		}
+		let tip = self.store.tip_block().await?.ok_or(RoundError::NotSynced)?;
+		if let Some(why) = refund_too_soon(&terms, &self.params, tip.height, tip.median_time as u32) {
+			return Ok(Some((true, format!("order {}: {}; the take is void", outpoint_text(&op), why))));
+		}
+		Ok(None)
+	}
+
+	/// Builds the next fill round of `asset`: a round of its own that fills
+	/// the on-chain orders pending takes ask for, every one selling `asset`,
+	/// and pays each take its leaf in a batch of `asset` (see the [module
+	/// documentation](self)). Each take's order is checked again first: one
+	/// spent by another transaction, or whose maker can refund it too soon,
+	/// is voided, saying why, and the round is built without it; so is one
+	/// the node finds spent when the round is put to it. Returns `None` when
+	/// nothing of it waits.
+	pub async fn run_fill_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		let _one = self.running.lock().await;
+		let now = self.now().await?;
+		if !self.params.assets.contains(&asset) {
+			return Ok(None);
+		}
+		let mut chosen: Vec<ParticipationRow> = vec![];
+		for id in self.store.participations_in(ParticipationState::Pending).await? {
+			let Some(row) = self.store.participation(&id).await? else { continue };
+			if row.fill.is_none() || row.outputs.first().map(|o| AssetId::from_byte_array(o.asset)) != Some(asset) {
+				continue;
+			}
+			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {
+				continue;
+			}
+			if chosen.len() >= MAX_FILLS.min(self.config.max_batch_leaves) {
+				continue;
+			}
+			if !self.still_good(&row, now).await? {
+				continue;
+			}
+			let mut taken = false;
+			for o in &row.outputs {
+				if let WantedKind::Leaf { owner_key, .. } = &o.kind {
+					taken |= self.store.key_owns_leaf(owner_key).await?;
+				}
+			}
+			if taken {
+				let why = self.paid_on(&row.id).await?.unwrap_or_else(|| "a key it wants a leaf under owns a leaf already".into());
+				let voided = self.store.void_participation(&row.id, &why).await?;
+				log::warn!("take {} cannot run: a key it wants owns a leaf (voided: {})", crate::signer::hex(&row.id), voided);
+				continue;
+			}
+			match self.order_unfit(&row).await? {
+				None => chosen.push(row),
+				Some((true, why)) => {
+					let voided = self.store.void_participation(&row.id, &why).await?;
+					log::warn!("take {} drops out of the fill round (voided: {}): {}", crate::signer::hex(&row.id), voided, why);
+				},
+				Some((false, why)) => {
+					log::warn!("take {} waits: {}", crate::signer::hex(&row.id), why);
+					self.store.set_waiting(&row.id, Some(&why)).await?;
+				},
+			}
+		}
+		let chosen = self.fundable_fills(chosen, now).await?;
+		let (mut chosen, ties) = self.tie_reruns(chosen).await?;
+		loop {
+			if chosen.is_empty() {
+				return Ok(None);
+			}
+			let fills = Self::plan_fills(&chosen)?;
+			match self.build_from(&chosen, &fills, now, &ties).await {
+				Err(RoundError::Wallet(WalletError::Insufficient { asset: short, need, have })) => {
+					let row = chosen.pop().expect("not empty");
+					self.wait(&row, short, need, have).await?;
+				},
+				// The node refused the round: an order spent since it was
+				// checked drops out, and the round is built without it.
+				Err(RoundError::Refused(reason)) => {
+					let mut dropped = 0;
+					let mut kept = vec![];
+					for row in chosen {
+						match self.order_unfit(&row).await? {
+							Some((true, why)) => {
+								self.store.void_participation(&row.id, &why).await?;
+								log::warn!("take {} drops out of the fill round the node refused ({}): {}", crate::signer::hex(&row.id),
+									reason, why);
+								dropped += 1;
+							},
+							Some((false, why)) => {
+								self.store.set_waiting(&row.id, Some(&why)).await?;
+								dropped += 1;
+							},
+							None => kept.push(row),
+						}
+					}
+					if dropped == 0 {
+						return Err(RoundError::Refused(reason));
+					}
+					chosen = kept;
+				},
+				other => return other,
+			}
+		}
+	}
+
+	/// The fills of `chosen`, a fill round's takes, in order: the order at
+	/// input `k` is the `k`-th take's.
+	fn plan_fills(chosen: &[ParticipationRow]) -> Result<Vec<PlannedFill>, RoundError> {
+		chosen.iter().enumerate().map(|(k, row)| {
+			let f = row.fill.as_ref().ok_or_else(|| RoundError::Internal("a fill round runs takes only".into()))?;
+			let terms = f.order()?;
+			let plan = terms.plan(f.locked, f.filled).map_err(|e| RoundError::Internal(format!("take {}: {}", crate::signer::hex(&row.id), e)))?;
+			if plan.credit.value != f.price {
+				return Err(RoundError::Internal(format!("take {}: its order prices the fill at {}, the take at {}", crate::signer::hex(&row.id),
+					plan.credit.value, f.price)));
+			}
+			Ok(PlannedFill { participation: k, order: f.outpoint(), terms, locked: f.locked, plan })
+		}).collect()
+	}
+
+	/// What a fill round with `rows` pays of each asset from the operator's
+	/// pool: the batch less what the orders fill (their own value pays the
+	/// leaves), and in each asset an order is paid in, its credit and the
+	/// output a full fill puts at its `2k+1`.
+	async fn fill_pays(&self, rows: &[&ParticipationRow], now: MedianTime) -> Result<BTreeMap<AssetId, u64>, RoundError> {
+		let mut pays = self.pays(rows, now).await?;
+		for row in rows {
+			let Some(f) = &row.fill else { continue };
+			let terms = f.order()?;
+			if let Some(a) = pays.get_mut(&terms.asset_a) {
+				*a = a.saturating_sub(f.filled);
+			}
+			let gap = if f.filled == f.locked { gap_value(terms.asset_b, terms.asset_b) } else { 0 };
+			*pays.entry(terms.asset_b).or_default() += f.price + gap;
+		}
+		Ok(pays)
+	}
+
+	/// The takes of `chosen` the wallet can fund now, in order, as
+	/// [`Self::fundable`] takes participations.
+	async fn fundable_fills(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
+		let balance = self.wallet.balance().await?;
+		let have = |a: &AssetId| balance.get(a).copied().unwrap_or(0);
+		let mut taken: Vec<ParticipationRow> = vec![];
+		for row in chosen {
+			let mut with: Vec<&ParticipationRow> = taken.iter().collect();
+			with.push(&row);
+			let pays = self.fill_pays(&with, now).await?;
+			match pays.iter().find(|(a, v)| **v > have(a)) {
+				Some((a, v)) => self.wait(&row, *a, *v, have(a)).await?,
+				None => taken.push(row),
+			}
+		}
+		Ok(taken)
 	}
 
 	/// Builds the next round: that of the first asset, in the order the
@@ -514,7 +789,7 @@ impl Rounds {
 			if chosen.is_empty() {
 				return Ok(None);
 			}
-			match self.build_from(&chosen, now, &ties).await {
+			match self.build_from(&chosen, &[], now, &ties).await {
 				// Short of an asset once the round's own fee and connector are
 				// counted: the last participation wanting that asset waits.
 				// The fee asset may be another than the round's: then every
@@ -734,10 +1009,17 @@ impl Rounds {
 	}
 
 	/// Builds, checks, records and broadcasts the round of `chosen`, spending
-	/// every coin of `ties` a participation of `chosen` needs.
-	async fn build_from(&self, chosen: &[ParticipationRow], now: MedianTime, ties: &[Tie]) -> Result<Option<Built>, RoundError> {
+	/// every coin of `ties` a participation of `chosen` needs, and filling
+	/// `fills`: the order at input `k` credited at output `2k` and resting
+	/// again at `2k+1` (or, filled whole, an output of another asset there),
+	/// the batches after them.
+	async fn build_from(&self, chosen: &[ParticipationRow], fills: &[PlannedFill], now: MedianTime, ties: &[Tie])
+		-> Result<Option<Built>, RoundError>
+	{
 		let p = self.params.clone();
 		let s = p.operator;
+		// Outputs 0..2n-1 are the orders'; the batches start after them.
+		let base = 2 * fills.len() as u32;
 
 		// The leaves per asset, and the offboards.
 		let mut groups: BTreeMap<AssetId, Vec<Planned>> = BTreeMap::new();
@@ -809,8 +1091,25 @@ impl Rounds {
 		if let Some(l) = lost.iter().find(|l| !ties.iter().any(|t| t.replaces == **l)) {
 			return Err(RoundError::Internal(format!("no coin keeps the round apart from lost round {}", l)));
 		}
-		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, |tokens| {
-			let mut outputs = vec![];
+		// Each order's input, first, and the outputs its FILL leaf reads: the
+		// credit at 2k, and at 2k+1 the order resting again or, for a full
+		// fill, an output to the operator in the asset the order is paid in.
+		let mut foreign = vec![];
+		let mut fill_outputs = vec![];
+		for f in fills {
+			foreign.push(Foreign {
+				outpoint: f.order,
+				txout: ExplicitOutput::new(f.terms.asset_a, f.locked, f.terms.script_pubkey()).txout(),
+				witness: f.terms.witness(),
+			});
+			fill_outputs.push(f.plan.credit.clone());
+			fill_outputs.push(match &f.plan.rest {
+				Some(rest) => rest.clone(),
+				None => ExplicitOutput::new(f.terms.asset_b, gap_value(f.terms.asset_b, fee_asset), self.wallet.change_script().await?),
+			});
+		}
+		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, |tokens| {
+			let mut outputs = fill_outputs.clone();
 			let mut trees = vec![];
 			for ((asset, leaves), token) in groups.iter().zip(tokens) {
 				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
@@ -847,7 +1146,7 @@ impl Rounds {
 		};
 		let mut new_batches = vec![];
 		for (i, (tree, (asset, leaves))) in trees.iter().zip(&groups).enumerate() {
-			let vout = 2 * i as u32;
+			let vout = base + 2 * i as u32;
 			let mut new_leaves = vec![];
 			for (j, (record, l)) in tree.records().into_iter().zip(leaves).enumerate() {
 				let valid = match record.validate_round(&tx, &accept) {
@@ -920,7 +1219,7 @@ impl Rounds {
 					value: tree.batch_output().value,
 					token: tp.schedule.token.into_inner().to_byte_array(),
 					token_vout: vout + 1,
-					issuer: (tx.input[i].previous_output.txid.to_byte_array(), tx.input[i].previous_output.vout),
+					issuer: (tx.input[fills.len() + i].previous_output.txid.to_byte_array(), tx.input[fills.len() + i].previous_output.vout),
 					schedule: tp.schedule.encode(),
 					burn: tp.burn,
 					radix: tp.radix as u16,
@@ -937,9 +1236,36 @@ impl Rounds {
 		if let Err(e) = (ConnectorPolicy { operator: s }).check(&tx, c) {
 			return release(RoundError::Check(e.to_string())).await;
 		}
+		// Each order as its FILL leaf reads the round: at input k, its credit
+		// at 2k, at 2k+1 what was planned, the fill and the credit the take
+		// was accepted for; and no batch output at an index any order reads.
+		for (k, f) in fills.iter().enumerate() {
+			if tx.input[k].previous_output != f.order || tx.input[k].witness.script_witness != f.terms.witness() {
+				return release(RoundError::Check(format!("input {} is not order {} with its FILL witness", k, outpoint_text(&f.order)))).await;
+			}
+			let got = match f.terms.check(&tx, k, f.locked) {
+				Ok(g) => g,
+				Err(e) => return release(RoundError::Check(e.to_string())).await,
+			};
+			if (got.filled, got.remainder, got.credited) != (f.plan.filled, f.plan.remainder, f.plan.credit.value) {
+				return release(RoundError::Check(format!("order {} at input {} fills {} and rests {} with a credit of {}; the take asked {}, {} \
+					and {}", outpoint_text(&f.order), k, got.filled, got.remainder, got.credited, f.plan.filled, f.plan.remainder,
+					f.plan.credit.value))).await;
+			}
+			let at = |i: u32| ExplicitOutput::from_txout(&tx.output[i as usize]);
+			if at(2 * k as u32).as_ref() != Some(&f.plan.credit) || at(2 * k as u32 + 1).as_ref() != Some(&fill_outputs[2 * k + 1]) {
+				return release(RoundError::Check(format!("outputs {} and {} are not order {}'s credit and what it planned at its 2k+1",
+					2 * k, 2 * k + 1, outpoint_text(&f.order)))).await;
+			}
+		}
+		for b in &new_batches {
+			if b.batch.vout < base {
+				return release(RoundError::Check(format!("a batch output at {}, among the outputs the orders read", b.batch.vout))).await;
+			}
+		}
 		let mut new_offboards = vec![];
 		for (k, o) in offboards.iter().enumerate() {
-			let vout = 2 * trees.len() as u32 + k as u32;
+			let vout = base + 2 * trees.len() as u32 + k as u32;
 			match o.policy.find(&tx) {
 				Ok(v) if v == vout => {},
 				Ok(v) => return release(RoundError::Check(format!("offboard {} is at output {}, not {}", k, v, vout))).await,
@@ -976,20 +1302,35 @@ impl Rounds {
 			reruns: ties.iter().map(|t| NewRerun {
 				replaces: t.replaces, tie: (t.coin.txid, t.coin.vout), via: t.via.map(|v| v.to_byte_array()),
 			}).collect(),
+			fills: fills.iter().enumerate().map(|(k, f)| NewRoundFill {
+				k: k as u32, participation_id: chosen[f.participation].id, attempt: chosen[f.participation].attempt,
+			}).collect(),
 		};
 		let round_id = match self.store.insert_round(&new).await {
 			Ok(id) => id,
 			Err(e) => return release(e.into()).await,
 		};
-		let broadcast = self.submit(round_id, &tx, built.fee).await?;
-		let batches: Vec<(AssetId, u32, usize)> = groups.iter().enumerate().map(|(i, (a, l))| (*a, 2 * i as u32, l.len())).collect();
-		log::info!("round {} ({}): {} batch(es), {} offboard(s), {} participation(s), {} vB, fee {} of {}: {}",
-			round_id, txid, batches.len(), offboards.len(), chosen.len(), tx.vsize(), built.fee.amount, fee_asset, broadcast);
+		// A round that fills orders waits, built, for its takes' forfeits
+		// ([`Self::takes_ready`]); any other goes out at once.
+		let broadcast = if fills.is_empty() {
+			self.submit(round_id, &tx, built.fee).await?
+		} else {
+			"held: it is broadcast once every take in it has handed over its forfeits".to_string()
+		};
+		let batches: Vec<(AssetId, u32, usize)> = groups.iter().enumerate().map(|(i, (a, l))| (*a, base + 2 * i as u32, l.len())).collect();
+		log::info!("round {} ({}): {} batch(es), {} offboard(s), {} participation(s), {} order(s) filled, {} vB, fee {} of {}: {}",
+			round_id, txid, batches.len(), offboards.len(), chosen.len(), fills.len(), tx.vsize(), built.fee.amount, fee_asset, broadcast);
+		for (k, f) in fills.iter().enumerate() {
+			log::info!("round {}: order {} at input {}, its credit of {} at output {}, {} at output {}", round_id, outpoint_text(&f.order), k,
+				f.plan.credit.value, 2 * k, if f.plan.rest.is_some() { "the order resting again" } else { "an output of another asset" },
+				2 * k + 1);
+		}
 		for row in chosen {
 			self.store.set_waiting(&row.id, None).await?;
 		}
 		Ok(Some(Built {
-			round_id, tx, batches, offboards: offboards.len(), participations: chosen.len(), connector_vout: c, broadcast,
+			round_id, tx, batches, offboards: offboards.len(), participations: chosen.len(), connector_vout: c,
+			fills: fills.iter().map(|f| f.order).collect(), broadcast,
 		}))
 	}
 
@@ -1011,6 +1352,12 @@ impl Rounds {
 	/// with a coin past its exit deadline is voided.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
+			// A round that fills orders goes out once every take in it has
+			// handed over its forfeits, and is dropped, unbroadcast, when one
+			// has not within the window.
+			if !self.store.round_fills(r.round_id).await?.is_empty() && !self.takes_ready(&r).await? {
+				continue;
+			}
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
 			self.submit(r.round_id, &tx, fee).await?;
@@ -1035,6 +1382,48 @@ impl Rounds {
 		self.expire().await?;
 		self.void_overdue().await?;
 		Ok(())
+	}
+
+	/// Whether the round `r`, built to fill on-chain orders and not yet
+	/// broadcast, may go out: every take in it has handed over its forfeits
+	/// (the owner's half of each, which is all the operator needs to complete
+	/// it). Its takes' forfeits are what the operator gets for paying their
+	/// orders' makers on the chain: a round broadcast without them would pay a
+	/// maker for a take that could then walk away with its coins. When the
+	/// window ([`Params::fill_forfeit_window_seconds`], by the chain's median
+	/// time from when the round was built) has passed without them, the round
+	/// is dropped unbroadcast: its coins are freed, each take whose forfeits
+	/// did not come is voided, saying why, and the others run again.
+	async fn takes_ready(&self, r: &RoundRow) -> Result<bool, RoundError> {
+		let mut missing = vec![];
+		for f in self.store.round_fills(r.round_id).await? {
+			let (n, whole, unsigned) = self.store.forfeit_count(&f.participation_id, r.round_id).await?;
+			if whole + unsigned < n {
+				missing.push(f.participation_id);
+			}
+		}
+		if missing.is_empty() {
+			return Ok(true);
+		}
+		let now = self.now().await?.to_consensus_u32() as u64;
+		if now < r.created_mtp as u64 + self.params.fill_forfeit_window_seconds as u64 {
+			return Ok(false);
+		}
+		let txid = Txid::from_byte_array(r.txid);
+		let Some(again) = self.store.drop_unbroadcast_round(r.round_id).await? else { return Ok(false) };
+		self.wallet.release(&txid).await?;
+		let why = format!("its forfeits did not come within {} s of its round {} being built: a round that fills orders pays their makers \
+			on the chain, so it goes out only once every take in it has handed over its forfeits; the round was dropped unbroadcast, the take \
+			is void and the coins it gave up are its owner's again", self.params.fill_forfeit_window_seconds, txid);
+		let mut voided = 0;
+		for id in &missing {
+			if self.store.void_participation(id, &why).await? {
+				voided += 1;
+			}
+		}
+		log::warn!("round {} ({}) dropped unbroadcast: {} take(s) handed over no forfeits in time and are void; {} run again", r.round_id,
+			txid, voided, again.len() - voided);
+		Ok(false)
 	}
 
 	/// Releases every participation issued in a final round whose preimage

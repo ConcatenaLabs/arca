@@ -654,6 +654,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		fills: api::FillsInfo {
 			order_margin_seconds: app.params.order_margin_seconds,
 			block_seconds: app.params.order_block_seconds,
+			forfeit_window_seconds: app.params.fill_forfeit_window_seconds,
 		},
 	})
 }
@@ -864,7 +865,10 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 		attempt: r.attempt,
 		unlock_hash: hex(&r.unlock_hash),
 		refund_delay_units: r.refund_delay_units,
-		round: s.round.as_ref().map(|rr| api::RoundRef { txid: rr.txid.to_string(), connector_vout: rr.connector_vout }),
+		round: s.round.as_ref().map(|rr| api::RoundRef {
+			txid: rr.txid.to_string(), connector_vout: rr.connector_vout,
+			tx: rr.unbroadcast.as_ref().map(|t| hex(&elements::encode::serialize(t))),
+		}),
 		inputs: r.inputs.iter().map(|i| api::ParticipationInputStatus {
 			leaf_id: hex(&i.leaf_id),
 			asset: AssetId::from_byte_array(i.asset).to_string(),
@@ -913,6 +917,9 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 				price: f.price.to_string(),
 				maker_script: hex(order.maker_script_pubkey().as_bytes()),
 				script: hex(&f.script_pubkey),
+				input: s.fill_at,
+				credit_vout: s.fill_at.map(|k| 2 * k),
+				remainder_vout: s.fill_at.map(|k| 2 * k + 1),
 			})
 		}),
 	}
@@ -1122,7 +1129,7 @@ async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	Ok(Json(api::Forfeited {
 		participation_id: hex(&done.participation_id),
 		state: done.state.as_str().into(),
-		preimage: hex(&done.preimage),
+		preimage: done.preimage.map(|p| hex(&p)),
 	}))
 }
 

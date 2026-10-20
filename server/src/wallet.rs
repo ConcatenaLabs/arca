@@ -100,6 +100,19 @@ pub enum WalletError {
 	WrongInput(usize),
 }
 
+/// An input of a round that is not the wallet's: an on-chain order the round
+/// fills, spent by its own script, which needs no signature. Such inputs come
+/// first, at `0..n-1`, so the order at input `k` reads its credit at `2k` and
+/// its remainder at `2k+1`.
+#[derive(Debug, Clone)]
+pub struct Foreign {
+	pub outpoint: OutPoint,
+	/// What it spends: an explicit output.
+	pub txout: TxOut,
+	/// Its witness, whole.
+	pub witness: Vec<Vec<u8>>,
+}
+
 /// How spendable a coin must be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendFrom {
@@ -231,6 +244,12 @@ impl Wallet {
 		self.new_script(RECEIVE).await
 	}
 
+	/// A fresh change script of the wallet's, for an output a transaction
+	/// pays back to the operator.
+	pub async fn change_script(&self) -> Result<Script, WalletError> {
+		self.new_script(CHANGE).await
+	}
+
 	/// Whether a coin is spendable under the configuration.
 	async fn spendable(&self, c: &WalletCoin) -> Result<bool, WalletError> {
 		if !c.in_chain || c.spent_by.is_some() {
@@ -287,7 +306,7 @@ impl Wallet {
 		// Refuse an asset the node does not accept before anything else.
 		self.fee_for(req.fee_asset, 1).await?;
 		let _one = self.building.lock().await;
-		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[], &[]).await
+		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[], &[], &[]).await
 	}
 
 	/// Builds and signs a round transaction that creates `batches` batches.
@@ -303,8 +322,8 @@ impl Wallet {
 	/// round apart from a lost round whose participations it runs again. The
 	/// lock time is 0 and every input final, so the transaction can always
 	/// return to the mempool unchanged after a rollback.
-	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, ties: &[WalletCoin], make: F)
-		-> Result<(Built, R), WalletError>
+	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, ties: &[WalletCoin],
+		foreign: &[Foreign], make: F) -> Result<(Built, R), WalletError>
 	where
 		F: FnOnce(&[AssetId]) -> Result<(Vec<ExplicitOutput>, R), String>,
 	{
@@ -351,15 +370,15 @@ impl Wallet {
 				return Err(WalletError::Round(format!("the token {} must be paid once, as one atom", t)));
 			}
 		}
-		let built = self.build_locked(&outputs, Some(connector), fee_asset, &issuers, ties).await?;
+		let built = self.build_locked(&outputs, Some(connector), fee_asset, foreign, &issuers, ties).await?;
 		Ok((built, made))
 	}
 
-	/// Builds and signs, the build lock held: `issuers` are the first inputs,
-	/// each issuing one atom of its token ([`token_of`]), and `forced` follow
-	/// them.
+	/// Builds and signs, the build lock held: `foreign` are the first inputs,
+	/// each with its own witness, then `issuers`, each issuing one atom of its
+	/// token ([`token_of`]), and `forced` follow them.
 	async fn build_locked(&self, outputs_req: &[ExplicitOutput], connector: Option<AssetAmount>, fee_asset: AssetId,
-		issuers: &[WalletCoin], forced: &[WalletCoin]) -> Result<Built, WalletError>
+		foreign: &[Foreign], issuers: &[WalletCoin], forced: &[WalletCoin]) -> Result<Built, WalletError>
 	{
 		for o in outputs_req {
 			if o.value == 0 {
@@ -374,13 +393,20 @@ impl Wallet {
 		});
 
 		// What each asset must cover, the fee aside; the tokens the issuing
-		// inputs create cover themselves.
+		// inputs create cover themselves, and the foreign inputs bring their
+		// own value.
 		let mut need: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for o in &outputs {
 			let a = o.asset.explicit().expect("explicit");
 			if !issued.contains(&a) {
 				*need.entry(a).or_insert(0) += o.value.explicit().expect("explicit");
 			}
+		}
+		for f in foreign {
+			let (a, v) = (f.txout.asset.explicit().ok_or(WalletError::Round("a foreign input hides its asset".into()))?,
+				f.txout.value.explicit().ok_or(WalletError::Round("a foreign input hides its value".into()))?);
+			let n = need.entry(a).or_insert(0);
+			*n = n.saturating_sub(v);
 		}
 		need.entry(fee_asset).or_insert(0);
 
@@ -420,12 +446,22 @@ impl Wallet {
 					return Err(WalletError::Insufficient { asset: *a, need: want, have });
 				}
 			}
-			let (tx, paid) = self.assemble(&chosen, issuers.len(), &outputs, fee_asset, fee, &mut change_scripts).await?;
-			let vsize = Self::signed_vsize(&tx);
+			let (tx, paid) = self.assemble(foreign, &chosen, issuers.len(), &outputs, fee_asset, fee, &mut change_scripts).await?;
+			let vsize = Self::signed_vsize(&tx, foreign.len());
 			let needed = self.fee_for(fee_asset, vsize).await?;
 			if needed <= paid {
 				let mut tx = tx;
-				self.sign(&mut tx, &chosen).await?;
+				if foreign.is_empty() {
+					self.sign(&mut tx, &chosen).await?;
+				} else {
+					// The kit's PSET signer is handed only the wallet's own
+					// inputs; with an input of another's before them, each is
+					// signed over the transaction itself, the foreign ones
+					// carrying their witnesses already.
+					for (i, c) in chosen.iter().enumerate() {
+						self.sign_input(&mut tx, foreign.len() + i, c)?;
+					}
+				}
 				let txid = tx.txid();
 				let spent: Vec<([u8; 32], u32)> = chosen.iter().map(|c| (c.txid, c.vout)).collect();
 				if !self.store.spend_wallet_coins(&spent, &txid.to_byte_array()).await? {
@@ -442,15 +478,22 @@ impl Wallet {
 		}
 	}
 
-	/// The unsigned transaction: `coins` in, the first `issuing` of them each
-	/// issuing one atom of its token, `outputs`, then change per asset to the
-	/// wallet's change scripts, then the fee output. Change in the fee asset
-	/// smaller than the fee goes to the fee rather than make an output too
-	/// small to relay. Returns the fee it pays.
-	async fn assemble(&self, coins: &[WalletCoin], issuing: usize, outputs: &[TxOut], fee_asset: AssetId, fee: u64,
+	/// The unsigned transaction: `foreign` in first, with their witnesses,
+	/// then `coins`, the first `issuing` of them each issuing one atom of its
+	/// token, `outputs`, then change per asset to the wallet's change scripts,
+	/// then the fee output. Change in the fee asset smaller than the fee goes
+	/// to the fee rather than make an output too small to relay. Returns the
+	/// fee it pays.
+	#[allow(clippy::too_many_arguments)]
+	async fn assemble(&self, foreign: &[Foreign], coins: &[WalletCoin], issuing: usize, outputs: &[TxOut], fee_asset: AssetId, fee: u64,
 		change_scripts: &mut BTreeMap<AssetId, Script>) -> Result<(Transaction, u64), WalletError>
 	{
 		let mut held: BTreeMap<AssetId, u64> = BTreeMap::new();
+		for f in foreign {
+			if let (Some(a), Some(v)) = (f.txout.asset.explicit(), f.txout.value.explicit()) {
+				*held.entry(a).or_insert(0) += v;
+			}
+		}
 		for c in coins {
 			*held.entry(AssetId::from_byte_array(c.asset)).or_insert(0) += c.value;
 		}
@@ -459,7 +502,9 @@ impl Wallet {
 		}
 		for o in outputs {
 			let a = o.asset.explicit().expect("explicit");
-			*held.get_mut(&a).expect("chosen for every asset") -= o.value.explicit().expect("explicit");
+			let h = held.get_mut(&a).ok_or(WalletError::Round(format!("no input holds asset {}", a)))?;
+			*h = h.checked_sub(o.value.explicit().expect("explicit"))
+				.ok_or(WalletError::Round(format!("the inputs hold too little of asset {}", a)))?;
 		}
 		*held.get_mut(&fee_asset).expect("chosen for the fee asset") -= fee;
 		let mut paid = fee;
@@ -482,6 +527,11 @@ impl Wallet {
 			}
 		}
 		all.push(fee_txout(AssetAmount::new(fee_asset, paid)));
+		let mut input: Vec<TxIn> = foreign.iter().map(|f| {
+			let mut i = TxIn { previous_output: f.outpoint, sequence: Sequence::MAX, ..Default::default() };
+			i.witness.script_witness = f.witness.clone();
+			i
+		}).collect();
 		let tx = Transaction {
 			version: 2,
 			lock_time: LockTime::ZERO,
@@ -507,14 +557,17 @@ impl Wallet {
 			}).collect(),
 			output: all,
 		};
+		input.extend(tx.input);
+		let tx = Transaction { input, ..tx };
 		Ok((tx, paid))
 	}
 
-	/// The virtual size `tx` will have once every input carries its
-	/// signature and key.
-	fn signed_vsize(tx: &Transaction) -> u64 {
+	/// The virtual size `tx` will have once every input past the first
+	/// `foreign`, which carry their witnesses already, carries its signature
+	/// and key.
+	fn signed_vsize(tx: &Transaction, foreign: usize) -> u64 {
 		let mut t = tx.clone();
-		for i in &mut t.input {
+		for i in t.input.iter_mut().skip(foreign) {
 			i.witness.script_witness = vec![vec![0; DUMMY_SIG], vec![0; 33]];
 		}
 		(t.weight() as u64).div_ceil(4)

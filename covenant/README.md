@@ -313,7 +313,10 @@ each refreshed owner would keep the old coin and the new leaf. So a round with
 another txid is always a new round, with a new tree and new unlock hashes, whose
 participations run again, and a round that carries refreshes takes no input of a
 third party (a covenant fill, say), which could be spent elsewhere and force a
-replacement; fills go in their own round transactions. A round that cannot
+replacement; fills go in their own round transactions, which carry only the
+takes that fill them and are broadcast only once the operator holds every
+take's forfeits, signed against the round's txid before it goes out. A round
+that cannot
 return leaves each owner who gave up a leaf for it a forfeit that no claim can
 answer and that ends in the owner's refund. An owner holding that forfeit
 whole, which happens only when the operator published it, and the preimage of
