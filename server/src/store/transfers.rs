@@ -5,10 +5,13 @@
 //! reserves their keys and every new script, in one database transaction.
 //! Only then does the server ask for `S`'s signatures, so a spend it signs is
 //! always one it has durably recorded, and a second spend of the same leaf is
-//! refused by the database whatever the timing. [`Store::complete_transfer`]
-//! stores the signatures and the receivers' coin records and posts them to
-//! their mailboxes. A request repeated byte for byte finds its transfer and
-//! gets the same answer.
+//! refused by the database whatever the timing. It posts each output to its
+//! mailbox as pending in the same transaction, so a receiver knows of the
+//! coin while the sender's post waits for the signer or its keepers.
+//! [`Store::complete_transfer`] stores the signatures and the receivers' coin
+//! records and posts them to their mailboxes; [`Store::drop_transfer`]
+//! withdraws the pending outputs, naming why. A request repeated byte for
+//! byte finds its transfer and gets the same answer.
 
 use std::collections::HashSet;
 
@@ -36,11 +39,13 @@ pub struct NewReassignment {
 }
 
 /// One output of a transfer to record: its coin (pending, its record empty
-/// until signed) and the mailbox it goes to.
+/// until signed), the mailbox it goes to, and the notice posted there as
+/// pending when the transfer is recorded (its JSON).
 #[derive(Debug, Clone)]
 pub struct NewTransferOutput {
 	pub coin: NewCoin,
 	pub mailbox_key: [u8; 32],
+	pub notice: Vec<u8>,
 }
 
 /// An input of a stored transfer: its leaf id, its checkpoint's value, and
@@ -116,7 +121,8 @@ impl Store {
 	/// one transaction could satisfy it and one of them. Then refuses an input
 	/// that is not live or is spent already, a nonce not issued or taken, a
 	/// key or script already known. `messages`, the ones the signer is to
-	/// sign for it, are recorded with it.
+	/// sign for it, are recorded with it, and each output's notice is posted
+	/// to its mailbox as pending.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn record_transfer<F>(&self, transfer_id: &[u8; 32], reassignment: &NewReassignment, admit: F,
 		inputs: &[NewTransferInput], outputs: &[NewTransferOutput], messages: &[super::SignerMessage]) -> Result<(), StoreError>
@@ -179,6 +185,8 @@ impl Store {
 			insert_coin(&t, &o.coin).await?;
 			t.execute("INSERT INTO transfer_output (transfer_id, idx, leaf_id, mailbox_key) VALUES ($1, $2, $3, $4)",
 				&[&&transfer_id[..], &(k as i16), &&o.coin.leaf_id[..], &&o.mailbox_key[..]]).await?;
+			t.execute("INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload) VALUES ($1, 'pending', NULL, $2)",
+				&[&&o.mailbox_key[..], &o.notice]).await?;
 		}
 		t.execute("INSERT INTO reassignment (transfer_id, first_output, inputs, outputs) VALUES ($1, $2, $3, $4)",
 			&[&&transfer_id[..], &&reassignment.first_output[..], &reassignment.inputs, &reassignment.outputs]).await?;
@@ -222,12 +230,14 @@ impl Store {
 	}
 
 	/// Drops the record of transfer `transfer_id`, recorded and never signed:
-	/// its new coins (pending, never posted), its reassignment, its inputs'
-	/// checkpoint scripts and the transfer itself, and gives each of its
-	/// inputs back to its owner, live again, all or nothing. For a transfer
-	/// the signer refused before signing anything of it. Returns the inputs
-	/// given back; none when the transfer is not recorded or was signed.
-	pub async fn drop_transfer(&self, transfer_id: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+	/// its new coins (pending, never posted but as pending), its
+	/// reassignment, its inputs' checkpoint scripts and the transfer itself,
+	/// and gives each of its inputs back to its owner, live again, all or
+	/// nothing. Each output's pending notice is withdrawn in its mailbox,
+	/// naming `reason`. For a transfer the signer refused before signing
+	/// anything of it. Returns the inputs given back; none when the transfer
+	/// is not recorded or was signed.
+	pub async fn drop_transfer(&self, transfer_id: &[u8; 32], reason: &str) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let state = t.query_opt("SELECT state FROM transfer WHERE transfer_id = $1 FOR UPDATE", &[&&transfer_id[..]]).await?;
@@ -236,8 +246,16 @@ impl Store {
 		}
 		let inputs: Vec<Vec<u8>> = t.query("SELECT leaf_id FROM transfer_input WHERE transfer_id = $1", &[&&transfer_id[..]]).await?
 			.iter().map(|r| r.get(0)).collect();
-		let outputs: Vec<Vec<u8>> = t.query("SELECT leaf_id FROM transfer_output WHERE transfer_id = $1", &[&&transfer_id[..]]).await?
-			.iter().map(|r| r.get(0)).collect();
+		let posted = t.query("SELECT leaf_id, mailbox_key FROM transfer_output WHERE transfer_id = $1 ORDER BY idx",
+			&[&&transfer_id[..]]).await?;
+		let outputs: Vec<Vec<u8>> = posted.iter().map(|r| r.get(0)).collect();
+		for r in &posted {
+			let leaf: Vec<u8> = r.get(0);
+			let mailbox: Vec<u8> = r.get(1);
+			let notice = serde_json::json!({"leaf_id": super::hex(&leaf), "transfer_id": super::hex(transfer_id), "reason": reason});
+			t.execute("INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload) VALUES ($1, 'withdrawn', NULL, $2)",
+				&[&mailbox, &notice.to_string().into_bytes()]).await?;
+		}
 		t.execute("DELETE FROM reassignment WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
 		t.execute("DELETE FROM transfer_output WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
 		t.execute("DELETE FROM leaf WHERE leaf_id = ANY($1) AND state = 'pending'", &[&outputs]).await?;

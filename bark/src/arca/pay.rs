@@ -1,7 +1,7 @@
 //! Paying and being paid out of round: receive requests, transfers, the
 //! mailbox, and the in-tree swap of two assets between two wallets.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use elements::hashes::{sha256, Hash};
@@ -963,12 +963,94 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// A notice the mailbox holds (D61): a coin `pending` for the wallet (a
+	/// transfer the operator recorded and has not signed yet) is kept, to
+	/// hold the schedule at a day until it comes, once its owner key is the
+	/// key the wallet derives from the nonce it names; one `withdrawn` (that
+	/// transfer dropped) is let go, with its reason. A pending coin is
+	/// counted nowhere and spendable nowhere. What it did, or `None` for a
+	/// notice of nothing the wallet waits for.
+	fn take_notice(&mut self, m: &Value, now: u32) -> Result<Option<Value>, Error> {
+		let n = &m["notice"];
+		let leaf = n["leaf_id"].as_str().unwrap_or("").to_string();
+		let mut book = self.pending_book()?;
+		match m["kind"].as_str() {
+			Some("pending") => {
+				if self.store.coin(&leaf)?.is_some() {
+					return Ok(None);
+				}
+				let nonce = unhex32(n["owner_nonce"].as_str().unwrap_or(""))?;
+				let ours = self.store.nonce(&nonce)?.is_some()
+					&& n["owner"].as_str() == Some(&hex(&self.keys.leaf_xonly(&nonce)?.serialize()));
+				if !ours {
+					self.store.refused(&format!("the notice of pending coin {}", leaf), "its owner key is not one the wallet derives from \
+						the nonce it names: not a coin of the wallet's")?;
+					return Ok(None);
+				}
+				let hold = now.saturating_add(super::wallet::REQUEST_HOLDS);
+				let until = n["until"].as_u64().map(|u| (u.min(u32::MAX as u64) as u32).min(hold)).unwrap_or(hold);
+				let v = json!({"leaf_id": leaf, "transfer_id": n["transfer_id"], "asset": n["asset"], "value": n["value"], "seen_at": now,
+					"until": until});
+				book.insert(leaf, v.clone());
+				self.set_pending_book(&book)?;
+				Ok(Some(v))
+			},
+			Some("withdrawn") => {
+				if book.remove(&leaf).is_none() {
+					return Ok(None);
+				}
+				self.set_pending_book(&book)?;
+				let why = n["reason"].as_str().unwrap_or("no reason given");
+				self.store.refused(&format!("pending coin {}", leaf), &format!("withdrawn: the operator dropped its transfer {} ({})",
+					n["transfer_id"].as_str().unwrap_or(""), why))?;
+				Ok(Some(json!({"leaf_id": leaf, "transfer_id": n["transfer_id"], "reason": why})))
+			},
+			_ => Ok(None),
+		}
+	}
+
+	/// The coins pending for the wallet, by leaf id, as the mailbox's notices
+	/// named them (D61).
+	pub(crate) fn pending_book(&self) -> Result<BTreeMap<String, Value>, Error> {
+		Ok(self.store.meta(super::wallet::PENDING_COINS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+	}
+
+	fn set_pending_book(&self, book: &BTreeMap<String, Value>) -> Result<(), Error> {
+		self.store.set_meta(super::wallet::PENDING_COINS, &serde_json::to_string(book).expect("a map"))
+	}
+
+	/// The coin `leaf` came, or was refused for good: it is pending no more.
+	fn pending_ended(&self, leaf: &str) -> Result<(), Error> {
+		let mut book = self.pending_book()?;
+		if book.remove(leaf).is_some() {
+			self.set_pending_book(&book)?;
+		}
+		Ok(())
+	}
+
+	/// The coins pending for the wallet now: each still to come (not held,
+	/// not withdrawn) and before the median time from which its transfer can
+	/// no longer complete.
+	pub(crate) fn pending_coins(&self, now: u32) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for (leaf, v) in self.pending_book()? {
+			if self.store.coin(&leaf)?.is_some() || v["until"].as_u64().is_some_and(|u| now as u64 >= u) {
+				continue;
+			}
+			out.push(v);
+		}
+		Ok(out)
+	}
+
 	/// Reads the wallet's mailbox, and the mailbox of every key of a receive
 	/// request still waiting, and validates every coin in them. Each coin is
 	/// kept or refused with its reason; one refused for a passing reason
 	/// (what it rests on not on the chain now, the node or the server not
 	/// answering) is kept aside and checked again on every read until it is
-	/// kept or refused for good. The cursor moves past all of them but one
+	/// kept or refused for good. A notice of a coin pending for the wallet,
+	/// or withdrawn, is taken as [`Self::take_notice`] says: the coins still
+	/// pending are listed (`pending`), counted nowhere, and those withdrawn
+	/// in this read with their reasons (`withdrawn`). The cursor moves past all of them but one
 	/// whose head of the operator's signer's record comes without the
 	/// acknowledgements of the keepers the wallet pinned: that coin is not
 	/// taken, and its message is read again on the next read.
@@ -1001,6 +1083,7 @@ impl Wallet {
 			match self.accept_coin_as(&bytes, &leaf, "mailbox", home.is_some()) {
 				Ok(v) => {
 					self.store.drop_retry(&leaf)?;
+					self.pending_ended(&leaf)?;
 					let head: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
 					if let Err(e) = self.keep_coin_head(&leaf, &head) {
 						self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
@@ -1013,11 +1096,14 @@ impl Wallet {
 				},
 				Err(e) => {
 					self.store.drop_retry(&leaf)?;
+					self.pending_ended(&leaf)?;
 					self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
 					refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 				},
 			}
 		}
+		let now = self.now()?.to_consensus_u32();
+		let mut withdrawn = vec![];
 		for key in keys {
 			let k = key.x_only_public_key().0.serialize();
 			let mut read_again: Option<i64> = None;
@@ -1031,6 +1117,16 @@ impl Wallet {
 				for m in &msgs {
 					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
 					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
+					// A notice of a coin pending or withdrawn (D61).
+					if m["kind"].as_str().is_some_and(|k| k != "coin") {
+						if let Some(w) = self.take_notice(m, now)? {
+							if m["kind"] == "withdrawn" {
+								withdrawn.push(w);
+							}
+						}
+						self.store.set_cursor(&k, cursor)?;
+						continue;
+					}
 					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
 					// A coin is taken only once the head it rests on is held
 					// outside the operator's machine as the wallet requires;
@@ -1044,6 +1140,7 @@ impl Wallet {
 					}
 					match self.accept_coin_as(&bytes, &leaf, "mailbox", home.is_some()) {
 						Ok(v) => {
+							self.pending_ended(&leaf)?;
 							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
 								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
 							}
@@ -1055,6 +1152,7 @@ impl Wallet {
 							waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 						},
 						Err(e) => {
+							self.pending_ended(&leaf)?;
 							self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
 							refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 						},
@@ -1069,6 +1167,13 @@ impl Wallet {
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
 		if !held.is_empty() {
 			out["already_held"] = json!(held);
+		}
+		let pending = self.pending_coins(now)?;
+		if !pending.is_empty() {
+			out["pending"] = json!(pending);
+		}
+		if !withdrawn.is_empty() {
+			out["withdrawn"] = json!(withdrawn);
 		}
 		if let Some((at, why)) = home {
 			out["witness"] = witness;

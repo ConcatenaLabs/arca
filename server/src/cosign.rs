@@ -512,6 +512,10 @@ impl Cosigner {
 					reassignment_owner_sig: sig_bytes(&i.reassignment_sig),
 					checkpoint_script: plan.checkpoint(k).script_pubkey().to_bytes(),
 				}).collect();
+				// Each output is posted to its mailbox as pending with the
+				// record (D61): the latest it can complete by is the earliest
+				// expiry of a batch its coins rest on.
+				let until = checked.iter().filter_map(|c| first_expiry(&c.record)).min();
 				let outs: Vec<NewTransferOutput> = req.outputs.iter().zip(&outputs).zip(&new_ids).map(|((o, out), id)| NewTransferOutput {
 					coin: NewCoin {
 						leaf_id: id.0,
@@ -530,6 +534,11 @@ impl Cosigner {
 						scripts: vec![NewScript { script_pubkey: out.script_pubkey.to_bytes(), kind: ScriptKind::Leaf }],
 					},
 					mailbox_key: o.mailbox.unwrap_or(o.leaf.owner).serialize(),
+					notice: serde_json::to_vec(&crate::api::MailboxNotice {
+						transfer_id: crate::signer::hex(&transfer), leaf_id: id.to_string(), asset: Some(o.asset.to_string()),
+						value: Some(o.value.to_string()), owner: Some(crate::signer::hex(&o.leaf.owner.serialize())),
+						owner_nonce: Some(crate::signer::hex(&o.leaf.owner_nonce)), until, reason: None,
+					}).expect("a notice"),
 				}).collect();
 				let spent: Vec<(LeafId, u64)> = plan.inputs.iter().map(|(c, v)| (c.id, *v)).collect();
 				let reassignment = NewReassignment {
@@ -820,7 +829,7 @@ impl Cosigner {
 		if signed_part {
 			return Err(lost_spend(refused, &leaf));
 		}
-		match self.store.drop_transfer(transfer).await {
+		match self.store.drop_transfer(transfer, &format!("double_spend: {}", refused)).await {
 			Ok(back) => log::warn!("transfer {} refused before anything of it was signed: the signer holds {} of coin {} (entry {}); \
 				the transfer's record is dropped and {} input(s) given back", crate::signer::hex(transfer), what, leaf, e.n, back.len()),
 			Err(d) => log::error!("transfer {} refused before anything of it was signed, for {} of coin {} the signer holds, and its record \
@@ -842,7 +851,7 @@ impl Cosigner {
 	async fn refused_first(&self, e: SignerError, leaf: &LeafId, transfer: &[u8; 32]) -> CosignError {
 		if let SignerError::AlreadySigned(m) = &e {
 			if names_forfeit(m) {
-				match self.store.drop_transfer(transfer).await {
+				match self.store.drop_transfer(transfer, &format!("double_spend: {}", m)).await {
 					Ok(back) => log::warn!("transfer {} refused: the signer holds a forfeit of coin {}, which was given up in a refresh, \
 						so the coin is its owner's on the chain only; the transfer's record is dropped and {} input(s) given back ({})",
 						crate::signer::hex(transfer), leaf, back.len(), m),
@@ -853,6 +862,16 @@ impl Cosigner {
 			}
 		}
 		lost_spend(e, leaf)
+	}
+}
+
+/// The earliest first expiry among the batches `record` rests on, as its
+/// record names them; `None` for a coin resting on boards alone.
+fn first_expiry(record: &CoinRecord) -> Option<u32> {
+	match record {
+		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
+		CoinRecord::Board(_) => None,
+		CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| first_expiry(&i.coin)).min(),
 	}
 }
 

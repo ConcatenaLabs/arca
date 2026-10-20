@@ -9,7 +9,8 @@
 //! `schema/V12__challenge_key.sql`, `schema/V13__reruns_are_ordinary.sql`,
 //! `schema/V14__keeper_acks.sql`, `schema/V15__rerun_ties.sql`,
 //! `schema/V16__keepers_pinned.sql`, `schema/V17__leaf_reserving.sql`,
-//! `schema/V18__lightning_send.sql`, `schema/V19__lightning_receive.sql`),
+//! `schema/V18__lightning_send.sql`, `schema/V19__lightning_receive.sql`,
+//! `schema/V20__pending_coins.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -92,6 +93,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(17, include_str!("../../schema/V17__leaf_reserving.sql")),
 	(18, include_str!("../../schema/V18__lightning_send.sql")),
 	(19, include_str!("../../schema/V19__lightning_receive.sql")),
+	(20, include_str!("../../schema/V20__pending_coins.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

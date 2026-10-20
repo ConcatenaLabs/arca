@@ -387,9 +387,15 @@ and a board whose registration never reached the server, are not recovered.
   lapse is `waiting` with `lapses_at` null, since its sender may pay it at
   any time: it holds the schedule until it is paid or forgotten
   (`forget-request`). A coin paid to a lapsed or forgotten request is still
-  read, by any later `sync`. A program built on the library gets the same
-  from `Wallet::sync_schedule`, which it can call on a timer (a program that runs
-  `arca` asks `arca schedule`), and runs
+  read, by any later `sync`. A payment the operator has recorded and not
+  completed (its sender's post waits for the operator's signer or its
+  keepers) is a coin pending for the wallet: `sync` reads the operator's
+  notice of it and lists it (`mailbox.pending`, and `schedule.pending_coins`)
+  without counting it or spending it, and the schedule holds at a day until
+  it comes, whatever the lapse of the request it pays, or is withdrawn
+  (`mailbox.withdrawn`, with the operator's reason). A program built on the
+  library gets the same from `Wallet::sync_schedule`, which it can call on a
+  timer (a program that runs `arca` asks `arca schedule`), and runs
   `Wallet::sync` when it says so. A payment spends the coins furthest from
   their exit date first, so a receiver gets the longest life the wallet can
   give it.

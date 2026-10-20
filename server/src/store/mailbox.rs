@@ -2,7 +2,9 @@
 
 use super::{Store, StoreError};
 
-/// One message in a mailbox.
+/// One message in a mailbox: a coin (`kind` `coin`, its record the payload),
+/// or a notice of one (`pending`, a transfer recorded and not yet signed;
+/// `withdrawn`, that transfer dropped), its JSON the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxMessage {
 	/// Increases with every message the server stores; a reader passes the
@@ -27,15 +29,19 @@ impl Store {
 		Ok(row.get(0))
 	}
 
-	/// Up to `limit` messages of `mailbox_key` after `after`, oldest first.
-	pub async fn mailbox_read(&self, mailbox_key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<MailboxMessage>, StoreError> {
+	/// Up to `limit` messages of `mailbox_key` after `after`, oldest first:
+	/// coins, and when `notices`, the notices of coins pending and withdrawn
+	/// too (a reader that does not ask for them reads coins alone).
+	pub async fn mailbox_read(&self, mailbox_key: &[u8; 32], after: i64, limit: i64, notices: bool)
+		-> Result<Vec<MailboxMessage>, StoreError>
+	{
 		let conn = self.conn().await?;
 		let rows = conn.query(
 			"SELECT m.cursor, m.kind, m.leaf_id, m.payload, t.signer_entry, t.signer_hash, t.signer_sig FROM mailbox_message m
 			 LEFT JOIN transfer_output o ON o.leaf_id = m.leaf_id
 			 LEFT JOIN transfer t ON t.transfer_id = o.transfer_id
-			 WHERE m.mailbox_key = $1 AND m.cursor > $2 ORDER BY m.cursor LIMIT $3",
-			&[&&mailbox_key[..], &after, &limit],
+			 WHERE m.mailbox_key = $1 AND m.cursor > $2 AND (m.kind = 'coin' OR $4) ORDER BY m.cursor LIMIT $3",
+			&[&&mailbox_key[..], &after, &limit, &notices],
 		).await?;
 		rows.iter().map(|r| {
 			let leaf: Option<Vec<u8>> = r.get(2);

@@ -222,6 +222,17 @@ pub(crate) const RECEIVE_ASKED: &str = "receive_asked";
 /// holds the schedule until it is paid or forgotten.
 pub(crate) const RECEIVE_UNTIL: &str = "receive_until";
 
+/// Where the wallet keeps the coins the mailbox says are pending for it
+/// (D61): `{leaf id: {transfer_id, asset, value, seen_at, until}}`, each
+/// until it comes, is withdrawn, or its transfer can no longer complete.
+pub(crate) const PENDING_COINS: &str = "pending_coins";
+
+/// Why the wallet's schedule is a day at most while a coin is pending for
+/// it.
+pub(crate) const PENDING_NOTE: &str = "a coin is pending for the wallet: the operator recorded a transfer that pays it and has not \
+	completed it yet (its sender's post waits for the operator's signer or its keepers), and the coin is read only by sync once it \
+	does, so sync runs at least once a day until it comes or is withdrawn, whatever the request it pays says";
+
 /// How long a receive request lasts, from the median time it was handed
 /// out: the acceptance horizon, 27 days. The request carries the median time
 /// it lapses at (`until`); a sender refuses to pay it from then, and until
@@ -1513,10 +1524,14 @@ impl Wallet {
 	/// that has not lapsed (a coin paid to it is read only by `sync`, and its
 	/// sender may have paid with a coin days from its exit date; one handed
 	/// out before requests carried their lapse holds it until it is paid or
-	/// forgotten); `null` when nothing waits. `due` says whether it is now;
+	/// forgotten), or while a coin is pending for it (D61: a transfer the
+	/// operator recorded and has not completed, whose coin is read only by
+	/// `sync` once it does, whatever the lapse of the request it pays);
+	/// `null` when nothing waits. `due` says whether it is now;
 	/// `why` says what holds the time back; `receive_requests` lists every
 	/// unpaid request, waiting or lapsed, with its dates
-	/// ([`Self::receive_requests`]).
+	/// ([`Self::receive_requests`]), and `pending_coins` every coin pending
+	/// for the wallet, counted nowhere.
 	/// Asks nothing of the operator or the node but the tip.
 	pub fn sync_schedule(&self) -> Result<Value, Error> {
 		let now = self.now()?.to_consensus_u32();
@@ -1568,6 +1583,18 @@ impl Wallet {
 		}
 		if !requests.is_empty() {
 			out["receive_requests"] = json!(requests);
+		}
+		// D61: a coin pending for the wallet is read only by `sync` once its
+		// transfer completes, whenever that is: a day at most, until it
+		// comes or is withdrawn.
+		let pending = self.pending_coins(now)?;
+		if !pending.is_empty() && !stopped {
+			let day = now.saturating_add(86_400);
+			next = Some(next.map_or(day, |n| n.min(day)));
+			out["why"] = json!(PENDING_NOTE);
+		}
+		if !pending.is_empty() {
+			out["pending_coins"] = json!(pending);
 		}
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));

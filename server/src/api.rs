@@ -644,13 +644,41 @@ pub struct Coin {
 }
 
 /// `POST /v1/mailbox_read`: messages after `after` (a cursor, decimal), up
-/// to `limit`.
+/// to `limit`: coins, and with `notices` the notices of coins pending and
+/// withdrawn too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxRead {
 	pub auth: Auth,
 	pub after: String,
 	pub limit: u32,
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub notices: bool,
+}
+
+/// A notice in a mailbox (D61): a transfer the server recorded and has not
+/// signed yet will make the coin `leaf_id` of the mailbox's (`pending`:
+/// its asset, value, owner key and nonce, and `until`, the median time from
+/// which it can no longer complete, its earliest batch's expiry, absent for
+/// coins resting on boards alone), or that transfer was dropped and the coin
+/// will never come (`withdrawn`, with the reason).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxNotice {
+	pub transfer_id: String,
+	pub leaf_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub asset: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub value: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner_nonce: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub until: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +698,10 @@ pub struct MailboxMessage {
 	/// transfer's last signature was recorded as, signed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub signer_record: Option<RecordHead>,
+	/// For a notice (`kind` `pending` or `withdrawn`), what it says; its
+	/// `record` is then empty.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notice: Option<MailboxNotice>,
 }
 
 /// `POST /v1/leaf_data`: the leaves served to the authenticated key, after

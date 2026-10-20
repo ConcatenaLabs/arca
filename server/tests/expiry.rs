@@ -958,3 +958,127 @@ async fn a_participation_stuck_from_old_state_is_released_on_the_watchers_claim(
 	assert_eq!(leaf_states(&r, &n), vec!["live"], "its leaf credited");
 	r.purse.put(fee_coin);
 }
+
+// ---------------------------------------------------------------------------
+// 4. A transfer recorded and not completed is pending for its receiver (D61)
+// ---------------------------------------------------------------------------
+
+/// The kinds of the messages of `mailbox` in the database, in order.
+async fn mailbox_kinds(db: &tokio_postgres::Client, mailbox: &Keypair) -> Vec<String> {
+	db.query("SELECT kind FROM mailbox_message WHERE mailbox_key = $1 ORDER BY cursor", &[&&xonly(mailbox).serialize()[..]]).await
+		.unwrap().iter().map(|r| r.get::<_, String>(0)).collect()
+}
+
+/// `mailbox`'s messages after `after`, notices included, as `mailbox_read`
+/// serves them.
+fn mailbox_with_notices(r: &Running, mailbox: &Keypair, after: i64) -> Answer {
+	let request = server::auth::mailbox_read_request(after as u64, 100);
+	r.http.post("mailbox_read", &json!({"auth": r.http.auth_for("mailbox_read", mailbox, &r.chain, &request), "after": after.to_string(),
+		"limit": 100, "notices": true}))
+}
+
+/// D61. A transfer recorded and not yet signed has its outputs posted to
+/// their mailboxes as pending, at once, and is withdrawn there, with the
+/// reason, when the operator drops it. A's board C is given up in a refresh
+/// that completes, so the signer holds its forfeit; the database is then
+/// put as an older server's expiry left it (C live again). With the signer
+/// away, A pays D out of C: the server records the transfer and cannot have
+/// it signed. D's mailbox holds a pending notice for the coin, served to a
+/// reader that asks for notices (and to no other): its leaf, transfer,
+/// asset, value and the latest it can complete by. The signer back, the
+/// same payment again is refused `double_spend` for the forfeit, the record
+/// dropped, and D's mailbox holds the withdrawal naming why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_transfer_is_pending_for_its_receiver_until_dropped() {
+	let mut r = start().await;
+	let x = r.x;
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let a = keypair("D61 A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("D61 A, new");
+	let (ans, pa, a2_nonce) = submit(&r, &a_board, &a2, VALUE, 0, None);
+	assert_eq!(ans.ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let (_, new_valid, _, _) = complete(&r, &pa, &a_board, &a, &a_tx, &a2, &a2_nonce).await;
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	db.execute("UPDATE participation SET state = 'expired' WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("DELETE FROM forfeit WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE participation_input SET active = false WHERE participation_id = $1", &[&&pa[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'live', spent_by = NULL WHERE leaf_id = $1", &[&&a_board.id.0[..]]).await.unwrap();
+	db.execute("UPDATE leaf SET state = 'expired' WHERE leaf_id = $1", &[&&new_valid.leaf_id.0[..]]).await.unwrap();
+	let a_old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let d = keypair("D61 D");
+	let (d_leaf, _) = common::client::new_leaf(&d);
+	let spend = common::client::transfer_body(&[(&a_board, a_old.clone(), VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)], xonly(&r.s), r.chain);
+	r.signer.kill();
+	let ans = r.http.post("cosign_transfer", &spend);
+	println!("D61 A pays D with the signer away: {} {}", ans.status, ans.json);
+	assert_eq!(ans.status, 503, "{}", ans.json);
+	let kinds = mailbox_kinds(&db, &d).await;
+	println!("D61 D's mailbox at the server once the transfer is recorded: {:?}", kinds);
+	assert_eq!(kinds, vec!["pending".to_string()], "the coin is posted pending when the transfer is recorded");
+	let plain = r.http.mailbox(&d, &r.chain, 0);
+	assert!(plain.is_empty(), "a reader that does not ask for notices is served none");
+	let read = mailbox_with_notices(&r, &d, 0).ok();
+	println!("D61 D's mailbox read with notices: {}", read);
+	let m = &read["messages"][0];
+	assert_eq!(m["kind"], "pending", "{}", read);
+	let n = &m["notice"];
+	let t = r.server.store.spent_by_transfer(&a_board.id.0).await.unwrap().expect("recorded");
+	let out = r.server.store.transfer(&t).await.unwrap().unwrap().outputs[0].0;
+	assert_eq!((n["leaf_id"].as_str(), n["transfer_id"].as_str()), (Some(hex(&out).as_str()), Some(hex(&t).as_str())), "{}", n);
+	assert_eq!((n["asset"].as_str(), n["value"].as_str()), (Some(x.to_string().as_str()), Some((VALUE - 4_000).to_string().as_str())), "{}", n);
+	assert_eq!(n["owner"], hex(&xonly(&d).serialize()), "{}", n);
+	// A coin resting on a board alone: no batch's expiry bounds when its
+	// transfer can complete.
+	assert!(n["until"].is_null(), "a board's coin names no expiry: {}", n);
+	let cursor: i64 = m["cursor"].as_str().unwrap().parse().unwrap();
+	tokio::task::block_in_place(|| r.signer.restart(&r.s, genesis));
+	let ans = r.http.post("cosign_transfer", &spend);
+	let why = refused(ans, 409, "double_spend");
+	assert!(why.contains("already co-signed the forfeit"), "{}", why);
+	let kinds = mailbox_kinds(&db, &d).await;
+	println!("D61 D's mailbox at the server once the transfer is dropped: {:?}", kinds);
+	assert_eq!(kinds, vec!["pending".to_string(), "withdrawn".to_string()]);
+	let read = mailbox_with_notices(&r, &d, cursor).ok();
+	println!("D61 D's mailbox read after the pending notice: {}", read);
+	let w = &read["messages"][0];
+	assert_eq!((w["kind"].as_str(), w["notice"]["leaf_id"].as_str()), (Some("withdrawn"), Some(hex(&out).as_str())), "{}", read);
+	assert!(w["notice"]["reason"].as_str().unwrap_or("").contains("already co-signed the forfeit"), "the reason: {}", w);
+}
+
+/// D61: a transfer recorded with the signer away, then completed when the
+/// same request is posted again, posts its coin after the pending notice;
+/// the coin is live, the notice was its first word.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_transfer_completed_posts_its_coin_after_the_pending_notice() {
+	let mut r = start().await;
+	let x = r.x;
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let a = keypair("D61C A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a_old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+	let d = keypair("D61C D");
+	let (d_leaf, _) = common::client::new_leaf(&d);
+	let spend = common::client::transfer_body(&[(&a_board, a_old, VALUE - 2_000)], &[(x, VALUE - 4_000, d_leaf)], xonly(&r.s), r.chain);
+	r.signer.kill();
+	assert_eq!(r.http.post("cosign_transfer", &spend).status, 503);
+	tokio::task::block_in_place(|| r.signer.restart(&r.s, genesis));
+	let done = r.http.post("cosign_transfer", &spend).ok();
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	let kinds = mailbox_kinds(&db, &d).await;
+	println!("D61C D's mailbox once the transfer completes: {:?}", kinds);
+	assert_eq!(kinds, vec!["pending".to_string(), "coin".to_string()]);
+	let coins = r.http.mailbox(&d, &r.chain, 0);
+	assert_eq!(coins.len(), 1, "a reader without notices reads the coin alone");
+	assert_eq!(coins[0].1.to_string(), done["outputs"][0]["leaf_id"].as_str().unwrap_or(""), "{}", done);
+}
