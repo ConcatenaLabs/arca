@@ -43,11 +43,12 @@ use elements::hashes::{sha256, Hash, HashEngine};
 use elements::opcodes::all::*;
 use elements::script::Builder;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, OutPoint, Script, Transaction};
+use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction};
 
 use crate::message::Chain;
 use crate::record::{LeafId, Template};
 use crate::script::{asset_bytes, witness_program, ExplicitOutput};
+use crate::spend::{explicit_txout, FeeSource, KeySpend, SpendError, FEE_COIN_SEQUENCE};
 use crate::taptree::{leaf_hash, TapOutput, NUMS};
 use crate::time::{MedianTime, RelativeTime};
 
@@ -224,6 +225,17 @@ impl FillOrder {
 		} else {
 			RefundLock::Time(self.expiry_locktime)
 		}
+	}
+
+	/// The maker's REFUND of the order resting at `coin`, holding `value` of
+	/// `asset_a`, into `outputs`: its lock time is `expiry_locktime` and
+	/// input 0's sequence enables it, so it confirms only once the chain has
+	/// passed that lock. The maker signs [`KeySpend::sighash`] with the key
+	/// of `maker_x` and finishes it with that signature alone.
+	pub fn refund_tx(&self, coin: OutPoint, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		let spent = explicit_txout(self.asset_a, value, self.script_pubkey());
+		let lock = LockTime::from_consensus(self.expiry_locktime);
+		KeySpend::build_at(lock, self.output(), self.refund_leaf(), vec![(coin, spent, Sequence(FEE_COIN_SEQUENCE.0))], outputs, fee)
 	}
 
 	/// Refuses terms no fill can satisfy: a rate or lot of zero, the same

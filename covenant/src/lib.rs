@@ -19,8 +19,8 @@
 //!   timeout in place of the exit;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
-//!   checkpoint ([`checkpoint`]), the offboard output
-//!   ([`offboard`]) and the round's connector output, which only the issuance
+//!   checkpoint ([`checkpoint`]), the offboard output with the margin its
+//!   unlock takes ([`offboard`]) and the round's connector output, which only the issuance
 //!   of the round's connector asset spends ([`forfeit::ConnectorPolicy`]);
 //! - the five checks a wallet runs on a round transaction and its published
 //!   clock schedule ([`checks`]);
@@ -35,8 +35,9 @@
 //!   receiver validates back to the batches and boards it came from;
 //! - an on-chain order a round fills ([`fill`]): SeqDEX's fill covenant, its
 //!   terms as the relay serves them, the credit at `2k` and remainder at
-//!   `2k+1` its FILL leaf reads, that leaf's judgement of a transaction, and
-//!   the id a holder's take of an order is attested by;
+//!   `2k+1` its FILL leaf reads, that leaf's judgement of a transaction, the
+//!   maker's REFUND once its lock has passed, and the id a holder's take of
+//!   an order is attested by;
 //! - the board (`board-1`: the leaf's collaborative path and the owner's
 //!   conversion into the leaf) and its record ([`board`]), and the
 //!   transactions that spend a leaf outside the unroll ([`spend`]): its exit,

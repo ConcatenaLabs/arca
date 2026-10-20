@@ -462,14 +462,8 @@ pub fn forfeit_margin(coin: &ValidCoin, refund_delay: RelativeTime, floor_per_kv
 /// the unlock with the margin as its fee; nothing when the node does not
 /// accept the asset for fees (whoever unlocks attaches a coin).
 pub fn offboard_margin(destination: &ExplicitOutput, operator: XOnlyPublicKey, reclaim_delay: RelativeTime, floor_per_kvb: Option<u64>) -> u64 {
-	let floor = match floor_per_kvb {
-		Some(f) => f,
-		None => return 0,
-	};
 	let policy = OffboardPolicy { unlock_hash: [0; 32], destination: destination.clone(), operator, reclaim_delay };
-	policy.unlock_tx(OutPoint::default(), destination.value.saturating_add(1), &[0; 32], &FeeSource::Reserve)
-		.map(|u| fees::atoms_for(floor, u.tx.vsize() as u64, fees::MULTIPLE))
-		.unwrap_or(0)
+	policy.unlock_margin(floor_per_kvb, fees::MULTIPLE)
 }
 
 /// Why a participation that carries `asset` and `others` too is refused.
