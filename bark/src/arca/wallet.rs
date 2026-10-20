@@ -76,6 +76,10 @@ pub struct Config {
 	/// included.
 	pub min_exit_delay_units: u16,
 	pub max_exit_delay_units: u16,
+	/// When the wallet joins an operator from its registry record: what the
+	/// server must show before it is pinned (its key, chain and keepers).
+	/// Only [`Wallet::create`] and [`Wallet::create_in`] read it.
+	pub expect: Option<super::registry::Expected>,
 }
 
 impl Config {
@@ -86,7 +90,7 @@ impl Config {
 		let max = RelativeTime::from_seconds_ceil(WalletPolicy::DEFAULT_MAX_EXIT_SECONDS).expect("48 hours").units();
 		Config {
 			server: server.into(), node_url: node_url.into(), node_user: None, node_password: None, node_cookie: None,
-			account: 0, exit_delay_units: d, min_exit_delay_units: d, max_exit_delay_units: max,
+			account: 0, exit_delay_units: d, min_exit_delay_units: d, max_exit_delay_units: max, expect: None,
 		}
 	}
 }
@@ -537,6 +541,12 @@ impl Wallet {
 		let chain_name = chain.chain_name()?;
 		let server = ServerClient::new(&cfg.server)?;
 		let info = server.info()?;
+		// A server joined from its registry record is the record's operator,
+		// on the record's chain, with the record's keepers, or nothing is
+		// pinned: the very `info` the pins come from is the one checked.
+		if let Some(e) = &cfg.expect {
+			e.check(&info)?;
+		}
 		let server_genesis = info["genesis_hash"].as_str().unwrap_or("");
 		if server_genesis != genesis.to_string() {
 			return Err(Error::Refused(format!("the server serves the chain of genesis {}; the node is on {}", server_genesis, genesis)));
@@ -623,6 +633,7 @@ impl Wallet {
 			exit_delay_units: parse("exit delay", &get("exit_delay_units")?)?,
 			min_exit_delay_units: parse("exit delay", &get("min_exit_delay_units")?)?,
 			max_exit_delay_units: parse("exit delay", &get("max_exit_delay_units")?)?,
+			expect: None,
 		};
 		let genesis = Chain::new(parse("the genesis hash", &get("genesis")?)?);
 		let operator = parse("the operator key", &get("operator")?)?;

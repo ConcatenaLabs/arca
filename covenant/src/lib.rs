@@ -40,7 +40,10 @@
 //!   reclaim, the margin or a fee coin paying;
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
-//!   ([`witness`]).
+//!   ([`witness`]);
+//! - the operator record ([`operator_record`]): what an operator publishes
+//!   about itself in the Sequentia registry, its canonical form and the
+//!   signature of the operator key over it.
 //!
 //! The scripts are frozen. Each one equals, byte for byte, the golden vector the
 //! regtest suite exports (`regtest/vectors/arca.json`), and the tests spend
@@ -66,6 +69,8 @@ pub mod leaf;
 pub mod message;
 pub mod node;
 pub mod offboard;
+#[cfg(feature = "json")]
+pub mod operator_record;
 pub mod record;
 pub mod release;
 #[cfg(feature = "json")]

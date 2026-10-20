@@ -4,6 +4,7 @@
 //! socket. See `server::signer` for the protocol.
 //!
 //!     arca-signer --key-file <file> --pubkey
+//!     arca-signer --key-file <file> --genesis <hash> --sign-operator-record <record.json>
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
 //!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
@@ -14,7 +15,14 @@
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. `--pubkey` prints the operator
 //! key `S` it holds, and exits: a new operator's keepers are made with it
-//! (`arca-keeper --operator <S> … --create`) before its record exists. The genesis hash is in display
+//! (`arca-keeper --operator <S> … --create`) before its record exists.
+//! `--sign-operator-record` signs the operator's record for the Sequentia
+//! registry (`arca_covenant::operator_record`) and prints
+//! `{"record", "signature"}`, the body the registry takes, and exits: it
+//! signs only a record that names this key and the chain of `--genesis`,
+//! under the record's own tag, which nothing else the key signs uses. It
+//! reads the key file and the record and nothing else, so it runs beside a
+//! signer that is serving. The genesis hash is in display
 //! order, as `getblockhash 0` prints it. The socket is created with mode 0600.
 //! The record is the signer's append-only record of every rebindable message
 //! it signed (`server::signer::SpendRecord`): it is what makes the signer the
@@ -123,6 +131,9 @@ struct Args {
 	key_file: PathBuf,
 	/// `--pubkey`: print `S` and exit; nothing else is read.
 	pubkey: bool,
+	/// `--sign-operator-record`: sign the operator record in this file and
+	/// exit; nothing else is read.
+	sign_record: Option<PathBuf>,
 	genesis: BlockHash,
 	/// `None` with `--create-record`, which serves nothing.
 	socket: Option<PathBuf>,
@@ -156,12 +167,14 @@ fn args() -> Result<Args, String> {
 	let mut keeper_timeout = std::time::Duration::from_secs(5);
 	let mut pubkey = false;
 	let mut start_keepers_seen = false;
+	let mut sign_record = None;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
 		match a.as_str() {
 			"--key-file" => key_file = Some(PathBuf::from(value()?)),
 			"--pubkey" => pubkey = true,
+			"--sign-operator-record" => sign_record = Some(PathBuf::from(value()?)),
 			"--genesis" => genesis = Some(BlockHash::from_str(&value()?).map_err(|e| format!("--genesis: {}", e))?),
 			"--socket" => socket = Some(PathBuf::from(value()?)),
 			"--record" => record = Some(PathBuf::from(value()?)),
@@ -180,6 +193,19 @@ fn args() -> Result<Args, String> {
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
+	if let Some(file) = sign_record {
+		if pubkey || socket.is_some() || record.is_some() || create_record || clear_stopped || compact_into.is_some() || drop_salts.is_some()
+			|| !keepers.is_empty() || !keeper_keys.is_empty() || no_keepers || keepers_required.is_some() || start_keepers_seen
+		{
+			return Err("--sign-operator-record takes --key-file and --genesis alone: it signs the record and exits".into());
+		}
+		return Ok(Args {
+			key_file: key_file.ok_or("--key-file is required")?, pubkey: false, sign_record: Some(file),
+			genesis: genesis.ok_or("--genesis is required: the record is signed only for the chain it names")?, socket: None,
+			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
+			start_keepers_seen: false,
+		});
+	}
 	if pubkey {
 		if genesis.is_some() || socket.is_some() || record.is_some() || create_record || clear_stopped || compact_into.is_some()
 			|| drop_salts.is_some() || !keepers.is_empty() || !keeper_keys.is_empty() || no_keepers || keepers_required.is_some()
@@ -187,7 +213,7 @@ fn args() -> Result<Args, String> {
 			return Err("--pubkey takes --key-file alone: it prints the operator key S and exits".into());
 		}
 		return Ok(Args {
-			key_file: key_file.ok_or("--key-file is required")?, pubkey, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
+			key_file: key_file.ok_or("--key-file is required")?, pubkey, sign_record: None, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
 			start_keepers_seen: false,
 		});
@@ -235,6 +261,7 @@ fn args() -> Result<Args, String> {
 	Ok(Args {
 		key_file: key_file.ok_or("--key-file is required")?,
 		pubkey: false,
+		sign_record: None,
 		genesis: genesis.ok_or("--genesis is required")?,
 		socket,
 		record: record.ok_or("--record is required: the signer keeps a record of every spend it co-signs")?,
@@ -887,6 +914,17 @@ async fn answer(state: &State, line: &str) -> Response {
 	}
 }
 
+/// The operator record in `file`, signed with `key` for the chain of
+/// `genesis`, as the registry takes it: `{"record", "signature"}`.
+fn sign_operator_record(key: &Keypair, file: &std::path::Path, genesis: &str) -> Result<serde_json::Value, String> {
+	let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+	let record: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("not JSON: {}", e))?;
+	let mut aux = [0u8; 32];
+	rand::rngs::OsRng.fill_bytes(&mut aux);
+	let sig = arca_covenant::operator_record::sign(key, &record, genesis, &aux).map_err(|e| e.to_string())?;
+	Ok(serde_json::json!({"record": record, "signature": hex(sig.as_ref())}))
+}
+
 // Requests are answered on several threads at once: a witness's signing
 // runs beside a co-signature, which waits only for the record's lock.
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -909,6 +947,18 @@ async fn main() {
 	if args.pubkey {
 		println!("{}", hex(&operator.serialize()));
 		return;
+	}
+	if let Some(file) = &args.sign_record {
+		match sign_operator_record(&key, file, &args.genesis.to_string()) {
+			Ok(v) => {
+				println!("{}", v);
+				return;
+			},
+			Err(e) => {
+				eprintln!("arca-signer: {}: {}", file.display(), e);
+				std::process::exit(1);
+			},
+		}
 	}
 	if let Some(keepers) = &args.record_keepers {
 		match SpendRecord::create(&args.record, &operator, &args.genesis, keepers) {

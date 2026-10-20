@@ -42,11 +42,23 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
 	/// Creates a wallet: a new mnemonic (or the one given), the node's chain,
-	/// and the server's operator key, pinned.
+	/// and the server's operator key, pinned. `join --from-registry KEY`
+	/// joins the operator the registry lists under that key instead of a
+	/// server named by address.
+	#[command(visible_alias = "join")]
 	Create {
 		/// The Arca server's base URL.
-		#[arg(long)]
-		server: String,
+		#[arg(long, required_unless_present = "from_registry", conflicts_with = "from_registry")]
+		server: Option<String>,
+		/// The operator key of an operator the registry lists: the wallet
+		/// reads its record, checks the operator's signature over it, takes
+		/// the server's address from it, and is created only when that server
+		/// shows the record's key, chain and keepers.
+		#[arg(long, requires = "registry")]
+		from_registry: Option<String>,
+		/// The registry's base URL (`https://host/registry`).
+		#[arg(long, env = "ARCA_REGISTRY")]
+		registry: Option<String>,
 		/// The node's JSON-RPC URL. The node must run with -txindex and
 		/// -validateanchor.
 		#[arg(long)]
@@ -88,6 +100,16 @@ enum Cmd {
 		/// The longest (default 48 hours).
 		#[arg(long)]
 		max_exit_delay_units: Option<u16>,
+	},
+	/// The operators the registry lists, each record's signature checked
+	/// here; needs no wallet.
+	Operators {
+		/// The registry's base URL (`https://host/registry`).
+		#[arg(long, env = "ARCA_REGISTRY")]
+		registry: String,
+		/// Only the operators of the chain of this genesis hash.
+		#[arg(long)]
+		genesis: Option<String>,
 	},
 	/// The wallet, its chain, its operator and what the server publishes.
 	Info,
@@ -410,8 +432,11 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if let Cmd::Bitcoin { args } = &cli.command {
 		return bitcoin(&datadir, args);
 	}
-	if let Cmd::Create { server, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file, account,
-		exit_delay_units, min_exit_delay_units, max_exit_delay_units } = cli.command
+	if let Cmd::Operators { registry, genesis } = &cli.command {
+		return bark::arca::command::operators(registry, genesis.as_deref());
+	}
+	if let Cmd::Create { server, from_registry, registry, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file,
+		account, exit_delay_units, min_exit_delay_units, max_exit_delay_units } = cli.command
 	{
 		// `-` reads the standard input itself: a path such as /dev/stdin
 		// cannot be opened when the input is a socket, which is what
@@ -427,7 +452,23 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				.split_whitespace().collect::<Vec<_>>().join(" ")),
 			None => mnemonic,
 		};
+		// From the registry: the record's signature checked here, the server's
+		// address taken from it, and what the server must show to be pinned.
+		let (server, joined) = match (server, from_registry) {
+			(Some(s), None) => (s, None),
+			(None, Some(key)) => {
+				let r = bark::arca::registry::RegistryClient::new(registry.as_deref().unwrap_or(""))?;
+				let (record, listing) = r.operator(&key)?;
+				let expect = bark::arca::registry::Expected::of(&record)?;
+				(record["api"].as_str().unwrap_or("").to_string(), Some((expect, listing)))
+			},
+			_ => return Err(bark::arca::Error::Parse("name the server (--server) or the registry's operator (--from-registry)".into())),
+		};
 		let mut cfg = Config::spec_delays(&server, &node_url);
+		let listing = joined.map(|(e, l)| {
+			cfg.expect = Some(e);
+			l
+		});
 		cfg.node_user = node_user;
 		cfg.node_password = match node_password_file {
 			Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?
@@ -455,6 +496,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			has pinned it, and refuses any server that names another", info["operator"].as_str().unwrap_or(""));
 		eprintln!("arca: {}", check);
 		info["operator_key_check"] = json!(check);
+		if let Some(l) = listing {
+			info["registry"] = l;
+		}
 		// A mnemonic given may have held coins: they are restored from what
 		// the server serves to the wallet's mailbox key, every record checked.
 		if restoring {
@@ -503,7 +547,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		}
 	}
 	match cli.command {
-		Cmd::Create { .. } | Cmd::Bitcoin { .. } => unreachable!("handled above"),
+		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Address => w.address(),
 		Cmd::Balance => {

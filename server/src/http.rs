@@ -610,7 +610,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			}.into(),
 			anchor_depth: app.anchor_depth,
 		},
-		templates: api::TemplatesInfo { version: 1, list: vec!["vtxo-1".into(), "board-1".into()] },
+		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter().map(|t| t.to_string()).collect() },
 		fees: api::FeesInfo {
 			transfer: "0".into(),
 			refresh_ppm: p.assets.default_fees().refresh_ppm,

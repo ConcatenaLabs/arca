@@ -518,11 +518,37 @@ the reason and Bark is not run. A Bitcoin invoice with `--asset` naming a
 Sequentia asset is refused before anything is signed. `ARCA_BARK_EXEC`
 names the `bark` binary when it is not the one beside `arca`.
 
+### Finding an operator in the registry
+
+An operator publishes a record of itself in the Sequentia registry: its
+operator key, the chain's genesis, its API's address, the assets it serves
+with their rate sources and fee schedules, its keepers, its exit delays and
+expiry, its template list and a contact, signed with its operator key. The
+registry checks each record against the operator's live `info` when it is
+listed and on a schedule, and marks it `stale` when the operator has not
+answered for a while and `mismatched` when its `info` no longer says what the
+record says.
+
+    arca operators --registry https://example.org/registry
+    arca join --from-registry <operator key> --registry https://example.org/registry \
+      --node-url http://127.0.0.1:18300 --node-cookie ~/.sequentia/regtest/.cookie
+
+The wallet trusts the registry for nothing it can check: it verifies every
+record's signature itself (`arca_covenant::operator_record`), so a registry
+can leave an operator out but cannot change what an operator said, and `join`
+pins the server only when the server's own `info` shows the record's key,
+chain and keepers. What the record cannot tell is whether the operator key is
+the one the operator means; compare it, as with `create`, with what the
+operator publishes through a channel you trust. `ARCA_REGISTRY` sets the
+registry for both commands.
+
 ### Commands
 
 | Command | Does |
 |---|---|
 | `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M \| --mnemonic-file FILE]` | Creates the wallet: a new mnemonic (or the one given, on the command line or read once from a file, `-` for the standard input, a pipe or a socket alike, which keeps it off the command line other users of the machine can read), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
+| `join --from-registry KEY --registry URL --node-url URL …` (`create --from-registry`) | Creates the wallet with the operator the Sequentia registry lists under operator key `KEY`, in place of a server named by address, taking the node, mnemonic and delay options of `create`: the operator's record is read from the registry, its signature by `KEY` checked by the wallet itself, the server's address taken from it, and the wallet created only when that server shows the record's operator key, chain and keepers (see Finding an operator in the registry); a record the registry finds `mismatched` is refused. The answer carries the record's listing under `registry` |
+| `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |

@@ -49,9 +49,26 @@ pub fn store_name(mnemonic: &str) -> Result<String, Error> {
 /// The configuration a wallet is created with, from JSON: `{"server",
 /// "node_url", "node_user"?, "node_password"?, "exit_delay_units"?,
 /// "min_exit_delay_units"?, "max_exit_delay_units"?}`, the delays as
-/// [`Config::spec_delays`] sets them unless given.
+/// [`Config::spec_delays`] sets them unless given. In place of `server`,
+/// `{"from_registry": KEY, "registry": URL}` joins the operator of key `KEY`
+/// that the registry at `URL` lists: its record's signature is checked, its
+/// address is the server's, and the wallet is created only when the server
+/// shows the record's key, chain and keepers ([`super::registry`]).
 pub fn config(c: &Value) -> Result<Config, Error> {
-	let mut cfg = Config::spec_delays(req_str(&c["server"], "the server")?, req_str(&c["node_url"], "the node")?);
+	let (server, expect) = match c["from_registry"].as_str().filter(|k| !k.is_empty()) {
+		Some(key) => {
+			if c.get("server").is_some_and(|s| !s.is_null()) {
+				return Err(Error::Parse("the server and from_registry: name one".into()));
+			}
+			let registry = super::registry::RegistryClient::new(req_str(&c["registry"], "the registry")?)?;
+			let (record, _) = registry.operator(key)?;
+			let api = record["api"].as_str().unwrap_or("").to_string();
+			(api, Some(super::registry::Expected::of(&record)?))
+		},
+		None => (req_str(&c["server"], "the server")?.to_string(), None),
+	};
+	let mut cfg = Config::spec_delays(&server, req_str(&c["node_url"], "the node")?);
+	cfg.expect = expect;
 	cfg.node_user = c["node_user"].as_str().map(String::from);
 	cfg.node_password = c["node_password"].as_str().map(String::from);
 	for (k, slot) in [("exit_delay_units", &mut cfg.exit_delay_units), ("min_exit_delay_units", &mut cfg.min_exit_delay_units),
@@ -62,6 +79,13 @@ pub fn config(c: &Value) -> Result<Config, Error> {
 		}
 	}
 	Ok(cfg)
+}
+
+/// The operators the registry at `registry` lists, each record's signature
+/// checked, as `arca operators` prints them; with `genesis`, those of that
+/// chain only.
+pub fn operators(registry: &str, genesis: Option<&str>) -> Result<Value, Error> {
+	super::registry::RegistryClient::new(registry)?.operators(genesis)
 }
 
 /// Runs one command, as `arca <command>` does, `args` a JSON object of its
@@ -213,6 +237,10 @@ mod test {
 		assert_eq!(config(&json!({"node_url": "http://n"})).unwrap_err().to_string(), "cannot parse the server is missing");
 		assert_eq!(config(&json!({"server": "s", "node_url": "n", "exit_delay_units": 70000})).unwrap_err().to_string(),
 			"refused: exit_delay_units is out of range");
+		assert_eq!(config(&json!({"server": "https://s", "from_registry": "ab", "registry": "https://r", "node_url": "n"})).unwrap_err()
+			.to_string(), "cannot parse the server and from_registry: name one");
+		assert_eq!(config(&json!({"from_registry": "ab", "node_url": "n"})).unwrap_err().to_string(), "cannot parse the registry is missing");
+		assert!(c.expect.is_none());
 	}
 
 	#[test]

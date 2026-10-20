@@ -14,6 +14,9 @@
 //!   derives them.
 //! - [`client`]: the server's JSON interface over HTTP, with challenge
 //!   authentication.
+//! - [`registry`]: the operators the Sequentia registry lists, each
+//!   record's signature checked by the wallet, and what a server joined from
+//!   a record must show before it is pinned.
 //! - [`command`]: the commands by name, with JSON arguments and answers, for a
 //!   program that embeds the library (a browser worker, a mobile app's core).
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
@@ -60,6 +63,7 @@ pub mod chain;
 pub mod client;
 pub mod command;
 pub mod keys;
+pub mod registry;
 pub mod store;
 
 mod exit;
