@@ -280,8 +280,9 @@ impl Forfeits {
 		let m = connector_asset(round_txid, round.connector_vout);
 		let refund = RelativeTime::from_units(p.refund_delay_units).map_err(|e| ForfeitError::Internal(e.to_string()))?;
 		// A coin is taken until its expiry: what matters now is that it is
-		// not past it, and that nothing of it is on the chain.
-		let policy = WalletPolicy { horizon: 0, ..self.params.policy(now) };
+		// not past it, and that nothing of it is on the chain. It was taken
+		// under the bounds of the time, which may have changed since.
+		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
 		let mut built = Vec::with_capacity(given.len());
 		for i in &p.inputs {
 			let leaf = LeafId(i.leaf_id);
@@ -317,7 +318,8 @@ impl Forfeits {
 		if auths.len() != new_ids.len() || auths.keys().any(|l| !new_ids.contains(l)) {
 			return Err(ForfeitError::LeafSet(format!("{} set(s) for the {} new leaf/leaves", auths.len(), new_ids.len())));
 		}
-		let receipt = self.params.policy(now);
+		// The round was built under the bounds of the time.
+		let receipt = self.params.taken_policy(now);
 		let mut records = Vec::with_capacity(new_ids.len());
 		for (_, leaf, _, _) in &at.leaves {
 			let leaf = LeafId(*leaf);
@@ -400,7 +402,7 @@ impl Forfeits {
 			let leaf = LeafId(f.leaf_id);
 			let built = async {
 				let now = self.now().await?;
-				let policy = WalletPolicy { horizon: 0, ..self.params.policy(now) };
+				let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
 				let checked = coins::resolve(&self.store, &policy, &leaf).await?;
 				let c = checked.coin;
 				let refund = RelativeTime::from_units(f.refund_delay_units).map_err(|e| ForfeitError::Internal(e.to_string()))?;

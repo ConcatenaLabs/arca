@@ -411,13 +411,28 @@ impl Rounds {
 	/// Whether every coin `p` gives up still passes the check it passed when
 	/// it was accepted, under the round's horizon. A participation with a
 	/// coin past that horizon can never run: it is voided, its coins given
-	/// back.
+	/// back. So is one that wants a leaf, or gives up a coin, outside the
+	/// exit-delay bounds the operator takes now (they changed at a restart
+	/// since it was accepted): no round of this operator makes that leaf or
+	/// takes that coin.
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
 		if p.attempt > 0 {
 			if let Some(why) = self.barred(p).await? {
 				let voided = self.store.void_participation(&p.id, &why).await?;
 				log::warn!("participation {} is never taken again (voided: {}): {}", crate::signer::hex(&p.id), voided, why);
 				return Ok(false);
+			}
+		}
+		let (min, max) = (self.params.min_exit_delay.units(), self.params.max_exit_delay.units());
+		for o in &p.outputs {
+			if let WantedKind::Leaf { exit_delay_units, .. } = &o.kind {
+				if !(min..=max).contains(exit_delay_units) {
+					let why = format!("it wants a leaf with an exit delay of {} units, and the operator takes {} to {} now",
+						exit_delay_units, min, max);
+					let voided = self.store.void_participation(&p.id, &why).await?;
+					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&p.id), why, voided);
+					return Ok(false);
+				}
 			}
 		}
 		let policy = self.params.round_policy(now);
@@ -429,6 +444,15 @@ impl Rounds {
 					error: arca_covenant::TransferError::Record(arca_covenant::RecordError::ExpiryTooSoon { .. }), ..
 				}) | Err(coins::CoinError::PastBoardDate { .. }) => {
 					let why = format!("coin {} is past its exit deadline, the last time a round takes it", LeafId(i.leaf_id));
+					let voided = self.store.void_participation(&p.id, &why).await?;
+					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&p.id), why, voided);
+					return Ok(false);
+				},
+				Err(coins::CoinError::InvalidCoin {
+					error: e @ (arca_covenant::TransferError::Record(arca_covenant::RecordError::ExitDelay { .. })
+						| arca_covenant::TransferError::LineageExitDelay { .. }), ..
+				}) => {
+					let why = format!("coin {} lies outside the exit-delay bounds the operator takes now ({})", LeafId(i.leaf_id), e);
 					let voided = self.store.void_participation(&p.id, &why).await?;
 					log::warn!("participation {} can never run: {} (voided: {})", crate::signer::hex(&p.id), why, voided);
 					return Ok(false);
@@ -1500,7 +1524,7 @@ impl Rounds {
 	/// gave up is off the chain.
 	async fn coin_on_chain(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
 		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
-		let policy = WalletPolicy { horizon: 0, ..self.params.policy(any_time) };
+		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
 		for i in p.inputs.iter().filter(|i| !i.returned) {
 			let leaf = LeafId(i.leaf_id);
 			let c = match coins::resolve(&self.store, &policy, &leaf).await {
@@ -1560,7 +1584,7 @@ impl Rounds {
 		let Some(p) = self.store.participation(id).await? else { return Ok(None) };
 		// Whatever the time: only the coins' dates are asked for.
 		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
-		let policy = WalletPolicy { horizon: 0, ..self.params.policy(any_time) };
+		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
 		let mut earliest: Option<u32> = None;
 		for i in &p.inputs {
 			let c = match coins::resolve(&self.store, &policy, &LeafId(i.leaf_id)).await {
