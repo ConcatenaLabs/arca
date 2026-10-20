@@ -82,11 +82,18 @@ fn leaf_probe() -> Script {
 	Script::from(b)
 }
 
-/// What each text the wallet hands out holds, by which another wallet knows
-/// it, whatever its prefix ([`super::wallet::Spelling`]).
-const REQUEST_KIND: &str = "arca_request";
-const OFFER_KIND: &str = "arca_swap_offer";
-const ACCEPT_KIND: &str = "arca_swap_accept";
+/// What each text the wallet hands out says it is (`kind`), by which another
+/// wallet knows it, whatever its prefix ([`super::wallet::Spelling`]), and
+/// the key an older wallet's text named it by instead, which is read too.
+#[derive(Debug, Clone, Copy)]
+struct Kind {
+	name: &'static str,
+	older: &'static str,
+}
+
+const REQUEST_KIND: Kind = Kind { name: "request", older: "arca_request" };
+const OFFER_KIND: Kind = Kind { name: "swap-offer", older: "arca_swap_offer" };
+const ACCEPT_KIND: Kind = Kind { name: "swap-accept", older: "arca_swap_accept" };
 
 fn encode(prefix: &str, v: &Value) -> String {
 	format!("{}{}", prefix, hex(v.to_string().as_bytes()))
@@ -94,15 +101,16 @@ fn encode(prefix: &str, v: &Value) -> String {
 
 /// The text `s` the wallet was handed, `what` (a receive request, an offer,
 /// an acceptance): a prefix, any word and a colon, as the wallet that made
-/// it spells it, then the hex of its JSON, which names its `kind`.
-fn decode(kind: &str, s: &str, what: &str) -> Result<Value, Error> {
+/// it spells it, then the hex of its JSON, which says what it is (`kind`),
+/// or, made by an older wallet, holds that kind's older key.
+fn decode(kind: Kind, s: &str, what: &str) -> Result<Value, Error> {
 	let (prefix, h) = s.trim().split_once(':').ok_or_else(|| Error::Parse(format!("{}: it has no prefix", what)))?;
 	if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
 		return Err(Error::Parse(format!("{}: its prefix {:?} is not a word", what, prefix)));
 	}
 	let bytes = unhex(h)?;
 	let v: Value = serde_json::from_slice(&bytes).map_err(|e| Error::Parse(format!("{}: {}", what, e)))?;
-	if v.get(kind).is_none() {
+	if v["kind"].as_str() != Some(kind.name) && v.get(kind.older).is_none() {
 		return Err(Error::Parse(format!("{}: the text is not one", what)));
 	}
 	Ok(v)
@@ -247,7 +255,7 @@ impl Wallet {
 			Ok(())
 		})?;
 		let mut req = json!({
-			(REQUEST_KIND): 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
+			"kind": REQUEST_KIND.name, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"owner": hex(&key.serialize()), "owner_nonce": hex(&nonce),
 			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()),
 			"exit_delay_units": self.cfg.exit_delay_units, "until": until,
@@ -1250,7 +1258,7 @@ impl Wallet {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox, until: None });
 		}
 		let offer = json!({
-			(OFFER_KIND): 1, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
+			"kind": OFFER_KIND.name, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"give": {"asset": give_asset.to_string(), "value": give.to_string()},
 			"want": {"asset": want_asset.to_string(), "value": want.to_string()},
 			"margin": margin.to_string(),
@@ -1366,7 +1374,7 @@ impl Wallet {
 			sigs.push(json!({"input": k, "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
 		}
 		let accept = json!({
-			(ACCEPT_KIND): 1, "swap": id,
+			"kind": ACCEPT_KIND.name, "swap": id,
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
 			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
@@ -1638,13 +1646,20 @@ mod tests {
 	}
 
 	/// A text the wallet is handed is read whatever its prefix, and known by
-	/// what it holds: a request made under any spelling, an older wallet's
-	/// included, is a request; an offer is not one, nor a text without a
-	/// prefix.
+	/// what it says it is: a request made under any spelling, an older
+	/// wallet's included (its older key), is a request; an offer is not one,
+	/// nor a text without a prefix. No text names the product.
 	#[test]
 	fn a_text_is_read_whatever_its_prefix_and_known_by_what_it_holds() {
-		let request = json!({(REQUEST_KIND): 1, "owner": "00"});
-		let offer = json!({(OFFER_KIND): 1});
+		let request = json!({"kind": REQUEST_KIND.name, "owner": "00"});
+		let older = json!({(REQUEST_KIND.older): 1, "owner": "00"});
+		let offer = json!({"kind": OFFER_KIND.name});
+		assert_eq!(decode(REQUEST_KIND, &encode("arca:", &older), "the receive request").unwrap(), older);
+		assert_eq!(decode(OFFER_KIND, &encode("offer:", &json!({(OFFER_KIND.older): 1})), "the offer").unwrap()[OFFER_KIND.older], 1);
+		assert!(decode(ACCEPT_KIND, &encode("accept:", &offer), "the acceptance").is_err());
+		for k in [REQUEST_KIND, OFFER_KIND, ACCEPT_KIND] {
+			assert!(!k.name.contains("arca"), "{}", k.name);
+		}
 		for prefix in ["arca:", "request:", "leaf-pay:"] {
 			assert_eq!(decode(REQUEST_KIND, &encode(prefix, &request), "the receive request").unwrap(), request);
 		}
