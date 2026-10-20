@@ -142,6 +142,14 @@ that serves pages without end is read no further, and the restore says so in
   never credits a leaf the operator may claim with a preimage it has. A leaf
   received over Lightning is bound to the mailbox key when it is made (the
   request names the key), so the restore finds it before it is claimed;
+- a payment received over Lightning whose leaf the wallet does not hold yet
+  (held, its leaf wanted in a round, or made and not yet released) is served
+  with the first page (`receives`), as the request bound it to the mailbox
+  key: it is rebuilt when its key is the one the mnemonic derives from the
+  nonce it names, the preimage the wallet derives from them opens its hash,
+  and its invoice is for that hash, asset and amount with the operator's fee
+  within the wallet's default bound; `sync` then takes up the participation
+  that wants its leaf and claims the leaf once held;
 - a participation in its forfeit step gets back the new leaves the wallet
   validated before it signed, from the published tree. One the operator
   released is completed once the preimage of its new leaves is in hand, from

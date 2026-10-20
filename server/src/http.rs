@@ -1288,7 +1288,10 @@ fn leaf_state(s: LeafState) -> &'static str {
 /// keepers' acknowledgements, and every way it was given up with the
 /// owner's own signature (the checkpoint signature of a transfer, the
 /// attestation of a participation with every part of its id, the owner's
-/// half of each forfeit). Nothing of a key the request does not prove.
+/// half of each forfeit). The first page also serves every payment into the
+/// tree asked under a key bound to it and not yet claimed or failed back,
+/// with its participation (D70). Nothing of a key the request does not
+/// prove.
 async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
 	body: Result<Bytes, BytesRejection>) -> Result<Json<api::LeafData>, Refusal>
 {
@@ -1317,7 +1320,27 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 		leaves.push(served_entry(&app, r).await?);
 	}
 	let next = leaves.last().and_then(|l: &api::LeafEntry| l.cursor.clone());
-	Ok(Json(api::LeafData { leaves, next }))
+	// D70: on the first page, the payments into the tree asked under a key
+	// bound to this one and not yet claimed: a leaf held, wanted or not yet
+	// released is taken up by a restore from them.
+	let receives = if after == 0 {
+		app.store.receives_bound_to(&k.serialize()).await?.into_iter().map(|r| api::ServedReceive {
+			payment_hash: hex(&r.new.payment_hash),
+			asset: AssetId::from_byte_array(r.new.asset).to_string(),
+			amount: r.new.amount.to_string(),
+			fee: r.new.fee.to_string(),
+			invoice: r.new.invoice.clone(),
+			owner: hex(&r.new.owner_key),
+			owner_nonce: hex(&r.new.owner_nonce),
+			exit_delay_units: r.new.exit_delay_units,
+			state: r.state.name().into(),
+			participation_id: r.participation_id.map(|p| hex(&p)),
+			timeout: r.timeout,
+		}).collect()
+	} else {
+		vec![]
+	};
+	Ok(Json(api::LeafData { leaves, next, receives }))
 }
 
 /// One leaf as `leaf_data` serves it.

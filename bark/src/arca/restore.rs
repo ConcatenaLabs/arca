@@ -101,6 +101,7 @@ impl Wallet {
 		let info = self.server_info()?;
 		let mailbox = self.keys.mailbox()?;
 		let mut entries: Vec<Value> = vec![];
+		let mut served_receives: Vec<Value> = vec![];
 		let mut after = 0i64;
 		let mut read_note: Option<String> = None;
 		let mut pages = 0;
@@ -112,6 +113,9 @@ impl Wallet {
 			}
 			pages += 1;
 			let page = self.server.leaf_data(&mailbox, &self.genesis, after, LEAF_PAGE)?;
+			if after == 0 {
+				served_receives = page["receives"].as_array().cloned().unwrap_or_default();
+			}
 			let leaves = page["leaves"].as_array().cloned().unwrap_or_default();
 			if leaves.is_empty() {
 				break;
@@ -212,6 +216,22 @@ impl Wallet {
 			let receive = h.direction == arca_covenant::HtlcDirection::Receive;
 			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending") || (receive && c.state == "sending")) {
 				notes.push(self.restore_htlc(id, &t.coin, h, &info, now)?);
+			}
+		}
+
+		// D70: the payments into the tree asked under the mailbox key and not
+		// yet claimed, whose leaf is not held yet (held, wanted in a round, or
+		// made and not yet released): each rebuilt from what the server serves,
+		// checked against the mnemonic, and taken up by `sync`.
+		for r in &served_receives {
+			match self.restore_receive(r, &info) {
+				Ok(Some(n)) => notes.push(n),
+				Ok(None) => {},
+				Err(why) => {
+					let hash = r["payment_hash"].as_str().unwrap_or("").to_string();
+					self.store.refused(&format!("restore of the payment received under hash {}", hash), &why)?;
+					not_recovered.push(json!({"payment_hash": hash, "why": why}));
+				},
 			}
 		}
 
@@ -623,6 +643,54 @@ impl Wallet {
 				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": note}))
 			},
 		}
+	}
+
+	/// D70: a payment into the tree the server serves (`r`, from `leaf_data`)
+	/// as asked under the mailbox key and not yet claimed, rebuilt so that
+	/// `sync` takes its leaf up as the lost wallet would have: its key must be
+	/// the one the mnemonic derives from the nonce it names, the preimage the
+	/// wallet derives from them must open its hash, and its invoice must be
+	/// for that hash, asset and amount, the operator's fee within the
+	/// wallet's default bound. Kept `waiting`: the next `sync` asks the
+	/// operator how it stands and follows the participation that wants its
+	/// leaf as its own. `None` for one the wallet holds already.
+	fn restore_receive(&mut self, r: &Value, info: &Value) -> Result<Option<Value>, String> {
+		let hash = r["payment_hash"].as_str().unwrap_or("").to_string();
+		if self.receives().map_err(|e| e.to_string())?.contains_key(&hash) {
+			return Ok(None);
+		}
+		let nonce = unhex32(r["owner_nonce"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+		let owner = self.keys.leaf_xonly(&nonce).map_err(|e| e.to_string())?;
+		if r["owner"].as_str() != Some(&hex(&owner.serialize())) {
+			return Err(format!("the server serves a payment received under hash {} for a key this wallet does not derive from the nonce it \
+				names", hash));
+		}
+		let preimage = self.receive_preimage(&nonce).map_err(|e| e.to_string())?;
+		if hex(&arca_covenant::script::sha256(&preimage)) != hash {
+			return Err(format!("the server serves a payment received under hash {}, which the preimage the wallet derives from its key \
+				does not open", hash));
+		}
+		let asset = AssetId::from_str(r["asset"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+		let asked = amount(&r["amount"], "an amount").map_err(|e| e.to_string())?;
+		let fee = amount(&r["fee"], "a fee").map_err(|e| e.to_string())?;
+		let invoice = r["invoice"].as_str().unwrap_or("").to_string();
+		let inv = super::lightning::parse_invoice(&invoice).map_err(|e| e.to_string())?;
+		if hex(&inv.payment_hash) != hash || inv.asset != Some(asset) || inv.amount_msat != Some(asked.saturating_mul(1000)) {
+			return Err(format!("the invoice served for the payment received under hash {} is not for that hash, asset and amount", hash));
+		}
+		if fee >= asked || !super::round::fee_within(fee, asked, super::DEFAULT_MAX_FEE_PPM) {
+			return Err(format!("the operator's fee of {} for the payment received under hash {} of {} is above the wallet's bound of {} ppm",
+				fee, hash, asked, super::DEFAULT_MAX_FEE_PPM));
+		}
+		if self.store.nonce(&nonce).map_err(|e| e.to_string())?.is_none() {
+			self.store.put_nonce(&nonce, &owner.serialize(), "lightning-receive").map_err(|e| e.to_string())?;
+		}
+		let window = info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600);
+		self.set_receive(&hash, json!({"state": "waiting", "nonce": hex(&nonce), "asset": asset.to_string(), "amount": asked.to_string(),
+			"fee": fee.to_string(), "value": (asked - fee).to_string(), "invoice": invoice, "max_fee_ppm": super::DEFAULT_MAX_FEE_PPM,
+			"window": window, "restored": true})).map_err(|e| e.to_string())?;
+		Ok(Some(json!({"payment_hash": hash, "state": r["state"], "note": "a payment received over Lightning and not yet claimed, restored \
+			waiting: sync asks how it stands, takes up the participation that wants its leaf, and claims the leaf once held"})))
 	}
 
 	/// Coin `record` of the wallet's key `owner` of `nonce`, checked against

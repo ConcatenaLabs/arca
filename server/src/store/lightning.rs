@@ -257,6 +257,16 @@ impl Store {
 		r.as_ref().map(receive_of).transpose()
 	}
 
+	/// Every payment into the tree not yet claimed or failed back (`open` or
+	/// `accepted`) whose leaf's key is bound to `mailbox`, oldest first.
+	pub async fn receives_bound_to(&self, mailbox: &[u8; 32]) -> Result<Vec<ReceiveRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("SELECT {} FROM lightning_receive WHERE state IN ('open', 'accepted')
+			AND owner_key IN (SELECT owner_key FROM leaf_mailbox WHERE mailbox_key = $1) ORDER BY created_at", RECEIVE_COLUMNS),
+			&[&&mailbox[..]]).await?;
+		rows.iter().map(receive_of).collect()
+	}
+
 	/// Whether a payment into the tree wants a leaf under `key`.
 	pub async fn receive_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
 		let conn = self.conn().await?;
