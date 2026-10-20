@@ -970,7 +970,7 @@ async fn an_exits_quote_with_its_claim_out_answers_the_claim() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaf_exited_before_the_device_was_lost_is_restored_exited() {
 	let mut r = Running::start().await;
-	let a = Arca::new("RXA");
+	let a = Arca::new("EXA");
 	let leaf = batch_leaf(&mut r, &a, 2_000_000).await;
 	exit_until(&r, &a, &leaf, "exited").await;
 	for _ in 0..3 {
@@ -982,7 +982,7 @@ async fn a_leaf_exited_before_the_device_was_lost_is_restored_exited() {
 	let bal_a = a.ok(&["balance"]);
 	println!("RX the lost wallet: the leaf {} | balance {}", coin_of(&a, &leaf)["state"], bal_a);
 	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
-	let a2 = Arca::new("RXA2");
+	let a2 = Arca::new("EXA2");
 	let (url, node) = (r.url(), r.node_url());
 	let mut args = create_args(&url, &node);
 	args.extend(["--mnemonic", &mnemonic]);
