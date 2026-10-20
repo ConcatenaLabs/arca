@@ -727,6 +727,10 @@ among `fee_assets`, else the first asset of `fee_assets` the node accepts;
 never another, and never one the node refuses. A round in an asset the node
 does not accept for fees so draws its fee and its connector from the pool
 of that fee asset, and waits, saying so, while that pool cannot pay them.
+A round spends only final coins, so an operator serving an asset the node
+does not accept for fees keeps several final coins of the first fee asset:
+a round of that asset built while the other rounds' change is not yet final
+otherwise waits for their confirmations.
 
 Before it records anything the runner checks its work as a wallet would:
 every leaf's record validates against the transaction under the acceptance

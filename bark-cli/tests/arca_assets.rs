@@ -413,6 +413,12 @@ async fn two_assets_refresh_independently() {
 	assert_eq!(rounds.iter().map(|b| b.batches[0].0).collect::<Vec<_>>(), vec![r.x], "X's round alone: Y takes no new work");
 	println!("STALE: round {} in X alone", rounds[0].tx.txid());
 	let x_round = rounds[0].tx.txid();
+	// Y is not accepted for fees, so Y's round pays its fee and connector from
+	// X's pool, and a round spends only final coins: X's round, which holds
+	// the pool's change, is mined and final before Y's is asked for.
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&x_round, RoundState::Final).await;
 
 	// Fresh again: Y's work goes on.
 	std::fs::write(&rate_file, format!("200000000 {}\n", now())).unwrap();
