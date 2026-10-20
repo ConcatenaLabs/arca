@@ -128,6 +128,20 @@ impl OffboardPolicy {
 		KeySpend::build(self.taproot(), self.reclaim_script(), vec![(coin, spent, Sequence(self.reclaim_delay.to_sequence()))], outputs, fee)
 	}
 
+	/// What the round's output holds beyond the destination for its unlock,
+	/// the margin that pays the unlock's fee: `multiple` times the relay floor
+	/// `floor_per_kvb` (the destination asset's atoms per 1,000 vbytes) for
+	/// the unlock with that margin as its fee; nothing when the node does not
+	/// accept the asset for fees (`None`), and whoever unlocks attaches a coin.
+	/// The operator prices it so when it takes an offboard, and the owner's
+	/// wallet the same way when it shows the fee before signing.
+	pub fn unlock_margin(&self, floor_per_kvb: Option<u64>, multiple: u64) -> u64 {
+		let Some(floor) = floor_per_kvb else { return 0 };
+		self.unlock_tx(OutPoint::default(), self.destination.value.saturating_add(1), &[0; 32], &FeeSource::Reserve)
+			.map(|u| crate::spend::margin_for(u.tx.vsize(), floor, multiple))
+			.unwrap_or(0)
+	}
+
 	/// The owner's check of the round before it signs the forfeit: the round
 	/// pays exactly one output carrying this offboard, explicit, in the
 	/// destination's asset and holding at least its value. Returns its index.
