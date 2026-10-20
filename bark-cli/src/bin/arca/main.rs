@@ -68,10 +68,10 @@ enum Cmd {
 		/// mailbox key, every record checked (`restore`).
 		#[arg(long, conflicts_with = "mnemonic_file")]
 		mnemonic: Option<String>,
-		/// The same, the mnemonic read once from this file (`/dev/stdin`
-		/// reads it from the standard input): a program that runs `arca`
-		/// keeps it off the command line, which other users of the machine
-		/// can read.
+		/// The same, the mnemonic read once from this file, or from the
+		/// standard input when it is `-` (a pipe or a socket alike): a
+		/// program that runs `arca` keeps it off the command line, which
+		/// other users of the machine can read.
 		#[arg(long)]
 		mnemonic_file: Option<PathBuf>,
 		/// The account of the leaf keys, m/6'/account'/….
@@ -413,7 +413,16 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if let Cmd::Create { server, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file, account,
 		exit_delay_units, min_exit_delay_units, max_exit_delay_units } = cli.command
 	{
+		// `-` reads the standard input itself: a path such as /dev/stdin
+		// cannot be opened when the input is a socket, which is what
+		// Node.js gives a child process.
 		let mnemonic = match mnemonic_file {
+			Some(f) if f.as_os_str() == "-" => {
+				let mut s = String::new();
+				std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+					.map_err(|e| bark::arca::Error::Io(format!("the standard input: {}", e)))?;
+				Some(s.split_whitespace().collect::<Vec<_>>().join(" "))
+			},
 			Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?
 				.split_whitespace().collect::<Vec<_>>().join(" ")),
 			None => mnemonic,

@@ -522,7 +522,7 @@ names the `bark` binary when it is not the one beside `arca`.
 
 | Command | Does |
 |---|---|
-| `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M \| --mnemonic-file FILE]` | Creates the wallet: a new mnemonic (or the one given, on the command line or read once from a file, `/dev/stdin` for the standard input, which keeps it off the command line other users of the machine can read), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
+| `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M \| --mnemonic-file FILE]` | Creates the wallet: a new mnemonic (or the one given, on the command line or read once from a file, `-` for the standard input, a pipe or a socket alike, which keeps it off the command line other users of the machine can read), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
@@ -676,8 +676,9 @@ bound is refused before anything is asked.
 
 `tests/arca_program_commands.rs` runs the same way, for a program that runs
 `arca` for its user: a wallet restored with its mnemonic read from the standard
-input (`--mnemonic-file /dev/stdin`) has the mailbox key and the board of the
-wallet it restores, and a mnemonic file that cannot be read makes no wallet;
+input (`--mnemonic-file -`), given as a socket as Node.js gives it, has the
+mailbox key and the board of the wallet it restores, and a mnemonic file that
+cannot be read makes no wallet;
 `quote` hands nothing over; `participate --shown` with a fee other than the
 one shown is refused before anything is signed, the coin still live, and with
 the very fees shown completes in a round; `schedule` names the board's free

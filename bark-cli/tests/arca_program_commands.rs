@@ -1,7 +1,7 @@
 //! The commands a program running `arca` for its user needs, run against a
 //! whole Arca server on an anchored proof-of-stake regtest chain, as the
-//! scenarios run it: a mnemonic restored from a file (the standard input),
-//! never the command line; the refresh fees shown before anything is signed
+//! scenarios run it: a mnemonic restored from the standard input (`-`), a
+//! socket as Node.js gives it, never the command line; the refresh fees shown before anything is signed
 //! (`quote`), and the participation taken only on the very fees shown
 //! (`participate --shown`), refused before anything is signed when they
 //! changed; and `schedule`, the time `sync` must next run, which asks
@@ -13,6 +13,8 @@
 mod common;
 
 use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 
 use elements::Script;
@@ -27,13 +29,18 @@ fn script(v: &Value) -> Script {
 	Script::from((0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<u8>>())
 }
 
-/// `arca create … --mnemonic-file /dev/stdin`, the mnemonic written to its
-/// standard input: whether it succeeded, and its JSON.
+/// `arca create … --mnemonic-file -`, the mnemonic written to its standard
+/// input, which is one end of a socket pair, as Node.js gives a child its
+/// input (a path such as /dev/stdin cannot be opened on a socket): whether
+/// it succeeded, and its JSON.
 fn create_from_stdin(w: &Arca, args: &[&str], mnemonic: &str) -> (bool, Value) {
-	let mut child = Command::new(env!("CARGO_BIN_EXE_arca")).arg("--datadir").arg(&w.dir).args(args)
-		.args(["--mnemonic-file", "/dev/stdin"]).env("ARCA_NODE_PASSWORD", "arca")
-		.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("run arca");
-	child.stdin.take().unwrap().write_all(mnemonic.as_bytes()).unwrap();
+	let (ours, theirs) = UnixStream::pair().unwrap();
+	let child = Command::new(env!("CARGO_BIN_EXE_arca")).arg("--datadir").arg(&w.dir).args(args)
+		.args(["--mnemonic-file", "-"]).env("ARCA_NODE_PASSWORD", "arca")
+		.stdin(Stdio::from(OwnedFd::from(theirs))).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("run arca");
+	let mut ours = ours;
+	ours.write_all(mnemonic.as_bytes()).unwrap();
+	ours.shutdown(std::net::Shutdown::Write).unwrap();
 	let out = tokio::task::block_in_place(|| child.wait_with_output()).unwrap();
 	(out.status.success(), serde_json::from_slice(&out.stdout).expect("JSON"))
 }
@@ -68,7 +75,8 @@ async fn a_program_restores_from_a_file_shows_fees_before_signing_and_reads_the_
 	assert_eq!(sch["next_sync_at"], sch["coins"][0]["refresh_from"], "the board's free window is the next date: {}", sch);
 
 	// The same wallet restored from its mnemonic, read from the standard
-	// input: the mnemonic is the one written, and the board is served back.
+	// input, a socket: the mnemonic is the one written, and the board is
+	// served back.
 	let words = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
 	let a2 = Arca::new("A2");
 	let (ok, v) = create_from_stdin(&a2, &create, &format!("  {}\n", words.split_whitespace().collect::<Vec<_>>().join("  ")));
