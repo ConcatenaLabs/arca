@@ -393,8 +393,10 @@ and a board whose registration never reached the server, are not recovered.
   request past it however late the payment reaches it (a post held, and
   sent again by a later `sync`): the server refuses it (`request_lapsed`),
   and the payer's coins are live again.
-  `sync`'s `schedule` says when it must run next (`next_sync_at`): an exit
-  under way at its next step (two blocks on while it unrolls, when its
+  `sync`'s `schedule` says when it must run next (`next_sync_at`; a time it
+  names relative to now counts from the last `sync`, so it stands between
+  syncs, and `due` turns true once it passes): a coin given to a refresh an
+  hour after the last sync, an exit under way at its next step (two blocks on while it unrolls, when its
   claim's delay ends, within half an hour while its claim becomes final),
   and never
   more than a day ahead while a receive request the wallet handed out is
