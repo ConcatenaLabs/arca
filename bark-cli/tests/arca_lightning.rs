@@ -1415,3 +1415,101 @@ async fn d70_restores_meet_payments_held_and_leaves_not_yet_released() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// The eleventh review's F6, turned around, for a receive over Lightning.
+/// A wallet just created asks to receive 100,000 of X and from then runs
+/// `sync` only when `schedule` says it is due, the chain a block a minute:
+/// a wallet that has never synced is due at once, so its first read of the
+/// schedule wakes it. The operator takes the preimage and co-signs nothing
+/// (the claim's first signature spoiled on the way, every claim answered
+/// 500, the mailbox empty). The scheduled syncs take the leaf up, hand the
+/// preimage over and take the leaf home by its claim before its timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_wallet_receives_over_lightning_on_its_schedule_alone() {
+	let Some(lnd) = lightningd("a_new_wallet_receives_over_lightning_on_its_schedule_alone") else { return };
+	let mut r = short_delays().await;
+	let (ox, px) = leg_in_x(&lnd, &mut r, "due").await;
+	let p = common::proxy::Proxy::start(&r.url());
+	p.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+			return Some(500);
+		}
+		if path == "/v1/mailbox_read" {
+			if let Some(m) = v.get_mut("messages") {
+				*m = json!([]);
+			}
+		}
+		None
+	})));
+	p.rewrite_request(Some(std::sync::Arc::new(spoiled_claims)));
+	let a = wallet_at("DUE", &p.url.clone(), &r);
+	let first = a.ok(&["schedule"]);
+	println!("DUE a new wallet's schedule: {}", first);
+	let inv = a.ok(&["lightning", "receive", &r.x.to_string(), "100000"]);
+	let hash = inv["payment_hash"].as_str().unwrap().to_string();
+	let (rpc, bolt11) = (px.rpc_path(), inv["invoice"].as_str().unwrap().to_string());
+	let paying = std::thread::spawn(move || sequentia_ext::lightning::call_at(&rpc, "pay", json!({ "bolt11": bolt11 })));
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+	while !receive_row(&r, &hash).await.is_some_and(|x| x.state.name() == "accepted") {
+		assert!(std::time::Instant::now() < deadline, "the payment was never held");
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+	let wifs = stakers();
+	let mut syncs = 0;
+	let mut round = false;
+	let mut timeout = None;
+	let mut leaf: Option<String> = None;
+	for _ in 0..1500 {
+		let sch = a.ok(&["schedule"]);
+		if sch["next_sync_at"].is_null() {
+			println!("DUE the schedule names no time at {}: {}", mtp(&r), sch);
+			break;
+		}
+		if sch["due"] != true {
+			tokio::task::block_in_place(|| block_a_minute(r.rt.client(), &wifs));
+			r.synced().await;
+			continue;
+		}
+		let s = a.run(&["sync"]).1;
+		syncs += 1;
+		tokio::task::block_in_place(|| block_a_minute(r.rt.client(), &wifs));
+		let row = receive_row(&r, &hash).await;
+		if timeout.is_none() {
+			timeout = row.as_ref().and_then(|x| x.timeout);
+		}
+		// The leaf's round, once the operator holds the participation for it.
+		if !round && row.as_ref().is_some_and(|x| x.state.name() == "accepted" && x.participation_id.is_some()) {
+			if let Ok(Some(built)) = r.server.rounds.run_round_of(r.x).await {
+				r.produce().await;
+				r.bury().await;
+				r.round_state(&built.tx.txid(), RoundState::Final).await;
+				round = true;
+				timeout = receive_row(&r, &hash).await.and_then(|x| x.timeout);
+			}
+		}
+		if leaf.is_none() {
+			leaf = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").map(|c| c["leaf_id"].as_str().unwrap().to_string());
+		}
+		let st = leaf.as_ref().map(|l| coin_of(&a, l)["state"].clone()).unwrap_or(Value::Null);
+		println!("DUE sync {} at {} ({} s from the timeout): receive {} | coin {} | next {}", syncs, mtp(&r),
+			timeout.map(|t| mtp(&r) as i64 - t as i64).unwrap_or(0), a.ok(&["lightning", "receives"])[&hash]["state"], st,
+			s["schedule"]["next_sync_at"]);
+		if st == "exited" || timeout.is_some_and(|t| mtp(&r) > t + 1200) {
+			break;
+		}
+	}
+	let paid = paying.join().unwrap();
+	println!("DUE the payer: {:?} | {} syncs, all on the schedule", paid.as_ref().map(|v| v["status"].clone()), syncs);
+	assert_eq!(first["due"], true, "a wallet that has never synced is due at once: {}", first);
+	assert_eq!(paid.as_ref().map(|v| v["status"].clone()).ok(), Some(json!("complete")), "the payment completed");
+	let l = leaf.expect("the wallet took the leaf up");
+	let rec = CoinRecordOf::of(&a, &l);
+	let spent = spent_on_chain(&r, &rec.0, 1500);
+	let (op, t, m) = spent.unwrap_or_else(|| panic!("the leaf never came home: coin {}", coin_of(&a, &l)));
+	println!("DUE the leaf's claim {} at {} (the timeout {:?})", t.txid(), m, timeout);
+	assert!(claims_with_preimage(&t, &op, &hash), "the leaf comes home by its claim");
+	assert!(m < timeout.unwrap(), "the claim is in a block before the timeout");
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+}

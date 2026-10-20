@@ -6831,3 +6831,47 @@ async fn d69_a_notice_whose_transfer_is_gone_holds_no_more_at_the_next_wake() {
 	}
 }
 
+
+/// The eleventh review's F6, turned around. B is created and hands out a
+/// request; A pays it at once out of a batch leaf. B reads its schedule
+/// every six hours and syncs only when it is due: a wallet that has never
+/// synced is due at once, so its first read wakes it, and it holds the
+/// payment long before the batch's expiry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_wallet_that_syncs_only_when_due_reads_its_first_payment() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, b) = (Arca::new("NEWWA"), Arca::new("NEWWB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
+	a.ok(&["participate"]);
+	final_round(&r).await;
+	let la = a.ok(&["sync"])["participations"][0]["new_leaves"][0]["leaf_id"].as_str().expect("A's leaf").to_string();
+	b.ok(&create_args(&url, &r.node_url()));
+	let first = b.ok(&["schedule"]);
+	println!("NEWW B's schedule once created: {}", first);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	let ea = coin_of(&a, &la)["expiry"].as_u64().unwrap() as u32;
+	let (mut polls, mut syncs) = (0, 0);
+	let start = common::node::median_time(&r.rt);
+	let held = |b: &Arca| b.ok(&["coins"]).as_array().unwrap().iter().any(|c| c["value"] == "600000" && c["state"] == "live");
+	while common::node::median_time(&r.rt) < ea && !held(&b) {
+		let s = b.ok(&["schedule"]);
+		polls += 1;
+		if s["due"] == true {
+			b.ok(&["sync"]);
+			syncs += 1;
+		}
+		if !held(&b) {
+			d57_to(&r, common::node::median_time(&r.rt) + 6 * 3_600).await;
+		}
+	}
+	println!("NEWW B read its schedule {} times over {} s and synced {} times; it holds the payment: {} | the batch's expiry {}", polls,
+		common::node::median_time(&r.rt) - start, syncs, held(&b), ea);
+	assert_eq!(first["due"], true, "a wallet that has never synced is due at once: {}", first);
+	assert!(held(&b), "B read the payment on its schedule before the batch's expiry");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

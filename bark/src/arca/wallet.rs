@@ -260,6 +260,10 @@ pub(crate) const PENDING_NOTE: &str = "a coin is announced by the operator as pe
 	its transfer recorded, whatever the request it pays says. An announcement is the operator's statement, not a payment: the coin \
 	is counted nowhere until it comes";
 
+/// Why the schedule of a wallet that has never synced is due at once.
+pub(crate) const NEVER_SYNCED_NOTE: &str = "the wallet has never synced: what is waiting for it (a payment to a request it handed \
+	out, a coin pending for it, a coin it holds) is read only by sync, so sync runs now";
+
 /// How long a receive request lasts, from the median time it was handed
 /// out: the acceptance horizon, 27 days. The request carries the median time
 /// it lapses at (`until`); a sender refuses to pay it from then, and until
@@ -1590,7 +1594,9 @@ impl Wallet {
 	/// forgotten), or while a coin is pending for it (D61: a transfer the
 	/// operator recorded and has not completed, whose coin is read only by
 	/// `sync` once it does, whatever the lapse of the request it pays);
-	/// `null` when nothing waits. `due` says whether it is now;
+	/// `null` when nothing waits, and now for a wallet that has never synced
+	/// (`create` leaves it due, so a client's first wake syncs). `due` says
+	/// whether it is now;
 	/// `why` says what holds the time back; `receive_requests` lists every
 	/// unpaid request, waiting or lapsed, with its dates
 	/// ([`Self::receive_requests`]), and `pending_coins` every coin pending
@@ -1606,7 +1612,8 @@ impl Wallet {
 		// The times named relative to now are relative to the last sync: they
 		// stand between syncs, so a client that syncs only when the schedule
 		// is due finds them due once they pass.
-		let base = self.store.meta(LAST_SYNC)?.and_then(|v| v.parse::<u32>().ok()).filter(|b| *b <= now).unwrap_or(now);
+		let last_sync = self.store.meta(LAST_SYNC)?.and_then(|v| v.parse::<u32>().ok());
+		let base = last_sync.filter(|b| *b <= now).unwrap_or(now);
 		// The steps of an exit under way count from when the exit steps were
 		// last taken, in a sync or alone.
 		let exit_base = self.store.meta(LAST_EXITS)?.and_then(|v| v.parse::<u32>().ok()).filter(|b| *b <= now).map_or(base, |e| e.max(base));
@@ -1691,6 +1698,14 @@ impl Wallet {
 		}
 		if !pending.is_empty() {
 			out["pending_coins"] = json!(pending);
+		}
+		// A wallet that has never synced is due at once: what is waiting for
+		// it (a payment to a request it handed out, a coin pending) is read
+		// only by `sync`, and a time relative to a sync it never ran would
+		// never come.
+		if last_sync.is_none() && !stopped {
+			next = Some(now);
+			out["why"] = json!(NEVER_SYNCED_NOTE);
 		}
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));
