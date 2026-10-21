@@ -287,3 +287,68 @@ async fn two_wallets_take_two_orders_and_hold_leaves() {
 	assert_eq!(live_of(&t4, y).iter().map(|c| c["value"].clone()).collect::<Vec<_>>(), vec![json!("20000")]);
 	println!("order 1 rests again with {} of Y at {}:{}", 400_000 - 26_666, again.txid(), 2 * k_rest + 1);
 }
+
+/// R7l's F3 probe, turned around (D74): a take by a wallet that syncs only
+/// when its schedule says it is due, as a program built on the library wakes
+/// on `sync_schedule`. The fill round is built at once; the chain then moves
+/// a minute at a time (twelve blocks, the parent chain burying them), the
+/// server passing its rounds after each step. The schedule names a wake
+/// within half the forfeit window while the take waits, saying why; the
+/// wallet hands its forfeits over in time, the round goes out, and the take
+/// completes: the wallet holds its leaf of Y, on the schedule alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_completes_on_the_schedule_alone() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+		c.assets[0].offboard_base = Some("1000".into());
+	}).await;
+	let y = r.y;
+	let t = holder(&mut r, "SCHED", 601_000).await;
+	let o = terms(&r, "maker s", 2, 1, 1_000);
+	let at = rest(&mut r, &o, 300_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let k = t.ok(&["take", &served("sched", &o, &at)]);
+	let pid = k["take"].as_str().unwrap().to_string();
+	let sch = t.ok(&["schedule"]);
+	println!("take {} {} | schedule: due {} next_sync_at {} (now {}) why {}", pid, k["state"], sch["due"], sch["next_sync_at"], sch["now"],
+		sch["why"]);
+	assert!(sch["why"].as_str().unwrap_or("").contains("a take of an on-chain order waits on its round"), "{}", sch);
+	let wake = sch["next_sync_at"].as_u64().unwrap();
+	assert!(wake <= sch["now"].as_u64().unwrap() + 300, "a wake within half the forfeit window: {}", sch);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	println!("the fill round built: {:?}", built.iter().map(|b| (b.tx.txid(), b.broadcast.clone())).collect::<Vec<_>>());
+	assert_eq!(built.len(), 1);
+	let mut syncs = 0;
+	let mut released = false;
+	for minute in 0..30 {
+		let sch = t.ok(&["schedule"]);
+		if sch["due"] == true {
+			let s = t.ok(&["sync"]);
+			syncs += 1;
+			let p = s["participations"].as_array().cloned().unwrap_or_default();
+			let mine = p.iter().find(|p| p["participation"] == json!(pid)).cloned().unwrap_or(Value::Null);
+			println!("minute {}: due ({}); sync -> the take {} {}", minute, sch["why"], mine["state"], mine["note"]);
+		}
+		let parts = t.ok(&["participations"]);
+		if parts.as_array().unwrap().iter().any(|p| p["participation"] == json!(pid) && p["state"] == "released") {
+			released = true;
+			println!("minute {}: the take is released", minute);
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 60));
+		r.bury().await;
+		r.synced().await;
+		r.server.rounds.pass().await.unwrap();
+	}
+	let row = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(built[0].tx.txid())).await.unwrap().unwrap();
+	let held: Vec<Value> = live_of(&t, y).iter().map(|c| c["value"].clone()).collect();
+	println!("{} syncs on the schedule; the round {:?}; the take released {}; the wallet holds Y {:?}", syncs, row.state, released, held);
+	assert!(released, "the take completed on the schedule alone");
+	assert_eq!(row.state, RoundState::Final);
+	assert_eq!(held, vec![json!("300000")]);
+	let after = t.ok(&["schedule"]);
+	assert!(!after["why"].as_str().unwrap_or("").contains("a take of an on-chain order"), "no take wake once it is released: {}", after);
+	let _ = std::fs::remove_dir_all(&t.dir);
+}

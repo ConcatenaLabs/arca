@@ -273,6 +273,11 @@ pub struct Params {
 	/// before it is broadcast; a take whose forfeits do not come is voided,
 	/// and the round built again without it.
 	pub fill_forfeit_window_seconds: u32,
+	/// The seconds between the runner's rounds while participations wait
+	/// (`round_interval_seconds`), published so a wallet with a take
+	/// pending wakes before its round is built; 0 when the runner builds
+	/// rounds only when it is asked to.
+	pub round_interval_seconds: u64,
 }
 
 /// The default [`Params::fill_forfeit_window_seconds`]: ten minutes.
@@ -308,6 +313,7 @@ impl Params {
 			order_margin_seconds: ORDER_MARGIN_SECONDS,
 			order_block_seconds: ORDER_BLOCK_SECONDS,
 			fill_forfeit_window_seconds: FILL_FORFEIT_WINDOW_SECONDS,
+			round_interval_seconds: 0,
 		};
 		p.set_delays();
 		p

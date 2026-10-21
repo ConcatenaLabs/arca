@@ -243,6 +243,15 @@ pub(crate) const LAST_SYNC: &str = "last_sync";
 /// minute.
 pub const EXIT_STEP: u32 = 120;
 
+/// Where the wallet keeps the operator's terms for a take's forfeits, as its
+/// `info.fills` last showed them: `{forfeit_window_seconds,
+/// round_interval_seconds}`. The schedule times a take's wakes from them.
+pub(crate) const FILLS_TERMS: &str = "fills_terms";
+
+/// A take's forfeits are due within the operator's window of its round being
+/// built; a wallet that has never read it counts on ten minutes.
+pub const DEFAULT_FORFEIT_WINDOW: u32 = 600;
+
 /// Where the wallet keeps the median time it last took the exit steps whose
 /// date had come, in `sync` or alone ([`Wallet::sync_exits`]): the steps of
 /// an exit under way are timed from it.
@@ -1621,7 +1630,12 @@ impl Wallet {
 	/// out before requests carried their lapse holds it until it is paid or
 	/// forgotten), or while a coin is pending for it (D61: a transfer the
 	/// operator recorded and has not completed, whose coin is read only by
-	/// `sync` once it does, whatever the lapse of the request it pays);
+	/// `sync` once it does, whatever the lapse of the request it pays), and
+	/// never more than the operator's round interval or half its forfeit
+	/// window ahead while a take of an on-chain order is not yet released
+	/// (D74: the take's forfeits are due within that window of its round
+	/// being built, by the chain's median time, or the take is void; the
+	/// terms are the operator's `info.fills` as the wallet last read them);
 	/// `null` when nothing waits, and now for a wallet that has never synced
 	/// (`create` leaves it due, so a client's first wake syncs). `due` says
 	/// whether it is now;
@@ -1727,6 +1741,15 @@ impl Wallet {
 		if !pending.is_empty() {
 			out["pending_coins"] = json!(pending);
 		}
+		// D74: a take keeps its wallet awake: its forfeits are due within the
+		// operator's window of its round being built.
+		if !stopped {
+			if let Some((t, window, period)) = self.take_wakes(base)? {
+				next = Some(next.map_or(t, |n| n.min(t)));
+				out["why"] = json!(format!("a take of an on-chain order waits on its round: its forfeits must reach the operator within \
+					{} s of the round being built, or the take is void, so sync runs every {} s until the take is released", window, period));
+			}
+		}
 		// A wallet that has never synced is due at once: what is waiting for
 		// it (a payment to a request it handed out, a coin pending) is read
 		// only by `sync`, and a time relative to a sync it never ran would
@@ -1740,6 +1763,48 @@ impl Wallet {
 		out["next_exit_at"] = json!(next_exit);
 		out["exit_due"] = json!(next_exit.is_some_and(|n| n <= now));
 		Ok(out)
+	}
+
+	/// Keeps the operator's terms for a take's forfeits from `info`
+	/// (`info.fills`), for the schedule.
+	pub(crate) fn remember_fills(&self, info: &Value) -> Result<(), Error> {
+		let f = &info["fills"];
+		let Some(window) = f["forfeit_window_seconds"].as_u64() else { return Ok(()) };
+		let terms = json!({"forfeit_window_seconds": window, "round_interval_seconds": f["round_interval_seconds"].as_u64().unwrap_or(0)});
+		if self.store.meta(FILLS_TERMS)?.as_deref() != Some(terms.to_string().as_str()) {
+			self.store.set_meta(FILLS_TERMS, &terms.to_string())?;
+		}
+		Ok(())
+	}
+
+	/// D74: when `sync` must run next for the takes of on-chain orders the
+	/// wallet waits on, `base` the median time of its last sync: every take
+	/// not yet released (being submitted, pending, issued, or with its
+	/// forfeits signed) wakes the wallet within the operator's round interval
+	/// and within half its forfeit window. A take's round is built at the
+	/// operator's next round, and its forfeits must reach the operator within
+	/// the window of that (by the chain's median time), or the take is void;
+	/// a round dropped then runs the take again in another, whose forfeits
+	/// are due the same way. `(when, the window, the period)`, or `None`.
+	pub(crate) fn take_wakes(&self, base: u32) -> Result<Option<(u32, u32, u32)>, Error> {
+		let mut waiting = false;
+		for (_, body, _, _, state, _, _) in self.store.participations()? {
+			if !matches!(state.as_str(), "submitting" | "pending" | "issued" | "forfeiting") {
+				continue;
+			}
+			if Self::is_take(&serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)) {
+				waiting = true;
+				break;
+			}
+		}
+		if !waiting {
+			return Ok(None);
+		}
+		let terms = self.store.meta(FILLS_TERMS)?.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
+		let window = terms["forfeit_window_seconds"].as_u64().map_or(DEFAULT_FORFEIT_WINDOW, |w| w.min(u32::MAX as u64) as u32).max(2);
+		let interval = terms["round_interval_seconds"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+		let period = if interval > 0 { (window / 2).min(interval) } else { window / 2 }.max(1);
+		Ok(Some((base.saturating_add(period), window, period)))
 	}
 
 	/// When `sync` must run next for the exits the wallet has started, `base`
