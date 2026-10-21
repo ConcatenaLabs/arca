@@ -2326,6 +2326,22 @@ forfeit in a block whose claim is not: its refund must not be open (the tip's
 median time short of the refund delay past that of the block before the
 forfeit's), and its owner's refund is refused. Every forfeit is claimed.
 
+`tests/plans.rs` runs offline refresh against the whole server: a plan of
+two steps from a coin of a round, each step run in its coin's free window
+with no holder present, its participation wanting the plan's leaf, the old
+batch released and swept only after the step, and a coin a step gave up
+brought on the chain answered with that step's refund, which pays the holder
+the step's value at its address. A stopped plan's coin is held, its batch not
+released past its expiry, until the holder cancels the plan. A step whose
+round is lost (its block disconnected and the operator's input taken by
+another transaction, final) is void, the plan stopped, and the holder takes
+the coin the step gave up home with nothing answering it. Every refusal of a
+quote and a plan (an operator script not the quote's, a holder address that
+is an Arca script, a nonce the quote did not draw, an unbalanced step, an
+exit delay above the operator's, a second plan of one coin, seven steps,
+another key's attestation, a board, a key another plan holds) is asserted by
+its code.
+
 `tests/orphan.rs` runs R7's F9: a deep anchor-driven reorganisation (eight
 Sequentia blocks) takes out a board's forfeit, the round's atom issuance and
 the claim on that atom, and another issuance of the same connector output

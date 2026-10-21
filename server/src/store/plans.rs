@@ -469,18 +469,19 @@ impl Store {
 		Ok(true)
 	}
 
-	/// Step `idx` of plan `plan` can never run: the step void with `reason`,
-	/// and the plan stopped with it, unless it was over already. Its
-	/// participation, if it has one, is voided by the caller.
+	/// Step `idx` of plan `plan` can never run, or ran in a round now lost:
+	/// the step void with `reason`, and the plan, open or done, stopped with
+	/// it. Its participation, if it has one, is voided by the caller.
 	pub async fn void_step(&self, plan: &[u8; 32], idx: u16, reason: &str) -> Result<bool, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		// A step done can be void too: its round lost after it was final.
 		let n = t.execute(
-			"UPDATE plan_step SET state = 'void', reason = $3, updated_at = now() WHERE plan_id = $1 AND idx = $2 AND state <> 'done'",
+			"UPDATE plan_step SET state = 'void', reason = $3, updated_at = now() WHERE plan_id = $1 AND idx = $2 AND state <> 'void'",
 			&[&&plan[..], &(idx as i16), &reason],
 		).await?;
 		t.execute(
-			"UPDATE plan SET state = 'stopped', reason = $2, updated_at = now() WHERE plan_id = $1 AND state = 'open'",
+			"UPDATE plan SET state = 'stopped', reason = $2, updated_at = now() WHERE plan_id = $1 AND state IN ('open', 'done')",
 			&[&&plan[..], &format!("step {}: {}", idx, reason)],
 		).await?;
 		t.commit().await?;

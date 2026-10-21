@@ -17,6 +17,8 @@
 //!    (stopped) is not released at its batch's expiry; once the holder
 //!    cancels the plan, it is.
 //! 3. Every refusal of a quote and of a plan, printed verbatim.
+//! 4. A step whose round is lost: void, the plan stopped, the coin it gave up
+//!    its holder's again, unreleased past its expiry, and taken home.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -59,7 +61,7 @@ struct Made {
 
 /// The quote for a plan of `steps` steps from `coin`.
 fn quote(r: &Running, coin: &Coin, nonces: &[[u8; 32]]) -> common::client::Answer {
-	let qd = server::plans::quote_digest(&r.server.params, &coin.held.id, nonces, exit_delay());
+	let qd = server::plans::quote_digest(&r.server.params.chain, &r.server.params.operator, &coin.held.id, nonces, exit_delay());
 	r.http.post("plan_quote", &json!({"coin": coin.held.id.to_string(), "owner_nonces": nonces.iter().map(|n| hex(n)).collect::<Vec<_>>(),
 		"exit_delay_units": exit_delay().units(), "attestation": hex(sign_digest(&coin.held.key, &qd, &random32()).as_ref())}))
 }
@@ -289,7 +291,7 @@ async fn the_current_coin_of_a_stopped_plan_is_not_released_until_its_holder_can
 	assert!(!has(&common::flow::log(&r).await, "release", &token), "the batch holding a stopped plan's coin is not released");
 	println!("past the expiry {}: the batch is not released while the plan is stopped", e0);
 	// A cancel signed by another key: refused; by the plan's mailbox key: done.
-	let cd = server::plans::cancel_digest(&r.server.params, &m.id);
+	let cd = server::plans::cancel_digest(&r.server.params.chain, &r.server.params.operator, &m.id);
 	refused(r.http.post("cancel_plan", &json!({"plan_id": hex(&m.id), "signature": hex(sign_digest(&m.keys[0], &cd, &random32()).as_ref())})),
 		"bad_attestation", "a cancel signed by another key than the plan's mailbox key");
 	let st = r.http.post("cancel_plan", &json!({"plan_id": hex(&m.id), "signature": hex(sign_digest(&m.mailbox, &cd, &random32()).as_ref())})).ok();
@@ -360,13 +362,13 @@ async fn a_plan_is_refused_for_what_it_breaks() {
 	// A quote: steps out of bounds, an attestation by another key, a board.
 	refused(quote(&r, &c0, &[[1; 32]; 7].map(|_| random32())), "malformed", "a quote for seven steps");
 	let c1 = round_coin(&mut r, "R2").await;
-	let qd = server::plans::quote_digest(&r.server.params, &c1.held.id, &n2, exit_delay());
+	let qd = server::plans::quote_digest(&r.server.params.chain, &r.server.params.operator, &c1.held.id, &n2, exit_delay());
 	refused(r.http.post("plan_quote", &json!({"coin": c1.held.id.to_string(), "owner_nonces": [hex(&n2[0])],
 		"exit_delay_units": exit_delay().units(), "attestation": hex(sign_digest(&other, &qd, &random32()).as_ref())})), "bad_attestation",
 		"a quote asked by another key than the coin's");
 	let x = r.x;
 	let (board, _) = credited_board(&mut r, &keypair("R3 owner"), x).await;
-	let qd = server::plans::quote_digest(&r.server.params, &board.id, &n2, exit_delay());
+	let qd = server::plans::quote_digest(&r.server.params.chain, &r.server.params.operator, &board.id, &n2, exit_delay());
 	refused(r.http.post("plan_quote", &json!({"coin": board.id.to_string(), "owner_nonces": [hex(&n2[0])],
 		"exit_delay_units": exit_delay().units(), "attestation": hex(sign_digest(&board.key, &qd, &random32()).as_ref())})), "out_of_bounds",
 		"a quote for a board");
@@ -375,4 +377,103 @@ async fn a_plan_is_refused_for_what_it_breaks() {
 	m2.body["steps"][0]["owner"] = m.body["steps"][0]["owner"].clone();
 	refused(r.http.post("submit_plan", &m2.body), "bad_attestation", "a plan naming another plan's key, signed by its own");
 	let _ = LeafId([0; 32]);
+}
+
+/// 4. A step whose round is lost (its block disconnected, the operator's coin
+///    it spent taken by another transaction, final): the step is void, the
+///    plan stopped, the coin it gave up is its holder's again, the watcher
+///    holds no refund for it, its batch is not released past its expiry, and
+///    the holder takes it home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_whose_round_is_lost_is_void_and_the_coin_it_gave_up_stays_its_holders() {
+	let mut r = common::rounds::start().await;
+	let c0 = round_coin(&mut r, "L").await;
+	let e0 = expiry_of(&c0);
+	let m = make_plan(&r, &c0, "L", 1);
+	assert_eq!(r.http.post("submit_plan", &m.body).ok()["state"], "open");
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, e0 - 5 * DAY + HOUR - now).await;
+	r.synced().await;
+	let lost = round(&mut r).await;
+	assert_eq!(plan_status(&r, &m.id)["steps"][0]["state"], "done");
+	// The rollback, the server stopped meanwhile: the round's block
+	// disconnected, and the operator's coin it spent taken by another
+	// transaction, final.
+	let tx = r.rt.client().raw_transaction(&lost).unwrap();
+	r.server.stop();
+	let w = tx.input[0].previous_output;
+	let w_out = r.rt.client().raw_transaction(&w.txid).unwrap().output[w.vout as usize].clone();
+	let v: Value = r.rt.client().call("getrawtransaction", &[json!(lost.to_string()), json!(true)]).unwrap();
+	let tip_time = { let h = r.rt.client().best_block_hash().unwrap(); let hdr: Value = r.rt.client().call("getblockheader", &[json!(h.to_string())]).unwrap(); hdr["time"].as_u64().unwrap() };
+	common::node::invalidate(&r.rt, &v["blockhash"].as_str().unwrap().parse().unwrap());
+	// The chain's clock runs weeks ahead of this machine's: the node starts
+	// again at the chain's time.
+	let mock = format!("-mocktime={}", tip_time + 60);
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0", &mock])).unwrap();
+	let (_, to) = server::wallet::Wallet::hand_out_receive_script(&r.db.store, common::keys::MNEMONIC).await.unwrap();
+	let back = sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(w_out.asset.explicit().unwrap(),
+		w_out.value.explicit().unwrap() - 3_000), to);
+	let elsewhere = common::rounds::spend_wallet_coin(w, &w_out, vec![back], 2_000);
+	r.rt.client().send_raw_transaction(&elsewhere).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	common::rounds::round_state(&r, &lost, server::store::RoundState::Lost).await;
+	// The round marked lost and the step voided are two writes: the server's
+	// own loop may have made the first when the round is seen lost.
+	let start = std::time::Instant::now();
+	while plan_status(&r, &m.id)["state"] == "done" && start.elapsed() < std::time::Duration::from_secs(60) {
+		r.server.rounds.pass().await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+	let st = plan_status(&r, &m.id);
+	println!("step 1's round {} lost: {}", lost, st);
+	assert_eq!(st["state"], "stopped");
+	assert_eq!(st["steps"][0]["state"], "void");
+	let row = r.server.store.leaf(&c0.held.id.0).await.unwrap().unwrap();
+	assert_eq!(row.state, server::store::LeafState::Live, "the coin the step gave up is its holder's again");
+	assert!(server::plans::refund_for(&r.server.store, &r.server.params, &c0.held.id.0).await.unwrap().is_none(),
+		"the watcher holds no refund for it: the step's leaf does not exist");
+	// The coin as its holder validated it, before its expiry.
+	let v0 = c0.valid(&r);
+	// Its batch is not released past its expiry while the plan is stopped.
+	let token = match &c0.held.record {
+		CoinRecord::Leaf { record, .. } => record.schedule.token.into_inner().to_byte_array().to_vec(),
+		_ => unreachable!(),
+	};
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, e0 + HOUR - now).await;
+	r.synced().await;
+	for _ in 0..3 {
+		r.server.watcher.pass().await.unwrap();
+		settle(&r).await;
+	}
+	assert!(!has(&common::flow::log(&r).await, "release", &token), "the batch of a stopped plan's coin is not released");
+	// The holder takes the coin home: its own authorisations, its preimage,
+	// its exit after the delay; nothing answers it.
+	let (valid, preimage, auths) = match &v0.origin {
+		arca_covenant::ValidOrigin::Leaf { valid, preimage, auths } => (valid.clone(), *preimage, auths.clone()),
+		_ => unreachable!(),
+	};
+	let txs = valid.branch.unroll(OutPoint::new(valid.round_txid, valid.batch_vout), &auths, &vec![FeeSource::Reserve; auths.len()]).unwrap();
+	for u in &txs {
+		r.rt.client().send_raw_transaction(&u.tx).unwrap();
+	}
+	let e = valid.branch.entry_tx(valid.branch.entry_outpoint(&txs).unwrap(), &preimage, &FeeSource::Reserve).unwrap();
+	let at = OutPoint::new(r.rt.client().send_raw_transaction(&e.tx).unwrap(), 0);
+	r.produce().await;
+	r.synced().await;
+	for _ in 0..3 {
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	assert!(r.unspent(&at), "nothing answers the holder's coin");
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, 37 * HOUR).await;
+	let _ = now;
+	let exit = common::flow::exit_tx(&r, &v0.leaf, at, v0.asset, v0.value, &c0.held.key);
+	let txid = r.rt.client().send_raw_transaction(&exit).unwrap();
+	r.produce().await;
+	assert!(r.rt.client().confirmations(&txid).unwrap() >= 1, "the holder's exit confirms");
+	println!("the holder took its coin home: {} ({} vB)", txid, exit.vsize());
 }

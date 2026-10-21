@@ -62,7 +62,7 @@ use elements::{AssetId, Script, Txid};
 use arca_covenant::plan::{key_proof_digest, Plan, PlanStep, MAX_STEPS};
 use arca_covenant::sign::verify_digest;
 use arca_covenant::spend::{FeeSource, Pair};
-use arca_covenant::{CoinRecord, LeafId, LeafPolicy, LeafRecord, MedianTime, RelativeTime, Template};
+use arca_covenant::{Chain, CoinRecord, LeafId, LeafPolicy, LeafRecord, MedianTime, RelativeTime, Template};
 
 use crate::chain::FinalityService;
 use crate::coins::{self, CoinError};
@@ -93,10 +93,12 @@ fn tagged(tag: &[u8]) -> sha256::HashEngine {
 /// What a coin's owner signs to ask for a quote: `SHA256(T ‖ T ‖ genesis ‖ S
 /// ‖ coin ‖ n ‖ owner nonces ‖ exit delay units (u16))`,
 /// `T = SHA256("Arca/plan-quote")`.
-pub fn quote_digest(params: &Params, coin: &LeafId, owner_nonces: &[[u8; 32]], exit_delay: RelativeTime) -> [u8; 32] {
+pub fn quote_digest(chain: &Chain, operator: &XOnlyPublicKey, coin: &LeafId, owner_nonces: &[[u8; 32]], exit_delay: RelativeTime)
+	-> [u8; 32]
+{
 	let mut e = tagged(QUOTE_TAG);
-	e.input(&params.chain.genesis_bytes());
-	e.input(&params.operator.serialize());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
 	e.input(&coin.0);
 	e.input(&[owner_nonces.len() as u8]);
 	for n in owner_nonces {
@@ -117,10 +119,10 @@ pub fn step_participation_id(plan: &[u8; 32], idx: u16) -> [u8; 32] {
 
 /// What the plan's mailbox key signs to cancel it: `SHA256(T ‖ T ‖ genesis ‖
 /// S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`.
-pub fn cancel_digest(params: &Params, plan: &[u8; 32]) -> [u8; 32] {
+pub fn cancel_digest(chain: &Chain, operator: &XOnlyPublicKey, plan: &[u8; 32]) -> [u8; 32] {
 	let mut e = tagged(CANCEL_TAG);
-	e.input(&params.chain.genesis_bytes());
-	e.input(&params.operator.serialize());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
 	e.input(plan);
 	sha256::Hash::from_engine(e).to_byte_array()
 }
@@ -384,7 +386,7 @@ impl Plans {
 				self.params.min_exit_delay.units(), self.params.max_exit_delay.units())));
 		}
 		let now = self.now().await?;
-		let digest = quote_digest(&self.params, &req.coin, &req.owner_nonces, req.exit_delay);
+		let digest = quote_digest(&self.params.chain, &self.params.operator, &req.coin, &req.owner_nonces, req.exit_delay);
 		let c = self.first_coin(&req.coin, &digest, now).await?;
 		if !verify_digest(&req.attestation, &digest, &c.coin.leaf.owner) {
 			return Err(PlanError::BadSignature("the attestation is not the coin's owner's signature over the quote request".into()));
@@ -574,7 +576,7 @@ impl Plans {
 	pub async fn cancel(&self, id: &[u8; 32], signature: &Signature) -> Result<PlanStatus, PlanError> {
 		let row = self.store.plan(id).await?.ok_or_else(|| PlanError::Unknown(hex(id)))?;
 		let mailbox = XOnlyPublicKey::from_slice(&row.mailbox_key).map_err(|e| PlanError::Internal(e.to_string()))?;
-		if !verify_digest(signature, &cancel_digest(&self.params, id), &mailbox) {
+		if !verify_digest(signature, &cancel_digest(&self.params.chain, &self.params.operator, id), &mailbox) {
 			return Err(PlanError::BadSignature("the signature is not the plan's mailbox key's over its cancel digest".into()));
 		}
 		if matches!(row.state, PlanState::Open | PlanState::Stopped) && !self.store.cancel_plan(id, "cancelled by its holder").await? {
@@ -611,8 +613,13 @@ impl Plans {
 		let round = self.store.round(b.round_id).await?.ok_or_else(|| PlanError::Internal(format!("round {} is not recorded", b.round_id)))?;
 		let round_tx: elements::Transaction = elements::encode::deserialize(&round.tx).map_err(|e| PlanError::Internal(e.to_string()))?;
 		let record = LeafRecord::from_bytes(&b.record).map_err(|e| PlanError::Internal(e.to_string()))?;
+		// As of now, or of its first expiry once that has passed: a holder back
+		// after the leaf's expiry hands its authorisations over all the same.
+		let now = self.now().await?;
+		let first = record.schedule.expiries()[0];
+		let as_of = if first.to_consensus_u32() < now.to_consensus_u32() { first } else { now };
 		let coin = CoinRecord::Leaf { record, preimage: step.step.preimage, auths };
-		let policy = arca_covenant::WalletPolicy { horizon: 0, ..self.params.taken_policy(self.now().await?) };
+		let policy = arca_covenant::WalletPolicy { horizon: 0, ..self.params.taken_policy(as_of) };
 		let valid = coin.resolve(std::slice::from_ref(&round_tx), &policy)
 			.map_err(|e| PlanError::Coin(CoinError::InvalidCoin { leaf: *leaf, error: e }))?;
 		if valid.id != *leaf {
