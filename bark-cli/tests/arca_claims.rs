@@ -262,3 +262,68 @@ async fn settle(r: &Running) {
 	r.server.watcher.pass().await.unwrap();
 	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 }
+
+/// Two holders named by their OpenAMP account key (`m/5/0`), as SeqPal names
+/// a security's holders: one a wallet that exists and shows its key
+/// (`arca openamp-key`), one that exists only as a mnemonic until after the
+/// round. Each finds its claim under that key (`named_as: openamp`) and takes
+/// it up, signing for the claim leaf with the claim key of its OpenAMP key.
+#[tokio::test(flavor = "multi_thread")]
+async fn holders_named_by_their_openamp_key_take_their_claims_up() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca"];
+
+	let payer = Arca::new("openamp payer");
+	payer.ok(&create);
+	r.pay_to(script(&payer.ok(&["address"])), r.x, 5_000_000);
+	r.produce().await;
+	payer.ok(&["board", &x, "4000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the payer's board to be credited", || payer.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	payer.ok(&["sync"]);
+
+	let shown_key = Arca::new("shows its key");
+	shown_key.ok(&create);
+	let k0 = shown_key.ok(&["openamp-key"]);
+	assert_eq!(k0["path"], "m/5/0");
+	let k0 = k0["key"].as_str().unwrap().to_string();
+	let mnemonic = bip39::Mnemonic::from_entropy(&[42u8; 16]).unwrap().to_string();
+	let k1 = hex(&Keys::new(&mnemonic, 0, 1).unwrap().openamp().unwrap().x_only_public_key().0.serialize());
+	assert_ne!(k0, k1);
+	let path = payer.dir.join("openamp-claims.txt");
+	std::fs::write(&path, format!("{} 1000000\n{} 1200000\n", k0, k1)).unwrap();
+	let file = path.to_string_lossy().to_string();
+	let fee = atoms(&payer.ok(&["distribute", &file, "--asset", &x, "--quote"])["fee"]);
+	payer.ok(&["distribute", &file, "--asset", &x, "--shown", &fee.to_string()]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	payer.ok(&["sync"]);
+	assert_eq!(shown(&payer)["state"], "released");
+
+	let late = Arca::new("mnemonic, after the round");
+	let mut args = create.to_vec();
+	args.extend(["--mnemonic", mnemonic.as_str()]);
+	late.ok(&args);
+	for (w, key, value) in [(&shown_key, &k0, 1_000_000u64), (&late, &k1, 1_200_000)] {
+		let found = w.ok(&["claims"]);
+		assert_eq!(found.as_array().unwrap().len(), 1, "{}: {}", w.name, found);
+		assert_eq!(found[0]["named_as"], "openamp", "{}", found);
+		assert_eq!(found[0]["key"], json!(key));
+		assert!(found[0]["address"].is_null());
+		let taken = w.ok(&["claim"]);
+		assert!(taken[0]["taken_up"]["transfer_id"].is_string(), "{}", taken);
+		let (coins, held) = live(w, &x);
+		assert_eq!(coins.len(), 1, "{}: {:?}", w.name, coins);
+		assert!(held > value - 10_000 && held <= value, "{} holds {}", w.name, held);
+		assert_eq!(w.ok(&["claims"])[0]["state"], "claimed");
+	}
+	let st = shown(&payer);
+	assert!(st["claims"].as_array().unwrap().iter().all(|c| c["state"] == "claimed"), "{}", st);
+	println!("two holders named by their OpenAMP keys took their claims up: {}", st);
+}

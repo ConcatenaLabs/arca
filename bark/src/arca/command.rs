@@ -22,7 +22,7 @@ use super::keys::Keys;
 use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
-pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
+pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
@@ -109,7 +109,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
-	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
+	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans");
 	let mut out = json!({});
 	if !local {
@@ -132,6 +132,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 	match command {
 		"info" => w.info(),
 		"address" => w.address(),
+		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
 		"balance" => w.balance(),
 		"coins" => w.coins(),
 		"record" => w.record(req_str(&a["leaf_id"], "the coin")?),

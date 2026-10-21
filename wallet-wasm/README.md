@@ -95,7 +95,7 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 
 `run(command, args)` is the library's `bark::arca::command::run`, which every
 program that embeds the library calls, and takes the command line's commands, each with its
-arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`,
+arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`, `openamp_key`,
 `balance`, `coins`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
