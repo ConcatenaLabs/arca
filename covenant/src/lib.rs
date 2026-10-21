@@ -49,6 +49,10 @@
 //! - claim trees ([`claim`]): the claim key a holder's leaf is owned by,
 //!   derived from the key a payer names and a nonce, and the distribution a
 //!   payer submits to pay many holders in one round;
+//! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
+//!   without the holder, and each step's refund, which spends the coin given
+//!   up and the new leaf together by their collaborative paths and pays the
+//!   holder first;
 //! - the operator record ([`operator_record`]): what an operator publishes
 //!   about itself in the Sequentia registry, its canonical form and the
 //!   signature of the operator key over it.
@@ -81,6 +85,7 @@ pub mod node;
 pub mod offboard;
 #[cfg(feature = "json")]
 pub mod operator_record;
+pub mod plan;
 pub mod record;
 pub mod release;
 #[cfg(feature = "json")]
@@ -110,6 +115,7 @@ pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;
+pub use plan::{Plan, PlanError, PlanStep, Refund};
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
 pub use release::Release;
 pub use script::{Child, ExplicitOutput};
