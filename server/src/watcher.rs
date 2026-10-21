@@ -91,7 +91,7 @@ use tokio::sync::{broadcast, Mutex};
 use arca_covenant::encode::Encoding;
 use arca_covenant::node::{connector_index, reclaim_items};
 use arca_covenant::sign::{script_spend_sighash, verify_digest};
-use arca_covenant::spend::{FeeSource, KeySpend};
+use arca_covenant::spend::{FeeSource, KeySpend, Rebindable};
 use arca_covenant::tree::Tree;
 use arca_covenant::{
 	connector_asset, sweep_tx, ClaimTx, Clock, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, MedianTime,
@@ -825,6 +825,9 @@ impl Watcher {
 	/// Answers the leaf of the coin `leaf_id`, given up and on the chain
 	/// unspent at `op`: its forfeit, or its checkpoint.
 	async fn answer_leaf(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<(), WatcherError> {
+		if self.answer_plan_coin(leaf_id, op).await? {
+			return Ok(());
+		}
 		let coin = self.coin(leaf_id).await?;
 		if let Some(f) = self.live_forfeit(leaf_id).await? {
 			let (forfeit, pair) = self.forfeit(&coin, &f)?;
@@ -853,6 +856,81 @@ impl Watcher {
 				format!("the checkpoint of coin {}, paid on in transfer {}, its leaf on the chain at {}", hex(leaf_id), hex(&t), op)).await?;
 		}
 		Ok(())
+	}
+
+	/// Answers the coin `leaf_id`, given up by a step of an offline-refresh
+	/// plan and on the chain unspent at `op`, with the step's refund: the
+	/// step's leaf brought on the chain first, one transaction a pass (its path
+	/// unrolled by the operator's own authorisations, its entry opened with
+	/// the plan's preimage), then both spent into the holder's `v(i)` and the
+	/// operator's share. `false` when no step gave the coin up.
+	async fn answer_plan_coin(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<bool, WatcherError> {
+		let Some(r) = crate::plans::refund_for(&self.store, &self.params, leaf_id).await? else { return Ok(false) };
+		let new_spk = r.refund.new.script_pubkey();
+		let mut new_at = None;
+		for (txid, vout) in self.store.sightings_of(new_spk.as_bytes()).await? {
+			let at = OutPoint::new(txid_of(&txid), vout);
+			if self.unspent(at).await?.is_some() {
+				new_at = Some(at);
+				break;
+			}
+		}
+		let Some(new_at) = new_at else {
+			let coin = self.plan_leaf_coin(&r.new_leaf, r.preimage).await?;
+			let now = self.now().await?;
+			self.bring_on_chain(&coin, now).await?;
+			return Ok(true);
+		};
+		if self.spending(&op).await? || self.spending(&new_at).await? {
+			return Ok(true);
+		}
+		let outs = r.refund.outputs();
+		let s_old = self.signer.rebind(&r.refund.old.owner, &r.old_half, &r.refund.old.salt, r.refund.asset, r.refund.old_value, &outs).await?;
+		let s_new = self.signer.rebind(&r.refund.new.owner, &r.new_half, &r.refund.new.salt, r.refund.asset, r.refund.new_value, &outs).await?;
+		let old_pair = Pair { operator: s_old, owner: r.old_half };
+		let new_pair = Pair { operator: s_new, owner: r.new_half };
+		r.refund.old.verify(r.refund.asset, r.refund.old_value, &outs, &old_pair).map_err(build("the refund's first pair"))?;
+		r.refund.new.verify(r.refund.asset, r.refund.new_value, &outs, &new_pair).map_err(build("the refund's second pair"))?;
+		let margin = (r.refund.old_value + r.refund.new_value).saturating_sub(outs.iter().map(|o| o.value).sum::<u64>());
+		let (u, fee_coin, fee) = self.margin_or_coin(r.refund.asset, margin, |fee| {
+			let u = r.refund.tx(op, new_at, &old_pair, &new_pair, fee).map_err(|e| e.to_string())?;
+			let t = u.tx.clone();
+			Ok((u, t))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		self.publish(Ready { tx: u.tx, wallet, fee }, "refund", leaf_id.to_vec(),
+			format!("the refund of step {} of plan {}: coin {}, on the chain at {}, and the step's leaf at {}, the holder paid {}",
+				r.idx, hex(&r.plan), hex(leaf_id), op, new_at, r.refund.new_value)).await?;
+		Ok(true)
+	}
+
+	/// The leaf a step of a plan made, as a coin the watcher can bring on the
+	/// chain: its record in the tree, validated against its round as of any
+	/// time, the step's preimage, and the operator's own unroll authorisation
+	/// for every node above it (the operator is member 0 of every node).
+	async fn plan_leaf_coin(&self, leaf: &[u8; 32], preimage: [u8; 32]) -> Result<ValidCoin, WatcherError> {
+		let b = self.store.batch_leaf(leaf).await?.ok_or_else(|| WatcherError::Build(format!("leaf {} is in no batch", hex(leaf))))?;
+		let round = self.store.round(b.round_id).await?.ok_or_else(|| WatcherError::Build(format!("round {} is not recorded", b.round_id)))?;
+		let round_tx: Transaction = deserialize(&round.tx).map_err(build("the round"))?;
+		let record = arca_covenant::LeafRecord::from_bytes(&b.record).map_err(build("the leaf's record"))?;
+		let any_time = MedianTime::from_consensus(500_000_000).map_err(build("a time"))?;
+		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
+		let valid = record.validate_round(&round_tx, &policy).map_err(build("the leaf's record"))?;
+		let tree = self.tree(&round, b.vout).await?;
+		let now = self.now().await?;
+		let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(1)).map_err(build("a time"))?;
+		let mut auths = Vec::with_capacity(valid.branch.nodes.len());
+		for ((node, _), bn) in tree.path(b.idx as usize).iter().zip(&valid.branch.nodes) {
+			let signature = self.signer.unroll(&bn.children_hash(), t).await?;
+			if !verify_digest(&signature, &bn.unroll_authorisation(t).digest, &self.params.operator) {
+				return Err(WatcherError::Build("the signer signed another unroll authorisation than the server built".into()));
+			}
+			auths.push(arca_covenant::UnrollAuth { signature, time: t, key: self.params.operator, proof: node.members().proof(0) });
+		}
+		Ok(ValidCoin {
+			id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
+			expiry: record.schedule.expiries()[0], hops: 0, origin: ValidOrigin::Leaf { valid, preimage, auths },
+		})
 	}
 
 	/// The inputs and committed outputs of the transfer `transfer_id`, from
@@ -1579,6 +1657,13 @@ impl Watcher {
 			TokenPlace::Clock(j) => {
 				let e = schedule.expiries()[j];
 				if now.to_consensus_u32() < e.to_consensus_u32() || self.unspent(at).await?.is_none() || self.spending(&at).await? {
+					return Ok(());
+				}
+				// A holder away on an offline-refresh plan finds its coin
+				// unswept: the batch holding a plan's current coin waits.
+				if let Some(why) = crate::plans::holds_batch(&self.store, round.round_id, b.vout).await? {
+					log::info!("watcher: the batch at output {} of round {} is not released at clock {}'s expiry: {}", b.vout, round.round_id,
+						j, why);
 					return Ok(());
 				}
 				let (ks, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets(AssetId::from_byte_array(b.asset)), |src| {

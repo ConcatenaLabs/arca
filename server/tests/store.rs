@@ -27,12 +27,13 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 25;
+const SCHEMA: i32 = 26;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "DROP TABLE distribution_claim; DROP TABLE distribution_return; DROP TABLE distribution;
+const UNDO_V17: &str = "DROP TABLE plan_step; DROP TABLE plan; DROP TABLE plan_quote; DROP TYPE plan_step_state; DROP TYPE plan_state;
+	DROP TABLE distribution_claim; DROP TABLE distribution_return; DROP TABLE distribution;
 	DROP TABLE round_fill; DROP TABLE participation_fill;
 	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_notice_has_no_leaf;
 	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_kind_check;

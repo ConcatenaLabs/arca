@@ -883,6 +883,67 @@ the distribution is released, `open`, `claimed`, `returned`), the deadline,
 and each payment back with its state. The return itself is the watcher's
 (see The watcher).
 
+### Offline refresh: plans
+
+A holder who will stay away past a coin's expiry pre-signs a plan
+(`plans`, `arca_covenant::plan`): a chain of 1 to 6 refresh steps the operator
+applies in later rounds without it. Step `i` gives up the holder's coin
+`L(i-1)` for a new leaf `L(i)`; `L(0)` is the coin the plan starts from, a leaf
+of a round (a board or a received coin is refreshed in a round first). Each
+step runs as a participation of the server's own making, wanting `L(i)` exactly
+as the plan names it (owner key, owner nonce, the operator nonce the quote drew,
+exit delay, value) under the plan's unlock hash, whose preimage the holder
+handed over and can derive again. It is created no earlier than the start of
+`L(i-1)`'s free window, five days before its first expiry, where the schedule
+charges nothing, runs in the asset's ordinary round, and may run after
+`L(i-1)`'s exit deadline while `L(i-1)`'s batch is not released. Once its round
+is final the server releases it without forfeits and credits `L(i)`, whose
+full record waits for the holder's unroll authorisations (`plan_leaf`). In
+place of the forfeit the holder could not sign before the round existed, the
+operator holds the step's refund: the holder's halves over `L(i-1)`'s and
+`L(i)`'s collaborative paths, both committing to `v(i)` at the holder's own
+address and the rest, less a margin for the refund's fee, at the operator's
+script. Every use of either half pays the holder `v(i)`.
+
+A plan is asked for in two calls. `plan_quote` takes the coin, one owner nonce
+per step and the exit delay, asked by the coin's owner (its signature over
+`SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ coin ‖ n ‖ owner nonces ‖ exit delay units)`,
+`T = SHA256("Arca/plan-quote")`); it draws an operator nonce for each step and
+names the script the operator's share of every refund pays to, each step's fee
+(the refresh fee in the coin's free window: nothing) and the refund's margin.
+`submit_plan` takes the plan, the coin's owner's signature over its id, and
+for each step the leaf key's signature over the plan's key digest, both refund
+halves, the preimage and the leaf key's binding to the wallet's mailbox key.
+The server takes a plan only when its coin passes what a refresh's coins pass,
+is a leaf of a round and is named by no plan that is open or stopped; each
+step's operator nonce is one the quote drew; each step's key owns no leaf and
+is wanted by nothing else; each step's salt is new to the server (promised to
+the step from then on); every signature verifies, every preimage opens its
+hash, every value and exit delay is within bounds, every fee covers the
+schedule, every operator script is the quote's, and no holder's address is a
+script the server knows as an Arca script. A plan submitted again is answered
+with its status.
+
+What the server does with a plan once it holds it:
+
+- A step whose coin is spent otherwise, lost or on the chain is void, and the
+  plan stopped: the coin it would have given up is its holder's again. So is a
+  step whose round is lost: a step runs only under the leaf its plan names, so
+  it is not run again.
+- The watcher releases no batch that holds the current coin of a plan that is
+  open or stopped, whether its step has run or not: a holder away on a plan
+  finds that coin unswept. A plan is over once it is done or its holder
+  cancels it (`cancel_plan`, signed by the plan's mailbox key).
+- A coin a plan names carries its holder's refund halves for as long as its
+  script is unspent; with one, the operator alone could void a reassignment of
+  it. So no transfer of such a coin is co-signed (`planned`); its holder
+  refreshes it in a round first. A coin a step made is taken into no
+  participation until the coin that step gave up is swept, its sweep final:
+  the refund that answers that coin needs the signer's one spend under the new
+  coin's salt.
+- A coin a step gave up that comes on the chain is answered by the step's
+  refund (see the watcher).
+
 ## Rounds
 
 A round carries one asset. Each asset the operator serves has rounds of its
@@ -1267,7 +1328,13 @@ one, nor for a reclaim before an owner under it has released.
   forfeit, or by its checkpoint; and a reassignment is published once every
   checkpoint it spends is on the chain. A board given up and then converted
   is the same case: its leaf appears. The answer confirms within the leaf's
-  exit delay, after which its owner's exit finds the leaf spent.
+  exit delay, after which its owner's exit finds the leaf spent. A coin given
+  up by a step of an offline-refresh plan is answered by the step's refund:
+  the watcher first brings the step's leaf on the chain, one transaction a
+  pass, unrolling its path with the operator's own unroll authorisations (the
+  operator is a member of every node, and the signer signs them) and opening
+  its entry with the plan's preimage, then spends the coin and the leaf
+  together, the holder paid the leaf's value at its own address.
 - **Boards given up in a round.** No batch sweeps a board, so once the round
   it was given up for is final the watcher publishes its forfeit from the
   board output itself, and claims it. Every forfeit's refund clock starts when it
@@ -1313,7 +1380,10 @@ one, nor for a reclaim before an owner under it has released.
   passed (the batch output, a node or an entry someone unrolled, a checkpoint
   of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
   the token to `R`. A leaf on the chain is its owner's and is never swept.
-  The server builds no burn-only batch and sweeps none.
+  The server builds no burn-only batch and sweeps none. A batch that holds
+  the current coin of an offline-refresh plan that is open or stopped is not
+  released: the release waits until the plan's step has taken that coin into
+  a final round, or the plan is over.
 - **Reclaim.** A lowest node every owner of which has released it is
   reclaimed with an atom of each connector asset the releases name. With
   `reclaim_early`, a node all of whose lowest nodes are released is unrolled
@@ -1393,6 +1463,12 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
 | `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it |
+| `POST plan_quote` | A quote for an offline-refresh plan from a coin (see Offline refresh: plans): the quote's id, the coin's asset, value and first expiry, the earliest time of step 1's round, the operator's script for every refund, and for each step its operator nonce, fee and refund margin |
+| `POST submit_plan` | Accepts a plan, answered as `plan_status` answers |
+| `POST plan_status` | A plan by its id: `open`, `done`, `cancelled` or `stopped` (with the reason), and each step: `waiting`, `running`, `done` or `void` (with the reason), the leaf it makes as the plan names it (value, fee, owner key, both nonces, exit delay, unlock hash, the holder's address), the coin it gives up, its participation, its round and the round's state, and its leaf with its place in the tree and, once its round is final, its record. Not authenticated: the id names the plan |
+| `POST plans` | Every plan whose leaves are bound to the authenticated key (a wallet's mailbox key), the newest first, each as `plan_status` answers it |
+| `POST cancel_plan` | Cancels the steps of a plan that have not started, on the plan's mailbox key's signature over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`; a plan with a step in a round is cancelled once that round decides it |
+| `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |
@@ -1402,13 +1478,13 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST bind_mailbox` | Binds leaves made before their wallet named its mailbox key when it asked for them: up to 64 bindings, each an owner key, a mailbox key and the owner key's signature over the binding; answers the mailbox each key is bound to (a binding made before stands), or none for a key the server knows no leaf of |
 | `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`) and a nonce the wallet draws fresh for the call, hands them to the signer, and answers the running hash the record holds at each entry, each signed, its latest entry, signed (`head`), the record's end signed together with the nonce (`end`), and whether the signer is stopped (`stopped`), with its proof (`proof`: the signed head that stopped it and, when the record holds another there, that head, signed) |
 
-`mailbox_read` and `leaf_data` need a proof of the key: a challenge from
+`mailbox_read`, `leaf_data` and `plans` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
 `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`
 with `T = SHA256("Arca/auth")`, where `request` is what the read asks besides
 its proof: for `mailbox_read` its cursor (eight bytes) and page size (four),
 little-endian; for `leaf_data` the same of its cursor and page size, or
-nothing when it names neither (it then reads the first page). The tag keeps it apart from
+nothing when it names neither (it then reads the first page); for `plans` nothing. The tag keeps it apart from
 everything else a leaf key signs, the genesis hash to one chain, the call and
 the request to one read, the challenge to a short while. A challenge is
 stored nowhere: it is the time it was issued, 12 random bytes, and a keyed
@@ -2249,6 +2325,22 @@ watcher passes once a block, and after each block the test checks every
 forfeit in a block whose claim is not: its refund must not be open (the tip's
 median time short of the refund delay past that of the block before the
 forfeit's), and its owner's refund is refused. Every forfeit is claimed.
+
+`tests/plans.rs` runs offline refresh against the whole server: a plan of
+two steps from a coin of a round, each step run in its coin's free window
+with no holder present, its participation wanting the plan's leaf, the old
+batch released and swept only after the step, and a coin a step gave up
+brought on the chain answered with that step's refund, which pays the holder
+the step's value at its address. A stopped plan's coin is held, its batch not
+released past its expiry, until the holder cancels the plan. A step whose
+round is lost (its block disconnected and the operator's input taken by
+another transaction, final) is void, the plan stopped, and the holder takes
+the coin the step gave up home with nothing answering it. Every refusal of a
+quote and a plan (an operator script not the quote's, a holder address that
+is an Arca script, a nonce the quote did not draw, an unbalanced step, an
+exit delay above the operator's, a second plan of one coin, seven steps,
+another key's attestation, a board, a key another plan holds) is asserted by
+its code.
 
 `tests/orphan.rs` runs R7's F9: a deep anchor-driven reorganisation (eight
 Sequentia blocks) takes out a board's forfeit, the round's atom issuance and

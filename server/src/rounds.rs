@@ -476,6 +476,19 @@ impl Rounds {
 				}
 			}
 		}
+		// A step of an offline-refresh plan gives up a coin whose holder is
+		// away, a leaf a step made among them, whose record waits for that
+		// holder's authorisations: it is taken while it is given up to the
+		// step and nothing of it is on the chain, late as well, its batch
+		// held unreleased meanwhile (`plans::holds_batch`).
+		if self.store.plan_step_of(&p.id).await?.is_some() {
+			if let Some(why) = crate::plans::step_coin_waits(&self.store, p).await? {
+				log::warn!("participation {} (a plan's step) waits: {}", crate::signer::hex(&p.id), why);
+				self.store.set_waiting(&p.id, Some(&why)).await?;
+				return Ok(false);
+			}
+			return Ok(true);
+		}
 		let policy = self.params.round_policy(now);
 		for i in &p.inputs {
 			match coins::check(&self.store, &policy, &LeafId(i.leaf_id), &p.id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await {
@@ -567,6 +580,7 @@ impl Rounds {
 	pub async fn run_rounds(&self) -> Result<(Vec<Built>, Vec<(AssetId, RoundError)>), RoundError> {
 		let mut built = vec![];
 		let mut failed = vec![];
+		self.plans_due().await?;
 		for asset in self.assets_waiting().await? {
 			match self.run_round_of(asset).await {
 				Ok(Some(b)) => built.push(b),
@@ -876,10 +890,19 @@ impl Rounds {
 		Ok(taken)
 	}
 
+	/// The steps of offline-refresh plans whose time has come join the
+	/// participations waiting, each its own participation
+	/// ([`crate::plans::apply`]).
+	async fn plans_due(&self) -> Result<usize, RoundError> {
+		let now = self.now().await?;
+		Ok(crate::plans::apply(&self.store, &self.params, now).await?)
+	}
+
 	/// Builds the next round: that of the first asset, in the order the
 	/// operator serves them, whose participations wait and can run. Returns
 	/// `None` when nothing waits.
 	pub async fn run_round(&self) -> Result<Option<Built>, RoundError> {
+		self.plans_due().await?;
 		for asset in self.assets_waiting().await? {
 			if let Some(b) = self.run_round_of(asset).await? {
 				return Ok(Some(b));
@@ -1590,6 +1613,9 @@ impl Rounds {
 			}
 			self.check_round(&r).await?;
 		}
+		// A step of an offline-refresh plan in a final round is done: released
+		// without forfeits (its refund stands in their place), its leaf credited.
+		crate::plans::finish(&self.store).await?;
 		self.release_held().await?;
 		self.expire().await?;
 		self.void_overdue().await?;
@@ -1949,6 +1975,11 @@ impl Rounds {
 		let cutoff = now.saturating_sub(Params::FORFEIT_DEADLINE);
 		let mut expired = vec![];
 		for id in self.store.overdue_participations(cutoff).await? {
+			// A plan's step waits for no forfeit: it is released once its
+			// round is final (`plans::finish`).
+			if self.store.plan_step_of(&id).await?.is_some() {
+				continue;
+			}
 			if self.exit_deadline_of(&id).await?.is_some_and(|d| now < d) {
 				continue;
 			}
@@ -2039,7 +2070,11 @@ impl Rounds {
 	/// apart from a round it was in ([`Self::tie_coins`]), is voided, saying
 	/// why.
 	async fn retire(&self, r: &RoundRow) -> Result<(), RoundError> {
-		let again = self.store.retire_round(r.round_id).await?;
+		let mut again = self.store.retire_round(r.round_id).await?;
+		// A step of an offline-refresh plan runs only under the leaf its plan
+		// names: it is not run again, and its coin is its holder's.
+		let voided = crate::plans::void_rerun(&self.store, &again, &Txid::from_byte_array(r.txid)).await?;
+		again.retain(|id| !voided.contains(id));
 		let never = self.rerun(r.round_id, &again).await?;
 		log::warn!("round {} ({}) is out of the chain and another transaction that took one of its inputs is final: retired; \
 			{} participation(s) run again, {} never taken", r.round_id, Txid::from_byte_array(r.txid), again.len() - never, never);

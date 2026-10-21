@@ -66,6 +66,8 @@ use crate::store::{LeafKind, LeafState, Store, WantedKind};
 
 #[path = "http_claims.rs"]
 mod claims;
+#[path = "http_plans.rs"]
+mod plans;
 
 /// What the HTTP handlers reach.
 pub struct App {
@@ -74,6 +76,7 @@ pub struct App {
 	pub boards: Arc<Boards>,
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
+	pub plans: Arc<crate::plans::Plans>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub certification: Certification,
@@ -370,9 +373,9 @@ pub fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"unknown_participation" | "unknown_batch" | "unknown_payment" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
-			| "order_taken" =>
+			| "order_taken" | "planned" | "conflict" | "hash_reused" =>
 			StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
@@ -1567,6 +1570,12 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/distribution_status", post(claims::distribution_status))
 		.route("/v1/claims", post(claims::claims))
 		.route("/v1/claim_leaf", post(claims::claim_leaf))
+		.route("/v1/plan_quote", post(plans::plan_quote))
+		.route("/v1/submit_plan", post(plans::submit_plan))
+		.route("/v1/plan_status", post(plans::plan_status))
+		.route("/v1/plans", post(plans::plans))
+		.route("/v1/cancel_plan", post(plans::cancel_plan))
+		.route("/v1/plan_leaf", post(plans::plan_leaf))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))

@@ -30,15 +30,15 @@ pub struct ErrorDetail {
 /// codes out of the source and compares them with this list, and the wallet's
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
-	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
-	"double_spend", "fee", "forfeit_set", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "conflict", "depth_limit",
+	"double_spend", "fee", "forfeit_set", "hash_reused", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "order", "order_expiring", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
+	"operator_key", "order", "order_expiring", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_leaf", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/info`.
@@ -1768,4 +1768,172 @@ pub struct ClaimLeaf {
 pub struct ClaimLeafAnswer {
 	pub leaf_id: String,
 	pub state: String,
+}
+
+/// `POST /v1/plan_quote`: a quote for an offline-refresh plan from the coin
+/// `coin`, one step per owner nonce, its leaves under the exit delay given,
+/// asked by the coin's owner (its signature over the quote digest,
+/// [`crate::plans::quote_digest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanQuoteRequest {
+	pub coin: String,
+	pub owner_nonces: Vec<String>,
+	pub exit_delay_units: u16,
+	pub attestation: String,
+}
+
+/// What `plan_quote` answers: the quote's id, the coin's asset, value and
+/// first expiry, the earliest median time of step 1's round, the script the
+/// operator's share of every refund pays to, and per step its operator
+/// nonce, its fee and its refund's margin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanQuote {
+	pub quote: String,
+	pub coin: String,
+	pub asset: String,
+	pub value: String,
+	pub expiry: u32,
+	pub earliest: u32,
+	pub operator_script: String,
+	pub steps: Vec<PlanQuoteStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanQuoteStep {
+	pub operator_nonce: String,
+	pub fee: String,
+	pub margin: String,
+}
+
+/// `POST /v1/submit_plan`: an offline-refresh plan, everything its holder
+/// hands over with it ([`crate::plans`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitPlan {
+	pub quote: String,
+	pub coin: String,
+	/// The mailbox key every leaf of the plan is bound to.
+	pub mailbox: String,
+	/// The coin's owner's signature over the plan's id.
+	pub attestation: String,
+	pub steps: Vec<SubmitPlanStep>,
+}
+
+/// One step of a plan: the leaf it makes, its refund, and what its key
+/// signed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitPlanStep {
+	pub value: String,
+	pub fee: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub operator_nonce: String,
+	pub exit_delay_units: u16,
+	pub unlock_hash: String,
+	pub preimage: String,
+	pub holder_script: String,
+	pub operator_script: String,
+	pub margin: String,
+	pub key_proof: String,
+	pub old_half: String,
+	pub new_half: String,
+	pub mailbox_proof: String,
+}
+
+/// `POST /v1/plan_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStatusRequest {
+	pub plan_id: String,
+}
+
+/// A plan as its holder sees it: `open`, `done`, `cancelled` or `stopped`
+/// (with the reason), and each step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStatus {
+	pub plan_id: String,
+	pub coin: String,
+	pub asset: String,
+	pub value: String,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+	pub steps: Vec<PlanStepStatus>,
+}
+
+/// A step: `waiting`, `running`, `done` or `void` (with the reason); the leaf
+/// it makes as the plan names it; the coin it gives up once known; its round
+/// once in one; and its leaf, with the leaf's record in the tree once its
+/// round is final.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStepStatus {
+	pub idx: u16,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+	/// The leaf the step makes, as the plan names it: what a wallet restored
+	/// from its mnemonic derives the leaf's key and preimage from, and
+	/// recognises the refund's output by.
+	pub value: String,
+	pub fee: String,
+	pub owner: String,
+	pub owner_nonce: String,
+	pub operator_nonce: String,
+	pub exit_delay_units: u16,
+	pub unlock_hash: String,
+	pub holder_script: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub participation_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gives_up: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_txid: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_state: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub batch_vout: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_index: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub record: Option<String>,
+}
+
+/// `POST /v1/plans`: every plan whose leaves are bound to the authenticated
+/// key (a wallet's mailbox key), the newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlansRequest {
+	pub auth: Auth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanList {
+	pub plans: Vec<PlanStatus>,
+}
+
+/// `POST /v1/cancel_plan`: the plan's mailbox key's signature over its
+/// cancel digest ([`crate::plans::cancel_digest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelPlan {
+	pub plan_id: String,
+	pub signature: String,
+}
+
+/// `POST /v1/plan_leaf`: the holder's unroll authorisations for a leaf a
+/// step of a plan made, signed by the leaf's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanLeaf {
+	pub leaf_id: String,
+	pub auths: Vec<UnrollAuth>,
 }

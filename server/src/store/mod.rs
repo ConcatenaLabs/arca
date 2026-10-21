@@ -13,7 +13,7 @@
 //! `schema/V20__pending_coins.sql`, `schema/V21__takes.sql`,
 //! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`,
 //! `schema/V24__distributions.sql`,
-//! `schema/V25__shared_fills.sql`),
+//! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -49,6 +49,7 @@ mod lightning;
 mod mailbox;
 mod nursery;
 mod participations;
+mod plans;
 mod reserving;
 mod rounds;
 mod transfers;
@@ -61,6 +62,7 @@ pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
 pub use mailbox::MailboxMessage;
+pub use plans::{NewPlan, NewPlanStep, PlanRow, PlanState, PlanStepRow, StepState};
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
 pub use nursery::{NurseryRow, NurseryState};
 pub use participations::{
@@ -104,6 +106,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(23, include_str!("../../schema/V23__lightning_internal.sql")),
 	(24, include_str!("../../schema/V24__distributions.sql")),
 	(25, include_str!("../../schema/V25__shared_fills.sql")),
+	(26, include_str!("../../schema/V26__plans.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -179,6 +182,13 @@ pub enum StoreError {
 	/// round is lost.
 	#[error("round {0} is lost: no forfeit naming it is published while it is")]
 	RoundLost(i64),
+	#[error("a plan with this id is already recorded")]
+	PlanExists,
+	/// The coin starts an open plan already: the coin, hex.
+	#[error("coin {0} starts an open plan already: a coin starts one open plan at a time")]
+	CoinPlanned(String),
+	#[error("the unlock hash is one the server knows already: every participation and plan step has a hash of its own")]
+	UnlockHashReused,
 }
 
 impl StoreError {
