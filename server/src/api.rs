@@ -1582,3 +1582,165 @@ pub struct Released {
 	/// The coins whose release is recorded.
 	pub released: Vec<String>,
 }
+
+/// `POST /v1/distribute`: a distribution, one round paying many holders
+/// (a claim tree). Each coin given up is attested over the distribution's id
+/// ([`arca_covenant::Distribution::id`]); each claim names a key, the nonce
+/// the payer drew for it and what its leaf holds, and the leaf is owned by
+/// the claim key of the two ([`arca_covenant::claim_key`]). Answered as
+/// `participation_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Distribute {
+	pub inputs: Vec<ParticipationInput>,
+	pub asset: String,
+	pub exit_delay_units: u16,
+	pub claims: Vec<ClaimWanted>,
+	/// The script the unclaimed sum is paid to, hex.
+	pub return_script: String,
+	pub fees: Vec<FeeAmount>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub not_before: Option<u32>,
+}
+
+/// One claim of a distribution: the named key (x-only, hex), the payer's
+/// nonce for it, and the leaf's value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimWanted {
+	pub key: String,
+	pub nonce: String,
+	pub value: String,
+}
+
+/// `POST /v1/distribution_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionStatusRequest {
+	pub distribution_id: String,
+}
+
+/// A distribution as its payer sees it: its participation's state, where
+/// its leaves are, the deadline by which a holder takes a claim up through
+/// the operator (the claim leaves' exit deadline, three days before their
+/// batch's first expiry), each claim, and each payment of unclaimed leaves
+/// back to the return script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionStatus {
+	pub distribution_id: String,
+	pub state: String,
+	pub asset: String,
+	pub return_script: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expiry: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deadline: Option<u32>,
+	pub claims: Vec<ClaimStatus>,
+	pub returns: Vec<ClaimReturn>,
+	/// What the returns pay together.
+	pub returned: String,
+}
+
+/// One claim's state: `pending` (its distribution not released), `open`
+/// (its leaf live, not taken up), `claimed` (its leaf spent, by its holder's
+/// take-up or refresh), `returned` (paid back to the payer after a final
+/// sweep took it), or the state of a distribution that never released
+/// (`void`, `expired`), or of a leaf lost with its round (`lost`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimStatus {
+	pub index: u16,
+	pub key: String,
+	pub owner: String,
+	pub value: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub returned_in: Option<String>,
+}
+
+/// A payment of unclaimed leaves to the payer: its transaction, what it
+/// pays, and where it stands in the nursery (`pending`, `final`, `lost`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimReturn {
+	pub txid: String,
+	pub value: String,
+	pub state: String,
+}
+
+/// `POST /v1/claims`: the claims under each key, each key proven by its
+/// signature over the authentication digest of the call `claims`, the
+/// challenge and the key, with an empty request ([`crate::auth`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimsRequest {
+	pub challenge: String,
+	pub keys: Vec<KeyProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyProof {
+	pub key: String,
+	pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Claims {
+	pub claims: Vec<ClaimFound>,
+}
+
+/// A claim found under a key: what its holder needs to check its leaf and
+/// take it up. The record (the leaf's record in its tree, hex) and the
+/// preimage come once the distribution is released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimFound {
+	pub distribution_id: String,
+	pub index: u16,
+	pub key: String,
+	pub nonce: String,
+	pub owner: String,
+	pub asset: String,
+	pub value: String,
+	pub exit_delay_units: u16,
+	pub state: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub batch_vout: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub leaf_index: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub record: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expiry: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deadline: Option<u32>,
+}
+
+/// `POST /v1/claim_leaf`: a holder's unroll authorisations for a claim leaf,
+/// one per node above it from the batch output down, signed by its claim key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimLeaf {
+	pub leaf_id: String,
+	pub auths: Vec<UnrollAuth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimLeafAnswer {
+	pub leaf_id: String,
+	pub state: String,
+}

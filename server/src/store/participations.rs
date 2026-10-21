@@ -27,7 +27,7 @@ impl ParticipationState {
 		}
 	}
 
-	fn parse(s: &str) -> Result<ParticipationState, StoreError> {
+	pub(super) fn parse(s: &str) -> Result<ParticipationState, StoreError> {
 		Ok(match s {
 			"pending" => ParticipationState::Pending,
 			"issued" => ParticipationState::Issued,
@@ -92,6 +92,9 @@ pub struct NewParticipation {
 	pub fees: Vec<([u8; 32], u64)>,
 	/// For a take, the order it takes.
 	pub fill: Option<FillRow>,
+	/// For a distribution, its return script and the key named for each
+	/// claim.
+	pub distribution: Option<super::distributions::NewDistribution>,
 }
 
 /// The on-chain order a take takes, as its id covers it.
@@ -448,6 +451,9 @@ impl Store {
 		for (asset, amount) in &p.fees {
 			t.execute("INSERT INTO participation_fee (participation_id, asset, amount) VALUES ($1, $2, $3)",
 				&[&&p.id[..], &&asset[..], &i64_of(*amount)?]).await?;
+		}
+		if let Some(d) = &p.distribution {
+			super::distributions::insert_distribution(&t, &p.id, d).await?;
 		}
 		t.commit().await?;
 		Ok(())
@@ -1256,7 +1262,7 @@ async fn give_back(t: &tokio_postgres::Transaction<'_>, id: &[u8; 32]) -> Result
 
 /// Credits, inside `t`, the new leaves of every released participation of
 /// the round `round_id` if it is final.
-async fn credit(t: &tokio_postgres::Transaction<'_>, round_id: i64) -> Result<u64, StoreError> {
+pub(super) async fn credit(t: &tokio_postgres::Transaction<'_>, round_id: i64) -> Result<u64, StoreError> {
 	Ok(t.execute(
 		"UPDATE leaf SET state = 'live', updated_at = now()
 		 WHERE state = 'pending' AND record <> ''::bytea AND leaf_id IN (

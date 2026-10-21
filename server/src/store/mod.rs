@@ -11,7 +11,8 @@
 //! `schema/V16__keepers_pinned.sql`, `schema/V17__leaf_reserving.sql`,
 //! `schema/V18__lightning_send.sql`, `schema/V19__lightning_receive.sql`,
 //! `schema/V20__pending_coins.sql`, `schema/V21__takes.sql`,
-//! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`),
+//! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`,
+//! `schema/V24__distributions.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -42,6 +43,7 @@ use tokio_postgres::NoTls;
 mod boards;
 mod chain;
 mod coins;
+mod distributions;
 mod lightning;
 mod mailbox;
 mod nursery;
@@ -55,6 +57,7 @@ mod watcher;
 pub use boards::{BoardRow, BoardState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
+pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
 pub use mailbox::MailboxMessage;
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
@@ -98,6 +101,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(21, include_str!("../../schema/V21__takes.sql")),
 	(22, include_str!("../../schema/V22__round_fills.sql")),
 	(23, include_str!("../../schema/V23__lightning_internal.sql")),
+	(24, include_str!("../../schema/V24__distributions.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

@@ -801,6 +801,77 @@ the leaf wanted, the fee and the earliest round time
 (`arca_covenant::Take::id` spells the layout). Its tag is its own, so no
 attestation of a take is one of a refresh.
 
+### Distributions: claim trees
+
+A distribution pays many holders from one round: a payer gives up its own
+coins in one asset and names, for each holder, a key and an amount, and each
+holder gets an ordinary `vtxo-1` leaf in that asset's round, which it takes
+up when it likes, having never been in contact with the payer or the
+operator before. What no holder takes up goes back to the payer once the
+batch's sweep is final. It serves a dividend or a coupon, a refund at a
+failed closing, a launch allocation, a reward payout.
+
+The payer names each holder by a 32-byte x-only key `A` (an on-chain address
+key, a taproot address's program, or any key the holder hands over) and
+draws a fresh nonce `n` for it. The holder's leaf is owned by the claim key
+`A' = lift_x(A) + t·G`, `t = SHA256(T ‖ T ‖ A ‖ n)`,
+`T = SHA256("Arca/claim-key")` (`arca_covenant::claim`), which the server
+derives itself, and `n` is the leaf's owner nonce. The holder signs for `A'`
+with its secret for `A` plus `t`. The claim key is a key of its own for
+every claim, so one address can be paid by any number of distributions while
+every leaf keeps a key of its own, and a payer, naming keys and never claim
+keys, can take no key a wallet uses for its own leaves.
+
+`distribute` names the coins given up, each with its owner's attestation
+over the distribution's id (`arca_covenant::Distribution::id`: a tagged hash
+of its own, `Arca/distribution`, with two-byte counts), the asset, the claim
+leaves' exit delay, the claims (each a key, a nonce and a value), the return
+script, and the fee. The server takes it only when:
+
+- it gives up 1 to 16 coins and names 1 to 1,024 claims, each holding
+  something, no key twice (`malformed`); the asset is served and its rate
+  fresh, and the fee is in that asset (`out_of_bounds`, `rate_stale`);
+- each claim's value is within the asset's bounds and the exit delay within
+  the operator's (`out_of_bounds`); no claim key is `S` (`operator_key`) or
+  owns a leaf or is wanted by another participation (`key_reused`);
+- the return script is 1 to 10,000 bytes and no Arca script the server
+  knows (`script_reused`): what nobody takes up is paid to an address of the
+  payer's, never into the tree;
+- every coin given up passes the checks a participation's coins pass, in the
+  distribution's asset, attested over its id (`bad_attestation`), with
+  nothing of it in the signer's record (`double_spend`);
+- the coins hold exactly the claims and the fee (`unbalanced`), and the fee
+  covers the asset's schedule (`fee`): the refresh fee of each coin given
+  up, `refresh_base` for each claim leaf, and `offboard_base` once, for the
+  payment of the unclaimed leaves back to the payer.
+
+It is recorded as a participation whose outputs are the claim leaves, runs
+in the asset's ordinary round, and completes as a refresh does: once the
+round is final the payer hands over the forfeit of each coin it gave up
+(`forfeit_leaves`, with no unroll authorisations: the payer holds no claim
+key, and one handing any over is refused `leaf_set`), and the
+distribution's one preimage goes out. A payer that never hands its
+forfeits over keeps its coins, and the claim leaves are never opened.
+
+A holder finds its claims with `claims`, naming each of its keys with a
+proof of it, and gets, once the distribution is released, each claim's leaf,
+round, record, the preimage that opens its entry, its batch's first expiry
+and the deadline, the leaf's exit deadline three days before that expiry, by
+which the operator co-signs its take-up. The published tree carries every
+leaf's owner key and owner nonce too, so a holder can also find a claim in
+any copy of a tree by testing its keys. To take a claim up, the holder hands
+over its unroll authorisations for the leaf, signed by the claim key
+(`claim_leaf`): the server keeps the leaf's full record and credits it,
+since signatures that verify under the claim key prove the key. Then it
+spends the leaf as any coin is spent, through `cosign_transfer`, into a fresh
+leaf of its own. That spend is the claim, in the signer's record under the
+leaf's salt like every spend.
+
+`distribution_status` shows the payer each claim's state (`pending` until
+the distribution is released, `open`, `claimed`, `returned`), the deadline,
+and each payment back with its state. The return itself is the watcher's
+(see The watcher).
+
 ## Rounds
 
 A round carries one asset. Each asset the operator serves has rounds of its
@@ -1230,6 +1301,18 @@ one, nor for a reclaim before an owner under it has released.
   the chain, so a fully refreshed batch comes back before it expires; the
   watcher never unrolls a node with an owner who has not released.
 
+- **Returns.** A claim leaf of a distribution whose value a final sweep took
+  (the batch output, a node above the leaf, or its entry), with no spend of
+  it recorded, is a claim nobody took up. The watcher pays every such leaf of
+  a distribution to its return script, an explicit output in its asset, in
+  one transaction of the operator's wallet, its fee from the operator's own
+  coins (the distribution's asset where the node takes it, else the first of
+  the operator's fee assets it takes), recorded with the claims it returns
+  before the nursery broadcasts it. A leaf whose own output came on the chain
+  is its holder's and is never returned. The return is the operator's
+  payment, not a script: a payer relies on the operator for it, and checks it
+  against `distribution_status`.
+
 A fee is paid from the value a transaction takes, or from the margin its
 signers left, when the node accepts that asset for fees now and it covers the
 node's floor. A margin of more than twice the fee the wallet pays for the
@@ -1286,6 +1369,10 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
+| `POST distribute` | Accepts a distribution (see Distributions: claim trees), answered as `participation_status` answers |
+| `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
+| `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
+| `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |
@@ -1317,7 +1404,11 @@ only the payment hash, and a preimage proves only a payment;
 `lightning_receive` by the signature of the key the leaf is asked under,
 issued at the operator nonces' rate; `lightning_receive_claim` by the
 preimage and the owners' signatures over the transfer;
-`submit_participation` by each owner's attestation over the participation;
+`submit_participation` by each owner's attestation over the participation,
+and `distribute` by each coin's owner's attestation over the distribution;
+`claims` by a proof of each key it names, as a mailbox read is;
+`claim_leaf` by the claim key's signatures over the authorisations themselves;
+`distribution_status` needs only the distribution's id;
 `participation_status` needs only the participation's id, which is a hash
 of its request, and `tree` and `rounds` are public. `bind_mailbox` is authenticated by
 each leaf's owner key's signature over its binding. `forfeit_leaves` and `release_leaves`
@@ -2045,6 +2136,23 @@ is uncredited, broadcast again by the server and credited again; the signer
 going away mid-transfer leaves the spend recorded and the same request
 completes once it returns; and the server, holding no policy asset, co-signs
 and broadcasts a transaction whose fee is in another asset.
+
+`tests/distributions.rs` runs a claim tree: a payer's distribution of five
+claims from two boards, its forfeit step with no authorisation for a claim
+leaf (one with any refused `leaf_set`), each holder's lookup proven with its
+named key (another key's proof refused), one holder's authorisations by its
+named key refused and by its claim key taken, its take-up by a transfer and
+a second spend refused, its coin refreshed in its free window; then the
+claim batch's expiry, release, notice and sweep, after which the watcher
+pays the four claims nobody took up back to the return script, exactly, in
+one transaction, and nothing more at a later pass, while the holder that
+took its claim up still holds its coin. Every refusal of a distribution is
+asserted by its code and printed: a key named twice, claims that do not
+balance, a claim below the smallest leaf, an exit delay out of bounds, a fee
+in another asset, an Arca script or none as the return script, an
+attestation by another key, an asset not served, a claim key another
+distribution wants, authorisations before the distribution is released, and
+a lookup naming no key.
 
 `tests/reserving.rs` re-serves a wallet's leaves to its mailbox key. A board
 bound to it, a transfer's change posted to it and a leaf a participation

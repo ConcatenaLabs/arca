@@ -27,7 +27,10 @@
 //! node above each new leaf, so the server holds each new leaf's full coin
 //! record (record, preimage, authorisations) and can serve it, and pass it on
 //! inside any later transfer. The record must validate against the round as a
-//! receiver checks a coin.
+//! receiver checks a coin. A distribution's payer hands over none: its new
+//! leaves are its claims, under keys it does not hold, and each holder hands
+//! over its own when it takes its claim up
+//! ([`crate::participations::Participations::claim_leaf`]).
 //!
 //! The forfeits are recorded first, each with its owner's half, together
 //! with the new leaves' records and the messages the signer is to sign, so
@@ -334,14 +337,26 @@ impl Forfeits {
 				return Err(ForfeitError::LeafSet(format!("leaf {} is named twice", a.leaf_id)));
 			}
 		}
-		let new_ids: HashSet<LeafId> = at.leaves.iter().map(|(_, l, _, _)| LeafId(*l)).collect();
+		// A distribution's new leaves are its claims, under keys the payer
+		// does not hold: their holders hand their authorisations over when
+		// they take them up (`claim_leaf`), and the payer hands none.
+		let distribution = self.store.is_distribution(&id).await?;
+		let new_ids: HashSet<LeafId> = if distribution {
+			HashSet::new()
+		} else {
+			at.leaves.iter().map(|(_, l, _, _)| LeafId(*l)).collect()
+		};
 		if auths.len() != new_ids.len() || auths.keys().any(|l| !new_ids.contains(l)) {
-			return Err(ForfeitError::LeafSet(format!("{} set(s) for the {} new leaf/leaves", auths.len(), new_ids.len())));
+			return Err(ForfeitError::LeafSet(match distribution {
+				true => format!("{} set(s) of unroll authorisations for a distribution: its claim leaves are authorised by their holders, \
+					never by the payer", auths.len()),
+				false => format!("{} set(s) for the {} new leaf/leaves", auths.len(), new_ids.len()),
+			}));
 		}
 		// The round was built under the bounds of the time.
 		let receipt = self.params.taken_policy(now);
 		let mut records = Vec::with_capacity(new_ids.len());
-		for (_, leaf, _, _) in &at.leaves {
+		for (_, leaf, _, _) in at.leaves.iter().filter(|(_, l, _, _)| new_ids.contains(&LeafId(*l))) {
 			let leaf = LeafId(*leaf);
 			let row = self.store.batch_leaf(&leaf.0).await?.ok_or_else(|| ForfeitError::Internal(format!("leaf {} is not in a batch", leaf)))?;
 			let record = LeafRecord::from_bytes(&row.record).map_err(|e| ForfeitError::Internal(e.to_string()))?;

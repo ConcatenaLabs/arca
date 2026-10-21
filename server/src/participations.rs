@@ -89,6 +89,9 @@ use arca_covenant::{
 	RelativeTime, Take, TakeLeaf, Template, ValidCoin,
 };
 
+#[path = "distributions.rs"]
+pub mod distributions;
+
 use crate::chain::FinalityService;
 use crate::coins::{self, CoinError};
 use crate::fees;
@@ -301,6 +304,14 @@ pub enum ParticipationError {
 	Fee(String),
 	#[error("no participation {0} is known")]
 	Unknown(String),
+	#[error("leaf {0} is no claim of a distribution this server knows")]
+	UnknownClaim(LeafId),
+	#[error("claim leaf {0} is not open yet: its distribution is not released, so no preimage opens its entry; it is taken up once \
+		its payer has handed over its forfeits")]
+	ClaimNotReleased(LeafId),
+	#[error("the return script is a script the server knows as an Arca script: what no holder takes up is paid to an address of the \
+		payer's, never into the tree")]
+	ReturnScriptReused,
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	/// The operator's signer holds a forfeit or a spend under a coin's salt.
@@ -357,6 +368,9 @@ impl ParticipationError {
 			Unbalanced(_) => "unbalanced",
 			Fee(_) => "fee",
 			Unknown(_) => "unknown_participation",
+			UnknownClaim(_) => "unknown_leaf",
+			ClaimNotReleased(_) => "not_live",
+			ReturnScriptReused => "script_reused",
 			NotSynced => "not_synced",
 			SignedAlready(_) => "double_spend",
 			Signer(_) => "signer_unavailable",
@@ -765,6 +779,7 @@ impl Participations {
 			outputs: wanted,
 			fees: req.fees.iter().map(|(a, v)| (a.into_inner().to_byte_array(), *v)).collect(),
 			fill: None,
+			distribution: None,
 		};
 		match self.store.insert_participation(&new).await {
 			Ok(()) => {},
@@ -944,6 +959,7 @@ impl Participations {
 				filled: req.filled,
 				price,
 			}),
+			distribution: None,
 		};
 		match self.store.insert_participation(&new).await {
 			Ok(()) => {},
