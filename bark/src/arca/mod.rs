@@ -22,6 +22,10 @@
 //! - [`order`]: an order placed on the chain from the wallet's leaves, by an
 //!   offboard into the address SeqDEX's fill covenant makes for its terms;
 //!   where it rests and what filled it, read from the chain; its REFUND.
+//! - [`btc_swap`]: a swap of native BTC in a Bitcoin ark for an asset in the
+//!   operator's tree, with another wallet of the operator, under one payment
+//!   hash; the Bitcoin side, Bark, is run by the program, which hands in what
+//!   Bark says and is told what Bark must run next.
 //! - [`Wallet`]: the operations — create, board, receive, send, read the
 //!   mailbox, take part in a round, take an on-chain order in a round
 //!   ([`Wallet::take`]), place one ([`Wallet::order_place`]), swap, exit,
@@ -86,6 +90,7 @@
 //! longer than its margin leaves a fee race the operator can still win by
 //! burning the leaf's value.
 
+pub mod btc_swap;
 pub mod chain;
 pub mod client;
 pub mod command;

@@ -397,6 +397,9 @@ pub struct Rounds {
 	/// One spend at a time of a dropped round's own coin
 	/// ([`Rounds::void_on_chain`]), so a round is voided by one transaction.
 	voiding: Mutex<()>,
+	/// One pass at a time over the rounds built and not yet broadcast, so a
+	/// round one pass hands to the node is never dropped by another.
+	going_out: Mutex<()>,
 }
 
 /// How the orders of a fill round not yet broadcast stand at the node, each
@@ -426,7 +429,8 @@ impl Rounds {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, wallet: Arc<Wallet>, nursery: Arc<Nursery>,
 		config: RoundConfig) -> Arc<Rounds>
 	{
-		Arc::new(Rounds { store, finality, params, wallet, nursery, config, running: Mutex::new(()), voiding: Mutex::new(()) })
+		Arc::new(Rounds { store, finality, params, wallet, nursery, config, running: Mutex::new(()), voiding: Mutex::new(()),
+			going_out: Mutex::new(()) })
 	}
 
 	pub fn config(&self) -> &RoundConfig {
@@ -1409,6 +1413,7 @@ impl Rounds {
 	/// whose forfeits are overdue expires, and every pending participation
 	/// with a coin past its exit deadline is voided.
 	pub async fn pass(&self) -> Result<(), RoundError> {
+		let going_out = self.going_out.lock().await;
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let fills = !self.store.round_fills(r.round_id).await?.is_empty();
 			if fills {
@@ -1419,6 +1424,15 @@ impl Rounds {
 					OrdersNow::Rest => {},
 					OrdersNow::Wait(why) => {
 						log::warn!("round {} ({}) waits before it goes out: {}", r.round_id, Txid::from_byte_array(r.txid), why);
+						continue;
+					},
+					// An order spent by the round itself: the node holds the
+					// round, handed to it before it was recorded as broadcast
+					// (the server stopped in between). It is broadcast, and
+					// goes on as any broadcast round.
+					OrdersNow::Taken(_) if self.node_holds(&r).await? => {
+						self.store.set_round_state(r.round_id, RoundState::Built, RoundState::Broadcast).await?;
+						log::warn!("round {} ({}) is held by the node: recorded as broadcast", r.round_id, Txid::from_byte_array(r.txid));
 						continue;
 					},
 					OrdersNow::Taken(voids) => {
@@ -1445,6 +1459,7 @@ impl Rounds {
 				}
 			}
 		}
+		drop(going_out);
 		// A round held as lost that is final again, before anything is
 		// retired: the parent chain decides which round stands.
 		for r in self.store.rounds_in(RoundState::Lost).await? {
@@ -1633,6 +1648,15 @@ impl Rounds {
 		Err(RoundError::Internal(format!("no coin of round {} could be spent back now: {}", round_txid, last)))
 	}
 
+	/// Whether the node holds the round `r` now: in a block of the chain the
+	/// server follows, or in its mempool. (Not `getrawtransaction`, whose
+	/// index can lag a block just connected.)
+	async fn node_holds(&self, r: &RoundRow) -> Result<bool, RoundError> {
+		let txid = Txid::from_byte_array(r.txid);
+		Ok(self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain()
+			|| self.finality.call(|c| c.mempool()).await.map_err(|e| RoundError::Chain(e.to_string()))?.contains(&txid))
+	}
+
 	/// Retires `r`, a broadcast fill round, as lost when the node does not
 	/// hold it (it refused it, or it left the mempool) because another
 	/// transaction took an order of it: each order input is looked up at the
@@ -1656,12 +1680,7 @@ impl Rounds {
 		}
 		let txid = Txid::from_byte_array(r.txid);
 		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
-		// The node holds it: in a block of the chain the server follows, or
-		// in its mempool. (Not `getrawtransaction`, whose index can lag a
-		// block just connected.)
-		if self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain()
-			|| self.finality.call(|c| c.mempool()).await.map_err(chain)?.contains(&txid)
-		{
+		if self.node_holds(r).await? {
 			return Ok(false);
 		}
 		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;

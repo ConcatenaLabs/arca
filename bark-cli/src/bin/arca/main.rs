@@ -288,6 +288,11 @@ enum Cmd {
 	/// An in-tree swap of two assets with another wallet.
 	#[command(subcommand)]
 	Swap(SwapCmd),
+	/// A swap of native BTC in a Bitcoin ark for an asset in this operator's
+	/// tree, with another wallet of the operator, under one payment hash:
+	/// the asset through the operator, the BTC through Bark.
+	#[command(subcommand, name = "btc-swap")]
+	BtcSwap(BtcSwapCmd),
 	/// Every refusal the wallet made, with its reason.
 	Refusals,
 	/// The Bitcoin side: Bark's wallet for Bitcoin arks, in `<datadir>/bitcoin`.
@@ -430,6 +435,152 @@ enum SwapCmd {
 	},
 	/// Cancels an offer or acceptance not completed.
 	Cancel { swap: String },
+}
+
+#[derive(Subcommand)]
+enum BtcSwapCmd {
+	/// Offers a swap: `--give btc` gives `--sats` of BTC for `--atoms` of
+	/// `--asset`; `--give asset` gives the atoms for the BTC, and makes now
+	/// the Bitcoin invoice the taker will pay. Shows what the wallet gives
+	/// and gets, with every fee; nothing is locked. The offer lapses after
+	/// `--lapse-seconds`, or with the invoice.
+	Offer {
+		#[arg(long)]
+		give: String,
+		#[arg(long)]
+		asset: String,
+		#[arg(long)]
+		atoms: u64,
+		#[arg(long)]
+		sats: u64,
+		#[arg(long, default_value_t = 1800)]
+		lapse_seconds: u64,
+	},
+	/// What taking an offer would give and get, with every fee; asks for,
+	/// makes and locks nothing.
+	Read { offer: String },
+	/// Takes an offer: as the one who gets the asset, asks the operator to
+	/// receive it under the hash of the maker's Bitcoin invoice; as the one
+	/// who gets the BTC, makes the Bitcoin invoice the maker will pay.
+	/// Nothing is locked. Prints the take, for the maker to complete.
+	Take { offer: String },
+	/// Completes the wallet's offer with the taker's take.
+	Complete { take: String },
+	/// Moves the wallet's swaps on (or the one named), running Bark as each
+	/// needs: the lock of the asset, the claim of the BTC while the payer
+	/// pays (in slices of `--claim-slice` seconds), the payment of the BTC
+	/// once the asset leaf is held and final, the claim of that leaf with the
+	/// preimage. Goes on for `--wait` seconds; one pass when 0.
+	Follow {
+		swap: Option<String>,
+		#[arg(long, default_value_t = 0)]
+		wait: u64,
+		#[arg(long, default_value_t = 20)]
+		claim_slice: u64,
+	},
+	/// Every swap the wallet takes part in, with where it stands, and the
+	/// legs a restore found of swaps whose record it lost.
+	List,
+	/// Cancels a swap the wallet has locked nothing of yet.
+	Cancel { swap: String },
+}
+
+/// `arca btc-swap …`: the Sequentia side is the library's
+/// ([`bark::arca::btc_swap`]); this runs Bark for the Bitcoin side and hands
+/// it what Bark said.
+fn btc_swap(w: &mut Wallet, datadir: &Path, c: BtcSwapCmd) -> Result<Value, bark::arca::Error> {
+	let gets_btc = |offer: &str, w: &mut Wallet, ark: &Value| -> Result<bool, bark::arca::Error> {
+		Ok(w.btc_swap_read(offer, &json!({"ark_info": ark}))?["role"] == "P")
+	};
+	match c {
+		BtcSwapCmd::Offer { give, asset: a, atoms, sats, lapse_seconds } => {
+			let ark = bitcoin::ark_info(datadir)?;
+			let p = give != "btc";
+			let fee = bitcoin::lightning_fee(datadir, if p { "receive" } else { "pay" }, sats)?;
+			let mut b = json!({"ark_info": ark, "fee": fee});
+			// The giver of the asset makes the Bitcoin invoice now; an offer
+			// refused cancels it.
+			let made = if p && give == "asset" {
+				let inv = bitcoin::invoice(datadir, sats, Some("btc swap"))?["invoice"].as_str().unwrap_or("").to_string();
+				b["invoice"] = json!(inv);
+				Some(inv)
+			} else { None };
+			w.btc_swap_offer(&give, asset(&a)?, atoms, sats, lapse_seconds, &b).inspect_err(|_| {
+				if let Some(i) = &made {
+					let _ = bitcoin::cancel_receive(datadir, i);
+				}
+			})
+		},
+		BtcSwapCmd::Read { offer } => {
+			let ark = bitcoin::ark_info(datadir)?;
+			let p = gets_btc(&offer, w, &ark)?;
+			let v = w.btc_swap_read(&offer, &json!({"ark_info": ark}))?;
+			let fee = bitcoin::lightning_fee(datadir, if p { "receive" } else { "pay" }, v["sats"].as_str().and_then(|s| s.parse().ok())
+				.unwrap_or(0))?;
+			w.btc_swap_read(&offer, &json!({"ark_info": ark, "fee": fee}))
+		},
+		BtcSwapCmd::Take { offer } => {
+			let ark = bitcoin::ark_info(datadir)?;
+			let p = gets_btc(&offer, w, &ark)?;
+			let sats: u64 = w.btc_swap_read(&offer, &json!({"ark_info": ark}))?["sats"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+			let fee = bitcoin::lightning_fee(datadir, if p { "receive" } else { "pay" }, sats)?;
+			let mut b = json!({"ark_info": ark, "fee": fee});
+			let made = if p {
+				let inv = bitcoin::invoice(datadir, sats, Some("btc swap"))?["invoice"].as_str().unwrap_or("").to_string();
+				b["invoice"] = json!(inv);
+				Some(inv)
+			} else { None };
+			w.btc_swap_take(&offer, &b).inspect_err(|_| {
+				if let Some(i) = &made {
+					let _ = bitcoin::cancel_receive(datadir, i);
+				}
+			})
+		},
+		BtcSwapCmd::Complete { take } => {
+			let ark = bitcoin::ark_info(datadir)?;
+			w.btc_swap_complete(&take, &json!({"ark_info": ark}))
+		},
+		BtcSwapCmd::Follow { swap, wait, claim_slice } => {
+			// A `bark` a stopped run left behind finishes first.
+			let ark = bitcoin::ark_info_waiting(datadir, std::time::Duration::from_secs(wait.max(120)))?;
+			let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+			let mut ran = vec![];
+			loop {
+				let steps = w.btc_swap_follow(swap.as_deref(), &json!({"ark_info": ark}))?;
+				let mut acted = false;
+				for s in &steps {
+					let (Some(id), Some(b)) = (s["swap"].as_str(), s.get("bitcoin")) else { continue };
+					let inv = b["invoice"].as_str().unwrap_or("");
+					let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+					let result = match b["action"].as_str() {
+						Some("claim") => bitcoin::claim_for_swap(datadir, inv, std::time::Duration::from_secs(claim_slice.min(left).max(5))),
+						Some("pay") => bitcoin::pay_for_swap(datadir, inv),
+						Some("pay_status") => bitcoin::pay_status_for_swap(datadir, inv),
+						Some("cancel_receive") => bitcoin::cancel_receive(datadir, inv),
+						_ => continue,
+					};
+					acted |= result["state"] != "waiting" && result["state"] != "pending";
+					let after = w.btc_swap_bitcoin(id, &result)?;
+					ran.push(json!({"swap": id, "bitcoin": result, "after": after}));
+				}
+				let done = steps.iter().all(|s| s.get("bitcoin").is_none());
+				if std::time::Instant::now() >= until || (done && wait == 0) {
+					return Ok(json!({"swaps": steps, "bitcoin": ran}));
+				}
+				if !acted {
+					std::thread::sleep(std::time::Duration::from_secs(2));
+				}
+			}
+		},
+		BtcSwapCmd::List => w.btc_swaps(),
+		BtcSwapCmd::Cancel { swap } => {
+			let mut v = w.btc_swap_cancel(&swap)?;
+			if let Some(i) = v["bitcoin"]["invoice"].as_str().map(String::from) {
+				v["bitcoin"]["result"] = bitcoin::cancel_receive(datadir, &i);
+			}
+			Ok(v)
+		},
+	}
 }
 
 fn asset(s: &str) -> Result<AssetId, bark::arca::Error> {
@@ -901,6 +1052,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
+		Cmd::BtcSwap(c) => btc_swap(&mut w, &datadir, c),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
 	}
