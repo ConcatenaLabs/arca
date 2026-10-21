@@ -209,7 +209,7 @@ impl Wallet {
 				continue;
 			}
 			match CoinRecord::from_bytes(&c.record) {
-				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() => out.push(c),
+				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() => out.push(c),
 				_ => {},
 			}
 		}

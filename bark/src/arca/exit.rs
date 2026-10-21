@@ -257,6 +257,13 @@ impl Wallet {
 		-> Result<UnrollTx, Error>
 	{
 		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
+		// A resting order's coin comes home by its landing, after the same
+		// delay: the whole of it as SeqDEX's own order for the same terms,
+		// which any taker fills on the chain, paying the order key's output;
+		// a fee coin pays, as the landing keeps nothing for one.
+		if let Some(o) = leaf.order_policy() {
+			return self.with_fee(payer, &|f| o.landing_tx(leaf_at, value, f).map_err(|e| Error::Refused(e.to_string())));
+		}
 		let min_fee = payer.min_fee;
 		self.key_spend_with(payer, key, after, &|f| {
 			let out = match f {
@@ -269,10 +276,6 @@ impl Wallet {
 				},
 				FeeSource::Coin { .. } | FeeSource::Burning { .. } => ExplicitOutput::new(asset, value, to.clone()),
 			};
-			if leaf.order.is_some() {
-				return Err(Error::Refused("a resting order's coin comes home by its landing, as SeqDEX's own order, not by a claim of \
-					its owner's".into()));
-			}
 			match leaf.htlc {
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
 				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
@@ -1368,6 +1371,12 @@ impl Wallet {
 		// and unlocked by the wallet when the operator has not.
 		let orders = self.progress_orders().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		self.exits_meanwhile();
+		// Each order resting in the tree: published once its round is final
+		// and its participation released; each fill the wallet sent and has
+		// no answer to sent again.
+		let resting = if talk { self.progress_resting().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
+		self.exits_meanwhile();
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
 		if talk {
@@ -1430,6 +1439,9 @@ impl Wallet {
 		}
 		if orders.as_array().is_none_or(|o| !o.is_empty()) {
 			out["orders"] = orders;
+		}
+		if resting.as_array().is_none_or(|o| !o.is_empty()) {
+			out["resting"] = resting;
 		}
 		if plans.as_array().is_none_or(|p| !p.is_empty()) {
 			out["plans"] = plans;

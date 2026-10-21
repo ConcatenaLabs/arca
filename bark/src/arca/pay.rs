@@ -357,6 +357,11 @@ impl Wallet {
 			if planned.contains(&row.leaf_id) {
 				continue;
 			}
+			// A resting order's coin is the order: a fill, a cancel or its
+			// landing spends it.
+			if super::resting::is_order_coin(&row) {
+				continue;
+			}
 			let (_, a) = self.held(&row)?;
 			if !a.all_final() {
 				continue;
@@ -850,7 +855,11 @@ impl Wallet {
 		if let Some(v) = self.held_again(&id, &record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?)? {
 			return Ok(v);
 		}
-		if row.state != "pending" {
+		// A resting order, resting again after a fill, is under its order's
+		// own key and nonce: every coin of its lineage is.
+		let rest = row.purpose == "resting order"
+			&& matches!(&record, CoinRecord::Fill(f) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }));
+		if row.state != "pending" && !rest {
 			return Err(Error::Refused(format!("a second coin for the single-use key {} (it already holds {})",
 				owner, row.leaf_id.unwrap_or_default())));
 		}
@@ -920,16 +929,25 @@ impl Wallet {
 		}
 		let coin = self.row(&record, &a, state, &note)?;
 		// The wallet's own coins this transfer spent (a swap's side).
-		let spent: Vec<String> = match &record {
+		let mut spent: Vec<String> = match &record {
 			CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| {
 				let (_, n) = owner_of(&i.coin);
 				self.store.nonce(&n).ok().flatten().and_then(|r| r.leaf_id)
 			}).collect(),
 			_ => vec![],
 		};
+		// A fill's coin: the order's coin it spent (the maker's) and the
+		// taker's coins, by their ids, which the record gives.
+		if let arca_covenant::ValidOrigin::Fill { order, inputs, .. } = &a.valid.origin {
+			for id in std::iter::once(order.id).chain(inputs.iter().map(|i| i.coin.id)) {
+				if self.store.coin(&id.to_string())?.is_some() {
+					spent.push(id.to_string());
+				}
+			}
+		}
 		self.store.atomically(|s| {
 			s.put_coin(&coin)?;
-			s.use_nonce(&nonce, &id)?;
+			if rest && row.state != "pending" { s.move_nonce(&nonce, &id)? } else { s.use_nonce(&nonce, &id)? }
 			for l in &spent {
 				if let Some(c) = s.coin(l)? {
 					if c.state != "spent" {

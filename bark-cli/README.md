@@ -886,6 +886,55 @@ memory and an offer lasts at most seven days (the wallet's lasts six, and ends
 before the operator's margin ahead of the REFUND): post the offer `orders`
 hands out again after a relay restart or before it expires.
 
+### Resting an order in the tree
+
+An order can also rest in the tree, as a leaf of its own (`order-2`), where
+takers fill it while the wallet is away. Each fill is co-signed by the
+operator alone, and the leaf's program holds every fill to the order's terms:
+the maker's credit, a leaf of the asset the order is paid in under the next of
+four credit keys of the wallet's, at least the price; and for a part fill the
+order resting again under a new salt. An order fills at most four times; what
+rests after the fourth is the maker's to cancel.
+
+`arca order rest` gives up leaves of the asset the order sells for one leaf of
+exactly the amount, paying their refresh fees (`--quote` shows them, and
+`--shown` rests on that very fee and those coins). The wallet checks the leaf
+the operator's round makes against exactly the terms it asked for before it
+signs a forfeit: a leaf of other terms, or a resting order where it asked for
+none, is refused. Once the round is final, `sync` hands over the forfeit and
+publishes the order to the operator; the wallet may then stop. On its return,
+`sync` takes up each credit and the order resting again from the wallet's
+mailbox, and the coin each fill spent is shown spent. `arca order resting`
+shows each order as the operator does: where it rests, what is left, its fills,
+and the credits the wallet holds of it. An order's coin is never paid on,
+refreshed by default or planned: `arca order cancel-resting` cancels it, a
+transfer of what rests into a leaf of the wallet's own.
+
+`arca order fill-resting ORDER` fills another maker's order by its id. The
+wallet reads the order, rebuilds the coin's script from its terms and checks
+the coin against its round before it signs anything, then gives up coins of
+the asset the order is paid in that expire no earlier than the order's coin
+(the operator takes no others), each through a checkpoint, for a leaf of what
+it fills and its change. A fill the operator does not answer is sent again,
+unchanged, by the next `sync`.
+
+An order's coin brought on the chain (`arca exit`) comes home by its landing:
+after the exit delay the whole of it becomes SeqDEX's own order for the same
+terms, which anyone fills on the chain with no signature, paying the order
+key's output (`landed_pays`, which the wallet scans). What rests of it
+unfilled is the order key's to refund once the chain passes the order's
+expiry, by SeqDEX's program; the wallet does not sign that refund. A coin the
+operator co-signed a fill of is answered there by the operator with the fill,
+within the delay.
+
+    arca order rest --sell X --amount 1000000 --for Y --rate-num 2 --rate-den 1 \
+        --min-lot 100000 --expires-in-hours 720 --quote       # the fee, the coins
+    arca order rest … --shown '<the quote>'                   # its round runs
+    arca sync                                                 # forfeit in; published
+    arca order fill-resting ORDER --amount 300000             # a taker, in the tree
+    arca sync                                                 # the maker: credits, what rests
+    arca order cancel-resting ORDER
+
 ### Taking an on-chain order
 
 An order resting on the chain under SeqDEX's fill covenant sells one asset
@@ -1149,6 +1198,10 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
 | `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
 | `order fill ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown FILL]` | `take` (see Taking an on-chain order), by the name an order's side goes by |
+| `order rest --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--max-fee-ppm N] [--quote \| --shown QUOTE]` | Rests an order in the tree as a leaf of its own (see Resting an order in the tree): with `--quote`, only says what it would cost; with `--shown` it is rested only on that fee and those coins. Answers the participation that rests it and `landed_pays`, the script a landed order's fills pay; `sync` publishes it once its round is final |
+| `order resting [ORDER…]` | The wallet's resting orders as the operator shows them (state, coin, what is left, each fill) with the credits the wallet holds of each, and any other resting orders named |
+| `order fill-resting ORDER [--amount N]` | Fills another maker's resting order in the tree: what is filled, the price paid, the fill's fee and the change, and the coins it makes the wallet's |
+| `order cancel-resting ORDER` | Cancels a resting order of the wallet's: what rests comes back to a leaf of its own |
 | `order refund ORDER [--fee-asset A]` | Takes what order `ORDER` holds where it rests home by its REFUND, once the chain's median time has passed its expiry, to an address of the wallet's; the fee from the order's own value where the node takes its asset for fees, else from an on-chain coin in `A` |
 | `distribute LIST --asset A [--return ADDRESS] [--quote \| --shown FEE]` | Pays the holders of `LIST` (a file or `-`, a line `KEY AMOUNT` each) in one round (see Paying many holders in one round): with `--quote`, only says what it would cost (the operator's fee, the coins it gives up, whether the wallet first pays itself a coin of exactly the claims and the fee), signing and asking nothing; with `--shown`, goes ahead only on that very fee. Refused before anything is signed, with `--quote` too: a key named twice, a claim below the operator's smallest leaf, a key the text does not name (a P2WPKH address), claims and a fee beyond what the wallet's live coins of the asset hold; without `--quote`, a fee that changed since it was shown |
 | `distributions` | Every distribution the wallet made, as the operator shows it: its state, round, deadline and expiry, each claim's key, claim key, value, leaf and state (`pending`, `open`, `claimed`, `returned`), and each payment of what no holder took up back to the return script, with its state |
@@ -1262,6 +1315,19 @@ orders`, boards its credits from the order key, and its REFUND is refused by
 the wallet and by the node before the expiry and mined after it. A second
 test runs an operator whose watcher never unlocks the order: the maker's
 `sync` unlocks it itself once the ten minutes have passed.
+
+`tests/arca_resting.rs` runs the same way: a maker that holds only leaves of
+X rests an order selling 1,000,000 X for Y with `arca order rest`, each
+refusal printed (a height as the expiry, an expiry within the operator's
+margin, more than it holds, one asset for itself, an amount below the lot),
+the fee quoted and shown; its `sync` publishes the order once the round is
+final. Two wallets holding leaves of Y fill it in part with `arca order
+fill-resting` (each refusal printed first: below the lot, leaving less than a
+lot resting, an order not published), each holding its leaf of X. The maker's
+one `sync` on return takes up both credits and what rests; `arca order
+resting` shows both fills. It cancels what rests, and a fill after is refused.
+A second maker's order is brought on with `arca exit`, lands after the exit
+delay as SeqDEX's order, and a taker on the chain fills it with no signature.
 
 `tests/arca_claims.rs` runs the same way: a payer boards its X and pays 20
 holders in one round with `arca distribute` (the wallet first paying itself a

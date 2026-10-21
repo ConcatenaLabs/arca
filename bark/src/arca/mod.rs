@@ -110,6 +110,7 @@ pub mod order;
 mod pay;
 pub mod plan;
 mod restore;
+pub mod resting;
 mod round;
 mod take;
 mod wallet;

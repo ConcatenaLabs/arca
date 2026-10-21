@@ -479,6 +479,71 @@ enum OrderCmd {
 		#[arg(long)]
 		shown: Option<String>,
 	},
+	/// Rests an order in the tree, as a leaf of its own (`order-2`): takers
+	/// fill it there while the wallet is away, each fill under the
+	/// operator's signature and held by the leaf's program to these terms.
+	/// It gives up leaves of `--sell` for one leaf of exactly `--amount` of
+	/// it, paying their refresh fees (shown before anything is signed with
+	/// `--quote`, then `--shown`). Once the operator's round is final, `sync`
+	/// hands over the forfeits and publishes the order; each `sync` after
+	/// takes up the credits its fills pay and what rests. Brought on the
+	/// chain, the order lands after the exit delay as SeqDEX's own order for
+	/// the same terms, filled on the chain by anyone and refundable by the
+	/// order key from `--expires`.
+	Rest {
+		/// The asset the order sells.
+		#[arg(long)]
+		sell: String,
+		/// How much of it, in its atoms: exactly what the order holds.
+		#[arg(long)]
+		amount: u64,
+		/// The asset it is paid in.
+		#[arg(long = "for")]
+		want: String,
+		#[arg(long)]
+		rate_num: u64,
+		#[arg(long)]
+		rate_den: u64,
+		/// The least a fill takes and a remainder holds; the whole amount
+		/// when not named.
+		#[arg(long)]
+		min_lot: Option<u64>,
+		/// The median time from which its landed order may be refunded; the
+		/// operator co-signs no fill within its order margin of it.
+		#[arg(long, required_unless_present = "expires_in_hours", conflicts_with = "expires_in_hours")]
+		expires: Option<u32>,
+		/// The same, as hours from the chain's median time now.
+		#[arg(long)]
+		expires_in_hours: Option<u32>,
+		/// The most the fee may take of the amount, in millionths: 10,000
+		/// unless raised.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what resting the order would cost, signing and asking
+		/// nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The quote shown to the user, as `--quote` answered it.
+		#[arg(long)]
+		shown: Option<String>,
+	},
+	/// The orders the wallet rests in the tree, as the operator shows them
+	/// (where each rests, what is left, its fills) with the credits the
+	/// wallet holds of each; and any other resting orders named by their ids.
+	Resting { orders: Vec<String> },
+	/// Fills another maker's order resting in the tree, by its id: the
+	/// wallet checks the coin it rests at against its round, and pays with
+	/// its own coins of the asset the order is paid in that expire no earlier.
+	FillResting {
+		order: String,
+		/// How much of the asset the order sells to take, in its atoms; all
+		/// of what rests when not named.
+		#[arg(long)]
+		amount: Option<u64>,
+	},
+	/// Cancels an order the wallet rests in the tree: what rests of it comes
+	/// back to a leaf of the wallet's own.
+	CancelResting { order: String },
 	/// Takes back what an order holds where it rests, by its REFUND, once
 	/// the chain's median time has passed its expiry: to an address of the
 	/// wallet's.
@@ -1150,6 +1215,26 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			wait_for_order(&mut w, placed, wait)
 		},
 		Cmd::Order(OrderCmd::Refund { order, fee_asset }) => w.order_refund(&order, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::Order(OrderCmd::Rest { sell, amount, want, rate_num, rate_den, min_lot, expires, expires_in_hours, max_fee_ppm, quote,
+			shown }) =>
+		{
+			let expiry = match (expires, expires_in_hours) {
+				(Some(t), _) => t,
+				(None, Some(h)) => w.expiry_in(h.saturating_mul(3600))?,
+				(None, None) => unreachable!("clap requires one"),
+			};
+			let ask = bark::arca::resting::RestAsk { sell: asset(&sell)?, amount, want: asset(&want)?, rate_num, rate_den,
+				min_lot: min_lot.unwrap_or(amount), expiry };
+			if quote {
+				return w.order_rest_quote(&ask, max_fee_ppm);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the order shown: {}", e)))).transpose()?;
+			w.order_rest(&ask, max_fee_ppm, shown.as_ref())
+		},
+		Cmd::Order(OrderCmd::Resting { orders }) => w.resting_orders(&orders),
+		Cmd::Order(OrderCmd::FillResting { order, amount }) => w.order_fill_resting(&order, amount),
+		Cmd::Order(OrderCmd::CancelResting { order }) => w.order_cancel_resting(&order),
 		Cmd::Orders => w.orders(),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
