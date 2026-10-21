@@ -834,9 +834,10 @@ script, and the fee. The server takes it only when:
 - each claim's value is within the asset's bounds and the exit delay within
   the operator's (`out_of_bounds`); no claim key is `S` (`operator_key`) or
   owns a leaf or is wanted by another participation (`key_reused`);
-- the return script is 1 to 10,000 bytes and no Arca script the server
-  knows (`script_reused`): what nobody takes up is paid to an address of the
-  payer's, never into the tree;
+- the return script is a standard address, P2PKH, P2SH, P2WPKH, P2WSH or
+  P2TR (`out_of_bounds`), so the payment back relays, and no Arca script the
+  server knows (`script_reused`): what nobody takes up is paid to an address
+  of the payer's, never into the tree;
 - every coin given up passes the checks a participation's coins pass, in the
   distribution's asset, attested over its id (`bad_attestation`), with
   nothing of it in the signer's record (`double_spend`);
@@ -2149,7 +2150,8 @@ one transaction, and nothing more at a later pass, while the holder that
 took its claim up still holds its coin. Every refusal of a distribution is
 asserted by its code and printed: a key named twice, claims that do not
 balance, a claim below the smallest leaf, an exit delay out of bounds, a fee
-in another asset, an Arca script or none as the return script, an
+in another asset, an Arca script, a script that is no standard address or
+none as the return script, an
 attestation by another key, an asset not served, a claim key another
 distribution wants, authorisations before the distribution is released, and
 a lookup naming no key.

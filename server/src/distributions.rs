@@ -21,8 +21,8 @@
 //! - each claim's value is within the asset's published bounds, its exit
 //!   delay within the operator's, and its claim key is not the operator's `S`
 //!   and owns no leaf;
-//! - the return script is an explicit destination of 1 to
-//!   [`arca_covenant::offboard::MAX_DESTINATION`] bytes that is no Arca script
+//! - the return script is a standard address (P2PKH, P2SH, P2WPKH, P2WSH or
+//!   P2TR), so the payment of the unclaimed leaves relays, and no Arca script
 //!   the server knows;
 //! - every coin given up passes what a refresh's coins pass, attested over
 //!   the distribution's id, with nothing of it in the signer's record;
@@ -155,6 +155,10 @@ impl Participations {
 		if ret.is_empty() || ret.len() > arca_covenant::offboard::MAX_DESTINATION {
 			return Err(ParticipationError::OutOfBounds(format!("a return script of {} bytes; it takes 1 to {}", ret.len(),
 				arca_covenant::offboard::MAX_DESTINATION)));
+		}
+		if !(ret.is_p2pkh() || ret.is_p2sh() || ret.is_v0_p2wpkh() || ret.is_v0_p2wsh() || ret.is_v1_p2tr()) {
+			return Err(ParticipationError::OutOfBounds("the return script is no standard address (P2PKH, P2SH, P2WPKH, P2WSH or P2TR): \
+				what no holder takes up is paid back on the chain, and a payment the node does not relay is never made".into()));
 		}
 		if self.store.arca_script(ret.as_bytes()).await?.is_some() {
 			return Err(ParticipationError::ReturnScriptReused);

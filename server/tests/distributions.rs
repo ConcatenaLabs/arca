@@ -286,6 +286,7 @@ async fn a_distribution_is_refused_for_what_it_breaks() {
 	};
 	try_(&r, &good, &board_spk, &[], exit_delay(), "script_reused", "a return script that is an Arca script");
 	try_(&r, &good, &Script::new(), &[], exit_delay(), "malformed", "no return script");
+	try_(&r, &good, &Script::from(vec![0x6a, 0x01, 0x07]), &[], exit_delay(), "out_of_bounds", "a return script that is no standard address");
 	// An attestation by another key.
 	let (mut body, _) = distribute_body(&r, &[&b1], x, &good, &ret, &[], exit_delay());
 	body["inputs"][0]["attestation"] = json!(hex(sign_digest(&h[2], &[1; 32], &random32()).as_ref()));
