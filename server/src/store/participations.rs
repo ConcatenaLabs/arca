@@ -681,19 +681,10 @@ impl Store {
 		).await?)
 	}
 
-	/// Retires the round `round_id`, which went out of the chain, whole or not
-	/// at all: the round is lost, its new leaves not yet spent are lost, and
-	/// every participation it ran runs again in a later round as an ordinary
-	/// participation, under a new unlock hash, with a new operator nonce for
-	/// each leaf it wants (its keys and owner nonces as before), the attempt
-	/// it leaves recorded, and any release of the coins it gave up retired.
-	/// The coins those participations gave up stay given up. The round's row
-	/// lock orders this against [`Store::insert_watcher_tx`]: a forfeit naming
-	/// the round is logged before it is lost, or never. Returns the
-	/// participations that run again.
 	/// Drops the round `round_id`, built and never broadcast, whole or not
 	/// at all: a round that fills on-chain orders whose takes did not all
-	/// hand over their forfeits in time. Every forfeit recorded for it (each
+	/// hand over their forfeits in time, or one of whose orders another
+	/// transaction took before it went out. Every forfeit recorded for it (each
 	/// an owner's half only: the signer is asked for nothing before a round
 	/// is broadcast) is deleted, and the round retired as
 	/// [`Store::retire_round`] retires one, its participations running again.
@@ -714,6 +705,16 @@ impl Store {
 		Ok(Some(again))
 	}
 
+	/// Retires the round `round_id`, which went out of the chain, whole or not
+	/// at all: the round is lost, its new leaves not yet spent are lost, and
+	/// every participation it ran runs again in a later round as an ordinary
+	/// participation, under a new unlock hash, with a new operator nonce for
+	/// each leaf it wants (its keys and owner nonces as before), the attempt
+	/// it leaves recorded, and any release of the coins it gave up retired.
+	/// The coins those participations gave up stay given up. The round's row
+	/// lock orders this against [`Store::insert_watcher_tx`]: a forfeit naming
+	/// the round is logged before it is lost, or never. Returns the
+	/// participations that run again.
 	pub async fn retire_round(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;

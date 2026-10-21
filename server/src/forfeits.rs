@@ -8,8 +8,9 @@
 //! the chain from the operator's coins, so it goes out only once every take
 //! in it has handed over its forfeits (the owner's halves, which are all the
 //! operator needs to complete them; the signer is asked for its half once
-//! the round is broadcast), and the preimage goes out once it is final, as
-//! for any participation. The forfeits must be exactly the coins the
+//! the node holds the round, in its mempool or a block), and the preimage
+//! goes out once it is final, as for any participation. The forfeits must
+//! be exactly the coins the
 //! participation gave up, one each, and the server verifies every one against
 //! the forfeit it builds itself ([`Forfeit::new`]) from what it chose: the
 //! participation's unlock hash, the connector asset of its round's connector
@@ -91,6 +92,7 @@ use arca_covenant::{
 	connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, Pair, RelativeTime, Release, WalletPolicy,
 };
 
+use crate::chain::FinalityService;
 use crate::coins::{self, CoinError};
 use crate::cosign::{CosignError, Cosigner};
 use crate::params::Params;
@@ -223,14 +225,32 @@ impl From<CoinError> for ForfeitError {
 /// See the [module documentation](self).
 pub struct Forfeits {
 	store: Store,
+	finality: Arc<FinalityService>,
 	params: Arc<Params>,
 	signer: SignerClient,
 	cosigner: Arc<Cosigner>,
 }
 
 impl Forfeits {
-	pub fn new(store: Store, params: Arc<Params>, signer: SignerClient, cosigner: Arc<Cosigner>) -> Arc<Forfeits> {
-		Arc::new(Forfeits { store, params, signer, cosigner })
+	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient, cosigner: Arc<Cosigner>)
+		-> Arc<Forfeits>
+	{
+		Arc::new(Forfeits { store, finality, params, signer, cosigner })
+	}
+
+	/// Whether the node holds the round `round_id` now: in a block of the
+	/// chain the server follows, or in its mempool (`pool`, read once per
+	/// call and kept).
+	async fn node_holds(&self, round_id: i64, pool: &mut Option<HashSet<Txid>>) -> Result<bool, ForfeitError> {
+		let round = self.store.round(round_id).await?.ok_or_else(|| ForfeitError::Internal(format!("round {} is not recorded", round_id)))?;
+		let txid = Txid::from_byte_array(round.txid);
+		if self.finality.status(&txid).await.map_err(|e| ForfeitError::Internal(e.to_string()))?.in_chain() {
+			return Ok(true);
+		}
+		if pool.is_none() {
+			*pool = Some(self.finality.call(|c| c.mempool()).await.map_err(|e| ForfeitError::Internal(e.to_string()))?.into_iter().collect());
+		}
+		Ok(pool.as_ref().is_some_and(|p| p.contains(&txid)))
 	}
 
 	async fn now(&self) -> Result<MedianTime, ForfeitError> {
@@ -394,12 +414,38 @@ impl Forfeits {
 	/// its coin up for its new leaf, and the claim that takes it reveals the
 	/// preimage that opens that leaf, so completing it takes nothing from
 	/// anyone. One the signer refuses (its record holds a spend of the coin)
-	/// stays without, and is logged. Returns how many were filled in.
+	/// stays without, and is logged. A take's forfeit, for a round that fills
+	/// on-chain orders, waits until the node holds that round (in its mempool
+	/// or a block): until then the round can still be dropped unbroadcast, and
+	/// a forfeit for a round that never reached the chain is never made whole.
+	/// Returns how many were filled in.
 	pub async fn fill_unsigned(&self) -> Result<usize, ForfeitError> {
 		let mut filled = 0;
+		let mut held: BTreeMap<i64, bool> = BTreeMap::new();
+		let mut pool: Option<HashSet<Txid>> = None;
 		for row in self.store.unsigned_forfeits().await? {
 			let f = &row.forfeit;
 			let leaf = LeafId(f.leaf_id);
+			// A take's forfeit is handed over before its round goes out, and
+			// the round can still be dropped unbroadcast until the node holds
+			// it: the signer is asked for its half only once the node does,
+			// so a forfeit for a round that never reached the chain is never
+			// whole.
+			if !self.store.round_fills(row.round_id).await?.is_empty() {
+				let holds = match held.get(&row.round_id) {
+					Some(h) => *h,
+					None => {
+						let h = self.node_holds(row.round_id, &mut pool).await?;
+						held.insert(row.round_id, h);
+						h
+					},
+				};
+				if !holds {
+					log::info!("the forfeit of coin {} for round {} waits for the operator's half: the node does not hold that round, \
+						which fills on-chain orders", leaf, row.round_id);
+					continue;
+				}
+			}
 			let built = async {
 				let now = self.now().await?;
 				let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };

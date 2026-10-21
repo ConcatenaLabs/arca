@@ -162,15 +162,33 @@
 //! what the operator gets for that is each take's forfeits. So it is held,
 //! built and unbroadcast, until every take in it has handed over its forfeits
 //! (the owner's half of each, which is all the operator needs to complete
-//! them; the signer is asked for its half once the round is broadcast), and
-//! only then broadcast ([`Rounds::pass`]). A take sees its round, the
-//! transaction without its witnesses, in its status, validates its new leaf
-//! against it, and signs. A take whose forfeits have not come
+//! them), and only then broadcast ([`Rounds::pass`]). A take sees its round,
+//! the transaction without its witnesses, in its status, validates its new
+//! leaf against it, and signs. A take whose forfeits have not come
 //! [`Params::fill_forfeit_window_seconds`] after its round was built (by the
 //! chain's median time) is voided, the round dropped unbroadcast and its
 //! coins freed, and the takes that did hand theirs over run again in the
 //! round built after it. Its preimage goes out once the round is final, as
 //! any participation's.
+//!
+//! A held round goes out only with its orders unspent. At every pass, and
+//! before it is handed to the nursery, each of its orders is checked again at
+//! the node: one spent meanwhile (anyone may fill an order on the chain while
+//! its round waits) drops the round unbroadcast, voids that take with the
+//! reason, and runs the others again. When the node refuses a fill round
+//! (an order taken between that check and its answer, or a round an older
+//! server put to the node regardless), its order inputs are looked up at the
+//! node, not in the store's index, which never saw a spend made before the
+//! round was handed over: a round whose order another transaction took is
+//! retired as lost, like any round another transaction took an input of
+//! ([`Rounds::retire`]). The signer is asked for its half of a take's
+//! forfeit only once the node holds the round, in its mempool or a block
+//! ([`crate::forfeits::Forfeits::fill_unsigned`]), so a forfeit for a round
+//! that never reached the chain is never whole. And a round dropped
+//! unbroadcast dies on the chain: one of its own coins is spent at once in a
+//! transaction of the wallet's ([`Rounds::void_on_chain`]), done again at
+//! each pass until one is under way, so the round can never confirm, whoever
+//! holds it, and every wallet that signed a forfeit for it sees it gone.
 //!
 //! Each batch is published ([`Rounds::tree`]): its round, its output, its
 //! token's output, the round's connector output, its asset, schedule, radix,
@@ -376,6 +394,22 @@ pub struct Rounds {
 	config: RoundConfig,
 	/// One round at a time.
 	running: Mutex<()>,
+	/// One spend at a time of a dropped round's own coin
+	/// ([`Rounds::void_on_chain`]), so a round is voided by one transaction.
+	voiding: Mutex<()>,
+}
+
+/// How the orders of a fill round not yet broadcast stand at the node, each
+/// checked again ([`Rounds::orders_now`]).
+enum OrdersNow {
+	/// Every one rests, unspent and final, its maker unable to refund it
+	/// within the margin.
+	Rest,
+	/// One is out of finality after a rollback: the round waits.
+	Wait(String),
+	/// These takes' orders can no longer be filled (spent by another
+	/// transaction, or refundable too soon), and why.
+	Taken(Vec<([u8; 32], String)>),
 }
 
 /// The size of the operator's issuance of a round's connector asset, with
@@ -392,7 +426,7 @@ impl Rounds {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, wallet: Arc<Wallet>, nursery: Arc<Nursery>,
 		config: RoundConfig) -> Arc<Rounds>
 	{
-		Arc::new(Rounds { store, finality, params, wallet, nursery, config, running: Mutex::new(()) })
+		Arc::new(Rounds { store, finality, params, wallet, nursery, config, running: Mutex::new(()), voiding: Mutex::new(()) })
 	}
 
 	pub fn config(&self) -> &RoundConfig {
@@ -1376,26 +1410,69 @@ impl Rounds {
 	/// with a coin past its exit deadline is voided.
 	pub async fn pass(&self) -> Result<(), RoundError> {
 		for r in self.store.rounds_in(RoundState::Built).await? {
-			// A round that fills orders goes out once every take in it has
-			// handed over its forfeits, and is dropped, unbroadcast, when one
-			// has not within the window.
-			if !self.store.round_fills(r.round_id).await?.is_empty() && !self.takes_ready(&r).await? {
-				continue;
+			let fills = !self.store.round_fills(r.round_id).await?.is_empty();
+			if fills {
+				// A round that fills orders goes out only with every order of
+				// it unspent: each is checked again at the node first, and
+				// one taken meanwhile drops the round unbroadcast.
+				match self.orders_now(&r).await? {
+					OrdersNow::Rest => {},
+					OrdersNow::Wait(why) => {
+						log::warn!("round {} ({}) waits before it goes out: {}", r.round_id, Txid::from_byte_array(r.txid), why);
+						continue;
+					},
+					OrdersNow::Taken(voids) => {
+						self.drop_fill_round(&r, &voids).await?;
+						continue;
+					},
+				}
+				// It goes out once every take in it has handed over its
+				// forfeits, and is dropped, unbroadcast, when one has not
+				// within the window.
+				if !self.takes_ready(&r).await? {
+					continue;
+				}
 			}
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
-			self.submit(r.round_id, &tx, fee).await?;
+			let answer = self.submit(r.round_id, &tx, fee).await?;
+			// An order taken between that check and the node's answer: the
+			// node refused the round, and it is resolved from the node's view
+			// of its orders at once.
+			if fills && answer != "accepted" {
+				if let Some(r) = self.store.round(r.round_id).await? {
+					self.refused_fill_round(&r).await?;
+				}
+			}
 		}
 		// A round held as lost that is final again, before anything is
 		// retired: the parent chain decides which round stands.
 		for r in self.store.rounds_in(RoundState::Lost).await? {
 			if self.finality.status(&Txid::from_byte_array(r.txid)).await.map_err(|e| RoundError::Chain(e.to_string()))?.is_final() {
 				self.restore(&r).await?;
+				continue;
+			}
+			// A fill round dropped unbroadcast (one the nursery was never
+			// handed) dies on the chain: one of its own coins spent in a
+			// transaction of the wallet's, done again at each pass until one
+			// is under way (after a restart, or when the wallet could not do
+			// it at once).
+			if !self.store.round_fills(r.round_id).await?.is_empty() && self.store.nursery_get(&r.txid).await?.is_none() {
+				if let Err(e) = self.void_on_chain(&r).await {
+					log::warn!("round {} ({}), dropped unbroadcast: its own coin could not be spent now: {}", r.round_id,
+						Txid::from_byte_array(r.txid), e);
+				}
 			}
 		}
 		let mut rows = self.store.rounds_in(RoundState::Broadcast).await?;
 		rows.extend(self.store.rounds_in(RoundState::Final).await?);
 		for r in rows {
+			// A fill round the node refused, because another transaction
+			// took an order of it, is resolved from the node's view of its
+			// orders, not the store's index, which never saw that spend.
+			if r.state == RoundState::Broadcast && self.refused_fill_round(&r).await? {
+				continue;
+			}
 			if self.nursery_lost(&r).await? {
 				self.retire(&r).await?;
 				continue;
@@ -1433,21 +1510,208 @@ impl Rounds {
 		if now < r.created_mtp as u64 + self.params.fill_forfeit_window_seconds as u64 {
 			return Ok(false);
 		}
+		let why = format!("its forfeits did not come within {} s of its round being built: a round that fills orders pays their makers \
+			on the chain, so it goes out only once every take in it has handed over its forfeits", self.params.fill_forfeit_window_seconds);
+		let voids: Vec<([u8; 32], String)> = missing.into_iter().map(|id| (id, why.clone())).collect();
+		self.drop_fill_round(r, &voids).await?;
+		Ok(false)
+	}
+
+	/// Each order of `r`, a fill round not yet broadcast, checked again at
+	/// the node as when the round was built ([`Self::order_unfit`]): spent
+	/// by another transaction, in a block or the node's mempool, or
+	/// refundable by its maker within the margin, it can no longer be filled.
+	async fn orders_now(&self, r: &RoundRow) -> Result<OrdersNow, RoundError> {
+		let mut taken = vec![];
+		let mut wait = None;
+		for f in self.store.round_fills(r.round_id).await? {
+			let Some(p) = self.store.participation(&f.participation_id).await? else { continue };
+			match self.order_unfit(&p).await? {
+				None => {},
+				Some((true, why)) => taken.push((p.id, why)),
+				Some((false, why)) => wait = Some(why),
+			}
+		}
+		Ok(match (taken.is_empty(), wait) {
+			(false, _) => OrdersNow::Taken(taken),
+			(true, Some(why)) => OrdersNow::Wait(why),
+			(true, None) => OrdersNow::Rest,
+		})
+	}
+
+	/// Drops `r`, a fill round built and never broadcast, whole or not at all
+	/// ([`Store::drop_unbroadcast_round`]): every forfeit recorded for it
+	/// deleted, its coins freed, each take of `voids` voided with its reason,
+	/// and every other take of it run again in the round built after it. One
+	/// of its own coins is then spent at once ([`Self::void_on_chain`]), so it
+	/// can never confirm. Returns whether it was dropped: not when it is no
+	/// longer built.
+	async fn drop_fill_round(&self, r: &RoundRow, voids: &[([u8; 32], String)]) -> Result<bool, RoundError> {
 		let txid = Txid::from_byte_array(r.txid);
 		let Some(again) = self.store.drop_unbroadcast_round(r.round_id).await? else { return Ok(false) };
 		self.wallet.release(&txid).await?;
-		let why = format!("its forfeits did not come within {} s of its round {} being built: a round that fills orders pays their makers \
-			on the chain, so it goes out only once every take in it has handed over its forfeits; the round was dropped unbroadcast, the take \
-			is void and the coins it gave up are its owner's again", self.params.fill_forfeit_window_seconds, txid);
 		let mut voided = 0;
-		for id in &missing {
+		for (id, why) in voids {
+			let why = format!("{}; its round {} was dropped unbroadcast, the take is void and the coins it gave up are its owner's again",
+				why, txid);
 			if self.store.void_participation(id, &why).await? {
 				voided += 1;
 			}
 		}
-		log::warn!("round {} ({}) dropped unbroadcast: {} take(s) handed over no forfeits in time and are void; {} run again", r.round_id,
-			txid, voided, again.len() - voided);
-		Ok(false)
+		log::warn!("round {} ({}), which fills on-chain orders, dropped unbroadcast: {} take(s) void, {} run again", r.round_id, txid,
+			voided, again.len().saturating_sub(voided));
+		let dropped = self.store.round(r.round_id).await?.unwrap_or_else(|| r.clone());
+		if let Err(e) = self.void_on_chain(&dropped).await {
+			log::warn!("round {} ({}), dropped unbroadcast: its own coin could not be spent now ({}); the next pass tries again", r.round_id,
+				txid, e);
+		}
+		Ok(true)
+	}
+
+	/// Spends one of the operator's own coins among the inputs of `r`, a fill
+	/// round dropped unbroadcast, back to the wallet in a transaction of its
+	/// own, handed to the nursery: once that is final the round can never
+	/// confirm, whoever holds it, and every wallet whose take signed a
+	/// forfeit for it finds it gone. Its fee is in the round's fee asset when
+	/// the node still accepts it, else in another the node accepts. Nothing
+	/// is done when a coin of the round is spent already by another
+	/// transaction of the wallet's (that one voids it, or frees the coin
+	/// again if it is dropped too), or when an order of it is spent by a
+	/// transaction that is final (it is void already). Returns the spend.
+	async fn void_on_chain(&self, r: &RoundRow) -> Result<Option<Txid>, RoundError> {
+		let _one = self.voiding.lock().await;
+		let round_txid = Txid::from_byte_array(r.txid);
+		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
+		let orders = self.store.round_fills(r.round_id).await?.len();
+		for i in tx.input.iter().take(orders) {
+			let op = i.previous_output;
+			if let Some(by) = self.store.outpoint_spender(&op.txid.to_byte_array(), op.vout).await? {
+				if by != r.txid && self.finality.status(&Txid::from_byte_array(by)).await.map_err(|e| RoundError::Chain(e.to_string()))?.is_final() {
+					return Ok(None);
+				}
+			}
+		}
+		let mut coins = vec![];
+		for i in tx.input.iter().skip(orders) {
+			let op = i.previous_output;
+			let Some(c) = self.store.wallet_coin_at(&op.txid.to_byte_array(), op.vout).await? else { continue };
+			match c.spent_by {
+				Some(by) if by != r.txid => return Ok(None),
+				_ => coins.push(c),
+			}
+		}
+		let fee_asset = AssetId::from_byte_array(r.fee_asset);
+		coins.sort_by_key(|c| (AssetId::from_byte_array(c.asset) != fee_asset, c.value));
+		let rates = self.finality.call(|c| c.fee_rates()).await.map_err(|e| RoundError::Chain(e.to_string()))?;
+		let mut fee_assets = vec![fee_asset];
+		fee_assets.extend(coins.iter().map(|c| AssetId::from_byte_array(c.asset)));
+		fee_assets.extend(rates.keys().copied());
+		let mut seen = HashSet::new();
+		fee_assets.retain(|a| rates.get(a).is_some_and(|r| *r > 0) && seen.insert(*a));
+		let mut last = String::from("no coin of the operator's among its inputs");
+		for coin in &coins {
+			for a in &fee_assets {
+				match self.wallet.spend_back(coin, *a).await {
+					Ok(built) => {
+						let txid = built.tx.txid();
+						let answer = self.nursery.submit(&built.tx, NurseryKind::Wallet, Some(built.fee)).await
+							.map_err(|e| RoundError::Internal(format!("the nursery: {}", e)))?;
+						log::warn!("round {} ({}), dropped unbroadcast: its coin {}:{} spent back to the wallet by {} (fee {} of {}): {}; once \
+							that is final the round can never confirm", r.round_id, round_txid, Txid::from_byte_array(coin.txid), coin.vout, txid,
+							built.fee.amount, built.fee.asset, answer);
+						return Ok(Some(txid));
+					},
+					Err(e @ (WalletError::FeeAssetNotAccepted(_) | WalletError::Insufficient { .. })) => last = e.to_string(),
+					Err(e @ WalletError::Raced) => {
+						last = e.to_string();
+						break;
+					},
+					Err(e) => return Err(e.into()),
+				}
+			}
+		}
+		Err(RoundError::Internal(format!("no coin of round {} could be spent back now: {}", round_txid, last)))
+	}
+
+	/// Retires `r`, a broadcast fill round, as lost when the node does not
+	/// hold it (it refused it, or it left the mempool) because another
+	/// transaction took an order of it: each order input is looked up at the
+	/// node, not in the store's index of spends, which never saw a spend made
+	/// before the round was handed over. The nursery gives the round up, the
+	/// wallet's coins of it are freed, and it is retired like any round
+	/// another transaction took an input of ([`Self::retire`]): its takes run
+	/// again, each order checked again, and the take whose order was taken is
+	/// voided then; a coin a take gave up whose forfeit it handed over stays
+	/// given up, its owner's on the chain. The transaction that took the order
+	/// is recorded where the nursery's check reads spends, so the round's
+	/// loss is the chain's as for any round. Returns whether it was retired.
+	async fn refused_fill_round(&self, r: &RoundRow) -> Result<bool, RoundError> {
+		let fills = self.store.round_fills(r.round_id).await?;
+		if fills.is_empty() {
+			return Ok(false);
+		}
+		let txid = Txid::from_byte_array(r.txid);
+		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
+		if self.finality.call(move |c| c.transaction(&txid)).await.map_err(chain)?.is_some() {
+			return Ok(false);
+		}
+		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
+		let mut taken = vec![];
+		for f in &fills {
+			let Some(op) = tx.input.get(f.k as usize).map(|i| i.previous_output) else { continue };
+			if self.finality.call(move |c| c.unspent(&op, true)).await.map_err(chain)?.is_some() {
+				continue;
+			}
+			taken.push((op, self.order_spender(&op).await?));
+		}
+		if taken.is_empty() {
+			return Ok(false);
+		}
+		for (op, by) in &taken {
+			match by {
+				Some(by) => {
+					self.store.watch_outpoint(&op.txid.to_byte_array(), op.vout, "nursery", &r.txid).await?;
+					self.store.set_outpoint_spender(&op.txid.to_byte_array(), op.vout, &by.to_byte_array()).await?;
+					self.finality.watch(*by, "spend").await.map_err(|e| RoundError::Chain(e.to_string()))?;
+					log::warn!("round {} ({}): the node does not hold it, and its order {} is spent by {}", r.round_id, txid,
+						outpoint_text(op), by);
+				},
+				None => log::warn!("round {} ({}): the node does not hold it, and its order {} is spent", r.round_id, txid, outpoint_text(op)),
+			}
+		}
+		if self.store.nursery_get(&r.txid).await?.is_some_and(|n| n.state != NurseryState::Lost) {
+			self.store.nursery_set_state(&r.txid, NurseryState::Lost).await?;
+		}
+		self.wallet.release(&txid).await?;
+		self.retire(r).await?;
+		Ok(true)
+	}
+
+	/// The transaction that spends `op` at the node: in its mempool, or in a
+	/// block of the chain the server follows from the block of `op`'s own
+	/// transaction up.
+	async fn order_spender(&self, op: &OutPoint) -> Result<Option<Txid>, RoundError> {
+		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
+		let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *op);
+		for t in self.finality.call(|c| c.mempool()).await.map_err(chain)? {
+			if let Some(tx) = self.finality.call(move |c| c.transaction(&t)).await.map_err(chain)? {
+				if spends(&tx) {
+					return Ok(Some(t));
+				}
+			}
+		}
+		let Some(from) = self.store.tx_location(&op.txid.to_byte_array()).await?.map(|b| b.height) else { return Ok(None) };
+		let tip = self.store.tip_block().await?.ok_or(RoundError::NotSynced)?.height;
+		for h in from..=tip {
+			let Some(b) = self.store.block_at(h).await? else { continue };
+			let hash = elements::BlockHash::from_byte_array(b.hash);
+			for tx in self.finality.call(move |c| c.block_txs(&hash)).await.map_err(chain)? {
+				if spends(&tx) {
+					return Ok(Some(tx.txid()));
+				}
+			}
+		}
+		Ok(None)
 	}
 
 	/// Releases every participation issued in a final round whose preimage

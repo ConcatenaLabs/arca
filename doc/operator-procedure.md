@@ -113,6 +113,14 @@ paid twice.
   spends only final coins: with one such coin, a round of that asset built
   while the other rounds' change is not yet final waits for their
   confirmations.
+- **Count a fee for each fill round dropped.** A round that fills on-chain
+  orders waits, built, for its takes' forfeits. When one never comes within
+  `[fills] forfeit_window_seconds`, or anyone fills one of its orders on the
+  chain meanwhile, the server drops the round and spends one of its own
+  coins back to its wallet, so the round can never confirm: one small
+  transaction's fee, in the round's fee asset, each time. The round's other
+  coins are free again at once, and its takes that can still run do so in
+  the next round.
 - **When the operator stops or moves, tell the holders.** Say which
   operator ends, from which time, and which operator replaces it, so each
   holder runs `arca sync` at once, takes its coins home on the chain, and
