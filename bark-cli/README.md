@@ -208,8 +208,10 @@ and a board whose registration never reached the server, are not recovered.
   operator's own), and the wallet says, when it gives up a coin for such a
   leaf and again when it takes the leaf, that every exit of it needs a fee coin
   in an accepted asset. Only once the round is final, and only when the operator's status
-  shows exactly the leaves the wallet asked for, in order, each validated, all
-  under the participation's one unlock hash, and exactly the coins it gave up.
+  shows exactly the leaves the wallet asked for, in order, each validated, a
+  resting order (`order-2`) only where it asked for one and on exactly its
+  terms, all under the participation's one unlock hash, and exactly the coins
+  it gave up.
   The forfeit of each coin given up is built from the validated leaf of the
   coin's own asset and its round, and its refund delay must end before the new
   leaves' exit deadline.
