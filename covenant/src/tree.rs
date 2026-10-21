@@ -52,6 +52,7 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn,
 use crate::clock::ClockSchedule;
 use crate::gate::{Members, MAX_OWNERS};
 use crate::htlc::HtlcTerms;
+use crate::order::OrderLeafTerms;
 use crate::leaf::leaf_salt;
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
@@ -134,6 +135,8 @@ pub struct LeafSpec {
 	pub unlock_hash: [u8; 32],
 	/// `htlc-1`'s terms, present exactly when the template is `htlc-1`.
 	pub htlc: Option<HtlcTerms>,
+	/// `order-2`'s terms, present exactly when the template is `order-2`.
+	pub order: Option<OrderLeafTerms>,
 }
 
 impl LeafSpec {
@@ -206,7 +209,7 @@ pub enum TreeError {
 	Radix(usize),
 	#[error("leaf {leaf} holds {value}, outside {min} to {max}", max = MAX_VALUE)]
 	LeafValue { leaf: usize, value: u64, min: u64 },
-	#[error("leaf {leaf} has a template this builder does not build, or htlc-1 terms that do not fit it")]
+	#[error("leaf {leaf} has a template this builder does not build, or htlc-1 or order-2 terms that do not fit it")]
 	Template { leaf: usize },
 	/// Two leaves with one script. With distinct operator nonces this takes a
 	/// SHA256 collision; the check stays as a guard.
@@ -299,9 +302,10 @@ impl Tree {
 			if let Some(first) = keys.insert(spec.owner, i) {
 				return Err(TreeError::DuplicateOwner { first, second: i });
 			}
-			match (spec.template, &spec.htlc) {
-				(Template::Vtxo1, None) => {},
-				(Template::Htlc1, Some(t)) if t.check(spec.exit_delay).is_ok() => {},
+			match (spec.template, &spec.htlc, &spec.order) {
+				(Template::Vtxo1, None, None) => {},
+				(Template::Htlc1, Some(t), None) if t.check(spec.exit_delay).is_ok() => {},
+				(Template::Order2, None, Some(o)) if o.check(params.asset, &spec.owner, &operator).is_ok() => {},
 				_ => return Err(TreeError::Template { leaf: i }),
 			}
 			if spec.value < min || spec.value > MAX_VALUE {
@@ -310,6 +314,7 @@ impl Tree {
 			let leaf = LeafPolicy {
 				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 				htlc: spec.htlc,
+				order: spec.order,
 			};
 			let program = leaf.program();
 			if let Some(first) = seen.insert(program, i) {
@@ -469,6 +474,7 @@ impl Tree {
 				siblings: siblings(lowest_node, lowest_index),
 				owners,
 			},
+			order: l.spec.order,
 		}
 	}
 

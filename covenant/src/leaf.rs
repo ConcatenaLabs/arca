@@ -51,7 +51,8 @@ use elements::{AssetId, Script};
 use crate::htlc::{HtlcPath, HtlcTerms};
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
-use crate::taptree::TapOutput;
+use crate::order::{order_cmr, OrderLeafTerms, OrderPolicy};
+use crate::taptree::{TapNode, TapOutput};
 use crate::time::RelativeTime;
 use crate::Error;
 
@@ -134,6 +135,9 @@ pub struct LeafPolicy {
 	pub exit_delay: RelativeTime,
 	/// `htlc-1`'s hash-locked pair, in place of the exit; `None` for `vtxo-1`.
 	pub htlc: Option<HtlcTerms>,
+	/// `order-2`'s terms: the leaf is a resting order ([`crate::order`]),
+	/// with the landing and the fill in place of the exit; `None` otherwise.
+	pub order: Option<OrderLeafTerms>,
 }
 
 impl LeafPolicy {
@@ -174,8 +178,17 @@ impl LeafPolicy {
 	}
 
 	/// `vtxo-1`: `[collab, exit]`, both at depth 1. `htlc-1`: `[collab,
-	/// [claim, refund]]`.
+	/// [claim, refund]]`. `order-2`: `[[collab, land], [fill, data]]`
+	/// ([`crate::order`]).
 	pub fn taproot(&self) -> TapOutput {
+		if let Some(o) = self.order_policy() {
+			return TapOutput::with_nodes(vec![
+				(2, TapNode::Tapscript(o.collab_script())),
+				(2, TapNode::Tapscript(o.landing_script())),
+				(2, TapNode::Simplicity(order_cmr())),
+				(2, TapNode::Hidden(o.data_leaf())),
+			]);
+		}
 		match self.htlc {
 			None => TapOutput::new(vec![(1, self.collab_script()), (1, self.exit_script())]),
 			Some(t) => TapOutput::new(vec![
@@ -186,9 +199,20 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, or `htlc-1`.
+	/// The template it follows: `vtxo-1`, `htlc-1` or `order-2`.
 	pub fn template(&self) -> crate::Template {
-		if self.htlc.is_some() { crate::Template::Htlc1 } else { crate::Template::Vtxo1 }
+		if self.order.is_some() {
+			crate::Template::Order2
+		} else if self.htlc.is_some() {
+			crate::Template::Htlc1
+		} else {
+			crate::Template::Vtxo1
+		}
+	}
+
+	/// The order an `order-2` leaf rests as; `None` for any other template.
+	pub fn order_policy(&self) -> Option<OrderPolicy> {
+		self.order.map(|t| t.policy(self.owner, self.operator, self.salt, self.chain, self.exit_delay))
 	}
 
 	pub fn script_pubkey(&self) -> Script {

@@ -174,6 +174,8 @@ pub enum OrderError {
 	Terms(String),
 	#[error("the fill: {0}")]
 	Amount(String),
+	#[error("the operator's signature is not over this fill of this coin")]
+	Signature,
 	#[error("the order at input {k}: {why}")]
 	Spend { k: usize, why: String },
 }
@@ -277,6 +279,109 @@ impl SeqdexOrder {
 	pub fn fill_witness(&self, partial: bool) -> Vec<Vec<u8>> {
 		let program = if partial { programs::SEQDEX_FILL } else { programs::SEQDEX_FILL_WHOLE };
 		vec![pack(&self.data_bytes(), &[false, partial]), unhex(program), seqdex_cmr().to_vec(), self.control_block()]
+	}
+}
+
+/// What an `order-2` leaf carries beyond the fields every leaf has (owner,
+/// salt, exit delay, asset and value): the order it lands as, which holds the
+/// price and lot every fill pays and the maker's on-chain terms, and the keys
+/// of its next credits, the next first, zero once used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrderLeafTerms {
+	pub landed: SeqdexOrder,
+	pub credits: [[u8; 32]; CREDIT_KEYS],
+}
+
+impl OrderLeafTerms {
+	/// The policy of the leaf these terms are part of.
+	pub fn policy(&self, owner: XOnlyPublicKey, operator: XOnlyPublicKey, salt: [u8; 32], chain: Chain, exit_delay: RelativeTime)
+		-> OrderPolicy
+	{
+		OrderPolicy { landed: self.landed, owner, operator, salt, chain, exit_delay, credits: self.credits }
+	}
+
+	/// Refuses terms no leaf of `asset` holding them may carry: terms no
+	/// fill satisfies, an order selling another asset than the leaf holds, a
+	/// REFUND time that is a height (it slips after an anchor rollback), a
+	/// credit key that is not a key, one after a used one, two alike, or one
+	/// that is the leaf's owner key or the operator's.
+	pub fn check(&self, asset: AssetId, owner: &XOnlyPublicKey, operator: &XOnlyPublicKey) -> Result<(), OrderError> {
+		let t = &self.landed.terms;
+		t.check()?;
+		if t.asset_a != asset {
+			return Err(OrderError::Terms(format!("it sells {} and the leaf holds {}", t.asset_a, asset)));
+		}
+		if self.landed.expiry < 500_000_000 {
+			return Err(OrderError::Terms(format!("its REFUND time {} is a height; an order resting in the tree takes a median time",
+				self.landed.expiry)));
+		}
+		let mut seen: Vec<[u8; 32]> = vec![];
+		let mut used = false;
+		for (i, c) in self.credits.iter().enumerate() {
+			if *c == [0u8; 32] {
+				used = true;
+				continue;
+			}
+			if used {
+				return Err(OrderError::Terms(format!("credit key {} follows a used one", i)));
+			}
+			let k = XOnlyPublicKey::from_slice(c).map_err(|_| OrderError::Terms(format!("credit key {} is not a key", i)))?;
+			if k == *owner || k == *operator || seen.contains(c) {
+				return Err(OrderError::Terms(format!("credit key {} is the owner's, the operator's or another credit's", i)));
+			}
+			seen.push(*c);
+		}
+		Ok(())
+	}
+
+	/// The binary form, without `asset_a` (the leaf's own asset):
+	/// `[32] asset_b, u64 rate_num, u64 rate_den, u64 min_lot, [32] maker,
+	/// u32 expiry, [32] refund key, 4 × [32] credit keys`, integers
+	/// little-endian.
+	pub fn encode_to(&self, w: &mut Vec<u8>) {
+		let t = &self.landed.terms;
+		w.extend(asset_bytes(t.asset_b));
+		w.extend(t.rate_num.to_le_bytes());
+		w.extend(t.rate_den.to_le_bytes());
+		w.extend(t.min_lot.to_le_bytes());
+		w.extend(self.landed.maker);
+		w.extend(self.landed.expiry.to_le_bytes());
+		w.extend(self.landed.refund_key.serialize());
+		for c in &self.credits {
+			w.extend(c);
+		}
+	}
+
+	/// Reads the binary form of a leaf holding `asset_a`.
+	pub fn decode_from(r: &mut crate::encode::Reader, asset_a: AssetId) -> Result<OrderLeafTerms, crate::encode::DecodeError> {
+		let asset_b = r.asset()?;
+		let rate_num = r.u64()?;
+		let rate_den = r.u64()?;
+		let min_lot = r.u64()?;
+		let maker = r.array32()?;
+		let expiry = r.u32()?;
+		let refund_key = r.key()?;
+		let mut credits = [[0u8; 32]; CREDIT_KEYS];
+		for c in credits.iter_mut() {
+			*c = r.array32()?;
+		}
+		Ok(OrderLeafTerms {
+			landed: SeqdexOrder { terms: OrderTerms { asset_a, asset_b, rate_num, rate_den, min_lot }, maker, expiry, refund_key },
+			credits,
+		})
+	}
+}
+
+impl OrderPolicy {
+	/// The terms beyond the standard leaf's.
+	pub fn leaf_terms(&self) -> OrderLeafTerms {
+		OrderLeafTerms { landed: self.landed, credits: self.credits }
+	}
+
+	/// The `order-2` leaf policy of this coin, as every other leaf's.
+	pub fn leaf(&self) -> LeafPolicy {
+		LeafPolicy { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay,
+			htlc: None, order: Some(self.leaf_terms()) }
 	}
 }
 
@@ -460,7 +565,7 @@ impl OrderPolicy {
 	pub fn credit_leaf(&self) -> Option<LeafPolicy> {
 		let key = XOnlyPublicKey::from_slice(&self.credits[0]).ok()?;
 		Some(LeafPolicy { owner: key, operator: self.operator, salt: self.credit_salt(), chain: self.chain, exit_delay: self.exit_delay,
-			htlc: None })
+			htlc: None, order: None })
 	}
 
 	/// The message maker and operator sign to spend the coin by the
@@ -562,19 +667,33 @@ impl OrderPolicy {
 		-> Result<OrderFilled, OrderError>
 	{
 		let fail = |why: String| OrderError::Spend { k, why };
-		let t = &self.landed.terms;
 		if k >= tx.input.len() {
 			return Err(fail(format!("the transaction has {} inputs", tx.input.len())));
 		}
 		if m as usize > tx.output.len() {
 			return Err(fail(format!("the operator commits to {} outputs and the transaction has {}", m, tx.output.len())));
 		}
-		let digest = self.fill_digest(locked, &tx.output[..m as usize]).map_err(|e| fail(e.to_string()))?;
+		self.check_signature(locked, &tx.output[..m as usize], operator_sig).map_err(|e| fail(e.to_string()))?;
+		self.judge(&tx.output, k, locked, partial)
+	}
+
+	/// Whether `operator_sig` is the operator's over a fill of a coin of this
+	/// script holding `locked` into `outputs` (all the outputs it commits to).
+	pub fn check_signature(&self, locked: u64, outputs: &[TxOut], operator_sig: &Signature) -> Result<(), OrderError> {
+		let digest = self.fill_digest(locked, outputs)?;
 		secp().verify_schnorr(operator_sig, &Message::from_digest(digest), &self.operator)
-			.map_err(|_| fail("the operator's signature is not over this fill of this coin".into()))?;
+			.map_err(|_| OrderError::Signature)
+	}
+
+	/// The covenant's rules on `outputs` for this coin at input `k`, holding
+	/// `locked`: the credit at `2k`, the remainder at `2k+1` for a partial
+	/// fill, the lot. The signature is [`OrderPolicy::check_signature`]'s.
+	pub fn judge(&self, outputs: &[TxOut], k: usize, locked: u64, partial: bool) -> Result<OrderFilled, OrderError> {
+		let fail = |why: String| OrderError::Spend { k, why };
+		let t = &self.landed.terms;
 		let (credit_at, rest_at) = (2 * k, 2 * k + 1);
 		let explicit = |i: usize| -> Result<(AssetId, u64, &Script), OrderError> {
-			let o = tx.output.get(i).ok_or_else(|| fail(format!("the transaction has no output {}", i)))?;
+			let o = outputs.get(i).ok_or_else(|| fail(format!("the transaction has no output {}", i)))?;
 			let a = o.asset.explicit().ok_or_else(|| fail(format!("output {} hides its asset", i)))?;
 			let v = o.value.explicit().ok_or_else(|| fail(format!("output {} hides its value", i)))?;
 			if !o.nonce.is_null() {
@@ -660,6 +779,47 @@ mod test {
 		assert_eq!(o.next().next().next().next().fills_left(), 0);
 		assert!(o.next().next().next().next().credit_leaf().is_none());
 		assert_ne!(o.credit_leaf().unwrap().script_pubkey(), n.credit_leaf().unwrap().script_pubkey());
+	}
+
+	#[test]
+	fn an_order_2_leaf_policy_is_the_orders_own_output() {
+		let o = order();
+		let leaf = o.leaf();
+		assert_eq!(leaf.template(), crate::Template::Order2);
+		assert_eq!(leaf.program(), o.program());
+		assert_eq!(leaf.order_policy(), Some(o));
+		assert_eq!(leaf.taproot().control_block(&o.collab_script()).unwrap(), o.control_block(OrderPath::Collab));
+		assert_eq!(leaf.taproot().control_block(&o.landing_script()).unwrap(), o.control_block(OrderPath::Land));
+		// The collaborative message is the standard leaf's, under the coin's salt.
+		let out = vec![ExplicitOutput::new(o.terms().asset_a, 5, o.landed.script_pubkey())];
+		assert_eq!(leaf.collab_message(o.terms().asset_a, 5, &out).unwrap(), o.collab_message(5, &out).unwrap());
+	}
+
+	#[test]
+	fn order_2_terms_refuse_what_no_leaf_may_carry() {
+		let o = order();
+		let t = o.leaf_terms();
+		let a = o.terms().asset_a;
+		t.check(a, &o.owner, &o.operator).unwrap();
+		assert!(t.check(o.terms().asset_b, &o.owner, &o.operator).is_err(), "another asset than the leaf's");
+		let mut h = t;
+		h.landed.expiry = 499_999_999;
+		assert!(h.check(a, &o.owner, &o.operator).is_err(), "a height");
+		let mut g = t;
+		g.credits[1] = [0; 32];
+		assert!(g.check(a, &o.owner, &o.operator).is_err(), "a key after a used one");
+		let mut d = t;
+		d.credits[2] = d.credits[0];
+		assert!(d.check(a, &o.owner, &o.operator).is_err(), "two credits under one key");
+		let mut w = t;
+		w.credits[0] = o.owner.serialize();
+		assert!(w.check(a, &o.owner, &o.operator).is_err(), "the owner's key");
+		let mut e = Vec::new();
+		t.encode_to(&mut e);
+		assert_eq!(e.len(), crate::record::ORDER_TERMS_BYTES);
+		assert_eq!(OrderLeafTerms::decode_from(&mut crate::encode::Reader::new(&e), a).unwrap(), t);
+		// A remainder's terms, with its keys moved up, still pass.
+		o.next().next().leaf_terms().check(a, &o.owner, &o.operator).unwrap();
 	}
 
 	#[test]

@@ -1404,6 +1404,8 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 		Ok(arca_covenant::CoinRecord::Leaf { record, .. }) => Some(record.owner_nonce),
 		Ok(arca_covenant::CoinRecord::Board(b)) => Some(b.owner_nonce),
 		Ok(arca_covenant::CoinRecord::Transfer(t)) => Some(t.leaf.owner_nonce),
+		// A fill's coin names the nonce its owner key comes from.
+		Ok(arca_covenant::CoinRecord::Fill(f)) => Some(f.leaf.owner_nonce()),
 		Err(_) => r.batch.as_ref().map(|b| b.owner_nonce),
 	};
 	let batch = match &r.batch {

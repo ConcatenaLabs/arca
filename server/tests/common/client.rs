@@ -364,6 +364,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
 		htlc: htlc_of(&l["htlc"]),
+		order: None,
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }

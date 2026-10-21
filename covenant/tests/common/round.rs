@@ -123,6 +123,7 @@ pub fn spec(owner: &Keypair, label: &str, value: u64, h: [u8; 32]) -> LeafSpec {
 		operator_nonce: label32(&format!("{} operator nonce", label)),
 		exit_delay: delay(), unlock_hash: h,
 		htlc: None,
+		order: None,
 	}
 }
 
@@ -226,6 +227,7 @@ pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, val
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
+		order: None,
 	};
 	let coin = net.fund(vec![explicit(net.x, value, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

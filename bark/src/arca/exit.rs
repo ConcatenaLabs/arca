@@ -269,6 +269,10 @@ impl Wallet {
 				},
 				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
 			};
+			if leaf.order.is_some() {
+				return Err(Error::Refused("a resting order's coin comes home by its landing, as SeqDEX's own order, not by a claim of \
+					its owner's".into()));
+			}
 			match leaf.htlc {
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
 				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
@@ -466,7 +470,9 @@ impl Wallet {
 	/// Every output on the way from the chain to `coin`'s leaf, the leaf's
 	/// own last: for a leaf of a batch, the batch output, each node's and the
 	/// entry's; for a board, the board output; for a coin a reassignment made,
-	/// those of each coin it spends, that coin's leaf and its checkpoint.
+	/// those of each coin it spends, that coin's leaf and its checkpoint; for
+	/// a coin a fill made, the order coin's path and its leaf, then the same
+	/// for each taker's coin.
 	fn path_outputs(coin: &ValidCoin, out: &mut Vec<TxOut>) {
 		match &coin.origin {
 			ValidOrigin::Leaf { valid, .. } => {
@@ -475,6 +481,13 @@ impl Wallet {
 			},
 			ValidOrigin::Board { record, .. } => out.push(record.output().txout()),
 			ValidOrigin::Transfer { inputs, .. } => {
+				for i in inputs {
+					Self::path_outputs(&i.coin, out);
+					out.push(i.checkpoint_output().txout());
+				}
+			},
+			ValidOrigin::Fill { order, inputs, .. } => {
+				Self::path_outputs(order, out);
 				for i in inputs {
 					Self::path_outputs(&i.coin, out);
 					out.push(i.checkpoint_output().txout());
@@ -530,35 +543,54 @@ impl Wallet {
 				Ok(leaf)
 			},
 			ValidOrigin::Transfer { inputs, index, .. } => {
-				let mut cps = vec![];
-				for i in inputs {
-					let cp = match here.or_built(txs, &i.checkpoint_output()) {
-						Some(at) => at,
-						None => {
-							let u = match (i.coin.board(), here.or_built(txs, &i.coin.output())) {
-								// A board not converted: its checkpoint spends the
-								// board output itself.
-								(Some((board, _)), None) if here.at(&board.output()).is_some() => {
-									self.with_fee(payer, &|f| i.board_checkpoint_tx(f).map_err(|e| Error::Refused(e.to_string())))?
-								},
-								_ => {
-									let at = self.bring(&i.coin, payer, txs, here)?;
-									self.with_fee(payer, &|f| i.checkpoint_tx(at, f).map_err(|e| Error::Refused(e.to_string())))?
-								},
-							};
-							let at = OutPoint::new(u.tx.txid(), 0);
-							txs.push(u);
-							at
-						},
-					};
-					cps.push(cp);
-				}
+				let cps = self.checkpoints(inputs, payer, txs, here)?;
 				let u = self.with_fee(payer, &|f| coin.reassignment_tx(&cps, f).map_err(|e| Error::Refused(e.to_string())))?;
 				let leaf = OutPoint::new(u.tx.txid(), *index as u32);
 				txs.push(u);
 				Ok(leaf)
 			},
+			ValidOrigin::Fill { order, inputs, index, .. } => {
+				// The order coin by its fill path, each taker's coin through
+				// its checkpoint, then the fill.
+				let order_at = self.bring(order, payer, txs, here)?;
+				let cps = self.checkpoints(inputs, payer, txs, here)?;
+				let u = self.with_fee(payer, &|f| coin.fill_tx(order_at, &cps, f).map_err(|e| Error::Refused(e.to_string())))?;
+				let leaf = OutPoint::new(u.tx.txid(), *index as u32);
+				txs.push(u);
+				Ok(leaf)
+			},
 		}
+	}
+
+	/// The checkpoint of each of `inputs` on the chain, building whatever is
+	/// still missing of each coin's path and its checkpoint.
+	fn checkpoints(&self, inputs: &[arca_covenant::ValidInput], payer: &mut Payer, txs: &mut Vec<UnrollTx>, here: &Here)
+		-> Result<Vec<OutPoint>, Error>
+	{
+		let mut cps = vec![];
+		for i in inputs {
+			let cp = match here.or_built(txs, &i.checkpoint_output()) {
+				Some(at) => at,
+				None => {
+					let u = match (i.coin.board(), here.or_built(txs, &i.coin.output())) {
+						// A board not converted: its checkpoint spends the
+						// board output itself.
+						(Some((board, _)), None) if here.at(&board.output()).is_some() => {
+							self.with_fee(payer, &|f| i.board_checkpoint_tx(f).map_err(|e| Error::Refused(e.to_string())))?
+						},
+						_ => {
+							let at = self.bring(&i.coin, payer, txs, here)?;
+							self.with_fee(payer, &|f| i.checkpoint_tx(at, f).map_err(|e| Error::Refused(e.to_string())))?
+						},
+					};
+					let at = OutPoint::new(u.tx.txid(), 0);
+					txs.push(u);
+					at
+				},
+			};
+			cps.push(cp);
+		}
+		Ok(cps)
 	}
 
 	/// Takes `leaf_id` on-chain from its record alone and claims it after the
@@ -992,7 +1024,11 @@ impl Wallet {
 	/// co-signed another spend of the coin, which reached the chain first.
 	/// Says so, or `None`.
 	fn paid_elsewhere(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
-		let ValidOrigin::Transfer { inputs, .. } = &coin.origin else { return Ok(None) };
+		let (order, inputs) = match &coin.origin {
+			ValidOrigin::Transfer { inputs, .. } => (None, inputs),
+			ValidOrigin::Fill { order, inputs, .. } => (Some(order), inputs),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return Ok(None),
+		};
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 		let mine = coin.output().txout();
 		let spent_by = |out: &TxOut| -> Result<Option<(Transaction, Transaction)>, Error> {
@@ -1003,6 +1039,18 @@ impl Wallet {
 		let elsewhere = |id: &arca_covenant::LeafId, sp: &Transaction| (format!("coin {} it rests on is spent on the chain by {}, which \
 			is not this coin's way out: the operator co-signed another spend of coin {} (a payment, or a forfeit), which reached the \
 			chain first, so this coin cannot be brought on the chain", id, sp.txid(), id), sp.txid());
+		// A fill's order coin, spent on the chain by anything but this fill
+		// (another fill, a cancel, its landing), leaves this coin out.
+		if let Some(o) = order {
+			if let Some((_, sp)) = spent_by(&o.output().txout())? {
+				if !sp.output.contains(&mine) {
+					return Ok(Some(elsewhere(&o.id, &sp)));
+				}
+			}
+			if let Some(why) = self.paid_elsewhere(o)? {
+				return Ok(Some(why));
+			}
+		}
 		for i in inputs {
 			let cp = i.checkpoint_output().txout();
 			let own = i.coin.output().txout();
@@ -1060,6 +1108,17 @@ impl Wallet {
 				Ok(None)
 			},
 			ValidOrigin::Transfer { inputs, .. } => {
+				for i in inputs {
+					if let Some(w) = self.swept(&i.coin)? {
+						return Ok(Some(w));
+					}
+				}
+				Ok(None)
+			},
+			ValidOrigin::Fill { order, inputs, .. } => {
+				if let Some(w) = self.swept(order)? {
+					return Ok(Some(w));
+				}
 				for i in inputs {
 					if let Some(w) = self.swept(&i.coin)? {
 						return Ok(Some(w));
@@ -1397,6 +1456,8 @@ impl Wallet {
 			CoinRecord::Leaf { record, .. } => record.to_json().map_err(|e| Error::Refused(e.to_string()))?,
 			CoinRecord::Board(b) => b.to_json().map_err(|e| Error::Refused(e.to_string()))?,
 			CoinRecord::Transfer(t) => json!({"inputs": t.inputs.len(), "outputs": t.outputs.len(), "index": t.index}),
+			CoinRecord::Fill(f) => json!({"fill_of_order": true, "inputs": f.fill.inputs.len(), "outputs": f.fill.outputs.len(),
+				"index": f.index, "partial": f.fill.partial}),
 		};
 		Ok(json!({"leaf_id": leaf_id, "kind": row.kind, "state": row.state, "record": hex(&row.record), "detail": detail}))
 	}

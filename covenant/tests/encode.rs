@@ -28,7 +28,7 @@ fn policies() -> Vec<Policy> {
 	let s = xonly(&keypair("S"));
 	let a = xonly(&keypair("A"));
 	let sch = schedule();
-	let leaf = LeafPolicy { owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None };
+	let leaf = LeafPolicy { owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None };
 	let owners: Vec<XOnlyPublicKey> = (0..5).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
@@ -219,6 +219,7 @@ fn witness_readers() {
 	};
 	let h = LeafPolicy {
 		owner: xonly(&a), operator: xonly(&s), salt: label32("htlc"), chain: chain(), exit_delay: sch.notice, htlc: Some(terms),
+		order: None,
 	};
 	let w = h.claim_witness(&sig(&s, &label32("x")), &pre).unwrap();
 	assert_eq!(find_preimage(&w, &terms.payment_hash), Some(pre));

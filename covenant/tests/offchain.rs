@@ -162,6 +162,7 @@ fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (Lea
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
+		order: None,
 	};
 	let coin = net.fund(vec![explicit(net.x, LEAF, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();
@@ -233,6 +234,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		template: Template::Vtxo1, owner: xonly(&a2), value: 19_990_000, owner_nonce: label32("board new leaf nonce"),
 		operator_nonce: label32("board new leaf operator nonce"), exit_delay: delay(), unlock_hash: sha256(&preimage),
 		htlc: None,
+		order: None,
 	};
 	let second_owner = keypair("refresh second owner, new leaf");
 	let preimage_b = label32("second owner refresh preimage");
@@ -241,6 +243,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		owner_nonce: label32("second owner new nonce"), operator_nonce: label32("second owner operator nonce"),
 		exit_delay: delay(), unlock_hash: sha256(&preimage_b),
 		htlc: None,
+		order: None,
 	};
 	let tree = c.tree(&sched, &[spec, spec_b]);
 	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
@@ -387,6 +390,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		owner_nonce: label32("second board new nonce"), operator_nonce: label32("second board new operator nonce"),
 		exit_delay: delay(), unlock_hash: sha256(&preimage3),
 		htlc: None,
+		order: None,
 	};
 	let tree3 = c.tree(&sched, &[spec3]);
 	let (round3, cv3) = round_tx(&c.net, &issuer, Some(&tree3), vec![], &s);
@@ -637,6 +641,7 @@ enum Event<'a> {
 /// says; returns where it lands. `hook` sees each [`Event`].
 fn bring(c: &mut Ctx, coin: &ValidCoin, label: &str, hook: &mut dyn FnMut(&mut Ctx, Event)) -> OutPoint {
 	match &coin.origin {
+		ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
 		ValidOrigin::Leaf { valid, preimage, auths } => {
 			let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
 			for (level, (node, auth)) in valid.branch.nodes.iter().zip(auths).enumerate() {

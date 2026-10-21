@@ -72,6 +72,7 @@ fn fx() -> Fx {
 /// its own margin, appends them to `out` and returns where the coin lands.
 fn bring(coin: &ValidCoin, out: &mut Vec<(String, UnrollTx)>) -> OutPoint {
 	match &coin.origin {
+		ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
 		ValidOrigin::Leaf { valid, preimage, auths } => {
 			let txs = valid.branch.unroll(OutPoint::new(valid.round_txid, valid.batch_vout), auths,
 				&vec![FeeSource::Reserve; auths.len()]).unwrap();

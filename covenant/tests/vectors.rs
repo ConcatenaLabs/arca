@@ -147,6 +147,7 @@ impl Ctx {
 			chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
+			order: None,
 		};
 		assert_eq!(leaf.leaf_constant(), h32(&p["K"]));
 		leaf
@@ -158,6 +159,7 @@ impl Ctx {
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
+			order: None,
 		};
 		assert_eq!(leaf.program(), h32(&p["leaf_program"]));
 		BoardPolicy { leaf, asset: AssetId::from_byte_array(h32(&p["asset"])), value: p["value"].as_u64().unwrap() }
@@ -216,6 +218,7 @@ impl Ctx {
 		let h = LeafPolicy {
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
+			order: None,
 		};
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
 		assert_eq!(h.leaf_constant(), h32(&p["K"]));

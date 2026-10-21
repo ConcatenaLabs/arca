@@ -65,7 +65,8 @@
 //!
 //! ```text
 //! u8    format version, 2
-//! u8    template, 1 (vtxo) or 3 (htlc)  u8   template version, 1
+//! u8    template, 1 (vtxo), 3 (htlc) or 4 (order)
+//! u8    template version, 1 (vtxo, htlc) or 2 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -75,6 +76,13 @@
 //! [32]  payment hash
 //! u32   timeout, a median time
 //! u16   operator delay, 512-second units
+//!       for order-2 only (the order sells the leaf's asset):
+//! [32]  asset B, what it is paid in
+//! u64   rate numerator, u64 rate denominator, u64 minimum lot
+//! [32]  SHA256 of the scriptPubKey the landed order's fills pay
+//! u32   the landed order's REFUND time, a median time
+//! [32]  the landed order's refund key
+//! 4 × [32]  the next credit keys, the next first, zero once used
 //! [32]  asset                         the leaf and its entry
 //! u64   value
 //! [32]  unlock hash h
@@ -129,6 +137,7 @@ use crate::checks::{check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Encoding, Reader};
 use crate::htlc::HtlcTerms;
+use crate::order::OrderLeafTerms;
 use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
 use crate::leaf::leaf_salt;
 use crate::message::{release_message, unroll_authorisation, Chain, CsfsMessage};
@@ -142,6 +151,9 @@ use crate::{EntryPolicy, LeafPolicy};
 
 /// The record format this crate writes and reads.
 pub const RECORD_VERSION: u8 = 2;
+
+/// The length of `order-2`'s terms in the binary form.
+pub const ORDER_TERMS_BYTES: usize = 32 + 8 + 8 + 8 + 32 + 4 + 32 + 4 * 32;
 
 /// The most levels a record's path has.
 pub const MAX_LEVELS: usize = 16;
@@ -172,12 +184,16 @@ pub enum Template {
 	/// `htlc-1`, a leaf whose exit is a hash-locked pair: a claim with a
 	/// preimage and a refund after a timeout ([`crate::htlc`]).
 	Htlc1,
+	/// `order-2`, a resting order: the operator fills it with the maker
+	/// offline, and one exit delay after it reaches the chain it lands as
+	/// SeqDEX's own order ([`crate::order`]).
+	Order2,
 }
 
 impl Template {
 	/// Every template this crate knows, in the order of their ids: the
 	/// operator's published list (`info.templates`).
-	pub const ALL: [Template; 3] = [Template::Vtxo1, Template::Board1, Template::Htlc1];
+	pub const ALL: [Template; 4] = [Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -185,6 +201,8 @@ impl Template {
 	pub const BOARD: u8 = 2;
 	/// The template id of `htlc`.
 	pub const HTLC: u8 = 3;
+	/// The template id of `order`.
+	pub const ORDER: u8 = 4;
 
 	/// Its id in the binary form.
 	pub fn id(self) -> u8 {
@@ -192,6 +210,7 @@ impl Template {
 			Template::Vtxo1 => Template::VTXO,
 			Template::Board1 => Template::BOARD,
 			Template::Htlc1 => Template::HTLC,
+			Template::Order2 => Template::ORDER,
 		}
 	}
 
@@ -199,6 +218,7 @@ impl Template {
 	pub fn version(self) -> u8 {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 => 1,
+			Template::Order2 => 2,
 		}
 	}
 
@@ -208,6 +228,7 @@ impl Template {
 			Template::Vtxo1 => "vtxo",
 			Template::Board1 => "board",
 			Template::Htlc1 => "htlc",
+			Template::Order2 => "order",
 		}
 	}
 
@@ -217,9 +238,11 @@ impl Template {
 			(Template::VTXO, 1) => Ok(Template::Vtxo1),
 			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
+			(Template::ORDER, 2) => Ok(Template::Order2),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
 			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
 			(Template::HTLC, v) => Err(RecordError::TemplateVersion { template: "htlc".into(), version: v as u64 }),
+			(Template::ORDER, v) => Err(RecordError::TemplateVersion { template: "order".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -246,10 +269,11 @@ impl FromStr for Template {
 			"vtxo" => Template::Vtxo1,
 			"board" => Template::Board1,
 			"htlc" => Template::Htlc1,
+			"order" => Template::Order2,
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
-			Ok(1) => Ok(known),
+			Ok(v) if v == known.version() as u64 => Ok(known),
 			Ok(v) => Err(RecordError::TemplateVersion { template: name.into(), version: v }),
 			Err(_) => Err(RecordError::TemplateVersion { template: name.into(), version: u64::MAX }),
 		}
@@ -302,6 +326,8 @@ pub struct LeafRecord {
 	pub exit_delay: RelativeTime,
 	/// `htlc-1`'s terms: present exactly when the template is `htlc-1`.
 	pub htlc: Option<HtlcTerms>,
+	/// `order-2`'s terms: present exactly when the template is `order-2`.
+	pub order: Option<OrderLeafTerms>,
 	/// The batch's asset.
 	pub asset: AssetId,
 	/// The leaf's value.
@@ -435,6 +461,8 @@ pub enum RecordError {
 	EntryReserve { reserve: u64, min: u64 },
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
+	#[error("the order-2 terms: {0}")]
+	Order(String),
 	#[error("the htlc-1 terms: {0}")]
 	Htlc(crate::Error),
 	#[error("not JSON: {0}")]
@@ -485,6 +513,7 @@ impl RecordError {
 			Value(_) | ValueSum | Amount(_) => "value",
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",
 			Htlc(_) => "htlc",
+			Order(_) => "order",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
 			NotOwner | OwnerNonce | OwnKeyTwice => "owner",
@@ -548,12 +577,15 @@ impl LeafRecord {
 	/// Checks the record's shape: counts, indices and value bounds. Every
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
-		match (self.template, &self.htlc) {
-			(Template::Vtxo1, None) => {},
-			(Template::Htlc1, Some(t)) => t.check(self.exit_delay).map_err(RecordError::Htlc)?,
-			(Template::Htlc1, None) => return Err(RecordError::Template("htlc-1 without its terms".into())),
-			(Template::Vtxo1, Some(_)) => return Err(RecordError::Template("vtxo-1 with htlc-1 terms".into())),
-			(t, _) => return Err(RecordError::Template(t.to_string())),
+		match (self.template, &self.htlc, &self.order) {
+			(Template::Vtxo1, None, None) => {},
+			(Template::Htlc1, Some(t), None) => t.check(self.exit_delay).map_err(RecordError::Htlc)?,
+			(Template::Order2, None, Some(o)) => o.check(self.asset, &self.owner, &self.schedule.operator)
+				.map_err(|e| RecordError::Order(e.to_string()))?,
+			(Template::Htlc1, None, _) => return Err(RecordError::Template("htlc-1 without its terms".into())),
+			(Template::Order2, _, None) => return Err(RecordError::Template("order-2 without its terms".into())),
+			(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
+			(t, ..) => return Err(RecordError::Template(t.to_string())),
 		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
@@ -608,6 +640,7 @@ impl LeafRecord {
 			chain: self.chain,
 			exit_delay: self.exit_delay,
 			htlc: self.htlc,
+			order: self.order,
 		}
 	}
 
@@ -763,6 +796,9 @@ impl LeafRecord {
 		if let Some(t) = &self.htlc {
 			t.encode_to(&mut w);
 		}
+		if let Some(o) = &self.order {
+			o.encode_to(&mut w);
+		}
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
 		w.extend(self.unlock_hash);
@@ -818,7 +854,20 @@ impl LeafRecord {
 			Template::Htlc1 => Some(HtlcTerms::decode_from(&mut r)?),
 			_ => None,
 		};
+		// order-2's terms come before the asset they sell, which the leaf's
+		// own asset field names: read them, then put the asset in.
+		let order_bytes = match template {
+			Template::Order2 => Some(r.bytes(ORDER_TERMS_BYTES)?),
+			_ => None,
+		};
 		let asset = r.asset()?;
+		let order = match order_bytes {
+			Some(b) => {
+				let mut or = Reader::new(b);
+				Some(OrderLeafTerms::decode_from(&mut or, asset)?)
+			},
+			None => None,
+		};
 		let value = r.u64()?;
 		let unlock_hash = r.array32()?;
 		let entry_reserve = r.u64()?;
@@ -882,7 +931,7 @@ impl LeafRecord {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
 		}
 		let record = LeafRecord {
-			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, asset, value, unlock_hash, entry_reserve, chain,
+			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, order, asset, value, unlock_hash, entry_reserve, chain,
 			schedule, burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;

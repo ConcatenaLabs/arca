@@ -94,6 +94,12 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 				Box::pin(bases(store, &i.coin, out)).await?;
 			}
 		},
+		CoinRecord::Fill(f) => {
+			Box::pin(bases(store, &f.fill.order, out)).await?;
+			for i in &f.fill.inputs {
+				Box::pin(bases(store, &i.coin, out)).await?;
+			}
+		},
 		CoinRecord::Leaf { record, .. } => {
 			let id = record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?;
 			let leaf = store.batch_leaf(&id.0).await?
@@ -123,6 +129,10 @@ pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u
 			CoinRecord::Board(b) => out.push(b.leaf_id().0),
 			CoinRecord::Leaf { .. } => {},
 			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out)),
+			CoinRecord::Fill(f) => {
+				collect(&f.fill.order, out);
+				f.fill.inputs.iter().for_each(|i| collect(&i.coin, out));
+			},
 		}
 	}
 	collect(record, &mut boards);

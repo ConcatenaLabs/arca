@@ -28,6 +28,16 @@ pub fn nums() -> XOnlyPublicKey {
 	XOnlyPublicKey::from_slice(&NUMS).expect("NUMS is a valid x coordinate")
 }
 
+/// A node of a script tree: a tapscript leaf (`0xc4`), a Simplicity leaf
+/// (`0xbe`, named by its commitment root), or a hidden node, which no path
+/// spends (a data leaf a program reads through its control block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TapNode {
+	Tapscript(Script),
+	Simplicity([u8; 32]),
+	Hidden([u8; 32]),
+}
+
 /// A taproot output with the NUMS internal key and the given script leaves.
 #[derive(Debug, Clone)]
 pub struct TapOutput {
@@ -43,6 +53,28 @@ impl TapOutput {
 		for (depth, script) in &leaves {
 			b = b.add_leaf_with_ver(*depth as usize, script.clone(), LeafVersion::default())
 				.expect("the policies only build complete trees");
+		}
+		let info = b.finalize(secp(), nums()).expect("the policies only build complete trees");
+		TapOutput { info, leaves }
+	}
+
+	/// The output for a tree that may hold Simplicity leaves and hidden nodes
+	/// beside its tapscript leaves, each with its depth, in depth-first order.
+	/// [`TapOutput::leaves`] and [`TapOutput::witness`] see the tapscript
+	/// leaves alone.
+	pub fn with_nodes(nodes: Vec<(u8, TapNode)>) -> TapOutput {
+		let mut b = TaprootBuilder::new();
+		let mut leaves = vec![];
+		for (depth, node) in nodes {
+			b = match node {
+				TapNode::Tapscript(script) => {
+					leaves.push((depth, script.clone()));
+					b.add_leaf_with_ver(depth as usize, script, LeafVersion::default())
+				},
+				TapNode::Simplicity(cmr) => b.add_leaf_with_ver(depth as usize, Script::from(cmr.to_vec()),
+					LeafVersion::from_u8(0xbe).expect("0xbe is a leaf version")),
+				TapNode::Hidden(hash) => b.add_hidden(depth as usize, elements::hashes::sha256::Hash::from_byte_array(hash)),
+			}.expect("the policies only build complete trees");
 		}
 		let info = b.finalize(secp(), nums()).expect("the policies only build complete trees");
 		TapOutput { info, leaves }
