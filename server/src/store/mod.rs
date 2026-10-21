@@ -14,7 +14,7 @@
 //! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`,
 //! `schema/V24__distributions.sql`,
 //! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`,
-//! `schema/V27__resting_orders.sql`),
+//! `schema/V27__resting_orders.sql`, `schema/V28__issuer_operated.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -73,8 +73,8 @@ pub use participations::{
 	ParticipationState, ReleaseRow, Restored, WantedKind,
 };
 pub use rounds::{
-	BatchLeafRow, BatchRow, NewBatch, NewBatchLeaf, NewOffboard, NewRerun, NewRound, NewRoundFill, OffboardRow, Placement, RoundRow,
-	RoundState, StoredReserve,
+	BatchLeafRow, BatchRow, MintRow, NewBatch, NewBatchLeaf, NewOffboard, NewRerun, NewRound, NewRoundFill, OffboardRow, Placement,
+	RoundRow, RoundState, StoredReserve,
 };
 pub use transfers::{NewReassignment, NewTransferInput, NewTransferOutput, RecordHeadRow, StoredInput, TransferRow};
 pub use wallet::{WalletCoin, WalletRefusal};
@@ -111,6 +111,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(25, include_str!("../../schema/V25__shared_fills.sql")),
 	(26, include_str!("../../schema/V26__plans.sql")),
 	(27, include_str!("../../schema/V27__resting_orders.sql")),
+	(28, include_str!("../../schema/V28__issuer_operated.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

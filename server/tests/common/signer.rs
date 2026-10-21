@@ -107,6 +107,32 @@ impl SignerProcess {
 		let _ = std::fs::remove_file(&self.socket);
 	}
 
+	/// Starts it again on the same key, record and socket, with `extra`
+	/// arguments (an issuer-operated asset's `--issuer`, say); its log to
+	/// `signer.log` in its directory.
+	pub fn restart_with(&mut self, genesis: BlockHash, extra: &[String]) {
+		self.kill();
+		let file = self.dir.join("operator.key");
+		let log = std::fs::File::create(self.dir.join("signer.log")).unwrap();
+		self.child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
+				"--record", self.record().to_str().unwrap()])
+			.args(extra)
+			.stdout(Stdio::null()).stderr(log)
+			.spawn().unwrap();
+		let start = Instant::now();
+		while !self.socket.exists() {
+			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket: {}",
+				std::fs::read_to_string(self.dir.join("signer.log")).unwrap_or_default());
+			std::thread::sleep(Duration::from_millis(50));
+		}
+	}
+
+	/// The signer's log since [`SignerProcess::restart_with`].
+	pub fn log(&self) -> String {
+		std::fs::read_to_string(self.dir.join("signer.log")).unwrap_or_default()
+	}
+
 	/// Starts it again on the same key and socket.
 	pub fn restart(&mut self, key: &Keypair, genesis: BlockHash) {
 		self.kill();

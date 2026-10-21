@@ -220,11 +220,12 @@ use crate::fees;
 use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{
-	BatchRow, FillRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewRoundFill, NewScript, NewTreeScript,
+	BatchRow, FillRow, LeafKind, LeafState, MintRow, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewRoundFill, NewScript, NewTreeScript,
 	ParticipationRow, NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, TreeScriptKind,
 	WalletCoin, WantedKind,
 };
 use crate::participations::{order_on_chain, outpoint_text, refund_too_soon, ParticipationError};
+use crate::signer::SignerClient;
 use crate::wallet::{Foreign, Wallet, WalletError};
 
 /// How the runner builds its trees and clocks.
@@ -274,9 +275,21 @@ pub enum RoundError {
 	Refused(String),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	/// An issuer-operated asset's mint limiter allows no mint of what the
+	/// round would pay now, and why.
+	#[error("the round's mint waits: {0}")]
+	MintWaits(String),
+	#[error("the signer did not sign the round's mint: {0}")]
+	Mint(String),
 	#[error("{0}")]
 	Internal(String),
 }
+
+/// The witness a mint limiter's spend carries, for sizing a round's fee
+/// before the limiter's tool makes it: the program's witness, its pruned
+/// program (1,339 bytes for a mint within a window, 1,296 for one opening a
+/// window), its commitment root and its control block, a little over.
+const MINT_WITNESS: [usize; 4] = [240, 1_400, 32, 65];
 
 /// A round the runner built and handed to the nursery.
 #[derive(Debug, Clone)]
@@ -394,6 +407,9 @@ pub struct Rounds {
 	params: Arc<Params>,
 	wallet: Arc<Wallet>,
 	nursery: Arc<Nursery>,
+	/// The signer, which signs an issuer-operated asset's mint
+	/// ([`crate::issuer`]).
+	signer: SignerClient,
 	config: RoundConfig,
 	/// One round at a time.
 	running: Mutex<()>,
@@ -430,10 +446,29 @@ pub fn issuance_vsize(operator: elements::secp256k1_zkp::XOnlyPublicKey, asset: 
 
 impl Rounds {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, wallet: Arc<Wallet>, nursery: Arc<Nursery>,
-		config: RoundConfig) -> Arc<Rounds>
+		signer: SignerClient, config: RoundConfig) -> Arc<Rounds>
 	{
-		Arc::new(Rounds { store, finality, params, wallet, nursery, config, running: Mutex::new(()), voiding: Mutex::new(()),
+		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
 			going_out: Mutex::new(()) })
+	}
+
+	/// What the operator minted and burned of the issuer-operated `asset`,
+	/// and what is live in its batches ([`crate::issuer::supply`]); `None`
+	/// for an asset not served issuer-operated.
+	pub async fn issuer_supply(&self, asset: AssetId) -> Result<Option<crate::api::IssuerSupply>, RoundError> {
+		let Some(i) = self.params.assets.get(&asset).and_then(|a| a.issuer) else { return Ok(None) };
+		crate::issuer::supply(&self.store, &self.finality, asset, &i).await.map(Some).map_err(|e| RoundError::Chain(e.to_string()))
+	}
+
+	/// Where `asset`'s mint limiter stands, and what it allows a round to
+	/// mint now, when the asset is served issuer-operated: `None` for an
+	/// asset the operator funds from its own coins; `Some(Err(why))` when it
+	/// allows no mint now.
+	async fn mint_room(&self, asset: AssetId) -> Result<Option<Result<crate::issuer::MintRoom, String>>, RoundError> {
+		let Some(issuer) = self.params.assets.get(&asset).and_then(|a| a.issuer) else { return Ok(None) };
+		let at = crate::issuer::limiter_now(&self.store, &self.finality, asset, &issuer).await
+			.map_err(|e| RoundError::Chain(e.to_string()))?;
+		Ok(Some(crate::issuer::MintRoom::of(&at, &issuer.limiter)))
 	}
 
 	pub fn config(&self) -> &RoundConfig {
@@ -981,6 +1016,14 @@ impl Rounds {
 					let row = chosen.remove(i);
 					self.wait(&row, short, need, have).await?;
 				},
+				// The limiter allows no such mint now (it moved since the
+				// participations were taken): they wait, saying why.
+				Err(RoundError::MintWaits(why)) => {
+					for row in &chosen {
+						self.wait_for(row, &format!("a round of asset {} mints what it pays of it, and {}", asset, why)).await?;
+					}
+					return Ok(None);
+				},
 				other => return other,
 			}
 		}
@@ -1135,7 +1178,23 @@ impl Rounds {
 	/// ones after it are taken if they fit.
 	async fn fundable(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
 		let balance = self.wallet.balance().await?;
-		let have = |a: &AssetId| balance.get(a).copied().unwrap_or(0);
+		// A round of an issuer-operated asset mints what it pays of it: what
+		// it may pay is what the asset's mint limiter allows now.
+		let mut minting: BTreeMap<AssetId, Result<crate::issuer::MintRoom, String>> = BTreeMap::new();
+		for row in &chosen {
+			if let Some(a) = Self::asset_of(row) {
+				if !minting.contains_key(&a) {
+					if let Some(r) = self.mint_room(a).await? {
+						minting.insert(a, r);
+					}
+				}
+			}
+		}
+		let have = |a: &AssetId| match minting.get(a) {
+			Some(Ok(m)) => m.room,
+			Some(Err(_)) => 0,
+			None => balance.get(a).copied().unwrap_or(0),
+		};
 		let all: Vec<&ParticipationRow> = chosen.iter().collect();
 		let whole = self.pays(&all, now).await?;
 		if whole.iter().all(|(a, v)| *v <= have(a)) {
@@ -1148,11 +1207,31 @@ impl Rounds {
 			let pays = self.pays(&with, now).await?;
 			let mine: Vec<AssetId> = row.outputs.iter().map(|o| AssetId::from_byte_array(o.asset)).collect();
 			match pays.iter().find(|(a, v)| mine.contains(a) && **v > have(a)) {
-				Some((a, v)) => self.wait(&row, *a, *v, have(a)).await?,
+				Some((a, v)) => match minting.get(a) {
+					Some(m) => {
+						let why = match m {
+							Ok(room) => room.wait(&self.params.assets.get(a).and_then(|x| x.issuer).expect("minting").limiter, *v)
+								.unwrap_or_default(),
+							Err(why) => why.clone(),
+						};
+						self.wait_for(&row, &format!("a round of asset {} mints what it pays of it, and {}; it runs once the limiter allows \
+							it", a, why)).await?;
+					},
+					None => self.wait(&row, *a, *v, have(a)).await?,
+				},
 				None => taken.push(row),
 			}
 		}
 		Ok(taken)
+	}
+
+	/// Records why `row` waits.
+	async fn wait_for(&self, row: &ParticipationRow, why: &str) -> Result<(), RoundError> {
+		if row.waiting.as_deref() != Some(why) {
+			log::warn!("participation {} waits: {}", crate::signer::hex(&row.id), why);
+		}
+		self.store.set_waiting(&row.id, Some(why)).await?;
+		Ok(())
 	}
 
 	/// The smallest leaf a batch of `asset` holding `specs` publishes: the
@@ -1200,8 +1279,6 @@ impl Rounds {
 	{
 		let p = self.params.clone();
 		let s = p.operator;
-		// Outputs 0..2n-1 are the orders'; the batches start after them.
-		let base = 2 * fills.len() as u32;
 
 		// The leaves per asset, and the offboards.
 		let mut groups: BTreeMap<AssetId, Vec<Planned>> = BTreeMap::new();
@@ -1227,10 +1304,24 @@ impl Rounds {
 			}
 		}
 
+		// A round of an issuer-operated asset mints what it pays in the asset
+		// ([`crate::issuer`]): the limiter's coin at input 0, its successor at
+		// output 0. It fills no order: the orders would hold the low inputs.
+		let round_asset = groups.keys().next().copied().or_else(|| offboards.first().map(|o| o.policy.destination.asset));
+		let issuer = round_asset.and_then(|a| p.assets.get(&a).and_then(|x| x.issuer).map(|i| (a, i)));
+		if issuer.is_some() && !fills.is_empty() {
+			return Err(RoundError::Internal("an issuer-operated asset's round fills no on-chain order".into()));
+		}
+		let minted = issuer.map(|(a, _)| a);
+		// Outputs 0..2n-1 are the orders', or output 0 the limiter's
+		// successor; the batches start after them.
+		let base = 2 * fills.len() as u32 + minted.is_some() as u32;
+
 		// The fee asset: the round's own, when the node accepts it and it is
 		// one of the operator's fee assets, else the first of those the node
-		// accepts.
-		let fee_assets = p.fee_assets();
+		// accepts; never an asset the round mints, of which the operator
+		// keeps nothing.
+		let fee_assets: Vec<AssetId> = p.fee_assets().into_iter().filter(|a| Some(*a) != minted).collect();
 		let mut floors: BTreeMap<AssetId, Option<u64>> = BTreeMap::new();
 		let round_assets: Vec<AssetId> = groups.keys().copied().chain(offboards.iter().map(|o| o.policy.destination.asset)).collect();
 		for a in round_assets.iter().chain(fee_assets.iter()) {
@@ -1273,31 +1364,57 @@ impl Rounds {
 		if let Some(l) = lost.iter().find(|l| !ties.iter().any(|t| t.replaces == **l)) {
 			return Err(RoundError::Internal(format!("no coin keeps the round apart from lost round {}", l)));
 		}
+		// The mint: exactly what the round pays in the asset, from the
+		// limiter's coin, which must allow it.
+		let mut foreign = vec![];
+		let mut successor = None;
+		let mut mint = None;
+		if let Some((asset, i)) = &issuer {
+			let rows: Vec<&ParticipationRow> = chosen.iter().collect();
+			let amount = self.pays(&rows, now).await?.get(asset).copied().unwrap_or(0);
+			let room = match self.mint_room(*asset).await? {
+				Some(Ok(r)) => r,
+				Some(Err(why)) => return Err(RoundError::MintWaits(why)),
+				None => return Err(RoundError::Internal("an issuer-operated asset with no limiter".into())),
+			};
+			if let Some(why) = room.wait(&i.limiter, amount) {
+				return Err(RoundError::MintWaits(why));
+			}
+			let next = i.limiter.mint(room.now.state, room.age, amount).map_err(|e| RoundError::MintWaits(e.to_string()))?;
+			let token_amount = room.now.txout.value.explicit().ok_or_else(|| RoundError::Internal("the limiter's coin hides its value".into()))?;
+			foreign.push(Foreign {
+				outpoint: room.now.coin,
+				txout: room.now.txout.clone(),
+				witness: MINT_WITNESS.iter().map(|n| vec![0; *n]).collect(),
+				sequence: arca_covenant::limiter::age_sequence(room.age),
+				issuance: Some(arca_covenant::limiter::reissuance(i.entropy, amount)),
+			});
+			successor = Some(ExplicitOutput::new(i.limiter.token, token_amount, i.limiter.script_pubkey(next)));
+			mint = Some((*asset, *i, room, amount, next));
+		}
 		// Each order's input, first, and the outputs its FILL leaf reads: the
 		// credit at 2k, and at 2k+1 the order resting again or, for a full
 		// fill, an output to the operator in the asset the order is paid in.
-		let mut foreign = vec![];
 		let mut fill_outputs = vec![];
 		for f in fills {
-			foreign.push(Foreign {
-				outpoint: f.order,
-				txout: ExplicitOutput::new(f.terms.asset_a, f.locked, f.terms.script_pubkey()).txout(),
-				witness: f.terms.witness(),
-			});
+			foreign.push(Foreign::spent_by_script(f.order, ExplicitOutput::new(f.terms.asset_a, f.locked, f.terms.script_pubkey()).txout(),
+				f.terms.witness()));
 			fill_outputs.push(f.plan.credit.clone());
 			fill_outputs.push(match &f.plan.rest {
 				Some(rest) => rest.clone(),
 				None => ExplicitOutput::new(f.terms.asset_b, gap_value(f.terms.asset_b, fee_asset), self.wallet.change_script().await?),
 			});
 		}
-		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, |tokens| {
-			let mut outputs = fill_outputs.clone();
+		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, minted, |tokens| {
+			let mut outputs: Vec<ExplicitOutput> = successor.iter().cloned().collect();
+			outputs.extend(fill_outputs.iter().cloned());
 			let mut trees = vec![];
 			for ((asset, leaves), token) in groups.iter().zip(tokens) {
 				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
+				// An issuer-operated asset's batch is burn-only.
 				let params = TreeParams {
-					asset: *asset, chain, schedule, burn: false, radix, reserve: reserves[asset],
+					asset: *asset, chain, schedule, burn: Some(*asset) == minted, radix, reserve: reserves[asset],
 					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
 				let tree = Tree::build(params, &specs).map_err(|e| format!("the tree of asset {}: {}", asset, e))?;
@@ -1310,7 +1427,7 @@ impl Rounds {
 			}
 			Ok((outputs, trees))
 		}).await?;
-		let tx = built.tx.clone();
+		let mut tx = built.tx.clone();
 		let txid = tx.txid();
 		let c = built.connector_vout.expect("a round has a connector");
 		let release = |e: RoundError| async move {
@@ -1319,6 +1436,32 @@ impl Rounds {
 			}
 			Err::<Option<Built>, RoundError>(e)
 		};
+		// The mint, signed by the signer once the round is whole: it checks
+		// every unit of the asset goes to a burn-only batch or an offboard it
+		// rebuilds, and the limiter's tool signs over the whole transaction.
+		// The wallet's signatures are made already; neither covers the
+		// other's witness.
+		if let Some((asset, i, room, amount, _)) = &mint {
+			let mut batches = vec![];
+			for (k, (tree, (_, leaves))) in trees.iter().zip(&groups).enumerate() {
+				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
+				match crate::issuer::WireBatch::of(base + 2 * k as u32, tree.params(), &specs) {
+					Ok(b) => batches.push(b),
+					Err(e) => return release(RoundError::Internal(e)).await,
+				}
+			}
+			let offs = offboards.iter().enumerate()
+				.map(|(k, o)| crate::issuer::WireOffboard::of(base + 2 * trees.len() as u32 + k as u32, &o.policy, o.margin)).collect();
+			let req = crate::issuer::WireReissue::new(&tx, &built.prevouts, *asset, i.entropy, room.now.state, batches, offs);
+			match self.signer.reissue(&req).await {
+				Ok(w) => tx.input[0].witness.script_witness = w,
+				Err(e) => return release(RoundError::Mint(e.to_string())).await,
+			}
+			let paid: u64 = tx.output.iter().filter(|o| o.asset.explicit() == Some(*asset)).filter_map(|o| o.value.explicit()).sum();
+			if paid != *amount {
+				return release(RoundError::Check(format!("the round mints {} of asset {} and pays {} of it", amount, asset, paid))).await;
+			}
+		}
 
 		// Checked as a wallet would check it.
 		let accept = WalletPolicy {
@@ -1402,7 +1545,8 @@ impl Rounds {
 					value: tree.batch_output().value,
 					token: tp.schedule.token.into_inner().to_byte_array(),
 					token_vout: vout + 1,
-					issuer: (tx.input[fills.len() + i].previous_output.txid.to_byte_array(), tx.input[fills.len() + i].previous_output.vout),
+					issuer: (tx.input[foreign.len() + i].previous_output.txid.to_byte_array(),
+						tx.input[foreign.len() + i].previous_output.vout),
 					schedule: tp.schedule.encode(),
 					burn: tp.burn,
 					radix: tp.radix as u16,
@@ -1488,6 +1632,17 @@ impl Rounds {
 			fills: fills.iter().enumerate().flat_map(|(k, f)| f.participations.iter().map(move |j| NewRoundFill {
 				k: k as u32, participation_id: chosen[*j].id, attempt: chosen[*j].attempt,
 			})).collect(),
+			mint: mint.as_ref().map(|(asset, _, room, amount, next)| MintRow {
+				round_id: 0,
+				asset: asset.into_inner().to_byte_array(),
+				coin: (room.now.coin.txid.to_byte_array(), room.now.coin.vout),
+				minted: room.now.state.minted,
+				elapsed: room.now.state.elapsed,
+				age: room.age,
+				amount: *amount,
+				next_minted: next.minted,
+				next_elapsed: next.elapsed,
+			}),
 		};
 		let round_id = match self.store.insert_round(&new).await {
 			Ok(id) => id,

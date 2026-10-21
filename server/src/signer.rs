@@ -58,6 +58,12 @@
 //!   creates the children its node pins, and the reserves are the
 //!   operator's.
 //!
+//! - `{"op":"reissue","reissue":{…}}`: for an issuer-operated asset whose
+//!   mint limiter the signer was started with, the witness of the limiter's
+//!   coin at input 0 of a round, once the signer has checked the round's
+//!   mint ([`crate::issuer::check_reissue`]) and the limiter's own tool has
+//!   signed it with the limiter's operator key, never `S`.
+//!
 //! It signs nothing else: no digest handed to it, no release, and no spend by
 //! a path that checks `S` with `OP_CHECKSIGFROMSTACK`, which only the
 //! rebindable message reaches. The
@@ -261,6 +267,10 @@ pub enum Request {
 	/// The operator's unroll authorisation for the node whose children hash
 	/// is `children_hash` (32 bytes, hex), from the median time `time` on.
 	Unroll { children_hash: String, time: u32 },
+	/// An issuer-operated asset's mint at input 0 of a round: the witness of
+	/// the limiter's coin, once the signer has checked the round
+	/// ([`crate::issuer::check_reissue`]) and the limiter's tool signed it.
+	Reissue { reissue: crate::issuer::WireReissue },
 	/// A fill of the resting order whose coin is `owner`'s (the maker's leaf
 	/// key) under `salt`: the order's terms in the leaf record's JSON form,
 	/// the asset it sells and its exit delay, what the coin holds, whether
@@ -406,6 +416,10 @@ pub struct Response {
 	/// one before it is answered (`pubkey`'s answer).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub keepers: Option<WireKeepers>,
+	/// A mint's witness for the limiter's coin (`reissue`'s answer), each
+	/// item hex.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub witness: Option<Vec<String>>,
 }
 
 /// The keepers a signer hands every head to before it answers an entry
@@ -1966,6 +1980,14 @@ impl SignerClient {
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		let sig = Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))?;
 		Ok((sig, head))
+	}
+
+	/// The witness of the limiter's coin at input 0 of the round `req`
+	/// names, signed through the limiter's tool once the signer has checked
+	/// the mint ([`crate::issuer::check_reissue`]).
+	pub async fn reissue(&self, req: &crate::issuer::WireReissue) -> Result<Vec<Vec<u8>>, SignerError> {
+		let r = self.ask(&Request::Reissue { reissue: req.clone() }).await?;
+		r.witness.ok_or_else(|| SignerError::Answer("no witness".into()))?.iter().map(|w| unhex(w).map_err(SignerError::Answer)).collect()
 	}
 
 	/// `S`'s signature over a fill of the resting order `order` (its coin

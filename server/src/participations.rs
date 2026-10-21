@@ -934,6 +934,15 @@ impl Participations {
 		let plan = terms.plan(req.locked, req.filled).map_err(fill_error)?;
 		let (asset_a, asset_b) = (terms.asset_a, terms.asset_b);
 		let price = plan.credit.value;
+		// An issuer-operated asset is not filled in a round: the orders hold
+		// the round's low inputs, where its mint limiter must be input 0, and
+		// the credit would come from coins the operator keeps none of.
+		for a in [asset_a, asset_b] {
+			if p.assets.get(&a).is_some_and(|x| x.issuer.is_some()) {
+				return Err(ParticipationError::OutOfBounds(format!("asset {} is issuer-operated here: its batches are funded by a mint in \
+					their round, and a round that fills an on-chain order mints nothing", a)));
+			}
+		}
 
 		// The leaf: what the take fills, in the asset the order sells, under
 		// a key the take proves it holds.

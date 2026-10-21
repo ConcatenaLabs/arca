@@ -614,6 +614,15 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				lightning_base_value: ap.fees.lightning_base.value().map(|v| v.to_string()),
 			}),
 			lightning: app.gateway.asset_info(a),
+			issuer: ap.issuer.map(|i| api::IssuerInfo {
+				limiter: arca_covenant::limiter::LIMITER_TEMPLATE.into(),
+				token: i.limiter.token.to_string(),
+				operator_key: hex(&i.limiter.operator.serialize()),
+				cold_key: hex(&i.limiter.cold.serialize()),
+				allowance: i.limiter.allowance.to_string(),
+				window_blocks: i.limiter.window,
+				recovery_delay_units: i.limiter.recovery_delay,
+			}),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -1173,6 +1182,22 @@ async fn rounds(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Sock
 /// The most rounds one `rounds` page lists.
 pub const ROUNDS_PAGE: u32 = 100;
 
+async fn issuer_supply(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::IssuerSupply>, Refusal>
+{
+	let req: api::IssuerSupplyRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a supply report", app.source(peer.ip(), &headers))?;
+	let asset = elements::AssetId::from_str(&req.asset).map_err(|e| Refusal::malformed(format!("asset: {}", e)))?;
+	match app.rounds.issuer_supply(asset).await {
+		Ok(Some(s)) => Ok(Json(s)),
+		Ok(None) => Err(Refusal::new(status_of("out_of_bounds"), "out_of_bounds", format!("asset {} is not served issuer-operated here", asset))),
+		Err(e) => {
+			log::error!("issuer_supply: {}", e);
+			Err(Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))
+		},
+	}
+}
+
 async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Forfeited>, Refusal> {
 	let req: api::ForfeitLeaves = parse(body, app.max_request)?;
 	let participation_id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
@@ -1579,6 +1604,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))
+		.route("/v1/issuer_supply", post(issuer_supply))
 		.route("/v1/distribute", post(claims::distribute))
 		.route("/v1/distribution_status", post(claims::distribution_status))
 		.route("/v1/claims", post(claims::claims))

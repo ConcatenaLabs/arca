@@ -610,6 +610,11 @@ pub struct AssetSection {
 	/// absent, and then nothing in the asset goes over Lightning here.
 	#[serde(default)]
 	pub lightning: Option<LegSection>,
+	/// The asset's mint limiter, when the operator serves it issuer-operated
+	/// ([`crate::issuer`]); none for an asset whose batches the operator funds
+	/// from its own coins.
+	#[serde(default)]
+	pub issuer: Option<crate::issuer::IssuerSection>,
 }
 
 impl AssetSection {
@@ -618,7 +623,7 @@ impl AssetSection {
 		AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
-			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None,
+			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None,
 		}
 	}
 }
@@ -968,7 +973,17 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			lightning_ppm: a.lightning_ppm.unwrap_or(config.fees.lightning_ppm),
 			lightning_base: amount("lightning_base", &a.lightning_base, &a.lightning_base_value)?,
 		};
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees }));
+		let issuer = match &a.issuer {
+			None => None,
+			Some(s) => {
+				if a.lightning.is_some() {
+					return Err(StartError(format!("asset {}: an issuer-operated asset has no Lightning leg here: the operator would pay out \
+						of and be paid into channels in the asset, units it keeps none of and mints only in a round", id)));
+				}
+				Some(crate::issuer::IssuerAsset::from_section(id, s, None).map_err(|e| StartError(format!("asset {}: issuer: {}", id, e)))?)
+			},
+		};
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -978,6 +993,33 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 		None => None,
 	};
 	Ok((list, fee_assets))
+}
+
+/// Refuses an issuer-operated asset whose mint limiter is an instance on
+/// another chain than `genesis`, and issuer-operated assets that leave no
+/// fee asset: a round that mints an asset, and a sweep that burns it, pay
+/// their fees in another (`fee_assets`, the served assets when `None`).
+fn issuers_on(list: &[(AssetId, AssetParams)], fee_assets: &Option<Vec<AssetId>>, genesis: elements::BlockHash) -> Result<(), StartError> {
+	for (a, p) in list {
+		if let Some(i) = &p.issuer {
+			if i.genesis != genesis {
+				return Err(StartError(format!("asset {}: issuer: the mint limiter is an instance on chain {}, and the server runs on {}", a,
+					i.genesis, genesis)));
+			}
+		}
+	}
+	let issuer = |a: &AssetId| list.iter().any(|(b, p)| b == a && p.issuer.is_some());
+	if list.iter().any(|(a, _)| issuer(a)) {
+		let payable = match fee_assets {
+			Some(f) => f.iter().any(|a| !issuer(a)),
+			None => list.iter().any(|(a, _)| !issuer(a)),
+		};
+		if !payable {
+			return Err(StartError("every fee asset is issuer-operated: a round that mints an asset, and a sweep that burns it, pay their \
+				fees in another asset, so list one in fee_assets (or serve one) that is not issuer-operated".into()));
+		}
+	}
+	Ok(())
 }
 
 /// Each served asset's Lightning node, as `config` names it.
@@ -1053,6 +1095,7 @@ impl Server {
 		}
 
 		let (list, fee_assets) = assets_of(config)?;
+		issuers_on(&list, &fee_assets, genesis)?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
 		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
@@ -1090,7 +1133,8 @@ impl Server {
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let plans = crate::plans::Plans::new(store.clone(), finality.clone(), params.clone(), signer.clone(), wallet.clone());
 		let orders = crate::orders::Orders::new(store.clone(), finality.clone(), params.clone(), signer.clone());
-		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
+		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer.clone(),
+			RoundConfig::default());
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {
@@ -1269,6 +1313,7 @@ impl Server {
 	/// it was and says so.
 	pub async fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
 		let (list, fee_assets) = assets_of(config)?;
+		issuers_on(&list, &fee_assets, self.params.chain.genesis_hash())?;
 		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();

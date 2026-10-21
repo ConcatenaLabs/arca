@@ -79,6 +79,10 @@ pub struct AssetParams {
 	pub rate: Option<RateConfig>,
 	/// What the operator charges in the asset.
 	pub fees: AssetFees,
+	/// The asset's mint limiter, when the operator serves it issuer-operated
+	/// ([`crate::issuer`]): its batches are funded by a reissue in the round
+	/// and swept only by burning.
+	pub issuer: Option<crate::issuer::IssuerAsset>,
 }
 
 /// The assets the operator serves, in the order its configuration lists

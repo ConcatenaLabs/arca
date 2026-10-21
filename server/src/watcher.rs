@@ -204,6 +204,19 @@ fn sized(mut tx: Transaction, wallet_inputs: &[usize]) -> u64 {
 	tx.vsize() as u64
 }
 
+/// A burn of `value` of `asset`.
+fn crate_burn(asset: AssetId, value: u64) -> ExplicitOutput {
+	arca_covenant::issuer::burn(asset, value)
+}
+
+/// `src`, a fee coin, as one that burns the margin it leaves.
+fn burning(src: &FeeSource) -> FeeSource {
+	match src {
+		FeeSource::Coin { outpoint, coin, fee, change } => FeeSource::Burning { outpoint: *outpoint, coin: coin.clone(), fee: *fee, change: change.clone() },
+		other => other.clone(),
+	}
+}
+
 /// The input of `tx` that a fee coin from `fee` holds.
 fn fee_input(tx: &Transaction, fee: &FeeSource) -> Option<usize> {
 	match fee {
@@ -442,6 +455,19 @@ impl Watcher {
 		v
 	}
 
+	/// Whether the operator burns every unit of `asset` it takes in, and pays
+	/// no fee in it: an issuer-operated asset ([`crate::issuer::burns`]).
+	async fn burns(&self, asset: AssetId) -> Result<bool, WatcherError> {
+		Ok(crate::issuer::burns(&self.params, &self.store, asset).await?)
+	}
+
+	/// The assets a wallet coin may pay a fee in for a transaction that takes
+	/// in `asset`, which the operator burns: the operator's fee assets but
+	/// `asset`.
+	fn fee_assets_but(&self, asset: AssetId) -> Vec<AssetId> {
+		self.params.fee_assets().into_iter().filter(|a| *a != asset).collect()
+	}
+
 	/// `S`'s signature over input `input` of `tx` by `leaf`, checked against
 	/// the signature hash the server computes itself. Every caller has
 	/// reserved the wallet coins `tx` spends, and publishes it only once it
@@ -542,6 +568,19 @@ impl Watcher {
 	where
 		F: FnMut(&[ExplicitOutput], &FeeSource) -> Result<(T, Transaction), String>,
 	{
+		// An issuer-operated asset: what the operator takes is burned whole,
+		// and a coin of another asset pays the fee.
+		if self.burns(asset).await? {
+			let outs = [crate_burn(asset, value)];
+			let (made, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets_but(asset), |src| {
+				let (made, dummy) = make(&outs, src)?;
+				let mut w = wallet_inputs.to_vec();
+				w.extend(fee_input(&dummy, src));
+				let txid = dummy.txid();
+				Ok((made, txid, sized(dummy, &w)))
+			}).await?;
+			return Ok(Payout { made, fee_coin: Some(coin), fee });
+		}
 		let to = self.to_wallet().await?;
 		if self.accepted(asset).await?.is_some() {
 			let (_, dummy) = make(&[ExplicitOutput::new(asset, value, to.clone())], &FeeSource::Reserve).map_err(WatcherError::Build)?;
@@ -571,6 +610,30 @@ impl Watcher {
 	where
 		F: FnMut(&[ExplicitOutput], &FeeSource) -> Result<(T, Transaction), String>,
 	{
+		// Any asset of them issuer-operated: each such asset's value is
+		// burned whole, the others go to the wallet, and a coin of an asset
+		// none of them burns pays the fee.
+		let mut burned = vec![];
+		for a in held.keys() {
+			if self.burns(*a).await? {
+				burned.push(*a);
+			}
+		}
+		if !burned.is_empty() {
+			let to = self.to_wallet().await?;
+			let outs: Vec<ExplicitOutput> = held.iter().map(|(a, v)| if burned.contains(a) { crate_burn(*a, *v) } else {
+				ExplicitOutput::new(*a, *v, to.clone())
+			}).collect();
+			let assets: Vec<AssetId> = self.params.fee_assets().into_iter().filter(|a| !burned.contains(a)).collect();
+			let (made, coin, fee) = self.wallet.with_fee_coin(&assets, |src| {
+				let (made, dummy) = make(&outs, src)?;
+				let mut w = wallet_inputs.to_vec();
+				w.extend(fee_input(&dummy, src));
+				let txid = dummy.txid();
+				Ok((made, txid, sized(dummy, &w)))
+			}).await?;
+			return Ok(Payout { made, fee_coin: Some(coin), fee });
+		}
 		let to = self.to_wallet().await?;
 		let outs = |less: Option<(AssetId, u64)>| -> Vec<ExplicitOutput> {
 			held.iter().map(|(a, v)| {
@@ -613,6 +676,18 @@ impl Watcher {
 	where
 		F: FnMut(&FeeSource) -> Result<(T, Transaction), String>,
 	{
+		// An issuer-operated asset: a coin of another asset pays, and the
+		// margin is burned, never paid as a fee nor kept.
+		if self.burns(asset).await? {
+			let (made, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets_but(asset), |src| {
+				let src = burning(src);
+				let (made, dummy) = make(&src)?;
+				let w: Vec<usize> = fee_input(&dummy, &src).into_iter().collect();
+				let txid = dummy.txid();
+				Ok((made, txid, sized(dummy, &w)))
+			}).await?;
+			return Ok((made, Some(coin), Some(fee)));
+		}
 		if let Some(floor) = self.accepted(asset).await? {
 			let (made, dummy) = make(&FeeSource::Reserve).map_err(WatcherError::Build)?;
 			if margin >= fees::atoms_for(floor, dummy.vsize() as u64, 1) {
@@ -1789,7 +1864,9 @@ impl Watcher {
 						j, why);
 					return Ok(());
 				}
-				let (ks, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets(AssetId::from_byte_array(b.asset)), |src| {
+				let asset = AssetId::from_byte_array(b.asset);
+				let fee_assets = if self.burns(asset).await? { self.fee_assets_but(asset) } else { self.fee_assets(asset) };
+				let (ks, coin, fee) = self.wallet.with_fee_coin(&fee_assets, |src| {
 					let ks = schedule.release_tx(j, at, src).map_err(|e| e.to_string())?;
 					let t = ks.clone().finish(Clock::witness_items(&dummy_sig())).tx;
 					let w: Vec<usize> = fee_input(&t, src).into_iter().collect();
@@ -1803,10 +1880,6 @@ impl Watcher {
 						e.to_consensus_u32())).await?;
 			},
 			TokenPlace::Released => {
-				if b.burn {
-					log::warn!("watcher: the batch at output {} of round {} is burn-only; this server sweeps none", b.vout, round.round_id);
-					return Ok(());
-				}
 				if !self.confirmed(at).await? || self.spending(&at).await?
 					|| !self.waited(at.txid, schedule.notice).await?
 				{
@@ -1818,6 +1891,26 @@ impl Watcher {
 				}
 				let asset = AssetId::from_byte_array(b.asset);
 				let total: u64 = swept.iter().map(|s| s.value).sum();
+				// A burn-only batch: each swept output is burned whole at its
+				// own index, and a coin of another asset pays the fee.
+				if b.burn {
+					let (sw, coin, fee) = self.wallet.with_fee_coin(&self.fee_assets_but(asset), |src| {
+						let sw = sweep_tx(&schedule, at, &swept, &[], src).map_err(|e| e.to_string())?;
+						let t = sw.clone().finish(&vec![dummy_sig(); sw.leaves.len()]).map_err(|e| e.to_string())?.tx;
+						let w: Vec<usize> = fee_input(&t, src).into_iter().collect();
+						Ok((sw, t.txid(), sized(t, &w)))
+					}).await?;
+					let mut sigs = Vec::with_capacity(sw.leaves.len());
+					for i in 0..sw.leaves.len() {
+						sigs.push(self.operator_sig(&sw.tx, &sw.prevouts, i, &sw.leaves[i]).await?);
+					}
+					let n = sw.tx.input.len();
+					let u = sw.finish(&sigs).map_err(build("the burn"))?;
+					self.publish(Ready { tx: u.tx, wallet: vec![(n - 1, coin)], fee: Some(fee) }, "sweep", subject,
+						format!("{} output(s) of the burn-only batch at output {} of round {}, {} of {} burned", swept.len(), b.vout,
+							round.round_id, total, asset)).await?;
+					return Ok(());
+				}
 				let pay = self.payout(asset, total, &[], |outs, fee| {
 					let sw = sweep_tx(&schedule, at, &swept, outs, fee).map_err(|e| e.to_string())?;
 					let t = sw.clone().finish(&vec![dummy_sig(); sw.leaves.len()]).map_err(|e| e.to_string())?.tx;

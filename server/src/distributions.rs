@@ -123,6 +123,12 @@ impl Participations {
 		if !p.assets.contains(&asset) {
 			return Err(ParticipationError::Assets(format!("asset {} is not served by this operator", asset)));
 		}
+		// An issuer-operated asset's operator keeps none of it, so it could
+		// pay no unclaimed value back to the payer.
+		if p.assets.get(&asset).is_some_and(|x| x.issuer.is_some()) {
+			return Err(ParticipationError::OutOfBounds(format!("asset {} is issuer-operated here: the operator keeps no unit of it, and a \
+				distribution's unclaimed value is paid back from the operator's coins", asset)));
+		}
 		if let Some((a, _)) = d.fees.iter().find(|(a, _)| *a != asset) {
 			return Err(ParticipationError::Assets(format!("a fee in asset {}: a distribution pays its fee in its own asset, {}", a, asset)));
 		}

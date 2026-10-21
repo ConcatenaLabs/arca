@@ -171,6 +171,24 @@ pub struct NewRound {
 	pub reruns: Vec<NewRerun>,
 	/// Each on-chain order it fills, at its input.
 	pub fills: Vec<NewRoundFill>,
+	/// For a round of an issuer-operated asset, its mint at input 0.
+	pub mint: Option<MintRow>,
+}
+
+/// A round's mint of an issuer-operated asset: the limiter coin it spends at
+/// input 0, the limiter's state before and after, the age the input
+/// declares, and the amount it reissues; the limiter's successor is output 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MintRow {
+	pub round_id: i64,
+	pub asset: [u8; 32],
+	pub coin: ([u8; 32], u32),
+	pub minted: u64,
+	pub elapsed: u16,
+	pub age: u16,
+	pub amount: u64,
+	pub next_minted: u64,
+	pub next_elapsed: u16,
 }
 
 /// An on-chain order a round fills: the covenant at input `k`, for the take
@@ -229,6 +247,24 @@ fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 
 const BATCH_COLUMNS: &str = "round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn, radix,
 	reserve_kind, reserve_a, reserve_b, min_leaf";
+
+fn mint_row(r: &tokio_postgres::Row) -> Result<MintRow, StoreError> {
+	let n = |i: usize, what: &str| -> Result<u64, StoreError> {
+		let v: i64 = r.get(i);
+		u64::try_from(v).map_err(|_| StoreError::Corrupt(format!("{} {}", what, v)))
+	};
+	Ok(MintRow {
+		round_id: r.get(0),
+		asset: array32(r.get(1), "asset")?,
+		coin: (array32(r.get(2), "coin txid")?, r.get::<_, i32>(3) as u32),
+		minted: n(4, "minted")?,
+		elapsed: r.get::<_, i32>(5) as u16,
+		age: r.get::<_, i32>(6) as u16,
+		amount: n(7, "amount")?,
+		next_minted: n(8, "next minted")?,
+		next_elapsed: r.get::<_, i32>(9) as u16,
+	})
+}
 
 fn batch_row(r: &tokio_postgres::Row) -> Result<BatchRow, StoreError> {
 	let (a, b) = (u64_of(r.get(12), "reserve")?, u64_of(r.get(13), "reserve")?);
@@ -376,8 +412,60 @@ impl Store {
 				&[&round_id, &(f.k as i32), &&f.participation_id[..], &(f.attempt as i32)],
 			).await?;
 		}
+		if let Some(m) = &r.mint {
+			t.execute(
+				"INSERT INTO round_mint (round_id, asset, coin_txid, coin_vout, minted, elapsed, age, amount, next_minted, next_elapsed)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+				&[&round_id, &&m.asset[..], &&m.coin.0[..], &(m.coin.1 as i32), &i64_of(m.minted)?, &(m.elapsed as i32), &(m.age as i32),
+					&i64_of(m.amount)?, &i64_of(m.next_minted)?, &(m.next_elapsed as i32)],
+			).await?;
+		}
 		t.commit().await?;
 		Ok(round_id)
+	}
+
+	/// The txids of the rounds whose mint spends the limiter coin at
+	/// `txid:vout`: one, unless a round was lost and run again from the same
+	/// coin.
+	pub async fn round_mints_spending(&self, txid: &[u8; 32], vout: u32) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT r.txid FROM round_mint m JOIN round r ON r.round_id = m.round_id WHERE m.coin_txid = $1 AND m.coin_vout = $2
+			 ORDER BY m.round_id", &[&&txid[..], &(vout as i32)]).await?;
+		rows.iter().map(|r| array32(r.get(0), "round txid")).collect()
+	}
+
+	/// Every mint of `asset`'s rounds, oldest first.
+	pub async fn round_mints(&self, asset: &[u8; 32]) -> Result<Vec<MintRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT round_id, asset, coin_txid, coin_vout, minted, elapsed, age, amount, next_minted, next_elapsed FROM round_mint
+			 WHERE asset = $1 ORDER BY round_id", &[&&asset[..]]).await?;
+		rows.iter().map(mint_row).collect()
+	}
+
+	/// The mint of the round `round_id`, if it has one.
+	pub async fn round_mint(&self, round_id: i64) -> Result<Option<MintRow>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT round_id, asset, coin_txid, coin_vout, minted, elapsed, age, amount, next_minted, next_elapsed FROM round_mint
+			 WHERE round_id = $1", &[&round_id]).await?;
+		r.as_ref().map(mint_row).transpose()
+	}
+
+	/// Whether a batch of `asset` was ever made burn-only.
+	pub async fn has_burn_batches(&self, asset: &[u8; 32]) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_one("SELECT EXISTS (SELECT 1 FROM batch WHERE asset = $1 AND burn)", &[&&asset[..]]).await?;
+		Ok(r.get(0))
+	}
+
+	/// Every burn-only batch of `asset`, with its round.
+	pub async fn burn_batches(&self, asset: &[u8; 32]) -> Result<Vec<BatchRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("SELECT {} FROM batch WHERE asset = $1 AND burn ORDER BY round_id, vout", BATCH_COLUMNS),
+			&[&&asset[..]]).await?;
+		rows.iter().map(batch_row).collect()
 	}
 
 	/// Where the take `id` fills its order in a round, at `attempt`: the
