@@ -109,6 +109,9 @@ pub struct FillRow {
 	pub locked: u64,
 	pub filled: u64,
 	pub price: u64,
+	/// Whether the take accepts a round that fills its order together with
+	/// other takes of it, each paid a leaf of its own fill.
+	pub shared: bool,
 }
 
 impl FillRow {
@@ -330,7 +333,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 		row.fees.push((array32(r.get(0), "asset")?, u64_of(r.get(1), "fee")?));
 	}
 	if let Some(r) = c.query_opt(
-		"SELECT order_txid, order_vout, terms, script_pubkey, locked, filled, price FROM participation_fill WHERE participation_id = $1",
+		"SELECT order_txid, order_vout, terms, script_pubkey, locked, filled, price, shared FROM participation_fill WHERE participation_id = $1",
 		&[&&id[..]],
 	).await? {
 		row.fill = Some(FillRow {
@@ -341,6 +344,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 			locked: u64_of(r.get(4), "locked")?,
 			filled: u64_of(r.get(5), "filled")?,
 			price: u64_of(r.get(6), "price")?,
+			shared: r.get(7),
 		});
 	}
 	Ok(Some(row))
@@ -368,25 +372,53 @@ impl Store {
 			return Err(e.into());
 		}
 		if let Some(f) = &p.fill {
-			// One take of an order at a time, checked under a lock on the
-			// order: two takes of it racing each other wait for one another.
+			// The takes of an order, checked under a lock on the order: two
+			// takes of it racing each other wait for one another. A take that
+			// takes the order alone stands only where no other does; takes
+			// that share it stand together while all of them together take
+			// what the order's FILL leaf lets one round take, so every round
+			// that runs any of them fills a whole that leaf takes.
 			let key = i64::from_le_bytes(arca_covenant::script::sha256(&[&f.order_txid[..], &f.order_vout.to_le_bytes()].concat())[..8]
 				.try_into().expect("8 bytes"));
 			t.execute("SELECT pg_advisory_xact_lock($1)", &[&key]).await?;
-			if let Some(r) = t.query_opt(
-				"SELECT f.participation_id FROM participation_fill f JOIN participation q USING (participation_id)
-				 WHERE f.order_txid = $1 AND f.order_vout = $2 AND q.state IN ('pending', 'issued')",
+			let op = f.outpoint();
+			let standing = t.query(
+				"SELECT f.participation_id, f.shared, f.filled, f.locked FROM participation_fill f JOIN participation q USING (participation_id)
+				 WHERE f.order_txid = $1 AND f.order_vout = $2 AND q.state IN ('pending', 'issued')
+				 ORDER BY q.created_at, f.participation_id",
 				&[&&f.order_txid[..], &(f.order_vout as i32)],
-			).await? {
+			).await?;
+			if let Some(r) = standing.iter().find(|r| !f.shared || !r.get::<_, bool>(1)) {
 				let by: Vec<u8> = r.get(0);
-				let op = f.outpoint();
 				return Err(StoreError::OrderTaken(format!("{}:{}", op.txid, op.vout), hex(&by)));
 			}
+			if !standing.is_empty() {
+				let terms = f.order()?;
+				let mut taken: u128 = f.filled as u128;
+				for r in &standing {
+					let locked = u64_of(r.get(3), "locked")?;
+					if locked != f.locked {
+						return Err(StoreError::OrderFull(format!("{}:{}", op.txid, op.vout), format!("a take standing for it reads {} \
+							resting there, and this one {}: the takes of an order read one output", locked, f.locked)));
+					}
+					taken += u64_of(r.get(2), "filled")? as u128;
+				}
+				let left = f.locked as i128 - taken as i128;
+				if left < 0 || (left > 0 && (left as u64) < terms.min_lot) {
+					let others = taken - f.filled as u128;
+					let room = f.locked as u128 - others.min(f.locked as u128);
+					let most = if room == 0 { 0 } else if room as u64 > terms.min_lot { room as u64 - terms.min_lot } else { 0 };
+					return Err(StoreError::OrderFull(format!("{}:{}", op.txid, op.vout), format!("it holds {}, and {} take(s) standing for \
+						it take {} of it in one round; with this one's {} they would leave {} resting, and its FILL leaf leaves nothing or at \
+						least its min_lot of {}: take {}{} now, or take it again once it rests anew", f.locked, standing.len(), others,
+						f.filled, left, terms.min_lot, room, if most >= terms.min_lot { format!(" or at most {}", most) } else { String::new() })));
+				}
+			}
 			t.execute(
-				"INSERT INTO participation_fill (participation_id, order_txid, order_vout, terms, script_pubkey, locked, filled, price)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+				"INSERT INTO participation_fill (participation_id, order_txid, order_vout, terms, script_pubkey, locked, filled, price, shared)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 				&[&&p.id[..], &&f.order_txid[..], &(f.order_vout as i32), &f.terms, &f.script_pubkey, &i64_of(f.locked)?,
-					&i64_of(f.filled)?, &i64_of(f.price)?],
+					&i64_of(f.filled)?, &i64_of(f.price)?, &f.shared],
 			).await?;
 		}
 		for (k, i) in p.inputs.iter().enumerate() {

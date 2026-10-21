@@ -96,6 +96,11 @@ pub struct FillsInfo {
 	/// forfeit window, so it hands its forfeits over in time.
 	#[serde(default)]
 	pub round_interval_seconds: u64,
+	/// Whether the server takes a take that shares its order
+	/// (`take_order`'s `share`): several such takes of one order stand
+	/// together, and one round fills their sum and pays each its own leaf.
+	#[serde(default)]
+	pub shared: bool,
 }
 
 /// An asset's Lightning leg: the operator's SeqLN node in that asset.
@@ -960,6 +965,9 @@ pub struct GivenFill {
 	pub order: serde_json::Value,
 	pub locked: String,
 	pub filled: String,
+	/// Whether the take shares its order with other takes of it.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub shared: bool,
 }
 
 /// An output a participation wants, as its id covers it, with the leaf the
@@ -1126,6 +1134,12 @@ pub struct TakeOrder {
 	pub fee: FeeAmount,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub not_before: Option<u32>,
+	/// Whether the take accepts a round that fills its order together with
+	/// other takes of it, each paid a leaf of its own fill (a server whose
+	/// `info.fills.shared` is true takes it). Absent or false: the take takes
+	/// the order alone.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub share: bool,
 }
 
 /// The order a take takes, in its status.
@@ -1156,6 +1170,17 @@ pub struct FillStatus {
 	pub credit_vout: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub remainder_vout: Option<u32>,
+	/// Once in a round: what the round fills of the order, every take of it
+	/// together (this one's `filled` among them), what rests again after
+	/// that, the maker's credit at `2k` for it, and how many takes share it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_filled: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_remainder: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_credit: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round_takes: Option<u32>,
 }
 
 /// `POST /v1/transfer_status`: how the transfer `transfer_id` stands, and

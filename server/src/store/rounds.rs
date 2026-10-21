@@ -389,16 +389,26 @@ impl Store {
 		Ok(r.map(|r| (r.get(0), r.get::<_, i32>(1) as u32)))
 	}
 
-	/// Every order the round `round_id` fills: each covenant's input and the
-	/// take it fills, in input order.
+	/// Every take the round `round_id` runs of an order it fills: the
+	/// covenant's input and the take, in input order (several takes of one
+	/// order share its input).
 	pub async fn round_fills(&self, round_id: i64) -> Result<Vec<NewRoundFill>, StoreError> {
 		let conn = self.conn().await?;
-		let rows = conn.query("SELECT k, participation_id, attempt FROM round_fill WHERE round_id = $1 ORDER BY k", &[&round_id]).await?;
+		let rows = conn.query("SELECT k, participation_id, attempt FROM round_fill WHERE round_id = $1 ORDER BY k, participation_id",
+			&[&round_id]).await?;
 		rows.iter().map(|r| Ok(NewRoundFill {
 			k: r.get::<_, i32>(0) as u32,
 			participation_id: array32(r.get(1), "participation id")?,
 			attempt: r.get::<_, i32>(2) as u32,
 		})).collect()
+	}
+
+	/// How many orders the round `round_id` fills: its covenant inputs,
+	/// `0..n`, whatever the number of takes of each.
+	pub async fn round_orders(&self, round_id: i64) -> Result<usize, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_one("SELECT count(DISTINCT k) FROM round_fill WHERE round_id = $1", &[&round_id]).await?;
+		Ok(r.get::<_, i64>(0) as usize)
 	}
 
 	/// The lost rounds round `round_id` runs participations of again, each

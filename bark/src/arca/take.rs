@@ -18,6 +18,13 @@
 //! what the operator's schedule asks for an offboard of the price in that
 //! asset, bounded by the wallet as a refresh's fee is.
 //!
+//! Where the operator says it takes them (`info.fills.shared`), the take
+//! shares its order: other takes of the same order may run in the same round,
+//! which then fills the order once by the sum of their fills, credits its
+//! maker the order's price for that sum, and pays each take a leaf of its own
+//! fill. The wallet's take is the same either way: it gives up the price of
+//! its own fill and the fee, and wants a leaf of its own fill.
+//!
 //! A take asks something of the wallet once more before its round runs: a
 //! round that fills orders pays their makers from the operator's coins, so
 //! the operator broadcasts it only once every take in it has handed over its
@@ -216,6 +223,12 @@ impl Wallet {
 			},
 			"fee": {"asset": b.to_string(), "amount": fee.to_string()},
 		});
+		// Shared with the order's other takes where the operator takes that
+		// (an operator that does not refuses the field).
+		let mut body = body;
+		if info["fills"]["shared"].as_bool() == Some(true) {
+			body["share"] = json!(true);
+		}
 		let pid = hex(&id);
 		let given = vec![coin.clone()];
 		let wanted = json!([{"nonce": hex(&nonce), "asset": o.terms.asset_a.to_string(), "value": filled.to_string()}]);
@@ -243,7 +256,10 @@ impl Wallet {
 	/// Checks that `round`, the round of the take `pid` whose status is `st`,
 	/// fills the take's order as it asked, at the input the status names:
 	/// the take's id covers that order and that fill, and the wallet signs
-	/// no forfeit for another.
+	/// no forfeit for another. A take that shares its order is in a round
+	/// that fills the order by the sum of every take of it: the round's fill,
+	/// as the order's FILL leaf reads it, must be the sum the status names
+	/// and hold at least this take's own fill.
 	pub(crate) fn check_take_round(&self, body: &Value, st: &Value, round: &elements::Transaction) -> Result<(), Error> {
 		let (at, terms) = FillOrder::from_relay(&body["order"]).map_err(|e| Error::Store(e.to_string()))?;
 		let locked: u64 = body["locked"].as_str().unwrap_or("0").parse().map_err(|_| Error::Store("a take's locked".into()))?;
@@ -254,9 +270,21 @@ impl Wallet {
 			return Err(Error::Refused(format!("input {} of round {} is not order {}", k, round.txid(), outpoint_text(&at))));
 		}
 		let f = terms.check(round, k, locked).map_err(|e| Error::Refused(format!("round {}: {}", round.txid(), e)))?;
-		if f.filled != filled {
-			return Err(Error::Refused(format!("round {} fills {} of order {}; the take asked {}", round.txid(), f.filled,
-				outpoint_text(&at), filled)));
+		let shared = body["share"].as_bool() == Some(true);
+		let sum: Option<u64> = st["fill"]["round_filled"].as_str().and_then(|v| v.parse().ok());
+		match (shared, sum) {
+			(true, Some(sum)) => {
+				if f.filled != sum || f.filled < filled {
+					return Err(Error::Refused(format!("round {} fills {} of order {}; its status says the takes of it fill {}, this take's {} \
+						among them", round.txid(), f.filled, outpoint_text(&at), sum, filled)));
+				}
+			},
+			_ => {
+				if f.filled != filled {
+					return Err(Error::Refused(format!("round {} fills {} of order {}; the take asked {}", round.txid(), f.filled,
+						outpoint_text(&at), filled)));
+				}
+			},
 		}
 		Ok(())
 	}

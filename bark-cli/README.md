@@ -905,6 +905,17 @@ hold exactly the price and the fee: where no live coin holds that much, the
 wallet first pays itself a coin of that much out of round from its coins of
 the asset.
 
+Where the operator takes them (`info.fills.shared`), the wallet's take shares
+the order: other takes of the same order stand beside it, as long as all of
+them together take no more than the order holds and leave nothing, or at
+least its lot, resting, and the operator's round spends the order once for
+all of them. It fills the order by their sum, credits the maker the order's
+price for that sum (rounded up once, so never more than the takes' own prices
+together) and pays each take a leaf of its own fill. The wallet gives up the
+price of its own fill and the fee either way; a take that would leave the
+takes standing past what the order holds is refused by the operator
+(`order_taken`), saying how much is left to take.
+
 A take asks the wallet for something once more before its round runs. A
 round that fills orders pays their makers from the operator's coins, so the
 operator broadcasts it only once every take in it has handed over its
@@ -912,7 +923,9 @@ forfeits, and voids a take whose forfeits have not come within ten minutes
 (the operator's `info.fills.forfeit_window_seconds`) of the round being
 built. `sync` hands them over: it validates the new leaf against the round's
 transaction as the take's status serves it, checks that the round fills the
-order as the take asked, and signs the forfeit of each coin given up. A
+order as the take asked (a take that shares the order: by the sum of the takes
+its status names, `fill.round_filled`, its own fill among it), and signs the
+forfeit of each coin given up. A
 later `sync`, once the round is final, takes the leaf. Until the take is
 released, `schedule` wakes the wallet within the operator's round interval
 (`info.fills.round_interval_seconds`) and within half that window, saying so
@@ -1061,8 +1074,22 @@ and hold their leaves once it is final, the makers credited on the chain at
 `2k`; the part of the first order left resting is taken again from its new
 outpoint in a round where it sits at input 1; and each refusal (an order not
 final, a fill leaving less than a lot, a fee over the bound, a maker's key
-path, terms not the order's, an order another take holds, an order spent) is
+path, terms not the order's, an order other takes already fill whole, an order spent) is
 printed as the wallet words it.
+
+`tests/arca_shared_fills.rs` runs the same way: a sale-shaped order (Y for
+X, by lots of 10,000, credited to a taproot treasury) stands at input 1 of a
+round behind another order, ten wallets take parts of it, each sharing it,
+and one spend of it serves all ten, the treasury credited at `2k` and the
+rest resting at `2k+1`; a take below the lot is refused by the wallet; the
+round is mined and its Bitcoin anchor orphaned, and it leaves the chain and
+comes back; ten more takes of what rests, one wallet never syncing, are
+dropped past the window and the nine others served in the round after it.
+When `ARCA_TEST_OBSERVER` names a program, it is run at each step with the
+step's name as its argument and the step's facts as JSON on its standard
+input, so a launchpad's ledger or an order book can follow the same rounds
+and check what it reads elsewhere; at the step `order` it may answer the
+order as it serves it, and the wallets take that.
 
 `tests/arca_orders.rs` runs the same way: a maker that holds only leaves of
 X places an order selling them for Y with `arca order place`, each refusal
