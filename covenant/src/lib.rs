@@ -46,6 +46,9 @@
 //! - signature hashes and signing ([`sign`]), the binary encodings of every
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]);
+//! - claim trees ([`claim`]): the claim key a holder's leaf is owned by,
+//!   derived from the key a payer names and a nonce, and the distribution a
+//!   payer submits to pay many holders in one round;
 //! - the operator record ([`operator_record`]): what an operator publishes
 //!   about itself in the Sequentia registry, its canonical form and the
 //!   signature of the operator key over it.
@@ -64,6 +67,7 @@ pub extern crate elements;
 pub mod board;
 pub mod checkpoint;
 pub mod checks;
+pub mod claim;
 pub mod clock;
 pub mod encode;
 pub mod entry;
@@ -95,6 +99,7 @@ pub mod witness;
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_round, RoundCheckFailure};
+pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};
 pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
 pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLeaf};

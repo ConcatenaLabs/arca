@@ -29,6 +29,7 @@ it: its REFUND lock may be a height, and Arca only reads it.
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
+| `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
@@ -718,6 +719,15 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   output that is not the connector, and the one-owner node is reclaimed with
   that round's `M` and not another's. Every negative case is refused by the
   mempool and in a block, for its reason.
+- `tests/claim.rs`: on an anchored regtest chain, a batch of four claim
+  leaves, each owned by the claim key of an address key (two of each parity)
+  and its nonce. Each record validates for its claim key and not for the named
+  key. The unroll authorised by the named key standing in for the claim key,
+  by the named key as a member and by the payer's key; the exit signed by the
+  named key and by the payer's key; and the collaborative path signed by the
+  named key and by the payer's key, each with the operator's signature: every
+  one refused by the mempool and in a block, for its reason. The same
+  transactions signed by the claim key confirm.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
