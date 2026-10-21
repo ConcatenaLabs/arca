@@ -167,9 +167,9 @@ Then, for each asset that receives:
   operator only what it did not burn. But a chain stall longer than the
   margin opens the claim and the refund in one block, and a fee race decides
   it, which an operator that burns the leaf's value, or produces the block
-  itself, can win; so does a holder whose only coin in an accepted asset is
-  the leaf, once that asset is no longer accepted. A refund lock that a
-  stall cannot leap is a change of the leaf's template, not made here.
+  itself, can win. A holder whose only coin in an accepted asset is the leaf
+  cannot pay its claim at all once that asset is no longer accepted. A
+  refund lock that a stall cannot leap would take another leaf template.
 - **Payers are told** that the invoice's final lock time is twice the leaf's
   lock, about 5,770 blocks with a 36-hour exit delay and the default window:
   a payer whose node pays with SeqLN's `pay` raises its `maxdelay` to that.
