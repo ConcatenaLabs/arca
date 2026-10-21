@@ -717,3 +717,53 @@ async fn care_plans_a_coin_near_its_window_and_cancels_a_plan_whose_coin_moved()
 	let c = a.ok(&["care"]);
 	assert_eq!((c["cancelled"].as_array().map(|p| p.len()), c["planned"].as_array().map(|p| p.len())), (Some(0), Some(0)), "{}", c);
 }
+
+/// 9. `care` with a coin that is no leaf of a round (a board here; a coin
+///    received or a claim taken up out of round is the same): left alone
+///    while young; once within ten days of its step window, refreshed in a
+///    round under the wallet's bound; the round's new leaf, near its window
+///    as well, planned at the next `care`.
+#[tokio::test(flavor = "multi_thread")]
+async fn care_refreshes_a_coin_of_no_round_in_a_round_and_plans_the_new_leaf() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let w = Arca::new("Q");
+	w.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	r.pay_to(script(&w.ok(&["address"])), r.x, 3_000_000);
+	r.produce().await;
+	w.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || w.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	w.ok(&["sync"]);
+	let board = coins(&w, "live");
+	assert_eq!(board.len(), 1);
+	let e0 = board[0]["exit_by"].as_u64().unwrap() as u32 + 3 * DAY;
+	let c = w.ok(&["care"]);
+	assert_eq!((c["refreshing"].as_array().map(|p| p.len()), &c["not_yet_planned"]), (Some(0), &json!(1)), "{}", c);
+	// Within ten days of its step window: refreshed in a round, not planned.
+	advance_to(&r, e0 - 5 * DAY - 10 * DAY + HOUR).await;
+	let c = w.ok(&["care"]);
+	println!("care, the board within reach: {}", c);
+	assert_eq!(c["planned"].as_array().map(|p| p.len()), Some(0), "{}", c);
+	assert!(c["refreshing"][0]["participation"].is_string() && c["refreshing"][0]["error"].is_null(), "{}", c);
+	let built = r.server.rounds.run_round().await.unwrap().expect("a round for the refresh");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	w.ok(&["sync"]);
+	let live = coins(&w, "live");
+	assert_eq!(live.len(), 1, "{:?}", live);
+	assert_ne!(live[0]["leaf_id"], board[0]["leaf_id"]);
+	// The new leaf expires a whole horizon later: planned once it too is
+	// within reach.
+	let e1 = live[0]["exit_by"].as_u64().unwrap() as u32 + 3 * DAY;
+	let c = w.ok(&["care"]);
+	assert_eq!((c["planned"].as_array().map(|p| p.len()), &c["not_yet_planned"]), (Some(0), &json!(1)), "{}", c);
+	advance_to(&r, e1 - 5 * DAY - 10 * DAY + HOUR).await;
+	let c = w.ok(&["care"]);
+	println!("care, the new leaf within reach: {}", c);
+	assert_eq!((c["planned"][0]["coin"].as_str(), c["planned"][0]["fee"].as_str()), (live[0]["leaf_id"].as_str(), Some("0")), "{}", c);
+}

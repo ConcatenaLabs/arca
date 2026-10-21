@@ -418,7 +418,9 @@ impl Wallet {
 	/// store); and plans each live coin of a round that no plan names and
 	/// whose first step could run within [`PLAN_WITHIN`], `steps` steps
 	/// under the fee bound `max_fee_ppm` ([`CARE_MAX_FEE_PPM`] unless
-	/// named). A plan's fee is the operator's, taken from the coin in the
+	/// named). A live coin that is no leaf of a round (a board, or a coin
+	/// received or taken up out of round) is refreshed in a round under the
+	/// same bound once within that reach, and its new leaf planned later. A plan's fee is the operator's, taken from the coin in the
 	/// coin's own asset; a coin the operator will not plan stays unplanned,
 	/// with the operator's reason, and `sync` refreshes it while the wallet
 	/// is open. One part failing stops no other; each says what it did.
@@ -441,19 +443,42 @@ impl Wallet {
 		}
 		let now = self.now()?.to_consensus_u32();
 		let bound = Some(max_fee_ppm.unwrap_or(CARE_MAX_FEE_PPM));
+		let within = |expiry: u32| now.saturating_add(PLAN_WITHIN) >= expiry.saturating_sub(STEP_FROM);
 		let mut planned = vec![];
 		let mut later = 0usize;
-		for c in self.plannable(None)? {
-			if now.saturating_add(PLAN_WITHIN) < c.expiry.saturating_sub(STEP_FROM) {
+		let plannable = self.plannable(None)?;
+		for c in &plannable {
+			if !within(c.expiry) {
 				later += 1;
 				continue;
 			}
-			planned.push(match self.make_plan(&c, steps, bound) {
+			planned.push(match self.make_plan(c, steps, bound) {
 				Ok(v) => v,
 				Err(e) => json!({"coin": c.leaf_id, "asset": c.asset, "error": e.to_string()}),
 			});
 		}
-		Ok(json!({"claims": claims, "cancelled": cancelled, "planned": planned, "not_yet_planned": later,
+		// A plan starts only from a leaf of a round: a board, or a coin
+		// received or taken up out of round, is refreshed in a round first,
+		// under the same bound, once it is within reach; its new leaf is
+		// planned at a later `care`.
+		let named = self.planned_coins()?;
+		let mut refreshing = vec![];
+		for c in self.store.coins_in("live")? {
+			if named.contains(&c.leaf_id) || plannable.iter().any(|p| p.leaf_id == c.leaf_id) || c.expiry == u32::MAX {
+				continue;
+			}
+			if !within(c.expiry) {
+				later += 1;
+				continue;
+			}
+			let asked = self.refresh_quote(std::slice::from_ref(&c.leaf_id), bound).and_then(|q| self.participate(q, None));
+			refreshing.push(match asked {
+				Ok(v) => json!({"coin": c.leaf_id, "asset": c.asset, "participation": v["participations"][0]["participation"],
+					"state": v["participations"][0]["state"], "error": v["participations"][0].get("error")}),
+				Err(e) => json!({"coin": c.leaf_id, "asset": c.asset, "error": e.to_string()}),
+			});
+		}
+		Ok(json!({"claims": claims, "cancelled": cancelled, "planned": planned, "refreshing": refreshing, "not_yet_planned": later,
 			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound}))
 	}
 

@@ -343,7 +343,8 @@ enum Cmd {
 	},
 	/// What a wallet does by itself at a sync: takes up every open claim,
 	/// cancels each plan whose coin has moved, and plans each coin whose
-	/// first step could run within ten days.
+	/// first step could run within ten days (a coin of no round is
+	/// refreshed in a round first).
 	Care {
 		/// How many receive addresses to look for claims under, from the
 		/// first; by default every one handed out and 20 more.
