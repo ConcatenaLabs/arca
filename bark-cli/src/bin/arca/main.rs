@@ -115,6 +115,10 @@ enum Cmd {
 	},
 	/// The wallet, its chain, its operator and what the server publishes.
 	Info,
+	/// What the operator minted and burned of an issuer-operated asset, and
+	/// what is live in its batches, each transaction read again from the
+	/// wallet's own node.
+	Supply { asset: String },
 	/// A new on-chain Sequentia address of the wallet's.
 	Address,
 	/// The wallet's OpenAMP account key (`m/5/0`): the key a SeqPal ID is,
@@ -1130,6 +1134,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	match cli.command {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
+		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
 		Cmd::Address => w.address(),
 		Cmd::OpenampKey => w.openamp_key().map(|k| serde_json::json!({"key": k.to_string(), "path": "m/5/0"})),
 		Cmd::Balance { without_bitcoin } => {

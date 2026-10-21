@@ -116,6 +116,33 @@ impl RefreshQuote {
 	}
 }
 
+/// A new leaf's batch against the profile the operator states for its asset
+/// (`info`'s `assets[].issuer`): the batch of an asset served issuer-operated
+/// is burn-only, its refresh liquidity minted for it and destroyed by its
+/// sweep, and no other asset's batch is. A batch with an operator sweep in
+/// an issuer-operated asset could hand minted units to the operator; a
+/// burn-only batch in another is an operator whose statement and scripts
+/// disagree. A round that mints the batch's asset is refused unless the
+/// batch is burn-only whatever `info` says (check 5).
+pub(crate) fn check_profile(info: &Value, record: &LeafRecord) -> Result<(), String> {
+	profile_agrees(info, record.asset, record.burn)
+}
+
+/// [`check_profile`] for a batch of `asset` whose sweep burns (`burn`) or
+/// pays the operator.
+fn profile_agrees(info: &Value, asset: AssetId, burn: bool) -> Result<(), String> {
+	let asset = asset.to_string();
+	let served = info["assets"].as_array().and_then(|a| a.iter().find(|x| x["asset"].as_str() == Some(asset.as_str())).cloned());
+	let issuer_operated = served.is_some_and(|a| !a["issuer"].is_null());
+	match (issuer_operated, burn) {
+		(true, false) => Err(format!("the operator serves asset {} issuer-operated, and this batch's sweep pays the operator: units minted for \
+			its refresh could be kept rather than burned, so the wallet takes no leaf of it", asset)),
+		(false, true) => Err(format!("this batch's sweep is burn-only, and the operator serves asset {} as no issuer-operated asset: its \
+			statement and its scripts disagree", asset)),
+		_ => Ok(()),
+	}
+}
+
 /// The tree a published batch describes, rebuilt by the wallet from the
 /// published parts alone.
 pub fn rebuild(t: &Value) -> Result<Tree, Error> {
@@ -862,6 +889,7 @@ impl Wallet {
 			}
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
+			check_profile(&info, &record).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			order_as_asked(w, record.template, record.order.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
 				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value, record.asset,
@@ -1741,6 +1769,31 @@ pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_batch_agrees_with_the_profile_its_operator_states() {
+		let z = AssetId::from_slice(&[7; 32]).unwrap();
+		let x = AssetId::from_slice(&[8; 32]).unwrap();
+		let info = json!({"assets": [
+			{"asset": z.to_string(), "issuer": {"limiter": "00"}},
+			{"asset": x.to_string()},
+		]});
+		assert_eq!(profile_agrees(&info, z, true), Ok(()), "issuer-operated, burn-only");
+		assert_eq!(profile_agrees(&info, x, false), Ok(()), "open, the operator's sweep");
+		let e = profile_agrees(&info, z, false).unwrap_err();
+		assert!(e.contains("issuer-operated") && e.contains("pays the operator"), "{}", e);
+		let e = profile_agrees(&info, x, true).unwrap_err();
+		assert!(e.contains("burn-only") && e.contains("no issuer-operated asset"), "{}", e);
+		// An asset `info` does not list is served as no issuer-operated asset.
+		let y = AssetId::from_slice(&[9; 32]).unwrap();
+		assert_eq!(profile_agrees(&info, y, false), Ok(()));
+		assert!(profile_agrees(&info, y, true).is_err());
+		assert!(profile_agrees(&json!({}), z, true).is_err(), "no asset list at all");
+		// `issuer: null` is no statement of the profile.
+		let null = json!({"assets": [{"asset": z.to_string(), "issuer": null}]});
+		assert!(profile_agrees(&null, z, true).is_err());
+		assert_eq!(profile_agrees(&null, z, false), Ok(()));
+	}
 
 	#[test]
 	fn a_new_leaf_is_a_resting_order_only_where_asked_and_on_its_terms() {

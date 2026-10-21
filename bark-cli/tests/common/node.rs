@@ -12,10 +12,17 @@ use sequentia_ext::{explicit_txout, fee_txout, AssetAmount, TxOutExt};
 
 /// A fresh chain under its own directory.
 pub fn start() -> Regtest {
+	start_with(&[])
+}
+
+/// [`start`], the node given `extra` arguments as well.
+pub fn start_with(extra: &[&str]) -> Regtest {
 	static N: AtomicUsize = AtomicUsize::new(0);
 	let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 		.join(format!("arca-cli-regtest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
-	Regtest::pos_from_env(&dir, &["-par=1"])
+	let mut args = vec!["-par=1"];
+	args.extend_from_slice(extra);
+	Regtest::pos_from_env(&dir, &args)
 }
 
 /// The chain SeqLN's `sequentia-regtest` network assumes, so SeqLN nodes run
@@ -38,7 +45,7 @@ fn free_coins(rt: &Regtest) -> (OutPoint, TxOut) {
 		.find(|(_, o)| o.script_pubkey == op_true()).expect("the genesis block pays the free coins to OP_TRUE")
 }
 
-fn spend_op_true(coin: &(OutPoint, TxOut), outputs: Vec<TxOut>, fee: u64) -> Transaction {
+pub fn spend_op_true(coin: &(OutPoint, TxOut), outputs: Vec<TxOut>, fee: u64) -> Transaction {
 	let have = coin.1.asset_amount().expect("an explicit coin");
 	let spent: u64 = outputs.iter().filter(|o| o.explicit_asset() == Some(have.asset)).map(|o| o.explicit_value().unwrap()).sum();
 	let mut output = outputs;
@@ -67,6 +74,16 @@ impl Purse {
 		let txid = rt.client().send_raw_transaction(&tx).unwrap();
 		rt.produce_block().unwrap();
 		Purse { policy, coins: vec![(OutPoint::new(txid, 0), tx.output[0].clone())] }
+	}
+
+	/// A purse coin of `asset`, given away: the caller spends it.
+	pub fn take_coin(&mut self, asset: AssetId) -> (OutPoint, TxOut) {
+		self.take(asset)
+	}
+
+	/// Puts a coin at a bare `OP_TRUE` back in the purse.
+	pub fn put(&mut self, coin: (OutPoint, TxOut)) {
+		self.coins.push(coin);
 	}
 
 	fn take(&mut self, asset: AssetId) -> (OutPoint, TxOut) {
