@@ -359,17 +359,42 @@ impl Wallet {
 		Ok(json!({"orders": out, "others": others}))
 	}
 
-	/// Fills `amount` (all of it when `None`) of another maker's resting
-	/// order `order` in the tree (see the [module documentation](self)).
-	pub fn order_fill_resting(&mut self, order: &str, amount: Option<u64>) -> Result<Value, Error> {
+	/// What filling `amount` (all of it when `None`) of another maker's
+	/// resting order `order` would cost, before anything is signed: the
+	/// order as the operator serves it now (`served`, the coin it rests at
+	/// among it), what the fill takes and pays, its fee in the asset paid,
+	/// the coins given up and the change. Refuses what
+	/// [`Self::order_fill_resting`] refuses for the same reason.
+	pub fn order_fill_resting_quote(&mut self, order: &str, amount: Option<u64>) -> Result<Value, Error> {
 		self.witnessed_now()?;
 		let info = self.server_info()?;
+		let o = self.served_order(order)?;
+		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
+			let n = random32();
+			Ok(NewLeaf { owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None })
+		};
+		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
+		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
+		Ok(f.quote(order, &o))
+	}
+
+	/// The order `order` as the operator serves it now, resting.
+	fn served_order(&self, order: &str) -> Result<Value, Error> {
 		let st = self.server.post("order_state", &json!({"orders": [order]}))?;
 		let o = st["orders"].as_array().and_then(|a| a.first()).cloned()
 			.ok_or_else(|| Error::Refused(format!("the operator has no resting order {} published", order)))?;
 		if o["state"].as_str() != Some("resting") {
 			return Err(Error::Refused(format!("order {} is {}: it takes no fill", order, o["state"])));
 		}
+		Ok(o)
+	}
+
+	/// The fill of `amount` of `order`, served as `o`, into the leaves `got`
+	/// (what it takes) and `change_leaf` (the change): the order's coin
+	/// checked against its round, the plan, and the wallet's coins.
+	fn resting_fill_plan(&mut self, info: &Value, order: &str, o: &Value, amount: Option<u64>, got: &NewLeaf, change_leaf: &NewLeaf)
+		-> Result<RestingFill, Error>
+	{
 		// The order's coin, from its record, checked against its round as a
 		// coin received is: the fill rests on it.
 		let asset_a = AssetId::from_str(o["asset"].as_str().unwrap_or("")).map_err(|e| Error::Parse(e.to_string()))?;
@@ -390,12 +415,9 @@ impl Wallet {
 		let plan = policy.plan(oc.value, filled).map_err(|e| Error::Refused(e.to_string()))?;
 		let asset_b = policy.terms().asset_b;
 		let price = plan.credit.value;
-		let m = Margins::of(&info, asset_b)?;
-		let min = Self::min_leaf(&info, asset_b)?;
-		Self::min_leaf(&info, asset_a)?;
-		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let got = self.own_leaf_for("resting order fill")?;
-		let change_leaf = self.own_leaf_for("change")?;
+		let m = Margins::of(info, asset_b)?;
+		let min = Self::min_leaf(info, asset_b)?;
+		Self::min_leaf(info, asset_a)?;
 		// The coins: of the asset the order is paid in, expiring no earlier
 		// than the order's coin, until they hold the price, every margin and
 		// change of none or at least the smallest leaf.
@@ -411,7 +433,7 @@ impl Wallet {
 			c.checkpoint_value = v;
 			kept = kept.saturating_add(v);
 			chosen.push(c);
-			let outs = fill_outputs(&plan, &policy, (&got, filled), Some((&change_leaf, asset_b, 1)), self);
+			let outs = fill_outputs(&plan, &policy, (got, filled), Some((change_leaf, asset_b, 1)), self);
 			let fee = fill_margin(&oc, &plan, &chosen, &outs, &m)?;
 			let need = price.saturating_add(fee);
 			if let Some(change) = kept.checked_sub(need).filter(|c| *c == 0 || *c >= min) {
@@ -424,6 +446,41 @@ impl Wallet {
 				{}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with change of none or at least {}", asset_b,
 				oc.expiry.to_consensus_u32(), kept, filled, price, min)));
 		};
+		Ok(RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b })
+	}
+
+	/// Fills `amount` (all of it when `None`) of another maker's resting
+	/// order `order` in the tree (see the [module documentation](self)).
+	/// With `shown` (an [`Self::order_fill_resting_quote`]'s answer), the fill
+	/// is made of the order as the quote served it, at the coin it rested at
+	/// then, and goes ahead only on the fee and the coins it showed: if the
+	/// order has moved since (another taker filled it), the operator refuses
+	/// it with `order_moved`, and a new quote names the coin it rests at now.
+	pub fn order_fill_resting(&mut self, order: &str, amount: Option<u64>, shown: Option<&Value>) -> Result<Value, Error> {
+		self.witnessed_now()?;
+		let info = self.server_info()?;
+		let o = match shown {
+			Some(s) => {
+				if s["order"].as_str() != Some(order) || !s["served"].is_object() {
+					return Err(Error::Refused(format!("the quote shown is not a quote of a fill of order {}", order)));
+				}
+				s["served"].clone()
+			},
+			None => self.served_order(order)?,
+		};
+		let got = self.own_leaf_for("resting order fill")?;
+		let change_leaf = self.own_leaf_for("change")?;
+		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
+		if let Some(s) = shown {
+			let q = f.quote(order, &o);
+			for k in ["filled", "paid", "fee", "gives"] {
+				if s[k] != q[k] {
+					return Err(Error::Refused(format!("the fill's {} changed since it was shown: it is now {}", k, q[k])));
+				}
+			}
+		}
+		let RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b } = f;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let outputs = fill_outputs(&plan, &policy, (&got, filled), (change > 0).then_some((&change_leaf, asset_b, change)), self);
 		let tplan = TransferPlan { inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		let mut inputs = vec![];
@@ -509,9 +566,9 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// Cancels the wallet's resting order `order` (the id the round's coin
-	/// gave it): its current coin spent into a leaf of the wallet's own.
-	pub fn order_cancel_resting(&mut self, order: &str) -> Result<Value, Error> {
+	/// The wallet's resting order `order` (the id the round's coin gave it)
+	/// and the coin it rests at now, live.
+	fn resting_to_cancel(&self, order: &str) -> Result<(RestingRow, CoinRow), Error> {
 		let r = self.store.restings()?.into_iter().find(|r| r.order_leaf.as_deref() == Some(order) || r.id == order)
 			.ok_or_else(|| Error::Refused(format!("the wallet rested no order {}", order)))?;
 		let leaf = self.store.nonce(&r.nonce)?.and_then(|n| n.leaf_id)
@@ -520,9 +577,68 @@ impl Wallet {
 		if row.state != "live" || !is_order_coin(&row) {
 			return Err(Error::Refused(format!("order {} rests at coin {}, which is {}: nothing rests to cancel", order, leaf, row.state)));
 		}
+		Ok((r, row))
+	}
+
+	/// What cancelling the wallet's resting order `order` would give back,
+	/// before anything is signed: the coin it rests at, what that coin
+	/// holds, the leaf of the wallet's own it becomes and the fee (the
+	/// transfer's margins, in the asset the order sells).
+	pub fn order_cancel_resting_quote(&mut self, order: &str) -> Result<Value, Error> {
+		let (_, row) = self.resting_to_cancel(order)?;
+		let (coin, holds) = (row.leaf_id.clone(), row.value);
+		let (asset, value, fee) = self.respend_quote(vec![row])?;
+		Ok(json!({"order": order, "coin": coin, "holds": holds.to_string(), "gets": {"asset": asset.to_string(), "amount": value.to_string()},
+			"fee": {"asset": asset.to_string(), "amount": fee.to_string()}}))
+	}
+
+	/// Cancels the wallet's resting order `order` (the id the round's coin
+	/// gave it): its current coin spent into a leaf of the wallet's own.
+	/// With `shown` (an [`Self::order_cancel_resting_quote`]'s answer), only
+	/// for the coin and the fee it showed.
+	pub fn order_cancel_resting(&mut self, order: &str, shown: Option<&Value>) -> Result<Value, Error> {
+		let (r, row) = self.resting_to_cancel(order)?;
+		let leaf = row.leaf_id.clone();
+		if let Some(s) = shown {
+			let q = self.order_cancel_resting_quote(order)?;
+			for k in ["coin", "gets", "fee"] {
+				if s[k] != q[k] {
+					return Err(Error::Refused(format!("the cancel's {} changed since it was shown: it is now {}", k, q[k])));
+				}
+			}
+		}
 		let done = self.respend_to_self(vec![row])?;
 		self.store.set_resting(&r.id, None, "cancelled")?;
 		Ok(json!({"order": order, "state": "cancelled", "coin": leaf, "transfer": done}))
+	}
+}
+
+/// A fill of a resting order the wallet would make: the order's coin, its
+/// plan, and the wallet's coins and what they pay.
+struct RestingFill {
+	oc: arca_covenant::ValidCoin,
+	policy: OrderPolicy,
+	plan: arca_covenant::order::OrderFillPlan,
+	filled: u64,
+	price: u64,
+	fee: u64,
+	change: u64,
+	chosen: Vec<In>,
+	asset_a: AssetId,
+	asset_b: AssetId,
+}
+
+impl RestingFill {
+	/// The fill as a quote shows it, with the order as it was served.
+	fn quote(&self, order: &str, served: &Value) -> Value {
+		json!({
+			"order": order, "coin": self.oc.id.to_string(), "rests": self.oc.value.to_string(),
+			"filled": self.filled.to_string(), "gets": {"asset": self.asset_a.to_string(), "amount": self.filled.to_string()},
+			"paid": self.price.to_string(), "fee": {"asset": self.asset_b.to_string(), "amount": self.fee.to_string()},
+			"change": self.change.to_string(), "remainder": self.plan.rest.as_ref().map(|r| r.value.to_string()),
+			"gives": self.chosen.iter().map(|c| c.row.leaf_id.clone()).collect::<Vec<_>>(),
+			"served": served,
+		})
 	}
 }
 
