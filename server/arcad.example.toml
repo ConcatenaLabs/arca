@@ -256,7 +256,12 @@ poll_seconds = 10
 # and needs eight sevenths of its exit delay and receive_window_seconds
 # before that, so with a 36-hour exit delay and the delays below such a
 # payment needs a timeout about two and a half days out, past the two days
-# the default allows: raise send_timeout_seconds to serve those.
+# the default allows: raise send_timeout_seconds to serve those. A swap of
+# BTC for an asset between two wallets (`arca btc-swap`) locks the asset
+# until the received leaf can come home an hour after its Bitcoin leg can
+# end: with 36-hour exit delays and a Bitcoin ark whose HTLC-send expiry
+# delta is 258 blocks, about six and a half days out, which a
+# send_timeout_seconds of four days (a window of four to eight) serves.
 operator_delay_units = 36
 owner_delay_units = 72
 send_timeout_seconds = 86400
