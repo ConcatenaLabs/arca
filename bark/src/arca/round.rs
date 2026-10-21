@@ -563,7 +563,13 @@ impl Wallet {
 
 	/// The server will not run participation `pid` (`why` is `void` or
 	/// `expired`), and `st` is its status: each coin it gave up that the
-	/// operator gave back (`returned`) is live again. Any other is held
+	/// operator gave back (`returned`) is live again, unless the wallet
+	/// signed a forfeit of it for a round that is not gone (D75: no input of
+	/// that round spent by a final transaction of another), as a take signs
+	/// its forfeits before its round is broadcast: such a forfeit could still
+	/// be claimed, and the round still confirm, whatever the operator says, so
+	/// the coin is held `forfeited` until the round is gone, and is live again
+	/// then ([`Self::watch_forfeits`]). Any other is held
 	/// under a forfeit the wallet signed: one for a round that is not gone,
 	/// which the operator could still claim, or one the operator published,
 	/// or handed to the node, for a round that is lost, which may
@@ -578,6 +584,8 @@ impl Wallet {
 		let reason = st["void_reason"].as_str().map(str::to_string);
 		let mut back = vec![];
 		let mut held = vec![];
+		// D75: given back, but under a forfeit for a round not gone.
+		let mut until_gone: Vec<(String, Vec<ForfeitRow>)> = vec![];
 		for l in given {
 			let Some(c) = self.store.coin(l)? else { continue };
 			if !matches!(c.state.as_str(), "given" | "forfeited") {
@@ -598,7 +606,17 @@ impl Wallet {
 				}
 			}
 			if returned.unwrap_or(followed.is_empty()) {
-				back.push(l.clone());
+				let mut standing = vec![];
+				for f in &followed {
+					if !self.round_gone(f)? {
+						standing.push(f.clone());
+					}
+				}
+				if standing.is_empty() {
+					back.push(l.clone());
+				} else {
+					until_gone.push((l.clone(), standing));
+				}
 			} else {
 				held.push((l.clone(), open));
 			}
@@ -610,6 +628,13 @@ impl Wallet {
 		self.store.atomically(|s| {
 			for l in &back {
 				s.set_coin_state(l, "live", "")?;
+			}
+			for (l, standing) in &until_gone {
+				s.set_coin_state(l, "forfeited", &format!("{}; the operator gave the coin back, but the wallet signed its forfeit for round \
+					{}, which is not gone (no input of it is spent by a final transaction of another) and could still confirm: the coin is \
+					held until that round is gone, and is live again then", note,
+					standing.iter().map(|f| f.round.clone()).collect::<Vec<_>>().join(", ")))?;
+				s.set_meta(&given_back_key(l), pid)?;
 			}
 			for (l, open) in &held {
 				s.set_coin_state(l, "forfeited", &format!("{}; the coin is held under its forfeit, and is the wallet's on the chain, \
@@ -638,7 +663,10 @@ impl Wallet {
 			}
 			out_held.push(h);
 		}
-		let mut out = json!({"participation": pid, "state": why, "live_again": back, "held": out_held,
+		let until: Vec<Value> = until_gone.iter().map(|(l, standing)| json!({"leaf_id": l,
+			"forfeit_for_round": standing.iter().map(|f| f.round.clone()).collect::<Vec<_>>(),
+			"note": "given back by the operator; held until the round its forfeit was signed for is gone"})).collect();
+		let mut out = json!({"participation": pid, "state": why, "live_again": back, "held": out_held, "held_until_gone": until,
 			"note": if held.is_empty() { format!("{}; its coins are live again", note) } else {
 				format!("{}; a coin under a forfeit that may still be claimed or confirm stays given up: its forfeit is followed on \
 				the chain and refunded once its delay has run, and one whose forfeit is not on the chain is exited", note) }});
@@ -1281,6 +1309,31 @@ impl Wallet {
 			// chain: the forfeit may still confirm, from any mempool that
 			// saw it, and is followed until the coin is exited.
 			if matches!(pstate.as_str(), "void" | "expired") && matches!(row.state.as_str(), "forfeited" | "exiting") {
+				// D75: a coin the operator gave back, held while this
+				// forfeit's round could confirm, is live again once that round
+				// and every other its forfeits were signed for are gone.
+				if row.state == "forfeited" && self.store.meta(&given_back_key(&f.leaf_id))?.is_some() {
+					let mut standing = false;
+					for g in self.store.forfeits_of(&f.leaf_id)? {
+						if g.round != f.round && FOLLOWED.contains(&g.state.as_str()) && !self.round_gone(&g)? {
+							standing = true;
+						}
+					}
+					let why = format!("round {} is gone: an input of it is spent by a final transaction of another, so its forfeit can \
+						never be claimed", f.round);
+					let key = given_back_key(&f.leaf_id);
+					self.store.atomically(|s| {
+						s.set_forfeit_state(&f.leaf_id, &f.round, "void", &why)?;
+						if !standing {
+							s.set_coin_state(&f.leaf_id, "live", "")?;
+							s.delete_meta(&key)?;
+						}
+						Ok(())
+					})?;
+					return Ok(Some(json!({"leaf_id": f.leaf_id, "round": f.round, "state": "void", "coin": if standing { "forfeited" } else { "live" },
+						"note": if standing { format!("{}; the coin waits for another round its forfeit was signed for", why) } else {
+							format!("{}; the operator gave the coin back, so it is live again", why) }})));
+				}
 				return Ok(None);
 			}
 			// The coin follows its participation, which the operator runs
@@ -1578,6 +1631,13 @@ impl Wallet {
 /// refund, not yet final), `claiming` (spent by the operator's claim, not yet
 /// final; the preimage is in hand).
 pub(crate) const FOLLOWED: [&str; 3] = ["signed", "refunding", "claiming"];
+
+/// Where the wallet marks a coin the operator gave back while a forfeit the
+/// wallet signed for it could still be claimed (D75): held `forfeited` until
+/// the round of that forfeit is gone. The value is the participation.
+pub(crate) fn given_back_key(leaf_id: &str) -> String {
+	format!("given_back_{}", leaf_id)
+}
 
 /// The states of a forfeit decided by a final spend of its output, which the
 /// wallet still looks at until its new leaves' batch has expired: `refunded`
