@@ -126,6 +126,9 @@ async fn a_payer_pays_twenty_holders_in_one_round_and_gets_back_what_nobody_took
 	let wpkh = payer.ok(&["address"])["address"].as_str().unwrap().to_string();
 	let by_hash = list(&[(wpkh, 1_000_000)]);
 	payer.refused(&["distribute", &by_hash, "--asset", &x], "names no key");
+	let beyond = list(&[(keys[0].clone(), 900_000_000)]);
+	payer.refused(&["distribute", &beyond, "--asset", &x, "--quote"], "and the claims and the fee take");
+	payer.refused(&["distribute", &beyond, "--asset", &x], "and the claims and the fee take");
 	let quote = payer.ok(&["distribute", &file, "--asset", &x, "--quote"]);
 	assert_eq!(quote["total"], json!(total.to_string()));
 	assert_eq!(quote["split"], json!(true), "no coin holds exactly the claims: the wallet pays itself one first");

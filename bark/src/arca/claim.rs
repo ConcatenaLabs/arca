@@ -351,6 +351,13 @@ impl Wallet {
 			fee = again;
 		}
 		bound(fee)?;
+		// Refused here, before a quote promises it or anything is signed: the
+		// coin the wallet would pay itself comes out of its live coins.
+		let held: u128 = coins.iter().map(|c| c.coin.value as u128).sum();
+		if held < total + fee as u128 {
+			return Err(Error::Refused(format!("the wallet's live coins of asset {} hold {}, and the claims and the fee take {}",
+				asset, held, total + fee as u128)));
+		}
 		Ok(Plan { coins: vec![], total, fee, split: true })
 	}
 
