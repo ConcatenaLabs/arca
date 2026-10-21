@@ -117,6 +117,9 @@ enum Cmd {
 	Info,
 	/// A new on-chain Sequentia address of the wallet's.
 	Address,
+	/// The wallet's OpenAMP account key (`m/5/0`): the key a SeqPal ID is,
+	/// which a payer may name for this wallet as for an address key.
+	OpenampKey,
 	/// What the wallet holds, per asset: Arca coins by state, on-chain coins,
 	/// and the Bitcoin side.
 	Balance {
@@ -358,8 +361,8 @@ enum Cmd {
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
 	},
-	/// The claims paid to this wallet's on-chain addresses, found by asking
-	/// the operator under each address key: their distribution, value,
+	/// The claims paid to this wallet, found by asking the operator under its
+	/// OpenAMP account key and each address key: their distribution, value,
 	/// state and deadline.
 	Claims {
 		/// How many receive addresses to ask under, from the first; by
@@ -367,8 +370,8 @@ enum Cmd {
 		#[arg(long)]
 		scan: Option<u32>,
 	},
-	/// Takes up the open claims paid to this wallet's on-chain addresses
-	/// (those named, as `DISTRIBUTION:INDEX` or by leaf id, or every one):
+	/// Takes up the open claims paid to this wallet's OpenAMP account key and
+	/// its on-chain addresses (those named, as `DISTRIBUTION:INDEX` or by leaf id, or every one):
 	/// each is checked, kept, and paid out of round to a fresh leaf of the
 	/// wallet's own.
 	Claim {
@@ -1014,7 +1017,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// spend through the operator, and refuses while no witness succeeds.
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
-	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
+	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
 		| Cmd::Distributions | Cmd::Plans)
 	{
@@ -1046,6 +1049,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Address => w.address(),
+		Cmd::OpenampKey => w.openamp_key().map(|k| serde_json::json!({"key": k.to_string(), "path": "m/5/0"})),
 		Cmd::Balance { without_bitcoin } => {
 			let mut b = w.balance()?;
 			b["bitcoin"] = if without_bitcoin {

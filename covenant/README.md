@@ -11,7 +11,11 @@ Elements tags. Amounts are explicit and always name their asset. Every lock is
 time based: `MedianTime` for `OP_CHECKLOCKTIMEVERIFY`, `RelativeTime` (512-second
 units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused. The one script here
 that is not Arca's, SeqDEX's fill covenant (`fill`), is read as SeqDEX builds
-it: its REFUND lock may be a height, and Arca only reads it.
+it: its REFUND lock may be a height, and Arca only reads it. The `order-2` leaf
+(`order`) carries one Simplicity leaf (`0xbe`), the fill program
+`arca/order-2`, and a hidden data leaf beside its tapscript leaves; its pruned
+programs come from sequentia-contracts (`order_programs`), so its spends are
+built with no compiler.
 
 ## What it builds
 
@@ -29,6 +33,7 @@ it: its REFUND lock may be a height, and Arca only reads it.
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
+| `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 

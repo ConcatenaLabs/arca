@@ -120,6 +120,17 @@ transaction is given whole, witnesses included, with the outputs it spends and,
 for a signature, the signature hash and the test key's signature, once with the
 spent output's margin as the fee and once with a fee coin attached.
 
+`vectors/order.json` holds the `order-2` leaf's vectors, written by
+`order.py`, which derives them on its own: the tree mixes tapscript leaves, a
+Simplicity leaf and a hidden data leaf, which the node framework's taproot code
+cannot express, so it builds the tagged hashes itself. It holds an order's
+terms and keys, its parameters, the collaborative, landing and fill leaves with
+their control blocks, the merkle root and scriptPubKey; the same for the
+remainder after one fill; the credit leaf that fill pays; the SeqDEX order it
+lands as; and the operator's digest over a fill's outputs with its signature.
+The two Simplicity commitment roots are sequentia-contracts' (`arca/order-2`,
+`seqdex/order`).
+
 `vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
 signature uses zero auxiliary randomness, so the output is the same on every run:
@@ -133,7 +144,7 @@ sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
 builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
 re-encodes and validates every record; `covenant/tests/transactions.rs` rebuilds
-every off-chain transaction byte for byte and verifies it.
+every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature.
 
 ## In CI
 
