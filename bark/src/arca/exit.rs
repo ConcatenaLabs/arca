@@ -1190,6 +1190,7 @@ impl Wallet {
 			}
 			// The last wait ends a second past the patience, never before it.
 			sequentia_ext::platform::sleep(wait.min(self.witness_patience - spent + std::time::Duration::from_secs(1)));
+			super::chain::gap();
 			wait = (wait * 2).min(std::time::Duration::from_secs(16));
 		}
 	}
