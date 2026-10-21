@@ -160,5 +160,8 @@ async fn a_swap_through_the_commands_shows_its_terms_before_anything_is_signed()
 	assert_eq!(c["cancelled"], true, "{}", c);
 	assert_eq!(total(&a, "offered", &x), 0);
 	assert_eq!(total(&a, "live", &x), a_x);
-	assert_eq!(library(&a, "swaps", json!({})).unwrap()[1]["state"], "cancelled");
+	let listed = library(&a, "swaps", json!({})).unwrap();
+	assert_eq!(listed.as_array().unwrap().iter().map(|s| s["swap"].clone()).collect::<Vec<_>>(), vec![json!(id), o2["swap"].clone()],
+		"swaps are listed in the order they were made, two in one second too");
+	assert_eq!(listed[1]["state"], "cancelled");
 }
