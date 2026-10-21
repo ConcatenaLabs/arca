@@ -108,6 +108,7 @@ mod exit;
 pub mod lightning;
 pub mod order;
 mod pay;
+pub mod plan;
 mod restore;
 mod round;
 mod take;

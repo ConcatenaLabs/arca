@@ -173,6 +173,7 @@ impl Spelling {
 			.replace("{address}", &command("address").map(|c| format!("an address of {}", c))
 				.unwrap_or_else(|| "the wallet's address".into()))
 			.replace("{orders}", &command("orders").unwrap_or_else(|| "the reading of the wallet's orders".into()))
+			.replace("{refresh}", &command("refresh").unwrap_or_else(|| "a refresh".into()))
 	}
 }
 
@@ -1585,7 +1586,13 @@ impl Wallet {
 		let refused = self.refused_refreshes()?;
 		let mut asked_at = self.refresh_asked()?;
 		let mut out = vec![];
+		// The current coin of an open offline-refresh plan is refreshed by the
+		// plan's step, which the operator runs in the same window.
+		let planned: Vec<String> = self.plan_currents()?.into_iter().map(|(_, c, _)| c).collect();
 		for c in self.store.coins_in("live")? {
+			if planned.contains(&c.leaf_id) {
+				continue;
+			}
 			let Some(d) = CoinDates::of(c.expiry) else { continue };
 			if now < d.refresh_from || now >= d.home_from {
 				continue;
@@ -1668,8 +1675,25 @@ impl Wallet {
 		let asked_at = self.refresh_asked()?;
 		let mut next: Option<u32> = None;
 		let mut coins = vec![];
+		// Offline refresh: the current coin of an open plan wakes the wallet
+		// at the plan's date, not its own; once that coin is past its home
+		// date with its step not done, the wallet that is open takes it home
+		// as any coin (D57), but a wallet that follows the schedule stays
+		// closed until then.
+		let currents = self.plan_currents()?;
 		for c in self.store.coins()? {
 			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
+				continue;
+			}
+			if let Some((pid, _, by)) = currents.iter().find(|(_, l, _)| *l == c.leaf_id) {
+				let at = (*by).max(base.min(now));
+				next = Some(next.map_or(at, |n| n.min(at)));
+				let mut v = CoinDates::of(c.expiry).map(|d| d.json()).unwrap_or_else(|| json!({}));
+				v["leaf_id"] = json!(c.leaf_id);
+				v["state"] = json!(c.state);
+				v["plan"] = json!(pid);
+				v["sync_by"] = json!(by);
+				coins.push(v);
 				continue;
 			}
 			let Some(d) = CoinDates::of(c.expiry) else { continue };
@@ -1757,6 +1781,10 @@ impl Wallet {
 		if last_sync.is_none() && !stopped {
 			next = Some(now);
 			out["why"] = json!(NEVER_SYNCED_NOTE);
+		}
+		let plans = self.plans()?["plans"].clone();
+		if plans.as_array().is_some_and(|p| !p.is_empty()) {
+			out["plans"] = plans;
 		}
 		out["next_sync_at"] = json!(next);
 		out["due"] = json!(next.is_some_and(|n| n <= now));
@@ -2089,7 +2117,10 @@ impl Wallet {
 		};
 		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
 		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
-		let mut changes = vec![];
+		// A step of an offline-refresh plan the wallet took up whose round can
+		// never return did not happen: the coin it gave up is the wallet's
+		// again, and is checked with the others below.
+		let mut changes = self.plan_rounds_gone()?;
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		for c in self.store.coins()? {
 			if !matches!(c.state.as_str(), "pending" | "live") && !revived.contains(&c.leaf_id) {

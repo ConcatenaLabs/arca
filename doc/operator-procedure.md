@@ -184,7 +184,8 @@ Every holder receives these rules before the operator holds their coins:
   operator's server.** An older wallet does not keep its coins alive by
   itself.
 - **Run `arca sync` at least once a day while the wallet holds a coin off
-  the chain or is waiting for a payment**, whatever `next_sync_at` says.
+  the chain or is waiting for a payment**, whatever `next_sync_at` says,
+  unless a plan covers every coin held (below).
   `sync` refreshes each coin for free in its last days, and takes a coin
   home on the chain when it cannot have it refreshed. A payment is read
   only by a `sync`. A receive request lasts 27 days and carries the date it
@@ -198,6 +199,17 @@ Every holder receives these rules before the operator holds their coins:
   whatever the request's lapse, for as long as the server shows its
   transfer recorded. An announcement is the operator's statement, not a
   payment: the coin counts only once it comes.
+- **To stay away past a coin's expiry, pre-sign a plan and sync by its
+  `sync_by`.** `arca plan` hands the operator a plan that refreshes each coin
+  of a round once per expiry while the wallet stays closed (two by default,
+  six at most), for free, each step in the coin's last days; `arca plans`
+  shows until when it covers the coin (`covered_until`) and the date by
+  which the wallet must sync again (`sync_by`). A wallet whose every coin a
+  plan covers need not sync until then, unless it is waiting for a payment. The operator runs the steps: one that runs none
+  and sweeps the coin takes it, as it can take any coin whose holder stays
+  away past its expiry, so a plan keeps a coin alive through an operator that
+  runs, not through one that turns against its holders. A coin a plan names
+  is paid out of round only once refreshed in a round.
 - **When a payment answers `unreachable`, run `arca sync` again that
   day.** The next `sync` posts the payment again, and its receiver reads it
   once it completes.

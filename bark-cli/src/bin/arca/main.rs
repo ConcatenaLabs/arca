@@ -312,6 +312,35 @@ enum Cmd {
 	/// Every distribution this wallet made, as the operator shows it: each
 	/// claim's state, the deadline and what went back.
 	Distributions,
+	/// Pre-signs an offline refresh of each coin named (by default every live
+	/// coin of a round that no plan names): the operator refreshes it in later
+	/// rounds while the wallet stays closed, one step per expiry, until the
+	/// date the plan names. Each step runs in its coin's free window, where a
+	/// refresh costs nothing. A coin a plan names is refreshed in a round
+	/// before it is paid out of round.
+	Plan {
+		/// The coins, by leaf id.
+		coins: Vec<String>,
+		/// How many expiries the wallet will be away for: one step each, 1 to 6.
+		#[arg(long, default_value_t = 2)]
+		expiries: usize,
+		/// Only says what each plan would cost and until when it would cover
+		/// its coin, signing and keeping nothing.
+		#[arg(long)]
+		quote: bool,
+		/// The most a step may cost, in millionths of the coin; a step costs
+		/// nothing unless this is given.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
+	/// Every offline-refresh plan this wallet made: its coin, each step's
+	/// state and leaf, until when it covers the coin at the earliest, and the
+	/// date the wallet must sync by.
+	Plans,
+	/// Cancels the steps of an offline-refresh plan that have not started.
+	PlanCancel {
+		plan: String,
+	},
 	/// The claims paid to this wallet's on-chain addresses, found by asking
 	/// the operator under each address key: their distribution, value,
 	/// state and deadline.
@@ -970,7 +999,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
-		| Cmd::Distributions)
+		| Cmd::Distributions | Cmd::Plans)
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -1121,6 +1150,13 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			}
 		},
 		Cmd::Distributions => w.distributions(),
+		Cmd::Plan { coins, expiries, quote, max_fee_ppm } => if quote {
+			w.plan_quote(&coins, expiries, max_fee_ppm)
+		} else {
+			w.plan(&coins, expiries, max_fee_ppm)
+		},
+		Cmd::Plans => w.plans(),
+		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
 	}

@@ -313,9 +313,14 @@ impl Wallet {
 				v["state"] = json!(c.state);
 			}
 		}
+		// Offline-refresh plans bound to the mailbox key: kept, their keys
+		// checked against the mnemonic; `sync` takes up each step whose round
+		// is final.
+		let plans = self.restore_plans().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let sync = self.sync()?;
 		let mut out = json!({
 			"served": entries.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes, "mailbox": mailbox_read,
+			"plans": plans,
 			"requests": {"lapses_at": until.max(held_until), "note": self.spelling.say(RESTORED_NOTE)},
 			"sync": sync,
 		});

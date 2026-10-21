@@ -984,6 +984,77 @@ as any.
     arca claims                                         # on a holder's wallet
     arca claim                                          # taken up
 
+### Refreshing while the wallet stays closed: plans
+
+A wallet that will be closed past a coin's expiry pre-signs an offline-refresh
+plan, and the operator refreshes the coin in later rounds without it. `arca
+plan` makes one for each coin named (every live coin of a round that no plan
+names when none is), with one step per expiry the wallet will be away for:
+`--expiries N`, 1 to 6, 2 by default. A plan starts from a leaf of a round, so a
+board or a coin received out of round is refreshed in a round first.
+
+Step i gives up the coin the step before it made (the first gives up the coin
+itself) for a new leaf under a key the wallet derives from the mnemonic and a
+nonce it draws, with the preimage its entry is locked to derived from that key
+and nonce. In place of the forfeit it cannot sign in advance, the wallet signs
+the step's refund: its halves over both coins' collaborative paths, each
+committing to the new leaf's value at a fresh on-chain address of the wallet's
+and the rest, less a margin, at the operator's script. Every use of a refund
+pays the wallet's address the step's value, and a refund spends the step's
+new leaf together with the coin it gave up, so it is void unless that leaf
+exists on the chain. The wallet also signs the coin's attestation
+over the plan, each new key's proof and each new key's binding to the mailbox
+key, and hands the plan to the operator.
+
+Each step runs no earlier than its coin's `refresh_from`, in the coin's free
+window, where a refresh costs nothing: a step whose fee is not zero is refused
+before anything is signed, unless `--max-fee-ppm` raises the bound for this
+command. `arca plan --quote` says what each plan would cost and until when it
+would cover its coin, signing and keeping nothing. Each plan answers two
+median times: `covered_until`, the date until which the plan covers the coin
+at the earliest if the operator applies it (the last leaf's exit deadline,
+counting each new batch from the earliest a step can run), and `sync_by`, the
+start of the last leaf's free window, by which the wallet must run `sync`
+again. While a plan is open, `schedule` wakes the wallet at `sync_by` for its
+coin rather than at the coin's own dates, and `sync` asks for no refresh of
+that coin: its step is the refresh.
+
+Back, `sync` reads each plan's status and takes up each step whose round is
+final: it rebuilds the step's leaf from the record the operator serves,
+validates it against the round, checks it is the leaf the plan names, signs
+its unroll authorisations, hands them over, keeps the leaf as a coin, and only
+then marks the coin the step gave up spent. A step it has not taken up leaves
+that coin the wallet's, to refresh or take home as any; past its home date
+with its step not done, `sync` takes it home. A step it took up whose round
+can never return, as the wallet's own node sees it (an input of the round
+spent by another transaction, final), did not happen: the coin it gave up is
+the wallet's again, and the step shows `lost`. A plan the operator stopped (a
+step that can never run, such as one whose round is lost) leaves its coin the
+wallet's, and the operator holds that coin's batch while the plan is
+stopped: `sync` cancels the plan while the coin can still be refreshed, or
+once the coin is home, and keeps it stopped while the coin is on its way. `arca
+plans` shows each plan, its steps and their leaves and states, and its dates;
+`arca plan-cancel PLAN` cancels the steps that have not started (refused while
+a step is running, its participation taken and its round not yet final). A
+wallet restored from its mnemonic finds its plans under its mailbox key,
+checks every key against the mnemonic, and `sync` takes up their steps.
+
+A coin a plan names carries refund halves that stay valid while its script is
+unspent, so the operator alone could void a payment of it out of round: no
+wallet pays it out of round: it is refreshed in a round first. The operator
+takes a coin a step made into a round once the batch of the coin that step
+gave up is swept and the sweep final, and the coin an open plan stands on
+once the plan is cancelled. The operator applies a plan, as it refreshes any coin: one that
+applies no step, or sweeps a coin whose holder is away, takes that coin as it
+can take any coin whose holder stays away past its expiry. A stopped operator,
+a step's round replaced, or an operator that co-signs nothing leave the coin
+the wallet knows its own, and the wallet takes it home.
+
+    arca plan --quote                             # what each plan costs, until when
+    arca plan                                     # two expiries, every coin of a round
+    arca plans                                    # each step's state, covered_until, sync_by
+    arca sync                                     # back: each step taken up
+
 ### Finding an operator in the registry
 
 An operator publishes a record of itself in the Sequentia registry: its
@@ -1015,7 +1086,7 @@ registry for both commands.
 | `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M \| --mnemonic-file FILE]` | Creates the wallet: a new mnemonic (or the one given, on the command line or read once from a file, `-` for the standard input, a pipe or a socket alike, which keeps it off the command line other users of the machine can read), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
 | `join --from-registry KEY --registry URL --node-url URL …` (`create --from-registry`) | Creates the wallet with the operator the Sequentia registry lists under operator key `KEY`, in place of a server named by address, taking the node, mnemonic and delay options of `create`: the operator's record is read from the registry, its signature by `KEY` checked by the wallet itself, the server's address taken from it, and the wallet created only when that server shows the record's operator key, chain and keepers (see Finding an operator in the registry); a record the registry finds `mismatched` is refused. The answer carries the record's listing under `registry` |
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
-| `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
+| `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
@@ -1037,12 +1108,12 @@ registry for both commands.
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
-| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window, follows on the chain every forfeit whose preimage it does not hold, follows
+| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window (but the current coin of an open offline-refresh plan, which its step refreshes), takes up each step of a plan whose round is final, holds again the coin a step gave up whose round can never return, and cancels a plan the operator stopped while its coin can be refreshed or once it is home (`plans`), follows on the chain every forfeit whose preimage it does not hold, follows
 every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
-| `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain and the unpaid receive requests, asking nothing of the operator: for a program that runs `sync` on a timer |
+| `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
@@ -1054,6 +1125,9 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `distributions` | Every distribution the wallet made, as the operator shows it: its state, round, deadline and expiry, each claim's key, claim key, value, leaf and state (`pending`, `open`, `claimed`, `returned`), and each payment of what no holder took up back to the return script, with its state |
 | `claims [--scan N]` | The claims paid to the wallet's on-chain addresses, found by asking the operator under each address key: each claim's distribution, address, key, value, state, deadline, and the coin the wallet holds of it |
 | `claim [CLAIM]… [--scan N]` | Takes up the open claims named (`DISTRIBUTION:INDEX` or a leaf id), or every one: each checked, its authorisations handed over, kept as a coin, and paid out of round to a fresh leaf of the wallet's own; a claim not open says its state |
+| `plan [LEAF]… [--expiries N] [--quote] [--max-fee-ppm N]` | Pre-signs an offline-refresh plan for each coin named (every live coin of a round that no plan names when none is), one step per expiry the wallet will be away for (1 to 6, 2 by default), quoted by the operator, signed and handed over: each step's leaf under a key from the mnemonic, the refund halves that pay the wallet the step's value at a fresh address of its own, the attestation, the key proofs and their bindings to the mailbox key. A step that costs anything is refused before anything is signed unless `--max-fee-ppm` raises the bound for this command. Each plan answers `covered_until` and `sync_by`; one the operator refused answers its `error`. `--quote` answers what each plan would cost and those dates, signing and keeping nothing (see Refreshing while the wallet stays closed) |
+| `plans` | Every plan the wallet made or restored: its coin, its state, each step's value, fee, state and leaf once taken up, `covered_until` and `sync_by`, and the operator's reason for a plan it stopped |
+| `plan-cancel PLAN` | Cancels the steps of plan `PLAN` that have not started, signed with the mailbox key; refused while a step is running. Every coin the plan named stays out of out-of-round payments until it is refreshed in a round |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives) |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -1174,6 +1248,31 @@ wallet made later from an unclaimed holder's mnemonic finds its claim
 returned. Each refusal (a key named twice, a claim below the smallest leaf,
 a P2WPKH address in place of a key, a fee that changed since it was shown) is
 asserted by its reason.
+
+`tests/arca_offline_refresh.rs` runs the same way: a holder pre-signs a plan
+of two steps with `arca plan` and its wallet stays closed across two expiries.
+The operator applies both steps in the coin's free window, releasing and
+sweeping each old batch after it, and the holder comes back to its value live
+in the second step's leaf, the coins it gave up spent, and pays no coin a plan
+names out of round. An operator stopped after step 1 and back past that coin's
+exit deadline runs step 2 late, its batch never released meanwhile, and a
+wallet restored from the mnemonic alone after the absence holds the second
+step's leaf. An operator stopped for good after step 1 sweeps nothing, and the
+holder, back, takes home the coin the plan started from at its whole value. A
+plan stopped because a step can never run holds that coin's batch unreleased
+past its expiry until the holder, back, cancels the plan and takes the coin
+home. An operator whose signer is stopped builds its rounds and runs the steps,
+and the holder, back, cannot witness the signer's record, takes no coin from
+it, and takes home the coin the plan started from, which no refund answers.
+A step the holder took up whose round an anchor-driven reorganisation then
+removes for good (its parent block orphaned, the operator's input taken by
+another transaction, final) did not happen: the wallet's own re-check holds
+the coin again and the step's leaf lost, `sync` cancels the stopped plan, and
+the coin is refreshed in a round, its whole value live. When the parent chain
+brings that round back, final, the re-check holds the step's leaf again and
+the coin spent again, the value counted once. The server's own tests (`server/tests/plans.rs`) run a step whose round is
+replaced, and the refunds' scripts with each negative mined into a block are
+in `covenant/tests/plan_refund.rs`.
 
 `tests/arca_restore.rs` runs the same way. A wallet holds a leaf of a batch,
 a board, its change from a payment out of round, a payment to it not yet
@@ -1641,10 +1740,10 @@ receives and payments out of the tree timing out four to eight days out, so a
 client can run a swap of BTC for an asset against it between wallets with the
 specification's 36-hour exit delays.
 
-`tests/arca_digests.rs` checks the wallet's call authentication and
-participation id against the server's own, and its list of refusal codes
-against the server's: the wallet takes every code the server answers with a
-4xx for a refusal (but `rate_limited`, a request to slow down), and no other.
+`tests/arca_digests.rs` checks the wallet's call authentication,
+participation id and plan digests against the server's own, and its list
+of refusal codes against the server's: the wallet takes every code the server
+answers with a 4xx for a refusal (but `rate_limited`, a request to slow down), and no other.
 
 They need `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` (as for the server's tests:
 [server/README.md](../server/README.md)) and the signer and keeper binaries,

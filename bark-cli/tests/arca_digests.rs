@@ -1,6 +1,6 @@
 //! The wallet's copies of the server's digests, the call authentication, the
-//! participation id and its key proof, agree with the server's own for the
-//! same parts.
+//! participation id and its key proof, and an offline-refresh plan's quote
+//! request and cancellation, agree with the server's own for the same parts.
 
 use std::str::FromStr;
 
@@ -71,4 +71,12 @@ fn the_wallets_digests_are_the_servers() {
 		assert_eq!(record_head_digest(&chain, n, &h), server::signer::record_head_digest(&chain.genesis_hash(), n, &h));
 	}
 	assert_ne!(record_head_digest(&chain, 1, &[9; 32]), record_head_digest(&chain, 2, &[9; 32]));
+	// An offline-refresh plan's quote request and its cancellation.
+	for nonces in [vec![[4u8; 32]], vec![[4; 32], [5; 32]], vec![[6; 32]; 6]] {
+		assert_eq!(bark::arca::plan::quote_digest(&chain, &s, &ids[0], &nonces, d), server::plans::quote_digest(&chain, &s, &ids[0], &nonces, d));
+	}
+	assert_ne!(bark::arca::plan::quote_digest(&chain, &s, &ids[0], &[[4; 32]], d), bark::arca::plan::quote_digest(&chain, &s, &ids[1], &[[4; 32]], d),
+		"the coin is bound");
+	assert_eq!(bark::arca::plan::cancel_digest(&chain, &s, &[8; 32]), server::plans::cancel_digest(&chain, &s, &[8; 32]));
+	assert_ne!(bark::arca::plan::cancel_digest(&chain, &s, &[8; 32]), bark::arca::plan::quote_digest(&chain, &s, &LeafId([8; 32]), &[], d));
 }
