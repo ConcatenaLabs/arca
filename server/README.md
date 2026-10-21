@@ -1321,6 +1321,11 @@ reads only what may still need it: an output a final transaction of the
 watcher's spends is not looked at again until a rollback takes that
 transaction out, a batch is not looked at for its expiry before its first
 one, nor for a reclaim before an owner under it has released.
+A transaction that needs the operator's signature takes the wallet coins
+that pay its fee before the signer is asked; when the signer gives no
+signature (it is stopped, say), those coins go back to the wallet, so a
+signer outage holds none of them, and the operator's rounds stay funded
+meanwhile.
 
 - **Stale exits.** A coin the server holds as given up, by a participation
   whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on
@@ -2341,6 +2346,12 @@ is an Arca script, a nonce the quote did not draw, an unbalanced step, an
 exit delay above the operator's, a second plan of one coin, seven steps,
 another key's attestation, a board, a key another plan holds) is asserted by
 its code.
+
+`tests/signer_outage.rs` takes a batch to its expiry with the signer
+stopped: the watcher's passes cannot sign its token's release, and the
+wallet can spend as much as it could before (without the coins going back,
+four passes left it nothing of the asset); once the signer is back, the
+release goes out.
 
 `tests/orphan.rs` runs R7's F9: a deep anchor-driven reorganisation (eight
 Sequentia blocks) takes out a board's forfeit, the round's atom issuance and
