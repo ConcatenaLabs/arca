@@ -36,6 +36,15 @@
 //! | `/round_state {txid}` | Where the server says the round stands: built, broadcast, final or lost |
 //! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
+//!
+//! With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`, a SeqLN
+//! `lightningd`), the chain is the one SeqLN's `sequentia-regtest` network
+//! assumes and the operator runs a SeqLN node in X that receives, with a
+//! channel to a node of its own, as the Lightning scenarios do; its payments
+//! out of the tree time out four to eight days out, which a swap of BTC for
+//! an asset (`arca btc-swap`) needs between wallets with the specification's
+//! 36-hour exit delays against a Bitcoin ark's 88-hour HTLC delays. `/state`
+//! then says `lightning: true`.
 
 mod common;
 
@@ -102,6 +111,7 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 	match path {
 		"/state" => Ok(json!({
 			"server": r.url(), "node_url": r.node_url(), "node_user": "arca", "node_password": "arca",
+			"lightning": r.config.assets.iter().any(|a| a.lightning.is_some()),
 			"x": r.x.to_string(), "y": r.y.to_string(),
 			// The test operator key's file, for `arca-signer --key-file …
 			// --sign-operator-record`, and the chain it signs for.
@@ -203,11 +213,52 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 	}
 }
 
+/// The server on SeqLN's chain, with its SeqLN node in X that receives and
+/// a channel to a node of its own; its Lightning terms short except a
+/// payment's timeout, four to eight days out.
+async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNode>) {
+	let lnd = common::lightning::lightningd("operator_for_browsers").expect("ARCA_OPERATOR_LIGHTNING needs LIGHTNINGD_EXEC");
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 4 * 86_400;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await;
+	let x = r.x;
+	let (ox, px) = tokio::task::block_in_place(|| {
+		let ox = common::lightning::node(&r.rt, &mut r.purse, &lnd, "browsers-o", true, x, 2_000_000_000);
+		let px = common::lightning::node(&r.rt, &mut r.purse, &lnd, "browsers-p", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		(ox, px)
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == x.to_string() {
+			a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	(r, vec![ox, px])
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a server kept running for a wallet outside this process; run by hand"]
 async fn operator_for_browsers() {
 	let addr = std::env::var("ARCA_OPERATOR_CONTROL").unwrap_or_else(|_| "127.0.0.1:18640".into());
-	let mut r = Running::start().await;
+	let (mut r, _nodes) = match std::env::var_os("ARCA_OPERATOR_LIGHTNING") {
+		Some(_) => with_lightning().await,
+		None => (Running::start().await, vec![]),
+	};
 	let listener = TcpListener::bind(&addr).expect("bind the control address");
 	listener.set_nonblocking(true).unwrap();
 	println!("operator for browsers: control {}, server {}, node {}, X {}, Y {}", addr, r.url(), r.node_url(), r.x, r.y);
