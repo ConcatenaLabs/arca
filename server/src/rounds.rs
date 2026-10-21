@@ -1644,7 +1644,11 @@ impl Rounds {
 	/// voided then; a coin a take gave up whose forfeit it handed over stays
 	/// given up, its owner's on the chain. The transaction that took the order
 	/// is recorded where the nursery's check reads spends, so the round's
-	/// loss is the chain's as for any round. Returns whether it was retired.
+	/// loss is the chain's as for any round. It acts only once that
+	/// transaction is found, in the mempool or a block the server follows,
+	/// and is not the round itself: a round just mined, which the node's
+	/// transaction index may not show yet, is left as it is. Returns whether
+	/// it was retired.
 	async fn refused_fill_round(&self, r: &RoundRow) -> Result<bool, RoundError> {
 		let fills = self.store.round_fills(r.round_id).await?;
 		if fills.is_empty() {
@@ -1652,7 +1656,12 @@ impl Rounds {
 		}
 		let txid = Txid::from_byte_array(r.txid);
 		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
-		if self.finality.call(move |c| c.transaction(&txid)).await.map_err(chain)?.is_some() {
+		// The node holds it: in a block of the chain the server follows, or
+		// in its mempool. (Not `getrawtransaction`, whose index can lag a
+		// block just connected.)
+		if self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?.in_chain()
+			|| self.finality.call(|c| c.mempool()).await.map_err(chain)?.contains(&txid)
+		{
 			return Ok(false);
 		}
 		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
@@ -1662,22 +1671,31 @@ impl Rounds {
 			if self.finality.call(move |c| c.unspent(&op, true)).await.map_err(chain)?.is_some() {
 				continue;
 			}
-			taken.push((op, self.order_spender(&op).await?));
+			match self.order_spender(&op).await? {
+				// The round itself spends it, in a block the server has not
+				// followed yet: the node holds the round.
+				Some(by) if by == txid => return Ok(false),
+				Some(by) => taken.push((op, by)),
+				// Spent, by a transaction neither in the mempool nor in a
+				// block the server has followed: looked up again at the next
+				// pass.
+				None => return Ok(false),
+			}
 		}
 		if taken.is_empty() {
 			return Ok(false);
 		}
+		// Read again: a pass that read the round before it was found final
+		// leaves it as it stands.
+		if self.store.round(r.round_id).await?.map(|x| x.state) != Some(RoundState::Broadcast) {
+			return Ok(false);
+		}
 		for (op, by) in &taken {
-			match by {
-				Some(by) => {
-					self.store.watch_outpoint(&op.txid.to_byte_array(), op.vout, "nursery", &r.txid).await?;
-					self.store.set_outpoint_spender(&op.txid.to_byte_array(), op.vout, &by.to_byte_array()).await?;
-					self.finality.watch(*by, "spend").await.map_err(|e| RoundError::Chain(e.to_string()))?;
-					log::warn!("round {} ({}): the node does not hold it, and its order {} is spent by {}", r.round_id, txid,
-						outpoint_text(op), by);
-				},
-				None => log::warn!("round {} ({}): the node does not hold it, and its order {} is spent", r.round_id, txid, outpoint_text(op)),
-			}
+			self.store.watch_outpoint(&op.txid.to_byte_array(), op.vout, "nursery", &r.txid).await?;
+			self.store.set_outpoint_spender(&op.txid.to_byte_array(), op.vout, &by.to_byte_array()).await?;
+			self.finality.watch(*by, "spend").await.map_err(|e| RoundError::Chain(e.to_string()))?;
+			log::warn!("round {} ({}): the node does not hold it, and its order {} is spent by {}: retired as lost", r.round_id, txid,
+				outpoint_text(op), by);
 		}
 		if self.store.nursery_get(&r.txid).await?.is_some_and(|n| n.state != NurseryState::Lost) {
 			self.store.nursery_set_state(&r.txid, NurseryState::Lost).await?;
