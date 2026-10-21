@@ -439,8 +439,23 @@ impl Watcher {
 	}
 
 	/// `S`'s signature over input `input` of `tx` by `leaf`, checked against
-	/// the signature hash the server computes itself.
+	/// the signature hash the server computes itself. Every caller has
+	/// reserved the wallet coins `tx` spends, and publishes it only once it
+	/// is signed: when the signer gives no good signature (it is stopped,
+	/// say), those coins are given back. A transaction never published would
+	/// otherwise hold them from every later transaction and round, and each
+	/// pass would reserve more.
 	async fn operator_sig(&self, tx: &Transaction, prevouts: &[elements::TxOut], input: usize, leaf: &Script)
+		-> Result<Signature, WatcherError>
+	{
+		let signed = self.checked_operator_sig(tx, prevouts, input, leaf).await;
+		if signed.is_err() {
+			self.wallet.release(&tx.txid()).await?;
+		}
+		signed
+	}
+
+	async fn checked_operator_sig(&self, tx: &Transaction, prevouts: &[elements::TxOut], input: usize, leaf: &Script)
 		-> Result<Signature, WatcherError>
 	{
 		let sig = self.signer.spend(tx, prevouts, input, leaf).await?;
