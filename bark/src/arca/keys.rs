@@ -22,6 +22,11 @@
 //!   main chain and 1 elsewhere), each an unblinded P2WPKH script: the same
 //!   key is a Bitcoin address and a Sequentia address, as on every Sequentia
 //!   wallet.
+//! - **The OpenAMP account key**, `m/5/0` (unhardened), as the kit and
+//!   Ambra derive it: the key an OpenAMP account and a SeqPal ID are. The
+//!   wallet looks for claims under it ([`super::claim`]), so a payer that
+//!   knows only that account, as SeqPal knows its holders, can pay the wallet;
+//!   here it signs nothing but the proof of a claims lookup.
 //! - **Order keys**, `m/86'/coin'/0'/0/<index>`, one for each order the
 //!   wallet places on the chain: the key itself is the order's REFUND key
 //!   (`maker_x`), and its key-path output, tweaked with no script tree (the
@@ -130,6 +135,12 @@ impl Keys {
 		self.keypair_at(&path)
 	}
 
+	/// The OpenAMP account key, `m/5/0`.
+	pub fn openamp(&self) -> Result<Keypair, Error> {
+		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
+		self.keypair_at(&DerivationPath::from(vec![normal(5)?, normal(0)?]))
+	}
+
 	/// The unblinded P2WPKH script of the on-chain key at `chain/index`.
 	pub fn onchain_script(&self, chain: u32, index: u32) -> Result<Script, Error> {
 		Ok(p2wpkh(&self.onchain(chain, index)?))
@@ -218,6 +229,20 @@ mod tests {
 		assert_eq!(keys.mailbox().unwrap().x_only_public_key().0.serialize(), kit.serialize());
 		assert_eq!(path.to_string().matches('/').count(), 5, "six hardened steps, as every Arca key of the kit: {}", path);
 		assert_ne!(Keys::new(MNEMONIC, 1, 1).unwrap().mailbox().unwrap().x_only_public_key().0, kit, "per account");
+	}
+
+	#[test]
+	fn the_openamp_key_is_the_kits_m_5_0() {
+		// The kit's `openampXonlyPubkey` for this mnemonic (lwk_wasm, run under
+		// node), and an independent BIP32 derivation of m/5/0 in Python.
+		let keys = Keys::new(MNEMONIC, 0, 1).unwrap();
+		let x = keys.openamp().unwrap().x_only_public_key().0.serialize();
+		let want = "1bec09aada7cdc3c9544fb44d9d01aa8d32e391f5c35346c3f3354d5f8c509dd";
+		assert_eq!(x.iter().map(|b| format!("{:02x}", b)).collect::<String>(), want);
+		// The same on every chain and every leaf account: an OpenAMP account is
+		// one key per mnemonic.
+		assert_eq!(Keys::new(MNEMONIC, 3, 0).unwrap().openamp().unwrap().x_only_public_key().0.serialize(), x);
+		assert_ne!(keys.onchain(RECEIVE, 0).unwrap().x_only_public_key().0.serialize(), x);
 	}
 
 	#[test]

@@ -19,10 +19,12 @@
 //! That payment is the operator's, not a script's; [`Wallet::distributions`]
 //! shows it and every claim's state.
 //!
-//! **The holder.** A wallet named by one of its on-chain receive keys finds
-//! its claims by asking the operator ([`Wallet::claims`]), proving each key it
-//! asks under, from the first index to [`super::wallet`]'s gap past the last
-//! it handed out. [`Wallet::claim`] takes each open claim up: it checks the
+//! **The holder.** A wallet named by one of its on-chain receive keys, or by
+//! its OpenAMP account key ([`super::keys::Keys::openamp`], the key a
+//! SeqPal ID is), finds its claims by asking the operator
+//! ([`Wallet::claims`]), proving each key it asks under: the OpenAMP key, and
+//! the receive keys from the first index to [`super::wallet`]'s gap past the
+//! last it handed out. [`Wallet::claim`] takes each open claim up: it checks the
 //! leaf as a leaf of its own refresh is checked (rebuilt from the published
 //! tree, validated against its round, final, under the claim key of its own
 //! key and the claim's nonce, with the five checks and the wallet's bounds,
@@ -32,8 +34,11 @@
 //! own nonce. A claim the operator does not take up is still the wallet's
 //! coin: its exit, its refresh and every date of it run as any coin's.
 //!
-//! The claim key signs for the claim leaf alone: the address key itself
-//! signs nothing of the tree, only the proofs of the lookup.
+//! The claim key signs for the claim leaf alone: the key named itself (an
+//! address key or the OpenAMP key) signs nothing of the tree, only the proofs
+//! of the lookup, each a BIP340 signature over the tagged `Arca/auth` digest
+//! of the call, the chain and the operator's challenge, which is no enclave
+//! sighash, no OpenAMP statement and no freeze message.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -64,22 +69,47 @@ pub const MAX_LOOKUP_KEYS: usize = 64;
 /// lookup names: the same gap the wallet's on-chain scan keeps.
 pub const CLAIM_GAP: u32 = 20;
 
-/// The purpose a claim leaf's nonce is recorded under: the on-chain key that
-/// was named, `claim <chain>/<index>`.
-fn claim_purpose(chain: u32, index: u32) -> String {
-	format!("claim {}/{}", chain, index)
+/// Which of the wallet's keys a claim was named under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+	/// The on-chain key at `chain/index`.
+	Onchain(u32, u32),
+	/// The OpenAMP account key, `m/5/0`.
+	OpenAmp,
 }
 
-/// The on-chain chain and index a claim nonce's purpose names.
-fn parse_claim_purpose(p: &str) -> Option<(u32, u32)> {
+impl std::fmt::Display for Named {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		match self {
+			Named::Onchain(c, i) => write!(f, "on-chain key {}/{}", c, i),
+			Named::OpenAmp => write!(f, "the OpenAMP account key"),
+		}
+	}
+}
+
+/// The purpose a claim leaf's nonce is recorded under: the key that was
+/// named, `claim <chain>/<index>` for an on-chain key, `claim openamp` for
+/// the OpenAMP account key.
+fn claim_purpose(named: Named) -> String {
+	match named {
+		Named::Onchain(c, i) => format!("claim {}/{}", c, i),
+		Named::OpenAmp => "claim openamp".to_string(),
+	}
+}
+
+/// The key a claim nonce's purpose names.
+fn parse_claim_purpose(p: &str) -> Option<Named> {
 	let rest = p.strip_prefix("claim ")?;
+	if rest == "openamp" {
+		return Some(Named::OpenAmp);
+	}
 	let (c, i) = rest.split_once('/')?;
-	Some((c.parse().ok()?, i.parse().ok()?))
+	Some(Named::Onchain(c.parse().ok()?, i.parse().ok()?))
 }
 
-/// A claim found under one of the wallet's keys, with the index of that key.
+/// A claim found under one of the wallet's keys, with that key.
 struct Found {
-	index: u32,
+	named: Named,
 	claim: Value,
 }
 
@@ -90,16 +120,30 @@ impl Wallet {
 	/// checked against the key the wallet recorded.
 	pub(crate) fn coin_key(&self, nonce: &[u8; 32]) -> Result<Keypair, Error> {
 		if let Some(row) = self.store.nonce(nonce)? {
-			if let Some((chain, index)) = parse_claim_purpose(&row.purpose) {
-				let k = claim_keypair(&self.keys.onchain(chain, index)?, nonce).map_err(|e| Error::Keys(e.to_string()))?;
+			if let Some(named) = parse_claim_purpose(&row.purpose) {
+				let k = claim_keypair(&self.named_keypair(named)?, nonce).map_err(|e| Error::Keys(e.to_string()))?;
 				if k.x_only_public_key().0.serialize() != row.owner_key {
-					return Err(Error::Keys(format!("the claim key of on-chain key {}/{} and nonce {} is not the key the wallet recorded",
-						chain, index, hex(nonce))));
+					return Err(Error::Keys(format!("the claim key of {} and nonce {} is not the key the wallet recorded",
+						named, hex(nonce))));
 				}
 				return Ok(k);
 			}
 		}
 		self.keys.leaf(nonce)
+	}
+
+	/// The wallet's own key that `named` is.
+	fn named_keypair(&self, named: Named) -> Result<Keypair, Error> {
+		match named {
+			Named::Onchain(c, i) => self.keys.onchain(c, i),
+			Named::OpenAmp => self.keys.openamp(),
+		}
+	}
+
+	/// The wallet's OpenAMP account key (`m/5/0`): the key a SeqPal ID is,
+	/// and one a payer can name for this wallet.
+	pub fn openamp_key(&self) -> Result<XOnlyPublicKey, Error> {
+		Ok(self.keys.openamp()?.x_only_public_key().0)
 	}
 
 	/// The key a payer names for `s` ([`named_key`]), an address read by the
@@ -338,19 +382,24 @@ impl Wallet {
 	// The holder
 	// -----------------------------------------------------------------------
 
-	/// The wallet's on-chain receive keys a lookup names: `scan` of them from
-	/// the first, or every index handed out and [`CLAIM_GAP`] more.
-	fn claim_keys(&self, scan: Option<u32>) -> Result<Vec<(u32, Keypair)>, Error> {
+	/// The keys a lookup names: the OpenAMP account key, then the on-chain
+	/// receive keys, `scan` of them from the first, or every index handed out
+	/// and [`CLAIM_GAP`] more.
+	fn claim_keys(&self, scan: Option<u32>) -> Result<Vec<(Named, Keypair)>, Error> {
 		let n = match scan {
 			Some(n) => n,
 			None => self.store.indices(RECEIVE)? + CLAIM_GAP,
 		};
-		(0..n).map(|i| Ok((i, self.keys.onchain(RECEIVE, i)?))).collect()
+		let mut keys = vec![(Named::OpenAmp, self.keys.openamp()?)];
+		for i in 0..n {
+			keys.push((Named::Onchain(RECEIVE, i), self.keys.onchain(RECEIVE, i)?));
+		}
+		Ok(keys)
 	}
 
-	/// The claims the operator holds under `keys`, each with the index of its
-	/// key, proven under one challenge for each [`MAX_LOOKUP_KEYS`] keys.
-	fn lookup(&self, keys: &[(u32, Keypair)]) -> Result<Vec<Found>, Error> {
+	/// The claims the operator holds under `keys`, each with its key, proven
+	/// under one challenge for each [`MAX_LOOKUP_KEYS`] keys.
+	fn lookup(&self, keys: &[(Named, Keypair)]) -> Result<Vec<Found>, Error> {
 		let mut out = vec![];
 		for chunk in keys.chunks(MAX_LOOKUP_KEYS) {
 			let v = self.server.post("challenge", &json!({}))?;
@@ -361,17 +410,18 @@ impl Wallet {
 			}).collect();
 			let answer = self.server.post("claims", &json!({"challenge": hex(&challenge), "keys": proofs}))?;
 			for c in answer["claims"].as_array().cloned().unwrap_or_default() {
-				let Some((index, _)) = chunk.iter().find(|(_, k)| c["key"].as_str() == Some(&hex(&k.x_only_public_key().0.serialize())))
+				let Some((named, _)) = chunk.iter().find(|(_, k)| c["key"].as_str() == Some(&hex(&k.x_only_public_key().0.serialize())))
 				else { continue };
-				out.push(Found { index: *index, claim: c });
+				out.push(Found { named: *named, claim: c });
 			}
 		}
 		Ok(out)
 	}
 
-	/// The claims under the wallet's on-chain receive keys, as the operator
-	/// shows them: each claim's distribution, the key it was named under and
-	/// its address, its value and state (`pending` until its distribution is
+	/// The claims under the wallet's OpenAMP key and its on-chain receive
+	/// keys, as the operator shows them: each claim's distribution, the key it
+	/// was named under and its address (`null` for the OpenAMP key, with
+	/// `named_as` saying which key it is), its value and state (`pending` until its distribution is
 	/// released, `open`, `claimed`, `returned`), its deadline, and whether
 	/// the wallet holds it. Asks the operator, proving each key; signs
 	/// nothing else.
@@ -383,9 +433,12 @@ impl Wallet {
 			let c = &f.claim;
 			let nonce = unhex32(c["nonce"].as_str().unwrap_or(""))?;
 			let held = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id);
-			let script = self.keys.onchain_script(RECEIVE, f.index)?;
+			let (address, named_as) = match f.named {
+				Named::Onchain(chain, index) => (json!(self.chain.address(&self.keys.onchain_script(chain, index)?)?), json!("address")),
+				Named::OpenAmp => (Value::Null, json!("openamp")),
+			};
 			out.push(json!({
-				"distribution": c["distribution_id"], "index": c["index"], "key": c["key"], "address": self.chain.address(&script)?,
+				"distribution": c["distribution_id"], "index": c["index"], "key": c["key"], "address": address, "named_as": named_as,
 				"asset": c["asset"], "value": c["value"], "state": c["state"], "leaf_id": c["leaf_id"], "deadline": c["deadline"],
 				"expiry": c["expiry"], "held": held,
 			}));
@@ -393,7 +446,8 @@ impl Wallet {
 		Ok(Value::Array(out))
 	}
 
-	/// Takes up every open claim under the wallet's on-chain receive keys, or
+	/// Takes up every open claim under the wallet's OpenAMP key and its
+	/// on-chain receive keys, or
 	/// those of `which` (leaf ids, or `distribution:index`): see the [module
 	/// documentation](self). Each is kept as a coin of the wallet's once
 	/// checked, and paid out of round to a fresh leaf of its own; a claim the
@@ -427,7 +481,7 @@ impl Wallet {
 			// failed; a held coin still live is paid on now.
 			let row = match self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) {
 				Some(id) => self.store.coin(&id)?,
-				None => match self.adopt_claim(f.index, c) {
+				None => match self.adopt_claim(f.named, c) {
 					Ok(r) => Some(r),
 					Err(e) => {
 						self.store.refused(&format!("claim {}", name), &e.to_string())?;
@@ -453,10 +507,10 @@ impl Wallet {
 		Ok(Value::Array(out))
 	}
 
-	/// Checks the claim `c`, found under the on-chain receive key at `index`,
-	/// hands its unroll authorisations to the operator, and keeps it.
-	fn adopt_claim(&mut self, index: u32, c: &Value) -> Result<CoinRow, Error> {
-		let named_pair = self.keys.onchain(RECEIVE, index)?;
+	/// Checks the claim `c`, found under the wallet's key `named`, hands its
+	/// unroll authorisations to the operator, and keeps it.
+	fn adopt_claim(&mut self, from: Named, c: &Value) -> Result<CoinRow, Error> {
+		let named_pair = self.named_keypair(from)?;
 		let named = named_pair.x_only_public_key().0;
 		if c["key"].as_str() != Some(&hex(&named.serialize())) {
 			return Err(Error::Refused("the operator answers for another key than the one asked under".into()));
@@ -529,10 +583,9 @@ impl Wallet {
 		let first = record.schedule.expiries()[0].to_consensus_u32();
 		let a = self.assess(&coin, &self.followed_policy(first, now), Some((&owner, &nonce)))?;
 		let state = if a.all_final() { "live" } else { "pending" };
-		let note = format!("claim {} of distribution {}, named under on-chain key {}", c["index"], c["distribution_id"].as_str().unwrap_or(""),
-			index);
+		let note = format!("claim {} of distribution {}, named under {}", c["index"], c["distribution_id"].as_str().unwrap_or(""), from);
 		let row = self.row(&coin, &a, state, &note)?;
-		let purpose = claim_purpose(RECEIVE, index);
+		let purpose = claim_purpose(from);
 		self.store.atomically(|s| {
 			s.put_nonce(&nonce, &owner.serialize(), &purpose)?;
 			s.put_coin_bound(&row, false)?;
