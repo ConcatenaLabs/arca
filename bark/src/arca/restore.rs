@@ -37,6 +37,15 @@
 //! one but the lost store knew: the schedule holds at a day for as long as
 //! such a request could last ([`super::wallet::REQUEST_HOLDS`] from the
 //! restore), since a payment to one is read only by `sync`.
+//!
+//! A restore retires the device it restores from: two live stores of one
+//! mnemonic draw their own owner nonces, and each refuses a coin made under
+//! a nonce it never drew, so a leaf one of them claims is refused by the
+//! other, whose own claim of it is then a double spend. A restore that stops
+//! at an error keeps what it took before it, and a later restore takes the
+//! rest. A take whose round is held for its takes' forfeits, unbroadcast, is
+//! restored from the round its status serves (its txid the round's), as
+//! `sync` reads it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -1006,6 +1015,18 @@ impl Wallet {
 				},
 			};
 			let rtx = round.clone().or(st["round"]["txid"].as_str().map(str::to_string)).unwrap_or_default();
+			// The round as the node holds it, or, for a take whose round is
+			// held unbroadcast for its takes' forfeits, as the take's status
+			// serves it (without its witnesses, its txid the round's), as
+			// `sync` reads it.
+			let round_tx: Option<elements::Transaction> = match Txid::from_str(&rtx) {
+				Ok(t) => match self.chain.transaction(&t)? {
+					Some(tx) => Some(tx),
+					None => st["round"]["tx"].as_str().and_then(|h| unhex(h).ok())
+						.and_then(|b| elements::encode::deserialize::<elements::Transaction>(&b).ok()).filter(|tx| tx.txid() == t),
+				},
+				Err(_) => None,
+			};
 			let released = st["state"] == "released" && st["round"]["txid"].as_str() == Some(rtx.as_str());
 			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
 			let mut news = vec![];
@@ -1044,7 +1065,7 @@ impl Wallet {
 						// by a preimage the chain or the operator gives later.
 						let (_, tree) = self.published_tree(trees, &rtx, vout as u32).map_err(Error::Refused)?;
 						let record = tree.record(index as usize);
-						let round_tx = Txid::from_str(&rtx).ok().map(|t| self.chain.transaction(&t)).transpose()?.flatten()
+						let round_tx = round_tx.clone()
 							.ok_or_else(|| Error::Missing(format!("round {} is not on the chain the node holds", rtx)))?;
 						let owner = self.keys.leaf_xonly(&nonce)?;
 						let first = record.schedule.expiries()[0].to_consensus_u32();
@@ -1066,10 +1087,8 @@ impl Wallet {
 					json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(&nonce),
 					"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()})));
 			}
-			if let Ok(t) = Txid::from_str(&rtx) {
-				if let Some(round_tx) = self.chain.transaction(&t)? {
-					self.store.put_tx(&rtx, &elements::encode::serialize(&round_tx), "round")?;
-				}
+			if let Some(round_tx) = &round_tx {
+				self.store.put_tx(&rtx, &elements::encode::serialize(round_tx), "round")?;
 			}
 			let all: Vec<Value> = news.iter().map(|n| n.5.clone()).collect();
 			self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": all}).to_string())?;
