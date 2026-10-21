@@ -154,6 +154,7 @@ jobs:
       - name: The ark on regtest
         run: |
           cat > "$RUNNER_TEMP/ark.sh" <<EOF
+          #!/usr/bin/env bash
           export H=$RUNNER_TEMP/h CORE_BIN=$RUNNER_TEMP/core/bin CLN_BIN=$RUNNER_TEMP/cln/usr/bin \
             HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=$RUNNER_TEMP/target-bark/debug/captaind \
             PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | tail -1)
