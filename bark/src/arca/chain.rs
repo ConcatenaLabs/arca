@@ -251,6 +251,22 @@ impl ChainSource {
 		}
 	}
 
+	/// Broadcasts `tx` whatever fee rate it pays: a claim racing a refund for
+	/// a received leaf may pay most of the leaf in fees, above the ceiling
+	/// `sendrawtransaction` puts on a fee rate unless told otherwise. One the
+	/// node already holds is not an error.
+	pub fn broadcast_any_fee(&self, tx: &Transaction) -> Result<Txid, Error> {
+		match self.client.call::<String>("sendrawtransaction", &[json!(hex(&elements::encode::serialize(tx))), json!(0)]) {
+			Ok(t) => Txid::from_str(&t).map_err(|e| Error::Node(e.to_string())),
+			Err(RpcError::Rpc { message, .. }) if message.contains("txn-already-in-mempool")
+				|| message.contains("txn-already-known")
+				|| message.contains("already in utxo set")
+				|| message.contains("already in block chain") => Ok(tx.txid()),
+			Err(RpcError::Rpc { message, .. }) => Err(Error::Refused(format!("the node refused {}: {}", tx.txid(), message))),
+			Err(e) => Err(node(e)),
+		}
+	}
+
 	/// The node's fee whitelist now: each accepted fee asset and its rate.
 	pub fn fee_rates(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
 		self.client.fee_exchange_rates().map_err(node)

@@ -1513,3 +1513,368 @@ async fn a_new_wallet_receives_over_lightning_on_its_schedule_alone() {
 	drop((ox, px));
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
+
+// ---------------------------------------------------------------------------
+// D76: the claim of a received leaf is a race the wallet runs to win. R7l's
+// probes (a chain stall past the leaf's margin, a claim the block producers
+// leave out) turned around, a claim paid from another asset once the node no
+// longer takes the leaf's, and the fee race that decides a stall past the
+// margin; every wallet driven by its schedule alone (`sync` when `due`,
+// `sync --exits-only` when `exit_due`), against D62's operator, which takes
+// the preimage, settles the payer and co-signs nothing.
+// ---------------------------------------------------------------------------
+
+/// D62's operator, the receive window two hours so the margin is an eighth
+/// of the lock, and a wallet that has handed the preimage over. Returns the
+/// server, the proxy, the wallet, the hash, the leaf, its record, its
+/// timeout, the round's confirmation time and the Lightning nodes.
+async fn handed_over(lnd: &std::path::PathBuf, tag: &str, window: u32)
+	-> (Running, common::proxy::Proxy, Arca, String, String, CoinRecordOf, u32, u32,
+		sequentia_ext::lightning::LightningNode, sequentia_ext::lightning::LightningNode)
+{
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = window;
+	}).await;
+	let x = r.x;
+	let (ox, px) = leg_in_x(lnd, &mut r, &tag.to_lowercase()).await;
+	let p = common::proxy::Proxy::start(&r.url());
+	p.rewrite(Some(std::sync::Arc::new(|path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/lightning_receive_claim" {
+			*v = json!({"code": "internal", "message": "the operator took the preimage and answers nothing"});
+			return Some(500);
+		}
+		None
+	})));
+	p.rewrite_request(Some(std::sync::Arc::new(spoiled_claims)));
+	let a = wallet_at(tag, &p.url.clone(), &r);
+	let (hash, paying) = held(&r, &a, &px, 100_000).await;
+	a.ok(&["sync"]);
+	let built = r.server.rounds.run_round_of(x).await.unwrap().expect("a round");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let timeout = receive_row(&r, &hash).await.unwrap().timeout.unwrap();
+	let s = a.run(&["sync"]).1;
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete", "the operator settled with the preimage it took");
+	let leaf_id = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch").map(|c| c["leaf_id"].as_str().unwrap().to_string())
+		.expect("the htlc-1 leaf");
+	let rec = CoinRecordOf::of(&a, &leaf_id);
+	let confirmed = block_time_of(&r, &built.tx.txid());
+	println!("{} handed over at {}: lightning {} | the round confirmed at {}, the timeout {} (lock {} s)", tag, mtp(&r), s["lightning"],
+		confirmed, timeout, timeout - confirmed);
+	(r, p, a, hash, leaf_id, rec, timeout, confirmed, ox, px)
+}
+
+/// One wake on the schedule alone: `sync --exits-only` when `exit_due`,
+/// `sync` when `due`, nothing otherwise. Returns what ran.
+fn wake(a: &Arca) -> (String, Value) {
+	let sch = a.ok(&["schedule"]);
+	if sch["exit_due"] == true && sch["due"] != true {
+		("sync --exits-only".into(), a.run(&["sync", "--exits-only"]).1)
+	} else if sch["due"] == true {
+		("sync".into(), a.run(&["sync"]).1)
+	} else {
+		("-".into(), sch)
+	}
+}
+
+/// One block whose time is `t`.
+fn block_at(c: &sequentia_ext::rpc::Client, wifs: &[String], t: u64) {
+	let _: Value = c.call("setmocktime", &[json!(t)]).unwrap();
+	for _ in 0..40 {
+		for w in wifs {
+			if c.call::<Value>("generateposblock", &[json!(w), json!(wifs)]).is_ok() {
+				return;
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_millis(250));
+	}
+	panic!("no block");
+}
+
+/// Who took the leaf: its spend on the chain, and whether it carries the
+/// preimage (the wallet's claim) or not (the operator's refund). Returns
+/// whether the wallet's claim took it, and the spend's fees.
+fn outcome(r: &Running, tag: &str, rec: &CoinRecordOf, hash: &str, timeout: u32) -> (bool, Vec<(String, u64)>) {
+	let spent = spent_on_chain(r, &rec.0, 3000);
+	let (o, t, m) = spent.unwrap_or_else(|| panic!("{}: the leaf is spent on the chain by nothing", tag));
+	let claimed = claims_with_preimage(&t, &o, hash);
+	let fees: Vec<(String, u64)> = t.output.iter().filter(|x| x.is_fee()).map(|x| (x.asset.explicit().unwrap().to_string()[..8].to_string(),
+		x.value.explicit().unwrap())).collect();
+	println!("{} THE LEAF'S SPEND: {} by {} in a block of median time {} ({} s from the timeout): {}, fees {:?}", tag, o, t.txid(), m,
+		m as i64 - timeout as i64, if claimed { "the wallet's claim, with the preimage" } else { "the operator's refund (no preimage)" }, fees);
+	(claimed, fees)
+}
+
+/// The operator's refund of the leaf's output `op`, paying `fee` of X.
+fn refund_paying(rec: &CoinRecordOf, r: &Running, op: elements::OutPoint, x: AssetId, fee: u64) -> elements::Transaction {
+	let tx = r.rt.client().raw_transaction(&op.txid).unwrap();
+	let value = tx.output[op.vout as usize].value.explicit().unwrap();
+	let to = arca_covenant::ExplicitOutput::new(x, value - fee, Script::from([0u8, 20].into_iter().chain([7u8; 20]).collect::<Vec<u8>>()));
+	let ks = rec.1.refund_tx(op, x, value, &[to], &arca_covenant::FeeSource::Reserve).unwrap();
+	let sighash = ks.sighash(r.rt.client().genesis_hash().unwrap()).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&common::running::keypair("operator"), &sighash, &[7u8; 32]);
+	ks.finish(vec![sig.as_ref().to_vec()]).tx
+}
+
+/// The chain stalls once the wallet has begun taking the received leaf home
+/// at its home date, for the margin and twenty minutes more, and resumes a
+/// block a minute: both the claim's and the refund's locks open in one
+/// block. The operator tries its refund (paying `refund_fee` of X) after
+/// every block once the leaf is on the chain; the wallet wakes on its
+/// schedule before each block, and, with `wallet_first`, right after each
+/// block too, before the operator. Returns whether the wallet's claim took
+/// the leaf, and the spend's fees.
+async fn stall(test: &str, tag: &str, wallet_first: bool, refund_fee: u64) -> Option<(bool, Vec<(String, u64)>)> {
+	let lnd = lightningd(test)?;
+	let (r, _p, a, hash, leaf_id, rec, timeout, confirmed, ox, px) = handed_over(&lnd, tag, 7200).await;
+	let x = r.x;
+	let margin = 180u32.max((timeout - confirmed) / 8);
+	let home = a.ok(&["lightning", "receives"])[&hash]["home_at"].as_u64().unwrap() as u32;
+	println!("{} margin {} s; home date {} ({} s before the timeout)", tag, margin, home, timeout - home);
+	let wifs = stakers();
+	let c = r.rt.client().clone();
+	let mut stalled = false;
+	let mut refund_hex: Option<String> = None;
+	for step in 0..600 {
+		let tip_time = { let h: Value = c.call("getblockheader", &[json!(c.best_block_hash().unwrap().to_string())]).unwrap(); h["time"].as_u64().unwrap() };
+		if !stalled && mtp(&r) + 600 < home {
+			advance(&r, home - 300 - mtp(&r)).await;
+		}
+		let (ran, v) = wake(&a);
+		if ran != "-" {
+			println!("{} step {} at {} ({} s from the timeout): {} -> coin {} | exits {}", tag, step, mtp(&r), mtp(&r) as i64 - timeout as i64,
+				ran, coin_of(&a, &leaf_id)["state"], v["exits"]);
+		}
+		if !stalled && coin_of(&a, &leaf_id)["state"] == "exiting" {
+			stalled = true;
+			let end = tip_time + (timeout - mtp(&r)) as u64 + 1200;
+			println!("{} THE STALL: from median time {} (tip time {}), no block until time {} ({} s, the margin is {} s)", tag, mtp(&r), tip_time,
+				end, end - tip_time, margin);
+			for k in 0..3 {
+				let (ran, v) = wake(&a);
+				println!("{} during the stall, wake {}: {} -> {}", tag, k, ran, v["schedule"]["next_exit_at"]);
+			}
+			tokio::task::block_in_place(|| block_at(&c, &wifs, end));
+			r.synced().await;
+			continue;
+		}
+		tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+		r.synced().await;
+		if wallet_first {
+			let (ran, v) = wake(&a);
+			if ran != "-" {
+				println!("{} wallet first at {} ({} s from the timeout): {} -> coin {} | exits {}", tag, mtp(&r), mtp(&r) as i64 - timeout as i64,
+					ran, coin_of(&a, &leaf_id)["state"], v["exits"]);
+			}
+		}
+		if refund_hex.is_none() {
+			if let Some((op, m)) = output_on_chain(&r, &rec.0, 400) {
+				refund_hex = Some(elements::encode::serialize_hex(&refund_paying(&rec, &r, op, x, refund_fee)));
+				println!("{} the leaf's output {} in a block of median time {} ({} s from the timeout)", tag, op, m, m as i64 - timeout as i64);
+			}
+		}
+		if let Some(hx) = &refund_hex {
+			let pool: Vec<String> = c.call::<Vec<String>>("getrawmempool", &[]).unwrap_or_default();
+			let tried = c.call::<Value>("sendrawtransaction", &[json!(hx), json!(0)]);
+			if mtp(&r) + 600 > timeout {
+				println!("{} the operator's refund paying {} at {} (mempool before it: {:?}): {:?}", tag, refund_fee, mtp(&r), pool,
+					tried.as_ref().map_err(|e| e.to_string()));
+			}
+		}
+		if spent_on_chain(&r, &rec.0, 400).is_some() {
+			break;
+		}
+	}
+	tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+	let got = outcome(&r, tag, &rec, &hash, timeout);
+	let (ran, v) = wake(&a);
+	println!("{} the wallet afterwards: {} -> exits {} | coin {} | balance {}", tag, ran, v["exits"], coin_of(&a, &leaf_id), a.ok(&["balance"]));
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+	Some(got)
+}
+
+/// R7l's stall probe, turned around: a stall longer than the margin opens
+/// the claim and the refund in one block; the operator's refund (5,000 of
+/// fee) goes in first; the wallet, at its next wake, finds it in the mempool
+/// and replaces it with its claim at its bid, the whole value from the
+/// timeout on. The wallet's claim takes the leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn d76_a_stall_past_the_margin_the_claim_outbids_the_refund() {
+	let Some((claimed, fees)) = stall("d76_a_stall_past_the_margin_the_claim_outbids_the_refund", "D76S1", false, 5_000).await else { return };
+	assert!(claimed, "the wallet's claim took the leaf (fees {:?})", fees);
+}
+
+/// The same, the wallet woken right after each block, before the operator:
+/// its claim goes out at the whole value past the timeout, and the
+/// operator's refund cannot replace it.
+#[tokio::test(flavor = "multi_thread")]
+async fn d76_a_stall_past_the_margin_the_wallet_first() {
+	let Some((claimed, fees)) = stall("d76_a_stall_past_the_margin_the_wallet_first", "D76S1B", true, 5_000).await else { return };
+	assert!(claimed, "the wallet's claim took the leaf (fees {:?})", fees);
+}
+
+/// What remains, as the documentation states it: past the margin a fee race
+/// decides. An operator whose refund pays more in fees than the wallet's
+/// best claim (the leaf's whole value less twice the dust its own output
+/// keeps) wins it, keeping only its refund's output at the node's dust
+/// threshold (300 atoms of X at a rate of 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn d76_past_the_margin_a_fee_race_decides() {
+	let Some((claimed, fees)) = stall("d76_past_the_margin_a_fee_race_decides", "D76S3", false, 99_900 - 300).await else { return };
+	assert!(!claimed, "a refund burning all but 300 atoms of the leaf outbids the wallet's best claim (fees {:?})", fees);
+	assert_eq!(fees.iter().map(|f| f.1).sum::<u64>(), 99_600, "the operator burnt the leaf to win the race");
+}
+
+/// R7l's claim-left-out probe, turned around: the wallet's claim goes out in
+/// time, and the block producers leave out every claim paying less than a
+/// bar (twenty times the first claim's fee at the node's floor: a congested
+/// chain, or producers that value the leaf's asset low), the chain a block a
+/// minute. The wallet raises its claim at every wake as the timeout nears;
+/// once it clears the bar it is mined, before the timeout. From the timeout
+/// the operator's refund, paying 5,000, is tried at every block.
+#[tokio::test(flavor = "multi_thread")]
+async fn d76_a_claim_left_out_until_its_fee_clears_the_bar() {
+	let Some(lnd) = lightningd("d76_a_claim_left_out_until_its_fee_clears_the_bar") else { return };
+	let tag = "D76S2";
+	let (r, _p, a, hash, leaf_id, rec, timeout, confirmed, ox, px) = handed_over(&lnd, tag, 7200).await;
+	let x = r.x;
+	let margin = 180u32.max((timeout - confirmed) / 8);
+	let home = a.ok(&["lightning", "receives"])[&hash]["home_at"].as_u64().unwrap() as u32;
+	println!("{} margin {} s; home date {} ({} s before the timeout)", tag, margin, home, timeout - home);
+	let wifs = stakers();
+	let c = r.rt.client().clone();
+	let mut refund_hex: Option<String> = None;
+	let mut seen: Vec<String> = vec![];
+	let mut bar: Option<u64> = None;
+	let mut raised = 0;
+	for step in 0..900 {
+		if mtp(&r) + 600 < home {
+			advance(&r, home - 300 - mtp(&r)).await;
+		}
+		let (ran, v) = wake(&a);
+		if ran != "-" {
+			println!("{} step {} at {} ({} s from the timeout): {} -> coin {} | exits {}", tag, step, mtp(&r), mtp(&r) as i64 - timeout as i64,
+				ran, coin_of(&a, &leaf_id)["state"], v["exits"]);
+		}
+		if let Some((op, _)) = output_on_chain(&r, &rec.0, 400) {
+			if refund_hex.is_none() {
+				refund_hex = Some(elements::encode::serialize_hex(&refund_paying(&rec, &r, op, x, 5_000)));
+				println!("{} the leaf's output {} on the chain", tag, op);
+			}
+			let pool: Vec<String> = c.call::<Vec<String>>("getrawmempool", &[]).unwrap_or_default();
+			for t in pool {
+				if seen.contains(&t) {
+					continue;
+				}
+				let raw: Value = c.call("getrawtransaction", &[json!(t), json!(true)]).unwrap();
+				let tx: elements::Transaction = elements::encode::deserialize(&unhex(raw["hex"].as_str().unwrap())).unwrap();
+				if !claims_with_preimage(&tx, &op, &hash) {
+					continue;
+				}
+				seen.push(t.clone());
+				let fee: u64 = tx.output.iter().filter(|o| o.is_fee()).filter_map(|o| o.value.explicit()).sum();
+				let bar = *bar.get_or_insert(20 * fee);
+				if fee < bar {
+					let pr: Result<Value, _> = c.call("prioritisetransaction", &[json!(t), json!(0), json!(-1_000_000_000i64)]);
+					println!("{} the wallet's claim {} paying {} in the mempool at {} ({} s before the timeout): below the bar of {}, left \
+						out of blocks ({:?})", tag, t, fee, mtp(&r), timeout as i64 - mtp(&r) as i64, bar, pr.is_ok());
+				} else {
+					raised += 1;
+					println!("{} the wallet's claim {} paying {} at {} ({} s before the timeout): clears the bar of {}, taken", tag, t, fee,
+						mtp(&r), timeout as i64 - mtp(&r) as i64, bar);
+				}
+			}
+		}
+		tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+		r.synced().await;
+		if let Some(hx) = &refund_hex {
+			if let Ok(v) = c.call::<Value>("sendrawtransaction", &[json!(hx)]) {
+				println!("{} the operator's refund accepted at median time {} ({} s from the timeout): {}", tag, mtp(&r),
+					mtp(&r) as i64 - timeout as i64, v);
+			}
+		}
+		if spent_on_chain(&r, &rec.0, 400).is_some() || mtp(&r) > timeout + 3600 {
+			break;
+		}
+	}
+	tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+	let (claimed, fees) = outcome(&r, tag, &rec, &hash, timeout);
+	let (ran, v) = wake(&a);
+	println!("{} the wallet afterwards: {} -> exits {} | coin {} | balance {}", tag, ran, v["exits"], coin_of(&a, &leaf_id), a.ok(&["balance"]));
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+	assert!(claimed, "the wallet's claim took the leaf (fees {:?})", fees);
+	assert!(raised >= 1, "a claim raised past the bar was taken");
+}
+
+/// D76: the leaf's own asset no longer accepted for fees by the node once
+/// the leaf is on its way home (producers that stop taking it): the wallet,
+/// which holds an on-chain coin of Y, pays its claim's fee from that coin,
+/// and the claim takes the leaf before the timeout. The operator's refund,
+/// paying its fee in X, is refused throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn d76_a_claim_paid_from_another_asset_when_the_leafs_is_not_accepted() {
+	let Some(lnd) = lightningd("d76_a_claim_paid_from_another_asset_when_the_leafs_is_not_accepted") else { return };
+	let tag = "D76S4";
+	let (mut r, _p, a, hash, leaf_id, rec, timeout, _confirmed, ox, px) = handed_over(&lnd, tag, 7200).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, y, 1_000_000);
+	r.produce().await;
+	let home = a.ok(&["lightning", "receives"])[&hash]["home_at"].as_u64().unwrap() as u32;
+	let wifs = stakers();
+	let c = r.rt.client().clone();
+	let mut delisted = false;
+	let mut refund_hex: Option<String> = None;
+	for step in 0..900 {
+		if mtp(&r) + 600 < home {
+			advance(&r, home - 300 - mtp(&r)).await;
+		}
+		// Once the wallet has begun the leaf's way home, the node stops
+		// taking X for fees.
+		if !delisted && coin_of(&a, &leaf_id)["state"] == "exiting" {
+			let rates: Value = c.call("getfeeexchangerates", &[]).unwrap();
+			let mut rates = rates.as_object().unwrap().clone();
+			rates.remove(&x.to_string());
+			let _: Value = c.call("setfeeexchangerates", &[Value::Object(rates)]).unwrap();
+			delisted = true;
+			println!("{} the node no longer takes X for fees: {}", tag, c.call::<Value>("getfeeexchangerates", &[]).unwrap());
+		}
+		let (ran, v) = wake(&a);
+		if ran != "-" {
+			println!("{} step {} at {} ({} s from the timeout): {} -> coin {} | exits {}", tag, step, mtp(&r), mtp(&r) as i64 - timeout as i64,
+				ran, coin_of(&a, &leaf_id)["state"], v["exits"]);
+		}
+		tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+		r.synced().await;
+		if refund_hex.is_none() {
+			if let Some((op, _)) = output_on_chain(&r, &rec.0, 400) {
+				refund_hex = Some(elements::encode::serialize_hex(&rec.refund(&r, op, x)));
+			}
+		}
+		if let Some(hx) = &refund_hex {
+			if let Ok(v) = c.call::<Value>("sendrawtransaction", &[json!(hx)]) {
+				println!("{} the operator's refund accepted at median time {}: {}", tag, mtp(&r), v);
+			}
+		}
+		if spent_on_chain(&r, &rec.0, 400).is_some() || mtp(&r) > timeout + 3600 {
+			break;
+		}
+	}
+	tokio::task::block_in_place(|| block_a_minute(&c, &wifs));
+	let (claimed, fees) = outcome(&r, tag, &rec, &hash, timeout);
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&a.dir);
+	assert!(claimed, "the wallet's claim took the leaf (fees {:?})", fees);
+	assert!(fees.iter().all(|f| y.to_string().starts_with(&f.0)), "the claim's fee paid in Y: {:?}", fees);
+}

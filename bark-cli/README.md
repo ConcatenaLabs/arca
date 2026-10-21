@@ -459,8 +459,11 @@ and a board whose registration never reached the server, are not recovered.
   whose date has come before it asks the operator anything (a received
   leaf's home date first, then every exit under way: an unroll, a claim
   once its delay has run, a claim broadcast again at every sync until it is
-  mined and replaced by one paying the node's floor when the floor rose
-  above what it pays), and again whenever one comes while it is asking, so
+  mined and replaced by one paying more when the node's floor rose above
+  what it pays, or, for a received leaf, when its fee falls below its share
+  of the leaf's value as the timeout nears, and any refund of a received
+  leaf in the mempool replaced by a claim that pays more), and again
+  whenever one comes while it is asking, so
   an operator that answers slowly holds back no claim. A coin whose refresh
   has not completed by its home date goes home after the operator is
   asked, so a refresh or payment completed in the same `sync` keeps it. The schedule names those dates on
@@ -599,7 +602,30 @@ does, and which `sync`'s schedule names (`next_sync_at` and
 wakes the wallet within a quarter of the operator's window; `exit` takes a
 `receiving` leaf home by its claim with the preimage. The payment is settled
 when the preimage is handed over. A payment the operator failed back is
-`failed`, with the reason. The
+`failed`, with the reason.
+
+The claim of a received leaf is a race the wallet runs to win: once its
+timeout has passed, the operator's refund is valid beside it. From its
+broadcast the claim's fee rises at every wake as the timeout nears, a share
+of the leaf's value that grows with the square of the time gone from the
+claim's opening (a quarter halfway), up to the leaf's whole value at the
+timeout (less what keeps its own output above the node's dust); a claim
+replaced this way, or because the node's floor rose, outbids the one before
+as the node asks of a replacement. When the node no longer accepts the
+leaf's asset for fees, the claim pays its fee from an on-chain coin of an
+asset it accepts (the leaf's value then counted at the node's rate, or at the
+rate the wallet kept when the node last took that asset), so keep one. After
+the timeout `sync` replaces any refund of the leaf in the mempool with a
+claim that pays more, at every wake, up to the leaf's whole value: an
+operator that takes the leaf by its refund then gains only what it did not
+burn in fees. What remains: a chain stall longer than the margin opens the
+claim and the refund in one block, and a fee race decides it, which an
+operator willing to burn the leaf's value, or that produces the block
+itself, can still win; and a wallet whose only coin in an accepted asset is
+the leaf cannot pay its claim once the node stops taking that asset. A
+refund lock that a stall cannot leap needs another leaf template.
+
+The
 invoice locks the payment for twice the leaf's lock, eight sevenths of its
 exit delay and the operator's window (so the window survives the margin),
 about 5,770 blocks with a 36-hour exit delay and a six-hour window: a payer

@@ -26,6 +26,17 @@
 //! An exit that needs a fee coin the wallet does not hold stops and says so:
 //! that coin cannot come home until the wallet holds one.
 //!
+//! The claim of a leaf received over Lightning races the operator's refund,
+//! valid beside it from the leaf's timeout (D76). From its broadcast its fee
+//! rises at every wake as the timeout nears ([`bid_share_ppm`]), up to the
+//! leaf's whole value (less twice the dust its own output keeps); when the
+//! node no longer accepts the leaf's asset it is paid from an on-chain coin of
+//! an asset it accepts; and past the timeout any refund of the leaf in the
+//! mempool is replaced by a claim that pays more, up to the leaf's whole
+//! value. A stall longer than the claim's margin still opens both in one
+//! block, and then the fee race decides; such claims are broadcast whatever
+//! their fee rate.
+//!
 //! An exit asks nothing of the coin's expiry: past it, the wallet goes on
 //! trying until the chain says the coin is gone, since the operator sweeps
 //! a batch only once its token has waited the notice. A coin whose path a
@@ -39,7 +50,7 @@ use elements::{AssetId, OutPoint, Script, Transaction, TxOut};
 use serde_json::{json, Value};
 
 use arca_covenant::spend::{FeeSource, KeySpend};
-use arca_covenant::{CoinRecord, ExplicitOutput, UnrollTx, ValidCoin, ValidOrigin};
+use arca_covenant::{CoinRecord, ExplicitOutput, HtlcDirection, UnrollTx, ValidCoin, ValidOrigin};
 
 use super::chain::hex;
 use super::keys::CHANGE;
@@ -93,6 +104,27 @@ impl Payer {
 
 fn txs_fee(tx: &Transaction) -> Vec<(AssetId, u64)> {
 	tx.output.iter().filter(|o| o.is_fee()).filter_map(|o| Some((o.asset.explicit()?, o.value.explicit()?))).collect()
+}
+
+/// The node's dust threshold for the claim's own output, a P2WPKH script,
+/// in atoms of the reference unit: 98 vbytes to spend and hold it at the
+/// default dust rate of 3,000 a kvB. A claim that pays its fee from the leaf
+/// keeps twice this in the leaf's asset, whatever its fee.
+const CLAIM_DUST_REFERENCE: u64 = 294;
+
+/// D76: the share of a received leaf's value its claim pays in fees at
+/// `now`, in millionths: from the claim's opening (`from`) to the leaf's
+/// timeout, the square of the part of that time gone by (a quarter halfway,
+/// nothing at the opening), and the whole value from the timeout on.
+pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
+	if now >= timeout {
+		return 1_000_000;
+	}
+	if now <= from || timeout <= from {
+		return 0;
+	}
+	let (gone, span) = ((now - from) as u128, (timeout - from) as u128);
+	(gone * gone * 1_000_000 / (span * span)) as u64
 }
 
 /// The vsize a claim of `leaf` pays its own fee for: a plain leaf's exit is
@@ -245,61 +277,187 @@ impl Wallet {
 		})
 	}
 
+	/// The asset a claim of `coin` pays its fee in now: the leaf's own when
+	/// the node accepts it for fees, else the one named for the exit, else
+	/// the one the wallet chooses among the accepted assets it holds on the
+	/// chain ([`Self::choose_fee_asset`]).
+	fn claim_fee_asset(&self, coin: &ValidCoin, named: Option<AssetId>) -> Result<AssetId, Error> {
+		if self.chain.floor_per_kvb(coin.asset)?.is_some() {
+			return Ok(coin.asset);
+		}
+		match named {
+			Some(a) => Ok(a),
+			None => self.choose_fee_asset(coin.asset, &self.fee_holdings()?),
+		}
+	}
+
+	/// D76: what the claim of `coin`, a leaf received over Lightning, pays in
+	/// fees now in `fee_asset`, at least, and the most it pays: from the
+	/// claim's opening (`prior["claim_from"]`, else when it was first
+	/// broadcast) a share of the leaf's value that grows as the leaf's
+	/// timeout nears ([`bid_share_ppm`]), the whole value from the timeout
+	/// on. Paid from the leaf itself, the whole value is the leaf's less what
+	/// keeps its own output above the node's dust; paid from a coin of
+	/// another asset, it is the leaf's value at the node's rates now, or at
+	/// the rate the wallet kept when the node last accepted the leaf's asset
+	/// (`prior["leaf_rate"]`). `None` for any other leaf, or one whose value
+	/// the wallet cannot tell in `fee_asset`.
+	fn claim_bid(&self, coin: &ValidCoin, prior: &Value, fee_asset: AssetId, now: u32) -> Result<Option<(u64, u64)>, Error> {
+		let Some(t) = coin.leaf.htlc.filter(|t| t.direction == HtlcDirection::Receive) else { return Ok(None) };
+		let timeout = t.timeout.to_consensus_u32();
+		let from = prior["claim_from"].as_u64().or_else(|| prior["claimed_at"].as_u64()).map_or(now, |v| v.min(u32::MAX as u64) as u32);
+		let rates = self.chain.fee_rates()?;
+		let rate = |a: &AssetId| rates.get(a).copied().filter(|r| *r > 0);
+		let fee_rate = rate(&fee_asset).ok_or_else(|| Self::not_accepted(fee_asset))? as u128;
+		let max = if fee_asset == coin.asset {
+			let keep = (2 * CLAIM_DUST_REFERENCE as u128 * 100_000_000).div_ceil(fee_rate).max(1);
+			(coin.value as u128).saturating_sub(keep) as u64
+		} else {
+			let Some(leaf_rate) = rate(&coin.asset).or_else(|| prior["leaf_rate"].as_u64().filter(|r| *r > 0)) else { return Ok(None) };
+			((coin.value as u128 * leaf_rate as u128 / fee_rate).min(u64::MAX as u128)) as u64
+		};
+		let bid = (max as u128 * bid_share_ppm(from, timeout, now) as u128 / 1_000_000) as u64;
+		Ok(Some((bid, max)))
+	}
+
+	/// The least fee, in `asset`, a transaction of `size` vbytes pays to
+	/// replace `old` in the node's mempool: what the node valued `old`'s fee
+	/// at when it took it, in `asset` at its rate now (or what `old` paid in
+	/// `asset`, if more), raised to `old`'s fee rate over the larger size,
+	/// and the node's floor on `size` more, as the node asks of a
+	/// replacement.
+	fn outbid(&self, old: &Transaction, asset: AssetId, size: u64) -> Result<u64, Error> {
+		let rate = self.chain.fee_rates()?.get(&asset).copied().filter(|r| *r > 0).ok_or_else(|| Self::not_accepted(asset))?;
+		let floor = self.chain.floor_per_kvb(asset)?.ok_or_else(|| Self::not_accepted(asset))?;
+		let paid = txs_fee(old).iter().filter(|(a, _)| *a == asset).map(|(_, v)| *v).sum::<u64>();
+		let valued = self.chain.mempool_fee_value(&old.txid())?.unwrap_or(0);
+		let old_now = ((valued as u128 * 100_000_000).div_ceil(rate as u128)).min(u64::MAX as u128) as u64;
+		let old_fee = paid.max(old_now);
+		let size = size.max(old.vsize() as u64);
+		let by_rate = ((old_fee as u128 * size as u128).div_ceil(old.vsize().max(1) as u128)).min(u64::MAX as u128) as u64;
+		Ok(by_rate.saturating_add(size.saturating_mul(floor).div_ceil(1000)).saturating_add(1))
+	}
+
+	/// D76: the leaf of `coin`, received over Lightning, whose output at
+	/// `leaf_at` another transaction `other` spends in the mempool and in no
+	/// block (the operator's refund, once the leaf's timeout has passed):
+	/// replaced by the wallet's claim paying more, its bid now and at least
+	/// what outbids `other`, up to the leaf's whole value. `None` for any
+	/// other leaf, or a spend already in a block (a replacement cannot take
+	/// it out: a rollback could, and the wallet tries again then).
+	fn outbid_refund(&mut self, leaf_id: &str, coin: &ValidCoin, other: &Transaction, leaf_at: OutPoint, prior: &Value)
+		-> Result<Option<Value>, Error>
+	{
+		if !coin.leaf.htlc.is_some_and(|t| t.direction == HtlcDirection::Receive) || self.chain.finality(&other.txid())?.in_chain() {
+			return Ok(None);
+		}
+		let Some(claim_index) = prior["claim_index"].as_u64() else { return Ok(None) };
+		let now = self.now()?.to_consensus_u32();
+		let named = prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?;
+		let asset = self.claim_fee_asset(coin, named)?;
+		let Some((bid, max)) = self.claim_bid(coin, prior, asset, now)? else { return Ok(None) };
+		let need = self.outbid(other, asset, claim_vsize(&coin.leaf))?.max(bid);
+		if need > max {
+			return Err(Error::Refused(format!("coin {}'s output is spent in the mempool by {}, which is not the wallet's (the operator's \
+				refund, the leaf's timeout past): outbidding it takes {} of asset {} in fees, more than the leaf's whole value ({}): a fee \
+				race the wallet cannot win", leaf_id, other.txid(), need, asset, max)));
+		}
+		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
+		let key = self.keys.leaf(&row.owner_nonce)?;
+		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index as u32)?;
+		let after = self.claim_witness(coin, &row.owner_nonce)?;
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need };
+		let new = self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after)?;
+		let txid = self.chain.broadcast_any_fee(&new.tx).map_err(|e| Error::Refused(format!("coin {}'s output is spent in the mempool \
+			by {}, which is not the wallet's; the node refused the claim that outbids it: {}", leaf_id, other.txid(), e)))?;
+		let txs = self.store.exit(leaf_id)?.map(|e| e.1).unwrap_or_else(|| prior.to_string());
+		self.store.set_exit(leaf_id, "claimed", &txs, Some(&txid.to_string()))?;
+		let why = format!("claimed by {}, which replaced {} (not the wallet's, the operator's refund once the leaf's timeout passed) by \
+			paying more in fees; the wallet replaces any refund again at every wake, up to the leaf's whole value, and follows the claim \
+			until it is final", txid, other.txid());
+		self.store.set_coin_state(leaf_id, "exiting", &why)?;
+		Ok(Some(json!({"leaf_id": leaf_id, "state": "claimed", "claim": {"txid": txid.to_string(), "replaced": other.txid().to_string(),
+			"fee": txs_fee(&new.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()},
+			"note": why})))
+	}
+
 	/// The wallet's own claim `old` of coin `leaf_id`'s leaf at `leaf_at`,
 	/// to receive address `claim_index`, in the mempool and in no block:
-	/// broadcast again, and replaced by one that pays the node's floor now
-	/// when the floor rose above what it pays (the replacement outbids it by
-	/// the floor on its size, as the node asks of a replacement). Says what
-	/// it did; `None` when the claim still pays the floor.
+	/// broadcast again, and replaced by one that pays more when it pays less
+	/// than the node's floor now, or, for a leaf received over Lightning
+	/// (D76), less than its bid now ([`Self::claim_bid`]): the share of the
+	/// leaf's value the claim pays rises at every wake as the leaf's timeout
+	/// nears, up to the whole value, and a claim paid in the leaf's asset
+	/// once the node no longer accepts it is paid from a coin of an asset
+	/// it accepts. The replacement outbids it as the node asks of a
+	/// replacement ([`Self::outbid`]). Says what it did; `None` when the
+	/// claim stands as it is.
 	fn raise_claim(&mut self, leaf_id: &str, coin: &ValidCoin, old: &Transaction, leaf_at: OutPoint, prior: &Value, claim_index: u32)
 		-> Result<Option<Value>, Error>
 	{
-		if self.pays_floor(old)? {
+		let now = self.now()?.to_consensus_u32();
+		let named = prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?;
+		let paid = txs_fee(old);
+		let asset = match self.claim_fee_asset(coin, named) {
+			Ok(a) => a,
+			Err(e) => {
+				let _ = self.chain.broadcast_any_fee(old);
+				if !self.pays_floor(old)? {
+					self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than the node's floor now, \
+						and no asset to pay a replacement in could be chosen: {}", old.txid(), e))?;
+				}
+				return Ok(None);
+			},
+		};
+		let bid = self.claim_bid(coin, prior, asset, now)?;
+		let pays = paid.iter().filter(|(a, _)| *a == asset).map(|(_, v)| *v).sum::<u64>();
+		let short = match bid {
+			Some((b, _)) => paid.len() != 1 || paid[0].0 != asset || pays < b,
+			None => false,
+		};
+		if self.pays_floor(old)? && !short {
 			// Broadcast again: a node that dropped it takes it back.
-			let _ = self.chain.broadcast(old);
+			let _ = self.chain.broadcast_any_fee(old);
 			return Ok(None);
 		}
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
 		let key = self.keys.leaf(&row.owner_nonce)?;
 		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
-		let fee_asset = prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?;
-		let paid = txs_fee(old);
-		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0 };
-		// Outbid in the asset it paid in (the leaf's own, unless a fee
-		// coin's): the node values the old fee as it did when it took it, and
-		// asks the replacement for that and the floor on its size more, at the
-		// asset's rate now.
-		let in_asset = paid.first().map(|(a, _)| *a).unwrap_or(coin.asset);
-		let rate = self.chain.fee_rates()?.get(&in_asset).copied().filter(|r| *r > 0);
-		if let (Some(floor), Some(rate)) = (self.chain.floor_per_kvb(in_asset)?, rate) {
-			let old_fee = paid.iter().filter(|(a, _)| *a == in_asset).map(|(_, v)| *v).sum::<u64>();
-			let valued = self.chain.mempool_fee_value(&old.txid())?.unwrap_or(0);
-			let old_now = ((valued as u128 * 100_000_000).div_ceil(rate as u128)).min(u64::MAX as u128) as u64;
-			let size = (old.vsize() as u64).max(claim_vsize(&coin.leaf));
-			payer.min_fee = old_fee.max(old_now).saturating_add(size.saturating_mul(floor).div_ceil(1000)).saturating_add(1);
+		let mut need = self.outbid(old, asset, claim_vsize(&coin.leaf))?;
+		if let Some((b, max)) = bid {
+			if need > max {
+				let _ = self.chain.broadcast_any_fee(old);
+				return Ok(None);
+			}
+			need = need.max(b);
 		}
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need };
 		let new = match self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after) {
 			Ok(c) => c,
 			Err(e) => {
-				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than the node's floor now, and \
-					no replacement could be built: {}", old.txid(), e))?;
+				let _ = self.chain.broadcast_any_fee(old);
+				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than it should now, and no \
+					replacement could be built: {}", old.txid(), e))?;
 				return Ok(None);
 			},
 		};
-		match self.chain.broadcast(&new.tx) {
+		let reason = if short { "it paid less than its bid as the leaf's timeout nears" } else { "the node's floor rose above what it paid" };
+		match self.chain.broadcast_any_fee(&new.tx) {
 			Ok(txid) => {
 				let txs = self.store.exit(leaf_id)?.map(|e| e.1).unwrap_or_else(|| prior.to_string());
 				self.store.set_exit(leaf_id, "claimed", &txs, Some(&txid.to_string()))?;
-				let why = format!("claimed by {}, which replaced {}: the node's floor rose above what that paid; the wallet follows the \
-					claim until it is final", txid, old.txid());
+				let why = format!("claimed by {}, which replaced {}: {}; the wallet follows the claim until it is final", txid, old.txid(),
+					reason);
 				self.store.set_coin_state(leaf_id, "exiting", &why)?;
 				Ok(Some(json!({"leaf_id": leaf_id, "state": "claimed", "claim": {"txid": txid.to_string(), "replaced": old.txid().to_string(),
+					"why": reason,
 					"fee": txs_fee(&new.tx).iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()}})))
 			},
 			Err(e) => {
-				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than the node's floor now, and \
-					the node refused its replacement {}: {}", old.txid(), new.tx.txid(), e))?;
+				let _ = self.chain.broadcast_any_fee(old);
+				self.store.refused(&format!("the claim of {}", leaf_id), &format!("its claim {} pays less than it should now ({}), and \
+					the node refused its replacement {}: {}", old.txid(), reason, new.tx.txid(), e))?;
 				Ok(None)
 			},
 		}
@@ -608,9 +766,23 @@ impl Wallet {
 		let plan: Vec<Transaction> = built.into_iter().map(|u| u.tx).collect();
 		// The fee asset named, or chosen while the plan was built, for the
 		// exit's later steps.
+		// What the claim's bid counts from (D76), kept across runs: when the
+		// claim opens, when it was first broadcast, and the leaf's rate when
+		// the node last accepted its asset.
+		let kept: Vec<(&str, Value)> = ["claim_from", "claimed_at", "leaf_rate"].iter()
+			.filter(|k| !prior[**k].is_null()).map(|k| (*k, prior[*k].clone())).collect();
+		let received = coin.leaf.htlc.is_some_and(|t| t.direction == HtlcDirection::Receive);
 		let record_exit = |state: &str, fee_asset: Option<AssetId>, s: &Wallet| -> Result<(), Error> {
-			let v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
+			let mut v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
 				"fee_asset": fee_asset.map(|a| a.to_string()), "claim_index": claim_index});
+			for (k, x) in &kept {
+				v[*k] = x.clone();
+			}
+			if received {
+				if let Some(r) = s.chain.fee_rates()?.get(&coin.asset).copied().filter(|r| *r > 0) {
+					v["leaf_rate"] = json!(r);
+				}
+			}
 			s.store.set_exit(leaf_id, state, &v.to_string(), None)
 		};
 		record_exit("unrolling", payer.asset, self)?;
@@ -643,17 +815,35 @@ impl Wallet {
 			Err(e) => return Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "leaf": leaf_at.to_string(),
 				"error": e.to_string()})),
 		};
+		// D76: a leaf received over Lightning: its claim pays its bid now,
+		// which rises as the leaf's timeout nears.
+		if received {
+			let exit_now: Value = self.store.exit(leaf_id)?.and_then(|e| serde_json::from_str(&e.1).ok()).unwrap_or(Value::Null);
+			if let Ok(asset) = self.claim_fee_asset(&coin, payer.asset) {
+				if let Some((bid, _)) = self.claim_bid(&coin, &exit_now, asset, now.to_consensus_u32())? {
+					payer.asset = Some(asset);
+					payer.min_fee = payer.min_fee.max(bid);
+				}
+			}
+		}
 		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		let claim = match claim {
 			Ok(c) => c,
 			Err(e) => return Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "error": e.to_string()})),
 		};
-		match self.chain.broadcast(&claim.tx) {
+		match self.chain.broadcast_any_fee(&claim.tx) {
 			Ok(txid) => {
 				// The coin is exited once the claim is final; until then the
 				// wallet follows it, and builds it again should it leave the
 				// chain and the mempool.
 				let txs = self.store.exit(leaf_id)?.expect("set").1;
+				let txs = match serde_json::from_str::<Value>(&txs) {
+					Ok(mut v) if v["claimed_at"].is_null() => {
+						v["claimed_at"] = json!(now.to_consensus_u32());
+						v.to_string()
+					},
+					_ => txs,
+				};
 				self.store.set_exit(leaf_id, "claimed", &txs, Some(&txid.to_string()))?;
 				self.store.set_coin_state(leaf_id, "exiting", &format!("claimed by {}; the wallet follows the claim until it is final", txid))?;
 				Ok(json!({"leaf_id": leaf_id, "state": "claimed", "broadcast": steps, "claim": {"txid": txid.to_string(),
@@ -782,6 +972,12 @@ impl Wallet {
 						it is final", txid, f.word()))?;
 					return Ok(Some(json!({"leaf_id": leaf_id, "state": "claimed", "claim": {"txid": txid, "finality": f.word()}})));
 				}
+			}
+			// D76: a leaf received over Lightning whose output another
+			// transaction spends in the mempool (the operator's refund, its
+			// timeout past) is claimed back by a claim paying more.
+			if let Some(v) = self.outbid_refund(leaf_id, coin, &sp, at, prior)? {
+				return Ok(Some(v));
 			}
 			return Err(Error::Refused(format!("coin {} was spent on the chain by {}, which is none of the wallet's and no spend it signed",
 				leaf_id, txid)));
@@ -942,7 +1138,9 @@ impl Wallet {
 	/// ([`Self::home_received`]), then every exit under way moved on
 	/// ([`Self::progress_exits`]): an unroll broadcast again, a claim made
 	/// once its delay has run, a claim broadcast again until it is mined,
-	/// raised when the node's floor rose. A coin whose refresh has not
+	/// raised when the node's floor rose or, for a received leaf, as its
+	/// timeout nears (D76), and a refund of a received leaf in the mempool
+	/// replaced by a claim paying more. A coin whose refresh has not
 	/// completed by its home date (D57) goes home after the operator is
 	/// asked, so a refresh or payment it completes in the same `sync` keeps
 	/// it. Returns the coins taken home and the exits moved on.
@@ -1193,5 +1391,21 @@ impl Wallet {
 			CoinRecord::Transfer(t) => json!({"inputs": t.inputs.len(), "outputs": t.outputs.len(), "index": t.index}),
 		};
 		Ok(json!({"leaf_id": leaf_id, "kind": row.kind, "state": row.state, "record": hex(&row.record), "detail": detail}))
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::bid_share_ppm;
+
+	#[test]
+	fn a_claims_bid_grows_to_the_whole_value_at_the_timeout() {
+		assert_eq!(bid_share_ppm(1_000, 2_000, 900), 0, "before the claim opens");
+		assert_eq!(bid_share_ppm(1_000, 2_000, 1_000), 0, "at its opening");
+		assert_eq!(bid_share_ppm(1_000, 2_000, 1_500), 250_000, "a quarter halfway");
+		assert_eq!(bid_share_ppm(1_000, 2_000, 1_900), 810_000);
+		assert_eq!(bid_share_ppm(1_000, 2_000, 2_000), 1_000_000, "the whole value at the timeout");
+		assert_eq!(bid_share_ppm(1_000, 2_000, 9_000), 1_000_000, "and after it");
+		assert_eq!(bid_share_ppm(2_000, 1_000, 900), 0, "an opening after the timeout bids nothing before the timeout");
 	}
 }

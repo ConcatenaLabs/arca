@@ -158,6 +158,18 @@ Then, for each asset that receives:
   `block_seconds` at the chain's block interval (60); `receive_window_seconds`
   at its default (six hours) or longer, the time a holder has to claim its
   leaf once its round is final; and `receive_cap_ppm` as above.
+- **Holders are told what remains.** A received leaf rests on its claim
+  being mined before the leaf's timeout, when the operator's refund becomes
+  valid beside it. The wallet raises the claim's fee as the timeout nears,
+  up to the leaf's whole value, pays it from a coin of another accepted
+  asset when the node no longer takes the leaf's, and after the timeout
+  replaces any refund with a claim that pays more, so a refund gains the
+  operator only what it did not burn. But a chain stall longer than the
+  margin opens the claim and the refund in one block, and a fee race decides
+  it, which an operator that burns the leaf's value, or produces the block
+  itself, can win; so does a holder whose only coin in an accepted asset is
+  the leaf, once that asset is no longer accepted. A refund lock that a
+  stall cannot leap is a change of the leaf's template, not made here.
 - **Payers are told** that the invoice's final lock time is twice the leaf's
   lock, about 5,770 blocks with a 36-hour exit delay and the default window:
   a payer whose node pays with SeqLN's `pay` raises its `maxdelay` to that.
@@ -195,8 +207,10 @@ Every holder receives these rules before the operator holds their coins:
   takes before it asks the operator anything; `next_exit_at` names it on
   its own, and `arca sync --exits-only` takes it without asking the
   operator. A wallet that wakes late for it by up to an eighth of the
-  leaf's lock still claims first. A payer whose node pays with SeqLN's `pay`
-  raises its `maxdelay` to the invoice's final lock time.
+  leaf's lock still claims first. Keep an on-chain coin in an asset the
+  node accepts for fees besides: should the node stop taking the leaf's
+  asset, the claim pays its fee from it. A payer whose node pays with
+  SeqLN's `pay` raises its `maxdelay` to the invoice's final lock time.
 - **When taking an order, follow `next_sync_at`.** After `arca take`, the
   wallet must sync within the operator's forfeit window (ten minutes unless
   the operator sets another) of the take's round being built, or the take is

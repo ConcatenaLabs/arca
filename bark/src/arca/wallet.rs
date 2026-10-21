@@ -1811,8 +1811,10 @@ impl Wallet {
 	/// the median time their steps were last taken at: one whose claim waits
 	/// for its delay, when the delay ends; one still unrolling, two blocks
 	/// on; one whose claim is not yet mined, two blocks on, to broadcast it
-	/// again (raised when the node's floor rose); one whose claim is mined,
-	/// within half an hour, to follow it until it is final.
+	/// again (raised when the node's floor rose, or, for a received leaf, as
+	/// its timeout nears, and a refund of it in the mempool replaced); one
+	/// whose claim is mined, within half an hour, to follow it until it is
+	/// final.
 	pub(crate) fn exit_wakes(&self, base: u32) -> Result<Option<u32>, Error> {
 		let mut next: Option<u32> = None;
 		for c in self.store.coins_in("exiting")? {
