@@ -131,7 +131,7 @@ its asset, value and expiry (a swap's coin, its expiry from `swap_read`'s
 dates): what settling it in the operator's next round costs now. The fee only
 falls as time passes, so the `quote` of the coin once held is at most it.
 `take_quote` answers what a take leaves the wallet in all (`spends`): the price,
-the operator's fee, and the margins of a payment to itself (`pays_itself`)
+the operator's fee, and the margins of a payment to itself (`pays_itself`, with its change and the change's expiry)
 when no coin holds exactly the price and the fee. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead

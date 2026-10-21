@@ -166,6 +166,7 @@ async fn two_wallets_take_two_orders_and_hold_leaves() {
 	let first_costs: u64 = ["margin", "margins"].iter().map(|k| first[*k].as_str().unwrap().parse::<u64>().unwrap()).sum();
 	let spends: u64 = q1["spends"].as_str().unwrap().parse().unwrap();
 	assert_eq!(spends, 901_000 + first_costs, "{}", q1);
+	assert!(first["expiry"].as_u64().is_some() && first["change"].as_str().is_some(), "the change and its expiry, for settling it: {}", q1);
 	let x_before: u64 = t1.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["asset"] == json!(x.to_string()) && c["state"] == "live")
 		.map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
 	let mut wrong = q1.clone();

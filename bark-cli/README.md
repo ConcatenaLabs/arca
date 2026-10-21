@@ -904,7 +904,7 @@ in, within the wallet's bound (`--max-fee-ppm` raises it). The coins given up
 hold exactly the price and the fee: where no live coin holds that much, the
 wallet first pays itself a coin of that much out of round from its coins of
 the asset, whose transfer leaves margins for its fees. `--quote` shows them
-(`pays_itself`: the margin and the coins' margins) and what leaves the wallet
+(`pays_itself`: the margin, the coins' margins, and the change with its expiry) and what leaves the wallet
 in all (`spends`: the price, the fee and those margins), and `--shown` holds
 the take to that too.
 
