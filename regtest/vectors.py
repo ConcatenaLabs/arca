@@ -27,6 +27,11 @@ vectors/transactions.json holds the off-chain transactions' vectors, which
 offchain.py generates: the board and its record, the forfeit with the
 issuance of the connector asset, its claim and refund, and the offboard's
 unlock and reclaim, each transaction whole, witnesses included.
+
+vectors/order.json holds the order-2 leaf's vectors, which order.py
+generates: an order's parameters, its three spendable leaves and their
+control blocks, its remainder after a fill, the credit that fill pays, the
+SeqDEX order it lands as, and the operator's fill digest and signature.
 """
 import json
 import os
@@ -43,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "vectors", "arca.json")
 RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
 TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
+ORDER_OUT = os.path.join(HERE, "vectors", "order.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -685,10 +691,14 @@ def generate():
 
 def main():
     import offchain
+    import order
     import records
+    order_keys = {k: Key("order " + k) for k in ["maker", "credit0", "credit1", "credit2", "credit3", "refund", "taker"]}
+    order_keys["S"] = S
     files = [(OUT, json.dumps(generate(), indent=1) + "\n"),
              (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n"),
-             (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n")]
+             (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n"),
+             (ORDER_OUT, json.dumps(order.generate(GENESIS, order_keys, label_hash, DELAY), indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:
