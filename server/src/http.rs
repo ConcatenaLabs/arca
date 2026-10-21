@@ -64,6 +64,9 @@ use crate::signer::{hex, parse_amount, unhex, unhex32};
 use crate::auth::ChallengeError;
 use crate::store::{LeafKind, LeafState, Store, WantedKind};
 
+#[path = "http_claims.rs"]
+mod claims;
+
 /// What the HTTP handlers reach.
 pub struct App {
 	pub store: Store,
@@ -1553,6 +1556,10 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))
+		.route("/v1/distribute", post(claims::distribute))
+		.route("/v1/distribution_status", post(claims::distribution_status))
+		.route("/v1/claims", post(claims::claims))
+		.route("/v1/claim_leaf", post(claims::claim_leaf))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))

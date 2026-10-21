@@ -55,6 +55,10 @@
 //!    records, so a fully refreshed batch comes back before it expires; a
 //!    node with an owner who has not released is never unrolled by the
 //!    watcher.
+//! 7. **Returns.** A claim leaf of a distribution that a final sweep took
+//!    with no spend of it recorded (its holder never took it up) is paid back
+//!    to the distribution's return script, with every other such leaf of the
+//!    distribution, from the operator's own coins (`returns.rs`).
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
@@ -107,6 +111,9 @@ use crate::store::{
 	StoreError, TreeScriptKind, WalletCoin, WantedKind,
 };
 use crate::wallet::{Wallet, WalletError};
+
+#[path = "returns.rs"]
+mod returns;
 
 /// How the watcher works.
 #[derive(Debug, Clone)]
@@ -318,6 +325,7 @@ impl Watcher {
 		self.offboards().await?;
 		self.expiries(now).await?;
 		self.reclaims(now).await?;
+		self.returns().await?;
 		Ok(())
 	}
 
