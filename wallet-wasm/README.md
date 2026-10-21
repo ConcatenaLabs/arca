@@ -111,8 +111,11 @@ amount?}`, `order_fill_resting {order, amount?, shown?}`,
 `order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
-ark (`btc_swap_*`); and the offline-refresh plans (`plan_quote`, `plan`,
-`plans`, `plan_cancel`), which a page shows only in developer mode; and `care {scan?, expiries?, max_fee_ppm?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days, refreshing a coin of no round in a round first (see the CLI README's offline refresh section for the gap this leaves). Its answer is `{"result", "start"}`: the
+ark (`btc_swap_*`); the offline-refresh plans (`plan_quote`, `plan`,
+`plans`, `plan_cancel`), which a page shows only in developer mode; `supply {asset}`, the operator's supply report for an asset
+it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` in `coins`
+(`issuer-operated` when its batch's sweep can only burn, `open` when it pays the operator), both of which a page shows only in
+developer mode; and `care {scan?, expiries?, max_fee_ppm?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days, refreshing a coin of no round in a round first (see the CLI README's offline refresh section for the gap this leaves). Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is

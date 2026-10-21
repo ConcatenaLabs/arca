@@ -762,6 +762,8 @@ impl Wallet {
 		let policy = self.followed_policy(first, now);
 		let valid = record.validate(&round, &policy, &key.x_only_public_key().0, &nonce)
 			.map_err(|e| Error::Refused(format!("step {}'s leaf does not check out: {}", j + 1, e)))?;
+		let info = self.server_info()?;
+		super::round::check_profile(&info, &record).map_err(|why| Error::Refused(format!("step {}'s leaf: {}", j + 1, why)))?;
 		let named = |k: &str| want[k].as_str().map(|v| v.to_string());
 		if Some(hex(&record.operator_nonce)) != named("operator_nonce") || Some(record.value.to_string()) != named("value")
 			|| Some(hex(&record.unlock_hash)) != named("unlock_hash") || record.exit_delay.units() as u64 != want["exit_delay_units"].as_u64().unwrap_or(0)

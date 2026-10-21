@@ -64,6 +64,12 @@ impl Running {
 		Self::start_tuned(keepers, required, |_, _, _| {}).await
 	}
 
+	/// [`Running::start_with`] on a node given `node_args` as well.
+	pub async fn start_on<F: FnOnce(&mut Config, AssetId, AssetId)>(node_args: &[&str], tune: F) -> Running {
+		let rt = tokio::task::block_in_place(|| node::start_with(node_args));
+		Self::start_at(rt, 0, None, tune).await
+	}
+
 	/// [`Running::start_with`] on the chain SeqLN's `sequentia-regtest`
 	/// network assumes, for scenarios with Lightning nodes.
 	pub async fn start_seqln<F: FnOnce(&mut Config, AssetId, AssetId)>(tune: F) -> Running {

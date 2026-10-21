@@ -215,6 +215,22 @@ and a board whose registration never reached the server, are not recovered.
   The forfeit of each coin given up is built from the validated leaf of the
   coin's own asset and its round, and its refund delay must end before the new
   leaves' exit deadline.
+- **An issuer-operated asset's batch.** An operator may serve an asset
+  issuer-operated: each round of it mints the refresh liquidity for its new
+  batch through the asset's mint limiter, and every sweep of such a batch only
+  burns, a bare `OP_RETURN` at the swept output's index carrying its whole
+  amount of the asset. `info` names such an asset's limiter
+  (`server_info.assets[].issuer`). A new leaf, or the leaf of an
+  offline-refresh plan's step, is refused before the wallet signs anything for
+  it when its asset is served issuer-operated and its batch's sweep pays the
+  operator (units minted for the refresh could be kept rather than burned),
+  and when its batch's sweep is burn-only and the asset is served as no
+  issuer-operated asset (the operator's statement and its scripts disagree).
+  Whatever `info` says, a round that mints the batch's asset is refused
+  unless every sweep above the leaf is burn-only, wherever the round appears
+  in a coin's lineage. `coins` names each coin's `batch_profile`, and `supply`
+  reads the operator's mints and burns of the asset again from the wallet's
+  node.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -1177,10 +1193,11 @@ registry for both commands.
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
+| `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `openamp-key` | The wallet's OpenAMP account key (`m/5/0`, as every wallet on the kit derives it): the key an OpenAMP account and a SeqPal ID are, which a payer may name to pay the wallet a claim |
 | `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
-| `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
+| `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |

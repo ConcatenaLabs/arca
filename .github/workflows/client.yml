@@ -82,5 +82,22 @@ jobs:
       - name: Build the signer and the keeper
         run: cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
 
+      # The mint limiter's tool, with which the signer signs an
+      # issuer-operated asset's mint (tests/arca_issuer.rs), at the
+      # sequentia-contracts commit it is pinned to.
+      - name: Cache the mint limiter's tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.mint-limiter
+          key: mint-limiter-9d3b569a2d36044a37170431c3fab4889032eff0
+
+      - name: The mint limiter's tool
+        run: |
+          if [ ! -x "$HOME/.mint-limiter/bin/mint-limiter" ]; then
+            cargo install --locked --root "$HOME/.mint-limiter" --git https://github.com/ConcatenaLabs/sequentia-contracts \
+              --rev 9d3b569a2d36044a37170431c3fab4889032eff0 mint-limiter
+          fi
+          echo "MINT_LIMITER=$HOME/.mint-limiter/bin/mint-limiter" >> "$GITHUB_ENV"
+
       - name: Scenarios
-        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh -- --nocapture
+        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer -- --nocapture

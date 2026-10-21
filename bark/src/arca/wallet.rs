@@ -489,6 +489,26 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 /// the coin's lineage on the chain.
 pub const BOARD_LIFETIME: u32 = 28 * 86_400;
 
+/// The profile of the batches a coin rests on, for people (developer mode):
+/// `issuer-operated` when a sweep above it can only burn (its asset's issuer
+/// runs that batch, minting its refresh liquidity and destroying it at
+/// expiry), `open` when it rests on batches whose sweeps pay the operator,
+/// none when it rests on boards alone.
+pub(crate) fn batch_profile(record: &CoinRecord) -> Option<&'static str> {
+	match record {
+		CoinRecord::Leaf { record, .. } => Some(if record.burn { "issuer-operated" } else { "open" }),
+		CoinRecord::Board(_) => None,
+		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
+			let all: Vec<&'static str> = record.parents().into_iter().filter_map(batch_profile).collect();
+			if all.contains(&"issuer-operated") {
+				Some("issuer-operated")
+			} else {
+				all.first().copied()
+			}
+		},
+	}
+}
+
 /// Whether `record`'s lineage holds a board.
 pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
 	match record {
@@ -2393,13 +2413,14 @@ impl Wallet {
 	/// the board's ([`BOARD_LIFETIME`]).
 	fn coin_json(c: &CoinRow) -> Value {
 		let on_board = Self::record_of(c).map(|r| rests_on_board(&r)).unwrap_or(false);
+		let profile = Self::record_of(c).ok().and_then(|r| batch_profile(&r));
 		let (expiry, deadline) = if c.expiry == u32::MAX { (Value::Null, Value::Null) } else {
 			(json!(c.expiry), json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)))
 		};
 		json!({
 			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
 			"standing": Self::standing(c), "note": c.note, "expiry": expiry, "exit_deadline": deadline, "rests_on_board": on_board,
-			"spent_by": c.spent_by,
+			"spent_by": c.spent_by, "batch_profile": profile,
 		})
 	}
 
@@ -2633,6 +2654,46 @@ impl Wallet {
 			"tip": {"height": tip.height, "hash": tip.hash.to_string(), "median_time": tip.median_time},
 			"server_info": server_info,
 		}))
+	}
+
+	/// The operator's supply report for the issuer-operated `asset`
+	/// (`issuer_supply`: every round's mint and every burn of the
+	/// operator's, the value live in its burn-only batches), each
+	/// transaction it lists read again from the wallet's own node: what each
+	/// mint issues and each burn burns of the asset there, and whether that
+	/// agrees with the operator's figure (`checked_on_the_node`). It checks
+	/// the transactions the report lists, not that the list is whole: a mint
+	/// the operator leaves out is found only by following the reissuance
+	/// token's coins on the chain.
+	pub fn supply(&self, asset: AssetId) -> Result<Value, Error> {
+		let mut rep = self.server.post("issuer_supply", &json!({"asset": asset.to_string()}))?;
+		let mut agree = true;
+		for (list, minting) in [("mints", true), ("burns", false)] {
+			let mut out = vec![];
+			for mut e in rep[list].as_array().cloned().unwrap_or_default() {
+				let txid = Txid::from_str(e["txid"].as_str().unwrap_or("")).map_err(|e| Error::Parse(format!("the report's txid: {}", e)))?;
+				match self.chain.transaction(&txid)? {
+					Some(tx) => {
+						let on_chain = if minting { arca_covenant::issuer::issued(&tx, asset).unwrap_or(0) } else {
+							arca_covenant::issuer::burned(&tx, asset)
+						};
+						let same = e["amount"].as_str() == Some(on_chain.to_string().as_str());
+						agree &= same;
+						e["on_chain"] = json!(on_chain.to_string());
+						e["agrees"] = json!(same);
+					},
+					None => {
+						agree = false;
+						e["on_chain"] = Value::Null;
+						e["agrees"] = json!(false);
+					},
+				}
+				out.push(e);
+			}
+			rep[list] = json!(out);
+		}
+		rep["checked_on_the_node"] = json!(agree);
+		Ok(rep)
 	}
 
 	/// The keepers the wallet pinned, for people.
