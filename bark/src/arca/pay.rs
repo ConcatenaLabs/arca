@@ -914,6 +914,13 @@ impl Wallet {
 			for l in &spent {
 				if let Some(c) = s.coin(l)? {
 					if c.state != "spent" {
+						// A coin held for a swap this wallet accepted, spent by the
+						// transfer the maker completed: the swap is done.
+						if let Some(swap) = c.note.strip_prefix("swap ").filter(|_| c.state == "offered") {
+							if s.swap(swap)?.is_some_and(|(role, _, _, st)| role == "taker" && st == "accepted") {
+								s.set_swap(swap, "done", None)?;
+							}
+						}
 						s.set_coin_spent(l, &format!("transfer creating {}", id))?;
 					}
 				}
