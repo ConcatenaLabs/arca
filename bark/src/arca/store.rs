@@ -676,7 +676,7 @@ impl Store {
 
 	/// `(id, role, offer, state)` of every swap, oldest first.
 	pub fn swaps(&self) -> Result<Vec<(String, String, String, String)>, Error> {
-		let mut st = self.conn.prepare("SELECT id, role, offer, state FROM swap ORDER BY created_at, id").map_err(db)?;
+		let mut st = self.conn.prepare("SELECT id, role, offer, state FROM swap ORDER BY created_at, rowid").map_err(db)?;
 		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(db)?;
 		rows.collect::<Result<Vec<_>, _>>().map_err(db)
 	}
