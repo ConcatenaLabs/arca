@@ -406,6 +406,9 @@ impl Wallet {
 			.map_err(|e| Error::Refused(format!("the order's record does not decode: {}", e)))?;
 		let now = self.now()?;
 		let held = self.assess(&record, &self.receipt_policy(now), None)?;
+		// When the order's coin expires as the operator serves it: its first
+		// expiry, or a board's service expiry where it rests on one.
+		let order_expiry = self.service_expiry(&record, &held)?;
 		let oc = held.valid;
 		if oc.id.to_string() != o["coin"].as_str().unwrap_or("") || oc.leaf.order_policy() != Some(policy) {
 			return Err(Error::Refused(format!("the operator serves order {} at coin {}, whose record is coin {} of other terms", order,
@@ -419,13 +422,15 @@ impl Wallet {
 		let min = Self::min_leaf(info, asset_b)?;
 		Self::min_leaf(info, asset_a)?;
 		// The coins: of the asset the order is paid in, expiring no earlier
-		// than the order's coin, until they hold the price, every margin and
-		// change of none or at least the smallest leaf.
+		// than the order's coin as the operator counts it (a coin resting on a
+		// board by the board's service expiry, when that comes first), until
+		// they hold the price, every margin and change of none or at least the
+		// smallest leaf.
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;
 		for mut c in self.spendable_coins(asset_b)? {
-			if c.coin.expiry.to_consensus_u32() < oc.expiry.to_consensus_u32() {
+			if c.row.expiry < order_expiry {
 				continue;
 			}
 			let cp = self.checkpoint_margin_of(&c.coin, &m)?;
@@ -444,7 +449,7 @@ impl Wallet {
 		let Some((fee, change)) = done else {
 			return Err(Error::Refused(format!("the wallet's live coins of asset {} that expire no earlier than the order's coin (median time \
 				{}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with change of none or at least {}", asset_b,
-				oc.expiry.to_consensus_u32(), kept, filled, price, min)));
+				order_expiry, kept, filled, price, min)));
 		};
 		Ok(RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b })
 	}
