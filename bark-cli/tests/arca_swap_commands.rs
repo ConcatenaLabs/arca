@@ -115,6 +115,13 @@ async fn a_swap_through_the_commands_shows_its_terms_before_anything_is_signed()
 	assert!(pays > 0, "the taker's checkpoint leaves a margin: {}", read);
 	assert_eq!(read["maker_pays"]["margin"], offer["pays"]["margin"]);
 	assert_eq!(num(&read["change"]["value"]), 3_000_000 - 400_000 - pays, "the taker's change: {}", read);
+	// What settling the coin it would get in the next round costs, priced before the
+	// wallet holds it, from the dates the read names.
+	let settle = library(&b, "settle_quote", json!({"asset": x, "value": "300000", "expiry": read["dates"]["expiry"]})).unwrap();
+	println!("SETTLE QUOTE: {}", settle);
+	assert_eq!((settle["asset"].as_str(), settle["value"].as_str()), (Some(x.as_str()), Some("300000")));
+	assert_eq!(num(&settle["after"]) + num(&settle["fee"]), 300_000, "{}", settle);
+	assert!(library(&b, "settle_quote", json!({"asset": x, "value": "300000"})).unwrap_err().contains("the expiry is missing"));
 	assert_eq!(library(&b, "swaps", json!({})).unwrap(), json!([]), "a read stores no swap");
 	assert_eq!(total(&b, "live", &y), 3_000_000, "a read holds no coin");
 
@@ -145,6 +152,10 @@ async fn a_swap_through_the_commands_shows_its_terms_before_anything_is_signed()
 	let mb = b.ok(&["mailbox"]);
 	assert_eq!(mb["accepted"].as_array().unwrap().len(), 2, "the taker gets its X leaf and its Y change: {}", mb);
 	assert_eq!(library(&b, "swaps", json!({})).unwrap()[0]["state"], "done", "once the maker's transfer arrives, the taker's swap is done");
+	// The coin it got, held now, costs at most what settle_quote said to refresh.
+	let got = coins(&b, "live", &x).into_iter().find(|c| value(c) == 300_000).expect("the coin the swap gave");
+	let q = library(&b, "quote", json!({"leaves": [got["leaf_id"]]})).unwrap();
+	assert!(num(&q["coins"][0]["fee"]) <= num(&settle["fee"]), "the held coin's refresh fee {} is above the one quoted before, {}", q, settle);
 	assert_eq!(total(&a, "live", &y), 400_000, "the maker holds what it wanted");
 	assert_eq!(total(&b, "live", &x), 300_000, "the taker holds what it was offered");
 	assert_eq!(total(&b, "live", &y), 3_000_000 - 400_000 - pays, "the taker paid what it was shown");

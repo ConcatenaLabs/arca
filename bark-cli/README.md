@@ -903,7 +903,10 @@ schedule asks for an offboard of the price, in the asset the order is paid
 in, within the wallet's bound (`--max-fee-ppm` raises it). The coins given up
 hold exactly the price and the fee: where no live coin holds that much, the
 wallet first pays itself a coin of that much out of round from its coins of
-the asset.
+the asset, whose transfer leaves margins for its fees. `--quote` shows them
+(`pays_itself`: the margin and the coins' margins) and what leaves the wallet
+in all (`spends`: the price, the fee and those margins), and `--shown` holds
+the take to that too.
 
 Where the operator takes them (`info.fills.shared`), the wallet's take shares
 the order: other takes of the same order stand beside it, as long as all of

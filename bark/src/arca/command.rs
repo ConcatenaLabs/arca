@@ -25,7 +25,7 @@ use super::{Config, Error, Wallet};
 pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
-	participations, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
+	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
@@ -170,6 +170,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.participate(quote, not_before)
 		},
 		"participations" => w.participations(),
+		// The fee of refreshing a coin the wallet is about to receive, before
+		// it holds it (a swap's coin, its expiry from `swap_read`'s dates).
+		"settle_quote" => {
+			let value = opt_u64(&a["value"], "the value")?.ok_or_else(|| Error::Parse("the value is missing".into()))?;
+			let expiry = opt_u64(&a["expiry"], "the expiry")?.ok_or_else(|| Error::Parse("the expiry is missing".into()))?;
+			let expiry = u32::try_from(expiry).map_err(|_| Error::Parse("the expiry is out of range".into()))?;
+			w.settle_quote(asset(req_str(&a["asset"], "the asset")?)?, value, expiry)
+		},
 		"sync" => w.sync(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),

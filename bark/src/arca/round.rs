@@ -312,6 +312,30 @@ impl Wallet {
 		Ok(RefreshQuote { info, rows, ids, assets, per, coins })
 	}
 
+	/// What refreshing a coin of `value` of `asset` whose expiry is median
+	/// time `expiry` into the operator's next round would cost now, priced as
+	/// [`Self::refresh_quote`] prices a coin the wallet holds, before the
+	/// wallet holds it: for a program that shows what a coin it is about to
+	/// receive (a swap's, whose `swap_read` names its dates) costs to settle
+	/// in a round. The fee only falls as time passes, so a quote of the coin
+	/// once held is at most this one. Signs, asks and stores nothing but the
+	/// operator's published schedule.
+	pub fn settle_quote(&self, asset: AssetId, value: u64, expiry: u32) -> Result<Value, Error> {
+		let info = self.server_info()?;
+		let now = self.now()?.to_consensus_u32();
+		let schedule = schedule_of(&info, asset);
+		let fee = refresh_fee(&schedule, value, expiry, now);
+		let after = value.checked_sub(fee).ok_or_else(|| Error::Refused(format!("the refresh fee of {} in asset {} is more than the \
+			coin holds, {}", fee, asset, value)))?;
+		let min = Self::min_leaf(&info, asset)?;
+		if after < min {
+			return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, after, min)));
+		}
+		Ok(json!({"asset": asset.to_string(), "value": value.to_string(), "expiry": expiry, "fee": fee.to_string(), "after": after.to_string(),
+			"ppm": ppm_of(fee, value), "free_window": in_free_window(expiry, now),
+			"schedule": {"refresh_ppm": schedule["refresh_ppm"], "refresh_base": schedule["refresh_base"]}}))
+	}
+
 	/// Gives up the coins of `quote` for a new leaf in each asset, in one
 	/// participation per asset: a round carries one asset, so each asset's
 	/// coins are refreshed in that asset's rounds. Each pays the fee the quote

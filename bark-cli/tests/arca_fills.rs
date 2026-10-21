@@ -160,6 +160,17 @@ async fn two_wallets_take_two_orders_and_hold_leaves() {
 	let q1 = t1.ok(&["take", &f1, "--amount", "600000", "--quote"]);
 	assert_eq!((q1["price"].as_str(), q1["fee"].as_str(), q1["gives"].as_str(), q1["pays_itself_first"].as_bool()),
 		(Some("900000"), Some("1000"), Some("901000"), Some(true)));
+	// Taker 1 holds no coin of exactly 901,000: it pays itself one first, whose margins the
+	// quote shows, and what leaves it in all is the price, the fee and those margins.
+	let first = &q1["pays_itself"];
+	let first_costs: u64 = ["margin", "margins"].iter().map(|k| first[*k].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	let spends: u64 = q1["spends"].as_str().unwrap().parse().unwrap();
+	assert_eq!(spends, 901_000 + first_costs, "{}", q1);
+	let x_before: u64 = t1.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["asset"] == json!(x.to_string()) && c["state"] == "live")
+		.map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	let mut wrong = q1.clone();
+	wrong["spends"] = json!((spends - 1).to_string());
+	t1.refused(&["take", &f1, "--amount", "600000", "--shown", &wrong.to_string()], "the take's spends changed since it was shown");
 	let k1 = t1.ok(&["take", &f1, "--amount", "600000", "--shown", &q1.to_string()]);
 	assert_eq!(k1["state"], "pending", "{}", k1);
 	assert!(k1["paid_itself"].is_object(), "taker 1 paid itself a coin of the price and the fee first: {}", k1);
@@ -223,6 +234,9 @@ async fn two_wallets_take_two_orders_and_hold_leaves() {
 		l2.iter().map(|c| c["value"].clone()).collect::<Vec<_>>());
 	assert_eq!(l1.len(), 1);
 	assert_eq!(l1[0]["value"], json!("600000"));
+	let x_after: u64 = t1.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["asset"] == json!(x.to_string()) && c["state"] == "live")
+		.map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	assert_eq!(x_before - x_after, spends, "what left taker 1 is what the quote said it spends");
 	assert_eq!(l2.len(), 1);
 	assert_eq!(l2[0]["value"], json!("300000"));
 	let parts = t1.ok(&["participations"]);

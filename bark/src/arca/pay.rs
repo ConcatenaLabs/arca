@@ -76,7 +76,7 @@ impl Margins {
 /// A script of a leaf's size, to size an output whose leaf is not known yet:
 /// every leaf pays a taproot output, and the operator prices a margin from
 /// the transaction's real size.
-fn leaf_probe() -> Script {
+pub(crate) fn leaf_probe() -> Script {
 	let mut b = vec![0x51, 0x20];
 	b.extend([0u8; 32]);
 	Script::from(b)

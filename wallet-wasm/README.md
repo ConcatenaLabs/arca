@@ -100,7 +100,8 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
-not_before?, max_fee_ppm?, shown}`, `participations`, `sync`, `schedule`,
+not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
+value, expiry}`, `sync`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `refusals`; a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
@@ -124,7 +125,14 @@ operator co-sign; `swaps` lists each swap with where it stands.
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it
-quotes again, so nothing is signed on a fee the user did not see. A board and
+quotes again, so nothing is signed on a fee the user did not see.
+`settle_quote` prices that refresh for a coin the wallet does not hold yet, from
+its asset, value and expiry (a swap's coin, its expiry from `swap_read`'s
+dates): what settling it in the operator's next round costs now. The fee only
+falls as time passes, so the `quote` of the coin once held is at most it.
+`take_quote` answers what a take leaves the wallet in all (`spends`): the price,
+the operator's fee, and the margins of a payment to itself (`pays_itself`)
+when no coin holds exactly the price and the fee. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
 only on it; `exit_quote` is each transaction an exit would broadcast now, with
