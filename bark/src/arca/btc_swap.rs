@@ -52,8 +52,6 @@ use elements::hashes::{sha256, Hash};
 use elements::AssetId;
 use serde_json::{json, Value};
 
-use arca_covenant::HtlcDirection;
-
 use super::chain::{hex, unhex32};
 use super::lightning::{network_of, parse_invoice, Invoice};
 use super::wallet::{amount, Wallet};
@@ -437,7 +435,6 @@ impl Wallet {
 	/// `Err` when it never will (the swap is then abandoned, unpaid).
 	pub fn btc_swap_ready(&self, rec: &Value, ark_info: &Value) -> Result<Option<String>, Error> {
 		let hash = rec["hash"].as_str().unwrap_or("");
-		let r = self.receives()?.get(hash).cloned().unwrap_or(Value::Null);
 		let atoms = amount(&rec["atoms"], "the swap's atoms")?;
 		let sats = amount(&rec["sats"], "the swap's satoshis")?;
 		let invoice = rec["invoice_btc"].as_str().unwrap_or("");
@@ -445,46 +442,20 @@ impl Wallet {
 		if hex(&inv.payment_hash) != hash {
 			return Err(Error::Refused("the swap's invoice is under another hash than its receive".into()));
 		}
-		if r["state"] != "issuing" {
-			return Ok(Some(format!("the receive under the swap's hash is {}", r["state"])));
-		}
-		let nonce = unhex32(r["nonce"].as_str().unwrap_or(""))?;
-		let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) else {
-			return Ok(Some("the received leaf's round has not come".into()));
+		let (asset, value, home_in) = match self.received_held(hash)? {
+			Ok(h) => h,
+			Err(why) => return Ok(Some(why)),
 		};
-		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf)))?;
-		if row.state != "receiving" {
-			return Err(Error::Refused(format!("the received leaf is {}", row.state)));
+		if asset.to_string() != rec["asset"].as_str().unwrap_or("") || value > atoms {
+			return Err(Error::Refused(format!("the received leaf is not the swap's: {} of {} under {}, the swap's {} of {}",
+				value, asset, hash, atoms, rec["asset"])));
 		}
-		let (_, a) = self.held(&row)?;
-		if !a.all_final() {
-			return Ok(Some(format!("the received leaf's round is not final: {}", a.waiting())));
-		}
-		let coin = a.valid;
-		let t = coin.leaf.htlc.ok_or_else(|| Error::Refused("the received leaf is no htlc-1 leaf".into()))?;
-		let info = self.server_info()?;
-		// The leaf's value is what the operator answered the receive with,
-		// which the wallet checked against its fee bound then.
-		let value = amount(&r["value"], "the receive's value")?;
-		let fee = atoms.saturating_sub(value);
-		if t.direction != HtlcDirection::Receive || hex(&t.payment_hash) != hash || coin.asset.to_string() != rec["asset"].as_str().unwrap_or("")
-			|| coin.value != value
-		{
-			return Err(Error::Refused(format!("the received leaf is not the swap's: {} of {} under {}, the swap's {} of {} less {}",
-				coin.value, coin.asset, hex(&t.payment_hash), atoms, rec["asset"], fee)));
-		}
-		if info["lightning"]["receive"]["operator_delay_units"].as_u64() != Some(t.operator_delay.units() as u64) {
-			return Err(Error::Refused("the received leaf's operator delay is not the one the operator publishes".into()));
-		}
-		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
-		let (home_at, _) = self.receive_home(&coin, &a.bases, t.timeout.to_consensus_u32() as u64, block)?;
-		let (median, wall) = (self.now()?.to_consensus_u32() as u64, wall_now());
+		let wall = wall_now();
 		let latest = bitcoin_latest(ark_info, expiry, wall)?;
-		let home_in = home_at.saturating_sub(median);
 		let need = latest.saturating_sub(wall) + REACTION;
 		if home_in < need {
-			return Err(Error::Refused(format!("the received leaf must start home in {} s (median time {}), and the Bitcoin leg can end \
-				up to {} s from now: Q pays only with an hour to spare after it; the swap is not paid", home_in, home_at, need - REACTION)));
+			return Err(Error::Refused(format!("the received leaf must start home in {} s, and the Bitcoin leg can end up to {} s from \
+				now: Q pays only with an hour to spare after it; the swap is not paid", home_in, need - REACTION)));
 		}
 		Ok(None)
 	}

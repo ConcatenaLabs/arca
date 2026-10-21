@@ -25,7 +25,7 @@ use std::str::FromStr;
 use elements::AssetId;
 use serde_json::{json, Value};
 
-use arca_covenant::{HtlcDirection, HtlcTerms, MedianTime, NewLeaf, RelativeTime};
+use arca_covenant::{HtlcDirection, HtlcTerms, LeafId, MedianTime, NewLeaf, RelativeTime, Sweep, ValidCoin, ValidOrigin};
 
 use super::chain::hex;
 use super::pay::{In, Out};
@@ -221,6 +221,114 @@ impl Wallet {
 	pub fn lightning_pay_until(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>)
 		-> Result<Value, Error>
 	{
+		self.lightning_pay_shown(invoice, from, max_fee_ppm, timeout, None)
+	}
+
+	/// What paying the BOLT11 `invoice` would take, with nothing signed and
+	/// nothing kept: the amount, the operator's fee, the margins of the
+	/// coins it would spend, and what leaves the wallet in all (`spends`:
+	/// the coins less the change). A program shows it, then pays with
+	/// `shown` ([`Self::lightning_pay_shown`]).
+	pub fn lightning_pay_quote(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
+		// A probe of the leaf the payment would make, for the margins: its key
+		// is derived and kept nowhere.
+		let nonce = random32();
+		let owner = self.keys.leaf_xonly(&nonce)?;
+		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash, timeout: p.default_timeout()?,
+			operator_delay: p.operator_delay };
+		let exit_delay = self.exit_delay().max(p.owner_delay);
+		let leaf = NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms) };
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let htlc = Out { asset: p.asset, value: p.value + p.fee, leaf, mailbox, until: None };
+		let min = Self::min_leaf(&p.info, p.asset)?;
+		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
+		let (inputs, margin, change) = self.choose_coins(&p.info, p.asset, p.value + p.fee, &htlc_out, min)?;
+		Ok(Self::pay_quote_of(&p, &inputs, margin, change))
+	}
+
+	/// The quote of a payment as [`Self::lightning_pay_quote`] answers it.
+	fn pay_quote_of(p: &PayChecks, inputs: &[In], margin: u64, change: u64) -> Value {
+		let total: u64 = inputs.iter().map(|i| i.coin.value).sum();
+		let checkpoints: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
+		json!({"payment_hash": hex(&p.inv.payment_hash), "asset": p.asset.to_string(), "amount": p.value.to_string(),
+			"fee": p.fee.to_string(), "margins": (checkpoints + margin).to_string(), "spends": total.saturating_sub(change).to_string(),
+			"expires_at": p.inv.timestamp.saturating_add(p.inv.expiry), "description": p.inv.description})
+	}
+
+	/// [`Self::lightning_pay_until`], going ahead, with `shown`, only on the
+	/// fee and on what leaves the wallet in all that a
+	/// [`Self::lightning_pay_quote`] showed.
+	pub fn lightning_pay_shown(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>,
+		shown: Option<&Value>) -> Result<Value, Error>
+	{
+		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
+		let PayChecks { asset, value, fee, ref hash, ref info, operator_delay, owner_delay, timeout_seconds, now, .. } = p;
+		let inv = p.inv.clone();
+		// The timeout a little past the operator's least, well within its
+		// most, unless the caller names one.
+		let at = timeout.unwrap_or_else(|| now.saturating_add(timeout_seconds).saturating_add(600));
+		if at < now.saturating_add(timeout_seconds) || at > now.saturating_add(timeout_seconds.saturating_mul(2)) {
+			return Err(Error::Refused(format!("a timeout of median time {} is outside the operator's window for a payment, {} to {}; \
+				nothing is signed", at, now.saturating_add(timeout_seconds), now.saturating_add(timeout_seconds.saturating_mul(2)))));
+		}
+		let timeout = MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?;
+		let nonce = random32();
+		let owner = self.keys.leaf_xonly(&nonce)?;
+		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: inv.payment_hash, timeout, operator_delay };
+		let exit_delay = self.exit_delay().max(owner_delay);
+		let leaf = NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms) };
+		terms.check(exit_delay).map_err(|e| Error::Refused(e.to_string()))?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
+		let min = Self::min_leaf(info, asset)?;
+		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
+		let (inputs, margin, change) = self.choose_coins(info, asset, value + fee, &htlc_out, min)?;
+		if let Some(s) = shown {
+			let quote = Self::pay_quote_of(&p, &inputs, margin, change);
+			for k in ["payment_hash", "asset", "amount", "fee", "spends"] {
+				if s[k] != quote[k] {
+					return Err(Error::Refused(format!("the payment's {} changed since it was shown: it is now {}; nothing is signed", k,
+						quote[k])));
+				}
+			}
+		}
+		self.store.put_nonce(&nonce, &owner.serialize(), "lightning")?;
+		let hash = hash.clone();
+		let mut outs = vec![htlc];
+		if change > 0 {
+			let leaf = self.own_leaf_for("change")?;
+			outs.push(Out { asset, value: change, leaf, mailbox, until: None });
+		}
+		self.set_send(&hash, json!({"invoice": invoice, "asset": asset.to_string(), "amount": value.to_string(), "fee": fee.to_string(),
+			"htlc_owner": hex(&owner.serialize()), "state": "requested"}))?;
+		let answer = match self.transfer_paying(&inputs, &outs, invoice) {
+			Ok(a) => a,
+			Err(e @ Error::Server { .. }) => {
+				// Refused: nothing of it stands, and the invoice may be paid
+				// again some other way.
+				let mut m = self.sends()?;
+				m.remove(&hash);
+				self.store.set_meta(SENDS, &serde_json::to_string(&m).expect("a map"))?;
+				return Err(e);
+			},
+			Err(e) => return Err(e),
+		};
+		Ok(json!({
+			"paying": {"payment_hash": hash, "asset": asset.to_string(), "amount": value.to_string(), "fee": fee.to_string(),
+				"description": inv.description},
+			"inputs": inputs.iter().map(|i| i.row.leaf_id.clone()).collect::<Vec<_>>(),
+			"margins": {"checkpoints": inputs.iter().map(|i| (i.coin.value - i.checkpoint_value).to_string()).collect::<Vec<_>>(),
+				"reassignment": margin.to_string()},
+			"change": if change > 0 { json!(change.to_string()) } else { Value::Null },
+			"transfer": answer,
+		}))
+	}
+
+	/// What the wallet reads of an invoice before paying it, and the terms
+	/// the operator publishes for a payment: refused as
+	/// [`Self::lightning_pay`] says.
+	fn pay_checks(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<PayChecks, Error> {
 		let inv = parse_invoice(invoice)?;
 		match network_of(&inv.currency) {
 			Some((net, false)) => return Err(Error::Refused(format!("the invoice is a Bitcoin invoice ({}): it is paid in native BTC, on \
@@ -241,7 +349,7 @@ impl Wallet {
 			return Err(Error::Refused(format!("the invoice asks {} msat, not a whole number of atoms; nothing is signed", msat)));
 		}
 		let value = msat / 1000;
-		let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let wall = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 		if inv.timestamp.saturating_add(inv.expiry) <= wall + 60 {
 			return Err(Error::Refused("the invoice has expired, or expires within a minute; nothing is signed".into()));
 		}
@@ -278,55 +386,8 @@ impl Wallet {
 		let owner_delay = units("owner_delay_units")?;
 		let timeout_seconds = send["timeout_seconds"].as_u64().ok_or_else(|| Error::Refused("the operator publishes no timeout for a \
 			payment over Lightning".into()))? as u32;
-		// The timeout a little past the operator's least, well within its
-		// most, unless the caller names one.
 		let now = self.now()?.to_consensus_u32();
-		let at = timeout.unwrap_or_else(|| now.saturating_add(timeout_seconds).saturating_add(600));
-		if at < now.saturating_add(timeout_seconds) || at > now.saturating_add(timeout_seconds.saturating_mul(2)) {
-			return Err(Error::Refused(format!("a timeout of median time {} is outside the operator's window for a payment, {} to {}; \
-				nothing is signed", at, now.saturating_add(timeout_seconds), now.saturating_add(timeout_seconds.saturating_mul(2)))));
-		}
-		let timeout = MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?;
-		let nonce = random32();
-		let owner = self.keys.leaf_xonly(&nonce)?;
-		self.store.put_nonce(&nonce, &owner.serialize(), "lightning")?;
-		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: inv.payment_hash, timeout, operator_delay };
-		let exit_delay = self.exit_delay().max(owner_delay);
-		let leaf = NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms) };
-		terms.check(exit_delay).map_err(|e| Error::Refused(e.to_string()))?;
-		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
-		let min = Self::min_leaf(&info, asset)?;
-		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
-		let (inputs, margin, change) = self.choose_coins(&info, asset, value + fee, &htlc_out, min)?;
-		let mut outs = vec![htlc];
-		if change > 0 {
-			let leaf = self.own_leaf_for("change")?;
-			outs.push(Out { asset, value: change, leaf, mailbox, until: None });
-		}
-		self.set_send(&hash, json!({"invoice": invoice, "asset": asset.to_string(), "amount": value.to_string(), "fee": fee.to_string(),
-			"htlc_owner": hex(&owner.serialize()), "state": "requested"}))?;
-		let answer = match self.transfer_paying(&inputs, &outs, invoice) {
-			Ok(a) => a,
-			Err(e @ Error::Server { .. }) => {
-				// Refused: nothing of it stands, and the invoice may be paid
-				// again some other way.
-				let mut m = self.sends()?;
-				m.remove(&hash);
-				self.store.set_meta(SENDS, &serde_json::to_string(&m).expect("a map"))?;
-				return Err(e);
-			},
-			Err(e) => return Err(e),
-		};
-		Ok(json!({
-			"paying": {"payment_hash": hash, "asset": asset.to_string(), "amount": value.to_string(), "fee": fee.to_string(),
-				"description": inv.description},
-			"inputs": inputs.iter().map(|i| i.row.leaf_id.clone()).collect::<Vec<_>>(),
-			"margins": {"checkpoints": inputs.iter().map(|i| (i.coin.value - i.checkpoint_value).to_string()).collect::<Vec<_>>(),
-				"reassignment": margin.to_string()},
-			"change": if change > 0 { json!(change.to_string()) } else { Value::Null },
-			"transfer": answer,
-		}))
+		Ok(PayChecks { inv, asset, value, fee, hash, info, operator_delay, owner_delay, timeout_seconds, now })
 	}
 
 	/// What the server answered of a payment (`lightning_send`, or its status
@@ -541,33 +602,7 @@ impl Wallet {
 	pub fn lightning_receive_under(&mut self, asset: AssetId, amount: u64, description: Option<&str>, max_fee_ppm: Option<u64>,
 		hash: Option<[u8; 32]>) -> Result<Value, Error>
 	{
-		let info = self.server_info()?;
-		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
-			.map(|a| a["lightning"].clone())
-			.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}", asset)))?;
-		if leg.is_null() {
-			return Err(Error::Refused(format!("the operator runs no Lightning node in asset {}", asset)));
-		}
-		if leg["state"] != "up" {
-			return Err(Error::Refused(format!("the operator's Lightning node in asset {} is down: {}", asset,
-				leg["reason"].as_str().unwrap_or("no reason given"))));
-		}
-		if leg["receives"] != true {
-			return Err(Error::Refused(format!("the operator's Lightning node in asset {} does not receive (it runs no hold-invoice \
-				plugin)", asset)));
-		}
-		let fee = fee_of(&info, asset, amount)?;
-		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
-		if !super::round::fee_within(fee, amount, bound) {
-			return Err(Error::Refused(format!("the operator charges {} of asset {} to receive {}, above the wallet's bound of {} ppm \
-				(--max-fee-ppm raises it for this payment)", fee, asset, amount, bound)));
-		}
-		let value = amount.checked_sub(fee).filter(|v| *v > 0).ok_or_else(|| Error::Refused("the fee takes the whole amount".into()))?;
-		let min = Self::min_leaf(&info, asset)?;
-		if value < min {
-			return Err(Error::Refused(format!("the leaf would hold {} (the {} asked, less the fee of {}), below the operator's smallest \
-				leaf {}", value, amount, fee, min)));
-		}
+		let (info, _, _, bound) = self.receive_checks(asset, amount, max_fee_ppm)?;
 		let recv = &info["lightning"]["receive"];
 		let operator_delay = recv["operator_delay_units"].as_u64().unwrap_or(0);
 		let exit_delay = self.exit_delay();
@@ -622,6 +657,81 @@ impl Wallet {
 		let rec = self.receive_answered(&hash_hex, &r)?;
 		Ok(json!({"invoice": rec["invoice"], "payment_hash": hash_hex, "asset": asset.to_string(), "amount": amount.to_string(),
 			"fee": rec["fee"], "value": rec["value"], "expires_at": rec["expires_at"], "hash_given": given}))
+	}
+
+	/// What receiving `amount` of `asset` over Lightning would leave in the
+	/// leaf, with nothing asked of the operator: its fee, out of the amount,
+	/// and the leaf's value. Refused as [`Self::lightning_receive`] says.
+	pub fn lightning_receive_quote(&mut self, asset: AssetId, amount: u64, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let (info, fee, value, _) = self.receive_checks(asset, amount, max_fee_ppm)?;
+		let claim = self.claim_margins(&info, asset, value)?;
+		let claimed = value.checked_sub(claim).filter(|v| *v > 0)
+			.ok_or_else(|| Error::Refused(format!("the leaf's {} do not cover the margins of its claim, {}", value, claim)))?;
+		Ok(json!({"asset": asset.to_string(), "amount": amount.to_string(), "fee": fee.to_string(), "value": value.to_string(),
+			"claim_margins": claim.to_string(), "claimed": claimed.to_string()}))
+	}
+
+	/// The margins of the claim of a leaf of `value` received over Lightning,
+	/// before the leaf exists: priced as the claim prices them, on a coin of
+	/// the leaf's shape (an `htlc-1` receive leaf on the operator's terms)
+	/// into a leaf of the wallet's own. A transaction's size depends on its
+	/// scripts, not on the leaf's place in its tree, so the claim's margins
+	/// are these.
+	fn claim_margins(&self, info: &Value, asset: AssetId, value: u64) -> Result<u64, Error> {
+		let units = info["lightning"]["receive"]["operator_delay_units"].as_u64().and_then(|u| u16::try_from(u).ok())
+			.and_then(|u| RelativeTime::from_units(u).ok())
+			.ok_or_else(|| Error::Refused("the operator publishes no delay for a payment received over Lightning".into()))?;
+		let timeout = MedianTime::from_consensus(self.now()?.to_consensus_u32().saturating_add(7 * 86_400))
+			.map_err(|e| Error::Refused(e.to_string()))?;
+		let probe_leaf = |htlc: Option<HtlcTerms>| -> Result<NewLeaf, Error> {
+			let nonce = random32();
+			Ok(NewLeaf { owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
+				htlc })
+		};
+		let terms = HtlcTerms { direction: HtlcDirection::Receive, payment_hash: [0; 32], timeout, operator_delay: units };
+		let leaf = probe_leaf(Some(terms))?.policy(self.operator, self.genesis);
+		let sweep = Sweep { token: asset, r_program: [0; 32], operator: self.operator, notice: None, burn: false };
+		let coin = ValidCoin { id: LeafId([0; 32]), leaf, asset, value, sweep, expiry: timeout, hops: 0,
+			origin: ValidOrigin::Transfer { inputs: vec![], outputs: vec![], index: 0 } };
+		let m = super::pay::Margins::of(info, asset)?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let own = Out { asset, value: 1, leaf: probe_leaf(None)?, mailbox, until: None };
+		Ok(self.checkpoint_margin_of(&coin, &m)? + self.reassignment_margin_of(&coin, &own, &m)?)
+	}
+
+	/// What the wallet checks before it asks to receive: the operator serves
+	/// the asset over Lightning, its node up and receiving, its fee within
+	/// the wallet's bound, the leaf at least the operator's smallest. The
+	/// operator's information, the fee, the leaf's value and the bound.
+	fn receive_checks(&mut self, asset: AssetId, amount: u64, max_fee_ppm: Option<u64>) -> Result<(Value, u64, u64, u64), Error> {
+		let info = self.server_info()?;
+		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
+			.map(|a| a["lightning"].clone())
+			.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}", asset)))?;
+		if leg.is_null() {
+			return Err(Error::Refused(format!("the operator runs no Lightning node in asset {}", asset)));
+		}
+		if leg["state"] != "up" {
+			return Err(Error::Refused(format!("the operator's Lightning node in asset {} is down: {}", asset,
+				leg["reason"].as_str().unwrap_or("no reason given"))));
+		}
+		if leg["receives"] != true {
+			return Err(Error::Refused(format!("the operator's Lightning node in asset {} does not receive (it runs no hold-invoice \
+				plugin)", asset)));
+		}
+		let fee = fee_of(&info, asset, amount)?;
+		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
+		if !super::round::fee_within(fee, amount, bound) {
+			return Err(Error::Refused(format!("the operator charges {} of asset {} to receive {}, above the wallet's bound of {} ppm \
+				(--max-fee-ppm raises it for this payment)", fee, asset, amount, bound)));
+		}
+		let value = amount.checked_sub(fee).filter(|v| *v > 0).ok_or_else(|| Error::Refused("the fee takes the whole amount".into()))?;
+		let min = Self::min_leaf(&info, asset)?;
+		if value < min {
+			return Err(Error::Refused(format!("the leaf would hold {} (the {} asked, less the fee of {}), below the operator's smallest \
+				leaf {}", value, amount, fee, min)));
+		}
+		Ok((info, fee, value, bound))
 	}
 
 	/// The preimage of the payment the wallet receives under `hash`, a hash
@@ -687,6 +797,70 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// The leaf the wallet receives under `hash`, as far as it holds it:
+	/// `Ok(Err(why))` while it is not held for good yet (the receive not
+	/// taken up, its round not come or not final); once it is held
+	/// validated, its round final, an `htlc-1` receive leaf under `hash` of
+	/// the value the operator answered the receive with and the operator's
+	/// published delay, `Ok(Ok((asset, value, home_in)))`, `home_in` the
+	/// seconds of median time to its home date (the latest moment it must
+	/// start home to be claimed); `Err` when it never will be.
+	pub(crate) fn received_held(&self, hash: &str) -> Result<Result<(AssetId, u64, u64), String>, Error> {
+		let r = self.receives()?.get(hash).cloned()
+			.ok_or_else(|| Error::Refused(format!("the wallet receives nothing under hash {}", hash)))?;
+		if r["state"] != "issuing" {
+			return Ok(Err(format!("the receive under hash {} is {}", hash, r["state"])));
+		}
+		let nonce = super::chain::unhex32(r["nonce"].as_str().unwrap_or(""))?;
+		let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) else {
+			return Ok(Err("the received leaf's round has not come".into()));
+		};
+		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf)))?;
+		if row.state != "receiving" {
+			return Err(Error::Refused(format!("the received leaf is {}", row.state)));
+		}
+		let (_, a) = self.held(&row)?;
+		if !a.all_final() {
+			return Ok(Err(format!("the received leaf's round is not final: {}", a.waiting())));
+		}
+		let coin = a.valid;
+		let t = coin.leaf.htlc.ok_or_else(|| Error::Refused("the received leaf is no htlc-1 leaf".into()))?;
+		let info = self.server_info()?;
+		// The leaf's value is what the operator answered the receive with,
+		// which the wallet checked against its fee bound then.
+		let value = amount(&r["value"], "the receive's value")?;
+		if t.direction != HtlcDirection::Receive || hex(&t.payment_hash) != hash || coin.asset.to_string() != r["asset"].as_str().unwrap_or("")
+			|| coin.value != value
+		{
+			return Err(Error::Refused(format!("the received leaf is not the receive's: {} of {} under {}, the receive's {} of {}",
+				coin.value, coin.asset, hex(&t.payment_hash), value, r["asset"])));
+		}
+		if info["lightning"]["receive"]["operator_delay_units"].as_u64() != Some(t.operator_delay.units() as u64) {
+			return Err(Error::Refused("the received leaf's operator delay is not the one the operator publishes".into()));
+		}
+		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
+		let (home_at, _) = self.receive_home(&coin, &a.bases, t.timeout.to_consensus_u32() as u64, block)?;
+		let median = self.now()?.to_consensus_u32() as u64;
+		Ok(Ok((coin.asset, coin.value, home_at.saturating_sub(median))))
+	}
+
+	/// Whether the wallet may hand over the price of the preimage of `hash`
+	/// now, a hash it did not make (its other side's, in a swap): the leaf
+	/// it receives under it held for good ([`Self::received_held`]), with
+	/// its home date at least `need` seconds away, the time the other side
+	/// can take to reveal the preimage and the wallet to claim with it.
+	/// `{"ready": true, "home_in"}` when it may; `{"ready": false, "why"}`
+	/// while it may not yet; refused when it never will.
+	pub fn lightning_receive_ready(&self, hash: &str, need: u64) -> Result<Value, Error> {
+		match self.received_held(hash)? {
+			Err(why) => Ok(json!({"payment_hash": hash, "ready": false, "why": why})),
+			Ok((asset, value, home_in)) if home_in >= need => Ok(json!({"payment_hash": hash, "ready": true, "asset": asset.to_string(),
+				"value": value.to_string(), "home_in": home_in})),
+			Ok((_, _, home_in)) => Err(Error::Refused(format!("the leaf received under hash {} must start home in {} s, and the other \
+				side can take {} s: nothing is to be handed over for it", hash, home_in, need))),
+		}
 	}
 
 	/// The operator's payment into its tree under `hash`, as it serves it to
@@ -1073,6 +1247,28 @@ pub fn receive_participation_id(hash: &[u8; 32]) -> [u8; 32] {
 	e.input(super::client::LIGHTNING_RECEIVE_TAG);
 	e.input(hash);
 	sha256::Hash::from_engine(e).to_byte_array()
+}
+
+/// What [`Wallet::pay_checks`] read of an invoice, and the operator's
+/// terms for paying it.
+struct PayChecks {
+	inv: Invoice,
+	asset: AssetId,
+	value: u64,
+	fee: u64,
+	hash: String,
+	info: Value,
+	operator_delay: RelativeTime,
+	owner_delay: RelativeTime,
+	timeout_seconds: u32,
+	now: u32,
+}
+
+impl PayChecks {
+	/// The timeout a payment takes unless its caller names one.
+	fn default_timeout(&self) -> Result<MedianTime, Error> {
+		MedianTime::from_consensus(self.now.saturating_add(self.timeout_seconds).saturating_add(600)).map_err(|e| Error::Refused(e.to_string()))
+	}
 }
 
 /// The explicit output of an [`Out`], from outside `pay`.
