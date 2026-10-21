@@ -2485,7 +2485,10 @@ impl Wallet {
 
 	/// What the wallet holds, per asset: off-chain coins by state (a coin
 	/// received out of round and not yet refreshed as `operator-confirmed`),
-	/// and its on-chain coins on Sequentia. No asset is set apart.
+	/// its on-chain coins on Sequentia, and each asset's holding as the total
+	/// counts it (`held`: a coin whose exit's claim is out once, as the
+	/// claim's output on the chain; a leaf awaiting its preimage not at all).
+	/// No asset is set apart.
 	pub fn balance(&self) -> Result<Value, Error> {
 		// A leaf received under a hash the wallet did not make, whose preimage
 		// it does not hold yet, is not the wallet's to spend or count: it is
@@ -2524,7 +2527,8 @@ impl Wallet {
 		let arca: Value = per.into_iter().map(|(a, m)| (a, json!(m.into_iter().map(|(s, v)| (s, json!(v.to_string()))).collect::<serde_json::Map<_, _>>())))
 			.collect::<serde_json::Map<_, _>>().into();
 		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
-		Ok(json!({"total": total, "arca": arca, "sequentia_onchain": onchain}))
+		let held: Value = held.into_iter().filter(|(_, v)| *v > 0).map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
+		Ok(json!({"total": total, "held": held, "arca": arca, "sequentia_onchain": onchain}))
 	}
 
 	/// The headline of a balance: what `held` (atoms of each asset) is worth

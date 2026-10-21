@@ -457,3 +457,111 @@ async fn a_coin_given_back_after_its_forfeit_waits_for_the_round_to_be_gone() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// R7l's Q1, turned around: two takes in one fill round; T hands its
+/// forfeits over, U not yet, so the round is held, unbroadcast. T's device is
+/// lost and T restored from its mnemonic then. The restore says what it
+/// restored (no error, "nothing was restored" nowhere): the coin given up and
+/// the take with its forfeits, the round read from the take's status as
+/// `sync` reads it. Once U hands its forfeits over the round goes out, and
+/// the restored wallet completes T's take once it is final.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_while_a_takes_round_is_held_says_what_it_restored() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+		c.assets[0].offboard_base = Some("1000".into());
+	}).await;
+	let y = r.y;
+	let t = holder(&mut r, "RSTT", 601_000).await;
+	let u = holder(&mut r, "RSTU", 601_000).await;
+	let ot = terms(&r, "maker t", 2, 1, 1_000);
+	let ou = terms(&r, "maker u", 2, 1, 1_000);
+	let att = rest(&mut r, &ot, 300_000);
+	let atu = rest(&mut r, &ou, 300_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let k = t.ok(&["take", &served("rst-t", &ot, &att)]);
+	let pid = k["take"].as_str().unwrap().to_string();
+	u.ok(&["take", &served("rst-u", &ou, &atu)]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let round = built[0].tx.txid();
+	let s = t.ok(&["sync"]);
+	println!("T's forfeits, before its round is broadcast: {}", s["participations"]);
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(round)).await.unwrap().unwrap();
+	assert_eq!(row.state, RoundState::Built, "held: U has handed nothing over");
+	// T's device is lost; the mnemonic restores the wallet while the round is held.
+	let mnemonic = std::fs::read_to_string(t.dir.join("mnemonic")).unwrap();
+	let t2 = Arca::new("RSTT2");
+	let (url, node) = (r.url(), r.node_url());
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	let made = t2.ok(&args);
+	println!("restored while the round is held: restored {} | not_recovered {} | notes {} | error {}", made["restore"]["restored"],
+		made["restore"]["not_recovered"], made["restore"]["notes"], made["restore"]["error"]);
+	assert!(made["restore"]["error"].is_null(), "the restore went through: {}", made["restore"]);
+	assert!(!made["restore"].to_string().contains("nothing was restored"));
+	assert_eq!(made["restore"]["restored"].as_array().map(|a| a.len()), Some(1), "the coin given up: {}", made["restore"]["restored"]);
+	let row = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(round)).await.unwrap().unwrap();
+	assert_eq!(row.state, RoundState::Built, "still held when the restore ran");
+	let parts = t2.ok(&["participations"]);
+	let take = parts.as_array().unwrap().iter().find(|p| p["participation"] == json!(pid)).cloned().expect("the take restored");
+	println!("the restored wallet's take: {} {}", take["state"], take["round"]);
+	assert_eq!(take["state"], "forfeiting");
+	// U hands its forfeits over: the round goes out, and becomes final.
+	u.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&round, RoundState::Final).await;
+	t2.ok(&["sync"]);
+	let held: Vec<Value> = live_of(&t2, y).iter().map(|c| c["value"].clone()).collect();
+	println!("the restored wallet holds Y {:?}", held);
+	assert_eq!(held, vec![json!("300000")]);
+	for w in [&t, &u, &t2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The balance's rows count a coin whose exit's claim is out once, as the
+/// claim's output on the chain, as the library's total does: a board taken
+/// home, its claim in a block and not final.
+#[tokio::test(flavor = "multi_thread")]
+async fn balance_rows_count_a_coin_whose_claim_is_out_once() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+	}).await;
+	let x = r.x;
+	let t = holder(&mut r, "ROWS", 2_000_000).await;
+	let coin = t.ok(&["coins"]).as_array().unwrap()[0]["leaf_id"].as_str().unwrap().to_string();
+	let mut claimed = false;
+	for _ in 0..10 {
+		let e = t.ok(&["exit", &coin]);
+		println!("exit: {} {}", e["state"], e["claim"]);
+		if e["state"] == "claimed" {
+			claimed = true;
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.synced().await;
+	}
+	assert!(claimed, "the exit's claim went out");
+	r.produce().await;
+	let b = t.ok(&["balance", "--without-bitcoin"]);
+	let row = b["rows"].as_array().unwrap().iter().find(|w| w["asset"] == json!(x.to_string())).cloned().unwrap();
+	println!("the coin {}, its claim in a block: rows {} | held {} | arca {} | on the chain {}", coin_of(&t, &coin), b["rows"], b["held"],
+		b["arca"], b["sequentia_onchain"]);
+	assert_eq!(row["total"], b["held"][x.to_string()], "the row is what the total counts");
+	let onchain: u64 = b["sequentia_onchain"][x.to_string()].as_str().unwrap().parse().unwrap();
+	assert_eq!(row["total"].as_str().unwrap().parse::<u64>().unwrap(), onchain, "the coin is counted once, on the chain");
+	let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+fn coin_of(w: &Arca, leaf: &str) -> Value {
+	w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == json!(leaf)).map(|c| json!({"state": c["state"], "note": c["note"]}))
+		.unwrap_or(Value::Null)
+}

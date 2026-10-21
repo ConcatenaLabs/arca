@@ -664,7 +664,9 @@ fn bitcoin(datadir: &Path, args: &[String]) -> Result<Value, bark::arca::Error> 
 /// One row per holding: BTC first, always, 0 included, as every Sequentia
 /// wallet shows it; then each Sequentia asset the wallet holds anything of,
 /// on-chain or in Arca, with nothing set apart, and its value in the
-/// reference unit where the wallet's node has a rate for it. An asset with
+/// reference unit where the wallet's node has a rate for it: what the
+/// library's balance counts of it (`held`, which counts a coin whose exit's
+/// claim is out once, as the claim's output on the chain). An asset with
 /// nothing in it has no row. The headline is the balance's `total`.
 fn rows(b: &Value) -> Value {
 	let mut rows = vec![match bitcoin::total_sat(&b["bitcoin"]) {
@@ -675,14 +677,18 @@ fn rows(b: &Value) -> Value {
 			b["bitcoin"]["error"].as_str().unwrap_or(""))}),
 	}];
 	let mut per: std::collections::BTreeMap<String, u128> = std::collections::BTreeMap::new();
-	for (a, states) in b["arca"].as_object().into_iter().flatten() {
+	for (a, v) in b["held"].as_object().into_iter().flatten() {
+		*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+	}
+	// A library from before `held` counted its rows here, by state.
+	for (a, states) in b["arca"].as_object().into_iter().flatten().filter(|_| b["held"].is_null()) {
 		// A leaf awaiting the preimage of a hash the wallet did not make is
 		// shown apart and counted in no row.
 		for (_, v) in states.as_object().into_iter().flatten().filter(|(s, _)| *s != "awaiting_preimage") {
 			*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
 		}
 	}
-	for (a, v) in b["sequentia_onchain"].as_object().into_iter().flatten() {
+	for (a, v) in b["sequentia_onchain"].as_object().into_iter().flatten().filter(|_| b["held"].is_null()) {
 		*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
 	}
 	for (a, total) in per {
@@ -898,7 +904,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		// the server serves to the wallet's mailbox key, every record checked.
 		if restoring {
 			info["restore"] = w.restore().unwrap_or_else(|e| json!({"error": {"kind": e.kind(), "message": e.to_string(),
-				"note": "nothing was restored: run `arca restore` once the cause is gone"}}));
+				"note": "the restore stopped at this error: what it took before it is kept (`arca coins`, `arca participations`), and \
+				`arca restore` takes the rest once the cause is gone"}}));
 		}
 		return Ok(info);
 	}
