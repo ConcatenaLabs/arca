@@ -49,6 +49,10 @@
 //! - claim trees ([`claim`]): the claim key a holder's leaf is owned by,
 //!   derived from the key a payer names and a nonce, and the distribution a
 //!   payer submits to pay many holders in one round;
+//! - a resting order in the tree ([`order`]): the `order-2` leaf, which the
+//!   operator fills with the maker offline under a Simplicity program, which
+//!   pays each credit to a leaf of its own, and which lands, one exit delay
+//!   after it reaches the chain, as SeqDEX's own order for the same terms;
 //! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
@@ -85,6 +89,8 @@ pub mod node;
 pub mod offboard;
 #[cfg(feature = "json")]
 pub mod operator_record;
+pub mod order;
+pub mod order_programs;
 pub mod plan;
 pub mod record;
 pub mod release;
@@ -115,6 +121,7 @@ pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;
+pub use order::{OrderError, OrderFillPlan, OrderFilled, OrderPath, OrderPolicy, OrderTerms, SeqdexOrder};
 pub use plan::{Plan, PlanError, PlanStep, Refund};
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
 pub use release::Release;
