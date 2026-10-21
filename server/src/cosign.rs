@@ -175,6 +175,9 @@ pub enum CosignError {
 	SaltReused(String),
 	#[error("leaf {0} has an open out-of-round reassignment: no release is accepted for it")]
 	OpenReassignment(LeafId),
+	/// A coin an offline-refresh plan names.
+	#[error("{0}")]
+	Planned(String),
 	#[error("one transaction could satisfy this reassignment and one already co-signed, and give one side's value to whoever broadcast it: {0}")]
 	Mergeable(String),
 	/// A coin resting on a board past its exit deadline: its owner takes it
@@ -224,6 +227,7 @@ impl CosignError {
 			ScriptReused => "script_reused",
 			SaltReused(_) => "salt",
 			OpenReassignment(_) => "open_reassignment",
+			Planned(_) => "planned",
 			Mergeable(_) => "merge",
 			RequestLapsed { .. } => "request_lapsed",
 			Htlc(_) => "htlc",
@@ -334,6 +338,12 @@ impl Cosigner {
 	/// deadline not past, nothing of its lineage on-chain
 	/// ([`crate::coins::check`]).
 	async fn check_input(&self, id: &LeafId, transfer: &[u8; 32], now: MedianTime) -> Result<Checked, CosignError> {
+		// A coin an offline-refresh plan names carries its holder's refund
+		// halves while its script is unspent: with one, the operator alone
+		// could void a reassignment of it, so none is co-signed.
+		if let Some(why) = crate::plans::blocks_transfer(&self.store, &id.0).await? {
+			return Err(CosignError::Planned(why));
+		}
 		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 

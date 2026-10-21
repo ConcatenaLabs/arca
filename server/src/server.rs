@@ -905,6 +905,7 @@ pub struct Server {
 	pub wallet: Arc<Wallet>,
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
+	pub plans: Arc<crate::plans::Plans>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub watcher: Arc<Watcher>,
@@ -1087,6 +1088,7 @@ impl Server {
 			Duration::from_secs(config.limits.board_unconfirmed_seconds));
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone(), signer.clone());
+		let plans = crate::plans::Plans::new(store.clone(), finality.clone(), params.clone(), signer.clone(), wallet.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
@@ -1202,7 +1204,7 @@ impl Server {
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
-			participations: participations.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
+			participations: participations.clone(), plans: plans.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
@@ -1247,8 +1249,8 @@ impl Server {
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
 			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, rounds, forfeits, watcher,
-			gateway, sends, receives, config: std::sync::Mutex::new(config.clone()), tasks })
+		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, plans, rounds, forfeits,
+			watcher, gateway, sends, receives, config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
 	/// Takes the assets `config` serves, each with its smallest leaf, its

@@ -319,6 +319,10 @@ pub enum ParticipationError {
 	#[error("the return script is a script the server knows as an Arca script: what no holder takes up is paid to an address of the \
 		payer's, never into the tree")]
 	ReturnScriptReused,
+	/// A coin an offline-refresh plan names, or a coin a step made whose
+	/// predecessor can still come home.
+	#[error("{0}")]
+	Planned(String),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	/// The operator's signer holds a forfeit or a spend under a coin's salt.
@@ -379,6 +383,7 @@ impl ParticipationError {
 			ClaimNotReleased(_) => "not_live",
 			ReturnScriptReused => "script_reused",
 			NotSynced => "not_synced",
+			Planned(_) => "planned",
 			SignedAlready(_) => "double_spend",
 			Signer(_) => "signer_unavailable",
 			Rate(_) => "rate_stale",
@@ -679,6 +684,9 @@ impl Participations {
 			let c = coins::check(&self.store, &policy, &i.leaf_id, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 			if c.coin.leaf.htlc.is_some() {
 				return Err(ParticipationError::HtlcInput(k, i.leaf_id));
+			}
+			if let Some(why) = crate::plans::blocks_participation(&self.store, &i.leaf_id.0, &id).await? {
+				return Err(ParticipationError::Planned(why));
 			}
 			if c.coin.asset != asset {
 				return Err(ParticipationError::Assets(one_asset(asset, &BTreeSet::from([c.coin.asset]))));

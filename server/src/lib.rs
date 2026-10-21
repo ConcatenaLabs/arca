@@ -27,6 +27,7 @@ pub mod lightning;
 pub mod nursery;
 pub mod params;
 pub mod participations;
+pub mod plans;
 pub mod rates;
 pub mod rounds;
 pub mod server;

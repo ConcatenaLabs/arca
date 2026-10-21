@@ -296,14 +296,14 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 /// 4xx, but `rate_limited`: a request to slow down is sent again later. A
 /// test compares the two lists.
 pub const REFUSALS: &[&str] = &[
-	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "depth_limit",
-	"double_spend", "fee", "forfeit_set", "htlc", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "conflict", "depth_limit",
+	"double_spend", "fee", "forfeit_set", "hash_reused", "htlc", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
 	"not_in_round", "not_live", "not_participating", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
-	"order_not_final", "order_spent", "order_taken", "out_of_bounds",
+	"order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",
-	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "unknown_payment", "value", "wrong_chain", "wrong_operator",
+	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator",
 	"wrong_round",
 ];
 
