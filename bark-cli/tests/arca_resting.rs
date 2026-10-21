@@ -150,9 +150,15 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	small[13] = "2000000".into();
 	refuse(small, "below its own min_lot");
 
+	// A wallet holding only a board of Y made before the order's round: the
+	// board's service expiry comes before the order's coin expires, so the
+	// operator takes no fill paid with it, and the wallet does not offer one.
+	let t0 = holder(&mut r, "RT0", y, 1_000_000, 0).await;
+
 	// M rests its order, and stops.
 	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
 	println!("M rests order {} and stops", order);
+	t0.refused(&["order", "fill-resting", &order, "--amount", "100000", "--quote"], "that expire no earlier than the order's coin");
 
 	// Two takers fill it in part, each from a leaf of Y.
 	let t1 = holder(&mut r, "RT1", y, 1_000_000, 0).await;
