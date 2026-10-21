@@ -53,6 +53,10 @@ fn script(v: &Value) -> Script {
 	Script::from((0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<u8>>())
 }
 
+fn hex(b: &[u8]) -> String {
+	b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
 fn unhex(h: &str) -> Vec<u8> {
 	(0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
 }
@@ -139,18 +143,39 @@ fn plan(w: &Arca, coin: &str, value: u64, expiry: u32) -> (String, u32, u32) {
 /// Runs the round a plan's step joins, follows it to final, and passes over
 /// the rounds once more, which completes the step.
 async fn step_round(r: &mut Running) -> elements::Txid {
-	// The server reads the chain's time from its own follower, which can
-	// trail the node by a poll: the step is due once it has caught up.
+	// The step waits while the operator's wallet cannot fund its round: it
+	// spends only coins whose transactions are final, and its coins can all
+	// be in transactions not final yet (the watcher's release of an expired
+	// batch, published after the clock jumped). The chain goes on, as a live
+	// one does, until the round is built.
 	let mut built = None;
-	for _ in 0..50 {
+	for _ in 0..10 {
 		r.synced().await;
 		built = r.server.rounds.run_round().await.unwrap();
 		if built.is_some() {
 			break;
 		}
+		r.bury().await;
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 	}
-	let built = built.expect("the step's round");
+	let Some(built) = built else {
+		let mut seen = vec![];
+		for id in r.server.store.unfinished_plans().await.unwrap() {
+			let p = r.server.store.plan(&id).await.unwrap().unwrap();
+			let mut steps = vec![];
+			for st in &p.steps {
+				let part = match st.participation {
+					Some(pid) => r.server.store.participation(&pid).await.unwrap()
+						.map(|x| format!("{:?} round {:?} attempt {} void {:?} waiting {:?}", x.state, x.round_id, x.attempt, x.void_reason, x.waiting)),
+					None => None,
+				};
+				steps.push(format!("step {} {:?} {:?} participation {:?}", st.step.idx, st.state, st.reason, part));
+			}
+			let coin = p.current_coin().map(|c| hex(&c));
+			seen.push(format!("plan {} {:?} {:?} current {:?} [{}]", hex(&id), p.state, p.reason, coin, steps.join("; ")));
+		}
+		panic!("no round for the step at median time {}: {}", mtp(r), seen.join(" | "));
+	};
 	r.produce().await;
 	r.bury().await;
 	r.round_state(&built.tx.txid(), RoundState::Final).await;
