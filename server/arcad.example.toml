@@ -269,13 +269,13 @@ send_stall_margin_seconds = 21600
 block_seconds = 60
 retry_seconds = 60
 # A payment into the tree: the invoice is good for invoice_expiry_seconds;
-# its final lock time is twice the leaf's exit delay and
+# its final lock time is twice eight sevenths of the leaf's exit delay and
 # receive_window_seconds, in blocks, and the leaf times out at half the time
 # the payment is held for, which leaves its owner the exit delay and the
-# window to claim it. The operator refunds the leaf operator_delay_units
-# after its timeout. With a 36-hour exit delay that lock time is about 5,060
-# blocks: a payer's SeqLN node pays it only with its pay's maxdelay raised
-# from its 2,016 blocks.
+# window to claim it after the claim's margin. The operator refunds the leaf
+# operator_delay_units after its timeout. With a 36-hour exit delay that lock
+# time is about 5,780 blocks: a payer's SeqLN node pays it only with its
+# pay's maxdelay raised from its 2,016 blocks.
 receive_window_seconds = 21600
 invoice_expiry_seconds = 3600
 # The leaves of payments held and not yet claimed hold at most this share of
