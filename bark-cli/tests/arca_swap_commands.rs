@@ -141,8 +141,10 @@ async fn a_swap_through_the_commands_shows_its_terms_before_anything_is_signed()
 	let e = library(&a, "swap_complete", json!({"accept": acc_text})).unwrap_err();
 	assert!(e.contains("is not an open offer"), "{}", e);
 	assert_eq!(library(&a, "swaps", json!({})).unwrap()[0]["state"], "done");
+	assert_eq!(library(&b, "swaps", json!({})).unwrap()[0]["state"], "accepted", "the taker's swap waits for the maker");
 	let mb = b.ok(&["mailbox"]);
 	assert_eq!(mb["accepted"].as_array().unwrap().len(), 2, "the taker gets its X leaf and its Y change: {}", mb);
+	assert_eq!(library(&b, "swaps", json!({})).unwrap()[0]["state"], "done", "once the maker's transfer arrives, the taker's swap is done");
 	assert_eq!(total(&a, "live", &y), 400_000, "the maker holds what it wanted");
 	assert_eq!(total(&b, "live", &x), 300_000, "the taker holds what it was offered");
 	assert_eq!(total(&b, "live", &y), 3_000_000 - 400_000 - pays, "the taker paid what it was shown");
