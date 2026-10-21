@@ -403,7 +403,13 @@ impl Plans {
 		let margin = refund_margin(&self.params, &c.coin.leaf, asset, c.coin.value, floor);
 		let quote_id = digest;
 		let nonces = self.store.draw_quote_nonces(&quote_id, n).await?;
-		let fresh = self.wallet.receive_script().await.map_err(|e| PlanError::Internal(e.to_string()))?;
+		// The operator's share of a step's refund: a burn when the asset is
+		// issuer-operated, whose operator keeps no unit of it.
+		let fresh = if self.params.assets.get(&asset).is_some_and(|a| a.issuer.is_some()) {
+			arca_covenant::issuer::burn_script()
+		} else {
+			self.wallet.receive_script().await.map_err(|e| PlanError::Internal(e.to_string()))?
+		};
 		let operator_script = Script::from(self.store.quote_script_or(&quote_id, fresh.as_bytes()).await?);
 		let steps = nonces.into_iter().map(|operator_nonce| {
 			// Each step runs in the free window of the coin it gives up,

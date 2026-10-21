@@ -73,5 +73,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The mint limiter's tool, which signs an issuer-operated asset's mint
+      # (tests/issuer.rs), at the sequentia-contracts commit it is pinned to.
+      - name: Cache the mint limiter's tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.mint-limiter
+          key: mint-limiter-9d3b569a2d36044a37170431c3fab4889032eff0
+
+      - name: The mint limiter's tool
+        run: |
+          if [ ! -x "$HOME/.mint-limiter/bin/mint-limiter" ]; then
+            cargo install --locked --root "$HOME/.mint-limiter" --git https://github.com/ConcatenaLabs/sequentia-contracts \
+              --rev 9d3b569a2d36044a37170431c3fab4889032eff0 mint-limiter
+          fi
+          echo "MINT_LIMITER=$HOME/.mint-limiter/bin/mint-limiter" >> "$GITHUB_ENV"
+
       - name: Tests
         run: cargo test --locked -p arca-server -- --nocapture

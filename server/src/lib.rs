@@ -10,6 +10,10 @@
 //! ([`wallet`]) is built on the Sequentia Wallet Kit, and the nursery
 //! ([`nursery`]) keeps the transactions it relies on broadcast until final.
 //!
+//! An asset its own issuer runs ([`issuer`]) has its batches funded by a
+//! reissue in the round, through the asset's mint limiter, and swept only by
+//! burning.
+//!
 //! The scripts, records and their validation are `arca-covenant`'s; the server
 //! uses them and writes none of its own.
 
@@ -22,6 +26,7 @@ pub mod cosign;
 pub mod fees;
 pub mod forfeits;
 pub mod http;
+pub mod issuer;
 pub mod keeper;
 pub mod lightning;
 pub mod nursery;

@@ -57,7 +57,12 @@ impl Running {
 	/// ([`node::start_plain`]), its finality the anchor alone, for a test
 	/// that forces a transaction into a block with `generateblock`.
 	pub async fn start_plain<F: FnOnce(&mut Config, AssetId)>(tune: F) -> Running {
-		let rt = tokio::task::block_in_place(|| node::start_plain(&[]));
+		Running::start_plain_on(&[], tune).await
+	}
+
+	/// [`Running::start_plain`] on a node given `node_args` as well.
+	pub async fn start_plain_on<F: FnOnce(&mut Config, AssetId)>(node_args: &[&str], tune: F) -> Running {
+		let rt = tokio::task::block_in_place(|| node::start_plain(node_args));
 		Running::start_at(rt, |c, y| {
 			c.finality.certification = "none".into();
 			tune(c, y);

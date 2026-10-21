@@ -101,16 +101,39 @@ pub enum WalletError {
 }
 
 /// An input of a round that is not the wallet's: an on-chain order the round
-/// fills, spent by its own script, which needs no signature. Such inputs come
+/// fills, spent by its own script, which needs no signature, or the mint
+/// limiter's coin that reissues an issuer-operated asset. Such inputs come
 /// first, at `0..n-1`, so the order at input `k` reads its credit at `2k` and
-/// its remainder at `2k+1`.
+/// its remainder at `2k+1`, and the limiter's coin is input 0.
 #[derive(Debug, Clone)]
 pub struct Foreign {
 	pub outpoint: OutPoint,
 	/// What it spends: an explicit output.
 	pub txout: TxOut,
-	/// Its witness, whole.
+	/// Its witness, whole; or, for a witness made once the transaction is
+	/// (the limiter's signature covers it all), a stand-in of its size,
+	/// which the fee is sized for and the caller replaces.
 	pub witness: Vec<Vec<u8>>,
+	/// Its sequence: final, or the age a mint declares.
+	pub sequence: Sequence,
+	/// The issuance it carries: the reissuance of a mint. Its amount pays
+	/// the round's outputs of its asset.
+	pub issuance: Option<AssetIssuance>,
+}
+
+impl Foreign {
+	/// An input spent by its own script, final, with no issuance.
+	pub fn spent_by_script(outpoint: OutPoint, txout: TxOut, witness: Vec<Vec<u8>>) -> Foreign {
+		Foreign { outpoint, txout, witness, sequence: Sequence::MAX, issuance: None }
+	}
+
+	/// The explicit amount it issues of an asset, and the asset.
+	fn issued(&self) -> Option<(AssetId, u64)> {
+		let i = self.issuance?;
+		let amount = i.amount.explicit()?;
+		let txin = TxIn { previous_output: self.outpoint, asset_issuance: i, ..Default::default() };
+		Some((txin.issuance_ids().0, amount))
+	}
 }
 
 /// How spendable a coin must be.
@@ -157,6 +180,8 @@ pub struct Built {
 	pub connector_vout: Option<u32>,
 	/// The coins it spends.
 	pub spent: Vec<OutPoint>,
+	/// The output each of its inputs spends, in input order.
+	pub prevouts: Vec<TxOut>,
 }
 
 /// See the [module documentation](self).
@@ -339,7 +364,7 @@ impl Wallet {
 	/// lock time is 0 and every input final, so the transaction can always
 	/// return to the mempool unchanged after a rollback.
 	pub async fn build_round<R, F>(&self, batches: usize, fee_asset: AssetId, connector: AssetAmount, ties: &[WalletCoin],
-		foreign: &[Foreign], make: F) -> Result<(Built, R), WalletError>
+		foreign: &[Foreign], exclude: Option<AssetId>, make: F) -> Result<(Built, R), WalletError>
 	where
 		F: FnOnce(&[AssetId]) -> Result<(Vec<ExplicitOutput>, R), String>,
 	{
@@ -355,8 +380,11 @@ impl Wallet {
 		// reclaims: it never issues a token.
 		let connectors = self.store.connector_assets().await?;
 		let mut coins = vec![];
+		// An asset the round mints is never paid from the wallet's coins: an
+		// issuer-operated asset's operator keeps none of it.
+		let excluded = |c: &WalletCoin| exclude.is_some_and(|x| x.into_inner().to_byte_array() == c.asset);
 		for c in self.store.wallet_coins(None).await? {
-			if !connectors.contains(&c.asset) && !tied(&c) && self.spendable(&c).await? {
+			if !connectors.contains(&c.asset) && !tied(&c) && !excluded(&c) && self.spendable(&c).await? {
 				coins.push(c);
 			}
 		}
@@ -423,6 +451,10 @@ impl Wallet {
 				f.txout.value.explicit().ok_or(WalletError::Round("a foreign input hides its value".into()))?);
 			let n = need.entry(a).or_insert(0);
 			*n = n.saturating_sub(v);
+			if let Some((a, v)) = f.issued() {
+				let n = need.entry(a).or_insert(0);
+				*n = n.saturating_sub(v);
+			}
 		}
 		need.entry(fee_asset).or_insert(0);
 
@@ -483,11 +515,14 @@ impl Wallet {
 				if !self.store.spend_wallet_coins(&spent, &txid.to_byte_array()).await? {
 					return Err(WalletError::Raced);
 				}
+				let prevouts = foreign.iter().map(|f| f.txout.clone()).chain(chosen.iter().map(|c| explicit_txout(
+					AssetAmount::new(AssetId::from_byte_array(c.asset), c.value), Script::from(c.script_pubkey.clone())))).collect();
 				return Ok(Built {
 					tx,
 					fee: AssetAmount::new(fee_asset, paid),
 					connector_vout,
 					spent: chosen.iter().map(|c| OutPoint::new(Txid::from_byte_array(c.txid), c.vout)).collect(),
+					prevouts,
 				});
 			}
 			fee = needed;
@@ -507,6 +542,9 @@ impl Wallet {
 		let mut held: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for f in foreign {
 			if let (Some(a), Some(v)) = (f.txout.asset.explicit(), f.txout.value.explicit()) {
+				*held.entry(a).or_insert(0) += v;
+			}
+			if let Some((a, v)) = f.issued() {
 				*held.entry(a).or_insert(0) += v;
 			}
 		}
@@ -544,7 +582,10 @@ impl Wallet {
 		}
 		all.push(fee_txout(AssetAmount::new(fee_asset, paid)));
 		let mut input: Vec<TxIn> = foreign.iter().map(|f| {
-			let mut i = TxIn { previous_output: f.outpoint, sequence: Sequence::MAX, ..Default::default() };
+			let mut i = TxIn { previous_output: f.outpoint, sequence: f.sequence, ..Default::default() };
+			if let Some(iss) = f.issuance {
+				i.asset_issuance = iss;
+			}
 			i.witness.script_witness = f.witness.clone();
 			i
 		}).collect();

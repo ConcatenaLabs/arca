@@ -176,6 +176,49 @@ Then, for each asset that receives:
   lock, about 5,770 blocks with a 36-hour exit delay and the default window:
   a payer whose node pays with SeqLN's `pay` raises its `maxdelay` to that.
 
+## Serving an asset issuer-operated
+
+An asset's own issuer may run its batches: each round mints the asset's
+refresh liquidity through its mint limiter and every sweep burns it
+([Issuer-operated assets](../server/README.md#issuer-operated-assets)). The
+issuer sets it up so:
+
+- **The token in a limiter, and nowhere else.** Make the instance with the
+  limiter's tool (`mint-limiter instance`), its operator key a mnemonic of its
+  own on the signer's machine (`mint-limiter key --new --mnemonic-file`), its
+  cold key's mnemonic offline, never on any machine of the operator's, and
+  move the asset's whole reissuance token to the instance's address. Check
+  the issuance: a token outside the limiter can still mint. Make the cold
+  key's brake signature (`mint-limiter arm-signature`) and keep it where the
+  brake should be pulled from.
+- **An allowance the operator's refreshes fit.** A window's allowance bounds
+  what the batches made in that window may hold; a round whose mint does not
+  fit waits until the window ends, and its holders' coins near their exit
+  date go home on the chain. Set it above a window's refreshes, and no
+  higher than the issuer would let a stolen minting key make.
+- **The signer alone holds the minting key.** Start the signer with
+  `--issuer <instance file>=<mnemonic file>`, the mnemonic file readable by
+  its owner alone, and `--mint-limiter` naming the tool; never give the
+  mnemonic to `arcad` or to any other machine. Then serve the asset with its
+  `[assets.issuer]` section and reload or restart `arcad`.
+- **Fee coins in another asset.** The operator holds none of the asset and
+  pays no fee in it: every round, release, sweep and claim of the asset
+  takes a coin of the operator's fee assets, so keep several final coins of
+  the first one. A configuration whose fee assets are all issuer-operated is
+  refused.
+- **One round of the asset at a time.** Each round mints from the coin the
+  last one left the limiter, once that round is final and its coin two
+  blocks old, so the asset's refreshes gather into rounds no closer together
+  than that; a participation waiting for it says so.
+- **No Lightning leg, no takes of on-chain orders, no distributions in the
+  asset.** The server refuses each.
+- **For a bridged asset, the reserve accounting first.** Units minted for a
+  refresh are backed by nothing while their batch lives. Before an asset
+  that is backed by reserves elsewhere (a bridge's) is served this way, the
+  bridge's supply and reserve checks must count the units live under
+  burn-only sweeps, which `issuer_supply` lists, or they read the mint as
+  inflation.
+
 ## What holders are told
 
 Every holder receives these rules before the operator holds their coins:

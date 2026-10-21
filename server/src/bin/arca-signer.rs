@@ -7,11 +7,19 @@
 //!     arca-signer --key-file <file> --pubkey
 //!     arca-signer --key-file <file> --genesis <hash> --sign-operator-record <record.json>
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
-//!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen]
+//!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen] \
+//!         [--issuer <instance file>=<mnemonic file> …] [--mint-limiter <path>]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
 //!         (--keeper-key <key> … --keepers-required <k> | --no-keepers)
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --clear-stopped
+//!
+//! With `--issuer`, the signer mints an issuer-operated asset through its mint
+//! limiter: the instance file the limiter's tool wrote, and the mnemonic file
+//! of the limiter's operator key, which only the tool reads (`--mint-limiter`
+//! names it, `mint-limiter` on the `PATH` by default). It checks a round's
+//! mint itself before the tool signs it (`server::issuer::check_reissue`),
+//! and signs no spend that pays a unit of such an asset anywhere but a burn.
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. `--pubkey` prints the operator
@@ -150,6 +158,11 @@ struct Args {
 	/// `--start-keepers-seen`: write `<record>.keepers-seen` at this start,
 	/// for a record whose signer kept none.
 	start_keepers_seen: bool,
+	/// `--issuer <instance>=<mnemonic>`: each issuer-operated asset's mint
+	/// limiter, and the mnemonic of its operator key.
+	issuers: Vec<(PathBuf, PathBuf)>,
+	/// `--mint-limiter <path>`: the limiter's tool, which signs a mint.
+	mint_tool: PathBuf,
 }
 
 fn args() -> Result<Args, String> {
@@ -169,6 +182,8 @@ fn args() -> Result<Args, String> {
 	let mut pubkey = false;
 	let mut start_keepers_seen = false;
 	let mut sign_record = None;
+	let mut issuers: Vec<(PathBuf, PathBuf)> = vec![];
+	let mut mint_tool = PathBuf::from("mint-limiter");
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -191,6 +206,12 @@ fn args() -> Result<Args, String> {
 			"--keepers-required" => keepers_required = Some(value()?.parse::<usize>().map_err(|e| format!("--keepers-required: {}", e))?),
 			"--keeper-timeout-ms" => keeper_timeout = std::time::Duration::from_millis(value()?.parse::<u64>()
 				.map_err(|e| format!("--keeper-timeout-ms: {}", e))?),
+			"--issuer" => {
+				let v = value()?;
+				let (i, m) = v.split_once('=').ok_or("--issuer <instance file>=<mnemonic file>")?;
+				issuers.push((PathBuf::from(i), PathBuf::from(m)));
+			},
+			"--mint-limiter" => mint_tool = PathBuf::from(value()?),
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
@@ -204,7 +225,7 @@ fn args() -> Result<Args, String> {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey: false, sign_record: Some(file),
 			genesis: genesis.ok_or("--genesis is required: the record is signed only for the chain it names")?, socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false,
+			start_keepers_seen: false, issuers: vec![], mint_tool,
 		});
 	}
 	if pubkey {
@@ -216,7 +237,7 @@ fn args() -> Result<Args, String> {
 		return Ok(Args {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey, sign_record: None, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false,
+			start_keepers_seen: false, issuers: vec![], mint_tool,
 		});
 	}
 	let compact = match (compact_into, drop_salts) {
@@ -272,7 +293,66 @@ fn args() -> Result<Args, String> {
 		record_keepers,
 		keeper_timeout,
 		start_keepers_seen,
+		issuers,
+		mint_tool,
 	})
+}
+
+/// The witness of the limiter's coin at input 0 of a checked mint, from the
+/// limiter's own tool (`mint-limiter sign`), which signs the program's
+/// signature hash over the whole transaction with the mnemonic's key and
+/// satisfies the program; the transaction it gives back must be the one
+/// checked, its input 0's witness aside.
+async fn mint_witness(state: &State, i: &Issuer, req: &server::issuer::WireReissue, checked: &server::issuer::CheckedReissue)
+	-> Result<Vec<Vec<u8>>, String>
+{
+	use tokio::process::Command;
+	let body = serde_json::json!({
+		"tx": req.tx, "prevouts": req.prevouts, "entropy": req.entropy,
+		"state": {"minted": req.state.minted, "elapsed": req.state.elapsed, "armed": req.state.armed as u8},
+	});
+	let mut child = Command::new(&state.mint_tool)
+		.args(["sign", "--instance"]).arg(&i.instance).arg("--mnemonic-file").arg(&i.mnemonic)
+		.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+		.kill_on_drop(true)
+		.spawn().map_err(|e| format!("the limiter's tool {}: {}", state.mint_tool.display(), e))?;
+	let mut stdin = child.stdin.take().ok_or("the tool's input")?;
+	stdin.write_all(body.to_string().as_bytes()).await.map_err(|e| e.to_string())?;
+	drop(stdin);
+	let out = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output()).await
+		.map_err(|_| "the limiter's tool did not answer in two minutes".to_string())?.map_err(|e| e.to_string())?;
+	if !out.status.success() {
+		return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+	}
+	let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("the tool's answer: {}", e))?;
+	let signed: elements::Transaction = elements::encode::deserialize(&unhex(v["hex"].as_str().unwrap_or(""))?)
+		.map_err(|e| format!("the tool's transaction: {}", e))?;
+	let mut bare = signed.clone();
+	bare.input[0].witness = checked.tx.input[0].witness.clone();
+	if elements::encode::serialize(&bare) != elements::encode::serialize(&checked.tx) {
+		return Err("the limiter's tool gave back another transaction than the one checked".into());
+	}
+	if v["next_state"]["minted"].as_str() != Some(&checked.next.minted.to_string())
+		|| v["next_state"]["elapsed"].as_u64() != Some(checked.next.elapsed as u64)
+	{
+		return Err(format!("the limiter's tool computes the next state {}, the signer {:?}", v["next_state"], checked.next));
+	}
+	Ok(signed.input[0].witness.script_witness.clone())
+}
+
+/// Stops the signer at start, saying why.
+fn fail(m: &str) -> ! {
+	eprintln!("arca-signer: {}", m);
+	std::process::exit(2)
+}
+
+/// An issuer-operated asset's mint limiter, as the signer mints through it:
+/// the instance, its file and the mnemonic file of its operator key, which
+/// only the limiter's tool reads.
+struct Issuer {
+	limiter: arca_covenant::LimiterParams,
+	instance: PathBuf,
+	mnemonic: PathBuf,
 }
 
 /// The signer's keepers: their clients, how many must hold a head, whether
@@ -382,6 +462,9 @@ struct State {
 	/// signer made or checked: handed out again rather than made again, and
 	/// a head handed back with it needs no check. At most [`MAX_KEPT_SIGS`].
 	sigs: Mutex<std::collections::HashMap<(u64, [u8; 32]), [u8; 64]>>,
+	/// The issuer-operated assets whose mints this signer signs.
+	issuers: Vec<Issuer>,
+	mint_tool: PathBuf,
 }
 
 /// How many heads' signatures the signer keeps at hand: about 15 MB. Past
@@ -959,6 +1042,9 @@ async fn answer(state: &State, line: &str) -> Response {
 					.collect::<Result<Vec<_>, String>>()?;
 				let leaf = elements::Script::from(unhex(&leaf)?);
 				check_spend(&key.x_only_public_key().0, &tx, &prevouts, input as usize, &leaf)?;
+				// The operator keeps no unit of an asset this signer mints.
+				let minted: Vec<elements::AssetId> = state.issuers.iter().map(|i| i.limiter.asset).collect();
+				server::issuer::check_spend_burns(&minted, &tx)?;
 				let digest = script_spend_sighash(&tx, input as usize, &prevouts, &leaf, genesis).map_err(|e| e.to_string())?;
 				Ok((tx.txid(), digest))
 			})();
@@ -971,6 +1057,24 @@ async fn answer(state: &State, line: &str) -> Response {
 			let sig = sign_digest(key, &digest, &aux);
 			eprintln!("arca-signer: signed spend of input {} of {}", input, txid);
 			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+		Request::Reissue { reissue } => {
+			let issuer = match elements::AssetId::from_str(&reissue.asset).ok().and_then(|a| state.issuers.iter().find(|i| i.limiter.asset == a)) {
+				Some(i) => i,
+				None => return Response { error: Some(format!("asset {} is minted by no limiter this signer holds", reissue.asset)), ..none },
+			};
+			let checked = match server::issuer::check_reissue(state.chain, state.operator(), &issuer.limiter, &reissue) {
+				Ok(c) => c,
+				Err(e) => return Response { error: Some(format!("the mint: {}", e)), ..none },
+			};
+			match mint_witness(state, issuer, &reissue, &checked).await {
+				Ok(w) => {
+					eprintln!("arca-signer: signed a mint of {} of asset {} in {}, the limiter's count to {} ({} blocks behind)", checked.amount,
+						issuer.limiter.asset, checked.tx.txid(), checked.next.minted, checked.next.elapsed);
+					Response { witness: Some(w.iter().map(|x| hex(x)).collect()), ..none }
+				},
+				Err(e) => Response { error: Some(format!("the mint: {}", e)), ..none },
+			}
 		},
 		Request::Unroll { children_hash, time } => {
 			let parsed = (|| -> Result<_, String> {
@@ -1144,7 +1248,35 @@ async fn main() {
 		acknowledged: std::sync::atomic::AtomicBool::new(server::signer::acknowledged_path(&args.record).exists()),
 		record: args.record.clone(),
 	});
-	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default() });
+	// Each issuer-operated asset's limiter: an instance on this chain, whose
+	// mnemonic file only its owner reads.
+	let mut issuers = vec![];
+	for (instance, mnemonic) in &args.issuers {
+		let text = match std::fs::read_to_string(instance) {
+			Ok(t) => t,
+			Err(e) => fail(&format!("--issuer: {}: {}", instance.display(), e)),
+		};
+		let (limiter, genesis) = match arca_covenant::LimiterParams::from_instance_json(&text) {
+			Ok(x) => x,
+			Err(e) => fail(&format!("--issuer: {}: {}", instance.display(), e)),
+		};
+		if genesis != args.genesis {
+			fail(&format!("--issuer: {} is a mint limiter on chain {}, not {}", instance.display(), genesis, args.genesis));
+		}
+		match std::fs::metadata(mnemonic) {
+			Ok(m) if m.permissions().mode() & 0o077 != 0 => fail(&format!("--issuer: {} is readable by others than its owner", mnemonic.display())),
+			Ok(_) => {},
+			Err(e) => fail(&format!("--issuer: {}: {}", mnemonic.display(), e)),
+		}
+		if limiter.operator == key.x_only_public_key().0 {
+			fail("--issuer: the limiter's operator key is S: a mint is signed by the issuer's own key, never by S");
+		}
+		eprintln!("arca-signer: mints asset {} through its limiter {} (allowance {} a window of {} blocks)", limiter.asset,
+			instance.display(), limiter.allowance, limiter.window);
+		issuers.push(Issuer { limiter, instance: instance.clone(), mnemonic: mnemonic.clone() });
+	}
+	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default(),
+		issuers, mint_tool: args.mint_tool.clone() });
 	match &state.keepers {
 		// At start, before anything is served: the keepers' latest heads
 		// against the record. One the record does not hold stops the signer

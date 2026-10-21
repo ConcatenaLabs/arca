@@ -28,12 +28,14 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 27;
+const SCHEMA: i32 = 28;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "DROP TABLE order_fill; DROP TABLE resting_order; ALTER TABLE participation_output DROP COLUMN order_terms;
+const UNDO_V17: &str = "DROP TABLE round_mint; ALTER TABLE watched_outpoint DROP CONSTRAINT watched_outpoint_kind_check;
+	ALTER TABLE watched_outpoint ADD CONSTRAINT watched_outpoint_kind_check CHECK (kind IN ('board', 'nursery', 'receive'));
+	DROP TABLE order_fill; DROP TABLE resting_order; ALTER TABLE participation_output DROP COLUMN order_terms;
 	DROP INDEX leaf_owner_key_key; ALTER TABLE leaf DROP COLUMN maker_coin;
 	CREATE UNIQUE INDEX leaf_owner_key_key ON leaf (owner_key) WHERE state NOT IN ('lost', 'expired');
 	DROP TABLE plan_step; DROP TABLE plan; DROP TABLE plan_quote; DROP TYPE plan_step_state; DROP TYPE plan_state;

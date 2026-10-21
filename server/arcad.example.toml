@@ -205,6 +205,15 @@ max_margin_multiple = 25
 # refused no_lightning. The node is checked every [lightning] poll_seconds;
 # while it does not answer, or holds no open channel in the asset, info shows
 # its leg down with the reason and a request is refused lightning_unavailable.
+#
+# [assets.issuer] serves the asset issuer-operated: each round mints what it
+# pays of the asset through the asset's mint limiter, which holds its
+# reissuance token, and every sweep of its batches burns. limiter is the
+# instance file `mint-limiter instance` writes, entropy the asset's issuance
+# entropy as issueasset prints it, coin the limiter's coin when the asset was
+# set up and state its MINTED,ELAPSED,ARMED then. The signer mints, started
+# with --issuer <instance file>=<mnemonic file> and --mint-limiter <tool>. An
+# issuer-operated asset has no [assets.lightning].
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
@@ -221,6 +230,11 @@ min_leaf = "1000"
 # max_age_seconds = 3600
 # [assets.lightning]
 # rpc = "/var/lib/seqln/<asset id>/sequentia/lightning-rpc"
+# [assets.issuer]
+# limiter = "/etc/arca/<asset id>.limiter.json"
+# entropy = "<the asset's issuance entropy>"
+# coin = "<txid>:<vout>"
+# state = "0,0,0"
 
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order

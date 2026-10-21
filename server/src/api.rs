@@ -259,6 +259,89 @@ pub struct AssetInfo {
 	/// node in it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lightning: Option<LightningLegInfo>,
+	/// Present when the operator serves the asset issuer-operated: every
+	/// batch of it is funded by a reissue in its round, through the asset's
+	/// mint limiter, and its sweep can only burn. A wallet refuses a batch
+	/// of the asset whose sweep is not burn-only, and one of another asset
+	/// whose sweep is.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub issuer: Option<IssuerInfo>,
+}
+
+/// An issuer-operated asset's mint limiter (sequentia-contracts
+/// `templates/mint_limiter`), as its instance names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerInfo {
+	/// The limiter's template hash.
+	pub limiter: String,
+	/// The asset's explicit reissuance token, which the limiter holds.
+	pub token: String,
+	/// The key that signs mints and the key that brakes them.
+	pub operator_key: String,
+	pub cold_key: String,
+	/// The most minted in a window, in the asset's atoms, and the window in
+	/// blocks.
+	pub allowance: String,
+	pub window_blocks: u16,
+	pub recovery_delay_units: u16,
+}
+
+/// `POST /v1/issuer_supply`: what the operator mints and burns of an
+/// issuer-operated asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerSupplyRequest {
+	pub asset: String,
+}
+
+/// What the operator minted and burned of an issuer-operated asset, each
+/// transaction named so a reader checks it against the chain, and what is
+/// live in its batches now. Only transactions of the active chain count;
+/// `state` says which are final.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerSupply {
+	pub asset: String,
+	/// The limiter's coin now, its state, and why it mints nothing now when
+	/// it does not.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limiter_coin: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limiter_minted: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limiter_elapsed: Option<u16>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limiter_armed: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limiter_unavailable: Option<String>,
+	/// Every round's mint in the chain.
+	pub mints: Vec<SupplyEntry>,
+	/// Every burn of the operator's in the chain: a sweep, a claim, a
+	/// reclaim, a refund, a margin.
+	pub burns: Vec<SupplyEntry>,
+	/// The sums of `mints` and `burns`, and of their final ones.
+	pub minted: String,
+	pub minted_final: String,
+	pub burned: String,
+	pub burned_final: String,
+	/// The value under burn-only sweeps now: every unspent output of a
+	/// burn-only batch of the asset (its batch output, a node or an entry on
+	/// the chain) whose round is in the chain.
+	pub in_batches: String,
+}
+
+/// A transaction that minted or burned an issuer-operated asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyEntry {
+	pub txid: String,
+	/// `round`, or the watcher's kind of transaction (`sweep`, `claim`,
+	/// `reclaim`, …).
+	pub kind: String,
+	pub amount: String,
+	/// `final`, `settled` or `unsettled`.
+	pub state: String,
 }
 
 /// What the operator charges in one asset: a refresh, falling to nothing in

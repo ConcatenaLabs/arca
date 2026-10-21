@@ -44,7 +44,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V24__distributions.sql`](schema/V24__distributions.sql),
 [`schema/V25__shared_fills.sql`](schema/V25__shared_fills.sql),
 [`schema/V26__plans.sql`](schema/V26__plans.sql),
-[`schema/V27__resting_orders.sql`](schema/V27__resting_orders.sql)). `Store::connect` builds it
+[`schema/V27__resting_orders.sql`](schema/V27__resting_orders.sql),
+[`schema/V28__issuer_operated.sql`](schema/V28__issuer_operated.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -1270,6 +1271,93 @@ The nursery does not call a round lost when its input's own transaction is
 reorganised away and never returns: such a round stays broadcast, its
 participations issued and its leaves uncredited.
 
+## Issuer-operated assets
+
+An asset's own issuer may run its batches: then the operator funds them by
+reissuing the asset in the round that makes them, instead of from its own
+coins, and every sweep of them can only burn. The refresh liquidity exists
+only while its batch lives, and the asset's supply returns to its level once
+the batch is swept, which anyone checks on the chain.
+
+The asset's reissuance token rests in a mint limiter (sequentia-contracts
+`templates/mint_limiter`): the whole token, explicitly, at the instance's
+address, its operator key the issuer's minting key, which `arca-signer`
+holds and arcad never does, and its cold key the issuer's, which can brake
+every mint. An asset whose token is not in a limiter is not served this way:
+the operator mints on every round with nobody present, and only the
+limiter bounds what a stolen minting key makes. The asset is served
+issuer-operated by its configuration:
+
+    [[assets]]
+    asset = "<asset id>"
+    min_leaf = "1000"
+    [assets.issuer]
+    limiter = "/etc/arca/z-limiter.json"   # the instance file `mint-limiter instance` writes
+    entropy = "<the asset's issuance entropy, as issueasset prints it>"
+    coin = "<txid>:<vout>"                 # the limiter's coin when the asset was set up
+    state = "0,0,0"                        # its MINTED,ELAPSED,ARMED then; 0,0,0 when absent
+
+and the signer started with the same instance and the mnemonic of the
+limiter's operator key (`--issuer <instance file>=<mnemonic file>`, a file
+only its owner reads, and `--mint-limiter <path>` naming the limiter's tool
+when it is not on the `PATH`). The instance must be on the server's chain, a
+limiter of the asset whose token is the asset's explicit reissuance token by
+that entropy, and its operator key is never `S`. `info` names the limiter
+(`assets[].issuer`).
+
+**Rounds.** A round of the asset mints exactly what it pays of it: the
+batch output, with its leaves and reserves as the builder makes them, and
+each offboard output. The limiter's coin is input 0, carrying the
+reissuance, its sequence the coin's age in blocks, and its successor, the
+token's whole amount in the next state, is output 0; the batch output and
+its token's atom follow, then the offboards, the connector, the change and
+the fee, which the operator pays from its fee assets but the asset (a
+configuration whose fee assets are all issuer-operated is refused at start
+and on reload, as its rounds and sweeps would have nothing to pay in). Every
+batch of the asset is burn-only. The server follows the limiter's coin on
+the chain from the one its configuration names, through its own rounds and
+any other spend of it (the cold key's brake, its release, its recovery), and
+a round mints only from a coin whose transaction is final, two blocks old or
+more, its brake off, spent by no round of the server's that is in no block
+yet (the next round of the asset waits for that one), and only what the
+window's allowance has room for: a
+participation whose mint does not fit waits, saying how much the limiter
+allows now and when its window ends. The signer checks the round before it
+signs the mint (`reissue`): input 0 spends the limiter's coin and reissues
+the asset, no other input reissues it or spends a coin of it, every output of
+the asset is a burn-only batch under `S` or an offboard under `S`, each
+rebuilt by the signer from its parts, and together they hold exactly what
+input 0 reissues, so nothing of the asset goes to change or a fee; then the
+limiter's own tool (`mint-limiter sign`) signs the program's signature hash
+over the whole round and satisfies the program, and refuses a mint over the
+allowance. The round records its mint (the coin, the states before and
+after, the age, the amount). A mint and its batch are one transaction, so a
+rollback takes both out together and the nursery broadcasts both again.
+
+**What the operator takes in.** The operator keeps no unit of the asset.
+Whatever an operator transaction takes in of it is burned whole in that
+transaction, a bare `OP_RETURN` of its explicit amount, and its fee is paid by
+a coin of another asset: a board's forfeit and its claim, a forfeit claimed
+against a stale exit, a reclaimed node, a reclaimed offboard, the operator's
+share of a plan step's refund (a plan quoted in the asset names a burn as
+the operator's script), and any margin or reserve such a transaction leaves.
+The signer signs no spend that pays a unit of an asset it mints anywhere but
+a burn. Fees holders pay in the asset are burned with the coins they gave up,
+so its operator earns nothing in it; an issuer that wants no fall in supply
+sets the asset's fees to zero. The same holds for an asset that once had a
+burn-only batch, whatever it is served as since.
+
+**Not served in the asset**: takes of on-chain orders (a round that fills
+them holds the orders at its low inputs and mints nothing), distributions
+(their unclaimed value is paid back from the operator's coins), and a
+Lightning leg (refused in the configuration).
+
+**The supply.** Anyone reads the asset's supply from the chain: every
+issuance of it, each reissuance a spend of the limiter's coin, less every
+bare `OP_RETURN` of it. `issuer_supply` lists the operator's part of it,
+transaction by transaction, and the value live under its burn-only sweeps,
+counting only what the active chain holds.
+
 ## The forfeit swap
 
 Once its round is final, an owner validates each new leaf from the published
@@ -1457,7 +1545,9 @@ meanwhile.
   passed (the batch output, a node or an entry someone unrolled, a checkpoint
   of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
   the token to `R`. A leaf on the chain is its owner's and is never swept.
-  The server builds no burn-only batch and sweeps none. A batch that holds
+  A burn-only batch's sweep burns each output it takes whole, at its own
+  index, several in one transaction, and a coin of another asset pays its
+  fee (see Issuer-operated assets). A batch that holds
   the current coin of an offline-refresh plan that is open or stopped is not
   released: the release waits until the plan's step has taken that coin into
   a final round, or the plan is over.
@@ -1521,7 +1611,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value) and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -1536,6 +1626,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
+| `POST issuer_supply` | What the operator minted and burned of an issuer-operated asset (see Issuer-operated assets): every round's mint and every burn of the watcher's the active chain holds, each with its txid, kind, amount and finality, their sums and those of the final ones, the value live under its burn-only sweeps (`in_batches`), and the limiter's coin and state, or why it mints nothing now. Not authenticated: everything in it is on the chain |
 | `POST distribute` | Accepts a distribution (see Distributions: claim trees), answered as `participation_status` answers |
 | `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
@@ -1663,9 +1754,16 @@ operator's unroll authorisation for a node (`unroll`), `S`'s signature over
 median time: `S` is a member of every node, and the watcher answers a holder
 who brings home a coin it gave up for a step of an offline refresh only after
 unrolling that step's leaf, whose tree did not exist when the holder signed.
-It signs no digest it is handed and no release, and nothing by a path that
-checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
-signature it gets back against the message or signature hash it built.
+For an issuer-operated asset whose mint limiter it was started with
+(`--issuer <instance file>=<mnemonic file>`), it answers one more request:
+the mint at input 0 of a round (`reissue`), which it checks as Issuer-operated
+assets says before the limiter's own tool (`--mint-limiter`) signs it with the
+limiter's operator key, never `S`; it answers the witness of the limiter's
+coin. For such an asset it signs no spend that pays a unit of it anywhere
+but a bare `OP_RETURN`. It signs no digest it is handed and no release, and
+nothing by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server
+checks each signature it gets back against the message or signature hash it
+built.
 Beside those it answers reads of its record: its latest head, its entries
 after one, a witness of heads (below), and the entries under a salt
 (`under`), which the server asks before it takes a coin into a refresh.
@@ -2229,6 +2327,24 @@ with `strace`, which must be on the `PATH`.
 
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
+
+`tests/issuer.rs` also needs the mint limiter's tool, named by
+`MINT_LIMITER` (sequentia-contracts `tools/mint-limiter`, with its `sign`
+command), and runs its chains with Simplicity active. On the proof-of-stake
+chain an asset is issued with its reissuance token straight into a limiter
+and served issuer-operated: a holder boards it, two refreshes each mint
+exactly their batch's value from the limiter's coin at input 0, its
+successor at output 0; the board taken back is burned whole; an offboard
+that would pass the window's allowance waits, saying why, and is minted
+once the window ends; both batches are burned by their sweeps after their
+notice, their fees in another asset; and the asset's supply, read from every
+block, is back at its level before the first round less the fee the holder
+paid for its offboard, which was burned, as `issuer_supply` says
+transaction by transaction. On the chain without proof of stake, the
+server's round minting within the allowance is the control for the same
+round minting one atom over it, its mint and its wallet inputs signed again,
+which a block refuses (`Assertion failed inside jet`); and a second refresh
+that would pass the allowance waits.
 
 The Lightning tests (`tests/lightning_*.rs`) also run SeqLN nodes beside the
 server: `LIGHTNINGD_EXEC` names a SeqLN `lightningd` (`make all-programs` in a
