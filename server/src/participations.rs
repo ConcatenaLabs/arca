@@ -55,7 +55,8 @@
 //! SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body),   T = SHA256("Arca/participation")
 //! body = n, each leaf id given up
 //!      ‖ m, each output: kind (0 leaf, 1 offboard), asset, value (u64),
-//!          then for a leaf: template id, template version, owner key, owner nonce, exit delay units (u16)
+//!          then for a leaf: template id, template version, owner key, owner nonce, exit delay units (u16),
+//!          and for an order-2 leaf its terms (the leaf record's binary form of them, 252 bytes)
 //!          and for an offboard: script length (u16), script
 //!      ‖ f, each fee: asset, amount (u64)
 //!      ‖ 0, or 1 and the earliest round time (u32)
@@ -140,7 +141,11 @@ pub struct InputRequest {
 /// An output wanted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputRequest {
-	Leaf { asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime },
+	Leaf {
+		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
+		/// `order-2`'s terms, for a resting order.
+		order: Option<arca_covenant::OrderLeafTerms>,
+	},
 	Offboard { asset: AssetId, value: u64, script: Script },
 }
 
@@ -210,7 +215,7 @@ pub struct TakeRequest {
 impl TakeRequest {
 	/// The take its id covers; `None` when the leaf wanted is not a leaf.
 	pub fn take(&self) -> Option<Take> {
-		let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } = &self.leaf else { return None };
+		let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, .. } = &self.leaf else { return None };
 		Some(Take {
 			order: self.order,
 			terms: self.terms.clone(),
@@ -243,7 +248,7 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	e.input(&[outputs.len() as u8]);
 	for o in outputs {
 		match o {
-			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => {
+			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
 				e.input(&[0]);
 				e.input(&asset.into_inner().to_byte_array());
 				e.input(&value.to_le_bytes());
@@ -251,6 +256,11 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 				e.input(&owner.serialize());
 				e.input(owner_nonce);
 				e.input(&exit_delay.units().to_le_bytes());
+				if let Some(o) = order {
+					let mut b = vec![];
+					o.encode_to(&mut b);
+					e.input(&b);
+				}
 			},
 			OutputRequest::Offboard { asset, value, script } => {
 				e.input(&[1]);
@@ -581,6 +591,38 @@ impl Participations {
 		fees::floor_per_kvb(&self.finality, asset).await.map_err(|e| ParticipationError::Internal(e.to_string()))
 	}
 
+	/// The terms of an `order-2` leaf wanted at output `j`, of `asset` under
+	/// `owner`: terms a leaf may carry ([`arca_covenant::OrderLeafTerms::check`]),
+	/// all four credit keys present, each owning no leaf now (a fill makes a
+	/// leaf under each), paid in an asset the operator serves (each credit is
+	/// a leaf of it), and a REFUND time past the order margin, before which
+	/// the operator co-signs fills.
+	async fn check_order_terms(&self, j: usize, o: &arca_covenant::OrderLeafTerms, asset: AssetId, owner: &XOnlyPublicKey,
+		now: MedianTime) -> Result<(), ParticipationError>
+	{
+		let p = &self.params;
+		o.check(asset, owner, &p.operator).map_err(|e| ParticipationError::Order(format!("output {}: {}", j, e)))?;
+		if o.credits.contains(&[0u8; 32]) {
+			return Err(ParticipationError::Order(format!("output {}: a resting order starts with all four of its credit keys", j)));
+		}
+		let paid_in = o.landed.terms.asset_b;
+		if !p.assets.contains(&paid_in) {
+			return Err(ParticipationError::Assets(format!("output {}: an order paid in asset {}, which is not served by this operator: \
+				each credit is a leaf of it", j, paid_in)));
+		}
+		let least = now.to_consensus_u32().saturating_add(p.order_margin_seconds);
+		if o.landed.expiry <= least {
+			return Err(ParticipationError::Order(format!("output {}: an order whose REFUND time {} is within the operator's order \
+				margin of {} s: it would take no fill", j, o.landed.expiry, p.order_margin_seconds)));
+		}
+		for c in &o.credits {
+			if self.store.key_owns_leaf(c).await? {
+				return Err(ParticipationError::KeyReused);
+			}
+		}
+		Ok(())
+	}
+
 	/// Accepts `req`: see the [module documentation](self). A participation
 	/// submitted again gets its status, whatever key proofs it carries: the
 	/// id does not cover them, and they were checked when it was taken.
@@ -622,9 +664,11 @@ impl Participations {
 		for (j, o) in req.outputs.iter().enumerate() {
 			p.check_value(o.asset(), o.value()).map_err(ParticipationError::OutOfBounds)?;
 			match o {
-				OutputRequest::Leaf { template, owner, exit_delay, .. } => {
-					if *template != Template::Vtxo1 {
-						return Err(ParticipationError::Template(j, template.to_string()));
+				OutputRequest::Leaf { template, owner, exit_delay, order, asset, .. } => {
+					match (template, order) {
+						(Template::Vtxo1, None) => {},
+						(Template::Order2, Some(o)) => self.check_order_terms(j, o, *asset, owner, now).await?,
+						_ => return Err(ParticipationError::Template(j, template.to_string())),
 					}
 					if !p.exit_delay_ok(*exit_delay) {
 						return Err(ParticipationError::OutOfBounds(format!(
@@ -762,13 +806,14 @@ impl Participations {
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {
 			let kind = match o {
-				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, .. } => WantedKind::Leaf {
+				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, order, .. } => WantedKind::Leaf {
 					template: template.to_string(),
 					owner_key: owner.serialize(),
 					owner_nonce: *owner_nonce,
 					exit_delay_units: exit_delay.units(),
 					operator_nonce: [0; 32],
 					htlc: None,
+					order: *order,
 				},
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());
@@ -987,6 +1032,7 @@ impl Participations {
 					exit_delay_units: leaf.exit_delay.units(),
 					operator_nonce: [0; 32],
 					htlc: None,
+					order: None,
 				},
 				leaf_id: None,
 			}],

@@ -137,6 +137,13 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 	};
 	let mut leaves = vec![];
 	for l in t["leaves"].as_array().cloned().unwrap_or_default() {
+		// A resting order's terms (`order-2`), another holder's or the
+		// wallet's own: the tree does not build without them.
+		let order = match l.get("order").filter(|o| !o.is_null()) {
+			Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, params.asset)
+				.map_err(|e| Error::Parse(format!("a published leaf's order terms: {}", e)))?),
+			None => None,
+		};
 		leaves.push(LeafSpec {
 			template: l["template"].as_str().unwrap_or("").parse().map_err(|e: arca_covenant::RecordError| Error::Parse(e.to_string()))?,
 			owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap_or(""))?)
@@ -147,12 +154,27 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?,
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
 			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
-			order: None,
+			order,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;
 	check_published(t, &tree)?;
 	Ok(tree)
+}
+
+/// Refuses a new leaf that is a resting order where the wallet's wanted leaf
+/// `w` asked for none, or one on other terms than it asked: an `order-2`
+/// leaf is filled under the operator's signature alone, at the price and to
+/// the credit keys its terms name.
+fn order_as_asked(w: &Value, template: Template, order: Option<&arca_covenant::OrderLeafTerms>) -> Result<(), String> {
+	let asked = w.get("order").filter(|o| !o.is_null());
+	let served = order.map(arca_covenant::record_json::order_terms_json);
+	if asked == served.as_ref() && (template == Template::Order2) == asked.is_some() {
+		return Ok(());
+	}
+	let say = |o: Option<&Value>| o.map_or("no resting order".to_string(), |o| format!("a resting order on terms {}", o));
+	Err(format!("it is {}, and the wallet asked for {}: it signs nothing for a leaf of other terms than it asked", say(served.as_ref()),
+		say(asked)))
 }
 
 /// What a published tree says beyond the parts it is built from, against
@@ -368,7 +390,8 @@ impl Wallet {
 		let nonce = super::random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
-		let wanted = vec![Wanted::Leaf { asset, value, template: Template::Vtxo1, owner, owner_nonce: nonce, exit_delay: self.exit_delay() }];
+		let wanted = vec![Wanted::Leaf { asset, value, template: Template::Vtxo1, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
+			order: None }];
 		let nonces = vec![json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()})];
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
 		let nb = not_before.map(MedianTime::from_consensus).transpose().map_err(|e| Error::Refused(e.to_string()))?;
@@ -813,6 +836,7 @@ impl Wallet {
 			}
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
+			order_as_asked(w, record.template, record.order.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
 				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value, record.asset,
 					w["value"], w["asset"])));
@@ -1691,6 +1715,33 @@ pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_new_leaf_is_a_resting_order_only_where_asked_and_on_its_terms() {
+		use arca_covenant::order::{OrderLeafTerms, OrderTerms, SeqdexOrder};
+		let key = |b: u8| elements::secp256k1_zkp::Keypair::from_seckey_slice(&elements::secp256k1_zkp::Secp256k1::new(), &[b; 32])
+			.unwrap().x_only_public_key().0;
+		let (a, b) = (AssetId::from_slice(&[1; 32]).unwrap(), AssetId::from_slice(&[2; 32]).unwrap());
+		let terms = OrderLeafTerms {
+			landed: SeqdexOrder { terms: OrderTerms { asset_a: a, asset_b: b, rate_num: 2, rate_den: 1, min_lot: 10 }, maker: [7; 32],
+				expiry: 1_800_000_000, refund_key: key(3) },
+			credits: [key(4).serialize(), key(5).serialize(), key(6).serialize(), key(8).serialize()],
+		};
+		let plain = json!({"nonce": "00", "asset": a.to_string(), "value": "1"});
+		let asked = json!({"nonce": "00", "asset": a.to_string(), "value": "1", "order": arca_covenant::record_json::order_terms_json(&terms)});
+		assert!(order_as_asked(&plain, Template::Vtxo1, None).is_ok(), "a plain leaf where a plain leaf was asked for");
+		assert!(order_as_asked(&asked, Template::Vtxo1, None).is_err(), "a plain leaf where an order was asked for");
+		assert!(order_as_asked(&asked, Template::Order2, Some(&terms)).is_ok(), "the order asked for");
+		let e = order_as_asked(&plain, Template::Order2, Some(&terms)).unwrap_err();
+		println!("an order the wallet did not ask for: {}", e);
+		assert!(e.contains("a resting order on terms"), "{}", e);
+		let mut other = terms;
+		other.credits[0] = key(9).serialize();
+		assert!(order_as_asked(&asked, Template::Order2, Some(&other)).is_err(), "an order with another credit key");
+		other = terms;
+		other.landed.terms.rate_num = 1;
+		assert!(order_as_asked(&asked, Template::Order2, Some(&other)).is_err(), "an order at another price");
+	}
 
 	#[test]
 	fn a_fee_is_bounded_in_millionths_of_its_coin() {

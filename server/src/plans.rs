@@ -709,7 +709,7 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 				asset: plan.asset, value: s.value,
 				kind: WantedKind::Leaf {
 					template: Template::Vtxo1.to_string(), owner_key: s.owner_key, owner_nonce: s.owner_nonce,
-					exit_delay_units: s.exit_delay_units, operator_nonce: s.operator_nonce, htlc: None,
+					exit_delay_units: s.exit_delay_units, operator_nonce: s.operator_nonce, htlc: None, order: None,
 				},
 				leaf_id: None,
 			}],

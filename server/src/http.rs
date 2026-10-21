@@ -68,6 +68,8 @@ use crate::store::{LeafKind, LeafState, Store, WantedKind};
 mod claims;
 #[path = "http_plans.rs"]
 mod plans;
+#[path = "http_orders.rs"]
+mod orders;
 
 /// What the HTTP handlers reach.
 pub struct App {
@@ -77,6 +79,7 @@ pub struct App {
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
 	pub plans: Arc<crate::plans::Plans>,
+	pub orders: Arc<crate::orders::Orders>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub certification: Certification,
@@ -373,9 +376,9 @@ pub fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
-		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
-			| "order_taken" | "planned" | "conflict" | "hash_reused" =>
+			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" =>
 			StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
@@ -981,6 +984,11 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 				owner: key(&l.owner)?,
 				owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
+				order: match &l.order {
+					Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, asset(&l.asset)?)
+						.map_err(|e| Refusal::malformed(format!("order: {}", e)))?),
+					None => None,
+				},
 			},
 			api::WantedOutput::Offboard(b) => part::OutputRequest::Offboard {
 				asset: asset(&b.asset)?,
@@ -1021,6 +1029,7 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 		owner,
 		owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
 		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
+		order: None,
 	};
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
@@ -1128,6 +1137,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			script_pubkey: Some(hex(r.1.as_bytes())),
 			preimage: p.map(|p| hex(&p)),
 			htlc: l.htlc.as_ref().map(api::HtlcTermsJson::of),
+			order: l.order.as_ref().map(arca_covenant::record_json::order_terms_json),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
 		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
@@ -1451,7 +1461,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			returned: mine.returned,
 			inputs: p.inputs.iter().map(|i| hex(&i.leaf_id)).collect(),
 			outputs: p.outputs.iter().map(|o| match &o.kind {
-				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
+				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, order, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
 					value: o.value.to_string(),
 					template: template.clone(),
@@ -1460,6 +1470,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 					exit_delay_units: *exit_delay_units,
 					leaf_id: o.leaf_id.map(|i| hex(&i)),
 					htlc: htlc.as_ref().map(api::HtlcTermsJson::of),
+					order: order.as_ref().map(arca_covenant::record_json::order_terms_json),
 				}),
 				WantedKind::Offboard { script, .. } => api::ServedOutput::Offboard(api::WantedOffboard {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
@@ -1578,6 +1589,9 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/plans", post(plans::plans))
 		.route("/v1/cancel_plan", post(plans::cancel_plan))
 		.route("/v1/plan_leaf", post(plans::plan_leaf))
+		.route("/v1/order_publish", post(orders::order_publish))
+		.route("/v1/order_fill", post(orders::order_fill))
+		.route("/v1/order_state", post(orders::order_state))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))

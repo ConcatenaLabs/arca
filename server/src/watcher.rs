@@ -16,7 +16,11 @@
 //!    reassignment is published once every checkpoint it spends is on the
 //!    chain. The answer confirms before the leaf's exit delay runs out, so
 //!    the leaf's owner can no longer exit it. A board given up and then
-//!    converted is the same case: its leaf appears.
+//!    converted is the same case: its leaf appears. A resting order's coin
+//!    that a co-signed fill spent ([`crate::orders`]) is answered by the
+//!    fill: each taker's coin is brought on and checkpointed, then the fill
+//!    spends the order's coin by its fill path before its landing delay
+//!    runs out, so its maker cannot land it.
 //! 2. **Boards given up in a round.** Once the round is final, the forfeit of
 //!    a board is published from the board output: no batch sweeps a board, so
 //!    this is how its value comes back to the operator. Every forfeit's
@@ -843,6 +847,11 @@ impl Watcher {
 		if self.answer_plan_coin(leaf_id, op).await? {
 			return Ok(());
 		}
+		if let Some(f) = self.store.order_fill_of(leaf_id).await? {
+			if f.signature.is_some() {
+				return self.answer_fill(&f.transfer_id, true).await;
+			}
+		}
 		let coin = self.coin(leaf_id).await?;
 		if let Some(f) = self.live_forfeit(leaf_id).await? {
 			let (forfeit, pair) = self.forfeit(&coin, &f)?;
@@ -955,9 +964,95 @@ impl Watcher {
 		let first = t.outputs.first().ok_or_else(|| WatcherError::Build("a transfer with no outputs".into()))?;
 		let coin = self.coin(&first.0).await?;
 		match coin.origin {
-			ValidOrigin::Transfer { inputs, outputs, .. } => Ok((inputs, outputs)),
+			ValidOrigin::Transfer { inputs, outputs, .. } | ValidOrigin::Fill { inputs, outputs, .. } => Ok((inputs, outputs)),
 			_ => Err(WatcherError::Build(format!("coin {} is not an output of a transfer", hex(&first.0)))),
 		}
+	}
+
+	/// The first coin the fill `transfer_id` of a resting order made,
+	/// resolved: its origin holds the order coin, the taker's inputs and the
+	/// fill's outputs.
+	async fn fill_coin(&self, transfer_id: &[u8; 32]) -> Result<ValidCoin, WatcherError> {
+		let t = self.store.transfer(transfer_id).await?.ok_or_else(|| WatcherError::Build(format!("fill {} is not known", hex(transfer_id))))?;
+		let first = t.outputs.first().ok_or_else(|| WatcherError::Build("a fill with no outputs".into()))?;
+		let coin = self.coin(&first.0).await?;
+		if !matches!(coin.origin, ValidOrigin::Fill { .. }) {
+			return Err(WatcherError::Build(format!("coin {} is not an output of a fill", hex(&first.0))));
+		}
+		Ok(coin)
+	}
+
+	/// The first output paying `script` the chain holds unspent.
+	async fn unspent_at(&self, script: &Script) -> Result<Option<OutPoint>, WatcherError> {
+		for (txid, vout) in self.store.sightings_of(script.as_bytes()).await? {
+			let op = OutPoint::new(txid_of(&txid), vout);
+			if self.unspent(op).await?.is_some() {
+				return Ok(Some(op));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Answers a resting order's coin that a fill the operator co-signed
+	/// spent, on the chain: the fill is published once the order's coin and
+	/// every taker's checkpoint are on the chain unspent, so the coin is
+	/// spent by its fill path before its landing delay runs out and its maker
+	/// cannot land it. Until then each taker coin is brought on (one step a
+	/// pass; once its leaf is there, the answers to stale exits publish its
+	/// checkpoint). `bring` is false when the answer is to a taker's
+	/// checkpoint: the order's coin is then the maker's to bring, as each
+	/// input of a transfer is its own holder's.
+	async fn answer_fill(&self, transfer_id: &[u8; 32], bring: bool) -> Result<(), WatcherError> {
+		let coin = self.fill_coin(transfer_id).await?;
+		let ValidOrigin::Fill { order, inputs, outputs, .. } = &coin.origin else { unreachable!("a fill's coin") };
+		let Some(order_at) = self.unspent_at(&order.leaf.script_pubkey()).await? else { return Ok(()) };
+		if self.spending(&order_at).await? {
+			return Ok(());
+		}
+		let now = self.now().await?;
+		let mut at = vec![];
+		let mut missing = false;
+		for i in inputs {
+			match self.unspent_at(&i.checkpoint_output().script_pubkey).await? {
+				Some(op) if !self.spending(&op).await? => at.push(op),
+				Some(_) => return Ok(()),
+				None => {
+					missing = true;
+					if bring && self.unspent_at(&i.coin.leaf.script_pubkey()).await?.is_none() {
+						Box::pin(self.bring_on_chain(&i.coin, now)).await?;
+					}
+				},
+			}
+		}
+		if missing {
+			return Ok(());
+		}
+		// What the inputs hold beyond the outputs, per asset: the fill's
+		// margin is in the asset the order is paid in.
+		let mut margins: BTreeMap<AssetId, u64> = BTreeMap::new();
+		*margins.entry(order.asset).or_default() += order.value;
+		for i in inputs {
+			*margins.entry(i.coin.asset).or_default() += i.checkpoint_value;
+		}
+		for o in outputs {
+			let m = margins.entry(o.asset).or_default();
+			*m = m.saturating_sub(o.value);
+		}
+		margins.retain(|_, v| *v > 0);
+		let (asset, margin) = match margins.iter().next() {
+			Some((a, m)) if margins.len() == 1 => (*a, *m),
+			_ => (outputs[0].asset, 0),
+		};
+		let (u, fee_coin, fee) = self.margin_or_coin(asset, margin, |fee| {
+			let u = coin.fill_tx(order_at, &at, fee).map_err(|e| e.to_string())?;
+			let tx = u.tx.clone();
+			Ok((u, tx))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		self.publish(Ready { tx: u.tx, wallet, fee }, "fill", transfer_id.to_vec(),
+			format!("the fill {} of resting order coin {}, on the chain at {}, every checkpoint on the chain", hex(transfer_id),
+				order.id, order_at)).await?;
+		Ok(())
 	}
 
 	/// Publishes the reassignment of the transfer that spent the coin
@@ -967,6 +1062,9 @@ impl Watcher {
 			Some(t) => t,
 			None => return Ok(()),
 		};
+		if self.store.order_fill_by_transfer(&t).await?.is_some_and(|f| f.signature.is_some()) {
+			return self.answer_fill(&t, false).await;
+		}
 		let (inputs, outputs) = self.transfer_parts(&t).await?;
 		let mut at = vec![];
 		for i in &inputs {

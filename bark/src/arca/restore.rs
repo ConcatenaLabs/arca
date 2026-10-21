@@ -860,9 +860,19 @@ impl Wallet {
 			let owner = XOnlyPublicKey::from_str(l["owner"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
 			let owner_nonce = unhex32(l["owner_nonce"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
 			let exit_delay = RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| e.to_string())?;
-			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay });
+			// A resting order's terms, as the participation wanted them: its id
+			// covers them, and its leaf is checked against them.
+			let order = match l.get("order").filter(|o| !o.is_null()) {
+				Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, asset).map_err(|e| e.to_string())?),
+				None => None,
+			};
+			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order });
 			nonces.push((owner_nonce, owner, asset, value));
-			wanted_json.push(json!({"nonce": hex(&owner_nonce), "asset": asset.to_string(), "value": value.to_string()}));
+			let mut w = json!({"nonce": hex(&owner_nonce), "asset": asset.to_string(), "value": value.to_string()});
+			if let Some(o) = &order {
+				w["order"] = arca_covenant::record_json::order_terms_json(o);
+			}
+			wanted_json.push(w);
 		}
 		let mut fees = vec![];
 		for f in p["fees"].as_array().cloned().unwrap_or_default() {
@@ -876,7 +886,7 @@ impl Wallet {
 			None => participation_id(&self.genesis, &self.operator, &inputs, &wanted, &fees, not_before),
 			Some(f) => {
 				let (order, terms) = arca_covenant::FillOrder::from_relay(&f["order"]).map_err(|e| format!("take {}: {}", pid, e))?;
-				let (Some(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay }), Some(fee), 1, 1) =
+				let (Some(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, .. }), Some(fee), 1, 1) =
 					(wanted.first().cloned(), fees.first().copied(), wanted.len(), fees.len()) else {
 					return Err(format!("take {} is served with {} leaves and {} fees: a take wants one leaf and pays one fee", pid,
 						wanted.len(), fees.len()));

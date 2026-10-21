@@ -25,6 +25,7 @@ pub mod http;
 pub mod keeper;
 pub mod lightning;
 pub mod nursery;
+pub mod orders;
 pub mod params;
 pub mod participations;
 pub mod plans;

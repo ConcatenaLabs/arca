@@ -186,6 +186,7 @@ impl Boards {
 				NewScript { script_pubkey: board.script_pubkey().to_bytes(), kind: ScriptKind::Board },
 				NewScript { script_pubkey: board.leaf.script_pubkey().to_bytes(), kind: ScriptKind::Leaf },
 			],
+			maker_coin: false,
 		};
 		self.store.insert_board(&coin, &record_bytes, &valid.txid.to_byte_array(), valid.vout, &serialize(tx)).await?;
 		log::info!("board {} registered, paid by {}:{}", leaf_id, valid.txid, valid.vout);

@@ -43,6 +43,7 @@ fn every_refusal_code_is_listed() {
 		include_str!("../src/boards.rs"), include_str!("../src/cosign.rs"), include_str!("../src/forfeits.rs"),
 		include_str!("../src/participations.rs"), include_str!("../src/lightning/mod.rs"),
 		include_str!("../src/lightning/send.rs"), include_str!("../src/lightning/receive.rs"), include_str!("../src/plans.rs"),
+		include_str!("../src/orders.rs"),
 	] {
 		found.extend(codes_of(src));
 	}

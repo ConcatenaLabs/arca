@@ -433,6 +433,31 @@ pub struct OrderFilled {
 	pub credited: u64,
 }
 
+/// The tag of the digest a maker signs to publish a resting order to its
+/// operator.
+pub const PUBLISH_TAG: &[u8] = b"Arca/order-publish";
+
+/// What an order's leaf key signs to publish it, so that takers fill it while
+/// its maker is away: `SHA256(T ‖ T ‖ genesis ‖ S ‖ order id ‖ the four credit
+/// nonces ‖ mailbox)`, `T = SHA256("Arca/order-publish")`, where the order id
+/// is the leaf id of the coin a round made of it.
+pub fn publish_digest(chain: &Chain, operator: &XOnlyPublicKey, order: &crate::LeafId, credit_nonces: &[[u8; 32]; CREDIT_KEYS],
+	mailbox: &XOnlyPublicKey) -> [u8; 32]
+{
+	let tag = sha256(PUBLISH_TAG);
+	let mut b = Vec::with_capacity(32 * 9 + 32 * CREDIT_KEYS);
+	b.extend(tag);
+	b.extend(tag);
+	b.extend(chain.genesis_bytes());
+	b.extend(operator.serialize());
+	b.extend(order.0);
+	for n in credit_nonces {
+		b.extend(n);
+	}
+	b.extend(mailbox.serialize());
+	sha256(&b)
+}
+
 /// The chain's commitment to an output (Simplicity's `output_hash`):
 /// `SHA256(asset ‖ value ‖ nonce ‖ SHA256(scriptPubKey) ‖ SHA256(range
 /// proof))`, the asset, value and nonce as the transaction encodes them (a
@@ -591,6 +616,22 @@ impl OrderPolicy {
 	/// The landed output for a coin holding `value`: the whole of it, as SeqDEX's order.
 	pub fn landed_output(&self, value: u64) -> ExplicitOutput {
 		ExplicitOutput::new(self.landed.terms.asset_a, value, self.landed.script_pubkey())
+	}
+
+	/// The landing of `coin`, this order on the chain holding `value`: the
+	/// whole of it into SeqDEX's order for the same terms at output 0, input
+	/// 0's sequence the exit delay, so it confirms only that long after the
+	/// coin did. It takes no signature, and keeps nothing for a fee: `fee` is
+	/// a fee coin ([`crate::spend::FeeSource::Coin`]).
+	pub fn landing_tx(&self, coin: elements::OutPoint, value: u64, fee: &crate::spend::FeeSource)
+		-> Result<crate::spend::UnrollTx, crate::spend::SpendError>
+	{
+		let spent = crate::spend::explicit_txout(self.landed.terms.asset_a, value, self.script_pubkey());
+		let seq = elements::Sequence(self.exit_delay.to_sequence());
+		let mut u = crate::spend::assemble(elements::LockTime::ZERO, vec![(coin, spent, seq)], &[self.landed_output(value)], fee,
+			crate::spend::FEE_COIN_SEQUENCE)?;
+		u.tx.input[0].witness.script_witness = self.landing_witness();
+		Ok(u)
 	}
 
 	/// What the operator signs to fill a coin of this script holding

@@ -131,66 +131,7 @@ impl Store {
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
-		// One reassignment at a time per output 0: two that could be merged
-		// always agree there.
-		let lock = i64::from_le_bytes(reassignment.first_output[..8].try_into().expect("8 bytes"));
-		t.execute("SELECT pg_advisory_xact_lock($1)", &[&lock]).await?;
-		let seen = t.query("SELECT inputs, outputs FROM reassignment WHERE first_output = $1",
-			&[&&reassignment.first_output[..]]).await?;
-		let seen: Vec<(Vec<u8>, Vec<u8>)> = seen.iter().map(|r| (r.get(0), r.get(1))).collect();
-		admit(&seen).map_err(StoreError::Mergeable)?;
-		for i in inputs {
-			let r = t.query_opt(
-				"SELECT leaf_id, kind::text, asset, value, owner_key, script_pubkey, hops, record, state::text, spent_by
-				 FROM leaf WHERE leaf_id = $1 FOR UPDATE",
-				&[&&i.leaf_id[..]],
-			).await?;
-			let leaf: LeafRow = match r {
-				Some(r) => leaf_row(&r)?,
-				None => return Err(StoreError::LeafUnknown(super::hex(&i.leaf_id))),
-			};
-			match leaf.state {
-				super::LeafState::Live => {},
-				super::LeafState::Spent => return Err(StoreError::LeafSpent(super::hex(&i.leaf_id))),
-				other => return Err(StoreError::LeafNotLive(super::hex(&i.leaf_id), other.as_str())),
-			}
-		}
-		t.execute("INSERT INTO transfer (transfer_id, request_hash, state) VALUES ($1, $1, 'recorded')",
-			&[&&transfer_id[..]]).await?;
-		for (k, i) in inputs.iter().enumerate() {
-			let value = i64::try_from(i.checkpoint_value).map_err(|_| StoreError::Corrupt("value".into()))?;
-			let r = t.execute(
-				"INSERT INTO transfer_input (transfer_id, idx, leaf_id, checkpoint_value, checkpoint_owner_sig, reassignment_owner_sig)
-				 VALUES ($1, $2, $3, $4, $5, $6)",
-				&[&&transfer_id[..], &(k as i16), &&i.leaf_id[..], &value, &&i.checkpoint_owner_sig[..], &&i.reassignment_owner_sig[..]],
-			).await;
-			if let Err(e) = r {
-				if StoreError::is_unique(&e, "transfer_input_leaf_id_key") {
-					return Err(StoreError::LeafSpent(super::hex(&i.leaf_id)));
-				}
-				return Err(e.into());
-			}
-			t.execute("UPDATE leaf SET state = 'spent', spent_by = $2, updated_at = now() WHERE leaf_id = $1",
-				&[&&i.leaf_id[..], &&transfer_id[..]]).await?;
-			let r = t.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'checkpoint', $2)",
-				&[&i.checkpoint_script, &&i.leaf_id[..]]).await;
-			if let Err(e) = r {
-				if StoreError::is_unique(&e, "arca_script_pkey") {
-					return Err(StoreError::ScriptReused);
-				}
-				return Err(e.into());
-			}
-		}
-		for (k, o) in outputs.iter().enumerate() {
-			insert_coin(&t, &o.coin).await?;
-			t.execute("INSERT INTO transfer_output (transfer_id, idx, leaf_id, mailbox_key) VALUES ($1, $2, $3, $4)",
-				&[&&transfer_id[..], &(k as i16), &&o.coin.leaf_id[..], &&o.mailbox_key[..]]).await?;
-			t.execute("INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload) VALUES ($1, 'pending', NULL, $2)",
-				&[&&o.mailbox_key[..], &o.notice]).await?;
-		}
-		t.execute("INSERT INTO reassignment (transfer_id, first_output, inputs, outputs) VALUES ($1, $2, $3, $4)",
-			&[&&transfer_id[..], &&reassignment.first_output[..], &reassignment.inputs, &reassignment.outputs]).await?;
-		super::insert_messages(&t, messages).await?;
+		record_transfer_in(&t, transfer_id, reassignment, admit, inputs, outputs, messages).await?;
 		t.commit().await?;
 		Ok(())
 	}
@@ -320,4 +261,76 @@ impl Store {
 		let r = conn.query_opt("SELECT transfer_id FROM transfer_input WHERE leaf_id = $1", &[&&leaf_id[..]]).await?;
 		r.map(|r| array32(r.get(0), "transfer id")).transpose()
 	}
+}
+
+/// [`Store::record_transfer`] inside the database transaction `t`, which the
+/// caller commits: a fill of a resting order records its transfer, the order
+/// coin's spend and the fill together.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_transfer_in<F>(t: &tokio_postgres::Transaction<'_>, transfer_id: &[u8; 32], reassignment: &NewReassignment,
+	admit: F, inputs: &[NewTransferInput], outputs: &[NewTransferOutput], messages: &[super::SignerMessage]) -> Result<(), StoreError>
+where
+	F: FnOnce(&[(Vec<u8>, Vec<u8>)]) -> Result<(), String>,
+{
+	// One reassignment at a time per output 0: two that could be merged
+	// always agree there.
+	let lock = i64::from_le_bytes(reassignment.first_output[..8].try_into().expect("8 bytes"));
+	t.execute("SELECT pg_advisory_xact_lock($1)", &[&lock]).await?;
+	let seen = t.query("SELECT inputs, outputs FROM reassignment WHERE first_output = $1",
+		&[&&reassignment.first_output[..]]).await?;
+	let seen: Vec<(Vec<u8>, Vec<u8>)> = seen.iter().map(|r| (r.get(0), r.get(1))).collect();
+	admit(&seen).map_err(StoreError::Mergeable)?;
+	for i in inputs {
+		let r = t.query_opt(
+			"SELECT leaf_id, kind::text, asset, value, owner_key, script_pubkey, hops, record, state::text, spent_by
+			 FROM leaf WHERE leaf_id = $1 FOR UPDATE",
+			&[&&i.leaf_id[..]],
+		).await?;
+		let leaf: LeafRow = match r {
+			Some(r) => leaf_row(&r)?,
+			None => return Err(StoreError::LeafUnknown(super::hex(&i.leaf_id))),
+		};
+		match leaf.state {
+			super::LeafState::Live => {},
+			super::LeafState::Spent => return Err(StoreError::LeafSpent(super::hex(&i.leaf_id))),
+			other => return Err(StoreError::LeafNotLive(super::hex(&i.leaf_id), other.as_str())),
+		}
+	}
+	t.execute("INSERT INTO transfer (transfer_id, request_hash, state) VALUES ($1, $1, 'recorded')",
+		&[&&transfer_id[..]]).await?;
+	for (k, i) in inputs.iter().enumerate() {
+		let value = i64::try_from(i.checkpoint_value).map_err(|_| StoreError::Corrupt("value".into()))?;
+		let r = t.execute(
+			"INSERT INTO transfer_input (transfer_id, idx, leaf_id, checkpoint_value, checkpoint_owner_sig, reassignment_owner_sig)
+			 VALUES ($1, $2, $3, $4, $5, $6)",
+			&[&&transfer_id[..], &(k as i16), &&i.leaf_id[..], &value, &&i.checkpoint_owner_sig[..], &&i.reassignment_owner_sig[..]],
+		).await;
+		if let Err(e) = r {
+			if StoreError::is_unique(&e, "transfer_input_leaf_id_key") {
+				return Err(StoreError::LeafSpent(super::hex(&i.leaf_id)));
+			}
+			return Err(e.into());
+		}
+		t.execute("UPDATE leaf SET state = 'spent', spent_by = $2, updated_at = now() WHERE leaf_id = $1",
+			&[&&i.leaf_id[..], &&transfer_id[..]]).await?;
+		let r = t.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'checkpoint', $2)",
+			&[&i.checkpoint_script, &&i.leaf_id[..]]).await;
+		if let Err(e) = r {
+			if StoreError::is_unique(&e, "arca_script_pkey") {
+				return Err(StoreError::ScriptReused);
+			}
+			return Err(e.into());
+		}
+	}
+	for (k, o) in outputs.iter().enumerate() {
+		insert_coin(&t, &o.coin).await?;
+		t.execute("INSERT INTO transfer_output (transfer_id, idx, leaf_id, mailbox_key) VALUES ($1, $2, $3, $4)",
+			&[&&transfer_id[..], &(k as i16), &&o.coin.leaf_id[..], &&o.mailbox_key[..]]).await?;
+		t.execute("INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload) VALUES ($1, 'pending', NULL, $2)",
+			&[&&o.mailbox_key[..], &o.notice]).await?;
+	}
+	t.execute("INSERT INTO reassignment (transfer_id, first_output, inputs, outputs) VALUES ($1, $2, $3, $4)",
+		&[&&transfer_id[..], &&reassignment.first_output[..], &reassignment.inputs, &reassignment.outputs]).await?;
+	super::insert_messages(&t, messages).await?;
+	Ok(())
 }

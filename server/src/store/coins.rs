@@ -131,6 +131,12 @@ pub struct NewCoin {
 	pub operator_nonce: Option<[u8; 32]>,
 	/// Every Arca script the coin brings, its own included.
 	pub scripts: Vec<NewScript>,
+	/// A coin a fill makes for an order's maker: its credit, or the order
+	/// resting again under the maker's leaf key (each under its own salt).
+	/// Such a coin is outside the one-key rule: the remainder shares the key
+	/// of the order's first coin, and a credit's key is public in the order's
+	/// terms, so a leaf anyone pays to it must not block the fill.
+	pub maker_coin: bool,
 }
 
 /// A coin as the database holds it.
@@ -221,8 +227,11 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 		take_nonce(tx, nonce, &coin.leaf_id).await?;
 	}
 	// A key a participation wants is promised to the leaf its round makes,
-	// while the participation stands.
-	if coin.kind != LeafKind::Batch
+	// while the participation stands. A coin a fill makes for an order's
+	// maker is under the order's own key, which its round made a leaf of
+	// already, or under a credit key no participation can want without the
+	// maker's proof.
+	if coin.kind != LeafKind::Batch && !coin.maker_coin
 		&& tx.query_opt("SELECT 1 FROM participation_output WHERE owner_key = $1 AND kind = 'leaf' AND active",
 			&[&&coin.owner_key[..]]).await?.is_some()
 	{
@@ -241,9 +250,12 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 		}
 	}
 	let value = i64::try_from(coin.value).map_err(|_| StoreError::Corrupt(format!("value {}", coin.value)))?;
+	// `maker_coin` defaults to false, and is named only for a coin a fill
+	// makes for an order's maker.
+	let maker = if coin.maker_coin { (", maker_coin", ", true") } else { ("", "") };
 	let r = tx.execute(
-		"INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state, spent_by)
-		 VALUES ($1, $2::text::leaf_kind, $3, $4, $5, $6, $7, $8, $9::text::leaf_state, NULL)",
+		&format!("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state, spent_by{})
+		 VALUES ($1, $2::text::leaf_kind, $3, $4, $5, $6, $7, $8, $9::text::leaf_state, NULL{})", maker.0, maker.1),
 		&[
 			&&coin.leaf_id[..], &coin.kind.as_str(), &&coin.asset[..], &value, &&coin.owner_key[..],
 			&coin.script_pubkey, &(coin.hops as i16), &coin.record, &coin.state.as_str(),

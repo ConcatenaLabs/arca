@@ -39,6 +39,15 @@
 //!   operator's own paths: a clock's release or roll, `R`, a sweep, a reclaim,
 //!   a forfeit's claim, the connector's issuance, an offboard's reclaim), and
 //!   only for an input that spends a taproot output;
+//! - `{"op":"order_fill","owner":…,"salt":…,"asset_in":…,"exit_delay_units":…,"order":{…},"value_in":…,"partial":…,"outputs":[…],"known":…}`:
+//!   `S`'s signature over a fill of a resting order's coin
+//!   ([`arca_covenant::order`]), which the signer builds from the order's
+//!   terms, the coin and the outputs after judging the fill by the order's
+//!   program: the credit at its price to the next credit leaf, the remainder
+//!   under the next salt, the lot. No owner signs a fill: the order's terms
+//!   are its maker's consent, and the program enforces them. It is recorded
+//!   under the coin's salt as its one spend, so a fill and a cancel of one
+//!   coin exclude each other, and two fills of it too;
 //! - `{"op":"unroll","children_hash":…,"time":…}`: the operator's unroll
 //!   authorisation for a node, `S`'s signature over
 //!   `SHA256("Arca/unroll" ‖ H ‖ t)`, which the signer builds itself from the
@@ -252,6 +261,20 @@ pub enum Request {
 	/// The operator's unroll authorisation for the node whose children hash
 	/// is `children_hash` (32 bytes, hex), from the median time `time` on.
 	Unroll { children_hash: String, time: u32 },
+	/// A fill of the resting order whose coin is `owner`'s (the maker's leaf
+	/// key) under `salt`: the order's terms in the leaf record's JSON form,
+	/// the asset it sells and its exit delay, what the coin holds, whether
+	/// the fill is partial, and the outputs it commits to (2 to 4). The
+	/// signer rebuilds the order, judges the fill by its program's rules,
+	/// and signs the fill digest it builds itself
+	/// (`arca_covenant::OrderPolicy::fill_digest`), recorded as the one
+	/// spend under the salt.
+	OrderFill {
+		owner: String, salt: String, asset_in: String, exit_delay_units: u16, order: serde_json::Value, value_in: String, partial: bool,
+		outputs: Vec<WireOutput>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		known: Option<WireEntryRef>,
+	},
 }
 
 /// Why the signer will not sign a spend: `Ok` when `leaf` names `operator`
@@ -1934,6 +1957,32 @@ impl SignerClient {
 		let r = self.ask(&Request::Rebind {
 			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
+		}).await?;
+		let head = SignedHead::from_answer(&r)?;
+		if let (Some(store), Some(h)) = (&self.store, &head) {
+			self.keep_acks(h).await?;
+			store.set_signer_head_signed(h.entry, &h.hash, h.signature.as_ref()).await.map_err(|e| SignerError::Database(e.to_string()))?;
+		}
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		let sig = Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))?;
+		Ok((sig, head))
+	}
+
+	/// `S`'s signature over a fill of the resting order `order` (its coin
+	/// holding `value_in`) into `outputs`, partial or whole, with the entry of
+	/// the record it was recorded as, signed.
+	pub async fn order_fill(&self, order: &arca_covenant::OrderPolicy, value_in: u64, partial: bool, outputs: &[ExplicitOutput])
+		-> Result<(Signature, Option<SignedHead>), SignerError>
+	{
+		let known = match &self.store {
+			Some(store) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
+				.map(|(entry, hash)| WireEntryRef { entry, hash: hex(&hash), signature: None }),
+			None => None,
+		};
+		let r = self.ask(&Request::OrderFill {
+			owner: hex(&order.owner.serialize()), salt: hex(&order.salt), asset_in: order.terms().asset_a.to_string(),
+			exit_delay_units: order.exit_delay.units(), order: arca_covenant::record_json::order_terms_json(&order.leaf_terms()),
+			value_in: value_in.to_string(), partial, outputs: outputs.iter().map(WireOutput::from_output).collect(), known,
 		}).await?;
 		let head = SignedHead::from_answer(&r)?;
 		if let (Some(store), Some(h)) = (&self.store, &head) {

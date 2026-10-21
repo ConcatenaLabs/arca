@@ -34,11 +34,11 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"double_spend", "fee", "forfeit_set", "hash_reused", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
-	"nonce_used", "not_accepted", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "order", "order_expiring", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
+	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
+	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_leaf", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/info`.
@@ -693,6 +693,112 @@ pub struct Cosigned {
 	pub signer_record: Option<RecordHead>,
 }
 
+/// `POST /v1/order_publish`: a maker publishes the resting order a round
+/// made it, so that takers fill it while the maker is away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderPublish {
+	/// The record of the coin a round made of the order, binary form, as
+	/// the maker holds it: with its entry's preimage and the maker's unroll
+	/// authorisations.
+	pub record: String,
+	/// The nonces of the order's four credit keys, the first credit's first.
+	pub credit_nonces: Vec<String>,
+	/// The mailbox the order's credits and remainders go to.
+	pub mailbox: String,
+	/// The order's leaf key's signature over the publication.
+	pub signature: String,
+}
+
+/// `POST /v1/order_fill`: a taker fills a resting order in the tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderFill {
+	/// The order: the leaf id of the coin a round made of it.
+	pub order: String,
+	/// The coin it rests at, as `order_state` showed it.
+	pub coin: String,
+	/// What the taker takes of the order's asset, in atoms.
+	pub filled: String,
+	/// The taker's coins, in the asset the order is paid in, each with its
+	/// owner's signatures over its checkpoint and over the fill's outputs.
+	pub inputs: Vec<TransferInput>,
+	/// The taker's leaves: of what it fills, then its change.
+	pub outputs: Vec<TransferOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderFilled {
+	pub transfer_id: String,
+	/// The operator's signature over the fill.
+	pub fill_signature: String,
+	/// The operator's signatures for each of the taker's coins.
+	pub signatures: Vec<OperatorSignatures>,
+	/// Each coin the fill makes, in output order: the maker's credit, the
+	/// order resting again after a partial fill, then the taker's leaves.
+	pub outputs: Vec<Coin>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signer_record: Option<RecordHead>,
+}
+
+/// `POST /v1/order_state`: how resting orders stand, by their ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderStateRequest {
+	pub orders: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderStates {
+	/// Each order asked for that is published here; one that is not is left
+	/// out.
+	pub orders: Vec<OrderState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderState {
+	pub order: String,
+	/// `resting` (a taker can fill it), `exhausted` (it rests, and fills no
+	/// more: its credit keys are used), `filled` (filled whole), `cancelled`
+	/// (its maker gave its coin up otherwise), `pending`, or `unknown`.
+	pub state: String,
+	/// The coin it rests at now, and what of the asset it sells it holds.
+	pub coin: String,
+	pub asset: String,
+	pub value: String,
+	/// What a taker builds a fill from: the coin's leaf key, salt, exit delay
+	/// and order terms (the leaf record's `order`, its credit keys the next
+	/// first).
+	pub owner: String,
+	pub salt: String,
+	pub exit_delay_units: u16,
+	pub terms: serde_json::Value,
+	pub fills_left: u8,
+	/// The earliest first expiry of the batches the coin rests on.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expiry: Option<u32>,
+	/// The coin's record, binary form, while it rests: a taker checks the
+	/// coin is in the tree before it signs a fill of it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub record: Option<String>,
+	pub fills: Vec<OrderFillState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderFillState {
+	pub transfer_id: String,
+	/// The order coin it spent.
+	pub coin: String,
+	pub filled: String,
+	pub credited: String,
+	pub partial: bool,
+	pub signed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorSignatures {
@@ -993,6 +1099,9 @@ pub struct ServedWantedLeaf {
 	/// An `htlc-1` leaf's terms (a payment received over Lightning).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
+	/// An `order-2` leaf's terms, a resting order.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub order: Option<serde_json::Value>,
 }
 
 /// A forfeit of the coin, for the round of one attempt: what its output
@@ -1097,6 +1206,11 @@ pub struct WantedLeaf {
 	pub mailbox: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mailbox_proof: Option<String>,
+	/// `order-2`'s terms, for a resting order (template `order-2`), in the
+	/// leaf record's JSON form of them (`arca_covenant::record_json::order_terms_json`):
+	/// covered by the participation's id.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub order: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1528,6 +1642,9 @@ pub struct TreeLeaf {
 	/// An `htlc-1` leaf's terms (a payment received over Lightning).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
+	/// An `order-2` leaf's terms, a resting order.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub order: Option<serde_json::Value>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each

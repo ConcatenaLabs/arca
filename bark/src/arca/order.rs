@@ -309,7 +309,7 @@ impl Wallet {
 			let owner = self.keys.leaf_xonly(&nonce)?;
 			self.store.put_nonce(&nonce, &owner.serialize(), "order change")?;
 			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner, owner_nonce: nonce,
-				exit_delay: self.exit_delay() });
+				exit_delay: self.exit_delay(), order: None });
 			wanted_json.push(json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
 		}
 		let fees = vec![(ask.sell, plan.fee)];

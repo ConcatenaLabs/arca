@@ -260,6 +260,7 @@ impl Participations {
 					exit_delay_units: d.exit_delay.units(),
 					operator_nonce: [0; 32],
 					htlc: None,
+					order: None,
 				},
 				leaf_id: None,
 			}).collect(),

@@ -187,7 +187,11 @@ pub fn lightning_receive_digest(chain: &Chain, operator: &XOnlyPublicKey, asset:
 /// An output a participation wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wanted {
-	Leaf { asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime },
+	/// A leaf; for `order-2`, a resting order, with its terms.
+	Leaf {
+		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
+		order: Option<arca_covenant::OrderLeafTerms>,
+	},
 	/// An on-chain output the round pays, hash-locked, and its unlock moves to
 	/// `script` with exactly `value` of `asset`.
 	Offboard { asset: AssetId, value: u64, script: elements::Script },
@@ -196,10 +200,16 @@ pub enum Wanted {
 impl Wanted {
 	pub fn json(&self) -> Value {
 		match self {
-			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => json!({"leaf": {
-				"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
-				"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
-			}}),
+			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
+				let mut j = json!({"leaf": {
+					"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
+					"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
+				}});
+				if let Some(o) = order {
+					j["leaf"]["order"] = arca_covenant::record_json::order_terms_json(o);
+				}
+				j
+			},
 			Wanted::Offboard { asset, value, script } => json!({"offboard": {
 				"asset": asset.to_string(), "value": value.to_string(), "script": hex(script.as_bytes()),
 			}}),
@@ -225,7 +235,7 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	e.input(&[outputs.len() as u8]);
 	for o in outputs {
 		match o {
-			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => {
+			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
 				e.input(&[0]);
 				e.input(&asset.into_inner().to_byte_array());
 				e.input(&value.to_le_bytes());
@@ -233,6 +243,11 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 				e.input(&owner.serialize());
 				e.input(owner_nonce);
 				e.input(&exit_delay.units().to_le_bytes());
+				if let Some(o) = order {
+					let mut b = vec![];
+					o.encode_to(&mut b);
+					e.input(&b);
+				}
 			},
 			Wanted::Offboard { asset, value, script } => {
 				e.input(&[1]);
@@ -299,11 +314,11 @@ pub const REFUSALS: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "conflict", "depth_limit",
 	"double_spend", "fee", "forfeit_set", "hash_reused", "htlc", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
-	"not_in_round", "not_live", "not_participating", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
-	"order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned",
+	"not_an_order", "not_in_round", "not_live", "not_participating", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
+	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",
-	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator",
+	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator",
 	"wrong_round",
 ];
 
