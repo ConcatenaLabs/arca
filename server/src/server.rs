@@ -1087,7 +1087,7 @@ impl Server {
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), RoundConfig::default());
-		let forfeits = Forfeits::new(store.clone(), params.clone(), signer.clone(), cosigner.clone());
+		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {
 				reclaim_early: config.watcher.reclaim_early,

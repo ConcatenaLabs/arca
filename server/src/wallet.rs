@@ -309,6 +309,22 @@ impl Wallet {
 		self.build_locked(&req.outputs, req.connector, req.fee_asset, &[], &[], &[]).await
 	}
 
+	/// Builds and signs a transaction that spends `coin` back to the wallet,
+	/// its fee in `fee_asset` (from `coin` itself when it is of that asset
+	/// and holds enough, else from the wallet's coins of it), the rest to
+	/// fresh change scripts. Once it is final, a transaction of the wallet's
+	/// that spends `coin` too and was never broadcast (a round dropped
+	/// unbroadcast) can never confirm. Refused (`Raced`) when `coin` is spent
+	/// or not spendable now.
+	pub async fn spend_back(&self, coin: &WalletCoin, fee_asset: AssetId) -> Result<Built, WalletError> {
+		self.fee_for(fee_asset, 1).await?;
+		let _one = self.building.lock().await;
+		if !self.store.wallet_coin_at(&coin.txid, coin.vout).await?.is_some_and(|w| w.spent_by.is_none()) || !self.spendable(coin).await? {
+			return Err(WalletError::Raced);
+		}
+		self.build_locked(&[], None, fee_asset, &[], &[], std::slice::from_ref(coin)).await
+	}
+
 	/// Builds and signs a round transaction that creates `batches` batches.
 	/// The wallet chooses one of its spendable coins per batch, each of which
 	/// issues one explicit atom of a new asset, with a zero contract hash and

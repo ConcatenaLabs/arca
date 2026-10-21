@@ -27,6 +27,7 @@
 mod common;
 
 use std::process::Command;
+use std::str::FromStr;
 
 use elements::encode::serialize;
 use elements::hashes::Hash;
@@ -581,4 +582,300 @@ async fn a_take_that_hands_over_no_forfeits_gets_no_maker_paid() {
 	round_final(&r, &again.txid()).await;
 	assert_eq!(complete(&r, &id1, &c1, &[b1], &k1, &n1), 499_500);
 	assert!(r.unspent(&at2), "order 2 still rests, unpaid");
+}
+
+/// The operator's spendable pools of `a` and `b`.
+async fn pools(r: &Running, a: AssetId, b: AssetId) -> (u64, u64) {
+	let bal = r.server.wallet.balance().await.unwrap();
+	(bal.get(&a).copied().unwrap_or(0), bal.get(&b).copied().unwrap_or(0))
+}
+
+/// [`hand_over`], when the take `id` is still issued in its unbroadcast
+/// round: whether its forfeits went in. A take whose round the server has
+/// dropped meanwhile hands nothing over.
+fn hand_over_if_held(r: &Running, id: &[u8; 32], coin: &Held, bases: &[Transaction], key: &Keypair, nonce: &[u8; 32]) -> bool {
+	let st = status(r, id);
+	if st["state"] != "issued" || st["round"]["tx"].as_str().is_none() {
+		println!("  {}: nothing to hand over, the take is {}", hex(&id[..4]), st["state"]);
+		return false;
+	}
+	let round: Transaction = elements::encode::deserialize(&unhex(st["round"]["tx"].as_str().unwrap())).unwrap();
+	let o = &st["outputs"][0];
+	let published = r.http.post("tree", &json!({"txid": st["round"]["txid"], "vout": o["batch_vout"]})).ok();
+	let tree = common::client::rebuild(&published);
+	let record = tree.record(o["leaf_index"].as_u64().unwrap() as usize);
+	let new_valid = record.validate(&round, &common::rounds::accept_policy(r), &xonly(key), nonce).unwrap();
+	let old = coin.record.resolve(bases, &r.policy()).unwrap();
+	let f = forfeit_for(&old, &new_valid, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(id),
+		"forfeits": [{"leaf_id": coin.id.to_string(), "signature": forfeit_sig(&f, &coin.key)}],
+		"leaves": [auths_json(&new_valid, key, created(&record))]}));
+	println!("  {}: forfeits handed over for round {}: {} {}", hex(&id[..4]), round.txid(), done.status, done.json["state"]);
+	done.status == 200
+}
+
+/// The coin of the operator's among the inputs of `tx` past its `orders`
+/// order inputs that the wallet has spent since in another transaction, and
+/// that transaction.
+async fn spent_otherwise(r: &Running, tx: &Transaction, orders: usize) -> Option<(OutPoint, elements::Txid)> {
+	let mut found = None;
+	for i in tx.input.iter().skip(orders) {
+		let op = i.previous_output;
+		let Some(c) = r.server.store.wallet_coin_at(&op.txid.to_byte_array(), op.vout).await.unwrap() else { continue };
+		if let Some(by) = c.spent_by.filter(|b| *b != tx.txid().to_byte_array()) {
+			assert!(found.is_none(), "one coin of the dropped round is spent, not two");
+			found = Some((op, elements::Txid::from_byte_array(by)));
+		}
+	}
+	found
+}
+
+/// The round `tx`, dropped unbroadcast, can never confirm: the transaction
+/// of the operator's wallet spending one of its coins is final, and the node
+/// refuses the round for that input.
+async fn dead_on_the_chain(r: &Running, tx: &Transaction, orders: usize) -> elements::Txid {
+	let (coin, by) = spent_otherwise(r, tx, orders).await.expect("one of the dropped round's own coins is spent");
+	let start = std::time::Instant::now();
+	loop {
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		if r.server.finality.status(&by).await.unwrap().is_final() {
+			break;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(120), "the spend of coin {} never became final", coin);
+	}
+	let spender: Transaction = r.rt.client().raw_transaction(&by).unwrap();
+	assert!(spender.input.iter().any(|i| i.previous_output == coin), "{} spends {}", by, coin);
+	assert!(!r.unspent(&coin));
+	let (ok, why, _) = tokio::task::block_in_place(|| r.server.finality.source().test_accept(tx)).unwrap();
+	println!("round {} can never confirm: its coin {} is spent by {} ({} input(s), {} output(s)), final; the node on the round: {} {:?}",
+		tx.txid(), coin, by, spender.input.len(), spender.output.len(), ok, why);
+	assert!(!ok);
+	let why = why.unwrap_or_default();
+	assert!(why.contains("missing-inputs") || why.contains("bad-txns-inputs-missingorspent"), "{}", why);
+	by
+}
+
+/// R7l's F4 probe, turned around (D73): two takes in one fill round; while
+/// the round is held for their forfeits, an outsider fills take 1's order on
+/// the chain, and both takes then hand their forfeits over, as far as the
+/// server still takes them. The round is never put to the node: before it
+/// goes out its orders are checked again at the node, and the spent one
+/// drops the round unbroadcast, voids take 1 with the reason and runs take 2
+/// again. One of the round's own coins is spent at once in a transaction of
+/// the operator's wallet, so the dropped round can never confirm. The
+/// operator's pools are free, take 2 completes in the round built after it,
+/// a refresh in Y runs, and a restart undoes none of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_spent_while_its_round_is_held_drops_the_round() {
+	let (mut r, z) = start(false).await;
+	let y = r.y;
+	let (c1, b1) = holder(&mut r, "held taker 1", y, 1_000_000).await;
+	let (c2, b2) = holder(&mut r, "held taker 2", z, 1_000_000).await;
+	let (c3, _) = holder(&mut r, "held refresher", y, 500_000).await;
+	let o1 = terms(&r, "held maker 1", y, 2, 1, 10_000);
+	let o2 = terms(&r, "held maker 2", z, 5, 2, 1_000);
+	let at1 = rest(&mut r, &o1, 600_000);
+	let at2 = rest(&mut r, &o2, 400_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let before = pools(&r, y, z).await;
+	let (id1, k1, n1) = take(&r, &c1, at1, &o1, 600_000, 499_500, 1_000, "held taker 1");
+	let (id2, k2, n2) = take(&r, &c2, at2, &o2, 400_000, 400_000, 0, "held taker 2");
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let tx = built[0].tx.clone();
+	println!("round built {}: {}", tx.txid(), built[0].broadcast);
+
+	// The outsider fills order 1 while the round is held.
+	let out = outside_fill(&mut r, &o1, at1, 600_000);
+	r.rt.client().send_raw_transaction(&out).unwrap();
+	println!("an outsider fills order 1 while the round is held: {}", out.txid());
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	hand_over_if_held(&r, &id1, &c1, &[b1.clone()], &k1, &n1);
+	hand_over_if_held(&r, &id2, &c2, &[b2.clone()], &k2, &n2);
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+	let nursery = r.server.store.nursery_get(&tx.txid().to_byte_array()).await.unwrap().map(|n| (n.state, n.last_result));
+	println!("after a pass: round {:?} | in the mempool {} | the nursery {:?}", row.state, node::in_mempool(&r.rt, &tx.txid()), nursery);
+	assert_eq!(row.state, server::store::RoundState::Lost, "the round is dropped, not broadcast");
+	assert!(nursery.is_none(), "never handed to the node");
+	assert!(!node::in_mempool(&r.rt, &tx.txid()));
+	let st1 = status(&r, &id1);
+	println!("take 1: {} — {}", st1["state"], st1["void_reason"]);
+	assert_eq!(st1["state"], "void");
+	let why = st1["void_reason"].as_str().unwrap();
+	assert!(why.contains("is spent") && why.contains("dropped unbroadcast"), "{}", why);
+	assert_eq!(st1["inputs"][0]["returned"], true, "no forfeit of it can confirm: the coin is its owner's again");
+	let st2 = status(&r, &id2);
+	println!("take 2: {} (attempt {})", st2["state"], st2["attempt"]);
+	assert_eq!(st2["state"], "pending");
+	assert_eq!(st2["attempt"], 1, "take 2 runs again");
+	assert_eq!(r.server.store.forfeit_count(&id1, row.round_id).await.unwrap().1, 0, "the signer was asked for nothing");
+	let (coin, kill) = spent_otherwise(&r, &tx, 2).await.expect("one of the dropped round's own coins is spent at once");
+	println!("the dropped round's coin {} is spent by {} (in the mempool {})", coin, kill, node::in_mempool(&r.rt, &kill));
+	assert!(node::in_mempool(&r.rt, &kill));
+
+	// A restart before that spend confirms: the round stays dropped, and its
+	// coin is spent once, not twice.
+	r.restart_server().await;
+	r.synced().await;
+	r.server.nursery.pass().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(row.state, server::store::RoundState::Lost);
+	assert_eq!(spent_otherwise(&r, &tx, 2).await.map(|(_, t)| t), Some(kill), "after a restart, the same spend");
+	assert_eq!(dead_on_the_chain(&r, &tx, 2).await, kill);
+
+	// Take 2 runs again, alone, and completes.
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	let again = built[0].tx.clone();
+	assert_eq!(built[0].fills, vec![at2]);
+	print_round(&r, &again, &[(at2, &o2)]);
+	check_rule(&again, &[(at2, &o2, 400_000, 400_000)], &[2]);
+	broadcast_after(&r, &again.txid(), &[(&id2, &c2, &[b2.clone()], &k2, &n2)]).await;
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &again.txid()).await;
+	assert_eq!(complete(&r, &id2, &c2, &[b2.clone()], &k2, &n2), 400_000);
+
+	// The operator's Y is free and whole: nothing of it went out.
+	let after = pools(&r, y, z).await;
+	println!("the operator's pools of Y and Z: before {:?} | after {:?}", before, after);
+	assert_eq!(after.0, before.0, "the operator's Y is free and whole");
+	// A refresh in Y runs.
+	let (w3, _) = want_leaf(&keypair("held refresher new"), y, 500_000);
+	let (body, pid3) = common::client::participation_body(&[&c3], &[w3], &[], None, xonly(&r.s), r.chain);
+	let a = r.http.post("submit_participation", &body);
+	assert_eq!(a.status, 200, "{}", a.json);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	println!("a refresh of Y: built {:?} | failed {:?} | the refresh {}", built.iter().map(|b| b.tx.txid()).collect::<Vec<_>>(), failed,
+		status(&r, &pid3)["state"]);
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert_eq!(status(&r, &pid3)["state"], "issued", "the refresh of Y runs");
+}
+
+/// A fill round an older server left broadcast and refused by the node: an
+/// outsider filled its order while it was held, before anything watched the
+/// order's outpoint, and that server put it to the node anyway (D73's
+/// second half, R7l's stuck state). The order is looked up at the node and
+/// the round retired as lost: the nursery gives it up, the take whose order
+/// was taken is voided (its coin, whose forfeit it handed over, stays given
+/// up), the other runs again and completes, and the operator's pools are
+/// free. The signer is asked for no half of a forfeit for a round the node
+/// does not hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_round_the_node_refused_for_a_taken_order_is_retired_as_lost() {
+	refused_round(false).await;
+}
+
+/// [`a_fill_round_the_node_refused_for_a_taken_order_is_retired_as_lost`],
+/// with take 1's forfeit whole, as an older server's signer left it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_round_refused_with_a_forfeit_whole_is_retired_as_lost() {
+	refused_round(true).await;
+}
+
+async fn refused_round(whole: bool) {
+	let (mut r, z) = start(false).await;
+	let y = r.y;
+	let (c1, b1) = holder(&mut r, "refused taker 1", y, 1_000_000).await;
+	let (c2, b2) = holder(&mut r, "refused taker 2", z, 1_000_000).await;
+	let o1 = terms(&r, "refused maker 1", y, 2, 1, 10_000);
+	let o2 = terms(&r, "refused maker 2", z, 5, 2, 1_000);
+	let at1 = rest(&mut r, &o1, 600_000);
+	let at2 = rest(&mut r, &o2, 400_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let before = pools(&r, y, z).await;
+	let (id1, k1, n1) = take(&r, &c1, at1, &o1, 600_000, 499_500, 1_000, "refused taker 1");
+	let (id2, k2, n2) = take(&r, &c2, at2, &o2, 400_000, 400_000, 0, "refused taker 2");
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let tx = built[0].tx.clone();
+	let round_id = built[0].round_id;
+	assert!(hand_over_if_held(&r, &id1, &c1, &[b1.clone()], &k1, &n1));
+
+	// The server stops; an outsider fills order 1, final; the database is
+	// left as an older server left it: the round broadcast, the node's
+	// refusal recorded, and (`whole`) take 1's forfeit given an operator's
+	// half.
+	r.server.stop();
+	let out = outside_fill(&mut r, &o1, at1, 600_000);
+	r.rt.client().send_raw_transaction(&out).unwrap();
+	r.produce().await;
+	r.bury().await;
+	let store = r.db.store.clone();
+	assert!(store.set_round_state(round_id, server::store::RoundState::Built, server::store::RoundState::Broadcast).await.unwrap());
+	// Handed to the nursery after the outsider's spend was scanned: the
+	// store's index of spends never sees it (none of its inputs is watched
+	// from before that block).
+	let fee = tx.output.iter().find(|o| o.is_fee()).unwrap();
+	store.nursery_insert(&tx.txid().to_byte_array(), &serialize(&tx), "round",
+		Some((fee.asset.explicit().unwrap().into_inner().to_byte_array(), fee.value.explicit().unwrap())), &[]).await.unwrap();
+	store.nursery_broadcast(&tx.txid().to_byte_array(), "the node refused it: bad-txns-inputs-missingorspent").await.unwrap();
+	if whole {
+		store.set_forfeit_operator_sig(&c1.id.0, round_id, &[7; 64]).await.unwrap();
+	}
+	println!("left as an older server leaves it: round {} broadcast and refused, take 1's forfeit {}", tx.txid(),
+		if whole { "whole" } else { "the owner's half" });
+	r.restart_server().await;
+	r.synced().await;
+
+	// No half of a forfeit is asked of the signer while the node does not
+	// hold the round (the server asks for missing halves at its start, and
+	// every minute).
+	r.server.forfeits.fill_unsigned().await.unwrap();
+	let counted = r.server.store.forfeit_count(&id1, round_id).await.unwrap();
+	println!("take 1's forfeits for the refused round (coins, whole, owner's half only): {:?}", counted);
+	if !whole {
+		assert_eq!(counted.1, 0, "the signer gave no half for a round the node does not hold");
+	}
+	let start = std::time::Instant::now();
+	loop {
+		r.server.nursery.pass().await.unwrap();
+		r.server.rounds.pass().await.unwrap();
+		let row = r.server.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+		if row.state == server::store::RoundState::Lost {
+			break;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(120), "the refused round was never resolved: {:?}", row.state);
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+	}
+	let nursery = r.server.store.nursery_get(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+	println!("round {} lost | the nursery {:?}: {:?}", tx.txid(), nursery.state, nursery.last_result);
+	assert_eq!(nursery.state, server::store::NurseryState::Lost, "never broadcast again");
+	// Lost like any round: its takes run again, and take 1's order is found
+	// spent when its round is built.
+	let (_, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	let st1 = status(&r, &id1);
+	println!("take 1: {} — {} | its coin returned: {}", st1["state"], st1["void_reason"], st1["inputs"][0]["returned"]);
+	assert_eq!(st1["state"], "void");
+	assert!(st1["void_reason"].as_str().unwrap().contains("is spent"));
+	assert_eq!(st1["inputs"][0]["returned"], false, "a coin whose forfeit was handed over stays given up, as for any lost round");
+	let st2 = status(&r, &id2);
+	println!("take 2: {} (attempt {})", st2["state"], st2["attempt"]);
+	assert!(st2["attempt"].as_u64().unwrap() >= 1, "take 2 runs again");
+	// Take 2 completes.
+	if st2["state"] == "pending" {
+		let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+		assert!(failed.is_empty(), "{:?}", failed);
+		assert_eq!(built[0].fills, vec![at2]);
+	}
+	let again = elements::Txid::from_str(status(&r, &id2)["round"]["txid"].as_str().unwrap()).unwrap();
+	broadcast_after(&r, &again, &[(&id2, &c2, &[b2.clone()], &k2, &n2)]).await;
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &again).await;
+	assert_eq!(complete(&r, &id2, &c2, &[b2.clone()], &k2, &n2), 400_000);
+	let after = pools(&r, y, z).await;
+	println!("the operator's pools of Y and Z: before {:?} | after {:?}", before, after);
+	assert_eq!(after.0, before.0, "the operator's Y is free and whole");
 }

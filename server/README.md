@@ -929,15 +929,34 @@ without its witnesses (`round.tx`, its txid the round's, which nobody but the
 operator can broadcast); the wallet validates its new leaf against it and
 signs a forfeit of each coin it gave up, which `forfeit_leaves` takes before
 the round is broadcast, recording the owner's half only: the signer is asked
-for its half once the round is broadcast, so a round dropped unbroadcast
-leaves nothing in the signer's record. A take whose forfeits have not come
-`[fills] forfeit_window_seconds` (600 unless set) after its round was built,
-by the chain's median time, is voided, its coins given back; the round is
-dropped unbroadcast, its coins freed, and every take that did hand its
-forfeits over runs again in the round built after it. A take's preimage goes
-out once its round is final, as any participation's: `forfeit_leaves` asked
-again then answers it, and the server releases the take itself once its
-forfeits are whole.
+for its half once the node holds the round, in its mempool or a block, so a
+round dropped unbroadcast leaves nothing in the signer's record. A take whose
+forfeits have not come `[fills] forfeit_window_seconds` (600 unless set) after
+its round was built, by the chain's median time, is voided, its coins given
+back; the round is dropped unbroadcast, its coins freed, and every take that
+did hand its forfeits over runs again in the round built after it. A take's
+preimage goes out once its round is final, as any participation's:
+`forfeit_leaves` asked again then answers it, and the server releases the
+take itself once its forfeits are whole.
+
+A held round goes out only with its orders unspent: anyone may fill an order
+on the chain while its round waits for forfeits. At every pass, and once more
+before the round is handed to the node, each of its orders is checked again
+at the node; one spent meanwhile drops the round unbroadcast, voids that take
+with the reason (`order … is spent …; its round … was dropped unbroadcast`),
+and runs the others again. When the node refuses a fill round, its order
+inputs are looked up at the node, not in the database's index of spends: a
+round whose order another transaction took is retired as lost, like any
+round another transaction took an input of (its takes run again, the take
+whose order was taken is voided, and a coin a take gave up whose forfeit it
+had handed over stays given up, its owner's on the chain). A round dropped
+unbroadcast is killed on the chain: the server spends one of the round's own
+coins back to its wallet at once, in a transaction of its own (its fee in the
+round's fee asset while the node accepts it, else in another it accepts), and
+tries again at every pass until one is under way, so the dropped round can
+never confirm, whoever holds it, and every wallet that signed a forfeit for it
+sees it gone. That costs the operator one small transaction's fee for each
+round dropped.
 
 ### Rollbacks
 
