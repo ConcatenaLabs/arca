@@ -674,6 +674,13 @@ impl Store {
 			|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional().map_err(db)
 	}
 
+	/// `(id, role, offer, state)` of every swap, oldest first.
+	pub fn swaps(&self) -> Result<Vec<(String, String, String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, role, offer, state FROM swap ORDER BY created_at, id").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
 	pub fn set_swap(&self, id: &str, state: &str, accept: Option<&str>) -> Result<(), Error> {
 		self.conn.execute("UPDATE swap SET state = ?2, accept = COALESCE(?3, accept) WHERE id = ?1", params![id, state, accept]).map_err(db)?;
 		Ok(())

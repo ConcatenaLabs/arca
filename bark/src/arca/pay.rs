@@ -183,6 +183,19 @@ pub(crate) struct In {
 	pub checkpoint_value: u64,
 }
 
+/// An offer of a swap, decoded and checked ([`Wallet::swap_read`]).
+struct OfferChecked {
+	offer: Value,
+	id: String,
+	give_asset: AssetId,
+	give: u64,
+	want_asset: AssetId,
+	want: u64,
+	margin: u64,
+	theirs: Vec<In>,
+	maker_outs: Vec<Out>,
+}
+
 /// The earliest first expiry among the batches `record` rests on, as its
 /// record names them; `None` for a coin resting on boards alone.
 pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
@@ -1361,7 +1374,33 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
-		Ok(json!({"swap": id, "offer": encode(&self.spelling.offer, &offer), "details": offer}))
+		Ok(json!({"swap": id, "offer": encode(&self.spelling.offer, &offer), "details": offer, "gives": offer["give"], "gets": offer["want"],
+			"pays": Self::maker_pays(give_asset, margin, &inputs)}))
+	}
+
+	/// What a maker's coins leave for a swap's fees, in the asset it gives:
+	/// the reassignment's margin and the margins of their checkpoints.
+	fn maker_pays(give_asset: AssetId, margin: u64, inputs: &[In]) -> Value {
+		let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
+		json!({"asset": give_asset.to_string(), "margin": margin.to_string(), "margins": margins.to_string()})
+	}
+
+	/// Every swap the wallet offered or accepted: its id, the wallet's role
+	/// (`maker` or `taker`), where it stands (`open`, `accepted`, `done`,
+	/// `cancelled`), what the wallet gives and gets, and, for an open offer of
+	/// the wallet's, the offer's text to hand to a taker again.
+	pub fn swaps(&self) -> Result<Value, Error> {
+		let mut out = vec![];
+		for (id, role, offer_json, state) in self.store.swaps()? {
+			let offer: Value = serde_json::from_str(&offer_json).map_err(|e| Error::Store(e.to_string()))?;
+			let (gives, gets) = if role == "maker" { (&offer["give"], &offer["want"]) } else { (&offer["want"], &offer["give"]) };
+			let mut v = json!({"swap": id, "role": role, "state": state, "gives": gives, "gets": gets});
+			if role == "maker" && state == "open" {
+				v["offer"] = json!(encode(&self.spelling.offer, &offer));
+			}
+			out.push(v);
+		}
+		Ok(Value::Array(out))
 	}
 
 	/// Checks an offer's coins as a receiver checks a coin, and their values.
@@ -1406,6 +1445,14 @@ impl Wallet {
 	/// exit deadline is less than [`SWAP_DEADLINE_MARGIN`] away, unless
 	/// `near_deadline` says to take it anyway.
 	pub fn swap_accept(&mut self, offer_text: &str, near_deadline: bool) -> Result<Value, Error> {
+		self.swap_accept_shown(offer_text, near_deadline, None)
+	}
+
+	/// An offer decoded and checked as [`Wallet::swap_accept`] checks it,
+	/// before the wallet adds anything of its own: the chain it names, the
+	/// maker's coins, that they keep exactly what the offer gives, its change
+	/// and its margin, and that its first output is what it wants.
+	fn swap_offer_checked(&self, offer_text: &str) -> Result<OfferChecked, Error> {
 		let offer = decode(OFFER_KIND, offer_text, "the offer")?;
 		self.check_chain(&offer, "offer")?;
 		let id = hex(&sha256::Hash::hash(offer.to_string().as_bytes()).to_byte_array());
@@ -1428,10 +1475,57 @@ impl Wallet {
 			return Err(Error::Refused(format!("the offered coins keep {} of asset {}; the offer gives {}, keeps {} as change \
 				and {} as margin", kept, give_asset, give, maker_change, margin)));
 		}
+		Ok(OfferChecked { offer, id, give_asset, give, want_asset, want, margin, theirs, maker_outs })
+	}
+
+	/// What taking an offer would do, with nothing signed, held or stored:
+	/// the offer checked as [`Wallet::swap_accept`] checks it; what the wallet
+	/// gives and gets; what its own coins leave for the transfer's fees (the
+	/// margins of their checkpoints, in the asset it gives) and its change;
+	/// the margin the maker pays; and the dates of the coins it would get,
+	/// refused as [`Wallet::swap_accept`] refuses them. A program shows this
+	/// and hands it to `swap_accept` as `shown`.
+	pub fn swap_read(&self, offer_text: &str, near_deadline: bool) -> Result<Value, Error> {
+		let o = self.swap_offer_checked(offer_text)?;
+		let info = self.server_info()?;
+		let min_want = Self::min_leaf(&info, o.want_asset)?;
+		// The leaf the wallet would get is not made here: a probe of its size
+		// prices the same margins.
+		let mut others: Vec<ExplicitOutput> = o.maker_outs.iter().map(|m| m.explicit(self)).collect();
+		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
+		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
+		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0)?;
+		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
+		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
+			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outputs,
+				arca_covenant::leaf::MAX_OUTPUTS)));
+		}
+		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
+		Ok(Self::swap_terms(&o, &mine, change, dates))
+	}
+
+	/// What a taker is shown of a swap, by [`Wallet::swap_read`] and
+	/// [`Wallet::swap_accept`] alike.
+	fn swap_terms(o: &OfferChecked, mine: &[In], change: u64, dates: Value) -> Value {
+		let margins: u64 = mine.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
+		json!({"swap": o.id, "gets": {"asset": o.give_asset.to_string(), "value": o.give.to_string()},
+			"gives": {"asset": o.want_asset.to_string(), "value": o.want.to_string()},
+			"pays": {"asset": o.want_asset.to_string(), "margins": margins.to_string()},
+			"maker_pays": {"asset": o.give_asset.to_string(), "margin": o.margin.to_string()},
+			"change": {"asset": o.want_asset.to_string(), "value": change.to_string()},
+			"coins_spent": mine.len(), "dates": dates})
+	}
+
+	/// [`Wallet::swap_accept`], going ahead only on the terms a program
+	/// showed (`shown`, a [`Wallet::swap_read`]'s answer): the same swap, what
+	/// the wallet gives and gets, and no more in margins.
+	pub fn swap_accept_shown(&mut self, offer_text: &str, near_deadline: bool, shown: Option<&Value>) -> Result<Value, Error> {
+		let o = self.swap_offer_checked(offer_text)?;
+		let (id, give_asset, give, want_asset, want) = (o.id.clone(), o.give_asset, o.give, o.want_asset, o.want);
 		let info = self.server_info()?;
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let mut outs = maker_outs.clone();
+		let mut outs = o.maker_outs.clone();
 		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
@@ -1445,7 +1539,17 @@ impl Wallet {
 		}
 		// The dates of the coins the wallet gets: the earliest of every coin
 		// spent, the maker's and its own.
-		let dates = self.swap_dates(theirs.iter().chain(mine.iter()), near_deadline)?;
+		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
+		let terms = Self::swap_terms(&o, &mine, change, dates.clone());
+		if let Some(shown) = shown {
+			for k in ["swap", "gets", "gives", "pays"] {
+				if shown[k] != terms[k] {
+					return Err(Error::Refused(format!("the swap's terms changed since they were shown; they are now {}", json!({
+						"swap": terms["swap"], "gets": terms["gets"], "gives": terms["gives"], "pays": terms["pays"]}))));
+				}
+			}
+		}
+		let OfferChecked { offer, theirs, .. } = o;
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
@@ -1480,7 +1584,7 @@ impl Wallet {
 			gets.push(json!({"asset": want_asset.to_string(), "value": change.to_string(), "change": true, "dates": dates}));
 		}
 		Ok(json!({"swap": id, "accept": encode(&self.spelling.accept, &accept), "gets": {"asset": give_asset.to_string(), "value": give.to_string()},
-			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "coins": gets, "dates": dates}))
+			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "pays": terms["pays"], "coins": gets, "dates": dates}))
 	}
 
 	/// The dates of the coins a swap spending `inputs` gives the wallet, as
