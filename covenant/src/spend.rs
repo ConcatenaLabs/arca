@@ -158,6 +158,7 @@ pub(crate) fn pay_fee(
 	fee: &FeeSource,
 	coin_sequence: Sequence,
 ) -> Result<(), UnrollError> {
+	let burning = matches!(fee, FeeSource::Burning { .. });
 	match fee {
 		FeeSource::Reserve => match margins {
 			[] => {},
@@ -175,7 +176,7 @@ pub(crate) fn pay_fee(
 			[(_, value)] => return Err(UnrollError::SplitFee { fee: *fee, margin: *value }),
 			_ => return Err(UnrollError::SeveralMarginAssets(margins.len())),
 		},
-		FeeSource::Coin { outpoint, coin, fee, change } => {
+		FeeSource::Coin { outpoint, coin, fee, change } | FeeSource::Burning { outpoint, coin, fee, change } => {
 			let (coin_asset, value) = match (coin.asset.explicit(), coin.value.explicit()) {
 				(Some(a), Some(v)) => (a, v),
 				_ => return Err(UnrollError::FeeCoinNotExplicit),
@@ -186,7 +187,8 @@ pub(crate) fn pay_fee(
 			tx.input.push(TxIn { previous_output: *outpoint, sequence: coin_sequence, ..Default::default() });
 			prevouts.push(coin.clone());
 			for (asset, margin) in margins {
-				tx.output.push(explicit_txout(*asset, *margin, change.clone()));
+				let to = if burning { crate::issuer::burn_script() } else { change.clone() };
+				tx.output.push(explicit_txout(*asset, *margin, to));
 			}
 			if value > *fee {
 				tx.output.push(explicit_txout(coin_asset, value - fee, change.clone()));

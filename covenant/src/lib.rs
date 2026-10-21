@@ -23,7 +23,14 @@
 //!   unlock takes ([`offboard`]) and the round's connector output, which only the issuance
 //!   of the round's connector asset spends ([`forfeit::ConnectorPolicy`]);
 //! - the five checks a wallet runs on a round transaction and its published
-//!   clock schedule ([`checks`]);
+//!   clock schedule ([`checks`]), the fifth refusing a batch that its round
+//!   funds by reissuing its asset unless every sweep above the leaf is
+//!   burn-only;
+//! - issuer-operated batches ([`issuer`]): the burn their sweeps end in, and
+//!   what a transaction issues and burns of an asset; and the mint limiter
+//!   their asset's reissuance token rests in ([`limiter`]): its coin's script
+//!   in each state, the state a mint leads to, and what a spend of the coin
+//!   did;
 //! - the leaf record ([`record`]): what a holder keeps, its id, its binary
 //!   and JSON forms ([`record_json`]), and its validation against the round;
 //! - the tree builder ([`tree`]), which turns the leaves of one asset into a
@@ -83,7 +90,9 @@ pub mod fill;
 pub mod forfeit;
 pub mod gate;
 pub mod htlc;
+pub mod issuer;
 pub mod leaf;
+pub mod limiter;
 pub mod message;
 pub mod node;
 pub mod offboard;
@@ -109,7 +118,7 @@ pub mod witness;
 
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use checkpoint::CheckpointPolicy;
-pub use checks::{check_round, RoundCheckFailure};
+pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};
 pub use clock::{Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
@@ -118,6 +127,7 @@ pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, For
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
 pub use leaf::LeafPolicy;
+pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;

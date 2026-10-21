@@ -1,0 +1,173 @@
+{
+ "source": "sequentia-contracts templates/mint_limiter/vectors.json at 2c44214, the address vectors of template 77218080daacd33cb636f1411920eb5f2d6ee805cb94d8d0651ce1808c0b557b",
+ "addresses": [
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 2, minted 0, elapsed 0, unbraked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "00",
+    "ELAPSED": "0000",
+    "MINTED": "0000000000000000"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee505a00000048c2739500013c70000000000000000000000",
+   "merkle_root": "327803bdd026f51f4bd9b68cdafc74495fdb0cf4b7bcbf6f7a4d8c0f9113639f",
+   "script_pubkey": "512055c6b0f43fcddac49cef0e4b6afd6f135bae30cb86f83d2575e8e1d93d40dfe3",
+   "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0035e60143e65b84f3a855fade9f61a68ddb01b80ef08b7abea2b3661731fd969"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 2, minted 100000000, elapsed 17, unbraked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "00",
+    "ELAPSED": "0011",
+    "MINTED": "0000000005f5e100"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee505a00000048c2739500013c70000000005f5e100001100",
+   "merkle_root": "d08bf6b6673963e6ae765828dea013c3e6c491bfe143e0c4366a602da7822dd2",
+   "script_pubkey": "512083bcaabdd72bec5048c50a91406d57b5653c86dc927a39dbf0fa6012bd599b8e",
+   "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0d17ed45ccf0638aec845f2b0f1f0f07ab89f346deff01ff70d9396e3cd958ee2"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 3, minted 0, elapsed 0, unbraked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "00",
+    "ELAPSED": "0000",
+    "MINTED": "0000000000000000"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f905a00000048c2739500013c70000000000000000000000",
+   "merkle_root": "dc45bdee268854968a6d5e4d61b8275b509bc708a526e088aa81f9c1ecbfd982",
+   "script_pubkey": "51203e2e790da565a619ae4dd9d7ddf5b845cd7e270e039c0ffe575ec78bdf28725c",
+   "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0ed3f826de802f1db62747c8930965bc25caf7f8fd7f0a3593b7f8ba1f27485fc"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 3, minted 123456789, elapsed 600, braked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "01",
+    "ELAPSED": "0258",
+    "MINTED": "00000000075bcd15"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f905a00000048c2739500013c700000000075bcd15025801",
+   "merkle_root": "1495e1213b1106af1ff42f2cbf3e06a91a1e053c37c00d7a808949ee03c6a94b",
+   "script_pubkey": "5120fd3508966b7ca06c5a940818a92e2f121ad25dcac2c11a6e4b79da40e5a305ab",
+   "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0176ec0aba8e105a695b25343cf22f34508f72f0da808b96752bda9910b729102"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 2, minted 5000000000000, elapsed 1439, unbraked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "00",
+    "ELAPSED": "059f",
+    "MINTED": "0000048c27395000"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee505a00000048c2739500013c70000048c27395000059f00",
+   "merkle_root": "0497a22315a6bb4cdaa9e938fd228c34af2b79cb9be8e79a73a6c2444702f7dd",
+   "script_pubkey": "51207c36274c2060be27cda8214135c76df75fdab444d55330e73cf86d7e4256d81d",
+   "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac06873ba280f9a67f62a493a009fdac278d5cbd54a32ce9f93510eeedfa5f4a036"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 2, minted 0, elapsed 0, braked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "01",
+    "ELAPSED": "0000",
+    "MINTED": "0000000000000000"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee505a00000048c2739500013c70000000000000000000001",
+   "merkle_root": "a84fa90b1794d52db58299a8054785c2dff01ed037e547812937994623d9e406",
+   "script_pubkey": "51205efbeb9a9a91e147812ff7d567e08a8cb866fe5fb429b498576b1e9e42d9c9b6",
+   "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac087aa1270412acaabfc8c38222badfc6edc42647ddbf93e16f11fec8ab8d77a7d"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 2, minted 123456789, elapsed 600, braked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "01",
+    "ELAPSED": "0258",
+    "MINTED": "00000000075bcd15"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee505a00000048c2739500013c700000000075bcd15025801",
+   "merkle_root": "486b807428c7b64ee5e13186ebffc05f2bbb365a3df8f1dda69e28858e05b111",
+   "script_pubkey": "5120464354b3e126be31eeb0e99bba60d0d2b3071f3370e8364bd018aba228872088",
+   "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac01eba24e215b1ceb9d588520fc2c42d4b7170fb63d3d3dc4121d01a760263a690"
+  },
+  {
+   "name": "allowance 50,000 a 1,440-block window, recovery 30 days, operator key 1, cold key 3, minted 100000000, elapsed 17, unbraked",
+   "params": {
+    "ALLOWANCE": "0000048c27395000",
+    "ASSET": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f",
+    "COLD_KEY": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "OPERATOR_KEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "RECOVERY_DELAY": "13c7",
+    "TOKEN": "3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f874",
+    "WINDOW": "05a0"
+   },
+   "slots": {
+    "ARMED": "00",
+    "ELAPSED": "0011",
+    "MINTED": "0000000005f5e100"
+   },
+   "data": "54a2cfc4ecd61c94bc1e51000139ea528f2835365ce123e0e1abd6e1bb3cdb4f3451dc1e07263404995266b7ba2df763bae70984936b6edf7bd149d913d2f87479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f905a00000048c2739500013c70000000005f5e100001100",
+   "merkle_root": "f7636201d7dfb6215259f926b0131372645f57d234eaadf34e75a918acb1c371",
+   "script_pubkey": "5120c771e59934ce55ee09f375c4f21b66ff27391309eafa657eb4a0ea7da7e78128",
+   "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0ec6490fdaf68dcb06aef2401fead1a43eaefafaa25c8a012396cd20778239430"
+  }
+ ]
+}

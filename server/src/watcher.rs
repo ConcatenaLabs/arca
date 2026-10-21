@@ -207,7 +207,7 @@ fn sized(mut tx: Transaction, wallet_inputs: &[usize]) -> u64 {
 /// The input of `tx` that a fee coin from `fee` holds.
 fn fee_input(tx: &Transaction, fee: &FeeSource) -> Option<usize> {
 	match fee {
-		FeeSource::Coin { outpoint, .. } => tx.input.iter().position(|i| i.previous_output == *outpoint),
+		FeeSource::Coin { outpoint, .. } | FeeSource::Burning { outpoint, .. } => tx.input.iter().position(|i| i.previous_output == *outpoint),
 		FeeSource::Reserve | FeeSource::Split { .. } => None,
 	}
 }

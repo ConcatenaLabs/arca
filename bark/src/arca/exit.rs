@@ -267,7 +267,7 @@ impl Wallet {
 					}
 					ExplicitOutput::new(asset, value - fee, to.clone())
 				},
-				FeeSource::Coin { .. } => ExplicitOutput::new(asset, value, to.clone()),
+				FeeSource::Coin { .. } | FeeSource::Burning { .. } => ExplicitOutput::new(asset, value, to.clone()),
 			};
 			if leaf.order.is_some() {
 				return Err(Error::Refused("a resting order's coin comes home by its landing, as SeqDEX's own order, not by a claim of \

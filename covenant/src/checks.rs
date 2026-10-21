@@ -19,10 +19,15 @@
 //!
 //! The fifth matters most: the later clocks are hidden inside the first
 //! clock's taproot commitment, and nothing in the round transaction shows them.
+//!
+//! The fifth also reads the batch's profile ([`check_reissue`]): when an input
+//! of the round reissues the batch's asset, every sweep path above the leaf
+//! must be burn-only. Units minted to fund a refresh that a sweep could hand
+//! to the operator would be inflation.
 
 use elements::confidential::Value;
 use elements::secp256k1_zkp::ZERO_TWEAK;
-use elements::Transaction;
+use elements::{AssetId, Transaction};
 
 use crate::clock::ClockSchedule;
 use crate::sweep::Sweep;
@@ -56,6 +61,9 @@ pub enum RoundCheckFailure {
 	NoNotice(usize),
 	#[error("check 5: the schedule runs backwards at step {0}")]
 	ScheduleBackwards(usize),
+	#[error("check 5: input {input} of the round reissues the batch's asset, and sweep path {path} is not burn-only: units minted for \
+		a refresh must end in a burn")]
+	ReissuedNotBurnOnly { input: usize, path: usize },
 }
 
 impl RoundCheckFailure {
@@ -67,7 +75,7 @@ impl RoundCheckFailure {
 			NotExplicit => 2,
 			ReissuanceToken | Reissued(_) => 3,
 			TokenOutputs(_) | TokenOutputNotOneAtom | BlindedOutput(_) | TokenAtR => 4,
-			NotClockZero | SweepMismatch(_) | NoNotice(_) | ScheduleBackwards(_) => 5,
+			NotClockZero | SweepMismatch(_) | NoNotice(_) | ScheduleBackwards(_) | ReissuedNotBurnOnly { .. } => 5,
 		}
 	}
 }
@@ -148,4 +156,17 @@ pub fn check_round(round: &Transaction, schedule: &ClockSchedule, batch_output: 
 		}
 	}
 	Ok(())
+}
+
+/// Check 5's clause on the batch's profile: when an input of `round`
+/// reissues `asset`, the batch's asset, every sweep path above the leaf (the
+/// batch output's, then those below it, as for [`check_round`]) must be
+/// burn-only. A round that reissues nothing of the asset passes whatever its
+/// sweeps are.
+pub fn check_reissue(round: &Transaction, asset: AssetId, batch_output: &Sweep, below: &[Sweep]) -> Result<(), RoundCheckFailure> {
+	let Some(&input) = crate::issuer::reissuing_inputs(round, asset).first() else { return Ok(()) };
+	match std::iter::once(batch_output).chain(below).position(|s| !s.burn) {
+		Some(path) => Err(RoundCheckFailure::ReissuedNotBurnOnly { input, path }),
+		None => Ok(()),
+	}
 }

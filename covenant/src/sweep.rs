@@ -206,11 +206,6 @@ impl SweepTx {
 	}
 }
 
-/// The script of an `OP_RETURN` a burn-only sweep pays.
-fn burn_script() -> Script {
-	Script::from(vec![OP_RETURN.into_u8()])
-}
-
 /// One wave of a batch's sweep: see the [module documentation](self).
 /// `swept` are the outputs taken, each under `schedule`'s token, `R` and
 /// operator, at inputs `0..n`; `token` is the token at `R`, at input `n`;
@@ -251,7 +246,7 @@ pub fn sweep_tx(
 		if !matches!(fee, FeeSource::Coin { .. }) {
 			return Err(SpendError::NeedsFeeCoin("a burn-only sweep"));
 		}
-		swept.iter().map(|s| ExplicitOutput::new(s.asset, s.value, burn_script())).collect()
+		swept.iter().map(|s| crate::issuer::burn(s.asset, s.value)).collect()
 	} else {
 		outputs.to_vec()
 	};
