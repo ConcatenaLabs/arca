@@ -374,7 +374,7 @@ impl Wallet {
 		let id = participation_id(&self.genesis, &self.operator, ids, &wanted, &fees, nb);
 		let mut inputs = vec![];
 		for r in rows {
-			let key = self.keys.leaf(&r.owner_nonce)?;
+			let key = self.coin_key(&r.owner_nonce)?;
 			inputs.push(json!({"leaf_id": r.leaf_id, "attestation": hex(sign(&key, &id).as_ref())}));
 		}
 		// Each leaf wanted under a key the wallet holds, and proves it holds.
@@ -451,7 +451,13 @@ impl Wallet {
 					Some(l) => self.store.coin(l)?,
 					None => None,
 				};
-				new_leaves.push(json!({"asset": w["asset"], "value": w["value"], "leaf_id": leaf, "state": coin.map(|c| c.state)}));
+				let mut e = json!({"asset": w["asset"], "value": w["value"], "leaf_id": leaf, "state": coin.map(|c| c.state)});
+				// A distribution's claim: the key it was named under; its leaf
+				// is its holder's, which `distributions` follows.
+				if let Some(k) = w.get("claim") {
+					e["claim"] = k.clone();
+				}
+				new_leaves.push(e);
 			}
 			out.push(json!({"participation": pid, "state": state, "round": round, "released": preimage.is_some(), "gives": gives,
 				"new_leaves": new_leaves}));
@@ -465,7 +471,13 @@ impl Wallet {
 	}
 
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
-		let call = if Self::is_take(body) { "take_order" } else { "submit_participation" };
+		let call = if Self::is_take(body) {
+			"take_order"
+		} else if body.get("claims").is_some() {
+			"distribute"
+		} else {
+			"submit_participation"
+		};
 		match self.server.post(call, body) {
 			Ok(a) => {
 				self.store.set_participation(pid, a["state"].as_str().unwrap_or("pending"), None, None)?;
@@ -748,6 +760,9 @@ impl Wallet {
 		// against the round before anything is signed for it: the leaves the
 		// wallet asked for, all of them, in order, and nothing else.
 		let mut news: Vec<(ValidLeaf, LeafRecord, [u8; 32])> = vec![];
+		// Which of them are a distribution's claims, under keys the wallet
+		// does not hold: it signs no authorisation for them and keeps none.
+		let mut claim_leaf: Vec<bool> = vec![];
 		let wanted = wanted.as_array().cloned().unwrap_or_default();
 		let outputs = st["outputs"].as_array().cloned().unwrap_or_default();
 		if outputs.len() != wanted.len() {
@@ -779,7 +794,16 @@ impl Wallet {
 				return Err(Error::Refused("the server names a leaf the published tree does not have".into()));
 			}
 			let record = tree.record(index);
-			let owner = self.keys.leaf_xonly(&nonce)?;
+			// A distribution's leaves are its claims, owned by the claim key of
+			// the key the wallet named and the nonce it drew; every other leaf
+			// the wallet asks for is its own.
+			let owner = match w["claim"].as_str() {
+				Some(named) => {
+					let named = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&unhex(named)?).map_err(|e| Error::Store(e.to_string()))?;
+					arca_covenant::claim_key(&named, &nonce).map_err(|e| Error::Refused(e.to_string()))?
+				},
+				None => self.keys.leaf_xonly(&nonce)?,
+			};
 			// The reserves, at four times the node's floor in the leaf's asset
 			// when it accepts that asset for fees, one atom when it does not.
 			let (accept, fee_coin) = self.leaf_policy(record.asset, as_of)?;
@@ -802,6 +826,7 @@ impl Wallet {
 					{}: a forfeit is claimable only by releasing every leaf the wallet asked for", record.asset, hex(&unlock_hash))));
 			}
 			news.push((valid, record, nonce));
+			claim_leaf.push(w.get("claim").is_some());
 		}
 		if news.is_empty() && offboards.is_empty() {
 			return Err(Error::Refused("the participation has no new leaf".into()));
@@ -872,7 +897,7 @@ impl Wallet {
 				(None, Some(p)) => Forfeit::for_offboard(old.leaf, (old.asset, old.value), old.id, p, &round, c, refund, margin),
 				(None, None) => unreachable!("refused above"),
 			}.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
-			let key = self.keys.leaf(&row.owner_nonce)?;
+			let key = self.coin_key(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
 			signed.push((l.clone(), margin));
 			// A batch leaf's lowest node is released for this round alone: the
@@ -893,7 +918,7 @@ impl Wallet {
 		let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3600)).map_err(|e| Error::Node(e.to_string()))?;
 		let mut leaves = vec![];
 		let mut auths_of = vec![];
-		for (valid, _, nonce) in &news {
+		for ((valid, _, nonce), _) in news.iter().zip(&claim_leaf).filter(|(_, c)| !**c) {
 			let key = self.keys.leaf(nonce)?;
 			let sigs: Vec<_> = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(t).digest), t)).collect();
 			leaves.push(json!({"leaf_id": valid.leaf_id.to_string(),
@@ -904,10 +929,20 @@ impl Wallet {
 		// round it is bound to, and the new leaves it validated, so that it
 		// can follow every forfeit on the chain and complete the leaves with a
 		// preimage the chain publishes, whatever the server does next.
-		let mut news_json = json!({"round": round_txid.to_string(), "leaves": news.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
+		let mine: Vec<&(ValidLeaf, LeafRecord, [u8; 32])> = news.iter().zip(&claim_leaf).filter(|(_, c)| !**c).map(|(n, _)| n).collect();
+		let mut news_json = json!({"round": round_txid.to_string(), "leaves": mine.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
 			Ok(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(nonce),
 				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))
 		}).collect::<Result<Vec<_>, Error>>()?});
+		// A distribution's claim leaves, as validated: the preimage that comes
+		// back must open them.
+		let claims_json: Vec<Value> = news.iter().zip(&claim_leaf).filter(|(_, c)| **c).map(|((v, r, n), _)| {
+			Ok(json!({"record": hex(&r.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(n),
+				"leaf_id": v.leaf_id.to_string()}))
+		}).collect::<Result<Vec<_>, Error>>()?;
+		if !claims_json.is_empty() {
+			news_json["claims"] = json!(claims_json);
+		}
 		if !offboards.is_empty() {
 			news_json["offboards"] = json!(offboards.iter().map(|(p, vout)| json!({
 				"vout": vout, "asset": p.destination.asset.to_string(), "value": p.destination.value.to_string(),
@@ -995,9 +1030,10 @@ impl Wallet {
 		if st["round"]["txid"].as_str() != Some(round.as_str()) {
 			return Ok(None);
 		}
-		// The unlock hash the wallet's new leaves carry, as it validated them.
+		// The unlock hash the wallet's new leaves carry, as it validated them
+		// (a distribution's claim leaves, for a distribution).
 		let mut unlock = None;
-		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+		for n in news["leaves"].as_array().cloned().unwrap_or_default().into_iter().chain(news["claims"].as_array().cloned().unwrap_or_default()) {
 			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
 			unlock = Some(record.unlock_hash);
 		}
@@ -1038,6 +1074,12 @@ impl Wallet {
 			.ok_or_else(|| Error::Store(format!("no participation {}", pid)))?;
 		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 		let now = self.now()?;
+		for n in news["claims"].as_array().cloned().unwrap_or_default() {
+			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
+			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+				return Err(Error::Refused("the preimage does not open the distribution's claim leaves".into()));
+			}
+		}
 		let mut kept = vec![];
 		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
 			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
@@ -1567,7 +1609,7 @@ impl Wallet {
 			v["note"] = json!("the operator's forfeit of the coin is in the mempool: its refund delay runs once it is in a block");
 			return Ok(v);
 		}
-		let key = self.keys.leaf(&row.owner_nonce)?;
+		let key = self.coin_key(&row.owner_nonce)?;
 		let index_key = format!("refund_index_{}_{}", f.leaf_id, f.round);
 		let index = match self.store.meta(&index_key)?.and_then(|v| v.parse().ok()) {
 			Some(i) => i,

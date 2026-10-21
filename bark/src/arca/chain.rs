@@ -459,6 +459,17 @@ impl ChainSource {
 		Ok(false)
 	}
 
+	/// The script the node reads `address` as, on its own chain: refused for
+	/// a text that is no address of it.
+	pub fn script_of(&self, address: &str) -> Result<Script, Error> {
+		let v: Value = self.client.call("validateaddress", &[json!(address)]).map_err(node)?;
+		if v["isvalid"].as_bool() != Some(true) {
+			return Err(Error::Parse(format!("{} is no address of this chain", address)));
+		}
+		let spk = v["scriptPubKey"].as_str().ok_or_else(|| Error::Node(format!("the node reads {} as no script", address)))?;
+		Ok(Script::from(unhex(spk)?))
+	}
+
 	/// The node's address for `script`, unblinded, on its own chain.
 	pub fn address(&self, script: &Script) -> Result<Option<String>, Error> {
 		let v: Value = self.client.call("decodescript", &[json!(hex(script.as_bytes()))]).map_err(node)?;

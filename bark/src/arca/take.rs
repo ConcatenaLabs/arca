@@ -208,7 +208,7 @@ impl Wallet {
 			not_before: None,
 		};
 		let id = take.id(&self.genesis, &self.operator);
-		let coin_key = self.keys.leaf(&row.owner_nonce)?;
+		let coin_key = self.coin_key(&row.owner_nonce)?;
 		let leaf_key = self.keys.leaf(&nonce)?;
 		let (mailbox, proof) = self.binding(&leaf_key)?;
 		let body = json!({

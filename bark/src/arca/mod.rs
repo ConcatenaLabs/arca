@@ -22,6 +22,11 @@
 //! - [`order`]: an order placed on the chain from the wallet's leaves, by an
 //!   offboard into the address SeqDEX's fill covenant makes for its terms;
 //!   where it rests and what filled it, read from the chain; its REFUND.
+//! - [`claim`]: claim trees: a distribution that pays many holders in one
+//!   round, each under a key the payer names, what no holder takes up going
+//!   back to the payer; and the claims a wallet finds under its own address
+//!   keys and takes up ([`Wallet::distribute`], [`Wallet::claims`],
+//!   [`Wallet::claim`]).
 //! - [`btc_swap`]: a swap of native BTC in a Bitcoin ark for an asset in the
 //!   operator's tree, with another wallet of the operator, under one payment
 //!   hash; the Bitcoin side, Bark, is run by the program, which hands in what
@@ -92,6 +97,7 @@
 
 pub mod btc_swap;
 pub mod chain;
+pub mod claim;
 pub mod client;
 pub mod command;
 pub mod keys;

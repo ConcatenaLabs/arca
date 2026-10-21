@@ -317,7 +317,7 @@ impl Wallet {
 		let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, None);
 		let mut inputs = vec![];
 		for c in &plan.coins {
-			let k = self.keys.leaf(&c.row.owner_nonce)?;
+			let k = self.coin_key(&c.row.owner_nonce)?;
 			inputs.push(json!({"leaf_id": c.row.leaf_id, "attestation": hex(sign(&k, &id).as_ref())}));
 		}
 		let mut outputs = vec![];
