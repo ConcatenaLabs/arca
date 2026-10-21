@@ -29,6 +29,7 @@ it: its REFUND lock may be a height, and Arca only reads it.
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
+| `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
@@ -519,6 +520,38 @@ its answer does not restart the delay of the leaf it answered. Against the sende
 and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.
 
+## Offline refresh
+
+A holder who will be away past a coin's expiry pre-signs a plan (`plan`):
+step `i` gives up the holder's coin `L(i-1)` for a new leaf `L(i)` the
+operator puts in a later round, and `L(0)` is the coin the plan starts from.
+A forfeit names its round's connector asset and cannot be signed before the
+round exists, so each step's forfeit is replaced by a refund: `L(i-1)` and
+`L(i)` spent together, each by its collaborative path, into `v(i)` at the
+holder's own address `Q(i)` (output 0) and the rest less a margin to the
+operator (output 1).
+
+```rust
+use arca_covenant::plan::{key_proof_digest, Plan};
+
+plan.check()?;                                       // steps, values, keys, nonces, addresses
+let id = plan.id();                                  // L(0)'s owner signs it; each A(i) signs key_proof_digest(&id)
+let refund = plan.refund(i).unwrap();
+let old = refund.old_message()?;                     // A(i-1)'s half, and S's when it is used
+let new = refund.new_message()?;                     // A(i)'s half, and S's
+let tx = refund.tx(old_coin, new_coin, &old_pair, &new_pair, &FeeSource::Reserve)?;
+```
+
+A half binds what the collaborative message binds: the chain, the leaf's
+salt, the coin's asset and amount, and the two outputs; no outpoint, round or
+time. Every use of either half creates output 0, so whatever the operator does
+with a refund the holder ends holding `v(i)`: the refund cannot be mined
+without a coin of `L(i)`'s script beside `L(i-1)`, and a copy of `L(i)` the
+operator funds itself pays the holder as the real one does. The halves stay
+valid while the coin's script is unspent, so a coin a plan names is refreshed
+in a round before it is paid out of round: with a half, the operator alone
+could otherwise void a reassignment of it.
+
 ## Building
 
 The crate depends on `elements`, `thiserror` and, for the JSON form, `serde` and
@@ -699,6 +732,19 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   exit. A board's forfeit seen in one block and disconnected: the owner has no
   exit from the board itself, its conversion starts the leaf's delay, and the
   same pair's forfeit takes the converted leaf.
+- `tests/plan_refund.rs`: on an anchored regtest chain, offline refresh's
+  refund, every pair made from the plan alone before any step's round
+  existed: the operator unrolls a step's new leaf with its own unroll
+  authorisations, opens its entry with the plan's preimage and spends the
+  coin given up and the new leaf together, the margin or an outside fee coin
+  paying, output 0 paying the holder; thirteen negative cases (an output
+  changed, swapped or one atom off, the halves of two steps mixed, a half made
+  for another salt, chain or amount, the operator's signature in both slots, a
+  slot left empty) each refused by the mempool and in a block; a step whose
+  round is replaced leaves the refund unminable and the coin given up the
+  holder's, and the step run again under the same leaf makes it good; and the
+  spends consensus accepts with either half alone, or with a copy of the new
+  leaf the operator funds, each pay the holder output 0.
 - `tests/reclaim.rs`: on an anchored regtest chain, the reclaim of a lowest
   node whose owners refreshed into new rounds, each release built with
   `Release::for_refresh`. The reclaim with an atom of `M` confirms; without it,
