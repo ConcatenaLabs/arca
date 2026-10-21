@@ -2299,6 +2299,16 @@ impl Wallet {
 		if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 > first as u64 {
 			let why = format!("past its exit date (median time {}, three days before its first expiry, {}): the operator co-signs no \
 				spend of it and takes it into no round", first.saturating_sub(WalletPolicy::EXIT_DEADLINE), first);
+			// The current coin of an open offline-refresh plan was given to the
+			// plan's step, which the operator runs in the coin's free window:
+			// `sync` asks for the plan's status and takes the step's leaf up,
+			// and takes the coin home only if the step is not done (D57).
+			// Taken on the chain here, by any command's re-check before `sync`
+			// has asked, the coin would leave the step's leaf behind.
+			if c.state == "live" && self.plan_currents()?.iter().any(|(_, l, _)| *l == c.leaf_id) {
+				return Ok(Checked::Holds("live", format!("{}; the current coin of an open offline-refresh plan: sync takes its step's \
+					leaf up, or takes it home if the step is not done", why)));
+			}
 			return Ok(if a.bases.iter().all(|(_, f)| f.in_chain()) {
 				Checked::Fails(why)
 			} else {

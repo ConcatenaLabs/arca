@@ -1023,7 +1023,10 @@ Back, `sync` reads each plan's status and takes up each step whose round is
 final: it rebuilds the step's leaf from the record the operator serves,
 validates it against the round, checks it is the leaf the plan names, signs
 its unroll authorisations, hands them over, keeps the leaf as a coin, and only
-then marks the coin the step gave up spent. A step it has not taken up leaves
+then marks the coin the step gave up spent. The re-check every command runs at its start
+leaves the current coin of an open plan to `sync` even past its exit date, so a wallet back
+before the operator has released the old batch takes the step's leaf up rather than taking
+the coin home. A step it has not taken up leaves
 that coin the wallet's, to refresh or take home as any; past its home date
 with its step not done, `sync` takes it home. A step it took up whose round
 can never return, as the wallet's own node sees it (an input of the round

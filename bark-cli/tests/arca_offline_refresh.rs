@@ -767,3 +767,33 @@ async fn care_refreshes_a_coin_of_no_round_in_a_round_and_plans_the_new_leaf() {
 	println!("care, the new leaf within reach: {}", c);
 	assert_eq!((c["planned"][0]["coin"].as_str(), c["planned"][0]["fee"].as_str()), (live[0]["leaf_id"].as_str(), Some("0")), "{}", c);
 }
+
+/// 10. A wallet back after its planned coin's exit date, before the operator
+///     has released or swept that coin's old batch, whose first command is
+///     not `sync` (a page reading its balance on opening): the start's
+///     re-check leaves the coin to the plan, and the next `sync` takes the
+///     step's leaf up, the whole value live there; nothing goes on the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn back_past_the_exit_date_before_the_sweep_the_wallet_takes_the_step_up_rather_than_home() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (a, coin, value, e0) = holder(&mut r, "V").await;
+	let (id, _, _) = plan(&a, &coin, value, e0);
+	advance_to(&r, e0 - 5 * DAY + HOUR).await;
+	let round1 = step_round(&mut r).await;
+	println!("step 1 in round {}", round1);
+	// Back a day past the coin's expiry; the watcher has not run.
+	advance_to(&r, e0 + DAY).await;
+	let b = a.ok(&["balance"]);
+	println!("A's first command back, balance: {}", b);
+	let c = coins(&a, "exiting");
+	assert!(c.is_empty(), "the start's re-check took the planned coin home: {:?}", c);
+	let s = a.ok(&["sync"]);
+	println!("A's sync: plans {} exits {}", s["plans"], s["exits"]);
+	assert_eq!(s["plans"][0]["taken_up"].as_array().map(|t| t.len()), Some(1), "{}", s);
+	let live = coins(&a, "live");
+	assert_eq!((live.len(), atoms(&live[0]["value"])), (1, value), "{:?}", live);
+	assert!(coins(&a, "exiting").is_empty());
+	assert_eq!(a.ok(&["plans"])["plans"][0]["plan_id"], json!(id));
+	assert_eq!(a.ok(&["balance"])["arca"][&x]["live"], json!(value.to_string()));
+}
