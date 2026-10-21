@@ -658,6 +658,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			order_margin_seconds: app.params.order_margin_seconds,
 			block_seconds: app.params.order_block_seconds,
 			forfeit_window_seconds: app.params.fill_forfeit_window_seconds,
+			round_interval_seconds: app.params.round_interval_seconds,
 		},
 	})
 }

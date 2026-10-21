@@ -189,6 +189,11 @@ Every holder receives these rules before the operator holds their coins:
   operator. A wallet that wakes late for it by up to an eighth of the
   leaf's lock still claims first. A payer whose node pays with SeqLN's `pay`
   raises its `maxdelay` to the invoice's final lock time.
+- **When taking an order, follow `next_sync_at`.** After `arca take`, the
+  wallet must sync within the operator's forfeit window (ten minutes unless
+  the operator sets another) of the take's round being built, or the take is
+  void and its coins come back; `next_sync_at` wakes it for that until the
+  take is released.
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
   for fees). `arca address` gives an address to pay it to.

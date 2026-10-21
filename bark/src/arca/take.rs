@@ -26,7 +26,9 @@
 //! fills the order as asked at the take's input, and signs the forfeit of
 //! each coin given up, built against that new leaf. The preimage comes once
 //! the round is final, at a later `sync`. A take whose forfeits do not come
-//! in time is voided, its coins the wallet's again.
+//! in time is voided, its coins the wallet's again, so the wallet's schedule
+//! ([`Wallet::sync_schedule`]) wakes it within the operator's round interval
+//! and within half its forfeit window until the take is released.
 
 use std::str::FromStr;
 
@@ -147,6 +149,7 @@ impl Wallet {
 		self.witnessed_now()?;
 		let o = self.read_order(text)?;
 		let info = self.server_info()?;
+		self.remember_fills(&info)?;
 		let (quote, exact) = self.quote_of(&o, &info, amount, max_fee_ppm)?;
 		if let Some(s) = shown {
 			for k in ["order", "filled", "price", "fee"] {

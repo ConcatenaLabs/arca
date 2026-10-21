@@ -428,7 +428,9 @@ and a board whose registration never reached the server, are not recovered.
   look): a coin given to a refresh an
   hour after the last sync, an exit under way at its next step (two blocks on while it unrolls, when its
   claim's delay ends, two blocks on while its claim is not yet mined, within
-  half an hour while its claim becomes final),
+  half an hour while its claim becomes final), a take of an on-chain order
+  not yet released within the operator's round interval and within half its
+  forfeit window,
   and never
   more than a day ahead while a receive request the wallet handed out is
   unpaid and has not lapsed, saying so (`why`); `receive_requests` lists
@@ -804,8 +806,12 @@ forfeits, and voids a take whose forfeits have not come within ten minutes
 built. `sync` hands them over: it validates the new leaf against the round's
 transaction as the take's status serves it, checks that the round fills the
 order as the take asked, and signs the forfeit of each coin given up. A
-later `sync`, once the round is final, takes the leaf. Run `sync` within that
-window of `take`, or on a timer.
+later `sync`, once the round is final, takes the leaf. Until the take is
+released, `schedule` wakes the wallet within the operator's round interval
+(`info.fills.round_interval_seconds`) and within half that window, saying so
+(`why`): a program that syncs when `schedule` says it is due completes the
+take, and one that sleeps longer than the window loses it, its coins its own
+again.
 
 `arca order fill` is the same command.
 

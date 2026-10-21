@@ -1069,6 +1069,7 @@ impl Server {
 		params.order_margin_seconds = config.fills.order_margin_seconds;
 		params.order_block_seconds = config.fills.block_seconds;
 		params.fill_forfeit_window_seconds = config.fills.forfeit_window_seconds;
+		params.round_interval_seconds = config.round_interval_seconds;
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;

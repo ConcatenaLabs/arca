@@ -68,7 +68,15 @@
 //! asks the operator anything, so an operator that answers slowly holds back
 //! no claim; the schedule names those dates on their own (`next_exit_at`),
 //! for [`Wallet::sync_exits`], which takes them and asks the operator
-//! nothing.
+//! nothing. A take of an on-chain order ([`Wallet::take`]) needs the wallet
+//! awake until it is released: its round goes out only once every take in
+//! it has handed over its forfeits, which are due within the operator's
+//! forfeit window (`info.fills.forfeit_window_seconds`, by the chain's median
+//! time) of the round being built, and a take whose forfeits do not come is
+//! void. The schedule wakes the wallet within the operator's round interval
+//! and within half that window for as long as a take waits, so a client that
+//! syncs when it is due completes the take; a client whose platform defers
+//! its wakes longer than that loses the take, its coins its own again.
 
 pub mod chain;
 pub mod client;

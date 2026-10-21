@@ -704,6 +704,9 @@ impl Wallet {
 			self.check_take_round(body, st, &round)?;
 		}
 		let info = self.server_info()?;
+		if take {
+			self.remember_fills(&info)?;
+		}
 		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
 			.map_err(|_| Error::Refused("the status names no unlock hash for the participation".into()))?;

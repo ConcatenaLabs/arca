@@ -90,6 +90,12 @@ pub struct FillsInfo {
 	/// seconds of the round being built (by the chain's median time) is
 	/// voided, and the round is built again without it.
 	pub forfeit_window_seconds: u32,
+	/// The seconds between the operator's rounds while participations wait,
+	/// a fill round among them; 0 when it builds rounds only when asked. A
+	/// wallet with a take pending wakes within this and within half the
+	/// forfeit window, so it hands its forfeits over in time.
+	#[serde(default)]
+	pub round_interval_seconds: u64,
 }
 
 /// An asset's Lightning leg: the operator's SeqLN node in that asset.
