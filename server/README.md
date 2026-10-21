@@ -2143,7 +2143,8 @@ claims from two boards, its forfeit step with no authorisation for a claim
 leaf (one with any refused `leaf_set`), each holder's lookup proven with its
 named key (another key's proof refused), one holder's authorisations by its
 named key refused and by its claim key taken, its take-up by a transfer and
-a second spend refused, its coin refreshed in its free window; then the
+a second spend refused, the payer's spend of another holder's claim leaf
+refused for its signature, its coin refreshed in its free window; then the
 claim batch's expiry, release, notice and sweep, after which the watcher
 pays the four claims nobody took up back to the return script, exactly, in
 one transaction, and nothing more at a later pass, while the holder that

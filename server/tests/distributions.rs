@@ -204,7 +204,16 @@ async fn a_distribution_pays_its_holders_and_what_nobody_takes_up_goes_back_to_i
 	let (v1, _, _) = checked(&r, &f1, &holders[1]);
 	let n1: [u8; 32] = unhex(f1["nonce"].as_str().unwrap()).try_into().unwrap();
 	let claim1 = claim_keypair(&holders[1], &n1).unwrap();
-	assert_eq!(r.http.post("claim_leaf", &auths_body(&v1.leaf_id, &auths(&v1, &claim1, t))).ok()["state"], "open");
+	let a1 = auths(&v1, &claim1, t);
+	assert_eq!(r.http.post("claim_leaf", &auths_body(&v1.leaf_id, &a1)).ok()["state"], "open");
+	// The payer, who drew holder 1's nonce and knows its claim key, cannot
+	// have the operator co-sign a spend of the leaf: it holds no key of it.
+	let held1 = Held { key: payer, nonce: n1, id: v1.leaf_id, record: CoinRecord::Leaf { record: tree.record(f1["leaf_index"].as_u64().unwrap()
+		as usize), preimage: pre, auths: a1 } };
+	let c1 = held1.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let (to_payer, _) = new_leaf(&keypair("D payer, a leaf of holder 1's claim"));
+	refused(r.http.post("cosign_transfer", &transfer_body(&[(&held1, c1.clone(), c1.value - 2_000)], &[(x, c1.value - 4_000, to_payer)],
+		xonly(&r.s), r.chain)), "bad_signature", "the payer's spend of holder 1's claim leaf, signed by the payer's key");
 
 	// In holder 0's coin's free window, it is refreshed into a later batch.
 	let now = mtp(&r).to_consensus_u32();
