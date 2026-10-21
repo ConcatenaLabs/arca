@@ -210,7 +210,7 @@ impl Wallet {
 	/// payment's preimage (which the operator then reads there).
 	fn claim_witness(&self, coin: &ValidCoin, nonce: &[u8; 32]) -> Result<Vec<Vec<u8>>, Error> {
 		Ok(match coin.leaf.htlc {
-			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.receive_preimage(nonce)?.to_vec()],
+			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.received_preimage(&t.payment_hash, nonce)?.to_vec()],
 			_ => vec![],
 		})
 	}
@@ -523,6 +523,14 @@ impl Wallet {
 		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
+		// A leaf received under a hash the wallet did not make is claimed only
+		// with that hash's preimage: before the wallet holds it, an exit
+		// would bring the leaf to the chain with nothing to claim it by.
+		if row.state != "exiting" && self.awaiting_preimage()?.contains(leaf_id) {
+			return Err(Error::Refused(format!("coin {} is a leaf received under a payment hash the wallet did not make, claimed only with \
+				that hash's preimage, which the wallet does not hold yet: nothing is broadcast; it can be exited once the preimage is in \
+				hand", leaf_id)));
+		}
 		let record = Self::record_of(&row)?;
 		let now = self.now()?;
 		// An exit asks nothing of the expiry: it is what a wallet does when
@@ -628,7 +636,13 @@ impl Wallet {
 		}
 		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
 		let leaf = coin.leaf;
-		let after = self.claim_witness(&coin, &row.owner_nonce)?;
+		// A received leaf whose preimage is not in hand yet waits on the chain
+		// for it; the claim goes out once it is.
+		let after = match self.claim_witness(&coin, &row.owner_nonce) {
+			Ok(a) => a,
+			Err(e) => return Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "leaf": leaf_at.to_string(),
+				"error": e.to_string()})),
+		};
 		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		let claim = match claim {
 			Ok(c) => c,

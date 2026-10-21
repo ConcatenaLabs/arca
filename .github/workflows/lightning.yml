@@ -116,4 +116,4 @@ jobs:
       - name: The wallet's scenario
         run: |
           cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
-          cargo test --locked -p arca-cli --test arca_lightning -- --nocapture
+          cargo test --locked -p arca-cli --test arca_lightning --test arca_lightning_hash -- --nocapture
