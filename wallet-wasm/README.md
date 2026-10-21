@@ -25,15 +25,19 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   only), `getmempoolentry`, `getmempoolinfo`, `scantxoutset` (`start`, with
   `raw()` descriptors), `decodescript`, `getanchorstatus`,
   `getfeeexchangerates` with `dumpassetlabels` (the node keys its rates by
-  label), and `sendrawtransaction`, the one that writes. A page
+  label), and `sendrawtransaction`, the one that writes. Reads that do not
+  depend on each other go together in one JSON-RPC batch where the node or
+  its proxy takes one; a proxy that refuses a batch is asked one call at a
+  time from then on. A page
   holds no node credential worth having, so a site serves its wallets a proxy
   that allows exactly these calls, adds the node's credential itself and
   limits each caller, and the wallet is created with `node_url` alone.
-  `scantxoutset` reads the whole UTXO set, and a command makes one for each
-  window of on-chain scripts and each output it looks for (three, among some
-  thirty calls, for a wallet with one coin on the chain): a limit that lets a
-  caller make a few dozen in a row, then about one a second, keeps the wallet
-  working.
+  `scantxoutset` reads the whole UTXO set. The wallet scans once for each
+  window of on-chain scripts and each output it looks for when the chain has
+  moved since its last command (a few, among some fifty calls, for a wallet of
+  twenty coins after a new block), and not at all while it has not (see What
+  is checked when): a limit that lets a caller make a few dozen in a row, then
+  about one a second, keeps the wallet working.
 - **The pause** waits on the clock: a worker blocked in the library has nothing
   else to do, and `Atomics.wait` needs a cross-origin-isolated page.
 - **The store** is the same SQLite schema, on SQLite's OPFS storage
@@ -158,6 +162,56 @@ the library names the act rather than a command ("run sync", "an exit takes
 it now", "send one to the wallet's address"), and prefixes the texts it hands
 out `request:`, `swap-offer:` and `swap-accept:`. It reads a text whatever its
 prefix, the command line's `arca:…` included.
+
+## What is checked when
+
+The wallet runs every check the Arca specification names, at the moments it
+names them; a page keeps one wallet open across commands, and the library
+spends nothing it does not have to on reading the chain again.
+
+- **At the start of every command:** the re-check of every coin the wallet
+  holds against the chain (`start.recheck`, except for `recheck`, `sync` and
+  `schedule`, which run it themselves): each coin's round or board read where
+  the chain holds it now, a round that another transaction replaced checked
+  again with the five checks and the wallet's bounds (a failure takes the coin
+  on the chain at once), every round and board's finality, each coin's dates,
+  and its lineage looked for on the chain and in the mempool. Then the witness
+  of the operator's signer's record (`start.witness`), unless the command stays
+  on the machine and the node; a witness stands for ten seconds.
+- **In every command that reads the operator's terms** (each quote, payment,
+  refresh, take, board and swap): the operator's `info`, its key, chain and
+  keepers against those the wallet pinned when it was created. An operator
+  showing another key is refused there, before anything is signed; a coin's
+  records are checked against the pinned key in any case. A command that asks
+  the operator nothing (`coins`, `balance`) answers from the wallet's own
+  store and the chain.
+- **Before every signature:** the command's own checks, on the chain as it is
+  then: a payment pays only from coins whose rounds and boards are final now,
+  a take reads its order unspent and final, a swap reads the other side's
+  coins as a receiver does; fees in what the node accepts now.
+- **When a coin is received:** the five checks and the bounds on every leaf of
+  its lineage, then it is kept; until then it is not counted.
+
+**How the chain is read.** What the node answers is fixed by three things: the
+tip of its active chain, its view of its anchors (`getanchorstatus`), and the
+transactions in its mempool. Any reorganisation, of any depth, an anchor-driven
+one included, changes the tip; a parent chain the node no longer follows
+changes the anchor status; a broadcast, a replacement or an eviction changes
+the mempool. The library looks at those three (one request where the node
+takes a batch, three calls where it does not) at the start of every command,
+after each request to the operator (who may broadcast), after each pause and
+each broadcast of its own, and at least once a second. While
+they stand it answers each read of the chain from what the node said in that
+view; when any changes it drops those answers and reads again. A
+transaction's bytes by its id and a block's or a header's by its hash are kept
+across views, since no view changes them. What the node values at broadcast
+(its fee whitelist, its rates, its relay floor) can change while the view
+stands, and is read again in every command. So a command between tip changes
+makes a handful of calls; the first after a new block reads, once each, every
+base transaction and block the wallet's coins rest on, in two batches where
+the node takes them (some fifty single calls for twenty coins where it does
+not). The checks themselves run as often as before. The command line reads
+the chain the same way, within the one command each of its processes runs.
 
 ## Building
 

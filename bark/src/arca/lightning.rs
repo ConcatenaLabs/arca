@@ -448,6 +448,7 @@ impl Wallet {
 				return Ok(rec);
 			}
 			std::thread::sleep(std::time::Duration::from_millis(500));
+			super::chain::gap();
 		}
 	}
 

@@ -808,6 +808,13 @@ impl Wallet {
 		self.spelling = s;
 	}
 
+	/// The requests the wallet made of its node since it was opened (a batch
+	/// of calls is one), and the reads its chain source answered from what it
+	/// kept for the view they were read in ([`super::chain`]).
+	pub fn node_calls(&self) -> (u64, u64) {
+		self.chain.calls()
+	}
+
 	pub fn mnemonic_path(&self) -> PathBuf {
 		self.datadir.join(MNEMONIC_FILE)
 	}
@@ -2133,6 +2140,28 @@ impl Wallet {
 	/// the tip the wallet last saw has been reorganised away.
 	pub fn recheck(&mut self) -> Result<Value, Error> {
 		let tip = self.chain.tip()?;
+		// What the checks below read of each coin's rounds and boards, read
+		// ahead in a few requests where the node takes a batch.
+		let mut bases: Vec<Txid> = vec![];
+		for c in self.store.coins()? {
+			if Self::homeward(&c.state) {
+				bases.extend(c.bases.iter().filter_map(|t| Txid::from_str(t).ok()));
+			}
+		}
+		bases.sort();
+		bases.dedup();
+		// A board's output, looked up unspent: the outputs of each board the
+		// wallet keeps (a board has a few; a round's are left to be read as
+		// they are needed).
+		let mut outpoints = vec![];
+		for t in &bases {
+			if let Some(tx) = self.store.tx(&t.to_string())?.and_then(|raw| elements::encode::deserialize::<Transaction>(&raw).ok()) {
+				if tx.output.len() <= 4 {
+					outpoints.extend((0..tx.output.len() as u32).map(|i| OutPoint::new(*t, i)));
+				}
+			}
+		}
+		self.chain.read_ahead_of(&bases, &outpoints);
 		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
 		let last_hash = self.store.meta("tip_hash")?;
 		let reorg = match (last_h, last_hash) {

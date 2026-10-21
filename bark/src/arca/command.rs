@@ -103,6 +103,9 @@ pub fn operators(registry: &str, genesis: Option<&str>) -> Result<Value, Error> 
 /// Runs one command, as `arca <command>` does, `args` a JSON object of its
 /// arguments ([`COMMANDS`]). The answer is `{"result", "start"}`.
 pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> {
+	// Every command reads the chain as it is when it starts: the view the
+	// chain source keeps is looked at again before its first read.
+	w.chain.new_command();
 	let start = start(w, command);
 	let result = command_of(w, command, args)?;
 	Ok(json!({"result": result, "start": start}))

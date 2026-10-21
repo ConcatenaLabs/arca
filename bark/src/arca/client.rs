@@ -388,7 +388,10 @@ impl ServerClient {
 			None => minreq::get(url),
 			Some(b) => minreq::post(url).with_header("Content-Type", "application/json").with_body(b.to_string()),
 		};
-		let r = request.with_timeout(self.timeout).send().map_err(|e| e.to_string())?;
+		// The operator may broadcast on a request: the chain is looked at again.
+		let r = request.with_timeout(self.timeout).send().map_err(|e| e.to_string());
+		super::chain::gap();
+		let r = r?;
 		Ok((i32::from(r.status_code), r.as_str().unwrap_or("").to_string()))
 	}
 
@@ -405,7 +408,10 @@ impl ServerClient {
 			body: text.as_deref(),
 			timeout_secs: self.timeout,
 		};
-		let r = sequentia_ext::platform::http(&request)?;
+		// The operator may broadcast on a request: the chain is looked at again.
+		let r = sequentia_ext::platform::http(&request);
+		super::chain::gap();
+		let r = r?;
 		Ok((r.status, r.body))
 	}
 

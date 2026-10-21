@@ -156,6 +156,34 @@ impl Client {
 		serde_json::from_value(reply["result"].clone()).map_err(|e| Error::Json(e.to_string()))
 	}
 
+	/// Calls each of `calls` (a method and its positional parameters) in one
+	/// JSON-RPC batch, one request: each call's answer, in order, or the
+	/// node's refusal of it. A server that takes no batch (a proxy that takes
+	/// one call at a time) answers something other than a list, which is an
+	/// error of the whole batch: the caller makes the calls one by one.
+	pub fn batch(&self, calls: &[(String, Vec<Json>)]) -> Result<Vec<Result<Json, Error>>, Error> {
+		let body: Vec<Json> = calls.iter().enumerate()
+			.map(|(i, (m, p))| json!({"jsonrpc": "1.0", "id": i, "method": m, "params": p})).collect();
+		let (status, text) = self.post(&Json::Array(body).to_string())?;
+		let reply: Json = serde_json::from_str(&text).map_err(|_| Error::Http { status, body: text.clone() })?;
+		let Some(list) = reply.as_array() else {
+			return Err(Error::Http { status, body: text });
+		};
+		let mut out: Vec<Option<Result<Json, Error>>> = (0..calls.len()).map(|_| None).collect();
+		for r in list {
+			let Some(i) = r["id"].as_u64().map(|i| i as usize).filter(|i| *i < calls.len()) else { continue };
+			out[i] = Some(if r["error"].is_null() {
+				Ok(r["result"].clone())
+			} else {
+				Err(Error::Rpc {
+					code: r["error"]["code"].as_i64().unwrap_or(0),
+					message: r["error"]["message"].as_str().unwrap_or("").to_string(),
+				})
+			});
+		}
+		Ok(out.into_iter().map(|o| o.unwrap_or_else(|| Err(Error::Json("the batch's answer leaves out a call".into())))).collect())
+	}
+
 	pub fn blockchain_info(&self) -> Result<BlockchainInfo, Error> {
 		self.call("getblockchaininfo", &[])
 	}
