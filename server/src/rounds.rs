@@ -220,7 +220,7 @@ use crate::fees;
 use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{
-	BatchRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewRoundFill, NewScript, NewTreeScript,
+	BatchRow, FillRow, LeafKind, LeafState, NewBatch, NewBatchLeaf, NewCoin, NewOffboard, NewRerun, NewRound, NewRoundFill, NewScript, NewTreeScript,
 	ParticipationRow, NurseryState, ParticipationState, RoundRow, RoundState, ScriptKind, Store, StoreError, StoredReserve, TreeScriptKind,
 	WalletCoin, WantedKind,
 };
@@ -333,11 +333,11 @@ struct PlannedOffboard {
 	margin: u64,
 }
 
-/// An on-chain order a fill round fills: the take that asks for it (its
-/// index among the round's participations), the order's outpoint, terms and
-/// what it holds, and the fill.
+/// An on-chain order a fill round fills: the takes that ask for it (their
+/// indices among the round's participations, one or several), the order's
+/// outpoint, terms and what it holds, and the fill, of all of them together.
 struct PlannedFill {
-	participation: usize,
+	participations: Vec<usize>,
 	order: OutPoint,
 	terms: FillOrder,
 	locked: u64,
@@ -346,6 +346,9 @@ struct PlannedFill {
 
 /// The most orders one round fills.
 pub const MAX_FILLS: usize = 16;
+
+/// The most takes one round runs, of all its orders together.
+pub const MAX_TAKES: usize = 64;
 
 /// The value of the output a full fill puts at its `2k+1`, which the FILL
 /// leaf reads only for its asset, an explicit one other than the order's:
@@ -657,7 +660,31 @@ impl Rounds {
 			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {
 				continue;
 			}
-			if chosen.len() >= MAX_FILLS.min(self.config.max_batch_leaves) {
+			if chosen.len() >= MAX_TAKES.min(self.config.max_batch_leaves) {
+				continue;
+			}
+			// A new order needs an input of its own; a take of an order the
+			// round fills already shares that order's.
+			let orders: BTreeSet<OutPoint> = chosen.iter().filter_map(|c| c.fill.as_ref().map(|f| f.outpoint())).collect();
+			if row.fill.as_ref().is_some_and(|f| !orders.contains(&f.outpoint())) && orders.len() >= MAX_FILLS {
+				continue;
+			}
+			// Each buyer's own fill is at least the order's minimum lot: the
+			// FILL leaf judges the round's fill of an order, every take of it
+			// together, so a share below the lot is the round's to refuse.
+			if let Some(why) = Self::below_min_lot(&row)? {
+				let voided = self.store.void_participation(&row.id, &why).await?;
+				log::warn!("take {} cannot run (voided: {}): {}", crate::signer::hex(&row.id), voided, why);
+				continue;
+			}
+			// Takes of one order that run together all share it, and fill
+			// no more of it than its FILL leaf takes; one that does not fit
+			// beside those chosen before it waits for a later round.
+			if let Some(why) = Self::does_not_fit(&chosen, &row)? {
+				if row.waiting.as_deref() != Some(why.as_str()) {
+					self.store.set_waiting(&row.id, Some(&why)).await?;
+				}
+				log::warn!("take {} waits: {}", crate::signer::hex(&row.id), why);
 				continue;
 			}
 			if !self.still_good(&row, now).await? {
@@ -729,18 +756,82 @@ impl Rounds {
 		}
 	}
 
-	/// The fills of `chosen`, a fill round's takes, in order: the order at
-	/// input `k` is the `k`-th take's.
+	/// Why the take `row`'s own fill is one no round runs, if it is: below
+	/// its order's minimum lot. A take is refused that at its submission;
+	/// the round builder holds the same rule, since the order's FILL leaf
+	/// reads only what a round fills of the order, every take of it together.
+	fn below_min_lot(row: &ParticipationRow) -> Result<Option<String>, RoundError> {
+		let Some(f) = &row.fill else { return Ok(None) };
+		let terms = f.order()?;
+		Ok((f.filled < terms.min_lot).then(|| format!("order {}: the take fills {} atoms, below the order's min_lot of {}: the covenant \
+			judges a round's whole fill of an order, so the operator holds each buyer's share to the minimum lot, and the take is void",
+			outpoint_text(&f.outpoint()), f.filled, terms.min_lot)))
+	}
+
+	/// Why the take `row` cannot run in the round beside the takes of
+	/// `chosen`, if it cannot: another take of its order is chosen and one of
+	/// the two takes it alone, or they read different amounts resting there,
+	/// or all of them together would fill more of the order than its FILL
+	/// leaf takes.
+	fn does_not_fit(chosen: &[ParticipationRow], row: &ParticipationRow) -> Result<Option<String>, RoundError> {
+		let Some(f) = &row.fill else { return Ok(None) };
+		let op = f.outpoint();
+		let same: Vec<&FillRow> = chosen.iter().filter_map(|c| c.fill.as_ref()).filter(|g| g.outpoint() == op).collect();
+		if same.is_empty() {
+			return Ok(None);
+		}
+		if !f.shared || same.iter().any(|g| !g.shared) {
+			return Ok(Some(format!("order {} is filled in this round for another take, and one of the two takes it alone: it runs in a \
+				later round", outpoint_text(&op))));
+		}
+		if same.iter().any(|g| g.locked != f.locked) {
+			return Ok(Some(format!("order {}: the takes of it read different amounts resting there", outpoint_text(&op))));
+		}
+		let total: u128 = same.iter().map(|g| g.filled as u128).sum::<u128>() + f.filled as u128;
+		let terms = f.order()?;
+		match u64::try_from(total).ok().map(|t| terms.plan(f.locked, t)) {
+			Some(Ok(_)) => Ok(None),
+			Some(Err(e)) => Ok(Some(format!("order {}: with the takes before it the round would fill {} of it: {}; it runs in a later round",
+				outpoint_text(&op), total, e))),
+			None => Ok(Some(format!("order {}: the takes of it fill more than it holds", outpoint_text(&op)))),
+		}
+	}
+
+	/// The fills of `chosen`, a fill round's takes, in order: each order
+	/// once, at the input of its first take, its fill the sum of every
+	/// chosen take of it; the order at input `k` is the `k`-th order met.
+	/// Each take's own price is its fill's, rounded up; the order's credit is
+	/// the price of the sum, rounded up once, so the operator pays the maker
+	/// at most what the takes pay it.
 	fn plan_fills(chosen: &[ParticipationRow]) -> Result<Vec<PlannedFill>, RoundError> {
-		chosen.iter().enumerate().map(|(k, row)| {
+		let mut fills: Vec<(OutPoint, Vec<usize>)> = vec![];
+		for (j, row) in chosen.iter().enumerate() {
 			let f = row.fill.as_ref().ok_or_else(|| RoundError::Internal("a fill round runs takes only".into()))?;
 			let terms = f.order()?;
-			let plan = terms.plan(f.locked, f.filled).map_err(|e| RoundError::Internal(format!("take {}: {}", crate::signer::hex(&row.id), e)))?;
-			if plan.credit.value != f.price {
+			let own = terms.plan(f.locked, f.filled).map_err(|e| RoundError::Internal(format!("take {}: {}", crate::signer::hex(&row.id), e)))?;
+			if own.credit.value != f.price {
 				return Err(RoundError::Internal(format!("take {}: its order prices the fill at {}, the take at {}", crate::signer::hex(&row.id),
-					plan.credit.value, f.price)));
+					own.credit.value, f.price)));
 			}
-			Ok(PlannedFill { participation: k, order: f.outpoint(), terms, locked: f.locked, plan })
+			match fills.iter_mut().find(|(op, _)| *op == f.outpoint()) {
+				Some((_, takes)) => takes.push(j),
+				None => fills.push((f.outpoint(), vec![j])),
+			}
+		}
+		fills.into_iter().map(|(order, takes)| {
+			let first = chosen[takes[0]].fill.as_ref().expect("a take");
+			let terms = first.order()?;
+			let mut total: u64 = 0;
+			for j in &takes {
+				let f = chosen[*j].fill.as_ref().expect("a take");
+				if f.locked != first.locked || f.order()? != terms {
+					return Err(RoundError::Internal(format!("order {}: its takes read it differently", outpoint_text(&order))));
+				}
+				total = total.checked_add(f.filled).ok_or_else(|| RoundError::Internal("a fill overflows".into()))?;
+			}
+			let plan = terms.plan(first.locked, total)
+				.map_err(|e| RoundError::Internal(format!("order {}, {} take(s): {}", outpoint_text(&order), takes.len(), e)))?;
+			Ok(PlannedFill { participations: takes, order, terms, locked: first.locked, plan })
 		}).collect()
 	}
 
@@ -750,14 +841,19 @@ impl Rounds {
 	/// output a full fill puts at its `2k+1`.
 	async fn fill_pays(&self, rows: &[&ParticipationRow], now: MedianTime) -> Result<BTreeMap<AssetId, u64>, RoundError> {
 		let mut pays = self.pays(rows, now).await?;
+		let mut orders: BTreeMap<OutPoint, (FillOrder, u64, u64)> = BTreeMap::new();
 		for row in rows {
 			let Some(f) = &row.fill else { continue };
-			let terms = f.order()?;
+			let e = orders.entry(f.outpoint()).or_insert((f.order()?, f.locked, 0));
+			e.2 = e.2.saturating_add(f.filled);
+		}
+		for (terms, locked, filled) in orders.values() {
 			if let Some(a) = pays.get_mut(&terms.asset_a) {
-				*a = a.saturating_sub(f.filled);
+				*a = a.saturating_sub(*filled);
 			}
-			let gap = if f.filled == f.locked { gap_value(terms.asset_b, terms.asset_b) } else { 0 };
-			*pays.entry(terms.asset_b).or_default() += f.price + gap;
+			let credit = terms.price(*filled).unwrap_or(u64::MAX);
+			let gap = if filled == locked { gap_value(terms.asset_b, terms.asset_b) } else { 0 };
+			*pays.entry(terms.asset_b).or_default() += credit.saturating_add(gap);
 		}
 		Ok(pays)
 	}
@@ -1364,9 +1460,9 @@ impl Rounds {
 			reruns: ties.iter().map(|t| NewRerun {
 				replaces: t.replaces, tie: (t.coin.txid, t.coin.vout), via: t.via.map(|v| v.to_byte_array()),
 			}).collect(),
-			fills: fills.iter().enumerate().map(|(k, f)| NewRoundFill {
-				k: k as u32, participation_id: chosen[f.participation].id, attempt: chosen[f.participation].attempt,
-			}).collect(),
+			fills: fills.iter().enumerate().flat_map(|(k, f)| f.participations.iter().map(move |j| NewRoundFill {
+				k: k as u32, participation_id: chosen[*j].id, attempt: chosen[*j].attempt,
+			})).collect(),
 		};
 		let round_id = match self.store.insert_round(&new).await {
 			Ok(id) => id,
@@ -1383,9 +1479,9 @@ impl Rounds {
 		log::info!("round {} ({}): {} batch(es), {} offboard(s), {} participation(s), {} order(s) filled, {} vB, fee {} of {}: {}",
 			round_id, txid, batches.len(), offboards.len(), chosen.len(), fills.len(), tx.vsize(), built.fee.amount, fee_asset, broadcast);
 		for (k, f) in fills.iter().enumerate() {
-			log::info!("round {}: order {} at input {}, its credit of {} at output {}, {} at output {}", round_id, outpoint_text(&f.order), k,
-				f.plan.credit.value, 2 * k, if f.plan.rest.is_some() { "the order resting again" } else { "an output of another asset" },
-				2 * k + 1);
+			log::info!("round {}: order {} at input {}, filled by {} for {} take(s), its credit of {} at output {}, {} at output {}", round_id,
+				outpoint_text(&f.order), k, f.plan.filled, f.participations.len(), f.plan.credit.value, 2 * k,
+				if f.plan.rest.is_some() { "the order resting again" } else { "an output of another asset" }, 2 * k + 1);
 		}
 		for row in chosen {
 			self.store.set_waiting(&row.id, None).await?;
@@ -1597,7 +1693,7 @@ impl Rounds {
 		let _one = self.voiding.lock().await;
 		let round_txid = Txid::from_byte_array(r.txid);
 		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
-		let orders = self.store.round_fills(r.round_id).await?.len();
+		let orders = self.store.round_orders(r.round_id).await?;
 		for i in tx.input.iter().take(orders) {
 			let op = i.previous_output;
 			if let Some(by) = self.store.outpoint_spender(&op.txid.to_byte_array(), op.vout).await? {
@@ -1685,8 +1781,9 @@ impl Rounds {
 		}
 		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 		let mut taken = vec![];
-		for f in &fills {
-			let Some(op) = tx.input.get(f.k as usize).map(|i| i.previous_output) else { continue };
+		let ks: BTreeSet<u32> = fills.iter().map(|f| f.k).collect();
+		for k in ks {
+			let Some(op) = tx.input.get(k as usize).map(|i| i.previous_output) else { continue };
 			if self.finality.call(move |c| c.unspent(&op, true)).await.map_err(chain)?.is_some() {
 				continue;
 			}
@@ -2338,5 +2435,84 @@ impl Rounds {
 				}
 			}
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn order() -> FillOrder {
+		let key = |b: u8| {
+			let sk = elements::secp256k1_zkp::SecretKey::from_slice(&[b; 32]).unwrap();
+			elements::secp256k1_zkp::Keypair::from_secret_key(elements::secp256k1_zkp::SECP256K1, &sk).x_only_public_key().0.serialize()
+		};
+		FillOrder {
+			asset_a: AssetId::from_byte_array([1; 32]), asset_b: AssetId::from_byte_array([2; 32]), rate_num: 3, rate_den: 2,
+			min_lot: 10_000, maker_prog: key(3), expiry_locktime: 1_800_000_000, maker_x: key(4),
+		}
+	}
+
+	fn take(n: u8, at: OutPoint, terms: &FillOrder, locked: u64, filled: u64, shared: bool) -> ParticipationRow {
+		ParticipationRow {
+			id: [n; 32], unlock_hash: [0; 32], preimage: [0; 32], attempt: 0, round_id: None, state: ParticipationState::Pending,
+			not_before: None, refund_delay_units: 1, inputs: vec![], outputs: vec![], fees: vec![], waiting: None, void_reason: None,
+			fill: Some(FillRow {
+				order_txid: at.txid.to_byte_array(), order_vout: at.vout, terms: terms.to_relay(&at).to_string(),
+				script_pubkey: terms.script_pubkey().to_bytes(), locked, filled, price: terms.price(filled).unwrap(), shared,
+			}),
+		}
+	}
+
+	/// Ten takes of one order and one of another: one fill each order, at
+	/// the input of its first take; the shared order's fill is the sum of its
+	/// takes and its credit the order's price of that sum, rounded up once.
+	#[test]
+	fn takes_of_one_order_are_one_fill_of_their_sum() {
+		let t = order();
+		let sale = OutPoint::new(Txid::from_byte_array([7; 32]), 0);
+		let other = OutPoint::new(Txid::from_byte_array([8; 32]), 1);
+		let mut rows = vec![take(100, other, &t, 50_000, 50_000, true)];
+		let shares: Vec<u64> = (0..10).map(|i| 100_001 + 10_000 * i).collect();
+		for (i, f) in shares.iter().enumerate() {
+			rows.push(take(i as u8, sale, &t, 2_000_000, *f, true));
+		}
+		let fills = Rounds::plan_fills(&rows).unwrap();
+		assert_eq!(fills.len(), 2);
+		assert_eq!((fills[0].order, fills[0].participations.clone()), (other, vec![0]));
+		assert_eq!(fills[1].order, sale);
+		assert_eq!(fills[1].participations, (1..=10).collect::<Vec<_>>());
+		let sum: u64 = shares.iter().sum();
+		assert_eq!((fills[1].plan.filled, fills[1].plan.remainder), (sum, 2_000_000 - sum));
+		let own: u64 = shares.iter().map(|f| t.price(*f).unwrap()).sum();
+		assert_eq!(fills[1].plan.credit.value, t.price(sum).unwrap());
+		// Each odd share's own price rounds up half an atom; the sum's once.
+		assert_eq!(own - fills[1].plan.credit.value, 5, "the takes pay {}, the maker is credited {}", own, fills[1].plan.credit.value);
+	}
+
+	/// The round builder's rules for a take of an order another chosen take
+	/// fills: below the minimum lot, void; beside a take that takes it alone,
+	/// or past what the FILL leaf lets one round take, a later round.
+	#[test]
+	fn the_round_builder_holds_each_share_to_the_order() {
+		let t = order();
+		let sale = OutPoint::new(Txid::from_byte_array([7; 32]), 0);
+		let small = take(1, sale, &t, 2_000_000, 9_999, true);
+		let why = Rounds::below_min_lot(&small).unwrap().expect("below the lot");
+		assert!(why.contains("below the order's min_lot of 10000"), "{}", why);
+		assert_eq!(Rounds::below_min_lot(&take(2, sale, &t, 2_000_000, 10_000, true)).unwrap(), None);
+
+		let chosen = vec![take(3, sale, &t, 2_000_000, 1_000_000, true), take(4, sale, &t, 2_000_000, 900_000, true)];
+		assert_eq!(Rounds::does_not_fit(&chosen, &take(5, sale, &t, 2_000_000, 100_000, true)).unwrap(), None, "fills it whole");
+		let why = Rounds::does_not_fit(&chosen, &take(6, sale, &t, 2_000_000, 95_000, true)).unwrap().expect("leaves 5000");
+		assert!(why.contains("below the order's min_lot of 10000"), "{}", why);
+		let why = Rounds::does_not_fit(&chosen, &take(7, sale, &t, 2_000_000, 200_000, true)).unwrap().expect("more than it holds");
+		assert!(why.contains("later round"), "{}", why);
+		let why = Rounds::does_not_fit(&chosen, &take(8, sale, &t, 2_000_000, 50_000, false)).unwrap().expect("takes it alone");
+		assert!(why.contains("takes it alone"), "{}", why);
+		let alone = vec![take(9, sale, &t, 2_000_000, 50_000, false)];
+		assert!(Rounds::does_not_fit(&alone, &take(10, sale, &t, 2_000_000, 50_000, true)).unwrap().is_some());
+		let other = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+		assert_eq!(Rounds::does_not_fit(&alone, &take(11, other, &t, 2_000_000, 50_000, false)).unwrap(), None, "another order");
 	}
 }

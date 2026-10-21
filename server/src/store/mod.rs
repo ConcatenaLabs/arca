@@ -12,7 +12,8 @@
 //! `schema/V18__lightning_send.sql`, `schema/V19__lightning_receive.sql`,
 //! `schema/V20__pending_coins.sql`, `schema/V21__takes.sql`,
 //! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`,
-//! `schema/V24__distributions.sql`),
+//! `schema/V24__distributions.sql`,
+//! `schema/V25__shared_fills.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -102,6 +103,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(22, include_str!("../../schema/V22__round_fills.sql")),
 	(23, include_str!("../../schema/V23__lightning_internal.sql")),
 	(24, include_str!("../../schema/V24__distributions.sql")),
+	(25, include_str!("../../schema/V25__shared_fills.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
@@ -162,9 +164,14 @@ pub enum StoreError {
 	Mergeable(String),
 	#[error("a participation with this id is already recorded")]
 	ParticipationExists,
-	/// Another pending or issued participation takes the same order.
+	/// Another pending or issued participation takes the same order, and
+	/// this take or that one takes it alone.
 	#[error("order {0} is taken by participation {1}, which is pending or in a round: an order is taken by one participation at a time")]
 	OrderTaken(String, String),
+	/// The takes that share an order would together take more of it than
+	/// its FILL leaf lets one round take: the order, what they take, and why.
+	#[error("order {0}: {1}")]
+	OrderFull(String, String),
 	/// The participation is no longer in its round's forfeit step.
 	#[error("the participation is {0}")]
 	NotInRound(&'static str),

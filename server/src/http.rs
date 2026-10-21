@@ -662,6 +662,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			block_seconds: app.params.order_block_seconds,
 			forfeit_window_seconds: app.params.fill_forfeit_window_seconds,
 			round_interval_seconds: app.params.round_interval_seconds,
+			shared: true,
 		},
 	})
 }
@@ -937,6 +938,10 @@ fn participation_status(s: &Status) -> api::ParticipationStatus {
 				input: s.fill_at,
 				credit_vout: s.fill_at.map(|k| 2 * k),
 				remainder_vout: s.fill_at.map(|k| 2 * k + 1),
+				round_filled: s.round_fill.map(|r| r.filled.to_string()),
+				round_remainder: s.round_fill.map(|r| r.remainder.to_string()),
+				round_credit: s.round_fill.map(|r| r.credit.to_string()),
+				round_takes: s.round_fill.map(|r| r.takes),
 			})
 		}),
 	}
@@ -1026,6 +1031,7 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 		key_proof: l.key_proof.as_deref().map(sig).transpose()?,
 		fee: (asset(&req.fee.asset)?, amount(&req.fee.amount)?),
 		not_before,
+		share: req.share,
 	}).await?;
 	if let Some((mailbox, proof)) = bound {
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
@@ -1474,6 +1480,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 				order: serde_json::from_str(&f.terms).unwrap_or(serde_json::Value::Null),
 				locked: f.locked.to_string(),
 				filled: f.filled.to_string(),
+				shared: f.shared,
 			}),
 		}));
 	}

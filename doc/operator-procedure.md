@@ -120,7 +120,9 @@ paid twice.
   coins back to its wallet, so the round can never confirm: one small
   transaction's fee, in the round's fee asset, each time. The round's other
   coins are free again at once, and its takes that can still run do so in
-  the next round.
+  the next round. Takes that share an order run in one round, so a single
+  take whose forfeits never come holds every other take of that round back
+  for the window before they run again without it.
 - **When the operator stops or moves, tell the holders.** Say which
   operator ends, from which time, and which operator replaces it, so each
   holder runs `arca sync` at once, takes its coins home on the chain, and

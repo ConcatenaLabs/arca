@@ -923,6 +923,11 @@ impl Wallet {
 			body["order"] = f["order"].clone();
 			body["locked"] = f["locked"].clone();
 			body["filled"] = f["filled"].clone();
+			// A take that shares its order checks its round against the sum
+			// of the takes of it, as the wallet that made it would.
+			if f["shared"] == json!(true) {
+				body["share"] = json!(true);
+			}
 		}
 		let s = &self.store;
 		let held = s.participations().map_err(|e| e.to_string())?.into_iter().any(|q| q.0 == pid);

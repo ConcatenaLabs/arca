@@ -40,7 +40,9 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V20__pending_coins.sql`](schema/V20__pending_coins.sql),
 [`schema/V21__takes.sql`](schema/V21__takes.sql),
 [`schema/V22__round_fills.sql`](schema/V22__round_fills.sql),
-[`schema/V23__lightning_internal.sql`](schema/V23__lightning_internal.sql)). `Store::connect` builds it
+[`schema/V23__lightning_internal.sql`](schema/V23__lightning_internal.sql),
+[`schema/V24__distributions.sql`](schema/V24__distributions.sql),
+[`schema/V25__shared_fills.sql`](schema/V25__shared_fills.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -754,8 +756,9 @@ broadcast (see Rounds that fill on-chain orders).
 `take_order` names the order as the relay serves it (its `CovenantTerms`, or
 an offer whose settlement is one), what it holds (`locked`), the fill
 (`filled`), the coins given up, each with its attestation over the take's id,
-the leaf wanted with its key proof, and the fee. The server takes it only
-when:
+the leaf wanted with its key proof, the fee, and whether it shares the order
+(`share`, which `info.fills.shared` says the server takes). The server takes
+it only when:
 
 - the order's terms are ones a resting order can have (an internal key other
   than NUMS is a maker's key path and is refused), and the fill is one the
@@ -780,9 +783,14 @@ when:
   covers that asset's schedule for an offboard of the price: the maker's
   credit is an on-chain output the operator pays, as an offboard is;
 - no other pending or issued participation takes the same order
-  (`order_taken`, a 409, naming that participation), checked
-  under a lock on the order so two takes racing each other cannot both be
-  taken.
+  (`order_taken`, a 409, naming that participation), unless this take and
+  every one standing share it: takes that share an order stand together as
+  long as all of them together take no more than it holds and leave nothing,
+  or at least `min_lot`, resting (`order_taken` again, saying how much is
+  left to take). Each take's own fill is still at least `min_lot`. This is
+  checked under a lock on the order so two takes racing each other cannot
+  both be taken past it, and it makes every set of them one round can run
+  together a fill the FILL leaf takes.
 
 Unlike a refresh, a take asks its owner for something once more before its
 round runs: its forfeits, once its round is built and before it is
@@ -791,8 +799,10 @@ Rounds that fill on-chain orders). A take is a participation of its own,
 carrying the two assets its nature asks: it is never taken into a refresh round, and its status
 (`participation_status`) shows its order (`fill`: the outpoint, both assets,
 what it holds, what is filled and what rests again, the price, the maker's
-script and the order's). The same request again is answered with its
-status.
+script and the order's; once in a round, the order's input `k`, the credit's
+`2k` and the rest's `2k+1`, and what the round fills of the order with every
+take of it together: `round_filled`, `round_remainder`, `round_credit` and
+`round_takes`). The same request again is answered with its status.
 
 The take's id is `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ body)`,
 `T = SHA256("Arca/take")`, over the order's outpoint and script (which commits
@@ -966,8 +976,17 @@ batches, so a mirror copies every published tree.
 A take runs in a round of its own kind, beside the refresh rounds: a fill
 round of the asset its order sells, which carries takes and nothing else, so
 an input a third party may spend first never stands in a round of refreshes.
-The runner builds one for each asset whose takes wait, at most 16 orders a
-round. It is built under the rule every SeqDEX fill covenant reads:
+The runner builds one for each asset whose takes wait, at most 16 orders and
+64 takes a round. Takes that share an order run in one round together: the
+round spends the order once, at the input of the first of them, fills it by
+the sum of their fills, credits its maker the order's price for that sum
+(rounded up once, so never more than the takes' own prices together), and
+pays each take a leaf of its own fill in the batch. The FILL leaf reads only
+that sum, so the round holds each buyer's share to the order's `min_lot`
+itself: a take below it is refused when it is submitted and voided if a
+round ever meets one; a take that shares an order with a take that takes it
+alone waits for a later round. It is built under the rule every SeqDEX fill
+covenant reads:
 
 | Inputs | Outputs |
 |---|---|

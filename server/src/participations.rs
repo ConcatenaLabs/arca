@@ -69,7 +69,9 @@
 //! to fill an on-chain order for its owner: it gives up coins in the asset the
 //! order is paid in and wants one leaf of what it fills, in the asset the
 //! order sells, so it carries those two assets and runs in no refresh round.
-//! Its id is [`arca_covenant::Take::id`], under its own tag.
+//! Its id is [`arca_covenant::Take::id`], under its own tag. Several takes of
+//! one order that each say they share it run in one round, which fills their
+//! sum and pays each its own leaf.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -198,6 +200,11 @@ pub struct TakeRequest {
 	/// The operator's fee, in the asset the order is paid in.
 	pub fee: (AssetId, u64),
 	pub not_before: Option<MedianTime>,
+	/// Whether the take accepts a round that fills its order together with
+	/// other takes of it: the round then fills their sum, and each is paid a
+	/// leaf of its own fill. Not covered by the id: it changes which takes a
+	/// round runs together, never what any take gives or gets.
+	pub share: bool,
 }
 
 impl TakeRequest {
@@ -391,8 +398,9 @@ impl From<StoreError> for ParticipationError {
 			StoreError::KeyReused => ParticipationError::KeyReused,
 			StoreError::ScriptReused => ParticipationError::ScriptReused,
 			StoreError::OrderTaken(order, by) => ParticipationError::OrderTaken(format!("order {} is taken by participation {}, \
-				which is pending or in a round: an order is taken by one participation at a time, and a take of it waits until that one \
-				is done", order, by)),
+				which is pending or in a round, and one of the two takes it alone: an order is taken by one such participation at a time \
+				(takes that both share it may stand together), and a take of it waits until that one is done", order, by)),
+			StoreError::OrderFull(order, why) => ParticipationError::OrderTaken(format!("order {}: {}", order, why)),
 			other => ParticipationError::Store(other),
 		}
 	}
@@ -440,6 +448,21 @@ pub struct Status {
 	/// For a take in a round: the input its order is at, `k`, credited at
 	/// `2k` and resting again, or holding another asset, at `2k+1`.
 	pub fill_at: Option<u32>,
+	/// For a take in a round: what the round fills of its order, every take
+	/// of it together, and the maker's credit for that ([`RoundFill`]).
+	pub round_fill: Option<RoundFill>,
+}
+
+/// What a round fills of one order, all its takes together: the sum of
+/// their fills, what rests again, and the maker's credit at `2k`, the
+/// order's price for the sum (rounded up once, so at most the sum of the
+/// takes' own prices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundFill {
+	pub filled: u64,
+	pub remainder: u64,
+	pub credit: u64,
+	pub takes: u32,
 }
 
 /// See the [module documentation](self).
@@ -816,7 +839,17 @@ impl Participations {
 	///   and the fee covers `asset_b`'s schedule for an offboard of the price
 	///   (the maker's credit is an on-chain output the operator pays in
 	///   `asset_b`, as it pays an offboard);
-	/// - no other pending or issued participation takes the order.
+	/// - no other pending or issued participation takes the order, unless
+	///   this take and every one standing share it ([`TakeRequest::share`]):
+	///   then they stand together while all of them together take no more
+	///   than the order holds and leave nothing resting below its min_lot,
+	///   so any of them a round runs together fill a whole its FILL leaf
+	///   takes.
+	///
+	/// Each take's own fill is at least the order's min_lot, as a fill alone
+	/// must be: a round that fills an order for several takes is judged by
+	/// the leaf on their sum, so the minimum lot of each buyer is the
+	/// operator's rule, here and again when the round is built.
 	///
 	/// A take submitted again is answered with its status.
 	pub async fn take(&self, req: &TakeRequest) -> Result<Status, ParticipationError> {
@@ -958,6 +991,7 @@ impl Participations {
 				locked: req.locked,
 				filled: req.filled,
 				price,
+				shared: req.share,
 			}),
 			distribution: None,
 		};
@@ -1062,7 +1096,29 @@ impl Participations {
 			(Some(_), Some(round_id)) => self.store.fill_in_round(id, row.attempt).await?.filter(|(r, _)| *r == round_id).map(|(_, k)| k),
 			_ => None,
 		};
-		Ok(Status { row, round, placed, fill_at })
+		let round_fill = match (&row.fill, row.round_id, fill_at) {
+			(Some(f), Some(round_id), Some(k)) => Some(self.round_fill(round_id, k, f).await?),
+			_ => None,
+		};
+		Ok(Status { row, round, placed, fill_at, round_fill })
+	}
+
+	/// What the round `round_id` fills of the order at its input `k`, whose
+	/// take `f` is one of the takes of it the round runs.
+	async fn round_fill(&self, round_id: i64, k: u32, f: &FillRow) -> Result<RoundFill, ParticipationError> {
+		let mut filled: u64 = 0;
+		let mut takes = 0;
+		for x in self.store.round_fills(round_id).await?.into_iter().filter(|x| x.k == k) {
+			let p = self.store.participation(&x.participation_id).await?
+				.ok_or_else(|| ParticipationError::Internal(format!("take {} of round {} is not recorded", hex(&x.participation_id), round_id)))?;
+			let g = p.fill.ok_or_else(|| ParticipationError::Internal(format!("participation {} is not a take", hex(&p.id))))?;
+			filled = filled.checked_add(g.filled).ok_or_else(|| ParticipationError::Internal("a round's fill overflows".into()))?;
+			takes += 1;
+		}
+		let terms = f.order()?;
+		let credit = terms.price(filled).ok_or_else(|| ParticipationError::Internal(format!("order {}: no price for {}", outpoint_text(&f.outpoint()),
+			filled)))?;
+		Ok(RoundFill { filled, remainder: f.locked.saturating_sub(filled), credit, takes })
 	}
 }
 
