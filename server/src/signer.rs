@@ -38,11 +38,20 @@
 //!   that names `S` with `OP_CHECKSIG` or `OP_CHECKSIGVERIFY` (one of the
 //!   operator's own paths: a clock's release or roll, `R`, a sweep, a reclaim,
 //!   a forfeit's claim, the connector's issuance, an offboard's reclaim), and
-//!   only for an input that spends a taproot output.
+//!   only for an input that spends a taproot output;
+//! - `{"op":"unroll","children_hash":…,"time":…}`: the operator's unroll
+//!   authorisation for a node, `S`'s signature over
+//!   `SHA256("Arca/unroll" ‖ H ‖ t)`, which the signer builds itself from the
+//!   node's children hash `H` and a median time `t`. `S` is a member of every
+//!   node, and the operator answers a holder who brings home a coin it gave
+//!   up for a leaf of an offline refresh only after unrolling that leaf, whose
+//!   tree did not exist when the holder signed. An unroll moves no coin: it
+//!   creates the children its node pins, and the reserves are the
+//!   operator's.
 //!
-//! It signs nothing else: no digest handed to it, no unroll authorisation, no
-//! release, and no spend by a path that checks `S` with
-//! `OP_CHECKSIGFROMSTACK`, which only the rebindable message reaches. The
+//! It signs nothing else: no digest handed to it, no release, and no spend by
+//! a path that checks `S` with `OP_CHECKSIGFROMSTACK`, which only the
+//! rebindable message reaches. The
 //! socket sits in a directory only the operator's user can enter, and the
 //! server checks every rule before it asks.
 //!
@@ -140,7 +149,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use arca_covenant::{ExplicitOutput, ForfeitPolicy, LeafId, RelativeTime};
+use arca_covenant::{ExplicitOutput, ForfeitPolicy, LeafId, MedianTime, RelativeTime};
 
 /// The longest request line the signer reads: a claim of 200 forfeits, its
 /// spent outputs with it, fits several times over.
@@ -240,6 +249,9 @@ pub enum Request {
 	/// The transaction and each output its inputs spend, in Sequentia's
 	/// encoding as hex; the input signed; the leaf it spends by, as hex.
 	Spend { tx: String, prevouts: Vec<String>, input: u32, leaf: String },
+	/// The operator's unroll authorisation for the node whose children hash
+	/// is `children_hash` (32 bytes, hex), from the median time `time` on.
+	Unroll { children_hash: String, time: u32 },
 }
 
 /// Why the signer will not sign a spend: `Ok` when `leaf` names `operator`
@@ -1949,6 +1961,16 @@ impl SignerClient {
 			input: input as u32,
 			leaf: hex(leaf.as_bytes()),
 		}).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s unroll authorisation for the node whose children hash is
+	/// `children_hash`, usable from the median time `t`: its signature over
+	/// [`arca_covenant::message::unroll_authorisation`], which the signer
+	/// builds itself.
+	pub async fn unroll(&self, children_hash: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
+		let r = self.ask(&Request::Unroll { children_hash: hex(children_hash), time: t.to_consensus_u32() }).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
 	}
