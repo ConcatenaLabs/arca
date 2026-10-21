@@ -29,7 +29,8 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
-	by the name an order's side goes by), btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
+	by the name an order's side goes by), swap_offer {give_asset, give, want_asset, want}, swap_read {offer, accept_near_deadline?}, \
+	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}";
 
@@ -107,7 +108,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
-		| "orders" | "order_refund");
+		| "orders" | "order_refund" | "swaps");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -197,6 +198,24 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.order_place(&super::order::ask_of(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
 		},
 		"orders" => w.orders(),
+		// An in-tree swap of two assets with another wallet: the maker
+		// offers (its coins held, nothing signed), the taker reads the offer
+		// and accepts it (signing its side), the maker completes it (signing
+		// its side; the server co-signs). With `shown`, an acceptance goes
+		// ahead only on the terms a `swap_read` showed.
+		"swap_offer" => {
+			let give = opt_u64(&a["give"], "what the wallet gives")?.ok_or_else(|| Error::Parse("what the wallet gives is missing".into()))?;
+			let want = opt_u64(&a["want"], "what the wallet wants")?.ok_or_else(|| Error::Parse("what the wallet wants is missing".into()))?;
+			w.swap_offer(asset(req_str(&a["give_asset"], "the asset given")?)?, give, asset(req_str(&a["want_asset"], "the asset wanted")?)?, want)
+		},
+		"swap_read" => w.swap_read(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
+		"swap_accept" => {
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.swap_accept_shown(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown)
+		},
+		"swap_complete" => w.swap_complete(req_str(&a["accept"], "the acceptance")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
+		"swap_cancel" => w.swap_cancel(req_str(&a["swap"], "the swap")?),
+		"swaps" => w.swaps(),
 		"order_refund" => w.order_refund(req_str(&a["order"], "the order")?, opt_asset(&a["fee_asset"])?),
 		// A swap of BTC in a Bitcoin ark for an asset here (`super::btc_swap`):
 		// `bitcoin` is what the program that runs Bark hands in (`ark_info`,
