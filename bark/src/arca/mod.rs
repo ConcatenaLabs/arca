@@ -77,6 +77,14 @@
 //! and within half that window for as long as a take waits, so a client that
 //! syncs when it is due completes the take; a client whose platform defers
 //! its wakes longer than that loses the take, its coins its own again.
+//! A leaf received over Lightning comes home, should the operator
+//! not co-sign its claim, by a claim that races the operator's refund once
+//! the leaf's timeout has passed: its fee rises at every wake as the timeout
+//! nears, up to the leaf's whole value, it is paid from a coin of another
+//! accepted asset when the node no longer takes the leaf's, and past the
+//! timeout it replaces any refund in the mempool by paying more. A stall
+//! longer than its margin leaves a fee race the operator can still win by
+//! burning the leaf's value.
 
 pub mod chain;
 pub mod client;
