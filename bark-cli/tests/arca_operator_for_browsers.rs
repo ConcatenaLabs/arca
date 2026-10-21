@@ -38,6 +38,12 @@
 //! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
 //!
+//! A browser wallet that bonds a stake on this chain (a stake carries no
+//! committee key) needs the committee to outweigh it, or sortition picks no
+//! committee member and no block is made: set
+//! `SEQUENTIA_REGTEST_COMMITTEE_STAKE` to each committee staker's weight in
+//! atoms, well above the stakes the wallet bonds (one atom when unset).
+//!
 //! With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`, a SeqLN
 //! `lightningd`), the chain is the one SeqLN's `sequentia-regtest` network
 //! assumes and the operator runs a SeqLN node in X that receives, with a
