@@ -187,6 +187,10 @@ pub const POS_ARGS: &[&str] = &[
 	"-acceptnonstdtxn=1",
 ];
 
+/// The environment variable that sets each committee staker's weight, in
+/// atoms (one atom when unset); see [`Committee::args`].
+pub const COMMITTEE_STAKE_ENV: &str = "SEQUENTIA_REGTEST_COMMITTEE_STAKE";
+
 /// The test stakers of a proof-of-stake chain: keys anyone can derive, for
 /// regtest only.
 struct Committee {
@@ -206,12 +210,18 @@ impl Committee {
 		Committee { wifs }
 	}
 
-	/// `-staker=<key>:1` for each staker.
+	/// `-staker=<key>:<weight>` for each staker: a weight of one atom, or
+	/// [`COMMITTEE_STAKE_ENV`] atoms when that is set. A test that bonds a
+	/// stake of its own (a wallet's, which carries no committee key) sets it
+	/// well above that stake: sortition picks the committee by weight, and a
+	/// stake heavier than the committee's takes every slot, so no committee
+	/// member is selected and no block is made.
 	fn args(&self) -> Vec<String> {
 		let secp = elements::bitcoin::secp256k1::Secp256k1::new();
+		let weight = std::env::var(COMMITTEE_STAKE_ENV).ok().and_then(|v| v.parse::<u64>().ok()).filter(|w| *w > 0).unwrap_or(1);
 		self.wifs.iter().map(|w| {
 			let key = elements::bitcoin::PrivateKey::from_wif(w).expect("our own WIF");
-			format!("-staker={}:1", key.public_key(&secp))
+			format!("-staker={}:{}", key.public_key(&secp), weight)
 		}).collect()
 	}
 }
