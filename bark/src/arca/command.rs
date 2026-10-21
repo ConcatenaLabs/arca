@@ -34,7 +34,10 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}";
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}, \
+	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
+	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting {order, amount?}, \
+	order_cancel_resting {order}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -201,6 +204,19 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.order_place(&super::order::ask_of(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
 		},
 		"orders" => w.orders(),
+		// An order resting in the tree (`super::resting`): its terms as an
+		// object, as an order placed on the chain names them.
+		"order_rest_quote" => w.order_rest_quote(&rest_ask(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"order_rest" => {
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.order_rest(&rest_ask(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
+		},
+		"order_resting" => {
+			let ids: Vec<String> = a["orders"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
+			w.resting_orders(&ids)
+		},
+		"order_fill_resting" => w.order_fill_resting(req_str(&a["order"], "the order")?, opt_u64(&a["amount"], "the amount")?),
+		"order_cancel_resting" => w.order_cancel_resting(req_str(&a["order"], "the order")?),
 		// An in-tree swap of two assets with another wallet: the maker
 		// offers (its coins held, nothing signed), the taker reads the offer
 		// and accepts it (signing its side), the maker completes it (signing
@@ -288,6 +304,17 @@ fn opt_u64(v: &Value, what: &str) -> Result<Option<u64>, Error> {
 		Value::Number(n) => n.as_u64().map(Some).ok_or_else(|| Error::Parse(format!("{}: {}", what, n))),
 		_ => Err(Error::Parse(format!("{}: {}", what, v))),
 	}
+}
+
+/// A resting order's terms, as an object: those of an order placed on the
+/// chain, without a credit program (a resting order credits its own keys).
+fn rest_ask(a: &Value) -> Result<super::resting::RestAsk, Error> {
+	if a.get("maker_prog").is_some_and(|v| !v.is_null()) {
+		return Err(Error::Parse("a resting order credits keys of the wallet's own, and names no maker_prog".into()));
+	}
+	let o = super::order::ask_of(a)?;
+	Ok(super::resting::RestAsk { sell: o.sell, amount: o.amount, want: o.want, rate_num: o.rate_num, rate_den: o.rate_den,
+		min_lot: o.min_lot, expiry: o.expiry })
 }
 
 fn req_str<'a>(v: &'a Value, what: &str) -> Result<&'a str, Error> {

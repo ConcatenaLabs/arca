@@ -29,9 +29,12 @@
 //! Where an order rests, what filled it and what it was paid are read from the
 //! chain each time they are asked for ([`Wallet::orders`]), never kept: a
 //! rollback that takes a fill out of the chain takes it out of what the
-//! wallet says. A leaf cannot carry the order itself: SeqDEX's FILL needs no
+//! wallet says. A leaf cannot carry this order itself: SeqDEX's FILL needs no
 //! signature and no delay, so a fill, cancel or refresh made in the tree
-//! could be undone by the maker bringing the leaf on the chain first.
+//! could be undone by the maker bringing the leaf on the chain first. An
+//! order that rests in the tree is an `order-2` leaf instead
+//! ([`super::resting`]), whose fills take the operator's signature and whose
+//! landing waits out an exit delay.
 
 use std::str::FromStr;
 

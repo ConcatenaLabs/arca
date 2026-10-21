@@ -272,7 +272,9 @@ impl Wallet {
 		let info = self.server_info()?;
 		let now = self.now()?;
 		let rows: Vec<_> = if leaf_ids.is_empty() {
-			self.store.coins_in("live")?
+			// Every live coin but a resting order's: refreshing one cancels
+			// the order, which only naming it does.
+			self.store.coins_in("live")?.into_iter().filter(|c| !super::resting::is_order_coin(c)).collect()
 		} else {
 			leaf_ids.iter().map(|l| {
 				let c = self.store.coin(l)?.ok_or_else(|| Error::Refused(format!("no coin {}", l)))?;

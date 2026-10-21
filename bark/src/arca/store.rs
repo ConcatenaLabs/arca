@@ -139,7 +139,35 @@ CREATE TABLE IF NOT EXISTS maker_order (
 	unlock_after INTEGER,
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS resting_order (
+	id TEXT PRIMARY KEY,
+	nonce BLOB NOT NULL,
+	terms TEXT NOT NULL,
+	amount INTEGER NOT NULL,
+	credit_nonces TEXT NOT NULL,
+	order_leaf TEXT,
+	state TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 ";
+
+/// A resting order the wallet made ([`super::resting`]), as the store holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestingRow {
+	/// The participation that rests it.
+	pub id: String,
+	/// The owner nonce of its leaf key.
+	pub nonce: [u8; 32],
+	/// Its terms, as the leaf record's JSON gives them.
+	pub terms: String,
+	pub amount: u64,
+	/// The nonces of its four credit keys, hex, the first credit's first.
+	pub credit_nonces: Vec<String>,
+	/// The coin its round made, once the wallet holds it: the order's id.
+	pub order_leaf: Option<String>,
+	/// `participating`, `published`, `cancelled` or `not_rested`.
+	pub state: String,
+}
 
 /// A coin as the store holds it.
 #[derive(Debug, Clone)]
@@ -378,6 +406,17 @@ impl Store {
 		Ok(())
 	}
 
+	/// The coin a resting order's nonce names now: the order resting again
+	/// after a fill, under the order's own key.
+	pub fn move_nonce(&self, nonce: &[u8; 32], leaf_id: &str) -> Result<(), Error> {
+		let n = self.conn.execute("UPDATE nonce SET leaf_id = ?2 WHERE nonce = ?1 AND state = 'used' AND purpose = 'resting order'",
+			params![&nonce[..], leaf_id]).map_err(db)?;
+		if n != 1 {
+			return Err(Error::Refused(format!("the owner nonce {} is no resting order's", super::chain::hex(nonce))));
+		}
+		Ok(())
+	}
+
 	pub fn use_nonce(&self, nonce: &[u8; 32], leaf_id: &str) -> Result<(), Error> {
 		let n = self.conn.execute("UPDATE nonce SET state = 'used', leaf_id = ?2 WHERE nonce = ?1 AND state = 'pending'",
 			params![&nonce[..], leaf_id]).map_err(db)?;
@@ -589,6 +628,35 @@ impl Store {
 			r.get::<_, i64>(3)? as u64, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?.map(|v| v as u32))))
 			.map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	pub fn put_resting(&self, r: &RestingRow) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO resting_order (id, nonce, terms, amount, credit_nonces, order_leaf, state, created_at)
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+			params![r.id, &r.nonce[..], r.terms, r.amount as i64, serde_json::to_string(&r.credit_nonces).expect("strings"), r.order_leaf,
+				r.state, now()]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Every resting order the wallet made, oldest first.
+	pub fn restings(&self) -> Result<Vec<RestingRow>, Error> {
+		let mut st = self.conn.prepare("SELECT id, nonce, terms, amount, credit_nonces, order_leaf, state FROM resting_order ORDER BY created_at")
+			.map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?,
+			r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, String>(6)?))).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		rows.into_iter().map(|(id, nonce, terms, amount, credits, order_leaf, state)| Ok(RestingRow {
+			id, nonce: nonce.try_into().map_err(|_| Error::Store("a resting order's nonce".into()))?, terms, amount: amount as u64,
+			credit_nonces: serde_json::from_str(&credits).map_err(|e| Error::Store(e.to_string()))?, order_leaf, state,
+		})).collect()
+	}
+
+	/// Resting order `id` rests at its round's coin `order_leaf` (once the
+	/// wallet holds it), and stands at `state`.
+	pub fn set_resting(&self, id: &str, order_leaf: Option<&str>, state: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE resting_order SET order_leaf = COALESCE(?2, order_leaf), state = ?3 WHERE id = ?1",
+			params![id, order_leaf, state]).map_err(db)?;
+		Ok(())
 	}
 
 	/// The offboard output order `id` was paid to (`txid:vout`), and the
