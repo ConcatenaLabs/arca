@@ -879,3 +879,49 @@ async fn refused_round(whole: bool) {
 	println!("the operator's pools of Y and Z: before {:?} | after {:?}", before, after);
 	assert_eq!(after.0, before.0, "the operator's Y is free and whole");
 }
+
+/// A fill round the node holds while the server's record still has it
+/// built: the server stopped after handing the round to the node and before
+/// recording it as broadcast (or another pass handed it over meanwhile).
+/// Its orders are spent, by the round itself; the round is recorded as
+/// broadcast and goes on, never dropped, and both takes complete once it is
+/// final.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_round_the_node_holds_is_broadcast_not_dropped() {
+	let (mut r, z) = start(false).await;
+	let y = r.y;
+	let (c1, b1) = holder(&mut r, "sent taker 1", y, 1_000_000).await;
+	let (c2, b2) = holder(&mut r, "sent taker 2", z, 1_000_000).await;
+	let o1 = terms(&r, "sent maker 1", y, 2, 1, 10_000);
+	let o2 = terms(&r, "sent maker 2", z, 5, 2, 1_000);
+	let at1 = rest(&mut r, &o1, 600_000);
+	let at2 = rest(&mut r, &o2, 400_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let (id1, k1, n1) = take(&r, &c1, at1, &o1, 600_000, 499_500, 1_000, "sent taker 1");
+	let (id2, k2, n2) = take(&r, &c2, at2, &o2, 400_000, 400_000, 0, "sent taker 2");
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let tx = built[0].tx.clone();
+	assert!(hand_over_if_held(&r, &id1, &c1, &[b1.clone()], &k1, &n1));
+	// The server stops; the round reaches the node as the server would have
+	// handed it over, its record still built.
+	r.server.stop();
+	let stored: Transaction = elements::encode::deserialize(&r.db.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap().tx).unwrap();
+	r.rt.client().send_raw_transaction(&stored).unwrap();
+	assert!(node::in_mempool(&r.rt, &tx.txid()));
+	println!("round {} in the node's mempool, recorded built", tx.txid());
+	r.restart_server().await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+	println!("after a restart and a pass: round {:?} | take 1 {} | take 2 {}", row.state, status(&r, &id1)["state"], status(&r, &id2)["state"]);
+	assert_eq!(row.state, server::store::RoundState::Broadcast, "recorded as broadcast, not dropped");
+	assert_eq!(status(&r, &id1)["state"], "issued");
+	assert_eq!(status(&r, &id2)["state"], "issued");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &tx.txid()).await;
+	assert_eq!(complete(&r, &id1, &c1, &[b1], &k1, &n1), 499_500);
+	assert_eq!(complete(&r, &id2, &c2, &[b2], &k2, &n2), 400_000);
+}
