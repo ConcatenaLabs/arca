@@ -1,5 +1,6 @@
 //! `arca-signer` as its own process: it holds `S`, answers its key, signs the
-//! rebindable message it builds itself for this chain, and nothing else.
+//! rebindable message it builds itself for this chain, the spends of the
+//! operator's own paths and its unroll authorisations, and nothing else.
 
 mod common;
 
@@ -112,6 +113,29 @@ async fn the_signer_process() {
 	let v: serde_json::Value = serde_json::from_str(&raw(&p.socket, &line).await).unwrap();
 	assert!(v["error"].is_string() && v["signature"].is_null(), "a stray digest: {}", v);
 	println!("refused, a spend request carrying a digest: {}", v["error"].as_str().unwrap());
+
+	// The operator's unroll authorisation for a node: it verifies under S over
+	// the message arca-covenant builds from the children hash and the time,
+	// and over no other node's or time's.
+	let h = [7u8; 32];
+	let t = arca_covenant::MedianTime::from_consensus(1_800_000_000).unwrap();
+	let sig = client.unroll(&h, t).await.unwrap();
+	let auth = arca_covenant::message::unroll_authorisation(&h, t).digest;
+	assert!(verify_digest(&sig, &auth, &xonly(&s)), "the unroll authorisation verifies");
+	assert!(!verify_digest(&sig, &arca_covenant::message::unroll_authorisation(&[8; 32], t).digest, &xonly(&s)));
+	let later = arca_covenant::MedianTime::from_consensus(1_800_000_001).unwrap();
+	assert!(!verify_digest(&sig, &arca_covenant::message::unroll_authorisation(&h, later).digest, &xonly(&s)));
+	println!("signed the operator's unroll authorisation of a node: it verifies for that node and time only");
+	for (what, line) in [
+		("a height for its time", format!(r#"{{"op":"unroll","children_hash":"{}","time":1000}}"#, "07".repeat(32))),
+		("a short children hash", format!(r#"{{"op":"unroll","children_hash":"{}","time":1800000000}}"#, "07".repeat(31))),
+		("a digest beside it", format!(r#"{{"op":"unroll","children_hash":"{}","time":1800000000,"digest":"{}"}}"#, "07".repeat(32), "00".repeat(32))),
+	] {
+		let answer = raw(&p.socket, &line).await;
+		let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
+		assert!(v["error"].is_string() && v["signature"].is_null(), "{}: {}", what, answer);
+		println!("refused, an unroll request with {}: {}", what, v["error"].as_str().unwrap());
+	}
 
 	// A key file others can read is refused at start.
 	let dir = signer_dir();

@@ -1501,9 +1501,14 @@ leaf, whose signature hash it computes itself from the transaction and the
 outputs every input spends, on its own chain. It signs a spend only by a leaf
 that names `S` with `OP_CHECKSIG` or `OP_CHECKSIGVERIFY` (the operator's own
 paths: a clock's release, `R`, a sweep, a reclaim, a forfeit's claim, the
-connector's issuance, an offboard's reclaim) and of a taproot output. It signs
-no digest it is handed, no unroll authorisation and no release, and nothing
-by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
+connector's issuance, an offboard's reclaim) and of a taproot output; and the
+operator's unroll authorisation for a node (`unroll`), `S`'s signature over
+`SHA256("Arca/unroll" ‖ H ‖ t)` built from the node's children hash and a
+median time: `S` is a member of every node, and the watcher answers a holder
+who brings home a coin it gave up for a step of an offline refresh only after
+unrolling that step's leaf, whose tree did not exist when the holder signed.
+It signs no digest it is handed and no release, and nothing by a path that
+checks `S` with `OP_CHECKSIGFROMSTACK`. The server checks each
 signature it gets back against the message or signature hash it built.
 Beside those it answers reads of its record: its latest head, its entries
 after one, a witness of heads (below), and the entries under a salt

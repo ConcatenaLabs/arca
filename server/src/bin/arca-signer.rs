@@ -1,7 +1,8 @@
 //! `arca-signer`: holds the operator key `S` and signs the rebindable messages
-//! of collaborative paths and the spends of the operator's own paths, each
-//! built by the signer itself, and nothing else, for the server on a Unix
-//! socket. See `server::signer` for the protocol.
+//! of collaborative paths, the spends of the operator's own paths and the
+//! operator's unroll authorisations, each built by the signer itself, and
+//! nothing else, for the server on a Unix socket. See `server::signer` for
+//! the protocol.
 //!
 //!     arca-signer --key-file <file> --pubkey
 //!     arca-signer --key-file <file> --genesis <hash> --sign-operator-record <record.json>
@@ -909,6 +910,23 @@ async fn answer(state: &State, line: &str) -> Response {
 			rand::rngs::OsRng.fill_bytes(&mut aux);
 			let sig = sign_digest(key, &digest, &aux);
 			eprintln!("arca-signer: signed spend of input {} of {}", input, txid);
+			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+		Request::Unroll { children_hash, time } => {
+			let parsed = (|| -> Result<_, String> {
+				let h = unhex32(&children_hash).map_err(|e| format!("children_hash: {}", e))?;
+				let t = arca_covenant::MedianTime::from_consensus(time).map_err(|e| format!("time: {}", e))?;
+				Ok((h, t))
+			})();
+			let (h, t) = match parsed {
+				Ok(p) => p,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			let message = arca_covenant::message::unroll_authorisation(&h, t);
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &message.digest, &aux);
+			eprintln!("arca-signer: signed the unroll authorisation of the node with children hash {} from {}", hex(&h), time);
 			Response { signature: Some(hex(sig.as_ref())), ..none }
 		},
 	}
