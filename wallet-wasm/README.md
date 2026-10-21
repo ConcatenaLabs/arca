@@ -94,18 +94,32 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 ```
 
 `run(command, args)` is the library's `bark::arca::command::run`, which every
-program that embeds the library calls, and takes the command line's commands: `info`, `address`,
+program that embeds the library calls, and takes the command line's commands, each with its
+arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`,
 `balance`, `coins`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, shown}`, `participations`, `sync`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
-shown?}` and `refusals`. Its answer is `{"result", "start"}`: the
+shown?}`, `refusals`; a take of an on-chain order and an order placed from
+leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
+`order_refund`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
+want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
+{accept}`, `swap_cancel {swap}`, `swaps`); and the swap of BTC in a Bitcoin
+ark (`btc_swap_*`). Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
 `recheck`, `sync` or `schedule`), as `arca` runs them on every start.
+
+An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
+holds its coins and signs nothing, and answers what it gives, gets and pays (the
+reassignment's margin and its checkpoints' margins). The taker's `swap_read`
+checks the offer as `swap_accept` does and answers what it gives, gets and pays,
+signing, holding and storing nothing; `swap_accept` with `shown` (that answer)
+signs only on those terms. The maker's `swap_complete` signs its side and has the
+operator co-sign; `swaps` lists each swap with where it stands.
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it

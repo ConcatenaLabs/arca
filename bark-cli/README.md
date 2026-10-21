@@ -1041,7 +1041,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `distributions` | Every distribution the wallet made, as the operator shows it: its state, round, deadline and expiry, each claim's key, claim key, value, leaf and state (`pending`, `open`, `claimed`, `returned`), and each payment of what no holder took up back to the return script, with its state |
 | `claims [--scan N]` | The claims paid to the wallet's on-chain addresses, found by asking the operator under each address key: each claim's distribution, address, key, value, state, deadline, and the coin the wallet holds of it |
 | `claim [CLAIM]… [--scan N]` | Takes up the open claims named (`DISTRIBUTION:INDEX` or a leaf id), or every one: each checked, its authorisations handed over, kept as a coin, and paid out of round to a fresh leaf of the wallet's own; a claim not open says its state |
-| `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
+| `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives) |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
 | `btc-swap offer --give btc\|asset --asset A --atoms N --sats S [--lapse-seconds L]` | Offers a swap of native BTC for an asset with another wallet of the operator (see Swapping BTC for an asset); giving the asset, makes the Bitcoin invoice the taker pays. The offer's text and what the wallet gives and gets, with every fee; nothing locked |
@@ -1306,6 +1306,15 @@ Q and P's lock to the restored P.
 write and broadcast nothing, and `board` and `exit` given a fee other than the
 one now (`--shown`, the library's `shown`) are refused, naming the fee now, before
 anything is registered or broadcast; given the fee shown, they pay exactly it.
+
+`tests/arca_swap_commands.rs` runs the same way: an in-tree swap through the
+library's commands, as a browser or a mobile app runs it. `swap_offer` holds the
+maker's coin and answers what it pays; `swap_read` refuses an offer whose coins
+do not keep what it gives, and otherwise answers what the taker gives, gets and
+pays with nothing signed, held or stored; `swap_accept` given terms other than
+those (`shown`) is refused, naming them, before anything is signed; given them,
+it signs, and `swap_complete` settles the swap with each side paying exactly what
+it was shown. `swap_cancel` frees an offer's coin, and `swaps` lists both.
 
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
