@@ -210,6 +210,12 @@ Every holder receives these rules before the operator holds their coins:
   away past its expiry, so a plan keeps a coin alive through an operator that
   runs, not through one that turns against its holders. A coin a plan names
   is paid out of round only once refreshed in a round.
+- **A wallet that runs `arca care` after each sync plans by itself.** `care`
+  takes up open claims, cancels each plan whose coin has moved, and plans each
+  coin once its first step could run within ten days; a younger coin stays
+  unplanned so it can still be paid out of round. A wallet closed within a
+  coin's first two weeks or so and kept closed through that coin's step window
+  can therefore lose the coin to the sweep, as any absent holder can.
 - **When a payment answers `unreachable`, run `arca sync` again that
   day.** The next `sync` posts the payment again, and its receiver reads it
   once it completes.

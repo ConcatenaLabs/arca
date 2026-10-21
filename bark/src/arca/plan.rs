@@ -123,6 +123,21 @@ pub fn covered_until(expiry: u32, steps: usize) -> u32 {
 	last_expiry(expiry, steps).saturating_sub(WalletPolicy::EXIT_DEADLINE)
 }
 
+/// How near its step window a coin must be before `care` plans it: a coin
+/// whose first step could run within this time of now. A younger coin stays
+/// free to spend out of round (a coin a plan names is not), and is planned at
+/// the first `care` once it comes this near. The gap this leaves, in plain
+/// words: a wallet closed within a coin's first two weeks or so and kept
+/// closed through that coin's step window can lose the coin to the
+/// operator's sweep, as any holder who stays away past an expiry can.
+pub const PLAN_WITHIN: u32 = 10 * 86_400;
+
+/// The fee bound `care` plans under when the caller names none: 2,000
+/// parts per million of a coin for each step. A step in its coin's free
+/// window costs nothing; the bound only lets a plan through when the
+/// operator asks a small fee there.
+pub const CARE_MAX_FEE_PPM: u64 = 2_000;
+
 /// The date by which the wallet must sync for a plan of `steps` steps from a
 /// coin whose first expiry is `expiry`: the start of the last coin's refresh
 /// window at the earliest.
@@ -394,6 +409,52 @@ impl Wallet {
 			out.push(p);
 		}
 		Ok(json!({"plans": out, "note": PLAN_NOTE}))
+	}
+
+	/// What a wallet does by itself at a sync, so that it needs no prompt:
+	/// takes up every open claim under its on-chain receive keys (`scan`
+	/// of them from the first, as [`Self::claim`]); cancels each open plan
+	/// whose current coin has moved (spent, exited or lost, or gone from the
+	/// store); and plans each live coin of a round that no plan names and
+	/// whose first step could run within [`PLAN_WITHIN`], `steps` steps
+	/// under the fee bound `max_fee_ppm` ([`CARE_MAX_FEE_PPM`] unless
+	/// named). A plan's fee is the operator's, taken from the coin in the
+	/// coin's own asset; a coin the operator will not plan stays unplanned,
+	/// with the operator's reason, and `sync` refreshes it while the wallet
+	/// is open. One part failing stops no other; each says what it did.
+	pub fn care(&mut self, scan: Option<u32>, steps: usize, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let claims = self.claim(&[], scan).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let mut cancelled = vec![];
+		for (id, coin, body, state, _) in self.plan_rows()? {
+			if state != "open" {
+				continue;
+			}
+			let current = Self::current_coin(&coin, &body);
+			let moved = self.store.coin(&current)?.is_none_or(|c| matches!(c.state.as_str(), "spent" | "exited" | "lost"));
+			if !moved {
+				continue;
+			}
+			cancelled.push(match self.cancel_at_operator(&id) {
+				Ok(st) => json!({"plan_id": id, "coin": current, "state": st["state"]}),
+				Err(e) => json!({"plan_id": id, "coin": current, "error": e.to_string()}),
+			});
+		}
+		let now = self.now()?.to_consensus_u32();
+		let bound = Some(max_fee_ppm.unwrap_or(CARE_MAX_FEE_PPM));
+		let mut planned = vec![];
+		let mut later = 0usize;
+		for c in self.plannable(None)? {
+			if now.saturating_add(PLAN_WITHIN) < c.expiry.saturating_sub(STEP_FROM) {
+				later += 1;
+				continue;
+			}
+			planned.push(match self.make_plan(&c, steps, bound) {
+				Ok(v) => v,
+				Err(e) => json!({"coin": c.leaf_id, "asset": c.asset, "error": e.to_string()}),
+			});
+		}
+		Ok(json!({"claims": claims, "cancelled": cancelled, "planned": planned, "not_yet_planned": later,
+			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound}))
 	}
 
 	/// Cancels the steps of plan `id` that have not started.

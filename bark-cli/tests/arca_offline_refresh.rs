@@ -634,3 +634,86 @@ async fn a_lost_step_round_that_returns_gives_the_holder_the_steps_leaf_and_spen
 	assert_eq!(bal["arca"][&x]["live"], json!(value.to_string()), "J's value live once, in step 1's leaf: {}", bal);
 	println!("J holds step 1's leaf {} again: {} live", l1, value);
 }
+
+/// 8. `arca care`, what a wallet runs by itself at a sync: a coin far from
+///    its step window is left unplanned, so it stays free to pay out of
+///    round; once its first step could run within ten days it is planned (two
+///    steps, no fee in the free window); the wallet closes, step 1 runs, and
+///    the wallet back holds its value live in step 1's leaf. That leaf, the
+///    plan's coin, is refreshed by hand only once the plan is cancelled; the
+///    holder takes it home instead, and the next `care` cancels the plan, its
+///    coin having moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn care_plans_a_coin_near_its_window_and_cancels_a_plan_whose_coin_moved() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (a, coin, value, e0) = holder(&mut r, "K").await;
+	let c = a.ok(&["care"]);
+	println!("care, the coin young: {}", c);
+	assert_eq!(c["planned"].as_array().map(|p| p.len()), Some(0), "{}", c);
+	assert_eq!(c["not_yet_planned"], json!(1), "{}", c);
+	assert_eq!(a.ok(&["plans"])["plans"].as_array().map(|p| p.len()), Some(0));
+	// No plan names the young coin, so it stays one a plan may start from.
+	let quote = a.ok(&["plan", "--quote"]);
+	assert_eq!(quote["plans"][0]["coin"].as_str(), Some(coin.as_str()));
+
+	// Ten days before its step window opens, less an hour: still not planned.
+	let window = e0 - 5 * DAY;
+	advance_to(&r, window - 10 * DAY - HOUR).await;
+	let c = a.ok(&["care"]);
+	assert_eq!((c["planned"].as_array().map(|p| p.len()), &c["not_yet_planned"]), (Some(0), &json!(1)), "{}", c);
+	// Within ten days of it: planned, two steps, no fee.
+	advance_to(&r, window - 10 * DAY + HOUR).await;
+	let c = a.ok(&["care"]);
+	println!("care, the coin within reach: {}", c);
+	let p = &c["planned"][0];
+	assert_eq!((p["coin"].as_str(), p["steps"].as_u64(), p["fee"].as_str()), (Some(coin.as_str()), Some(2), Some("0")), "{}", c);
+	let id = p["plan_id"].as_str().unwrap().to_string();
+	// A second care plans nothing more.
+	let c = a.ok(&["care"]);
+	assert_eq!((c["planned"].as_array().map(|p| p.len()), &c["not_yet_planned"]), (Some(0), &json!(0)), "{}", c);
+
+	// A closes its wallet; step 1 runs in the coin's free window, and the old
+	// batch is released and swept.
+	advance_to(&r, window + HOUR).await;
+	let round1 = step_round(&mut r).await;
+	println!("step 1 in round {}", round1);
+	released_and_swept(&r, &leaf_id(&coin), e0).await;
+	// A is back after the coin's expiry: its value live in step 1's leaf.
+	assert!(mtp(&r) > e0);
+	let s = a.ok(&["sync"]);
+	let l1 = s["plans"][0]["taken_up"][0]["leaf_id"].as_str().unwrap_or_default().to_string();
+	assert!(!l1.is_empty(), "{}", s);
+	let bal = a.ok(&["balance"]);
+	println!("A back at {}, past expiry {}: {}", mtp(&r), e0, bal);
+	assert_eq!(bal["arca"][&x]["live"], json!(value.to_string()), "A's whole value live");
+
+	// The coin a plan stands on cannot be refreshed by hand while the plan
+	// is open: the operator says to cancel it first, which is developer
+	// mode's Release.
+	let q = a.ok(&["quote", "--leaf", &l1]);
+	a.refused(&["participate", "--leaf", &l1, "--shown", &q["coins"].to_string()], "cancel the plan first");
+	// The holder takes step 1's leaf home instead: the coin moves on the
+	// chain, and the next care, once it is home, cancels the plan whose step
+	// 2 has nothing left to stand on.
+	a.ok(&["exit", &l1]);
+	let mut home = false;
+	for _ in 0..40 {
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.bury().await;
+		a.ok(&["sync"]);
+		if coins(&a, "exited").iter().any(|c| c["leaf_id"] == json!(l1)) {
+			home = true;
+			break;
+		}
+	}
+	assert!(home, "step 1's leaf comes home: {:?}", a.ok(&["coins"]));
+	let c = a.ok(&["care"]);
+	println!("care, the planned coin moved: {}", c);
+	assert_eq!((c["cancelled"][0]["plan_id"].as_str(), c["cancelled"][0]["state"].as_str()), (Some(id.as_str()), Some("cancelled")), "{}", c);
+	assert_eq!(a.ok(&["plans"])["plans"][0]["state"], "cancelled");
+	// Nothing more to plan: the wallet holds no live coin of a round.
+	let c = a.ok(&["care"]);
+	assert_eq!((c["cancelled"].as_array().map(|p| p.len()), c["planned"].as_array().map(|p| p.len())), (Some(0), Some(0)), "{}", c);
+}

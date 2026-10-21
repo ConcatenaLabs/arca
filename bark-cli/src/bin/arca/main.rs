@@ -341,6 +341,22 @@ enum Cmd {
 	PlanCancel {
 		plan: String,
 	},
+	/// What a wallet does by itself at a sync: takes up every open claim,
+	/// cancels each plan whose coin has moved, and plans each coin whose
+	/// first step could run within ten days.
+	Care {
+		/// How many receive addresses to look for claims under, from the
+		/// first; by default every one handed out and 20 more.
+		#[arg(long)]
+		scan: Option<u32>,
+		/// How many expiries each new plan covers: one step each.
+		#[arg(long, default_value_t = 2)]
+		expiries: usize,
+		/// The most a step may cost, in millionths of the coin (2,000 unless
+		/// given).
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
 	/// The claims paid to this wallet's on-chain addresses, found by asking
 	/// the operator under each address key: their distribution, value,
 	/// state and deadline.
@@ -1157,6 +1173,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Plans => w.plans(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
+		Cmd::Care { scan, expiries, max_fee_ppm } => w.care(scan, expiries, max_fee_ppm),
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
 	}
