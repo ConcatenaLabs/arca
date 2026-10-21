@@ -555,7 +555,16 @@ payment is `returned`. While the operator has not decided, the leaf is
 `paying` and the wallet pays nothing else from it; should the operator never
 decide, `exit` takes it home by its refund path, once its timeout and its exit
 delay have passed. An invoice is paid once through the operator: a payment
-that failed is not tried again with the same invoice.
+that failed is not tried again with the same invoice. The `htlc-1` leaf
+times out a little past the least the operator takes (`info`'s
+`lightning.send.timeout_seconds` past the chain's median time) unless
+`--timeout` names a median time, which must lie in the operator's window,
+that least to twice it, or the payment is refused before anything is signed.
+An invoice the operator made itself, for a payment into its tree (one wallet
+of the operator paying another), is paid inside the operator, with no lock
+time on any channel: the receiver's leaf times out the operator's
+`lightning.receive.internal_gap_seconds` before the payer's, and must keep
+the receive's least lock, so such a payment needs a timeout that far out.
 
 `lightning receive ASSET AMOUNT` asks for an invoice for `AMOUNT` of `ASSET`
 paid into a leaf of the wallet's own, refused before anything is asked when
@@ -594,6 +603,28 @@ exit delay and the operator's window (so the window survives the margin),
 about 5,770 blocks with a 36-hour exit delay and a six-hour window: a payer
 whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016
 blocks.
+
+`lightning receive ASSET AMOUNT --hash HASH` asks under a payment hash the
+wallet did not make, whose preimage someone else holds and reaches the wallet
+later: the hash of a swap made on its other side. The leaf comes as any
+received leaf does, but until the wallet holds the preimage it is held apart,
+`awaiting_preimage` in `balance`, counted in no row and no total, and `exit`
+refuses it before anything is broadcast. The preimage reaches the wallet
+either way: `lightning preimage HASH PREIMAGE` hands it over (kept once it
+opens the hash), or `sync` takes it from the operator's status of the
+payment, which serves it once anyone has posted it (`lightning post-preimage
+HASH PREIMAGE`) or a claim on the chain revealed it. Then `sync` claims the
+leaf with it, co-signed, and does so whenever the preimage comes, since it is
+no secret the wallet keeps; `exit` takes the leaf home on the chain with it.
+A payment whose preimage never comes is failed back by the operator once the
+time to claim its leaf is over: the receive is `failed` and the leaf the
+operator's. A wallet restored from the mnemonic recognises such a leaf by
+its preimage not being the one it derives, and holds it the same way.
+`lightning lookup HASH` shows the operator's payment into its tree under a
+hash as the operator serves it to anyone holding the hash: its invoice and
+state, the receiver leaf's exit delay, what holds it (`held_by`: `node`, or
+`send` for a payment inside the operator, with that send leaf's timeout), and
+the preimage once the operator knows it.
 
 ### The Bitcoin side
 
@@ -817,7 +848,7 @@ registry for both commands.
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
-| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
+| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate; and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
 | `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
@@ -825,10 +856,13 @@ registry for both commands.
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
 | `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; the read's cursor never moves back (a message at or before what was read is not read again, a page with nothing past it ends the read, and one read takes at most a hundred pages of a key, `MAILBOX_PAGES`, the rest left to the next, each said in `note`); a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
-| `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
+| `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--timeout T] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
 | `lightning payments` | Every payment over Lightning the wallet made, by payment hash: the invoice, asset, amount, fee, the `htlc-1` leaf, its state and its preimage or reason |
-| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it. `btc` for native BTC: an invoice for `AMOUNT` satoshis on the Bitcoin ark wallet, which `lightning claim` then claims (see The Bitcoin side) |
+| `lightning receive ASSET AMOUNT [--description D] [--max-fee-ppm N] [--hash H]` | An invoice for `AMOUNT` of `ASSET` paid into a leaf of the wallet's own (see Paying and receiving over Lightning): the invoice, its payment hash, the fee and what the leaf will hold; `sync` claims the leaf once the wallet holds it. With `--hash`, under a hash the wallet did not make, the leaf claimed once its preimage reaches the wallet (`hash_given`). `btc` for native BTC: an invoice for `AMOUNT` satoshis on the Bitcoin ark wallet, which `lightning claim` then claims (see The Bitcoin side) |
 | `lightning claim INVOICE [--wait S]` | Claims a payment to a Bitcoin invoice of the wallet's while the payer pays, waiting up to `S` seconds (300): `claimed`, `waiting`, or `reissued` with a fresh invoice when the payment can no longer be claimed (see The Bitcoin side) |
+| `lightning preimage HASH PREIMAGE` | Hands the wallet the preimage of a payment it receives under a hash it did not make: kept once it opens the hash; `sync` then claims the leaf |
+| `lightning lookup HASH` | The operator's payment into its tree under `HASH`, as it serves it to anyone holding the hash: invoice, state, the leaf's exit delay, `held_by`, and the preimage once known |
+| `lightning post-preimage HASH PREIMAGE` | Hands the operator the preimage of a payment into its tree: it claims the payment once its leaf is its owner's and decides a payment held inside the operator; the operator serves it from then on |
 | `lightning receives` | Every payment the wallet asked to receive, by payment hash: the invoice, asset, amount, fee, the leaf's value and participation, and its state (`waiting`, `issuing`, `claiming`, `received` or `failed` with the reason); never the preimage |
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
@@ -1003,6 +1037,24 @@ asset's next round and claimed by `sync` with the preimage, the payment
 settled at the payer's node only then; in each asset the wallet holds the
 amount less the fee and the claim's margins, and a fee above the wallet's
 bound is refused before anything is asked.
+
+`tests/arca_lightning_hash.rs` runs the same way, with the operator's SeqLN
+node in X: a receiver asks under hashes whose preimages it does not hold, and
+a payer of the same operator pays each invoice with a leaf timing out when it
+says, the payment held inside the operator (`held_by: send`, the receiver's
+leaf timing out `internal_gap_seconds` before the payer's). Refused before
+anything is signed or asked: a timeout below the operator's window and one
+above it, a BTC invoice under a hash, a second receive under the same hash,
+a preimage of another hash, one for a hash the wallet receives nothing
+under. Each leaf is held apart, `awaiting_preimage`, counted in no row and
+no total, and `exit` refuses it. One is claimed once its preimage is handed
+to the wallet, the payer's payment then `paid` with it; one is held the same
+way by a wallet restored from the mnemonic and claimed once the payer posts
+the preimage to the operator; one is taken home on the chain by its claim
+with the preimage handed over, which the operator reads there and decides
+the payer's payment `paid`; and one whose preimage never comes is failed back
+past the time to claim it, the payer's leaf co-signed back to it and the
+receiver's receive `failed`, nothing of it ever counted.
 
 `tests/arca_program_commands.rs` runs the same way, for a program that runs
 `arca` for its user: a wallet restored with its mnemonic read from the standard

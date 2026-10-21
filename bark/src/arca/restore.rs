@@ -608,8 +608,18 @@ impl Wallet {
 				let row = self.store.coin(id)?.ok_or_else(|| Error::Store(format!("no coin {}", id)))?;
 				let nonce = row.owner_nonce;
 				if hex(&arca_covenant::script::sha256(&self.receive_preimage(&nonce)?)) != hash {
-					return Err(Error::Refused(format!("coin {} is an htlc-1 leaf received under hash {}, which the preimage the wallet derives \
-						from its key does not open", id, hash)));
+					// A hash the wallet did not make (a swap's): held for its
+					// preimage, which the operator serves once it knows it,
+					// and counted nowhere until then.
+					let note = format!("the leaf received over Lightning under hash {}, a hash this wallet did not make: held for its \
+						preimage, which sync takes from the operator once it knows it, then claims the leaf", hash);
+					self.store.set_coin_state(id, "receiving", &note)?;
+					let rec = json!({"state": "issuing", "nonce": hex(&nonce), "asset": coin.asset.to_string(), "value": coin.value.to_string(),
+						"participation": hex(&super::lightning::receive_participation_id(&h.payment_hash)), "timeout": h.timeout.to_consensus_u32(),
+						"hash_given": true, "restored": true,
+						"window": info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600)});
+					self.set_receive(&hash, rec)?;
+					return Ok(json!({"leaf_id": id, "payment_hash": hash, "note": note}));
 				}
 				let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
 				let timeout = h.timeout.to_consensus_u32() as u64;
@@ -665,11 +675,9 @@ impl Wallet {
 			return Err(format!("the server serves a payment received under hash {} for a key this wallet does not derive from the nonce it \
 				names", hash));
 		}
+		// A hash the wallet did not make (a swap's) is held for its preimage.
 		let preimage = self.receive_preimage(&nonce).map_err(|e| e.to_string())?;
-		if hex(&arca_covenant::script::sha256(&preimage)) != hash {
-			return Err(format!("the server serves a payment received under hash {}, which the preimage the wallet derives from its key \
-				does not open", hash));
-		}
+		let given = hex(&arca_covenant::script::sha256(&preimage)) != hash;
 		let asset = AssetId::from_str(r["asset"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
 		let asked = amount(&r["amount"], "an amount").map_err(|e| e.to_string())?;
 		let fee = amount(&r["fee"], "a fee").map_err(|e| e.to_string())?;
@@ -686,9 +694,16 @@ impl Wallet {
 			self.store.put_nonce(&nonce, &owner.serialize(), "lightning-receive").map_err(|e| e.to_string())?;
 		}
 		let window = info["lightning"]["receive"]["window_seconds"].as_u64().unwrap_or(6 * 3600);
-		self.set_receive(&hash, json!({"state": "waiting", "nonce": hex(&nonce), "asset": asset.to_string(), "amount": asked.to_string(),
+		let mut rec = json!({"state": "waiting", "nonce": hex(&nonce), "asset": asset.to_string(), "amount": asked.to_string(),
 			"fee": fee.to_string(), "value": (asked - fee).to_string(), "invoice": invoice, "max_fee_ppm": super::DEFAULT_MAX_FEE_PPM,
-			"window": window, "restored": true})).map_err(|e| e.to_string())?;
+			"window": window, "restored": true});
+		if given {
+			rec["hash_given"] = json!(true);
+			if let Some(p) = r["preimage"].as_str().filter(|p| unhex32(p).is_ok_and(|b| hex(&arca_covenant::script::sha256(&b)) == hash)) {
+				rec["preimage"] = json!(p);
+			}
+		}
+		self.set_receive(&hash, rec).map_err(|e| e.to_string())?;
 		Ok(Some(json!({"payment_hash": hash, "state": r["state"], "note": "a payment received over Lightning and not yet claimed, restored \
 			waiting: sync asks how it stands, takes up the participation that wants its leaf, and claims the leaf once held"})))
 	}

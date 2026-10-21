@@ -209,6 +209,18 @@ impl Wallet {
 	/// are to be of, which must be the invoice's. `max_fee_ppm` raises the
 	/// wallet's bound on the operator's fee for this payment.
 	pub fn lightning_pay(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		self.lightning_pay_until(invoice, from, max_fee_ppm, None)
+	}
+
+	/// [`Self::lightning_pay`], the `htlc-1` leaf timing out at `timeout` (a
+	/// median time) when named: within the operator's window for a payment's
+	/// timeout, which the operator checks; a little past its least
+	/// otherwise. A payment of the operator's own invoice, for a payment into
+	/// its tree, is settled inside the operator, and its receiver's leaf
+	/// times out the operator's gap before this one.
+	pub fn lightning_pay_until(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>)
+		-> Result<Value, Error>
+	{
 		let inv = parse_invoice(invoice)?;
 		match network_of(&inv.currency) {
 			Some((net, false)) => return Err(Error::Refused(format!("the invoice is a Bitcoin invoice ({}): it is paid in native BTC, on \
@@ -266,9 +278,15 @@ impl Wallet {
 		let owner_delay = units("owner_delay_units")?;
 		let timeout_seconds = send["timeout_seconds"].as_u64().ok_or_else(|| Error::Refused("the operator publishes no timeout for a \
 			payment over Lightning".into()))? as u32;
-		// The timeout a little past the operator's least, well within its most.
-		let timeout = MedianTime::from_consensus(self.now()?.to_consensus_u32().saturating_add(timeout_seconds).saturating_add(600))
-			.map_err(|e| Error::Refused(e.to_string()))?;
+		// The timeout a little past the operator's least, well within its
+		// most, unless the caller names one.
+		let now = self.now()?.to_consensus_u32();
+		let at = timeout.unwrap_or_else(|| now.saturating_add(timeout_seconds).saturating_add(600));
+		if at < now.saturating_add(timeout_seconds) || at > now.saturating_add(timeout_seconds.saturating_mul(2)) {
+			return Err(Error::Refused(format!("a timeout of median time {} is outside the operator's window for a payment, {} to {}; \
+				nothing is signed", at, now.saturating_add(timeout_seconds), now.saturating_add(timeout_seconds.saturating_mul(2)))));
+		}
+		let timeout = MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?;
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "lightning")?;
@@ -511,6 +529,18 @@ impl Wallet {
 	pub fn lightning_receive(&mut self, asset: AssetId, amount: u64, description: Option<&str>, max_fee_ppm: Option<u64>)
 		-> Result<Value, Error>
 	{
+		self.lightning_receive_under(asset, amount, description, max_fee_ppm, None)
+	}
+
+	/// [`Self::lightning_receive`], under `hash` when named: a hash the
+	/// wallet did not make, whose preimage reaches it later (a swap's, made
+	/// on its other side). Such a receive is claimed only once the wallet
+	/// holds the preimage ([`Self::lightning_receive_preimage`], or the
+	/// operator's status once it knows it); until then its leaf is the
+	/// wallet's to hold and counts nowhere.
+	pub fn lightning_receive_under(&mut self, asset: AssetId, amount: u64, description: Option<&str>, max_fee_ppm: Option<u64>,
+		hash: Option<[u8; 32]>) -> Result<Value, Error>
+	{
 		let info = self.server_info()?;
 		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
 			.map(|a| a["lightning"].clone())
@@ -549,8 +579,16 @@ impl Wallet {
 		let key = self.keys.leaf(&nonce)?;
 		let owner = key.x_only_public_key().0;
 		self.store.put_nonce(&nonce, &owner.serialize(), "lightning-receive")?;
-		let preimage = self.receive_preimage(&nonce)?;
-		let hash = arca_covenant::script::sha256(&preimage);
+		let given = hash.is_some();
+		let hash = match hash {
+			Some(h) => {
+				if self.receives()?.contains_key(&hex(&h)) || self.sends()?.contains_key(&hex(&h)) {
+					return Err(Error::Refused(format!("the wallet has a payment under hash {} already", hex(&h))));
+				}
+				h
+			},
+			None => arca_covenant::script::sha256(&self.receive_preimage(&nonce)?),
+		};
 		let digest = super::client::lightning_receive_digest(&self.genesis, &self.operator, &asset, amount, &hash, &owner, &nonce,
 			exit_delay.units());
 		// The leaf is bound to the wallet's mailbox key when it is made, so a
@@ -565,8 +603,12 @@ impl Wallet {
 			body["description"] = json!(d);
 		}
 		let hash_hex = hex(&hash);
-		self.set_receive(&hash_hex, json!({"state": "requested", "request": body, "asset": asset.to_string(), "amount": amount.to_string(),
-			"nonce": hex(&nonce), "max_fee_ppm": bound, "window": recv["window_seconds"].as_u64().unwrap_or(DEFAULT_WINDOW)}))?;
+		let mut rec = json!({"state": "requested", "request": body, "asset": asset.to_string(), "amount": amount.to_string(),
+			"nonce": hex(&nonce), "max_fee_ppm": bound, "window": recv["window_seconds"].as_u64().unwrap_or(DEFAULT_WINDOW)});
+		if given {
+			rec["hash_given"] = json!(true);
+		}
+		self.set_receive(&hash_hex, rec)?;
 		let r = match self.server.post("lightning_receive", &body) {
 			Ok(r) => r,
 			Err(e @ Error::Server { .. }) => {
@@ -579,7 +621,89 @@ impl Wallet {
 		};
 		let rec = self.receive_answered(&hash_hex, &r)?;
 		Ok(json!({"invoice": rec["invoice"], "payment_hash": hash_hex, "asset": asset.to_string(), "amount": amount.to_string(),
-			"fee": rec["fee"], "value": rec["value"], "expires_at": rec["expires_at"]}))
+			"fee": rec["fee"], "value": rec["value"], "expires_at": rec["expires_at"], "hash_given": given}))
+	}
+
+	/// The preimage of the payment the wallet receives under `hash`, a hash
+	/// it did not make: kept once it opens the hash, and the leaf claimed
+	/// with it at the next step.
+	pub fn lightning_receive_preimage(&mut self, hash: &str, preimage: &[u8; 32]) -> Result<Value, Error> {
+		let mut rec = self.receives()?.get(hash).cloned()
+			.ok_or_else(|| Error::Refused(format!("the wallet receives nothing under hash {}", hash)))?;
+		if hex(&arca_covenant::script::sha256(preimage)) != hash {
+			return Err(Error::Refused(format!("the preimage does not open hash {}", hash)));
+		}
+		if rec["hash_given"] != true {
+			return Err(Error::Refused(format!("the wallet made the preimage of hash {} itself", hash)));
+		}
+		if rec["preimage"].is_null() {
+			rec["preimage"] = json!(hex(preimage));
+			self.set_receive(hash, rec.clone())?;
+		}
+		Ok(json!({"payment_hash": hash, "state": rec["state"], "preimage": "held"}))
+	}
+
+	/// The preimage the wallet holds for the payment it receives under
+	/// `hash`: its own, derived from the leaf's key, or one handed to it
+	/// for a hash it did not make.
+	fn preimage_for(&self, hash: &str, rec: &Value) -> Result<Option<[u8; 32]>, Error> {
+		if rec["hash_given"] == true {
+			return match rec["preimage"].as_str() {
+				Some(p) => Ok(Some(super::chain::unhex32(p)?)),
+				None => Ok(None),
+			};
+		}
+		let nonce = super::chain::unhex32(rec["nonce"].as_str().unwrap_or(""))?;
+		let p = self.receive_preimage(&nonce)?;
+		if hex(&arca_covenant::script::sha256(&p)) != hash {
+			return Err(Error::Store("the preimage the wallet derives does not open the hash".into()));
+		}
+		Ok(Some(p))
+	}
+
+	/// The preimage that claims the leaf received under `hash` into the leaf
+	/// of owner nonce `nonce`: the one the wallet derives, or, for a hash it
+	/// did not make, the one it was handed; refused while it has none.
+	pub(crate) fn received_preimage(&self, hash: &[u8; 32], nonce: &[u8; 32]) -> Result<[u8; 32], Error> {
+		let h = hex(hash);
+		if let Some(rec) = self.receives()?.get(&h).filter(|r| r["hash_given"] == true) {
+			return self.preimage_for(&h, rec)?.ok_or_else(|| Error::Refused(format!("the leaf received under hash {} is claimed only with \
+				its preimage, which the wallet does not hold yet", h)));
+		}
+		self.receive_preimage(nonce)
+	}
+
+	/// The leaves received under a hash the wallet did not make whose
+	/// preimage it does not hold yet, by leaf id.
+	pub(crate) fn awaiting_preimage(&self) -> Result<std::collections::BTreeSet<String>, Error> {
+		let mut out = std::collections::BTreeSet::new();
+		for rec in self.receives()?.values() {
+			if rec["hash_given"] != true || !rec["preimage"].is_null() {
+				continue;
+			}
+			let Ok(nonce) = super::chain::unhex32(rec["nonce"].as_str().unwrap_or("")) else { continue };
+			if let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) {
+				out.insert(leaf);
+			}
+		}
+		Ok(out)
+	}
+
+	/// The operator's payment into its tree under `hash`, as it serves it to
+	/// anyone holding the hash: its invoice, its state, and the preimage once
+	/// it knows it.
+	pub fn lightning_lookup(&self, hash: &str) -> Result<Value, Error> {
+		self.server.post("lightning_receive_status", &json!({"payment_hash": hash}))
+	}
+
+	/// Hands the operator the preimage of a payment into its tree: it decides
+	/// a payment held inside the operator, and the operator serves it from
+	/// then on.
+	pub fn lightning_post_preimage(&self, hash: &str, preimage: &[u8; 32]) -> Result<Value, Error> {
+		if hex(&arca_covenant::script::sha256(preimage)) != hash {
+			return Err(Error::Refused(format!("the preimage does not open hash {}", hash)));
+		}
+		self.server.post("lightning_preimage", &json!({"payment_hash": hash, "preimage": hex(preimage)}))
 	}
 
 	/// The operator's answer to a request to receive, checked against what
@@ -643,6 +767,7 @@ impl Wallet {
 	fn receive_status(&mut self, hash: &str) -> Result<Value, Error> {
 		let st = self.server.post("lightning_receive_status", &json!({"payment_hash": hash}))?;
 		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
+		self.take_served_preimage(hash, &mut rec, &st)?;
 		match st["state"].as_str() {
 			Some("accepted") | Some("claimed") => {
 				let pid = st["participation_id"].as_str().ok_or_else(|| Error::Refused("the operator names no participation".into()))?;
@@ -670,6 +795,22 @@ impl Wallet {
 		}
 		self.set_receive(hash, rec.clone())?;
 		Ok(json!({"payment_hash": hash, "state": rec["state"], "operator": st["state"], "reason": rec["reason"]}))
+	}
+
+	/// A preimage the operator serves for a payment received under a hash
+	/// the wallet did not make, checked against the hash and kept.
+	fn take_served_preimage(&self, hash: &str, rec: &mut Value, st: &Value) -> Result<(), Error> {
+		if rec["hash_given"] != true || !rec["preimage"].is_null() {
+			return Ok(());
+		}
+		if let Some(p) = st["preimage"].as_str() {
+			let bytes = super::chain::unhex32(p)?;
+			if hex(&arca_covenant::script::sha256(&bytes)) == hash {
+				rec["preimage"] = json!(p);
+				self.set_receive(hash, rec.clone())?;
+			}
+		}
+		Ok(())
 	}
 
 	/// Claims the leaf of the payment `hash` once the wallet holds it: its
@@ -754,7 +895,34 @@ impl Wallet {
 		let refund_from = t.timeout.to_consensus_u32() as u64;
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
 		let (home_at, margin) = self.receive_home(&coin, &a.bases, refund_from, block)?;
-		if !handed && now > home_at {
+		let given = rec["hash_given"] == true;
+		// A hash the wallet did not make: its preimage comes from elsewhere,
+		// and until it has it the leaf is held as it is. That preimage is no
+		// secret of the wallet's, whose payer may have it already, so it is
+		// handed over whenever it comes, late or not.
+		if given && rec["preimage"].is_null() {
+			if let Ok(st) = self.server.post("lightning_receive_status", &json!({"payment_hash": hash})) {
+				self.take_served_preimage(hash, &mut rec, &st)?;
+				// Failed back with no preimage ever in hand (its payer's leg
+				// never completed): the leaf is the operator's to refund, and
+				// nothing of it was ever the wallet's to count.
+				if rec["preimage"].is_null() && st["state"] == "cancelled" {
+					rec["state"] = json!("failed");
+					rec["reason"] = st["reason"].clone();
+					self.set_receive(hash, rec.clone())?;
+					self.store.set_coin_spent(&leaf, &format!("the operator's: the payment of hash {}, received under a hash the wallet \
+						did not make, was failed back with no preimage in hand ({})", hash, st["reason"].as_str().unwrap_or("")))?;
+					return Ok(json!({"payment_hash": hash, "state": "failed", "reason": rec["reason"]}));
+				}
+			}
+			if rec["preimage"].is_null() {
+				rec["home_at"] = json!(home_at);
+				self.set_receive(hash, rec.clone())?;
+				return Ok(json!({"payment_hash": hash, "state": rec["state"], "note": "the leaf is held; waiting for the preimage of a hash \
+					the wallet did not make", "home_at": home_at}));
+			}
+		}
+		if !given && !handed && now > home_at {
 			rec["state"] = json!("failed");
 			rec["reason"] = json!(format!("the leaf came too late to be claimed safely: the operator's refund opens at its timeout (median \
 				time {}), and its unroll, its exit delay and a margin of {} s would end after it; the preimage stays with the wallet, \
@@ -764,9 +932,9 @@ impl Wallet {
 				never handed over", hash))?;
 			return Ok(json!({"payment_hash": hash, "state": "failed", "reason": rec["reason"]}));
 		}
-		let preimage = self.receive_preimage(&nonce)?;
+		let preimage = self.preimage_for(hash, &rec)?.ok_or_else(|| Error::Store("no preimage for the hash".into()))?;
 		if arca_covenant::script::sha256(&preimage) != hash_bytes {
-			return Err(Error::Store("the preimage the wallet derives does not open the hash".into()));
+			return Err(Error::Store("the preimage does not open the hash".into()));
 		}
 		let asset = coin.asset;
 		let m = super::pay::Margins::of(&info, asset)?;
@@ -783,7 +951,7 @@ impl Wallet {
 		// and the leaf comes home by its claim at its home date unless the
 		// operator co-signs.
 		rec["state"] = json!("claiming");
-		if rec["home_at"].is_null() {
+		if rec["home_at"].is_null() || rec["handed_over_at"].is_null() {
 			rec["home_at"] = json!(home_at);
 			rec["margin"] = json!(margin);
 			rec["handed_over_at"] = json!(now);

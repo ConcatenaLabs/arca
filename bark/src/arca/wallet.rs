@@ -2420,12 +2420,17 @@ impl Wallet {
 	/// received out of round and not yet refreshed as `operator-confirmed`),
 	/// and its on-chain coins on Sequentia. No asset is set apart.
 	pub fn balance(&self) -> Result<Value, Error> {
+		// A leaf received under a hash the wallet did not make, whose preimage
+		// it does not hold yet, is not the wallet's to spend or count: it is
+		// shown apart, and in no total.
+		let awaiting = self.awaiting_preimage()?;
 		let mut per: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
 		for c in self.store.coins()? {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}
-			*per.entry(c.asset.clone()).or_default().entry(Self::standing(&c).to_string()).or_default() += c.value;
+			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(&c) };
+			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += c.value;
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
 		// Its on-chain coins and its orders' credits at their keys alike.
@@ -2438,7 +2443,9 @@ impl Wallet {
 		// claim is out is counted once, as the claim's output on the chain.
 		let mut held: BTreeMap<String, u128> = BTreeMap::new();
 		for c in self.store.coins()? {
-			if matches!(c.state.as_str(), "spent" | "exited" | "lost") || (c.state == "exiting" && c.note.starts_with("claimed by")) {
+			if matches!(c.state.as_str(), "spent" | "exited" | "lost") || (c.state == "exiting" && c.note.starts_with("claimed by"))
+				|| awaiting.contains(&c.leaf_id)
+			{
 				continue;
 			}
 			*held.entry(c.asset.clone()).or_default() += c.value as u128;

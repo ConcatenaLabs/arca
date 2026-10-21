@@ -436,6 +436,15 @@ fn asset(s: &str) -> Result<AssetId, bark::arca::Error> {
 	AssetId::from_str(s).map_err(|e| bark::arca::Error::Parse(format!("asset {:?}: {}", s, e)))
 }
 
+/// Thirty-two bytes from their hex.
+fn unhex32(s: &str) -> Result<[u8; 32], bark::arca::Error> {
+	bark::arca::chain::unhex32(s.trim())
+}
+
+fn hex_of(b: &[u8]) -> String {
+	bark::arca::chain::hex(b)
+}
+
 /// Whether `a` names native BTC rather than a Sequentia asset.
 fn is_btc(a: &str) -> bool {
 	a.eq_ignore_ascii_case("btc")
@@ -516,7 +525,9 @@ fn rows(b: &Value) -> Value {
 	}];
 	let mut per: std::collections::BTreeMap<String, u128> = std::collections::BTreeMap::new();
 	for (a, states) in b["arca"].as_object().into_iter().flatten() {
-		for (_, v) in states.as_object().into_iter().flatten() {
+		// A leaf awaiting the preimage of a hash the wallet did not make is
+		// shown apart and counted in no row.
+		for (_, v) in states.as_object().into_iter().flatten().filter(|(s, _)| *s != "awaiting_preimage") {
 			*per.entry(a.clone()).or_default() += v.as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
 		}
 	}
@@ -553,6 +564,15 @@ enum LightningCmd {
 		/// in parts per million of what it pays.
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// The htlc-1 leaf's timeout, a median time of the chain: within the
+		/// operator's window for a payment's timeout (its `timeout_seconds` to
+		/// twice that past the chain's median time), refused before anything
+		/// is signed otherwise. A little past the operator's least unless
+		/// given. An invoice of the operator's own, for a payment into its
+		/// tree, is paid inside the operator, and its receiver's leaf times
+		/// out the operator's `internal_gap_seconds` before this one.
+		#[arg(long)]
+		timeout: Option<u32>,
 		/// How long to wait for the operator to say how the payment went, in
 		/// seconds; `sync` follows it after that.
 		#[arg(long, default_value_t = 60)]
@@ -576,6 +596,36 @@ enum LightningCmd {
 		/// in parts per million of the amount.
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// Receives under this payment hash (hex), one the wallet did not
+		/// make and whose preimage reaches it later (`lightning preimage`, or
+		/// the operator's status once the operator knows it). Until the
+		/// wallet holds the preimage its leaf is held apart, counted in no
+		/// balance (`awaiting_preimage`). Not for `btc`: Bark makes every
+		/// invoice's preimage itself.
+		#[arg(long)]
+		hash: Option<String>,
+	},
+	/// Hands the wallet the preimage (hex) of a payment it receives under a
+	/// hash it did not make (`receive --hash`): kept once it opens the hash,
+	/// and the leaf claimed with it by the next `sync`.
+	Preimage {
+		hash: String,
+		preimage: String,
+	},
+	/// The operator's payment into its tree under a payment hash, as it
+	/// serves it to anyone holding the hash: its invoice, its state, the
+	/// receiver leaf's exit delay, what holds it, and the preimage once the
+	/// operator knows it.
+	Lookup {
+		hash: String,
+	},
+	/// Hands the operator the preimage (hex) of a payment into its tree:
+	/// the payment is claimed with it once its leaf is its owner's, a
+	/// payment held inside the operator is decided by it, and the operator
+	/// serves it from then on. The preimage is public once posted.
+	PostPreimage {
+		hash: String,
+		preimage: String,
 	},
 	/// Claims a payment to a Bitcoin invoice of the wallet's (`receive
 	/// btc`): waits up to `--wait` seconds for the payer's payment and claims
@@ -611,6 +661,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				return bitcoin::pay(&datadir, invoice);
 			}
 		},
+		Cmd::Lightning(LightningCmd::Receive { asset: a, hash: Some(_), .. }) if is_btc(a) =>
+			return Err(bark::arca::Error::Refused("a BTC invoice is Bark's, and Bark makes every invoice's preimage itself: it takes no \
+				payment hash".into())),
 		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, .. }) if is_btc(a) =>
 			return bitcoin::invoice(&datadir, *amount, description.as_deref()),
 		Cmd::Lightning(LightningCmd::Claim { invoice, wait }) => {
@@ -767,15 +820,20 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
 		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
 		Cmd::Mailbox => w.mailbox(),
-		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, wait }) => {
-			let mut v = w.lightning_pay(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm)?;
+		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, timeout, wait }) => {
+			let mut v = w.lightning_pay_until(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm, timeout)?;
 			let hash = v["paying"]["payment_hash"].as_str().unwrap_or("").to_string();
 			v["payment"] = w.lightning_follow(&hash, std::time::Duration::from_secs(wait))?;
 			Ok(v)
 		},
 		Cmd::Lightning(LightningCmd::Payments) => w.lightning_payments(),
-		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, max_fee_ppm }) =>
-			w.lightning_receive(asset(&a)?, amount, description.as_deref(), max_fee_ppm),
+		Cmd::Lightning(LightningCmd::Receive { asset: a, amount, description, max_fee_ppm, hash }) => {
+			let hash = hash.as_deref().map(unhex32).transpose()?;
+			w.lightning_receive_under(asset(&a)?, amount, description.as_deref(), max_fee_ppm, hash)
+		},
+		Cmd::Lightning(LightningCmd::Preimage { hash, preimage }) => w.lightning_receive_preimage(&hash.to_lowercase(), &unhex32(&preimage)?),
+		Cmd::Lightning(LightningCmd::Lookup { hash }) => w.lightning_lookup(&hex_of(&unhex32(&hash)?)),
+		Cmd::Lightning(LightningCmd::PostPreimage { hash, preimage }) => w.lightning_post_preimage(&hash.to_lowercase(), &unhex32(&preimage)?),
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
 		Cmd::Restore => w.restore(),
