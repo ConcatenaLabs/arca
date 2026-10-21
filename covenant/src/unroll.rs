@@ -50,6 +50,17 @@ pub enum FeeSource {
 		fee: u64,
 		change: Script,
 	},
+	/// A coin of the broadcaster's pays the fee as for [`FeeSource::Coin`],
+	/// its change to `change`; the spent outputs' reserve or margin is
+	/// burned, a bare `OP_RETURN` of each asset's whole margin. An operator
+	/// that serves an asset issuer-operated keeps no unit of it and pays no
+	/// fee in it ([`crate::issuer`]).
+	Burning {
+		outpoint: OutPoint,
+		coin: TxOut,
+		fee: u64,
+		change: Script,
+	},
 }
 
 /// One member's unroll authorisation for one node: its signature over

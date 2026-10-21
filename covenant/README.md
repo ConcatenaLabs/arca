@@ -35,6 +35,8 @@ built with no compiler.
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
+| `limiter` | No output of Arca's: the mint limiter of sequentia-contracts (`templates/mint_limiter`), which holds an issuer-operated asset's reissuance token (`LimiterParams`, read from the instance file the limiter's tool writes, and `LimiterState`) | None of Arca's: the coin's script in each state (`script_pubkey`, rebuilt from the template's root and the data leaf, equal to the template's address vectors), the state a mint leads to by the program's own rule (`mint`, `room`), what a spend of the coin did (`follow`: a mint, the brake applied or lifted, the recovery), and the reissuance a round's input 0 carries (`reissuance`). The limiter's tool signs and satisfies a mint (`mint-limiter sign`) |
+| `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
 `record` holds the leaf record, `record_json` its JSON form (the `json`
@@ -51,7 +53,10 @@ sweep of an expired batch; all described below.
 rebindable message bound to the spent coin and the chain, the unroll
 authorisation, the release bound to the round of the owner's new leaf), `sign` the Elements taproot signature hash and BIP340
 signing, `checks` the five client checks (`check_round` returns the check that
-failed), `encode` a canonical binary encoding of every policy and of the clock
+failed; `check_reissue` is the fifth's clause on the batch's profile: a round
+whose input reissues the batch's asset passes only when every sweep path above
+the leaf is burn-only, and `LeafRecord::validate_round` runs it after the
+others), `encode` a canonical binary encoding of every policy and of the clock
 schedule, and `witness` the reading of witnesses found on-chain (the preimage a
 claim revealed, an unroll authorisation).
 
@@ -257,6 +262,15 @@ only `W` after its own confirmation. What the swept outputs hold beyond the
 outputs paid is the fee, in the batch asset, or a fee coin pays. A burn-only
 sweep pays every input whole to an `OP_RETURN` at its own index, and takes a
 fee coin. The operator signs each input's signature hash.
+
+A batch run by its asset's issuer is burn-only: the round that makes it
+reissues its value through the asset's mint limiter (`limiter`), and its sweep
+destroys whatever it takes, so the units minted for a refresh exist only while
+their batch lives. Every other way the operator takes a unit of such an asset
+(a forfeit's claim, a reclaim, a reclaimed offboard, a reserve or margin left
+over) is the operator's to burn too: those scripts pin no output, so the
+transaction pays `issuer::burn` and takes its fee from a coin of another
+asset, `FeeSource::Burning` burning whatever margin its inputs leave.
 
 ```rust
 let fee = FeeSource::Coin { outpoint, coin, fee: atoms, change };
@@ -641,7 +655,10 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   it) and with the operator's signature, and mined at its time.
   `--nocapture` prints the table.
 - `tests/checks.rs`: the five client checks accept an honest round and refuse
-  each attack that consensus accepts, naming the check.
+  each attack that consensus accepts, naming the check; and a round that
+  reissues the batch's asset passes check 5 only when every sweep path above
+  the leaf is burn-only, while a round funded from coins, or reissuing another
+  asset, passes with either sweep.
 - `tests/encode.rs`: the encodings round-trip and refuse malformed bytes; the
   witness readers recover what the builders wrote.
 - `tests/record.rs`: every leaf record in the regtest suite's record vectors
@@ -808,6 +825,13 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   output that is not the connector, and the one-owner node is reclaimed with
   that round's `M` and not another's. Every negative case is refused by the
   mempool and in a block, for its reason.
+- `tests/issuer.rs`: what a transaction issues and burns of an asset (a bare
+  `OP_RETURN` alone counts as a burn), and a fee coin that burns the margin
+  its inputs leave while its own change goes back.
+- `tests/limiter.rs`: the mint limiter's coin rebuilt for each of the
+  template's eight address vectors, an instance file read as the limiter's
+  tool writes it, the program's rule for the state a mint leads to, and the
+  following of a mint, the brake, its release and the recovery.
 - `tests/claim.rs`: on an anchored regtest chain, a batch of four claim
   leaves, each owned by the claim key of an address key (two of each parity)
   and its nonce. Each record validates for its claim key and not for the named
@@ -821,7 +845,15 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and
   the burn-only sweep, each clock move and sweep built by `release_tx`, `roll_tx`
-  and `sweep_tx`; and a 17-leaf and a 64-leaf batch built by the tree
+  and `sweep_tx`; an issuer-operated batch: an asset issued with an explicit
+  reissuance token, a round that reissues exactly its burn-only batch's value
+  (every leaf's record validates), the same round funding a batch whose sweep
+  pays the operator (the chain takes it; every leaf's record is refused by
+  check 5), and that batch's sweep refused in a block before its notice, paying
+  a script instead of the burn, one atom short, in another asset and at
+  another index, beside the burn the operator makes after the notice; the
+  asset's supply, read from every block, back at its level less what the open
+  batch still holds; and a 17-leaf and a 64-leaf batch built by the tree
   builder, every record checked against the confirmed round and three leaves in
   different subtrees unrolled from their records, unlocked and exited: every
   spend confirms, and every negative case is refused by the mempool and again

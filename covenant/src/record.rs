@@ -133,7 +133,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script, Transaction, TxOut, Txid};
 
-use crate::checks::{check_round, RoundCheckFailure};
+use crate::checks::{check_reissue, check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Encoding, Reader};
 use crate::htlc::HtlcTerms;
@@ -719,7 +719,8 @@ impl LeafRecord {
 	/// (asset, value and script), so the leaf is where the record says, and
 	/// the round passes the five client checks on the token and its clock
 	/// ([`check_round`]) for the record's schedule and every sweep path above
-	/// the leaf.
+	/// the leaf, and, when an input of the round reissues the leaf's asset,
+	/// every one of those sweep paths is burn-only ([`check_reissue`]).
 	///
 	/// Whether the round is final (its block certified and its anchor buried)
 	/// is for the caller to establish.
@@ -749,6 +750,7 @@ impl LeafRecord {
 		};
 		let sweeps = branch.sweeps();
 		check_round(round, &self.schedule, &sweeps[0], &sweeps[1..])?;
+		check_reissue(round, self.asset, &sweeps[0], &sweeps[1..])?;
 		Ok(ValidLeaf { leaf_id: branch.leaf_id(), round_txid: round.txid(), batch_vout, branch })
 	}
 

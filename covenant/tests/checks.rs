@@ -156,3 +156,40 @@ fn honest_round_passes_and_each_attack_names_its_check() {
 	}
 	assert_eq!(check(&honest, &sched, &[none, none, none, none]), RoundCheckFailure::NoNotice(1));
 }
+
+/// Check 5's clause on the batch's profile: a round that reissues the batch's
+/// asset passes only when every sweep path above the leaf is burn-only.
+#[test]
+fn a_round_that_reissues_the_batch_asset_needs_burn_only_sweeps() {
+	let r = Round::new();
+	let entropy = label32("the asset's entropy");
+	let x = arca_covenant::limiter::asset_of_entropy(entropy);
+	let sched = schedule(r.token, &[1_793_419_200, 1_795_838_400, 1_798_257_600]);
+	let batch = explicit(x, 50_000_000, op_true().script_pubkey());
+	let atom = explicit(r.token, 1, sched.clock0_script_pubkey());
+	let open = [sched.sweep(false, false), sched.sweep(true, false), sched.sweep(true, false)];
+	let burn = [sched.sweep(false, true), sched.sweep(true, true), sched.sweep(true, true)];
+	let token_coin = OutPoint::new(elements::Txid::from_byte_array(label32("limiter coin")), 0);
+	let reissue = TxIn {
+		previous_output: token_coin, asset_issuance: arca_covenant::limiter::reissuance(entropy, 50_000_000), ..Default::default()
+	};
+	let one = Value::Explicit(1);
+	let minted = r.tx(vec![reissue.clone(), r.issuance(one, Value::Null)], vec![batch.clone(), atom.clone(), fee(r.token, 1)]);
+	let funded = r.tx(vec![r.issuance(one, Value::Null)], vec![batch.clone(), atom.clone(), fee(x, 1_000)]);
+	let clause = |tx: &Transaction, sw: &[Sweep]| check_reissue(tx, x, &sw[0], &sw[1..]);
+
+	// Minted, burn-only: passes, as does a batch funded from coins with either sweep.
+	assert_eq!(clause(&minted, &burn), Ok(()));
+	assert_eq!(clause(&funded, &open), Ok(()));
+	assert_eq!(clause(&funded, &burn), Ok(()));
+	// Minted, with an operator sweep anywhere above the leaf: refused, naming
+	// the reissuing input and the first path that is not burn-only.
+	let e = clause(&minted, &open).unwrap_err();
+	assert_eq!((e.check(), &e), (5, &RoundCheckFailure::ReissuedNotBurnOnly { input: 0, path: 0 }));
+	let mixed = [burn[0], burn[1], open[2]];
+	assert_eq!(clause(&minted, &mixed), Err(RoundCheckFailure::ReissuedNotBurnOnly { input: 0, path: 2 }));
+	// A reissuance of another asset says nothing of this batch.
+	let other = r.tx(vec![TxIn { asset_issuance: arca_covenant::limiter::reissuance(label32("another"), 5), ..reissue },
+		r.issuance(one, Value::Null)], vec![batch, atom, fee(r.token, 1)]);
+	assert_eq!(clause(&other, &open), Ok(()));
+}

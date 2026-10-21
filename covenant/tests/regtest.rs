@@ -17,7 +17,10 @@
 //!    into it, each lock refused before it is reached;
 //! 4. the swap of two leaves in two assets in one transaction;
 //! 5. the hash-locked entry's sweep behind the token and the notice;
-//! 6. the burn-only sweep behind the token;
+//! 6. the burn-only sweep behind the token, and an issuer-operated batch:
+//!    reissued in its round, refused by a wallet when its sweep can pay the
+//!    operator, its sweep's violations refused in blocks, and the asset's
+//!    supply read from the chain back at its level once the batch is burned;
 //! 7. a 17-leaf and a 64-leaf batch built by the tree builder, with reserves
 //!    at four times the node's own relay floor: every leaf's record checked
 //!    against the confirmed round, and three leaves in different subtrees
@@ -830,6 +833,183 @@ fn burn(net: &mut Net) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. An issuer-operated batch: reissued in its round, burned at its sweep
+// ---------------------------------------------------------------------------
+
+/// What every block of the chain issues and burns of `asset`, read from the
+/// chain alone: the supply is the first less the second.
+fn supply_of(net: &Net, asset: elements::AssetId) -> (u64, u64) {
+	let (mut issued, mut burned) = (0u64, 0u64);
+	for h in 0..=net.height() {
+		let hash = net.rpc("getblockhash", json!([h]));
+		let raw = net.rpc("getblock", json!([hash, 0]));
+		let bytes: Vec<u8> = (0..raw.as_str().unwrap().len()).step_by(2)
+			.map(|i| u8::from_str_radix(&raw.as_str().unwrap()[i..i + 2], 16).unwrap()).collect();
+		let block: elements::Block = elements::encode::deserialize(&bytes).unwrap();
+		for tx in &block.txdata {
+			issued += issuer::issued(tx, asset).expect("explicit issuances");
+			burned += issuer::burned(tx, asset);
+		}
+	}
+	(issued, burned)
+}
+
+/// A round of the issuer-operated asset whose entropy is `entropy`: the token
+/// coin at input 0 reissues exactly the batch output's value, an X coin at
+/// input 1 issues the sweep token; the token goes back to OP_TRUE at output 0,
+/// the batch output follows at 1 and the sweep token's atom in clock 0 at 2.
+fn issuer_round(net: &mut Net, name: &str, entropy: [u8; 32], token: &Coin, issuer: &Coin, tree: &Tree) -> (Transaction, Txid) {
+	let batch = tree.batch_output();
+	let t = tree.params().schedule.token;
+	let total = issuer.txout.value.explicit().unwrap();
+	let mut s = spend(0).coin(token, 0xffff_ffff).coin(issuer, 0xffff_ffff).outputs(vec![
+		token.txout.clone(), batch.txout(), explicit(t, 1, tree.clock0_script_pubkey()),
+		explicit(net.x, total - 3_000, op_true_spk()), fee(net.x, 3_000),
+	]);
+	s.tx.input[0].asset_issuance = limiter::reissuance(entropy, batch.value);
+	s.tx.input[1].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
+		amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,
+		denomination: 8,
+	};
+	s.witness(0, op_true_witness());
+	s.witness(1, op_true_witness());
+	let txid = net.pass(name, &s.tx);
+	net.purse.push(coin_of(txid, 3, &s.tx));
+	(s.tx, txid)
+}
+
+fn issuer_operated(net: &mut Net) {
+	let s_key = keypair("issuer-operated operator");
+	// Z, issued with one explicit atom of its reissuance token, to OP_TRUE.
+	let funding = net.fund(vec![explicit(net.x, 1_000_000_000, op_true_spk())]).remove(0);
+	let contract = label32("asset Z");
+	let entropy = elements::AssetId::generate_asset_entropy(funding.outpoint, <elements::ContractHash as elements::hashes::Hash>::from_byte_array(contract))
+		.to_byte_array();
+	let (z, zt) = (limiter::asset_of_entropy(entropy), limiter::token_of_entropy(entropy));
+	let total = funding.txout.value.explicit().unwrap();
+	let mut s = spend(0).coin(&funding, 0xffff_ffff).outputs(vec![
+		explicit(z, 1_000_000_000, op_true_spk()), explicit(zt, 1, op_true_spk()),
+		explicit(net.x, total - 3_000, op_true_spk()), fee(net.x, 3_000),
+	]);
+	s.tx.input[0].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: contract,
+		amount: elements::confidential::Value::Explicit(1_000_000_000), inflation_keys: elements::confidential::Value::Explicit(1),
+		denomination: 8,
+	};
+	s.witness(0, op_true_witness());
+	let itx = net.pass("issuer/Z issued with an explicit reissuance token", &s.tx);
+	let z_coin = coin_of(itx, 0, &s.tx);
+	let mut token = coin_of(itx, 1, &s.tx);
+	let level = supply_of(net, z);
+	assert_eq!(level, (1_000_000_000, 0));
+
+	// A burn-only tree of four leaves of Z, which the node does not accept for
+	// fees: reserves of one atom, every exit with a fee coin.
+	let e0 = net.now() + 24 * H as u64;
+	let tree_of = |net: &Net, label: &str, issuer: &Coin, burn: bool| -> Tree {
+		let sched = ClockSchedule::new(token_of(issuer), xonly(&s_key), delay(), vec![mt(e0)]).unwrap();
+		let leaves: Vec<LeafSpec> = (0..4).map(|i| LeafSpec {
+			template: Template::Vtxo1, owner: xonly(&keypair(&format!("{} owner {}", label, i))), value: 25_000_000,
+			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
+			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
+			exit_delay: delay(), unlock_hash: sha256(&label32(&format!("{} preimage {}", label, i))), htlc: None, order: None,
+		}).collect();
+		Tree::build(TreeParams {
+			asset: z, chain: net.chain, schedule: sched, burn, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1,
+		}, &leaves).unwrap()
+	};
+	let issuer = net.fund(vec![explicit(net.x, 100_000, op_true_spk())]).remove(0);
+	let tree = tree_of(net, "minted", &issuer, true);
+	let v = tree.batch_output().value;
+	let (round, rtx) = issuer_round(net, "issuer/round reissuing its batch's value into a burn-only batch", entropy, &token, &issuer, &tree);
+	token = coin_of(rtx, 0, &round);
+	let policy = WalletPolicy { min_reserve: ReserveFloor::Atoms(1), horizon: 0, ..WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp())) };
+	for r in tree.records() {
+		r.validate_round(&round, &policy).unwrap();
+	}
+	assert_eq!(issuer::issued(&round, z), Some(v));
+	assert_eq!(supply_of(net, z), (level.0 + v, 0));
+	println!("issuer: round {} reissued {} of Z into a burn-only batch; every leaf's record validates", rtx, v);
+
+	// The same round funding a batch whose sweep pays the operator: the chain
+	// takes it, and a wallet refuses every leaf of it (check 5).
+	let issuer2 = net.fund(vec![explicit(net.x, 100_000, op_true_spk())]).remove(0);
+	let open = tree_of(net, "open", &issuer2, false);
+	let (round2, rtx2) = issuer_round(net, "issuer/round reissuing into a batch with an operator sweep (the chain takes it)", entropy,
+		&token, &issuer2, &open);
+	token = coin_of(rtx2, 0, &round2);
+	for r in open.records() {
+		let e = r.validate_round(&round2, &policy).unwrap_err();
+		assert!(matches!(e, RecordError::Round(RoundCheckFailure::ReissuedNotBurnOnly { input: 0, path: 0 })), "{:?}", e);
+	}
+	println!("issuer: a wallet refuses the leaves of {}: {}", rtx2, open.records()[0].validate_round(&round2, &policy).unwrap_err());
+	let _ = token;
+
+	// The minted batch expires: its token is released and waits the notice.
+	net.mtp_past(e0);
+	let sched = tree.params().schedule.clone();
+	let fc = net.fee_coin();
+	let tx = clock_move(net, &s_key, &sched, 0, false, &coin_of(rtx, 2, &round), &fc, e0 as u32);
+	let rl = net.pass("issuer/release of the burn-only batch's token", &tx);
+	let at_r = coin_of(rl, 0, &tx);
+	let batch_coin = coin_of(rtx, 1, &round);
+	let root = tree.root();
+	let swept = [root.policy.sweepable(batch_coin.outpoint, v)];
+	let tx = built_sweep(net, &s_key, &sched, &swept, &at_r, &[]);
+	net.refuse("issuer/neg the batch burned before its notice", &tx, "non-BIP68-final");
+	net.wait_csv(&rl, delay());
+
+	// Each violation, forced into a block: the batch output at input 0, the
+	// token at R at input 1, then any coin the violation needs, then a fee coin.
+	let burn_spk = issuer::burn_script();
+	let t_back = explicit(sched.token, 1, sched.r().script_pubkey());
+	let violation = |net: &mut Net, extra: Option<&Coin>, outs: Vec<TxOut>| -> Transaction {
+		let fc = net.fee_coin();
+		let mut s = spend(0).coin(&batch_coin, 0xffff_fffe).coin(&at_r, delay().to_sequence());
+		if let Some(c) = extra {
+			s = s.coin(c, 0xffff_ffff);
+		}
+		let k = 1u32;
+		let f = if extra.is_some() { 3 } else { 2 };
+		s = s.coin(&fc, 0xffff_fffe).outputs(outs)
+			.outputs(vec![explicit(net.policy, fc.txout.value.explicit().unwrap() - 5_000, op_true_spk()), fee(net.policy, 5_000)]);
+		let sg = s.sign(&s_key, 0, &root.policy.sweep_script(), net.genesis);
+		s.witness(0, root.policy.sweep_witness(&sg, k));
+		r_sign(net, &s_key, &sched, &mut s, 1);
+		if extra.is_some() {
+			s.witness(2, op_true_witness());
+		}
+		s.witness(f, op_true_witness());
+		s.tx
+	};
+	let tx = violation(net, None, vec![explicit(z, v, op_true_spk()), t_back.clone()]);
+	net.refuse("issuer/neg the batch paid to a script instead of the burn", &tx, "Script failed an OP_EQUALVERIFY operation");
+	let tx = violation(net, None, vec![explicit(z, v - 1, burn_spk.clone()), t_back.clone(), explicit(z, 1, op_true_spk())]);
+	net.refuse("issuer/neg a burn one atom short of the batch's value", &tx, "Script failed an OP_EQUALVERIFY operation");
+	let y = net.fund(vec![explicit(net.y, v, op_true_spk())]).remove(0);
+	let tx = violation(net, Some(&y), vec![explicit(net.y, v, burn_spk.clone()), t_back.clone(), explicit(z, v, op_true_spk())]);
+	net.refuse("issuer/neg a burn of the batch's value in another asset", &tx, "Script failed an OP_EQUALVERIFY operation");
+	let tx = violation(net, None, vec![t_back.clone(), explicit(z, v, burn_spk.clone())]);
+	net.refuse("issuer/neg the burn at another output index", &tx, "Script failed an OP_EQUALVERIFY operation");
+
+	// The control: the burn-only sweep, after the notice, behind the token.
+	let tx = built_sweep(net, &s_key, &sched, &swept, &at_r, &[]);
+	let bt = net.pass("issuer/the batch burned after its notice, behind the token", &tx);
+	assert!(net.rpc("gettxout", json!([bt.to_string(), 0])).is_null(), "the burn never enters the UTXO set");
+	assert_eq!(issuer::burned(&tx, z), v);
+
+	// Read from the chain: the batch's minted value is burned; what stands
+	// above the level is the other round's batch, whose sweep pays the
+	// operator.
+	let (issued, burned) = supply_of(net, z);
+	let open_v = open.batch_output().value;
+	assert_eq!((issued, burned), (level.0 + v + open_v, v));
+	println!("issuer: Z issued {} burned {}: the burn-only batch's {} is gone, the open batch's {} stands", issued, burned, v, open_v);
+	let _ = z_coin;
+}
+
+// ---------------------------------------------------------------------------
 // 7. Batches built by the tree builder
 // ---------------------------------------------------------------------------
 
@@ -1169,6 +1349,7 @@ fn frozen_constructions_on_regtest() {
 	swap(&mut net);
 	entry_sweep(&mut net);
 	burn(&mut net);
+	issuer_operated(&mut net);
 	built_trees(&mut net);
 	probes_turned_around(&mut net);
 	net.print();
