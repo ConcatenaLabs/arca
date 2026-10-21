@@ -177,7 +177,7 @@ pub fn parse_invoice(s: &str) -> Result<Invoice, Error> {
 
 /// The fee the operator charges for a payment of `amount` in `asset`, from
 /// its `info`: `lightning_ppm` of it, rounded up, and `lightning_base`.
-fn fee_of(info: &Value, asset: AssetId, amount: u64) -> Result<u64, Error> {
+pub(crate) fn fee_of(info: &Value, asset: AssetId, amount: u64) -> Result<u64, Error> {
 	let a = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
 		.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}", asset)))?;
 	let fees = &a["fees"];

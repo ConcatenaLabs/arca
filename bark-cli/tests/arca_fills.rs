@@ -353,6 +353,111 @@ async fn a_take_completes_on_the_schedule_alone() {
 	let _ = std::fs::remove_dir_all(&t.dir);
 }
 
+/// The order of `maker` selling Y for X at 2 X each, by lots of 1,000, its
+/// REFUND `ahead` blocks from now.
+fn terms_ahead(r: &Running, maker: &str, ahead: u32) -> FillOrder {
+	FillOrder { expiry_locktime: r.rt.client().blockchain_info().unwrap().blocks as u32 + ahead, ..terms(r, maker, 2, 1, 1_000) }
+}
+
+/// The state of each of `w`'s coins: leaf id (8), value, state.
+fn coin_states(w: &Arca) -> Vec<String> {
+	w.ok(&["coins"]).as_array().unwrap().iter().map(|c| format!("{} {} {}", &c["leaf_id"].as_str().unwrap()[..8],
+		c["value"].as_str().unwrap_or(""), c["state"].as_str().unwrap_or(""))).collect()
+}
+
+/// R7l's F2 probe, turned around (D73's spend of a dropped round's coin, and
+/// D75): three takes in one fill round. C and E hand their forfeits over; D
+/// never does, so the window drops the round unbroadcast and the server
+/// spends one of its coins at once. C runs again alone. E's take, run again
+/// once its order's REFUND is within the margin, is voided and its coin
+/// given back; but E's wallet signed a forfeit of that coin for the dropped
+/// round, which could still confirm while the server's spend is not final.
+/// So E holds the coin `forfeited` and cannot pay with it; once that spend
+/// is final the round is gone, the coin is live again, and E pays F with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_given_back_after_its_forfeit_waits_for_the_round_to_be_gone() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+		c.assets[0].offboard_base = Some("1000".into());
+	}).await;
+	let x = r.x;
+	let tc = holder(&mut r, "GBC", 601_000).await;
+	let td = holder(&mut r, "GBD", 601_000).await;
+	let te = holder(&mut r, "GBE", 601_000).await;
+	let tf = holder(&mut r, "GBF", 50_000).await;
+	let oc = terms_ahead(&r, "maker c", 50_000);
+	let od = terms_ahead(&r, "maker d", 50_000);
+	// E's order: its REFUND opens 390 blocks from now, 30 blocks past the
+	// six-hour margin (360 blocks at 60 s).
+	let oe = terms_ahead(&r, "maker e", 390);
+	let atc = rest(&mut r, &oc, 300_000);
+	let atd = rest(&mut r, &od, 300_000);
+	let ate = rest(&mut r, &oe, 300_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for (w, o, at, n) in [(&tc, &oc, &atc, "c"), (&td, &od, &atd, "d"), (&te, &oe, &ate, "e")] {
+		let k = w.ok(&["take", &served(&format!("gb-{}", n), o, at)]);
+		assert_eq!(k["state"], "pending", "{}", k);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	let r1 = built[0].tx.clone();
+	println!("round 1 built {}: fills {:?} | {}", r1.txid(), built[0].fills, built[0].broadcast);
+	// C and E hand their forfeits over; D never does.
+	tc.ok(&["sync"]);
+	te.ok(&["sync"]);
+	let e_coin = te.ok(&["coins"]).as_array().unwrap()[0]["leaf_id"].as_str().unwrap().to_string();
+	r.server.rounds.pass().await.unwrap();
+	// The window passes: round 1 dropped unbroadcast, one of its coins spent.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 700));
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(r1.txid())).await.unwrap().unwrap();
+	println!("round 1 after the window: {:?}", row.state);
+	assert_eq!(row.state, RoundState::Lost);
+	// E's order's REFUND comes within the margin before E runs again; the
+	// blocks bury nothing on the parent chain, so nothing new is final.
+	let tip = r.rt.client().blockchain_info().unwrap().blocks as u32;
+	for _ in 0..(oe.expiry_locktime - 360).saturating_sub(tip) + 2 {
+		r.produce().await;
+	}
+	r.synced().await;
+	let (built2, failed2) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed2.is_empty(), "{:?}", failed2);
+	println!("the run after: built {:?}", built2.iter().map(|b| (b.tx.txid(), b.fills.clone())).collect::<Vec<_>>());
+	assert_eq!(built2[0].fills, vec![atc], "C runs again alone");
+	let se = te.ok(&["sync"]);
+	let p = se["participations"].as_array().unwrap().iter().find(|p| p["state"] == "void").cloned().expect("E's take void");
+	println!("E's sync after its re-run: {} | coins {:?}", p, coin_states(&te));
+	assert!(p["void_reason"].as_str().unwrap().contains("its maker can refund it"), "{}", p);
+	assert_eq!(p["live_again"], json!([]), "not live while the dropped round can still confirm: {}", p);
+	assert_eq!(p["held_until_gone"][0]["leaf_id"], json!(e_coin), "{}", p);
+	let held = te.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == json!(e_coin)).cloned().unwrap();
+	assert_eq!(held["state"], "forfeited", "{}", held);
+	// E cannot pay F with it while the round can still confirm.
+	let req = tf.ok(&["receive"]);
+	let refused = te.run(&["send", req["request"].as_str().unwrap(), "--amount", "500000", "--asset", &x.to_string()]);
+	println!("E pays F 500000 of X while the coin is held: ok {} | {}", refused.0, refused.1);
+	assert!(!refused.0, "a held coin pays nothing");
+	// The server's spend of round 1's coin becomes final: the round is gone.
+	r.bury().await;
+	r.synced().await;
+	let se = te.ok(&["sync"]);
+	println!("E's sync once round 1 is gone: forfeits {} | coins {:?}", se["forfeits"], coin_states(&te));
+	let live = te.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == json!(e_coin)).cloned().unwrap();
+	assert_eq!(live["state"], "live", "live again once the round is gone: {} | {}", live, se["forfeits"]);
+	let sent = te.ok(&["send", req["request"].as_str().unwrap(), "--amount", "500000", "--asset", &x.to_string()]);
+	println!("E pays F 500000 of X: {}", sent);
+	let stored = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(r1.txid())).await.unwrap().unwrap().tx;
+	let accept: Value = r.rt.client().call("testmempoolaccept", &[json!([hex(&stored)])]).unwrap();
+	println!("round 1 as stored, the node now: {}", accept);
+	assert_eq!(accept[0]["allowed"], false);
+	for w in [&tc, &td, &te, &tf] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// R7l's Q1, turned around: two takes in one fill round; T hands its
 /// forfeits over, U not yet, so the round is held, unbroadcast. T's device is
 /// lost and T restored from its mnemonic then. The restore says what it

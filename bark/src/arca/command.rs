@@ -29,7 +29,9 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
-	by the name an order's side goes by)";
+	by the name an order's side goes by), btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
+	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
+	{swap, result}, btc_swaps, btc_swap_cancel {swap}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -196,6 +198,23 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"orders" => w.orders(),
 		"order_refund" => w.order_refund(req_str(&a["order"], "the order")?, opt_asset(&a["fee_asset"])?),
+		// A swap of BTC in a Bitcoin ark for an asset here (`super::btc_swap`):
+		// `bitcoin` is what the program that runs Bark hands in (`ark_info`,
+		// `fee`, `invoice`), and `btc_swap_follow` says what Bark must run
+		// next, whose outcome `btc_swap_bitcoin` takes.
+		"btc_swap_offer" => {
+			let atoms = opt_u64(&a["atoms"], "the atoms")?.ok_or_else(|| Error::Parse("the atoms are missing".into()))?;
+			let sats = opt_u64(&a["sats"], "the satoshis")?.ok_or_else(|| Error::Parse("the satoshis are missing".into()))?;
+			w.btc_swap_offer(req_str(&a["gives"], "what the maker gives")?, asset(req_str(&a["asset"], "the asset")?)?, atoms, sats,
+				opt_u64(&a["lapse_seconds"], "the lapse")?.unwrap_or(1800), &a["bitcoin"])
+		},
+		"btc_swap_read" => w.btc_swap_read(req_str(&a["offer"], "the offer")?, &a["bitcoin"]),
+		"btc_swap_take" => w.btc_swap_take(req_str(&a["offer"], "the offer")?, &a["bitcoin"]),
+		"btc_swap_complete" => w.btc_swap_complete(req_str(&a["take"], "the take")?, &a["bitcoin"]),
+		"btc_swap_follow" => Ok(Value::Array(w.btc_swap_follow(a["swap"].as_str().filter(|s| !s.is_empty()), &a["bitcoin"])?)),
+		"btc_swap_bitcoin" => w.btc_swap_bitcoin(req_str(&a["swap"], "the swap")?, &a["result"]),
+		"btc_swaps" => w.btc_swaps(),
+		"btc_swap_cancel" => w.btc_swap_cancel(req_str(&a["swap"], "the swap")?),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
 }

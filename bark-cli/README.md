@@ -711,6 +711,77 @@ While the wallet has no Bitcoin ark wallet, each of these is refused with the
 reason and Bark is not run. `ARCA_BARK_EXEC` and `ARCA_BARKD_EXEC` name the
 `bark` and `barkd` binaries when they are not the ones beside `arca`.
 
+### Swapping BTC for an asset
+
+`arca btc-swap` swaps native BTC, held in a Bitcoin ark, for an asset held in
+the operator's tree, between two wallets of one operator that are in one
+Bitcoin ark, under one payment hash. P gives the asset and gets the BTC; Q
+gives the BTC and gets the asset. Nothing is pegged: the BTC moves on
+Bitcoin, through Bark, and the asset moves in the tree.
+
+    arca btc-swap offer --give asset --asset X --atoms 100000 --sats 30000
+    arca btc-swap read OFFER        # the taker: what it gives and gets, every fee
+    arca btc-swap take OFFER        # prints the take, for the maker
+    arca btc-swap complete TAKE     # the maker
+    arca btc-swap follow --wait 25  # both, until each swap is over
+
+Either side may make the offer (`--give btc` or `--give asset`). Offer, take
+and completion lock nothing; each shows what the wallet gives and gets with
+every fee: the operator's fee for the asset's payment, and Bark's fee for
+paying or receiving the BTC, quoted by Bark's daemon for the coins it would
+spend. The offer (`btc-swap-offer:…`) and the take (`btc-swap-take:…`) are
+handed over by hand; after the completion the two wallets run alone, each
+running `follow`, which moves its swaps on and runs Bark as each needs.
+
+- The hash is P's: Bark makes every invoice's preimage itself and takes no
+  hash, so P's Bark invoice for the BTC names it, and Q asks the operator to
+  receive the asset under it (`lightning receive --hash`).
+- P locks first: its asset goes into an `htlc-1` leaf paying the operator's
+  invoice for Q's receive, settled inside the operator. The leaf times out
+  late enough that Q's leaf, which the operator times out its
+  `internal_gap_seconds` earlier, keeps a home date an hour past the latest
+  moment the Bitcoin leg can end (the later of P's invoice's expiry and Bark's
+  HTLC-send expiry delta and six blocks, at half Bitcoin's pace, and ten
+  minutes) after its unroll, its exit delay and an eighth of its lock: on a
+  Bitcoin ark with a delta of 258 blocks and 36-hour exit delays that is about
+  six and a half days. The timeout must lie in the operator's window for a
+  payment's timeout (`lightning.send.timeout_seconds` to twice that), or P
+  refuses to lock and says how far out the swap needs it.
+- Q pays P's invoice only once its leaf is held and validated, its round
+  final (certified, its anchor buried), the leaf the swap's (received under
+  the hash, of the atoms less the fee, the operator's delay as published),
+  its home date at least an hour past the Bitcoin leg's latest moment, and the
+  invoice ten minutes from its expiry at least. It pays once; a payment that
+  did not go through is tried again at most twice, which Bark refuses at once
+  once it has failed the first back.
+- P's claim of the BTC reveals the preimage. `follow` claims it in slices
+  (`--claim-slice`, 20 seconds) while the payer may pay, since Bark's server
+  fails a payment back unless the receiver claims within its forward timeout,
+  and never as a fresh invoice, whose hash would not be the swap's. P then
+  posts the preimage to the operator (`lightning post-preimage`), so P's leaf
+  is the operator's, and Q takes the preimage from its payment or from the
+  operator and claims its leaf.
+
+An abandoned swap leaves each leg with one party. Before P locks, nothing is
+locked: a lapsed offer cancels P's invoice. P's lock comes back to P once the
+operator fails Q's receive back: Q's leaf never came, or was not claimed by
+its time. Q's payment comes back to Q once Bark fails it back (P never
+claimed) or cancels P's receive at the invoice's expiry. A swap whose
+record is lost with a device leaves its legs where a restore finds them:
+`btc-swap list` shows a received leaf held for its preimage, and a restored
+payment out of the tree, by hash. Bark keeps an invoice's preimage only in
+its own store, so P restored before it claimed cannot claim: Q's payment
+fails back and P's lock comes back to it. Q restored after it paid takes the
+preimage from the operator, which serves it once P has posted it.
+
+`follow` needs the wallet's Bitcoin ark wallet (`bitcoin create`) and, for
+P's claim, the Bitcoin ark's server able to grant the payment's HTLCs: a
+server whose pool of VTXOs is empty grants none, and the payer's payment is
+failed back. `btc-swap list` shows every swap with its state (`offered`,
+`taken`, `locked`, `paying`, `claimed`, `claiming`, then `done`, or `lapsed`,
+`abandoned`, `btc_failed`, `refunded`, `cancelled`) and what happened when;
+`btc-swap cancel` ends one before the wallet has locked anything.
+
 ### Placing an order on the chain
 
 A maker who holds only leaves places an ordinary SeqDEX order: `arca order
@@ -899,6 +970,10 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
+| `btc-swap offer --give btc\|asset --asset A --atoms N --sats S [--lapse-seconds L]` | Offers a swap of native BTC for an asset with another wallet of the operator (see Swapping BTC for an asset); giving the asset, makes the Bitcoin invoice the taker pays. The offer's text and what the wallet gives and gets, with every fee; nothing locked |
+| `btc-swap read OFFER`, `btc-swap take OFFER`, `btc-swap complete TAKE` | What taking an offer gives and gets, with every fee; the take (asking the operator to receive under the offer's hash, or making the Bitcoin invoice), its text for the maker; the maker's completion |
+| `btc-swap follow [SWAP] [--wait S] [--claim-slice C]` | Moves the wallet's swaps on, running Bark as each needs (lock, claim, payment, claim of the leaf), for `S` seconds; one pass when 0 |
+| `btc-swap list`, `btc-swap cancel SWAP` | Every swap with its state and log, and the legs a restore found; cancels a swap the wallet has locked nothing of |
 | `refusals` | Every refusal the wallet made, with its reason |
 | `bitcoin create (--testnet4 \| --mainnet \| --signet \| --mutinynet \| --regtest) --ark URL (--bitcoind URL (--bitcoind-cookie F \| --bitcoind-user U) \| --esplora URL) [--birthday-height H]` | Makes the wallet's Bitcoin ark wallet from its own mnemonic, through Bark's daemon (see The Bitcoin side): the network, the ark, the chain source (no password), the height it scans from and what the ark's server says of itself |
 | `bitcoin [--] ARGS…` | Runs Bark's `bark` with `--datadir <datadir>/bitcoin` and the arguments given: the wallet's Bitcoin side. Put `--` before an argument `arca` would read itself, such as `--help` |
@@ -1107,6 +1182,34 @@ mnemonic holds the same; a refresh; and an exit alone, its leaves claimed to
 the on-chain wallet. It needs the harness running (`ARCA_TEST_BITCOIN_ARK`,
 the harness script with its environment) and the patched `bark` and `barkd`
 (`ARCA_BARK_EXEC`, `ARCA_BARKD_EXEC`), and is skipped without them.
+
+`tests/arca_btc_swap.rs` runs the swap of BTC for an asset (`btc-swap`) with
+both: a whole Arca server with its SeqLN node in X (`LIGHTNINGD_EXEC`) and the
+Bitcoin ark on regtest (`ARCA_TEST_BITCOIN_ARK`, `ARCA_BARK_EXEC`,
+`ARCA_BARKD_EXEC`), two dual-chain wallets each with its Bitcoin ark wallet
+made from its own mnemonic, run one test at a time since they share the ark.
+A swap completes in each direction, the maker giving the asset and then the
+BTC, each side seeing its fees before anything is locked, and the books hold
+to the atom and the satoshi: P gives the atoms, the operator's fee and the
+transfer's margins and gets the satoshis less Bark's receive fee; Q gives the
+satoshis and Bark's send fee and gets the atoms less the fee and its claim's
+margins. Each row of an abandoned swap is forced, and nobody ends holding
+both legs: an offer never taken lapses and its Bark invoice is cancelled; one
+taken and never completed lapses at the operator, and a late completion locks
+nothing; P's lock with Q's leaf never coming, with Q never paying, and with
+Q's payment failed back by Bark because P never claims, each comes back to P
+once its time is over, Q's BTC coming back in full; and a P that claims the
+BTC with Bark alone and posts nothing still loses its lock to the operator,
+which reads the preimage from Q's claim. The Sequentia leg's round is rolled
+back through its Bitcoin anchor before the swap (Q pays nothing while it is
+out of the chain or not final, then pays once it is back, the same
+transaction) and after it, three Bitcoin blocks deep, past finality (the round
+returns with the same txid and every coin of the swap is the same coin
+again). A Q killed while Bark pays reads the payment back when it starts
+again and claims; a Q restored from the mnemonic after it paid claims its leaf
+with the preimage P posted; a P restored before it claimed cannot claim, as
+Bark kept the preimage only on the lost device, and Q's payment comes back to
+Q and P's lock to the restored P.
 
 `tests/arca_quotes.rs` runs the same way: a board's quote and an exit's quote
 (`--quote`, and the library's `board_quote` and `exit_quote`) sign, ask,
@@ -1405,6 +1508,12 @@ move the chain's median time (`ARCA_OPERATOR_CONTROL`, the file's comment
 lists the calls). It runs until it is told to stop (`POST /quit`):
 
     ARCA_OPERATOR_CONTROL=127.0.0.1:18640 cargo test -p arca-cli --test arca_operator_for_browsers -- --ignored --nocapture
+
+With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`), it runs on the
+chain SeqLN's `sequentia-regtest` network assumes, with a SeqLN node in X that
+receives and payments out of the tree timing out four to eight days out, so a
+client can run a swap of BTC for an asset against it between wallets with the
+specification's 36-hour exit delays.
 
 `tests/arca_digests.rs` checks the wallet's call authentication and
 participation id against the server's own, and its list of refusal codes
