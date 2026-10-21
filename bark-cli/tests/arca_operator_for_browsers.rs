@@ -53,6 +53,15 @@
 //! an asset (`arca btc-swap`) needs between wallets with the specification's
 //! 36-hour exit delays against a Bitcoin ark's 88-hour HTLC delays. `/state`
 //! then says `lightning: true`.
+//!
+//! With `ARCA_OPERATOR_BTC_LIGHTNING` set to a count `n` as well (and
+//! `BITCOIND_EXEC`, a Bitcoin Core `bitcoind` with `bitcoin-cli` beside it),
+//! a Bitcoin regtest chain runs beside it with `n + 1` Lightning nodes on
+//! Bitcoin: a hub, for a maker of BTC, with a channel of 10,000,000 sat to
+//! each of the other `n`, half of it pushed to them, one for each wallet
+//! that trades BTC for an asset under one hash. `/state` then names their
+//! sockets (`btc_lightning: {hub, wallets}`), and `/btc_mine` (`{blocks}`)
+//! mines blocks on Bitcoin.
 
 mod common;
 
@@ -65,6 +74,7 @@ use elements::{AssetId, Script};
 use serde_json::{json, Value};
 
 use common::running::Running;
+use sequentia_ext::lightning::{BitcoinRegtest, LightningNode};
 use server::store::RoundState;
 
 /// One request: its path and its JSON body.
@@ -275,6 +285,54 @@ async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNo
 	(r, vec![ox, px])
 }
 
+/// The Bitcoin side of a trade of BTC over Lightning: a Bitcoin regtest
+/// chain, a hub node and a node for each wallet, each with a channel from
+/// the hub. Stopped, and their directories deleted, on drop.
+struct BitcoinSide {
+	btc: BitcoinRegtest,
+	hub: LightningNode,
+	wallets: Vec<LightningNode>,
+}
+
+/// The hub and `n` nodes on a new Bitcoin regtest chain, each node with a
+/// channel of 10,000,000 sat from the hub, 5,000,000 of it pushed to it.
+fn bitcoin_side(n: usize) -> BitcoinSide {
+	let lnd = common::lightning::lightningd("operator_for_browsers").expect("ARCA_OPERATOR_BTC_LIGHTNING needs LIGHTNINGD_EXEC");
+	let exe = BitcoinRegtest::exe_from_env().expect("ARCA_OPERATOR_BTC_LIGHTNING needs BITCOIND_EXEC");
+	let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("browsers-btc{}", std::process::id()));
+	let btc = BitcoinRegtest::start(&exe, &dir).expect("a Bitcoin regtest chain");
+	btc.mine(101);
+	let hub = LightningNode::start_on_bitcoin(&btc, &lnd, &dir.with_extension("hub"), &[]).expect("the hub node");
+	let addr = hub.ok("newaddr", json!({ "addresstype": "bech32" }))["bech32"].as_str().expect("an address").to_string();
+	for _ in 0..n {
+		btc.cli(&["sendtoaddress", &addr, "0.2"]).expect("a payment to the hub");
+	}
+	btc.mine(1);
+	hub.wait_funds(n);
+	let mut wallets = vec![];
+	for i in 0..n {
+		let w = LightningNode::start_on_bitcoin(&btc, &lnd, &dir.with_extension(format!("w{}", i)), &[]).expect("a wallet's node");
+		hub.open_bitcoin_channel(&btc, &w, 10_000_000, 5_000_000);
+		wallets.push(w);
+	}
+	// Six blocks, so that every channel is announced and every node routes.
+	btc.mine(6);
+	BitcoinSide { btc, hub, wallets }
+}
+
+/// The Bitcoin side's paths: its sockets in `/state`, and `/btc_mine`.
+fn bitcoin_handle(side: &Option<BitcoinSide>, path: &str, b: &Value) -> Option<Result<Value, String>> {
+	let side = side.as_ref()?;
+	match path {
+		"/btc_mine" => {
+			let n = b["blocks"].as_u64().unwrap_or(1).min(1000) as u32;
+			side.btc.mine(n);
+			Some(side.btc.cli(&["getblockcount"]).map(|c| json!({"blocks": c.trim().parse::<u64>().unwrap_or(0)})))
+		},
+		_ => None,
+	}
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a server kept running for a wallet outside this process; run by hand"]
 async fn operator_for_browsers() {
@@ -283,6 +341,10 @@ async fn operator_for_browsers() {
 		Some(_) => with_lightning().await,
 		None => (Running::start().await, vec![]),
 	};
+	let btc = std::env::var("ARCA_OPERATOR_BTC_LIGHTNING").ok().map(|n| {
+		let n = n.parse::<usize>().expect("ARCA_OPERATOR_BTC_LIGHTNING is a count of wallets' nodes");
+		tokio::task::block_in_place(|| bitcoin_side(n))
+	});
 	let listener = TcpListener::bind(&addr).expect("bind the control address");
 	listener.set_nonblocking(true).unwrap();
 	println!("operator for browsers: control {}, server {}, node {}, X {}, Y {}", addr, r.url(), r.node_url(), r.x, r.y);
@@ -304,7 +366,16 @@ async fn operator_for_browsers() {
 			answer(&mut s, 200, &json!({"quit": true}));
 			break;
 		}
-		let out = handle(&mut r, &path, &body).await;
+		let out = match bitcoin_handle(&btc, &path, &body) {
+			Some(out) => out,
+			None => handle(&mut r, &path, &body).await.map(|mut v| {
+				if let (Some(side), "/state") = (&btc, path.as_str()) {
+					v["btc_lightning"] = json!({"hub": side.hub.rpc_path().display().to_string(),
+						"wallets": side.wallets.iter().map(|w| w.rpc_path().display().to_string()).collect::<Vec<_>>()});
+				}
+				v
+			}),
+		};
 		println!("operator for browsers: {} {} -> {}", path, body, match &out { Ok(v) => v.to_string(), Err(e) => format!("error: {}", e) });
 		match out {
 			Ok(v) => answer(&mut s, 200, &v),

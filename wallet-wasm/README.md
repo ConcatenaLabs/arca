@@ -111,7 +111,14 @@ amount?}`, `order_fill_resting {order, amount?, shown?}`,
 `order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
-ark (`btc_swap_*`); the offline-refresh plans (`plan_quote`, `plan`,
+ark (`btc_swap_*`); payments over Lightning in and out of the tree
+(`lightning_pay_quote {invoice, asset?, max_fee_ppm?}`, `lightning_pay {invoice,
+asset?, max_fee_ppm?, timeout?, shown?}`, `lightning_payments`,
+`lightning_receive_quote {asset, amount, max_fee_ppm?}`, `lightning_receive
+{asset, amount, description?, max_fee_ppm?, hash?}`,
+`lightning_receive_preimage {hash, preimage}`, `lightning_receive_ready {hash,
+need_seconds}`, `lightning_receives`, `lightning_lookup {hash}`,
+`lightning_post_preimage {hash, preimage}`); the offline-refresh plans (`plan_quote`, `plan`,
 `plans`, `plan_cancel`), which a page shows only in developer mode; `supply {asset}`, the operator's supply report for an asset
 it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` in `coins`
 (`issuer-operated` when its batch's sweep can only burn, `open` when it pays the operator), both of which a page shows only in
@@ -138,7 +145,20 @@ dates): what settling it in the operator's next round costs now. The fee only
 falls as time passes, so the `quote` of the coin once held is at most it.
 `take_quote` answers what a take leaves the wallet in all (`spends`): the price,
 the operator's fee, and the margins of a payment to itself (`pays_itself`, with its change and the change's expiry)
-when no coin holds exactly the price and the fee. A board and
+when no coin holds exactly the price and the fee. A payment
+over Lightning works the same way: `lightning_pay_quote` answers what paying an
+invoice leaves the wallet in all (`spends`: the amount, the operator's fee and
+the margins of the coins it spends), and `lightning_pay` with `shown` set to
+that answer pays only on it. `lightning_receive_quote` answers what a receive's
+leaf will hold once claimed (`claimed`: the amount less the operator's fee and
+the margins of the claim), asking the operator nothing. A receive under a hash
+the wallet did not make (`lightning_receive` with `hash`, its preimage someone
+else's) is claimed only once `lightning_receive_preimage` hands the preimage
+over; `lightning_receive_ready` says when its leaf is held for good enough to
+pay that preimage's price: validated, its round final, and its home date at
+least `need_seconds` away (the time the other side may take to reveal the
+preimage, and the wallet to claim with it). `sync` moves every payment and
+receive on. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
 only on it; `exit_quote` is each transaction an exit would broadcast now, with

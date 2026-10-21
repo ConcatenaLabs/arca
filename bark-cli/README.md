@@ -1570,6 +1570,17 @@ those (`shown`) is refused, naming them, before anything is signed; given them,
 it signs, and `swap_complete` settles the swap with each side paying exactly what
 it was shown. `swap_cancel` frees an offer's coin, and `swaps` lists both.
 
+`tests/arca_lightning_commands.rs` runs the same way, with the operator's SeqLN
+node in X (`LIGHTNINGD_EXEC`): a payment under a hash between two wallets of one
+operator through the library's commands. `lightning_receive_quote` answers what
+the receiver's leaf will hold once claimed, asking the operator nothing;
+`lightning_pay_quote` answers what the payment takes in all, signing and keeping
+nothing, and `lightning_pay` on other terms than it is refused before anything is
+signed. `lightning_receive_ready` answers not ready before the leaf's round, ready
+after it, and refuses a wait longer than the leaf's home date allows. The claim
+then leaves exactly the quoted amount and the payer's coins fall by exactly the
+quoted amount.
+
 `tests/arca_adversity.rs` runs the same way, with a proxy that can rewrite any
 answer of the server or any request on its way there, or hold a call unanswered, and with transactions the test
 builds itself as the operator or as a sender. Each case is one way an operator
@@ -1866,7 +1877,13 @@ With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`), it runs on the
 chain SeqLN's `sequentia-regtest` network assumes, with a SeqLN node in X that
 receives and payments out of the tree timing out four to eight days out, so a
 client can run a swap of BTC for an asset against it between wallets with the
-specification's 36-hour exit delays.
+specification's 36-hour exit delays. With `ARCA_OPERATOR_BTC_LIGHTNING` set to a
+count `n` as well (and `BITCOIND_EXEC`, a Bitcoin Core `bitcoind` with
+`bitcoin-cli` beside it), a Bitcoin regtest chain runs beside it with a hub
+Lightning node and `n` others, each with a channel of 10,000,000 sat from the
+hub, half of it its own: a maker of BTC and the wallets that trade BTC for an
+asset under one hash, as the web wallet's user-mode drill runs them. `/state`
+names their sockets (`btc_lightning`) and `/btc_mine` mines on Bitcoin.
 
 `tests/arca_digests.rs` checks the wallet's call authentication,
 participation id and plan digests against the server's own, and its list

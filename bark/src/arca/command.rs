@@ -32,7 +32,10 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	by the name an order's side goes by), swap_offer {give_asset, give, want_asset, want}, swap_read {offer, accept_near_deadline?}, \
 	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
-	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
+	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?}, lightning_pay {invoice, \
+	asset?, max_fee_ppm?, timeout?, shown?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
+	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
+	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
@@ -113,7 +116,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
-		| "orders" | "order_refund" | "swaps" | "plans");
+		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -272,6 +275,40 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"btc_swap_bitcoin" => w.btc_swap_bitcoin(req_str(&a["swap"], "the swap")?, &a["result"]),
 		"btc_swaps" => w.btc_swaps(),
 		"btc_swap_cancel" => w.btc_swap_cancel(req_str(&a["swap"], "the swap")?),
+		// Payments over Lightning, in and out of the tree, as `arca lightning`
+		// makes them: `lightning_pay_quote` says what a payment takes, and
+		// `lightning_pay` with `shown` goes ahead only on it; a receive under
+		// a hash the wallet did not make (`hash`) is claimed once its
+		// preimage is handed in, and `lightning_receive_ready` says when its
+		// leaf is held for good enough to pay that preimage's price. `sync`
+		// moves both on.
+		"lightning_pay_quote" => w.lightning_pay_quote(req_str(&a["invoice"], "the invoice")?, opt_asset(&a["asset"])?,
+			opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"lightning_pay" => {
+			let timeout = opt_u64(&a["timeout"], "the timeout")?.map(|t| u32::try_from(t).map_err(|_| Error::Parse("the timeout".into())))
+				.transpose()?;
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.lightning_pay_shown(req_str(&a["invoice"], "the invoice")?, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?,
+				timeout, shown)
+		},
+		"lightning_payments" => w.lightning_payments(),
+		"lightning_receive_quote" => w.lightning_receive_quote(asset(req_str(&a["asset"], "the asset")?)?,
+			opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?,
+			opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"lightning_receive" => {
+			let hash = a["hash"].as_str().filter(|h| !h.is_empty()).map(|h| super::chain::unhex32(&h.to_lowercase())).transpose()?;
+			w.lightning_receive_under(asset(req_str(&a["asset"], "the asset")?)?,
+				opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?,
+				a["description"].as_str(), opt_u64(&a["max_fee_ppm"], "the fee bound")?, hash)
+		},
+		"lightning_receive_preimage" => w.lightning_receive_preimage(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			&super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
+		"lightning_receive_ready" => w.lightning_receive_ready(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			opt_u64(&a["need_seconds"], "the seconds needed")?.ok_or_else(|| Error::Parse("the seconds needed are missing".into()))?),
+		"lightning_receives" => w.lightning_receives(),
+		"lightning_lookup" => w.lightning_lookup(&super::chain::hex(&super::chain::unhex32(req_str(&a["hash"], "the hash")?)?)),
+		"lightning_post_preimage" => w.lightning_post_preimage(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			&super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
 		"distribute_quote" => {
 			let (asset, claims) = distribution_of(w, a)?;
 			w.distribute_quote(asset, &claims)
