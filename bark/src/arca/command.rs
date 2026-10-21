@@ -33,7 +33,8 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
-	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}";
+	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -109,7 +110,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
-		| "orders" | "order_refund" | "swaps");
+		| "orders" | "order_refund" | "swaps" | "plans");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -250,6 +251,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"distributions" => w.distributions(),
 		"claims" => w.claims(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32)),
 		"claim" => w.claim(&texts(&a["claims"], "the claims")?, opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32)),
+		"plan_quote" | "plan" => {
+			let leaves = texts(&a["leaves"], "the coins")?;
+			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
+			let bound = opt_u64(&a["max_fee_ppm"], "the bound")?;
+			if command == "plan" { w.plan(&leaves, steps, bound) } else { w.plan_quote(&leaves, steps, bound) }
+		},
+		"plans" => w.plans(),
+		"plan_cancel" => w.plan_cancel(req_str(&a["plan"], "the plan")?),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
 }

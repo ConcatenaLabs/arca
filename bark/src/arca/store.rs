@@ -122,6 +122,14 @@ CREATE TABLE IF NOT EXISTS forfeit (
 CREATE TABLE IF NOT EXISTS refusal (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, what TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS signer_seen (entry INTEGER PRIMARY KEY, hash TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS coin_entry (leaf_id TEXT PRIMARY KEY, entry INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS plan (
+	id TEXT PRIMARY KEY,
+	coin TEXT NOT NULL,
+	body TEXT NOT NULL,
+	state TEXT NOT NULL,
+	status TEXT,
+	created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS maker_order (
 	id TEXT PRIMARY KEY,
 	terms TEXT NOT NULL,
@@ -476,6 +484,14 @@ impl Store {
 		Ok(())
 	}
 
+	/// A coin marked spent by `by` is the wallet's again, `live`, saying why:
+	/// what spent it did not happen. `false` when it was not so marked.
+	pub fn unspend_coin(&self, leaf_id: &str, by: &str, note: &str) -> Result<bool, Error> {
+		let n = self.conn.execute("UPDATE coin SET state = 'live', spent_by = NULL, note = ?3 WHERE leaf_id = ?1 AND state = 'spent' AND spent_by = ?2",
+			params![leaf_id, by, note]).map_err(db)?;
+		Ok(n == 1)
+	}
+
 	pub fn set_coin_spent(&self, leaf_id: &str, by: &str) -> Result<(), Error> {
 		self.conn.execute("UPDATE coin SET state = 'spent', spent_by = ?2, note = '' WHERE leaf_id = ?1", params![leaf_id, by]).map_err(db)?;
 		Ok(())
@@ -530,6 +546,33 @@ impl Store {
 
 	/// Records an order placed by participation `id`: its terms (the relay's
 	/// form, without an outpoint), the index of its order key, its amount.
+	/// Records an offline-refresh plan the wallet made, `open`; one recorded
+	/// before stays as it is.
+	pub fn put_plan(&self, id: &str, coin: &str, body: &str, state: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT OR IGNORE INTO plan (id, coin, body, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+			params![id, coin, body, state, now()]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Every plan: `(id, coin, body, state, status)`, oldest first.
+	pub fn plans(&self) -> Result<Vec<(String, String, String, String, Option<String>)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, coin, body, state, status FROM plan ORDER BY created_at, id").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).map_err(db)?;
+		rows.collect::<Result<_, _>>().map_err(db)
+	}
+
+	/// What the wallet keeps of a plan, its steps' leaves as taken up.
+	pub fn update_plan_body(&self, id: &str, body: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE plan SET body = ?2 WHERE id = ?1", params![id, body]).map_err(db)?;
+		Ok(())
+	}
+
+	/// A plan's state, and the status the operator last served for it.
+	pub fn set_plan(&self, id: &str, state: &str, status: Option<&str>) -> Result<(), Error> {
+		self.conn.execute("UPDATE plan SET state = ?2, status = coalesce(?3, status) WHERE id = ?1", params![id, state, status]).map_err(db)?;
+		Ok(())
+	}
+
 	pub fn put_order(&self, id: &str, terms: &str, key_index: u32, amount: u64) -> Result<(), Error> {
 		self.conn.execute("INSERT INTO maker_order (id, terms, key_index, amount, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
 			params![id, terms, key_index, amount as i64, now()]).map_err(db)?;

@@ -341,12 +341,20 @@ impl Wallet {
 	/// what a receiver gets has the longest life the wallet can give it), the
 	/// largest first among those of one date, each resolved; a coin past its
 	/// exit deadline is not paid on (the operator co-signs no spend of it,
-	/// and `sync` takes it on the chain).
+	/// and `sync` takes it on the chain), nor one an offline-refresh plan
+	/// names ([`super::plan`]).
 	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
 		let now = self.now()?.to_consensus_u32() as u64;
+		// A coin an offline-refresh plan names carries refund halves the
+		// wallet signed, valid while its script is unspent: it is paid out of
+		// round by no wallet, and is refreshed in a round first.
+		let planned = self.planned_coins()?;
 		for row in self.store.coins_in("live")?.into_iter().filter(|c| c.asset == asset.to_string()) {
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
+				continue;
+			}
+			if planned.contains(&row.leaf_id) {
 				continue;
 			}
 			let (_, a) = self.held(&row)?;
@@ -447,8 +455,19 @@ impl Wallet {
 			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
 				pay a little less, or that much more", asset, min_leaf)));
 		}
+		// Coins an offline-refresh plan names are paid out of round by no
+		// wallet: say so, with what they hold.
+		let planned = self.planned_coins()?;
+		let held_planned: u64 = self.store.coins_in("live")?.iter()
+			.filter(|c| c.asset == asset.to_string() && planned.contains(&c.leaf_id)).map(|c| c.value).sum();
+		let note = if held_planned > 0 {
+			format!("; {} more is in coins an offline-refresh plan names, which carry refund halves the wallet signed and are paid out of \
+				round only once refreshed in a round ({})", held_planned, self.spelling.say("{refresh}"))
+		} else {
+			String::new()
+		};
 		Err(Error::Refused(format!("the wallet holds {} of asset {} in live coins, and paying {} takes {} with the margins its \
-			transactions leave for their fees", total_live, asset, paid, paid + total_live.saturating_sub(kept) + margin)))
+			transactions leave for their fees{}", total_live, asset, paid, paid + total_live.saturating_sub(kept) + margin, note)))
 	}
 
 	/// Pays `value` of `asset` to the receive request `request`, out of round:

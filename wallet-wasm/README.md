@@ -106,8 +106,9 @@ shown?}`, `refusals`; a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
-{accept}`, `swap_cancel {swap}`, `swaps`); and the swap of BTC in a Bitcoin
-ark (`btc_swap_*`). Its answer is `{"result", "start"}`: the
+{accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
+ark (`btc_swap_*`); and the offline-refresh plans (`plan_quote`, `plan`,
+`plans`, `plan_cancel`), which a page shows only in developer mode. Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
