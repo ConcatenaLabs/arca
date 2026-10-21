@@ -437,6 +437,7 @@ pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 		CoinRecord::Leaf { .. } => "batch",
 		CoinRecord::Transfer(_) => "transfer",
 		CoinRecord::Board(_) => "board",
+		CoinRecord::Fill(_) => "fill",
 	}
 }
 
@@ -446,6 +447,9 @@ pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 		CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce),
 		CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce),
 		CoinRecord::Board(b) => (b.owner, b.owner_nonce),
+		// A fill's coin: a record whose order names no order names the NUMS
+		// point, which no coin validates under.
+		CoinRecord::Fill(_) => record.owner().unwrap_or((arca_covenant::taptree::nums(), [0; 32])),
 	}
 }
 
@@ -454,7 +458,7 @@ pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirectio
 	match record {
 		CoinRecord::Leaf { record, .. } => record.htlc.map(|t| t.direction),
 		CoinRecord::Transfer(t) => t.leaf.htlc.map(|t| t.direction),
-		CoinRecord::Board(_) => None,
+		CoinRecord::Board(_) | CoinRecord::Fill(_) => None,
 	}
 }
 
@@ -466,9 +470,9 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 			out.push(record.branch().map_err(|e| Error::Refused(e.to_string()))?.batch_output().txout());
 		},
 		CoinRecord::Board(b) => out.push(b.output().txout()),
-		CoinRecord::Transfer(t) => {
-			for i in &t.inputs {
-				base_outputs(&i.coin, out)?;
+		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
+			for p in record.parents() {
+				base_outputs(p, out)?;
 			}
 		},
 	}
@@ -490,7 +494,7 @@ pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
 	match record {
 		CoinRecord::Board(_) => true,
 		CoinRecord::Leaf { .. } => false,
-		CoinRecord::Transfer(t) => t.inputs.iter().any(|i| rests_on_board(&i.coin)),
+		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().any(rests_on_board),
 	}
 }
 
@@ -2042,7 +2046,7 @@ impl Wallet {
 			match r {
 				CoinRecord::Board(b) => out.push(b.output().txout()),
 				CoinRecord::Leaf { .. } => {},
-				CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| boards(&i.coin, out)),
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
 			}
 		}
 		let mut outs = vec![];
@@ -2299,6 +2303,16 @@ impl Wallet {
 		if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 > first as u64 {
 			let why = format!("past its exit date (median time {}, three days before its first expiry, {}): the operator co-signs no \
 				spend of it and takes it into no round", first.saturating_sub(WalletPolicy::EXIT_DEADLINE), first);
+			// The current coin of an open offline-refresh plan was given to the
+			// plan's step, which the operator runs in the coin's free window:
+			// `sync` asks for the plan's status and takes the step's leaf up,
+			// and takes the coin home only if the step is not done (D57).
+			// Taken on the chain here, by any command's re-check before `sync`
+			// has asked, the coin would leave the step's leaf behind.
+			if c.state == "live" && self.plan_currents()?.iter().any(|(_, l, _)| *l == c.leaf_id) {
+				return Ok(Checked::Holds("live", format!("{}; the current coin of an open offline-refresh plan: sync takes its step's \
+					leaf up, or takes it home if the step is not done", why)));
+			}
 			return Ok(if a.bases.iter().all(|(_, f)| f.in_chain()) {
 				Checked::Fails(why)
 			} else {
@@ -3125,6 +3139,7 @@ mod tests {
 			template: Template::Vtxo1, owner: key(i + 1).x_only_public_key().0, value: 1_000_000,
 			owner_nonce: [i; 32], operator_nonce: [i + 100; 32], exit_delay: w, unlock_hash: [i + 50; 32],
 			htlc: None,
+			order: None,
 		}).collect();
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();

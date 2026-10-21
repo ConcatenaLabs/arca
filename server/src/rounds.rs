@@ -1177,6 +1177,7 @@ impl Rounds {
 				exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: row.unlock_hash,
 				htlc: *htlc,
+				order: None,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -2433,6 +2434,7 @@ impl Rounds {
 				unlock_hash: l.unlock_hash,
 				// An htlc-1 leaf's terms, from the record the builder gave it.
 				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
+				order: None,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

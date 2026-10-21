@@ -72,8 +72,9 @@ fn the_builder_rebuilds_every_record_vector() {
 				timeout: MedianTime::from_consensus(h["timeout"].as_u64().unwrap() as u32).unwrap(),
 				operator_delay: RelativeTime::from_units(h["operator_delay_units"].as_u64().unwrap() as u16).unwrap(),
 			});
+			let order = l.get("order").map(|o| arca_covenant::record_json::order_terms_from_json(o, asset).unwrap());
 			LeafSpec {
-				template: if htlc.is_some() { Template::Htlc1 } else { Template::Vtxo1 },
+				template: if order.is_some() { Template::Order2 } else if htlc.is_some() { Template::Htlc1 } else { Template::Vtxo1 },
 				owner: key_of(&l["owner"]),
 				value: l["value"].as_u64().unwrap(),
 				owner_nonce: h32(&l["owner_nonce"]),
@@ -81,6 +82,7 @@ fn the_builder_rebuilds_every_record_vector() {
 				exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 				unlock_hash: h32(&l["unlock_hash"]),
 				htlc,
+				order,
 			}
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
@@ -172,6 +174,7 @@ impl Fx {
 			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
 			exit_delay: w, unlock_hash: sha256(&preimages[i]),
 			htlc: None,
+			order: None,
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
 		let round = self.round(&tree, issuer);

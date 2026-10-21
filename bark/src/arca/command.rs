@@ -22,7 +22,7 @@ use super::keys::Keys;
 use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
-pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
+pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
@@ -34,7 +34,7 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}";
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -109,7 +109,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
-	let local = matches!(command, "address" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
+	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans");
 	let mut out = json!({});
 	if !local {
@@ -132,6 +132,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 	match command {
 		"info" => w.info(),
 		"address" => w.address(),
+		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
 		"balance" => w.balance(),
 		"coins" => w.coins(),
 		"record" => w.record(req_str(&a["leaf_id"], "the coin")?),
@@ -266,6 +267,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			if command == "plan" { w.plan(&leaves, steps, bound) } else { w.plan_quote(&leaves, steps, bound) }
 		},
 		"plans" => w.plans(),
+		"care" => {
+			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
+			w.care(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32), steps,
+				opt_u64(&a["max_fee_ppm"], "the bound")?)
+		},
 		"plan_cancel" => w.plan_cancel(req_str(&a["plan"], "the plan")?),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}

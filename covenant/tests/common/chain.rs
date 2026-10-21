@@ -78,6 +78,7 @@ pub fn batches(chain: Chain, x: AssetId, y: AssetId, s: Keypair, sched1: ClockSc
 			operator_nonce: label32(&format!("chain {} operator nonce {}", label, i)),
 			exit_delay: delay, unlock_hash: sha256(&preimages[i]),
 			htlc: None,
+			order: None,
 		}).collect();
 		let tree = Tree::build(TreeParams { asset, chain, schedule: sched, burn: false, radix: 4, reserve, min_leaf: 1 }, &leaves).unwrap();
 		(tree, preimages)

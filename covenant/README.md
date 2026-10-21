@@ -11,7 +11,11 @@ Elements tags. Amounts are explicit and always name their asset. Every lock is
 time based: `MedianTime` for `OP_CHECKLOCKTIMEVERIFY`, `RelativeTime` (512-second
 units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused. The one script here
 that is not Arca's, SeqDEX's fill covenant (`fill`), is read as SeqDEX builds
-it: its REFUND lock may be a height, and Arca only reads it.
+it: its REFUND lock may be a height, and Arca only reads it. The `order-2` leaf
+(`order`) carries one Simplicity leaf (`0xbe`), the fill program
+`arca/order-2`, and a hidden data leaf beside its tapscript leaves; its pruned
+programs come from sequentia-contracts (`order_programs`), so its spends are
+built with no compiler.
 
 ## What it builds
 
@@ -29,6 +33,7 @@ it: its REFUND lock may be a height, and Arca only reads it.
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
+| `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
@@ -67,8 +72,10 @@ tx.input[i].witness.script_witness = w;
 
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
-It names the leaf's template and version (`vtxo-1`, or `htlc-1` with its
-payment hash, timeout, direction and operator delay), the owner's key, the two
+It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
+payment hash, timeout, direction and operator delay; or `order-2` with its
+order's terms: the asset it is paid in, the price and lot, the landed order's
+maker script hash, REFUND time and key, and the four credit keys), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
 clock schedule
@@ -519,6 +526,42 @@ reassignment within that delay. It answers at once: a rollback that disconnects
 its answer does not restart the delay of the leaf it answered. Against the sender
 and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.
+
+## In-tree fills of a resting order
+
+An `order-2` leaf (`order`) is filled off the chain by a transaction that
+spends the order's coin by its fill path, under the operator's signature over
+the fill's outputs, and each of the taker's coins through a checkpoint, as a
+transfer does. The outputs (2 to 4, all committed by every signature) are the
+maker's credit at 0, for a partial fill the order resting again at 1, then the
+taker's leaves. Every coin it makes has a `CoinRecord::Fill`: the order coin's
+own record, the operator's signature, whether the fill is partial, the taker's
+inputs with their checkpoint values and pairs, the outputs, the coin's index,
+and which coin it is (`FillLeaf`): the maker's credit or the order resting
+again, whose leaves follow from the order's terms and which name only the nonce
+the maker derived the owner key from, or a taker's new leaf.
+
+```rust
+let op = order_coin.leaf.order_policy().unwrap();      // the coin a round made, or a fill's remainder
+let plan = op.plan(order_coin.value, filled)?;          // the credit at its price, the order resting again
+let digest = op.fill_digest(order_coin.value, &outputs)?; // what the operator signs, outputs 0..m
+let credit = CoinRecord::Fill(Box::new(FillCoin {
+	fill: OrderFill { order: order_record, signature, partial: true, inputs: vec![taker_input], outputs },
+	index: 0, leaf: FillLeaf::Credit { owner_nonce },
+}));
+```
+
+`CoinRecord::validate` checks a fill as the program does (`OrderPolicy::check_signature`
+and `judge`: the operator's signature over the outputs, the credit to the
+order's next credit leaf at its price, the remainder under the next salt, the
+lot), each taker's pairs, that no asset leaves the fill in more than its inputs
+hold, and the coin at its index; a fill coin is one hop deeper than the deepest
+coin it spends, and its expiry the earliest of theirs. `ValidCoin::fill_tx`
+builds the fill from the record, the order coin's outpoint and the taker's
+checkpoints. A fill's binary form is tag 4 of the coin record: the order coin,
+the signature, a partial flag, the inputs and outputs as a reassignment's, the
+index, and the coin's kind (0 the credit and 1 the remainder, each with its
+owner nonce; 2 a taker's leaf, as a reassignment's leaf).
 
 ## Offline refresh
 

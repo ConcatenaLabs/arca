@@ -468,7 +468,7 @@ impl CoinRecordOf {
 		let arca_covenant::CoinRecord::Leaf { record, .. } = rec else { panic!("a round's leaf") };
 		let s = common::running::keypair("operator");
 		let policy = arca_covenant::LeafPolicy { owner: record.owner, operator: s.x_only_public_key().0, salt: record.salt(),
-			chain: record.chain, exit_delay: record.exit_delay, htlc: record.htlc };
+			chain: record.chain, exit_delay: record.exit_delay, htlc: record.htlc, order: None };
 		CoinRecordOf(policy.script_pubkey(), policy)
 	}
 

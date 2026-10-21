@@ -95,7 +95,7 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 
 `run(command, args)` is the library's `bark::arca::command::run`, which every
 program that embeds the library calls, and takes the command line's commands, each with its
-arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`,
+arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`, `openamp_key`,
 `balance`, `coins`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
@@ -109,7 +109,7 @@ leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
 ark (`btc_swap_*`); and the offline-refresh plans (`plan_quote`, `plan`,
-`plans`, `plan_cancel`), which a page shows only in developer mode. Its answer is `{"result", "start"}`: the
+`plans`, `plan_cancel`), which a page shows only in developer mode; and `care {scan?, expiries?, max_fee_ppm?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days, refreshing a coin of no round in a round first (see the CLI README's offline refresh section for the gap this leaves). Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is

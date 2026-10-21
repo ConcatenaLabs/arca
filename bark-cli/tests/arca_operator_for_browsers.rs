@@ -33,6 +33,7 @@
 //! | `/fees {asset, refresh_ppm?, offboard_base?}` | Sets the asset's refresh fee, or the fixed part of its offboard fee (what a take pays), and reloads the server's configuration, as an operator's SIGHUP does |
 //! | `/build` | Builds the rounds of whatever participations stand, and broadcasts none that waits on a take's forfeits: their txids, sizes and the orders each fills |
 //! | `/pass` | One pass over the rounds: a round held for takes' forfeits goes out once every one is in |
+//! | `/settle` | One pass of the watcher (releases, notices, sweeps, the return of unclaimed claims), a block buried two Bitcoin blocks deep, one pass of the nursery and another of the watcher, as an operator's timers do between them; the chain's tip |
 //! | `/round_state {txid}` | Where the server says the round stands: built, broadcast, final or lost |
 //! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
 //! | `/restart` | Stops the server and starts it again on the same database, at the same address, as an operator's restart does; the chain and the signer keep running |
@@ -179,6 +180,17 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 		"/pass" => {
 			r.server.rounds.pass().await.map_err(|e| e.to_string())?;
 			Ok(json!({"passed": true}))
+		},
+		"/settle" => {
+			r.server.watcher.pass().await.map_err(|e| e.to_string())?;
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			r.produce().await;
+			r.bury().await;
+			r.synced().await;
+			r.server.nursery.pass().await.map_err(|e| e.to_string())?;
+			r.server.watcher.pass().await.map_err(|e| e.to_string())?;
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			Ok(json!({"tip": r.rt.client().blockchain_info().map_err(|e| e.to_string())?.blocks}))
 		},
 		"/round_state" => {
 			use elements::hashes::Hash;
