@@ -421,7 +421,7 @@ impl Wallet {
 			return Ok(None);
 		}
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
-		let key = self.keys.leaf(&row.owner_nonce)?;
+		let key = self.coin_key(&row.owner_nonce)?;
 		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
 		let mut need = self.outbid(old, asset, claim_vsize(&coin.leaf))?;
@@ -601,7 +601,7 @@ impl Wallet {
 		let policy = self.followed_policy(row.expiry, now);
 		let txs = self.accepted_bases(&record)?;
 		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
-		let key = self.keys.leaf(&row.owner_nonce)?;
+		let key = self.coin_key(&row.owner_nonce)?;
 		let prior: Value = match self.store.exit(leaf_id)? {
 			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,
 			None => json!({}),
@@ -700,7 +700,7 @@ impl Wallet {
 		let policy = self.followed_policy(row.expiry, now);
 		let txs = self.accepted_bases(&record)?;
 		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
-		let key = self.keys.leaf(&row.owner_nonce)?;
+		let key = self.coin_key(&row.owner_nonce)?;
 		let prior: Value = match self.store.exit(leaf_id)? {
 			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,
 			None => json!({}),

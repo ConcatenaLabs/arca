@@ -927,6 +927,50 @@ again.
     arca sync                                     # forfeits in, once the round is built
     arca sync                                     # the leaf, once the round is final
 
+### Paying many holders in one round, and taking a claim up
+
+`arca distribute` pays many holders from one round: a dividend, a coupon, a
+refund, an allocation, a reward payout. Its list holds a line per holder,
+`KEY AMOUNT`, the amount in atoms of `--asset`; a key is an x-only key (64 hex
+digits), a compressed public key (66), or a taproot address, whose program is
+its key. A P2WPKH address names only its key's hash, so the holder hands over
+its key instead: `arca address` shows each new address's `key`. Each holder
+gets an ordinary leaf, owned by a key of its own that the wallet derives from
+the key named and a nonce it draws, so one address can be paid by any number
+of distributions and the address key itself signs nothing of the tree.
+
+The coins given up hold exactly the claims and the operator's fee (its
+refresh fee of each coin given up, its fixed part per claim leaf, and its
+offboard's fixed part once): where no live coin holds that much, the wallet
+first pays itself one out of round. `sync` hands over the forfeits once the
+round is final, as for a refresh, and the claims open. A holder takes its
+claim up through the operator until the deadline, three days before the
+claim batch's first expiry. What no holder has taken up when the operator
+sweeps the expired batch goes back to `--return`, by default a new on-chain
+address of the wallet's, once that sweep is final. The operator pays that
+return out of its own coins: a payer relies on it for the return, and
+`arca distributions` shows each claim's state and each payment back.
+
+A holder needs no prior contact. `arca claims` asks the operator for the
+claims under the wallet's on-chain receive keys (every address handed out
+and 20 more, or `--scan N`), proving each key, and `arca claim` takes each
+open one up. The wallet checks the leaf as it checks a leaf of its own
+refresh: rebuilt from the published tree, validated against its round, final,
+under its own key, with the preimage that opens its entry. Then it signs the
+leaf's unroll authorisations with that key, hands them to the operator, keeps
+the leaf as a coin, and pays it out of round to a fresh leaf of its own. A
+wallet restored from its mnemonic finds its claims the same way. A claim the
+operator does not take up is still the wallet's coin, refreshed or taken home
+as any.
+
+    arca address                                        # its key, for a payer
+    arca distribute holders.txt --asset X --quote       # the fee, the coins given up
+    arca distribute holders.txt --asset X --shown 0     # one round pays them all
+    arca sync                                           # the forfeits, once final
+    arca distributions                                  # each claim, the deadline, the return
+    arca claims                                         # on a holder's wallet
+    arca claim                                          # taken up
+
 ### Finding an operator in the registry
 
 An operator publishes a record of itself in the Sequentia registry: its
@@ -960,7 +1004,7 @@ registry for both commands.
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
-| `address` | A new on-chain address, to pay the wallet's boards and fee coins from |
+| `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
 | `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`) and whether it rests on a board, and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
@@ -993,6 +1037,10 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
 | `order fill ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown FILL]` | `take` (see Taking an on-chain order), by the name an order's side goes by |
 | `order refund ORDER [--fee-asset A]` | Takes what order `ORDER` holds where it rests home by its REFUND, once the chain's median time has passed its expiry, to an address of the wallet's; the fee from the order's own value where the node takes its asset for fees, else from an on-chain coin in `A` |
+| `distribute LIST --asset A [--return ADDRESS] [--quote \| --shown FEE]` | Pays the holders of `LIST` (a file or `-`, a line `KEY AMOUNT` each) in one round (see Paying many holders in one round): with `--quote`, only says what it would cost (the operator's fee, the coins it gives up, whether the wallet first pays itself a coin of exactly the claims and the fee), signing and asking nothing; with `--shown`, goes ahead only on that very fee. Refused before anything is signed: a key named twice, a claim below the operator's smallest leaf, a key the text does not name (a P2WPKH address), a fee that changed since it was shown |
+| `distributions` | Every distribution the wallet made, as the operator shows it: its state, round, deadline and expiry, each claim's key, claim key, value, leaf and state (`pending`, `open`, `claimed`, `returned`), and each payment of what no holder took up back to the return script, with its state |
+| `claims [--scan N]` | The claims paid to the wallet's on-chain addresses, found by asking the operator under each address key: each claim's distribution, address, key, value, state, deadline, and the coin the wallet holds of it |
+| `claim [CLAIM]… [--scan N]` | Takes up the open claims named (`DISTRIBUTION:INDEX` or a leaf id), or every one: each checked, its authorisations handed over, kept as a coin, and paid out of round to a fresh leaf of the wallet's own; a claim not open says its state |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`); the maker pays its margin, in the asset it gives |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -1083,6 +1131,22 @@ orders`, boards its credits from the order key, and its REFUND is refused by
 the wallet and by the node before the expiry and mined after it. A second
 test runs an operator whose watcher never unlocks the order: the maker's
 `sync` unlocks it itself once the ten minutes have passed.
+
+`tests/arca_claims.rs` runs the same way: a payer boards its X and pays 20
+holders in one round with `arca distribute` (the wallet first paying itself a
+coin of exactly the claims), eight of them wallets that exist and handed out
+an address, whose key it names, and twelve that exist only as mnemonics,
+named by the key of their first address as an x-only key, a compressed public
+key or the key's taproot address. Fourteen take their claims up with `arca
+claims` and `arca claim`, the mnemonic ones from wallets created after the
+round; each claimed coin is refreshed by its holder's `sync` in its free
+window. After the claim batch's expiry, release, notice and sweep, the
+operator pays the six claims nobody took up back to the payer's return
+address, exactly, and every holder that claimed still holds its coin; a
+wallet made later from an unclaimed holder's mnemonic finds its claim
+returned. Each refusal (a key named twice, a claim below the smallest leaf,
+a P2WPKH address in place of a key, a fee that changed since it was shown) is
+asserted by its reason.
 
 `tests/arca_restore.rs` runs the same way. A wallet holds a leaf of a batch,
 a board, its change from a payment out of round, a payment to it not yet

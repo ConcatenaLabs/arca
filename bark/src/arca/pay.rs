@@ -551,7 +551,7 @@ impl Wallet {
 			let (cp, re) = match theirs.iter().find(|(j, _, _)| *j == k) {
 				Some((_, cp, re)) => (*cp, *re),
 				None => {
-					let key = self.keys.leaf(&i.row.owner_nonce)?;
+					let key = self.coin_key(&i.row.owner_nonce)?;
 					mine.push(i.row.leaf_id.clone());
 					let cp = sign(&key, &plan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 					let re = sign(&key, &plan.reassignment_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
@@ -1455,7 +1455,7 @@ impl Wallet {
 		};
 		let mut sigs = vec![];
 		for (k, i) in inputs.iter().enumerate().skip(n) {
-			let key = self.keys.leaf(&i.row.owner_nonce)?;
+			let key = self.coin_key(&i.row.owner_nonce)?;
 			let cp = sign(&key, &plan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 			let re = sign(&key, &plan.reassignment_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 			sigs.push(json!({"input": k, "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
@@ -1627,7 +1627,7 @@ impl Wallet {
 
 	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's
 	/// own, through the server, with the margins a transfer leaves.
-	fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
+	pub(crate) fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
 		let asset = AssetId::from_str(&rows[0].asset).map_err(|e| Error::Store(e.to_string()))?;
 		let margins = Margins::of(&self.server_info()?, asset)?;
 		let mut inputs = vec![];

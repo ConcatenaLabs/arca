@@ -285,6 +285,51 @@ enum Cmd {
 	/// rests (and its terms as SeqDEX's relay serves them), each fill and
 	/// what it credited, and the credits at its key. Asks the node only.
 	Orders,
+	/// Pays many holders in one round (a claim tree): each line of `list`
+	/// (a file, or `-` for standard input) names a holder's key and an amount
+	/// of `asset`, `KEY AMOUNT`; a key is 64 hex digits (x-only), 66 (a
+	/// compressed public key) or a taproot address. Each holder takes its
+	/// leaf up with `arca claim`; what no holder takes up by the deadline
+	/// goes back to `--return`, by default a new on-chain address of this
+	/// wallet's, once the operator's sweep of it is final. `sync` hands over
+	/// the forfeits once the round is final.
+	Distribute {
+		list: String,
+		#[arg(long)]
+		asset: String,
+		/// The address what no holder takes up is paid back to.
+		#[arg(long = "return")]
+		return_address: Option<String>,
+		/// Only says what the distribution would cost (the operator's fee,
+		/// the coins it gives up), signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The fee shown to the user, as `--quote` answered it (its `fee`):
+		/// the distribution goes ahead only on this very fee.
+		#[arg(long)]
+		shown: Option<u64>,
+	},
+	/// Every distribution this wallet made, as the operator shows it: each
+	/// claim's state, the deadline and what went back.
+	Distributions,
+	/// The claims paid to this wallet's on-chain addresses, found by asking
+	/// the operator under each address key: their distribution, value,
+	/// state and deadline.
+	Claims {
+		/// How many receive addresses to ask under, from the first; by
+		/// default every one handed out and 20 more.
+		#[arg(long)]
+		scan: Option<u32>,
+	},
+	/// Takes up the open claims paid to this wallet's on-chain addresses
+	/// (those named, as `DISTRIBUTION:INDEX` or by leaf id, or every one):
+	/// each is checked, kept, and paid out of round to a fresh leaf of the
+	/// wallet's own.
+	Claim {
+		claims: Vec<String>,
+		#[arg(long)]
+		scan: Option<u32>,
+	},
 	/// An in-tree swap of two assets with another wallet.
 	#[command(subcommand)]
 	Swap(SwapCmd),
@@ -924,7 +969,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }))
+		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
+		| Cmd::Distributions)
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -1062,7 +1108,50 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::BtcSwap(c) => btc_swap(&mut w, &datadir, c),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
+		Cmd::Distribute { list, asset: a, return_address, quote, shown } => {
+			let mut claims = vec![];
+			for (key, amount) in read_claims(&list)? {
+				claims.push((w.named(&key)?, amount));
+			}
+			if quote {
+				w.distribute_quote(asset(&a)?, &claims)
+			} else {
+				let return_to = return_address.as_deref().map(|r| w.script_of(r)).transpose()?;
+				w.distribute(asset(&a)?, &claims, return_to, shown)
+			}
+		},
+		Cmd::Distributions => w.distributions(),
+		Cmd::Claims { scan } => w.claims(scan),
+		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
 	}
+}
+
+/// The claims of a distribution's list: a file, or `-` for standard input,
+/// each line `KEY AMOUNT` (a comma between them is taken too), blank lines
+/// and lines from `#` on left out.
+fn read_claims(list: &str) -> Result<Vec<(String, u64)>, bark::arca::Error> {
+	let text = if list == "-" {
+		let mut s = String::new();
+		std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| bark::arca::Error::Io(e.to_string()))?;
+		s
+	} else {
+		std::fs::read_to_string(list).map_err(|e| bark::arca::Error::Io(format!("{}: {}", list, e)))?
+	};
+	let mut out = vec![];
+	for (n, line) in text.lines().enumerate() {
+		let line = line.split('#').next().unwrap_or("").trim();
+		if line.is_empty() {
+			continue;
+		}
+		let parts: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == ',').filter(|p| !p.is_empty()).collect();
+		let [key, amount] = parts[..] else {
+			return Err(bark::arca::Error::Parse(format!("line {} of the list: {:?} is not KEY AMOUNT", n + 1, line)));
+		};
+		let amount = amount.parse::<u64>().map_err(|_| bark::arca::Error::Parse(format!("line {} of the list: {:?} is no amount in \
+			atoms", n + 1, amount)))?;
+		out.push((key.to_string(), amount));
+	}
+	Ok(out)
 }
 
 /// Waits up to `wait` seconds for the order `placed` names to rest on the

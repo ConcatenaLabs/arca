@@ -31,7 +31,8 @@ pub const COMMANDS: &str = "info, address, balance, coins, record {leaf_id}, boa
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
 	by the name an order's side goes by), btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
-	{swap, result}, btc_swaps, btc_swap_cancel {swap}";
+	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
+	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -215,6 +216,21 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"btc_swap_bitcoin" => w.btc_swap_bitcoin(req_str(&a["swap"], "the swap")?, &a["result"]),
 		"btc_swaps" => w.btc_swaps(),
 		"btc_swap_cancel" => w.btc_swap_cancel(req_str(&a["swap"], "the swap")?),
+		"distribute_quote" => {
+			let (asset, claims) = distribution_of(w, a)?;
+			w.distribute_quote(asset, &claims)
+		},
+		"distribute" => {
+			let (asset, claims) = distribution_of(w, a)?;
+			let return_to = match a["return_address"].as_str().filter(|s| !s.is_empty()) {
+				Some(r) => Some(w.chain.script_of(r)?),
+				None => None,
+			};
+			w.distribute(asset, &claims, return_to, opt_u64(&a["shown"], "the fee shown")?)
+		},
+		"distributions" => w.distributions(),
+		"claims" => w.claims(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32)),
+		"claim" => w.claim(&texts(&a["claims"], "the claims")?, opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32)),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
 }
@@ -250,6 +266,16 @@ fn order(a: &Value) -> Result<String, Error> {
 		Value::String(s) if !s.is_empty() => Ok(s.clone()),
 		Value::Object(_) => Ok(a["order"].to_string()),
 		_ => Err(Error::Parse("the order is missing".into())),
+	}
+}
+
+/// A list of texts, or none.
+fn texts(v: &Value, what: &str) -> Result<Vec<String>, Error> {
+	match v {
+		Value::Null => Ok(vec![]),
+		Value::Array(v) => v.iter().map(|l| l.as_str().map(String::from).ok_or_else(|| Error::Parse(format!("{}: an entry is not text", what))))
+			.collect(),
+		other => Err(Error::Parse(format!("{}: {}", what, other))),
 	}
 }
 
@@ -319,4 +345,19 @@ mod test {
 		assert!(a.starts_with("arca-") && a.ends_with(".sqlite") && a.len() == "arca-.sqlite".len() + 16);
 		assert_ne!(a, store_name("legal winner thank year wave sausage worth useful legal winner thank yellow").unwrap());
 	}
+}
+
+/// A distribution's asset and claims from a command's arguments: `asset`,
+/// and `claims`, each `{key, amount}`, the key 64 hex digits (x-only), 66 (a
+/// compressed public key) or a taproot address.
+fn distribution_of(w: &Wallet, a: &Value) -> Result<(AssetId, Vec<(elements::secp256k1_zkp::XOnlyPublicKey, u64)>), Error> {
+	let asset = asset(req_str(&a["asset"], "the asset")?)?;
+	let list = a["claims"].as_array().ok_or_else(|| Error::Parse("the claims: a list of {key, amount}".into()))?;
+	let mut claims = Vec::with_capacity(list.len());
+	for c in list {
+		let key = super::claim::named_key(req_str(&c["key"], "a claim's key")?, &w.chain)?;
+		let amount = opt_u64(&c["amount"], "a claim's amount")?.ok_or_else(|| Error::Parse("a claim names no amount".into()))?;
+		claims.push((key, amount));
+	}
+	Ok((asset, claims))
 }

@@ -727,7 +727,7 @@ impl Wallet {
 		for chunk in coins.chunks(super::client::MAX_BINDINGS) {
 			let mut bindings = vec![];
 			for c in chunk {
-				let key = self.keys.leaf(&c.owner_nonce)?;
+				let key = self.coin_key(&c.owner_nonce)?;
 				let (mailbox, proof) = self.binding(&key)?;
 				bindings.push(json!({"owner": hex(&key.x_only_public_key().0.serialize()), "mailbox": mailbox, "proof": proof}));
 			}
@@ -2618,10 +2618,15 @@ impl Wallet {
 	}
 
 	/// A new on-chain receive address on Sequentia (an unblinded P2WPKH, the
-	/// same key as the Bitcoin address of that script), and its script.
+	/// same key as the Bitcoin address of that script), its script, and its
+	/// key.
 	pub fn address(&self) -> Result<Value, Error> {
-		let s = self.new_script(RECEIVE)?;
-		Ok(json!({"address": self.chain.address(&s)?, "script_pubkey": hex(s.as_bytes())}))
+		let i = self.store.take_index(RECEIVE)?;
+		let k = self.keys.onchain(RECEIVE, i)?;
+		let s = p2wpkh(&k);
+		// Its key, x-only: what a payer names to pay the wallet a claim
+		// (`claim`), as a P2WPKH address names only its hash.
+		Ok(json!({"address": self.chain.address(&s)?, "script_pubkey": hex(s.as_bytes()), "key": hex(&k.x_only_public_key().0.serialize())}))
 	}
 
 	/// The wallet's unspent on-chain coins (spends in the mempool excluded),
