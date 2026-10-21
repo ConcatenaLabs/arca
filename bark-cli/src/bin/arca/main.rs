@@ -540,10 +540,27 @@ enum OrderCmd {
 		/// of what rests when not named.
 		#[arg(long)]
 		amount: Option<u64>,
+		/// Only says what the fill would take, pay and cost, and the coin the
+		/// order rests at now, signing nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The quote shown to the user, as `--quote` answered it: the fill is
+		/// of the order as it was served then, and goes ahead only on what
+		/// the quote showed.
+		#[arg(long)]
+		shown: Option<String>,
 	},
 	/// Cancels an order the wallet rests in the tree: what rests of it comes
 	/// back to a leaf of the wallet's own.
-	CancelResting { order: String },
+	CancelResting {
+		order: String,
+		/// Only says what the cancel would give back and cost, signing nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The quote shown to the user, as `--quote` answered it.
+		#[arg(long)]
+		shown: Option<String>,
+	},
 	/// Takes back what an order holds where it rests, by its REFUND, once
 	/// the chain's median time has passed its expiry: to an address of the
 	/// wallet's.
@@ -1233,8 +1250,22 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.order_rest(&ask, max_fee_ppm, shown.as_ref())
 		},
 		Cmd::Order(OrderCmd::Resting { orders }) => w.resting_orders(&orders),
-		Cmd::Order(OrderCmd::FillResting { order, amount }) => w.order_fill_resting(&order, amount),
-		Cmd::Order(OrderCmd::CancelResting { order }) => w.order_cancel_resting(&order),
+		Cmd::Order(OrderCmd::FillResting { order, amount, quote, shown }) => {
+			if quote {
+				return w.order_fill_resting_quote(&order, amount);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the fill shown: {}", e)))).transpose()?;
+			w.order_fill_resting(&order, amount, shown.as_ref())
+		},
+		Cmd::Order(OrderCmd::CancelResting { order, quote, shown }) => {
+			if quote {
+				return w.order_cancel_resting_quote(&order);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the cancel shown: {}", e)))).transpose()?;
+			w.order_cancel_resting(&order, shown.as_ref())
+		},
 		Cmd::Orders => w.orders(),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),

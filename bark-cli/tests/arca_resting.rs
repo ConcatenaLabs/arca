@@ -160,13 +160,25 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	t1.refused(&["order", "fill-resting", &order, "--amount", "99999"], "below the order's min_lot");
 	t1.refused(&["order", "fill-resting", &order, "--amount", "950000"], "below the order's min_lot of");
 	t1.refused(&["order", "fill-resting", &"00".repeat(32), "--amount", "100000"], "has no resting order");
+	// T2 is shown a fill of the order where it rests now; T1's fill moves it
+	// before T2 goes ahead.
+	let q2 = t2.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	assert_eq!((q2["coin"].as_str(), q2["paid"].as_str(), q2["gets"]["amount"].as_str()), (Some(order.as_str()), Some("400000"), Some("200000")), "{}", q2);
+	assert_eq!(q2["fee"]["asset"], json!(y.to_string()), "the fee is in the asset paid: {}", q2);
 	let f1 = t1.ok(&["order", "fill-resting", &order, "--amount", "300000"]);
 	assert_eq!((f1["filled"].as_str(), f1["paid"].as_str()), (Some("300000"), Some("600000")), "{}", f1);
 	let got1 = live_of(&t1, x);
 	assert_eq!(got1.len(), 1, "T1 holds a leaf of X: {:?}", got1);
 	assert_eq!(got1[0]["value"], "300000");
-	let f2 = t2.ok(&["order", "fill-resting", &order, "--amount", "200000"]);
-	assert_eq!(f2["paid"], "400000", "{}", f2);
+	// T2's fill as it was shown: the order has moved, the operator refuses it
+	// and T2's coins are its own again; a new quote names the coin it rests at.
+	t2.refused(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q2.to_string()], "rests at coin");
+	assert_eq!(live_of(&t2, y).len(), 1, "T2's coin of Y is live again");
+	let q2b = t2.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	assert_ne!(q2b["coin"], q2["coin"], "the order rests at its remainder: {}", q2b);
+	assert_eq!(q2b["rests"], "700000");
+	let f2 = t2.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q2b.to_string()]);
+	assert_eq!((f2["paid"].as_str(), f2["fee"].as_str()), (Some("400000"), q2b["fee"]["amount"].as_str()), "{}", f2);
 	assert_eq!(live_of(&t2, x)[0]["value"], "200000");
 	println!("T1 and T2 filled 300,000 and 200,000 X, each holding its leaf of X");
 
@@ -184,8 +196,12 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	assert_eq!((rest_coin["state"].as_str(), rest_coin["value"].as_str()), (Some("live"), Some("500000")));
 	assert!(live_of(&maker, y).len() >= 2, "the credits are live coins of Y");
 
-	// M cancels what rests; a fill after the cancel is refused.
-	let cancelled = maker.ok(&["order", "cancel-resting", &order]);
+	// M cancels what rests, as the quote showed it; a fill after the cancel is refused.
+	let cq = maker.ok(&["order", "cancel-resting", &order, "--quote"]);
+	assert_eq!((cq["coin"].clone(), cq["holds"].as_str()), (mine["operator"]["coin"].clone(), Some("500000")), "{}", cq);
+	let fee: u64 = cq["fee"]["amount"].as_str().unwrap().parse().unwrap();
+	assert_eq!(cq["gets"]["amount"], json!((500_000 - fee).to_string()), "{}", cq);
+	let cancelled = maker.ok(&["order", "cancel-resting", &order, "--shown", &cq.to_string()]);
 	assert_eq!(cancelled["state"], "cancelled");
 	let view = maker.ok(&["order", "resting"]);
 	let mine = view["orders"].as_array().unwrap().iter().find(|o| o["order"] == json!(order)).unwrap().clone();

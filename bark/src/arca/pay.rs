@@ -1776,6 +1776,25 @@ impl Wallet {
 	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's
 	/// own, through the server, with the margins a transfer leaves.
 	pub(crate) fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
+		let leaf = self.own_leaf("cancel")?;
+		let (asset, inputs, value) = self.respend_plan(rows, &leaf)?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
+	}
+
+	/// What [`Self::respend_to_self`] of `rows` would leave the wallet, and
+	/// its fee, before anything is signed: `(asset, value, fee)`.
+	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
+		let n = random32();
+		let leaf = NewLeaf { owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None };
+		let held: u64 = rows.iter().map(|r| r.value).sum();
+		let (asset, _, value) = self.respend_plan(rows, &leaf)?;
+		Ok((asset, value, held.saturating_sub(value)))
+	}
+
+	/// The inputs of a transfer of `rows` into `leaf`, and the value it
+	/// holds after every margin.
+	fn respend_plan(&mut self, rows: Vec<CoinRow>, leaf: &NewLeaf) -> Result<(AssetId, Vec<In>, u64), Error> {
 		let asset = AssetId::from_str(&rows[0].asset).map_err(|e| Error::Store(e.to_string()))?;
 		let margins = Margins::of(&self.server_info()?, asset)?;
 		let mut inputs = vec![];
@@ -1784,7 +1803,6 @@ impl Wallet {
 			let m = self.checkpoint_margin(&a.valid, &margins)?;
 			inputs.push(In { checkpoint_value: a.valid.value - m.min(a.valid.value - 1), row, coin: a.valid });
 		}
-		let leaf = self.own_leaf("cancel")?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox, until: None };
 		let all: Vec<&ValidCoin> = inputs.iter().map(|i| &i.coin).collect();
@@ -1792,7 +1810,7 @@ impl Wallet {
 		let kept: u64 = inputs.iter().map(|i| i.checkpoint_value).sum();
 		let value = kept.checked_sub(margin).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused("the coins do not cover the margins of a transfer to the wallet itself".into()))?;
-		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
+		Ok((asset, inputs, value))
 	}
 }
 

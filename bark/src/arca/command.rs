@@ -36,8 +36,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
-	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting {order, amount?}, \
-	order_cancel_resting {order}";
+	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
+	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -223,8 +223,18 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			let ids: Vec<String> = a["orders"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
 			w.resting_orders(&ids)
 		},
-		"order_fill_resting" => w.order_fill_resting(req_str(&a["order"], "the order")?, opt_u64(&a["amount"], "the amount")?),
-		"order_cancel_resting" => w.order_cancel_resting(req_str(&a["order"], "the order")?),
+		"order_fill_resting_quote" => w.order_fill_resting_quote(req_str(&a["order"], "the order")?, opt_u64(&a["amount"], "the amount")?),
+		"order_fill_resting" => {
+			// With `shown`, the fill is of the order as the quote served it,
+			// and goes ahead only on the fill, price, fee and coins it showed.
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.order_fill_resting(req_str(&a["order"], "the order")?, opt_u64(&a["amount"], "the amount")?, shown)
+		},
+		"order_cancel_resting_quote" => w.order_cancel_resting_quote(req_str(&a["order"], "the order")?),
+		"order_cancel_resting" => {
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.order_cancel_resting(req_str(&a["order"], "the order")?, shown)
+		},
 		// An in-tree swap of two assets with another wallet: the maker
 		// offers (its coins held, nothing signed), the taker reads the offer
 		// and accepts it (signing its side), the maker completes it (signing

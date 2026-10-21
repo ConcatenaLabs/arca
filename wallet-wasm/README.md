@@ -106,8 +106,9 @@ value, expiry}`, `sync`, `schedule`,
 shown?}`, `refusals`; a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); an order resting in the tree (`order_rest_quote`,
-`order_rest`, `order_resting {orders?}`, `order_fill_resting {order,
-amount?}`, `order_cancel_resting {order}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
+`order_rest`, `order_resting {orders?}`, `order_fill_resting_quote {order,
+amount?}`, `order_fill_resting {order, amount?, shown?}`,
+`order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
 ark (`btc_swap_*`); and the offline-refresh plans (`plan_quote`, `plan`,
