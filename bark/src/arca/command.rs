@@ -34,7 +34,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}";
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, care {scan?, expiries?, max_fee_ppm?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -259,6 +259,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			if command == "plan" { w.plan(&leaves, steps, bound) } else { w.plan_quote(&leaves, steps, bound) }
 		},
 		"plans" => w.plans(),
+		"care" => {
+			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
+			w.care(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32), steps,
+				opt_u64(&a["max_fee_ppm"], "the bound")?)
+		},
 		"plan_cancel" => w.plan_cancel(req_str(&a["plan"], "the plan")?),
 		other => Err(Error::Refused(format!("no command {}", other))),
 	}
