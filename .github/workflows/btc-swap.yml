@@ -1,0 +1,183 @@
+name: btc-swap
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'bark/src/arca/**'
+      - 'bark-cli/**'
+      - 'server/src/lightning/**'
+      - 'contrib/bitcoin-ark-regtest/**'
+      - '.github/workflows/btc-swap.yml'
+  pull_request:
+    paths:
+      - 'bark/src/arca/**'
+      - 'bark-cli/**'
+      - 'server/src/lightning/**'
+      - 'contrib/bitcoin-ark-regtest/**'
+      - '.github/workflows/btc-swap.yml'
+  workflow_dispatch:
+
+# The swap of native BTC in a Bitcoin ark for an asset in an Arca tree
+# (`arca btc-swap`, bark-cli/tests/arca_btc_swap.rs): a whole Arca server with
+# its SeqLN node in X, as the lightning workflow runs it, beside a Bitcoin ark
+# on regtest, as the bitcoin-ark workflow runs it, the wallets' Bitcoin side
+# Bark's own client and daemon.
+env:
+  SEQLN_COMMIT: 6e527da5f83aac332fe89e0faeb0023a512bcb3f
+  BARK_COMMIT: 8f5d8c4f4afae87c8e4b3c6fb26fe06e9ae50e6a
+  HOLD_COMMIT: af0055b132f3b9f24d0b1d478a15005fcf8f014f
+  BITCOIN_VERSION: "31.1"
+  BITCOIN_SHA256: b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e
+  CLN_VERSION: "26.06.6"
+  CLN_SHA256: 3214d71227f780a9a53cf264ab35cf452e0bdf43c1497ea406beedf2ad0af058
+
+jobs:
+  # The newest node master commit whose Build-dev workflow passed and
+  # published a Linux build, as the node workflow finds it.
+  node-build:
+    name: find the node build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      run: ${{ steps.node.outputs.run }}
+    steps:
+      - name: Find the node build
+        id: node
+        run: |
+          run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&per_page=50" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | sort_by(.created_at) | last | .id')
+          if [ -z "$run" ] || [ "$run" = null ]; then
+            echo "no successful node build on master"; exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  btc-swap:
+    name: a swap of BTC for an asset across a Bitcoin ark and an Arca tree
+    needs: node-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: arca
+          POSTGRES_PASSWORD: arca
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arca"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ARCA_TEST_POSTGRES: postgres://arca:arca@127.0.0.1:5432/postgres
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sequentiad
+        run: |
+          gh run download ${{ needs.node-build.outputs.run }} -R ConcatenaLabs/Sequentia \
+            -n sequentia-dev-x86_64-pc-linux-gnu -D "$RUNNER_TEMP/node"
+          tar -xf "$RUNNER_TEMP/node/sequentia-dev-linux.tar" -C "$RUNNER_TEMP/node"
+          echo "SEQUENTIAD_EXEC=$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" >> "$GITHUB_ENV"
+
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler libpq-dev libsqlite3-dev jq postgresql \
+            autoconf automake build-essential libtool libffi-dev python3 python3-mako net-tools zlib1g-dev libsodium-dev gettext lowdown
+
+      # Bitcoin Core is the Sequentia chain's parent and the Bitcoin ark's
+      # chain alike; Core Lightning is the Bitcoin ark's gateway and its peer.
+      - name: Bitcoin Core and Core Lightning
+        run: |
+          f=bitcoin-$BITCOIN_VERSION-x86_64-linux-gnu.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/$f" "https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$f"
+          echo "$BITCOIN_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/core" && tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/core" --strip-components=1
+          echo "BITCOIND_EXEC=$RUNNER_TEMP/core/bin/bitcoind" >> "$GITHUB_ENV"
+          f=clightning-v$CLN_VERSION-Ubuntu-24.04-amd64.tar.xz
+          curl -sSfL -o "$RUNNER_TEMP/$f" "https://github.com/ElementsProject/lightning/releases/download/v$CLN_VERSION/$f"
+          echo "$CLN_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/cln" && tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/cln"
+
+      - name: SeqLN build cache
+        id: seqln-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/seqln
+          key: seqln-${{ env.SEQLN_COMMIT }}-ubuntu-24.04
+
+      - name: Build SeqLN
+        if: steps.seqln-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/seqln"
+          cd "$RUNNER_TEMP/seqln"
+          git fetch -q --depth 1 https://github.com/ConcatenaLabs/seqln.git "$SEQLN_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update -q --init --recursive
+          ./configure --disable-rust --disable-valgrind
+          make -j4 all-programs PYTHON=python3
+
+      - name: SeqLN
+        run: echo "LIGHTNINGD_EXEC=$RUNNER_TEMP/seqln/lightningd/lightningd" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/target-bark
+            ${{ runner.temp }}/target-hold
+          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ env.HOLD_COMMIT }}
+
+      - name: Bark (captaind, bark, barkd) and the hold plugin
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          git init -q "$RUNNER_TEMP/bark" && cd "$RUNNER_TEMP/bark"
+          git fetch -q --depth 1 https://gitlab.com/ark-bitcoin/bark.git "$BARK_COMMIT" && git checkout -q FETCH_HEAD
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind \
+            -p bark-cli --bin bark --bin barkd
+          git init -q "$RUNNER_TEMP/hold" && cd "$RUNNER_TEMP/hold"
+          git fetch -q --depth 1 https://github.com/BoltzExchange/hold.git "$HOLD_COMMIT" && git checkout -q FETCH_HEAD
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-hold" cargo build --locked --bin hold
+
+      - name: The ark on regtest
+        run: |
+          cat > "$RUNNER_TEMP/ark.sh" <<EOF
+          export H=$RUNNER_TEMP/h CORE_BIN=$RUNNER_TEMP/core/bin CLN_BIN=$RUNNER_TEMP/cln/usr/bin \
+            HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=$RUNNER_TEMP/target-bark/debug/captaind \
+            PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | tail -1)
+          exec $GITHUB_WORKSPACE/contrib/bitcoin-ark-regtest/regtest.sh "\$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/ark.sh"
+          "$RUNNER_TEMP/ark.sh" up
+          echo "ARCA_TEST_BITCOIN_ARK=$RUNNER_TEMP/ark.sh" >> "$GITHUB_ENV"
+          echo "ARCA_BARK_EXEC=$RUNNER_TEMP/target-bark/debug/bark" >> "$GITHUB_ENV"
+          echo "ARCA_BARKD_EXEC=$RUNNER_TEMP/target-bark/debug/barkd" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The swaps run one at a time: they share the one Bitcoin ark.
+      - name: The swap
+        run: |
+          cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
+          cargo test --locked -p arca-cli --test arca_btc_swap -- --nocapture --test-threads=1
+
+      - name: The harness's logs
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/h/log/*.log; do echo "=== $f"; tail -n 60 "$f"; done
+
+      - name: Stop the ark
+        if: always()
+        run: '[ -x "$RUNNER_TEMP/ark.sh" ] && "$RUNNER_TEMP/ark.sh" down || true'

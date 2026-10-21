@@ -355,6 +355,46 @@ fn free_port() -> Result<u16, Error> {
 	Err(Error::Io("no free loopback port for barkd".into()))
 }
 
+/// Runs Bark's daemon on the Bitcoin ark wallet's directory `d`, on a
+/// loopback port, for the duration of `f`, which is handed the port and the
+/// token the daemon wrote there; then stops it and removes the token, which
+/// served that one call. Bark lets one process at a time open its wallet,
+/// so nothing else of Bark runs meanwhile.
+fn with_barkd<T>(d: &Path, f: impl FnOnce(u16, &str) -> Result<T, Error>) -> Result<T, Error> {
+	let port = free_port()?;
+	let mut cmd = Command::new(barkd_exe());
+	cmd.arg("--datadir").arg(d).arg("--port").arg(port.to_string()).arg("--quiet")
+		.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+	for (k, _) in std::env::vars_os() {
+		if k.to_string_lossy().starts_with("BARKD_") {
+			cmd.env_remove(k);
+		}
+	}
+	let mut barkd = cmd.spawn().map_err(|e| Error::Io(format!("cannot run Bark's daemon ({}): {}", barkd_exe().display(), e)))?;
+	let token_file = d.join("auth_token");
+	let result = (|| {
+		let addr = SocketAddr::from(([127, 0, 0, 1], port));
+		let until = Instant::now() + Duration::from_secs(60);
+		loop {
+			if let Ok(Some(s)) = barkd.try_wait() {
+				return Err(Error::Io(format!("Bark's daemon stopped ({}) before it answered", s)));
+			}
+			if token_file.exists() && TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+				break;
+			}
+			if Instant::now() >= until {
+				return Err(Error::Io("Bark's daemon did not start within 60 s".into()));
+			}
+			std::thread::sleep(Duration::from_millis(200));
+		}
+		let token = std::fs::read_to_string(&token_file).map_err(|e| Error::Io(format!("{}: {}", token_file.display(), e)))?;
+		f(port, token.trim())
+	})();
+	stop(&mut barkd);
+	let _ = std::fs::remove_file(&token_file);
+	result
+}
+
 /// Creates the Bitcoin ark wallet from the Arca wallet's own mnemonic: a new
 /// wallet scans Bitcoin from now (or `birthday_height`); a restored one
 /// recovers its ark coins from the server's recovery mailbox and its
@@ -391,37 +431,11 @@ pub fn create(datadir: &Path, o: CreateOpts) -> Result<Value, Error> {
 		use std::os::unix::fs::PermissionsExt;
 		let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
 	}
-	let port = free_port()?;
-	let mut cmd = Command::new(barkd_exe());
-	cmd.arg("--datadir").arg(&d).arg("--port").arg(port.to_string()).arg("--quiet")
-		.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-	for (k, _) in std::env::vars_os() {
-		if k.to_string_lossy().starts_with("BARKD_") {
-			cmd.env_remove(k);
-		}
-	}
-	let mut barkd = cmd.spawn().map_err(|e| Error::Io(format!("cannot run Bark's daemon ({}): {}", barkd_exe().display(), e)))?;
-	let token_file = d.join("auth_token");
-	let result = (|| {
-		let addr = SocketAddr::from(([127, 0, 0, 1], port));
-		let until = Instant::now() + Duration::from_secs(60);
-		loop {
-			if let Ok(Some(s)) = barkd.try_wait() {
-				return Err(Error::Io(format!("Bark's daemon stopped ({}) before the wallet was made", s)));
-			}
-			if token_file.exists() && TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-				break;
-			}
-			if Instant::now() >= until {
-				return Err(Error::Io("Bark's daemon did not start within 60 s".into()));
-			}
-			std::thread::sleep(Duration::from_millis(200));
-		}
-		let token = std::fs::read_to_string(&token_file).map_err(|e| Error::Io(format!("{}: {}", token_file.display(), e)))?;
+	let fingerprint = with_barkd(&d, |port, token| {
 		let body = json!({"ark_server": o.ark, "chain_source": chain_source, "mnemonic": mnemonic, "network": o.network,
 			"birthday_height": birthday});
 		let r = minreq::post(format!("http://127.0.0.1:{}/api/v1/wallet/create", port))
-			.with_header("Authorization", format!("Bearer {}", token.trim())).with_header("Content-Type", "application/json")
+			.with_header("Authorization", format!("Bearer {}", token)).with_header("Content-Type", "application/json")
 			.with_body(body.to_string()).with_timeout(600).send()
 			.map_err(|e| Error::Io(format!("Bark's daemon: {}", e)))?;
 		if r.status_code != 200 {
@@ -431,11 +445,7 @@ pub fn create(datadir: &Path, o: CreateOpts) -> Result<Value, Error> {
 		}
 		let v: Value = serde_json::from_slice(r.as_bytes()).unwrap_or(Value::Null);
 		Ok(v["fingerprint"].clone())
-	})();
-	stop(&mut barkd);
-	// The token served this one create; nothing needs it after.
-	let _ = std::fs::remove_file(&token_file);
-	let fingerprint = result?;
+	})?;
 	let info = bark_json(datadir, &["ark-info"])?;
 	let mut source = chain_source;
 	if let Some(a) = source["bitcoind"]["bitcoind_auth"].get_mut("user-pass") {
@@ -446,6 +456,157 @@ pub fn create(datadir: &Path, o: CreateOpts) -> Result<Value, Error> {
 		"ark_info": {"network": info["network"], "server_pubkey": info["server_pubkey"], "round_interval": info["round_interval"],
 			"vtxo_exit_delta": info["vtxo_exit_delta"], "vtxo_lifetime": info["vtxo_lifetime"]},
 		"note": "the Bitcoin ark wallet is made from this wallet's own mnemonic: restoring the mnemonic restores both sides"}))
+}
+
+/// Bark's `ark-info`: the Bitcoin ark the wallet is in, its network, its
+/// HTLC expiry deltas and its fees.
+pub fn ark_info(datadir: &Path) -> Result<Value, Error> {
+	if !has_wallet(datadir) {
+		return Err(no_wallet());
+	}
+	bark_json(datadir, &["ark-info"])
+}
+
+/// [`ark_info`], waiting up to `patience` while another process holds Bark's
+/// wallet: Bark lets one process at a time open it, and a `bark` left running
+/// by a run of `arca` that was stopped goes on to finish what it was doing
+/// (a payment, a claim) before it lets go.
+pub fn ark_info_waiting(datadir: &Path, patience: Duration) -> Result<Value, Error> {
+	let until = Instant::now() + patience;
+	loop {
+		match ark_info(datadir) {
+			Err(Error::Refused(m)) if m.contains("another process is already using datadir") && Instant::now() < until => {
+				std::thread::sleep(Duration::from_secs(2));
+			},
+			other => return other,
+		}
+	}
+}
+
+/// Bark's quote of its fee for paying (`pay`) or receiving (`receive`)
+/// `sats` over Lightning, from its daemon, which alone quotes it: the gross
+/// and net amounts and the fee, for the coins it would spend now.
+pub fn lightning_fee(datadir: &Path, side: &str, sats: u64) -> Result<Value, Error> {
+	if !has_wallet(datadir) {
+		return Err(no_wallet());
+	}
+	with_barkd(&dir(datadir), |port, token| {
+		let r = minreq::get(format!("http://127.0.0.1:{}/api/v1/fees/lightning/{}?amount_sat={}", port, side, sats))
+			.with_header("Authorization", format!("Bearer {}", token)).with_timeout(60).send()
+			.map_err(|e| Error::Io(format!("Bark's daemon: {}", e)))?;
+		let v: Value = serde_json::from_slice(r.as_bytes()).unwrap_or_else(|_| json!(r.as_str().unwrap_or("")));
+		if r.status_code != 200 {
+			return Err(Error::Refused(format!("Bark gave no fee quote: {}", v["message"].as_str().map(String::from)
+				.unwrap_or_else(|| v.to_string()))));
+		}
+		Ok(v)
+	})
+}
+
+/// How Bark holds the receive of `invoice`: its state (`awaiting-payment`,
+/// `htlcs-ready`, `preimage-revealed`, `delivering`, `settled`) and its
+/// preimage, which Bark made and keeps.
+pub fn receive_status(datadir: &Path, invoice: &str) -> Result<Value, Error> {
+	bark_json(datadir, &["lightning", "receive", "status", invoice, "--no-sync"])
+}
+
+/// A swap's claim of a payment to its Bitcoin invoice (P): waits up to
+/// `wait` for the payer's payment and claims it, as [`claim`] does, but never
+/// asks for a fresh invoice, whose hash would not be the swap's. Answers
+/// `{action: claim, state}`: `claimed` with the preimage once Bark has
+/// revealed it to its server (the preimage is then out, whether or not the
+/// coins are delivered yet: `settled` says), `waiting`, or `lost` when the
+/// payment can no longer be claimed.
+pub fn claim_for_swap(datadir: &Path, invoice: &str, wait: Duration) -> Value {
+	let out = |state: &str, extra: Value| {
+		let mut v = json!({"action": "claim", "state": state});
+		if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+			o.extend(e.clone());
+		}
+		v
+	};
+	if !has_wallet(datadir) {
+		return out("failed", json!({"why": no_wallet().to_string()}));
+	}
+	let revealed = |r: &Value| matches!(r["state"].as_str(), Some("preimage-revealed" | "delivering" | "settled"));
+	// Revealed already (an earlier claim, ended before the coins came): the
+	// claim goes on to deliver them.
+	let before = receive_status(datadir, invoice).ok();
+	let mut child = match Command::new(bark_exe()).arg("--datadir").arg(dir(datadir)).arg("--quiet")
+		.args(["lightning", "claim", invoice, "--wait"])
+		.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
+	{
+		Ok(c) => c,
+		Err(e) => return out("failed", json!({"why": format!("cannot run Bark ({}): {}", bark_exe().display(), e)})),
+	};
+	let mut err = child.stderr.take().expect("piped");
+	let errs = std::thread::spawn(move || { let mut s = String::new(); let _ = err.read_to_string(&mut s); s });
+	let until = Instant::now() + wait;
+	let status = loop {
+		match child.try_wait() {
+			Ok(Some(s)) => break Some(s),
+			Ok(None) if Instant::now() >= until => { stop(&mut child); break None },
+			Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+			Err(_) => { stop(&mut child); break None },
+		}
+	};
+	let words = { let e = errs.join().unwrap_or_default(); e.trim().strip_prefix("Error: ").unwrap_or(e.trim()).to_string() };
+	let after = receive_status(datadir, invoice).ok();
+	if let Some(r) = after.as_ref().filter(|r| revealed(r)) {
+		return out("claimed", json!({"preimage": r["payment_preimage"], "settled": r["state"] == "settled", "receive": r}));
+	}
+	match status {
+		None => out("waiting", json!({"receive": after.or(before)})),
+		Some(s) if s.success() => out("waiting", json!({"receive": after, "note": "Bark's claim ended without the payment claimed"})),
+		Some(_) if words.contains("too close") || words.contains("no pending lightning receive") => out("lost", json!({"why": words})),
+		Some(_) => out("waiting", json!({"why": words})),
+	}
+}
+
+/// A swap's payment of the Bitcoin invoice (Q), and how it stands after:
+/// `{action: pay, state}`, `paid` with the preimage, `pending` while Bark's
+/// server holds it, or `failed`.
+pub fn pay_for_swap(datadir: &Path, invoice: &str) -> Value {
+	if !has_wallet(datadir) {
+		return json!({"action": "pay", "state": "failed", "why": no_wallet().to_string()});
+	}
+	let paid = bark(datadir, &["lightning", "pay", "invoice", invoice, "--wait"]);
+	let mut v = pay_status_for_swap(datadir, invoice);
+	v["action"] = json!("pay");
+	if let Err(e) = paid {
+		if v["state"] != "paid" {
+			v["why"] = json!(e.to_string());
+		}
+	}
+	v
+}
+
+/// How a swap's payment of the Bitcoin invoice stands at Bark: `paid` with
+/// the preimage; `pending` while Bark's server holds it (`start`,
+/// `htlc-received`, `payment-initiated`); `failed` when it was failed back
+/// (`revocable-htlcs`, the coins coming back to the wallet) or Bark knows no
+/// payment of it (never made, or failed back and its coins returned).
+pub fn pay_status_for_swap(datadir: &Path, invoice: &str) -> Value {
+	match bark_json(datadir, &["lightning", "pay", "status", invoice, "--no-sync"]) {
+		Ok(s) => {
+			let state = match s["state"].as_str() {
+				Some("paid") => "paid",
+				Some("start" | "htlc-received" | "payment-initiated") => "pending",
+				_ => "failed",
+			};
+			json!({"action": "pay_status", "state": state, "preimage": s["preimage"], "bark": s})
+		},
+		Err(e) => json!({"action": "pay_status", "state": "failed", "why": e.to_string()}),
+	}
+}
+
+/// Ends Bark's receive of `invoice`: refused by Bark once its server has
+/// granted the payer's HTLCs or the preimage is out, which is then said.
+pub fn cancel_receive(datadir: &Path, invoice: &str) -> Value {
+	match bark(datadir, &["lightning", "receive", "cancel", invoice]) {
+		Ok(_) => json!({"action": "cancel_receive", "state": "cancelled"}),
+		Err(e) => json!({"action": "cancel_receive", "state": "refused", "why": e.to_string()}),
+	}
 }
 
 #[cfg(test)]
