@@ -13,7 +13,8 @@
 //! `schema/V20__pending_coins.sql`, `schema/V21__takes.sql`,
 //! `schema/V22__round_fills.sql`, `schema/V23__lightning_internal.sql`,
 //! `schema/V24__distributions.sql`,
-//! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`),
+//! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`,
+//! `schema/V27__resting_orders.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -48,6 +49,7 @@ mod distributions;
 mod lightning;
 mod mailbox;
 mod nursery;
+mod orders;
 mod participations;
 mod plans;
 mod reserving;
@@ -65,6 +67,7 @@ pub use mailbox::MailboxMessage;
 pub use plans::{NewPlan, NewPlanStep, PlanRow, PlanState, PlanStepRow, StepState};
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
 pub use nursery::{NurseryRow, NurseryState};
+pub use orders::{NewOrderFill, OrderFillRow, RestingOrderRow};
 pub use participations::{
 	AttemptRow, FillRow, ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow,
 	ParticipationState, ReleaseRow, Restored, WantedKind,
@@ -107,6 +110,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(24, include_str!("../../schema/V24__distributions.sql")),
 	(25, include_str!("../../schema/V25__shared_fills.sql")),
 	(26, include_str!("../../schema/V26__plans.sql")),
+	(27, include_str!("../../schema/V27__resting_orders.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

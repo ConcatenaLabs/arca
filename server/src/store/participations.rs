@@ -62,6 +62,8 @@ pub enum WantedKind {
 	Leaf {
 		template: String, owner_key: [u8; 32], owner_nonce: [u8; 32], exit_delay_units: u16, operator_nonce: [u8; 32],
 		htlc: Option<arca_covenant::HtlcTerms>,
+		/// `order-2`'s terms, for a resting order.
+		order: Option<arca_covenant::OrderLeafTerms>,
 	},
 	/// An offboard's on-chain output: the destination script, the margin the
 	/// round's output holds for its unlock, the operator's reclaim delay.
@@ -298,7 +300,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	}
 	for r in c.query(
 		"SELECT kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, leaf_id,
-		        script, margin, reclaim_delay_units, htlc
+		        script, margin, reclaim_delay_units, htlc, order_terms
 		 FROM participation_output WHERE participation_id = $1 ORDER BY idx",
 		&[&&id[..]],
 	).await? {
@@ -313,6 +315,15 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 					use arca_covenant::encode::Encoding;
 					arca_covenant::HtlcTerms::decode(&b).map_err(|e| StoreError::Corrupt(format!("an output's htlc-1 terms: {}", e)))
 				}).transpose()?,
+				order: match r.get::<_, Option<Vec<u8>>>(13) {
+					Some(b) => {
+						let asset = elements::AssetId::from_byte_array(array32(r.get(1), "asset")?);
+						let mut rd = arca_covenant::encode::Reader::new(&b);
+						Some(arca_covenant::OrderLeafTerms::decode_from(&mut rd, asset)
+							.map_err(|e| StoreError::Corrupt(format!("an output's order-2 terms: {}", e)))?)
+					},
+					None => None,
+				},
 			},
 			"offboard" => WantedKind::Offboard {
 				script: r.get(9),
@@ -1278,7 +1289,7 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 	}
 	for (k, o) in p.outputs.iter().enumerate() {
 		let r = match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce } => {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce, order } => {
 				if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state NOT IN ('lost', 'expired')", &[&&owner_key[..]]).await?.is_some() {
 					return Err(StoreError::KeyReused);
 				}
@@ -1293,12 +1304,18 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 				// taken; every other leaf takes a fresh one.
 				let nonce = if keep_nonces { *operator_nonce } else { draw_salted_nonce(t, &p.id, owner_nonce).await? };
 				let htlc = htlc.map(|h| { use arca_covenant::encode::Encoding; h.encode() });
+				let order_terms = order.map(|o| {
+					let mut b = vec![];
+					o.encode_to(&mut b);
+					b
+				});
 				t.execute(
 					"INSERT INTO participation_output
-					 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc)
-					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10)",
+					 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc,
+					  order_terms)
+					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
 					&[&&p.id[..], &(k as i16), &&o.asset[..], &i64_of(o.value)?, template, &&owner_key[..], &&owner_nonce[..],
-						&(*exit_delay_units as i32), &&nonce[..], &htlc],
+						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms],
 				).await
 			},
 			WantedKind::Offboard { script, margin, reclaim_delay_units } => t.execute(

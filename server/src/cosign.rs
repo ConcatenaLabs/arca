@@ -542,6 +542,7 @@ impl Cosigner {
 						// The sender's creator nonce, not one the operator issued.
 						operator_nonce: None,
 						scripts: vec![NewScript { script_pubkey: out.script_pubkey.to_bytes(), kind: ScriptKind::Leaf }],
+						maker_coin: false,
 					},
 					mailbox_key: o.mailbox.unwrap_or(o.leaf.owner).serialize(),
 					notice: serde_json::to_vec(&crate::api::MailboxNotice {
@@ -917,7 +918,7 @@ impl Cosigner {
 
 /// The earliest first expiry among the batches `record` rests on, as its
 /// record names them; `None` for a coin resting on boards alone.
-fn first_expiry(record: &CoinRecord) -> Option<u32> {
+pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
 		CoinRecord::Board(_) => None,
@@ -930,7 +931,7 @@ fn first_expiry(record: &CoinRecord) -> Option<u32> {
 /// the signer co-signed; or, when what it holds is a forfeit of the coin,
 /// that the coin was given up in a refresh and given back while its forfeit
 /// stood in the signer's record.
-fn lost_spend(e: SignerError, leaf: &LeafId) -> CosignError {
+pub(crate) fn lost_spend(e: SignerError, leaf: &LeafId) -> CosignError {
 	if let SignerError::AlreadySigned(m) = &e {
 		if names_forfeit(m) {
 			log::error!("the signer refused a spend of leaf {}: its record holds a forfeit of the coin, signed in a refresh the \
@@ -949,7 +950,7 @@ fn names_forfeit(m: &str) -> bool {
 	m.contains("already co-signed the forfeit")
 }
 
-fn sig_bytes(s: &Signature) -> [u8; 64] {
+pub(crate) fn sig_bytes(s: &Signature) -> [u8; 64] {
 	let mut b = [0u8; 64];
 	b.copy_from_slice(s.as_ref());
 	b
@@ -961,7 +962,7 @@ fn sig_from(b: &[u8; 64]) -> Result<Signature, CosignError> {
 
 /// A reassignment's inputs, as the store keeps them: each coin's id and its
 /// checkpoint's value.
-fn encode_inputs(inputs: &[(LeafId, u64)]) -> Vec<u8> {
+pub(crate) fn encode_inputs(inputs: &[(LeafId, u64)]) -> Vec<u8> {
 	let mut w = vec![inputs.len() as u8];
 	for (id, v) in inputs {
 		w.extend(id.0);
@@ -970,7 +971,7 @@ fn encode_inputs(inputs: &[(LeafId, u64)]) -> Vec<u8> {
 	w
 }
 
-fn decode_inputs(b: &[u8]) -> Result<Vec<(LeafId, u64)>, String> {
+pub(crate) fn decode_inputs(b: &[u8]) -> Result<Vec<(LeafId, u64)>, String> {
 	let bad = || "a stored reassignment's inputs do not decode".to_string();
 	let n = *b.first().ok_or_else(bad)? as usize;
 	if b.len() != 1 + n * 40 {
@@ -983,7 +984,7 @@ fn decode_inputs(b: &[u8]) -> Result<Vec<(LeafId, u64)>, String> {
 }
 
 /// A reassignment's committed outputs, as the store keeps them.
-fn encode_outputs(outputs: &[ExplicitOutput]) -> Vec<u8> {
+pub(crate) fn encode_outputs(outputs: &[ExplicitOutput]) -> Vec<u8> {
 	let mut w = vec![outputs.len() as u8];
 	for o in outputs {
 		w.extend(o.asset.into_inner().to_byte_array());
@@ -995,7 +996,7 @@ fn encode_outputs(outputs: &[ExplicitOutput]) -> Vec<u8> {
 	w
 }
 
-fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
+pub(crate) fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
 	let bad = || "a stored reassignment's outputs do not decode".to_string();
 	let mut at = 1;
 	let n = *b.first().ok_or_else(bad)? as usize;

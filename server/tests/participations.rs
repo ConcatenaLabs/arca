@@ -146,7 +146,7 @@ async fn participation_accepted_and_refused() {
 	// Outside the bounds: an exit delay, an asset not served, a leaf too small,
 	// a round time too far ahead.
 	let short = OutputRequest::Leaf { asset: x, value: VALUE - fee, template: arca_covenant::Template::Vtxo1, owner: xonly(&b2),
-		owner_nonce: random32(), exit_delay: RelativeTime::from_units(10).unwrap() };
+		owner_nonce: random32(), exit_delay: RelativeTime::from_units(10).unwrap(), order: None };
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[short], &[(x, fee)], None, s, chain).0), 422, "out_of_bounds");
 	let (w, _) = want_leaf(&b2, r.y, VALUE - fee);
 	refused(r.http.post("submit_participation", &participation_body(&[&b_coin], &[w], &[(x, fee)], None, s, chain).0), 422, "out_of_bounds");
@@ -237,7 +237,7 @@ async fn a_participation_wants_only_keys_it_holds_and_frees_them_when_it_never_r
 	let (xb, _) = credited_board(&mut r, &keypair("X")).await;
 	let y = keypair("Y receive");
 	let want_y = OutputRequest::Leaf { asset: x, value: VALUE - fee, template: arca_covenant::Template::Vtxo1, owner: xonly(&y),
-		owner_nonce: random32(), exit_delay: exit_delay() };
+		owner_nonce: random32(), exit_delay: exit_delay(), order: None };
 	let (body, id) = participation_body(&[&xb], std::slice::from_ref(&want_y), &[(x, fee)], None, s, chain);
 	let a = r.http.post("submit_participation", &body);
 	println!("X's participation wanting Y's key, no key proof: {} {:?}", a.status, a.refusal());

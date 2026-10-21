@@ -74,7 +74,7 @@ fn policy(r: &Running) -> WalletPolicy {
 fn want(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [u8; 32]) {
 	let nonce = random32();
 	common::client::hold_key(key);
-	(OutputRequest::Leaf { asset, value, template: Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: short_delay() }, nonce)
+	(OutputRequest::Leaf { asset, value, template: Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: short_delay(), order: None }, nonce)
 }
 
 /// A participant: the coins it gives up (key, coin, the transaction its

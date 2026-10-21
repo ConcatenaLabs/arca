@@ -1168,7 +1168,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order } => Ok(LeafSpec {
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -1177,7 +1177,7 @@ impl Rounds {
 				exit_delay: RelativeTime::from_units(*exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: row.unlock_hash,
 				htlc: *htlc,
-				order: None,
+				order: *order,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -1358,6 +1358,7 @@ impl Rounds {
 						// Taken when the participation was accepted.
 						operator_nonce: None,
 						scripts: vec![NewScript { script_pubkey: leaf_spk.to_bytes(), kind: ScriptKind::Leaf }],
+						maker_coin: false,
 					},
 					idx: j as u32,
 					participation_id: row.id,
@@ -2432,9 +2433,9 @@ impl Rounds {
 				operator_nonce: l.operator_nonce,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: l.unlock_hash,
-				// An htlc-1 leaf's terms, from the record the builder gave it.
+				// An htlc-1 or order-2 leaf's terms, from the record the builder gave it.
 				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
-				order: None,
+				order: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.order,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

@@ -540,7 +540,7 @@ impl Receives {
 				value: r.new.amount - r.new.fee,
 				kind: WantedKind::Leaf {
 					template: Template::Htlc1.to_string(), owner_key: r.new.owner_key, owner_nonce: r.new.owner_nonce,
-					exit_delay_units: r.new.exit_delay_units, operator_nonce: [0; 32], htlc: Some(terms),
+					exit_delay_units: r.new.exit_delay_units, operator_nonce: [0; 32], htlc: Some(terms), order: None,
 				},
 				leaf_id: None,
 			}],

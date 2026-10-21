@@ -42,7 +42,9 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V22__round_fills.sql`](schema/V22__round_fills.sql),
 [`schema/V23__lightning_internal.sql`](schema/V23__lightning_internal.sql),
 [`schema/V24__distributions.sql`](schema/V24__distributions.sql),
-[`schema/V25__shared_fills.sql`](schema/V25__shared_fills.sql)). `Store::connect` builds it
+[`schema/V25__shared_fills.sql`](schema/V25__shared_fills.sql),
+[`schema/V26__plans.sql`](schema/V26__plans.sql),
+[`schema/V27__resting_orders.sql`](schema/V27__resting_orders.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -944,6 +946,69 @@ What the server does with a plan once it holds it:
 - A coin a step gave up that comes on the chain is answered by the step's
   refund (see the watcher).
 
+### Resting orders
+
+A resting order is an `order-2` leaf (`arca-covenant`'s `order`): an order of
+SeqDEX's, selling the leaf's asset at a fixed rate and lot, that takers fill
+in the tree while its maker is away, and that lands on the chain as SeqDEX's
+own order (`seqdex/order`, for the same terms) if anyone brings it there. Each
+fill is co-signed by the operator alone, and the leaf's program holds every
+co-signed fill to the order's terms: the maker's credit at output 0, a `vtxo-1`
+leaf under the order's next credit key paying at least the price, and for a
+part fill the order resting again at output 1 under a new salt, holding the
+rest. An order fills at most four times along its lineage, one credit key a
+fill.
+
+A maker asks a round for the leaf as for any leaf, its wanted leaf naming the
+template `order-2` and the order's terms (`order`: the asset it is paid in,
+the rate, the lot, the landed order's maker script hash, REFUND time and
+refund key, and four credit keys). The server takes it only when the terms
+hold (`order`): the asset it is paid in is one it serves, its four credit keys
+are distinct, own no leaf and are not the operator's or the leaf's key, and
+its REFUND time is more than the order margin (`fills.order_margin_seconds`)
+ahead. Once the round is final and the participation released, the maker
+publishes the order (`order_publish`) and can stop: the publication carries
+the coin's record as the maker holds it, the nonces its credit keys come from
+and the mailbox its credits and remainders go to, signed by the order's leaf
+key over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ order id ‖ the four credit nonces
+‖ mailbox)`, `T = SHA256("Arca/order-publish")`.
+
+A taker reads the order (`order_state`): the coin it rests at, what that
+holds, the coin's leaf key, salt, exit delay and terms (from which it rebuilds
+the coin's script and the fill's outputs), the coin's record (it checks the
+coin is in the tree before it signs), and every fill so far. It fills by
+giving up coins of the asset the order is paid in, each through a checkpoint
+as in a transfer, for a leaf of what it takes and a leaf of its change
+(`order_fill`). The operator co-signs only when:
+
+- the coin is the one the order rests at now, live, its lineage off the chain
+  and its first expiry past its exit deadline, and the signer holds no other
+  spend under its salt;
+- it is before the order's REFUND time less the order margin;
+- each taker coin passes what a transfer's input passes, is of the asset the
+  order is paid in, and expires no earlier than the order's coin, so every
+  coin the fill makes ages with the order's lineage;
+- the fill takes at least the lot and leaves nothing or at least the lot
+  resting, the taker's first leaf holds exactly what it takes and its second
+  the change, a checkpoint and the fill each leave a margin that pays their
+  fee as a transfer's does (the fill's in the asset paid), the depth limit
+  holds, and every signature verifies.
+
+The fill is recorded, the order's coin spent by it, before anything is
+signed. The signer co-signs the taker's checkpoints and their pair over the
+fill's outputs, then the fill itself, after judging it by the program's rules,
+as the one spend under the order coin's salt. The answer carries each coin the
+fill makes with its record; the maker's credit and the order resting again go
+to the maker's mailbox, the taker's leaves to the taker's, and the order rests
+at the remainder from then on. A fill sent again gets the same answer.
+
+The maker cancels by spending the order's coin as any coin: a transfer into a
+leaf of its own (`cosign_transfer`), or a refresh. The signer's one spend per
+salt keeps a cancel and a fill of one coin apart. A credit's key is public in
+the order's terms, so the coins a fill makes for the maker are outside the
+one-key rule: a leaf anyone pays to a credit key does not block the fill that
+credits it.
+
 ## Rounds
 
 A round carries one asset. Each asset the operator serves has rounds of its
@@ -1339,7 +1404,14 @@ meanwhile.
   pass, unrolling its path with the operator's own unroll authorisations (the
   operator is a member of every node, and the signer signs them) and opening
   its entry with the plan's preimage, then spends the coin and the leaf
-  together, the holder paid the leaf's value at its own address.
+  together, the holder paid the leaf's value at its own address. A resting
+  order's coin that a co-signed fill spent is answered by the fill: the
+  watcher brings each taker's coin on, one transaction a pass, and
+  checkpoints it, then publishes the fill, which spends the order's coin by
+  its fill path within the landing delay, so its maker cannot land it; a
+  remainder that comes on with it and was filled again is answered the same
+  way. A taker's checkpoint on the chain is answered by the fill once the
+  order's coin is there too.
 - **Boards given up in a round.** No batch sweeps a board, so once the round
   it was given up for is final the watcher publishes its forfeit from the
   board output itself, and claims it. Every forfeit's refund clock starts when it
@@ -1474,6 +1546,9 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST plans` | Every plan whose leaves are bound to the authenticated key (a wallet's mailbox key), the newest first, each as `plan_status` answers it |
 | `POST cancel_plan` | Cancels the steps of a plan that have not started, on the plan's mailbox key's signature over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`; a plan with a step in a round is cancelled once that round decides it |
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
+| `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
+| `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`) |
+| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filled`, `cancelled`, `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |

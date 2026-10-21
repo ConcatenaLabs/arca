@@ -238,16 +238,23 @@ pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [
 	let nonce = random32();
 	(OutputRequest::Leaf {
 		asset, value, template: arca_covenant::Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
+		order: None,
 	}, nonce)
 }
 
 /// The JSON of one output wanted.
 pub fn output_json(o: &OutputRequest) -> Value {
 	match o {
-		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } => json!({"leaf": {
-			"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
-			"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
-		}}),
+		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
+			let mut j = json!({"leaf": {
+				"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
+				"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
+			}});
+			if let Some(o) = order {
+				j["leaf"]["order"] = arca_covenant::record_json::order_terms_json(o);
+			}
+			j
+		},
 		OutputRequest::Offboard { asset, value, script } => json!({"offboard": {
 			"asset": asset.to_string(), "value": value.to_string(), "script": hex(script.as_bytes()),
 		}}),
@@ -295,7 +302,7 @@ pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(A
 pub fn take_body(coins: &[&Held], order: OutPoint, terms: &arca_covenant::FillOrder, locked: u64, filled: u64, leaf: &OutputRequest,
 	fee: (AssetId, u64), operator: XOnlyPublicKey, chain: Chain) -> (Value, [u8; 32])
 {
-	let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay } = leaf else { panic!("a take wants a leaf") };
+	let OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, .. } = leaf else { panic!("a take wants a leaf") };
 	let take = arca_covenant::Take {
 		order, terms: terms.clone(), locked, filled,
 		inputs: coins.iter().map(|h| h.id).collect(),
@@ -355,6 +362,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		reserve,
 		min_leaf: num(&t["min_leaf"]),
 	};
+	let tree_asset: elements::AssetId = s("asset").parse().unwrap();
 	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
 		template: l["template"].as_str().unwrap().parse().unwrap(),
 		owner: XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap())).unwrap(),
@@ -364,7 +372,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
 		htlc: htlc_of(&l["htlc"]),
-		order: None,
+		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }

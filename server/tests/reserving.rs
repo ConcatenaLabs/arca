@@ -201,6 +201,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 			owner: XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap())).unwrap(),
 			owner_nonce: unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+			order: None,
 		}
 	}).collect();
 	assert_eq!(outs, vec![w]);

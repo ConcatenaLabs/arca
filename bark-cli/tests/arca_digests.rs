@@ -57,15 +57,38 @@ fn the_wallets_digests_are_the_servers() {
 	let a = AssetId::from_slice(&[0x28; 32]).unwrap();
 	let d = RelativeTime::from_units(253).unwrap();
 	let ids = [LeafId([1; 32]), LeafId([2; 32])];
-	for (fees, nb) in [(vec![], None), (vec![(a, 17u64)], Some(MedianTime::from_consensus(1_800_000_000).unwrap()))] {
-		let mine = participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Vtxo1, owner: k,
-			owner_nonce: [3; 32], exit_delay: d }], &fees, nb);
+	// A resting order's leaf (`order-2`): its id covers its terms too.
+	let order = arca_covenant::OrderLeafTerms {
+		landed: arca_covenant::order::SeqdexOrder {
+			terms: arca_covenant::order::OrderTerms { asset_a: a, asset_b: AssetId::from_slice(&[0x29; 32]).unwrap(), rate_num: 3,
+				rate_den: 2, min_lot: 1_000 },
+			maker: [0x2a; 32], expiry: 1_800_000_000, refund_key: key("refund").x_only_public_key().0,
+		},
+		credits: [1, 2, 3, 4].map(|i| key(&format!("credit {}", i)).x_only_public_key().0.serialize()),
+	};
+	let mut ids_seen = vec![];
+	for (fees, nb, template, terms) in [
+		(vec![], None, Template::Vtxo1, None),
+		(vec![(a, 17u64)], Some(MedianTime::from_consensus(1_800_000_000).unwrap()), Template::Vtxo1, None),
+		(vec![], None, Template::Order2, Some(order)),
+	] {
+		let mine = participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template, owner: k,
+			owner_nonce: [3; 32], exit_delay: d, order: terms }], &fees, nb);
 		let theirs = server::participations::participation_id(&chain, &s, &ids, &[OutputRequest::Leaf { asset: a, value: 5_000,
-			template: Template::Vtxo1, owner: k, owner_nonce: [3; 32], exit_delay: d }], &fees, nb);
+			template, owner: k, owner_nonce: [3; 32], exit_delay: d, order: terms }], &fees, nb);
 		assert_eq!(mine, theirs);
 		assert_eq!(key_proof_digest(&mine), server::participations::key_proof_digest(&theirs));
 		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");
+		ids_seen.push(mine);
 	}
+	let mut other = order;
+	other.credits[3] = key("another credit").x_only_public_key().0.serialize();
+	assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Order2, owner: k,
+		owner_nonce: [3; 32], exit_delay: d, order: Some(other) }], &[], None), ids_seen[2], "an order's credit keys are bound");
+	// The publication of a resting order binds its credit nonces.
+	let mailbox = key("mailbox").x_only_public_key().0;
+	assert_ne!(arca_covenant::order::publish_digest(&chain, &s, &ids[0], &[[5; 32]; 4], &mailbox),
+		arca_covenant::order::publish_digest(&chain, &s, &ids[0], &[[6; 32]; 4], &mailbox), "the credit nonces are bound");
 	// A signed head of the operator's signer's record.
 	for (n, h) in [(0u64, [0u8; 32]), (1, [9; 32]), (4_000_000, [0xa5; 32])] {
 		assert_eq!(record_head_digest(&chain, n, &h), server::signer::record_head_digest(&chain.genesis_hash(), n, &h));

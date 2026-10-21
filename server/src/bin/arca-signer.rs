@@ -891,6 +891,66 @@ async fn answer(state: &State, line: &str) -> Response {
 				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt), entry.n);
 			Response { signature: Some(hex(sig.as_ref())), entry: Some(head), acks, ..none }
 		},
+		Request::OrderFill { owner, salt, asset_in, exit_delay_units, order, value_in, partial, outputs, known } => {
+			let parsed = (|| -> Result<_, String> {
+				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
+				let salt = unhex32(&salt)?;
+				let asset_in = elements::AssetId::from_str(&asset_in).map_err(|e| format!("asset_in: {}", e))?;
+				let terms = arca_covenant::record_json::order_terms_from_json(&order, asset_in).map_err(|e| format!("order: {}", e))?;
+				let exit_delay = arca_covenant::RelativeTime::from_units(exit_delay_units).map_err(|e| format!("exit delay: {}", e))?;
+				let value_in = parse_amount(&value_in)?;
+				if !(2..=arca_covenant::order::MAX_FILL_OUTPUTS as usize).contains(&outputs.len()) {
+					return Err(format!("{} committed outputs; a fill commits to 2 to 4", outputs.len()));
+				}
+				let outputs = outputs.iter().map(|o| o.to_output().map(|o| o.txout())).collect::<Result<Vec<_>, _>>()?;
+				let policy = terms.policy(owner, key.x_only_public_key().0, salt, *chain, exit_delay);
+				// The order's terms are its maker's consent: the signer signs a
+				// fill only as the program would take it.
+				policy.judge(&outputs, 0, value_in, partial).map_err(|e| format!("the fill does not hold: {}", e))?;
+				let digest = policy.fill_digest(value_in, &outputs).map_err(|e| e.to_string())?;
+				let known = match &known {
+					Some(k) => (k.entry, unhex32(&k.hash)?),
+					None => (0, [0; 32]),
+				};
+				Ok((owner, salt, digest, known))
+			})();
+			let (owner, salt, digest, known) = match parsed {
+				Ok(p) => p,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			if let Err(e) = state.check_keepers().await {
+				eprintln!("arca-signer: refused order fill for the order of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
+				return Response { code: code_of(&e), error: Some(e), ..none };
+			}
+			let admitted = {
+				let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
+				r.check_known(known.0, &known.1).and_then(|_| r.admit(&owner.serialize(), &salt, Signed::Spend, &digest))
+			};
+			let entry = match admitted {
+				Ok(e) => e,
+				Err(e) => {
+					eprintln!("arca-signer: refused order fill {} for the order of {} under salt {}: {}", hex(&digest),
+						hex(&owner.serialize()), hex(&salt), e);
+					return Response { code: code_of(&e), error: Some(e), ..none };
+				},
+			};
+			let (head, acks) = match &state.keepers {
+				Some(_) => match state.held_outside(entry.n).await {
+					Ok((h, a)) => (h, Some(a)),
+					Err(e) => {
+						eprintln!("arca-signer: order fill {} recorded as entry {}, not answered: {}", hex(&digest), entry.n, e);
+						return Response { code: code_of(&e), error: Some(e), ..none };
+					},
+				},
+				None => (state.signed_head(entry.n, &entry.hash), None),
+			};
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &digest, &aux);
+			eprintln!("arca-signer: signed order fill {} for the order of {} under salt {}: entry {}", hex(&digest),
+				hex(&owner.serialize()), hex(&salt), entry.n);
+			Response { signature: Some(hex(sig.as_ref())), entry: Some(head), acks, ..none }
+		},
 		Request::Spend { tx, prevouts, input, leaf } => {
 			let parsed = (|| -> Result<_, String> {
 				let tx: elements::Transaction = elements::encode::deserialize(&unhex(&tx)?).map_err(|e| format!("tx: {}", e))?;

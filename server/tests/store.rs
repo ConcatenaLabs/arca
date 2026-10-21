@@ -23,16 +23,20 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 		promised_to: None,
 		operator_nonce: Some(nonce),
 		scripts: vec![NewScript { script_pubkey: script, kind: ScriptKind::Board }],
+		maker_coin: false,
 	}
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 26;
+const SCHEMA: i32 = 27;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "DROP TABLE plan_step; DROP TABLE plan; DROP TABLE plan_quote; DROP TYPE plan_step_state; DROP TYPE plan_state;
+const UNDO_V17: &str = "DROP TABLE order_fill; DROP TABLE resting_order; ALTER TABLE participation_output DROP COLUMN order_terms;
+	DROP INDEX leaf_owner_key_key; ALTER TABLE leaf DROP COLUMN maker_coin;
+	CREATE UNIQUE INDEX leaf_owner_key_key ON leaf (owner_key) WHERE state NOT IN ('lost', 'expired');
+	DROP TABLE plan_step; DROP TABLE plan; DROP TABLE plan_quote; DROP TYPE plan_step_state; DROP TYPE plan_state;
 	DROP TABLE distribution_claim; DROP TABLE distribution_return; DROP TABLE distribution;
 	DROP TABLE round_fill; DROP TABLE participation_fill;
 	ALTER TABLE mailbox_message DROP CONSTRAINT mailbox_message_notice_has_no_leaf;
