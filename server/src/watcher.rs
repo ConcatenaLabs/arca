@@ -644,7 +644,7 @@ impl Watcher {
 			match r {
 				CoinRecord::Leaf { auths, .. } => auths.iter().map(|(_, t)| t.to_consensus_u32()).max().unwrap_or(0),
 				CoinRecord::Board(_) => 0,
-				CoinRecord::Transfer(t) => t.inputs.iter().map(|i| latest(&i.coin)).max().unwrap_or(0),
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().map(latest).max().unwrap_or(0),
 			}
 		}
 		let at = MedianTime::from_consensus(latest(record).max(arca_covenant::time::LOCKTIME_THRESHOLD)).map_err(build("a time"))?;
@@ -1198,7 +1198,7 @@ impl Watcher {
 			match r {
 				CoinRecord::Board(_) => true,
 				CoinRecord::Leaf { .. } => false,
-				CoinRecord::Transfer(t) => t.inputs.iter().all(|i| boards_alone(&i.coin)),
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().all(boards_alone),
 			}
 		}
 		for (leaf_id, record) in self.store.forfeited_transfer_coins().await? {
@@ -1304,7 +1304,7 @@ impl Watcher {
 			match r {
 				CoinRecord::Leaf { record, .. } => out.extend(record.schedule.expiries().first().map(|e| e.to_consensus_u32())),
 				CoinRecord::Board(_) => {},
-				CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| batches(&i.coin, out)),
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| batches(p, out)),
 			}
 		}
 		let mut dates = vec![];
@@ -1406,6 +1406,16 @@ impl Watcher {
 					} else {
 						Box::pin(self.bring_on_chain(&i.coin, now)).await?;
 					}
+				}
+				Ok(())
+			},
+			// A fill's coins: the order coin and each taker's coin it spends,
+			// each brought on the chain as its own coin; once they are there,
+			// the answers to stale exits take the checkpoints and the fill on.
+			ValidOrigin::Fill { order, inputs, .. } => {
+				Box::pin(self.bring_on_chain(order, now)).await?;
+				for i in inputs {
+					Box::pin(self.bring_on_chain(&i.coin, now)).await?;
 				}
 				Ok(())
 			},

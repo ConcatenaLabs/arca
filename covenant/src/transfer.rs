@@ -243,6 +243,7 @@ impl NewLeaf {
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
+			order: None,
 		}
 	}
 
@@ -269,6 +270,79 @@ pub enum CoinRecord {
 	Transfer(Box<Transfer>),
 	/// A board, on-chain.
 	Board(BoardRecord),
+	/// An output of an in-tree fill of a resting order.
+	Fill(Box<FillCoin>),
+}
+
+/// An in-tree fill of a resting order ([`crate::order`]): the order's coin,
+/// an `order-2` coin, spent by its fill path under the operator's signature,
+/// the taker's coins through their checkpoints, and the outputs every
+/// signature commits to: the maker's credit at 0, for a partial fill the
+/// order resting again at 1, then the taker's leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderFill {
+	pub order: CoinRecord,
+	/// The operator's signature over [`crate::OrderPolicy::fill_digest`].
+	pub signature: Signature,
+	pub partial: bool,
+	/// The taker's coins, each with its checkpoint's value and both pairs.
+	pub inputs: Vec<TransferInput>,
+	/// The committed outputs, 2 to 4.
+	pub outputs: Vec<ExplicitOutput>,
+}
+
+/// A coin a fill created: the fill, the coin's index among its outputs and
+/// which coin it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillCoin {
+	pub fill: OrderFill,
+	pub index: u8,
+	pub leaf: FillLeaf,
+}
+
+/// Which coin of a fill a [`FillCoin`] is. The maker's credit (index 0) and
+/// the order resting again (index 1 of a partial fill) are the order's own:
+/// their leaves follow from it, and each names only the nonce its owner key
+/// comes from, which the maker published; a taker's leaf is a new leaf as a
+/// reassignment makes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillLeaf {
+	/// The maker's credit, under the order's next credit key, derived from `owner_nonce`.
+	Credit { owner_nonce: [u8; 32] },
+	/// The order resting again, under the maker's leaf key, derived from `owner_nonce`.
+	Rest { owner_nonce: [u8; 32] },
+	New(NewLeaf),
+}
+
+impl FillLeaf {
+	/// The nonce the coin's owner key comes from.
+	pub fn owner_nonce(&self) -> [u8; 32] {
+		match self {
+			FillLeaf::Credit { owner_nonce } | FillLeaf::Rest { owner_nonce } => *owner_nonce,
+			FillLeaf::New(l) => l.owner_nonce,
+		}
+	}
+}
+
+/// The tag of a fill's hash, from which its outputs' ids follow.
+pub const FILL_TAG: &[u8] = b"Arca/order-fill-id";
+
+/// What a fill is, for its outputs' ids: the order coin's id and program,
+/// each taker input's coin id and checkpoint program, and the outputs.
+pub fn fill_hash(order: (LeafId, [u8; 32]), inputs: &[(LeafId, [u8; 32])], outputs: &[ExplicitOutput]) -> [u8; 32] {
+	let mut b = sha256(FILL_TAG).to_vec();
+	b.extend(order.0 .0);
+	b.extend(order.1);
+	b.push(inputs.len() as u8);
+	for (id, p) in inputs {
+		b.extend(id.0);
+		b.extend(p);
+	}
+	b.push(outputs.len() as u8);
+	for o in outputs {
+		b.extend(sha256(&o.record()));
+	}
+	sha256(&b)
 }
 
 /// A reassignment, and the coin's place in it.
@@ -361,6 +435,10 @@ pub enum TransferError {
 	NotABoard,
 	#[error("{given} checkpoints for a reassignment of {needed} inputs")]
 	Checkpoints { given: usize, needed: usize },
+	#[error("the coin a fill spends is not a resting order")]
+	NotAnOrder,
+	#[error("the fill: {0}")]
+	Fill(String),
 }
 
 impl TransferError {
@@ -384,6 +462,7 @@ impl TransferError {
 			LineageExitDelay { .. } => "policy",
 			OnChain { .. } | BoardSpent(_) => "on_chain",
 			NotATransfer | NotABoard | Checkpoints { .. } => "use",
+			NotAnOrder | Fill(_) => "fill",
 		}
 	}
 }
@@ -421,6 +500,10 @@ pub enum ValidOrigin {
 	Transfer { inputs: Vec<ValidInput>, outputs: Vec<ExplicitOutput>, index: usize },
 	/// A board, checked against its board transaction.
 	Board { valid: ValidBoard, record: BoardRecord },
+	/// An output of an in-tree fill: the order coin, the operator's
+	/// signature, the taker's inputs, the outputs and the coin's index.
+	Fill { order: Box<ValidCoin>, signature: Signature, partial: bool, inputs: Vec<ValidInput>, outputs: Vec<ExplicitOutput>,
+		index: usize },
 }
 
 /// One checked input of a reassignment.
@@ -478,12 +561,19 @@ impl ValidCoin {
 	}
 
 	fn lineage_into(&self, out: &mut Vec<LineageOutput>) {
-		if let ValidOrigin::Transfer { inputs, .. } = &self.origin {
-			for i in inputs {
-				i.coin.lineage_into(out);
-				out.push(LineageOutput { kind: LineageKind::Leaf, output: i.coin.output() });
-				out.push(LineageOutput { kind: LineageKind::Checkpoint, output: i.checkpoint_output() });
-			}
+		let inputs = match &self.origin {
+			ValidOrigin::Transfer { inputs, .. } => inputs,
+			ValidOrigin::Fill { order, inputs, .. } => {
+				order.lineage_into(out);
+				out.push(LineageOutput { kind: LineageKind::Leaf, output: order.output() });
+				inputs
+			},
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return,
+		};
+		for i in inputs {
+			i.coin.lineage_into(out);
+			out.push(LineageOutput { kind: LineageKind::Leaf, output: i.coin.output() });
+			out.push(LineageOutput { kind: LineageKind::Checkpoint, output: i.checkpoint_output() });
 		}
 	}
 
@@ -494,6 +584,7 @@ impl ValidCoin {
 		match &self.origin {
 			ValidOrigin::Board { valid, .. } => vec![valid.outpoint()],
 			ValidOrigin::Transfer { inputs, .. } => inputs.iter().flat_map(|i| i.coin.boards()).collect(),
+			ValidOrigin::Fill { order, inputs, .. } => order.boards().into_iter().chain(inputs.iter().flat_map(|i| i.coin.boards())).collect(),
 			ValidOrigin::Leaf { .. } => vec![],
 		}
 	}
@@ -548,9 +639,21 @@ impl ValidCoin {
 	pub fn reassignment_tx(&self, checkpoints: &[OutPoint], fee: &FeeSource) -> Result<UnrollTx, TransferError> {
 		let (inputs, outputs) = match &self.origin {
 			ValidOrigin::Transfer { inputs, outputs, .. } => (inputs, outputs),
-			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return Err(TransferError::NotATransfer),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Fill { .. } => return Err(TransferError::NotATransfer),
 		};
 		reassignment_tx(inputs, outputs, checkpoints, fee)
+	}
+
+	/// The fill that created this coin, the order coin at `order_at` and the
+	/// taker's checkpoints at `checkpoints` (one per input, in order): the
+	/// order by its fill path under the operator's signature, each
+	/// checkpoint by its pair. What the inputs hold beyond the committed
+	/// outputs pays the fee as `fee` says.
+	pub fn fill_tx(&self, order_at: OutPoint, checkpoints: &[OutPoint], fee: &FeeSource) -> Result<UnrollTx, TransferError> {
+		let ValidOrigin::Fill { order, signature, partial, inputs, outputs, .. } = &self.origin else {
+			return Err(TransferError::Fill("this coin is not an output of a fill".into()));
+		};
+		fill_tx(order, signature, *partial, inputs, outputs, order_at, checkpoints, fee)
 	}
 }
 
@@ -587,6 +690,27 @@ pub fn reassignment_tx(inputs: &[ValidInput], outputs: &[ExplicitOutput], checkp
 	let mut u = assemble(LockTime::ZERO, ins, outputs, fee, FINAL)?;
 	for (k, i) in inputs.iter().enumerate() {
 		u.tx.input[k].witness.script_witness = i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8);
+	}
+	Ok(u)
+}
+
+/// The in-tree fill of the order coin `order` at `order_at` with the taker's
+/// `inputs` (their checkpoints at `checkpoints`) into `outputs`.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_tx(order: &ValidCoin, signature: &Signature, partial: bool, inputs: &[ValidInput], outputs: &[ExplicitOutput],
+	order_at: OutPoint, checkpoints: &[OutPoint], fee: &FeeSource) -> Result<UnrollTx, TransferError>
+{
+	if checkpoints.len() != inputs.len() {
+		return Err(TransferError::Checkpoints { given: checkpoints.len(), needed: inputs.len() });
+	}
+	let op = order.leaf.order_policy().ok_or(TransferError::NotAnOrder)?;
+	let mut ins: Vec<(OutPoint, TxOut, elements::Sequence)> = vec![(order_at, order.output().txout(), FINAL)];
+	ins.extend(inputs.iter().zip(checkpoints).map(|(i, at)| (*at, i.checkpoint_output().txout(), FINAL)));
+	let mut u = assemble(LockTime::ZERO, ins, outputs, fee, FINAL)?;
+	u.tx.input[0].witness.script_witness = op.fill_witness(signature, outputs.len() as u8, partial)
+		.map_err(|e| TransferError::Fill(e.to_string()))?;
+	for (k, i) in inputs.iter().enumerate() {
+		u.tx.input[k + 1].witness.script_witness = i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8);
 	}
 	Ok(u)
 }
@@ -793,7 +917,113 @@ fn spend_hash(inputs: &[(LeafId, [u8; 32])], values: &[u64], outputs: &[Explicit
 	sha256(&b)
 }
 
+/// Checks each input of a reassignment or a fill against the coin it
+/// resolved to: its checkpoint's value, the pair into the checkpoint and the
+/// pair over `outputs`; adds what the checkpoints hold to `held`. `first` is
+/// the index of the first of them among the spend's inputs.
+fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[ExplicitOutput], first: usize,
+	held: &mut Vec<(AssetId, u64)>) -> Result<Vec<ValidInput>, TransferError>
+{
+	let mut out = Vec::with_capacity(inputs.len());
+	for (k, (input, coin)) in inputs.iter().zip(coins).enumerate() {
+		let k = k + first;
+		if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
+			return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
+		}
+		let checkpoint = coin.checkpoint();
+		let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
+		coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
+			.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
+		checkpoint.verify(coin.asset, input.checkpoint_value, outputs, &input.reassignment)
+			.map_err(|error| TransferError::Pair { input: k, pair: "reassignment", error })?;
+		add_held(held, coin.asset, input.checkpoint_value)?;
+		out.push(ValidInput {
+			checkpoint, checkpoint_value: input.checkpoint_value, checkpoint_pair: input.checkpoint,
+			reassignment_pair: input.reassignment, coin,
+		});
+	}
+	Ok(out)
+}
+
+fn add_held(held: &mut Vec<(AssetId, u64)>, asset: AssetId, value: u64) -> Result<(), TransferError> {
+	match held.iter_mut().find(|(a, _)| *a == asset) {
+		Some((_, v)) => *v = v.checked_add(value).ok_or(SpendError::Overflow)?,
+		None => held.push((asset, value)),
+	}
+	Ok(())
+}
+
+/// Refuses outputs that take more of an asset than the inputs hold.
+fn check_overspend(outputs: &[ExplicitOutput], held: &[(AssetId, u64)]) -> Result<(), TransferError> {
+	for asset in outputs.iter().map(|o| o.asset) {
+		let mut out: u64 = 0;
+		for o in outputs.iter().filter(|o| o.asset == asset) {
+			out = out.checked_add(o.value).ok_or(SpendError::Overflow)?;
+		}
+		let have = held.iter().find(|(a, _)| *a == asset).map(|(_, v)| *v).unwrap_or(0);
+		if out > have {
+			return Err(TransferError::Overspend(asset));
+		}
+	}
+	Ok(())
+}
+
+/// Refuses committed outputs of no value, past the largest amount, or two
+/// under one script.
+fn check_outputs(outputs: &[ExplicitOutput]) -> Result<(), TransferError> {
+	for (j, o) in outputs.iter().enumerate() {
+		if o.value == 0 || o.value > MAX_VALUE {
+			return Err(RecordError::Value(o.value).into());
+		}
+		if outputs[..j].iter().any(|p| p.script_pubkey == o.script_pubkey) {
+			return Err(TransferError::DuplicateOutput);
+		}
+	}
+	Ok(())
+}
+
 impl CoinRecord {
+	/// The coin records this coin's own transaction spends: a reassignment's
+	/// inputs, or a fill's order coin and taker inputs; none for a batch leaf
+	/// or a board, which rest on the chain's own transactions.
+	pub fn parents(&self) -> Vec<&CoinRecord> {
+		match self {
+			CoinRecord::Leaf { .. } | CoinRecord::Board(_) => vec![],
+			CoinRecord::Transfer(t) => t.inputs.iter().map(|i| &i.coin).collect(),
+			CoinRecord::Fill(f) => std::iter::once(&f.fill.order).chain(f.fill.inputs.iter().map(|i| &i.coin)).collect(),
+		}
+	}
+
+	/// The order an `order-2` coin rests as, from its record alone: a batch
+	/// leaf of the template, or the order resting again after a fill; `None`
+	/// for any other coin.
+	pub fn order_policy(&self) -> Option<crate::OrderPolicy> {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.leaf().order_policy(),
+			CoinRecord::Fill(f) if matches!(f.leaf, FillLeaf::Rest { .. }) => f.fill.order.order_policy().map(|o| o.next()),
+			_ => None,
+		}
+	}
+
+	/// The key and nonce the coin's record names for its owner. For a fill's
+	/// credit and remainder the key comes from the order's terms; `None` when
+	/// the order coin's record names no order.
+	pub fn owner(&self) -> Option<(XOnlyPublicKey, [u8; 32])> {
+		match self {
+			CoinRecord::Leaf { record, .. } => Some((record.owner, record.owner_nonce)),
+			CoinRecord::Transfer(t) => Some((t.leaf.owner, t.leaf.owner_nonce)),
+			CoinRecord::Board(b) => Some((b.owner, b.owner_nonce)),
+			CoinRecord::Fill(f) => match &f.leaf {
+				FillLeaf::New(l) => Some((l.owner, l.owner_nonce)),
+				FillLeaf::Credit { owner_nonce } => {
+					let key = XOnlyPublicKey::from_slice(&f.fill.order.order_policy()?.credits[0]).ok()?;
+					Some((key, *owner_nonce))
+				},
+				FillLeaf::Rest { owner_nonce } => Some((f.fill.order.order_policy()?.owner, *owner_nonce)),
+			},
+		}
+	}
+
 	/// The check a wallet runs before it accepts a coin it receives: every
 	/// check of [`CoinRecord::resolve`], then that the coin is for `owner`
 	/// with the nonce the wallet published, its exit delay within the
@@ -802,20 +1032,34 @@ impl CoinRecord {
 		-> Result<ValidCoin, TransferError>
 	{
 		let (key, nonce, delay) = match self {
-			CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce, record.exit_delay),
-			CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce, t.leaf.exit_delay),
-			CoinRecord::Board(b) => (b.owner, b.owner_nonce, b.exit_delay),
+			CoinRecord::Leaf { record, .. } => (record.owner, Some(record.owner_nonce), record.exit_delay),
+			CoinRecord::Transfer(t) => (t.leaf.owner, Some(t.leaf.owner_nonce), t.leaf.exit_delay),
+			CoinRecord::Board(b) => (b.owner, Some(b.owner_nonce), b.exit_delay),
+			// A fill's credit and remainder have their keys from the order's
+			// terms and their salts from its coin: their keys are checked
+			// below, on the resolved coin, and the nonce each names is the
+			// one its owner key comes from.
+			CoinRecord::Fill(f) => match &f.leaf {
+				FillLeaf::New(l) => (l.owner, Some(l.owner_nonce), l.exit_delay),
+				FillLeaf::Credit { owner_nonce } | FillLeaf::Rest { owner_nonce } => (*owner, Some(*owner_nonce), policy.min_exit_delay),
+			},
 		};
 		if key != *owner {
 			return Err(TransferError::NotOwner);
 		}
-		if nonce != *owner_nonce {
+		if nonce.is_some_and(|n| n != *owner_nonce) {
 			return Err(TransferError::OwnerNonce);
 		}
 		if !policy.exit_delay_ok(delay) {
 			return Err(TransferError::ExitDelay);
 		}
 		let coin = self.resolve(rounds, policy)?;
+		if coin.leaf.owner != *owner {
+			return Err(TransferError::NotOwner);
+		}
+		if !policy.exit_delay_ok(coin.leaf.exit_delay) {
+			return Err(TransferError::ExitDelay);
+		}
 		if coin.hops > DEPTH_LIMIT {
 			return Err(TransferError::DepthLimit { hops: coin.hops, limit: DEPTH_LIMIT });
 		}
@@ -895,14 +1139,7 @@ impl CoinRecord {
 				if t.index as usize >= m {
 					return Err(TransferError::Index { index: t.index as usize, count: m });
 				}
-				for (j, o) in t.outputs.iter().enumerate() {
-					if o.value == 0 || o.value > MAX_VALUE {
-						return Err(RecordError::Value(o.value).into());
-					}
-					if t.outputs[..j].iter().any(|p| p.script_pubkey == o.script_pubkey) {
-						return Err(TransferError::DuplicateOutput);
-					}
-				}
+				check_outputs(&t.outputs)?;
 				// Every input resolves under the receiver's policy, so its
 				// leaf is the policy's operator's, on the policy's chain.
 				let coins = t.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
@@ -912,34 +1149,9 @@ impl CoinRecord {
 				for (k, coin) in coins.iter().enumerate() {
 					spent.add(coin, &spend, k)?;
 				}
-				let mut inputs = Vec::with_capacity(n);
 				let mut held: Vec<(AssetId, u64)> = vec![];
-				for (k, (input, coin)) in t.inputs.iter().zip(coins).enumerate() {
-					if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
-						return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
-					}
-					let checkpoint = coin.checkpoint();
-					let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
-					coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
-						.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
-					checkpoint.verify(coin.asset, input.checkpoint_value, &t.outputs, &input.reassignment)
-						.map_err(|error| TransferError::Pair { input: k, pair: "reassignment", error })?;
-					match held.iter_mut().find(|(a, _)| *a == coin.asset) {
-						Some((_, v)) => *v = v.checked_add(input.checkpoint_value).ok_or(SpendError::Overflow)?,
-						None => held.push((coin.asset, input.checkpoint_value)),
-					}
-					inputs.push(ValidInput {
-						checkpoint, checkpoint_value: input.checkpoint_value, checkpoint_pair: input.checkpoint,
-						reassignment_pair: input.reassignment, coin,
-					});
-				}
-				for (asset, _) in t.outputs.iter().map(|o| (o.asset, o.value)) {
-					let out: u64 = t.outputs.iter().filter(|o| o.asset == asset).map(|o| o.value).sum();
-					let have = held.iter().find(|(a, _)| *a == asset).map(|(_, v)| *v).unwrap_or(0);
-					if out > have {
-						return Err(TransferError::Overspend(asset));
-					}
-				}
+				let inputs = check_inputs(&t.inputs, coins, &t.outputs, 0, &mut held)?;
+				check_overspend(&t.outputs, &held)?;
 				// The new leaf is in the receiver's lineage whoever owns it: a
 				// short exit delay anywhere lets its owner exit before the
 				// receiver can answer.
@@ -964,6 +1176,78 @@ impl CoinRecord {
 					expiry: inputs.iter().map(|i| i.coin.expiry).min_by_key(|e| e.to_consensus_u32()).expect("one input"),
 					hops: 1 + inputs.iter().map(|i| i.coin.hops).max().expect("one input"),
 					origin: ValidOrigin::Transfer { inputs, outputs: t.outputs.clone(), index: t.index as usize },
+				})
+			},
+			CoinRecord::Fill(f) => {
+				let fill = &f.fill;
+				let n = fill.inputs.len();
+				if n == 0 || n > MAX_INPUTS {
+					return Err(TransferError::Inputs(n));
+				}
+				let m = fill.outputs.len();
+				if !(2..=crate::order::MAX_FILL_OUTPUTS as usize).contains(&m) {
+					return Err(TransferError::Outputs(m));
+				}
+				if f.index as usize >= m {
+					return Err(TransferError::Index { index: f.index as usize, count: m });
+				}
+				check_outputs(&fill.outputs)?;
+				let order = fill.order.resolve_in(rounds, policy, spent, depth + 1)?;
+				let op = order.leaf.order_policy().ok_or(TransferError::NotAnOrder)?;
+				// The fill the operator signed, by the covenant's rules: the
+				// program is the judge on the chain, this its mirror.
+				let txouts: Vec<TxOut> = fill.outputs.iter().map(|o| o.txout()).collect();
+				op.check_signature(order.value, &txouts, &fill.signature).map_err(|e| TransferError::Fill(e.to_string()))?;
+				op.judge(&txouts, 0, order.value, fill.partial).map_err(|e| TransferError::Fill(e.to_string()))?;
+				let coins = fill.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
+				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().map(|c| (c.id, c.checkpoint().taproot().program())).collect();
+				let mut values = vec![order.value];
+				values.extend(fill.inputs.iter().map(|i| i.checkpoint_value));
+				let hash = fill_hash((order.id, order.leaf.program()), &parts, &fill.outputs);
+				let mut spend = hash.to_vec();
+				for v in &values {
+					spend.extend(v.to_le_bytes());
+				}
+				let spend = sha256(&spend);
+				spent.add(&order, &spend, 0)?;
+				for (k, coin) in coins.iter().enumerate() {
+					spent.add(coin, &spend, k + 1)?;
+				}
+				let mut held: Vec<(AssetId, u64)> = vec![];
+				add_held(&mut held, order.asset, order.value)?;
+				let inputs = check_inputs(&fill.inputs, coins, &fill.outputs, 1, &mut held)?;
+				check_overspend(&fill.outputs, &held)?;
+				let index = f.index as usize;
+				let leaf = match (index, fill.partial, &f.leaf) {
+					(0, _, FillLeaf::Credit { .. }) => op.credit_leaf().ok_or_else(|| TransferError::Fill("the order's credit keys are used up".into()))?,
+					(1, true, FillLeaf::Rest { .. }) => op.next().leaf(),
+					(i, partial, FillLeaf::New(l)) if i >= if partial { 2 } else { 1 } => {
+						if l.htlc.is_some() {
+							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
+						}
+						if !policy.exit_delay_ok(l.exit_delay) {
+							return Err(TransferError::LineageExitDelay {
+								hops: depth, delay: l.exit_delay.units(), min: policy.min_exit_delay.units(),
+								max: policy.max_exit_delay.units(),
+							});
+						}
+						l.policy(op.operator, op.chain)
+					},
+					_ => return Err(TransferError::Fill(format!("output {} of a fill is not the coin its record names: 0 is the maker's \
+						credit, 1 of a partial fill the order resting again, and every other output a taker's leaf", index))),
+				};
+				let mine = &fill.outputs[index];
+				if mine.script_pubkey != leaf.script_pubkey() {
+					return Err(TransferError::LeafMismatch);
+				}
+				let id = LeafId::compute(&hash, &[index as u8], &leaf.program());
+				let expiry = inputs.iter().map(|i| i.coin.expiry).chain(std::iter::once(order.expiry))
+					.min_by_key(|e| e.to_consensus_u32()).expect("the order");
+				let hops = 1 + inputs.iter().map(|i| i.coin.hops).chain(std::iter::once(order.hops)).max().expect("the order");
+				Ok(ValidCoin {
+					id, leaf, asset: mine.asset, value: mine.value, sweep: order.sweep, expiry, hops,
+					origin: ValidOrigin::Fill { order: Box::new(order), signature: fill.signature, partial: fill.partial, inputs,
+						outputs: fill.outputs.clone(), index },
 				})
 			},
 		}
@@ -1012,25 +1296,8 @@ impl CoinRecord {
 					return Err(TransferError::Outputs(t.outputs.len()));
 				}
 				w.push(if t.leaf.htlc.is_some() { 3 } else { 1 });
-				w.push(t.inputs.len() as u8);
-				for i in &t.inputs {
-					i.coin.write(w, depth + 1)?;
-					w.extend(i.checkpoint_value.to_le_bytes());
-					for s in [&i.checkpoint.operator, &i.checkpoint.owner, &i.reassignment.operator, &i.reassignment.owner] {
-						w.extend(s.as_ref());
-					}
-				}
-				w.push(t.outputs.len() as u8);
-				for o in &t.outputs {
-					w.extend(asset_bytes(o.asset));
-					w.extend(o.value.to_le_bytes());
-					let spk = o.script_pubkey.as_bytes();
-					if spk.len() > MAX_DESTINATION {
-						return Err(DecodeError::Count(spk.len() as u64).into());
-					}
-					write_compact_size(w, spk.len() as u64);
-					w.extend(spk);
-				}
+				write_inputs(w, &t.inputs, depth)?;
+				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
 				w.extend(t.leaf.owner.serialize());
 				w.extend(t.leaf.owner_nonce);
@@ -1038,6 +1305,42 @@ impl CoinRecord {
 				w.extend(t.leaf.exit_delay.units().to_le_bytes());
 				if let Some(terms) = &t.leaf.htlc {
 					terms.encode_to(w);
+				}
+			},
+			CoinRecord::Fill(f) => {
+				let fill = &f.fill;
+				if fill.inputs.is_empty() || fill.inputs.len() > MAX_INPUTS {
+					return Err(TransferError::Inputs(fill.inputs.len()));
+				}
+				if !(2..=crate::order::MAX_FILL_OUTPUTS as usize).contains(&fill.outputs.len()) {
+					return Err(TransferError::Outputs(fill.outputs.len()));
+				}
+				w.push(4);
+				fill.order.write(w, depth + 1)?;
+				w.extend(fill.signature.as_ref());
+				w.push(fill.partial as u8);
+				write_inputs(w, &fill.inputs, depth)?;
+				write_outputs(w, &fill.outputs)?;
+				w.push(f.index);
+				match &f.leaf {
+					FillLeaf::Credit { owner_nonce } => {
+						w.push(0);
+						w.extend(owner_nonce);
+					},
+					FillLeaf::Rest { owner_nonce } => {
+						w.push(1);
+						w.extend(owner_nonce);
+					},
+					FillLeaf::New(l) => {
+						if l.htlc.is_some() {
+							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
+						}
+						w.push(2);
+						w.extend(l.owner.serialize());
+						w.extend(l.owner_nonce);
+						w.extend(l.creator_nonce);
+						w.extend(l.exit_delay.units().to_le_bytes());
+					},
 				}
 			},
 		}
@@ -1076,37 +1379,9 @@ impl CoinRecord {
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
 			tag @ (1 | 3) => {
-				let n = r.u8()? as usize;
-				if n == 0 || n > MAX_INPUTS {
-					return Err(TransferError::Inputs(n));
-				}
-				let mut inputs = Vec::with_capacity(n);
-				for _ in 0..n {
-					let coin = CoinRecord::read(r, depth + 1)?;
-					let checkpoint_value = r.u64()?;
-					let mut sigs = [None; 4];
-					for s in sigs.iter_mut() {
-						*s = Some(Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?);
-					}
-					let [a, b, c, d] = sigs.map(|s| s.expect("read"));
-					inputs.push(TransferInput {
-						coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d },
-					});
-				}
-				let m = r.u8()? as usize;
-				if m == 0 || m > MAX_OUTPUTS as usize {
-					return Err(TransferError::Outputs(m));
-				}
-				let mut outputs = Vec::with_capacity(m);
-				for _ in 0..m {
-					let asset = r.asset()?;
-					let value = r.u64()?;
-					let len = r.compact_size()?;
-					if len > MAX_DESTINATION as u64 {
-						return Err(DecodeError::Count(len).into());
-					}
-					outputs.push(ExplicitOutput::new(asset, value, Script::from(r.bytes(len as usize)?.to_vec())));
-				}
+				let inputs = read_inputs(r, depth)?;
+				let outputs = read_outputs(r)?;
+				let m = outputs.len();
 				let index = r.u8()?;
 				if index as usize >= m {
 					return Err(TransferError::Index { index: index as usize, count: m });
@@ -1125,7 +1400,96 @@ impl CoinRecord {
 				let len = r.u16()? as usize;
 				Ok(CoinRecord::Board(BoardRecord::from_bytes(r.bytes(len)?)?))
 			},
+			4 => {
+				let order = CoinRecord::read(r, depth + 1)?;
+				let signature = Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?;
+				let partial = r.flag()?;
+				let inputs = read_inputs(r, depth)?;
+				let outputs = read_outputs(r)?;
+				if !(2..=crate::order::MAX_FILL_OUTPUTS as usize).contains(&outputs.len()) {
+					return Err(TransferError::Outputs(outputs.len()));
+				}
+				let index = r.u8()?;
+				if index as usize >= outputs.len() {
+					return Err(TransferError::Index { index: index as usize, count: outputs.len() });
+				}
+				let leaf = match r.u8()? {
+					0 => FillLeaf::Credit { owner_nonce: r.array32()? },
+					1 => FillLeaf::Rest { owner_nonce: r.array32()? },
+					2 => FillLeaf::New(NewLeaf {
+						owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
+					}),
+					f => return Err(DecodeError::Flag(f).into()),
+				};
+				Ok(CoinRecord::Fill(Box::new(FillCoin { fill: OrderFill { order, signature, partial, inputs, outputs }, index, leaf })))
+			},
 			t => Err(TransferError::Tag(t)),
 		}
 	}
+}
+
+fn write_inputs(w: &mut Vec<u8>, inputs: &[TransferInput], depth: usize) -> Result<(), TransferError> {
+	w.push(inputs.len() as u8);
+	for i in inputs {
+		i.coin.write(w, depth + 1)?;
+		w.extend(i.checkpoint_value.to_le_bytes());
+		for s in [&i.checkpoint.operator, &i.checkpoint.owner, &i.reassignment.operator, &i.reassignment.owner] {
+			w.extend(s.as_ref());
+		}
+	}
+	Ok(())
+}
+
+fn write_outputs(w: &mut Vec<u8>, outputs: &[ExplicitOutput]) -> Result<(), TransferError> {
+	w.push(outputs.len() as u8);
+	for o in outputs {
+		w.extend(asset_bytes(o.asset));
+		w.extend(o.value.to_le_bytes());
+		let spk = o.script_pubkey.as_bytes();
+		if spk.len() > MAX_DESTINATION {
+			return Err(DecodeError::Count(spk.len() as u64).into());
+		}
+		write_compact_size(w, spk.len() as u64);
+		w.extend(spk);
+	}
+	Ok(())
+}
+
+fn read_inputs(r: &mut Reader, depth: usize) -> Result<Vec<TransferInput>, TransferError> {
+	let n = r.u8()? as usize;
+	if n == 0 || n > MAX_INPUTS {
+		return Err(TransferError::Inputs(n));
+	}
+	let mut inputs = Vec::with_capacity(n);
+	for _ in 0..n {
+		let coin = CoinRecord::read(r, depth + 1)?;
+		let checkpoint_value = r.u64()?;
+		let mut sigs = [None; 4];
+		for s in sigs.iter_mut() {
+			*s = Some(Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?);
+		}
+		let [a, b, c, d] = sigs.map(|s| s.expect("read"));
+		inputs.push(TransferInput {
+			coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d },
+		});
+	}
+	Ok(inputs)
+}
+
+fn read_outputs(r: &mut Reader) -> Result<Vec<ExplicitOutput>, TransferError> {
+	let m = r.u8()? as usize;
+	if m == 0 || m > MAX_OUTPUTS as usize {
+		return Err(TransferError::Outputs(m));
+	}
+	let mut outputs = Vec::with_capacity(m);
+	for _ in 0..m {
+		let asset = r.asset()?;
+		let value = r.u64()?;
+		let len = r.compact_size()?;
+		if len > MAX_DESTINATION as u64 {
+			return Err(DecodeError::Count(len).into());
+		}
+		outputs.push(ExplicitOutput::new(asset, value, Script::from(r.bytes(len as usize)?.to_vec())));
+	}
+	Ok(outputs)
 }

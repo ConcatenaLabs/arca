@@ -39,7 +39,8 @@ All integers are little-endian. Asset ids and the genesis hash are in internal
 byte order.
 
     u8    format version, 2
-    u8    template, 1 (vtxo) or 3 (htlc)   u8  template version, 1
+    u8    template, 1 (vtxo), 3 (htlc) or 4 (order)
+    u8    template version, 1 (vtxo, htlc) or 2 (order)
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
     [32]  operator nonce
@@ -50,6 +51,13 @@ byte order.
     [32]  payment hash
     u32   timeout, a median time
     u16   operator delay, 512-second units; shorter than the exit delay
+          order-2 only (a resting order, order.py; it sells the leaf's asset):
+    [32]  asset B, what it is paid in
+    u64   rate numerator   u64 rate denominator   u64 minimum lot
+    [32]  SHA256 of the scriptPubKey the landed order's fills pay
+    u32   the landed order's REFUND time, a median time
+    [32]  the landed order's refund key
+    4 × [32]  the next credit keys, the next first, zero once used
     [32]  asset                       the leaf and its entry
     u64   value
     [32]  unlock hash h
@@ -80,7 +88,9 @@ The leaf id is the BIP340 tagged hash, tag "Arca/leaf-id", of
 
 The JSON form has the same fields; an htlc-1 record's terms are one object,
 `htlc`: {"direction": "send" or "receive", "payment_hash", "timeout",
-"operator_delay_units"}. Its canonical text has its keys sorted and
+"operator_delay_units"}, and an order-2 record's `order`: {"asset_b",
+"rate_num", "rate_den", "min_lot", "maker", "expiry", "refund_key",
+"credits"}. Its canonical text has its keys sorted and
 no whitespace. Asset ids, the token and the genesis hash are hex in display
 order (the order the node's RPCs print), every other byte string hex in its
 own order, lower case. Amounts are decimal strings, so that no reader rounds
@@ -94,10 +104,25 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
                                      CAssetIssuance, uint256_from_str)
 
 FORMAT_VERSION = 2
-TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3}   # name -> template id; a leaf record names vtxo or htlc, a board record board
+TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4}   # name -> template id; a board record names board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
 TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
+TEMPLATE_ORDER, TEMPLATE_ORDER_VERSION = 4, 2
+
+
+class _Spk:
+    def __init__(self, spk):
+        self.scriptPubKey = spk
+
+
+def order_leaf_tap(lf, S, salt, ctag, asset):
+    """An order-2 leaf, through order.py's own derivation."""
+    import order as order_py
+    o = lf["order"]
+    terms = {"asset_a": asset, "asset_b": o["asset_b"], "num": o["num"], "den": o["den"], "min_lot": o["min_lot"],
+             "maker": o["maker"], "expiry": o["expiry"], "refund_key": o["refund_key"]}
+    return _Spk(order_py.Order(terms, lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], o["credits"]).spk)
 DIRECTIONS = {"send": 0, "receive": 1}
 LEAF_ID_TAG = b"Arca/leaf-id"
 SALT_TAG = b"Arca/salt"
@@ -229,7 +254,9 @@ class Batch:
         for i, lf in enumerate(leaves):
             salt = leaf_salt(lf["owner_nonce"], lf["operator_nonce"])
             h = lf.get("htlc")
-            if h is None:
+            if lf.get("order") is not None:
+                tap = order_leaf_tap(lf, S, salt, ctag, p["asset"])
+            elif h is None:
                 tap, _ = leaf3_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], fold=True)
             else:
                 assert h["operator_delay"] < lf["exit_delay"], "an htlc-1 operator delay is shorter than the exit delay"
@@ -293,9 +320,12 @@ class Batch:
             idx = j
         levels.reverse()                   # from the batch output down
         h = lf.get("htlc")
+        o = lf.get("order")
         return {
-            "template": ("htlc", TEMPLATE_HTLC_VERSION) if h else ("vtxo", TEMPLATE_VTXO_VERSION),
+            "template": ("order", TEMPLATE_ORDER_VERSION) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
+            else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
+            "order": o,
             "owner": lf["owner"], "owner_nonce": lf["owner_nonce"], "operator_nonce": lf["operator_nonce"],
             "exit_delay": lf["exit_delay"],
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
@@ -317,6 +347,10 @@ def encode(rec):
     if name == "htlc":
         h = rec["htlc"]
         b += bytes([DIRECTIONS[h["direction"]]]) + h["payment_hash"] + le32(h["timeout"]) + le16(h["operator_delay"])
+    if name == "order":
+        o = rec["order"]
+        b += o["asset_b"] + le64(o["num"]) + le64(o["den"]) + le64(o["min_lot"]) + o["maker"] + le32(o["expiry"])
+        b += o["refund_key"] + b"".join(o["credits"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
     b += bytes([1 if rec["burn"] else 0])
@@ -359,7 +393,16 @@ def to_json(rec):
         h = rec["htlc"]
         o["htlc"] = {"direction": h["direction"], "payment_hash": h["payment_hash"].hex(), "timeout": h["timeout"],
                      "operator_delay_units": h["operator_delay"]}
+    if name == "order":
+        t = rec["order"]
+        o["order"] = order_json(t)
     return o
+
+
+def order_json(t):
+    return {"asset_b": display(t["asset_b"]), "rate_num": str(t["num"]), "rate_den": str(t["den"]),
+            "min_lot": str(t["min_lot"]), "maker": t["maker"].hex(), "expiry": t["expiry"],
+            "refund_key": t["refund_key"].hex(), "credits": [c.hex() for c in t["credits"]]}
 
 
 def json_text(obj):
@@ -403,7 +446,7 @@ def txout(asset, value, spk):
 
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
-                 expiries=(28, 56, 84), odd_delay=None, htlc=None):
+                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -425,6 +468,12 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     for i, direction in (htlc or {}).items():
         leaves[i]["htlc"] = {"direction": direction, "payment_hash": sha256(label_hash("preimage", "%s payment %d" % (name, i))),
                              "timeout": CREATED + 2 * DAY, "operator_delay": EXIT_DELAY // 3}
+    # order: [leaf index]; each such leaf is an order-2 leaf selling the batch's asset.
+    for i in (order or []):
+        leaves[i]["order"] = {"asset_b": label_hash("asset", "%s paid in %d" % (name, i)), "num": 3, "den": 2,
+                              "min_lot": 1_000, "maker": sha256(b"\x51\x20" + xonly("%s maker %d" % (name, i))),
+                              "expiry": CREATED + 10 * DAY, "refund_key": xonly("%s refund %d" % (name, i)),
+                              "credits": [xonly("%s credit %d.%d" % (name, i, k)) for k in range(4)]}
     b = Batch(p, leaves)
 
     # The round: the issuing input, the batch output at 0, the token's atom in
@@ -469,7 +518,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                             **({"htlc": {"direction": lf["htlc"]["direction"],
                                          "payment_hash": lf["htlc"]["payment_hash"].hex(),
                                          "timeout": lf["htlc"]["timeout"],
-                                         "operator_delay_units": lf["htlc"]["operator_delay"]}} if "htlc" in lf else {}))
+                                         "operator_delay_units": lf["htlc"]["operator_delay"]}} if "htlc" in lf else {}),
+                            **({"order": order_json(lf["order"])} if "order" in lf else {}))
                        for lf in leaves],
         },
         "levels": [len(lv) for lv in b.levels],
@@ -591,10 +641,11 @@ def generate():
         batch_vector("seven leaves at radix 6", 7, 6, node_reserve=0, entry_reserve=0),
         batch_vector("sixty-four leaves", 64, 4, export=[0, 5, 21, 42, 63]),
         batch_vector("five leaves, two of them htlc-1", 5, 4, htlc={1: "receive", 3: "send"}),
+        batch_vector("five leaves, two of them order-2", 5, 4, order=[0, 3]),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
-    h = batches[-1]["records"][1]
+    h = batches[-2]["records"][1]
     hi, hj = invalid_htlc_vectors(h["binary"], h["json"])
     invalid += hi
     invalid_json += hj

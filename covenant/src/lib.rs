@@ -121,7 +121,7 @@ pub use leaf::LeafPolicy;
 pub use message::{Chain, CsfsMessage};
 pub use node::NodePolicy;
 pub use offboard::OffboardPolicy;
-pub use order::{OrderError, OrderFillPlan, OrderFilled, OrderPath, OrderPolicy, OrderTerms, SeqdexOrder};
+pub use order::{OrderError, OrderFillPlan, OrderFilled, OrderLeafTerms, OrderPath, OrderPolicy, OrderTerms, SeqdexOrder};
 pub use plan::{Plan, PlanError, PlanStep, Refund};
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
 pub use release::Release;
@@ -140,6 +140,8 @@ pub use unroll::{FeeSource, UnrollAuth, UnrollTx};
 /// Why a policy cannot be built or a spend cannot be made.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+	#[error("order-2's terms: {0}")]
+	OrderTerms(String),
 	#[error("a node has {0} children; it must have 1 to 6")]
 	ChildCount(usize),
 	#[error("a rebindable spend commits to {0} outputs; it must commit to 1 to {max}", max = leaf::MAX_OUTPUTS)]

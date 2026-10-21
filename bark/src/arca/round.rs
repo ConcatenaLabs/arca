@@ -147,6 +147,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?,
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
 			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
+			order: None,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;

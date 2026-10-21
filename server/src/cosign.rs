@@ -921,7 +921,7 @@ fn first_expiry(record: &CoinRecord) -> Option<u32> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
 		CoinRecord::Board(_) => None,
-		CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| first_expiry(&i.coin)).min(),
+		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().filter_map(first_expiry).min(),
 	}
 }
 

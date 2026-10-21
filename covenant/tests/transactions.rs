@@ -222,6 +222,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 		salt: arca_covenant::leaf::leaf_salt(&h32(&inp["owner_nonce"]), &h32(&inp["operator_nonce"])),
 		chain, exit_delay: RelativeTime::from_units(inp["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		htlc: None,
+		order: None,
 	};
 	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&f["leaf_script_pubkey"])[..]);
 	let p = leaf.program();
@@ -371,6 +372,7 @@ fn the_transfer_chain() {
 		.map(|x| (x["name"].as_str().unwrap().to_string(), x)).collect();
 	fn walk(fx: &Fx, coin: &ValidCoin, bases: &Value, txs: &std::collections::BTreeMap<String, &Value>, n: &mut usize) -> OutPoint {
 		match &coin.origin {
+			ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
 			ValidOrigin::Leaf { .. } => outpoint(&bases[coin.id.to_string()]),
 			ValidOrigin::Board { valid, .. } => valid.outpoint(),
 			ValidOrigin::Transfer { inputs, index, .. } => {

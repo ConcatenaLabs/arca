@@ -32,6 +32,7 @@ use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::gate::MAX_OWNERS;
 use crate::htlc::{HtlcDirection, HtlcTerms};
 use crate::message::Chain;
+use crate::order::OrderLeafTerms;
 use crate::node::MAX_CHILDREN;
 use crate::script::{asset_bytes, Child};
 use crate::sweep::Sweep;
@@ -252,8 +253,9 @@ impl Encoding for ClockSchedule {
 	}
 }
 
-/// A leaf: `vtxo-1`'s fields, then `htlc-1`'s terms when it carries them.
-/// Decoding reads a `vtxo-1` leaf; [`Policy`] reads either, by its type byte.
+/// A leaf: `vtxo-1`'s fields, then `htlc-1`'s terms when it carries them,
+/// or `order-2`'s: the asset it sells and its terms. Decoding reads a
+/// `vtxo-1` leaf; [`Policy`] reads any, by its type byte.
 impl Encoding for LeafPolicy {
 	fn encode_to(&self, w: &mut Vec<u8>) {
 		w.extend(self.owner.serialize());
@@ -263,6 +265,10 @@ impl Encoding for LeafPolicy {
 		w.extend(self.exit_delay.units().to_le_bytes());
 		if let Some(t) = &self.htlc {
 			t.encode_to(w);
+		}
+		if let Some(o) = &self.order {
+			w.extend(asset_bytes(o.landed.terms.asset_a));
+			o.encode_to(w);
 		}
 	}
 
@@ -274,6 +280,7 @@ impl Encoding for LeafPolicy {
 			chain: r.chain()?,
 			exit_delay: r.relative_time()?,
 			htlc: None,
+			order: None,
 		})
 	}
 }
@@ -441,7 +448,7 @@ impl Encoding for OffboardPolicy {
 /// Any of the output policies, tagged with its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
-	/// A leaf, `vtxo-1` or `htlc-1`.
+	/// A leaf, `vtxo-1`, `htlc-1` or `order-2`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -468,7 +475,7 @@ impl Encoding for Policy {
 	fn encode_to(&self, w: &mut Vec<u8>) {
 		w.push(VERSION);
 		match self {
-			Policy::Leaf(p) => { w.push(if p.htlc.is_some() { 6 } else { 1 }); p.encode_to(w) },
+			Policy::Leaf(p) => { w.push(if p.order.is_some() { 8 } else if p.htlc.is_some() { 6 } else { 1 }); p.encode_to(w) },
 			Policy::Node(p) => { w.push(2); p.encode_to(w) },
 			Policy::Entry(p) => { w.push(3); p.encode_to(w) },
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
@@ -496,6 +503,14 @@ impl Encoding for Policy {
 				Policy::Leaf(p)
 			},
 			7 => Policy::Offboard(OffboardPolicy::decode_from(r)?),
+			8 => {
+				let mut p = LeafPolicy::decode_from(r)?;
+				let asset = r.asset()?;
+				let o = OrderLeafTerms::decode_from(r, asset)?;
+				o.check(asset, &p.owner, &p.operator).map_err(|e| DecodeError::Policy(crate::Error::OrderTerms(e.to_string())))?;
+				p.order = Some(o);
+				Policy::Leaf(p)
+			},
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}

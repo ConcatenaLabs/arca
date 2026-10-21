@@ -171,6 +171,7 @@ fn a_degenerate_layout_is_refused() {
 		upper: (0..15).map(|_| UpperLevel { index: 0, reserve: 0, siblings: vec![], member: proof.clone() }).collect(),
 		lowest: LowestLevel { index: 0, reserve: 0, siblings: vec![], owners: vec![] },
 		htlc: None,
+		order: None,
 	};
 	let record = LeafRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
 	let (round, _) = round_tx(&c.net, &issuer, &[], &record.branch().unwrap().batch_output(), &sched);
