@@ -36,6 +36,7 @@
 //! | `/settle` | One pass of the watcher (releases, notices, sweeps, the return of unclaimed claims), a block buried two Bitcoin blocks deep, one pass of the nursery and another of the watcher, as an operator's timers do between them; the chain's tip |
 //! | `/round_state {txid}` | Where the server says the round stands: built, broadcast, final or lost |
 //! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
+//! | `/restart` | Stops the server and starts it again on the same database, at the same address, as an operator's restart does; the chain and the signer keep running |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
 //!
 //! A browser wallet that bonds a stake on this chain (a stake carries no
@@ -207,6 +208,11 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 			let height = b["height"].as_u64().ok_or("no height")?;
 			let gone = tokio::task::block_in_place(|| r.rt.orphan_parent_from(height))?;
 			Ok(json!({"orphaned": gone.len()}))
+		},
+		"/restart" => {
+			r.restart_server().await;
+			r.synced().await;
+			Ok(json!({"server": r.url()}))
 		},
 		"/fees" => {
 			let asset = b["asset"].as_str().ok_or("no asset")?;

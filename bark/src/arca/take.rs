@@ -46,7 +46,7 @@ use arca_covenant::{ExplicitOutput, FillOrder, LeafId, RelativeTime, Take, TakeL
 
 use super::chain::hex;
 use super::client::key_proof_digest;
-use super::pay::{In, Out};
+use super::pay::{leaf_probe, In, Out};
 use super::round::{fee_within, schedule_of, DEFAULT_MAX_FEE_PPM};
 use super::wallet::{sign, Wallet};
 use super::{random32, Error};
@@ -109,7 +109,9 @@ impl Wallet {
 	/// named) would cost, before anything is signed or asked of the
 	/// operator: the fill, the price the order asks, the operator's fee, what
 	/// the coins given up hold, and whether the wallet must first pay itself
-	/// a coin of that much. Refuses a fill the order's covenant would refuse,
+	/// a coin of that much, with the margins that payment leaves for its fees
+	/// (`pays_itself`, with its change and the change's expiry) and what leaves the wallet in all (`spends`: the price,
+	/// the fee and those margins). Refuses a fill the order's covenant would refuse,
 	/// a fee above the wallet's bound (`max_fee_ppm` millionths of the price,
 	/// 10,000 unless raised), and a leaf below the operator's smallest.
 	pub fn take_quote(&self, text: &str, amount: Option<u64>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
@@ -135,14 +137,34 @@ impl Wallet {
 				of {} ppm of the price (raise it with max_fee_ppm)", price, b, fee, bound)));
 		}
 		let need = price.checked_add(fee).ok_or_else(|| Error::Refused("the price and the fee overflow".into()))?;
-		// A live coin of exactly that much, or a payment to itself first.
+		// A live coin of exactly that much, or a payment to itself first,
+		// which leaves margins of its own for its fees: they are shown, so
+		// what leaves the wallet is known before anything is signed.
 		let exact = self.spendable_coins(b)?.into_iter().find(|i| i.coin.value == need).map(|i| i.row.leaf_id);
+		let first = match &exact {
+			Some(_) => None,
+			None => {
+				let probe = ExplicitOutput::new(b, need, leaf_probe());
+				let (inputs, margin, change) = self.choose_coins(info, b, need, &probe, Self::min_leaf(info, b)?)?;
+				let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
+				// The change rests on every coin the payment spends: the earliest
+				// expiry among them, for a program that settles it in a round
+				// (`settle_quote`).
+				let expiry = inputs.iter().map(|i| i.row.expiry).min().unwrap_or(u32::MAX);
+				Some((margin, margins, change, expiry))
+			},
+		};
+		let first_costs = first.map_or(0, |(m, ms, _, _)| m + ms);
+		let spends = need.checked_add(first_costs).ok_or_else(|| Error::Refused("the price, the fee and the margins overflow".into()))?;
 		let q = json!({
 			"order": outpoint_text(&o.at), "asset_a": a.to_string(), "asset_b": b.to_string(),
 			"locked": o.locked.to_string(), "filled": filled.to_string(), "remainder": plan.remainder.to_string(),
 			"price": price.to_string(), "fee": fee.to_string(), "gives": need.to_string(),
 			"maker_script": hex(o.terms.maker_script_pubkey().as_bytes()),
 			"coin": exact, "pays_itself_first": exact.is_none(),
+			"pays_itself": first.map(|(m, ms, ch, ex)| json!({"margin": m.to_string(), "margins": ms.to_string(), "change": ch.to_string(),
+				"expiry": (ex != u32::MAX).then_some(ex)})),
+			"spends": spends.to_string(),
 		});
 		Ok((q, exact))
 	}
@@ -159,7 +181,11 @@ impl Wallet {
 		self.remember_fills(&info)?;
 		let (quote, exact) = self.quote_of(&o, &info, amount, max_fee_ppm)?;
 		if let Some(s) = shown {
-			for k in ["order", "filled", "price", "fee"] {
+			// What leaves the wallet in all is held to as well, when the
+			// program showed it.
+			let keys: &[&str] = if s.get("spends").is_some() { &["order", "filled", "price", "fee", "spends"] } else { &["order", "filled", "price", "fee"] };
+			for k in keys {
+				let k = *k;
 				if s[k] != quote[k] {
 					return Err(Error::Refused(format!("the take's {} changed since it was shown: it is now {}", k, quote[k])));
 				}
