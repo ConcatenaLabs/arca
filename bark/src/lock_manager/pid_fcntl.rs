@@ -3,8 +3,9 @@
 //!
 //! Same shape as [`super::pid_flock::FlockPidLockManager`] — one
 //! OS-level lock on `<datadir>/LOCK` held for the manager's lifetime,
-//! all per-key locking delegated to an internal
-//! [`MemoryLockManager`]. The only
+//! all per-key locking delegated to a keyspace of the manager's own (an
+//! `InternalMemoryLockManager`), so two datadirs in one process never
+//! contend on a key. The only
 //! difference is the OS primitive: this variant uses POSIX
 //! `fcntl(F_SETLK)` instead of `flock(2)`.
 //!
@@ -39,7 +40,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Context;
 
 use super::{LockGuard, LockManager, PidLockError};
-use super::memory::MemoryLockManager;
+use super::internal_memory::InternalMemoryLockManager;
 
 /// File name used for the datadir-level PID lock.
 pub const LOCK_FILE: &str = "LOCK";
@@ -82,7 +83,7 @@ pub struct FcntlPidLockManager {
 	// subsequent `new()` can re-acquire.
 	_registration: Registration,
 	datadir: PathBuf,
-	in_process: MemoryLockManager,
+	in_process: InternalMemoryLockManager,
 }
 
 impl FcntlPidLockManager {
@@ -129,7 +130,7 @@ impl FcntlPidLockManager {
 			_pid_file: file,
 			_registration: registration,
 			datadir,
-			in_process: MemoryLockManager::new(),
+			in_process: InternalMemoryLockManager::new(),
 		})
 	}
 
@@ -252,5 +253,20 @@ mod test {
 		assert!(g2.is_some(), "different key should be free");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn two_datadirs_keep_their_own_keys() {
+		let (one, two) = (tmp_dir().join("one"), tmp_dir().join("two"));
+		let a = FcntlPidLockManager::new(&one).unwrap();
+		let b = FcntlPidLockManager::new(&two).unwrap();
+
+		let held = a.try_lock("wallet").await;
+		assert!(held.is_some());
+		assert!(a.try_lock("wallet").await.is_none(), "the same key of the same datadir is held");
+		assert!(b.try_lock("wallet").await.is_some(), "the same key of another datadir is another lock");
+
+		let _ = fs::remove_dir_all(&one);
+		let _ = fs::remove_dir_all(&two);
 	}
 }
