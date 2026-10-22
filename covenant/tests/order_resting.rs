@@ -1,7 +1,10 @@
-//! `order-2` on regtest: every way A3.3 found to reverse a spend made in the
-//! tree, run against the resting-order template, and each refused.
+//! `order-3` on regtest: every way A3.3 found to reverse a spend made in the
+//! tree, run against the resting-order template, and each refused; a fill
+//! with an annex refused; and an `order-2` leaf, resting from before
+//! `order-3`, still filled.
 //!
-//! Eight `order-2` leaves (orders A to H) sit beside eight ordinary leaves in
+//! Eight `order-3` leaves (orders A to H) and one `order-2` leaf (order O) sit
+//! beside seven ordinary leaves in
 //! one batch of asset X behind their hash-locked entries; the round and the
 //! unroll are the frozen ones, and the operator alone brings the orders to the
 //! chain (its own authorisations, the entry preimages it chose): no key of a
@@ -36,18 +39,30 @@
 //!   nor the checkpoint of a cancel.
 //! - **The operator alone** cannot take an order: not by the collaborative
 //!   path, nor by a fill that pays anyone but the maker, nor by the landing.
+//! - **No annex.** The operator's signed fill of A and the on-chain fill of
+//!   A's landed order (`seqdex/order` version 2), each with an annex of 3 and
+//!   of 1,000 bytes and a zero annex of 1,000 bytes on the order's input, are refused at relay and in a block
+//!   by the program (`Assertion failed`), beside the same fills without one,
+//!   which are mined.
+//! - **O. An `order-2` leaf.** Its program takes an annex nobody signed,
+//!   which is why new orders rest as `order-3`: its fill with a 1,000-byte
+//!   annex is mined (through the mempool on a node before Sequentia 25.2.4,
+//!   which relays it; by `generateblock` on one from it, whose relay refuses
+//!   a nonzero annex). The order fills as before: the remainder rests as
+//!   `order-2`, and its own fill is mined.
 //!
 //! Needs `SEQUENTIAD_EXEC`; run with `--nocapture` for the table.
 
 mod common;
 
 use elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
+use elements::hex::FromHex;
 use elements::secp256k1_zkp::rand::{CryptoRng, RngCore};
 use elements::secp256k1_zkp::{Keypair, Secp256k1};
 use elements::{AssetIssuance, Script, Transaction, TxOut, TxOutSecrets};
 use serde_json::{json, Value};
 
-use arca_covenant::order::{OrderPolicy, OrderTerms, SeqdexOrder};
+use arca_covenant::order::{OrderPolicy, OrderTerms, SeqdexOrder, SeqdexVersion};
 use arca_covenant::script::sha256;
 use arca_covenant::*;
 
@@ -106,11 +121,11 @@ struct Maker {
 	order: OrderPolicy,
 }
 
-fn maker(net: &Net, s: &Keypair, name: &str, terms: OrderTerms, expiry: u32) -> Maker {
+fn maker(net: &Net, s: &Keypair, name: &str, terms: OrderTerms, expiry: u32, version: SeqdexVersion) -> Maker {
 	let leaf_key = keypair(&format!("order-2 maker {} leaf key", name));
 	let credit_keys: Vec<Keypair> = (0..4).map(|i| keypair(&format!("order-2 maker {} credit key {}", name, i))).collect();
 	let refund_key = keypair(&format!("order-2 maker {} refund key", name));
-	let landed = SeqdexOrder { terms, maker: sha256(plain(&refund_key).as_bytes()), expiry, refund_key: xonly(&refund_key) };
+	let landed = SeqdexOrder { terms, maker: sha256(plain(&refund_key).as_bytes()), expiry, refund_key: xonly(&refund_key), version };
 	let order = OrderPolicy {
 		landed,
 		owner: xonly(&leaf_key),
@@ -253,6 +268,45 @@ fn collab(net: &mut Net, o: &OrderPolicy, oc: &Coin, outs: &[ExplicitOutput], s_
 	s.tx
 }
 
+/// An annex on a Simplicity leaf the program does not need: relay refuses a
+/// nonzero one before the program runs on a node from Sequentia 25.2.4,
+/// which relays an annex only when it is zeros and as large as the program's
+/// cost needs. On an older node relay runs the program.
+const ANNEX_NONZERO: &str = "Simplicity annex must be zeros after its tag";
+/// The same node's refusal of a zero annex the program's cost does not need.
+const ANNEX_UNNEEDED: &str = "Simplicity annex is larger than the program's cost needs";
+/// The program's own refusal of an annex (`current_annex_hash` is none), the
+/// block's reason on every node.
+const ANNEX_REFUSED: &str = "(Assertion failed)";
+
+/// Refused at relay (for the annex on a node from 25.2.4, by the program on
+/// an older one) and by the program in a block.
+fn refuse_annexed(net: &mut Net, name: &str, tx: &Transaction) {
+	let r = net.rt.client().test_mempool_accept(&[tx]).unwrap().remove(0);
+	let reason = r.reject_reason.unwrap_or_default();
+	let relay = if reason.contains(ANNEX_NONZERO) { ANNEX_NONZERO } else if reason.contains(ANNEX_UNNEEDED) { ANNEX_UNNEEDED }
+		else { ANNEX_REFUSED };
+	net.refuse_relay_and_block(name, tx, relay, ANNEX_REFUSED);
+}
+
+/// `tx` with an annex of `n` bytes (0x50, then zeros) on input `k`'s witness.
+fn zero_annexed(tx: &Transaction, k: usize, n: usize) -> Transaction {
+	let mut t = tx.clone();
+	let mut a = vec![0; n];
+	a[0] = 0x50;
+	t.input[k].witness.script_witness.push(a);
+	t
+}
+
+/// `tx` with an annex of `n` bytes (0x50, then 0xab) on input `k`'s witness.
+fn annexed(tx: &Transaction, k: usize, n: usize) -> Transaction {
+	let mut t = tx.clone();
+	let mut a = vec![0xab; n];
+	a[0] = 0x50;
+	t.input[k].witness.script_witness.push(a);
+	t
+}
+
 /// The fill outputs a taker wants: credit, remainder, its leaf of X, change.
 fn outputs(o: &OrderPolicy, locked: u64, filled: u64, taker_x: &Script, change: Option<(u64, Script)>) -> Vec<TxOut> {
 	let plan = o.plan(locked, filled).unwrap();
@@ -268,7 +322,7 @@ fn outputs(o: &OrderPolicy, locked: u64, filled: u64, taker_x: &Script, change: 
 }
 
 #[test]
-fn order_2_on_regtest() {
+fn order_3_on_regtest() {
 	let mut net = Net::start();
 	// The takers' batch is in Y: list it for fees too, so its round, nodes
 	// and entries pay from their own reserves.
@@ -287,19 +341,26 @@ fn order_2_on_regtest() {
 	let issuer_x = net.fund(vec![explicit(net.x, 1_000_000_000, op_true_spk())]).remove(0);
 	let sched_x = ClockSchedule::new(token_of(&issuer_x), xonly(&s), delay(), vec![mt(net.now() + 28 * 24 * H as u64)]).unwrap();
 	let names = ["A", "B", "C", "D", "E", "F", "G", "H"];
-	let makers: Vec<Maker> = names.iter().map(|n| maker(&net, &s, n, terms, if *n == "D" { soon } else { far })).collect();
+	let makers: Vec<Maker> =
+		names.iter().map(|n| maker(&net, &s, n, terms, if *n == "D" { soon } else { far }, SeqdexVersion::V2)).collect();
+	assert!(makers.iter().all(|m| m.order.leaf().template() == Template::Order3));
+	// Order O, leaf 8: an order-2 leaf, as an order resting from before order-3.
+	let old = maker(&net, &s, "O", terms, far, SeqdexVersion::V1);
+	assert_eq!(old.order.leaf().template(), Template::Order2);
 	let mut owners: Vec<Keypair> = makers.iter().map(|m| m.leaf_key).collect();
 	let mut programs: Vec<[u8; 32]> = makers.iter().map(|m| m.order.program()).collect();
-	for i in makers.len()..LEAVES {
+	owners.push(old.leaf_key);
+	programs.push(old.order.program());
+	for i in makers.len() + 1..LEAVES {
 		let k = keypair(&format!("order-2 batch owner {}", i));
 		programs.push(net.leaf(&k, &s, &format!("order-2 batch leaf {}", i)).program());
 		owners.push(k);
 	}
 	let tx_ = tree(net.x, &net, &s, &sched_x, &owners, &programs, &[N; LEAVES], "x");
-	println!("order-2: {} bytes of parameters, collab {} B, landing {} B, fill program {} to {} B",
+	println!("order-3: {} bytes of parameters, collab {} B, landing {} B, fill program {} to {} B",
 		makers[0].order.data_bytes().len(), makers[0].order.collab_script().len(), makers[0].order.landing_script().len(),
-		arca_covenant::order_programs::ORDER_FILL_WHOLE_M2.len() / 2, arca_covenant::order_programs::ORDER_FILL_M4.len() / 2);
-	let (rx, rxt) = round(&mut net, "round: one batch of X holding eight order-2 leaves", &issuer_x, &sched_x, &tx_);
+		arca_covenant::order_programs::ORDER3_FILL_WHOLE_M2.len() / 2, arca_covenant::order_programs::ORDER3_FILL_M4.len() / 2);
+	let (rx, rxt) = round(&mut net, "round: one batch of X holding eight order-3 leaves and one order-2 leaf", &issuer_x, &sched_x, &tx_);
 	net.purse.push(coin_of(rxt, 2, &rx));
 
 	// Y: the takers' leaves, one per part.
@@ -413,6 +474,11 @@ fn order_2_on_regtest() {
 	// The control: the same fill, the operator's signature over its outputs.
 	let t = fill(&mut net, &a.order, &oa, good.clone(), &good, 4, true, &s, payers(&pay));
 	println!("A/fill 1: {}", judged(&a.order, &t, N, 4, true));
+	// The operator's signature covers no annex, so a relay could add one: order-3 refuses it.
+	assert_eq!(t.input[0].witness.script_witness.len(), 4);
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 3-byte annex", &annexed(&t, 0, 3));
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 1,000-byte annex", &annexed(&t, 0, 1_000));
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 1,000-byte zero annex", &zero_annexed(&t, 0, 1_000));
 	let a1 = net.pass("A/fill 1: 3,000,000 X for 6,000,000 Y; credit 0 to its leaf, the rest under the next salt", &t);
 	let credit_a1 = coin_of(a1, 0, &t);
 	let ra = coin_of(a1, 1, &t);
@@ -489,7 +555,44 @@ fn order_2_on_regtest() {
 	short.tx.output[0] = explicit(net.y, 2 * lf - 1, plain(&a.refund_key));
 	short.tx.output[3] = explicit(net.y, 1_001, op_true_spk());
 	net.refuse("A/neg an on-chain fill of the landed order one atom short", &short.tx, jet);
-	net.pass("A/an on-chain taker fills the landed order by seqdex/order (no signature)", &sx.tx);
+	// The fill signs nothing, so anyone could add an annex: seqdex/order version 2 refuses it.
+	assert_eq!(a.order.landed.version, SeqdexVersion::V2);
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 3-byte annex", &annexed(&sx.tx, 0, 3));
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 1,000-byte annex", &annexed(&sx.tx, 0, 1_000));
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 1,000-byte zero annex",
+		&zero_annexed(&sx.tx, 0, 1_000));
+	net.pass("A/an on-chain taker fills the landed order by seqdex/order version 2 (no signature)", &sx.tx);
+
+	// ---------------------------------------------------------------- O
+	// An order-2 leaf resting from before order-3 is filled as it always was.
+	let tx = unroll(&tx_.lowest[2], &lows[2], &s, t0);
+	let l2 = net.pass("O/unroll of X lowest node 2, by the operator", &tx);
+	let tx = unlock(&tx_, 8, &coin_of(l2, 0, &tx), old.order.script_pubkey());
+	let uo = net.pass("O/order O's entry into its order-2 leaf, by the operator", &tx);
+	let oo = coin_of(uo, 0, &tx);
+	let pay_o = net.fund(vec![explicit(net.y, 30_000_000, op_true_spk())]).remove(0);
+	let good_o = outputs(&old.order, N, f1, &taker_x, Some((30_000_000 - 2 * f1, op_true_spk())));
+	let t = fill(&mut net, &old.order, &oo, good_o.clone(), &good_o, 4, true, &s, payers(&pay_o));
+	println!("O/fill: {}", judged(&old.order, &t, N, 4, true));
+	assert_eq!(t.input[0].witness.script_witness[2], Vec::<u8>::from_hex(arca_covenant::order_programs::ORDER_CMR).unwrap());
+	// order-2 takes an annex the operator never signed. A node before
+	// Sequentia 25.2.4 relays the fill with one; a node from it refuses the
+	// annex at relay (it is not zeros), and a block producer can still mine
+	// it: the block takes the padded fill either way, and the order fills.
+	let padded = annexed(&t, 0, 1_000);
+	assert_eq!(padded.txid(), t.txid(), "the annex is witness data");
+	let fo = net.pass_or_mine("O/fill of the order-2 leaf with a 1,000-byte annex nobody signed: 3,000,000 X for 6,000,000 Y, \
+		the rest resting as order-2", &padded, ANNEX_NONZERO);
+	assert_eq!(net.witness_of(&fo, 0).len(), 5, "the block keeps the annex");
+	assert_eq!(coin_of(fo, 1, &t).txout.script_pubkey, old.order.next().script_pubkey());
+	assert_eq!(old.order.next().leaf().template(), Template::Order2);
+	assert_eq!(coin_of(fo, 0, &t).txout.script_pubkey, old.order.credit_leaf().unwrap().script_pubkey());
+	// Its remainder, an order-2 leaf too, fills as it always did.
+	let o2n = old.order.next();
+	let pay_o2 = net.fund(vec![explicit(net.y, 2 * 2_000_000, op_true_spk())]).remove(0);
+	let outs = outputs(&o2n, N - f1, 2_000_000, &taker_x, None);
+	let t = fill(&mut net, &o2n, &coin_of(fo, 1, &t), outs.clone(), &outs, 3, true, &s, payers(&pay_o2));
+	net.pass("O/fill of the order-2 remainder: 2,000,000 X, m = 3, the rest resting as order-2", &t);
 
 	// The takers' Y tree, down to the lowest nodes, by the operator: the
 	// lineage it publishes to answer an order brought to the chain.
@@ -527,7 +630,7 @@ fn order_2_on_regtest() {
 			return InTree { fill: sx.tx, checkpoint: None, taker_leaf_tx: unl };
 		}
 		let cp = CheckpointPolicy { owner: xonly(tk), operator: xonly(&s), salt: label32(&format!("order-2 taker {} checkpoint", i)),
-			chain: net.chain, sweep: sched_y.sweep(true, false) };
+			chain: net.chain, sweep: sched_y.sweep(true, false), v2: false };
 		let cp_out = ExplicitOutput::new(net.y, ty_value, cp.script_pubkey());
 		let m_cp = tl.collab_message(net.y, ty_value, std::slice::from_ref(&cp_out)).unwrap();
 		let fcc = net.fee_coin();
@@ -710,7 +813,7 @@ fn order_2_on_regtest() {
 	let ug = unlock(&tx_, 6, &entry[6], g.order.script_pubkey());
 	let og = coin_of(ug.txid(), 0, &ug);
 	let cpg = CheckpointPolicy { owner: xonly(&g.leaf_key), operator: xonly(&s), salt: label32("order-2 G cancel checkpoint"),
-		chain: net.chain, sweep: sched_x.sweep(true, false) };
+		chain: net.chain, sweep: sched_x.sweep(true, false), v2: false };
 	let cpo = ExplicitOutput::new(net.x, N, cpg.script_pubkey());
 	let cancel = collab(&mut net, &g.order, &og, std::slice::from_ref(&cpo), &s, &g.leaf_key);
 	net.pass("G/the maker brings the order it cancelled to the chain", &ug);

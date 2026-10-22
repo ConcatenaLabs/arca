@@ -9,7 +9,8 @@
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
 //!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen] \
 //!         [--issuer <instance file>=<mnemonic file> …] [--mint-limiter <path>] \
-//!         [--supervision-node <url> --supervision-cookie <file>]
+//!         [--supervision-node <url> --supervision-cookie <file>] \
+//!         [--restricted <asset>=<policy key>[:<clawback key>] …]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
 //!         (--keeper-key <key> … --keepers-required <k> | --no-keepers)
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
@@ -31,6 +32,18 @@
 //! as the coin's script does, so a request naming another landing gets a
 //! signature that spends nothing (`server::supervision`). Without one it signs no message
 //! for a `landing-1` coin at all.
+//!
+//! With `--restricted`, the signer serves a restricted asset (an OpenAMP
+//! asset) held in `enclave-1` leaves, whose policy server co-signs beside the
+//! operator (`server::restricted`): it signs a rebindable message of that
+//! asset only beside the policy key's signature over that very message
+//! (`arca_covenant::enclave::policy_cosign_digest`), and for an `enclave-1`
+//! coin it builds the message with the digest of the holder's enclave after
+//! `K`, from the holder the request names and the asset's keys given here, as
+//! the coin's script does. So no database and no server gets `S`'s signature
+//! for a move of the asset the policy server did not approve, and a request
+//! naming another holder gets a signature that spends nothing. It signs no
+//! forfeit of such an asset, and no `enclave-1` message of any other asset.
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. `--pubkey` prints the operator
@@ -180,6 +193,22 @@ struct Args {
 	/// `--supervision-node <url>` and `--supervision-cookie <file>`: the node
 	/// the signer reads freezes from.
 	supervision: Option<(String, PathBuf)>,
+	/// `--restricted <asset>=<policy key>[:<clawback key>]`: each restricted
+	/// asset's policy key, and its issuer's clawback key where it elected one.
+	restricted: Vec<(elements::AssetId, XOnlyPublicKey, Option<XOnlyPublicKey>)>,
+}
+
+/// Reads `--restricted`'s value: `<asset>=<policy key>[:<clawback key>]`,
+/// the keys x-only, in hex.
+fn restricted_arg(v: &str) -> Result<(elements::AssetId, XOnlyPublicKey, Option<XOnlyPublicKey>), String> {
+	let (a, keys) = v.split_once('=').ok_or("--restricted <asset>=<policy key>[:<clawback key>]")?;
+	let asset = elements::AssetId::from_str(a).map_err(|e| format!("--restricted: the asset: {}", e))?;
+	let key = |k: &str| XOnlyPublicKey::from_slice(&unhex(k)?).map_err(|e| format!("--restricted: a key: {}", e));
+	let (policy, clawback) = match keys.split_once(':') {
+		Some((p, c)) => (key(p)?, Some(key(c)?)),
+		None => (key(keys)?, None),
+	};
+	Ok((asset, policy, clawback))
 }
 
 fn args() -> Result<Args, String> {
@@ -198,6 +227,7 @@ fn args() -> Result<Args, String> {
 	let mut keeper_timeout = std::time::Duration::from_secs(5);
 	let mut pubkey = false;
 	let mut start_keepers_seen = false;
+	let mut restricted = vec![];
 	let mut sign_record = None;
 	let mut issuers: Vec<(PathBuf, PathBuf)> = vec![];
 	let mut mint_tool = PathBuf::from("mint-limiter");
@@ -233,6 +263,7 @@ fn args() -> Result<Args, String> {
 			"--mint-limiter" => mint_tool = PathBuf::from(value()?),
 			"--supervision-node" => supervision_node = Some(value()?),
 			"--supervision-cookie" => supervision_cookie = Some(PathBuf::from(value()?)),
+			"--restricted" => restricted.push(restricted_arg(&value()?)?),
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
@@ -246,7 +277,7 @@ fn args() -> Result<Args, String> {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey: false, sign_record: Some(file),
 			genesis: genesis.ok_or("--genesis is required: the record is signed only for the chain it names")?, socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None,
+			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None, restricted: vec![],
 		});
 	}
 	if pubkey {
@@ -258,7 +289,7 @@ fn args() -> Result<Args, String> {
 		return Ok(Args {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey, sign_record: None, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None,
+			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None, restricted: vec![],
 		});
 	}
 	let compact = match (compact_into, drop_salts) {
@@ -321,6 +352,7 @@ fn args() -> Result<Args, String> {
 			(None, None) => None,
 			_ => return Err("--supervision-node and --supervision-cookie go together".into()),
 		},
+		restricted,
 	})
 }
 
@@ -493,6 +525,8 @@ struct State {
 	mint_tool: PathBuf,
 	/// The node the signer reads freezes of supervised assets from.
 	supervision: Option<sequentia_ext::rpc::Client>,
+	/// Each restricted asset's policy key and clawback key.
+	restricted: std::collections::HashMap<elements::AssetId, (XOnlyPublicKey, Option<XOnlyPublicKey>)>,
 }
 
 /// Whether `landing`, a `landing-1` coin's landing program, is free for
@@ -787,7 +821,8 @@ async fn futures_join<F: std::future::Future>(fs: impl Iterator<Item = F>) -> Ve
 
 /// The refusal code of a signer error: the code it starts with.
 fn code_of(e: &str) -> Option<String> {
-	[ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED, KEEPERS_UNAVAILABLE, server::supervision::FROZEN].into_iter()
+	[ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED, KEEPERS_UNAVAILABLE, server::supervision::FROZEN, server::restricted::POLICY,
+		server::restricted::RESTRICTED].into_iter()
 		.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string)
 }
 
@@ -941,7 +976,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig, named } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -973,9 +1008,54 @@ async fn answer(state: &State, line: &str) -> Response {
 					Some(l) => Some(<[u8; 20]>::try_from(unhex(l)?.as_slice()).map_err(|_| "landing: 20 bytes".to_string())?),
 					None => None,
 				};
-				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing))
+				// A vtxo-2 coin: the inputs its message names, the coin's own
+				// at its index, of the asset and value it spends.
+				let named = match &named {
+					Some(n) => {
+						if landing.is_some() {
+							return Err("a vtxo-2 coin has no landing".into());
+						}
+						let inputs = n.inputs.iter().map(|o| o.to_output().map(|o| o.txout())).collect::<Result<Vec<_>, _>>()?;
+						match inputs.get(n.index as usize) {
+							Some(o) if o.asset.explicit() == Some(asset_in) && o.value.explicit() == Some(value_in) => {},
+							_ => return Err(format!("named input {} is not the coin spent, {} of {}", n.index, value_in, asset_in)),
+						}
+						Some((n.index, inputs))
+					},
+					None => None,
+				};
+				let enclave = match &enclave {
+					Some(h) => Some(XOnlyPublicKey::from_slice(&unhex(h)?).map_err(|e| format!("enclave: {}", e))?),
+					None => None,
+				};
+				let policy_sig = match &policy_sig {
+					Some(s) => Some(Signature::from_slice(&unhex(s)?).map_err(|e| format!("policy_sig: {}", e))?),
+					None => None,
+				};
+				// A restricted asset's coin: the asset's keys, as given at
+				// start; a coin of no restricted asset is never enclave-1.
+				let restricted = state.restricted.get(&asset_in).copied();
+				match (&restricted, &enclave, &landing, &forfeit) {
+					(None, Some(_), _, _) => return Err(format!("{}: asset {} is not served restricted here: no enclave-1 coin of it is \
+						co-signed", server::restricted::RESTRICTED, asset_in)),
+					(_, Some(_), Some(_), _) => return Err("a coin is enclave-1 or landing-1, not both".into()),
+					(Some(_), _, _, Some(_)) => return Err(format!("{}: asset {} is restricted: it is not refreshed in the tree, so no \
+						forfeit of it is signed", server::restricted::RESTRICTED, asset_in)),
+					_ => {},
+				}
+				let enclave = match (enclave, restricted) {
+					(Some(holder), Some((policy, clawback))) => Some(arca_covenant::Enclave { holder, policy, clawback }),
+					_ => None,
+				};
+				// A vtxo-2 coin is of an open asset: a restricted asset's coins
+				// are enclave-1 leaves and their checkpoints, under vtxo-1's path.
+				if named.is_some() && restricted.is_some() {
+					return Err(format!("{}: asset {} is restricted: its coins are enclave-1, never vtxo-2", server::restricted::RESTRICTED,
+						asset_in));
+				}
+				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig, named))
 			})();
-			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing) = match parsed {
+			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig, named) = match parsed {
 				Ok(p) => p,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
@@ -994,14 +1074,36 @@ async fn answer(state: &State, line: &str) -> Response {
 					return Response { code: code_of(&e), error: Some(e), ..none };
 				}
 			}
-			let k = match &landing {
-				Some(l) => chain.landing_prefix(&salt, l),
-				None => chain.leaf_constant(&salt).to_vec(),
+			let k = match (&landing, &enclave) {
+				(Some(l), _) => chain.landing_prefix(&salt, l),
+				(None, Some(e)) => chain.enclave_prefix(&salt, &e.digest()),
+				(None, None) => chain.leaf_constant(&salt).to_vec(),
 			};
-			let message = match rebind_message(&k, asset_in, value_in, &outputs) {
+			let built = match &named {
+				Some((index, inputs)) => {
+					let c = arca_covenant::collab::Collab2 { owner, operator: key.x_only_public_key().0, salt, chain: *chain };
+					let txouts: Vec<elements::TxOut> = outputs.iter().map(|o| o.txout()).collect();
+					c.message(*index, inputs, &txouts)
+				},
+				None => rebind_message(&k, asset_in, value_in, &outputs),
+			};
+			let message = match built {
 				Ok(m) => m,
 				Err(e) => return Response { error: Some(e.to_string()), ..none },
 			};
+			// A restricted asset's message is signed only beside its policy
+			// key's approval of that very message.
+			if let Some((policy, _)) = restricted {
+				let approved = policy_sig.is_some_and(|s| verify_digest(&s,
+					&arca_covenant::enclave::policy_cosign_digest(&message.digest), &policy));
+				if !approved {
+					let e = format!("{}: message {} of restricted asset {} carries no valid approval by its policy key {}: the signer \
+						co-signs a move of the asset only beside its policy server's", server::restricted::POLICY, hex(&message.digest),
+						asset_in, hex(&policy.serialize()));
+					eprintln!("arca-signer: refused rebind for the leaf of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
+					return Response { code: Some(server::restricted::POLICY.into()), error: Some(e), ..none };
+				}
+			}
 			// The owner signed this very message: an entry under its key is
 			// its own doing, never another holder's.
 			if !verify_digest(&owner_sig, &message.digest, &owner) {
@@ -1455,8 +1557,13 @@ async fn main() {
 		eprintln!("arca-signer: reads freezes of supervised assets from the node at {}", url);
 		sequentia_ext::rpc::Client::new(url.clone(), sequentia_ext::rpc::Auth::CookieFile(cookie.clone())).with_timeout(30)
 	});
+	for (a, p, c) in &args.restricted {
+		eprintln!("arca-signer: serves restricted asset {}: its messages co-signed only beside policy key {}, clawback {}", a,
+			hex(&p.serialize()), c.map_or("none".to_string(), |k| hex(&k.serialize())));
+	}
+	let restricted = args.restricted.iter().map(|(a, p, c)| (*a, (*p, *c))).collect();
 	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default(),
-		issuers, mint_tool: args.mint_tool.clone(), supervision });
+		issuers, mint_tool: args.mint_tool.clone(), supervision, restricted });
 	match &state.keepers {
 		// At start, before anything is served: the keepers' latest heads
 		// against the record. One the record does not hold stops the signer

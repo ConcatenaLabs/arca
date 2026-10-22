@@ -112,6 +112,7 @@ impl Participations {
 		}
 		// A coin whose holder is frozen is refused before anything else.
 		crate::supervision::gate(&self.store, &self.finality, p, &d.inputs).await?;
+		crate::restricted::gate(&self.store, p, &d.inputs, "a distribution").await?;
 		let now = self.now().await?;
 		if let Some(t) = d.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {

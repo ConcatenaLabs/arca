@@ -300,9 +300,10 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		};
 		let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
 			(Template::Channel1, None, None, None) => None,
-			(Template::Vtxo1, None, None, None) => None,
+			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
-			(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
+			(Template::Order2 | Template::Order3, None, Some(o), None)
+				if o.template() == spec.template && o.check(params.asset, &spec.owner, &operator).is_ok() => None,
 			(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
 				Ok(t) => Some(t),
 				Err(_) => return Err(TreeError::Template { leaf: i }),
@@ -312,12 +313,13 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		if spec.value < min || spec.value > MAX_VALUE {
 			return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 		}
-		let leaf = LeafPolicy {
+		let leaf = LeafPolicy { enclave: None,
 			owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 			htlc: spec.htlc,
 			order: spec.order,
 			landing,
 			channel,
+			v2: spec.template == Template::Vtxo2,
 		};
 		let program = leaf.program();
 		if let Some(first) = seen.insert(program, i) {

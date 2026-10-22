@@ -140,6 +140,8 @@ pub enum PlanError {
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
 	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
+	#[error(transparent)]
 	Coin(CoinError),
 	#[error("{0}")]
 	BadSignature(String),
@@ -186,6 +188,7 @@ impl PlanError {
 			Rate(_) => "rate_stale",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Store(StoreError::KeyReused) => "key_reused",
 			Store(StoreError::SaltReused(_)) => "salt",
 			Store(StoreError::NonceUnknown) => "nonce_unknown",
@@ -398,6 +401,7 @@ impl Plans {
 		let now = self.now().await?;
 		let digest = quote_digest(&self.params.chain, &self.params.operator, &req.coin, &req.owner_nonces, req.exit_delay);
 		let c = self.first_coin(&req.coin, &digest, now).await?;
+		vtxo1_only(&c.coin)?;
 		if !verify_digest(&req.attestation, &digest, &c.coin.leaf.owner) {
 			return Err(PlanError::BadSignature("the attestation is not the coin's owner's signature over the quote request".into()));
 		}
@@ -437,6 +441,7 @@ impl Plans {
 	/// on-chain script, not its landing.
 	async fn supervised_coin(&self, coin: &LeafId) -> Result<(), PlanError> {
 		crate::supervision::gate(&self.store, &self.finality, &self.params, std::slice::from_ref(coin)).await?;
+		crate::restricted::gate(&self.store, &self.params, std::slice::from_ref(coin), "a plan of offline refresh").await?;
 		if let Some(row) = self.store.leaf(&coin.0).await? {
 			let asset = AssetId::from_byte_array(row.asset);
 			if self.params.supervised(&asset).is_some() {
@@ -479,6 +484,7 @@ impl Plans {
 		}
 		plan.check().map_err(PlanError::Plan)?;
 		let c = self.first_coin(&req.coin, &id, now).await?;
+		vtxo1_only(&c.coin)?;
 		if c.coin.leaf != first {
 			return Err(PlanError::Internal("the coin's record gives another leaf".into()));
 		}
@@ -908,6 +914,18 @@ pub async fn blocks_participation(store: &Store, leaf: &[u8; 32], participation:
 	Ok(None)
 }
 
+/// A plan's coin is spent by the tapscript collaborative path: each step's
+/// refund spends the coin and its new leaf in one transaction, and a
+/// `vtxo-2` pair names the inputs it is spent beside, which the refund the
+/// holder signs does not. A `vtxo-2` coin is refreshed by its holder.
+fn vtxo1_only(coin: &arca_covenant::ValidCoin) -> Result<(), PlanError> {
+	if coin.leaf.v2 {
+		return Err(PlanError::OutOfBounds(format!("coin {} is vtxo-2: offline refresh plans vtxo-1 coins, as a step's refund spends \
+			the coin beside its new leaf, which a vtxo-2 pair names; its holder refreshes it", coin.id)));
+	}
+	Ok(())
+}
+
 /// The participation of its holder's that holds the coin `row`, when it is
 /// spent by one that is no plan's step: the coin is then the holder's to give
 /// up in that participation's round, and no step runs from it.
@@ -953,12 +971,12 @@ pub async fn release_given_up(store: &Store) -> Result<usize, StoreError> {
 /// The covenant plan a stored plan is, rebuilt from what the server keeps.
 pub fn plan_of(row: &PlanRow, params: &Params) -> Result<Plan, String> {
 	let key = |b: &[u8; 32]| XOnlyPublicKey::from_slice(b).map_err(|e| e.to_string());
-	let first = LeafPolicy {
+	let first = LeafPolicy { enclave: None,
 		owner: key(&row.first_owner)?, operator: params.operator, salt: row.first_salt, chain: params.chain,
 		exit_delay: RelativeTime::from_units(row.first_delay).map_err(|e| e.to_string())?, htlc: None,
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let mut steps = Vec::with_capacity(row.steps.len());
 	for s in &row.steps {

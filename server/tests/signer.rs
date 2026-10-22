@@ -44,19 +44,19 @@ async fn the_signer_process() {
 
 	// A rebindable message for a leaf on this chain: the signature verifies
 	// against the message arca-covenant builds.
-	let leaf = LeafPolicy {
+	let leaf = LeafPolicy { enclave: None,
 		owner: xonly(&keypair("owner")), operator: xonly(&s), salt: [5; 32], chain: Chain::new(genesis),
 		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(),
 		htlc: None,
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let asset = AssetId::from_slice(&[3; 32]).unwrap();
 	let outs = vec![ExplicitOutput::new(asset, 9_000, Script::from(vec![0x51]))];
 	let owner = keypair("owner");
 	let msg = leaf.collab_message(asset, 10_000, &outs).unwrap();
-	let sig = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs).await.unwrap();
+	let sig = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs, None).await.unwrap();
 	assert!(verify_digest(&sig, &msg.digest, &xonly(&s)));
 	// The same parts on another chain give another message: this signature
 	// means nothing there.
@@ -79,7 +79,7 @@ async fn the_signer_process() {
 		assert!(v["error"].is_string() && v["signature"].is_null(), "{}: {}", what, answer);
 		println!("refused, {}: {}", what, v["error"].as_str().unwrap());
 	}
-	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &[0; 32], &[0; 32]), &[0; 32], None, asset, 1, &[]).await.unwrap_err();
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &[0; 32], &[0; 32]), &[0; 32], None, asset, 1, &[], None).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 
 	// The spend of one of the operator's own paths: a clock's release. The
@@ -182,7 +182,7 @@ async fn the_signers_record() {
 	let spend = |k: &Keypair, salt: [u8; 32], o: ExplicitOutput| {
 		let client = client.clone();
 		let k = *k;
-		async move { client.rebind(&xonly(&k), &owner_sig(&k, genesis, &salt, asset, 10_000, &[o.clone()]), &salt, None, asset, 10_000, &[o]).await }
+		async move { client.rebind(&xonly(&k), &owner_sig(&k, genesis, &salt, asset, 10_000, &[o.clone()]), &salt, None, asset, 10_000, &[o], None).await }
 	};
 
 	// A spend of A's leaf under salt 1, the same again, and a second spend
@@ -211,15 +211,15 @@ async fn the_signers_record() {
 	// refused, and nothing recorded under that key.
 	let o = out(9_000, 5);
 	let wrong_key = owner_sig(&b, genesis, &[5; 32], asset, 10_000, &[o.clone()]);
-	let e = client.rebind(&xonly(&a), &wrong_key, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_key, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A named, B's signature: {}", e);
 	let wrong_message = owner_sig(&a, genesis, &[5; 32], asset, 10_000, &[out(9_000, 6)]);
-	let e = client.rebind(&xonly(&a), &wrong_message, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_message, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A's signature over another message: {}", e);
 	let wrong_salt = owner_sig(&a, genesis, &[6; 32], asset, 10_000, &[o.clone()]);
-	let e = client.rebind(&xonly(&a), &wrong_salt, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_salt, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A's signature for another salt: {}", e);
 
@@ -234,7 +234,7 @@ async fn the_signers_record() {
 		let client = client.clone();
 		async move {
 			let sig = owner_sig(&a, genesis, &salt, asset, 10_000, &[o.clone()]);
-			client.rebind_forfeit(&xonly(&a), &sig, &salt, None, asset, 10_000, &f, &o).await
+			client.rebind_forfeit(&xonly(&a), &sig, &salt, None, asset, 10_000, &f, &o, None).await
 		}
 	};
 	let (f1, f1b, f2) = (forfeit(7, 1), forfeit(7, 2), forfeit(8, 1));
@@ -257,7 +257,7 @@ async fn the_signers_record() {
 	let fb = ForfeitPolicy { owner: xonly(&b), ..forfeit(7, 3) };
 	let ob = fout(&fb);
 	let sig = owner_sig(&b, genesis, &[2; 32], asset, 10_000, &[ob.clone()]);
-	let e = client.rebind_forfeit(&xonly(&b), &sig, &[2; 32], None, asset, 10_000, &fb, &ob).await.unwrap_err();
+	let e = client.rebind_forfeit(&xonly(&b), &sig, &[2; 32], None, asset, 10_000, &fb, &ob, None).await.unwrap_err();
 	println!("salt 2: B's forfeit for the round A's forfeit was signed for: {}", e);
 	refused_twice(e);
 	refused_twice(spend(&b, [2; 32], out(9_000, 1)).await.unwrap_err());
@@ -1539,4 +1539,62 @@ async fn what_a_witness_costs_the_signer() {
 	}
 	run.stop();
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `vtxo-2` coin: the signer builds `arca/collab-2`'s message from the
+/// inputs the request names, the coin's own at its index; refuses a named
+/// input that is not the coin it spends and a landing beside named inputs;
+/// and signs one message per salt whatever its form.
+#[tokio::test]
+async fn the_signer_builds_a_vtxo_2_message_from_its_named_inputs() {
+	let s = keypair("v2 operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a v2 chain"));
+	let p = SignerProcess::start(&s, genesis);
+	let client = SignerClient::new(&p.socket);
+	let owner = keypair("v2 owner");
+	let leaf = LeafPolicy {
+		owner: xonly(&owner), operator: xonly(&s), salt: [6; 32], chain: Chain::new(genesis),
+		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, enclave: None, v2: true,
+	};
+	let asset = AssetId::from_slice(&[3; 32]).unwrap();
+	let coin = ExplicitOutput::new(asset, 10_000, leaf.script_pubkey());
+	let other = ExplicitOutput::new(asset, 7_000, Script::from(vec![0x51, 0x20].into_iter().chain([8u8; 32]).collect::<Vec<u8>>()));
+	let outs = vec![ExplicitOutput::new(asset, 16_000, Script::from(vec![0x51]))];
+	let named = vec![other.clone(), coin.clone()];
+	use arca_covenant::Rebindable;
+	let msg = leaf.message_in(1, &named.iter().map(|o| o.txout()).collect::<Vec<_>>(), &outs).unwrap();
+	let wire = || Some(server::signer::WireNamed::new(1, &named));
+	// The coin at another index than it is named: refused before anything is
+	// recorded.
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs,
+		Some(server::signer::WireNamed::new(0, &named))).await.unwrap_err();
+	println!("REFUSED, the coin named at another index: {}", e);
+	// A landing with named inputs: refused.
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, Some([4; 20]), asset, 10_000, &outs,
+		wire()).await.unwrap_err();
+	println!("REFUSED, a landing beside named inputs: {}", e);
+	// The owner's signature over the vtxo-1 form of the same spend: not the
+	// message the signer builds, so refused.
+	let v1 = LeafPolicy { v2: false, ..leaf }.collab_message(asset, 10_000, &outs).unwrap();
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &v1.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs, wire())
+		.await.unwrap_err();
+	println!("REFUSED, the owner's signature over the vtxo-1 form: {}", e);
+	// The honest request: S signs arca/collab-2's message.
+	let sig = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs, wire())
+		.await.unwrap();
+	assert!(verify_digest(&sig, &msg.digest, &xonly(&s)), "S signed the vtxo-2 message the covenant builds");
+	assert_eq!(msg.preimage.len(), 32 + arca_covenant::collab::REST_BYTES);
+	println!("signed the vtxo-2 message of the coin at index 1 of 2 named inputs");
+	// One message per salt: the vtxo-1 form of another spend under the same
+	// salt, and the vtxo-2 form of other outputs, are both refused.
+	let other_outs = vec![ExplicitOutput::new(asset, 15_000, Script::from(vec![0x52]))];
+	let v1b = LeafPolicy { v2: false, ..leaf }.collab_message(asset, 10_000, &other_outs).unwrap();
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &v1b.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &other_outs, None)
+		.await.unwrap_err();
+	assert!(matches!(e, SignerError::AlreadySigned(_)), "{}", e);
+	let m2 = leaf.message_in(1, &named.iter().map(|o| o.txout()).collect::<Vec<_>>(), &other_outs).unwrap();
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &m2.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &other_outs, wire())
+		.await.unwrap_err();
+	assert!(matches!(e, SignerError::AlreadySigned(_)), "{}", e);
+	println!("REFUSED, a second message under the salt, in either form: {}", e);
 }

@@ -360,7 +360,7 @@ fn a_boards_forfeit_rolled_back_still_wins() {
 	let x = c.net.x;
 	let s = keypair("d4 operator");
 	let a = keypair("d4 board owner");
-	let rec = BoardRecord {
+	let rec = BoardRecord { enclave: None,
 		template: Template::Board1, owner: xonly(&a), owner_nonce: label32("d4 board nonce"),
 		operator_nonce: label32("d4 board operator nonce"), exit_delay: delay(), asset: x, value: LEAF,
 		chain: c.net.chain, operator: xonly(&s),
