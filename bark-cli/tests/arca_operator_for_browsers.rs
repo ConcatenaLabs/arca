@@ -53,7 +53,15 @@
 //! With `ARCA_OPERATOR_SUPERVISED` set, the chain issues an asset Z under
 //! the supervision descriptor (pause allowed, listed for fees at 1:1), and
 //! the operator serves it under the supervised profile, its signer reading
-//! freezes from the chain's node; `/state` names it `supervised`. With
+//! freezes from the chain's node; `/state` names it `supervised`. Set to a
+//! count `n`, it issues `n` such assets (Z, Z1, …), all named in
+//! `supervised_all`; `/freeze` and `/lift` act on Z. With
+//! `ARCA_OPERATOR_MORE_ASSETS` set to a count `n`, the chain issues `n`
+//! plain assets beyond X and Y (listed for fees at 1:1) and the operator
+//! serves them; `/state` names them `more`, and every asset served in
+//! `assets`. With `ARCA_OPERATOR_LIGHTNING` as well, each of them gets a
+//! Lightning leg as X has (a channel of 10^12 atoms between the same two
+//! nodes). With
 //! `ARCA_OPERATOR_ISSUER` set (and `MINT_LIMITER`, the mint limiter's tool
 //! of `sequentia-contracts` with `sign`), the chain runs Simplicity and the
 //! operator serves an asset I issuer-operated, its reissuance token in a
@@ -159,12 +167,16 @@ fn unhex(h: &str) -> Result<Vec<u8>, String> {
 	script(h).map(|s| s.into_bytes())
 }
 
-/// What the operator serves beyond X and Y: a supervised asset and its
-/// issuer's freeze records, an issuer-operated asset, and its bond.
+/// What the operator serves beyond X and Y: supervised assets and the first
+/// one's freeze records, an issuer-operated asset, plain assets, and its bond.
 #[derive(Default)]
 struct Profiles {
-	/// The supervised asset and its issuer's operational key.
+	/// The (first) supervised asset and its issuer's operational key.
 	supervised: Option<(AssetId, Keypair)>,
+	/// Every supervised asset, the first one included.
+	supervised_all: Vec<AssetId>,
+	/// The plain assets served beyond X and Y.
+	more: Vec<AssetId>,
 	/// Each standing freeze record, by the script it names.
 	freezes: std::collections::HashMap<String, (OutPoint, String)>,
 	/// The issuer-operated asset.
@@ -173,18 +185,20 @@ struct Profiles {
 	bond: Option<(Keypair, OutPoint)>,
 }
 
-/// Z, issued under the supervision descriptor with the pause capability
-/// into the purse, and listed for fees at 1:1.
-fn issue_supervised(r: &mut Running) -> (AssetId, Keypair) {
-	let op = keypair("Z operational");
-	let rec = keypair("Z recovery");
+/// Z (the `i`th supervised asset; the first is named Z), 1,000,000 units, issued under the
+/// supervision descriptor with the pause capability into the purse, and
+/// listed for fees at 1:1.
+fn issue_supervised(r: &mut Running, i: usize) -> (AssetId, Keypair) {
+	let name = if i == 0 { "Z".to_string() } else { format!("Z{}", i) };
+	let op = keypair(&format!("{} operational", name));
+	let rec = keypair(&format!("{} recovery", name));
 	let coin = r.purse.take_coin(r.purse.policy);
 	let tx = node::spend_op_true(&coin, vec![], 20_000);
 	let parked = Script::new_v0_wpkh(&elements::WPubkeyHash::from_byte_array([1; 20]));
 	let d: Value = r.rt.client().call("decodescript", &[json!(hex(parked.as_bytes()))]).unwrap();
 	let to = d["address"].as_str().or_else(|| d["segwit"]["address"].as_str()).unwrap().to_string();
 	let issued: Value = r.rt.client().call("rawissueasset", &[json!(hex(&serialize(&tx))), json!([{
-		"asset_amount": 100, "asset_address": to, "token_amount": 1, "token_address": to, "blind": false,
+		"asset_amount": 1_000_000, "asset_address": to, "token_amount": 1, "token_address": to, "blind": false,
 		"supervision": {"operationalkey": hex(&op.x_only_public_key().0.serialize()),
 			"recoverykey": hex(&rec.x_only_public_key().0.serialize()), "pause": true},
 	}])]).unwrap();
@@ -311,25 +325,43 @@ fn issue_issuer_operated(r: &mut Running, dir: &std::path::Path) -> (AssetId, Is
 	(i, IssuerSection { limiter: instance.clone(), entropy: entropy_hex, coin: format!("{}:1", txid), state: None }, words)
 }
 
-/// The server with what `ARCA_OPERATOR_SUPERVISED` and `ARCA_OPERATOR_ISSUER`
-/// ask: the assets issued, the signer started again reading freezes from the
-/// chain's node and minting through the limiter, the assets served.
+/// A count from the environment: unset is 0, set to anything but a number 1.
+fn env_count(name: &str) -> usize {
+	std::env::var(name).ok().map(|v| v.trim().parse::<usize>().unwrap_or(1)).unwrap_or(0)
+}
+
+/// The server with what `ARCA_OPERATOR_SUPERVISED`, `ARCA_OPERATOR_ISSUER`
+/// and `ARCA_OPERATOR_MORE_ASSETS` ask: the assets issued, the signer started
+/// again reading freezes from the chain's node and minting through the
+/// limiter, the assets served.
 async fn serve_profiles(r: &mut Running, p: &mut Profiles) {
-	let supervised = std::env::var_os("ARCA_OPERATOR_SUPERVISED").is_some();
+	let supervised = env_count("ARCA_OPERATOR_SUPERVISED");
 	let issuer = std::env::var_os("ARCA_OPERATOR_ISSUER").is_some();
-	if !supervised && !issuer {
+	let more = env_count("ARCA_OPERATOR_MORE_ASSETS");
+	if supervised == 0 && !issuer && more == 0 {
 		return;
 	}
 	let genesis = r.rt.client().genesis_hash().unwrap();
 	let mut extra = vec!["--keeper-timeout-ms".to_string(), "2000".into()];
 	let mut sections = vec![];
-	if supervised {
-		let (z, op) = tokio::task::block_in_place(|| issue_supervised(r));
+	if supervised > 0 {
 		let cookie = r.signer.dir.join("node.cookie");
 		std::fs::write(&cookie, "arca:arca").unwrap();
 		extra.extend(["--supervision-node".to_string(), r.node_url(), "--supervision-cookie".into(), cookie.display().to_string()]);
-		sections.push(AssetSection::new(z, common::running::MIN_LEAF));
-		p.supervised = Some((z, op));
+		for i in 0..supervised {
+			let (z, op) = tokio::task::block_in_place(|| issue_supervised(r, i));
+			sections.push(AssetSection::new(z, common::running::MIN_LEAF));
+			if i == 0 {
+				p.supervised = Some((z, op));
+			}
+			p.supervised_all.push(z);
+		}
+	}
+	for i in 0..more {
+		let m = tokio::task::block_in_place(|| r.purse.issue(&r.rt, &format!("asset M{}", i), 100_000_000_000_000));
+		node::list_fee_asset(&r.rt, m, 100_000_000);
+		sections.push(AssetSection::new(m, common::running::MIN_LEAF));
+		p.more.push(m);
 	}
 	if issuer {
 		let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("browsers-issuer{}", std::process::id()));
@@ -355,7 +387,7 @@ async fn serve_profiles(r: &mut Running, p: &mut Profiles) {
 	config.assets.extend(sections);
 	r.server.reload(&config).await.unwrap();
 	r.config = config;
-	if let Some((z, _)) = p.supervised {
+	for z in p.supervised_all.clone() {
 		r.fund_server(z, 50_000_000).await;
 	}
 	r.produce().await;
@@ -614,6 +646,39 @@ async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNo
 	(r, vec![ox, px])
 }
 
+/// The operator's Lightning leg in each of `more` too, on the same two
+/// nodes as X's: a channel of 10^12 atoms of the asset from its node to the
+/// other, 3·10^11 of it pushed, so that it both receives and pays in it.
+async fn legs_in(r: &mut Running, nodes: &[LightningNode], more: &[AssetId]) {
+	let [ox, px] = nodes else { return };
+	for m in more {
+		let to = ox.receive_script(&r.rt);
+		r.pay_to(to, *m, 2_000_000_000_000);
+		r.produce().await;
+		tokio::task::block_in_place(|| {
+			ox.wait("its funds in the asset", |n| n.ok("listfunds", json!({}))["outputs"].as_array().map(|o| o.iter()
+				.any(|x| x["status"] == "confirmed" && x["asset"].as_str() == Some(&m.to_string()))).unwrap_or(false));
+			ox.open_channel(&r.rt, px, *m, 1_000_000_000_000, 300_000_000_000);
+		});
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if more.iter().any(|m| a.asset == m.to_string()) {
+			a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	for m in more {
+		let g = r.server.gateway.clone();
+		let m = *m;
+		r.wait("the asset's leg up", || g.leg(&m, true).is_ok()).await;
+	}
+}
+
 /// The Bitcoin side of a trade of BTC over Lightning: a Bitcoin regtest
 /// chain, a hub node and a node for each wallet, each with a channel from
 /// the hub. Stopped, and their directories deleted, on drop.
@@ -673,6 +738,11 @@ async fn operator_for_browsers() {
 	};
 	let mut profiles = Profiles::default();
 	serve_profiles(&mut r, &mut profiles).await;
+	// With Lightning, the plain assets beyond X and Y get legs of their own.
+	if !_nodes.is_empty() && !profiles.more.is_empty() {
+		let more = profiles.more.clone();
+		legs_in(&mut r, &_nodes, &more).await;
+	}
 	let btc = std::env::var("ARCA_OPERATOR_BTC_LIGHTNING").ok().map(|n| {
 		let n = n.parse::<usize>().expect("ARCA_OPERATOR_BTC_LIGHTNING is a count of wallets' nodes");
 		tokio::task::block_in_place(|| bitcoin_side(n))
@@ -707,6 +777,9 @@ async fn operator_for_browsers() {
 			None => handle(&mut r, &path, &body).await.map(|mut v| {
 				if path == "/state" {
 					v["supervised"] = json!(profiles.supervised.as_ref().map(|(z, _)| z.to_string()));
+					v["supervised_all"] = json!(profiles.supervised_all.iter().map(|z| z.to_string()).collect::<Vec<_>>());
+					v["more"] = json!(profiles.more.iter().map(|m| m.to_string()).collect::<Vec<_>>());
+					v["assets"] = json!(r.config.assets.iter().map(|a| a.asset.to_string()).collect::<Vec<_>>());
 					v["issuer"] = json!(profiles.issuer.map(|i| i.to_string()));
 					v["bond"] = json!(profiles.bond.as_ref().map(|(_, o)| format!("{}:{}", o.txid, o.vout)));
 				}

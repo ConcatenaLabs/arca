@@ -136,7 +136,7 @@ impl F {
 	}
 
 	fn leaf(&self, owner: &Keypair, salt: &str) -> LeafPolicy {
-		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, channel: None }
+		LeafPolicy { enclave: None, owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, channel: None , v2: false}
 	}
 
 	fn r_coin(&self) -> TxOut {
@@ -875,7 +875,7 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 fn checkpoint_swap_cases(f: &F, book: &mut Book) {
 	// The checkpoint and the reassignment, both signed before anything exists.
 	let leaf = f.leaf(&f.a, "cp leaf");
-	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: f.schedule.sweep(true, false) };
+	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: f.schedule.sweep(true, false), v2: false };
 	let cp_out = ExplicitOutput::new(f.x, LEAF - FEE, cp.script_pubkey());
 	let m1 = leaf.collab_message(f.x, LEAF, std::slice::from_ref(&cp_out)).unwrap();
 	let recv = ExplicitOutput::new(f.x, 7_000_000, f.leaf(&f.b, "cp recv").script_pubkey());
@@ -1065,7 +1065,7 @@ fn builder_cases(f: &F, book: &mut Book) {
 	let entry = EntryPolicy { unlock_hash: label32("h"), asset: f.x, value: LEAF, leaf_program: f.leaf(&f.a, "salt").program(),
 		sweep: f.schedule.sweep(true, false) };
 	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp salt"), chain: f.chain,
-		sweep: f.schedule.sweep(true, false) };
+		sweep: f.schedule.sweep(true, false), v2: false };
 	let swept = vec![
 		batch.sweepable(fake_outpoint("batch"), value),
 		lowest.sweepable(fake_outpoint("lowest"), value),
@@ -1218,12 +1218,12 @@ fn htlc_cases(f: &F, book: &mut Book) {
 	let timeout = MedianTime::from_consensus(f.created.to_consensus_u32() + 2 * 86_400).unwrap();
 	let lt = timeout.to_consensus_u32();
 	let opd = RelativeTime::from_units(f.delay.units() / 3).unwrap();
-	let mk = |direction, salt: &str| LeafPolicy {
+	let mk = |direction, salt: &str| LeafPolicy { enclave: None,
 		owner: xonly(&f.a), operator: xonly(&f.s), salt: label32(salt), chain: f.chain, exit_delay: f.delay,
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout, operator_delay: opd }),
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let tx = |h: &LeafPolicy, lock: u32, seq: u32, outs: Vec<TxOut>| {
 		Spend::new(lock).fake_input("htlc", explicit(f.x, LEAF, h.script_pubkey()), seq).outputs(outs)

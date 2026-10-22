@@ -648,6 +648,22 @@ pub struct AssetSection {
 	pub channel_capacity: Option<String>,
 	#[serde(default)]
 	pub channel_capacity_value: Option<String>,
+	/// The restricted profile ([`crate::restricted`]): the asset is a
+	/// restricted asset its issuer serves in this tree, and its policy server
+	/// co-signs beside the operator.
+	#[serde(default)]
+	pub restricted: Option<RestrictedSection>,
+}
+
+/// A restricted asset's policy server.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RestrictedSection {
+	/// The policy server's base URL, as `http://host:port`.
+	pub policy_server: String,
+	/// The file holding the issuer's token for the policy server's issuer
+	/// calls, readable by the operator alone.
+	pub token_file: String,
 }
 
 /// A supervised asset's settings.
@@ -671,7 +687,7 @@ impl AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
 			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None, supervised: None,
-			channel_capacity: None, channel_capacity_value: None,
+			channel_capacity: None, channel_capacity_value: None, restricted: None,
 		}
 	}
 }
@@ -1322,7 +1338,7 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			},
 		};
 		let channel_capacity = amount("channel_capacity", &a.channel_capacity, &a.channel_capacity_value)?;
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity }));
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, restricted: None }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1377,6 +1393,40 @@ async fn supervise(list: &mut [(AssetId, AssetParams)], config: &Config, finalit
 		}
 		log::info!("asset {} is supervised: served under the supervised profile, landing allowance {}", id, landing_allowance);
 		p.supervised = Some(crate::params::Supervised { landing_allowance });
+	}
+	Ok(())
+}
+
+/// Serves every asset whose section names a policy server under the
+/// restricted profile ([`crate::restricted`]): the asset's tree terms read
+/// from its policy server, which must name `operator` as the tree's operator.
+/// Refuses a restricted asset that is also supervised, issuer-operated or
+/// served over Lightning, none of which keeps it in `enclave-1` leaves.
+async fn restrict(list: &mut [(AssetId, AssetParams)], config: &Config, operator: elements::secp256k1_zkp::XOnlyPublicKey) -> Result<(), StartError> {
+	for (id, p) in list.iter_mut() {
+		let section = config.assets.iter().find(|s| AssetId::from_str(&s.asset).ok() == Some(*id));
+		let Some(r) = section.and_then(|s| s.restricted.clone()) else {
+			p.restricted = None;
+			continue;
+		};
+		if p.supervised.is_some() || p.issuer.is_some() || section.is_some_and(|s| s.lightning.is_some())
+			|| p.channel_capacity != crate::params::Amount::Atoms(0) {
+			return Err(StartError(format!("asset {}: restricted: a restricted asset is held in enclave-1 leaves alone, so it is not also \
+				supervised, issuer-operated, served over Lightning or in channel-1 leaves here", id)));
+		}
+		let token = std::fs::read_to_string(&r.token_file)
+			.map_err(|e| StartError(format!("asset {}: restricted.token_file {}: {}", id, r.token_file, e)))?.trim().to_string();
+		let terms = crate::restricted::tree_terms(&r.policy_server, *id).await
+			.map_err(|e| StartError(format!("asset {}: restricted: {}", id, e)))?;
+		if terms.operator != operator {
+			return Err(StartError(format!("asset {}: restricted: the policy server names {} as the operator of the asset's tree, and this \
+				operator's key is {}: it serves the asset only in a tree its issuer names it the operator of", id,
+				crate::signer::hex(&terms.operator.serialize()), crate::signer::hex(&operator.serialize()))));
+		}
+		log::info!("asset {} is restricted: served in its issuer's tree, every leaf enclave-1, policy key {}, clawback {}, policy server {}",
+			id, crate::signer::hex(&terms.policy.serialize()),
+			terms.clawback.map_or("none".to_string(), |k| crate::signer::hex(&k.serialize())), r.policy_server);
+		p.restricted = Some(crate::restricted::Restricted { policy: terms.policy, clawback: terms.clawback, server: r.policy_server, token });
 	}
 	Ok(())
 }
@@ -1483,6 +1533,7 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, genesis)?;
 		supervise(&mut list, config, &finality).await?;
+		restrict(&mut list, config, operator).await?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
 		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
@@ -1745,6 +1796,7 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, self.params.chain.genesis_hash())?;
 		supervise(&mut list, config, &self.finality).await?;
+		restrict(&mut list, config, self.params.operator).await?;
 		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();

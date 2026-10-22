@@ -21,9 +21,17 @@ jobs:
       - name: Find the node build
         id: node
         run: |
-          run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&per_page=50" \
-            --jq '[.workflow_runs[] | select(.conclusion == "success")] | sort_by(.created_at) | last
-              | {databaseId: .id, headSha: .head_sha}')
+          # GitHub's listing of runs now and then answers with none at all
+          # (total_count 0), which a workflow with builds never has: asked
+          # again until it lists one.
+          run=""
+          for i in $(seq 1 10); do
+            run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&status=success&per_page=1" \
+              --jq 'select(.total_count > 0) | .workflow_runs[0] | {databaseId: .id, headSha: .head_sha}' || true)
+            [ -n "$run" ] && break
+            echo "GitHub listed no successful node build (try $i of 10); asking again"
+            sleep 6
+          done
           if [ -z "$run" ] || [ "$(jq -r .databaseId <<<"$run")" = null ]; then
             echo "no successful node build on master"; exit 1
           fi

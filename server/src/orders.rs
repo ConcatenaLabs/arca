@@ -1,8 +1,9 @@
-//! Resting orders in the tree: an `order-2` leaf ([`arca_covenant::order`])
+//! Resting orders in the tree: an `order-3` leaf ([`arca_covenant::order`])
 //! that its maker rests and leaves, and that takers fill out of round with
-//! the maker offline.
+//! the maker offline. An `order-2` leaf resting from before `order-3` is
+//! published, filled and landed the same way; no round makes a new one.
 //!
-//! **Resting.** A maker asks a round for an `order-2` leaf as for any leaf
+//! **Resting.** A maker asks a round for an `order-3` leaf as for any leaf
 //! (a participation whose wanted leaf names the template and carries the
 //! order's terms; [`crate::participations`] checks them), completes the
 //! participation, then publishes the order ([`Orders::publish`]): the coin's
@@ -71,7 +72,7 @@ use elements::{AssetId, Transaction};
 
 use arca_covenant::order::OrderPolicy;
 use arca_covenant::sign::verify_digest;
-use arca_covenant::spend::margin_for;
+use arca_covenant::spend::{margin_for, Rebindable};
 use arca_covenant::transfer::{fill_hash, FillCoin, FillLeaf, OrderFill, SeenReassignments, TransferInput, MAX_INPUTS};
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, Pair, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
@@ -235,7 +236,7 @@ impl FillRequest {
 				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
 			};
 			outputs.push(OutputRequest {
-				asset, value, leaf: arca_covenant::NewLeaf { owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
+				asset, value, leaf: arca_covenant::NewLeaf { enclave: None, v2: false, owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
 				mailbox, until,
 			});
 		}
@@ -387,7 +388,7 @@ impl Orders {
 			return Err(OrderError::NotAnOrder("a resting order is published by the record of the coin a round made of it".into()));
 		};
 		if record.order.is_none() {
-			return Err(OrderError::NotAnOrder(format!("the coin's template is {}, not order-2", record.template)));
+			return Err(OrderError::NotAnOrder(format!("the coin's template is {}, not an order", record.template)));
 		}
 		let id = record.leaf_id().map_err(|e| OrderError::Malformed(e.to_string()))?;
 		if self.store.resting_order(&id.0).await?.is_some() {
@@ -536,6 +537,7 @@ impl Orders {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, &self.params, &given).await.map_err(CosignError::from)?;
+		crate::restricted::gate(&self.store, &self.params, &given, "a fill of a resting order").await.map_err(CosignError::from)?;
 		let order = self.store.resting_order(&req.order.0).await?.ok_or_else(|| OrderError::UnknownOrder(req.order.to_string()))?;
 		let recorded = self.store.order_fill_by_transfer(&transfer).await?.is_some();
 		if !recorded && order.current_leaf != req.coin.0 {
@@ -673,10 +675,15 @@ impl Orders {
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
+		// The fill spends the order's coin at input 0 and the checkpoints
+		// after it: a vtxo-2 checkpoint's pair names them all, its own index
+		// one past its place among the checkpoints (`fill_tx`).
+		let mut named = vec![oc.coin.output().txout()];
+		named.extend((0..n).map(|j| tplan.checkpoint_output(j).txout()));
 		let mut messages = Vec::with_capacity(n);
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp = tplan.checkpoint_message(k).map_err(internal)?.digest;
-			let re = tplan.reassignment_message(k).map_err(internal)?.digest;
+			let re = tplan.checkpoint(k).message_in(k as u32 + 1, &named, &outputs).map_err(internal)?.digest;
 			if !verify_digest(&i.checkpoint_sig, &cp, &c.coin.leaf.owner) {
 				return Err(OrderError::Cosign(CosignError::BadSignature { input: k, which: "checkpoint" }));
 			}
@@ -812,11 +819,18 @@ impl Orders {
 			let cp_out = tplan.checkpoint_output(k);
 			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
 				c.coin.asset, c.coin.value,
-				std::slice::from_ref(&cp_out)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
+			// A vtxo-2 checkpoint's pair names the fill's inputs: the order's
+			// coin at 0, then every taker checkpoint.
+			let named = checkpoint.v2.then(|| {
+				let mut ins = vec![oc.coin.output()];
+				ins.extend((0..n).map(|j| tplan.checkpoint_output(j)));
+				crate::signer::WireNamed::new(k as u32 + 1, &ins)
+			});
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
-				i.checkpoint_value, &outputs).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				i.checkpoint_value, &outputs, named).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(internal("the signer signed another message than the server built"));

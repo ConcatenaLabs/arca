@@ -1,6 +1,6 @@
 //! The coin records of an in-tree fill of a resting order, on regtest.
 //!
-//! An `order-2` leaf rests in a batch of X; a taker's leaf sits in a batch of
+//! An `order-3` leaf rests in a batch of X; a taker's leaf sits in a batch of
 //! Y. The taker fills the order in the tree: its coin goes through a
 //! checkpoint, and the operator signs the fill. Every coin the fill makes (the
 //! maker's credit, the order resting again, the taker's leaf of X and its
@@ -76,10 +76,10 @@ struct Taker {
 
 fn taker(label: &str) -> Taker {
 	let key = keypair(&format!("order-fill taker {}", label));
-	let leaf = |what: &str| NewLeaf {
+	let leaf = |what: &str| NewLeaf { enclave: None,
 		owner: xonly(&key), owner_nonce: label32(&format!("order-fill taker {} {} owner nonce", label, what)),
 		creator_nonce: label32(&format!("order-fill taker {} {} creator nonce", label, what)), exit_delay: delay(), htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	Taker { x_leaf: leaf("x"), change: leaf("change"), key }
 }
@@ -145,17 +145,18 @@ fn an_in_tree_fill_and_its_coin_records() {
 			maker: arca_covenant::script::sha256(plain(&refund).as_bytes()),
 			expiry: (c.net.now() + 30 * DAY) as u32,
 			refund_key: xonly(&refund),
+			version: arca_covenant::order::SeqdexVersion::V2,
 		},
 		credits: [0, 1, 2, 3].map(|i| xonly(&credit_keys[i]).serialize()),
 	};
 	let (issuer_x, sched_x) = c.schedule(&s);
-	let mut xs = vec![LeafSpec { template: Template::Order2, order: Some(terms), ..spec(&maker, "order-fill order", N, hash(&label32("ox"))) }];
+	let mut xs = vec![LeafSpec { template: Template::Order3, order: Some(terms), ..spec(&maker, "order-fill order", N, hash(&label32("ox"))) }];
 	for i in 1..4 {
 		xs.push(spec(&keypair(&format!("order-fill x owner {}", i)), &format!("order-fill x {}", i), N, hash(&label32(&format!("x{}", i)))));
 	}
 	let tx_ = tree_in(&c, c.net.x, &sched_x, &xs);
 	let (x, y) = (c.net.x, c.net.y);
-	let round_x = round_in(&mut c, "round: an order-2 leaf in a batch of X", x, &issuer_x, &sched_x, &tx_);
+	let round_x = round_in(&mut c, "round: an order-3 leaf in a batch of X", x, &issuer_x, &sched_x, &tx_);
 
 	// The takers' leaves of Y.
 	let issuer_y = c.net.fund(vec![explicit(c.net.y, 2_000_000_000, op_true_spk())]).remove(0);
@@ -169,7 +170,7 @@ fn an_in_tree_fill_and_its_coin_records() {
 	let policy = c.policy(&s);
 	let order_rec = base(&tx_, 0, &maker, label32("ox"), t0);
 	let order = order_rec.validate(&rounds, &policy, &xonly(&maker), &label32("order-fill order owner nonce")).unwrap();
-	assert_eq!(order.leaf.template(), Template::Order2);
+	assert_eq!(order.leaf.template(), Template::Order3);
 	let taker_rec = base(&ty, 0, &takers[0], label32("y0"), t0);
 	let taker_coin = taker_rec.validate(&rounds, &policy, &xonly(&takers[0]), &label32("order-fill y 0 owner nonce")).unwrap();
 
@@ -184,7 +185,7 @@ fn an_in_tree_fill_and_its_coin_records() {
 	assert_eq!(credit_coin.value, 8_000_000);
 	assert_eq!(credit_coin.leaf.template(), Template::Vtxo1);
 	let rest_coin = rest.validate(&rounds, &policy, &xonly(&maker), &label32("order-fill order owner nonce")).unwrap();
-	assert_eq!(rest_coin.leaf.template(), Template::Order2);
+	assert_eq!(rest_coin.leaf.template(), Template::Order3);
 	assert_eq!(rest_coin.value, N - 4_000_000);
 	assert_eq!(rest_coin.hops, 1);
 	let x_coin = got_x.validate(&rounds, &policy, &xonly(&t1.key), &t1.x_leaf.owner_nonce).unwrap();

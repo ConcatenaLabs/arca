@@ -1,4 +1,4 @@
-//! Orders resting in the tree (`order-2`), as the `arca` wallet rests, fills,
+//! Orders resting in the tree (`order-3`), as the `arca` wallet rests, fills,
 //! cancels and lands them, against a whole Arca server on an anchored
 //! proof-of-stake regtest chain.
 //!
