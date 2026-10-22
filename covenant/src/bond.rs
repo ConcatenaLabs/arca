@@ -492,7 +492,9 @@ pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input:
 /// the salt its data leaf names, how many inputs it names and how many
 /// outputs it commits to. `None` when the witness is no such spend.
 pub fn collab2_spend(witness: &[Vec<u8>]) -> Option<([u8; 32], u8, u8)> {
-	let w = witness;
+	// Read as the program sees it, past any annex (BIP341's rule): a valid
+	// spend carries none, since the program refuses one.
+	let w = crate::witness::without_annex(witness);
 	if w.len() != 4 || w[2] != crate::collab::collab_cmr() || w[0].len() != crate::collab::DATA_BYTES + 2 + 128 {
 		return None;
 	}
@@ -509,7 +511,7 @@ pub fn collab2_spend(witness: &[Vec<u8>]) -> Option<([u8; 32], u8, u8)> {
 /// commits to cannot be read. The caller checks the signature
 /// ([`BondPolicy::verify`]).
 pub fn collab2_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, named: &[TxOut]) -> Option<Signed> {
-	let w = &tx.input.get(input)?.witness.script_witness;
+	let w = crate::witness::without_annex(&tx.input.get(input)?.witness.script_witness);
 	let (found, n, m) = collab2_spend(w)?;
 	if found != *salt || named.len() != n as usize || tx.output.len() < m as usize || m == 0 {
 		return None;

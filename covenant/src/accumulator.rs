@@ -548,9 +548,11 @@ impl SeenExit {
 }
 
 /// Reads an exit from an input's witness: `None` when the input does not spend
-/// an accumulator batch by its program.
+/// an accumulator batch by its program. An annex (BIP341), which the
+/// authorisation does not cover and anyone broadcasting the exit can add, is
+/// set aside first ([`crate::witness::without_annex`]): the exit is the same.
 pub fn read_exit(witness: &[Vec<u8>]) -> Option<SeenExit> {
-	let [w, program, cmr, _cb] = witness else { return None };
+	let [w, program, cmr, _cb] = crate::witness::without_annex(witness) else { return None };
 	if cmr[..] != accumulator_cmr()[..] || w.len() != WITNESS_BYTES {
 		return None;
 	}

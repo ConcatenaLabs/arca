@@ -9,10 +9,11 @@
 //! (`flock(2)` on Unix, `LockFileEx` on Windows). The OS releases that
 //! lock when the process exits, even on SIGKILL or a crash.
 //!
-//! From that point on, all per-key locking is in-memory: by
-//! construction, this is the only process touching `datadir`, so the
-//! cross-process semantics of file-based per-key locking would be
-//! redundant.
+//! From that point on, all per-key locking is in-memory, in a keyspace
+//! of the manager's own: by construction, this is the only process
+//! touching `datadir`, so the cross-process semantics of file-based
+//! per-key locking would be redundant, and two datadirs in one process
+//! never contend on a key.
 //!
 //! # Platform support
 //!
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::{LockGuard, LockManager, PidLockError};
-use super::memory::MemoryLockManager;
+use super::internal_memory::InternalMemoryLockManager;
 
 /// File name used for the datadir-level PID lock.
 pub const LOCK_FILE: &str = "LOCK";
@@ -52,7 +53,7 @@ pub struct FlockPidLockManager {
 	// drop of the manager — at which point the OS releases the lock.
 	_pid_file: File,
 	datadir: PathBuf,
-	in_process: MemoryLockManager,
+	in_process: InternalMemoryLockManager,
 }
 
 impl FlockPidLockManager {
@@ -106,7 +107,7 @@ impl FlockPidLockManager {
 		Ok(Self {
 			_pid_file: file,
 			datadir,
-			in_process: MemoryLockManager::new(),
+			in_process: InternalMemoryLockManager::new(),
 		})
 	}
 
@@ -207,5 +208,20 @@ mod test {
 		assert!(g2.is_some(), "different key should be free");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn two_datadirs_keep_their_own_keys() {
+		let (one, two) = (tmp_dir().join("one"), tmp_dir().join("two"));
+		let a = FlockPidLockManager::new(&one).unwrap();
+		let b = FlockPidLockManager::new(&two).unwrap();
+
+		let held = a.try_lock("wallet").await;
+		assert!(held.is_some());
+		assert!(a.try_lock("wallet").await.is_none(), "the same key of the same datadir is held");
+		assert!(b.try_lock("wallet").await.is_some(), "the same key of another datadir is another lock");
+
+		let _ = fs::remove_dir_all(&one);
+		let _ = fs::remove_dir_all(&two);
 	}
 }
