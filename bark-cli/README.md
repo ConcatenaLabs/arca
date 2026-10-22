@@ -1168,16 +1168,22 @@ how many, as `arca claim`), cancels each open plan whose coin has moved
 (spent, exited or lost), and plans each live coin of a round that no plan
 names once its first step could run within ten days (`PLAN_WITHIN` in
 `bark/src/arca/plan.rs`), two expiries ahead (`--expiries`), each step's fee
-bounded at 2,000 millionths of the coin (`--max-fee-ppm`). A plan starts only
+bounded at 2,000 millionths of the coin (`--max-fee-ppm`). `--plan-within
+SECONDS` widens the planning reach alone: `4294967295` plans every leaf of a
+round at the first `care` after it is made, which is what a wallet runs when it
+pays its planned coins through `plan-release` (below), so that a wallet closed
+in a coin's first weeks keeps it. A plan starts only
 from a leaf of a round, so a board or a coin received or taken up out of round
 is refreshed in a round under the same bound once within that reach, and its
 new leaf is planned by a later `care`. A plan's fee is
 taken from the coin, in the coin's own asset; a coin the operator will not
 plan stays unplanned, with its reason, and `sync` refreshes it while the
-wallet is open. A younger coin is left unplanned so that it stays free to pay
-out of round. That leaves a gap: a wallet closed within a coin's first two
-weeks or so and kept closed through that coin's step window can lose the coin
-to the operator's sweep, as any holder who stays away past an expiry can.
+wallet is open. At the default reach a younger coin is left unplanned so that it stays free
+to pay out of round. That leaves a gap: a wallet closed within a coin's first
+two weeks or so and kept closed through that coin's step window can lose the
+coin to the operator's sweep, as any holder who stays away past an expiry can.
+Planning every leaf of a round closes it, at the price that a payment the
+unplanned coins cannot cover waits for one round (`plan-release`).
 
 A coin a plan names carries refund halves that stay valid while its script is
 unspent, so the operator alone could void a payment of it out of round: no
@@ -1189,7 +1195,12 @@ step from the coin while it holds it; the plan ends once the round is final
 and the forfeit handed over (at `sync`), and stands as it was should the round
 never complete, so the coin is never left neither planned nor refreshed. A
 payment the unplanned coins cannot cover is refused, naming how much the
-planned coins hold and `plan-release`. The new leaf costs the refresh fee the
+planned coins hold and `plan-release`; when they hold enough, the refusal's
+JSON is of kind `planned`, with the `asset` and `release`, the fewest planned
+coins, largest first, whose release covers the payment. A program pays by
+releasing those, running `sync` until the round is final and the new leaf is
+held, and asking again (a release can fall short by the new leaf's own margins,
+and the refusal then names the next coin). The new leaf costs the refresh fee the
 asset's schedule asks then (none in the coin's free window), and `care` leaves
 it unplanned for a day. The operator takes a coin a step made into a round once
 the batch of the coin that step gave up is swept and the sweep final. The operator applies a plan, as it refreshes any coin: one that

@@ -88,6 +88,8 @@ pub enum SpendError {
 	NeedsFeeCoin(&'static str),
 	#[error(transparent)]
 	Landing(crate::LandingError),
+	#[error(transparent)]
+	Channel(crate::channel::ChannelError),
 	#[error("a landing pays its fee from the coin, naming the amount (a split), or from a coin attached")]
 	LandingFee,
 	#[error("the schedule has no clock {step}; it has {steps}")]

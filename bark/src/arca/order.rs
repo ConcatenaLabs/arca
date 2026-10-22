@@ -210,9 +210,10 @@ impl Wallet {
 			}
 		}
 		let Some((fee, change)) = done else {
-			return Err(Error::Refused(format!("the wallet's live coins of asset {} hold {} and the order of {} and its fee need {} (refresh {}, \
-				offboard {}), with any change at least the operator's smallest leaf of {}: board or receive more, or place less", a, total,
-				ask.amount, ask.amount.saturating_add(refresh).saturating_add(offboard), refresh, offboard, min)));
+			let need = ask.amount.saturating_add(refresh).saturating_add(offboard);
+			return Err(self.short_of(a, need.saturating_sub(total).max(1), format!("the wallet's live coins of asset {} hold {} and the order \
+				of {} and its fee need {} (refresh {}, offboard {}), with any change at least the operator's smallest leaf of {}: board or \
+				receive more, or place less", a, total, ask.amount, need, refresh, offboard, min))?);
 		};
 		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
 		if !fee_within(fee, ask.amount, bound) {

@@ -39,11 +39,24 @@ the exit or the sweep, control blocks, merkle root and scriptPubKey), and a
 spend of each by arca/collab-2: the signed bytes, the digest, both
 signatures and the Simplicity witness.
 
+vectors/accumulator.json holds the accumulator batch's vectors, which
+accumulator.py generates: six leaves behind their entries, each slot's
+record, the Merkle-sum root and the batch's weight, the state's data leaf,
+the batch output's tree, scriptPubKey and control block, and two exits, by
+an owner and then by the operator, each with its digest, signature, witness
+value and the state it leaves.
+
 vectors/bond.json holds the equivocation bond's vectors, which bond.py
 generates: its three scripts, the bond's and the notice output's
 scriptPubKeys and control blocks, and a slash's evidence: two messages S
 signed under one salt, and a fill beside one, with their digests and the
 items the slash takes.
+
+vectors/channel.json holds the channel-1 leaf's vectors, which channel.py
+generates: one channel's outputs at three states (each one's update, settle
+and collaborative leaves, its credit output's claim and provider leaves,
+their control blocks), each state's message with both signatures, and two
+credit notes with the operator's signatures.
 """
 import json
 import os
@@ -63,6 +76,8 @@ TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
 ORDER_OUT = os.path.join(HERE, "vectors", "order.json")
 COLLAB2_OUT = os.path.join(HERE, "vectors", "collab2.json")
 BOND_OUT = os.path.join(HERE, "vectors", "bond.json")
+CHANNEL_OUT = os.path.join(HERE, "vectors", "channel.json")
+ACCUMULATOR_OUT = os.path.join(HERE, "vectors", "accumulator.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -728,13 +743,16 @@ def generate():
 
 
 def main():
+    import accumulator
     import bond
     import collab2
+    import channel
     import offchain
     import order
     import records
     order_keys = {k: Key("order " + k) for k in ["maker", "credit0", "credit1", "credit2", "credit3", "refund", "taker"]}
     order_keys["S"] = S
+    accumulator_keys = dict([("S", S)] + [("owner%d" % i, Key("accumulator owner %d" % i)) for i in range(6)])
     files = [(OUT, json.dumps(generate(), indent=1) + "\n"),
              (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n"),
              (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n"),
@@ -742,7 +760,10 @@ def main():
              (COLLAB2_OUT, json.dumps(collab2.generate(GENESIS, {"S": S, "A": A, "B": B}, label_hash, DELAY,
                                                        sweep_token(T_ID, R_PROG, S.x, W), T_ID, R_PROG, W), indent=1) + "\n"),
              (BOND_OUT, json.dumps(bond.generate(GENESIS, {"S": S, "W": Key("bond W"), "A": A, "B": B}, label_hash,
-                                                 rel_time(32 * DAY)), indent=1) + "\n")]
+                                                 rel_time(32 * DAY)), indent=1) + "\n"),
+             (CHANNEL_OUT, json.dumps(channel.generate(GENESIS, {"A": A, "S": S}, label_hash, DELAY, rel_time(48 * H)),
+                                      indent=1) + "\n"),
+             (ACCUMULATOR_OUT, json.dumps(accumulator.generate(GENESIS, accumulator_keys), indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:

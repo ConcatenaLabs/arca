@@ -261,6 +261,73 @@ pub(crate) fn fee_rate_reserve(floor_per_kvb: u64, multiple: u64, witness: Vec<V
 	vsize.saturating_mul(floor_per_kvb).div_ceil(1000).saturating_mul(multiple)
 }
 
+/// The leaves of a batch, each behind its hash-locked entry, by the rules
+/// every kind of batch shares: rules 1, 7 and 8 above, the entry's reserve
+/// and the leaf's value bounds. A tree ([`Tree::build`]) and an accumulator
+/// batch ([`crate::accumulator::Accumulator::build`]) pay the same entries.
+pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<Vec<TreeLeaf>, TreeError> {
+	let n = leaves.len();
+	let operator = params.schedule.operator;
+	let min = params.min_leaf.max(1);
+
+	// The leaves and their entries.
+	let entry_sweep = params.schedule.sweep(true, params.burn);
+	let mut tree_leaves: Vec<TreeLeaf> = Vec::with_capacity(n);
+	let mut seen = std::collections::HashMap::with_capacity(n);
+	let mut nonces = std::collections::HashMap::with_capacity(n);
+	let mut keys = std::collections::HashMap::with_capacity(n);
+	for (i, spec) in leaves.iter().enumerate() {
+		if let Some(first) = nonces.insert(spec.operator_nonce, i) {
+			return Err(TreeError::DuplicateOperatorNonce { first, second: i });
+		}
+		if let Some(first) = keys.insert(spec.owner, i) {
+			return Err(TreeError::DuplicateOwner { first, second: i });
+		}
+		let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
+			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
+			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
+			(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
+			(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
+				Ok(t) => Some(t),
+				Err(_) => return Err(TreeError::Template { leaf: i }),
+			},
+			_ => return Err(TreeError::Template { leaf: i }),
+		};
+		if spec.value < min || spec.value > MAX_VALUE {
+			return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
+		}
+		let leaf = LeafPolicy {
+			owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
+			htlc: spec.htlc,
+			order: spec.order,
+			landing,
+			v2: spec.template == Template::Vtxo2,
+		};
+		let program = leaf.program();
+		if let Some(first) = seen.insert(program, i) {
+			return Err(TreeError::DuplicateLeaf { first, second: i });
+		}
+		let entry = EntryPolicy {
+			unlock_hash: spec.unlock_hash, asset: params.asset, value: spec.value, leaf_program: program,
+			sweep: entry_sweep,
+		};
+		let entry_tap = entry.taproot();
+		let entry_reserve = match params.reserve {
+			ReserveRule::Fixed { entry, .. } => entry,
+			ReserveRule::FeeRate { floor_per_kvb, multiple } => {
+				let w = entry_tap.witness(&entry.unlock_script(), vec![vec![0; 32]]);
+				let leaf_out = ExplicitOutput::new(params.asset, spec.value, leaf.script_pubkey()).txout();
+				fee_rate_reserve(floor_per_kvb, multiple, w, vec![leaf_out], params.asset)
+			},
+		};
+		let entry_value = sum(spec.value, entry_reserve)?;
+		tree_leaves.push(TreeLeaf {
+			spec: *spec, leaf, entry, entry_value, entry_reserve, entry_program: entry_tap.program(),
+		});
+	}
+	Ok(tree_leaves)
+}
+
 impl Tree {
 	/// Builds the tree over `leaves`, in order.
 	pub fn build(params: TreeParams, leaves: &[LeafSpec]) -> Result<Tree, TreeError> {
@@ -291,62 +358,7 @@ impl Tree {
 			return Err(TreeError::TooDeep(depth));
 		}
 		let operator = params.schedule.operator;
-		let min = params.min_leaf.max(1);
-
-		// The leaves and their entries.
-		let entry_sweep = params.schedule.sweep(true, params.burn);
-		let mut tree_leaves: Vec<TreeLeaf> = Vec::with_capacity(n);
-		let mut seen = std::collections::HashMap::with_capacity(n);
-		let mut nonces = std::collections::HashMap::with_capacity(n);
-		let mut keys = std::collections::HashMap::with_capacity(n);
-		for (i, spec) in leaves.iter().enumerate() {
-			if let Some(first) = nonces.insert(spec.operator_nonce, i) {
-				return Err(TreeError::DuplicateOperatorNonce { first, second: i });
-			}
-			if let Some(first) = keys.insert(spec.owner, i) {
-				return Err(TreeError::DuplicateOwner { first, second: i });
-			}
-			let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
-				(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
-				(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
-				(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
-				(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
-					Ok(t) => Some(t),
-					Err(_) => return Err(TreeError::Template { leaf: i }),
-				},
-				_ => return Err(TreeError::Template { leaf: i }),
-			};
-			if spec.value < min || spec.value > MAX_VALUE {
-				return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
-			}
-			let leaf = LeafPolicy {
-				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
-				htlc: spec.htlc,
-				order: spec.order,
-				landing, v2: spec.template == Template::Vtxo2,
-			};
-			let program = leaf.program();
-			if let Some(first) = seen.insert(program, i) {
-				return Err(TreeError::DuplicateLeaf { first, second: i });
-			}
-			let entry = EntryPolicy {
-				unlock_hash: spec.unlock_hash, asset: params.asset, value: spec.value, leaf_program: program,
-				sweep: entry_sweep,
-			};
-			let entry_tap = entry.taproot();
-			let entry_reserve = match params.reserve {
-				ReserveRule::Fixed { entry, .. } => entry,
-				ReserveRule::FeeRate { floor_per_kvb, multiple } => {
-					let w = entry_tap.witness(&entry.unlock_script(), vec![vec![0; 32]]);
-					let leaf_out = ExplicitOutput::new(params.asset, spec.value, leaf.script_pubkey()).txout();
-					fee_rate_reserve(floor_per_kvb, multiple, w, vec![leaf_out], params.asset)
-				},
-			};
-			let entry_value = sum(spec.value, entry_reserve)?;
-			tree_leaves.push(TreeLeaf {
-				spec: *spec, leaf, entry, entry_value, entry_reserve, entry_program: entry_tap.program(),
-			});
-		}
+		let tree_leaves = build_leaves(&params, leaves)?;
 
 		// The nodes, bottom-up.
 		let mut below: Vec<(Child, Range<usize>)> =

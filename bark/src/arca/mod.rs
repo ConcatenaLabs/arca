@@ -132,6 +132,13 @@ pub enum Error {
 	/// The wallet refused: the reason is for the user.
 	#[error("refused: {0}")]
 	Refused(String),
+	/// A payment of `asset` that the coins it may spend cannot cover, and
+	/// that the coins an offline-refresh plan names could: `release` names
+	/// the fewest of those, largest first, whose release through the next
+	/// round (`plan_release`) would make up the difference. A program pays
+	/// by releasing them, waiting for their round, and asking again.
+	#[error("refused: {message}")]
+	Planned { asset: String, release: Vec<String>, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
@@ -158,6 +165,7 @@ impl Error {
 	pub fn kind(&self) -> &'static str {
 		match self {
 			Error::Refused(_) => "refused",
+			Error::Planned { .. } => "planned",
 			Error::Server { .. } => "server_refused",
 			Error::Unreachable(_) => "unreachable",
 			Error::Missing(_) => "missing",

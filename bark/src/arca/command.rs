@@ -37,7 +37,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?}, \
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
@@ -49,6 +49,10 @@ pub fn refusal(e: &Error) -> Value {
 	if let Error::Server { code, status, .. } = e {
 		out["error"]["code"] = json!(code);
 		out["error"]["status"] = json!(status);
+	}
+	if let Error::Planned { asset, release, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["release"] = json!(release);
 	}
 	out
 }
@@ -350,7 +354,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"care" => {
 			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
 			w.care(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32), steps,
-				opt_u64(&a["max_fee_ppm"], "the bound")?)
+				opt_u64(&a["max_fee_ppm"], "the bound")?, opt_u64(&a["plan_within"], "the planning reach")?.map(|n| n.min(u32::MAX as u64) as u32))
 		},
 		"plan_cancel" => w.plan_cancel(req_str(&a["plan"], "the plan")?),
 		"plan_release" => {
@@ -472,6 +476,8 @@ mod test {
 		assert_eq!(r["error"]["status"], 409);
 		assert_eq!(r["error"]["message"], "the server refused cosign_transfer (409 key_reused): m");
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
+		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
+		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));
 	}
 
 	#[test]
