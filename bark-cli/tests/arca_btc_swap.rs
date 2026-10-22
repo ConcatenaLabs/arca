@@ -131,6 +131,17 @@ async fn receive_row(r: &Running, hash: &str) -> Option<server::store::ReceiveRo
 	r.server.receives.status(&h).await.unwrap()
 }
 
+/// Waits until the operator holds the payment under `hash` inside it, its
+/// leaf wanted in the next round: P's lock is answered before the operator's
+/// payment loop takes it up, so a round run at once can come before it.
+async fn until_held(r: &Running, hash: &str) {
+	let t0 = Instant::now();
+	while !receive_row(r, hash).await.is_some_and(|x| x.state.name() == "accepted") {
+		assert!(t0.elapsed() < Duration::from_secs(60), "the operator never held the payment");
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+}
+
 /// An operator whose Lightning terms let a swap run on the regtest Bitcoin
 /// ark: a payment's timeout three to six days out, since the Bitcoin leg can
 /// end 88 hours after it starts (Bark's HTLC-send expiry delta of 258 blocks
@@ -701,8 +712,9 @@ async fn a_swap_survives_a_restart_and_a_restore_of_each_party() {
 
 	// Q killed while Bark pays; started again.
 	refill_pool();
-	let (id1, _) = agreed(&r, &p, &q, true, 100_000, 20_000, 1800);
+	let (id1, hash1) = agreed(&r, &p, &q, true, 100_000, 20_000, 1800);
 	follow_until(&p, &id1, "locked", 60);
+	until_held(&r, &hash1).await;
 	leaf_round(&r).await;
 	let pf = follow_in_background(&p, 180);
 	let mut child = Command::new(env!("CARGO_BIN_EXE_arca")).arg("--datadir").arg(&q.dir).arg("--witness-patience").arg("3")
@@ -724,6 +736,7 @@ async fn a_swap_survives_a_restart_and_a_restore_of_each_party() {
 	refill_pool();
 	let (id2, hash2) = agreed(&r, &p, &q, true, 110_000, 21_000, 1800);
 	follow_until(&p, &id2, "locked", 60);
+	until_held(&r, &hash2).await;
 	leaf_round(&r).await;
 	let pf = follow_in_background(&p, 180);
 	let mut child = Command::new(env!("CARGO_BIN_EXE_arca")).arg("--datadir").arg(&q.dir).arg("--witness-patience").arg("3")
@@ -761,6 +774,7 @@ async fn a_swap_survives_a_restart_and_a_restore_of_each_party() {
 	let q2_btc = spendable_sat(&q2);
 	let (id3, hash3) = agreed(&r, &p, &q2, true, 90_000, 18_000, 1800);
 	follow_until(&p, &id3, "locked", 60);
+	until_held(&r, &hash3).await;
 	leaf_round(&r).await;
 	let p2 = dual_wallet(&r, "SWRP2", 0, Some(&p_m));
 	let sends = p2.ok(&["lightning", "payments"]);
