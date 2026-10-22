@@ -140,7 +140,7 @@ fn v1_spk(key: &XOnlyPublicKey) -> Script {
 	Builder::new().push_int(1).push_slice(&key.serialize()).into_script()
 }
 
-fn control_block(version: u8, root: [u8; 32], path: &[[u8; 32]]) -> Vec<u8> {
+pub(crate) fn control_block(version: u8, root: [u8; 32], path: &[[u8; 32]]) -> Vec<u8> {
 	let parity = output_key(root).1;
 	let mut cb = vec![version | if parity == Parity::Odd { 1 } else { 0 }];
 	cb.extend(NUMS);

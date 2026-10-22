@@ -391,6 +391,34 @@ pub struct IssuerSupply {
 	/// burn-only batch of the asset (its batch output, a node or an entry on
 	/// the chain) whose round is in the chain.
 	pub in_batches: String,
+	/// Each output `in_batches` counts, so a reader checks each against the
+	/// chain and against its batch's published tree (`tree`).
+	#[serde(default)]
+	pub in_batches_outputs: Vec<BatchOutputEntry>,
+}
+
+/// An unspent output under a burn-only sweep: where it is, what it holds,
+/// and where it sits in its batch's published tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchOutputEntry {
+	/// `txid:vout`.
+	pub outpoint: String,
+	pub value: String,
+	/// The batch's round and its output there, as `tree` takes them.
+	pub round_txid: String,
+	pub batch_vout: u32,
+	/// `batch` (the round's batch output, the top level's one node), `node`
+	/// (a node below it, on the chain once unrolled) or `entry` (a leaf's
+	/// entry, below a lowest node).
+	pub kind: String,
+	/// A node's level in the published tree's `nodes`, the lowest nodes 0,
+	/// and its index in that level; for an entry, -1 and its leaf's index.
+	/// Absent for the batch output.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub level: Option<i16>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub index: Option<u32>,
 }
 
 /// A transaction that minted or burned an issuer-operated asset.

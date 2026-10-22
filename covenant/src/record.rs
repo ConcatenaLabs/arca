@@ -582,6 +582,51 @@ fn bounded(v: u64) -> Result<u64, RecordError> {
 	if v > MAX_VALUE { Err(RecordError::Value(v)) } else { Ok(v) }
 }
 
+/// Refuses a leaf whose template and terms do not fit: a template's terms
+/// present exactly for that template, and each set of terms valid for the
+/// leaf's asset, value, keys and exit delay. Every kind of leaf record runs it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order: &Option<OrderLeafTerms>,
+	landing: &Option<Landing>, asset: AssetId, value: u64, owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, exit_delay: RelativeTime)
+	-> Result<(), RecordError>
+{
+	match (template, htlc, order, landing) {
+		(Template::Vtxo1, None, None, None) => {},
+		(Template::Htlc1, Some(t), None, None) => t.check(exit_delay).map_err(RecordError::Htlc)?,
+		(Template::Order2, None, Some(o), None) => o.check(asset, owner, operator)
+			.map_err(|e| RecordError::Order(e.to_string()))?,
+		(Template::Landing1, None, None, Some(l)) => {
+			l.terms(asset, value).map_err(RecordError::Landing)?;
+		},
+		(Template::Htlc1, None, ..) => return Err(RecordError::Template("htlc-1 without its terms".into())),
+		(Template::Order2, _, None, _) => return Err(RecordError::Template("order-2 without its terms".into())),
+		(Template::Landing1, _, _, None) => return Err(RecordError::Template("landing-1 without its terms".into())),
+		(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
+		(t, ..) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
+	}
+	Ok(())
+}
+
+/// The leaf a record names. Each kind of leaf record builds it here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn leaf_policy(template_terms: (&Option<HtlcTerms>, &Option<OrderLeafTerms>, &Option<Landing>),
+	owner: XOnlyPublicKey, operator: XOnlyPublicKey, salt: [u8; 32], chain: Chain, exit_delay: RelativeTime, asset: AssetId, value: u64)
+	-> LeafPolicy
+{
+	let (htlc, order, landing) = template_terms;
+	LeafPolicy {
+		owner, operator, salt, chain, exit_delay,
+		htlc: *htlc,
+		order: *order,
+		// check_template() refuses an allowance not below the value; built
+		// anyway, the script is the one such a record names.
+		landing: landing.map(|l| crate::landing::LandingTerms {
+			program: l.program, asset, min_value: value.saturating_sub(l.allowance),
+		}),
+		channel: None,
+	}
+}
+
 impl LeafRecord {
 	/// The number of levels on the path.
 	pub fn levels(&self) -> usize {
@@ -625,23 +670,11 @@ impl LeafRecord {
 			(Template::Channel1, Some(c)) if self.htlc.is_none() && self.order.is_none() && self.landing.is_none() => {
 				c.terms(self.value).check(self.exit_delay).map_err(RecordError::Channel)?;
 			},
-			(t, Some(_)) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
-			_ => {},
-		}
-		match (self.template, &self.htlc, &self.order, &self.landing) {
-			(Template::Channel1, None, None, None) => {},
-			(Template::Vtxo1, None, None, None) => {},
-			(Template::Htlc1, Some(t), None, None) => t.check(self.exit_delay).map_err(RecordError::Htlc)?,
-			(Template::Order2, None, Some(o), None) => o.check(self.asset, &self.owner, &self.schedule.operator)
-				.map_err(|e| RecordError::Order(e.to_string()))?,
-			(Template::Landing1, None, None, Some(l)) => {
-				l.terms(self.asset, self.value).map_err(RecordError::Landing)?;
+			(t, Some(_)) | (t @ Template::Channel1, None) => {
+				return Err(RecordError::Template(format!("{} with another template's terms", t)))
 			},
-			(Template::Htlc1, None, ..) => return Err(RecordError::Template("htlc-1 without its terms".into())),
-			(Template::Order2, _, None, _) => return Err(RecordError::Template("order-2 without its terms".into())),
-			(Template::Landing1, _, _, None) => return Err(RecordError::Template("landing-1 without its terms".into())),
-			(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
-			(t, ..) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
+			_ => check_template(self.template, &self.htlc, &self.order, &self.landing, self.asset, self.value, &self.owner,
+				&self.schedule.operator, self.exit_delay)?,
 		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
@@ -690,19 +723,9 @@ impl LeafRecord {
 	/// The leaf's policy.
 	pub fn leaf(&self) -> LeafPolicy {
 		LeafPolicy {
-			owner: self.owner,
-			operator: self.schedule.operator,
-			salt: self.salt(),
-			chain: self.chain,
-			exit_delay: self.exit_delay,
-			htlc: self.htlc,
-			order: self.order,
-			// check() refuses an allowance not below the value; built anyway,
-			// the script is the one such a record names.
-			landing: self.landing.map(|l| crate::landing::LandingTerms {
-				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance),
-			}),
 			channel: self.channel.map(|c| c.terms(self.value)),
+			..leaf_policy((&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
+				self.exit_delay, self.asset, self.value)
 		}
 	}
 
@@ -1150,29 +1173,37 @@ impl WalletPolicy {
 		RecordError::ExitDelay { delay: delay.units(), min: self.min_exit_delay.units(), max: self.max_exit_delay.units() }
 	}
 
+	/// Refuses a batch's chain, operator, notice and first expiry, and a
+	/// leaf's exit delay, outside the policy: the part of [`WalletPolicy::check`]
+	/// every kind of batch shares.
+	pub fn check_terms(&self, chain: Chain, schedule: &ClockSchedule, exit_delay: RelativeTime) -> Result<(), RecordError> {
+		if chain != self.chain {
+			return Err(RecordError::WrongChain);
+		}
+		if schedule.operator != self.operator {
+			return Err(RecordError::WrongOperator);
+		}
+		let notice = schedule.notice.units();
+		if notice < self.min_notice.units() {
+			return Err(RecordError::NoticeTooShort { notice, min: self.min_notice.units() });
+		}
+		let expiry = schedule.expiries()[0].to_consensus_u32();
+		let earliest = self.now.to_consensus_u32() as u64 + self.horizon as u64;
+		if (expiry as u64) < earliest {
+			return Err(RecordError::ExpiryTooSoon { expiry, earliest });
+		}
+		if !self.exit_delay_ok(exit_delay) {
+			return Err(self.exit_delay_error(exit_delay));
+		}
+		Ok(())
+	}
+
 	/// Refuses a record outside the policy: its chain, operator, notice, first
 	/// expiry and exit delay; a path deeper than `max_levels`; a node of one
 	/// child anywhere but in a batch of one leaf; and a reserve below
 	/// `min_reserve` on any node of the path or on the entry.
 	pub fn check(&self, record: &LeafRecord) -> Result<(), RecordError> {
-		if record.chain != self.chain {
-			return Err(RecordError::WrongChain);
-		}
-		if record.schedule.operator != self.operator {
-			return Err(RecordError::WrongOperator);
-		}
-		let notice = record.schedule.notice.units();
-		if notice < self.min_notice.units() {
-			return Err(RecordError::NoticeTooShort { notice, min: self.min_notice.units() });
-		}
-		let expiry = record.schedule.expiries()[0].to_consensus_u32();
-		let earliest = self.now.to_consensus_u32() as u64 + self.horizon as u64;
-		if (expiry as u64) < earliest {
-			return Err(RecordError::ExpiryTooSoon { expiry, earliest });
-		}
-		if !self.exit_delay_ok(record.exit_delay) {
-			return Err(self.exit_delay_error(record.exit_delay));
-		}
+		self.check_terms(record.chain, &record.schedule, record.exit_delay)?;
 		let levels = record.levels();
 		if levels > self.max_levels {
 			return Err(RecordError::TooManyLevels { levels, max: self.max_levels });
