@@ -69,6 +69,10 @@
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
 //!   holder first;
+//! - `channel-1` ([`channel`]): a leaf with a balance for each of owner and
+//!   operator, replaced at once by a newer state both sign, settled after the
+//!   exit delay, the operator's balance landing in a credit output from which
+//!   the owner claims what the operator's cumulative note credits;
 //! - the operator's equivocation bond ([`bond`]): a coin anyone burns with
 //!   two different messages the operator key signed under one coin's salt,
 //!   and which the operator withdraws only a delay after a public notice;
@@ -91,6 +95,7 @@ pub mod accumulator;
 pub mod accumulator_programs;
 pub mod board;
 pub mod bond;
+pub mod channel;
 pub mod checkpoint;
 pub mod checks;
 pub mod claim;
@@ -134,6 +139,7 @@ pub use accumulator::{
 };
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
+pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelTerms, State};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};

@@ -37,6 +37,11 @@
 //! | `/round_state {txid}` | Where the server says the round stands: built, broadcast, final or lost |
 //! | `/orphan {height}` | Reorganises the parent chain from that height (an anchor rollback): every block anchored there or above leaves the chain |
 //! | `/restart` | Stops the server and starts it again on the same database, at the same address, as an operator's restart does; the chain and the signer keep running |
+//! | `/freeze {script}` | A freeze record of the supervised asset naming the script (hex), signed by its issuer and mined |
+//! | `/lift {script}` | Spends that record, lifting the freeze, and mines it |
+//! | `/bond_post {amount?}` | Posts the operator's equivocation bond in X (5,000,000 unless named), names it in the configuration, and starts the server again |
+//! | `/bond_notice` | Gives the bond's notice, names it, and starts the server again: the bond reads `noticed` |
+//! | `/bond_drop` | Names no bond in the configuration, and starts the server again: a wallet that saw one reads it `missing` |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
 //!
 //! A browser wallet that bonds a stake on this chain (a stake carries no
@@ -44,6 +49,15 @@
 //! committee member and no block is made: set
 //! `SEQUENTIA_REGTEST_COMMITTEE_STAKE` to each committee staker's weight in
 //! atoms, well above the stakes the wallet bonds (one atom when unset).
+//!
+//! With `ARCA_OPERATOR_SUPERVISED` set, the chain issues an asset Z under
+//! the supervision descriptor (pause allowed, listed for fees at 1:1), and
+//! the operator serves it under the supervised profile, its signer reading
+//! freezes from the chain's node; `/state` names it `supervised`. With
+//! `ARCA_OPERATOR_ISSUER` set (and `MINT_LIMITER`, the mint limiter's tool
+//! of `sequentia-contracts` with `sign`), the chain runs Simplicity and the
+//! operator serves an asset I issuer-operated, its reissuance token in a
+//! mint limiter the signer mints through; `/state` names it `issuer`.
 //!
 //! With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`, a SeqLN
 //! `lightningd`), the chain is the one SeqLN's `sequentia-regtest` network
@@ -73,7 +87,19 @@ use std::time::Duration;
 use elements::{AssetId, Script};
 use serde_json::{json, Value};
 
-use common::running::Running;
+use arca_covenant::bond::BondPolicy;
+use arca_covenant::limiter::{self, LimiterParams, LimiterState};
+use arca_covenant::RelativeTime;
+use common::node::{self, op_true};
+use common::running::{keypair, Running};
+use elements::encode::{deserialize, serialize};
+use elements::hashes::Hash;
+use elements::secp256k1_zkp::Keypair;
+use elements::{AssetIssuance, ContractHash, OutPoint, Transaction, TxIn};
+use sequentia_ext::{explicit_txout, AssetAmount};
+use server::bond::BondSection;
+use server::issuer::IssuerSection;
+use server::server::AssetSection;
 use sequentia_ext::lightning::{BitcoinRegtest, LightningNode};
 use server::store::RoundState;
 
@@ -123,6 +149,309 @@ fn script(h: &str) -> Result<Script, String> {
 	}
 	(0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| e.to_string()))
 		.collect::<Result<Vec<u8>, _>>().map(Script::from)
+}
+
+fn hex(b: &[u8]) -> String {
+	b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn unhex(h: &str) -> Result<Vec<u8>, String> {
+	script(h).map(|s| s.into_bytes())
+}
+
+/// What the operator serves beyond X and Y: a supervised asset and its
+/// issuer's freeze records, an issuer-operated asset, and its bond.
+#[derive(Default)]
+struct Profiles {
+	/// The supervised asset and its issuer's operational key.
+	supervised: Option<(AssetId, Keypair)>,
+	/// Each standing freeze record, by the script it names.
+	freezes: std::collections::HashMap<String, (OutPoint, String)>,
+	/// The issuer-operated asset.
+	issuer: Option<AssetId>,
+	/// The bond's notice key and outpoint, once posted.
+	bond: Option<(Keypair, OutPoint)>,
+}
+
+/// Z, issued under the supervision descriptor with the pause capability
+/// into the purse, and listed for fees at 1:1.
+fn issue_supervised(r: &mut Running) -> (AssetId, Keypair) {
+	let op = keypair("Z operational");
+	let rec = keypair("Z recovery");
+	let coin = r.purse.take_coin(r.purse.policy);
+	let tx = node::spend_op_true(&coin, vec![], 20_000);
+	let parked = Script::new_v0_wpkh(&elements::WPubkeyHash::from_byte_array([1; 20]));
+	let d: Value = r.rt.client().call("decodescript", &[json!(hex(parked.as_bytes()))]).unwrap();
+	let to = d["address"].as_str().or_else(|| d["segwit"]["address"].as_str()).unwrap().to_string();
+	let issued: Value = r.rt.client().call("rawissueasset", &[json!(hex(&serialize(&tx))), json!([{
+		"asset_amount": 100, "asset_address": to, "token_amount": 1, "token_address": to, "blind": false,
+		"supervision": {"operationalkey": hex(&op.x_only_public_key().0.serialize()),
+			"recoverykey": hex(&rec.x_only_public_key().0.serialize()), "pause": true},
+	}])]).unwrap();
+	let mut tx: Transaction = deserialize(&unhex(issued[0]["hex"].as_str().unwrap()).unwrap()).unwrap();
+	let z = AssetId::from_str(issued[0]["asset"].as_str().unwrap()).unwrap();
+	for o in tx.output.iter_mut() {
+		if o.script_pubkey == parked {
+			o.script_pubkey = op_true();
+		}
+	}
+	let txid = r.rt.client().send_raw_transaction(&tx).unwrap();
+	r.rt.produce_block().unwrap();
+	for (j, o) in tx.output.iter().enumerate() {
+		if o.script_pubkey == op_true() && !o.is_fee() {
+			r.purse.put((OutPoint::new(txid, j as u32), o.clone()));
+		}
+	}
+	node::list_fee_asset(&r.rt, z, 100_000_000);
+	(z, op)
+}
+
+/// A BIP340 signature by `key` over `digest`.
+fn sign(key: &Keypair, digest: &[u8]) -> Result<String, String> {
+	let d: [u8; 32] = digest.try_into().map_err(|_| "a digest of 32 bytes".to_string())?;
+	Ok(hex(arca_covenant::sign::sign_digest(key, &d, &[0; 32]).as_ref()))
+}
+
+/// A freeze record of `z` naming `target`, signed and mined: its outpoint
+/// and the target's hash.
+fn freeze(r: &mut Running, z: AssetId, op: &Keypair, target: &Script) -> Result<(OutPoint, String), String> {
+	let coin = r.purse.take_coin(r.purse.policy);
+	let t = json!(hex(target.as_bytes()));
+	let c = r.rt.client();
+	let h: Value = c.call("getsupervisionrecordhash", &[json!("freeze"), json!(z.to_string()), t.clone(), Value::Null,
+		json!(coin.0.txid.to_string()), json!(coin.0.vout)]).map_err(|e| e.to_string())?;
+	let built: Value = c.call("buildsupervisionrecord", &[json!("freeze"), json!(z.to_string()), t, Value::Null,
+		json!(sign(op, &unhex(h["sighash"].as_str().ok_or("no sighash")?)?)?)]).map_err(|e| e.to_string())?;
+	let tx = node::spend_op_true(&coin, vec![], 20_000);
+	let raw: Value = c.call("addsupervisionrecordoutput", &[json!(hex(&serialize(&tx))), built["script"].clone(), json!(z.to_string())])
+		.map_err(|e| e.to_string())?;
+	let tx: Transaction = deserialize(&unhex(raw.as_str().ok_or("no transaction")?)?).map_err(|e| e.to_string())?;
+	let txid = c.send_raw_transaction(&tx).map_err(|e| e.to_string())?;
+	r.rt.produce_block().map_err(|e| e.to_string())?;
+	let record = unhex(built["script"].as_str().ok_or("no record")?)?;
+	let mut at = None;
+	for (j, o) in tx.output.iter().enumerate() {
+		if o.script_pubkey.as_bytes() == &record[..] {
+			at = Some(OutPoint::new(txid, j as u32));
+		} else if o.script_pubkey == op_true() {
+			r.purse.put((OutPoint::new(txid, j as u32), o.clone()));
+		}
+	}
+	let at = at.ok_or("no record output")?;
+	Ok((at, built["targethash"].as_str().ok_or("no target hash")?.to_string()))
+}
+
+/// Spends the freeze record at `at`, whose target hashes to `target`, and
+/// mines it.
+fn lift(r: &mut Running, z: AssetId, op: &Keypair, at: OutPoint, target: &str) -> Result<String, String> {
+	let c = r.rt.client();
+	let h: Value = c.call("getsupervisionunfreezehash", &[json!(at.txid.to_string()), json!(at.vout), json!(z.to_string()),
+		json!(target)]).map_err(|e| e.to_string())?;
+	let coin = r.purse.take_coin(r.purse.policy);
+	let mut tx = node::spend_op_true(&coin, vec![], 20_000);
+	tx.input.insert(0, TxIn { previous_output: at, ..Default::default() });
+	let raw: Value = c.call("setsupervisionunfreezesig", &[json!(hex(&serialize(&tx))), json!(0),
+		json!(sign(op, &unhex(h.as_str().ok_or("no digest")?)?)?)]).map_err(|e| e.to_string())?;
+	let tx: Transaction = deserialize(&unhex(raw.as_str().ok_or("no transaction")?)?).map_err(|e| e.to_string())?;
+	let txid = c.send_raw_transaction(&tx).map_err(|e| e.to_string())?;
+	r.rt.produce_block().map_err(|e| e.to_string())?;
+	for (j, o) in tx.output.iter().enumerate() {
+		if o.script_pubkey == op_true() {
+			r.purse.put((OutPoint::new(txid, j as u32), o.clone()));
+		}
+	}
+	Ok(txid.to_string())
+}
+
+fn limiter_tool() -> std::path::PathBuf {
+	std::path::PathBuf::from(std::env::var("MINT_LIMITER").expect("ARCA_OPERATOR_ISSUER needs MINT_LIMITER, the mint limiter's tool \
+		(sequentia-contracts tools/mint-limiter, with `sign`)"))
+}
+
+fn limiter_json(args: &[&str]) -> Value {
+	let out = std::process::Command::new(limiter_tool()).args(args).output().unwrap();
+	assert!(out.status.success(), "mint-limiter {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+	serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// I, issued with one explicit atom of reissuance token straight into a new
+/// mint limiter: the limiter's instance, its words and the coin's outpoint.
+fn issue_issuer_operated(r: &mut Running, dir: &std::path::Path) -> (AssetId, IssuerSection, std::path::PathBuf) {
+	let words = dir.join("mint.words");
+	let op = limiter_json(&["key", "--new", "--mnemonic-file", words.to_str().unwrap()])["key"].as_str().unwrap().to_string();
+	let cold = keypair("I's cold key").x_only_public_key().0.to_string();
+	let coin = r.purse.take_coin(r.purse.policy);
+	let contract = arca_covenant::script::sha256(b"asset I, issuer-operated, for browser wallets");
+	let i = AssetId::new_issuance(coin.0, ContractHash::from_byte_array(contract));
+	let entropy = AssetId::generate_asset_entropy(coin.0, ContractHash::from_byte_array(contract)).to_byte_array();
+	let entropy_hex = elements::hashes::sha256::Midstate::from_byte_array(entropy).to_string();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let inst = limiter_json(&["instance", "--asset", &i.to_string(), "--token", &limiter::token_of_entropy(entropy).to_string(),
+		"--entropy", &entropy_hex, "--operator-key", &op, "--cold-key", &cold, "--window", "1000", "--allowance", "100000000",
+		"--recovery-delay", "10", "--genesis", &genesis.to_string()]);
+	let mut file = inst.clone();
+	file.as_object_mut().unwrap().remove("address");
+	let instance = dir.join("limiter.json");
+	std::fs::write(&instance, file.to_string()).unwrap();
+	let (l, _) = LimiterParams::from_instance_json(&file.to_string()).unwrap();
+	let mut tx = node::spend_op_true(&coin, vec![
+		explicit_txout(AssetAmount::new(i, 10_000_000_000), op_true()),
+		explicit_txout(AssetAmount::new(l.token, 1), l.script_pubkey(LimiterState::default())),
+	], 10_000);
+	tx.input[0].asset_issuance = AssetIssuance {
+		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: contract,
+		amount: elements::confidential::Value::Explicit(10_000_000_000), inflation_keys: elements::confidential::Value::Explicit(1),
+		denomination: 8,
+	};
+	let txid = r.rt.client().send_raw_transaction(&tx).unwrap();
+	r.rt.produce_block().unwrap();
+	r.purse.put((OutPoint::new(txid, 0), tx.output[0].clone()));
+	r.purse.put((OutPoint::new(txid, 2), tx.output[2].clone()));
+	node::list_fee_asset(&r.rt, i, 100_000_000);
+	(i, IssuerSection { limiter: instance.clone(), entropy: entropy_hex, coin: format!("{}:1", txid), state: None }, words)
+}
+
+/// The server with what `ARCA_OPERATOR_SUPERVISED` and `ARCA_OPERATOR_ISSUER`
+/// ask: the assets issued, the signer started again reading freezes from the
+/// chain's node and minting through the limiter, the assets served.
+async fn serve_profiles(r: &mut Running, p: &mut Profiles) {
+	let supervised = std::env::var_os("ARCA_OPERATOR_SUPERVISED").is_some();
+	let issuer = std::env::var_os("ARCA_OPERATOR_ISSUER").is_some();
+	if !supervised && !issuer {
+		return;
+	}
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let mut extra = vec!["--keeper-timeout-ms".to_string(), "2000".into()];
+	let mut sections = vec![];
+	if supervised {
+		let (z, op) = tokio::task::block_in_place(|| issue_supervised(r));
+		let cookie = r.signer.dir.join("node.cookie");
+		std::fs::write(&cookie, "arca:arca").unwrap();
+		extra.extend(["--supervision-node".to_string(), r.node_url(), "--supervision-cookie".into(), cookie.display().to_string()]);
+		sections.push(AssetSection::new(z, common::running::MIN_LEAF));
+		p.supervised = Some((z, op));
+	}
+	if issuer {
+		let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("browsers-issuer{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let (i, section, words) = tokio::task::block_in_place(|| issue_issuer_operated(r, &dir));
+		extra.extend(["--issuer".to_string(), format!("{}={}", section.limiter.display(), words.display()), "--mint-limiter".into(),
+			limiter_tool().display().to_string()]);
+		let mut a = AssetSection::new(i, 1_000);
+		a.issuer = Some(section);
+		sections.push(a);
+		p.issuer = Some(i);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	tokio::task::block_in_place(|| {
+		r.signer.halt();
+		r.signer.set_extra(extra);
+		r.signer.resume(genesis);
+	});
+	let mut config = r.config.clone();
+	config.assets.extend(sections);
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	if let Some((z, _)) = p.supervised {
+		r.fund_server(z, 50_000_000).await;
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+}
+
+/// The least notice delay at the default exit-delay bounds, in units.
+fn notice_units() -> u16 {
+	server::bond::min_notice_seconds(server::bond::LIFETIME, RelativeTime::from_units(338).unwrap()).div_ceil(512) as u16
+}
+
+/// The paths of the supervised asset and the bond.
+async fn profile_handle(r: &mut Running, p: &mut Profiles, path: &str, b: &Value) -> Option<Result<Value, String>> {
+	Some(match path {
+		"/freeze" | "/lift" => {
+			let Some((z, op)) = p.supervised.clone() else { return Some(Err("the operator serves no supervised asset".into())) };
+			let target = match script(b["script"].as_str().unwrap_or("")) {
+				Ok(t) if !t.is_empty() => t,
+				_ => return Some(Err("name the script (hex)".into())),
+			};
+			let key = hex(target.as_bytes());
+			let out = if path == "/freeze" {
+				tokio::task::block_in_place(|| freeze(r, z, &op, &target)).map(|(at, th)| {
+					p.freezes.insert(key.clone(), (at, th));
+					json!({"record": format!("{}:{}", at.txid, at.vout)})
+				})
+			} else {
+				match p.freezes.remove(&key) {
+					Some((at, th)) => tokio::task::block_in_place(|| lift(r, z, &op, at, &th)).map(|t| json!({"lifted": t})),
+					None => Err("no freeze stands for that script".into()),
+				}
+			};
+			r.synced().await;
+			out.and_then(|mut v| {
+				v["status"] = r.rt.client().call::<Value>("isassetfrozen", &[json!(z.to_string()), json!(key)]).map_err(|e| e.to_string())?;
+				Ok(v)
+			})
+		},
+		"/bond_post" => {
+			let amount = b["amount"].as_u64().unwrap_or(5_000_000);
+			let w = keypair("browsers bond W");
+			let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+			let policy = match BondPolicy::new(chain, keypair("operator").x_only_public_key().0, w.x_only_public_key().0,
+				RelativeTime::from_units(notice_units()).unwrap()) {
+				Ok(p) => p,
+				Err(e) => return Some(Err(e.to_string())),
+			};
+			let x = r.x;
+			let tx = r.pay_to(policy.script_pubkey(), x, amount);
+			r.produce().await;
+			r.bury().await;
+			let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+			let op = OutPoint::new(tx.txid(), vout);
+			r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
+				outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None });
+			r.restart_server().await;
+			r.synced().await;
+			p.bond = Some((w, op));
+			Ok(json!({"bond": format!("{}:{}", op.txid, op.vout), "asset": x.to_string(), "amount": amount}))
+		},
+		"/bond_notice" => {
+			let Some((w, _)) = p.bond.clone() else { return Some(Err("no bond posted".into())) };
+			let x = r.x;
+			r.fund_server(x, 50_000_000).await;
+			r.produce().await;
+			r.bury().await;
+			r.synced().await;
+			let key_file = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("browsers-bond-w{}.key", std::process::id()));
+			let _ = std::fs::remove_file(&key_file);
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file).unwrap();
+				std::io::Write::write_all(&mut f, hex(&w.secret_bytes()).as_bytes()).unwrap();
+			}
+			let noticed = server::server::bond_notice(&r.config, &key_file).await;
+			let _ = std::fs::remove_file(&key_file);
+			let noticed = match noticed {
+				Ok(n) => n,
+				Err(e) => return Some(Err(e.to_string())),
+			};
+			r.produce().await;
+			r.bury().await;
+			r.config.bond.as_mut().unwrap().notice = noticed["notice"].as_str().map(String::from);
+			r.restart_server().await;
+			r.synced().await;
+			Ok(json!({"notice": noticed["notice"]}))
+		},
+		"/bond_drop" => {
+			r.config.bond = None;
+			r.restart_server().await;
+			r.synced().await;
+			Ok(json!({"bond": null}))
+		},
+		_ => return None,
+	})
 }
 
 async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String> {
@@ -339,8 +668,11 @@ async fn operator_for_browsers() {
 	let addr = std::env::var("ARCA_OPERATOR_CONTROL").unwrap_or_else(|_| "127.0.0.1:18640".into());
 	let (mut r, _nodes) = match std::env::var_os("ARCA_OPERATOR_LIGHTNING") {
 		Some(_) => with_lightning().await,
+		None if std::env::var_os("ARCA_OPERATOR_ISSUER").is_some() => (Running::start_on(&["-evbparams=simplicity:-1:::"], |_, _, _| {}).await, vec![]),
 		None => (Running::start().await, vec![]),
 	};
+	let mut profiles = Profiles::default();
+	serve_profiles(&mut r, &mut profiles).await;
 	let btc = std::env::var("ARCA_OPERATOR_BTC_LIGHTNING").ok().map(|n| {
 		let n = n.parse::<usize>().expect("ARCA_OPERATOR_BTC_LIGHTNING is a count of wallets' nodes");
 		tokio::task::block_in_place(|| bitcoin_side(n))
@@ -366,9 +698,18 @@ async fn operator_for_browsers() {
 			answer(&mut s, 200, &json!({"quit": true}));
 			break;
 		}
-		let out = match bitcoin_handle(&btc, &path, &body) {
+		let profiled = match bitcoin_handle(&btc, &path, &body) {
+			Some(out) => Some(out),
+			None => profile_handle(&mut r, &mut profiles, &path, &body).await,
+		};
+		let out = match profiled {
 			Some(out) => out,
 			None => handle(&mut r, &path, &body).await.map(|mut v| {
+				if path == "/state" {
+					v["supervised"] = json!(profiles.supervised.as_ref().map(|(z, _)| z.to_string()));
+					v["issuer"] = json!(profiles.issuer.map(|i| i.to_string()));
+					v["bond"] = json!(profiles.bond.as_ref().map(|(_, o)| format!("{}:{}", o.txid, o.vout)));
+				}
 				if let (Some(side), "/state") = (&btc, path.as_str()) {
 					v["btc_lightning"] = json!({"hub": side.hub.rpc_path().display().to_string(),
 						"wallets": side.wallets.iter().map(|w| w.rpc_path().display().to_string()).collect::<Vec<_>>()});

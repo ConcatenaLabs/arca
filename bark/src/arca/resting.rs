@@ -154,9 +154,9 @@ impl Wallet {
 			}
 		}
 		let Some(change) = done else {
-			return Err(Error::Refused(format!("the wallet's live coins of asset {} hold {} and the order of {} and its refresh fees need {}, \
-				with any change at least the operator's smallest leaf of {}: board or receive more, or rest less", a, total, ask.amount,
-				ask.amount.saturating_add(fee), min)));
+			return Err(self.short_of(a, ask.amount.saturating_add(fee).saturating_sub(total).max(1), format!("the wallet's live coins of \
+				asset {} hold {} and the order of {} and its refresh fees need {}, with any change at least the operator's smallest leaf of \
+				{}: board or receive more, or rest less", a, total, ask.amount, ask.amount.saturating_add(fee), min))?);
 		};
 		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
 		if !fee_within(fee, ask.amount, bound) {
@@ -447,9 +447,9 @@ impl Wallet {
 			}
 		}
 		let Some((fee, change)) = done else {
-			return Err(Error::Refused(format!("the wallet's live coins of asset {} that expire no earlier than the order's coin (median time \
-				{}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with change of none or at least {}", asset_b,
-				order_expiry, kept, filled, price, min)));
+			return Err(self.short_of(asset_b, price.saturating_sub(kept).max(1), format!("the wallet's live coins of asset {} that expire \
+				no earlier than the order's coin (median time {}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with \
+				change of none or at least {}", asset_b, order_expiry, kept, filled, price, min))?);
 		};
 		Ok(RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b })
 	}

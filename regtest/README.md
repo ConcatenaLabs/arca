@@ -68,6 +68,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T21 | Every frozen construction together in a 16-leaf tree in an asset that is not the policy asset |
 | T22 | The operator's equivocation bond (`bond.py`): a payment and a second spend of one leaf, both co-signed by the operator, burn the bond whole; refused beside it one signature twice, two signatures over one digest, two salts, another key and a burn short; a fill beside a payment under one salt burns another; the notice keeps the bond whole and is W's alone; the withdrawal waits the notice's delay |
 | T23 | `landing-1`, the leaf of a supervised asset: the collaborative path over its prefix `K ‖ P`, which binds the landing program, refused over the plain constant and over another landing's prefix; the landing refused before its delay, to another key's P2WPKH, to a taproot output, in another asset and one atom below the value less the allowance; under a pause, with the leaf's own script named in a freeze, the landing confirms, the landed coin is refused by the pause and by a freeze of its address, and spent once the freeze is lifted |
+| T24 | `channel-1`, a leaf with a balance for each of owner and operator (`channel.py`): an update moves the coin to a newer state at once, both signing the state's number and program; refused to an equal or older state, over another state's program, keeping one atom less, into another asset, with either signature from another key, with 33-byte and 9-byte witness items; an older state's settle on a newer output, the newer settle paying the older balances, short by one atom, swapped, to another channel's credit output, and before its delay; the collaborative path spends a state output. The credit output's claim pays the owner what the operator's cumulative note credits less what was paid, capped at the state's `s + F`; refused above the signed amount, one atom over, with a note already paid, with another channel's note, with a 33-byte amount or signature, with the rest short or elsewhere; a stale state's claim takes the operator's whole balance; the provider path after the window, refused before it; the unroll gate above a channel leaf refuses a 33-byte member key |
 
 The node runs on a custom chain with the arguments in `ArkBase.ark_params`
 (`arklib.py`): transparent addresses, fees in any accepted asset, and an issued
@@ -144,6 +145,14 @@ evidence: two messages the operator signed under one leaf salt (a payment and
 a second spend of the same leaf), and a fill beside the first, each with its
 rest, digest and signature, and the witness items the slash takes for each
 pair.
+
+`vectors/channel.json` holds the `channel-1` leaf's vectors, written by
+`channel.py`: one channel's keys, salt, value, capacity, exit delay and credit
+window, its state and credit constants, its outputs at three states (each
+one's collaborative, update and settle leaves, scriptPubKey, merkle root and
+control blocks, and its credit output's claim and provider leaves), each
+state's message with both signatures, and two credit notes with the
+operator's signatures.
 
 `vectors/accumulator.json` holds the accumulator batch's vectors, written by
 `accumulator.py`, which derives them on its own from the batch's rules: six
