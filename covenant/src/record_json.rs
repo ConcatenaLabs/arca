@@ -313,6 +313,28 @@ pub fn channel_from_json(v: &Value) -> Result<Channel, RecordError> {
 	Ok(Channel { capacity, window })
 }
 
+/// An `enclave-1` leaf's enclave as the record's JSON form and the server's
+/// interface write it: `{"holder": hex, "policy": hex, "clawback": hex or null}`.
+pub fn enclave_json(e: &crate::enclave::Enclave) -> Value {
+	let mut m = Map::new();
+	m.insert("holder".into(), Value::String(hex(&e.holder.serialize())));
+	m.insert("policy".into(), Value::String(hex(&e.policy.serialize())));
+	m.insert("clawback".into(), e.clawback.map_or(Value::Null, |k| Value::String(hex(&k.serialize()))));
+	Value::Object(m)
+}
+
+/// Reads [`enclave_json`].
+pub fn enclave_from_json(v: &Value) -> Result<crate::enclave::Enclave, RecordError> {
+	let o = object(v, "enclave", &["holder", "policy", "clawback"])?;
+	let holder = key(o, "holder")?;
+	let policy = key(o, "policy")?;
+	let clawback = match &o["clawback"] {
+		Value::Null => None,
+		_ => Some(key(o, "clawback")?),
+	};
+	Ok(crate::enclave::Enclave { holder, policy, clawback })
+}
+
 /// `v` as an object with exactly the keys `keys`.
 /// `order-2`'s terms as the record's JSON form and the server's interface
 /// write them: the asset it is paid in, the price and lot, the landed order's

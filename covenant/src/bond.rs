@@ -9,8 +9,9 @@
 //!
 //! - the rebindable message of a collaborative path ([`crate::message`]),
 //!   `SHA256(K ‖ r)`, `K = SHA256(C ‖ salt)`, `C = SHA256("ArcaRbd1" ‖ genesis)`
-//!   (a `landing-1` leaf's `r` starts with its landing program; a `vtxo-2`
-//!   coin's `r` is the 70 bytes `k ‖ n ‖ I ‖ m ‖ O` of [`crate::collab`]);
+//!   (a `landing-1` leaf's `r` starts with its landing program, an
+//!   `enclave-1` leaf's with its enclave's digest; a `vtxo-2` coin's `r` is
+//!   the 70 bytes `k ‖ n ‖ I ‖ m ‖ O` of [`crate::collab`]);
 //! - an `order-2` fill ([`crate::order`]), `SHA256(F ‖ salt ‖ r)`,
 //!   `F = SHA256(SHA256("Arca/order-fill") ‖ genesis)`.
 //!
@@ -461,7 +462,7 @@ fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 /// output it spends: the message rebuilt from the transaction and the coin,
 /// and the operator's signature, the witness's first item. `None` when the
 /// input is no such spend: its script pushes no `K` of `salt` (nor a
-/// `landing-1` leaf's `K ‖ P`), its witness, an annex (BIP341) set aside
+/// `landing-1` leaf's `K ‖ P`, an `enclave-1` leaf's `K ‖ D`), its witness, an annex (BIP341) set aside
 /// ([`crate::witness::without_annex`]), is not
 /// `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
 /// explicit. The caller checks the signature ([`BondPolicy::verify`]). The
@@ -474,7 +475,8 @@ pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input:
 	let k = chain.leaf_constant(salt);
 	let script = Script::from(w[3].clone());
 	// What the script pushes for its message: `K`, or a `landing-1` leaf's
-	// `K ‖ P` ([`Chain::landing_prefix`]).
+	// `K ‖ P` ([`Chain::landing_prefix`]), or an `enclave-1` leaf's `K ‖ D`
+	// ([`Chain::enclave_prefix`]), both 52 bytes.
 	let k = script.instructions().find_map(|i| match i {
 		Ok(elements::script::Instruction::PushBytes(b))
 			if b.starts_with(&k) && (b.len() == 32 || b.len() == 32 + crate::landing::PROGRAM_BYTES) => Some(b.to_vec()),

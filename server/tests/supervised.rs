@@ -210,7 +210,7 @@ fn board_z(r: &mut Running, z: AssetId, owner: &Keypair, value: u64, landing: Op
 
 /// A new leaf of Z for `key`, landing at `landing`, holding `value`.
 fn landing_leaf(key: &Keypair, z: AssetId, value: u64, landing: &Landing) -> NewLeaf {
-	NewLeaf {
+	NewLeaf { enclave: None,
 		owner: xonly(key), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay(), htlc: None,
 		landing: Some(landing.terms(z, value).unwrap()), v2: false,
 	}
@@ -399,8 +399,8 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 		direction: arca_covenant::HtlcDirection::Send, payment_hash: [9; 32],
 		timeout: arca_covenant::MedianTime::from_consensus(2_000_000_000).unwrap(), operator_delay: arca_covenant::RelativeTime::from_units(36).unwrap(),
 	};
-	let ln = NewLeaf { owner: xonly(&keypair("alice ln")), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay(),
-		htlc: Some(htlc), landing: None, v2: false };
+	let ln = NewLeaf { enclave: None, v2: false, owner: xonly(&keypair("alice ln")), owner_nonce: random32(), creator_nonce: random32(), exit_delay: exit_delay(),
+		htlc: Some(htlc), landing: None };
 	let send = transfer_body(&[(&alice2.held, alice2.valid(&r), alice2.valid(&r).value - MARGIN)],
 		&[(z, alice2.valid(&r).value - 2 * MARGIN, ln)], xonly(&r.s), r.chain);
 	refused("Lightning payment by the frozen holder", r.http.post("lightning_send", &json!({"invoice": "lnbcrt1",

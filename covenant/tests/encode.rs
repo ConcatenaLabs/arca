@@ -28,7 +28,7 @@ fn policies() -> Vec<Policy> {
 	let s = xonly(&keypair("S"));
 	let a = xonly(&keypair("A"));
 	let sch = schedule();
-	let leaf = LeafPolicy { owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None , v2: false };
+	let leaf = LeafPolicy { enclave: None, owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None , v2: false};
 	let owners: Vec<XOnlyPublicKey> = (0..5).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
@@ -99,8 +99,8 @@ fn malformed_encodings_are_refused() {
 	b[0] = 2;
 	assert_eq!(Policy::decode(&b), Err(DecodeError::Version(2)));
 	let mut b = leaf.clone();
-	b[1] = 13;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(13)));
+	b[1] = 14;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(14)));
 	// a key that is not on the curve: x = 0xff..ff is above the field size
 	let mut b = leaf.clone();
 	b[2..34].copy_from_slice(&[0xff; 32]);
@@ -227,7 +227,7 @@ fn witness_readers() {
 		direction: HtlcDirection::Send, payment_hash: sha256(&pre),
 		timeout: MedianTime::from_consensus(1_800_000_000).unwrap(), operator_delay: RelativeTime::from_units(1).unwrap(),
 	};
-	let h = LeafPolicy {
+	let h = LeafPolicy { enclave: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32("htlc"), chain: chain(), exit_delay: sch.notice, htlc: Some(terms),
 		order: None,
 		landing: None,

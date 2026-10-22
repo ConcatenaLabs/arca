@@ -21,8 +21,8 @@
 //! Beside them: the swap with both legs, mined; what `vtxo-2` still allows,
 //! a coin funded twice spent alone a second time into the same outputs; the
 //! operator alone, the two signatures swapped, a pair under another salt and
-//! a `vtxo-1` pair under the same `K`, and an annex (which a block takes on a
-//! co-signed `vtxo-1` spend), refused; the exit, refused before its
+//! a `vtxo-1` pair under the same `K`, and an annex, zero or not (which a
+//! block takes on a co-signed `vtxo-1` spend), refused by relay and in a block; the exit, refused before its
 //! delay and mined after it at `vtxo-1`'s size; and the equivocation bond
 //! burned in a block with a `vtxo-2` co-signature read from the chain beside
 //! a second one under the same salt.
@@ -59,7 +59,7 @@ const FEE: u64 = 2_000;
 fn leaf(net: &Net, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp256k1_zkp::Keypair, salt: &str, v2: bool) -> LeafPolicy {
 	LeafPolicy {
 		owner: xonly(owner), operator: xonly(s), salt: label32(salt), chain: net.chain, exit_delay: delay(), htlc: None, order: None,
-		landing: None, channel: None, v2,
+		landing: None, channel: None, enclave: None, v2,
 	}
 }
 
@@ -262,7 +262,14 @@ fn the_bindings_vtxo_2_adds_refuse_what_vtxo_1_allowed() {
 	let annex = [vec![0x50u8], vec![0xab; 999]].concat();
 	let mut annexed = collab.clone();
 	annexed.input[0].witness.script_witness.push(annex.clone());
-	net.refuse("vtxo-2: the honest pair with a 1,000-byte annex attached", &annexed, "(Assertion failed)");
+	// Relay refuses it before the program runs (a Simplicity leaf's annex must
+	// be zeros); a block runs the program, which requires no annex at all.
+	net.refuse_relay_and_block("vtxo-2: the honest pair with a 1,000-byte annex attached", &annexed,
+		"Simplicity annex must be zeros after its tag", "(Assertion failed)");
+	let mut zeros = collab.clone();
+	zeros.input[0].witness.script_witness.push([vec![0x50u8], vec![0x00; 999]].concat());
+	net.refuse_relay_and_block("vtxo-2: the honest pair with a 1,000-byte zero annex attached", &zeros,
+		"Simplicity annex is larger than the program's cost needs", "(Assertion failed)");
 	{
 		let l1 = leaf(&net, &a, &s, "annex vtxo-1", false);
 		let c1 = net.fund(vec![explicit(x, V, l1.script_pubkey())]).remove(0);
