@@ -251,6 +251,9 @@ impl Wallet {
 		if let Some(a) = asset {
 			Self::min_leaf(&self.server_info()?, a)?;
 		}
+		// A payment to this request comes out of round: the operator's bond
+		// covers it, or the wallet says the operator posts none.
+		let bond_note = self.bond_gate(asset.zip(value))?;
 		let nonce = random32();
 		let key = self.keys.leaf_xonly(&nonce)?;
 		// When it was handed out, by the chain's clock, and when it lapses.
@@ -280,7 +283,11 @@ impl Wallet {
 		if let Some(v) = value {
 			req["value"] = json!(v.to_string());
 		}
-		Ok(json!({"request": encode(&self.spelling.request, &req), "details": req}))
+		let mut out = json!({"request": encode(&self.spelling.request, &req), "details": req});
+		if let Some(n) = bond_note {
+			out["bond"] = json!(n);
+		}
+		Ok(out)
 	}
 
 	fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
@@ -1345,6 +1352,16 @@ impl Wallet {
 			}
 		}
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
+		// A coin paid out of round while the operator's bond does not stand,
+		// or does not cover it, is the wallet's still: sync refreshes it at
+		// once.
+		if !accepted.is_empty() {
+			let uncovered = self.uncovered()?;
+			if !uncovered.is_empty() {
+				out["uncovered"] = json!(uncovered);
+				notes.push("the operator's bond does not cover the coins in uncovered: sync asks for their refresh at once".into());
+			}
+		}
 		if !held.is_empty() {
 			out["already_held"] = json!(held);
 		}
@@ -1387,6 +1404,8 @@ impl Wallet {
 			return Err(Error::Refused("a swap exchanges two assets".into()));
 		}
 		let info = self.server_info()?;
+		// The coin the swap pays this wallet comes out of round.
+		self.bond_gate(Some((want_asset, want)))?;
 		let min_give = Self::min_leaf(&info, give_asset)?;
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		if give < min_give || want < min_want {
@@ -1569,6 +1588,8 @@ impl Wallet {
 	pub fn swap_accept_shown(&mut self, offer_text: &str, near_deadline: bool, shown: Option<&Value>) -> Result<Value, Error> {
 		let o = self.swap_offer_checked(offer_text)?;
 		let (id, give_asset, give, want_asset, want) = (o.id.clone(), o.give_asset, o.give, o.want_asset, o.want);
+		// The coin the swap pays this wallet comes out of round.
+		self.bond_gate(Some((give_asset, give)))?;
 		let info = self.server_info()?;
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;

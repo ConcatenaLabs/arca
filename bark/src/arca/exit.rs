@@ -85,7 +85,7 @@ pub(crate) struct Payer {
 	asset: Option<AssetId>,
 	/// The asset the exit moves, from which the wallet chooses the fee asset
 	/// when none is named; `None` where nothing is to be chosen.
-	moved: Option<AssetId>,
+	pub(crate) moved: Option<AssetId>,
 	coin: Option<(OutPoint, TxOut, Keypair)>,
 	change: Option<(Script, Keypair)>,
 	/// Coins the exit has already taken.
@@ -180,7 +180,7 @@ impl Wallet {
 
 	/// Builds one transaction of an exit: with the output's own reserve when
 	/// that pays the floor, else with a fee coin, whose input it signs.
-	fn with_fee(&self, payer: &mut Payer, build: &dyn Fn(&FeeSource) -> Result<UnrollTx, Error>) -> Result<UnrollTx, Error> {
+	pub(crate) fn with_fee(&self, payer: &mut Payer, build: &dyn Fn(&FeeSource) -> Result<UnrollTx, Error>) -> Result<UnrollTx, Error> {
 		let u = build(&FeeSource::Reserve);
 		if let Ok(u) = &u {
 			if self.pays_floor(&u.tx)? {

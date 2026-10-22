@@ -663,6 +663,28 @@ impl ChainSource {
 		}
 	}
 
+	/// The active chain's block at `height`, if the chain is that long.
+	pub fn block_at(&self, height: u64) -> Result<Option<Block>, Error> {
+		let Some(hash) = self.block_hash(height)? else { return Ok(None) };
+		self.raw_block(&hash).map(Some).map_err(node)
+	}
+
+	/// The txids in the node's mempool.
+	pub fn mempool(&self) -> Result<Vec<Txid>, Error> {
+		self.call("getrawmempool", &[]).map_err(node)
+	}
+
+	/// The median time a relative lock on an output of `txid` counts from:
+	/// that of the block before the one holding `txid` (BIP68); `None` while
+	/// `txid` is in no block of the active chain.
+	pub fn coin_time(&self, txid: &Txid) -> Result<Option<u32>, Error> {
+		let Some((_, height)) = self.tx_block(txid)? else { return Ok(None) };
+		if height == 0 {
+			return Ok(None);
+		}
+		self.median_time_at(height - 1)
+	}
+
 	/// Whether `outpoint` is unspent, the mempool's spends included.
 	pub fn unspent(&self, outpoint: &OutPoint) -> Result<bool, Error> {
 		let v: Value = self.call("gettxout", &[json!(outpoint.txid.to_string()), json!(outpoint.vout), json!(true)])

@@ -27,6 +27,10 @@
 //!   back to the payer; and the claims a wallet finds under its own address
 //!   keys and takes up ([`Wallet::distribute`], [`Wallet::claims`],
 //!   [`Wallet::claim`]).
+//! - [`bond`]: the operator's equivocation bond, checked on the wallet's own
+//!   node before every payment out of round, the operator's signatures the
+//!   wallet's coins carry as evidence, and `watch-bond`, which burns the bond
+//!   on two different messages the operator key signed under one salt.
 //! - [`btc_swap`]: a swap of native BTC in a Bitcoin ark for an asset in the
 //!   operator's tree, with another wallet of the operator, under one payment
 //!   hash; the Bitcoin side, Bark, is run by the program, which hands in what
@@ -95,6 +99,7 @@
 //! longer than its margin leaves a fee race the operator can still win by
 //! burning the leaf's value.
 
+pub mod bond;
 pub mod btc_swap;
 pub mod chain;
 pub mod claim;

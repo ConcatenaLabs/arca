@@ -40,7 +40,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
-	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}";
+	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -141,6 +142,13 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 	match command {
 		"info" => w.info(),
 		"supply" => w.supply(asset(req_str(&a["asset"], "the asset")?)?),
+		"bond" => w.bond(),
+		"bond_evidence" => w.bond_evidence().map(|l| json!({"lines": l})),
+		"watch_bond" => {
+			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
+			let fee = a["fee_asset"].as_str().map(asset).transpose()?;
+			w.watch_bond(&lines, fee)
+		},
 		"address" => w.address(),
 		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
 		"balance" => w.balance(),

@@ -119,6 +119,28 @@ enum Cmd {
 	/// what is live in its batches, each transaction read again from the
 	/// wallet's own node.
 	Supply { asset: String },
+	/// The operator's equivocation bond as this wallet checks it on its own
+	/// node, and what the wallet holds out of round against it.
+	Bond,
+	/// Every message the operator key signed that the wallet's coins rest
+	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
+	/// watcher.
+	BondEvidence,
+	/// Compares the wallet's evidence and every file of others' under each
+	/// salt, reads the chain and the mempool for spends of the coins they
+	/// name, and burns the operator's bond on two different messages under
+	/// one salt; sends every slash again until it is final.
+	WatchBond {
+		/// A file of evidence lines another wallet wrote: what `arca
+		/// bond-evidence` printed, or one line a line. May be given more than
+		/// once.
+		#[arg(long)]
+		evidence: Vec<std::path::PathBuf>,
+		/// The asset the slash's fee is paid in: the bond's own when the
+		/// node accepts it, else as for an exit.
+		#[arg(long)]
+		fee_asset: Option<String>,
+	},
 	/// A new on-chain Sequentia address of the wallet's.
 	Address,
 	/// The wallet's OpenAMP account key (`m/5/0`): the key a SeqPal ID is,
@@ -1148,6 +1170,23 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
+		Cmd::Bond => w.bond(),
+		Cmd::BondEvidence => w.bond_evidence().map(|lines| json!({"lines": lines})),
+		Cmd::WatchBond { evidence, fee_asset } => {
+			// A file is what `bond-evidence` printed, or one line a line.
+			let mut lines = vec![];
+			for f in &evidence {
+				let text = std::fs::read_to_string(f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?;
+				match serde_json::from_str::<Value>(&text) {
+					Ok(v) if v["lines"].is_array() => lines.extend(v["lines"].as_array().cloned().unwrap_or_default()),
+					_ => for l in text.lines().filter(|l| !l.trim().is_empty()) {
+						lines.push(serde_json::from_str(l).map_err(|e| bark::arca::Error::Parse(format!("{}: {}", f.display(), e)))?);
+					},
+				}
+			}
+			let fee = fee_asset.as_deref().map(asset).transpose()?;
+			w.watch_bond(&lines, fee)
+		},
 		Cmd::Address => w.address(),
 		Cmd::OpenampKey => w.openamp_key().map(|k| serde_json::json!({"key": k.to_string(), "path": "m/5/0"})),
 		Cmd::Balance { without_bitcoin } => {
