@@ -38,6 +38,12 @@ generates: its three scripts, the bond's and the notice output's
 scriptPubKeys and control blocks, and a slash's evidence: two messages S
 signed under one salt, and a fill beside one, with their digests and the
 items the slash takes.
+
+vectors/channel.json holds the channel-1 leaf's vectors, which channel.py
+generates: one channel's outputs at three states (each one's update, settle
+and collaborative leaves, its credit output's claim and provider leaves,
+their control blocks), each state's message with both signatures, and two
+credit notes with the operator's signatures.
 """
 import json
 import os
@@ -56,6 +62,7 @@ RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
 TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
 ORDER_OUT = os.path.join(HERE, "vectors", "order.json")
 BOND_OUT = os.path.join(HERE, "vectors", "bond.json")
+CHANNEL_OUT = os.path.join(HERE, "vectors", "channel.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -722,6 +729,7 @@ def generate():
 
 def main():
     import bond
+    import channel
     import offchain
     import order
     import records
@@ -732,7 +740,9 @@ def main():
              (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n"),
              (ORDER_OUT, json.dumps(order.generate(GENESIS, order_keys, label_hash, DELAY), indent=1) + "\n"),
              (BOND_OUT, json.dumps(bond.generate(GENESIS, {"S": S, "W": Key("bond W"), "A": A, "B": B}, label_hash,
-                                                 rel_time(32 * DAY)), indent=1) + "\n")]
+                                                 rel_time(32 * DAY)), indent=1) + "\n"),
+             (CHANNEL_OUT, json.dumps(channel.generate(GENESIS, {"A": A, "S": S}, label_hash, DELAY, rel_time(48 * H)),
+                                      indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:
