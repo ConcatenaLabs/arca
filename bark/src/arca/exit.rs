@@ -635,7 +635,7 @@ impl Wallet {
 		let now = self.now()?;
 		let policy = self.followed_policy(row.expiry, now);
 		let txs = self.accepted_bases(&record)?;
-		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
+		let coin = self.resolve(&record, &txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let key = self.coin_key(&row.owner_nonce)?;
 		let prior: Value = match self.store.exit(leaf_id)? {
 			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,
@@ -734,7 +734,7 @@ impl Wallet {
 		// chain's.
 		let policy = self.followed_policy(row.expiry, now);
 		let txs = self.accepted_bases(&record)?;
-		let coin = record.resolve(&txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
+		let coin = self.resolve(&record, &txs, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let key = self.coin_key(&row.owner_nonce)?;
 		let prior: Value = match self.store.exit(leaf_id)? {
 			Some((_, j, _)) => serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?,

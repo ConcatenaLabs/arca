@@ -680,7 +680,7 @@ impl Wallet {
 						// of its expiry once that has passed (an answer read
 						// again, the request posted again past it).
 						let txs = self.base_txs(&record)?;
-						record.resolve(&txs, &self.followed_policy(first_expiry(&record).unwrap_or(u32::MAX), self.now()?))
+						self.resolve(&record, &txs, &self.followed_policy(first_expiry(&record).unwrap_or(u32::MAX), self.now()?))
 							.map_err(|e| Error::Refused(format!("the server's record of output {}: {}", o["leaf_id"], e)))?;
 					}
 				}
