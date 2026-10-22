@@ -307,7 +307,7 @@ impl Tree {
 				return Err(TreeError::DuplicateOwner { first, second: i });
 			}
 			let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
-				(Template::Vtxo1, None, None, None) => None,
+				(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
 				(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
 				(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
 				(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
@@ -323,7 +323,7 @@ impl Tree {
 				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 				htlc: spec.htlc,
 				order: spec.order,
-				landing,
+				landing, v2: spec.template == Template::Vtxo2,
 			};
 			let program = leaf.program();
 			if let Some(first) = seen.insert(program, i) {

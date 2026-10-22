@@ -106,7 +106,13 @@ impl TapOutput {
 
 	/// The control block that proves `script` is a leaf of this output.
 	pub fn control_block(&self, script: &Script) -> Option<Vec<u8>> {
-		self.info.control_block(&(script.clone(), LeafVersion::default())).map(|c| c.serialize())
+		self.control_block_at(script, LeafVersion::default())
+	}
+
+	/// The control block that proves `script` is a leaf of `version`: a
+	/// Simplicity leaf's `script` is its commitment root.
+	pub fn control_block_at(&self, script: &Script, version: LeafVersion) -> Option<Vec<u8>> {
+		self.info.control_block(&(script.clone(), version)).map(|c| c.serialize())
 	}
 
 	/// A full script-path witness: `below` (bottom of the stack first), then

@@ -235,7 +235,7 @@ impl FillRequest {
 				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
 			};
 			outputs.push(OutputRequest {
-				asset, value, leaf: arca_covenant::NewLeaf { owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
+				asset, value, leaf: arca_covenant::NewLeaf { owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None, v2: false },
 				mailbox, until,
 			});
 		}

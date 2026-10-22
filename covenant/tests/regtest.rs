@@ -232,7 +232,7 @@ fn checkpoint_chain(net: &mut Net, external: bool) {
 	// Every collaborative signature is made now, before the round exists.
 	let margin = if external { 0 } else { FEE };
 	let cp = CheckpointPolicy { owner: xonly(a), operator: xonly(&s_key), salt: label32(&format!("{} checkpoint", tag)),
-		chain: net.chain, sweep: sched.sweep(true, false) };
+		chain: net.chain, sweep: sched.sweep(true, false), v2: false };
 	let v_cp = LEAF - margin;
 	let cp_out = ExplicitOutput::new(net.x, v_cp, cp.script_pubkey());
 	let m1 = leaf.collab_message(net.x, LEAF, std::slice::from_ref(&cp_out)).unwrap();
@@ -508,7 +508,7 @@ fn htlc(net: &mut Net) {
 		owner: xonly(&a), operator: xonly(&s_key), salt: label32(salt), chain: net.chain, exit_delay: delay(),
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout: mt(timeout), operator_delay }),
 		order: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	let (claimed, refunded, together) = (mk(HtlcDirection::Send, "htlc claimed"), mk(HtlcDirection::Send, "htlc refunded"),
 		mk(HtlcDirection::Send, "htlc together"));
@@ -1272,7 +1272,7 @@ fn probes_turned_around(net: &mut Net) {
 	// By hand: the four entries under one node, gated to [S, A, A, B, C],
 	// whose RECLAIM names A twice.
 	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
-		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None };
+		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None, v2: false };
 		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
 			sweep: sched.sweep(true, false) };
 		(leaf, entry)

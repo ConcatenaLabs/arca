@@ -80,7 +80,8 @@ fn the_builder_rebuilds_every_record_vector() {
 			});
 			LeafSpec {
 				template: if order.is_some() { Template::Order2 } else if htlc.is_some() { Template::Htlc1 }
-					else if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 },
+					else if landing.is_some() { Template::Landing1 } else if l.get("template") == Some(&serde_json::json!("vtxo-2")) {
+						Template::Vtxo2 } else { Template::Vtxo1 },
 				owner: key_of(&l["owner"]),
 				value: l["value"].as_u64().unwrap(),
 				owner_nonce: h32(&l["owner_nonce"]),

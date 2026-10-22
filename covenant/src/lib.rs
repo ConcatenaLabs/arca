@@ -16,7 +16,9 @@
 //!   ([`sweep::sweep_tx`]) that takes a batch's outputs behind the token;
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit,
 //!   or, for `htlc-1` ([`htlc`]), a claim with a preimage and a refund after a
-//!   timeout in place of the exit;
+//!   timeout in place of the exit; for `vtxo-2` ([`collab`]) the
+//!   collaborative path is the Simplicity program `arca/collab-2`, which also
+//!   binds the coin's index and the inputs its signers name;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
 //!   checkpoint ([`checkpoint`]), the offboard output with the margin its
@@ -91,6 +93,7 @@ pub mod board;
 pub mod bond;
 pub mod checkpoint;
 pub mod checks;
+pub mod collab;
 pub mod claim;
 pub mod clock;
 pub mod encode;
@@ -194,4 +197,8 @@ pub enum Error {
 	HtlcHasNoExit,
 	#[error("a vtxo-1 leaf has no {0} path")]
 	NotAnHtlc(&'static str),
+	#[error("a vtxo-2 pair names {0} inputs; it names 1 to {max}", max = collab::MAX_NAMED)]
+	NamedCount(usize),
+	#[error("named input {0}'s asset or amount is not explicit")]
+	NamedNotExplicit(usize),
 }

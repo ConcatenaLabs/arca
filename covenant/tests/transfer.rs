@@ -601,7 +601,7 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 	let htlc = NewLeaf {
 		owner: xonly(&htlc_key), owner_nonce: label32("htlc owner nonce"), creator_nonce: label32("htlc creator nonce"),
 		exit_delay: delay, htlc: Some(terms),
-		landing: None,
+		landing: None, v2: false,
 	};
 	let change = Party::new("htlc change", delay);
 	let pay = 3_000_000;

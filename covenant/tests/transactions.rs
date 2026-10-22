@@ -224,7 +224,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 		chain, exit_delay: RelativeTime::from_units(inp["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		htlc: None,
 		order: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&f["leaf_script_pubkey"])[..]);
 	let p = leaf.program();

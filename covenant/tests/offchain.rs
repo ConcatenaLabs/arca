@@ -163,7 +163,7 @@ fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (Lea
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
 		order: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	let coin = net.fund(vec![explicit(net.x, LEAF, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

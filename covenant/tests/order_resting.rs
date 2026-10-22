@@ -527,7 +527,7 @@ fn order_2_on_regtest() {
 			return InTree { fill: sx.tx, checkpoint: None, taker_leaf_tx: unl };
 		}
 		let cp = CheckpointPolicy { owner: xonly(tk), operator: xonly(&s), salt: label32(&format!("order-2 taker {} checkpoint", i)),
-			chain: net.chain, sweep: sched_y.sweep(true, false) };
+			chain: net.chain, sweep: sched_y.sweep(true, false), v2: false };
 		let cp_out = ExplicitOutput::new(net.y, ty_value, cp.script_pubkey());
 		let m_cp = tl.collab_message(net.y, ty_value, std::slice::from_ref(&cp_out)).unwrap();
 		let fcc = net.fee_coin();
@@ -710,7 +710,7 @@ fn order_2_on_regtest() {
 	let ug = unlock(&tx_, 6, &entry[6], g.order.script_pubkey());
 	let og = coin_of(ug.txid(), 0, &ug);
 	let cpg = CheckpointPolicy { owner: xonly(&g.leaf_key), operator: xonly(&s), salt: label32("order-2 G cancel checkpoint"),
-		chain: net.chain, sweep: sched_x.sweep(true, false) };
+		chain: net.chain, sweep: sched_x.sweep(true, false), v2: false };
 	let cpo = ExplicitOutput::new(net.x, N, cpg.script_pubkey());
 	let cancel = collab(&mut net, &g.order, &og, std::slice::from_ref(&cpo), &s, &g.leaf_key);
 	net.pass("G/the maker brings the order it cancelled to the chain", &ug);

@@ -8,7 +8,8 @@
 //!   checkpoint spent by its collaborative path. Owner and operator sign the
 //!   coin's asset and amount and the outputs, never the outpoint, so the pair
 //!   ([`Pair`]) can be made before the coin is on-chain and survives any
-//!   unroll;
+//!   unroll. A `vtxo-2` pair also signs the coin's index and the inputs it
+//!   names ([`Rebindable::message_in`]);
 //! - a spend whose path ends in `<key> OP_CHECKSIG` ([`KeySpend`]): an exit,
 //!   a forfeit's claim or refund, an offboard's reclaim. Its signature
 //!   commits to the whole transaction, so it is made once the transaction is
@@ -38,7 +39,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, BlockHash, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut, TxOutWitness};
 
 use crate::checkpoint::CheckpointPolicy;
-use crate::leaf::{two_party_items, two_party_message, LeafPolicy, MAX_OUTPUTS};
+use crate::leaf::{two_party_items, LeafPolicy, MAX_OUTPUTS};
 use crate::message::CsfsMessage;
 use crate::script::ExplicitOutput;
 use crate::sign::{script_spend_sighash, verify_digest};
@@ -268,6 +269,41 @@ pub trait Rebindable {
 	fn witness(&self, pair: &Pair, m: u8) -> Vec<Vec<u8>> {
 		self.tap().witness(&self.collab(), two_party_items(&pair.operator, &pair.owner, m))
 	}
+
+	/// Whether the pair also signs the coin's index and the inputs it names
+	/// (a `vtxo-2` leaf or checkpoint, [`crate::collab`]).
+	fn names_inputs(&self) -> bool {
+		false
+	}
+
+	/// The message both sign to spend the coin at input `index` of a
+	/// transaction whose first inputs spend `named` (the coin among them)
+	/// into `outputs`. A `vtxo-1` path signs neither the index nor the other
+	/// inputs, so for it this is [`Self::message`] of `named[index]`.
+	fn message_in(&self, index: u32, named: &[TxOut], outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		let coin = named.get(index as usize).ok_or(Error::InputIndex(index as usize))?;
+		let (asset, value) = coin.asset.explicit().zip(coin.value.explicit()).ok_or(Error::NamedNotExplicit(index as usize))?;
+		self.message(asset, value, outputs)
+	}
+
+	/// Whether `pair` signs [`Self::message_in`], each signature by its own key.
+	fn verify_in(&self, index: u32, named: &[TxOut], outputs: &[ExplicitOutput], pair: &Pair) -> Result<(), SpendError> {
+		let msg = self.message_in(index, named, outputs)?;
+		if !verify_digest(&pair.operator, &msg.digest, &self.operator()) {
+			return Err(SpendError::Signature("operator"));
+		}
+		if !verify_digest(&pair.owner, &msg.digest, &self.owner()) {
+			return Err(SpendError::Signature("owner"));
+		}
+		Ok(())
+	}
+
+	/// The collaborative witness of a spend naming `n` inputs and committing
+	/// to `m` outputs. A `vtxo-1` path takes no `n`.
+	fn witness_in(&self, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
+		let _ = n;
+		self.witness(pair, m)
+	}
 }
 
 impl Rebindable for LeafPolicy {
@@ -288,7 +324,32 @@ impl Rebindable for LeafPolicy {
 	}
 
 	fn message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
-		two_party_message(&self.collab_prefix(), asset_in, value_in, outputs)
+		self.collab_message(asset_in, value_in, outputs)
+	}
+
+	fn witness(&self, pair: &Pair, m: u8) -> Vec<Vec<u8>> {
+		self.collab_witness(&pair.operator, &pair.owner, m)
+	}
+
+	fn names_inputs(&self) -> bool {
+		self.v2
+	}
+
+	fn message_in(&self, index: u32, named: &[TxOut], outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		if !self.v2 {
+			let coin = named.get(index as usize).ok_or(Error::InputIndex(index as usize))?;
+			let (asset, value) = coin.asset.explicit().zip(coin.value.explicit()).ok_or(Error::NamedNotExplicit(index as usize))?;
+			return self.collab_message(asset, value, outputs);
+		}
+		let outs: Vec<TxOut> = outputs.iter().map(|o| o.txout()).collect();
+		self.collab2().message(index, named, &outs)
+	}
+
+	fn witness_in(&self, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
+		if !self.v2 {
+			return self.collab_witness(&pair.operator, &pair.owner, m);
+		}
+		self.collab2().witness(self.exit_script(), pair, n, m)
 	}
 }
 
@@ -310,7 +371,32 @@ impl Rebindable for CheckpointPolicy {
 	}
 
 	fn message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
-		two_party_message(&self.leaf_constant(), asset_in, value_in, outputs)
+		self.collab_message(asset_in, value_in, outputs)
+	}
+
+	fn witness(&self, pair: &Pair, m: u8) -> Vec<Vec<u8>> {
+		self.collab_witness(&pair.operator, &pair.owner, m)
+	}
+
+	fn names_inputs(&self) -> bool {
+		self.v2
+	}
+
+	fn message_in(&self, index: u32, named: &[TxOut], outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		if !self.v2 {
+			let coin = named.get(index as usize).ok_or(Error::InputIndex(index as usize))?;
+			let (asset, value) = coin.asset.explicit().zip(coin.value.explicit()).ok_or(Error::NamedNotExplicit(index as usize))?;
+			return self.collab_message(asset, value, outputs);
+		}
+		let outs: Vec<TxOut> = outputs.iter().map(|o| o.txout()).collect();
+		self.collab2().message(index, named, &outs)
+	}
+
+	fn witness_in(&self, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
+		if !self.v2 {
+			return self.collab_witness(&pair.operator, &pair.owner, m);
+		}
+		self.collab2().witness(self.sweep_script(), pair, n, m)
 	}
 }
 

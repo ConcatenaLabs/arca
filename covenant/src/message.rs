@@ -44,6 +44,11 @@ impl CsfsMessage {
 		let digest = sha256(&preimage);
 		CsfsMessage { preimage, digest }
 	}
+
+	/// The message whose bytes are `preimage`.
+	pub(crate) fn from_preimage(preimage: Vec<u8>) -> CsfsMessage {
+		CsfsMessage::new(preimage)
+	}
 }
 
 /// The chain a policy is bound to, named by its genesis block hash.

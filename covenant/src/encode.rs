@@ -12,7 +12,7 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `vtxo-2` leaf; 5 a checkpoint, 11 a `vtxo-2` coin's checkpoint), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
 //! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
@@ -286,7 +286,7 @@ impl Encoding for LeafPolicy {
 			exit_delay: r.relative_time()?,
 			htlc: None,
 			order: None,
-			landing: None,
+			landing: None, v2: false,
 		})
 	}
 }
@@ -416,7 +416,7 @@ impl Encoding for CheckpointPolicy {
 			operator: r.key()?,
 			salt: r.array32()?,
 			chain: r.chain()?,
-			sweep: Sweep::decode_from(r)?,
+			sweep: Sweep::decode_from(r)?, v2: false,
 		})
 	}
 }
@@ -454,7 +454,7 @@ impl Encoding for OffboardPolicy {
 /// Any of the output policies, tagged with its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
-	/// A leaf, `vtxo-1`, `htlc-1` or `order-2`.
+	/// A leaf, `vtxo-1`, `vtxo-2`, `htlc-1`, `order-2` or `landing-1`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -482,13 +482,13 @@ impl Encoding for Policy {
 		w.push(VERSION);
 		match self {
 			Policy::Leaf(p) => {
-				w.push(if p.order.is_some() { 8 } else if p.landing.is_some() { 9 } else if p.htlc.is_some() { 6 } else { 1 });
+				w.push(if p.order.is_some() { 8 } else if p.landing.is_some() { 9 } else if p.htlc.is_some() { 6 } else if p.v2 { 10 } else { 1 });
 				p.encode_to(w)
 			},
 			Policy::Node(p) => { w.push(2); p.encode_to(w) },
 			Policy::Entry(p) => { w.push(3); p.encode_to(w) },
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
-			Policy::Checkpoint(p) => { w.push(5); p.encode_to(w) },
+			Policy::Checkpoint(p) => { w.push(if p.v2 { 11 } else { 5 }); p.encode_to(w) },
 			Policy::Offboard(p) => { w.push(7); p.encode_to(w) },
 		}
 	}
@@ -532,6 +532,8 @@ impl Encoding for Policy {
 				p.landing = Some(crate::landing::LandingTerms { program, asset, min_value });
 				Policy::Leaf(p)
 			},
+			10 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
+			11 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}

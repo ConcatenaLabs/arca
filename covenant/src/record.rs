@@ -197,12 +197,18 @@ pub enum Template {
 	/// of the owner's landing key, where a freeze of the asset binds
 	/// ([`crate::landing`]).
 	Landing1,
+	/// `vtxo-2`, the ordinary holding whose collaborative path is the
+	/// Simplicity program `arca/collab-2`, which also binds the coin's index
+	/// and the inputs its signers name ([`crate::collab`]). Its exit is
+	/// `vtxo-1`'s.
+	Vtxo2,
 }
 
 impl Template {
 	/// Every template this crate knows, in the order of their ids: the
 	/// operator's published list (`info.templates`).
-	pub const ALL: [Template; 5] = [Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1];
+	pub const ALL: [Template; 6] =
+		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1, Template::Vtxo2];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -223,6 +229,7 @@ impl Template {
 			Template::Htlc1 => Template::HTLC,
 			Template::Order2 => Template::ORDER,
 			Template::Landing1 => Template::LANDING,
+			Template::Vtxo2 => Template::VTXO,
 		}
 	}
 
@@ -230,14 +237,14 @@ impl Template {
 	pub fn version(self) -> u8 {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 => 1,
-			Template::Order2 => 2,
+			Template::Order2 | Template::Vtxo2 => 2,
 		}
 	}
 
 	/// Its name, without the version.
 	pub fn name(self) -> &'static str {
 		match self {
-			Template::Vtxo1 => "vtxo",
+			Template::Vtxo1 | Template::Vtxo2 => "vtxo",
 			Template::Board1 => "board",
 			Template::Htlc1 => "htlc",
 			Template::Order2 => "order",
@@ -249,6 +256,7 @@ impl Template {
 	pub fn from_id(id: u8, version: u8) -> Result<Template, RecordError> {
 		match (id, version) {
 			(Template::VTXO, 1) => Ok(Template::Vtxo1),
+			(Template::VTXO, 2) => Ok(Template::Vtxo2),
 			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
 			(Template::ORDER, 2) => Ok(Template::Order2),
@@ -279,6 +287,9 @@ impl FromStr for Template {
 			&& !(version.len() > 1 && version.starts_with('0'));
 		if !canonical {
 			return Err(RecordError::Template(s.into()));
+		}
+		if name == "vtxo" && version == "2" {
+			return Ok(Template::Vtxo2);
 		}
 		let known = match name {
 			"vtxo" => Template::Vtxo1,
@@ -600,7 +611,7 @@ impl LeafRecord {
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
 		match (self.template, &self.htlc, &self.order, &self.landing) {
-			(Template::Vtxo1, None, None, None) => {},
+			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => {},
 			(Template::Htlc1, Some(t), None, None) => t.check(self.exit_delay).map_err(RecordError::Htlc)?,
 			(Template::Order2, None, Some(o), None) => o.check(self.asset, &self.owner, &self.schedule.operator)
 				.map_err(|e| RecordError::Order(e.to_string()))?,
@@ -672,6 +683,7 @@ impl LeafRecord {
 			landing: self.landing.map(|l| crate::landing::LandingTerms {
 				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance),
 			}),
+			v2: self.template == Template::Vtxo2,
 		}
 	}
 

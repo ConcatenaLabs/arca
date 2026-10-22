@@ -953,7 +953,7 @@ pub fn plan_of(row: &PlanRow, params: &Params) -> Result<Plan, String> {
 		owner: key(&row.first_owner)?, operator: params.operator, salt: row.first_salt, chain: params.chain,
 		exit_delay: RelativeTime::from_units(row.first_delay).map_err(|e| e.to_string())?, htlc: None,
 		order: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	let mut steps = Vec::with_capacity(row.steps.len());
 	for s in &row.steps {
