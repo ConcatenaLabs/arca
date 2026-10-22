@@ -331,3 +331,98 @@ async fn accumulator_leaves_are_held_paid_left_and_swept() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// An offline-refresh plan that starts from a leaf of an accumulator batch.
+/// Five wallets refresh into one accumulator batch; P plans its leaf (two
+/// steps) and closes its wallet. Step 1 runs in the leaf's free window,
+/// giving it up under the plan's terms for a leaf of a new round; P, back,
+/// takes that leaf up, and its accumulator leaf is spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_starts_from_an_accumulator_leaf() {
+	const HOUR: u32 = 3_600;
+	const DAY: u32 = 86_400;
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.accumulator_exit_rate_ppm = Some(10_000);
+	}).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x.to_string();
+	let ws: Vec<Arca> = ["ACCP-P", "ACCP-1", "ACCP-2", "ACCP-3", "ACCP-4"].iter().map(|n| Arca::new(n)).collect();
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	for w in &ws {
+		w.ok(&create);
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, r.x, 6_000_000);
+	}
+	r.produce().await;
+	for w in &ws {
+		w.ok(&["board", &x, "2000000"]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit every board", || {
+		ws.iter().all(|w| w.ok(&["boards"])[0]["server"]["state"] == "credited")
+	}).await;
+	for w in &ws {
+		w.ok(&["sync"]);
+		w.ok(&["participate"]);
+	}
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	for w in &ws {
+		assert_eq!(w.ok(&["sync"])["participations"][0]["state"], "released");
+	}
+	let p = &ws[0];
+	let live: Vec<Value> = p.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live").cloned().collect();
+	assert_eq!(live.len(), 1);
+	let coin = live[0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(matches!(record_of(p, &coin), CoinRecord::Accumulator { .. }), "P holds a leaf of an accumulator batch");
+	let e0 = live[0]["exit_by"].as_u64().unwrap() as u32 + 3 * DAY;
+
+	// P's plan, from its accumulator leaf.
+	let q = p.ok(&["plan", "--quote"]);
+	assert_eq!((q["plans"][0]["coin"].as_str(), q["plans"][0]["steps"].as_u64()), (Some(coin.as_str()), Some(2)), "{}", q);
+	let made = p.ok(&["plan"]);
+	let plan = &made["plans"][0];
+	assert_eq!(plan["state"], "open", "{}", made);
+	let id = plan["plan_id"].as_str().unwrap().to_string();
+	println!("P's plan {} from its accumulator leaf {}", id, coin);
+
+	// P away; step 1 in the leaf's free window.
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, (e0 - 5 * DAY + HOUR).saturating_sub(now)));
+	r.synced().await;
+	let mut stepped = None;
+	for _ in 0..10 {
+		r.synced().await;
+		stepped = r.server.rounds.run_round().await.unwrap();
+		if stepped.is_some() {
+			break;
+		}
+		r.bury().await;
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+	let stepped = stepped.expect("a round for the plan's step");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&stepped.tx.txid(), RoundState::Final).await;
+	r.server.rounds.pass().await.unwrap();
+	let row = r.server.store.plan(&unhex(&id).try_into().unwrap()).await.unwrap().unwrap();
+	assert_eq!(row.steps[0].state, server::store::StepState::Done, "step 1 is done");
+	println!("step 1 ran in round {}", stepped.tx.txid());
+
+	// P back: the step's leaf taken up, its accumulator leaf spent.
+	let s = p.ok(&["sync"]);
+	let taken = &s["plans"][0]["taken_up"];
+	assert_eq!(taken.as_array().map(|t| t.len()), Some(1), "{}", s);
+	let new = taken[0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(p, &new)["state"], "live");
+	assert_eq!(coin_of(p, &coin)["state"], "spent", "the accumulator leaf went into the step");
+	println!("P took up {} from step 1; its accumulator leaf is spent", new);
+	for w in &ws {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

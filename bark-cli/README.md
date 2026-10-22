@@ -1511,16 +1511,21 @@ the new round. Every
 refusal is asserted by its reason.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
-accumulator batches (`[batches] accumulator_exit_rate_ppm`): five wallets
+accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets
 refresh in one round into one accumulator batch, each holding its leaf with
-one exit authorisation; one pays another out of round from its leaf; one
+one exit authorisation; one pays another out of round from its leaf; a
+wallet restored from one holder's mnemonic finds its leaf; one
 takes its leaf out (the exit, the entry, the claim), its exit and entry
 mined in a block anchored to a parent block that is then orphaned, and goes
 on once they are back; another's exit, by the authorisation it signed before,
-spends the batch output where the first left it; the payment is taken out
+spends the batch output where the first left it; one refreshes its leaf in
+a round of its own; the payment is taken out
 through the payer's leaf, its checkpoint and its reassignment; and the last
 holder, away past the expiry and the notice, finds its coin `lost` to the
-operator's sweep of the batch output where the last exit left it.
+operator's sweep of the batch output where the last exit left it. A second
+test makes an offline-refresh plan from a leaf of an accumulator batch: its
+first step runs in the leaf's free window, and the holder, back, takes up the
+step's leaf.
 
 `tests/arca_channel.rs` runs the same way: two wallets open channel leaves
 in one round, the operator funding its side of each; they pay each other,
