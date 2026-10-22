@@ -2770,7 +2770,9 @@ impl Wallet {
 				continue;
 			}
 			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(&c) };
-			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += c.value;
+			// A channel coin counts the wallet's side of it alone.
+			let worth = self.channel_worth(&c)?.unwrap_or(c.value);
+			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += worth;
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
 		let mut frozen_onchain: BTreeMap<String, u64> = BTreeMap::new();
@@ -2796,7 +2798,7 @@ impl Wallet {
 			{
 				continue;
 			}
-			*held.entry(c.asset.clone()).or_default() += c.value as u128;
+			*held.entry(c.asset.clone()).or_default() += self.channel_worth(&c)?.unwrap_or(c.value) as u128;
 		}
 		for (a, v) in &onchain {
 			*held.entry(a.clone()).or_default() += *v as u128;

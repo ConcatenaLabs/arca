@@ -193,6 +193,8 @@ pub enum Wanted {
 		order: Option<arca_covenant::OrderLeafTerms>,
 		/// `landing-1`'s landing, for a leaf of a supervised asset.
 		landing: Option<arca_covenant::Landing>,
+		/// `channel-1`'s terms, for a channel leaf.
+		channel: Option<arca_covenant::Channel>,
 	},
 	/// An on-chain output the round pays, hash-locked, and its unlock moves to
 	/// `script` with exactly `value` of `asset`.
@@ -202,7 +204,7 @@ pub enum Wanted {
 impl Wanted {
 	pub fn json(&self) -> Value {
 		match self {
-			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
+			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing, channel } => {
 				let mut j = json!({"leaf": {
 					"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
 					"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
@@ -212,6 +214,9 @@ impl Wanted {
 				}
 				if let Some(l) = landing {
 					j["leaf"]["landing"] = arca_covenant::record_json::landing_json(l);
+				}
+				if let Some(c) = channel {
+					j["leaf"]["channel"] = arca_covenant::record_json::channel_json(c);
 				}
 				j
 			},
@@ -240,7 +245,7 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	e.input(&[outputs.len() as u8]);
 	for o in outputs {
 		match o {
-			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
+			Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing, channel } => {
 				e.input(&[0]);
 				e.input(&asset.into_inner().to_byte_array());
 				e.input(&value.to_le_bytes());
@@ -256,6 +261,10 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 				if let Some(l) = landing {
 					e.input(&l.program);
 					e.input(&l.allowance.to_le_bytes());
+				}
+				if let Some(c) = channel {
+					e.input(&c.capacity.to_le_bytes());
+					e.input(&c.window.units().to_le_bytes());
 				}
 			},
 			Wanted::Offboard { asset, value, script } => {

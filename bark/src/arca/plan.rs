@@ -271,9 +271,12 @@ impl Wallet {
 				continue;
 			}
 			// A supervised asset's leaf (`landing-1`) is not planned: its
-			// operator runs no plans for it, and `sync` refreshes it.
+			// operator runs no plans for it, and `sync` refreshes it. Nor is a
+			// channel leaf (`channel-1`): `care` closes it into a round once
+			// its expiry is within reach, for a plain leaf a plan starts from.
 			match CoinRecord::from_bytes(&c.record) {
-				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none() => out.push(c),
+				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none()
+					&& record.channel.is_none() => out.push(c),
 				_ => {},
 			}
 		}

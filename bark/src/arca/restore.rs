@@ -876,9 +876,17 @@ impl Wallet {
 				return Err(format!("participation {} wants a landing-1 leaf landing at another key than this wallet's: the wallet takes the \
 					coin as not given up to it", pid));
 			}
-			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing });
+			// A channel leaf's terms, likewise covered by the id.
+			let channel = match l.get("channel").filter(|c| !c.is_null()) {
+				Some(c) => Some(arca_covenant::record_json::channel_from_json(c).map_err(|e| e.to_string())?),
+				None => None,
+			};
+			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing, channel });
 			nonces.push((owner_nonce, owner, asset, value));
 			let mut w = json!({"nonce": hex(&owner_nonce), "asset": asset.to_string(), "value": value.to_string()});
+			if let Some(c) = &channel {
+				w["channel"] = arca_covenant::record_json::channel_json(c);
+			}
 			if let Some(o) = &order {
 				w["order"] = arca_covenant::record_json::order_terms_json(o);
 			}
