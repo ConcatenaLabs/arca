@@ -50,6 +50,7 @@ async fn the_signer_process() {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let asset = AssetId::from_slice(&[3; 32]).unwrap();
 	let outs = vec![ExplicitOutput::new(asset, 9_000, Script::from(vec![0x51]))];

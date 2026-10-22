@@ -241,6 +241,7 @@ impl BoardRecord {
 			landing: self.landing.map(|l| LandingTerms {
 				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance),
 			}),
+			channel: None,
 		}
 	}
 

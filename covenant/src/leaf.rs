@@ -46,6 +46,10 @@
 //! has the exit replaced by the landing, which pays only P2WPKH of the
 //! owner's landing key, where a freeze of the asset binds; its collaborative
 //! constant also commits to that key's program: `[collab, landing]`.
+//!
+//! A `channel-1` leaf ([`crate::channel`]) holds a balance for each of owner
+//! and operator: it is the output of the channel's state 0,
+//! `[collab, [update(0), settle(0)]]`, its collaborative path this very one.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -53,6 +57,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
+use crate::channel::{ChannelPolicy, ChannelTerms};
 use crate::htlc::{HtlcPath, HtlcTerms};
 use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
@@ -128,7 +133,7 @@ pub(crate) fn two_party_items(operator_sig: &Signature, owner_sig: &Signature, m
 
 /// A leaf's policy: `vtxo-1`, or `htlc-1` when it carries [`HtlcTerms`],
 /// `order-2` when it carries [`OrderLeafTerms`], `landing-1` when it carries
-/// [`LandingTerms`].
+/// [`LandingTerms`], `channel-1` when it carries [`ChannelTerms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafPolicy {
 	/// The owner's key `A`.
@@ -149,6 +154,9 @@ pub struct LeafPolicy {
 	/// `landing-1`'s terms: the exit pays only P2WPKH of the owner's landing
 	/// key ([`crate::landing`]); `None` otherwise.
 	pub landing: Option<LandingTerms>,
+	/// `channel-1`'s terms: the leaf is the output of the channel's state 0
+	/// ([`crate::channel`]); `None` otherwise.
+	pub channel: Option<ChannelTerms>,
 }
 
 impl LeafPolicy {
@@ -202,8 +210,12 @@ impl LeafPolicy {
 
 	/// `vtxo-1`: `[collab, exit]`, both at depth 1; `landing-1`: `[collab,
 	/// landing]`, the same. `htlc-1`: `[collab, [claim, refund]]`. `order-2`:
-	/// `[[collab, land], [fill, data]]` ([`crate::order`]).
+	/// `[[collab, land], [fill, data]]` ([`crate::order`]). `channel-1`:
+	/// `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
 	pub fn taproot(&self) -> TapOutput {
+		if let Some(c) = self.channel_policy() {
+			return c.taproot(&c.opening());
+		}
 		if let Some(o) = self.order_policy() {
 			return TapOutput::with_nodes(vec![
 				(2, TapNode::Tapscript(o.collab_script())),
@@ -222,9 +234,12 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, `htlc-1`, `order-2` or `landing-1`.
+	/// The template it follows: `vtxo-1`, `htlc-1`, `order-2`, `landing-1`
+	/// or `channel-1`.
 	pub fn template(&self) -> crate::Template {
-		if self.order.is_some() {
+		if self.channel.is_some() {
+			crate::Template::Channel1
+		} else if self.order.is_some() {
 			crate::Template::Order2
 		} else if self.landing.is_some() {
 			crate::Template::Landing1
@@ -233,6 +248,13 @@ impl LeafPolicy {
 		} else {
 			crate::Template::Vtxo1
 		}
+	}
+
+	/// The channel a `channel-1` leaf opens; `None` for any other template.
+	pub fn channel_policy(&self) -> Option<ChannelPolicy> {
+		self.channel.map(|terms| ChannelPolicy {
+			owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay, terms,
+		})
 	}
 
 	/// The order an `order-2` leaf rests as; `None` for any other template.

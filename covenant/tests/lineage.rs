@@ -173,6 +173,7 @@ fn a_degenerate_layout_is_refused() {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let record = LeafRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
 	let (round, _) = round_tx(&c.net, &issuer, &[], &record.branch().unwrap().batch_output(), &sched);

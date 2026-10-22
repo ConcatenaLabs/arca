@@ -125,6 +125,7 @@ pub fn spec(owner: &Keypair, label: &str, value: u64, h: [u8; 32]) -> LeafSpec {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	}
 }
 
@@ -231,6 +232,7 @@ pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, val
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let coin = net.fund(vec![explicit(net.x, value, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

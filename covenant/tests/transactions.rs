@@ -225,6 +225,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&f["leaf_script_pubkey"])[..]);
 	let p = leaf.program();

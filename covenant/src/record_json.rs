@@ -15,6 +15,7 @@
 //!                    "min_lot": decimal strings, "maker": hex, "expiry": median time,
 //!                    "refund_key": hex, "credits": [4 × hex, zero once used]}
 //! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
+//! channel            channel-1 only: {"capacity": decimal string, "window_units": 512-second units}
 //! asset              hex, display order
 //! value              decimal string
 //! unlock_hash        hex
@@ -55,6 +56,7 @@ use serde_json::{Map, Value};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::gate::{MemberProof, MAX_DEPTH};
 use crate::htlc::{HtlcDirection, HtlcTerms};
+use crate::channel::Channel;
 use crate::landing::{Landing, PROGRAM_BYTES};
 use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder};
 use crate::message::Chain;
@@ -131,6 +133,9 @@ impl LeafRecord {
 		if let Some(l) = &self.landing {
 			m.insert("landing".into(), landing_json(l));
 		}
+		if let Some(c) = &self.channel {
+			m.insert("channel".into(), channel_json(c));
+		}
 		m.insert("asset".into(), Value::String(display(asset_bytes(self.asset))));
 		m.insert("value".into(), Value::String(self.value.to_string()));
 		m.insert("unlock_hash".into(), Value::String(hex(&self.unlock_hash)));
@@ -174,6 +179,9 @@ impl LeafRecord {
 		if named == Some(Template::Landing1) {
 			fields.push("landing");
 		}
+		if named == Some(Template::Channel1) {
+			fields.push("channel");
+		}
 		let m = object(v, "record", &fields)?;
 		let version = int(m, "version", u64::MAX)?;
 		if version != RECORD_VERSION as u64 {
@@ -205,6 +213,7 @@ impl LeafRecord {
 			Some(o) => Some(order_terms_from_json(o, asset)?),
 		};
 		let landing = m.get("landing").map(landing_from_json).transpose()?;
+		let channel = m.get("channel").map(channel_from_json).transpose()?;
 		let value = amount(m, "value")?;
 		let unlock_hash = bytes32(m, "unlock_hash")?;
 		let entry_reserve = amount(m, "entry_reserve")?;
@@ -252,6 +261,7 @@ impl LeafRecord {
 			upper, lowest: LowestLevel { index, reserve, siblings, owners },
 			order,
 			landing,
+			channel,
 		};
 		record.check()?;
 		Ok(record)
@@ -281,6 +291,26 @@ pub fn landing_from_json(v: &Value) -> Result<Landing, RecordError> {
 		_ => return Err(RecordError::Type("landing.allowance".into())),
 	};
 	Ok(Landing { program, allowance })
+}
+
+/// `channel-1`'s terms as the record's JSON form and the server's interface
+/// write them: `{"capacity": decimal string, "window_units": 512-second units}`.
+pub fn channel_json(c: &Channel) -> Value {
+	let mut m = Map::new();
+	m.insert("capacity".into(), Value::String(c.capacity.to_string()));
+	m.insert("window_units".into(), c.window.units().into());
+	Value::Object(m)
+}
+
+/// Reads [`channel_json`].
+pub fn channel_from_json(v: &Value) -> Result<Channel, RecordError> {
+	let o = object(v, "channel", &["capacity", "window_units"])?;
+	let capacity = match &o["capacity"] {
+		Value::String(_) => amount(o, "capacity").map_err(|_| RecordError::Amount("channel.capacity".into()))?,
+		_ => return Err(RecordError::Type("channel.capacity".into())),
+	};
+	let window = units(o, "window_units").map_err(|_| RecordError::Type("channel.window_units".into()))?;
+	Ok(Channel { capacity, window })
 }
 
 /// `v` as an object with exactly the keys `keys`.

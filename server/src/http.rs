@@ -685,7 +685,9 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			}.into(),
 			anchor_depth: app.anchor_depth,
 		},
-		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter().map(|t| t.to_string()).collect() },
+		// channel-1 is a template the covenant knows and this server does not yet serve.
+		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter()
+			.filter(|t| **t != arca_covenant::Template::Channel1).map(|t| t.to_string()).collect() },
 		fees: api::FeesInfo {
 			transfer: "0".into(),
 			refresh_ppm: p.assets.default_fees().refresh_ppm,

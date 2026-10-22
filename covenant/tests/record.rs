@@ -235,6 +235,14 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 	add("notice".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, x.schedule.operator,
 		RelativeTime::from_units(x.schedule.notice.units() + 1).unwrap(), x.schedule.expiries().to_vec()).unwrap());
 	add("burn".into(), &|x| x.burn = !x.burn);
+	if r.channel.is_some() {
+		add("channel capacity + 1".into(), &|x| x.channel.as_mut().unwrap().capacity += 1);
+		add("channel window + 1".into(), &|x| {
+			let c = x.channel.as_mut().unwrap();
+			c.window = RelativeTime::from_units(c.window.units() + 1).unwrap();
+		});
+		add("channel-1 as vtxo-1".into(), &|x| { x.channel = None; x.template = arca_covenant::Template::Vtxo1; });
+	}
 	if r.landing.is_some() {
 		add("landing program".into(), &|x| x.landing.as_mut().unwrap().program[0] ^= 1);
 		add("landing allowance + 1".into(), &|x| x.landing.as_mut().unwrap().allowance += 1);

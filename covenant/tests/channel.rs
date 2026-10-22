@@ -20,7 +20,7 @@ use elements::{BlockHash, OutPoint, Transaction};
 use serde_json::Value;
 
 use arca_covenant::channel::{owner_script_pubkey, ChannelPolicy, ChannelTerms, State};
-use arca_covenant::spend::{FeeSource, UnrollTx};
+use arca_covenant::spend::{FeeSource, Pair, UnrollTx};
 use arca_covenant::*;
 use common::net::*;
 use common::*;
@@ -214,4 +214,101 @@ fn a_channel_on_the_node() {
 	assert_eq!(capped.output[1].script_pubkey, op_true_spk(), "no rest output: the fee coin's change follows");
 	r.net.pass("claim capped at B: the whole 40M, no rest", &capped);
 	r.net.print();
+}
+
+/// Two `channel-1` leaves and a `vtxo-1` leaf in one batch of a real round:
+/// each channel leaf's record validates against the round, survives both
+/// forms, and its leaf is the channel's state-0 output. One channel is
+/// brought on-chain, updated to state 1 and then spent by the coin's
+/// collaborative pair, as a forfeit answers a coin given up in a round; the
+/// other is brought on-chain, updated, settled after the exit delay, and its
+/// unfolded credit claimed.
+#[test]
+fn channel_leaves_from_a_round() {
+	use common::round::*;
+	let mut a = Arca::start();
+	let s = keypair("round operator");
+	let (issuer, sched) = a.schedule(&s);
+	let owners = [keypair("vtxo owner"), keypair("channel owner one"), keypair("channel owner two")];
+	let preimages: Vec<[u8; 32]> = (0..3).map(|i| label32(&format!("entry preimage {}", i))).collect();
+	let window = RelativeTime::from_units(delay().units() * 2).unwrap();
+	let leaves: Vec<_> = (0..3).map(|i| {
+		let mut sp = spec(&owners[i], &format!("round leaf {}", i), 20_000_000, hash(&preimages[i]));
+		if i > 0 {
+			sp.template = Template::Channel1;
+			sp.channel = Some(Channel { capacity: 8_000_000, window });
+		}
+		sp
+	}).collect();
+	let tree = a.tree(&sched, &leaves);
+	let (round, _) = round_tx(&a.net, &issuer, &[], &tree.batch_output(), &sched);
+	a.net.pass("round with two channel-1 leaves", &round);
+	let x = a.net.x;
+	let policy = a.policy(&s);
+	let t = mt(a.net.mtp() - 60);
+	let mut coins = vec![];
+	for i in 1..3 {
+		let record = tree.record(i);
+		assert_eq!(record.template, Template::Channel1);
+		assert_eq!(LeafRecord::from_bytes(&record.to_bytes().unwrap()).unwrap(), record);
+		assert_eq!(LeafRecord::from_json_str(&record.to_json_string().unwrap()).unwrap(), record);
+		let valid = record.validate(&round, &policy, &xonly(&owners[i]), &record.owner_nonce).unwrap();
+		let cp = record.leaf().channel_policy().unwrap();
+		assert_eq!(cp.program(&cp.opening()), record.leaf().program());
+		assert_eq!(cp.opening(), State { number: 0, owner: 12_000_000, operator: 8_000_000, folded: 0 });
+		let auths = owner_auths(&valid, &owners[i], t);
+		let at = if i == 1 {
+			a.bring_leaf("channel 1", &valid, &auths, &preimages[i])
+		} else {
+			// the one node above both leaves is on-chain already: only the entry
+			let txs = valid.branch.unroll(OutPoint::new(valid.round_txid, valid.batch_vout), &auths,
+				&vec![FeeSource::Reserve; auths.len()]).unwrap();
+			let e = valid.branch.entry_tx(valid.branch.entry_outpoint(&txs).unwrap(), &preimages[i], &FeeSource::Reserve).unwrap();
+			OutPoint::new(a.net.pass("channel 2: entry into the leaf", &e.tx), 0)
+		};
+		coins.push((cp, at));
+	}
+	let fee = |a: &mut Arca| {
+		let c = a.net.fee_coin();
+		FeeSource::Coin { outpoint: c.outpoint, coin: c.txout, fee: 2_000, change: op_true_spk() }
+	};
+	let done = |u: UnrollTx| { let mut tx = u.tx; tx.input[1].witness.script_witness = op_true_witness(); tx };
+	let state_pair = |cp: &ChannelPolicy, st: &State, owner: &elements::secp256k1_zkp::Keypair| {
+		let d = cp.state_message(st).unwrap().digest;
+		(sig(&s, &d), sig(owner, &d))
+	};
+
+	// Channel one: updated to state 1, then answered by the coin's pair.
+	let (cp, at) = coins[0];
+	let s1 = cp.opening().pay(2_000_000, 0).unwrap();
+	let (so, ao) = state_pair(&cp, &s1, &owners[1]);
+	let f = fee(&mut a);
+	let t1 = a.net.pass("channel one: update 0 -> 1", &done(cp.update_tx(at, x, &cp.opening(), &s1, &so, &ao, &f).unwrap()));
+	let leaf = tree.record(1).leaf();
+	let outs = [ExplicitOutput::new(x, 20_000_000 - 1_000, op_true_spk())];
+	let d = leaf.collab_message(x, 20_000_000, &outs).unwrap().digest;
+	let pair = Pair { operator: sig(&s, &d), owner: sig(&owners[1], &d) };
+	let f = fee(&mut a);
+	let answer = done(cp.collab_tx(OutPoint::new(t1, 0), x, &s1, &outs, &pair, &f).unwrap());
+	// the channel's 1,000-atom margin is the fee coin's change's to take
+	assert!(answer.output.len() >= 2);
+	a.net.pass("channel one: the coin's pair spends its state-1 output", &answer);
+
+	// Channel two: updated, settled after the exit delay, credit claimed.
+	let (cp, at) = coins[1];
+	let s1 = cp.opening().pay(3_000_000, 0).unwrap();
+	let s2 = s1.pay(0, 5_000_000).unwrap();
+	assert_eq!(s2, State { number: 2, owner: 14_000_000, operator: 6_000_000, folded: 5_000_000 });
+	let (so, ao) = state_pair(&cp, &s2, &owners[2]);
+	let f = fee(&mut a);
+	let t2 = a.net.pass("channel two: update 0 -> 2", &done(cp.update_tx(at, x, &cp.opening(), &s2, &so, &ao, &f).unwrap()));
+	a.net.wait_csv(&t2, cp.exit_delay);
+	let f = fee(&mut a);
+	let ts = a.net.pass("channel two: settle(2)", &done(cp.settle_tx(OutPoint::new(t2, 0), x, &s2, &f).unwrap()));
+	let note = sig(&s, &cp.note_message(7_000_000).unwrap().digest);
+	let f = fee(&mut a);
+	let claim = done(cp.claim_tx(OutPoint::new(ts, 1), x, &s2, s2.operator, 7_000_000, &note, &f).unwrap());
+	assert_eq!(claim.output[0].value.explicit(), Some(2_000_000));
+	a.net.pass("channel two: claim of 2M unfolded credit (note 7M, 5M folded)", &claim);
+	a.net.print();
 }

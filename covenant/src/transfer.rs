@@ -252,6 +252,7 @@ impl NewLeaf {
 		LeafPolicy {
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
 			order: None, landing: self.landing,
+			channel: None,
 		}
 	}
 
