@@ -831,14 +831,16 @@ async fn a_wallet_that_plans_every_coin_pays_one_through_the_next_round_and_keep
 	assert_eq!(live.len(), 2, "two leaves of a round: {:?}", live);
 	let (ca, cb) = (live[0]["leaf_id"].as_str().unwrap().to_string(), live[1]["leaf_id"].as_str().unwrap().to_string());
 
-	// Every coin planned.
-	let p = w.ok(&["plan"]);
-	println!("PR plans every coin it holds: {}", p);
-	let made = p["plans"].as_array().unwrap();
-	assert_eq!(made.len(), 2);
-	assert!(made.iter().all(|m| m["state"] == "open"), "{}", p);
+	// Every coin planned, by `care` with the reach that plans every leaf of
+	// a round at once, whatever its expiry, as a wallet that pays planned
+	// coins through `plan-release` runs it.
+	let p = w.ok(&["care", "--plan-within", "4294967295"]);
+	println!("PR's care plans every coin it holds: {}", p);
+	assert_eq!((p["plan_within"].as_u64(), p["refresh_within"].as_u64()), (Some(u32::MAX as u64), Some(10 * 86_400)), "{}", p);
+	let made = p["planned"].as_array().unwrap();
+	assert_eq!(made.len(), 2, "{}", p);
+	assert!(made.iter().all(|m| m["plan_id"].is_string() && m["error"].is_null()), "{}", p);
 	let plan_of = |c: &str| made.iter().find(|m| m["coin"] == json!(c)).unwrap()["plan_id"].as_str().unwrap().to_string();
-	let (pa, pb) = (plan_of(&ca), plan_of(&cb));
 
 	// A receiver; a payment no unplanned coin covers is refused, saying how
 	// the planned coins are paid.
@@ -847,6 +849,21 @@ async fn a_wallet_that_plans_every_coin_pays_one_through_the_next_round_and_keep
 	let req = v.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let why = w.refused(&["send", &req, "--amount", "500000", "--asset", &x], "plan-release");
 	println!("PR pays 500,000 with every coin planned: REFUSED: {}", why);
+	// The refusal names the coin to release, so a program pays without
+	// reading its words: the larger of the two covers 500,000.
+	let (ok, j) = w.run(&["send", &req, "--amount", "500000", "--asset", &x]);
+	assert!(!ok);
+	assert_eq!((j["error"]["kind"].as_str(), j["error"]["asset"].as_str()), (Some("planned"), Some(x.as_str())), "{}", j);
+	let named: Vec<String> = j["error"]["release"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+	let value_of = |c: &str| coins(&w, "live").iter().find(|k| k["leaf_id"] == json!(c)).unwrap()["value"].as_str().unwrap().parse::<u64>().unwrap();
+	assert_eq!(named.len(), 1, "one coin covers it: {}", j);
+	let (ca, cb) = if named[0] == ca { (ca, cb) } else { (cb, ca) };
+	assert_eq!(named[0], ca);
+	assert!(value_of(&ca) >= value_of(&cb), "the largest planned coin first");
+	let (pa, pb) = (plan_of(&ca), plan_of(&cb));
+	// Asking for more than every coin holds names none: an ordinary refusal.
+	let (_, j) = w.run(&["send", &req, "--amount", "9000000", "--asset", &x]);
+	assert_eq!(j["error"]["kind"].as_str(), Some("refused"), "{}", j);
 
 	// PR gives coin A up in the next round, for a leaf of its own.
 	let rel = w.ok(&["plan-release", &ca]);

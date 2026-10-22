@@ -491,19 +491,10 @@ impl Wallet {
 				pay a little less, or that much more", asset, min_leaf)));
 		}
 		// Coins an offline-refresh plan names are paid out of round by no
-		// wallet: say so, with what they hold.
-		let planned = self.planned_coins()?;
-		let held_planned: u64 = self.store.coins_in("live")?.iter()
-			.filter(|c| c.asset == asset.to_string() && planned.contains(&c.leaf_id)).map(|c| c.value).sum();
-		let note = if held_planned > 0 {
-			format!("; {} more is in coins an offline-refresh plan names, which carry refund halves the wallet signed and are paid out of \
-				round only once given up in a round for a leaf no plan names ({}, which ends the coin's plan)", held_planned,
-				self.spelling.say("{plan_release}"))
-		} else {
-			String::new()
-		};
-		Err(Error::Refused(format!("the wallet holds {} of asset {} in live coins, and paying {} takes {} with the margins its \
-			transactions leave for their fees{}", total_live, asset, paid, paid + total_live.saturating_sub(kept) + margin, note)))
+		// wallet: say so, naming those whose release would cover it.
+		let need = paid + total_live.saturating_sub(kept) + margin;
+		Err(self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
+			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?)
 	}
 
 	/// Pays `value` of `asset` to the receive request `request`, out of round:

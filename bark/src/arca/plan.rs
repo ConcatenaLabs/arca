@@ -133,6 +133,11 @@ pub fn covered_until(expiry: u32, steps: usize) -> u32 {
 /// operator's sweep, as any holder who stays away past an expiry can.
 pub const PLAN_WITHIN: u32 = 10 * 86_400;
 
+/// The planning reach that plans every leaf of a round at the first `care`
+/// after it is made, whatever its expiry: `care`'s `plan_within` for a wallet
+/// that pays its planned coins through [`Wallet::plan_release`].
+pub const PLAN_EVERY_ROUND_LEAF: u32 = u32::MAX;
+
 /// The fee bound `care` plans under when the caller names none: 2,000
 /// parts per million of a coin for each step. A step in its coin's free
 /// window costs nothing; the bound only lets a plan through when the
@@ -203,6 +208,43 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// The refusal of a payment of `asset` that the coins it may spend leave
+	/// `short` atoms short of: [`Error::Planned`] naming the fewest current
+	/// coins of open or stopped plans of the wallet's, live in `asset` and
+	/// largest first, whose values make up `short`, when they do; `refused`
+	/// as it is when they do not. A released coin comes back as a new leaf
+	/// less its refresh fee (none in its free window) and its own margins,
+	/// so a payment asked again after the release can still fall short by
+	/// those, and is refused again naming the next coin.
+	pub(crate) fn short_of(&self, asset: AssetId, short: u64, refused: String) -> Result<Error, Error> {
+		let mut current: HashSet<String> = HashSet::new();
+		for (_, coin, body, state, _) in self.plan_rows()? {
+			if state == "open" || state == "stopped" {
+				current.insert(Self::current_coin(&coin, &body));
+			}
+		}
+		let mut held: Vec<(String, u64)> = self.store.coins_in("live")?.into_iter()
+			.filter(|c| c.asset == asset.to_string() && current.contains(&c.leaf_id))
+			.map(|c| (c.leaf_id, c.value)).collect();
+		held.sort_by_key(|(id, v)| (std::cmp::Reverse(*v), id.clone()));
+		let total: u64 = held.iter().map(|(_, v)| v).sum();
+		if total == 0 || total < short {
+			return Ok(Error::Refused(refused));
+		}
+		let (mut release, mut sum) = (vec![], 0u64);
+		for (id, v) in held {
+			if sum >= short && !release.is_empty() {
+				break;
+			}
+			sum = sum.saturating_add(v);
+			release.push(id);
+		}
+		let message = format!("{}; {} more is in coins an offline-refresh plan names, which carry refund halves the wallet signed and are \
+			paid out of round only once given up in a round for a leaf no plan names ({}, which ends the coin's plan): releasing {} of them \
+			covers it", refused, total, self.spelling.say("{plan_release}"), release.len());
+		Ok(Error::Planned { asset: asset.to_string(), release, message })
 	}
 
 	/// The current coin of each plan that is open: the coin its next step
@@ -450,7 +492,15 @@ impl Wallet {
 	/// coin's own asset; a coin the operator will not plan stays unplanned,
 	/// with the operator's reason, and `sync` refreshes it while the wallet
 	/// is open. One part failing stops no other; each says what it did.
-	pub fn care(&mut self, scan: Option<u32>, steps: usize, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+	///
+	/// `plan_within` widens the planning reach alone (seconds, [`PLAN_WITHIN`]
+	/// unless named): a wallet that pays a planned coin through
+	/// [`Self::plan_release`] when its free coins fall short names the
+	/// batch lifetime or more ([`PLAN_EVERY_ROUND_LEAF`]), so every leaf of a
+	/// round is planned at the first `care` after it is made and a wallet
+	/// closed in a coin's first weeks keeps it. The refresh of a coin of no
+	/// round keeps the reach of [`PLAN_WITHIN`], since that refresh costs a fee.
+	pub fn care(&mut self, scan: Option<u32>, steps: usize, max_fee_ppm: Option<u64>, plan_within: Option<u32>) -> Result<Value, Error> {
 		let claims = self.claim(&[], scan).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut cancelled = vec![];
 		for (id, coin, body, state, _) in self.plan_rows()? {
@@ -469,6 +519,8 @@ impl Wallet {
 		}
 		let now = self.now()?.to_consensus_u32();
 		let bound = Some(max_fee_ppm.unwrap_or(CARE_MAX_FEE_PPM));
+		let plan_reach = plan_within.unwrap_or(PLAN_WITHIN);
+		let within_plan = |expiry: u32| now.saturating_add(plan_reach) >= expiry.saturating_sub(STEP_FROM);
 		let within = |expiry: u32| now.saturating_add(PLAN_WITHIN) >= expiry.saturating_sub(STEP_FROM);
 		let mut planned = vec![];
 		let mut later = 0usize;
@@ -477,7 +529,7 @@ impl Wallet {
 		let plannable: Vec<CoinRow> = self.plannable(None)?.into_iter()
 			.filter(|c| released.get(&hex(&c.owner_nonce)).is_none_or(|until| *until <= now)).collect();
 		for c in &plannable {
-			if !within(c.expiry) {
+			if !within_plan(c.expiry) {
 				later += 1;
 				continue;
 			}
@@ -517,7 +569,7 @@ impl Wallet {
 			});
 		}
 		let mut out = json!({"claims": claims, "cancelled": cancelled, "planned": planned, "refreshing": refreshing, "not_yet_planned": later,
-			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound});
+			"plan_within": plan_reach, "refresh_within": PLAN_WITHIN, "max_fee_ppm": bound});
 		if left_to_sync > 0 {
 			out["supervised"] = json!({"coins": left_to_sync, "note": "coins of a supervised asset are not planned: sync refreshes each in \
 				its window, so keep syncing while the wallet holds them"});

@@ -404,6 +404,12 @@ enum Cmd {
 		/// given).
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// How near its step window a coin of a round must be to be planned,
+		/// in seconds: ten days unless given; 4294967295 plans every coin of a
+		/// round at once. A coin of no round is refreshed within ten days
+		/// whatever this says.
+		#[arg(long)]
+		plan_within: Option<u32>,
 	},
 	/// The claims paid to this wallet, found by asking the operator under its
 	/// OpenAMP account key and each address key: their distribution, value,
@@ -1362,7 +1368,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Plans => w.plans(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
-		Cmd::Care { scan, expiries, max_fee_ppm } => w.care(scan, expiries, max_fee_ppm),
+		Cmd::Care { scan, expiries, max_fee_ppm, plan_within } => w.care(scan, expiries, max_fee_ppm, plan_within),
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
 	}
@@ -1448,11 +1454,7 @@ fn main() {
 	match run(cli) {
 		Ok(v) => println!("{}", serde_json::to_string_pretty(&v).expect("JSON")),
 		Err(e) => {
-			let mut out = json!({"error": {"kind": e.kind(), "message": e.to_string()}});
-			if let bark::arca::Error::Server { code, status, .. } = &e {
-				out["error"]["code"] = json!(code);
-				out["error"]["status"] = json!(status);
-			}
+			let out = bark::arca::command::refusal(&e);
 			println!("{}", serde_json::to_string_pretty(&out).expect("JSON"));
 			eprintln!("arca: {}", e);
 			std::process::exit(1);
