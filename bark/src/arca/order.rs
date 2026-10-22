@@ -467,7 +467,9 @@ impl Wallet {
 				return Ok(Standing { state: "spent", at: Some((here, held)), fills, note: Some("spent by a transaction the node no longer has".into()) });
 			};
 			let k = tx.input.iter().position(|x| x.previous_output == here).expect("it spends it");
-			let w = &tx.input[k].witness.script_witness;
+			// The leaf it spent by: the script before the control block, an
+			// annex (BIP341) set aside, which neither leaf covers.
+			let w = arca_covenant::witness::without_annex(&tx.input[k].witness.script_witness);
 			let leaf = if w.len() >= 2 { w[w.len() - 2].as_slice() } else { &[] };
 			let finality = self.chain.finality(&tx.txid())?.word();
 			if leaf == t.refund_leaf().as_bytes() {
