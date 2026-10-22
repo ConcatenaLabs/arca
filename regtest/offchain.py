@@ -53,6 +53,15 @@ Its JSON form has the leaf record's field names and conventions. Its leaf id
 is the leaf id of a batch with no levels whose batch output is the board
 output: tagged hash "Arca/leaf-id" of board program || 0x00 || leaf program.
 
+A board of a supervised asset converts into a landing-1 leaf (arklib3.
+landing_taptree) instead, whose collaborative path its own is. Its record is
+format version 3: the fields above, then
+
+    [20]  P, the landing program: hash160 of the owner's landing key L
+    u64   the fee allowance, below the value
+
+and its JSON form has `landing`: {"program", "allowance"}, as the leaf record's.
+
 The forfeit
 -----------
 The old leaf, by its collaborative path, into the forfeit output, holding the
@@ -147,6 +156,7 @@ from test_framework.key import SECP256K1_ORDER
 from test_framework.messages import CAssetIssuance, COutPoint, CTxIn, CTxOutValue, uint256_from_str
 from test_framework.script import TaprootSignatureHash
 
+import json
 import records
 import struct
 
@@ -154,6 +164,7 @@ from records import (ASSET, GENESIS, OPERATOR, TEMPLATE_BOARD_VERSION, TEMPLATES
                      le16, le64, leaf_salt, tagged_hash, txout, LEAF_ID_TAG)
 
 BOARD_FORMAT_VERSION = 2
+BOARD_LANDING_FORMAT_VERSION = 3          # a board of a supervised asset, into a landing-1 leaf
 CTAG = chain_tag(GENESIS)
 H = 3600
 DELAY = (36 * H + 511) // 512              # exit and forfeit-refund delay, 512-second units
@@ -313,17 +324,79 @@ def key_spend(name, tap, leafname, script, coin, spent, seq, outputs, fee, signe
 
 def board_record(rec):
     name, ver = rec["template"]
-    return (bytes([BOARD_FORMAT_VERSION, TEMPLATES[name], ver]) + rec["owner"] + rec["owner_nonce"]
-            + rec["operator_nonce"] + le16(rec["exit_delay"]) + rec["asset"] + le64(rec["value"]) + rec["genesis"]
-            + rec["operator"])
+    g = rec.get("landing")
+    b = (bytes([BOARD_FORMAT_VERSION if g is None else BOARD_LANDING_FORMAT_VERSION, TEMPLATES[name], ver]) + rec["owner"]
+         + rec["owner_nonce"] + rec["operator_nonce"] + le16(rec["exit_delay"]) + rec["asset"] + le64(rec["value"])
+         + rec["genesis"] + rec["operator"])
+    if g is not None:
+        b += g["program"] + le64(g["allowance"])
+    return b
 
 
 def board_json(rec):
     name, ver = rec["template"]
-    return {"version": BOARD_FORMAT_VERSION, "template": "%s-%d" % (name, ver), "owner": rec["owner"].hex(),
-            "owner_nonce": rec["owner_nonce"].hex(), "operator_nonce": rec["operator_nonce"].hex(),
-            "exit_delay_units": rec["exit_delay"], "asset": display(rec["asset"]), "value": str(rec["value"]),
-            "genesis_hash": display(rec["genesis"]), "operator": rec["operator"].hex()}
+    g = rec.get("landing")
+    o = {"version": BOARD_FORMAT_VERSION if g is None else BOARD_LANDING_FORMAT_VERSION, "template": "%s-%d" % (name, ver),
+         "owner": rec["owner"].hex(),
+         "owner_nonce": rec["owner_nonce"].hex(), "operator_nonce": rec["operator_nonce"].hex(),
+         "exit_delay_units": rec["exit_delay"], "asset": display(rec["asset"]), "value": str(rec["value"]),
+         "genesis_hash": display(rec["genesis"]), "operator": rec["operator"].hex()}
+    if g is not None:
+        o["landing"] = {"program": g["program"].hex(), "allowance": str(g["allowance"])}
+    return o
+
+
+def landing_board():
+    """A board of a supervised asset: it converts into a landing-1 leaf, and its
+    record (format 3) carries the landing program and the allowance."""
+    value = 25_000_000
+    g = {"program": label_hash("landing", "board")[:20], "allowance": 2_000}
+    rec = {"template": ("board", TEMPLATE_BOARD_VERSION), "owner": A.x,
+           "owner_nonce": label_hash("owner nonce", "landing board"),
+           "operator_nonce": label_hash("operator nonce", "landing board"),
+           "exit_delay": DELAY, "asset": ASSET, "value": value, "genesis": GENESIS, "operator": S.x, "landing": g}
+    salt = leaf_salt(rec["owner_nonce"], rec["operator_nonce"])
+    ltap, lscripts = landing_taptree(A.x, S.x, salt, CTAG, SEQ_TIME | DELAY, g["program"], ASSET, value, g["allowance"])
+    lspk = bytes(ltap.scriptPubKey)
+    collab = lscripts["collab"]
+    convert = CScript([A.x, OP_CHECKSIGVERIFY] + unroll_body([(ASSET, value, lspk[2:])]))
+    btap = taproot_construct(NUMS, [("collab", collab), ("convert", convert)])
+    bspk = bytes(btap.scriptPubKey)
+    conversion = key_spend("the owner's conversion into a landing-1 leaf", btap, "convert", convert,
+                           outpoint("landing board output"), (ASSET, value, bspk), FINAL,
+                           [(ASSET, value, lspk)], fee_coin("landing conversion fee coin"), A)
+    leaf_coin = coin_at(Tx.from_hex(conversion["tx"]), 0)
+    landing_tx = key_spend("the converted leaf's landing", ltap, "landing", lscripts["landing"], leaf_coin,
+                           (ASSET, value, lspk), SEQ_TIME | DELAY, [(ASSET, value - 1_500, b"\x00\x14" + g["program"])],
+                           "reserve", A)
+    binary = board_record(rec)
+    bad = [
+        ("format version 3 without the landing", binary[:-28], "end"),
+        ("format version 2 with the landing after it", bytes([BOARD_FORMAT_VERSION]) + binary[1:], "trailing"),
+        ("an allowance as large as the value", binary[:-8] + le64(value), "landing"),
+    ]
+    j = board_json(rec)
+
+    def edit(f):
+        o = json.loads(json_text(j))
+        f(o)
+        return json_text(o)
+
+    bad_json = [
+        ("format version 3 without its landing", edit(lambda o: o.pop("landing")), "field"),
+        ("format version 2 with a landing", edit(lambda o: o.update({"version": BOARD_FORMAT_VERSION})), "field"),
+        ("an allowance as large as the value", edit(lambda o: o["landing"].update({"allowance": str(value)})), "landing"),
+    ]
+    return {
+        "record": {"binary": binary.hex(), "json": json_text(j), "salt": salt.hex(), "leaf_program": lspk[2:].hex(),
+                   "leaf_id": tagged_hash(LEAF_ID_TAG, bspk[2:] + b"\x00" + lspk[2:]).hex(),
+                   "leaf_script_pubkey": lspk.hex(), "script_pubkey": bspk.hex(),
+                   "convert_script": hx(convert), "collab_script": hx(collab), "landing_script": hx(lscripts["landing"])},
+        "conversion_tx": conversion,
+        "landing_tx": landing_tx,
+        "invalid_binary": [{"name": n, "binary": x.hex(), "kind": k} for n, x, k in bad],
+        "invalid_json": [{"name": n, "json": x, "kind": k} for n, x, k in bad_json],
+    }
 
 
 def board_parts():
@@ -824,6 +897,7 @@ def generate():
                    "operator": S.x.hex(), "owner": A.x.hex(), "op_true_script_pubkey": OP_TRUE_SPK.hex(),
                    "operator_script_pubkey": OPERATOR_SPK.hex(), "owner_script_pubkey": OWNER_SPK.hex()},
         "board": board(),
+        "landing_board": landing_board(),
         "forfeit": forfeit(),
         "offboard": offboard(),
         "transfer": transfer(),

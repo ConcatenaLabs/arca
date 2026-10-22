@@ -165,6 +165,7 @@ impl Out {
 				exit_delay: RelativeTime::from_units(v["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
+				landing: None,
 			},
 			mailbox: XOnlyPublicKey::from_slice(&unhex(v["mailbox"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 			until: v["until"].as_u64().map(|u| u32::try_from(u).map_err(|_| Error::Parse(format!("an output's lapse {}", u)))).transpose()?,
@@ -301,7 +302,7 @@ impl Wallet {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
-		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None })
+		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None })
 	}
 
 	/// [`Self::own_leaf`], for the other modules.
@@ -529,6 +530,7 @@ impl Wallet {
 				exit_delay: RelativeTime::from_units(req["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
+				landing: None,
 			},
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
 			// The server records no payment to the request past its lapse,
@@ -1786,7 +1788,7 @@ impl Wallet {
 	/// its fee, before anything is signed: `(asset, value, fee)`.
 	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
 		let n = random32();
-		let leaf = NewLeaf { owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None };
+		let leaf = NewLeaf { owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
 		let held: u64 = rows.iter().map(|r| r.value).sum();
 		let (asset, _, value) = self.respend_plan(rows, &leaf)?;
 		Ok((asset, value, held.saturating_sub(value)))

@@ -172,6 +172,7 @@ fn a_degenerate_layout_is_refused() {
 		lowest: LowestLevel { index: 0, reserve: 0, siblings: vec![], owners: vec![] },
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let record = LeafRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
 	let (round, _) = round_tx(&c.net, &issuer, &[], &record.branch().unwrap().batch_output(), &sched);
@@ -219,6 +220,7 @@ fn a_board_is_paid_out_of_round() {
 			template: Template::Board1, owner: xonly(&a), owner_nonce: label32(&format!("{} nonce", label)),
 			operator_nonce: label32(&format!("{} operator nonce", label)), exit_delay: delay(), asset: x, value: LEAF,
 			chain: c.net.chain, operator: xonly(&s),
+			landing: None,
 		};
 		let coin = c.net.fund(vec![rec.output().txout()]).remove(0);
 		(rec, c.net.rt.client().raw_transaction(&coin.outpoint.txid).unwrap())

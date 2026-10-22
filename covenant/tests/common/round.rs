@@ -124,6 +124,7 @@ pub fn spec(owner: &Keypair, label: &str, value: u64, h: [u8; 32]) -> LeafSpec {
 		exit_delay: delay(), unlock_hash: h,
 		htlc: None,
 		order: None,
+		landing: None,
 	}
 }
 
@@ -207,6 +208,7 @@ pub fn party(label: &str, d: RelativeTime) -> (Keypair, NewLeaf) {
 		owner: xonly(&k), owner_nonce: label32(&format!("party {} owner nonce", label)),
 		creator_nonce: label32(&format!("party {} creator nonce", label)), exit_delay: d,
 		htlc: None,
+		landing: None,
 	};
 	(k, leaf)
 }
@@ -228,6 +230,7 @@ pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, val
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let coin = net.fund(vec![explicit(net.x, value, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

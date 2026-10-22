@@ -182,6 +182,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
 			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
 			order,
+			landing: None,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;

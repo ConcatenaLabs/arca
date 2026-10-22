@@ -41,7 +41,7 @@ async fn eight_boards_of_y(r: &mut Running, d: RelativeTime) -> Vec<(elements::s
 		let key = keypair(&format!("board of Y {}", i));
 		let nonce = r.http.operator_nonce();
 		let record = BoardRecord { template: Template::Board1, owner: xonly(&key), owner_nonce: random32(), operator_nonce: nonce,
-			exit_delay: d, asset: y, value: VALUE, chain: r.chain, operator: s };
+			exit_delay: d, asset: y, value: VALUE, chain: r.chain, operator: s, landing: None };
 		let coins = vec![r.purse.take_coin(y), r.purse.take_coin(x)];
 		let tx = record.tx(&coins, x, 2_000, &common::node::op_true()).unwrap().tx;
 		for (j, o) in tx.output.iter().enumerate().skip(1) {

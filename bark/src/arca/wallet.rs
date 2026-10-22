@@ -2970,6 +2970,7 @@ impl Wallet {
 		let record = BoardRecord {
 			template: Template::Board1, owner: dummy.x_only_public_key().0, owner_nonce: [1; 32], operator_nonce: [2; 32],
 			exit_delay: self.exit_delay(), asset, value, chain: self.genesis, operator: self.operator,
+			landing: None,
 		};
 		let (tx, fee, inputs) = self.board_tx(&record, fee_asset, &change, false)?;
 		Ok(json!({
@@ -3007,6 +3008,7 @@ impl Wallet {
 		let record = BoardRecord {
 			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
 			asset, value, chain: self.genesis, operator: self.operator,
+			landing: None,
 		};
 		let (tx, fee, _) = self.board_tx(&record, fee_asset, &change, true)?;
 		// The coins could have moved between the two: the fee signed is the
@@ -3274,6 +3276,7 @@ mod tests {
 			owner_nonce: [i; 32], operator_nonce: [i + 100; 32], exit_delay: w, unlock_hash: [i + 50; 32],
 			htlc: None,
 			order: None,
+			landing: None,
 		}).collect();
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();

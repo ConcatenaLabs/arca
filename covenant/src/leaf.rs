@@ -41,6 +41,11 @@
 //! place of the exit, a claim with a preimage and a refund after a timeout,
 //! each behind a relative delay: `[collab, [claim, refund]]`. Its owner's
 //! delay is the exit delay; the operator's is in its [`HtlcTerms`].
+//!
+//! A `landing-1` leaf ([`crate::landing`]), the leaf of a supervised asset,
+//! has the exit replaced by the landing, which pays only P2WPKH of the
+//! owner's landing key, where a freeze of the asset binds; its collaborative
+//! constant also commits to that key's program: `[collab, landing]`.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -49,6 +54,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::htlc::{HtlcPath, HtlcTerms};
+use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
 use crate::order::{order_cmr, OrderLeafTerms, OrderPolicy};
@@ -73,9 +79,9 @@ pub fn leaf_salt(owner_nonce: &[u8; 32], creator_nonce: &[u8; 32]) -> [u8; 32] {
 	crate::script::sha256(&b)
 }
 
-/// The rebindable two-party script for the constant `k`, shared by the leaf
-/// and the checkpoint.
-pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, k: &[u8; 32]) -> Script {
+/// The rebindable two-party script for the constant `k` (`K`, or a
+/// `landing-1` leaf's `K ‖ P`), shared by the leaf and the checkpoint.
+pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, k: &[u8]) -> Script {
 	let slot = |b: Builder, j: i64| b.output_record(j).ops(&[OP_SHA256, OP_ROT, OP_SWAP, OP_CAT, OP_SWAP]);
 	let mut b = Builder::new()
 		.push_opcode(OP_SIZE).push_int(1).push_opcode(OP_EQUALVERIFY)
@@ -104,7 +110,7 @@ impl TwoPartyCsfs for Builder {
 
 /// The message both parties sign for a rebindable two-party spend.
 pub(crate) fn two_party_message(
-	k: &[u8; 32],
+	k: &[u8],
 	asset_in: AssetId,
 	value_in: u64,
 	outputs: &[ExplicitOutput],
@@ -120,7 +126,9 @@ pub(crate) fn two_party_items(operator_sig: &Signature, owner_sig: &Signature, m
 	vec![operator_sig.as_ref().to_vec(), owner_sig.as_ref().to_vec(), vec![m]]
 }
 
-/// A leaf's policy: `vtxo-1`, or `htlc-1` when it carries [`HtlcTerms`].
+/// A leaf's policy: `vtxo-1`, or `htlc-1` when it carries [`HtlcTerms`],
+/// `order-2` when it carries [`OrderLeafTerms`], `landing-1` when it carries
+/// [`LandingTerms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafPolicy {
 	/// The owner's key `A`.
@@ -138,22 +146,37 @@ pub struct LeafPolicy {
 	/// `order-2`'s terms: the leaf is a resting order ([`crate::order`]),
 	/// with the landing and the fill in place of the exit; `None` otherwise.
 	pub order: Option<OrderLeafTerms>,
+	/// `landing-1`'s terms: the exit pays only P2WPKH of the owner's landing
+	/// key ([`crate::landing`]); `None` otherwise.
+	pub landing: Option<LandingTerms>,
 }
 
 impl LeafPolicy {
-	/// `K` for this leaf.
+	/// `K` for this leaf, over its salt.
 	pub fn leaf_constant(&self) -> [u8; 32] {
 		self.chain.leaf_constant(&self.salt)
 	}
 
-	pub fn collab_script(&self) -> Script {
-		rebindable_two_party(&self.owner, &self.operator, &self.leaf_constant())
+	/// What the collaborative script pushes and its message starts with:
+	/// `K`, or for `landing-1` `K ‖ P` ([`Chain::landing_prefix`]).
+	pub fn collab_prefix(&self) -> Vec<u8> {
+		match &self.landing {
+			Some(l) => self.chain.landing_prefix(&self.salt, &l.program),
+			None => self.leaf_constant().to_vec(),
+		}
 	}
 
-	/// The exit of a `vtxo-1` leaf. An `htlc-1` leaf has none: its tree
-	/// does not carry this script.
+	pub fn collab_script(&self) -> Script {
+		rebindable_two_party(&self.owner, &self.operator, &self.collab_prefix())
+	}
+
+	/// The exit of a `vtxo-1` leaf, or the landing of a `landing-1` leaf. An
+	/// `htlc-1` leaf has none: its tree does not carry this script.
 	pub fn exit_script(&self) -> Script {
-		exit_script(&self.owner, self.exit_delay)
+		match &self.landing {
+			Some(l) => l.script(&self.owner, self.exit_delay),
+			None => exit_script(&self.owner, self.exit_delay),
+		}
 	}
 
 	/// The claim of an `htlc-1` leaf.
@@ -177,9 +200,9 @@ impl LeafPolicy {
 		}
 	}
 
-	/// `vtxo-1`: `[collab, exit]`, both at depth 1. `htlc-1`: `[collab,
-	/// [claim, refund]]`. `order-2`: `[[collab, land], [fill, data]]`
-	/// ([`crate::order`]).
+	/// `vtxo-1`: `[collab, exit]`, both at depth 1; `landing-1`: `[collab,
+	/// landing]`, the same. `htlc-1`: `[collab, [claim, refund]]`. `order-2`:
+	/// `[[collab, land], [fill, data]]` ([`crate::order`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(o) = self.order_policy() {
 			return TapOutput::with_nodes(vec![
@@ -199,10 +222,12 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, `htlc-1` or `order-2`.
+	/// The template it follows: `vtxo-1`, `htlc-1`, `order-2` or `landing-1`.
 	pub fn template(&self) -> crate::Template {
 		if self.order.is_some() {
 			crate::Template::Order2
+		} else if self.landing.is_some() {
+			crate::Template::Landing1
 		} else if self.htlc.is_some() {
 			crate::Template::Htlc1
 		} else {
@@ -226,7 +251,7 @@ impl LeafPolicy {
 	/// The message owner and operator sign to spend a coin of this leaf,
 	/// holding `value_in` of `asset_in`, into `outputs` at indices `0..m`.
 	pub fn collab_message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
-		two_party_message(&self.leaf_constant(), asset_in, value_in, outputs)
+		two_party_message(&self.collab_prefix(), asset_in, value_in, outputs)
 	}
 
 	/// The full collaborative witness for `m` committed outputs.
@@ -235,7 +260,8 @@ impl LeafPolicy {
 	}
 
 	/// The full exit witness: the owner's signature over the exit claim, a
-	/// version 2 transaction whose input sequence is the exit delay.
+	/// version 2 transaction whose input sequence is the exit delay. For a
+	/// `landing-1` leaf it is the landing's witness.
 	pub fn exit_witness(&self, owner_sig: &Signature) -> Vec<Vec<u8>> {
 		self.taproot().witness(&self.exit_script(), vec![owner_sig.as_ref().to_vec()])
 	}

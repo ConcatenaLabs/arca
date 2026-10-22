@@ -8,7 +8,8 @@
 //! Every message `S` signs under a salt has one of two forms:
 //!
 //! - the rebindable message of a collaborative path ([`crate::message`]),
-//!   `SHA256(K ‖ r)`, `K = SHA256(C ‖ salt)`, `C = SHA256("ArcaRbd1" ‖ genesis)`;
+//!   `SHA256(K ‖ r)`, `K = SHA256(C ‖ salt)`, `C = SHA256("ArcaRbd1" ‖ genesis)`
+//!   (a `landing-1` leaf's `r` starts with its landing program);
 //! - an `order-2` fill ([`crate::order`]), `SHA256(F ‖ salt ‖ r)`,
 //!   `F = SHA256(SHA256("Arca/order-fill") ‖ genesis)`.
 //!
@@ -456,7 +457,8 @@ fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 /// collaborative path) found on the chain or in a mempool, `prevout` the
 /// output it spends: the message rebuilt from the transaction and the coin,
 /// and the operator's signature, the witness's first item. `None` when the
-/// input is no such spend: its script pushes no `K` of `salt`, its witness is
+/// input is no such spend: its script pushes no `K` of `salt` (nor a
+/// `landing-1` leaf's `K ‖ P`), its witness is
 /// not `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
 /// explicit. The caller checks the signature ([`BondPolicy::verify`]).
 pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, prevout: &TxOut) -> Option<Signed> {
@@ -466,10 +468,13 @@ pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input:
 	}
 	let k = chain.leaf_constant(salt);
 	let script = Script::from(w[3].clone());
-	let pushes_k = script.instructions().any(|i| matches!(i, Ok(elements::script::Instruction::PushBytes(b)) if b == k));
-	if !pushes_k {
-		return None;
-	}
+	// What the script pushes for its message: `K`, or a `landing-1` leaf's
+	// `K ‖ P` ([`Chain::landing_prefix`]).
+	let k = script.instructions().find_map(|i| match i {
+		Ok(elements::script::Instruction::PushBytes(b))
+			if b.starts_with(&k) && (b.len() == 32 || b.len() == 32 + crate::landing::PROGRAM_BYTES) => Some(b.to_vec()),
+		_ => None,
+	})?;
 	let m = w[2][0] as usize;
 	if m == 0 || m > crate::leaf::MAX_OUTPUTS as usize || tx.output.len() < m {
 		return None;

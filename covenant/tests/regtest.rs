@@ -508,6 +508,7 @@ fn htlc(net: &mut Net) {
 		owner: xonly(&a), operator: xonly(&s_key), salt: label32(salt), chain: net.chain, exit_delay: delay(),
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout: mt(timeout), operator_delay }),
 		order: None,
+		landing: None,
 	};
 	let (claimed, refunded, together) = (mk(HtlcDirection::Send, "htlc claimed"), mk(HtlcDirection::Send, "htlc refunded"),
 		mk(HtlcDirection::Send, "htlc together"));
@@ -914,6 +915,7 @@ fn issuer_operated(net: &mut Net) {
 			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
 			exit_delay: delay(), unlock_hash: sha256(&label32(&format!("{} preimage {}", label, i))), htlc: None, order: None,
+			landing: None,
 		}).collect();
 		Tree::build(TreeParams {
 			asset: z, chain: net.chain, schedule: sched, burn, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1,
@@ -1053,6 +1055,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 		exit_delay: delay(), unlock_hash: sha256(&preimages[i]),
 		htlc: None,
 		order: None,
+		landing: None,
 	}).collect();
 	let params = TreeParams {
 		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
@@ -1259,6 +1262,7 @@ fn probes_turned_around(net: &mut Net) {
 		exit_delay: delay(), unlock_hash: sha256(&label32(&format!("probe B preimage {}", i))),
 		htlc: None,
 		order: None,
+		landing: None,
 	}).collect();
 	let params = TreeParams {
 		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
@@ -1268,7 +1272,7 @@ fn probes_turned_around(net: &mut Net) {
 	// By hand: the four entries under one node, gated to [S, A, A, B, C],
 	// whose RECLAIM names A twice.
 	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
-		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None };
+		let leaf = LeafPolicy { owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None };
 		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
 			sweep: sched.sweep(true, false) };
 		(leaf, entry)
@@ -1293,6 +1297,7 @@ fn probes_turned_around(net: &mut Net) {
 			},
 			htlc: None,
 			order: None,
+			landing: None,
 		};
 		let r = rec.validate(&round, &policy, &specs[i].owner, &specs[i].owner_nonce);
 		if i < 2 {
@@ -1322,6 +1327,7 @@ fn probes_turned_around(net: &mut Net) {
 		exit_delay: delay(), unlock_hash: sha256(&label32("probe F new entry preimage")),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let tree = Tree::build(TreeParams { schedule: sched.clone(), ..params.clone() }, &[replayed]).unwrap();
 	let (_, round) = plain_round(net, "probe F turned around / round with a replayed salt", &issuer, &sched, &tree.batch_output());

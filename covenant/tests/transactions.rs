@@ -149,6 +149,7 @@ fn the_board_and_its_record() {
 	assert_eq!(policy.leaf.collab_script().as_bytes(), &bytes(&b["record"]["collab_script"])[..]);
 	assert_eq!(rec.leaf_id().to_string(), b["record"]["leaf_id"].as_str().unwrap());
 	assert_eq!(rec.operator, key(&v["inputs"]["operator"]));
+	assert_eq!(arca_covenant::CoinRecord::Board(rec).landing(), None, "a board into vtxo-1 has no landing");
 	println!("board-1: convert script {} bytes, collab script {} bytes (the leaf's own)",
 		policy.convert_script().len(), policy.leaf.collab_script().len());
 
@@ -223,6 +224,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 		chain, exit_delay: RelativeTime::from_units(inp["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&f["leaf_script_pubkey"])[..]);
 	let p = leaf.program();
@@ -408,4 +410,66 @@ fn the_transfer_chain() {
 	assert_eq!(e.lineage().len(), 2);
 	assert_eq!(e.expiry, MedianTime::MAX, "a coin from a board alone never expires");
 	assert_eq!(n, txs.len(), "every transfer transaction in the vectors was rebuilt");
+}
+
+#[test]
+fn the_landing_board_and_its_record() {
+	let v = vectors();
+	let fx = Fx::new(&v);
+	let b = &v["landing_board"];
+	let rec = BoardRecord::from_bytes(&bytes(&b["record"]["binary"])).unwrap();
+	assert_eq!(rec.version(), arca_covenant::board::BOARD_LANDING_RECORD_VERSION);
+	assert_eq!(rec.to_bytes().unwrap(), bytes(&b["record"]["binary"]));
+	assert_eq!(BoardRecord::from_json_str(b["record"]["json"].as_str().unwrap()).unwrap(), rec);
+	assert_eq!(rec.to_json_string().unwrap(), b["record"]["json"].as_str().unwrap());
+	assert_eq!(rec.salt().to_vec(), bytes(&b["record"]["salt"]));
+	let leaf = rec.leaf();
+	assert_eq!(leaf.template(), arca_covenant::Template::Landing1);
+	assert_eq!(leaf.program().to_vec(), bytes(&b["record"]["leaf_program"]));
+	assert_eq!(leaf.script_pubkey().as_bytes(), &bytes(&b["record"]["leaf_script_pubkey"])[..]);
+	assert_eq!(rec.output().script_pubkey.as_bytes(), &bytes(&b["record"]["script_pubkey"])[..]);
+	let policy = rec.policy();
+	assert_eq!(policy.convert_script().as_bytes(), &bytes(&b["record"]["convert_script"])[..]);
+	assert_eq!(leaf.collab_script().as_bytes(), &bytes(&b["record"]["collab_script"])[..]);
+	assert_eq!(leaf.exit_script().as_bytes(), &bytes(&b["record"]["landing_script"])[..]);
+	assert_eq!(rec.leaf_id().to_string(), b["record"]["leaf_id"].as_str().unwrap());
+	assert_eq!(arca_covenant::CoinRecord::Board(rec).landing(), leaf.landing, "the coin's landing, from its record");
+	println!("board-1 into landing-1: landing script {} bytes", leaf.exit_script().len());
+
+	// The owner's conversion into the landing-1 leaf, then its landing.
+	let c = &b["conversion_tx"];
+	let board_at = outpoint(&c["inputs"][0]["outpoint"]);
+	let ks = policy.conversion(board_at, &fee_of(&c["fee"])).unwrap();
+	let u = fx.sign("the owner's conversion into a landing-1 leaf", ks, "A", vec![], c);
+	let conversion = fx.check("the owner's conversion into a landing-1 leaf", u, c);
+	let e = &b["landing_tx"];
+	let at = OutPoint::new(conversion.txid(), 0);
+	let ks = leaf.exit_tx(at, rec.asset, rec.value, &chosen(e), &fee_of(&e["fee"])).unwrap();
+	let u = fx.sign("the converted leaf's landing", ks, "A", vec![], e);
+	fx.check("the converted leaf's landing", u, e);
+	// Built from the leaf alone, with its fee named: the same transaction.
+	let paid = chosen(e)[0].value;
+	let ks = leaf.landing_tx(at, rec.asset, rec.value, &FeeSource::Split { fee: rec.value - paid, change: Script::new() }).unwrap();
+	let u = fx.sign("the converted leaf's landing, from the leaf", ks, "A", vec![], e);
+	fx.check("the converted leaf's landing, from the leaf", u, e);
+	// Anywhere else, the builder refuses it before any signature.
+	let mut other = chosen(e);
+	other[0].script_pubkey = Script::from(vec![0x00, 0x14, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+	assert!(leaf.exit_tx(at, rec.asset, rec.value, &other, &fee_of(&e["fee"])).is_err());
+	let mut short = chosen(e);
+	short[0].value = leaf.landing.unwrap().min_value - 1;
+	assert!(leaf.exit_tx(at, rec.asset, rec.value, &short, &fee_of(&e["fee"])).is_err());
+
+	for x in b["invalid_binary"].as_array().unwrap() {
+		let err = BoardRecord::from_bytes(&bytes(&x["binary"])).err()
+			.unwrap_or_else(|| panic!("{}: decoded", x["name"]));
+		assert_eq!(err.kind(), x["kind"].as_str().unwrap(), "{}: {}", x["name"], err);
+		println!("landing board record, binary  {:<44} refused: {}", x["name"].as_str().unwrap(), err);
+	}
+	for x in b["invalid_json"].as_array().unwrap() {
+		let err = BoardRecord::from_json_str(x["json"].as_str().unwrap()).err()
+			.unwrap_or_else(|| panic!("{}: decoded", x["name"]));
+		assert_eq!(err.kind(), x["kind"].as_str().unwrap(), "{}: {}", x["name"], err);
+		println!("landing board record, JSON    {:<44} refused: {}", x["name"].as_str().unwrap(), err);
+	}
 }

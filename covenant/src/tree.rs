@@ -52,6 +52,7 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn,
 use crate::clock::ClockSchedule;
 use crate::gate::{Members, MAX_OWNERS};
 use crate::htlc::HtlcTerms;
+use crate::landing::Landing;
 use crate::order::OrderLeafTerms;
 use crate::leaf::leaf_salt;
 use crate::message::Chain;
@@ -137,6 +138,9 @@ pub struct LeafSpec {
 	pub htlc: Option<HtlcTerms>,
 	/// `order-2`'s terms, present exactly when the template is `order-2`.
 	pub order: Option<OrderLeafTerms>,
+	/// `landing-1`'s landing, present exactly when the template is
+	/// `landing-1`: every leaf of a supervised asset's batch.
+	pub landing: Option<Landing>,
 }
 
 impl LeafSpec {
@@ -302,12 +306,16 @@ impl Tree {
 			if let Some(first) = keys.insert(spec.owner, i) {
 				return Err(TreeError::DuplicateOwner { first, second: i });
 			}
-			match (spec.template, &spec.htlc, &spec.order) {
-				(Template::Vtxo1, None, None) => {},
-				(Template::Htlc1, Some(t), None) if t.check(spec.exit_delay).is_ok() => {},
-				(Template::Order2, None, Some(o)) if o.check(params.asset, &spec.owner, &operator).is_ok() => {},
+			let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
+				(Template::Vtxo1, None, None, None) => None,
+				(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
+				(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
+				(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
+					Ok(t) => Some(t),
+					Err(_) => return Err(TreeError::Template { leaf: i }),
+				},
 				_ => return Err(TreeError::Template { leaf: i }),
-			}
+			};
 			if spec.value < min || spec.value > MAX_VALUE {
 				return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 			}
@@ -315,6 +323,7 @@ impl Tree {
 				owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 				htlc: spec.htlc,
 				order: spec.order,
+				landing,
 			};
 			let program = leaf.program();
 			if let Some(first) = seen.insert(program, i) {
@@ -475,6 +484,7 @@ impl Tree {
 				owners,
 			},
 			order: l.spec.order,
+			landing: l.spec.landing,
 		}
 	}
 

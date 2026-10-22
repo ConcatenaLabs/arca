@@ -134,7 +134,8 @@
 //!              its owner's unroll authorisation for each node, from the batch output down
 //!   u8  2, a board:
 //!         u16  length L, then L bytes: its BoardRecord, binary form
-//!   u8  1, an output of a reassignment whose leaf is vtxo-1, or 3, one whose leaf is htlc-1:
+//!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, or 5 one
+//!       whose leaf is landing-1:
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
@@ -145,6 +146,8 @@
 //!         [32] owner key, [32] owner nonce, [32] creator nonce (the sender's), u16 exit delay units
 //!         for tag 3 only: u8 direction (0 send, 1 receive), [32] payment hash, u32 timeout,
 //!                         u16 operator delay units
+//!         for tag 5 only: [20] the landing program, u64 the fee allowance: the landing
+//!                         pays at least the coin's output value less it, in its asset
 //! ```
 //!
 //! A reassignment may create an `htlc-1` leaf ([`crate::htlc`]): a payment
@@ -172,6 +175,7 @@ use crate::checkpoint::CheckpointPolicy;
 use crate::clock::ClockSchedule;
 use crate::encode::{write_compact_size, DecodeError, Encoding, Reader};
 use crate::htlc::HtlcTerms;
+use crate::landing::LandingTerms;
 use crate::leaf::{leaf_salt, LeafPolicy, MAX_OUTPUTS};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::MAX_DESTINATION;
@@ -236,6 +240,10 @@ pub struct NewLeaf {
 	pub exit_delay: RelativeTime,
 	/// `htlc-1`'s terms; `None` for a `vtxo-1` leaf.
 	pub htlc: Option<HtlcTerms>,
+	/// `landing-1`'s terms, for a leaf of a supervised asset: they name the
+	/// asset and the least the landing pays, so they must agree with the
+	/// output the leaf is paid ([`LandingTerms::landing`]); `None` otherwise.
+	pub landing: Option<LandingTerms>,
 }
 
 impl NewLeaf {
@@ -243,7 +251,7 @@ impl NewLeaf {
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
-			order: None,
+			order: None, landing: self.landing,
 		}
 	}
 
@@ -379,6 +387,8 @@ pub enum TransferError {
 	Spend(#[from] SpendError),
 	#[error("unknown coin record format version {0}")]
 	Version(u8),
+	#[error("a landing-1 leaf's terms: {0}")]
+	Landing(String),
 	#[error("unknown coin tag {0}")]
 	Tag(u8),
 	#[error("reassignments nest more than {max} deep", max = MAX_HOPS)]
@@ -447,6 +457,7 @@ impl TransferError {
 		use TransferError::*;
 		match self {
 			Decode(_) | Version(_) | Tag(_) | TooDeep | Inputs(_) | Outputs(_) | Index { .. } => "decode",
+			Landing(_) => "landing",
 			Record(e) => e.kind(),
 			Spend(_) => "spend",
 			DepthLimit { .. } => "depth",
@@ -1005,6 +1016,20 @@ impl CoinRecord {
 		}
 	}
 
+	/// The landing of a `landing-1` coin, from its record alone: where its
+	/// exit pays, in what, and at least how much (a leaf of a supervised
+	/// asset's batch, a board that converts into one, or a reassignment's
+	/// output); `None` for a coin of any other template. An operator reads the
+	/// freeze of a supervised coin's holder at this landing.
+	pub fn landing(&self) -> Option<LandingTerms> {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.leaf().landing,
+			CoinRecord::Board(b) => b.leaf().landing,
+			CoinRecord::Transfer(t) => t.leaf.landing,
+			CoinRecord::Fill(_) => None,
+		}
+	}
+
 	/// The key and nonce the coin's record names for its owner. For a fill's
 	/// credit and remainder the key comes from the order's terms; `None` when
 	/// the order coin's record names no order.
@@ -1170,6 +1195,11 @@ impl CoinRecord {
 				if mine.script_pubkey != leaf.script_pubkey() {
 					return Err(TransferError::LeafMismatch);
 				}
+				// A landing-1 leaf lands in the asset it holds, all but its
+				// allowance.
+				if let Some(terms) = &t.leaf.landing {
+					terms.landing(mine.asset, mine.value).map_err(|e| TransferError::Landing(e.to_string()))?;
+				}
 				let id = transfer_id(&parts, &t.outputs, t.index, &leaf.program());
 				Ok(ValidCoin {
 					id, leaf, asset: mine.asset, value: mine.value, sweep: first.sweep,
@@ -1222,7 +1252,7 @@ impl CoinRecord {
 					(0, _, FillLeaf::Credit { .. }) => op.credit_leaf().ok_or_else(|| TransferError::Fill("the order's credit keys are used up".into()))?,
 					(1, true, FillLeaf::Rest { .. }) => op.next().leaf(),
 					(i, partial, FillLeaf::New(l)) if i >= if partial { 2 } else { 1 } => {
-						if l.htlc.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						if !policy.exit_delay_ok(l.exit_delay) {
@@ -1295,7 +1325,12 @@ impl CoinRecord {
 				if t.outputs.is_empty() || t.outputs.len() > MAX_OUTPUTS as usize {
 					return Err(TransferError::Outputs(t.outputs.len()));
 				}
-				w.push(if t.leaf.htlc.is_some() { 3 } else { 1 });
+				let landing = match (&t.leaf.landing, t.outputs.get(t.index as usize)) {
+					(Some(terms), Some(o)) => Some(terms.landing(o.asset, o.value).map_err(|e| TransferError::Landing(e.to_string()))?),
+					(Some(_), None) => return Err(TransferError::Index { index: t.index as usize, count: t.outputs.len() }),
+					(None, _) => None,
+				};
+				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else { 1 });
 				write_inputs(w, &t.inputs, depth)?;
 				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
@@ -1305,6 +1340,10 @@ impl CoinRecord {
 				w.extend(t.leaf.exit_delay.units().to_le_bytes());
 				if let Some(terms) = &t.leaf.htlc {
 					terms.encode_to(w);
+				}
+				if let Some(l) = landing {
+					w.extend(l.program);
+					w.extend(l.allowance.to_le_bytes());
 				}
 			},
 			CoinRecord::Fill(f) => {
@@ -1332,7 +1371,7 @@ impl CoinRecord {
 						w.extend(owner_nonce);
 					},
 					FillLeaf::New(l) => {
-						if l.htlc.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						w.push(2);
@@ -1378,7 +1417,7 @@ impl CoinRecord {
 				}
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
-			tag @ (1 | 3) => {
+			tag @ (1 | 3 | 5) => {
 				let inputs = read_inputs(r, depth)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
@@ -1388,11 +1427,19 @@ impl CoinRecord {
 				}
 				let mut leaf = NewLeaf {
 					owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
+					landing: None,
 				};
 				if tag == 3 {
 					let terms = HtlcTerms::decode_from(r)?;
 					terms.check(leaf.exit_delay).map_err(DecodeError::from)?;
 					leaf.htlc = Some(terms);
+				}
+				if tag == 5 {
+					let mut program = [0u8; crate::landing::PROGRAM_BYTES];
+					program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
+					let l = crate::landing::Landing { program, allowance: r.u64()? };
+					let o = &outputs[index as usize];
+					leaf.landing = Some(l.terms(o.asset, o.value).map_err(|e| TransferError::Landing(e.to_string()))?);
 				}
 				Ok(CoinRecord::Transfer(Box::new(Transfer { inputs, outputs, index, leaf })))
 			},
@@ -1418,6 +1465,7 @@ impl CoinRecord {
 					1 => FillLeaf::Rest { owner_nonce: r.array32()? },
 					2 => FillLeaf::New(NewLeaf {
 						owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
+						landing: None,
 					}),
 					f => return Err(DecodeError::Flag(f).into()),
 				};

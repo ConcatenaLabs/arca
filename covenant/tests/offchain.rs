@@ -163,6 +163,7 @@ fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (Lea
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let coin = net.fund(vec![explicit(net.x, LEAF, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();
@@ -208,6 +209,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		template: Template::Board1, owner: xonly(&a1), owner_nonce: label32("board owner nonce"),
 		operator_nonce: label32("board operator nonce"), exit_delay: delay(), asset: x, value: 20_000_000,
 		chain: c.net.chain, operator: xonly(&s),
+		landing: None,
 	};
 	let bp = rec.policy();
 	// The owner's wallet coin pays the board, with change, the fee in X.
@@ -235,6 +237,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		operator_nonce: label32("board new leaf operator nonce"), exit_delay: delay(), unlock_hash: sha256(&preimage),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let second_owner = keypair("refresh second owner, new leaf");
 	let preimage_b = label32("second owner refresh preimage");
@@ -244,6 +247,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		exit_delay: delay(), unlock_hash: sha256(&preimage_b),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let tree = c.tree(&sched, &[spec, spec_b]);
 	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
@@ -391,6 +395,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		exit_delay: delay(), unlock_hash: sha256(&preimage3),
 		htlc: None,
 		order: None,
+		landing: None,
 	};
 	let tree3 = c.tree(&sched, &[spec3]);
 	let (round3, cv3) = round_tx(&c.net, &issuer, Some(&tree3), vec![], &s);

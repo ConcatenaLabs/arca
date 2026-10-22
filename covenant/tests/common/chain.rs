@@ -40,6 +40,7 @@ impl Party {
 				owner: xonly(&key), owner_nonce: label32(&format!("chain {} owner nonce", label)),
 				creator_nonce: label32(&format!("chain {} creator nonce", label)), exit_delay: delay,
 				htlc: None,
+				landing: None,
 			},
 			key,
 		}
@@ -79,6 +80,7 @@ pub fn batches(chain: Chain, x: AssetId, y: AssetId, s: Keypair, sched1: ClockSc
 			exit_delay: delay, unlock_hash: sha256(&preimages[i]),
 			htlc: None,
 			order: None,
+			landing: None,
 		}).collect();
 		let tree = Tree::build(TreeParams { asset, chain, schedule: sched, burn: false, radix: 4, reserve, min_leaf: 1 }, &leaves).unwrap();
 		(tree, preimages)

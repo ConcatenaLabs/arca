@@ -431,6 +431,7 @@ impl WireBatch {
 				unlock_hash: unhex32(&l.unlock_hash)?,
 				htlc: None,
 				order: None,
+				landing: None,
 			});
 		}
 		let params = TreeParams {
