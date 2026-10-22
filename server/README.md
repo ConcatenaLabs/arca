@@ -2160,7 +2160,8 @@ opening, neither recorded and both refused once its record holds anything
 under the coin's salt (see Channel leaves). For a restricted asset it was
 started with (`--restricted <asset>=<policy key>[:<clawback key>]`) it signs a
 rebindable message only beside the asset's policy key's approval of that very
-message, and no forfeit of the asset (see Restricted assets). It signs no digest it is handed and no release, and
+message, no forfeit of the asset, and no `vtxo-2` message for it, since its
+coins are `enclave-1` (see Restricted assets). It signs no digest it is handed and no release, and
 nothing else by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
 message for a `landing-1` coin, the leaf of a supervised asset, names the
 coin's landing program: the signer builds the message over the constant
