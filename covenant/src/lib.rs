@@ -87,6 +87,8 @@
 
 pub extern crate elements;
 
+pub mod accumulator;
+pub mod accumulator_programs;
 pub mod board;
 pub mod bond;
 pub mod checkpoint;
@@ -126,6 +128,10 @@ pub mod tree;
 pub mod unroll;
 pub mod witness;
 
+pub use accumulator::{
+	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, Bitmap, Exit, ExitAuth, SeenExit, Slot,
+	ValidAccumulatorLeaf,
+};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use checkpoint::CheckpointPolicy;

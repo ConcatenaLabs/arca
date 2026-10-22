@@ -16,6 +16,10 @@ it: its REFUND lock may be a height, and Arca only reads it. The `order-2` leaf
 `arca/order-2`, and a hidden data leaf beside its tapscript leaves; its pruned
 programs come from sequentia-contracts (`order_programs`), so its spends are
 built with no compiler.
+An accumulator batch (`accumulator`) holds its leaves as a fixed root of leaf
+records and a bitmap of the leaves that have left, under the Simplicity
+program `arca/accumulator-1`, whose two pruned forms also come from
+sequentia-contracts (`accumulator_programs`).
 
 ## What it builds
 
@@ -36,6 +40,7 @@ built with no compiler.
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
+| `accumulator` | An accumulator batch output (`AccumulatorPolicy`): up to 1,024 leaves of one asset as a fixed Merkle-sum root of slot records (`Slot`: the owner key, the SHA256 of the leaf's entry's scriptPubKey, the entry's value and the reserve of the slot's exit), the operator's key and a bitmap of the slots that have left, in a hidden data leaf beside the program | EXIT (`arca/accumulator-1`, Simplicity): one slot out in one transaction, under the owner's or the operator's signature over `exit_digest` (chain, root, record and a not-before time, no outpoint and no bitmap) with the lock time at or after that time; the slot's entry at `2k`, the rest at `2k+1` under the same state with the slot's bit set (`exit_tx`; `check` mirrors the program); SWEEP, the tree's batch-output sweep behind the token. `read_exit` and `follow` read the state from the exits on the chain |
 | `limiter` | No output of Arca's: the mint limiter of sequentia-contracts (`templates/mint_limiter`), which holds an issuer-operated asset's reissuance token (`LimiterParams`, read from the instance file the limiter's tool writes, and `LimiterState`) | None of Arca's: the coin's script in each state (`script_pubkey`, rebuilt from the template's root and the data leaf, equal to the template's address vectors), the state a mint leads to by the program's own rule (`mint`, `room`), what a spend of the coin did (`follow`: a mint, the brake applied or lifted, the recovery), and the reissuance a round's input 0 carries (`reissuance`). The limiter's tool signs and satisfies a mint (`mint-limiter sign`) |
 | `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `bond` | The operator's equivocation bond (`BondPolicy`: the chain, `S`, the withdrawal key `W`, the notice delay `D`), and the notice output a withdrawal waits in | SLASH, in both outputs: the salt, two messages `S` signed under it (each a form, `Rebind` for a collaborative path's message `SHA256(K ‖ rest)` or `Fill` for an `order-2` fill's `SHA256(F ‖ salt ‖ rest)`, its rest in three chunks of at most 80 bytes, and `S`'s signature), the digests computed in the script and required to differ, and the output at the input's own index a bare `OP_RETURN` of its whole amount, so a slash pays no one; NOTICE, `W`'s signature, the bond whole to the notice output; WITHDRAW, on the notice output, `W`'s signature `D` after the notice confirmed. `slash_tx`, `notice_tx` and `withdraw_tx` build the three spends, a fee coin paying; `check` judges evidence as SLASH will; `rebind_signed_in` reads `S`'s signature and its message from a collaborative spend found on the chain; `cosigned_by` lists every message `S` signed that a coin's lineage rests on, each under its salt, which a holder hands a watcher |
@@ -543,6 +548,70 @@ reassignment within that delay. It answers at once: a rollback that disconnects
 its answer does not restart the delay of the leaf it answered. Against the sender
 and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.
+
+## The accumulator batch
+
+An accumulator batch (`accumulator`) replaces a tree's node levels for a batch
+of up to 1,024 leaves. `Accumulator::build` takes the leaves of one asset and
+the batch's parameters (`AccumulatorParams`: a tree's, but for the radix) and
+puts each leaf behind its hash-locked entry under the tree's rules (one key per
+leaf, no operator nonce twice, no leaf script twice, the leaf's value bounds);
+slot `j` holds leaf `j`. The batch output is
+`P2TR(NUMS, TapBranch(TapBranch(X, D), SWEEP))`: `X` the program, `D` the
+data leaf of the root, the operator's key and the bitmap, `SWEEP` the sweep a
+tree's batch output carries. A slot's record is
+`SHA256(0x00 ‖ j ‖ owner ‖ SHA256(entry scriptPubKey) ‖ entry value ‖ exit
+reserve)` and weighs the entry's value and the reserve; an inner node is
+`SHA256(0x01 ‖ h_l ‖ w_l ‖ h_r ‖ w_r)`; the root's weight is what the batch
+output holds. `ReserveRule::Fixed { node, entry }` puts `node` on every slot's
+exit; `ReserveRule::FeeRate` sizes it from the exit itself.
+
+An exit of slot `j` from the batch output at input `k` needs the slot's record
+on its path to the root, every weight on the path the sum of its children,
+its bit clear, and the signature of the slot's owner, or of the operator (the
+operator's path is the tree's gate, where the operator is a member of every
+node), over `exit_digest`: the chain, the root, the record and a time `t`,
+with the transaction's lock time at or after `t`. It names no outpoint and no
+bitmap, so it holds for every state of the batch: an owner signs it when the
+leaf is accepted and hands it to a watcher or a receiver, as it does the
+unroll authorisations of a tree leaf. The exit pays the slot's entry at `2k`,
+the very output a tree's lowest node pays, and the rest at `2k+1` under the
+same state with the slot's bit set; the slot's reserve pays the fee, or a coin
+attached does. From the entry on, the leaf is a tree leaf's: the entry's
+unlock with the preimage, the exit delay, and every signature made for the
+leaf. Because the root never changes, every other holder's record and
+authorisation stay valid through every exit, and because every weight on an
+exit's path is checked, a record under a node whose weight is not the sum of
+its children can never leave, so the batch always holds enough for every
+record that can.
+
+```rust
+use arca_covenant::accumulator::{Accumulator, AccumulatorParams, ExitAuth};
+
+let acc = Accumulator::build(params, &leaves)?;
+let batch = acc.batch_output();                          // the round pays this
+let record = acc.record(i);                              // for leaf i's owner
+let valid = record.validate(&round, &policy, &leaf_key, &leaf_nonce)?;
+let auth = ExitAuth { by_operator: false, time: t, signature: sign(&valid.exit_digest(t)) };
+let exit = valid.exit_tx(&state, batch_outpoint, held, &auth, &FeeSource::Reserve)?;   // state: the batch's latest
+let entry = valid.entry_tx(OutPoint::new(exit.tx.txid(), 0), &preimage, &FeeSource::Reserve)?;
+```
+
+`AccumulatorRecord::validate` is the wallet's check before it accepts a leaf in
+an accumulator batch: the record is for its key and nonce, within its policy
+(chain, operator, notice, first expiry, exit delay, and the reserves of the
+entry and of the slot's exit), and the round pays exactly one output equal to
+the batch output the record rebuilds (asset, the root's weight, and the script
+with every bit clear), with the five checks on the token and its clock. Every
+exit publishes the whole state it spends, so `read_exit` reads the bitmap of a
+batch from its latest exit, and `follow` replays a batch's exits from its
+round; a builder checks the state it spends against the batch output's script.
+
+Exits are serial: each spends the batch output and re-creates it, so a batch
+takes 25 exits a block from one unconfirmed chain. An exit is 976 vB with its
+fee from the slot's reserve, against 2,854 vB for the five node transactions of
+a 1,024-leaf tree; the entry's unlock (234 vB) and the leaf's exit follow in
+both (`covenant/tests/accumulator.rs`).
 
 ## In-tree fills of a resting order
 
