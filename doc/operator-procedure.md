@@ -257,8 +257,9 @@ issuer sets it up so:
   refresh are backed by nothing while their batch lives. Before an asset
   that is backed by reserves elsewhere (a bridge's) is served this way, the
   bridge's supply and reserve checks must count the units live under
-  burn-only sweeps, which `issuer_supply` lists, or they read the mint as
-  inflation.
+  burn-only sweeps, which `issuer_supply` lists output by output, or they
+  read the mint as inflation. Compages does this for the assets it bridges
+  (its `docs/issuer-operated.md`).
 
 ## Serving a supervised asset
 
