@@ -154,6 +154,15 @@ control blocks, and its credit output's claim and provider leaves), each
 state's message with both signatures, and two credit notes with the
 operator's signatures.
 
+`vectors/accumulator.json` holds the accumulator batch's vectors, written by
+`accumulator.py`, which derives them on its own from the batch's rules: six
+leaves behind the entries a tree would pay them through, each slot's record,
+the Merkle-sum root and the batch's weight, the state's data leaf, the batch
+output's merkle root, scriptPubKey and control block, and two exits, by an
+owner and then by the operator, each with its path, digest, signature, witness
+value and the state it leaves. The Simplicity commitment root is
+sequentia-contracts' (`arca/accumulator-1`).
+
 `vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
 signature uses zero auxiliary randomness, so the output is the same on every run:
@@ -167,11 +176,11 @@ sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
 builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
 re-encodes and validates every record; `covenant/tests/transactions.rs` rebuilds
-every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature.
+every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature; `covenant/tests/accumulator_vectors.rs` rebuilds every accumulator vector and checks each exit's signature.
 
 ## In CI
 
 The `regtest-suite` job of [node.yml](../.github/workflows/node.yml) runs
-`vectors.py --check`, which regenerates both vector files, and the whole suite against the newest node build, with the
+`vectors.py --check`, which regenerates every vector file, and the whole suite against the newest node build, with the
 functional test framework from the same node commit. The logs and result files
 are kept as the job's artifact.
