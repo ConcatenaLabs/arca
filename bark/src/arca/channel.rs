@@ -55,6 +55,13 @@ struct Kept {
 	pending: Option<Value>,
 }
 
+/// The credit of `k` not folded in `latest`, as the chain pays it: a note
+/// counts up to the cap of the state it is claimed under, the operator's
+/// balance and what was folded, and no further.
+fn unfolded(k: &Kept, latest: &State) -> u64 {
+	k.credit.min(latest.credit_cap()).saturating_sub(latest.folded)
+}
+
 fn state_json(s: &State) -> Value {
 	json!({"number": s.number.to_string(), "owner": s.owner.to_string(), "operator": s.operator.to_string(),
 		"folded": s.folded.to_string()})
@@ -184,18 +191,19 @@ impl Wallet {
 		let Some(policy) = policy else { return Ok(None) };
 		let k = self.kept(&row.leaf_id)?;
 		let latest = k.latest(&policy);
-		Ok(Some(latest.owner.saturating_add(k.credit.saturating_sub(latest.folded))))
+		Ok(Some(latest.owner.saturating_add(unfolded(&k, &latest))))
 	}
 
 	/// What the wallet holds of channel `leaf_id`, asking nothing.
 	fn channel_view(&self, leaf_id: &str, policy: &ChannelPolicy, asset: AssetId, k: &Kept) -> Value {
 		let latest = k.latest(policy);
+		let unfolded = unfolded(k, &latest);
 		json!({
 			"leaf_id": leaf_id, "asset": asset.to_string(), "value": policy.terms.value.to_string(),
 			"state": state_json(&latest),
-			"balance": latest.owner.saturating_add(k.credit.saturating_sub(latest.folded)).to_string(),
-			"credit": k.credit.to_string(), "credit_not_folded": k.credit.saturating_sub(latest.folded).to_string(),
-			"operator_side": latest.operator.saturating_sub(k.credit.saturating_sub(latest.folded)).to_string(),
+			"balance": latest.owner.saturating_add(unfolded).to_string(),
+			"credit": k.credit.to_string(), "credit_not_folded": unfolded.to_string(),
+			"operator_side": latest.operator.saturating_sub(unfolded).to_string(),
 			"pending": k.pending.is_some(),
 		})
 	}
@@ -314,12 +322,12 @@ impl Wallet {
 		}
 		let latest = k.latest(&policy);
 		let amount = pay.map_or(0, |p| p.1);
-		if pay.is_none() && k.credit <= latest.folded {
+		let unfolded = unfolded(&k, &latest);
+		if pay.is_none() && unfolded == 0 {
 			return Err(Error::Refused(format!("channel {} has no credit to fold", leaf_id)));
 		}
-		let next = latest.pay(amount, k.credit.max(latest.folded)).ok_or_else(|| Error::Refused(format!(
-			"channel {} holds {} and {} of credit not folded: less than {}", leaf_id, latest.owner,
-			k.credit.saturating_sub(latest.folded), amount)))?;
+		let next = latest.pay(amount, latest.folded + unfolded).ok_or_else(|| Error::Refused(format!(
+			"channel {} holds {} and {} of credit not folded: less than {}", leaf_id, latest.owner, unfolded, amount)))?;
 		let key = self.coin_key(&row.owner_nonce)?;
 		let d = policy.state_message(&next).map_err(|e| Error::Refused(e.to_string()))?.digest;
 		let owner_sig = hex(sign(&key, &d).as_ref());
@@ -510,5 +518,25 @@ impl Wallet {
 			},
 			Err(e) => Some(format!("{}: {}", what, e)),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn kept(credit: u64) -> Kept {
+		Kept { states: vec![], credit, credit_sig: None, pending: None }
+	}
+
+	#[test]
+	fn a_note_counts_as_far_as_the_chain_pays_it() {
+		let st = State { number: 3, owner: 2_500_000, operator: 1_000_000, folded: 500_000 };
+		assert_eq!(unfolded(&kept(0), &st), 0, "no note");
+		assert_eq!(unfolded(&kept(400_000), &st), 0, "a note already folded");
+		assert_eq!(unfolded(&kept(900_000), &st), 400_000, "within the cap");
+		assert_eq!(unfolded(&kept(1_500_000), &st), 1_000_000, "at the cap: the operator's whole balance");
+		assert_eq!(unfolded(&kept(9_000_000), &st), 1_000_000, "above the cap, as the claim pays it: the operator's balance, no more");
+		assert_eq!(st.owner + unfolded(&kept(9_000_000), &st), st.owner + st.operator, "never beyond the leaf's value");
 	}
 }
