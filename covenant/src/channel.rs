@@ -93,6 +93,20 @@ pub enum ChannelError {
 	NothingToClaim { note: u64, paid: u64 },
 	#[error("the credit output holds {value}, more than the {cap} its state owes")]
 	CreditValue { value: u64, cap: u64 },
+	#[error("the spend of the output of state {from} is not one of its leaves' spends: {why}")]
+	Spend { from: u64, why: &'static str },
+}
+
+/// How a spend of a channel's output left it, as [`ChannelPolicy::read_spend`]
+/// reads it from the spending input's witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelSpend {
+	/// `update(n)`, into the output of state `to`, the witness's number.
+	Update { to: u64 },
+	/// `settle(n)`: the state's balances paid out.
+	Settle,
+	/// The collaborative path under `K`: a forfeit or another co-signed spend.
+	Collab,
 }
 
 /// `Q = SHA256(SHA256("ArcaChn1" ‖ genesis) ‖ salt)`: the constant every
@@ -406,6 +420,37 @@ impl ChannelPolicy {
 		self.taproot(from).witness(&self.update_script(from.number), vec![
 			operator_sig.as_ref().to_vec(), owner_sig.as_ref().to_vec(), to.number.to_le_bytes().to_vec(),
 		])
+	}
+
+	/// How the spend whose input carries `witness` left the channel's output
+	/// of `from`: by which of its three leaves, and for an update the number
+	/// it moved to. The leaf is the script the spend ran, the item below the
+	/// control block, read through [`crate::witness::without_annex`]: an
+	/// annex is the same spend (consensus drops it before the script runs),
+	/// and nothing a channel signs covers one (the state message, the note
+	/// and the collaborative pair are built over messages of their own), so
+	/// anyone who relays or mines a spend can add one. A witness whose script
+	/// is none of the output's leaves, or whose items do not fit that leaf,
+	/// is refused, never taken for one of them.
+	pub fn read_spend(&self, from: &State, witness: &[Vec<u8>]) -> Result<ChannelSpend, ChannelError> {
+		let w = crate::witness::without_annex(witness);
+		let refused = |why| ChannelError::Spend { from: from.number, why };
+		let [items @ .., leaf, _control] = w else { return Err(refused("not a script-path spend")) };
+		if leaf.as_slice() == self.update_script(from.number).as_bytes() {
+			match items {
+				[_, _, m] if m.len() == 8 => Ok(ChannelSpend::Update { to: u64::from_le_bytes(m[..].try_into().expect("8 bytes")) }),
+				_ => Err(refused("an update's items are two signatures and an 8-byte number")),
+			}
+		} else if leaf.as_slice() == self.settle_script(from).as_bytes() {
+			match items {
+				[] => Ok(ChannelSpend::Settle),
+				_ => Err(refused("a settle takes no items")),
+			}
+		} else if leaf.as_slice() == self.collab_script().as_bytes() {
+			Ok(ChannelSpend::Collab)
+		} else {
+			Err(refused("its script is none of the output's leaves"))
+		}
 	}
 
 	/// The settle witness of `state`: the script and its control block.

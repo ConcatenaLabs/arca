@@ -30,7 +30,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::{AssetId, OutPoint, Transaction, TxOut};
 use serde_json::{json, Value};
 
-use arca_covenant::channel::{owner_script_pubkey, ChannelPolicy, State};
+use arca_covenant::channel::{owner_script_pubkey, ChannelPolicy, ChannelSpend, State};
 use arca_covenant::sign::verify_digest;
 use arca_covenant::{CoinRecord, ExplicitOutput};
 
@@ -415,18 +415,27 @@ impl Wallet {
 					"next": format!("channel output {} is spent by a transaction the wallet cannot find yet", at)}));
 			};
 			let i = tx.input.iter().position(|x| x.previous_output == at).expect("it spends the output");
-			let w = &tx.input[i].witness.script_witness;
-			if w.len() == 5 && w[2].len() == 8 {
-				let n = u64::from_le_bytes(w[2].clone().try_into().expect("8 bytes"));
-				state = k.state(&policy, n).ok_or_else(|| Error::Refused(format!("channel {} was moved to state {}, which the wallet \
-					never signed", leaf_id, n)))?;
-				at = OutPoint::new(tx.txid(), i as u32);
-			} else if w.len() == 2 {
-				break Some((tx, state));
-			} else {
-				self.store.set_coin_state(leaf_id, "spent", &format!("its channel was spent by {}, by its collaborative path", tx.txid()))?;
-				return Ok(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": tx.txid().to_string(),
-					"note": "the coin was spent by its collaborative path (a forfeit or a co-signed spend), not by a state"}));
+			// Which leaf the spend ran, read without its annex: whoever
+			// published it may have added one, which changes nothing it did.
+			let spend = policy.read_spend(&state, &tx.input[i].witness.script_witness).map_err(|e| Error::Refused(format!(
+				"channel {}: transaction {}: {}", leaf_id, tx.txid(), e)))?;
+			match spend {
+				ChannelSpend::Update { to } => {
+					state = k.state(&policy, to).ok_or_else(|| Error::Refused(format!("channel {} was moved to state {}, which the \
+						wallet never signed", leaf_id, to)))?;
+					if tx.output.get(i).map(|o| &o.script_pubkey) != Some(&policy.script_pubkey(&state)) {
+						return Err(Error::Refused(format!("channel {}: transaction {} moved it to state {} at an output other than \
+							that state's", leaf_id, tx.txid(), to)));
+					}
+					at = OutPoint::new(tx.txid(), i as u32);
+				},
+				ChannelSpend::Settle => break Some((tx, state)),
+				ChannelSpend::Collab => {
+					self.store.set_coin_state(leaf_id, "spent", &format!("its channel was spent by {}, by its collaborative path",
+						tx.txid()))?;
+					return Ok(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": tx.txid().to_string(),
+						"note": "the coin was spent by its collaborative path (a forfeit or a co-signed spend), not by a state"}));
+				},
 			}
 		};
 		let Some((settle, settled_state)) = settled else {

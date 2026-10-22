@@ -1289,6 +1289,10 @@ wallet's outputs swept to an address of its own. Fees come from an on-chain
 coin of the wallet's, in the asset named (`--fee-asset`) or chosen as for an
 exit. An older state the operator publishes never pays the wallet less than
 the latest: the wallet's latest note takes the rest from the operator's side.
+The wallet follows the coin through whatever was published on it, by whom
+and with or without an annex on its witness, by the leaf each spend ran; a
+spend it cannot read as one of the coin's leaves stops the exit with the
+transaction named, and never marks the coin spent.
 
 Credit not folded has a deadline that a balance does not. Once any state of
 the channel is settled on the chain, by whoever published it, the operator
