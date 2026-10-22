@@ -302,7 +302,8 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			(Template::Channel1, None, None, None) => None,
 			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
-			(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
+			(Template::Order2 | Template::Order3, None, Some(o), None)
+				if o.template() == spec.template && o.check(params.asset, &spec.owner, &operator).is_ok() => None,
 			(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
 				Ok(t) => Some(t),
 				Err(_) => return Err(TreeError::Template { leaf: i }),

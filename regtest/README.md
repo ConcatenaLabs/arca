@@ -103,7 +103,7 @@ forms and the leaf id, which its docstring states in full. For each of seven
 batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
 second and fourth leaves are `htlc-1`, one whose first and fourth are
-`order-2`, one of a supervised asset whose five leaves are all
+`order-2`, one whose second and fifth are `order-3`, one of a supervised asset whose five leaves are all
 `landing-1`, one whose second and fifth leaves are `channel-1` (the
 fifth with no opening balance for the operator), and one whose second and third are `vtxo-2`, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
@@ -130,7 +130,8 @@ transaction is given whole, witnesses included, with the outputs it spends and,
 for a signature, the signature hash and the test key's signature, once with the
 spent output's margin as the fee and once with a fee coin attached.
 
-`vectors/order.json` holds the `order-2` leaf's vectors, written by
+`vectors/order.json` holds the `order-2` leaf's vectors, and under `order_3`
+the same order's as an `order-3` leaf, written by
 `order.py`, which derives them on its own: the tree mixes tapscript leaves, a
 Simplicity leaf and a hidden data leaf, which the node framework's taproot code
 cannot express, so it builds the tagged hashes itself. It holds an order's
@@ -138,8 +139,9 @@ terms and keys, its parameters, the collaborative, landing and fill leaves with
 their control blocks, the merkle root and scriptPubKey; the same for the
 remainder after one fill; the credit leaf that fill pays; the SeqDEX order it
 lands as; and the operator's digest over a fill's outputs with its signature.
-The two Simplicity commitment roots are sequentia-contracts' (`arca/order-2`,
-`seqdex/order`).
+The Simplicity commitment roots are sequentia-contracts': `arca/order-3`
+and `seqdex/order` version 2 for an `order-3` leaf, `arca/order-2` and
+`seqdex/order` version 1 for an `order-2` leaf.
 
 `vectors/collab2.json` holds the `vtxo-2` leaf's vectors, written by
 `collab2.py`, which derives them on its own from the tagged hashes, as
@@ -191,7 +193,7 @@ sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
 builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
 re-encodes and validates every record; `covenant/tests/transactions.rs` rebuilds
-every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature; `covenant/tests/accumulator_vectors.rs` rebuilds every accumulator vector, checks each exit's signature, and encodes and decodes every record and coin record.
+every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` and `order-3` vector and verifies the fill signature; `covenant/tests/accumulator_vectors.rs` rebuilds every accumulator vector, checks each exit's signature, and encodes and decodes every record and coin record.
 
 ## In CI
 
