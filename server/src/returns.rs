@@ -95,17 +95,34 @@ impl Watcher {
 	async fn swept_final(&self, leaf: &[u8; 32]) -> Result<bool, WatcherError> {
 		let Some(bl) = self.store.batch_leaf(leaf).await? else { return Ok(false) };
 		let Some(round) = self.store.round(bl.round_id).await? else { return Ok(false) };
-		let tree = self.tree(&round, bl.vout).await?;
 		let idx = bl.idx as usize;
-		let mut above = vec![OutPoint::new(txid_of(&round.txid), bl.vout)];
-		for s in self.store.tree_sightings(bl.round_id, bl.vout).await? {
-			let covers = match s.kind {
-				TreeScriptKind::Node => tree.levels().get(s.level as usize).and_then(|l| l.get(s.idx as usize))
-					.is_some_and(|n| n.leaves.contains(&idx)),
-				TreeScriptKind::Entry => s.idx as usize == idx,
-			};
-			if covers {
-				above.push(OutPoint::new(txid_of(&s.txid), s.vout));
+		let mut above = vec![];
+		if bl.kind == arca_covenant::BatchKind::Accumulator {
+			// The batch output where its exits have left it, while it still
+			// holds the leaf's slot, and the leaf's entry once an exit paid it.
+			let acc = self.accumulator(&round, bl.vout).await?;
+			if let Some((at, state, _)) = self.accumulator_now(&round, bl.vout, &acc).await? {
+				if !state.bitmap.is_left(bl.idx as u16) {
+					above.push(at);
+				}
+			}
+			for s in self.store.tree_sightings(bl.round_id, bl.vout).await? {
+				if s.kind == TreeScriptKind::Entry && s.idx as usize == idx {
+					above.push(OutPoint::new(txid_of(&s.txid), s.vout));
+				}
+			}
+		} else {
+			let tree = self.tree(&round, bl.vout).await?;
+			above.push(OutPoint::new(txid_of(&round.txid), bl.vout));
+			for s in self.store.tree_sightings(bl.round_id, bl.vout).await? {
+				let covers = match s.kind {
+					TreeScriptKind::Node => tree.levels().get(s.level as usize).and_then(|l| l.get(s.idx as usize))
+						.is_some_and(|n| n.leaves.contains(&idx)),
+					TreeScriptKind::Entry => s.idx as usize == idx,
+				};
+				if covers {
+					above.push(OutPoint::new(txid_of(&s.txid), s.vout));
+				}
 			}
 		}
 		for op in above {

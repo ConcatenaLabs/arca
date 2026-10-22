@@ -268,6 +268,19 @@ order_margin_seconds = 21600
 block_seconds = 60
 forfeit_window_seconds = 600
 
+# How batches are built. A batch is a tree, whose leaves leave through its
+# node levels, or an accumulator batch, one output of up to 1,024 leaves from
+# which each leaf leaves in one transaction (976 vB at any size, against five
+# node transactions of a 1,024-leaf tree). Exits from an accumulator batch are
+# serial and do not share nodes, so it is the cheaper one only while few
+# leaves leave: accumulator_exit_rate_ppm is the share of a batch's leaves, in
+# millionths, the operator expects to leave on their own, and a batch is built
+# as an accumulator when that many exits cost less from one (up to about 78
+# of 1,024). Batches with resting orders or channels, and an issuer-operated
+# asset's batches, are trees. Unset, every batch is a tree.
+[batches]
+# accumulator_exit_rate_ppm = 10000
+
 # The Lightning gateway beside each asset's own node.
 [lightning]
 # How often every Lightning node is checked, in seconds.

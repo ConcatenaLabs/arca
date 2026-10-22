@@ -66,7 +66,7 @@ use elements::{AssetId, Script, Txid};
 use arca_covenant::plan::{key_proof_digest, Plan, PlanStep, MAX_STEPS};
 use arca_covenant::sign::verify_digest;
 use arca_covenant::spend::{FeeSource, Pair};
-use arca_covenant::{Chain, CoinRecord, LeafId, LeafPolicy, LeafRecord, MedianTime, RelativeTime, Template};
+use arca_covenant::{Chain, CoinRecord, LeafId, LeafPolicy, MedianTime, RelativeTime, Template};
 
 use crate::chain::FinalityService;
 use crate::coins::{self, CoinError};
@@ -645,13 +645,12 @@ impl Plans {
 		let b = self.store.batch_leaf(&leaf.0).await?.ok_or_else(|| PlanError::Internal(format!("leaf {} is in no batch", leaf)))?;
 		let round = self.store.round(b.round_id).await?.ok_or_else(|| PlanError::Internal(format!("round {} is not recorded", b.round_id)))?;
 		let round_tx: elements::Transaction = elements::encode::deserialize(&round.tx).map_err(|e| PlanError::Internal(e.to_string()))?;
-		let record = LeafRecord::from_bytes(&b.record).map_err(|e| PlanError::Internal(e.to_string()))?;
 		// As of now, or of its first expiry once that has passed: a holder back
 		// after the leaf's expiry hands its authorisations over all the same.
 		let now = self.now().await?;
-		let first = record.schedule.expiries()[0];
-		let as_of = if first.to_consensus_u32() < now.to_consensus_u32() { first } else { now };
-		let coin = CoinRecord::Leaf { record, preimage: step.step.preimage, auths };
+		let first = crate::coins::batch_leaf_expiry(&b).ok_or_else(|| PlanError::Internal(format!("leaf {}'s record", leaf)))?;
+		let as_of = if first < now.to_consensus_u32() { MedianTime::from_consensus(first).map_err(|e| PlanError::Internal(e.to_string()))? } else { now };
+		let coin = crate::coins::batch_coin(&b, step.step.preimage, auths).map_err(|e| PlanError::Internal(format!("leaf {}: {}", leaf, e)))?;
 		let policy = arca_covenant::WalletPolicy { horizon: 0, ..self.params.taken_policy(as_of) };
 		let valid = coin.resolve(std::slice::from_ref(&round_tx), &policy)
 			.map_err(|e| PlanError::Coin(CoinError::InvalidCoin { leaf: *leaf, error: e }))?;
@@ -672,13 +671,15 @@ pub async fn coin_expiry(store: &Store, leaf: &[u8; 32]) -> Result<Option<u32>, 
 	let Some(row) = store.leaf(leaf).await? else { return Ok(None) };
 	if !row.record.is_empty() {
 		if let Ok(c) = CoinRecord::from_bytes(&row.record) {
-			if let CoinRecord::Leaf { record, .. } = c {
-				return Ok(Some(record.schedule.expiries()[0].to_consensus_u32()));
+			match c {
+				CoinRecord::Leaf { record, .. } => return Ok(Some(record.schedule.expiries()[0].to_consensus_u32())),
+				CoinRecord::Accumulator { record, .. } => return Ok(Some(record.schedule.expiries()[0].to_consensus_u32())),
+				_ => {},
 			}
 		}
 	}
 	let Some(b) = store.batch_leaf(leaf).await? else { return Ok(None) };
-	Ok(LeafRecord::from_bytes(&b.record).ok().map(|r| r.schedule.expiries()[0].to_consensus_u32()))
+	Ok(crate::coins::batch_leaf_expiry(&b))
 }
 
 /// Starts every step whose turn it is and whose time has come (`now` at or

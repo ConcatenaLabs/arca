@@ -93,6 +93,7 @@ pub extern crate elements;
 
 pub mod accumulator;
 pub mod accumulator_programs;
+pub mod batch;
 pub mod board;
 pub mod bond;
 pub mod channel;
@@ -137,6 +138,7 @@ pub use accumulator::{
 	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, Bitmap, Exit, ExitAuth, SeenExit, Slot,
 	ValidAccumulatorLeaf,
 };
+pub use batch::{Batch, BatchKind};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelTerms, State};
