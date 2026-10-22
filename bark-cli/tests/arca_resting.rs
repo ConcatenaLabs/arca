@@ -9,14 +9,17 @@
 //! the order; the maker's process then stops. Two takers holding leaves of Y
 //! fill it in part, one after the other, with `arca order fill-resting`, each
 //! checking the order's coin against its round and holding a leaf of X
-//! afterwards. The maker comes back: one `sync` takes up both credits (leaves
+//! afterwards; the first fills from a `vtxo-2` leaf, whose checkpoint's pair
+//! names the order's coin beside it. The maker comes back: one `sync` takes up both credits (leaves
 //! of Y under its credit keys) and the order resting at the second
 //! remainder; `arca order resting` shows both fills. It cancels what rests,
 //! and a fill after the cancel is refused. A second maker rests an order and
 //! takes it home with `arca exit`: the coin is unrolled, its landing waits
 //! out the exit delay (refused before it by the node) and then moves the
 //! whole of it into SeqDEX's own order, which a taker on the chain fills
-//! with no signature, paying the order key's output.
+//! with no signature, paying the order key's output. Last, the first taker
+//! takes its leaf of X home: the fill reaches the chain, its `vtxo-2`
+//! checkpoint spent at input 1 by `arca/collab-2`.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -154,6 +157,12 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	// board's service expiry comes before the order's coin expires, so the
 	// operator takes no fill paid with it, and the wallet does not offer one.
 	let t0 = holder(&mut r, "RT0", y, 1_000_000, 0).await;
+	// The board's service expiry and the order coin's expiry are both 28 days
+	// after the median time of their blocks: the chain's clock moves on an
+	// hour first, so the board's comes earlier by that hour, not by however
+	// far the clock moved between the two blocks (which can be nothing).
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 3600));
+	r.synced().await;
 
 	// M rests its order, and stops.
 	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
@@ -162,6 +171,12 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 
 	// Two takers fill it in part, each from a leaf of Y.
 	let t1 = holder(&mut r, "RT1", y, 1_000_000, 0).await;
+	// T1 refreshes its board into a vtxo-2 leaf, which it fills from.
+	assert_eq!(t1.ok(&["leaf-template", "vtxo-2"])["leaf_template"], "vtxo-2");
+	t1.ok(&["participate"]);
+	rounds(&mut r, &[&t1]).await;
+	let l1 = live_of(&t1, y);
+	assert!(l1.len() == 1 && l1[0]["template"] == "vtxo-2", "T1 holds a vtxo-2 leaf of Y: {:?}", l1);
 	let t2 = holder(&mut r, "RT2", y, 1_000_000, 0).await;
 	t1.refused(&["order", "fill-resting", &order, "--amount", "99999"], "below the order's min_lot");
 	t1.refused(&["order", "fill-resting", &order, "--amount", "950000"], "below the order's min_lot of");
@@ -265,4 +280,42 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	r.produce().await;
 	println!("a taker on the chain filled 100,000 X of the landed order: {} ({} vB)", filled, tx.vsize());
 	assert!(r.rt.client().raw_transaction(&filled).is_ok());
+
+	// T1 takes home the leaf of X its fill made: the fill reaches the chain,
+	// T1's vtxo-2 checkpoint spent at input 1, beside the order's coin, by
+	// arca/collab-2.
+	let t1_x = got1[0]["leaf_id"].as_str().unwrap().to_string();
+	let mut broadcast: Vec<String> = vec![];
+	let mut claimed = false;
+	for _ in 0..16 {
+		let e = t1.ok(&["exit", &t1_x]);
+		for t in e["broadcast"].as_array().into_iter().flatten() {
+			if let Some(id) = t.as_str().or_else(|| t["txid"].as_str()) {
+				broadcast.push(id.to_string());
+			}
+		}
+		if e["state"] == "claimed" {
+			claimed = true;
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.synced().await;
+	}
+	assert!(claimed, "T1's leaf of X claimed");
+	r.produce().await;
+	let cmr = arca_covenant::collab::collab_cmr().to_vec();
+	let mut in_fill = false;
+	for id in broadcast.iter().filter_map(|t| elements::Txid::from_str(t).ok()) {
+		let tx = r.rt.client().raw_transaction(&id).unwrap();
+		for (i, input) in tx.input.iter().enumerate() {
+			let w = arca_covenant::witness::without_annex(&input.witness.script_witness);
+			if w.len() == 4 && w[2] == cmr {
+				println!("on the chain: {} input {} of {} spends by arca/collab-2 ({} vB)", id, i, tx.input.len(), tx.vsize());
+				in_fill |= i >= 1;
+			}
+		}
+	}
+	assert!(in_fill, "the fill on the chain, T1's vtxo-2 checkpoint at input 1 by arca/collab-2: {:?}", broadcast);
 }

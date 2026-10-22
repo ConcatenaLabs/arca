@@ -149,7 +149,7 @@ pub use accumulator::{
 pub use batch::{Batch, BatchKind};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
-pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelTerms, State};
+pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTerms, State};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};

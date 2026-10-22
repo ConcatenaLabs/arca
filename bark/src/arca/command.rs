@@ -43,7 +43,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, max_fee_ppm?}, channel_sync {leaf_id}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}";
+	fee_asset?}, leaf_template {template?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -148,6 +148,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 	match command {
 		"info" => w.info(),
 		"supply" => w.supply(asset(req_str(&a["asset"], "the asset")?)?),
+		"leaf_template" => w.leaf_template(a["template"].as_str()),
 		"bond" => w.bond(),
 		"bond_evidence" => w.bond_evidence().map(|l| json!({"lines": l})),
 		"watch_bond" => {

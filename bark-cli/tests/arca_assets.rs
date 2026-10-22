@@ -442,8 +442,28 @@ async fn two_assets_refresh_independently() {
 		o.value.explicit().unwrap() as i128
 	}).sum();
 	books.chain(&b.name, &x, -bfee);
-	let (rounds, failed) = r.server.rounds.run_rounds().await.unwrap();
-	assert!(failed.is_empty(), "{:?}", failed);
+	// Y's round pays its fee and connector in X, from the operator's final
+	// coins. The watcher pays the fees of its own transactions in X as well
+	// (the forfeits of the boards given up in the refresh, and their claims,
+	// published at a pass it makes as the chain moves), and while those wait
+	// for a block the wallet may hold no final X: the participation then
+	// waits, saying so, and runs once they are final.
+	let pid: [u8; 32] = unhex(posted["participation"].as_str().unwrap()).try_into().unwrap();
+	let mut rounds = vec![];
+	for _ in 0..5 {
+		let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+		assert!(failed.is_empty(), "{:?}", failed);
+		if !built.is_empty() {
+			rounds = built;
+			break;
+		}
+		let why = r.server.store.participation(&pid).await.unwrap().unwrap().waiting.unwrap_or_default();
+		println!("FRESH: Y's participation waits: {}", why);
+		assert!(why.contains("the operator's wallet cannot fund it in a round now") && why.contains(&x), "it waits on X alone: {}", why);
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+	}
 	assert_eq!(rounds.iter().map(|b| b.batches[0].0).collect::<Vec<_>>(), vec![r.y], "Y's round, now");
 	r.produce().await;
 	r.bury().await;

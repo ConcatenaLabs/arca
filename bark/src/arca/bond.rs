@@ -402,6 +402,30 @@ impl Wallet {
 				// The items without an annex (BIP341), which the operator's
 				// signature does not cover: a spend with one is the same.
 				let w = arca_covenant::witness::without_annex(&input.witness.script_witness);
+				// A vtxo-2 spend (arca/collab-2) names its salt in its data
+				// leaf's bytes and signs the outputs its first n inputs spend,
+				// read from the node.
+				if let Some((salt, n, _)) = bond::collab2_spend(w).filter(|(salt, ..)| by_salt.contains_key(salt)) {
+					let mut named = Vec::with_capacity(n as usize);
+					for j in tx.input.iter().take(n as usize) {
+						let prev = self.chain.transaction(&j.previous_output.txid)?
+							.and_then(|t| t.output.get(j.previous_output.vout as usize).cloned());
+						match prev {
+							Some(o) => named.push(o),
+							None => break,
+						}
+					}
+					if let Some(signed) = bond::collab2_signed_in(&policy.chain, &salt, tx, i, &named) {
+						if policy.verify(&salt, &signed) {
+							let list = by_salt.get_mut(&salt).expect("watched");
+							if !list.iter().any(|x| policy.digest_of(&salt, x) == policy.digest_of(&salt, &signed)) {
+								list.push(signed);
+								from_chain += 1;
+							}
+						}
+					}
+					continue;
+				}
 				if w.len() != 5 {
 					continue;
 				}

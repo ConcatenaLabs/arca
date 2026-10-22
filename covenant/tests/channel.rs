@@ -19,7 +19,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{BlockHash, OutPoint, Transaction};
 use serde_json::Value;
 
-use arca_covenant::channel::{owner_script_pubkey, ChannelPolicy, ChannelTerms, State};
+use arca_covenant::channel::{owner_script_pubkey, ChannelPolicy, ChannelSpend, ChannelTerms, State};
 use arca_covenant::spend::{FeeSource, Pair, UnrollTx};
 use arca_covenant::*;
 use common::net::*;
@@ -213,6 +213,79 @@ fn a_channel_on_the_node() {
 	assert_eq!(capped.output[0].value.explicit(), Some(40_000_000));
 	assert_eq!(capped.output[1].script_pubkey, op_true_spk(), "no rest output: the fee coin's change follows");
 	r.net.pass("claim capped at B: the whole 40M, no rest", &capped);
+	r.net.print();
+}
+
+/// Spends of a channel's outputs whose witnesses end with an annex
+/// (BIP341). Nothing a channel signs covers one (the state message, the note
+/// and the collaborative pair are messages of their own), so whoever relays
+/// or mines an update, a settle or a claim can add one: the same transaction,
+/// the same txid, the same outputs. The node relays an annex only on a
+/// Simplicity leaf, so a block producer would mine these (`generateblock`).
+/// Read back from the chain through `read_spend`, each is the plain spend;
+/// counted as raw items, an annexed update has six and a settle three.
+#[test]
+fn annexed_channel_spends_are_read_as_the_plain_ones() {
+	let net = Net::start();
+	let mut r = Run { net, a: keypair("channel owner"), s: keypair("channel operator") };
+	let x = r.net.x;
+	let p = r.policy("channel annexed");
+	let (s0, s2) = (p.opening(), State { number: 2, owner: 45_000_000, operator: 55_000_000, folded: 0 });
+	let s3 = State { number: 3, owner: 65_000_000, operator: 35_000_000, folded: 20_000_000 };
+	let coin = r.net.fund(vec![explicit(x, p.terms.value, p.script_pubkey(&s0))]).remove(0);
+	let annex = vec![0x50, 0x0a, 0x11];
+	let annexed = |tx: &Transaction| {
+		let mut t = tx.clone();
+		t.input[0].witness.script_witness.push(annex.clone());
+		assert_eq!(t.txid(), tx.txid(), "the annex is witness data: the txid is the plain spend's");
+		t
+	};
+	let witness_on_chain = |r: &Run, txid: &elements::Txid| r.net.rt.client().raw_transaction(txid).unwrap().input[0]
+		.witness.script_witness.clone();
+
+	// Update 0 -> 2 with an annex: the same output, read as the same update.
+	let plain = r.update(&p, coin.outpoint, &s0, &s2);
+	let t2 = r.net.pass_or_mine("update 0 -> 2, an annex on its witness", &annexed(&plain), "bad-witness-nonstandard");
+	let w = witness_on_chain(&r, &t2);
+	println!("update 0 -> 2 on the chain: {} witness items, the last {:02x?}", w.len(), w.last().unwrap());
+	assert_eq!(w.len(), 6, "three items, the script, the control block and the annex");
+	assert_eq!(p.read_spend(&s0, &w), Ok(ChannelSpend::Update { to: 2 }));
+	assert_eq!(p.read_spend(&s0, &w), p.read_spend(&s0, &plain.input[0].witness.script_witness));
+	assert_eq!(r.net.rt.client().raw_transaction(&t2).unwrap().output[0].script_pubkey, p.script_pubkey(&s2));
+	let tx = r.update(&p, OutPoint::new(t2, 0), &s2, &s3);
+	let t3 = r.net.pass("update 2 -> 3, plain", &tx);
+	assert_eq!(p.read_spend(&s2, &witness_on_chain(&r, &t3)), Ok(ChannelSpend::Update { to: 3 }));
+
+	// Settle(3) with an annex, after the delay: the same balances paid.
+	r.net.wait_csv(&t3, p.exit_delay);
+	let fee = r.fee();
+	let plain = Run::done(p.settle_tx(OutPoint::new(t3, 0), x, &s3, &fee).unwrap());
+	let ts = r.net.pass_or_mine("settle(3), an annex on its witness", &annexed(&plain), "bad-witness-nonstandard");
+	let w = witness_on_chain(&r, &ts);
+	assert_eq!(w.len(), 3, "the script, the control block and the annex");
+	assert_eq!(p.read_spend(&s3, &w), Ok(ChannelSpend::Settle));
+	let settled = r.net.rt.client().raw_transaction(&ts).unwrap();
+	assert_eq!((settled.output[0].value.explicit(), settled.output[1].value.explicit()), (Some(s3.owner), Some(s3.operator)));
+
+	// The unfolded credit claimed with an annex: the same 10M to the owner.
+	let fee = r.fee();
+	let plain = Run::done(p.claim_tx(OutPoint::new(ts, 1), x, &s3, s3.operator, 30_000_000, &r.note(&p, 30_000_000), &fee).unwrap());
+	let tc = r.net.pass_or_mine("claim of the unfolded 10M, an annex on its witness", &annexed(&plain), "bad-witness-nonstandard");
+	let claimed = r.net.rt.client().raw_transaction(&tc).unwrap();
+	assert_eq!(claimed.output[0].value.explicit(), Some(10_000_000));
+	assert_eq!(claimed.output[0].script_pubkey, owner_script_pubkey(&p.owner));
+
+	// What is not a spend of the output read is refused, annex or none.
+	let (so, ao) = r.state_sigs(&p, &s3);
+	let of_two = p.update_witness(&s2, &s3, &so, &ao);
+	assert!(p.read_spend(&s3, &of_two).is_err(), "state 2's update leaf is no leaf of state 3's output");
+	let mut nine = p.update_witness(&s0, &s2, &so, &ao);
+	nine[2].push(0);
+	assert!(p.read_spend(&s0, &nine).is_err(), "a 9-byte number");
+	assert!(p.read_spend(&s0, &[annex.clone()]).is_err(), "a lone item");
+	let mut extra = p.settle_witness(&s3);
+	extra.insert(0, vec![1]);
+	assert!(p.read_spend(&s3, &extra).is_err(), "a settle with an item");
 	r.net.print();
 }
 
