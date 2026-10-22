@@ -432,6 +432,7 @@ impl WireBatch {
 				htlc: None,
 				order: None,
 				landing: None,
+				channel: None,
 			});
 		}
 		let params = TreeParams {
@@ -615,11 +616,11 @@ pub async fn supply(store: &Store, finality: &FinalityService, asset: AssetId, i
 	let mut out = IssuerSupply {
 		asset: asset.to_string(), limiter_coin: None, limiter_minted: None, limiter_elapsed: None, limiter_armed: None,
 		limiter_unavailable: None, mints: vec![], burns: vec![], minted: String::new(), minted_final: String::new(),
-		burned: String::new(), burned_final: String::new(), in_batches: String::new(),
+		burned: String::new(), burned_final: String::new(), in_batches: String::new(), in_batches_outputs: vec![],
 	};
 	match limiter_now(store, finality, asset, i).await? {
 		LimiterAt::Ready(n) => {
-			out.limiter_coin = Some(n.coin.to_string());
+			out.limiter_coin = Some(format!("{}:{}", n.coin.txid, n.coin.vout));
 			out.limiter_minted = Some(n.state.minted.to_string());
 			out.limiter_elapsed = Some(n.state.elapsed);
 			out.limiter_armed = Some(n.state.armed);
@@ -663,17 +664,22 @@ pub async fn supply(store: &Store, finality: &FinalityService, asset: AssetId, i
 		if !finality.watch(Txid::from_byte_array(r.txid), "round").await.map_err(chain_err)?.in_chain() {
 			continue;
 		}
-		let mut candidates = vec![(OutPoint::new(Txid::from_byte_array(r.txid), b.vout), b.value)];
+		let round_txid = Txid::from_byte_array(r.txid);
+		let mut candidates = vec![(OutPoint::new(round_txid, b.vout), b.value, "batch", None, None)];
 		for s in store.tree_sightings(b.round_id, b.vout).await? {
-			candidates.push((OutPoint::new(Txid::from_byte_array(s.txid), s.vout), s.value));
+			candidates.push((OutPoint::new(Txid::from_byte_array(s.txid), s.vout), s.value, s.kind.as_str(), Some(s.level), Some(s.idx)));
 		}
 		let mut seen = std::collections::HashSet::new();
-		for (op, value) in candidates {
+		for (op, value, kind, level, index) in candidates {
 			if !seen.insert(op) {
 				continue;
 			}
 			if finality.call(move |n| n.unspent(&op, false)).await.map_err(|e| IssuerError::Chain(e.to_string()))?.is_some() {
 				live = live.saturating_add(value);
+				out.in_batches_outputs.push(crate::api::BatchOutputEntry {
+					outpoint: format!("{}:{}", op.txid, op.vout), value: value.to_string(), round_txid: round_txid.to_string(), batch_vout: b.vout,
+					kind: kind.into(), level, index,
+				});
 			}
 		}
 	}

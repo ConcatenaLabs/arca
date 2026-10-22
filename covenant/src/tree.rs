@@ -141,6 +141,10 @@ pub struct LeafSpec {
 	/// `landing-1`'s landing, present exactly when the template is
 	/// `landing-1`: every leaf of a supervised asset's batch.
 	pub landing: Option<Landing>,
+	/// `channel-1`'s terms, present exactly when the template is
+	/// `channel-1`: the operator's opening balance, part of the leaf's value,
+	/// and the credit window.
+	pub channel: Option<crate::channel::Channel>,
 }
 
 impl LeafSpec {
@@ -283,7 +287,19 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		if let Some(first) = keys.insert(spec.owner, i) {
 			return Err(TreeError::DuplicateOwner { first, second: i });
 		}
+		let channel = match (spec.template, &spec.channel) {
+			(Template::Channel1, Some(c)) if spec.htlc.is_none() && spec.order.is_none() && spec.landing.is_none() => {
+				let t = c.terms(spec.value);
+				if t.check(spec.exit_delay).is_err() {
+					return Err(TreeError::Template { leaf: i });
+				}
+				Some(t)
+			},
+			(Template::Channel1, _) | (_, Some(_)) => return Err(TreeError::Template { leaf: i }),
+			_ => None,
+		};
 		let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
+			(Template::Channel1, None, None, None) => None,
 			(Template::Vtxo1, None, None, None) => None,
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
 			(Template::Order2, None, Some(o), None) if o.check(params.asset, &spec.owner, &operator).is_ok() => None,
@@ -301,6 +317,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			htlc: spec.htlc,
 			order: spec.order,
 			landing,
+			channel,
 		};
 		let program = leaf.program();
 		if let Some(first) = seen.insert(program, i) {
@@ -496,6 +513,7 @@ impl Tree {
 			},
 			order: l.spec.order,
 			landing: l.spec.landing,
+			channel: l.spec.channel,
 		}
 	}
 
