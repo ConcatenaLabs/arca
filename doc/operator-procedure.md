@@ -117,13 +117,15 @@ paid twice.
 
 A taproot spend may end its witness with an annex (BIP341). Consensus sets
 it aside before the script runs, so the spend is the same spend with or
-without it. Sequentia's relay policy takes an annex on a Simplicity leaf, up
-to 100,000 bytes, and refuses one elsewhere, which a block producer can
-still mine. Where an Arca coin's spend is authorised by a signature over a
+without it. Sequentia's relay policy takes an annex only on a Simplicity
+leaf, and there only when it is zeros and exactly as large as the program's
+cost needs; it refuses every other annex, which a block producer can still
+mine. Where an Arca coin's spend is authorised by a signature over a
 message of its own (a collaborative path, an `order-2` fill) or by no
 signature at all (an entry's unlock, a landing, an on-chain order's FILL
-leaf), nothing covers the annex, so whoever relays or mines the spend can add
-one without changing its txid. An exit from an accumulator batch is the
+leaf), nothing covers the annex, so whoever mines the spend, or relays it
+through a node that does not apply that rule, can add one without changing
+its txid. An exit from an accumulator batch is the
 exception: its program refuses an annex.
 
 The server, its watcher and the wallets read every spend found on the chain
@@ -134,8 +136,9 @@ nothing to do about one.
 
 An annex does make a spend larger and so lowers its fee rate, and a node
 holding one copy of a transaction keeps it against another copy with a
-different witness. A relay that adds an annex to a transaction on its way can
-therefore hold it at a lower fee rate than was paid for. Leave fee margin on
+different witness. A relay that adds an annex to a transaction on its way,
+among nodes that do not apply the rule above, can therefore hold it at a lower
+fee rate than was paid for. Leave fee margin on
 transactions the operator broadcasts, and watch that they confirm.
 
 ## Storage and restore
