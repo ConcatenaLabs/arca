@@ -276,9 +276,20 @@ impl LightningNode {
 		}
 	}
 
-	/// Connects to `peer`.
+	/// Connects to `peer`. A node answers its JSON-RPC before its connection
+	/// daemon listens, which on a loaded machine can take a while: a refused
+	/// connection is tried again for up to a minute.
 	pub fn connect(&self, peer: &LightningNode) {
-		self.ok("connect", json!({ "id": peer.id, "host": "127.0.0.1", "port": peer.port }));
+		let start = Instant::now();
+		loop {
+			match self.call("connect", json!({ "id": peer.id, "host": "127.0.0.1", "port": peer.port })) {
+				Ok(_) => return,
+				Err(e) if e.contains("Connection refused") && start.elapsed() < Duration::from_secs(60) => {
+					std::thread::sleep(Duration::from_millis(500));
+				},
+				Err(e) => panic!("{}", e),
+			}
+		}
 	}
 
 	/// Opens a channel to `peer` of `atoms` of `asset`, pushing `push` atoms
