@@ -75,7 +75,7 @@ fn the_wallets_digests_are_the_servers() {
 		let mine = participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template, owner: k,
 			owner_nonce: [3; 32], exit_delay: d, order: terms }], &fees, nb);
 		let theirs = server::participations::participation_id(&chain, &s, &ids, &[OutputRequest::Leaf { asset: a, value: 5_000,
-			template, owner: k, owner_nonce: [3; 32], exit_delay: d, order: terms }], &fees, nb);
+			template, owner: k, owner_nonce: [3; 32], exit_delay: d, order: terms, landing: None }], &fees, nb);
 		assert_eq!(mine, theirs);
 		assert_eq!(key_proof_digest(&mine), server::participations::key_proof_digest(&theirs));
 		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");

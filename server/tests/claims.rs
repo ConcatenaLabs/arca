@@ -126,7 +126,7 @@ async fn claims_keep_up(n: usize) {
 		let nonce = random32();
 		common::client::hold_key(&new_key);
 		let w = OutputRequest::Leaf { asset: x, value: VALUE * group.len() as u64, template: Template::Vtxo1, owner: xonly(&new_key),
-			owner_nonce: nonce, exit_delay: one, order: None };
+			owner_nonce: nonce, exit_delay: one, order: None, landing: None };
 		let refs: Vec<&Held> = held.iter().collect();
 		let (body, id) = participation_body(&refs, &[w], &[], None, s, r.chain);
 		assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");

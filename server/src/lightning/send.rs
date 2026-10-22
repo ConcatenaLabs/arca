@@ -269,6 +269,10 @@ impl Sends {
 				return Ok(Sent { cosigned, payment: r });
 			}
 		}
+		// A coin whose holder is frozen is refused before anything else
+		// about the payment.
+		let given: Vec<arca_covenant::LeafId> = req.transfer.inputs.iter().map(|i| i.leaf_id).collect();
+		self.cosigner.gate(&given).await?;
 		if terms.direction != HtlcDirection::Send {
 			return Err(SendError::Htlc("the htlc-1 leaf of a payment out of the tree is one the operator claims (direction send)".into()));
 		}

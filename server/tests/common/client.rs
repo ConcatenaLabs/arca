@@ -199,6 +199,9 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 				"timeout": h.timeout.to_consensus_u32(), "operator_delay_units": h.operator_delay.units(),
 			});
 		}
+		if let Some(t) = &l.landing {
+			o["landing"] = arca_covenant::record_json::landing_json(&t.landing(*a, *v).unwrap());
+		}
 		o
 	}).collect();
 	json!({"inputs": inputs, "outputs": outs})
@@ -239,20 +242,34 @@ pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [
 	let nonce = random32();
 	(OutputRequest::Leaf {
 		asset, value, template: arca_covenant::Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
-		order: None,
+		order: None, landing: None,
+	}, nonce)
+}
+
+/// [`want_leaf`] for a leaf of a supervised asset: `landing-1`, landing at
+/// `landing`.
+pub fn want_landing(key: &Keypair, asset: AssetId, value: u64, landing: arca_covenant::Landing) -> (OutputRequest, [u8; 32]) {
+	hold_key(key);
+	let nonce = random32();
+	(OutputRequest::Leaf {
+		asset, value, template: arca_covenant::Template::Landing1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
+		order: None, landing: Some(landing),
 	}, nonce)
 }
 
 /// The JSON of one output wanted.
 pub fn output_json(o: &OutputRequest) -> Value {
 	match o {
-		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
+		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
 			let mut j = json!({"leaf": {
 				"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
 				"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
 			}});
 			if let Some(o) = order {
 				j["leaf"]["order"] = arca_covenant::record_json::order_terms_json(o);
+			}
+			if let Some(l) = landing {
+				j["leaf"]["landing"] = arca_covenant::record_json::landing_json(l);
 			}
 			j
 		},
@@ -374,7 +391,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
 		htlc: htlc_of(&l["htlc"]),
 		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
-		landing: None,
+		landing: (!l["landing"].is_null()).then(|| arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap()),
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }

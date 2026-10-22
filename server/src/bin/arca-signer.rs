@@ -8,7 +8,8 @@
 //!     arca-signer --key-file <file> --genesis <hash> --sign-operator-record <record.json>
 //!     arca-signer --key-file <file> --genesis <hash> --socket <path> --record <file> \
 //!         [--keeper <host:port>=<key> …] [--keeper-timeout-ms <ms>] [--start-keepers-seen] \
-//!         [--issuer <instance file>=<mnemonic file> …] [--mint-limiter <path>]
+//!         [--issuer <instance file>=<mnemonic file> …] [--mint-limiter <path>] \
+//!         [--supervision-node <url> --supervision-cookie <file>]
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --create-record \
 //!         (--keeper-key <key> … --keepers-required <k> | --no-keepers)
 //!     arca-signer --key-file <file> --genesis <hash> --record <file> --compact-into <new file> --drop-salts <file>
@@ -20,6 +21,16 @@
 //! names it, `mint-limiter` on the `PATH` by default). It checks a round's
 //! mint itself before the tool signs it (`server::issuer::check_reissue`),
 //! and signs no spend that pays a unit of such an asset anywhere but a burn.
+//!
+//! With `--supervision-node`, the signer reads freezes of supervised assets
+//! from that node itself (`isassetfrozen`, over JSON-RPC, authenticated by
+//! the cookie file or a file holding `user:password`), independently of the
+//! server: it signs a rebindable message for a `landing-1` coin, the leaf of
+//! a supervised asset, only while its node shows the coin's landing free and
+//! the asset not paused, and builds the message with that landing after `K`,
+//! as the coin's script does, so a request naming another landing gets a
+//! signature that spends nothing (`server::supervision`). Without one it signs no message
+//! for a `landing-1` coin at all.
 //!
 //! The key file holds the 32-byte secret key as 64 hex characters, and must
 //! not be readable by anyone but its owner. `--pubkey` prints the operator
@@ -163,6 +174,9 @@ struct Args {
 	issuers: Vec<(PathBuf, PathBuf)>,
 	/// `--mint-limiter <path>`: the limiter's tool, which signs a mint.
 	mint_tool: PathBuf,
+	/// `--supervision-node <url>` and `--supervision-cookie <file>`: the node
+	/// the signer reads freezes from.
+	supervision: Option<(String, PathBuf)>,
 }
 
 fn args() -> Result<Args, String> {
@@ -184,6 +198,8 @@ fn args() -> Result<Args, String> {
 	let mut sign_record = None;
 	let mut issuers: Vec<(PathBuf, PathBuf)> = vec![];
 	let mut mint_tool = PathBuf::from("mint-limiter");
+	let mut supervision_node = None;
+	let mut supervision_cookie = None;
 	let mut it = std::env::args().skip(1);
 	while let Some(a) = it.next() {
 		let mut value = || it.next().ok_or_else(|| format!("{} needs a value", a));
@@ -212,6 +228,8 @@ fn args() -> Result<Args, String> {
 				issuers.push((PathBuf::from(i), PathBuf::from(m)));
 			},
 			"--mint-limiter" => mint_tool = PathBuf::from(value()?),
+			"--supervision-node" => supervision_node = Some(value()?),
+			"--supervision-cookie" => supervision_cookie = Some(PathBuf::from(value()?)),
 			other => return Err(format!("unknown argument {}", other)),
 		}
 	}
@@ -225,7 +243,7 @@ fn args() -> Result<Args, String> {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey: false, sign_record: Some(file),
 			genesis: genesis.ok_or("--genesis is required: the record is signed only for the chain it names")?, socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false, issuers: vec![], mint_tool,
+			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None,
 		});
 	}
 	if pubkey {
@@ -237,7 +255,7 @@ fn args() -> Result<Args, String> {
 		return Ok(Args {
 			key_file: key_file.ok_or("--key-file is required")?, pubkey, sign_record: None, genesis: <BlockHash as elements::hashes::Hash>::all_zeros(), socket: None,
 			record: PathBuf::new(), compact: None, clear_stopped: false, keepers: vec![], record_keepers: None, keeper_timeout,
-			start_keepers_seen: false, issuers: vec![], mint_tool,
+			start_keepers_seen: false, issuers: vec![], mint_tool, supervision: None,
 		});
 	}
 	let compact = match (compact_into, drop_salts) {
@@ -295,6 +313,11 @@ fn args() -> Result<Args, String> {
 		start_keepers_seen,
 		issuers,
 		mint_tool,
+		supervision: match (supervision_node, supervision_cookie) {
+			(Some(n), Some(c)) => Some((n, c)),
+			(None, None) => None,
+			_ => return Err("--supervision-node and --supervision-cookie go together".into()),
+		},
 	})
 }
 
@@ -465,6 +488,29 @@ struct State {
 	/// The issuer-operated assets whose mints this signer signs.
 	issuers: Vec<Issuer>,
 	mint_tool: PathBuf,
+	/// The node the signer reads freezes of supervised assets from.
+	supervision: Option<sequentia_ext::rpc::Client>,
+}
+
+/// Whether `landing`, a `landing-1` coin's landing program, is free for
+/// `asset` as the signer's own node shows it: `Err` naming why not. Without a
+/// node, nothing that names a landing is signed.
+async fn landing_free(state: &State, asset: elements::AssetId, landing: [u8; 20]) -> Result<(), String> {
+	let client = state.supervision.clone().ok_or_else(|| format!("{}: this signer reads freezes from no node (--supervision-node), so it \
+		signs no spend of a landing-1 coin, the leaf of a supervised asset", server::supervision::FROZEN))?;
+	let script = format!("0014{}", hex(&landing));
+	let answer = tokio::task::spawn_blocking(move || {
+		client.call::<serde_json::Value>("isassetfrozen", &[serde_json::json!(asset.to_string()), serde_json::json!(script)])
+	}).await.map_err(|e| format!("{}: the node call did not finish: {}", server::supervision::FROZEN, e))?;
+	let v = answer.map_err(|e| format!("{}: the signer's node did not say whether landing {} is frozen for asset {}: {}",
+		server::supervision::FROZEN, hex(&landing), asset, e))?;
+	match (v["frozen"].as_bool(), v["paused"].as_bool()) {
+		(Some(false), Some(false)) | (Some(false), None) => Ok(()),
+		(_, Some(true)) => Err(format!("{}: asset {} is paused, as the signer's node shows it: no landing-1 coin of it is spent \
+			off the chain", server::supervision::FROZEN, asset)),
+		_ => Err(format!("{}: landing {} is frozen for asset {}, as the signer's node shows it: the coin is spent only by its \
+			landing", server::supervision::FROZEN, hex(&landing), asset)),
+	}
 }
 
 /// How many heads' signatures the signer keeps at hand: about 15 MB. Past
@@ -738,7 +784,7 @@ async fn futures_join<F: std::future::Future>(fs: impl Iterator<Item = F>) -> Ve
 
 /// The refusal code of a signer error: the code it starts with.
 fn code_of(e: &str) -> Option<String> {
-	[ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED, KEEPERS_UNAVAILABLE].into_iter()
+	[ALREADY_SIGNED, RECORD_BEHIND, RECORD_DIFFERS, STOPPED, KEEPERS_UNAVAILABLE, server::supervision::FROZEN].into_iter()
 		.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string)
 }
 
@@ -888,7 +934,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -916,9 +962,13 @@ async fn answer(state: &State, line: &str) -> Response {
 					Some(k) => (k.entry, unhex32(&k.hash)?),
 					None => (0, [0; 32]),
 				};
-				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known))
+				let landing = match &landing {
+					Some(l) => Some(<[u8; 20]>::try_from(unhex(l)?.as_slice()).map_err(|_| "landing: 20 bytes".to_string())?),
+					None => None,
+				};
+				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing))
 			})();
-			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known) = match parsed {
+			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing) = match parsed {
 				Ok(p) => p,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
@@ -928,7 +978,20 @@ async fn answer(state: &State, line: &str) -> Response {
 				eprintln!("arca-signer: refused rebind for the leaf of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
 				return Response { code: code_of(&e), error: Some(e), ..none };
 			}
-			let message = match rebind_message(&chain.leaf_constant(&salt), asset_in, value_in, &outputs) {
+			// A landing-1 coin's freeze, read from the signer's own node,
+			// before anything is recorded; its message carries its landing
+			// program after `K`.
+			if let Some(l) = landing {
+				if let Err(e) = landing_free(state, asset_in, l).await {
+					eprintln!("arca-signer: refused rebind for the leaf of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
+					return Response { code: code_of(&e), error: Some(e), ..none };
+				}
+			}
+			let k = match &landing {
+				Some(l) => chain.landing_prefix(&salt, l),
+				None => chain.leaf_constant(&salt).to_vec(),
+			};
+			let message = match rebind_message(&k, asset_in, value_in, &outputs) {
 				Ok(m) => m,
 				Err(e) => return Response { error: Some(e.to_string()), ..none },
 			};
@@ -1275,8 +1338,12 @@ async fn main() {
 			instance.display(), limiter.allowance, limiter.window);
 		issuers.push(Issuer { limiter, instance: instance.clone(), mnemonic: mnemonic.clone() });
 	}
+	let supervision = args.supervision.as_ref().map(|(url, cookie)| {
+		eprintln!("arca-signer: reads freezes of supervised assets from the node at {}", url);
+		sequentia_ext::rpc::Client::new(url.clone(), sequentia_ext::rpc::Auth::CookieFile(cookie.clone())).with_timeout(30)
+	});
 	let state = Arc::new(State { key, chain: Chain::new(args.genesis), genesis: args.genesis, record, keepers, sigs: Default::default(),
-		issuers, mint_tool: args.mint_tool.clone() });
+		issuers, mint_tool: args.mint_tool.clone(), supervision });
 	match &state.keepers {
 		// At start, before anything is served: the keepers' latest heads
 		// against the record. One the record does not hold stops the signer

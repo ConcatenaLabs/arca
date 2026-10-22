@@ -72,6 +72,42 @@ impl AnchorStatus {
 	}
 }
 
+/// A supervised asset as the node's freeze registry holds it now
+/// (`getsupervisedassets`): an asset whose issuer can freeze holdings by
+/// consensus rule, committed in its id at issuance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisedAsset {
+	pub asset: AssetId,
+	/// Whether a pause record freezes every single-owner holding of it now.
+	pub paused: bool,
+}
+
+/// Whether one script is frozen for one supervised asset, as the node's
+/// registry holds it at its tip (`isassetfrozen`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FreezeStatus {
+	/// A freeze record names the script, or the asset is paused.
+	pub frozen: bool,
+	/// The asset is paused.
+	pub paused: bool,
+	/// The node's hash of the script (`targethash`), as a freeze record
+	/// names it and `getassetfreezes` lists it.
+	pub target: Option<[u8; 32]>,
+}
+
+/// A `targethash` as the node prints it, as bytes in that order.
+fn target_of(v: &Value) -> Option<[u8; 32]> {
+	let s = v.as_str()?;
+	if s.len() != 64 {
+		return None;
+	}
+	let mut out = [0u8; 32];
+	for (i, b) in out.iter_mut().enumerate() {
+		*b = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+	}
+	Some(out)
+}
+
 /// Everything the server reads from, or sends to, the chain. Calls block; the
 /// async code runs them on the blocking pool.
 pub trait ChainSource: Send + Sync + 'static {
@@ -106,6 +142,23 @@ pub trait ChainSource: Send + Sync + 'static {
 	/// confirmations (0 in the mempool), or `None` when it is spent or does
 	/// not exist.
 	fn unspent(&self, outpoint: &OutPoint, mempool: bool) -> Result<Option<u64>, ChainError>;
+	/// Every supervised asset the node's registry holds now. A source that
+	/// knows of none answers none.
+	fn supervised_assets(&self) -> Result<Vec<SupervisedAsset>, ChainError> {
+		Ok(vec![])
+	}
+	/// Whether `script` is frozen for the supervised `asset` at the node's
+	/// tip. Asked only of a single-owner script (a landing's P2WPKH): for an
+	/// Arca script the node's answer says frozen once the script is named or
+	/// the asset paused, although its script-path spends confirm.
+	fn freeze_status(&self, _asset: &AssetId, _script: &elements::Script) -> Result<FreezeStatus, ChainError> {
+		Ok(FreezeStatus::default())
+	}
+	/// Every script a freeze record of the supervised `asset` names now, by
+	/// the node's hash of it (`getassetfreezes`).
+	fn asset_freezes(&self, _asset: &AssetId) -> Result<Vec<[u8; 32]>, ChainError> {
+		Ok(vec![])
+	}
 }
 
 /// A `sequentiad` reached over JSON-RPC. It must run with `-txindex`, and with
@@ -226,6 +279,33 @@ impl ChainSource for NodeSource {
 			return Ok(None);
 		}
 		Ok(Some(v["confirmations"].as_u64().ok_or_else(|| ChainError::Answer("gettxout gave no confirmations".into()))?))
+	}
+
+	fn supervised_assets(&self) -> Result<Vec<SupervisedAsset>, ChainError> {
+		let v: Value = self.client.call("getsupervisedassets", &[])?;
+		let list = v.as_array().ok_or_else(|| ChainError::Answer("getsupervisedassets gave no list".into()))?;
+		list.iter().map(|a| Ok(SupervisedAsset {
+			asset: a["asset"].as_str().and_then(|s| AssetId::from_str(s).ok())
+				.ok_or_else(|| ChainError::Answer("getsupervisedassets: an entry without an asset".into()))?,
+			paused: a["paused"].as_bool().unwrap_or(false),
+		})).collect()
+	}
+
+	fn freeze_status(&self, asset: &AssetId, script: &elements::Script) -> Result<FreezeStatus, ChainError> {
+		let hex: String = script.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+		let v: Value = self.client.call("isassetfrozen", &[json!(asset.to_string()), json!(hex)])?;
+		Ok(FreezeStatus {
+			frozen: v["frozen"].as_bool().ok_or_else(|| ChainError::Answer("isassetfrozen gave no answer".into()))?,
+			paused: v["paused"].as_bool().unwrap_or(false),
+			target: Some(target_of(&v["targethash"]).ok_or_else(|| ChainError::Answer("isassetfrozen gave no targethash".into()))?),
+		})
+	}
+
+	fn asset_freezes(&self, asset: &AssetId) -> Result<Vec<[u8; 32]>, ChainError> {
+		let v: Value = self.client.call("getassetfreezes", &[json!(asset.to_string())])?;
+		let list = v.as_array().ok_or_else(|| ChainError::Answer("getassetfreezes gave no list".into()))?;
+		list.iter().map(|f| target_of(&f["targethash"]).ok_or_else(|| ChainError::Answer("getassetfreezes: an entry without a \
+			targethash".into()))).collect()
 	}
 }
 

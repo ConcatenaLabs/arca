@@ -40,6 +40,7 @@ pub mod rounds;
 pub mod server;
 pub mod signer;
 pub mod store;
+pub mod supervision;
 pub mod wallet;
 pub mod watcher;
 

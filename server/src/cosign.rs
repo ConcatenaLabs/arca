@@ -196,6 +196,8 @@ pub enum CosignError {
 	Htlc(String),
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
+	#[error(transparent)]
+	Supervision(#[from] crate::supervision::SupervisionError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	#[error(transparent)]
@@ -232,8 +234,10 @@ impl CosignError {
 			RequestLapsed { .. } => "request_lapsed",
 			Htlc(_) => "htlc",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
+			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
+			Supervision(e) => e.code(),
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -311,6 +315,20 @@ impl TransferRequest {
 				}
 			}
 		}
+		// The landing of each landing-1 leaf, the same way.
+		if self.outputs.iter().any(|o| o.leaf.landing.is_some()) {
+			e.input(&[0xfd]);
+			for o in &self.outputs {
+				match &o.leaf.landing {
+					None => e.input(&[0]),
+					Some(l) => {
+						e.input(&[1]);
+						e.input(&l.program);
+						e.input(&l.min_value.to_le_bytes());
+					},
+				}
+			}
+		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
 }
@@ -347,6 +365,13 @@ impl Cosigner {
 		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 
+	/// The freeze check of the supervised profile on the coins `leaves`
+	/// names ([`crate::supervision::gate`]), for a caller that checks it
+	/// before its own rules.
+	pub async fn gate(&self, leaves: &[LeafId]) -> Result<(), CosignError> {
+		Ok(crate::supervision::gate(&self.store, &self.finality, &self.params, leaves).await?)
+	}
+
 	/// Co-signs `req`: see the [module documentation](self). An output of the
 	/// `htlc-1` template is refused: one is made only by a payment over
 	/// Lightning ([`Cosigner::cosign_htlc`]).
@@ -380,6 +405,9 @@ impl Cosigner {
 		if self.store.transfer(&transfer).await?.is_some_and(|t| t.signed) {
 			return self.answer(&transfer).await;
 		}
+		// A coin whose holder is frozen is refused before anything else.
+		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
+		crate::supervision::gate(&self.store, &self.finality, &self.params, &given).await?;
 		let now = self.now().await?;
 		let s = self.params.operator;
 		let chain = self.params.chain;
@@ -396,6 +424,16 @@ impl Cosigner {
 				Some(t) => t.check(o.leaf.exit_delay).map_err(|e| CosignError::OutOfBounds(e.to_string()))?,
 				None => {},
 			}
+			// The supervised profile: a leaf of a supervised asset is
+			// landing-1 with the published allowance, and nothing else holds
+			// it; no other asset's leaf is landing-1.
+			if o.leaf.htlc.is_some() && self.params.supervised(&o.asset).is_some() {
+				return Err(CosignError::OutOfBounds(format!("asset {} is supervised: no htlc-1 leaf holds it, as its paths pay a key a \
+					freeze cannot follow", o.asset)));
+			}
+			let landing = o.leaf.landing.map(|t| t.landing(o.asset, o.value)).transpose()
+				.map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
+			self.params.check_landing(o.asset, o.value, landing.as_ref()).map_err(CosignError::OutOfBounds)?;
 			if !self.params.exit_delay_ok(o.leaf.exit_delay) {
 				return Err(CosignError::OutOfBounds(format!(
 					"an exit delay of {} units; the operator takes {} to {}", o.leaf.exit_delay.units(),
@@ -604,8 +642,8 @@ impl Cosigner {
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
-			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
-				std::slice::from_ref(&cp_out)).await;
+			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await;
 			let (cp, h) = match cp {
 				Ok(x) => x,
 				// The first message of the transfer refused: nothing of it is
@@ -615,7 +653,7 @@ impl Cosigner {
 			};
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
-			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset,
+			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
 				plan.inputs[k].1, &outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
@@ -1055,7 +1093,12 @@ mod test {
 		let first = req(vec![output(4, Some(t)), output(5, None)]);
 		let second = req(vec![output(4, None), output(5, Some(t))]);
 		let other = req(vec![output(4, Some(HtlcTerms { payment_hash: [8; 32], ..t })), output(5, None)]);
-		let all = [plain, first, second, other];
+		let landed = |program: [u8; 20]| {
+			let mut o = output(4, None);
+			o.leaf.landing = Some(arca_covenant::LandingTerms { program, asset: o.asset, min_value: 900 });
+			req(vec![o, output(5, None)])
+		};
+		let all = [plain, first, second, other, landed([7; 20]), landed([8; 20])];
 		for i in 0..all.len() {
 			for j in i + 1..all.len() {
 				assert_ne!(all[i], all[j], "requests {} and {} hash alike", i, j);

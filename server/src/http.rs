@@ -383,7 +383,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
-			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" =>
+			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" =>
 			StatusCode::CONFLICT,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
@@ -674,6 +674,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				window_blocks: i.limiter.window,
 				recovery_delay_units: i.limiter.recovery_delay,
 			}),
+			supervised: ap.supervised.map(|s| api::SupervisedInfo { landing_allowance: s.landing_allowance.to_string() }),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -824,7 +825,9 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 				htlc,
-				landing: None,
+				landing: landing_of(&o.landing)?.map(|l| l.terms(asset(&o.asset)?, amount(&o.value)?)
+					.map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "out_of_bounds", format!("landing: {}", e))))
+					.transpose()?,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,
@@ -1051,6 +1054,7 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 						.map_err(|e| Refusal::malformed(format!("order: {}", e)))?),
 					None => None,
 				},
+				landing: landing_of(&l.landing)?,
 			},
 			api::WantedOutput::Offboard(b) => part::OutputRequest::Offboard {
 				asset: asset(&b.asset)?,
@@ -1070,6 +1074,12 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
 	}
 	Ok(Json(participation_status(&status)))
+}
+
+/// A `landing-1` leaf's landing, in the record's JSON form of it.
+fn landing_of(v: &Option<serde_json::Value>) -> Result<Option<arca_covenant::Landing>, Refusal> {
+	v.as_ref().map(|v| arca_covenant::record_json::landing_from_json(v).map_err(|e| Refusal::malformed(format!("landing: {}", e))))
+		.transpose()
 }
 
 async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ParticipationStatus>, Refusal> {
@@ -1092,6 +1102,7 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 		owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
 		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 		order: None,
+		landing: landing_of(&l.landing)?,
 	};
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
@@ -1200,6 +1211,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			preimage: p.map(|p| hex(&p)),
 			htlc: l.htlc.as_ref().map(api::HtlcTermsJson::of),
 			order: l.order.as_ref().map(arca_covenant::record_json::order_terms_json),
+			landing: l.landing.as_ref().map(arca_covenant::record_json::landing_json),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
 		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
@@ -1539,7 +1551,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			returned: mine.returned,
 			inputs: p.inputs.iter().map(|i| hex(&i.leaf_id)).collect(),
 			outputs: p.outputs.iter().map(|o| match &o.kind {
-				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, order, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
+				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, order, landing, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
 					value: o.value.to_string(),
 					template: template.clone(),
@@ -1549,6 +1561,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 					leaf_id: o.leaf_id.map(|i| hex(&i)),
 					htlc: htlc.as_ref().map(api::HtlcTermsJson::of),
 					order: order.as_ref().map(arca_covenant::record_json::order_terms_json),
+					landing: landing.as_ref().map(arca_covenant::record_json::landing_json),
 				}),
 				WantedKind::Offboard { script, .. } => api::ServedOutput::Offboard(api::WantedOffboard {
 					asset: AssetId::from_byte_array(o.asset).to_string(),

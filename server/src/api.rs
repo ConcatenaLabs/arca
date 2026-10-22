@@ -31,7 +31,7 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "conflict", "depth_limit",
-	"double_spend", "fee", "forfeit_set", "hash_reused", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
+	"double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
@@ -311,6 +311,23 @@ pub struct AssetInfo {
 	/// whose sweep is.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub issuer: Option<IssuerInfo>,
+	/// Present when the asset is supervised on the chain (its issuer can
+	/// freeze holdings by consensus rule) and the operator serves it under
+	/// the supervised profile: every leaf of it is `landing-1`, landing in
+	/// its owner's own key with the allowance here; the operator co-signs
+	/// nothing that spends a coin whose holder is frozen.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub supervised: Option<SupervisedInfo>,
+}
+
+/// What the operator serves of a supervised asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisedInfo {
+	/// The fee allowance every `landing-1` leaf of the asset carries, in its
+	/// atoms: the most of a leaf's value its landing may leave out of the
+	/// output it pays its owner.
+	pub landing_allowance: String,
 }
 
 /// An issuer-operated asset's mint limiter (sequentia-contracts
@@ -629,6 +646,12 @@ pub struct TransferOutput {
 	/// (`lightning_send`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
+	/// The landing of a `landing-1` leaf, for a leaf of a supervised asset,
+	/// in the leaf record's JSON form (`{"program", "allowance"}`): the
+	/// program of the receiver's landing key, as its receive request names
+	/// it, and the operator's published allowance.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub landing: Option<serde_json::Value>,
 }
 
 /// An `htlc-1` leaf's terms beside its owner's key, nonces and exit delay.
@@ -1236,6 +1259,9 @@ pub struct ServedWantedLeaf {
 	/// An `order-2` leaf's terms, a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
+	/// A `landing-1` leaf's landing, a leaf of a supervised asset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub landing: Option<serde_json::Value>,
 }
 
 /// A forfeit of the coin, for the round of one attempt: what its output
@@ -1345,6 +1371,13 @@ pub struct WantedLeaf {
 	/// covered by the participation's id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
+	/// `landing-1`'s landing, for a leaf of a supervised asset (template
+	/// `landing-1`), in the leaf record's JSON form (`{"program", "allowance"}`,
+	/// `arca_covenant::record_json::landing_json`): the program of the
+	/// owner's landing key its exit pays, and the operator's published
+	/// allowance. Covered by the participation's id.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub landing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1779,6 +1812,11 @@ pub struct TreeLeaf {
 	/// An `order-2` leaf's terms, a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
+	/// A `landing-1` leaf's landing (`{"program", "allowance"}`): where its
+	/// owner's exit pays, the leaf of a supervised asset. Anyone, its issuer
+	/// included, reads from it where each leaf of a batch lands.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub landing: Option<serde_json::Value>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each

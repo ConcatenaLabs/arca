@@ -372,6 +372,23 @@ impl FinalityService {
 		self.status(&txid).await
 	}
 
+	/// Whether the block `hash` of the followed chain is final: certified,
+	/// its anchor buried, the tip's anchor checked. `None` when the followed
+	/// chain does not hold it.
+	pub async fn block_final(&self, hash: &[u8; 32]) -> Result<Option<bool>, FinalityError> {
+		let block = match self.store.block_by_hash(hash).await? {
+			Some(b) => b,
+			None => return Ok(None),
+		};
+		let certified = match self.config.certification {
+			Certification::NotOnThisChain => true,
+			Certification::Required => self.store.certified_at_or_above(block.height).await?,
+		};
+		let tip = self.store.tip_block().await?.ok_or_else(|| StoreError::Corrupt("a located block with no tip".into()))?;
+		let depth = tip.anchor_height.saturating_sub(block.anchor_height);
+		Ok(Some(certified && depth >= self.config.anchor_depth as u64 && self.anchor_ok.load(Ordering::SeqCst)))
+	}
+
 	/// Where the watched transaction `txid` stands. A transaction never
 	/// watched is reported as not in the chain.
 	pub async fn status(&self, txid: &Txid) -> Result<Finality, FinalityError> {

@@ -20,7 +20,12 @@
 //!   exit deadline, three days ahead ([`Params::participation_policy`]); its
 //!   attestation verifies; and the earliest round time asked for, if any,
 //!   lies before every coin's exit deadline;
-//! - every leaf wanted is a template the round builds (`vtxo-1`), within the
+//! - no coin given up is of a supervised asset whose holder is frozen
+//!   ([`crate::supervision`]), checked before anything else about the
+//!   request;
+//! - every leaf wanted is a template the round builds (`vtxo-1`; `landing-1`
+//!   with the published allowance for a supervised asset, whose leaves are
+//!   all `landing-1`; `order-2` for a resting order), within the
 //!   published bounds (an asset served, a value within its bounds, an exit
 //!   delay within the bounds), under a key that owns no leaf, is wanted by no
 //!   other participation and is not the operator's `S`; every offboard pays a served asset within its
@@ -57,6 +62,7 @@
 //!      ‖ m, each output: kind (0 leaf, 1 offboard), asset, value (u64),
 //!          then for a leaf: template id, template version, owner key, owner nonce, exit delay units (u16),
 //!          and for an order-2 leaf its terms (the leaf record's binary form of them, 252 bytes)
+//!          and for a landing-1 leaf its landing (the program, 20 bytes, and the allowance, u64)
 //!          and for an offboard: script length (u16), script
 //!      ‖ f, each fee: asset, amount (u64)
 //!      ‖ 0, or 1 and the earliest round time (u32)
@@ -145,6 +151,8 @@ pub enum OutputRequest {
 		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
 		/// `order-2`'s terms, for a resting order.
 		order: Option<arca_covenant::OrderLeafTerms>,
+		/// `landing-1`'s landing, for a leaf of a supervised asset.
+		landing: Option<arca_covenant::Landing>,
 	},
 	Offboard { asset: AssetId, value: u64, script: Script },
 }
@@ -248,7 +256,7 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	e.input(&[outputs.len() as u8]);
 	for o in outputs {
 		match o {
-			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order } => {
+			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
 				e.input(&[0]);
 				e.input(&asset.into_inner().to_byte_array());
 				e.input(&value.to_le_bytes());
@@ -260,6 +268,10 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 					let mut b = vec![];
 					o.encode_to(&mut b);
 					e.input(&b);
+				}
+				if let Some(l) = landing {
+					e.input(&l.program);
+					e.input(&l.allowance.to_le_bytes());
 				}
 			},
 			OutputRequest::Offboard { asset, value, script } => {
@@ -338,6 +350,8 @@ pub enum ParticipationError {
 	/// The operator's signer holds a forfeit or a spend under a coin's salt.
 	#[error("{0}")]
 	SignedAlready(String),
+	#[error(transparent)]
+	Supervision(#[from] crate::supervision::SupervisionError),
 	#[error("the signer: {0}")]
 	Signer(SignerError),
 	/// The operator's rate for the participation's asset is stale, or
@@ -395,7 +409,9 @@ impl ParticipationError {
 			NotSynced => "not_synced",
 			Planned(_) => "planned",
 			SignedAlready(_) => "double_spend",
+			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(_) => "signer_unavailable",
+			Supervision(e) => e.code(),
 			Rate(_) => "rate_stale",
 			Order(_) => "order",
 			OrderSpent(_) => "order_spent",
@@ -606,6 +622,10 @@ impl Participations {
 			return Err(ParticipationError::Order(format!("output {}: a resting order starts with all four of its credit keys", j)));
 		}
 		let paid_in = o.landed.terms.asset_b;
+		if p.supervised(&paid_in).is_some() {
+			return Err(ParticipationError::OutOfBounds(format!("output {}: an order paid in asset {}, which is supervised: each credit \
+				is a vtxo-1 leaf, out of a freeze's reach", j, paid_in)));
+		}
 		if !p.assets.contains(&paid_in) {
 			return Err(ParticipationError::Assets(format!("output {}: an order paid in asset {}, which is not served by this operator: \
 				each credit is a leaf of it", j, paid_in)));
@@ -646,6 +666,9 @@ impl Participations {
 		if self.store.participation(&id).await?.is_some() {
 			return self.status(&id).await;
 		}
+		// A coin whose holder is frozen is refused before anything else.
+		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
+		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -664,12 +687,14 @@ impl Participations {
 		for (j, o) in req.outputs.iter().enumerate() {
 			p.check_value(o.asset(), o.value()).map_err(ParticipationError::OutOfBounds)?;
 			match o {
-				OutputRequest::Leaf { template, owner, exit_delay, order, asset, .. } => {
-					match (template, order) {
-						(Template::Vtxo1, None) => {},
-						(Template::Order2, Some(o)) => self.check_order_terms(j, o, *asset, owner, now).await?,
+				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, .. } => {
+					match (template, order, landing) {
+						(Template::Vtxo1, None, None) | (Template::Landing1, None, Some(_)) => {},
+						(Template::Order2, Some(o), None) => self.check_order_terms(j, o, *asset, owner, now).await?,
 						_ => return Err(ParticipationError::Template(j, template.to_string())),
 					}
+					p.check_landing(*asset, *value, landing.as_ref())
+						.map_err(|e| ParticipationError::OutOfBounds(format!("output {}: {}", j, e)))?;
 					if !p.exit_delay_ok(*exit_delay) {
 						return Err(ParticipationError::OutOfBounds(format!(
 							"an exit delay of {} units; the operator takes {} to {}", exit_delay.units(),
@@ -806,7 +831,7 @@ impl Participations {
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {
 			let kind = match o {
-				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, order, .. } => WantedKind::Leaf {
+				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, order, landing, .. } => WantedKind::Leaf {
 					template: template.to_string(),
 					owner_key: owner.serialize(),
 					owner_nonce: *owner_nonce,
@@ -814,6 +839,7 @@ impl Participations {
 					operator_nonce: [0; 32],
 					htlc: None,
 					order: *order,
+					landing: *landing,
 				},
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());
@@ -919,6 +945,9 @@ impl Participations {
 		if self.store.participation(&id).await?.is_some() {
 			return self.status(&id).await;
 		}
+		// A coin whose holder is frozen is refused before anything else.
+		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
+		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -941,6 +970,13 @@ impl Participations {
 			if p.assets.get(&a).is_some_and(|x| x.issuer.is_some()) {
 				return Err(ParticipationError::OutOfBounds(format!("asset {} is issuer-operated here: its batches are funded by a mint in \
 					their round, and a round that fills an on-chain order mints nothing", a)));
+			}
+			// A supervised asset is not taken through a round: the taker's
+			// leaf is vtxo-1 by the take's own id, and the order's covenant
+			// pays its maker by a script path a freeze cannot follow.
+			if p.supervised(&a).is_some() {
+				return Err(ParticipationError::OutOfBounds(format!("asset {} is supervised: a take of an on-chain order is not served in \
+					it, as its leaf would be vtxo-1, out of a freeze's reach", a)));
 			}
 		}
 
@@ -1042,6 +1078,7 @@ impl Participations {
 					operator_nonce: [0; 32],
 					htlc: None,
 					order: None,
+					landing: None,
 				},
 				leaf_id: None,
 			}],

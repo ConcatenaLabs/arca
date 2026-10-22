@@ -618,6 +618,26 @@ pub struct AssetSection {
 	/// from its own coins.
 	#[serde(default)]
 	pub issuer: Option<crate::issuer::IssuerSection>,
+	/// The supervised profile's settings ([`crate::supervision`]). An asset
+	/// the node lists as supervised is served under the profile whether or
+	/// not its section names one; one that names one and is not supervised
+	/// on the chain is refused.
+	#[serde(default)]
+	pub supervised: Option<SupervisedSection>,
+}
+
+/// A supervised asset's settings.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisedSection {
+	/// The fee allowance every `landing-1` leaf of the asset carries, in its
+	/// atoms, as a decimal string: the most of a leaf's value its landing may
+	/// leave out of the output it pays the owner. When absent, four times the
+	/// node's fee floor in the asset for a landing when the server starts,
+	/// or none where the node takes no fees in the asset (a landing then
+	/// pays its fee from a coin of another asset).
+	#[serde(default)]
+	pub landing_allowance: Option<String>,
 }
 
 impl AssetSection {
@@ -626,7 +646,7 @@ impl AssetSection {
 		AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
-			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None,
+			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None, supervised: None,
 		}
 	}
 }
@@ -1266,7 +1286,7 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 				Some(crate::issuer::IssuerAsset::from_section(id, s, None).map_err(|e| StartError(format!("asset {}: issuer: {}", id, e)))?)
 			},
 		};
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer }));
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1276,6 +1296,53 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 		None => None,
 	};
 	Ok((list, fee_assets))
+}
+
+/// The size a landing's transaction is priced at for its default fee
+/// allowance: the claim measured 227 vbytes, with room for a fee output.
+pub const LANDING_VSIZE: u64 = 250;
+
+/// Serves every asset of `list` that the node lists as supervised under the
+/// supervised profile ([`crate::supervision`]), with its fee allowance; and
+/// refuses a configuration that names the profile for an asset the chain does
+/// not supervise, or serves a supervised asset issuer-operated or over
+/// Lightning, neither of which keeps it in `landing-1` leaves.
+async fn supervise(list: &mut [(AssetId, AssetParams)], config: &Config, finality: &FinalityService) -> Result<(), StartError> {
+	let listed = finality.call(|c| c.supervised_assets()).await.map_err(err("the node's supervised assets"))?;
+	for (id, p) in list.iter_mut() {
+		let section = config.assets.iter().find(|s| AssetId::from_str(&s.asset).ok() == Some(*id));
+		let named = section.and_then(|s| s.supervised.clone());
+		if !listed.iter().any(|s| s.asset == *id) {
+			if named.is_some() {
+				return Err(StartError(format!("asset {}: supervised: the node does not list it as supervised; an asset is supervised \
+					only if it was issued so, with the descriptor in its id", id)));
+			}
+			p.supervised = None;
+			continue;
+		}
+		if p.issuer.is_some() {
+			return Err(StartError(format!("asset {}: supervised on the chain, and configured issuer-operated: the two profiles are \
+				not served together", id)));
+		}
+		if section.is_some_and(|s| s.lightning.is_some()) {
+			return Err(StartError(format!("asset {}: supervised on the chain: no Lightning leg serves it here, as an htlc-1 leaf's \
+				paths pay a key a freeze cannot follow", id)));
+		}
+		let landing_allowance = match named.and_then(|s| s.landing_allowance) {
+			Some(a) => parse_amount(&a).map_err(|e| StartError(format!("asset {}: supervised.landing_allowance: {}", id, e)))?,
+			None => match crate::fees::floor_per_kvb(finality, *id).await.map_err(err("the node's fee floor"))? {
+				Some(floor) => crate::fees::atoms_for(floor, LANDING_VSIZE, crate::fees::MULTIPLE),
+				None => 0,
+			},
+		};
+		if landing_allowance > 0 && landing_allowance >= p.min_leaf.max(1) && p.min_leaf_value.is_none() {
+			return Err(StartError(format!("asset {}: a landing allowance of {} is not below the smallest leaf, {}", id,
+				landing_allowance, p.min_leaf)));
+		}
+		log::info!("asset {} is supervised: served under the supervised profile, landing allowance {}", id, landing_allowance);
+		p.supervised = Some(crate::params::Supervised { landing_allowance });
+	}
+	Ok(())
 }
 
 /// Refuses an issuer-operated asset whose mint limiter is an instance on
@@ -1377,8 +1444,9 @@ impl Server {
 			},
 		}
 
-		let (list, fee_assets) = assets_of(config)?;
+		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, genesis)?;
+		supervise(&mut list, config, &finality).await?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
 		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
@@ -1519,6 +1587,26 @@ impl Server {
 			tasks.push(watcher.spawn());
 		}
 		tasks.push(finality.spawn());
+		// The supervised profile's watch on the node: after each pass over
+		// the chain, every freeze and pause of a supervised asset the server
+		// serves is held, and each lifting counted from there.
+		tasks.push({
+			let (store, finality, params) = (store.clone(), finality.clone(), params.clone());
+			let mut rx = finality.subscribe();
+			tokio::spawn(async move {
+				loop {
+					match rx.recv().await {
+						Ok(crate::chain::ChainEvent::Synced { .. }) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+						Ok(_) => continue,
+						Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+					}
+					let assets: Vec<AssetId> = params.assets.ids().into_iter().filter(|a| params.supervised(a).is_some()).collect();
+					if let Err(e) = crate::supervision::observe(&store, &finality, &assets).await {
+						log::warn!("supervision: reading the node's freezes: {}", e);
+					}
+				}
+			})
+		});
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
 		// Once a minute: the forfeits without the operator's half, the fills
@@ -1616,8 +1704,9 @@ impl Server {
 	/// other setting that changed takes a restart; the reload leaves it as
 	/// it was and says so.
 	pub async fn reload(&self, config: &Config) -> Result<Reloaded, StartError> {
-		let (list, fee_assets) = assets_of(config)?;
+		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, self.params.chain.genesis_hash())?;
+		supervise(&mut list, config, &self.finality).await?;
 		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();

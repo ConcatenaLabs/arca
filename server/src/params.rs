@@ -83,6 +83,19 @@ pub struct AssetParams {
 	/// ([`crate::issuer`]): its batches are funded by a reissue in the round
 	/// and swept only by burning.
 	pub issuer: Option<crate::issuer::IssuerAsset>,
+	/// Set when the operator's node lists the asset as supervised: its issuer
+	/// can freeze holdings by consensus rule, and the operator serves it
+	/// under the supervised profile ([`crate::supervision`]).
+	pub supervised: Option<Supervised>,
+}
+
+/// What the operator serves of a supervised asset beside the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Supervised {
+	/// The fee allowance every `landing-1` leaf of the asset carries: the
+	/// most of a leaf's value its landing may leave out of the landing's
+	/// output, in the asset's atoms.
+	pub landing_allowance: u64,
 }
 
 /// The assets the operator serves, in the order its configuration lists
@@ -394,6 +407,31 @@ impl Params {
 	/// new work in the asset (a board, a participation) otherwise.
 	pub fn fresh_rate(&self, asset: &AssetId) -> Result<Option<u64>, RateError> {
 		self.rates.fresh(asset, unix_now())
+	}
+
+	/// The supervised profile of `asset`, when the operator serves it so.
+	pub fn supervised(&self, asset: &AssetId) -> Option<Supervised> {
+		self.assets.get(asset).and_then(|p| p.supervised)
+	}
+
+	/// Why a new leaf of `asset` and `value` with `landing` breaks the
+	/// supervised profile, if it does: a leaf of a supervised asset is
+	/// `landing-1` with the published allowance, and no other asset's is
+	/// ([`crate::supervision`]).
+	pub fn check_landing(&self, asset: AssetId, value: u64, landing: Option<&arca_covenant::Landing>) -> Result<(), String> {
+		match (self.supervised(&asset), landing) {
+			(None, None) => Ok(()),
+			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing-1", asset)),
+			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is landing-1, naming the landing its owner's exit \
+				pays, where a freeze of the asset binds", asset)),
+			(Some(s), Some(l)) => {
+				if l.allowance != s.landing_allowance {
+					return Err(format!("a landing-1 leaf of asset {} carries the published allowance, {}, not {}", asset,
+						s.landing_allowance, l.allowance));
+				}
+				l.terms(asset, value).map(|_| ()).map_err(|e| e.to_string())
+			},
+		}
 	}
 
 	/// Why a leaf of `asset` and `value` is outside the published bounds, if

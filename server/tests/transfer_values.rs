@@ -54,7 +54,7 @@ async fn one_transfer_with_other_checkpoint_values_is_refused() {
 	let sig = sign_digest(&a, &plan.checkpoint_message(0).unwrap().digest, &random32());
 	let cp_out = ExplicitOutput::new(v.asset, kept - 1, v.checkpoint().script_pubkey());
 	let client = server::signer::SignerClient::new(&r.signer.socket);
-	let refused = client.rebind(&xonly(&a), &sig, &salt, v.asset, v.value, &[cp_out]).await;
+	let refused = client.rebind(&xonly(&a), &sig, &salt, None, v.asset, v.value, &[cp_out]).await;
 	let why = refused.err().map(|e| e.to_string()).unwrap_or_default();
 	println!("V the signer, asked for the checkpoint at value {}: {}", kept - 1, why);
 	assert!(why.contains("already_signed"), "{}", why);
