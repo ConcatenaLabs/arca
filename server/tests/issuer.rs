@@ -259,6 +259,16 @@ async fn an_issuer_operated_asset_mints_its_refresh_liquidity_and_burns_it_at_ex
 	assert_eq!(issuer::issued(&round2, z), Some(v2));
 	println!("round 2 {}: {} vB, mints {} from {}:0", round2.txid(), round2.vsize(), v2, round1.txid());
 	assert_eq!(supply(&r, z), level + v1 - VALUE + v2);
+	// Both batches are live: the report names each batch output it counts.
+	let rep = r.http.post("issuer_supply", &json!({"asset": z.to_string()})).ok();
+	let outs = rep["in_batches_outputs"].as_array().cloned().unwrap_or_default();
+	println!("in batches after round 2: {} in {}", rep["in_batches"], serde_json::to_string(&outs).unwrap());
+	assert_eq!(rep["in_batches"], json!((v1 + v2).to_string()));
+	let named: Vec<(String, String)> = outs.iter().map(|o| (o["outpoint"].as_str().unwrap().to_string(), o["kind"].as_str().unwrap().to_string())).collect();
+	for (round, v) in [(&round1, v1), (&round2, v2)] {
+		let vout = outputs_of(round, z).iter().find(|o| o.1 == v).expect("the batch output").0;
+		assert!(named.contains(&(format!("{}:{}", round.txid(), vout), "batch".to_string())), "{:?}", named);
+	}
 
 	// An offboard of the second leaf: its mint would pass the window's
 	// allowance, so it waits, saying why.
