@@ -1607,8 +1607,8 @@ that gives the coin up, so nothing slips between. From then on no state or
 payment of the channel, in or out, is taken (`in_use`). Its forfeit gives up
 the whole coin as any coin's does; every state output carries the coin's
 collaborative leaf, so the forfeit answers the coin on the chain whatever
-state it reaches before its settle's delay. A channel coin is given up
-nowhere else: a transfer, a take, a plan, a distribution or a fill refuses
+state it reaches before its settle's delay, as the watcher does (see The
+watcher). A channel coin is given up nowhere else: a transfer, a take, a plan, a distribution or a fill refuses
 it (`template`).
 
 **The signer** signs a channel state only for a program it rebuilds itself
@@ -1742,6 +1742,15 @@ signature (it is stopped, say), those coins go back to the wallet, so a
 signer outage holds none of them, and the operator's rounds stay funded
 meanwhile.
 
+- **Channel states.** Every state the operator co-signs registers its output's
+  script as the channel coin's, so the chain's outputs paying any state are
+  sighted as the coin's own. A live channel coin seen on the chain unspent at
+  a state older than its latest both sides signed (its leaf, state 0, among
+  them) is answered at once by the latest state, published over it, its fee
+  from the operator's wallet: an older state's settle would pay the owner what
+  it paid out since. A channel coin given up is answered by its forfeit at
+  whatever state output it reached: every state output carries the coin's
+  collaborative leaf, which the forfeit's pair spends.
 - **Stale exits.** A coin the server holds as given up, by a participation
   whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on
   the chain unspent, in a block or the mempool, is answered at once: by its

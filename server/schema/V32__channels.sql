@@ -40,3 +40,10 @@ CREATE TABLE channel_note (
 	PRIMARY KEY (leaf_id, credit)
 );
 CREATE UNIQUE INDEX channel_note_by ON channel_note (by_leaf, by_number);
+
+-- The watcher's answer to an older state of a live channel coin on the
+-- chain: the latest state both sides signed, published over it.
+ALTER TABLE watcher_tx DROP CONSTRAINT watcher_tx_kind_check;
+ALTER TABLE watcher_tx ADD CONSTRAINT watcher_tx_kind_check CHECK (kind IN (
+	'forfeit', 'issue', 'claim', 'checkpoint', 'reassignment', 'release', 'sweep', 'reclaim', 'unroll', 'entry',
+	'unlock', 'offboard_reclaim', 'htlc_claim', 'htlc_refund', 'refund', 'fill', 'landing', 'channel_update'));

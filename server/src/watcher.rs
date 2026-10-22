@@ -341,6 +341,7 @@ impl Watcher {
 	/// exit delay), then the claims (the refund delay), then new forfeits
 	/// and the rest, which have none.
 	pub async fn pass(&self) -> Result<(), WatcherError> {
+		self.answer_stale_channel_states().await?;
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
@@ -786,6 +787,62 @@ impl Watcher {
 	// 1. Stale exits
 	// -----------------------------------------------------------------------
 
+	/// The state of the channel coin `leaf_id` (of `policy`) whose output is
+	/// at `op`: its opening, or a state recorded for it, matched by the
+	/// script the chain's output at `op` pays.
+	async fn channel_state_at(&self, leaf_id: &[u8; 32], policy: &arca_covenant::ChannelPolicy, op: OutPoint)
+		-> Result<arca_covenant::State, WatcherError>
+	{
+		let mut states = vec![policy.opening()];
+		states.extend(self.store.channel_states(leaf_id).await?.into_iter().map(|r| r.state));
+		for s in states {
+			let spk = policy.script_pubkey(&s);
+			let at = self.store.sightings_of(spk.as_bytes()).await?;
+			if at.iter().any(|(t, v)| txid_of(t) == op.txid && *v == op.vout) {
+				return Ok(s);
+			}
+		}
+		Err(WatcherError::Build(format!("output {} of channel coin {} pays no state the operator knows", op, hex(leaf_id))))
+	}
+
+	/// Answers every live channel coin on the chain unspent at a state older
+	/// than its latest, both sides signed: the latest published over it at
+	/// once, the fee from the operator's wallet. An older state's settle pays
+	/// the owner what it paid out since; the latest's waits the exit delay
+	/// from its own block.
+	async fn answer_stale_channel_states(&self) -> Result<(), WatcherError> {
+		for (leaf_id, txid, vout) in self.store.live_channel_sightings().await? {
+			let op = OutPoint::new(txid_of(&txid), vout);
+			if self.spending(&op).await? || self.unspent(op).await?.is_none() {
+				continue;
+			}
+			let r = self.answer_channel_state(&leaf_id, op).await;
+			Self::item(&format!("the channel coin {} at {}", hex(&leaf_id), op), r)?;
+		}
+		Ok(())
+	}
+
+	async fn answer_channel_state(&self, leaf_id: &[u8; 32], op: OutPoint) -> Result<(), WatcherError> {
+		let coin = self.coin(leaf_id).await?;
+		let Some(policy) = coin.leaf.channel_policy() else { return Ok(()) };
+		let Some(latest) = self.store.channel_latest_signed(leaf_id).await? else { return Ok(()) };
+		let at = self.channel_state_at(leaf_id, &policy, op).await?;
+		if at.number >= latest.state.number {
+			return Ok(());
+		}
+		let operator_sig = Signature::from_slice(&latest.operator_sig.expect("signed")).map_err(build("a signature"))?;
+		let owner_sig = Signature::from_slice(&latest.owner_sig).map_err(build("a signature"))?;
+		let (u, fee_coin, fee) = self.margin_or_coin(coin.asset, 0, |fee| {
+			let u = policy.update_tx(op, coin.asset, &at, &latest.state, &operator_sig, &owner_sig, fee).map_err(|e| e.to_string())?;
+			let t = u.tx.clone();
+			Ok((u, t))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		self.publish(Ready { tx: u.tx, wallet, fee }, "channel_update", leaf_id.to_vec(),
+			format!("state {} of channel coin {} over state {} on the chain at {}", latest.state.number, hex(leaf_id), at.number, op)).await?;
+		Ok(())
+	}
+
 	/// Answers every coin given up whose leaf, or whose checkpoint, is on
 	/// the chain unspent.
 	async fn answer_stale_exits(&self) -> Result<(), WatcherError> {
@@ -948,8 +1005,17 @@ impl Watcher {
 		let coin = self.coin(leaf_id).await?;
 		if let Some(f) = self.live_forfeit(leaf_id).await? {
 			let (forfeit, pair) = self.forfeit(&coin, &f)?;
+			// A channel coin answered at whatever state output it reached: its
+			// forfeit's pair spends any of them by the same collaborative leaf.
+			let channel = match coin.leaf.channel_policy() {
+				Some(p) => Some((p, self.channel_state_at(leaf_id, &p, op).await?)),
+				None => None,
+			};
 			let (u, fee_coin, fee) = self.margin_or_coin(coin.asset, forfeit.margin, |fee| {
-				let u = forfeit.tx(op, &pair, fee).map_err(|e| e.to_string())?;
+				let u = match &channel {
+					Some((p, state)) => p.collab_tx(op, coin.asset, state, &[forfeit.output()], &pair, fee),
+					None => forfeit.tx(op, &pair, fee),
+				}.map_err(|e| e.to_string())?;
 				let t = u.tx.clone();
 				Ok((u, t))
 			}).await?;

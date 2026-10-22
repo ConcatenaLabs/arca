@@ -51,6 +51,9 @@ pub struct NewChannelState {
 	/// A payment: the receiving channel and the amount. The receiver's note
 	/// is its latest credit plus the amount.
 	pub pays: Option<([u8; 32], u64)>,
+	/// The state's output script: registered as the channel coin's, so the
+	/// chain's outputs paying it are sighted as the coin's own.
+	pub script_pubkey: Vec<u8>,
 }
 
 /// What [`Store::begin_channel_state`] found.
@@ -166,6 +169,34 @@ impl Store {
 		r.as_ref().map(state_row).transpose()
 	}
 
+	/// Every state of channel `leaf` past its opening, signed or not, lowest
+	/// number first.
+	pub async fn channel_states(&self, leaf: &[u8; 32]) -> Result<Vec<ChannelStateRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("SELECT {} FROM channel_state WHERE leaf_id = $1 ORDER BY number", STATE_COLUMNS),
+			&[&&leaf[..]]).await?;
+		rows.iter().map(state_row).collect()
+	}
+
+	/// Every output of a live channel coin's scripts sighted on the chain
+	/// (its leaf, or the output of one of its states), where the channel has
+	/// a state past its opening that both sides signed: `(leaf id, txid,
+	/// vout)`, oldest first. The watcher answers an older state there with the
+	/// latest ([`crate::watcher`]).
+	pub async fn live_channel_sightings(&self) -> Result<Vec<([u8; 32], [u8; 32], u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT a.leaf_id, s.txid, s.vout FROM script_sighting s
+			 JOIN arca_script a ON a.script_pubkey = s.script_pubkey
+			 JOIN leaf l ON l.leaf_id = a.leaf_id
+			 WHERE a.kind = 'leaf' AND l.state = 'live'
+			   AND EXISTS (SELECT 1 FROM channel_state c WHERE c.leaf_id = a.leaf_id AND c.operator_sig IS NOT NULL)
+			 ORDER BY s.seen_at, s.txid, s.vout",
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, array32(r.get(1), "txid")?, r.get::<_, i32>(2) as u32))).collect()
+	}
+
 	/// The highest credit note of channel `leaf`, signed or not.
 	pub async fn channel_note(&self, leaf: &[u8; 32]) -> Result<Option<ChannelNoteRow>, StoreError> {
 		let conn = self.conn().await?;
@@ -254,6 +285,8 @@ impl Store {
 			Some((to, amount)) => (Some(to.to_vec()), *amount),
 			None => (None, 0),
 		};
+		t.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'leaf', $2) ON CONFLICT DO NOTHING",
+			&[&new.script_pubkey, &&new.leaf_id[..]]).await?;
 		t.execute("INSERT INTO channel_state (leaf_id, number, owner_balance, operator_balance, folded, owner_sig, pays, amount)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 			&[&&new.leaf_id[..], &i64_of(new.state.number)?, &i64_of(new.state.owner)?, &i64_of(new.state.operator)?,

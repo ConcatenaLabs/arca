@@ -257,7 +257,8 @@ impl Channels {
 		let amount = u.pay.map_or(0, |p| p.1);
 		let opening = policy.opening();
 		let r_opening = receiver.map(|r| r.opening());
-		let new = NewChannelState { leaf_id: u.leaf.0, state: u.state, owner_sig: *u.owner_sig.as_ref(), pays: u.pay.map(|(t, a)| (t.0, a)) };
+		let new = NewChannelState { leaf_id: u.leaf.0, state: u.state, owner_sig: *u.owner_sig.as_ref(), pays: u.pay.map(|(t, a)| (t.0, a)),
+			script_pubkey: policy.script_pubkey(&u.state).to_bytes() };
 		let begun = self.store.begin_channel_state(&new, |latest, credit, recv| {
 			let from = latest.map_or(opening, |r| r.state);
 			follows(&from, &u.state, amount, credit)?;

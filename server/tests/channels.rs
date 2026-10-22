@@ -8,7 +8,10 @@
 //! a lost answer answered the same; one channel closed into a round for its
 //! owner's side, the latest balance and the credit not folded, and nothing of
 //! it moving after; and the signer's own refusal of a state for a coin whose
-//! forfeit it signed.
+//! forfeit it signed. Then the watcher: a live channel brought on the chain
+//! at its opening, older than its latest state, is answered by the latest,
+//! published over it; and a channel given up in a round and moved on the
+//! chain to a later state by its owner is answered there by its forfeit.
 
 mod common;
 
@@ -227,4 +230,88 @@ async fn channels_pay_each_other_at_once_and_close_into_a_round() {
 	assert!(e.to_string().contains("given up or paid on"), "{}", e);
 	let e = signer.channel_note(&a.policy, &a1, None, 40_000).await.unwrap_err();
 	println!("the signer refuses a note: {}", e);
+}
+
+/// The unroll of channel `c`'s path and its entry, each broadcast (a level
+/// already on the chain is passed over): the leaf's outpoint, the
+/// channel's state-0 output.
+fn bring(r: &Running, c: &Chan) -> elements::OutPoint {
+	use arca_covenant::spend::FeeSource;
+	use arca_covenant::ValidOrigin;
+	let v = c.coin.valid(r);
+	let (valid, preimage, auths) = match &v.origin {
+		ValidOrigin::Leaf { valid, preimage, auths } => (valid, preimage, auths),
+		_ => panic!("a batch leaf"),
+	};
+	let txs = valid.branch.unroll(elements::OutPoint::new(valid.round_txid, valid.batch_vout), auths,
+		&vec![FeeSource::Reserve; auths.len()]).unwrap();
+	for u in &txs {
+		let _ = r.rt.client().send_raw_transaction(&u.tx);
+	}
+	let entry = valid.branch.entry_tx(valid.branch.entry_outpoint(&txs).unwrap(), preimage, &FeeSource::Reserve).unwrap();
+	elements::OutPoint::new(r.rt.client().send_raw_transaction(&entry.tx).unwrap(), 0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_watcher_answers_an_older_state_and_a_given_up_channel_at_any_state() {
+	use common::flow::{drive, has, log};
+	let mut r = start().await;
+	let ch = open(&mut r, &[keypair("carol"), keypair("dave")]).await;
+	let (c, d) = (&ch[0], &ch[1]);
+	let x = r.x;
+
+	// C pays D: C's latest is state 1. D folds its credit: D's latest is 1.
+	let c1 = c.policy.opening().pay(100_000, 0).unwrap();
+	update(&r, c, &c1, Some((d, 100_000))).ok();
+	let d1 = d.policy.opening().pay(0, 100_000).unwrap();
+	let d1_ans = update(&r, d, &d1, None).ok();
+	println!("C paid D 100000; D folded it: both channels at state 1");
+
+	// C brings its leaf on the chain: its state 0, older than its latest.
+	let c_leaf = bring(&r, c);
+	r.produce().await;
+	let cid = c.id().0.to_vec();
+	drive(&r, "the answer to C's older state", 6, |l| has(l, "channel_update", &cid)).await;
+	let l = log(&r).await;
+	let w = l.iter().find(|w| w.kind == "channel_update" && w.subject == cid).unwrap();
+	let tx: elements::Transaction = elements::encode::deserialize(&w.tx).unwrap();
+	assert_eq!(tx.input[0].previous_output, c_leaf, "the update spends C's leaf where C put it");
+	assert_eq!(tx.output[0].script_pubkey, c.policy.script_pubkey(&c1), "to the output of C's latest state");
+	println!("the watcher published state 1 over C's state 0 at {}: {} ({} vB)", c_leaf, tx.txid(), tx.vsize());
+
+	// D closes into a round, then brings its leaf on the chain and moves it
+	// to its state 1 itself: the forfeit answers it there.
+	let new_key = keypair("dave after the channel");
+	let (w, nonce) = want_leaf(&new_key, x, d1.owner);
+	let (body, id) = participation_body(&[&d.coin.held], &[w], &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &id);
+	let (valid, record, round) = validate_new_leaf(&r, &id, 0, &new_key, &nonce);
+	let f = forfeit_for(&d.coin.valid(&r), &valid, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id),
+		"forfeits": [{"leaf_id": d.id().to_string(), "signature": forfeit_sig(&f, &d.key)}],
+		"leaves": [auths_json(&valid, &new_key, created(&record))]})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let d_leaf = bring(&r, d);
+	r.produce().await;
+	let fee_coin = r.purse.take_coin(x);
+	let owner_sig = sign_digest(&d.key, &d.policy.state_message(&d1).unwrap().digest, &random32());
+	let fee = arca_covenant::spend::FeeSource::Coin { outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 3_000,
+		change: common::node::op_true() };
+	let up = d.policy.update_tx(d_leaf, x, &d.policy.opening(), &d1, &sig_of(&d1_ans["operator_sig"]), &owner_sig, &fee).unwrap();
+	let up_id = r.rt.client().send_raw_transaction(&up.tx).unwrap();
+	r.produce().await;
+	let at1 = elements::OutPoint::new(up_id, 0);
+	println!("D, its channel given up, moved it to state 1 itself: {} ({} vB)", up_id, up.tx.vsize());
+	let did = d.id().0.to_vec();
+	drive(&r, "the forfeit of D's channel at its state 1", 6, |l| has(l, "forfeit", &did)).await;
+	let l = log(&r).await;
+	let w = l.iter().find(|w| w.kind == "forfeit" && w.subject == did).unwrap();
+	let tx: elements::Transaction = elements::encode::deserialize(&w.tx).unwrap();
+	assert_eq!(tx.input[0].previous_output, at1, "the forfeit spends D's coin at its state-1 output");
+	println!("the watcher answered D's channel at its state-1 output {} with its forfeit: {} ({} vB)", at1, tx.txid(), tx.vsize());
 }
