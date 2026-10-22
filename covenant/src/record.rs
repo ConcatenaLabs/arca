@@ -215,8 +215,9 @@ pub enum Template {
 }
 
 impl Template {
-	/// Every template this crate knows, in the order of their ids: the
-	/// operator's published list (`info.templates`).
+	/// Every template this crate knows, in the order of their ids. The
+	/// operator publishes those its rounds make (`info.templates`), which
+	/// leaves out `order-2`.
 	pub const ALL: [Template; 7] =
 		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Order3, Template::Landing1, Template::Channel1];
 

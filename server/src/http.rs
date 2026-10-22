@@ -689,8 +689,11 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			}.into(),
 			anchor_depth: app.anchor_depth,
 		},
-		// channel-1 is listed when the operator makes channel leaves of an asset.
+		// channel-1 is listed when the operator makes channel leaves of an asset;
+		// order-2 never: no round makes a new one, though one resting from
+		// before order-3 is still filled.
 		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter()
+			.filter(|t| **t != arca_covenant::Template::Order2)
 			.filter(|t| **t != arca_covenant::Template::Channel1
 				|| p.assets.all().iter().any(|(a, _)| p.channel_capacity(a).is_ok_and(|c| c > 0)))
 			.map(|t| t.to_string()).collect() },

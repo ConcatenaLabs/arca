@@ -296,6 +296,9 @@ async fn a_resting_order_fills_with_its_maker_away_and_every_exit_of_it_is_answe
 	let (body, _) = participation_body(&[&bm.held], &[w], &[], None, s, r.chain);
 	let a = r.http.post("submit_participation", &body);
 	println!("refused, a new order-2 leaf: {} {:?}", a.status, a.refusal());
+	let templates = r.http.get("info").ok()["templates"]["list"].clone();
+	assert!(templates.as_array().unwrap().contains(&json!("order-3")) && !templates.as_array().unwrap().contains(&json!("order-2")),
+		"{}", templates);
 	assert_eq!(a.refusal().0, "order");
 	assert!(a.refusal().1.contains("order-2") && a.refusal().1.contains("order-3"), "{:?}", a.refusal());
 
