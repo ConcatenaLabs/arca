@@ -715,7 +715,7 @@ async fn the_record_names_its_keepers_and_the_signer_serves_only_with_them() {
 	let seen = server::signer::read_keepers_seen(&compacted).unwrap();
 	println!("what the signer saw its keepers hold, carried over: {:?}", seen);
 	assert!(seen.len() == 2 && seen == server::signer::read_keepers_seen(&record).unwrap(), "{:?}", seen);
-	assert!(header.starts_with(&format!("arca-signer-record 4 {} {} keepers=2:{},{} 3 ", hex(&xonly(&t.s).serialize()), t.genesis, h1, h2)),
+	assert!(header.starts_with(&format!("arca-signer-record 5 {} {} keepers=2:{},{} 3 ", hex(&xonly(&t.s).serialize()), t.genesis, h1, h2)),
 		"{}", header);
 	std::fs::write(&record, text.replacen(&format!("keepers=2:{},{}", h1, h2), &format!("keepers=1:{}", h1), 1)).unwrap();
 	let e = refused("a compacted record's keepers edited", &keepers_args(&[keeper1.arg()]));

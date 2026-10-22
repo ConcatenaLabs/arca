@@ -89,8 +89,10 @@
 //! connector asset `M`. A message is refused (`already_signed`) when any
 //! entry under the salt, whatever its owner and kind, carries another
 //! message, whatever the database says: a second forfeit for a later round as
-//! much as a spend after a forfeit. The same message again is signed again,
-//! so a request repeated after a signer outage completes. Two messages `S`
+//! much as a spend after a forfeit, and so is any message under a salt whose
+//! entries a compaction dropped and whose salt it kept. The same message
+//! again is signed again, so a request repeated after a signer outage
+//! completes. Two messages `S`
 //! signed under one salt are what burns the operator's equivocation bond
 //! ([`arca_covenant::bond`]), so an honest signer never makes a second; a
 //! coin whose forfeit `S` signed for a round that could never return is not
@@ -258,6 +260,10 @@ pub enum Request {
 	},
 	/// The entries after entry `after`, at most `limit` of them.
 	Entries { after: u64, limit: u32 },
+	/// What the record is: its format, how many salts it keeps whose
+	/// entries a compaction dropped, and whether a compaction dropped salts
+	/// it did not keep ([`WireRecord`]).
+	Record {},
 	/// The entries under `salt` (32 bytes, hex), whatever their owner: what
 	/// the record holds of a leaf of that salt, a spend or forfeits.
 	Under { salt: String },
@@ -420,6 +426,23 @@ pub struct Response {
 	/// item hex.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub witness: Option<Vec<String>>,
+	/// What the record is (`record`'s answer).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub record: Option<WireRecord>,
+}
+
+/// What a signer's record is: its format, how many salts it keeps whose
+/// entries a compaction dropped (each refused any message), and whether it
+/// is a compaction by an older signer, which dropped entries without
+/// keeping their salts: a salt it dropped would be signed again, so a bond
+/// is not posted over it until it is compacted again
+/// ([`SpendRecord::salts_lost`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WireRecord {
+	pub format: u32,
+	pub dropped_salts: u64,
+	pub salts_lost: bool,
 }
 
 /// The keepers a signer hands every head to before it answers an entry
@@ -790,6 +813,16 @@ pub const RECORD_VERSION_COMPACTED: u32 = 2;
 /// line `<n> <hash>` in place of every entry it dropped, so the record
 /// answers the running hash at every entry for its whole life.
 pub const RECORD_VERSION_HASHES: u32 = 3;
+/// The format of a record compacted from another
+/// ([`SpendRecord::compact`]), the one a compaction writes: as a compacted
+/// record of [`RECORD_VERSION_KEEPERS`], with every salt whose entries a
+/// compaction dropped kept, sorted, in a line `dropped <salt>` each before
+/// the carried lines, so the signer refuses any message under one for the
+/// record's whole life. A compacted record of format 2, 3 or 4 kept none.
+pub const RECORD_VERSION_SALTS: u32 = 5;
+/// The first word of a kept salt's line in a record of
+/// [`RECORD_VERSION_SALTS`].
+const DROPPED: &str = "dropped";
 /// The tag of the hash over a compacted record's carried lines.
 pub const RECORD_CARRIED_TAG: &[u8] = b"Arca/signer-record-carried";
 
@@ -957,8 +990,8 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 ///
 /// A record can be compacted into a new one ([`SpendRecord::compact`]),
 /// dropping the entries under salts the server no longer serves (leaves
-/// whose batches have expired): the new record's first line,
-/// `arca-signer-record 4 <S> <genesis> keepers=… <n> <hash> <carried> <carried hash>`,
+/// whose batches have expired): a compacted record's first line, in format
+/// 4, `arca-signer-record 4 <S> <genesis> keepers=… <n> <hash> <carried> <carried hash>`,
 /// names the old record's keepers, its latest entry and running hash, from
 /// which its own entries go on, and how many lines it carries over from it,
 /// with a hash over the keepers field and them
@@ -967,8 +1000,14 @@ fn line_at(file: &std::fs::File, at: u64) -> Result<String, String> {
 /// names no keepers and hashes the lines alone): every entry
 /// it keeps, verbatim, and for every entry it drops a hash line
 /// `<n> <hash>`, its running hash, so the record answers the running hash
-/// at any of its entries for its whole life. A record of format 2, compacted
-/// without those lines, is read too.
+/// at any of its entries for its whole life. A compaction writes format 5,
+/// `arca-signer-record 5 <S> <genesis> keepers=… <n> <hash> <salts> <carried> <carried hash>`:
+/// before the carried lines, the salt of every entry a compaction dropped,
+/// sorted, a line `dropped <salt>` each, which the carried hash covers after
+/// the keepers field; the signer refuses any message under one of them
+/// ([`RECORD_VERSION_SALTS`]). A compacted record of format 4, 3 or 2 (2
+/// without the hash lines) is read too; it kept no salt, and says so
+/// ([`SpendRecord::info`]).
 ///
 /// The record is never made in passing: [`SpendRecord::create`] makes a new
 /// one, once, and [`SpendRecord::open`] refuses a path where there is none,
@@ -1028,6 +1067,14 @@ pub struct SpendRecord {
 	genesis: elements::BlockHash,
 	/// The keepers its first line names: none for a record of format 1 to 3.
 	keepers: RecordKeepers,
+	/// The record's format, as its first line names it.
+	format: u32,
+	/// Every salt whose entries a compaction dropped, sorted: refused any
+	/// message ([`RECORD_VERSION_SALTS`]).
+	dropped: Vec<[u8; 32]>,
+	/// Whether it is a compaction of format 2, 3 or 4, which dropped entries
+	/// without keeping their salts.
+	salts_lost: bool,
 }
 
 impl SpendRecord {
@@ -1115,8 +1162,19 @@ impl SpendRecord {
 			Some(RECORD_VERSION_KEEPERS) if f.len() == 5 || f.len() == 9 => (
 				RecordKeepers::from_field(f[4]).map_err(|e| format!("{}: the header: {}", path.display(), e))?, &f[5..]),
 			Some(RECORD_VERSION_KEEPERS) => return Err(format!("{}: a header of format 4 with {} fields", path.display(), f.len())),
+			Some(RECORD_VERSION_SALTS) if f.len() == 10 => (
+				RecordKeepers::from_field(f[4]).map_err(|e| format!("{}: the header: {}", path.display(), e))?, &f[5..]),
+			Some(RECORD_VERSION_SALTS) => return Err(format!("{}: a header of format 5 with {} fields", path.display(), f.len())),
 			_ => (RecordKeepers::default(), f.get(4..).unwrap_or(&[])),
 		};
+		// A record of format 5 names how many salts it keeps, between where
+		// it was compacted from and its carried lines.
+		let (salts, rest): (u64, Vec<&str>) = match version {
+			Some(RECORD_VERSION_SALTS) => (rest[2].parse().map_err(|_| format!("{}: the header's kept salts {:?}", path.display(), rest[2]))?,
+				vec![rest[0], rest[1], rest[3], rest[4]]),
+			_ => (0, rest.to_vec()),
+		};
+		let rest = &rest[..];
 		let compacted = |rest: &[&str]| -> Result<_, String> {
 			let n: u64 = rest[0].parse().map_err(|_| format!("{}: the header's latest entry {:?}", path.display(), rest[0]))?;
 			let carried: u64 = rest[2].parse().map_err(|_| format!("{}: the header's carried count {:?}", path.display(), rest[2]))?;
@@ -1126,7 +1184,7 @@ impl SpendRecord {
 		let (base, carried) = match version {
 			Some(RECORD_VERSION) if f.len() == 4 => (None, None),
 			Some(RECORD_VERSION_KEEPERS) if rest.is_empty() => (None, None),
-			Some(RECORD_VERSION_KEEPERS) => {
+			Some(RECORD_VERSION_KEEPERS | RECORD_VERSION_SALTS) => {
 				hash_lines = true;
 				compacted(rest)?
 			},
@@ -1134,15 +1192,37 @@ impl SpendRecord {
 				hash_lines = v == RECORD_VERSION_HASHES;
 				compacted(rest)?
 			},
-			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {}, {}, {} and {}", path.display(), f.get(1),
-				RECORD_VERSION, RECORD_VERSION_COMPACTED, RECORD_VERSION_HASHES, RECORD_VERSION_KEEPERS)),
+			_ => return Err(format!("{}: the record is of format {:?}; this signer reads formats {}, {}, {}, {} and {}", path.display(),
+				f.get(1), RECORD_VERSION, RECORD_VERSION_COMPACTED, RECORD_VERSION_HASHES, RECORD_VERSION_KEEPERS, RECORD_VERSION_SALTS)),
 		};
+		let format = version.expect("a format this signer reads");
+		let salts_lost = base.is_some() && format != RECORD_VERSION_SALTS;
+		// The salts it keeps: whole lines, strictly ascending, read before
+		// the carried lines and hashed with them.
+		let mut dropped: Vec<[u8; 32]> = Vec::with_capacity(salts.min(1 << 24) as usize);
+		let mut salts_len = 0u64;
+		for i in 0..salts {
+			let got = read(&mut reader, &mut line)?;
+			let text = std::str::from_utf8(&line[..got.saturating_sub(1)]).unwrap_or("");
+			let bad = |what: &str| format!("{} line {}: {}: {:?}", path.display(), i + 2, what, text.chars().take(200).collect::<String>());
+			if got == 0 || !line.ends_with(b"\n") {
+				return Err(bad("a kept salt's line is missing or cut short: the record has been changed"));
+			}
+			let salt = text.strip_prefix(DROPPED).and_then(|t| t.strip_prefix(' ')).filter(|h| is_hex32(h.as_bytes()))
+				.ok_or_else(|| bad("not a kept salt's line"))?;
+			let salt = unhex32(salt).map_err(|e| bad(&e))?;
+			if dropped.last().is_some_and(|l| *l >= salt) {
+				return Err(bad("a kept salt out of order"));
+			}
+			dropped.push(salt);
+			salts_len += got as u64;
+		}
 		if f.get(2..4) != ours.get(2..4) {
 			return Err(format!("{}: the record is kept for another operator key or another chain ({:?}); this signer holds \
 				{} on {}", path.display(), header, hex(&operator.serialize()), genesis));
 		}
 		let base = base.unwrap_or((0, chain_hash(&[0; 32], &header)));
-		let first = got as u64;
+		let first = got as u64 + salts_len;
 		// About 300 bytes a line: room for every entry at once.
 		let lines = file.metadata().map(|m| m.len()).unwrap_or(0) / 280 + 16;
 		let stop_path = stopped_path(path);
@@ -1155,7 +1235,7 @@ impl SpendRecord {
 		let mut record = SpendRecord {
 			file, size: first, first, base, head: base, count: 0, kept: Vec::with_capacity(lines as usize), added: Default::default(),
 			lines: 0, marks: vec![], recent: Default::default(), refusing: None, stopped, stop_path, stop_head, operator: *operator,
-			genesis: *genesis, keepers,
+			genesis: *genesis, keepers, format, dropped, salts_lost,
 		};
 		let mut at = first;
 		let mut k = 1u64;
@@ -1164,9 +1244,12 @@ impl SpendRecord {
 		if let Some((carried, want)) = carried {
 			let mut e = sha256::Hash::engine();
 			e.input(RECORD_CARRIED_TAG);
-			if version == Some(RECORD_VERSION_KEEPERS) {
+			if matches!(version, Some(RECORD_VERSION_KEEPERS | RECORD_VERSION_SALTS)) {
 				e.input(record.keepers.field().as_bytes());
 				e.input(b"\n");
+			}
+			for salt in &record.dropped {
+				e.input(format!("{} {}\n", DROPPED, hex(salt)).as_bytes());
 			}
 			let mut last = 0u64;
 			for _ in 0..carried {
@@ -1341,6 +1424,28 @@ impl SpendRecord {
 	/// file.
 	pub fn entries_under(&self, salt: &[u8; 32]) -> Result<Vec<Entry>, String> {
 		self.under(salt)
+	}
+
+	/// Whether `salt`'s entries were dropped by a compaction that kept the
+	/// salt: `S` signed under it, and signs nothing more under it.
+	pub fn dropped(&self, salt: &[u8; 32]) -> bool {
+		self.dropped.binary_search(salt).is_ok()
+	}
+
+	/// What the record is: its format, how many salts it keeps whose entries
+	/// a compaction dropped, and whether it is a compaction of format 2, 3 or
+	/// 4, which dropped entries without keeping their salts. Under such a
+	/// salt the signer would sign again, so such a record is compacted again
+	/// before a bond is posted (`arcad bond-post` refuses until then): the
+	/// salts `arcad expired-salts` lists are then kept, the lost ones with
+	/// them.
+	pub fn info(&self) -> WireRecord {
+		WireRecord { format: self.format, dropped_salts: self.dropped.len() as u64, salts_lost: self.salts_lost }
+	}
+
+	/// Whether a compaction dropped salts this record does not keep.
+	pub fn salts_lost(&self) -> bool {
+		self.salts_lost
 	}
 
 	/// The entries after entry `after`, at most `limit` of them, read back
@@ -1602,6 +1707,12 @@ impl SpendRecord {
 		if let Some(why) = self.refusing() {
 			return Err(why.to_string());
 		}
+		if self.dropped(salt) {
+			return Err(format!(
+				"{}: S co-signed a message under salt {} before the record was compacted, which dropped its entries (its \
+				 batch expired) and kept the salt; the signer co-signs one message under a salt, ever, and two messages \
+				 under one salt burn the operator's bond", ALREADY_SIGNED, hex(salt)));
+		}
 		let had = self.under(salt).map_err(|e| format!("the record could not be read: {}", e))?;
 		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
 			return Ok(*e);
@@ -1650,10 +1761,14 @@ impl SpendRecord {
 	/// own entries go on, so the server's database, which knows that entry,
 	/// knows the new record; it carries every other entry's line over
 	/// verbatim, and for each entry it drops a hash line with its running
-	/// hash. Returns how many entries it carried and dropped, and the entry
-	/// the new record goes on from.
+	/// hash. It keeps every salt whose entries it or an earlier compaction
+	/// dropped ([`RECORD_VERSION_SALTS`]), so the signer never signs under
+	/// one again; compacting a record an older signer compacted, which kept
+	/// none, it keeps every salt of `drop`. Returns how many entries it
+	/// carried and dropped, how many salts the new record keeps, and the
+	/// entry the new record goes on from.
 	pub fn compact(from: &Path, into: &Path, operator: &XOnlyPublicKey, genesis: &elements::BlockHash,
-		drop: &std::collections::HashSet<[u8; 32]>) -> Result<(u64, u64, (u64, [u8; 32])), String>
+		drop: &std::collections::HashSet<[u8; 32]>) -> Result<(u64, u64, u64, (u64, [u8; 32])), String>
 	{
 		use std::io::Write;
 		let (old, repaired) = Self::open(from, operator, genesis)?;
@@ -1669,6 +1784,29 @@ impl SpendRecord {
 			}
 		};
 		let (mut carried, mut dropped, mut lines) = (0u64, 0u64, 0u64);
+		// The salts the new record keeps, so that the signer refuses any
+		// message under them for good: those the old record kept, the salt of
+		// every entry dropped now, and, where an older compaction dropped
+		// entries without keeping their salts, every salt listed, since any
+		// of them may be one it lost (`arcad expired-salts` lists every
+		// expired leaf's).
+		let mut kept: std::collections::BTreeSet<[u8; 32]> = old.dropped.iter().copied().collect();
+		if old.salts_lost {
+			kept.extend(drop.iter().copied());
+		}
+		old.each_from(old.first, |_, l, _| {
+			match l {
+				Line::Entry(x) if drop.contains(&x.salt) => {
+					dropped += 1;
+					kept.insert(x.salt);
+				},
+				Line::Entry(_) => carried += 1,
+				Line::Hash(..) => {},
+			}
+			lines += 1;
+			Ok(true)
+		})?;
+		let salt_lines: Vec<String> = kept.iter().map(|salt| format!("{} {}\n", DROPPED, hex(salt))).collect();
 		let mut e = sha256::Hash::engine();
 		e.input(RECORD_CARRIED_TAG);
 		// The keepers go over to the new record with the rest: a record never
@@ -1676,22 +1814,22 @@ impl SpendRecord {
 		let keepers = old.keepers.field();
 		e.input(keepers.as_bytes());
 		e.input(b"\n");
+		for l in &salt_lines {
+			e.input(l.as_bytes());
+		}
 		old.each_from(old.first, |text, l, _| {
-			match l {
-				Line::Entry(x) if drop.contains(&x.salt) => dropped += 1,
-				Line::Entry(_) => carried += 1,
-				Line::Hash(..) => {},
-			}
-			lines += 1;
 			e.input(carry(text, l).as_bytes());
 			e.input(b"\n");
 			Ok(true)
 		})?;
 		let carried_hash = sha256::Hash::from_engine(e).to_byte_array();
 		let base = old.head();
-		let header = format!("{} {} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_KEEPERS, hex(&operator.serialize()), genesis,
-			keepers, base.0, hex(&base.1), lines, hex(&carried_hash));
+		let header = format!("{} {} {} {} {} {} {} {} {} {}\n", RECORD_MAGIC, RECORD_VERSION_SALTS, hex(&operator.serialize()), genesis,
+			keepers, base.0, hex(&base.1), salt_lines.len(), lines, hex(&carried_hash));
 		Self::write_new(into, &header, |w| {
+			for l in &salt_lines {
+				w.write_all(l.as_bytes()).map_err(|e| format!("{}: {}", into.display(), e))?;
+			}
 			old.each_from(old.first, |text, l, _| {
 				w.write_all(carry(text, l).as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| format!("{}: {}", into.display(), e))?;
 				Ok(true)
@@ -1712,7 +1850,7 @@ impl SpendRecord {
 			let seen = read_keepers_seen(from)?;
 			write_keepers_seen(into, &seen.into_iter().collect::<Vec<_>>())?;
 		}
-		Ok((carried, dropped, base))
+		Ok((carried, dropped, salt_lines.len() as u64, base))
 	}
 }
 
@@ -1908,6 +2046,12 @@ impl SignerClient {
 	pub async fn entries(&self, after: u64) -> Result<Vec<Entry>, SignerError> {
 		let r = self.ask(&Request::Entries { after, limit: MAX_ENTRIES }).await?;
 		r.entries.unwrap_or_default().iter().map(Entry::from_wire).collect::<Result<_, _>>().map_err(SignerError::Answer)
+	}
+
+	/// What the signer's record is ([`WireRecord`]).
+	pub async fn record(&self) -> Result<WireRecord, SignerError> {
+		let r = self.ask(&Request::Record {}).await?;
+		r.record.ok_or_else(|| SignerError::Answer("no record in the answer".into()))
 	}
 
 	/// The entries of the signer's record under `salt`: what `S` has

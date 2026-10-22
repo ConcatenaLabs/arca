@@ -4623,18 +4623,20 @@ async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
 	let text = std::fs::read_to_string(&compacted).unwrap();
 	let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 	let header: Vec<String> = lines[0].split(' ').map(str::to_string).collect();
-	assert!(header[4].starts_with("keepers=1:"), "{}", lines[0]);
-	let carried: usize = header[7].parse().unwrap();
+	assert!(header[1] == "5" && header[4].starts_with("keepers=1:"), "{}", lines[0]);
+	// Its kept salts (none: nothing dropped) and carried lines, hashed after
+	// the keepers field.
+	let (salts, carried): (usize, usize) = (header[7].parse().unwrap(), header[8].parse().unwrap());
 	let mut e = sha256::Hash::engine();
 	e.input(server::signer::RECORD_CARRIED_TAG);
 	e.input(b"keepers=none\n");
-	for l in &lines[1..1 + carried] {
+	for l in &lines[1..1 + salts + carried] {
 		e.input(l.as_bytes());
 		e.input(b"\n");
 	}
 	let mut edited = header.clone();
 	edited[4] = "keepers=none".into();
-	edited[8] = hex(&sha256::Hash::from_engine(e).to_byte_array());
+	edited[9] = hex(&sha256::Hash::from_engine(e).to_byte_array());
 	lines[0] = edited.join(" ");
 	std::fs::write(&record, format!("{}\n", lines.join("\n"))).unwrap();
 	println!("PK the compacted record, its first line edited: {}", lines[0]);

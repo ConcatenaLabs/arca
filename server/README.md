@@ -294,7 +294,9 @@ The commands that work the bond each print JSON:
   participation again with a second forfeit, before it kept one message per
   salt, left such pairs). Each pair burns any bond under the key in the hands
   of whoever holds the database or a backup of it, so such an operator posts
-  its bond under a new operator key. The fee is in the bond's own asset unless
+  its bond under a new operator key. Nor does it pay while the signer's
+  record is a compaction that kept no salt it dropped (`salts_lost`): compact
+  it again first (see The signer). The fee is in the bond's own asset unless
   another is named, and never falls back to another. It prints the `outpoint`
   line for `[bond]`; add it and restart `arcad`.
 - `bond-notice` and `bond-withdraw` sign with `W`'s key from its file. Their
@@ -1963,11 +1965,22 @@ resting on one is never listed), and `arca-signer --compact-into <new file>
 --drop-salts <list>` writes a new record without the entries under those
 salts. The new record's first line names the old record's keepers, and its
 latest entry and running hash, from which its own entries go on, so the entry the server's
-database knows is still the record's; it carries every other entry's line
-over verbatim, and for every entry it drops a line with that entry's number
-and running hash (about 70 bytes an entry, on disk), with a hash over all of
-them and the keepers in that first line, which the signer checks at start. So the record
-answers the running hash at every one of its entries for its whole life.
+database knows is still the record's. It keeps the salt of every entry it
+drops, and of every entry an earlier compaction dropped, in a sorted line
+`dropped <salt>` each, and the signer refuses any message under a kept salt
+(`already_signed`): `S` signed one under it, and a second would burn the
+operator's equivocation bond. It carries every other entry's line over
+verbatim, and for every entry it drops a line with that entry's number and
+running hash (with the kept salt, about 140 bytes an entry, on disk), with a
+hash over the keepers, the kept salts and those lines in that first line,
+which the signer checks at start. So the record answers the running hash at
+every one of its entries, and refuses every salt it signed under, for its
+whole life. A record compacted by a signer that kept no salt (formats 2 and
+3, and format 4 with a compaction's fields; `record`'s `salts_lost`, and a
+line at the signer's start, say so) is signed under a dropped salt again
+until it is compacted once more: that compaction keeps every salt the list
+names, the ones dropped before with them, since `expired-salts` lists every
+expired leaf's salt.
 The compaction also writes the new record's side files beside it,
 `<new file>.acknowledged` and `<new file>.keepers-seen`, carried over from
 the old record's. The operator then moves the new file and those two side
@@ -2948,15 +2961,23 @@ opened, then `fsync`ed, before the first answer is written (watched with
 `strace`); an edited line, and a record of another key, refusing the start. Its compaction: no
 compaction while a signer holds the record, nor over a file that is there;
 the entries under the salts listed dropped, each leaving a line with its
-running hash, the rest carried over verbatim, the new record going on from
+running hash and its salt kept, the rest carried over verbatim, the new record going on from
 the old one's latest entry; the signer on it refusing another message under a
-salt carried over, signing the same message again as its entry, taking a
-dropped salt afresh, answering the running hash at a dropped entry, a head
+salt carried over, signing the same message again as its entry, refusing any
+message under a kept salt (where a signer before kept salts signed one again
+as entry 8), a kept salt changed, unsorted or removed refusing the start,
+answering the running hash at a dropped entry, a head
 of it signed before the compaction stopping nothing, accepting the
 database's knowledge of an entry compacted away whose hash it kept and
 refusing another hash there (`record_differs`), listing its entries; a
 carried line changed refusing the start; and a compacted record compacted
-again. And the signed head: every rebind's entry and `head` signed by `S`; an
+again, its kept salts kept. A record of format 1, as an operator made it
+before records named their keepers, its entries the signer's, compacts into
+format 5 with every line accounted for, the head and the running hash at
+every entry as they were, and its dropped salts refused. A record an older
+signer compacted says it lost salts and signs under one again (entry 6);
+compacted again, it keeps every salt listed, the one lost before included, and
+refuses them. And the signed head: every rebind's entry and `head` signed by `S`; an
 unsigned head, one signed by another key or for another chain, a signature
 moved to another hash or entry, garbage, and a head the record holds each
 stopping nothing; a record rolled back to an older copy and signing two

@@ -71,7 +71,10 @@ payment out of round
   has already signed two messages under one salt (forfeits a signer gave a
   lost round's re-run before it kept one message per salt): whoever holds the
   database or a backup could burn such a bond, so post it under a new operator
-  key instead. Add the `outpoint` line it prints to
+  key instead. Nor does it pay while the signer's record is a compaction by a
+  signer that kept no salt it dropped, under which it would sign again: the
+  signer says so at start; compact the record once more first, with the list
+  `arcad <config> expired-salts` prints, which keeps every salt it names. Add the `outpoint` line it prints to
   `[bond]`, restart `arcad`, and check that `info.bond.state` reads `bonded`
   and `final` reads `true`.
 - **To withdraw, give the notice first:** `arcad <config> bond-notice <key
