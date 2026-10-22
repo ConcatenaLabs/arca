@@ -995,13 +995,20 @@ as in a transfer, for a leaf of what it takes and a leaf of its change
   fee as a transfer's does (the fill's in the asset paid), the depth limit
   holds, and every signature verifies.
 
-The fill is recorded, the order's coin spent by it, before anything is
-signed. The signer co-signs the taker's checkpoints and their pair over the
+The fill is recorded, the order's coin spent by it and the taker's request
+kept with it, before anything is signed. The signer co-signs the taker's checkpoints and their pair over the
 fill's outputs, then the fill itself, after judging it by the program's rules,
 as the one spend under the order coin's salt. The answer carries each coin the
 fill makes with its record; the maker's credit and the order resting again go
 to the maker's mailbox, the taker's leaves to the taker's, and the order rests
-at the remainder from then on. A fill sent again gets the same answer.
+at the remainder from then on. A fill sent again gets the same answer. A fill
+left unsigned (the server stopped, or the signer went away after it signed the
+taker's pairs and before the fill) is completed by the server from the request
+it kept, at start and every minute after, as when the taker sends it again: the
+taker signed its pairs over exactly these outputs, so completing it takes
+nothing from anyone, and the order's coin is not held until the taker returns.
+One the signer refuses (its record holds another spend of a coin) is dropped,
+its coins live again. While a fill is unsigned the order reads `filling`.
 
 The maker cancels by spending the order's coin as any coin: a transfer into a
 leaf of its own (`cosign_transfer`), or a refresh. The signer's one spend per

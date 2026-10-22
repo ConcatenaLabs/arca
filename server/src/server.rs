@@ -911,6 +911,7 @@ pub struct Server {
 	pub cosigner: Arc<Cosigner>,
 	pub participations: Arc<Participations>,
 	pub plans: Arc<crate::plans::Plans>,
+	pub orders: Arc<crate::orders::Orders>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
 	pub watcher: Arc<Watcher>,
@@ -1166,6 +1167,12 @@ impl Server {
 			Ok(n) => log::info!("{} forfeit(s) given the operator's half at start", n),
 			Err(e) => log::warn!("forfeits without the operator's half: {}", e),
 		}
+		// So is a fill of a resting order the signer left half done.
+		match orders.finish_unsigned().await {
+			Ok(0) => {},
+			Ok(n) => log::info!("{} fill(s) of resting orders completed at start", n),
+			Err(e) => log::warn!("fills of resting orders left unsigned: {}", e),
+		}
 		// D61 for a transfer recorded before this server posted notices (an
 		// operator moved from an older version with one in flight): each of
 		// its outputs posted as pending, once, before anything is served.
@@ -1225,12 +1232,13 @@ impl Server {
 		tasks.push(finality.spawn());
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
-		// Once a minute: the forfeits without the operator's half, and the
-		// keepers the signer names, against the pinned set.
+		// Once a minute: the forfeits without the operator's half, the fills
+		// of resting orders left unsigned, and the keepers the signer names,
+		// against the pinned set.
 		let replaced: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
 		let pinned_keepers = Arc::new(std::sync::Mutex::new(keepers.clone()));
 		tasks.push({
-			let forfeits = forfeits.clone();
+			let (forfeits, orders) = (forfeits.clone(), orders.clone());
 			let (signer, pinned, replaced) = (cosigner.signer().clone(), pinned_keepers.clone(), replaced.clone());
 			tokio::spawn(async move {
 				loop {
@@ -1242,6 +1250,11 @@ impl Server {
 						Ok(0) => {},
 						Ok(n) => log::info!("{} forfeit(s) given the operator's half", n),
 						Err(e) => log::warn!("forfeits without the operator's half: {}", e),
+					}
+					match orders.finish_unsigned().await {
+						Ok(0) => {},
+						Ok(n) => log::info!("{} fill(s) of resting orders completed", n),
+						Err(e) => log::warn!("fills of resting orders left unsigned: {}", e),
 					}
 				}
 			})
@@ -1294,8 +1307,8 @@ impl Server {
 		}));
 		log::info!("arca server on {}: operator {}, genesis {}, assets {}", addr, crate::signer::hex(&operator.serialize()), genesis,
 			params.assets.ids().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, plans, rounds, forfeits,
-			watcher, gateway, sends, receives, config: std::sync::Mutex::new(config.clone()), tasks })
+		Ok(Server { addr, metrics_addr, store, params, finality, nursery, boards, wallet, cosigner, participations, plans, orders, rounds,
+			forfeits, watcher, gateway, sends, receives, config: std::sync::Mutex::new(config.clone()), tasks })
 	}
 
 	/// Takes the assets `config` serves, each with its smallest leaf, its

@@ -57,6 +57,9 @@ pub struct NewOrderFill {
 	pub credited: u64,
 	pub partial: bool,
 	pub m: u8,
+	/// The fill's request as its taker sent it
+	/// ([`crate::orders::FillRequest::to_bytes`]).
+	pub request: Vec<u8>,
 }
 
 fn nonces(b: Vec<u8>) -> Result<[[u8; 32]; 4], StoreError> {
@@ -141,6 +144,14 @@ impl Store {
 		rows.iter().map(fill_row).collect()
 	}
 
+	/// Every fill recorded and not signed, the oldest first: its transfer's
+	/// id and the request it was recorded from, when it was kept.
+	pub async fn unsigned_order_fills(&self) -> Result<Vec<([u8; 32], Option<Vec<u8>>)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT transfer_id, request FROM order_fill WHERE signature IS NULL ORDER BY created_at, transfer_id", &[]).await?;
+		rows.iter().map(|r| Ok((super::array32(r.get(0), "transfer id")?, r.get(1)))).collect()
+	}
+
 	/// The fill that spends the order coin `order_leaf`, if any.
 	pub async fn order_fill_of(&self, order_leaf: &[u8; 32]) -> Result<Option<OrderFillRow>, StoreError> {
 		let conn = self.conn().await?;
@@ -175,10 +186,10 @@ impl Store {
 		}
 		record_transfer_in(&t, transfer_id, reassignment, admit, inputs, outputs, messages).await?;
 		let r = t.execute(
-			"INSERT INTO order_fill (transfer_id, order_id, order_leaf, seq, filled, credited, partial, m)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+			"INSERT INTO order_fill (transfer_id, order_id, order_leaf, seq, filled, credited, partial, m, request)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 			&[&&transfer_id[..], &&fill.order_id[..], &&fill.order_leaf[..], &(fill.seq as i32), &(fill.filled as i64),
-				&(fill.credited as i64), &fill.partial, &(fill.m as i16)],
+				&(fill.credited as i64), &fill.partial, &(fill.m as i16), &fill.request],
 		).await;
 		if let Err(e) = r {
 			if StoreError::is_unique(&e, "order_fill_order_leaf_key") || StoreError::is_unique(&e, "order_fill_order_id_seq_key") {
