@@ -670,7 +670,7 @@ impl LeafRecord {
 			(Template::Channel1, Some(c)) if self.htlc.is_none() && self.order.is_none() && self.landing.is_none() => {
 				c.terms(self.value).check(self.exit_delay).map_err(RecordError::Channel)?;
 			},
-			(t, Some(_)) | (t @ Template::Channel1, None) => {
+			(t, Some(_)) => {
 				return Err(RecordError::Template(format!("{} with another template's terms", t)))
 			},
 			_ => check_template(self.template, &self.htlc, &self.order, &self.landing, self.asset, self.value, &self.owner,

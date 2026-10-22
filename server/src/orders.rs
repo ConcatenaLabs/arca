@@ -549,7 +549,7 @@ impl Orders {
 		let dates = BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE);
 
 		// The order coin.
-		let oc = coins::check(&self.store, &policy, &req.coin, &transfer, dates).await?;
+		let oc = coins::check_plain(&self.store, &policy, &req.coin, &transfer, dates).await?;
 		let op = oc.coin.leaf.order_policy().ok_or_else(|| OrderError::NotAnOrder(format!("coin {} is not a resting order's", req.coin)))?;
 		let t = op.terms();
 		let refund_time = op.landed.expiry;
@@ -609,7 +609,7 @@ impl Orders {
 		// the order is paid in, expiring no earlier than the order coin.
 		let mut checked: Vec<Checked> = Vec::with_capacity(n);
 		for i in &req.inputs {
-			let c = coins::check(&self.store, &policy, &i.leaf_id, &transfer, dates).await?;
+			let c = coins::check_plain(&self.store, &policy, &i.leaf_id, &transfer, dates).await?;
 			if c.coin.asset != t.asset_b {
 				return Err(OrderError::Terms(format!("coin {} is of asset {}; a fill of this order is paid in {}", i.leaf_id, c.coin.asset,
 					t.asset_b)));

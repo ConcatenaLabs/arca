@@ -345,7 +345,7 @@ impl Plans {
 	/// its salt; with its first expiry.
 	async fn first_coin(&self, coin: &LeafId, holder: &[u8; 32], now: MedianTime) -> Result<coins::Checked, PlanError> {
 		let policy = self.params.participation_policy(now);
-		let c = coins::check(&self.store, &policy, coin, holder, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+		let c = coins::check_plain(&self.store, &policy, coin, holder, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 		if !matches!(c.record, CoinRecord::Leaf { .. }) || c.coin.leaf.htlc.is_some() {
 			return Err(PlanError::OutOfBounds(format!("coin {} is not a vtxo-1 leaf of a round: a plan starts from a coin of a round, \
 				so refresh a board or a received coin in a round first", coin)));
@@ -747,6 +747,7 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 					template: Template::Vtxo1.to_string(), owner_key: s.owner_key, owner_nonce: s.owner_nonce,
 					exit_delay_units: s.exit_delay_units, operator_nonce: s.operator_nonce, htlc: None, order: None,
 					landing: None,
+					channel: None,
 				},
 				leaf_id: None,
 			}],

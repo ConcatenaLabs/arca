@@ -73,6 +73,11 @@ pub enum CoinError {
 	#[error("leaf {leaf} rests on a board whose service ends at median time {expiry}: it is taken here only until {horizon} s before \
 		that, its exit deadline, for a transfer and a refresh alike)")]
 	PastBoardDate { leaf: LeafId, expiry: u32, horizon: u32 },
+	/// A `channel-1` coin, given up only in a round's participation and
+	/// paid from only by a state of its channel ([`crate::channels`]): its
+	/// collaborative spend would move the operator's side too.
+	#[error("leaf {0} is a channel-1 coin: it is given up in a round's participation, and paid from by its channel's states alone")]
+	Channel(LeafId),
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
@@ -238,4 +243,17 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		}
 	}
 	Ok(Checked { record, coin, bases: found, board_expiry })
+}
+
+/// [`check`] for a coin given up anywhere but a round's participation (a
+/// transfer, a take, a plan, a distribution, an order's fill): a
+/// `channel-1` coin is refused ([`CoinError::Channel`]).
+pub async fn check_plain(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
+	-> Result<Checked, CoinError>
+{
+	let c = check(store, policy, id, holder, dates).await?;
+	if c.coin.leaf.channel.is_some() {
+		return Err(CoinError::Channel(*id));
+	}
+	Ok(c)
 }

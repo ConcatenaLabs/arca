@@ -82,6 +82,7 @@ pub struct App {
 	pub orders: Arc<crate::orders::Orders>,
 	pub rounds: Arc<Rounds>,
 	pub forfeits: Arc<Forfeits>,
+	pub channels: Arc<crate::channels::Channels>,
 	pub certification: Certification,
 	pub anchor_depth: u32,
 	pub max_request: usize,
@@ -675,6 +676,9 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 				recovery_delay_units: i.limiter.recovery_delay,
 			}),
 			supervised: ap.supervised.map(|s| api::SupervisedInfo { landing_allowance: s.landing_allowance.to_string() }),
+			channels: p.channel_capacity(a).ok().filter(|c| *c > 0).map(|c| api::ChannelsInfo {
+				capacity: c.to_string(), window_units: p.channel_window.units(),
+			}),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -685,9 +689,11 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			}.into(),
 			anchor_depth: app.anchor_depth,
 		},
-		// channel-1 is a template the covenant knows and this server does not yet serve.
+		// channel-1 is listed when the operator makes channel leaves of an asset.
 		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter()
-			.filter(|t| **t != arca_covenant::Template::Channel1).map(|t| t.to_string()).collect() },
+			.filter(|t| **t != arca_covenant::Template::Channel1
+				|| p.assets.all().iter().any(|(a, _)| p.channel_capacity(a).is_ok_and(|c| c > 0)))
+			.map(|t| t.to_string()).collect() },
 		fees: api::FeesInfo {
 			transfer: "0".into(),
 			refresh_ppm: p.assets.default_fees().refresh_ppm,
@@ -1057,6 +1063,8 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 					None => None,
 				},
 				landing: landing_of(&l.landing)?,
+				channel: l.channel.as_ref().map(|v| arca_covenant::record_json::channel_from_json(v)
+					.map_err(|e| Refusal::malformed(format!("channel: {}", e)))).transpose()?,
 			},
 			api::WantedOutput::Offboard(b) => part::OutputRequest::Offboard {
 				asset: asset(&b.asset)?,
@@ -1079,6 +1087,71 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 }
 
 /// A `landing-1` leaf's landing, in the record's JSON form of it.
+fn state_of(s: &api::ChannelStateJson) -> Result<arca_covenant::State, Refusal> {
+	Ok(arca_covenant::State { number: amount(&s.number)?, owner: amount(&s.owner)?, operator: amount(&s.operator)?,
+		folded: amount(&s.folded)? })
+}
+
+fn state_json(s: &arca_covenant::State) -> api::ChannelStateJson {
+	api::ChannelStateJson { number: s.number.to_string(), owner: s.owner.to_string(), operator: s.operator.to_string(),
+		folded: s.folded.to_string() }
+}
+
+impl From<crate::channels::ChannelError> for Refusal {
+	fn from(e: crate::channels::ChannelError) -> Refusal {
+		let code = e.code();
+		if code == "internal" {
+			log::error!("channel: {}", e);
+		}
+		Refusal::new(status_of(code), code, e.to_string())
+	}
+}
+
+/// `POST /v1/channel_update`: a channel state its owner signed, co-signed,
+/// and for a payment the receiver's note ([`crate::channels`]). The owner's
+/// signature over the state is the request's authority.
+async fn channel_update(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChannelUpdated>, Refusal> {
+	let req: api::ChannelUpdate = parse(body, app.max_request)?;
+	let pay = match &req.pay {
+		Some(p) => Some((leaf_id(&p.to)?, amount(&p.amount)?)),
+		None => None,
+	};
+	let a = app.channels.update(&crate::channels::Update {
+		leaf: leaf_id(&req.leaf_id)?, state: state_of(&req.state)?, owner_sig: sig(&req.owner_sig)?, pay,
+	}).await?;
+	Ok(Json(api::ChannelUpdated {
+		operator_sig: hex(a.operator_sig.as_ref()),
+		note: a.note.map(|(l, c, s)| api::ChannelNote { leaf_id: l.to_string(), credit: c.to_string(), signature: hex(s.as_ref()) }),
+	}))
+}
+
+/// `POST /v1/channel_state`: what the server holds of a channel, for its
+/// owner's key.
+async fn channel_state(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::ChannelView>, Refusal>
+{
+	let req: api::ChannelStateRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a read of a channel", app.source(peer.ip(), &headers))?;
+	let id = leaf_id(&req.leaf_id)?;
+	let k = authenticate(&app, "channel_state", &req.auth, &id.0).await?;
+	let v = app.channels.view(&id).await?;
+	if k != v.policy.owner {
+		return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated", "the key is not the channel's owner's".to_string()));
+	}
+	Ok(Json(api::ChannelView {
+		leaf_id: id.to_string(),
+		asset: v.asset.to_string(),
+		value: v.policy.terms.value.to_string(),
+		capacity: v.policy.terms.capacity.to_string(),
+		window_units: v.policy.terms.window.units(),
+		state: state_json(&v.state),
+		owner_sig: v.sigs.map(|(o, _)| hex(o.as_ref())),
+		operator_sig: v.sigs.map(|(_, s)| hex(s.as_ref())),
+		note: v.note.map(|(c, s)| api::ChannelNote { leaf_id: id.to_string(), credit: c.to_string(), signature: hex(s.as_ref()) }),
+		pending: v.pending,
+	}))
+}
+
 fn landing_of(v: &Option<serde_json::Value>) -> Result<Option<arca_covenant::Landing>, Refusal> {
 	v.as_ref().map(|v| arca_covenant::record_json::landing_from_json(v).map_err(|e| Refusal::malformed(format!("landing: {}", e))))
 		.transpose()
@@ -1105,6 +1178,7 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 		order: None,
 		landing: landing_of(&l.landing)?,
+		channel: None,
 	};
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
@@ -1214,6 +1288,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			htlc: l.htlc.as_ref().map(api::HtlcTermsJson::of),
 			order: l.order.as_ref().map(arca_covenant::record_json::order_terms_json),
 			landing: l.landing.as_ref().map(arca_covenant::record_json::landing_json),
+			channel: l.channel.as_ref().map(arca_covenant::record_json::channel_json),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
 		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
@@ -1554,7 +1629,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			returned: mine.returned,
 			inputs: p.inputs.iter().map(|i| hex(&i.leaf_id)).collect(),
 			outputs: p.outputs.iter().map(|o| match &o.kind {
-				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, order, landing, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
+				WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, order, landing, channel, .. } => api::ServedOutput::Leaf(api::ServedWantedLeaf {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
 					value: o.value.to_string(),
 					template: template.clone(),
@@ -1565,6 +1640,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 					htlc: htlc.as_ref().map(api::HtlcTermsJson::of),
 					order: order.as_ref().map(arca_covenant::record_json::order_terms_json),
 					landing: landing.as_ref().map(arca_covenant::record_json::landing_json),
+					channel: channel.as_ref().map(arca_covenant::record_json::channel_json),
 				}),
 				WantedKind::Offboard { script, .. } => api::ServedOutput::Offboard(api::WantedOffboard {
 					asset: AssetId::from_byte_array(o.asset).to_string(),
@@ -1695,6 +1771,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/leaf_data", post(leaf_data))
 		.route("/v1/bind_mailbox", post(bind_mailbox))
 		.route("/v1/witness", post(witness))
+		.route("/v1/channel_update", post(channel_update))
+		.route("/v1/channel_state", post(channel_state))
 		.layer(axum::middleware::from_fn_with_state(app.clone(), serving))
 		.layer(DefaultBodyLimit::max(limit))
 		.with_state(app)
