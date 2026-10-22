@@ -141,6 +141,11 @@ enum Cmd {
 		#[arg(long)]
 		fee_asset: Option<String>,
 	},
+	/// Checks a published batch of a supervised asset, `TXID:VOUT` of its
+	/// round: the asset supervised on the wallet's own node, every leaf
+	/// `landing-1` with the published allowance, every output of the round
+	/// explicit; each leaf's landing and whether the node shows it frozen.
+	SupervisedCheck { batch: String },
 	/// A new on-chain Sequentia address of the wallet's.
 	Address,
 	/// The wallet's OpenAMP account key (`m/5/0`): the key a SeqPal ID is,
@@ -1186,6 +1191,11 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			}
 			let fee = fee_asset.as_deref().map(asset).transpose()?;
 			w.watch_bond(&lines, fee)
+		},
+		Cmd::SupervisedCheck { batch } => {
+			let o = bark::arca::elements::OutPoint::from_str(&batch)
+				.map_err(|e| bark::arca::Error::Parse(format!("the batch, TXID:VOUT of its round: {}", e)))?;
+			w.supervised_check(o.txid, o.vout)
 		},
 		Cmd::Address => w.address(),
 		Cmd::OpenampKey => w.openamp_key().map(|k| serde_json::json!({"key": k.to_string(), "path": "m/5/0"})),

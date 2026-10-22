@@ -636,6 +636,30 @@ impl ChainSource {
 		}).collect()
 	}
 
+	/// The supervised assets the node lists now (`getsupervisedassets`):
+	/// assets whose issuer can freeze holdings by consensus rule, committed
+	/// in their ids. A node without the supervision registry lists none.
+	pub fn supervised_assets(&self) -> Result<BTreeSet<AssetId>, Error> {
+		let v: Value = match self.call("getsupervisedassets", &[]) {
+			Ok(v) => v,
+			Err(RpcError::Rpc { code: -32601, .. }) => return Ok(BTreeSet::new()),
+			Err(e) => return Err(node(e)),
+		};
+		v.as_array().cloned().unwrap_or_default().iter()
+			.map(|a| AssetId::from_str(a["asset"].as_str().unwrap_or("")).map_err(|e| Error::Node(format!("getsupervisedassets: {}", e))))
+			.collect()
+	}
+
+	/// Whether `script`, a single-owner script (a landing's P2WPKH), is
+	/// frozen for the supervised `asset` at the node's tip, and whether the
+	/// asset is paused (`isassetfrozen`). Never asked of an Arca script: the
+	/// node calls one frozen once it is named, although its script-path
+	/// spends confirm.
+	pub fn freeze_status(&self, asset: AssetId, script: &Script) -> Result<(bool, bool), Error> {
+		let v: Value = self.call("isassetfrozen", &[json!(asset.to_string()), json!(hex(script.as_bytes()))]).map_err(node)?;
+		Ok((v["frozen"].as_bool().unwrap_or(false), v["paused"].as_bool().unwrap_or(false)))
+	}
+
 	/// The node's relay floor in `asset`'s own atoms per 1,000 vbytes, now;
 	/// `None` when the node does not accept `asset` for fees.
 	pub fn floor_per_kvb(&self, asset: AssetId) -> Result<Option<u64>, Error> {

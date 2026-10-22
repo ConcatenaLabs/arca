@@ -216,7 +216,7 @@ impl Wallet {
 		}
 		let terms_json = order_terms_json(&terms);
 		let mut wanted = vec![Wanted::Leaf { asset: ask.sell, value: ask.amount, template: Template::Order2, owner, owner_nonce: nonce,
-			exit_delay: self.exit_delay(), order: Some(terms) }];
+			exit_delay: self.exit_delay(), order: Some(terms), landing: None }];
 		let mut wanted_json = vec![json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": ask.amount.to_string(),
 			"order": terms_json})];
 		if plan.change > 0 {
@@ -224,7 +224,7 @@ impl Wallet {
 			let o = self.keys.leaf_xonly(&n)?;
 			self.store.put_nonce(&n, &o.serialize(), "order change")?;
 			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner: o, owner_nonce: n,
-				exit_delay: self.exit_delay(), order: None });
+				exit_delay: self.exit_delay(), order: None, landing: None });
 			wanted_json.push(json!({"nonce": hex(&n), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
 		}
 		let fees = vec![(ask.sell, plan.fee)];

@@ -71,6 +71,9 @@ one mnemonic serves both:
   use. Each index is taken in one statement of the store, so two processes on
   one directory never hand out the same address; each exit claims to one
   address, however often it is run;
+- the landing key is the first on-chain key, `m/84'/1'/0'/0/0`: every coin of
+  a supervised asset the wallet holds lands there (see Holding a supervised
+  asset), and `info` shows its address as `landing_address`;
 - order keys are `m/86'/1'/0'/0/<index>` (`0'` instead of `1'` on the main
   chain), one for each order the wallet places on the chain (see Placing an
   order on the chain): the key is the order's REFUND key, and its key-path
@@ -1223,6 +1226,70 @@ watchers, or run your own. A watcher learns the salts and messages it is
 given, not who holds the coins; it cannot take a coin, and a slash pays no
 one. Run `watch-bond` beside `sync`, at least as often.
 
+### Holding a supervised asset
+
+A supervised asset is one whose issuer can freeze holdings by a rule of the
+chain: the issuer names an address in a freeze record, or pauses the asset,
+which freezes every holder at once. The node lists such assets
+(`getsupervisedassets`), and an operator serves one under the supervised
+profile, which `info` shows as the asset's `supervised` entry with its
+`landing_allowance`.
+
+The wallet holds a coin of such an asset only as a `landing-1` leaf, and only
+when its own node lists the asset as supervised and the operator serves it so.
+A `landing-1` leaf's exit pays one output only: P2WPKH of the wallet's landing
+key (`landing_address` in `info`), explicitly in the asset, all of the coin's
+value but at most the allowance. The wallet asks for every leaf of such an
+asset that way, in a board, a refresh, a payment it receives (its receive
+request carries the landing) and the change of a payment it sends; it pays
+such an asset only to a request that names a landing, takes a coin only when
+its landing is the wallet's own with the published allowance, and refuses a
+round of such an asset with a blinded output, which consensus refuses as well.
+The landing is one address for every coin of every supervised asset, so a
+freeze of that address reaches every coin the holder has and every one it
+receives later, as the issuer expects of an address; the price is that the
+holder's coins of supervised assets are linked to each other through it.
+
+The wallet reads a freeze from its own node, at the landing address, never at
+a coin's own Arca script: the node calls an Arca script frozen once a record
+names it or the asset is paused, although its script-path spends still
+confirm. `coins` shows each coin of a supervised asset with its `landing` and
+`frozen` (`frozen`, `paused`, and a `note` saying what follows while either
+holds). While its holder is frozen the operator co-signs nothing that spends
+the coin, no payment, swap, refresh, offboard, take, fill, distribution, plan
+or Lightning payment, and refuses with `frozen`; a payment to a frozen holder
+is still co-signed, and arrives frozen. The operator takes the lifting of a
+freeze only once the block that first showed the landing free is final, so a
+coin is still refused in the tree for a while after the node shows it free.
+
+A coin of a supervised asset is never planned or paid out as a claim: the
+operator runs no plans and no distributions in such an asset, so `plan`
+refuses the coin and `care` leaves it to `sync`, which refreshes it in its
+window.
+
+A frozen coin leaves the tree only by its landing. `arca exit LEAF` unrolls
+its path and claims it to the landing key, and `sync` does so before the
+coin's exit date, as for any coin whose refresh the operator refuses. On the
+chain it is an ordinary coin of the wallet's, frozen by the same record:
+`balance` counts it in its asset's row and again under
+`sequentia_onchain_frozen`, and the wallet keeps it out of every spend (a
+board, a fee coin) while the node shows it frozen. Once the issuer lifts the
+freeze, the wallet spends it like any other coin.
+
+`arca supervised-check TXID:VOUT` reads a whole published batch of a
+supervised asset, as its issuer or an auditor reads one, from the published
+tree and the chain alone: the tree rebuilt from its parts and its batch output
+compared with the round on the wallet's node, the asset supervised on that
+node, every leaf `landing-1` with the allowance the operator publishes, and
+every output of the round explicit. Each leaf is listed with where it lands
+and whether the node shows that landing frozen; `ok` is true only when every
+check holds, and `problems` lists what did not.
+
+    arca info                                     # landing_address
+    arca coins                                    # each coin's landing and frozen
+    arca exit LEAF                                # a frozen coin home, into the landing key
+    arca supervised-check TXID:VOUT               # a supervised batch, read whole
+
 ### Finding an operator in the registry
 
 An operator publishes a record of itself in the Sequentia registry: its
@@ -1255,7 +1322,8 @@ registry for both commands.
 | `join --from-registry KEY --registry URL --node-url URL …` (`create --from-registry`) | Creates the wallet with the operator the Sequentia registry lists under operator key `KEY`, in place of a server named by address, taking the node, mnemonic and delay options of `create`: the operator's record is read from the registry, its signature by `KEY` checked by the wallet itself, the server's address taken from it, and the wallet created only when that server shows the record's operator key, chain and keepers (see Finding an operator in the registry); a record the registry finds `mismatched` is refused. The answer carries the record's listing under `registry` |
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`) |
-| `info` | The wallet's chain, operator, mailbox key and policy, and what the server publishes |
+| `info` | The wallet's chain, operator, mailbox key and policy, the address every coin of a supervised asset lands at (`landing_address`), and what the server publishes |
+| `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf `landing-1` with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
 | `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, and whether the bond covers it (`covers`) |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
@@ -1263,7 +1331,7 @@ registry for both commands.
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `openamp-key` | The wallet's OpenAMP account key (`m/5/0`, as every wallet on the kit derives it): the key an OpenAMP account and a SeqPal ID are, which a payer may name to pay the wallet a claim |
 | `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
-| `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); one coin's record |
+| `coins`, `record LEAF` | Every coin held or once held, with its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
@@ -1288,7 +1356,7 @@ asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
-| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
+| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
 | `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
@@ -1306,7 +1374,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `plans` | Every plan the wallet made or restored: its coin, its state, each step's value, fee, state and leaf once taken up, `covered_until` and `sync_by`, and the operator's reason for a plan it stopped |
 | `plan-cancel PLAN` | Cancels the steps of plan `PLAN` that have not started, signed with the mailbox key; refused while a step is running. Every coin the plan named stays out of out-of-round payments until it is refreshed in a round |
 | `plan-release COIN… [--max-fee-ppm N]` | Gives up each named coin, the current coin of an open or stopped plan, in the next round for a leaf of the wallet's own that no plan names; the plan ends once the round is final and the forfeit handed over, and stands should the round never complete. The new leaf is paid out of round like any coin |
-| `care [--scan N] [--expiries N] [--max-fee-ppm N]` | Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first); what a wallet does by itself at a sync |
+| `care [--scan N] [--expiries N] [--max-fee-ppm N]` | Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first; a coin of a supervised asset is left to `sync`'s refresh and counted under `supervised`); what a wallet does by itself at a sync |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives) |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -1929,6 +1997,23 @@ and holding it there, with the reason shown:
   password in none of the store's, and its balance of one row, 0 BTC; and a
   wallet restored from the mnemonic that finds on-chain coins past the first
   20 unused addresses.
+
+`tests/arca_supervised.rs` runs the same way, with an asset Z issued under
+the supervision descriptor (the pause capability allowed), which the operator
+serves under the supervised profile once its node lists it, and a signer that
+reads freezes from a node of its own. A holder boards Z and refreshes it, and
+`supervised-check` reads the round's batch whole (every leaf `landing-1` at
+the published allowance, every output explicit) and finds a batch of X not a
+supervised one; the holder pays a second holder out of round, both coins
+landing at their holders' landing keys. A freeze record then names the first
+holder's landing address: `coins` shows its coin frozen, a payment and a
+refresh are refused with `frozen`, and a payment to it from the second holder
+is co-signed and arrives frozen. `exit` takes its frozen coin home: the claim
+pays the landing key, explicitly in Z, all but at most the allowance, every
+output explicit; the node shows the landed coin frozen, `balance` counts it
+under `sequentia_onchain_frozen`, and the wallet keeps it out of a board. Once
+the issuer lifts the freeze, a board spends the landed coin, and once the
+lifting is final the holder pays from that board in the tree.
 
 `tests/arca_operator_for_browsers.rs` is not a test that ends: ignored by
 default, it starts the scenarios' server and keeps it running for a wallet

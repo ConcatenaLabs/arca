@@ -22,6 +22,12 @@
 //!   main chain and 1 elsewhere), each an unblinded P2WPKH script: the same
 //!   key is a Bitcoin address and a Sequentia address, as on every Sequentia
 //!   wallet.
+//! - **The landing key**, the first on-chain key, `m/84'/coin'/0'/0/0`: every
+//!   leaf the wallet holds of a supervised asset is `landing-1`, whose exit
+//!   pays only P2WPKH of this key, where a freeze of the asset binds. One key
+//!   for every such leaf, so that a freeze of the holder's address reaches
+//!   every coin it holds, and a landed coin is an ordinary coin of the
+//!   wallet's on either chain.
 //! - **The OpenAMP account key**, `m/5/0` (unhardened), as the kit and
 //!   Ambra derive it: the key an OpenAMP account and a SeqPal ID are. The
 //!   wallet looks for claims under it ([`super::claim`]), so a payer that
@@ -133,6 +139,16 @@ impl Keys {
 		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
 		let path = DerivationPath::from(vec![hardened(84)?, hardened(self.coin_type)?, hardened(0)?, normal(chain)?, normal(index)?]);
 		self.keypair_at(&path)
+	}
+
+	/// The landing key: the first on-chain key, `m/84'/coin'/0'/0/0`.
+	pub fn landing(&self) -> Result<Keypair, Error> {
+		self.onchain(RECEIVE, 0)
+	}
+
+	/// The landing program: `hash160` of the landing key.
+	pub fn landing_program(&self) -> Result<[u8; 20], Error> {
+		Ok(hash160::Hash::hash(&compressed(&self.landing()?)).to_byte_array())
 	}
 
 	/// The OpenAMP account key, `m/5/0`.

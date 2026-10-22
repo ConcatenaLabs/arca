@@ -1970,6 +1970,108 @@ impl Wallet {
 		amount(&a["min_leaf"], "min_leaf")
 	}
 
+	/// The landing a new leaf of `asset` the wallet asks for or takes must
+	/// carry: `Some` for a supervised asset, `landing-1` at the wallet's
+	/// landing key with the allowance the operator publishes; `None` for any
+	/// other asset. Whether an asset is supervised is the chain's: the
+	/// wallet's own node must list it as `info` says, or the wallet takes no
+	/// leaf of it, since an operator that serves a supervised asset in plain
+	/// leaves, or a plain asset in landing-1 leaves, says what the chain does
+	/// not.
+	pub(crate) fn landing_rule(&self, info: &Value, asset: AssetId) -> Result<Option<arca_covenant::Landing>, Error> {
+		let served = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()));
+		let stated = served.and_then(|a| a.get("supervised")).filter(|s| !s.is_null());
+		let listed = self.chain.supervised_assets()?.contains(&asset);
+		match (stated, listed) {
+			(None, false) => Ok(None),
+			(Some(_), false) => Err(Error::Refused(format!("the operator serves asset {} as supervised, and the wallet's node does not \
+				list it as supervised: the wallet takes no leaf of it", asset))),
+			(None, true) => Err(Error::Refused(format!("asset {} is supervised on the chain (the wallet's node lists it), and the \
+				operator does not serve it so: its leaves' exits would pay where a freeze does not follow, so the wallet takes no leaf \
+				of it", asset))),
+			(Some(s), true) => {
+				let allowance = amount(&s["landing_allowance"], "landing_allowance")?;
+				Ok(Some(arca_covenant::Landing { program: self.keys.landing_program()?, allowance }))
+			},
+		}
+	}
+
+	/// The landing key's address: where every coin of a supervised asset
+	/// lands, the wallet's first on-chain address.
+	pub(crate) fn landing_address(&self) -> Result<String, Error> {
+		let spk = super::keys::p2wpkh(&self.keys.landing()?);
+		Ok(self.chain.address(&spk)?.unwrap_or_else(|| hex(spk.as_bytes())))
+	}
+
+	/// Whether the holder of a coin of `asset` landing at `program` is
+	/// frozen, as the wallet's own node shows it: `(frozen, paused)`. Asked
+	/// of the landing's P2WPKH, never of the coin's own Arca script.
+	pub(crate) fn landing_frozen(&self, asset: AssetId, program: &[u8; 20]) -> Result<(bool, bool), Error> {
+		self.chain.freeze_status(asset, &arca_covenant::landing::landing_script_pubkey(program))
+	}
+
+	/// Checks a whole published batch of a supervised asset, the batch at
+	/// output `vout` of round `txid`, as its issuer or an auditor reads one:
+	/// from the published tree and the chain alone. The tree is rebuilt from
+	/// its parts ([`super::round::rebuild`]) and its batch output compared
+	/// with the round's on the wallet's node; then the asset must be
+	/// supervised on the wallet's node, every leaf `landing-1` with the
+	/// allowance the operator publishes for the asset, and every output of
+	/// the round explicit. Each leaf is listed with where it lands and
+	/// whether the node shows that landing frozen. `ok` only when every check
+	/// holds; `problems` says which did not.
+	pub fn supervised_check(&self, txid: Txid, vout: u32) -> Result<Value, Error> {
+		let t = self.server.post("tree", &json!({"txid": txid.to_string(), "vout": vout}))?;
+		if t["round_txid"].as_str() != Some(txid.to_string().as_str()) || t["batch_vout"].as_u64() != Some(vout as u64) {
+			return Err(Error::Refused(format!("the server published the tree of another batch than {}:{}", txid, vout)));
+		}
+		let tree = super::round::rebuild(&t)?;
+		let asset = tree.params().asset;
+		let round = self.chain.transaction(&txid)?
+			.ok_or_else(|| Error::Refused(format!("round {} is not on the chain the wallet's node holds", txid)))?;
+		let mut problems: Vec<String> = vec![];
+		match round.output.get(vout as usize) {
+			Some(o) if *o == tree.batch_output().txout() => {},
+			Some(_) => problems.push(format!("output {} of round {} is not the batch output the published tree builds", vout, txid)),
+			None => problems.push(format!("round {} has no output {}", txid, vout)),
+		}
+		let supervised = self.chain.supervised_assets()?.contains(&asset);
+		if !supervised {
+			problems.push(format!("asset {} is not supervised on the wallet's node", asset));
+		}
+		let info = self.server.info()?;
+		let allowance = info["assets"].as_array().into_iter().flatten()
+			.find(|a| a["asset"].as_str() == Some(asset.to_string().as_str()))
+			.and_then(|a| a.get("supervised")).filter(|s| !s.is_null())
+			.map(|s| amount(&s["landing_allowance"], "landing_allowance")).transpose()?;
+		if allowance.is_none() {
+			problems.push(format!("the operator does not serve asset {} as supervised", asset));
+		}
+		let explicit = arca_covenant::landing::check_explicit(&round);
+		if let Err(e) = &explicit {
+			problems.push(format!("round {}: {}", txid, e));
+		}
+		let mut leaves = vec![];
+		for (i, r) in tree.records().iter().enumerate() {
+			let Some(l) = r.landing.filter(|_| r.template == Template::Landing1) else {
+				problems.push(format!("leaf {} is {}, not landing-1", i, r.template));
+				leaves.push(json!({"index": i, "template": r.template.to_string(), "value": r.value.to_string()}));
+				continue;
+			};
+			if let Some(a) = allowance.filter(|a| *a != l.allowance) {
+				problems.push(format!("leaf {} lands with an allowance of {}, and the operator publishes {}", i, l.allowance, a));
+			}
+			let spk = l.script_pubkey();
+			let (frozen, paused) = if supervised { self.chain.freeze_status(asset, &spk)? } else { (false, false) };
+			leaves.push(json!({"index": i, "template": r.template.to_string(), "value": r.value.to_string(),
+				"landing": self.chain.address(&spk)?.unwrap_or_else(|| hex(spk.as_bytes())), "landing_program": hex(&l.program),
+				"allowance": l.allowance.to_string(), "frozen": frozen, "paused": paused}));
+		}
+		Ok(json!({"round": txid.to_string(), "vout": vout, "asset": asset.to_string(), "supervised_on_the_node": supervised,
+			"published_allowance": allowance.map(|a| a.to_string()), "explicit": explicit.is_ok(), "leaves": leaves,
+			"ok": problems.is_empty(), "problems": problems}))
+	}
+
 	// -----------------------------------------------------------------------
 	// Coins against the chain
 	// -----------------------------------------------------------------------
@@ -2521,6 +2623,23 @@ impl Wallet {
 			if alone && c.kind == "transfer" && HELD.contains(&c.state.as_str()) {
 				v["record_held"] = json!(NO_KEEPER);
 			}
+			// A coin of a supervised asset: where it lands, and whether its
+			// issuer has frozen it, read from the wallet's own node at the
+			// landing, never at the coin's own Arca script.
+			if Self::homeward(&c.state) {
+				if let Some(l) = CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.landing()) {
+					v["landing"] = json!(self.chain.address(&l.script_pubkey())?.unwrap_or_else(|| hex(l.script_pubkey().as_bytes())));
+					let (frozen, paused) = self.landing_frozen(l.asset, &l.program)?;
+					v["frozen"] = json!({"frozen": frozen, "paused": paused});
+					if frozen || paused {
+						v["frozen"]["note"] = json!(format!("{} of supervised asset {}: the operator co-signs nothing that spends it (no transfer, \
+							swap, refresh or offboard); it leaves the tree only by its landing, into this wallet's own key {}, where it stays \
+							frozen until the issuer lifts the freeze, and sync takes it home there before its exit date (exit takes it now)",
+							if paused { "the issuer has paused this asset" } else { "the issuer has frozen this coin's landing" }, l.asset,
+							v["landing"].as_str().unwrap_or("")));
+					}
+				}
+			}
 			if Self::homeward(&c.state) && !self.given_up_for_held_leaves(&c)? {
 				if let Some(d) = CoinDates::of(c.expiry) {
 					v["sync_daily_from"] = json!(d.sync_daily_from);
@@ -2575,7 +2694,7 @@ impl Wallet {
 	/// block, and the change an earlier exit of this process made from one,
 	/// while unspent.
 	pub(crate) fn fee_candidates(&self) -> Result<Vec<(OutPoint, TxOut, Keypair)>, Error> {
-		let mut out: Vec<(OutPoint, TxOut, Keypair)> = self.onchain_coins()?.into_iter().map(|(op, o, k, _)| (op, o, k)).collect();
+		let mut out: Vec<(OutPoint, TxOut, Keypair)> = self.spendable_onchain_coins()?.into_iter().map(|(op, o, k, _)| (op, o, k)).collect();
 		for (op, o, k) in self.change_in_flight.borrow().iter() {
 			if !out.iter().any(|c| c.0 == *op) && self.chain.unspent(op)? {
 				out.push((*op, o.clone(), *k));
@@ -2647,10 +2766,18 @@ impl Wallet {
 			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += c.value;
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
-		// Its on-chain coins and its orders' credits at their keys alike.
-		for (_, o, _, _) in self.onchain_coins()?.into_iter().chain(self.order_coins()?) {
+		let mut frozen_onchain: BTreeMap<String, u64> = BTreeMap::new();
+		// Its on-chain coins and its orders' credits at their keys alike; a
+		// coin a freeze binds is held, counted, and shown apart, as nothing
+		// spends it until the freeze is lifted.
+		let coins: Vec<(OutPoint, TxOut)> = self.onchain_coins()?.into_iter().chain(self.order_coins()?).map(|(op, o, _, _)| (op, o)).collect();
+		let frozen = self.frozen_onchain(&coins)?;
+		for (op, o) in &coins {
 			if let (Some(a), Some(v)) = (o.asset.explicit(), o.value.explicit()) {
 				*onchain.entry(a.to_string()).or_default() += v;
+				if frozen.contains(op) {
+					*frozen_onchain.entry(a.to_string()).or_default() += v;
+				}
 			}
 		}
 		// Each asset held, Arca and on-chain together: a coin whose exit's
@@ -2672,7 +2799,12 @@ impl Wallet {
 			.collect::<serde_json::Map<_, _>>().into();
 		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
 		let held: Value = held.into_iter().filter(|(_, v)| *v > 0).map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
-		Ok(json!({"total": total, "held": held, "arca": arca, "sequentia_onchain": onchain}))
+		let mut out = json!({"total": total, "held": held, "arca": arca, "sequentia_onchain": onchain});
+		if !frozen_onchain.is_empty() {
+			out["sequentia_onchain_frozen"] = frozen_onchain.into_iter().map(|(a, v)| (a, json!(v.to_string())))
+				.collect::<serde_json::Map<_, _>>().into();
+		}
+		Ok(out)
 	}
 
 	/// The headline of a balance: what `held` (atoms of each asset) is worth
@@ -2726,6 +2858,9 @@ impl Wallet {
 			"chain": self.store.meta("chain_name")?,
 			"operator": self.operator.to_string(),
 			"mailbox_key": self.keys.mailbox()?.x_only_public_key().0.to_string(),
+			// Where every coin of a supervised asset lands, and stays frozen
+			// while its issuer freezes the holder.
+			"landing_address": self.landing_address()?,
 			"exit_delay_units": self.cfg.exit_delay_units,
 			"accepted_exit_delay_units": {"min": self.cfg.min_exit_delay_units, "max": self.cfg.max_exit_delay_units},
 			"keepers": self.keepers_json()?,
@@ -2845,6 +2980,34 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// The coins among `coins` (on-chain, single-owner) that a freeze binds
+	/// now: of a supervised asset, at a script frozen for it or with the
+	/// asset paused, as the wallet's node shows it. The node refuses every
+	/// spend of one, so the wallet spends none: it keeps them out of every
+	/// selection, and shows them apart.
+	pub(crate) fn frozen_onchain(&self, coins: &[(OutPoint, TxOut)]) -> Result<Vec<OutPoint>, Error> {
+		let supervised = self.chain.supervised_assets()?;
+		let mut out = vec![];
+		for (op, o) in coins {
+			let Some(a) = o.asset.explicit() else { continue };
+			if supervised.contains(&a) {
+				let (frozen, paused) = self.chain.freeze_status(a, &o.script_pubkey)?;
+				if frozen || paused {
+					out.push(*op);
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// [`Self::onchain_coins`] the wallet can spend: without those a freeze
+	/// binds ([`Self::frozen_onchain`]).
+	pub(crate) fn spendable_onchain_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
+		let all = self.onchain_coins()?;
+		let frozen = self.frozen_onchain(&all.iter().map(|(op, o, _, _)| (*op, o.clone())).collect::<Vec<_>>())?;
+		Ok(all.into_iter().filter(|(op, _, _, _)| !frozen.contains(op)).collect())
 	}
 
 	/// The wallet's unspent coins at its order keys' programs: the credits
@@ -3010,10 +3173,13 @@ impl Wallet {
 		let key = self.keys.leaf(&owner_nonce)?;
 		let owner = key.x_only_public_key().0;
 		self.store.put_nonce(&owner_nonce, &owner.serialize(), "board")?;
+		// A board of a supervised asset converts into a landing-1 leaf at the
+		// wallet's landing key.
+		let landing = self.landing_rule(&info, asset)?;
 		let record = BoardRecord {
 			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
 			asset, value, chain: self.genesis, operator: self.operator,
-			landing: None,
+			landing,
 		};
 		let (tx, fee, _) = self.board_tx(&record, fee_asset, &change, true)?;
 		// The coins could have moved between the two: the fee signed is the
@@ -3037,7 +3203,7 @@ impl Wallet {
 		// which a key-path signature spends.
 		let order_coins = self.order_coins()?;
 		let key_path: Vec<OutPoint> = order_coins.iter().map(|c| c.0).collect();
-		let coins: Vec<(OutPoint, TxOut, Keypair, u64)> = self.onchain_coins()?.into_iter().chain(order_coins).collect();
+		let coins: Vec<(OutPoint, TxOut, Keypair, u64)> = self.spendable_onchain_coins()?.into_iter().chain(order_coins).collect();
 		let mut chosen: Vec<(OutPoint, TxOut, Keypair)> = vec![];
 		let mut fee = self.fee_for(fee_asset, 300)?;
 		let tx = loop {

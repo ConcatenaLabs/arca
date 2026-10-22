@@ -866,11 +866,24 @@ impl Wallet {
 				Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, asset).map_err(|e| e.to_string())?),
 				None => None,
 			};
-			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order });
+			// A landing-1 leaf's landing, likewise covered by the id: the
+			// wallet's own landing key, or the participation is not its own.
+			let landing = match l.get("landing").filter(|g| !g.is_null()) {
+				Some(g) => Some(arca_covenant::record_json::landing_from_json(g).map_err(|e| e.to_string())?),
+				None => None,
+			};
+			if landing.is_some_and(|g| self.keys.landing_program().is_ok_and(|p| p != g.program)) {
+				return Err(format!("participation {} wants a landing-1 leaf landing at another key than this wallet's: the wallet takes the \
+					coin as not given up to it", pid));
+			}
+			wanted.push(Wanted::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing });
 			nonces.push((owner_nonce, owner, asset, value));
 			let mut w = json!({"nonce": hex(&owner_nonce), "asset": asset.to_string(), "value": value.to_string()});
 			if let Some(o) = &order {
 				w["order"] = arca_covenant::record_json::order_terms_json(o);
+			}
+			if let Some(g) = &landing {
+				w["landing"] = arca_covenant::record_json::landing_json(g);
 			}
 			wanted_json.push(w);
 		}

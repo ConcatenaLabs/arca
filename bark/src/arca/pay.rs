@@ -151,13 +151,23 @@ impl Out {
 			v["htlc"] = json!({"direction": t.direction.name(), "payment_hash": hex(&t.payment_hash),
 				"timeout": t.timeout.to_consensus_u32(), "operator_delay_units": t.operator_delay.units()});
 		}
+		if let Some(l) = self.leaf.landing.and_then(|t| t.landing(self.asset, self.value).ok()) {
+			v["landing"] = arca_covenant::record_json::landing_json(&l);
+		}
 		v
 	}
 
 	fn from_json(v: &Value) -> Result<Out, Error> {
+		let asset = asset_of(&v["asset"], "an output's asset")?;
+		let value = amount(&v["value"], "an output's value")?;
+		let landing = match v.get("landing").filter(|g| !g.is_null()) {
+			Some(g) => Some(arca_covenant::record_json::landing_from_json(g).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?
+				.terms(asset, value).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?),
+			None => None,
+		};
 		Ok(Out {
-			asset: asset_of(&v["asset"], "an output's asset")?,
-			value: amount(&v["value"], "an output's value")?,
+			asset,
+			value,
 			leaf: NewLeaf {
 				owner: XOnlyPublicKey::from_slice(&unhex(v["owner"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 				owner_nonce: unhex32(v["owner_nonce"].as_str().unwrap_or(""))?,
@@ -165,7 +175,7 @@ impl Out {
 				exit_delay: RelativeTime::from_units(v["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
-				landing: None,
+				landing,
 			},
 			mailbox: XOnlyPublicKey::from_slice(&unhex(v["mailbox"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 			until: v["until"].as_u64().map(|u| u32::try_from(u).map_err(|_| Error::Parse(format!("an output's lapse {}", u)))).transpose()?,
@@ -276,6 +286,9 @@ impl Wallet {
 			"owner": hex(&key.serialize()), "owner_nonce": hex(&nonce),
 			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()),
 			"exit_delay_units": self.cfg.exit_delay_units, "until": until,
+			// Where a coin of a supervised asset paid to it lands: the
+			// wallet's landing key, the same for every such coin.
+			"landing": hex(&self.keys.landing_program()?),
 		});
 		if let Some(a) = asset {
 			req["asset"] = json!(a.to_string());
@@ -310,6 +323,15 @@ impl Wallet {
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
 		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None })
+	}
+
+	/// [`Self::own_leaf`] of `value` of `asset`: for a supervised asset a
+	/// `landing-1` leaf at the wallet's landing key ([`Wallet::landing_rule`]).
+	pub(crate) fn own_leaf_of(&self, purpose: &str, info: &Value, asset: AssetId, value: u64) -> Result<NewLeaf, Error> {
+		let mut leaf = self.own_leaf(purpose)?;
+		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose()
+			.map_err(|e| Error::Refused(e.to_string()))?;
+		Ok(leaf)
 	}
 
 	/// [`Self::own_leaf`], for the other modules.
@@ -527,6 +549,20 @@ impl Wallet {
 		if value < min {
 			return Err(Error::Refused(format!("{} is below the operator's smallest leaf in asset {}, {}", value, asset, min)));
 		}
+		// A supervised asset is paid into a landing-1 leaf at the landing the
+		// request names, with the operator's allowance; the change lands at
+		// the wallet's own.
+		let rule = self.landing_rule(&info, asset)?;
+		let theirs = match &rule {
+			Some(own) => {
+				let program: [u8; 20] = unhex(req["landing"].as_str().unwrap_or(""))?.try_into().map_err(|_| Error::Refused(format!(
+					"asset {} is supervised, and the request names no landing: a coin of it lands only at its receiver's own key, which a \
+					request from an older wallet does not name; ask the receiver for a new request", asset)))?;
+				Some(arca_covenant::Landing { program, allowance: own.allowance }.terms(asset, value)
+					.map_err(|e| Error::Refused(e.to_string()))?)
+			},
+			None => None,
+		};
 		let to = Out {
 			asset, value,
 			leaf: NewLeaf {
@@ -538,7 +574,7 @@ impl Wallet {
 				exit_delay: RelativeTime::from_units(req["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
-				landing: None,
+				landing: theirs,
 			},
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
 			// The server records no payment to the request past its lapse,
@@ -549,7 +585,8 @@ impl Wallet {
 		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0)?;
 		let mut outs = vec![to];
 		if change > 0 {
-			let leaf = self.own_leaf("change")?;
+			let mut leaf = self.own_leaf("change")?;
+			leaf.landing = rule.map(|own| own.terms(asset, change)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 			outs.push(Out { asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0, until: None });
 		}
 		let answer = self.transfer(&inputs, &outs, &[])?;
@@ -875,6 +912,18 @@ impl Wallet {
 		}
 		if let Some(c) = self.store.coin_by_salt(&a.valid.leaf.salt)? {
 			return Err(Error::Refused(format!("the coin's salt is that of coin {} the wallet has held: its old pairs would spend it", c.leaf_id)));
+		}
+		// A coin of a supervised asset lands at the wallet's own key, as the
+		// wallet's node says the asset is; a landing elsewhere would put the
+		// coin's exit in another's key.
+		if let Some(t) = &a.valid.leaf.landing {
+			if t.program != self.keys.landing_program()? {
+				return Err(Error::Refused(format!("the coin lands at P2WPKH {}, which is not this wallet's landing key: its exit would pay \
+					another", hex(&t.program))));
+			}
+		} else if self.chain.supervised_assets()?.contains(&a.valid.asset) {
+			return Err(Error::Refused(format!("the coin is of asset {}, which is supervised on the chain, and it is no landing-1 leaf: its \
+				exit would pay where a freeze of the asset does not follow", a.valid.asset)));
 		}
 		// D57: a coin a day or less from its exit date, or past it, goes on
 		// the chain at once from wherever its lineage is: whoever shares that
@@ -1412,7 +1461,7 @@ impl Wallet {
 			return Err(Error::Refused("each side of a swap is at least the operator's smallest leaf in its asset".into()));
 		}
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let want_leaf = self.own_leaf("swap")?;
+		let want_leaf = self.own_leaf_of("swap", &info, want_asset, want)?;
 		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox, until: None };
 		// The taker's leaf of `give`, and its change, are not known yet: size
 		// with probes of the same shape.
@@ -1421,7 +1470,7 @@ impl Wallet {
 		let (inputs, margin, change) = self.choose(&info, give_asset, give, &others, true, min_give, 1)?;
 		let mut outs = vec![wanted];
 		if change > 0 {
-			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf("change")?, mailbox, until: None });
+			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
 		}
 		let offer = json!({
 			"kind": OFFER_KIND.name, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
@@ -1594,12 +1643,13 @@ impl Wallet {
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let mut outs = o.maker_outs.clone();
-		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf("swap")?, mailbox, until: None });
+		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_of("swap", &info, give_asset, give)?, mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		let (mine, _, change) = self.choose(&info, want_asset, want, &others, false, min_want, 0)?;
 		if change > 0 {
-			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf("change")?, mailbox, until: None });
+			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_of("change", &info, want_asset, change)?, mailbox,
+				until: None });
 		}
 		if outs.len() > arca_covenant::leaf::MAX_OUTPUTS as usize {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outs.len(),
@@ -1800,8 +1850,13 @@ impl Wallet {
 	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's
 	/// own, through the server, with the margins a transfer leaves.
 	pub(crate) fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
-		let leaf = self.own_leaf("cancel")?;
+		let mut leaf = self.own_leaf("cancel")?;
 		let (asset, inputs, value) = self.respend_plan(rows, &leaf)?;
+		// A coin of a supervised asset goes back into a landing-1 leaf at the
+		// wallet's own landing; the plan sized it with a leaf of the same shape.
+		let info = self.server_info()?;
+		leaf.landing = self.landing_rule(&info, asset)?.map(|l| l.terms(asset, value)).transpose()
+			.map_err(|e| Error::Refused(e.to_string()))?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
 	}

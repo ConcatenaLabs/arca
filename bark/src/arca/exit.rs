@@ -128,13 +128,26 @@ pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
 }
 
 /// The vsize a claim of `leaf` pays its own fee for: a plain leaf's exit is
-/// about 220 vbytes; an `htlc-1` leaf's claim or refund, its longer script
-/// and a received leaf's preimage in its witness, about 250, priced at 300.
+/// about 220 vbytes; a `landing-1` leaf's landing, its script checking the
+/// output, about 227, priced at 240; an `htlc-1` leaf's claim or refund, its
+/// longer script and a received leaf's preimage in its witness, about 250,
+/// priced at 300.
 fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
-	if leaf.htlc.is_some() { 300 } else { 220 }
+	if leaf.htlc.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
 }
 
 impl Wallet {
+	/// Where the claim of `coin` pays: receive address `claim_index`, or, for
+	/// a `landing-1` leaf of a supervised asset, its landing, P2WPKH of the
+	/// wallet's landing key, the only output its exit can pay, where a freeze
+	/// of the asset binds on the chain.
+	fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {
+		match coin.leaf.landing {
+			Some(l) => Ok(l.script_pubkey()),
+			None => self.keys.onchain_script(super::keys::RECEIVE, claim_index),
+		}
+	}
+
 	fn change_key(&self) -> Result<(Script, Keypair), Error> {
 		let i = self.store.take_index(CHANGE)?;
 		let k = self.keys.onchain(CHANGE, i)?;
@@ -371,7 +384,7 @@ impl Wallet {
 		}
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
 		let key = self.keys.leaf(&row.owner_nonce)?;
-		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index as u32)?;
+		let to = self.claim_script(coin, claim_index as u32)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
 		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need };
 		let new = self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after)?;
@@ -429,7 +442,7 @@ impl Wallet {
 		}
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf_id)))?;
 		let key = self.coin_key(&row.owner_nonce)?;
-		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
+		let to = self.claim_script(coin, claim_index)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
 		let mut need = self.outbid(old, asset, claim_vsize(&coin.leaf))?;
 		if let Some((b, max)) = bid {
@@ -841,7 +854,7 @@ impl Wallet {
 			return Ok(json!({"leaf_id": leaf_id, "state": "unrolling", "broadcast": steps, "leaf": leaf_at.to_string(),
 				"next": "the leaf's transaction is not in a block yet; run exit again once it is"}));
 		}
-		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
+		let to = self.claim_script(&coin, claim_index)?;
 		let leaf = coin.leaf;
 		// A received leaf whose preimage is not in hand yet waits on the chain
 		// for it; the claim goes out once it is.
@@ -983,7 +996,7 @@ impl Wallet {
 				return Ok(Some(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": txid, "note": why})));
 			}
 			if let Some(i) = prior["claim_index"].as_u64() {
-				let to = self.keys.onchain_script(super::keys::RECEIVE, i as u32)?;
+				let to = self.claim_script(coin, i as u32)?;
 				if sp.output.iter().any(|o| o.script_pubkey == to) {
 					// The wallet's own claim: the coin is exited once it is final.
 					let f = self.chain.finality(&sp.txid())?;
