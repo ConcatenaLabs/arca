@@ -287,9 +287,16 @@ The commands that work the bond each print JSON:
 
 - `bond-post` pays the bond from a node wallet the operator names. It refuses
   a wallet whose name marks it a treasury, a reserve, a bridge's, an escrow or
-  another service's. The fee is in the bond's own asset unless another is
-  named, and never falls back to another. It prints the `outpoint` line for
-  `[bond]`; add it and restart `arcad`.
+  another service's. It pays nothing while the operator key has already
+  signed two messages under one salt: a salt under which the signer's record
+  holds two different digests, or a leaf the database holds operator-signed
+  forfeits of for more than one round (a signer that ran a lost round's
+  participation again with a second forfeit, before it kept one message per
+  salt, left such pairs). Each pair burns any bond under the key in the hands
+  of whoever holds the database or a backup of it, so such an operator posts
+  its bond under a new operator key. The fee is in the bond's own asset unless
+  another is named, and never falls back to another. It prints the `outpoint`
+  line for `[bond]`; add it and restart `arcad`.
 - `bond-notice` and `bond-withdraw` sign with `W`'s key from its file. Their
   fee comes from the operator's on-chain wallet: the bond's asset first, then
   the fee assets, then the served assets.
@@ -2909,7 +2916,10 @@ configuration names it and `noticed` after, with the median time from which
 it can be withdrawn; a second notice and a withdrawal before the delay are
 refused (`non-BIP68-final`); and a server with a notice one unit short of a
 lifetime, the longest exit delay and a day, or with the operator key as the
-withdrawal key, does not start.
+withdrawal key, does not start. After a board is refreshed in two rounds no
+salt holds two messages; with the board's forfeit for the first round held for
+the second as well, as a lost round's re-run under the old rule left it,
+`bond-post` names the leaf and pays nothing.
 
 `tests/signer.rs` runs `arca-signer` as its own process: its key, a
 rebindable message, and the spend of a clock's release whose signature verifies
