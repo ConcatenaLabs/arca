@@ -213,7 +213,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let landing = Landing { program, allowance: ALLOWANCE };
 	let land_spk = landing.script_pubkey();
 	let (chain, genesis) = (net.chain, net.genesis);
-	let leaf = |salt: &str| LeafPolicy {
+	let leaf = |salt: &str| LeafPolicy { enclave: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
 		landing: Some(landing.terms(sup.z, V).unwrap()),
 		channel: None,

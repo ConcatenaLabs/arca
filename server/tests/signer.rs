@@ -44,7 +44,7 @@ async fn the_signer_process() {
 
 	// A rebindable message for a leaf on this chain: the signature verifies
 	// against the message arca-covenant builds.
-	let leaf = LeafPolicy {
+	let leaf = LeafPolicy { enclave: None,
 		owner: xonly(&keypair("owner")), operator: xonly(&s), salt: [5; 32], chain: Chain::new(genesis),
 		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(),
 		htlc: None,

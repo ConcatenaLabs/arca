@@ -65,6 +65,10 @@
 //!   binds, and whose collaborative constant commits to that key too; and
 //!   the check that a round of a supervised asset keeps every output
 //!   explicit;
+//! - the leaf of a restricted asset ([`enclave`]): `enclave-1`, whose exit
+//!   pays only its holder's enclave, in full, whose owner key is derived from
+//!   the holder's registered key, and which carries the asset's claw leaf
+//!   where the asset elected clawback;
 //! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
@@ -108,6 +112,7 @@ pub mod forfeit;
 pub mod gate;
 pub mod htlc;
 pub mod issuer;
+pub mod enclave;
 pub mod landing;
 pub mod leaf;
 pub mod limiter;
@@ -151,6 +156,7 @@ pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLea
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
+pub use enclave::{enclave_key, enclave_keypair, Enclave, EnclaveError, EnclaveTerms};
 pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};

@@ -69,6 +69,16 @@
 //! u64   the fee allowance, below the value
 //! ```
 //!
+//! A board of a restricted asset converts into an `enclave-1` leaf
+//! ([`crate::enclave`]) and carries the asset's claw leaf where it elected
+//! clawback. Its record is format version 4: the fields above, then
+//!
+//! ```text
+//! [32]  H, the holder's registered key; the owner key is its enclave key for the owner nonce
+//! [32]  Kp, the asset's policy key
+//! u8    1 where the asset elected clawback, then [32] Ki, the issuer's key; else 0
+//! ```
+//!
 //! The leaf id of a board is the leaf id of a batch of no levels whose batch
 //! output is the board output: the BIP340 tagged hash, tag `Arca/leaf-id`, of
 //! `board program (32) ‖ 0x00 ‖ leaf program (32)`. A leaf of a batch always
@@ -81,6 +91,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, Txid};
 
 use crate::encode::{DecodeError, Reader};
+use crate::enclave::Enclave;
 use crate::landing::{Landing, LandingTerms, PROGRAM_BYTES};
 use crate::leaf::{leaf_salt, LeafPolicy};
 use crate::message::{Chain, CsfsMessage};
@@ -98,6 +109,10 @@ pub const BOARD_RECORD_VERSION: u8 = 2;
 /// The board record format of a board that converts into a `landing-1`
 /// leaf: [`BOARD_RECORD_VERSION`]'s fields, then the landing.
 pub const BOARD_LANDING_RECORD_VERSION: u8 = 3;
+
+/// The board record format of a board that converts into an `enclave-1`
+/// leaf: [`BOARD_RECORD_VERSION`]'s fields, then the enclave.
+pub const BOARD_ENCLAVE_RECORD_VERSION: u8 = 4;
 
 /// A board output's policy: the leaf it converts into, and its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,9 +138,21 @@ impl BoardPolicy {
 			.into_script()
 	}
 
-	/// `[collab, convert]`, both at depth 1; `collab` is the leaf's own.
+	/// `[collab, convert]`, both at depth 1; `collab` is the leaf's own. A
+	/// board that converts into an `enclave-1` leaf of an asset that elected
+	/// clawback carries the claw leaf too, `[collab, [convert, claw]]`: the
+	/// coin is on the chain from the start.
 	pub fn taproot(&self) -> TapOutput {
-		TapOutput::new(vec![(1, self.leaf.collab_script()), (1, self.convert_script())])
+		match self.leaf.claw_script() {
+			Ok(claw) => TapOutput::new(vec![(1, self.leaf.collab_script()), (2, self.convert_script()), (2, claw)]),
+			Err(_) => TapOutput::new(vec![(1, self.leaf.collab_script()), (1, self.convert_script())]),
+		}
+	}
+
+	/// The board's claw witness, where its leaf has a claw path: the policy
+	/// key's signature below the issuer's, over the claw's signature hash.
+	pub fn claw_witness(&self, issuer_sig: &Signature, policy_sig: &Signature) -> Result<Vec<Vec<u8>>, crate::EnclaveError> {
+		Ok(self.taproot().witness(&self.leaf.claw_script()?, vec![policy_sig.as_ref().to_vec(), issuer_sig.as_ref().to_vec()]))
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -153,6 +180,16 @@ impl BoardPolicy {
 	pub fn conversion(&self, board: OutPoint, fee: &FeeSource) -> Result<KeySpend, SpendError> {
 		let u = assemble(LockTime::ZERO, vec![(board, self.output().txout(), FINAL)], &[self.leaf_output()], fee, FINAL)?;
 		Ok(KeySpend::from_parts(u.tx, u.prevouts, self.taproot(), self.convert_script()))
+	}
+
+	/// The clawback of the board at `board` by its claw leaf, into `outputs`,
+	/// for a board of a restricted asset that elected clawback. The issuer and
+	/// the policy key each sign [`KeySpend::sighash`]; it is finished with
+	/// `[policy_sig, issuer_sig]`.
+	pub fn claw_tx(&self, board: OutPoint, outputs: &[ExplicitOutput], fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		let claw = self.leaf.claw_script().map_err(SpendError::Enclave)?;
+		let u = assemble(LockTime::ZERO, vec![(board, self.output().txout(), FINAL)], outputs, fee, FINAL)?;
+		Ok(KeySpend::from_parts(u.tx, u.prevouts, self.taproot(), claw))
 	}
 
 	/// The full conversion witness: the owner's signature.
@@ -206,6 +243,9 @@ pub struct BoardRecord {
 	/// The landing of the `landing-1` leaf it converts into, for a board of a
 	/// supervised asset; `None` for one that converts into `vtxo-1`.
 	pub landing: Option<Landing>,
+	/// The holder's enclave of the `enclave-1` leaf it converts into, for a
+	/// board of a restricted asset; `None` otherwise.
+	pub enclave: Option<Enclave>,
 }
 
 /// What [`BoardRecord::validate`] returns for a board it accepts.
@@ -242,6 +282,7 @@ impl BoardRecord {
 				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance),
 			}),
 			channel: None,
+			enclave: self.enclave.map(|e| e.terms(self.asset, self.value)),
 		}
 	}
 
@@ -271,12 +312,24 @@ impl BoardRecord {
 		if let Some(l) = &self.landing {
 			l.terms(self.asset, self.value).map_err(RecordError::Landing)?;
 		}
+		if let Some(e) = &self.enclave {
+			if self.landing.is_some() {
+				return Err(RecordError::Template("a board converts into landing-1 or enclave-1, not both".into()));
+			}
+			e.check_owner(&self.owner, &self.owner_nonce).map_err(RecordError::Enclave)?;
+		}
 		Ok(())
 	}
 
 	/// The record format version it is written in.
 	pub fn version(&self) -> u8 {
-		if self.landing.is_some() { BOARD_LANDING_RECORD_VERSION } else { BOARD_RECORD_VERSION }
+		if self.landing.is_some() {
+			BOARD_LANDING_RECORD_VERSION
+		} else if self.enclave.is_some() {
+			BOARD_ENCLAVE_RECORD_VERSION
+		} else {
+			BOARD_RECORD_VERSION
+		}
 	}
 
 	/// The wallet's check that the record is for its key and for the nonce it
@@ -380,6 +433,9 @@ impl BoardRecord {
 			w.extend(l.program);
 			w.extend(l.allowance.to_le_bytes());
 		}
+		if let Some(e) = &self.enclave {
+			e.write(&mut w);
+		}
 		Ok(w)
 	}
 
@@ -387,7 +443,7 @@ impl BoardRecord {
 	pub fn from_bytes(data: &[u8]) -> Result<BoardRecord, RecordError> {
 		let mut r = Reader::new(data);
 		let version = r.u8()?;
-		if version != BOARD_RECORD_VERSION && version != BOARD_LANDING_RECORD_VERSION {
+		if version != BOARD_RECORD_VERSION && version != BOARD_LANDING_RECORD_VERSION && version != BOARD_ENCLAVE_RECORD_VERSION {
 			return Err(RecordError::Version(version as u64));
 		}
 		let template_id = r.u8()?;
@@ -403,11 +459,15 @@ impl BoardRecord {
 			chain: r.chain()?,
 			operator: r.key()?,
 			landing: None,
+			enclave: None,
 		};
 		if version == BOARD_LANDING_RECORD_VERSION {
 			let mut program = [0u8; PROGRAM_BYTES];
 			program.copy_from_slice(r.bytes(PROGRAM_BYTES)?);
 			record.landing = Some(Landing { program, allowance: r.u64()? });
+		}
+		if version == BOARD_ENCLAVE_RECORD_VERSION {
+			record.enclave = Some(r.enclave()?);
 		}
 		if r.remaining() != 0 {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
@@ -423,7 +483,7 @@ mod json {
 	use elements::{AssetId, BlockHash};
 	use serde_json::{Map, Value};
 
-	use super::{BoardRecord, BOARD_LANDING_RECORD_VERSION, BOARD_RECORD_VERSION};
+	use super::{BoardRecord, BOARD_ENCLAVE_RECORD_VERSION, BOARD_LANDING_RECORD_VERSION, BOARD_RECORD_VERSION};
 	use crate::message::Chain;
 	use crate::record::{RecordError, Template};
 	use crate::record_json::{amount, bytes32, canonical_text, display, display32, hex, int, key, object, string, strict, units};
@@ -433,8 +493,8 @@ mod json {
 		/// The JSON form: the binary form's fields, named as the leaf
 		/// record's are (`version`, `template`, `owner`, `owner_nonce`,
 		/// `operator_nonce`, `exit_delay_units`, `asset`, `value`,
-		/// `genesis_hash`, `operator`, and `landing` in format 3), with the
-		/// same conventions.
+		/// `genesis_hash`, `operator`, `landing` in format 3 and `enclave` in
+		/// format 4), with the same conventions.
 		pub fn to_json(&self) -> Result<Value, RecordError> {
 			self.check()?;
 			let mut m = Map::new();
@@ -450,6 +510,9 @@ mod json {
 			m.insert("operator".into(), Value::String(hex(&self.operator.serialize())));
 			if let Some(l) = &self.landing {
 				m.insert("landing".into(), crate::record_json::landing_json(l));
+			}
+			if let Some(e) = &self.enclave {
+				m.insert("enclave".into(), crate::record_json::enclave_json(e));
 			}
 			Ok(Value::Object(m))
 		}
@@ -475,9 +538,13 @@ mod json {
 			if named == Some(BOARD_LANDING_RECORD_VERSION as u64) {
 				fields.push("landing");
 			}
+			if named == Some(BOARD_ENCLAVE_RECORD_VERSION as u64) {
+				fields.push("enclave");
+			}
 			let m = object(v, "board", &fields)?;
 			let version = int(m, "version", u64::MAX)?;
-			if version != BOARD_RECORD_VERSION as u64 && version != BOARD_LANDING_RECORD_VERSION as u64 {
+			if version != BOARD_RECORD_VERSION as u64 && version != BOARD_LANDING_RECORD_VERSION as u64
+				&& version != BOARD_ENCLAVE_RECORD_VERSION as u64 {
 				return Err(RecordError::Version(version));
 			}
 			let template: Template = string(m, "template")?.parse()?;
@@ -492,6 +559,7 @@ mod json {
 				chain: Chain::new(BlockHash::from_byte_array(display32(m, "genesis_hash")?)),
 				operator: key(m, "operator")?,
 				landing: m.get("landing").map(crate::record_json::landing_from_json).transpose()?,
+				enclave: m.get("enclave").map(crate::record_json::enclave_from_json).transpose()?,
 			};
 			record.check()?;
 			Ok(record)

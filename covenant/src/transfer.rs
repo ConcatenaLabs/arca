@@ -140,8 +140,8 @@
 //!         u16  length L, then L bytes: its AccumulatorRecord, binary form
 //!         [32] the preimage of its entry's unlock hash
 //!         [64] signature, u32 time: its owner's exit authorisation
-//!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, or 5 one
-//!       whose leaf is landing-1:
+//!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, 5 one
+//!       whose leaf is landing-1, or 7 one whose leaf is enclave-1:
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
@@ -154,6 +154,9 @@
 //!                         u16 operator delay units
 //!         for tag 5 only: [20] the landing program, u64 the fee allowance: the landing
 //!                         pays at least the coin's output value less it, in its asset
+//!         for tag 7 only (enclave-1): [32] the holder's key H, [32] the policy key Kp,
+//!                         u8 1 and [32] the issuer's key Ki where the asset elected
+//!                         clawback, else 0; the exit pays the coin's whole output value
 //! ```
 //!
 //! A reassignment may create an `htlc-1` leaf ([`crate::htlc`]): a payment
@@ -251,6 +254,11 @@ pub struct NewLeaf {
 	/// asset and the least the landing pays, so they must agree with the
 	/// output the leaf is paid ([`LandingTerms::landing`]); `None` otherwise.
 	pub landing: Option<LandingTerms>,
+	/// `enclave-1`'s terms, for a leaf of a restricted asset: the holder's
+	/// enclave, with the asset and the whole value its exit pays, so they
+	/// must agree with the output the leaf is paid
+	/// ([`crate::EnclaveTerms::check_leaf`]); `None` otherwise.
+	pub enclave: Option<crate::EnclaveTerms>,
 }
 
 impl NewLeaf {
@@ -258,7 +266,7 @@ impl NewLeaf {
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
-			order: None, landing: self.landing,
+			order: None, landing: self.landing, enclave: self.enclave,
 			channel: None,
 		}
 	}
@@ -408,6 +416,8 @@ pub enum TransferError {
 	Version(u8),
 	#[error("a landing-1 leaf's terms: {0}")]
 	Landing(String),
+	#[error("an enclave-1 leaf's terms: {0}")]
+	Enclave(String),
 	#[error("unknown coin tag {0}")]
 	Tag(u8),
 	#[error("reassignments nest more than {max} deep", max = MAX_HOPS)]
@@ -477,6 +487,7 @@ impl TransferError {
 		match self {
 			Decode(_) | Version(_) | Tag(_) | TooDeep | Inputs(_) | Outputs(_) | Index { .. } => "decode",
 			Landing(_) => "landing",
+			Enclave(_) => "enclave",
 			Record(e) => e.kind(),
 			Accumulator(AccumulatorError::Record(e)) => e.kind(),
 			Accumulator(_) => "accumulator",
@@ -1062,6 +1073,21 @@ impl CoinRecord {
 		}
 	}
 
+	/// The enclave terms of an `enclave-1` coin, from its record alone: the
+	/// holder whose enclave its exit pays (a board that converts into one, or a
+	/// reassignment's output); `None` for a coin of any other template. An
+	/// operator asks the policy server about this holder before it co-signs.
+	pub fn enclave(&self) -> Option<crate::EnclaveTerms> {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.leaf().enclave,
+			// No batch holds an enclave-1 leaf, an accumulator batch neither.
+			CoinRecord::Accumulator { .. } => None,
+			CoinRecord::Board(b) => b.leaf().enclave,
+			CoinRecord::Transfer(t) => t.leaf.enclave,
+			CoinRecord::Fill(_) => None,
+		}
+	}
+
 	/// The key and nonce the coin's record names for its owner. For a fill's
 	/// credit and remainder the key comes from the order's terms; `None` when
 	/// the order coin's record names no order.
@@ -1256,6 +1282,12 @@ impl CoinRecord {
 				if let Some(terms) = &t.leaf.landing {
 					terms.landing(mine.asset, mine.value).map_err(|e| TransferError::Landing(e.to_string()))?;
 				}
+				// An enclave-1 leaf exits with all it holds, and its owner key
+				// is its holder's for its owner nonce.
+				if let Some(terms) = &t.leaf.enclave {
+					terms.check_leaf(mine.asset, mine.value).map_err(|e| TransferError::Enclave(e.to_string()))?;
+					terms.enclave.check_owner(&t.leaf.owner, &t.leaf.owner_nonce).map_err(|e| TransferError::Enclave(e.to_string()))?;
+				}
 				let id = transfer_id(&parts, &t.outputs, t.index, &leaf.program());
 				Ok(ValidCoin {
 					id, leaf, asset: mine.asset, value: mine.value, sweep: first.sweep,
@@ -1308,7 +1340,7 @@ impl CoinRecord {
 					(0, _, FillLeaf::Credit { .. }) => op.credit_leaf().ok_or_else(|| TransferError::Fill("the order's credit keys are used up".into()))?,
 					(1, true, FillLeaf::Rest { .. }) => op.next().leaf(),
 					(i, partial, FillLeaf::New(l)) if i >= if partial { 2 } else { 1 } => {
-						if l.htlc.is_some() || l.landing.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() || l.enclave.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						if !policy.exit_delay_ok(l.exit_delay) {
@@ -1396,7 +1428,14 @@ impl CoinRecord {
 					(Some(_), None) => return Err(TransferError::Index { index: t.index as usize, count: t.outputs.len() }),
 					(None, _) => None,
 				};
-				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else { 1 });
+				if let Some(terms) = &t.leaf.enclave {
+					let o = t.outputs.get(t.index as usize).ok_or(TransferError::Index { index: t.index as usize, count: t.outputs.len() })?;
+					terms.check_leaf(o.asset, o.value).map_err(|e| TransferError::Enclave(e.to_string()))?;
+					if landing.is_some() || t.leaf.htlc.is_some() {
+						return Err(TransferError::Enclave("an enclave-1 leaf carries no other template's terms".into()));
+					}
+				}
+				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else if t.leaf.enclave.is_some() { 7 } else { 1 });
 				write_inputs(w, &t.inputs, depth)?;
 				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
@@ -1410,6 +1449,9 @@ impl CoinRecord {
 				if let Some(l) = landing {
 					w.extend(l.program);
 					w.extend(l.allowance.to_le_bytes());
+				}
+				if let Some(terms) = &t.leaf.enclave {
+					terms.enclave.write(w);
 				}
 			},
 			CoinRecord::Fill(f) => {
@@ -1437,7 +1479,7 @@ impl CoinRecord {
 						w.extend(owner_nonce);
 					},
 					FillLeaf::New(l) => {
-						if l.htlc.is_some() || l.landing.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() || l.enclave.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						w.push(2);
@@ -1483,7 +1525,7 @@ impl CoinRecord {
 				}
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
-			tag @ (1 | 3 | 5) => {
+			tag @ (1 | 3 | 5 | 7) => {
 				let inputs = read_inputs(r, depth)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
@@ -1493,7 +1535,7 @@ impl CoinRecord {
 				}
 				let mut leaf = NewLeaf {
 					owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-					landing: None,
+					landing: None, enclave: None,
 				};
 				if tag == 3 {
 					let terms = HtlcTerms::decode_from(r)?;
@@ -1506,6 +1548,10 @@ impl CoinRecord {
 					let l = crate::landing::Landing { program, allowance: r.u64()? };
 					let o = &outputs[index as usize];
 					leaf.landing = Some(l.terms(o.asset, o.value).map_err(|e| TransferError::Landing(e.to_string()))?);
+				}
+				if tag == 7 {
+					let o = &outputs[index as usize];
+					leaf.enclave = Some(r.enclave()?.terms(o.asset, o.value));
 				}
 				Ok(CoinRecord::Transfer(Box::new(Transfer { inputs, outputs, index, leaf })))
 			},
@@ -1538,7 +1584,7 @@ impl CoinRecord {
 					1 => FillLeaf::Rest { owner_nonce: r.array32()? },
 					2 => FillLeaf::New(NewLeaf {
 						owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-						landing: None,
+						landing: None, enclave: None,
 					}),
 					f => return Err(DecodeError::Flag(f).into()),
 				};

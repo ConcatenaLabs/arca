@@ -826,7 +826,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
-			leaf: NewLeaf {
+			leaf: NewLeaf { enclave: None,
 				owner: key(&o.owner)?,
 				owner_nonce: unhex32(&o.owner_nonce).map_err(Refusal::malformed)?,
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
