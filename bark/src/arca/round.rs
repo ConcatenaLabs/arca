@@ -182,7 +182,11 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			unlock_hash: unhex32(l["unlock_hash"].as_str().unwrap_or(""))?,
 			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
 			order,
-			landing: None,
+			landing: match l.get("landing").filter(|g| !g.is_null()) {
+				Some(g) => Some(arca_covenant::record_json::landing_from_json(g)
+					.map_err(|e| Error::Parse(format!("a published leaf's landing: {}", e)))?),
+				None => None,
+			},
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;
@@ -197,15 +201,19 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 /// knows can be claimed out of the tree by the operator; an `order-2` leaf is
 /// filled under the operator's signature alone. So a leaf is `vtxo-1` unless
 /// the wallet asked for something else: `order-2` on the terms of a resting
-/// order it asked for (`w["order"]`), or `htlc-1` in the one participation
-/// that names one, a payment received over Lightning, locked to that
-/// payment's hash (`receive`) in the receiving direction.
+/// order it asked for (`w["order"]`), `landing-1` for a supervised asset at
+/// the landing it asked for (`w["landing"]`, which the caller compares with
+/// the leaf's), or `htlc-1` in the one participation that names one, a
+/// payment received over Lightning, locked to that payment's hash
+/// (`receive`) in the receiving direction.
 pub(crate) fn leaf_as_asked(w: &Value, record: &LeafRecord, receive: Option<&[u8; 32]>) -> Result<(), String> {
 	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
-	let want = match (receive, asked_order) {
-		(Some(_), _) => Template::Htlc1,
-		(None, true) => Template::Order2,
-		(None, false) => Template::Vtxo1,
+	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
+	let want = match (receive, asked_order, asked_landing) {
+		(Some(_), _, _) => Template::Htlc1,
+		(None, true, _) => Template::Order2,
+		(None, false, true) => Template::Landing1,
+		(None, false, false) => Template::Vtxo1,
 	};
 	if record.template != want {
 		return Err(format!("it is a leaf of template {}, and the wallet asked for one of template {}: the template is part of what a \
@@ -223,6 +231,15 @@ pub(crate) fn leaf_as_asked(w: &Value, record: &LeafRecord, receive: Option<&[u8
 		},
 		_ if record.htlc.is_some() => Err(format!("it carries htlc-1 terms, and the wallet asked for a leaf of template {}", want)),
 		_ => order_as_asked(w, record.template, record.order.as_ref()),
+	}
+}
+
+/// A landing as the wallet names it to its user: the program and the
+/// allowance, or that there is none.
+pub(crate) fn landing_text(l: Option<&arca_covenant::Landing>) -> String {
+	match l {
+		Some(l) => format!("P2WPKH {} (allowance {})", hex(&l.program), l.allowance),
+		None => "no landing (a plain leaf)".into(),
 	}
 }
 
@@ -477,12 +494,20 @@ impl Wallet {
 		if value < min {
 			return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 		}
+		// A leaf of a supervised asset is landing-1, at the wallet's landing
+		// key; the operator's statement is checked against the wallet's node.
+		let landing = self.landing_rule(info, asset)?;
 		let nonce = super::random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
-		let wanted = vec![Wanted::Leaf { asset, value, template: Template::Vtxo1, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
-			order: None }];
-		let nonces = vec![json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()})];
+		let template = if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		let wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
+			order: None, landing }];
+		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
+		if let Some(l) = &landing {
+			entry["landing"] = arca_covenant::record_json::landing_json(l);
+		}
+		let nonces = vec![entry];
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
 		let nb = not_before.map(MedianTime::from_consensus).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 		let id = participation_id(&self.genesis, &self.operator, ids, &wanted, &fees, nb);
@@ -937,7 +962,32 @@ impl Wallet {
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
 			check_profile(&info, &record).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
+			// The supervised profile: a leaf of a supervised asset lands at the
+			// wallet's own key, with the published allowance, and its round
+			// keeps every output explicit; no other asset's leaf is landing-1.
+			// A claim's leaf names no landing of the wallet's.
 			leaf_as_asked(w, &record, receive.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
+			// The supervised profile: a leaf of a supervised asset is asked
+			// for landing-1 at the wallet's own key, and lands where it was
+			// asked; its round keeps every output explicit. No other asset's
+			// leaf is landing-1, and a claim's leaf names no landing.
+			let asked = match w.get("landing").filter(|l| !l.is_null()) {
+				Some(l) => Some(arca_covenant::record_json::landing_from_json(l).map_err(|e| Error::Store(format!("a wanted landing: {}", e)))?),
+				None => None,
+			};
+			let supervised = self.chain.supervised_assets()?.contains(&record.asset);
+			if w.get("claim").is_none() && supervised != asked.is_some() {
+				return Err(Error::Refused(format!("the new leaf in round {} is of asset {}, which the wallet's node {} supervised, and the \
+					wallet asked for {}: it signs nothing for it", round_txid, record.asset, if supervised { "lists as" } else { "does not list as" },
+					landing_text(asked.as_ref()))));
+			}
+			if record.landing != asked {
+				return Err(Error::Refused(format!("the new leaf in round {} lands at {}, and the wallet asked for {}: a leaf of a supervised \
+					asset lands only where its owner asked", round_txid, landing_text(record.landing.as_ref()), landing_text(asked.as_ref()))));
+			}
+			if asked.is_some() {
+				arca_covenant::landing::check_explicit(&round).map_err(|e| Error::Refused(format!("round {}: {}", round_txid, e)))?;
+			}
 			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
 				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value, record.asset,
 					w["value"], w["asset"])));

@@ -159,6 +159,12 @@ pub fn sync_by(expiry: u32, steps: usize) -> u32 {
 	last_expiry(expiry, steps).saturating_sub(STEP_FROM)
 }
 
+/// Whether `c` is a coin of a supervised asset: a `landing-1` leaf, or a
+/// coin whose record lands as one.
+fn supervised(c: &CoinRow) -> bool {
+	CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.landing()).is_some()
+}
+
 impl Wallet {
 	/// The preimage of step `nonce`'s entry: `SHA256(T ‖ secret(A) ‖ nonce)`,
 	/// `A` the key the mnemonic derives from the nonce: a restore derives it
@@ -222,8 +228,10 @@ impl Wallet {
 			if named.contains(&c.leaf_id) || asset.is_some_and(|a| c.asset != a.to_string()) {
 				continue;
 			}
+			// A supervised asset's leaf (`landing-1`) is not planned: its
+			// operator runs no plans for it, and `sync` refreshes it.
 			match CoinRecord::from_bytes(&c.record) {
-				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() => out.push(c),
+				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none() => out.push(c),
 				_ => {},
 			}
 		}
@@ -241,6 +249,10 @@ impl Wallet {
 			return Ok(all);
 		}
 		let ok = self.plannable(None)?;
+		if let Some(l) = coins.iter().find(|l| self.store.coin(l).ok().flatten().is_some_and(|c| supervised(&c))) {
+			return Err(Error::Refused(format!("coin {} is of a supervised asset, whose operator runs no plans for it: `sync` refreshes it \
+				in its window, so keep syncing while the wallet holds it", l)));
+		}
 		coins.iter().map(|l| ok.iter().find(|c| &c.leaf_id == l).cloned().ok_or_else(|| Error::Refused(format!(
 			"coin {} is no live coin of a round that no plan names: a plan starts from a coin of a round, so refresh a board or a received \
 			coin in a round first", l)))).collect()
@@ -480,10 +492,17 @@ impl Wallet {
 		// planned at a later `care`.
 		let named = self.planned_coins()?;
 		let mut refreshing = vec![];
+		let mut left_to_sync = 0usize;
 		for c in self.store.coins_in("live")? {
 			if named.contains(&c.leaf_id) || plannable.iter().any(|p| p.leaf_id == c.leaf_id) || c.expiry == u32::MAX
 				|| released.get(&hex(&c.owner_nonce)).is_some_and(|until| *until > now)
 			{
+				continue;
+			}
+			// A supervised asset's coin is never planned, so it is not
+			// refreshed early for a plan: `sync` refreshes it in its window.
+			if supervised(&c) {
+				left_to_sync += 1;
 				continue;
 			}
 			if !within(c.expiry) {
@@ -497,8 +516,13 @@ impl Wallet {
 				Err(e) => json!({"coin": c.leaf_id, "asset": c.asset, "error": e.to_string()}),
 			});
 		}
-		Ok(json!({"claims": claims, "cancelled": cancelled, "planned": planned, "refreshing": refreshing, "not_yet_planned": later,
-			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound}))
+		let mut out = json!({"claims": claims, "cancelled": cancelled, "planned": planned, "refreshing": refreshing, "not_yet_planned": later,
+			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound});
+		if left_to_sync > 0 {
+			out["supervised"] = json!({"coins": left_to_sync, "note": "coins of a supervised asset are not planned: sync refreshes each in \
+				its window, so keep syncing while the wallet holds them"});
+		}
+		Ok(out)
 	}
 
 	/// Gives up `coins`, each the current coin of an open or stopped plan of

@@ -363,6 +363,15 @@ Every holder receives these rules before the operator holds their coins:
   the operator sets another) of the take's round being built, or the take is
   void and its coins come back; `next_sync_at` wakes it for that until the
   take is released.
+- **A supervised asset's issuer can freeze its holders.** A coin of an
+  asset the operator serves supervised (`supervised` in its `info`) lands
+  only at the wallet's landing address (`landing_address` in `arca info`).
+  When the issuer freezes that address or pauses the asset, `arca coins`
+  shows the coin `frozen`, the operator co-signs nothing that spends it,
+  and its only way out of the tree is its landing into the holder's own
+  key, which `sync` takes before the coin's exit date and `arca exit` takes
+  at once. There it stays frozen until the issuer lifts the freeze. A frozen
+  coin pays no fee, so keep the fee coin below in another asset.
 - **Keep an on-chain coin in an asset the node accepts for fees.** Some
   exits need one (a board, or a coin in an asset the node does not accept
   for fees). `arca address` gives an address to pay it to.

@@ -41,7 +41,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}";
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -148,6 +148,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
 			let fee = a["fee_asset"].as_str().map(asset).transpose()?;
 			w.watch_bond(&lines, fee)
+		},
+		"supervised_check" => {
+			let txid = elements::Txid::from_str(req_str(&a["txid"], "the round")?).map_err(|e| Error::Parse(format!("the round: {}", e)))?;
+			let vout = opt_u64(&a["vout"], "the batch output")?.ok_or_else(|| Error::Parse("the batch output is missing".into()))?;
+			w.supervised_check(txid, u32::try_from(vout).map_err(|_| Error::Parse("the batch output is out of range".into()))?)
 		},
 		"address" => w.address(),
 		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
