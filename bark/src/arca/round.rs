@@ -436,6 +436,7 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
 	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
 	let asked_channel = w.get("channel").filter(|c| !c.is_null());
+	let asked_v2 = w.get("template").and_then(|t| t.as_str()) == Some("vtxo-2");
 	let want = match (receive, asked_order, asked_landing, asked_channel) {
 		(Some(_), ..) => Template::Htlc1,
 		// The terms name their version: order-3, or order-2 for a leaf from
@@ -444,6 +445,7 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 			.map_or(Template::Order3, |o| o.template()),
 		(None, false, true, _) => Template::Landing1,
 		(None, false, false, Some(_)) => Template::Channel1,
+		(None, false, false, None) if asked_v2 => Template::Vtxo2,
 		(None, false, false, None) => Template::Vtxo1,
 	};
 	// A channel leaf on exactly the terms asked: the operator's side and
@@ -771,7 +773,15 @@ impl Wallet {
 			Some(c) => Some(Self::channel_terms(info, asset, c)?),
 			None => None,
 		};
-		let template = if channel.is_some() { Template::Channel1 } else if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		let template = if channel.is_some() {
+			Template::Channel1
+		} else if landing.is_some() {
+			Template::Landing1
+		} else if self.asks_vtxo2() {
+			Template::Vtxo2
+		} else {
+			Template::Vtxo1
+		};
 		let value = value.checked_add(capacity.unwrap_or(0)).ok_or_else(|| Error::Refused("the channel's value overflows".into()))?;
 		let wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
 			order: None, landing, channel }];
@@ -781,6 +791,9 @@ impl Wallet {
 		}
 		if let Some(c) = &channel {
 			entry["channel"] = arca_covenant::record_json::channel_json(c);
+		}
+		if template == Template::Vtxo2 {
+			entry["template"] = json!("vtxo-2");
 		}
 		let nonces = vec![entry];
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
