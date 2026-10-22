@@ -140,7 +140,7 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 		let o = if k == 0 { &ox } else { &oy };
 		// The channel settles the HTLC a moment after the payment completes.
 		let (base, a) = (channels0[k], asset);
-		r.wait("the channels settled", || settled_balance(o, a) == base.0 - amount && settled_balance(payee, a) == base.1 + amount).await;
+		until_settled(&[(o, base.0 - amount), (payee, base.1 + amount)], a).await;
 		let (o1, p1) = (channel_balance(o, asset), channel_balance(payee, asset));
 		println!("channels in {}: the operator's node {} -> {}, the payee's {} -> {}", asset, channels0[k].0, o1, channels0[k].1, p1);
 		assert_eq!((channels0[k].0 - o1, p1 - channels0[k].1), (amount, amount));
@@ -204,7 +204,8 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 		// it, and claims it with the preimage.
 		let s = a.ok(&["sync"]);
 		println!("sync: lightning {}", s["lightning"]);
-		let paid = paying.join().unwrap().unwrap();
+		let paid = paying.join().unwrap().unwrap_or_else(|e| panic!("the payer's pay ended without an answer ({}): the operator's {} | \
+			the payer's {}", e, channels_in(operator, asset), channels_in(payer, asset)));
 		println!("the payer's node: {} {}", paid["status"], paid["amount_sent_msat"]);
 		assert_eq!(paid["status"], "complete");
 		assert_eq!(paid["payment_preimage"].as_str().map(|p| elements::hashes::sha256::Hash::hash(&unhex(p)).to_string()),
@@ -213,7 +214,7 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 		assert_eq!(rec["state"], "received", "{}", rec);
 		assert!(rec.get("preimage").is_none() && rec.get("request").is_none(), "{}", rec);
 		let (sa, op, pa) = (asset, operator, payer);
-		r.wait("the channels settled", || settled_balance(op, sa) == o0 + amount && settled_balance(pa, sa) == p0 - amount).await;
+		until_settled(&[(op, o0 + amount), (pa, p0 - amount)], sa).await;
 		let held1 = arca_held(&a, &asset);
 		println!("books in {}: the payer's channel {} -> {}, the operator's {} -> {}; the wallet held {}, holds {}: {} received, less the \
 			fee {} and {} of the claim's margins", asset, p0, p0 - amount, o0, o0 + amount, held0, held1, amount, fee(amount),
@@ -224,6 +225,30 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 	}
 	drop((ox, px, oy, py));
 	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// `node`'s channels in `asset`: each one's state, whether its peer is
+/// connected, its side of the balance and the HTLCs on it.
+fn channels_in(node: &sequentia_ext::lightning::LightningNode, asset: AssetId) -> Value {
+	Value::Array(node.ok("listpeerchannels", json!({}))["channels"].as_array().unwrap().iter()
+		.filter(|c| c["channel_asset"].as_str() == Some(&asset.to_string()))
+		.map(|c| json!({"state": c["state"], "peer_connected": c["peer_connected"], "to_us_msat": c["to_us_msat"],
+			"htlcs": c["htlcs"]})).collect())
+}
+
+/// Waits until each node's channels in `asset` hold no HTLC and the node's
+/// side of them is what `want` names; on a minute without, says what each
+/// node's channels hold.
+async fn until_settled(want: &[(&sequentia_ext::lightning::LightningNode, u64)], asset: AssetId) {
+	let start = std::time::Instant::now();
+	while !want.iter().all(|(n, v)| settled_balance(n, asset) == *v) {
+		if start.elapsed() > std::time::Duration::from_secs(60) {
+			let seen: Vec<String> = want.iter().map(|(n, v)| format!("want {} on our side, the channels: {}", v, channels_in(n, asset)))
+				.collect();
+			panic!("the channels never settled: {}", seen.join(" | "));
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
 }
 
 /// The payment held at the operator's node for `hash`, as the server says.
