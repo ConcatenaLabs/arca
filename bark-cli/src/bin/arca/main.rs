@@ -323,8 +323,8 @@ enum Cmd {
 	/// coin of a round that no plan names): the operator refreshes it in later
 	/// rounds while the wallet stays closed, one step per expiry, until the
 	/// date the plan names. Each step runs in its coin's free window, where a
-	/// refresh costs nothing. A coin a plan names is refreshed in a round
-	/// before it is paid out of round.
+	/// refresh costs nothing. A coin a plan names is paid out of round only
+	/// once given up in a round (`plan-release`), which ends its plan.
 	Plan {
 		/// The coins, by leaf id.
 		coins: Vec<String>,
@@ -347,6 +347,19 @@ enum Cmd {
 	/// Cancels the steps of an offline-refresh plan that have not started.
 	PlanCancel {
 		plan: String,
+	},
+	/// Gives up planned coins in the next round for a leaf of the wallet's
+	/// own, named by no plan, which is then paid out of round like any
+	/// coin; each coin's plan ends once that round is final and the forfeit
+	/// handed over (at sync), and stands should the round never complete.
+	PlanRelease {
+		/// The coins: each the current coin of an open or stopped plan.
+		#[arg(required = true)]
+		coins: Vec<String>,
+		/// The most the refresh may cost, in millionths of each coin (the
+		/// wallet's refresh bound by default).
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
 	},
 	/// What a wallet does by itself at a sync: takes up every open claim,
 	/// cancels each plan whose coin has moved, and plans each coin whose
@@ -1299,6 +1312,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Plans => w.plans(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
+		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
 		Cmd::Care { scan, expiries, max_fee_ppm } => w.care(scan, expiries, max_fee_ppm),
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),

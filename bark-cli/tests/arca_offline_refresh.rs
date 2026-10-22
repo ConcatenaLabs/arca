@@ -32,6 +32,11 @@
 //!    wallet holds the step's leaf again and the coin it gave up spent again,
 //!    its value counted once.
 //!
+//! The last test: a wallet that plans every coin it holds is refused a
+//! payment its unplanned coins cannot cover, gives one planned coin up in the
+//! next round (`arca plan-release`), pays from the new leaf out of round, and
+//! keeps the other coin planned.
+//!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
 
@@ -688,12 +693,7 @@ async fn care_plans_a_coin_near_its_window_and_cancels_a_plan_whose_coin_moved()
 	println!("A back at {}, past expiry {}: {}", mtp(&r), e0, bal);
 	assert_eq!(bal["arca"][&x]["live"], json!(value.to_string()), "A's whole value live");
 
-	// The coin a plan stands on cannot be refreshed by hand while the plan
-	// is open: the operator says to cancel it first, which is developer
-	// mode's Release.
-	let q = a.ok(&["quote", "--leaf", &l1]);
-	a.refused(&["participate", "--leaf", &l1, "--shown", &q["coins"].to_string()], "cancel the plan first");
-	// The holder takes step 1's leaf home instead: the coin moves on the
+	// The holder takes step 1's leaf home: the coin moves on the
 	// chain, and the next care, once it is home, cancels the plan whose step
 	// 2 has nothing left to stand on.
 	a.ok(&["exit", &l1]);
@@ -796,4 +796,88 @@ async fn back_past_the_exit_date_before_the_sweep_the_wallet_takes_the_step_up_r
 	assert!(coins(&a, "exiting").is_empty());
 	assert_eq!(a.ok(&["plans"])["plans"][0]["plan_id"], json!(id));
 	assert_eq!(a.ok(&["balance"])["arca"][&x]["live"], json!(value.to_string()));
+}
+
+/// A wallet plans every coin it holds; out of round it can pay with none of
+/// them. It gives one up in the next round (`arca plan-release`): the plan
+/// ends once that round is final and the forfeit handed over, and the new
+/// leaf, named by no plan, pays a receiver out of round. The other coin stays
+/// planned, its plan open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_that_plans_every_coin_pays_one_through_the_next_round_and_keeps_the_rest_planned() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let w = Arca::new("PR");
+	w.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	r.pay_to(script(&w.ok(&["address"])), r.x, 3_000_000);
+	r.pay_to(script(&w.ok(&["address"])), r.x, 3_000_000);
+	r.produce().await;
+	let b1 = w.ok(&["board", &x, "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	let b2 = w.ok(&["board", &x, "1500000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards to be credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	w.ok(&["sync"]);
+	w.ok(&["participate", "--leaf", &b1]);
+	w.ok(&["participate", "--leaf", &b2]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	w.ok(&["sync"]);
+	let live = coins(&w, "live");
+	assert_eq!(live.len(), 2, "two leaves of a round: {:?}", live);
+	let (ca, cb) = (live[0]["leaf_id"].as_str().unwrap().to_string(), live[1]["leaf_id"].as_str().unwrap().to_string());
+
+	// Every coin planned.
+	let p = w.ok(&["plan"]);
+	println!("PR plans every coin it holds: {}", p);
+	let made = p["plans"].as_array().unwrap();
+	assert_eq!(made.len(), 2);
+	assert!(made.iter().all(|m| m["state"] == "open"), "{}", p);
+	let plan_of = |c: &str| made.iter().find(|m| m["coin"] == json!(c)).unwrap()["plan_id"].as_str().unwrap().to_string();
+	let (pa, pb) = (plan_of(&ca), plan_of(&cb));
+
+	// A receiver; a payment no unplanned coin covers is refused, saying how
+	// the planned coins are paid.
+	let v = Arca::new("PRV");
+	v.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	let req = v.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let why = w.refused(&["send", &req, "--amount", "500000", "--asset", &x], "plan-release");
+	println!("PR pays 500,000 with every coin planned: REFUSED: {}", why);
+
+	// PR gives coin A up in the next round, for a leaf of its own.
+	let rel = w.ok(&["plan-release", &ca]);
+	println!("PR releases coin {} (plan {}): {}", ca, pa, rel);
+	assert_eq!(rel["plans"][0]["plan_id"].as_str(), Some(pa.as_str()));
+	assert_eq!(rel["participations"][0]["state"], "pending", "{}", rel);
+	let built = r.server.rounds.run_round().await.unwrap().expect("the round of PR's participation");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let s = w.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s);
+	r.server.rounds.pass().await.unwrap();
+	w.ok(&["sync"]);
+	let plans = w.ok(&["plans"]);
+	let state_of = |id: &str| plans["plans"].as_array().unwrap().iter().find(|p| p["plan_id"] == json!(id)).unwrap().clone();
+	println!("PR's plans after the round {}: A {} B {}", built.tx.txid(), state_of(&pa)["state"], state_of(&pb)["state"]);
+	assert_eq!(state_of(&pa)["state"], "cancelled", "coin A's plan ended with its coin: {}", state_of(&pa));
+	assert!(state_of(&pa)["reason"].as_str().unwrap_or_default().contains("released"), "{}", state_of(&pa));
+	assert_eq!(state_of(&pb)["state"], "open", "coin B stays planned");
+	let live: Vec<String> = coins(&w, "live").iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert!(live.contains(&cb) && !live.contains(&ca) && live.len() == 2, "B and A's new leaf: {:?}", live);
+
+	// Out of round, from the new leaf: B is not touched.
+	let sent = w.ok(&["send", &req, "--amount", "500000", "--asset", &x]);
+	println!("PR pays 500,000 out of round: {}", sent);
+	let inputs: Vec<String> = sent["inputs"].as_array().unwrap().iter().map(|i| i.as_str().unwrap().to_string()).collect();
+	assert!(!inputs.contains(&cb) && !inputs.contains(&ca), "paid from the new leaf: {:?}", inputs);
+	let got = v.ok(&["sync"]);
+	println!("the receiver's sync: {}", got["mailbox"]);
+	assert_eq!(v.ok(&["balance"])["arca"][&x]["operator-confirmed"], json!("500000"), "the receiver holds the payment, operator-confirmed");
+	assert_eq!(w.ok(&["plans"])["plans"].as_array().unwrap().iter().find(|p| p["plan_id"] == json!(pb)).unwrap()["state"], "open");
+	assert!(coins(&w, "live").iter().any(|c| c["leaf_id"] == json!(cb)), "B is still the wallet's, planned");
 }

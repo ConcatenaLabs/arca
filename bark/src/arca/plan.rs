@@ -27,7 +27,8 @@
 //!
 //! A coin a plan names is paid out of round by no wallet: its refund halves
 //! are valid while its script is unspent, and with one the operator alone
-//! could void a reassignment of it. The wallet refreshes it in a round first.
+//! could void a reassignment of it. The wallet gives it up in a round first
+//! ([`Wallet::plan_release`]), for a leaf no plan names, which ends its plan.
 //!
 //! The schedule names, for each plan, the date until which it covers the coin
 //! at the earliest, if the operator applies it ([`covered_until`]): each step
@@ -39,7 +40,7 @@
 //! that coin, as it can take any coin whose holder stays away past its expiry.
 //! What the wallet hands over gives it nothing more.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use elements::hashes::{sha256, Hash, HashEngine};
@@ -137,6 +138,19 @@ pub const PLAN_WITHIN: u32 = 10 * 86_400;
 /// window costs nothing; the bound only lets a plan through when the
 /// operator asks a small fee there.
 pub const CARE_MAX_FEE_PPM: u64 = 2_000;
+
+/// How long `care` leaves unplanned a leaf [`Wallet::plan_release`] made:
+/// the day its holder has to pay or trade it out of round.
+pub const RELEASE_HOLD: u32 = 86_400;
+
+/// The wallet's record of the leaves [`Wallet::plan_release`] made, by owner
+/// nonce, each with the median time until which `care` leaves it unplanned.
+const RELEASED: &str = "plan_released";
+
+/// What [`Wallet::plan_release`] says.
+const RELEASE_NOTE: &str = "each coin is given up in the next round of its asset for a new leaf of the wallet's, named by no plan; \
+	its plan ends once that round is final and the forfeit handed over at sync, and stands as it was should the round never complete. \
+	The new leaf is paid or traded out of round like any coin";
 
 /// The date by which the wallet must sync for a plan of `steps` steps from a
 /// coin whose first expiry is `expiry`: the start of the last coin's refresh
@@ -446,7 +460,10 @@ impl Wallet {
 		let within = |expiry: u32| now.saturating_add(PLAN_WITHIN) >= expiry.saturating_sub(STEP_FROM);
 		let mut planned = vec![];
 		let mut later = 0usize;
-		let plannable = self.plannable(None)?;
+		// A leaf made to be paid out of round stays unplanned for a while.
+		let released: BTreeMap<String, u32> = self.store.meta(RELEASED)?.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+		let plannable: Vec<CoinRow> = self.plannable(None)?.into_iter()
+			.filter(|c| released.get(&hex(&c.owner_nonce)).is_none_or(|until| *until <= now)).collect();
 		for c in &plannable {
 			if !within(c.expiry) {
 				later += 1;
@@ -464,7 +481,9 @@ impl Wallet {
 		let named = self.planned_coins()?;
 		let mut refreshing = vec![];
 		for c in self.store.coins_in("live")? {
-			if named.contains(&c.leaf_id) || plannable.iter().any(|p| p.leaf_id == c.leaf_id) || c.expiry == u32::MAX {
+			if named.contains(&c.leaf_id) || plannable.iter().any(|p| p.leaf_id == c.leaf_id) || c.expiry == u32::MAX
+				|| released.get(&hex(&c.owner_nonce)).is_some_and(|until| *until > now)
+			{
 				continue;
 			}
 			if !within(c.expiry) {
@@ -480,6 +499,49 @@ impl Wallet {
 		}
 		Ok(json!({"claims": claims, "cancelled": cancelled, "planned": planned, "refreshing": refreshing, "not_yet_planned": later,
 			"plan_within": PLAN_WITHIN, "max_fee_ppm": bound}))
+	}
+
+	/// Gives up `coins`, each the current coin of an open or stopped plan of
+	/// the wallet's, in the next round of its asset for a new leaf of the
+	/// wallet's own, one participation per asset under the refresh-fee bound
+	/// `max_fee_ppm` (as [`Self::refresh_quote`] bounds a refresh). The
+	/// operator takes the participation for a planned coin and runs no step
+	/// from the coin while it holds it; the plan ends once the participation
+	/// is released (its round final and the forfeit handed over, at `sync`),
+	/// and stands as it was should the participation never complete. The new
+	/// leaf carries no refund half and is named by no plan, so it is paid or
+	/// traded out of round like any coin; `care` leaves it unplanned for
+	/// [`RELEASE_HOLD`].
+	pub fn plan_release(&mut self, coins: &[String], max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		if coins.is_empty() {
+			return Err(Error::Refused("name the planned coins to give up in the next round".into()));
+		}
+		let mut current: HashMap<String, String> = HashMap::new();
+		for (id, coin, body, state, _) in self.plan_rows()? {
+			if state == "open" || state == "stopped" {
+				current.insert(Self::current_coin(&coin, &body), id);
+			}
+		}
+		let mut plans = vec![];
+		for c in coins {
+			let id = current.get(c).ok_or_else(|| Error::Refused(format!("coin {} is the current coin of no open or stopped plan of the \
+				wallet's: a coin no plan names is paid out of round as it is", c)))?;
+			plans.push(json!({"coin": c, "plan_id": id}));
+		}
+		let q = self.refresh_quote(coins, max_fee_ppm)?;
+		let v = self.participate(q, None)?;
+		let now = self.now()?.to_consensus_u32();
+		let mut held: BTreeMap<String, u32> = self.store.meta(RELEASED)?.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+		held.retain(|_, until| *until > now);
+		for p in v["participations"].as_array().into_iter().flatten() {
+			for w in p["wants"].as_array().into_iter().flatten() {
+				if let Some(n) = w["nonce"].as_str() {
+					held.insert(n.to_string(), now.saturating_add(RELEASE_HOLD));
+				}
+			}
+		}
+		self.store.set_meta(RELEASED, &serde_json::to_string(&held).expect("a map"))?;
+		Ok(json!({"plans": plans, "participations": v["participations"], "note": RELEASE_NOTE}))
 	}
 
 	/// Cancels the steps of plan `id` that have not started.
@@ -797,7 +859,7 @@ impl Wallet {
 		let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
 		let a = self.assess(&coin, &policy, Some((&record.owner, &nonce)))?;
 		let state = if a.all_final() { "live" } else { "pending" };
-		let note = format!("made by step {} of plan {}: refreshed in a round before it is paid out of round", j + 1, id);
+		let note = format!("made by step {} of plan {}: given up in a round before it is paid out of round", j + 1, id);
 		let row = self.row(&coin, &a, state, &note)?;
 		let leaf = row.leaf_id.clone();
 		let gave_up = if j == 0 { body["coin"].as_str().unwrap_or("").to_string() }
@@ -837,8 +899,8 @@ fn s_next_done(body: &Value, j: usize) -> bool {
 pub const PLAN_NOTE: &str = "a plan lets the operator refresh a coin while the wallet stays closed, until covered_until at the earliest; \
 	the wallet must sync by sync_by. The operator applies it: one that applies no step, applies one early, or sweeps a coin whose holder \
 	is away takes that coin, as it can take any coin whose holder stays away past its expiry. What the wallet hands over gives it nothing \
-	more: every pre-signed refund pays the wallet the step's value. A coin a plan names is refreshed in a round before it is paid out of \
-	round.";
+	more: every pre-signed refund pays the wallet the step's value. A coin a plan names is paid out of round only once given up in a \
+	round for a leaf no plan names (plan_release), which ends its plan.";
 
 #[cfg(test)]
 mod test {

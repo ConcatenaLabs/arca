@@ -1155,10 +1155,18 @@ to the operator's sweep, as any holder who stays away past an expiry can.
 
 A coin a plan names carries refund halves that stay valid while its script is
 unspent, so the operator alone could void a payment of it out of round: no
-wallet pays it out of round: it is refreshed in a round first. The operator
-takes a coin a step made into a round once the batch of the coin that step
-gave up is swept and the sweep final, and the coin an open plan stands on
-once the plan is cancelled. The operator applies a plan, as it refreshes any coin: one that
+wallet pays it out of round. `arca plan-release COIN…` gives it up in the next
+round instead, for a leaf of the wallet's own that no plan names, which is then
+paid or traded out of round like any coin. The operator takes the
+participation for the current coin of an open or stopped plan and runs no
+step from the coin while it holds it; the plan ends once the round is final
+and the forfeit handed over (at `sync`), and stands as it was should the round
+never complete, so the coin is never left neither planned nor refreshed. A
+payment the unplanned coins cannot cover is refused, naming how much the
+planned coins hold and `plan-release`. The new leaf costs the refresh fee the
+asset's schedule asks then (none in the coin's free window), and `care` leaves
+it unplanned for a day. The operator takes a coin a step made into a round once
+the batch of the coin that step gave up is swept and the sweep final. The operator applies a plan, as it refreshes any coin: one that
 applies no step, or sweeps a coin whose holder is away, takes that coin as it
 can take any coin whose holder stays away past its expiry. A stopped operator,
 a step's round replaced, or an operator that co-signs nothing leave the coin
@@ -1248,6 +1256,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `plan [LEAF]… [--expiries N] [--quote] [--max-fee-ppm N]` | Pre-signs an offline-refresh plan for each coin named (every live coin of a round that no plan names when none is), one step per expiry the wallet will be away for (1 to 6, 2 by default), quoted by the operator, signed and handed over: each step's leaf under a key from the mnemonic, the refund halves that pay the wallet the step's value at a fresh address of its own, the attestation, the key proofs and their bindings to the mailbox key. A step that costs anything is refused before anything is signed unless `--max-fee-ppm` raises the bound for this command. Each plan answers `covered_until` and `sync_by`; one the operator refused answers its `error`. `--quote` answers what each plan would cost and those dates, signing and keeping nothing (see Refreshing while the wallet stays closed) |
 | `plans` | Every plan the wallet made or restored: its coin, its state, each step's value, fee, state and leaf once taken up, `covered_until` and `sync_by`, and the operator's reason for a plan it stopped |
 | `plan-cancel PLAN` | Cancels the steps of plan `PLAN` that have not started, signed with the mailbox key; refused while a step is running. Every coin the plan named stays out of out-of-round payments until it is refreshed in a round |
+| `plan-release COIN… [--max-fee-ppm N]` | Gives up each named coin, the current coin of an open or stopped plan, in the next round for a leaf of the wallet's own that no plan names; the plan ends once the round is final and the forfeit handed over, and stands should the round never complete. The new leaf is paid out of round like any coin |
 | `care [--scan N] [--expiries N] [--max-fee-ppm N]` | Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first); what a wallet does by itself at a sync |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives) |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |

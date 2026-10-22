@@ -1774,6 +1774,9 @@ impl Rounds {
 		// without forfeits (its refund stands in their place), its leaf credited.
 		crate::plans::finish(&self.store).await?;
 		self.release_held().await?;
+		// A plan whose coin its holder gave up in a participation of its own,
+		// now released, ends.
+		crate::plans::release_given_up(&self.store).await?;
 		self.expire().await?;
 		self.void_overdue().await?;
 		Ok(())

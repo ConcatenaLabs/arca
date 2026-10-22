@@ -606,9 +606,9 @@ time. Every use of either half creates output 0, so whatever the operator does
 with a refund the holder ends holding `v(i)`: the refund cannot be mined
 without a coin of `L(i)`'s script beside `L(i-1)`, and a copy of `L(i)` the
 operator funds itself pays the holder as the real one does. The halves stay
-valid while the coin's script is unspent, so a coin a plan names is refreshed
-in a round before it is paid out of round: with a half, the operator alone
-could otherwise void a reassignment of it.
+valid while the coin's script is unspent, so a coin a plan names is given up
+in a round for a leaf no plan names before it is paid out of round: with a
+half, the operator alone could otherwise void a reassignment of it.
 
 ## Building
 

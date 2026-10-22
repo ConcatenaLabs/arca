@@ -940,7 +940,13 @@ What the server does with a plan once it holds it:
 - A coin a plan names carries its holder's refund halves for as long as its
   script is unspent; with one, the operator alone could void a reassignment of
   it. So no transfer of such a coin is co-signed (`planned`); its holder
-  refreshes it in a round first. A coin a step made is taken into no
+  gives it up in a round first, by a participation of its own, which the
+  operator takes for the current coin of an open or stopped plan unless the
+  plan's step is in a round. While that participation holds the coin no step
+  runs from it; once it is released (its round final, its forfeit handed
+  over) the plan ends, the reason naming the participation and round; should
+  it never complete, the coin is live again and the plan stands. A coin a step
+  made is taken into no
   participation until the coin that step gave up is swept, its sweep final:
   the refund that answers that coin needs the signer's one spend under the new
   coin's salt.

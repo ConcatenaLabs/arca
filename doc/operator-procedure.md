@@ -252,7 +252,8 @@ Every holder receives these rules before the operator holds their coins:
   and sweeps the coin takes it, as it can take any coin whose holder stays
   away past its expiry, so a plan keeps a coin alive through an operator that
   runs, not through one that turns against its holders. A coin a plan names
-  is paid out of round only once refreshed in a round.
+  is paid out of round only once given up in a round for a leaf no plan
+  names (`arca plan-release`), which ends its plan.
 - **A wallet that runs `arca care` after each sync plans by itself.** `care`
   takes up open claims, cancels each plan whose coin has moved, and plans each
   coin once its first step could run within ten days; a younger coin stays

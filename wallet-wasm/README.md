@@ -123,7 +123,7 @@ asset?, max_fee_ppm?, timeout?, shown?}`, `lightning_payments`,
 `lightning_receive_preimage {hash, preimage}`, `lightning_receive_ready {hash,
 need_seconds}`, `lightning_receives`, `lightning_lookup {hash}`,
 `lightning_post_preimage {hash, preimage}`); the offline-refresh plans (`plan_quote`, `plan`,
-`plans`, `plan_cancel`), which a page shows only in developer mode; `supply {asset}`, the operator's supply report for an asset
+`plans`, `plan_cancel`, `plan_release {leaves, max_fee_ppm?}`), which a page shows only in developer mode; `supply {asset}`, the operator's supply report for an asset
 it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` in `coins`
 (`issuer-operated` when its batch's sweep can only burn, `open` when it pays the operator), both of which a page shows only in
 developer mode; and `care {scan?, expiries?, max_fee_ppm?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days, refreshing a coin of no round in a round first (see the CLI README's offline refresh section for the gap this leaves). Its answer is `{"result", "start"}`: the
