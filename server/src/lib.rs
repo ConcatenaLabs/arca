@@ -22,6 +22,7 @@ pub mod auth;
 pub mod boards;
 pub mod bond;
 pub mod chain;
+pub mod channels;
 pub mod coins;
 pub mod cosign;
 pub mod fees;

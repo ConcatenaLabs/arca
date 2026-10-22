@@ -214,6 +214,11 @@ max_margin_multiple = 25
 # set up and state its MINTED,ELAPSED,ARMED then. The signer mints, started
 # with --issuer <instance file>=<mnemonic file> and --mint-limiter <tool>. An
 # issuer-operated asset has no [assets.lightning].
+#
+# channel_capacity (or channel_capacity_value, a value in atoms of the
+# reference unit at the asset's rate) is the most the operator puts on its own
+# side of a channel-1 leaf of the asset (README, "Channel leaves"); no channel
+# leaf of the asset is made when absent.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
@@ -224,6 +229,7 @@ min_leaf = "1000"
 # lightning_ppm = 0
 # lightning_base = "0"
 # min_leaf_value = "100000"
+# channel_capacity = "1000000"
 # [assets.rate]
 # source = "file"
 # path = "/var/lib/arca/rates/<asset id>.json"

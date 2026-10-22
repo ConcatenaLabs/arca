@@ -30,8 +30,9 @@ pub struct ErrorDetail {
 /// codes out of the source and compares them with this list, and the wallet's
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
-	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "conflict", "depth_limit",
-	"double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin", "invalid_leaf", "invalid_record", "invoice",
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
+	"depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
+	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
@@ -318,6 +319,22 @@ pub struct AssetInfo {
 	/// nothing that spends a coin whose holder is frozen.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub supervised: Option<SupervisedInfo>,
+	/// Present when the operator makes `channel-1` leaves of the asset: the
+	/// most it puts on its own side of one, in the asset's atoms now, and the
+	/// credit window every one carries.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub channels: Option<ChannelsInfo>,
+}
+
+/// What the operator makes of `channel-1` leaves in an asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelsInfo {
+	/// The most the operator puts on its own side of a channel leaf, in the
+	/// asset's atoms.
+	pub capacity: String,
+	/// The credit window every channel leaf carries, in 512-second units.
+	pub window_units: u16,
 }
 
 /// What the operator serves of a supervised asset.
@@ -1290,6 +1307,9 @@ pub struct ServedWantedLeaf {
 	/// A `landing-1` leaf's landing, a leaf of a supervised asset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
+	/// A `channel-1` leaf's terms.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub channel: Option<serde_json::Value>,
 }
 
 /// A forfeit of the coin, for the round of one attempt: what its output
@@ -1406,6 +1426,97 @@ pub struct WantedLeaf {
 	/// allowance. Covered by the participation's id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
+	/// `channel-1`'s terms, for a channel leaf (template `channel-1`), in the
+	/// leaf record's JSON form (`{"capacity", "window_units"}`,
+	/// `arca_covenant::record_json::channel_json`): the operator's side of the
+	/// value, which the operator funds, and its credit window. Covered by the
+	/// participation's id.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub channel: Option<serde_json::Value>,
+}
+
+/// A channel's state on the wire: its number, the owner's and the
+/// operator's balances and the credit folded into the owner's, decimal
+/// strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelStateJson {
+	pub number: String,
+	pub owner: String,
+	pub operator: String,
+	pub folded: String,
+}
+
+/// `POST /v1/channel_update`: state `state` of the channel `leaf_id`, signed
+/// by its owner (`owner_sig`, over its state message), paying `pay` when it
+/// names a payment, folding the channel's credit otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelUpdate {
+	pub leaf_id: String,
+	pub state: ChannelStateJson,
+	pub owner_sig: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pay: Option<ChannelPay>,
+}
+
+/// A payment into another channel of the operator, of `amount` atoms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPay {
+	pub to: String,
+	pub amount: String,
+}
+
+/// A credit note: the channel, the cumulative credit, the operator's
+/// signature over its note message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelNote {
+	pub leaf_id: String,
+	pub credit: String,
+	pub signature: String,
+}
+
+/// The answer to a channel update: the operator's signature over the state
+/// message, and for a payment the receiver's note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelUpdated {
+	pub operator_sig: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<ChannelNote>,
+}
+
+/// `POST /v1/channel_state`: what the server holds of the channel
+/// `leaf_id`, for its owner's key (`auth`, over the leaf id's 32 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelStateRequest {
+	pub auth: Auth,
+	pub leaf_id: String,
+}
+
+/// What the server holds of a channel: the asset, the terms, the latest
+/// state both sides signed with their signatures (the opening, with none,
+/// until there is one), the latest note, and whether a state or a note of
+/// it waits for the operator's signer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelView {
+	pub leaf_id: String,
+	pub asset: String,
+	pub value: String,
+	pub capacity: String,
+	pub window_units: u16,
+	pub state: ChannelStateJson,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner_sig: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub operator_sig: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<ChannelNote>,
+	pub pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1845,6 +1956,10 @@ pub struct TreeLeaf {
 	/// included, reads from it where each leaf of a batch lands.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
+	/// A `channel-1` leaf's terms (`{"capacity", "window_units"}`): the
+	/// operator's side of its value and its credit window.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub channel: Option<serde_json::Value>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each
