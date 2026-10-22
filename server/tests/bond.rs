@@ -5,7 +5,10 @@
 //! configuration does not name read as spent, then in notice with its
 //! withdrawal time), the withdrawal before the delay is refused by the node,
 //! and a configuration whose notice is too short, or whose withdrawal key is
-//! the operator key, does not start.
+//! the operator key, does not start. A key that has already signed two
+//! messages under one salt (a leaf the database holds operator-signed
+//! forfeits of for two rounds, as a signer that ran a lost round's
+//! participation again left it) bonds nothing.
 
 mod common;
 
@@ -14,11 +17,14 @@ use elements::Script;
 use serde_json::{json, Value};
 
 use arca_covenant::{BondPolicy, RelativeTime};
+use common::flow::{refresh, Coin};
+use common::keys::keypair;
+use common::rounds::credited_board;
 use common::running::Running;
 use sequentia_ext::rpc::{Auth, Client};
 use sequentia_ext::{explicit_txout, AssetAmount};
 use server::bond::{min_notice_seconds, BondSection, LIFETIME};
-use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, Server};
+use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, signed_twice, Server};
 
 const BOND: u64 = 1_000_000_000;
 
@@ -148,6 +154,64 @@ async fn the_bond_is_posted_named_and_noticed() {
 	let e = Server::start(&same).await.err().expect("refused");
 	println!("the withdrawal key S: {}", e);
 	assert!(e.to_string().contains("operator key"), "{}", e);
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_bond_is_posted_under_a_key_that_signed_twice() {
+	let dir = std::env::temp_dir().join(format!("arca-bond-twice-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let key_file = dir.join("withdraw.key");
+	let _ = std::fs::remove_file(&key_file);
+	let w = server::bond::new_key(&key_file).unwrap();
+	let units = min_notice_seconds(LIFETIME, RelativeTime::from_units(338).unwrap()).div_ceil(512) as u16;
+	let mut r = Running::start_on(&["-disablewallet=0"], |c, _| {
+		c.assets[0].rate = Some(toml::from_str("source = \"node\"").unwrap());
+		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None });
+	}).await;
+	let x = r.x;
+	let _: Value = r.rt.client().call("createwallet", &[json!("operating")]).unwrap();
+	let a: String = wallet_rpc(&r, "operating").call("getnewaddress", &[]).unwrap();
+	let info: Value = wallet_rpc(&r, "operating").call("getaddressinfo", &[json!(a)]).unwrap();
+	let spk = Script::from(Vec::<u8>::from_str_hex(info["scriptPubKey"].as_str().unwrap()));
+	tokio::task::block_in_place(|| r.purse.pay(&r.rt, vec![explicit_txout(AssetAmount::new(x, 2 * BOND), spk)]));
+	// The operator's own coins, which pay its rounds' fees.
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+
+	// A board refreshed in a round, and its new leaf in a second: one
+	// message under each salt.
+	let owner = keypair("bond twice: owner");
+	let (held, tx) = credited_board(&mut r, &owner, x).await;
+	let board = Coin { held, bases: vec![tx] };
+	let first = refresh(&mut r, &[(&board, &keypair("bond twice: owner, first leaf"))]).await;
+	let _second = refresh(&mut r, &[(&first[0].new, &keypair("bond twice: owner, second leaf"))]).await;
+	let twice = signed_twice(&r.config).await.unwrap();
+	println!("signed twice, after two rounds: {:?}", twice);
+	assert!(twice.is_empty(), "{:?}", twice);
+
+	// The board's forfeit for the first round, held for the second as well,
+	// as a lost round's re-run left it under the old rule: two operator
+	// signatures under the board's salt.
+	let (db, conn) = tokio_postgres::connect(&r.config.database, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let id: String = board.held.id.0.iter().map(|b| format!("{:02x}", b)).collect();
+	db.batch_execute(&format!("CREATE TEMP TABLE f AS SELECT * FROM forfeit WHERE leaf_id = decode('{id}', 'hex');
+		UPDATE f SET round_id = (SELECT max(round_id) FROM round);
+		INSERT INTO forfeit SELECT * FROM f;")).await.unwrap();
+	let twice = signed_twice(&r.config).await.unwrap();
+	println!("signed twice, a forfeit held for two rounds: {:?}", twice);
+	assert_eq!(twice.len(), 1, "{:?}", twice);
+	assert!(twice[0].contains("forfeits for more than one round of 1 leaf") && twice[0].contains(&id), "{:?}", twice);
+	let e = bond_post(&r.config, "operating", x, BOND, None).await.unwrap_err();
+	println!("bond-post over it: {}", e);
+	assert!(e.to_string().contains("has already signed two messages under one salt"), "{}", e);
+	let to = bond_address(&r.config).await.unwrap()["address"].clone();
+	let sends: Value = wallet_rpc(&r, "operating").call("listtransactions", &[json!("*"), json!(1000)]).unwrap();
+	assert!(!sends.as_array().unwrap().iter().any(|t| t["category"] == "send" && t["address"] == to), "nothing paid to {}: {}", to, sends);
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 

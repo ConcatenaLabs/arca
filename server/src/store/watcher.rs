@@ -282,6 +282,23 @@ impl Store {
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get::<_, i32>(1) as u32))).collect()
 	}
 
+	/// The leaves whose forfeits the database holds whole (the operator's
+	/// half in) for more than one round: each two operator signatures under
+	/// one salt, which a signer that let a lost round's participation run
+	/// again made before it kept one message per salt. At most `limit`, and
+	/// how many there are.
+	pub async fn leaves_forfeited_twice(&self, limit: i64) -> Result<(Vec<[u8; 32]>, i64), StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT leaf_id, count(*) OVER () FROM forfeit WHERE operator_sig IS NOT NULL
+			 GROUP BY leaf_id HAVING count(*) > 1 ORDER BY leaf_id LIMIT $1",
+			&[&limit],
+		).await?;
+		let total = rows.first().map(|r| r.get::<_, i64>(1)).unwrap_or(0);
+		let ids = rows.iter().map(|r| array32(r.get(0), "leaf id")).collect::<Result<Vec<_>, _>>()?;
+		Ok((ids, total))
+	}
+
 	/// Every forfeit stored whole (the operator's half in) for `leaf_id`,
 	/// for any round.
 	pub async fn forfeits_of(&self, leaf_id: &[u8; 32]) -> Result<Vec<ForfeitRow>, StoreError> {

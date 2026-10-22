@@ -59,13 +59,19 @@ payment out of round
 - **Set `[bond] notice_units` to at least 5,232** (a coin's 28-day lifetime,
   the 48-hour longest exit delay, and a day). The server refuses to start with
   less.
-- **Choose the asset and the size.** Any asset may bond. Size it above the
-  most a holder keeps out of round: a double-sign must cost the operator more
-  than it could take.
+- **Choose the asset and the size.** Any asset may bond. Size it above what
+  holders keep out of round together, not one holder's most: a double-sign
+  must cost the operator more than it could take, it could take from many
+  holders at once, and one slash burns the bond once. Each wallet checks the
+  bond against its own holdings only.
 - **Post it from an operating wallet:**
   `arcad <config> bond-post <node wallet> <asset> <atoms>`. Never use a
   treasury, a reserve, a bridge's, an escrow or another service's wallet; the
-  command refuses one by its name. Add the `outpoint` line it prints to
+  command refuses one by its name. It also pays nothing while the operator key
+  has already signed two messages under one salt (forfeits a signer gave a
+  lost round's re-run before it kept one message per salt): whoever holds the
+  database or a backup could burn such a bond, so post it under a new operator
+  key instead. Add the `outpoint` line it prints to
   `[bond]`, restart `arcad`, and check that `info.bond.state` reads `bonded`
   and `final` reads `true`.
 - **To withdraw, give the notice first:** `arcad <config> bond-notice <key
