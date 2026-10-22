@@ -626,8 +626,15 @@ record alone takes the leaf out. Its binary form is tag 6 of the coin record
 preimage against the entry's unlock hash and the authorisation as the owner's,
 good now (`ValidOrigin::Accumulator`).
 
-Exits are serial: each spends the batch output and re-creates it, so a batch
-takes 25 exits a block from one unconfirmed chain. An exit is 976 vB with its
+The exit's input carries no annex: the authorisation does not name one, so the
+program refuses one rather than let whoever holds the authorisation add
+weight to the exit (its cost is a constant well inside its witness's budget,
+so it never needs the budget an annex buys). `read_exit` strips an annex all
+the same.
+
+Exits are serial: each spends the batch output and re-creates it, so the
+mempool takes 25 exits of one batch from one unconfirmed chain, and a block
+takes them together. An exit is 979 vB with its
 fee from the slot's reserve, against 2,854 vB for the five node transactions of
 a 1,024-leaf tree; the entry's unlock (234 vB) and the leaf's exit follow in
 both (`covenant/tests/accumulator.rs`).
