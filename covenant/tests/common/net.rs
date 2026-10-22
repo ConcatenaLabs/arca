@@ -268,6 +268,33 @@ impl Net {
 		self.rows.push(Row { name: name.into(), vsize: String::new(), mempool: send, block });
 	}
 
+	/// Refused by relay policy with `relay` (the mempool and
+	/// sendrawtransaction), and by consensus in a block with `block`: for a
+	/// transaction relay refuses before the program runs, such as a
+	/// Simplicity spend with an annex the program does not need.
+	pub fn refuse_relay_and_block(&mut self, name: &str, tx: &Transaction, relay: &str, block: &str) {
+		let r = self.rt.client().test_mempool_accept(&[tx]).unwrap().remove(0);
+		assert!(!r.allowed, "{}: ACCEPTED by testmempoolaccept", name);
+		let reason = r.reject_reason.unwrap_or_default();
+		assert!(reason.contains(relay), "{}: the mempool said {:?}, expected {:?}", name, reason, relay);
+		let send = match self.rt.client().send_raw_transaction(tx) {
+			Ok(_) => panic!("{}: BROADCAST", name),
+			Err(RpcError::Rpc { code, message }) => format!("{} (code {})", message, code),
+			Err(e) => panic!("{}: {}", name, e),
+		};
+		assert!(send.contains(relay), "{}: sendrawtransaction said {:?}, expected {:?}", name, send, relay);
+		let h0 = self.height();
+		let refused = match self.rt.client().generate_block("raw(51)", &[tx]) {
+			Ok(_) => panic!("{}: MINED by generateblock", name),
+			Err(RpcError::Rpc { code, message }) => format!("{} (code {})", message, code),
+			Err(e) => panic!("{}: {}", name, e),
+		};
+		assert_eq!(self.height(), h0);
+		assert!(refused.contains(block), "{}: the block was refused with {:?}, expected {:?}", name, refused, block);
+		self.refused += 1;
+		self.rows.push(Row { name: name.into(), vsize: String::new(), mempool: send, block: refused });
+	}
+
 	/// Accepted by the mempool and mined if this node's relay policy allows
 	/// it; otherwise refused by relay policy with `expect` and mined with
 	/// `generateblock`. Either way the block takes it.
