@@ -5,6 +5,17 @@
 //! entry; the unroll authorisation a third party used. These parsers take a
 //! witness as the node serialised it, which anyone can make, so they refuse
 //! anything malformed instead of trusting its shape.
+//!
+//! A taproot spend may end its witness with an annex (BIP341). Consensus
+//! accepts it and drops it before the script runs, so a spend with an annex
+//! is the same spend as the one without it. Sequentia's relay policy takes
+//! an annex on a Simplicity leaf and refuses one elsewhere, which a block
+//! producer can still mine; and nothing signs it where a signed message is
+//! built by introspection or over a message of its own, so whoever relays or
+//! mines such a spend can add one. Every reader of a spend's items therefore
+//! reads them through [`without_annex`], which removes the annex by BIP341's
+//! rule exactly, and never counts or indexes the raw stack; only
+//! [`find_preimage`] scans the raw stack, annex included.
 
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
@@ -39,6 +50,35 @@ pub enum WitnessError {
 	Key,
 }
 
+/// The annex of a taproot spend's witness, BIP341's rule exactly: when the
+/// witness has at least two items and its last item's first byte is `0x50`,
+/// that item. An empty last item, or a lone item however it starts, is no
+/// annex.
+///
+/// The rule is taproot's: it is what consensus applies to a spend of a
+/// witness version 1 output, which every Arca coin is. A version 0 spend has
+/// no annex; its last item is the witness script or the key, and neither can
+/// begin with `0x50` and be valid (the script would start with
+/// `OP_RESERVED`, the key would not be one), so reading a spend found on the
+/// chain through this function gives the same items either way.
+pub fn annex(stack: &[Vec<u8>]) -> Option<&[u8]> {
+	match stack {
+		[_, .., last] if last.first() == Some(&ANNEX_TAG) => Some(&last[..]),
+		_ => None,
+	}
+}
+
+/// The items of a taproot spend's witness without its annex ([`annex`]): the
+/// key path's signature, or the items below the script, the script and the
+/// control block. This is the witness the script sees, and the one a reader
+/// counts and indexes.
+pub fn without_annex(stack: &[Vec<u8>]) -> &[Vec<u8>] {
+	match annex(stack) {
+		Some(_) => &stack[..stack.len() - 1],
+		None => stack,
+	}
+}
+
 /// A script-path spend split into its parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptPath<'a> {
@@ -53,12 +93,8 @@ impl<'a> ScriptPath<'a> {
 	/// Splits a witness stack: an optional annex last, then the control block,
 	/// then the script.
 	pub fn parse(stack: &'a [Vec<u8>]) -> Result<ScriptPath<'a>, WitnessError> {
-		let mut end = stack.len();
-		let mut annex = None;
-		if end >= 2 && stack[end - 1].first() == Some(&ANNEX_TAG) {
-			annex = Some(&stack[end - 1][..]);
-			end -= 1;
-		}
+		let annex = annex(stack);
+		let end = without_annex(stack).len();
 		if end < 2 {
 			return Err(WitnessError::NotScriptPath);
 		}
@@ -70,7 +106,10 @@ impl<'a> ScriptPath<'a> {
 
 /// The first 32-byte witness item whose SHA256 is `hash`: the preimage a
 /// forfeit claim, an entry unlock or an HTLC claim revealed. Every item is
-/// scanned, so an annex or a reordered witness does not hide it.
+/// scanned, the annex too, so neither an annex nor a reordered witness hides
+/// it: whatever item opens the hash, the preimage is public once mined. This
+/// is the one reader that takes the raw stack rather than
+/// [`without_annex`]'s.
 pub fn find_preimage(stack: &[Vec<u8>], hash: &[u8; 32]) -> Option<[u8; 32]> {
 	stack.iter().filter(|i| i.len() == 32).find(|i| &sha256(i) == hash).map(|i| i[..].try_into().unwrap())
 }
@@ -133,4 +172,54 @@ fn parse_time(item: &[u8]) -> Option<MedianTime> {
 		return None; // not minimal
 	}
 	MedianTime::from_consensus(t).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn items(v: &[&[u8]]) -> Vec<Vec<u8>> {
+		v.iter().map(|i| i.to_vec()).collect()
+	}
+
+	#[test]
+	fn the_annex_is_bip341s_last_item_and_nothing_else() {
+		let sig: &[u8] = &[7; 64];
+		let script: &[u8] = &[0x51];
+		let cb: &[u8] = &[0xc4; 33];
+		// A script path, then the same with an annex: the items are the same.
+		let plain = items(&[sig, script, cb]);
+		let annexed = items(&[sig, script, cb, &[0x50, 1, 2]]);
+		assert_eq!(annex(&plain), None);
+		assert_eq!(annex(&annexed), Some(&[0x50, 1, 2][..]));
+		assert_eq!(without_annex(&annexed), &plain[..]);
+		assert_eq!(without_annex(&plain), &plain[..]);
+		// A key path with an annex: two items, the second the annex.
+		let key_path = items(&[sig, &[0x50]]);
+		assert_eq!(annex(&key_path), Some(&[0x50][..]));
+		assert_eq!(without_annex(&key_path), &items(&[sig])[..]);
+		// A lone item is never an annex, however it starts.
+		let lone = items(&[&[0x50, 9]]);
+		assert_eq!(annex(&lone), None);
+		assert_eq!(without_annex(&lone), &lone[..]);
+		// An empty last item is no annex; nor is one that starts otherwise.
+		for last in [&[][..], &[0x51][..], &[0x4f, 0x50][..]] {
+			let w = items(&[sig, script, cb, last]);
+			assert_eq!(annex(&w), None, "{:?}", last);
+			assert_eq!(without_annex(&w), &w[..]);
+		}
+		// Only the last item: an item before it that starts with 0x50 stays.
+		let two = items(&[sig, &[0x50, 3], &[0x50, 4]]);
+		assert_eq!(without_annex(&two), &items(&[sig, &[0x50, 3]])[..]);
+		assert_eq!(without_annex(&[]), &[] as &[Vec<u8>]);
+	}
+
+	#[test]
+	fn a_preimage_is_found_in_any_item_the_annex_too() {
+		let p = [0x50u8; 32];
+		let h = sha256(&p);
+		assert_eq!(find_preimage(&items(&[&[1; 64], &p, &[0x51], &[0xc4; 33], &[0x50]]), &h), Some(p));
+		assert_eq!(find_preimage(&items(&[&[1; 64], &[0x51], &[0xc4; 33], &p]), &h), Some(p));
+		assert_eq!(find_preimage(&items(&[&[1; 64], &[0x51], &[0xc4; 33]]), &h), None);
+	}
 }
