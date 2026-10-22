@@ -208,10 +208,15 @@ and a board whose registration never reached the server, are not recovered.
   operator's own), and the wallet says, when it gives up a coin for such a
   leaf and again when it takes the leaf, that every exit of it needs a fee coin
   in an accepted asset. Only once the round is final, and only when the operator's status
-  shows exactly the leaves the wallet asked for, in order, each validated, a
-  resting order (`order-2`) only where it asked for one and on exactly its
-  terms, all under the participation's one unlock hash, and exactly the coins
-  it gave up.
+  shows exactly the leaves the wallet asked for, in order, each validated, each
+  of the template it asked for (`vtxo-1`; a resting order, `order-2`, only
+  where it asked for one and on exactly its terms; `htlc-1` only for a payment
+  it receives over Lightning, locked to that payment's hash), all under the
+  participation's one unlock hash, and exactly the coins it gave up. The same
+  owner key, nonce, asset and value under another template is another coin:
+  an `htlc-1` leaf locked to a hash the operator knows is the operator's to
+  claim. A leaf a step of an offline-refresh plan made, and a claim leaf of a
+  distribution, are taken only as `vtxo-1`.
   The forfeit of each coin given up is built from the validated leaf of the
   coin's own asset and its round, and its refund delay must end before the new
   leaves' exit deadline.

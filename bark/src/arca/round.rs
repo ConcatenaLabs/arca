@@ -189,6 +189,42 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 	Ok(tree)
 }
 
+/// Refuses a new leaf whose template is not the one the wallet asked for, or
+/// whose terms are not the ones it asked for. The template is part of what
+/// a leaf is: the same owner key, nonce, asset and value under another
+/// template is another coin. An `htlc-1` leaf locked to a hash its operator
+/// knows can be claimed out of the tree by the operator; an `order-2` leaf is
+/// filled under the operator's signature alone. So a leaf is `vtxo-1` unless
+/// the wallet asked for something else: `order-2` on the terms of a resting
+/// order it asked for (`w["order"]`), or `htlc-1` in the one participation
+/// that names one, a payment received over Lightning, locked to that
+/// payment's hash (`receive`) in the receiving direction.
+pub(crate) fn leaf_as_asked(w: &Value, record: &LeafRecord, receive: Option<&[u8; 32]>) -> Result<(), String> {
+	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
+	let want = match (receive, asked_order) {
+		(Some(_), _) => Template::Htlc1,
+		(None, true) => Template::Order2,
+		(None, false) => Template::Vtxo1,
+	};
+	if record.template != want {
+		return Err(format!("it is a leaf of template {}, and the wallet asked for one of template {}: the template is part of what a \
+			coin is, and the wallet signs nothing for a leaf of another template than it asked", record.template, want));
+	}
+	match want {
+		Template::Htlc1 => {
+			let hash = receive.expect("asked");
+			match &record.htlc {
+				Some(h) if h.direction == arca_covenant::HtlcDirection::Receive && &h.payment_hash == hash && record.order.is_none() => Ok(()),
+				Some(h) => Err(format!("it is an htlc-1 leaf {} under hash {}, and the wallet asked for the leaf receiving payment hash {}",
+					h.direction.name(), hex(&h.payment_hash), hex(hash))),
+				None => Err("it is an htlc-1 leaf with no terms".into()),
+			}
+		},
+		_ if record.htlc.is_some() => Err(format!("it carries htlc-1 terms, and the wallet asked for a leaf of template {}", want)),
+		_ => order_as_asked(w, record.template, record.order.as_ref()),
+	}
+}
+
 /// Refuses a new leaf that is a resting order where the wallet's wanted leaf
 /// `w` asked for none, or one on other terms than it asked: an `order-2`
 /// leaf is filled under the operator's signature alone, at the price and to
@@ -824,6 +860,16 @@ impl Wallet {
 		if take {
 			self.remember_fills(&info)?;
 		}
+		// The one participation whose new leaf is `htlc-1`: a payment the
+		// wallet receives over Lightning, whose participation id its hash
+		// gives. Every other new leaf is the template the wallet asked for.
+		let mut receive = None;
+		for hash in self.receives()?.keys() {
+			let h = unhex32(hash)?;
+			if hex(&super::lightning::receive_participation_id(&h)) == pid {
+				receive = Some(h);
+			}
+		}
 		let mut needs_fee_coin: Vec<String> = vec![];
 		let unlock_hash = unhex32(st["unlock_hash"].as_str().unwrap_or(""))
 			.map_err(|_| Error::Refused("the status names no unlock hash for the participation".into()))?;
@@ -890,7 +936,7 @@ impl Wallet {
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
 			check_profile(&info, &record).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
-			order_as_asked(w, record.template, record.order.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
+			leaf_as_asked(w, &record, receive.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
 				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value, record.asset,
 					w["value"], w["asset"])));

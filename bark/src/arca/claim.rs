@@ -565,6 +565,8 @@ impl Wallet {
 		let (policy, _) = self.leaf_policy(record.asset, as_of)?;
 		let valid = record.validate(&round, &policy, &owner, &nonce)
 			.map_err(|e| Error::Refused(format!("the claim leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
+		super::round::leaf_as_asked(&json!({}), &record, None)
+			.map_err(|why| Error::Refused(format!("the claim leaf in round {}: {}", round_txid, why)))?;
 		if Some(valid.leaf_id.to_string().as_str()) != c["leaf_id"].as_str() {
 			return Err(Error::Refused("the operator names the claim leaf by another id than its record gives".into()));
 		}
