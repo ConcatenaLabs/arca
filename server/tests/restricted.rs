@@ -305,7 +305,7 @@ async fn a_restricted_asset_moves_in_its_issuers_tree_under_its_policy() {
 		let leaf = NewLeaf {
 			owner: enclave_key(&xonly(h), &n).unwrap(), owner_nonce: n, creator_nonce: random32(),
 			exit_delay: common::client::exit_delay(), htlc: None, landing: None,
-			enclave: Some(Enclave { clawback, ..enclave(h) }.terms(rr, value)),
+			enclave: Some(Enclave { clawback, ..enclave(h) }.terms(rr, value)), v2: false,
 		};
 		(rr, value, leaf)
 	};
