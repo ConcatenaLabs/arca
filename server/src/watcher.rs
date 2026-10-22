@@ -1137,10 +1137,12 @@ impl Watcher {
 			return Ok(true);
 		}
 		let outs = r.refund.outputs();
+		// A plan holds vtxo-1 coins alone (`Plans` refuses a vtxo-2 coin), so
+		// neither pair names inputs.
 		let s_old = self.signer.rebind(&r.refund.old.owner, &r.old_half, &r.refund.old.salt, r.refund.old.landing.map(|l| l.program), r.refund.asset,
-			r.refund.old_value, &outs).await?;
+			r.refund.old_value, &outs, None).await?;
 		let s_new = self.signer.rebind(&r.refund.new.owner, &r.new_half, &r.refund.new.salt, r.refund.new.landing.map(|l| l.program), r.refund.asset,
-			r.refund.new_value, &outs).await?;
+			r.refund.new_value, &outs, None).await?;
 		let old_pair = Pair { operator: s_old, owner: r.old_half };
 		let new_pair = Pair { operator: s_new, owner: r.new_half };
 		r.refund.old.verify(r.refund.asset, r.refund.old_value, &outs, &old_pair).map_err(build("the refund's first pair"))?;

@@ -697,6 +697,12 @@ pub struct TransferOutput {
 	/// it, and the operator's published allowance.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
+	/// The new leaf's template, `vtxo-2` for a leaf whose collaborative path
+	/// is `arca/collab-2` (its receive request asks for it); absent or
+	/// `vtxo-1` for the tapscript path. `htlc-1` and `landing-1` are named
+	/// by their terms.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub template: Option<String>,
 }
 
 /// An `htlc-1` leaf's terms beside its owner's key, nonces and exit delay.

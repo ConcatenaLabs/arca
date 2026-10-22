@@ -823,6 +823,12 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 					.map_err(|e| Refusal::malformed(format!("htlc operator delay: {}", e)))?,
 			}),
 		};
+		let v2 = match o.template.as_deref() {
+			None | Some("vtxo-1") => false,
+			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() => true,
+			Some(t) => return Err(Refusal::malformed(format!("template {:?}: a transfer creates vtxo-1 or vtxo-2 leaves, htlc-1 and \
+				landing-1 by their terms", t))),
+		};
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
@@ -835,7 +841,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 				htlc,
 				landing: landing_of(&o.landing)?.map(|l| l.terms(asset(&o.asset)?, amount(&o.value)?)
 					.map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "out_of_bounds", format!("landing: {}", e))))
-					.transpose()?, v2: false,
+					.transpose()?, v2,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,

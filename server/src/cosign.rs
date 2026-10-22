@@ -77,7 +77,7 @@ use crate::chain::FinalityService;
 use crate::coins::{self, Checked, CoinError};
 use crate::fees;
 use crate::params::Params;
-use crate::signer::{SignerClient, SignerError};
+use crate::signer::{SignerClient, SignerError, WireNamed};
 use crate::store::{
 	LeafKind, LeafState, NewCoin, NewReassignment, NewScript, NewTransferInput, NewTransferOutput, ScriptKind, SignerMessage, Store,
 	StoreError,
@@ -333,6 +333,13 @@ impl TransferRequest {
 						e.input(&l.min_value.to_le_bytes());
 					},
 				}
+			}
+		}
+		// Which leaves are vtxo-2, the same way.
+		if self.outputs.iter().any(|o| o.leaf.v2) {
+			e.input(&[0xfc]);
+			for o in &self.outputs {
+				e.input(&[o.leaf.v2 as u8]);
 			}
 		}
 		sha256::Hash::from_engine(e).to_byte_array()
@@ -649,7 +656,7 @@ impl Cosigner {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
 			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
-				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await;
+				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
 			let (cp, h) = match cp {
 				Ok(x) => x,
 				// The first message of the transfer refused: nothing of it is
@@ -659,8 +666,9 @@ impl Cosigner {
 			};
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
+			let named = checkpoint.v2.then(|| WireNamed::new(k as u32, &(0..n).map(|j| plan.checkpoint_output(j)).collect::<Vec<_>>()));
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
-				plan.inputs[k].1, &outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+				plan.inputs[k].1, &outputs, named).await.map_err(|e| lost_spend(e, &c.coin.id))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
@@ -1062,6 +1070,13 @@ pub(crate) fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
 		return Err(bad());
 	}
 	Ok(out)
+}
+
+/// What the signer is told of a coin spent alone at input 0 (into its
+/// checkpoint, or its forfeit): for a `vtxo-2` coin the one input its
+/// message names, itself; nothing for any other.
+pub(crate) fn alone(coin: &arca_covenant::ValidCoin) -> Option<WireNamed> {
+	coin.leaf.v2.then(|| WireNamed::new(0, &[coin.output()]))
 }
 
 #[cfg(test)]

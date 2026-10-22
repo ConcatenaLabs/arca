@@ -706,7 +706,7 @@ impl Participations {
 			match o {
 				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, channel, .. } => {
 					match (template, order, landing, channel) {
-						(Template::Vtxo1, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+						(Template::Vtxo1 | Template::Vtxo2, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
 						(Template::Order2, Some(o), None, None) => self.check_order_terms(j, o, *asset, owner, now).await?,
 						(Template::Channel1, None, None, Some(c)) => p.check_channel(*asset, *value, c)
 							.map_err(|e| ParticipationError::OutOfBounds(format!("output {}: {}", j, e)))?,

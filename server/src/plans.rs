@@ -397,6 +397,7 @@ impl Plans {
 		let now = self.now().await?;
 		let digest = quote_digest(&self.params.chain, &self.params.operator, &req.coin, &req.owner_nonces, req.exit_delay);
 		let c = self.first_coin(&req.coin, &digest, now).await?;
+		vtxo1_only(&c.coin)?;
 		if !verify_digest(&req.attestation, &digest, &c.coin.leaf.owner) {
 			return Err(PlanError::BadSignature("the attestation is not the coin's owner's signature over the quote request".into()));
 		}
@@ -477,6 +478,7 @@ impl Plans {
 		}
 		plan.check().map_err(PlanError::Plan)?;
 		let c = self.first_coin(&req.coin, &id, now).await?;
+		vtxo1_only(&c.coin)?;
 		if c.coin.leaf != first {
 			return Err(PlanError::Internal("the coin's record gives another leaf".into()));
 		}
@@ -904,6 +906,18 @@ pub async fn blocks_participation(store: &Store, leaf: &[u8; 32], participation:
 		}
 	}
 	Ok(None)
+}
+
+/// A plan's coin is spent by the tapscript collaborative path: each step's
+/// refund spends the coin and its new leaf in one transaction, and a
+/// `vtxo-2` pair names the inputs it is spent beside, which the refund the
+/// holder signs does not. A `vtxo-2` coin is refreshed by its holder.
+fn vtxo1_only(coin: &arca_covenant::ValidCoin) -> Result<(), PlanError> {
+	if coin.leaf.v2 {
+		return Err(PlanError::OutOfBounds(format!("coin {} is vtxo-2: offline refresh plans vtxo-1 coins, as a step's refund spends \
+			the coin beside its new leaf, which a vtxo-2 pair names; its holder refreshes it", coin.id)));
+	}
+	Ok(())
 }
 
 /// The participation of its holder's that holds the coin `row`, when it is

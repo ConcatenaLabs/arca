@@ -661,7 +661,11 @@ A sender gives up coins the server knows, by leaf id, each with the value its
 checkpoint keeps and its owner's signatures over the checkpoint and the
 reassignment, for one to four new leaves, each named by its receiver's key and
 nonce, a creator nonce the sender draws fresh for that leaf, an exit delay, an
-asset and a value. The server co-signs only when every rule holds:
+asset and a value, and `template: "vtxo-2"` for a `vtxo-2` leaf (a `vtxo-1`
+leaf when absent). A `vtxo-2` coin moves into a `vtxo-2` checkpoint, whose
+pair names every checkpoint of the reassignment and its own index
+(`arca-covenant`'s `collab`), so its owner's signature binds the coins it is
+spent beside. The server co-signs only when every rule holds:
 
 - each input is live (a board once credited) and spent by nothing else: a
   second spend of a leaf is refused, which is the whole of the double-spend
@@ -748,8 +752,8 @@ anything while the round runs: the participation names the coins it gives up,
 each with an attestation (its owner key's BIP340 signature over the
 participation's id), the outputs it wants for them, the fee it pays, and
 optionally the earliest median time of a round it may run in, at
-most seven days ahead. An output wanted is a leaf (its template, `vtxo-1`, its
-owner key and nonce, its exit delay, asset and value, and its key proof: the
+most seven days ahead. An output wanted is a leaf (its template, `vtxo-1` or
+`vtxo-2`, its owner key and nonce, its exit delay, asset and value, and its key proof: the
 owner key's BIP340 signature over `SHA256(T ‖ T ‖ id)`,
 `T = SHA256("Arca/participation-key")`, so a participation wants a leaf only
 under a key it holds, and optionally the leaf's binding to its owner's
@@ -974,7 +978,10 @@ and each payment back with its state. The return itself is the watcher's
 ### Offline refresh: plans
 
 A holder who will stay away past a coin's expiry pre-signs a plan
-(`plans`, `arca_covenant::plan`): a chain of 1 to 6 refresh steps the operator
+(`plans`, `arca_covenant::plan`) for a `vtxo-1` coin (a `vtxo-2` coin is
+refused, `out_of_bounds`: each step's refund spends the coin beside its new
+leaf, which a `vtxo-2` pair would have to name; its holder refreshes it in
+its window): a chain of 1 to 6 refresh steps the operator
 applies in later rounds without it. Step `i` gives up the holder's coin
 `L(i-1)` for a new leaf `L(i)`; `L(0)` is the coin the plan starts from, a leaf
 of a round (a board or a received coin is refreshed in a round first). Each
@@ -2042,7 +2049,10 @@ refuses one others can), listens on a Unix socket of mode 0600, and answers
 three requests: its public key; `S`'s signature over the rebindable message of
 a collaborative path, which it builds itself from the parts (the salt, the
 coin's asset and value, one to four committed outputs, and for a forfeit the
-forfeit's own parts) on its own chain, for the leaf of an owner key the
+forfeit's own parts; for a `vtxo-2` coin or its checkpoint, also the coin's
+input index and the outputs the transaction's first inputs spend, the coin's
+own among them, which `arca/collab-2`'s message names, `named`) on its own
+chain, for the leaf of an owner key the
 request names together with that owner's own signature over the same
 message, which the signer checks; and
 `S`'s signature over the spend of one input of a transaction by one tapscript

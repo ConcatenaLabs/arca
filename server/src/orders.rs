@@ -812,11 +812,18 @@ impl Orders {
 			let cp_out = tplan.checkpoint_output(k);
 			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
 				c.coin.asset, c.coin.value,
-				std::slice::from_ref(&cp_out)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
+			// A vtxo-2 checkpoint's pair names the fill's inputs: the order's
+			// coin at 0, then every taker checkpoint.
+			let named = checkpoint.v2.then(|| {
+				let mut ins = vec![oc.coin.output()];
+				ins.extend((0..n).map(|j| tplan.checkpoint_output(j)));
+				crate::signer::WireNamed::new(k as u32 + 1, &ins)
+			});
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
-				i.checkpoint_value, &outputs).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				i.checkpoint_value, &outputs, named).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(internal("the signer signed another message than the server built"));
