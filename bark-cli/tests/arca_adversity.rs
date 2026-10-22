@@ -160,6 +160,69 @@ async fn a_status_that_hides_a_new_leaf_is_refused_before_any_forfeit() {
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// The operator publishes the leaf a refresh asked for, `vtxo-1`, as an
+/// `htlc-1` leaf of its own terms: the same owner key, nonce, asset and
+/// value, locked to a hash whose preimage the operator knows, so that it
+/// could claim the leaf out of the tree after its own delay. The round and
+/// its published tree build the leaf honestly; only its template is not
+/// the one asked for. The wallet signs no forfeit for it, and its coin
+/// stays its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wanted_leaf_published_under_another_template_is_refused_before_any_forfeit() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	let c = Arca::new("F1T");
+	let x = r.x;
+	let mut args = create_args(&proxy.url, &r.node_url()).into_iter().map(String::from).collect::<Vec<_>>();
+	let k = args.iter().position(|a| a == "--exit-delay-units").unwrap();
+	args[k + 1] = "2".into();
+	c.ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+	let s = script(&c.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	let board = c.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || c.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	c.ok(&["sync"]);
+	let p = c.ok(&["participate"]);
+	let pid = p["participations"][0]["participation"].as_str().unwrap().to_string();
+
+	// The operator's own terms: a payment out of the tree, which it claims
+	// with the preimage after a delay shorter than the owner's.
+	let preimage = [7u8; 32];
+	let hash = arca_covenant::script::sha256(&preimage);
+	let now = rpc(&r, "getblockchaininfo", &[])["mediantime"].as_u64().unwrap() as u32;
+	let terms = arca_covenant::HtlcTerms {
+		direction: arca_covenant::HtlcDirection::Send, payment_hash: hash,
+		timeout: arca_covenant::MedianTime::from_consensus(now + 60 * 86_400).unwrap(),
+		operator_delay: RelativeTime::from_units(1).unwrap(),
+	};
+	let bytes = { use arca_covenant::encode::Encoding; terms.encode() };
+	let (db, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move { let _ = conn.await; });
+	let n = db.execute("UPDATE participation_output SET template = 'htlc-1', htlc = $2 WHERE participation_id = $1 AND kind = 'leaf'",
+		&[&unhex(&pid), &bytes]).await.unwrap();
+	assert_eq!(n, 1, "the wanted leaf of participation {}", pid);
+	let round = final_round(&r).await;
+	println!("F1T round {} publishes the wanted leaf as htlc-1, hash {}", round.txid(), hex(&hash));
+
+	let s = c.ok(&["sync"]);
+	let done = &s["participations"][0];
+	if let Some(l) = done["new_leaves"][0]["leaf_id"].as_str() {
+		let CoinRecord::Leaf { record, .. } = record_of(&c, l) else { panic!("a leaf") };
+		println!("F1T the wallet took leaf {} of template {} locked to hash {:?}, forfeits signed: {}", l, record.template,
+			record.htlc.map(|h| hex(&h.payment_hash)), proxy.count("/v1/forfeit_leaves"));
+	}
+	let why = done["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F1T the wanted vtxo-1 leaf published as htlc-1: REFUSED: {}", why);
+	assert!(why.contains("htlc-1") && why.contains("vtxo-1"), "{}", why);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "no forfeit was signed");
+	assert_eq!(coin_of(&c, &board)["state"], "given", "the coin is still the wallet's");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 // ---------------------------------------------------------------------------
 // After a rollback: the round the chain holds
 // ---------------------------------------------------------------------------
