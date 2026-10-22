@@ -1303,7 +1303,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel } => Ok(LeafSpec {
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -1314,7 +1314,7 @@ impl Rounds {
 				htlc: *htlc,
 				order: *order,
 				landing: *landing,
-				channel: None,
+				channel: *channel,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -2720,16 +2720,17 @@ impl Rounds {
 		};
 		let mut specs = Vec::with_capacity(leaves.len());
 		for l in &leaves {
-			// An htlc-1, order-2 or landing-1 leaf's terms, from the record the
-			// builder gave it: a tree leaf record, or an accumulator record.
-			let (htlc, order, landing) = match b.kind {
+			// An htlc-1, order-2, landing-1 or channel-1 leaf's terms, from the
+			// record the builder gave it: a tree leaf record, or an
+			// accumulator record (which carries no channel).
+			let (htlc, order, landing, channel) = match b.kind {
 				BatchKind::Tree => {
 					let r = arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
-					(r.htlc, r.order, r.landing)
+					(r.htlc, r.order, r.landing, r.channel)
 				},
 				BatchKind::Accumulator => {
 					let r = AccumulatorRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
-					(r.htlc, r.order, r.landing)
+					(r.htlc, r.order, r.landing, None)
 				},
 			};
 			specs.push(LeafSpec {
@@ -2743,7 +2744,7 @@ impl Rounds {
 				htlc,
 				order,
 				landing,
-				channel: None,
+				channel,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

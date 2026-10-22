@@ -184,7 +184,7 @@ impl Participations {
 		let mut dated = Vec::with_capacity(d.inputs.len());
 		let mut last_times = Vec::with_capacity(d.inputs.len());
 		for (k, (leaf, att)) in d.inputs.iter().zip(&req.attestations).enumerate() {
-			let c = coins::check(&self.store, &policy, leaf, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			let c = coins::check_plain(&self.store, &policy, leaf, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 			if c.coin.leaf.htlc.is_some() {
 				return Err(ParticipationError::HtlcInput(k, *leaf));
 			}
@@ -276,6 +276,7 @@ impl Participations {
 					htlc: None,
 					order: None,
 					landing: None,
+					channel: None,
 				},
 				leaf_id: None,
 			}).collect(),

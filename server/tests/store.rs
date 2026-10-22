@@ -34,6 +34,7 @@ const SCHEMA: i32 = 33;
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
 const UNDO_V17: &str = "ALTER TABLE batch DROP COLUMN kind;
+	DROP TABLE channel_note; DROP TABLE channel_state; ALTER TABLE participation_output DROP COLUMN channel;
 	DROP TABLE supervision_hold; ALTER TABLE participation_output DROP COLUMN landing;
 	DROP TABLE round_mint; ALTER TABLE watched_outpoint DROP CONSTRAINT watched_outpoint_kind_check;
 	ALTER TABLE watched_outpoint ADD CONSTRAINT watched_outpoint_kind_check CHECK (kind IN ('board', 'nursery', 'receive'));

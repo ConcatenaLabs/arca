@@ -16,7 +16,8 @@
 //! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`,
 //! `schema/V27__resting_orders.sql`, `schema/V28__issuer_operated.sql`,
 //! `schema/V29__fill_requests.sql`, `schema/V30__order_landings.sql`,
-//! `schema/V31__supervised.sql`, `schema/V33__accumulator_batches.sql`),
+//! `schema/V31__supervised.sql`, `schema/V32__channels.sql`,
+//! `schema/V33__accumulator_batches.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -46,6 +47,7 @@ use tokio_postgres::NoTls;
 
 mod boards;
 mod chain;
+mod channels;
 mod coins;
 mod distributions;
 mod lightning;
@@ -62,6 +64,7 @@ mod wallet;
 mod watcher;
 
 pub use boards::{BoardRow, BoardState};
+pub use channels::{Begun, ChannelNoteRow, ChannelSeen, ChannelStateRow, NewChannelState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
@@ -119,6 +122,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(29, include_str!("../../schema/V29__fill_requests.sql")),
 	(30, include_str!("../../schema/V30__order_landings.sql")),
 	(31, include_str!("../../schema/V31__supervised.sql")),
+	(32, include_str!("../../schema/V32__channels.sql")),
 	(33, include_str!("../../schema/V33__accumulator_batches.sql")),
 ];
 
@@ -180,6 +184,13 @@ pub enum StoreError {
 	Mergeable(String),
 	#[error("a participation with this id is already recorded")]
 	ParticipationExists,
+	/// A channel's state or note waits for the signer, or moved since it was
+	/// read: the channel's coin, hex.
+	#[error("channel {0} has a state or a note in flight, or moved since it was read: ask again")]
+	ChannelBusy(String),
+	/// A channel state that does not follow the channel's latest.
+	#[error("{0}")]
+	ChannelState(String),
 	/// Another pending or issued participation takes the same order, and
 	/// this take or that one takes it alone.
 	#[error("order {0} is taken by participation {1}, which is pending or in a round: an order is taken by one participation at a time")]

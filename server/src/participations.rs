@@ -153,6 +153,9 @@ pub enum OutputRequest {
 		order: Option<arca_covenant::OrderLeafTerms>,
 		/// `landing-1`'s landing, for a leaf of a supervised asset.
 		landing: Option<arca_covenant::Landing>,
+		/// `channel-1`'s terms, for a channel leaf: the operator's side of
+		/// `value` and the credit window.
+		channel: Option<arca_covenant::Channel>,
 	},
 	Offboard { asset: AssetId, value: u64, script: Script },
 }
@@ -167,6 +170,15 @@ impl OutputRequest {
 	pub fn value(&self) -> u64 {
 		match self {
 			OutputRequest::Leaf { value, .. } | OutputRequest::Offboard { value, .. } => *value,
+		}
+	}
+
+	/// What the output takes of the participation's coins: its value, less
+	/// the operator's side of a channel leaf, which the operator funds.
+	pub fn owner_value(&self) -> u64 {
+		match self {
+			OutputRequest::Leaf { value, channel: Some(c), .. } => value.saturating_sub(c.capacity),
+			o => o.value(),
 		}
 	}
 }
@@ -256,7 +268,7 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 	e.input(&[outputs.len() as u8]);
 	for o in outputs {
 		match o {
-			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
+			OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing, channel } => {
 				e.input(&[0]);
 				e.input(&asset.into_inner().to_byte_array());
 				e.input(&value.to_le_bytes());
@@ -272,6 +284,10 @@ pub fn participation_id(chain: &Chain, operator: &XOnlyPublicKey, inputs: &[Leaf
 				if let Some(l) = landing {
 					e.input(&l.program);
 					e.input(&l.allowance.to_le_bytes());
+				}
+				if let Some(c) = channel {
+					e.input(&c.capacity.to_le_bytes());
+					e.input(&c.window.units().to_le_bytes());
 				}
 			},
 			OutputRequest::Offboard { asset, value, script } => {
@@ -393,6 +409,7 @@ impl ParticipationError {
 			Coin(CoinError::RoundNotFinal(_)) => "round_not_final",
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
+			Coin(CoinError::Channel(_)) => "template",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
 			Template(..) | HtlcInput(..) => "template",
@@ -687,10 +704,12 @@ impl Participations {
 		for (j, o) in req.outputs.iter().enumerate() {
 			p.check_value(o.asset(), o.value()).map_err(ParticipationError::OutOfBounds)?;
 			match o {
-				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, .. } => {
-					match (template, order, landing) {
-						(Template::Vtxo1, None, None) | (Template::Landing1, None, Some(_)) => {},
-						(Template::Order2, Some(o), None) => self.check_order_terms(j, o, *asset, owner, now).await?,
+				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, channel, .. } => {
+					match (template, order, landing, channel) {
+						(Template::Vtxo1, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+						(Template::Order2, Some(o), None, None) => self.check_order_terms(j, o, *asset, owner, now).await?,
+						(Template::Channel1, None, None, Some(c)) => p.check_channel(*asset, *value, c)
+							.map_err(|e| ParticipationError::OutOfBounds(format!("output {}: {}", j, e)))?,
 						_ => return Err(ParticipationError::Template(j, template.to_string())),
 					}
 					p.check_landing(*asset, *value, landing.as_ref())
@@ -798,14 +817,28 @@ impl Participations {
 			}
 		}
 
+		// A channel coin gives up its owner's side: the latest state's
+		// balance and every credit not folded, read with the state and note
+		// they come from, which must still be the latest when it is given up.
+		let mut seen = vec![];
+		let mut shares = Vec::with_capacity(n);
+		for (c, i) in coins.iter().zip(&req.inputs) {
+			match crate::channels::owner_share(&self.store, &i.leaf_id, &c.leaf).await? {
+				Some((share, s)) => {
+					shares.push(share);
+					seen.push(s);
+				},
+				None => shares.push(c.value),
+			}
+		}
 		// The amounts, per asset: in = out + fee, exactly.
 		let mut held: BTreeMap<AssetId, u128> = BTreeMap::new();
-		for c in &coins {
-			*held.entry(c.asset).or_default() += c.value as u128;
+		for (c, share) in coins.iter().zip(&shares) {
+			*held.entry(c.asset).or_default() += *share as u128;
 		}
 		let mut taken: BTreeMap<AssetId, u128> = BTreeMap::new();
 		for o in &req.outputs {
-			*taken.entry(o.asset()).or_default() += o.value() as u128;
+			*taken.entry(o.asset()).or_default() += o.owner_value() as u128;
 		}
 		let paid: BTreeMap<AssetId, u64> = req.fees.iter().copied().collect();
 		for (a, v) in &paid {
@@ -824,14 +857,14 @@ impl Participations {
 		let refund_delay = p.refund_delay;
 		let mut margins = Vec::with_capacity(n);
 		let mut due: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for (c, expiry) in coins.iter().zip(&expiries) {
+		for ((c, expiry), share) in coins.iter().zip(&expiries).zip(&shares) {
 			margins.push(forfeit_margin(c, refund_delay, self.floor(c.asset).await?));
-			*due.entry(c.asset).or_default() += schedule.refresh(c.value, *expiry, now);
+			*due.entry(c.asset).or_default() += schedule.refresh(*share, *expiry, now);
 		}
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {
 			let kind = match o {
-				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, order, landing, .. } => WantedKind::Leaf {
+				OutputRequest::Leaf { template, owner, owner_nonce, exit_delay, order, landing, channel, .. } => WantedKind::Leaf {
 					template: template.to_string(),
 					owner_key: owner.serialize(),
 					owner_nonce: *owner_nonce,
@@ -840,6 +873,7 @@ impl Participations {
 					htlc: None,
 					order: *order,
 					landing: *landing,
+					channel: *channel,
 				},
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());
@@ -883,11 +917,13 @@ impl Participations {
 			fill: None,
 			distribution: None,
 		};
-		match self.store.insert_participation(&new).await {
+		match self.store.insert_participation_seen(&new, &seen).await {
 			Ok(()) => {},
 			Err(StoreError::ParticipationExists) => return self.status(&id).await,
 			Err(StoreError::LeafSpent(l)) => return Err(CoinError::Spent(l.parse().unwrap_or(req.inputs[0].leaf_id)).into()),
 			Err(StoreError::LeafNotLive(l, s)) => return Err(CoinError::NotLive(l.parse().unwrap_or(req.inputs[0].leaf_id), s).into()),
+			Err(StoreError::ChannelBusy(l)) => return Err(ParticipationError::OutOfBounds(format!(
+				"channel {} has a state or a payment in flight, or moved since its share was read: submit again", l))),
 			Err(e) => return Err(e.into()),
 		}
 		log::info!("participation {} accepted: {} coin(s) given up for {} output(s)", crate::signer::hex(&id), n, m);
@@ -1079,6 +1115,7 @@ impl Participations {
 					htlc: None,
 					order: None,
 					landing: None,
+					channel: None,
 				},
 				leaf_id: None,
 			}],
@@ -1128,7 +1165,7 @@ impl Participations {
 		let mut last_times = Vec::with_capacity(inputs.len());
 		let policy = self.params.participation_policy(now);
 		for (k, i) in inputs.iter().enumerate() {
-			let c = coins::check(&self.store, &policy, &i.leaf_id, id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			let c = coins::check_plain(&self.store, &policy, &i.leaf_id, id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 			if c.coin.leaf.htlc.is_some() {
 				return Err(ParticipationError::HtlcInput(k, i.leaf_id));
 			}

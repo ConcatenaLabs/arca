@@ -640,6 +640,14 @@ pub struct AssetSection {
 	/// on the chain is refused.
 	#[serde(default)]
 	pub supervised: Option<SupervisedSection>,
+	/// The most the operator puts on its own side of a `channel-1` leaf in
+	/// the asset ([`crate::channels`]), in its atoms, or (`_value`) as a
+	/// value in atoms of the reference unit, converted at the asset's rate;
+	/// decimal strings. No channel leaf of the asset is made when absent.
+	#[serde(default)]
+	pub channel_capacity: Option<String>,
+	#[serde(default)]
+	pub channel_capacity_value: Option<String>,
 }
 
 /// A supervised asset's settings.
@@ -663,6 +671,7 @@ impl AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
 			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None, supervised: None,
+			channel_capacity: None, channel_capacity_value: None,
 		}
 	}
 }
@@ -1312,7 +1321,8 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 				Some(crate::issuer::IssuerAsset::from_section(id, s, None).map_err(|e| StartError(format!("asset {}: issuer: {}", id, e)))?)
 			},
 		};
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None }));
+		let channel_capacity = amount("channel_capacity", &a.channel_capacity, &a.channel_capacity_value)?;
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1514,6 +1524,7 @@ impl Server {
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),
 			Duration::from_secs(config.limits.board_unconfirmed_seconds));
 		let cosigner = Cosigner::new(store.clone(), finality.clone(), params.clone(), signer.clone());
+		let channels = crate::channels::Channels::new(store.clone(), params.clone(), signer.clone());
 		let participations = Participations::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let plans = crate::plans::Plans::new(store.clone(), finality.clone(), params.clone(), signer.clone(), wallet.clone());
 		let orders = crate::orders::Orders::new(store.clone(), finality.clone(), params.clone(), signer.clone());
@@ -1665,7 +1676,8 @@ impl Server {
 
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
-			participations: participations.clone(), plans: plans.clone(), orders: orders.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(), certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
+			participations: participations.clone(), plans: plans.clone(), orders: orders.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(),
+			channels, certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
