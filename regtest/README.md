@@ -104,8 +104,8 @@ batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
 second and fourth leaves are `htlc-1`, one whose first and fourth are
 `order-2`, one whose second and fifth are `order-3`, one of a supervised asset whose five leaves are all
-`landing-1`, and one whose second and fifth leaves are `channel-1` (the
-fifth with no opening balance for the operator), it holds the inputs, the
+`landing-1`, one whose second and fifth leaves are `channel-1` (the
+fifth with no opening balance for the operator), and one whose second and third are `vtxo-2`, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds
@@ -142,6 +142,17 @@ lands as; and the operator's digest over a fill's outputs with its signature.
 The Simplicity commitment roots are sequentia-contracts': `arca/order-3`
 and `seqdex/order` version 2 for an `order-3` leaf, `arca/order-2` and
 `seqdex/order` version 1 for an `order-2` leaf.
+
+`vectors/collab2.json` holds the `vtxo-2` leaf's vectors, written by
+`collab2.py`, which derives them on its own from the tagged hashes, as
+`order.py` does: a leaf and its checkpoint, each a Simplicity leaf
+(`arca/collab-2`, named by sequentia-contracts' commitment root), a hidden data
+leaf over the owner's key, the operator's key and the salt, and a tapscript
+leaf (the exit, or the checkpoint's sweep), with their control blocks, merkle
+roots and scriptPubKeys; and a spend of each, the leaf alone into its
+checkpoint and the checkpoint at index 1 of a swap: the bytes both keys sign
+(the coin's index, the inputs named by asset, amount and script, the
+outputs), the digest, both signatures and the Simplicity witness.
 
 `vectors/bond.json` holds the equivocation bond's vectors, written by
 `bond.py`: its keys and notice delay, its three scripts, the bond's and the

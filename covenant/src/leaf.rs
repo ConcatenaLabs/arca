@@ -50,6 +50,12 @@
 //! A `channel-1` leaf ([`crate::channel`]) holds a balance for each of owner
 //! and operator: it is the output of the channel's state 0,
 //! `[collab, [update(0), settle(0)]]`, its collaborative path this very one.
+//!
+//! A `vtxo-2` leaf ([`crate::collab`]) keeps the exit and replaces the
+//! collaborative script with the Simplicity program `arca/collab-2` and its
+//! data leaf, `[[program, data], exit]`: owner and operator sign the coin's
+//! index and the inputs they name as well as the outputs, still never the
+//! outpoint. Its salt, keys and exit are a `vtxo-1` leaf's.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -58,6 +64,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::channel::{ChannelPolicy, ChannelTerms};
+use crate::collab::Collab2;
 use crate::htlc::{HtlcPath, HtlcTerms};
 use crate::enclave::EnclaveTerms;
 use crate::landing::LandingTerms;
@@ -162,6 +169,10 @@ pub struct LeafPolicy {
 	/// and the asset's issuer may claw the coin back where it elected to
 	/// ([`crate::enclave`]); `None` otherwise.
 	pub enclave: Option<EnclaveTerms>,
+	/// `vtxo-2`: the collaborative path is the Simplicity program
+	/// `arca/collab-2` ([`crate::collab`]) in place of the tapscript path. Only
+	/// a leaf with no `htlc`, `order` or `landing` terms is `vtxo-2`.
+	pub v2: bool,
 }
 
 impl LeafPolicy {
@@ -181,8 +192,16 @@ impl LeafPolicy {
 		}
 	}
 
+	/// The tapscript collaborative path. A `vtxo-2` leaf's tree does not
+	/// carry it: its path is [`Self::collab2`].
 	pub fn collab_script(&self) -> Script {
 		rebindable_two_party(&self.owner, &self.operator, &self.collab_prefix())
+	}
+
+	/// The parameters of `arca/collab-2` for this leaf: what a `vtxo-2`
+	/// leaf's data leaf holds.
+	pub fn collab2(&self) -> Collab2 {
+		Collab2 { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain }
 	}
 
 	/// The exit of a `vtxo-1` leaf, or the landing of a `landing-1` leaf. An
@@ -227,9 +246,13 @@ impl LeafPolicy {
 	/// refund]]`. `order-3` and `order-2`: `[[collab, land], [fill, data]]`
 	/// ([`crate::order`]), the fill the template's program.
 	/// `channel-1`: `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
+	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
+		}
+		if self.v2 {
+			return self.collab2().taproot(self.exit_script());
 		}
 		if let Some(o) = self.order_policy() {
 			return TapOutput::with_nodes(vec![
@@ -252,11 +275,13 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, `htlc-1`, `order-3` (or `order-2`),
-	/// `landing-1` or `channel-1`.
+	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
+	/// `order-2`), `landing-1`, `enclave-1` or `channel-1`.
 	pub fn template(&self) -> crate::Template {
 		if self.channel.is_some() {
 			crate::Template::Channel1
+		} else if self.v2 {
+			crate::Template::Vtxo2
 		} else if let Some(o) = &self.order {
 			o.template()
 		} else if self.landing.is_some() {
@@ -293,12 +318,23 @@ impl LeafPolicy {
 
 	/// The message owner and operator sign to spend a coin of this leaf,
 	/// holding `value_in` of `asset_in`, into `outputs` at indices `0..m`.
+	/// For a `vtxo-2` leaf it is the spend of the coin alone, at input 0 and
+	/// the only input named ([`crate::Rebindable::message_in`] names more).
 	pub fn collab_message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		if self.v2 {
+			let coin = ExplicitOutput::new(asset_in, value_in, self.script_pubkey()).txout();
+			let outs: Vec<elements::TxOut> = outputs.iter().map(|o| o.txout()).collect();
+			return self.collab2().message(0, &[coin], &outs);
+		}
 		two_party_message(&self.collab_prefix(), asset_in, value_in, outputs)
 	}
 
-	/// The full collaborative witness for `m` committed outputs.
+	/// The full collaborative witness for `m` committed outputs; for a
+	/// `vtxo-2` leaf, of the coin alone at input 0.
 	pub fn collab_witness(&self, operator_sig: &Signature, owner_sig: &Signature, m: u8) -> Vec<Vec<u8>> {
+		if self.v2 {
+			return self.collab2().witness(self.exit_script(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
+		}
 		self.taproot().witness(&self.collab_script(), two_party_items(operator_sig, owner_sig, m))
 	}
 

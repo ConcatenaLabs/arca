@@ -283,6 +283,7 @@ impl BoardRecord {
 			}),
 			channel: None,
 			enclave: self.enclave.map(|e| e.terms(self.asset, self.value)),
+			v2: false,
 		}
 	}
 

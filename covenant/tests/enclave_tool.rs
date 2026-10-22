@@ -71,7 +71,7 @@ fn the_tool_gives_the_wallets_digests() {
 	let n2 = label32("tool n2");
 	let leaf2 = NewLeaf {
 		owner: enclave_key(&xonly(&h2), &n2).unwrap(), owner_nonce: n2, creator_nonce: label32("tool c2"),
-		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h2).terms(r, V)),
+		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h2).terms(r, V)), v2: false,
 	};
 	let out2 = vec![ExplicitOutput::new(r, V, leaf2.policy(xonly(&s), chain).script_pubkey())];
 	let plan = TransferPlan { inputs: vec![(c1.clone(), V)], outputs: out2.clone() };
@@ -105,7 +105,7 @@ fn the_tool_gives_the_wallets_digests() {
 	let n3 = label32("tool n3");
 	let leaf3 = NewLeaf {
 		owner: enclave_key(&xonly(&h1), &n3).unwrap(), owner_nonce: n3, creator_nonce: label32("tool c3"),
-		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h1).terms(r, V)),
+		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h1).terms(r, V)), v2: false,
 	};
 	let plan = TransferPlan { inputs: vec![(c2, V)], outputs: vec![ExplicitOutput::new(r, V, leaf3.policy(xonly(&s), chain).script_pubkey())] };
 	let (ok, v) = tool("transfer", &req(&rec2, &h1, n3, label32("tool c3")));

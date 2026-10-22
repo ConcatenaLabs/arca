@@ -257,7 +257,7 @@ async fn a_restricted_asset_settles_in_its_issuers_tree_under_its_rules() {
 		let n = random32();
 		(rr, value, NewLeaf {
 			owner: enclave_key(&xonly(k), &n).unwrap(), owner_nonce: n, creator_nonce: random32(),
-			exit_delay: common::client::exit_delay(), htlc: None, landing: None, enclave: Some(enclave(k).terms(rr, value)),
+			exit_delay: common::client::exit_delay(), htlc: None, landing: None, enclave: Some(enclave(k).terms(rr, value)), v2: false,
 		})
 	};
 	let v1 = c1.valid(&r);

@@ -126,8 +126,8 @@ signature at all (an entry's unlock, a landing, an on-chain order's FILL
 leaf), nothing covers the annex (`order-3` and `seqdex/order` version 2,
 which every new order uses, refuse one), so whoever mines the spend, or relays it
 through a node that does not apply that rule, can add one without changing
-its txid. An exit from an accumulator batch is the
-exception: its program refuses an annex.
+its txid. An exit from an accumulator batch and a `vtxo-2` coin's
+collaborative spend are the exceptions: their programs refuse an annex.
 
 The server, its watcher and the wallets read every spend found on the chain
 with its annex set aside: a forfeit or `htlc-1` claim, a fill, an exit, a

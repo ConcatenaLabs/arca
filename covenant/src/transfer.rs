@@ -141,7 +141,7 @@
 //!         [32] the preimage of its entry's unlock hash
 //!         [64] signature, u32 time: its owner's exit authorisation
 //!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, 5 one
-//!       whose leaf is landing-1, or 7 one whose leaf is enclave-1:
+//!       whose leaf is landing-1, 7 one whose leaf is enclave-1, or 8 one whose leaf is vtxo-2:
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
@@ -259,6 +259,9 @@ pub struct NewLeaf {
 	/// must agree with the output the leaf is paid
 	/// ([`crate::EnclaveTerms::check_leaf`]); `None` otherwise.
 	pub enclave: Option<crate::EnclaveTerms>,
+	/// A `vtxo-2` leaf ([`crate::collab`]); only with no `htlc` or `landing`
+	/// terms.
+	pub v2: bool,
 }
 
 impl NewLeaf {
@@ -267,7 +270,7 @@ impl NewLeaf {
 		LeafPolicy {
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
 			order: None, landing: self.landing, enclave: self.enclave,
-			channel: None,
+			channel: None, v2: self.v2,
 		}
 	}
 
@@ -418,6 +421,8 @@ pub enum TransferError {
 	Landing(String),
 	#[error("an enclave-1 leaf's terms: {0}")]
 	Enclave(String),
+	#[error("the new leaf's template: {0}")]
+	Template(String),
 	#[error("unknown coin tag {0}")]
 	Tag(u8),
 	#[error("reassignments nest more than {max} deep", max = MAX_HOPS)]
@@ -488,6 +493,7 @@ impl TransferError {
 			Decode(_) | Version(_) | Tag(_) | TooDeep | Inputs(_) | Outputs(_) | Index { .. } => "decode",
 			Landing(_) => "landing",
 			Enclave(_) => "enclave",
+			Template(_) => "template",
 			Record(e) => e.kind(),
 			Accumulator(AccumulatorError::Record(e)) => e.kind(),
 			Accumulator(_) => "accumulator",
@@ -674,7 +680,7 @@ impl ValidCoin {
 	pub fn checkpoint(&self) -> CheckpointPolicy {
 		CheckpointPolicy {
 			owner: self.leaf.owner, operator: self.leaf.operator, salt: checkpoint_salt(&self.leaf.salt),
-			chain: self.leaf.chain, sweep: self.sweep,
+			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2,
 		}
 	}
 
@@ -741,7 +747,7 @@ pub fn reassignment_tx(inputs: &[ValidInput], outputs: &[ExplicitOutput], checkp
 		.map(|(i, at)| (*at, i.checkpoint_output().txout(), FINAL)).collect();
 	let mut u = assemble(LockTime::ZERO, ins, outputs, fee, FINAL)?;
 	for (k, i) in inputs.iter().enumerate() {
-		u.tx.input[k].witness.script_witness = i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8);
+		u.tx.input[k].witness.script_witness = i.checkpoint.witness_in(&i.reassignment_pair, inputs.len() as u8, outputs.len() as u8);
 	}
 	Ok(u)
 }
@@ -762,7 +768,8 @@ pub fn fill_tx(order: &ValidCoin, signature: &Signature, partial: bool, inputs: 
 	u.tx.input[0].witness.script_witness = op.fill_witness(signature, outputs.len() as u8, partial)
 		.map_err(|e| TransferError::Fill(e.to_string()))?;
 	for (k, i) in inputs.iter().enumerate() {
-		u.tx.input[k + 1].witness.script_witness = i.checkpoint.witness(&i.reassignment_pair, outputs.len() as u8);
+		u.tx.input[k + 1].witness.script_witness =
+			i.checkpoint.witness_in(&i.reassignment_pair, inputs.len() as u8 + 1, outputs.len() as u8);
 	}
 	Ok(u)
 }
@@ -902,10 +909,11 @@ impl TransferPlan {
 	}
 
 	/// What input `i`'s owner and the operator sign to spend its checkpoint
-	/// into the outputs.
+	/// into the outputs. A `vtxo-2` coin's checkpoint also signs its index
+	/// and every checkpoint of the reassignment ([`crate::collab`]).
 	pub fn reassignment_message(&self, i: usize) -> Result<CsfsMessage, SpendError> {
-		let (coin, v) = &self.inputs[i];
-		Ok(self.checkpoint(i).message(coin.asset, *v, &self.outputs)?)
+		let named: Vec<TxOut> = (0..self.inputs.len()).map(|j| self.checkpoint_output(j).txout()).collect();
+		Ok(self.checkpoint(i).message_in(i as u32, &named, &self.outputs)?)
 	}
 
 	/// The operator's rule before it co-signs: refuses the plan when one
@@ -971,11 +979,17 @@ fn spend_hash(inputs: &[(LeafId, [u8; 32])], values: &[u64], outputs: &[Explicit
 
 /// Checks each input of a reassignment or a fill against the coin it
 /// resolved to: its checkpoint's value, the pair into the checkpoint and the
-/// pair over `outputs`; adds what the checkpoints hold to `held`. `first` is
-/// the index of the first of them among the spend's inputs.
-fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[ExplicitOutput], first: usize,
+/// pair over `outputs`; adds what the checkpoints hold to `held`. `before`
+/// are the outputs the spend's inputs before them spend (a fill's order
+/// coin), which a `vtxo-2` checkpoint's pair names with the checkpoints.
+fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[ExplicitOutput], before: &[TxOut],
 	held: &mut Vec<(AssetId, u64)>) -> Result<Vec<ValidInput>, TransferError>
 {
+	let first = before.len();
+	let mut named = before.to_vec();
+	for (input, coin) in inputs.iter().zip(&coins) {
+		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint().script_pubkey()).txout());
+	}
 	let mut out = Vec::with_capacity(inputs.len());
 	for (k, (input, coin)) in inputs.iter().zip(coins).enumerate() {
 		let k = k + first;
@@ -986,7 +1000,7 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
 		coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
 			.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
-		checkpoint.verify(coin.asset, input.checkpoint_value, outputs, &input.reassignment)
+		checkpoint.verify_in(k as u32, &named, outputs, &input.reassignment)
 			.map_err(|error| TransferError::Pair { input: k, pair: "reassignment", error })?;
 		add_held(held, coin.asset, input.checkpoint_value)?;
 		out.push(ValidInput {
@@ -1257,7 +1271,7 @@ impl CoinRecord {
 					spent.add(coin, &spend, k)?;
 				}
 				let mut held: Vec<(AssetId, u64)> = vec![];
-				let inputs = check_inputs(&t.inputs, coins, &t.outputs, 0, &mut held)?;
+				let inputs = check_inputs(&t.inputs, coins, &t.outputs, &[], &mut held)?;
 				check_overspend(&t.outputs, &held)?;
 				// The new leaf is in the receiver's lineage whoever owns it: a
 				// short exit delay anywhere lets its owner exit before the
@@ -1333,14 +1347,14 @@ impl CoinRecord {
 				}
 				let mut held: Vec<(AssetId, u64)> = vec![];
 				add_held(&mut held, order.asset, order.value)?;
-				let inputs = check_inputs(&fill.inputs, coins, &fill.outputs, 1, &mut held)?;
+				let inputs = check_inputs(&fill.inputs, coins, &fill.outputs, &[order.output().txout()], &mut held)?;
 				check_overspend(&fill.outputs, &held)?;
 				let index = f.index as usize;
 				let leaf = match (index, fill.partial, &f.leaf) {
 					(0, _, FillLeaf::Credit { .. }) => op.credit_leaf().ok_or_else(|| TransferError::Fill("the order's credit keys are used up".into()))?,
 					(1, true, FillLeaf::Rest { .. }) => op.next().leaf(),
 					(i, partial, FillLeaf::New(l)) if i >= if partial { 2 } else { 1 } => {
-						if l.htlc.is_some() || l.landing.is_some() || l.enclave.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() || l.enclave.is_some() || l.v2 {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						if !policy.exit_delay_ok(l.exit_delay) {
@@ -1435,7 +1449,10 @@ impl CoinRecord {
 						return Err(TransferError::Enclave("an enclave-1 leaf carries no other template's terms".into()));
 					}
 				}
-				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else if t.leaf.enclave.is_some() { 7 } else { 1 });
+				if t.leaf.v2 && (t.leaf.htlc.is_some() || landing.is_some() || t.leaf.enclave.is_some()) {
+					return Err(TransferError::Template("vtxo-2 with another template's terms".into()));
+				}
+				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else if t.leaf.enclave.is_some() { 7 } else if t.leaf.v2 { 8 } else { 1 });
 				write_inputs(w, &t.inputs, depth)?;
 				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
@@ -1525,7 +1542,7 @@ impl CoinRecord {
 				}
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
-			tag @ (1 | 3 | 5 | 7) => {
+			tag @ (1 | 3 | 5 | 7 | 8) => {
 				let inputs = read_inputs(r, depth)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
@@ -1535,7 +1552,7 @@ impl CoinRecord {
 				}
 				let mut leaf = NewLeaf {
 					owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-					landing: None, enclave: None,
+					landing: None, enclave: None, v2: tag == 8,
 				};
 				if tag == 3 {
 					let terms = HtlcTerms::decode_from(r)?;
@@ -1584,7 +1601,7 @@ impl CoinRecord {
 					1 => FillLeaf::Rest { owner_nonce: r.array32()? },
 					2 => FillLeaf::New(NewLeaf {
 						owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-						landing: None, enclave: None,
+						landing: None, enclave: None, v2: false,
 					}),
 					f => return Err(DecodeError::Flag(f).into()),
 				};

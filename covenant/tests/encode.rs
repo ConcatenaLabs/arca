@@ -28,7 +28,7 @@ fn policies() -> Vec<Policy> {
 	let s = xonly(&keypair("S"));
 	let a = xonly(&keypair("A"));
 	let sch = schedule();
-	let leaf = LeafPolicy { enclave: None, owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None };
+	let leaf = LeafPolicy { enclave: None, owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None , v2: false};
 	let owners: Vec<XOnlyPublicKey> = (0..5).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
@@ -41,7 +41,7 @@ fn policies() -> Vec<Policy> {
 			unlock_hash: label32("h"), owner: a, operator: s, refund_delay: sch.notice,
 			leaf_id: LeafId(label32("leaf id")), connector: asset("connector"),
 		}),
-		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: sch.sweep(true, false) }),
+		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: sch.sweep(true, false), v2: false }),
 		Policy::Leaf(LeafPolicy {
 			htlc: Some(HtlcTerms {
 				direction: HtlcDirection::Receive, payment_hash: label32("p"),
@@ -57,6 +57,8 @@ fn policies() -> Vec<Policy> {
 			channel: Some(arca_covenant::ChannelTerms { value: 1_000_000, capacity: 400_000, window: RelativeTime::from_units(300).unwrap() }),
 			..leaf
 		}),
+		Policy::Leaf(LeafPolicy { v2: true, ..leaf }),
+		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp2"), chain: chain(), sweep: sch.sweep(true, false), v2: true }),
 		Policy::Offboard(OffboardPolicy {
 			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
 			operator: s, reclaim_delay: sch.notice,
@@ -97,8 +99,8 @@ fn malformed_encodings_are_refused() {
 	b[0] = 2;
 	assert_eq!(Policy::decode(&b), Err(DecodeError::Version(2)));
 	let mut b = leaf.clone();
-	b[1] = 12;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(12)));
+	b[1] = 15;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(15)));
 	// a key that is not on the curve: x = 0xff..ff is above the field size
 	let mut b = leaf.clone();
 	b[2..34].copy_from_slice(&[0xff; 32]);
@@ -229,7 +231,7 @@ fn witness_readers() {
 		owner: xonly(&a), operator: xonly(&s), salt: label32("htlc"), chain: chain(), exit_delay: sch.notice, htlc: Some(terms),
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let w = h.claim_witness(&sig(&s, &label32("x")), &pre).unwrap();
 	assert_eq!(find_preimage(&w, &terms.payment_hash), Some(pre));

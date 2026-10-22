@@ -217,14 +217,19 @@ pub enum Template {
 	/// the asset elected clawback ([`crate::enclave`]). It rests on a board or
 	/// comes from a reassignment; no batch holds it.
 	Enclave1,
+	/// `vtxo-2`, the ordinary holding whose collaborative path is the
+	/// Simplicity program `arca/collab-2`, which also binds the coin's index
+	/// and the inputs its signers name ([`crate::collab`]). Its exit is
+	/// `vtxo-1`'s.
+	Vtxo2,
 }
 
 impl Template {
-	/// Every template this crate knows, in the order of their ids. The
-	/// operator publishes those its rounds make (`info.templates`), which
-	/// leaves out `order-2`.
-	pub const ALL: [Template; 8] = [Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Order3,
-		Template::Landing1, Template::Enclave1, Template::Channel1];
+	/// Every template this crate knows, in the order of their ids and
+	/// versions. The operator publishes those its rounds make
+	/// (`info.templates`), which leaves out `order-2`.
+	pub const ALL: [Template; 9] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
+		Template::Order3, Template::Landing1, Template::Enclave1, Template::Channel1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -251,6 +256,7 @@ impl Template {
 			Template::Landing1 => Template::LANDING,
 			Template::Channel1 => Template::CHANNEL,
 			Template::Enclave1 => Template::ENCLAVE,
+			Template::Vtxo2 => Template::VTXO,
 		}
 	}
 
@@ -258,7 +264,7 @@ impl Template {
 	pub fn version(self) -> u8 {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Enclave1 | Template::Channel1 => 1,
-			Template::Order2 => 2,
+			Template::Order2 | Template::Vtxo2 => 2,
 			Template::Order3 => 3,
 		}
 	}
@@ -266,7 +272,7 @@ impl Template {
 	/// Its name, without the version.
 	pub fn name(self) -> &'static str {
 		match self {
-			Template::Vtxo1 => "vtxo",
+			Template::Vtxo1 | Template::Vtxo2 => "vtxo",
 			Template::Board1 => "board",
 			Template::Htlc1 => "htlc",
 			Template::Order2 | Template::Order3 => "order",
@@ -280,6 +286,7 @@ impl Template {
 	pub fn from_id(id: u8, version: u8) -> Result<Template, RecordError> {
 		match (id, version) {
 			(Template::VTXO, 1) => Ok(Template::Vtxo1),
+			(Template::VTXO, 2) => Ok(Template::Vtxo2),
 			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
 			(Template::ORDER, 2) => Ok(Template::Order2),
@@ -317,7 +324,7 @@ impl FromStr for Template {
 			return Err(RecordError::Template(s.into()));
 		}
 		let known: &[Template] = match name {
-			"vtxo" => &[Template::Vtxo1],
+			"vtxo" => &[Template::Vtxo1, Template::Vtxo2],
 			"board" => &[Template::Board1],
 			"htlc" => &[Template::Htlc1],
 			"order" => &[Template::Order2, Template::Order3],
@@ -618,7 +625,7 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 	-> Result<(), RecordError>
 {
 	match (template, htlc, order, landing) {
-		(Template::Vtxo1, None, None, None) => {},
+		(Template::Vtxo1 | Template::Vtxo2, None, None, None) => {},
 		(Template::Htlc1, Some(t), None, None) => t.check(exit_delay).map_err(RecordError::Htlc)?,
 		(Template::Order2 | Template::Order3, None, Some(o), None) if o.template() == template => o.check(asset, owner, operator)
 			.map_err(|e| RecordError::Order(e.to_string()))?,
@@ -640,7 +647,7 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 
 /// The leaf a record names. Each kind of leaf record builds it here.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn leaf_policy(template_terms: (&Option<HtlcTerms>, &Option<OrderLeafTerms>, &Option<Landing>),
+pub(crate) fn leaf_policy(template: Template, template_terms: (&Option<HtlcTerms>, &Option<OrderLeafTerms>, &Option<Landing>),
 	owner: XOnlyPublicKey, operator: XOnlyPublicKey, salt: [u8; 32], chain: Chain, exit_delay: RelativeTime, asset: AssetId, value: u64)
 	-> LeafPolicy
 {
@@ -657,6 +664,7 @@ pub(crate) fn leaf_policy(template_terms: (&Option<HtlcTerms>, &Option<OrderLeaf
 			program: l.program, asset, min_value: value.saturating_sub(l.allowance),
 		}),
 		channel: None,
+		v2: template == Template::Vtxo2,
 	}
 }
 
@@ -757,7 +765,7 @@ impl LeafRecord {
 	pub fn leaf(&self) -> LeafPolicy {
 		LeafPolicy {
 			channel: self.channel.map(|c| c.terms(self.value)),
-			..leaf_policy((&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
+			..leaf_policy(self.template, (&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
 				self.exit_delay, self.asset, self.value)
 		}
 	}

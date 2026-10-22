@@ -209,7 +209,7 @@ pub fn party(label: &str, d: RelativeTime) -> (Keypair, NewLeaf) {
 		owner: xonly(&k), owner_nonce: label32(&format!("party {} owner nonce", label)),
 		creator_nonce: label32(&format!("party {} creator nonce", label)), exit_delay: d,
 		htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	(k, leaf)
 }
@@ -232,7 +232,7 @@ pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, val
 		htlc: None,
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let coin = net.fund(vec![explicit(net.x, value, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

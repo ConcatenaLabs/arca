@@ -68,7 +68,7 @@ fn leaf(net: &Net, k: &Keys, holder: &Keypair, nonce: [u8; 32], salt: &str, asse
 	LeafPolicy {
 		owner: enclave_key(&xonly(holder), &nonce).unwrap(), operator: xonly(&k.operator), salt: label32(salt), chain: net.chain,
 		exit_delay: delay(), htlc: None, order: None, landing: None, channel: None,
-		enclave: Some(k.enclave(holder, clawback).terms(asset, value)),
+		enclave: Some(k.enclave(holder, clawback).terms(asset, value)), v2: false,
 	}
 }
 

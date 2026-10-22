@@ -927,7 +927,7 @@ impl AccumulatorRecord {
 
 	/// The leaf's policy.
 	pub fn leaf(&self) -> LeafPolicy {
-		leaf_policy((&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
+		leaf_policy(self.template, (&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
 			self.exit_delay, self.asset, self.value)
 	}
 

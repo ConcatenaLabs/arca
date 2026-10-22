@@ -170,7 +170,7 @@ fn transfer(req: &Value) -> Result<Value, String> {
 		let leaf = NewLeaf {
 			owner: enclave_key(&holder, &owner_nonce).map_err(|e| e.to_string())?, owner_nonce,
 			creator_nonce: bytes32(o, "creator_nonce")?, exit_delay, htlc: None, landing: None,
-			enclave: Some(enclave.terms(a, value)),
+			enclave: Some(enclave.terms(a, value)), v2: false,
 		};
 		let p = leaf.policy(operator, chain);
 		new.push(ExplicitOutput::new(a, value, p.script_pubkey()));
@@ -200,7 +200,7 @@ fn transfer(req: &Value) -> Result<Value, String> {
 			return Err("the inputs are of two assets: a restricted asset's transfer moves one".into());
 		}
 		let checkpoint_value = amount(input, "checkpoint_value")?;
-		let ckpt = CheckpointPolicy { owner: leaf.owner, operator, salt: checkpoint_salt(&leaf.salt), chain, sweep };
+		let ckpt = CheckpointPolicy { owner: leaf.owner, operator, salt: checkpoint_salt(&leaf.salt), chain, sweep, v2: false };
 		let ckpt_out = ExplicitOutput::new(a, checkpoint_value, ckpt.script_pubkey());
 		let cm = leaf.message(a, value, &[ckpt_out]).map_err(|e| e.to_string())?;
 		let rm = ckpt.message(a, checkpoint_value, &new).map_err(|e| e.to_string())?;

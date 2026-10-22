@@ -122,7 +122,7 @@ async fn cosign(State(s): State<Arc<Stub>>, headers: HeaderMap, Json(body): Json
 			creator_nonce: unhex(o["creator_nonce"].as_str().unwrap()).try_into().unwrap(),
 			exit_delay: arca_covenant::RelativeTime::from_units(o["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 			htlc: None, landing: None,
-			enclave: Some(Enclave { holder, policy: xonly(&s.policy), clawback: s.clawback }.terms(asset, value)),
+			enclave: Some(Enclave { holder, policy: xonly(&s.policy), clawback: s.clawback }.terms(asset, value)), v2: false,
 		};
 		outs.push(ExplicitOutput::new(asset, value, leaf.policy(s.operator, chain).script_pubkey()));
 	}
@@ -131,7 +131,7 @@ async fn cosign(State(s): State<Arc<Stub>>, headers: HeaderMap, Json(body): Json
 		let coin = CoinRecord::from_bytes(&unhex(i["coin"].as_str().unwrap())).unwrap();
 		let v: u64 = i["checkpoint_value"].as_str().unwrap().parse().unwrap();
 		let (leaf, sweep, asset, value) = coin_leaf(&coin);
-		let cp = CheckpointPolicy { owner: leaf.owner, operator: s.operator, salt: checkpoint_salt(&leaf.salt), chain, sweep };
+		let cp = CheckpointPolicy { owner: leaf.owner, operator: s.operator, salt: checkpoint_salt(&leaf.salt), chain, sweep, v2: false };
 		let cm = leaf.message(asset, value, &[ExplicitOutput::new(asset, v, cp.script_pubkey())]).unwrap().digest;
 		let rm = cp.message(asset, v, &outs).unwrap().digest;
 		for d in [cm, rm] {
@@ -305,7 +305,7 @@ async fn a_restricted_asset_moves_in_its_issuers_tree_under_its_policy() {
 		let leaf = NewLeaf {
 			owner: enclave_key(&xonly(h), &n).unwrap(), owner_nonce: n, creator_nonce: random32(),
 			exit_delay: common::client::exit_delay(), htlc: None, landing: None,
-			enclave: Some(Enclave { clawback, ..enclave(h) }.terms(rr, value)),
+			enclave: Some(Enclave { clawback, ..enclave(h) }.terms(rr, value)), v2: false,
 		};
 		(rr, value, leaf)
 	};

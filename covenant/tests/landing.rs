@@ -216,7 +216,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let leaf = |salt: &str| LeafPolicy { enclave: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
 		landing: Some(landing.terms(sup.z, V).unwrap()),
-		channel: None,
+		channel: None, v2: false,
 	};
 	assert_eq!(leaf("x").template(), Template::Landing1);
 	println!("landing script {} bytes, collaborative script {} bytes", leaf("x").exit_script().len(), leaf("x").collab_script().len());

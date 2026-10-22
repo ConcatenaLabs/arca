@@ -40,7 +40,8 @@ byte order.
 
     u8    format version, 2
     u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
-    u8    template version, 1 (vtxo, htlc, landing, channel), or 2 or 3 (order)
+    u8    template version, 1 (vtxo, htlc, landing, channel), 2 or 3 (order), or 2
+          (vtxo-2, a vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
     [32]  operator nonce
@@ -120,11 +121,18 @@ TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
 TEMPLATE_ORDER, TEMPLATE_ORDER_VERSION = 4, 2
 TEMPLATE_LANDING, TEMPLATE_LANDING_VERSION = 5, 1
 TEMPLATE_CHANNEL, TEMPLATE_CHANNEL_VERSION = 7, 1
+TEMPLATE_VTXO2_VERSION = 2
 
 
 class _Spk:
     def __init__(self, spk):
         self.scriptPubKey = spk
+
+
+def vtxo2_leaf_tap(lf, S, salt, ctag):
+    """A vtxo-2 leaf, through collab2.py's own derivation."""
+    import collab2
+    return _Spk(collab2.Collab2(lf["owner"], S, salt, ctag, exit_leaf(lf["owner"], SEQ_TIME | lf["exit_delay"])).spk)
 
 
 def order_leaf_tap(lf, S, salt, ctag, asset):
@@ -278,6 +286,8 @@ class Batch:
                 g = lf["landing"]
                 tap, _ = landing_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], g["program"], p["asset"],
                                          lf["value"], g["allowance"])
+            elif lf.get("v2"):
+                tap = vtxo2_leaf_tap(lf, S, salt, ctag)
             elif h is None:
                 tap, _ = leaf3_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], fold=True)
             else:
@@ -348,7 +358,7 @@ class Batch:
         return {
             "template": ("order", o.get("version", TEMPLATE_ORDER_VERSION)) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
             else ("landing", TEMPLATE_LANDING_VERSION) if g else ("channel", TEMPLATE_CHANNEL_VERSION) if c
-            else ("vtxo", TEMPLATE_VTXO_VERSION),
+            else ("vtxo", TEMPLATE_VTXO2_VERSION) if lf.get("v2") else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
             "order": o,
             "landing": g,
@@ -489,7 +499,8 @@ def txout(asset, value, spk):
 
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
-                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None):
+                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
+                 v2=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -525,6 +536,9 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     # operator's opening balance that part of its value.
     for i, capacity in (channel or {}).items():
         leaves[i]["channel"] = {"capacity": capacity, "window": 2 * EXIT_DELAY}
+    # v2: [leaf index]; each such leaf is a vtxo-2 leaf.
+    for i in (v2 or []):
+        leaves[i]["v2"] = True
     b = Batch(p, leaves)
 
     # The round: the issuing input, the batch output at 0, the token's atom in
@@ -574,7 +588,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                             **({"landing": {"program": lf["landing"]["program"].hex(),
                                             "allowance": lf["landing"]["allowance"]}} if "landing" in lf else {}),
                             **({"channel": {"capacity": lf["channel"]["capacity"],
-                                            "window_units": lf["channel"]["window"]}} if "channel" in lf else {}))
+                                            "window_units": lf["channel"]["window"]}} if "channel" in lf else {}),
+                            **({"template": "vtxo-2"} if lf.get("v2") else {}))
                        for lf in leaves],
         },
         "levels": [len(lv) for lv in b.levels],
@@ -607,7 +622,7 @@ def invalid_vectors(valid_binary, valid_json):
         ("format version 1", v[:0] + b"\x01" + v[1:], "version"),
         ("format version 3", v[:0] + b"\x03" + v[1:], "version"),
         ("template 2", put(1, b"\x02"), "template"),
-        ("template vtxo, version 2", put(2, b"\x02"), "template_version"),
+        ("template vtxo, version 3", put(2, b"\x03"), "template_version"),
         ("a trailing byte", v + b"\x00", "trailing"),
         ("the last byte missing", v[:-1], "end"),
         ("empty", b"", "end"),
@@ -640,7 +655,7 @@ def invalid_vectors(valid_binary, valid_json):
         ("a missing field", edit(lambda o: o.pop("owner_nonce")), "field"),
         ("the salt in place of the nonces", edit(lambda o: (o.pop("owner_nonce"), o.pop("operator_nonce"),
                                                             o.update({"salt": "00" * 32}))), "field"),
-        ("template vtxo-2", edit(lambda o: o.update({"template": "vtxo-2"})), "template_version"),
+        ("template vtxo-3", edit(lambda o: o.update({"template": "vtxo-3"})), "template_version"),
         ("template enclave-1", edit(lambda o: o.update({"template": "enclave-1"})), "template"),
         ("template landing-1 without its terms", edit(lambda o: o.update({"template": "landing-1"})), "field"),
         ("format version 1", edit(lambda o: o.update({"version": 1})), "version"),
@@ -795,22 +810,23 @@ def generate():
         batch_vector("five leaves, two of them order-3", 5, 4, order=[1, 4], order_version=3),
         batch_vector("five leaves of a supervised asset, every one landing-1", 5, 4, landing=[0, 1, 2, 3, 4]),
         batch_vector("five leaves, two of them channel-1", 5, 4, channel={1: 4_000_000, 4: 0}),
+        batch_vector("five leaves, two of them vtxo-2", 5, 4, v2=[1, 2]),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
-    h = batches[-5]["records"][1]
+    h = batches[7]["records"][1]
     hi, hj = invalid_htlc_vectors(h["binary"], h["json"])
     invalid += hi
     invalid_json += hj
-    o3, o2 = batches[-3]["records"][1], batches[-4]["records"][0]
+    o3, o2 = batches[9]["records"][1], batches[8]["records"][0]
     oi, oj = invalid_order_vectors(o3["binary"], o3["json"], o2["json"])
     invalid += oi
     invalid_json += oj
-    g = batches[-2]["records"][2]
+    g = batches[10]["records"][2]
     gi, gj = invalid_landing_vectors(g["binary"], g["json"])
     invalid += gi
     invalid_json += gj
-    c = batches[-1]["records"][1]
+    c = batches[11]["records"][1]
     ci, cj = invalid_channel_vectors(c["binary"], c["json"])
     invalid += ci
     invalid_json += cj

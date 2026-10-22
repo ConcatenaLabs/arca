@@ -165,7 +165,7 @@ pub struct Held {
 /// fresh for this leaf.
 pub fn new_leaf(key: &Keypair) -> (NewLeaf, [u8; 32]) {
 	let nonce = random32();
-	(NewLeaf { enclave: None, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
+	(NewLeaf { enclave: None, v2: false, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
 }
 
 /// Resolves `held` under `policy` against `bases`, as its owner would before

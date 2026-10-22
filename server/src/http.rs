@@ -846,7 +846,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 				htlc,
 				landing: landing_of(&o.landing)?.map(|l| l.terms(asset(&o.asset)?, amount(&o.value)?)
 					.map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "out_of_bounds", format!("landing: {}", e))))
-					.transpose()?,
+					.transpose()?, v2: false,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,

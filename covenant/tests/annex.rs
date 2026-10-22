@@ -114,7 +114,7 @@ fn preimages_are_read_from_annexed_claims() {
 	let mk = |direction, salt: &str| LeafPolicy { enclave: None,
 		owner: xonly(&a), operator: xonly(&s_key), salt: label32(salt), chain: net.chain, exit_delay: delay(),
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&pay), timeout: mt(timeout), operator_delay }),
-		order: None, landing: None, channel: None,
+		order: None, landing: None, channel: None, v2: false,
 	};
 	let (sent, received) = (mk(HtlcDirection::Send, "annex htlc sent"), mk(HtlcDirection::Receive, "annex htlc received"));
 	let coins = net.fund(vec![explicit(x, LEAF, sent.script_pubkey()), explicit(x, LEAF, received.script_pubkey())]);
