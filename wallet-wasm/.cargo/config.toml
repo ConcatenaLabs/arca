@@ -4,3 +4,10 @@ target = "wasm32-unknown-unknown"
 [target.wasm32-unknown-unknown]
 # getrandom 0.3 takes its browser backend only when asked for it by name.
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
+[env]
+# libsecp256k1 in 32-bit limbs (its 10x26 field): wasm32 has no 64x64->128
+# multiply, and the 64-bit limbs it would otherwise pick spend most of a
+# command's time in the multiply's emulation (`__multi3`). Both are
+# libsecp256k1's own, tested field implementations.
+CFLAGS_wasm32_unknown_unknown = "-DUSE_FORCE_WIDEMUL_INT64"
