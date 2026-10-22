@@ -111,8 +111,10 @@ regenerate, and runs the regtest suite, all against the newest node build.
 end-to-end ones with the signer process and the minimal client included,
 against a PostgreSQL service and the newest node build.
 [client.yml](.github/workflows/client.yml) runs the `arca` wallet's
-scenarios against a whole server, the same PostgreSQL service and the newest
-node build.
+library tests, its scenarios, and its orders and fills against a whole
+server, the same PostgreSQL service and the newest node build, and starts the
+server kept running for browser wallets (`tests/arca_operator_for_browsers.rs`),
+drives it through its control address and tells it to stop.
 [covenant.yml](.github/workflows/covenant.yml) checks that `arca-covenant`
 builds with the Rust version the Sequentia Wallet Kit pins, which is the
 `rust-version` in `covenant/Cargo.toml`.
