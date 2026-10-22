@@ -119,6 +119,14 @@ enum Cmd {
 	/// what is live in its batches, each transaction read again from the
 	/// wallet's own node.
 	Supply { asset: String },
+	/// The template of the wallet's own new leaves (its refreshes, its
+	/// change and what its receive requests ask for), after setting it when
+	/// one is named: vtxo-1, or vtxo-2, whose collaborative path also binds
+	/// the coin's index and the inputs its signers name. Both exit alike.
+	LeafTemplate {
+		/// vtxo-1 or vtxo-2.
+		template: Option<String>,
+	},
 	/// The operator's equivocation bond as this wallet checks it on its own
 	/// node, and what the wallet holds out of round against it.
 	Bond,
@@ -1181,6 +1189,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
+		Cmd::LeafTemplate { template } => w.leaf_template(template.as_deref()),
 		Cmd::Bond => w.bond(),
 		Cmd::BondEvidence => w.bond_evidence().map(|lines| json!({"lines": lines})),
 		Cmd::WatchBond { evidence, fee_asset } => {

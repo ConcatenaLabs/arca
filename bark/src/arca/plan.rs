@@ -262,7 +262,8 @@ impl Wallet {
 	}
 
 	/// The coins a plan may start from: live leaves of a round, `vtxo-1`,
-	/// named by no plan, all of them or those of `asset`.
+	/// named by no plan, all of them or those of `asset`. A `vtxo-2` leaf is
+	/// refreshed by `sync` in its window instead.
 	fn plannable(&self, asset: Option<AssetId>) -> Result<Vec<CoinRow>, Error> {
 		let named = self.planned_coins()?;
 		let mut out = vec![];
@@ -272,9 +273,12 @@ impl Wallet {
 			}
 			// A supervised asset's leaf (`landing-1`) is not planned: its
 			// operator runs no plans for it, and `sync` refreshes it. Nor is
-			// a leaf of an accumulator batch.
+			// a leaf of an accumulator batch, nor a `vtxo-2` leaf: a step's
+			// refund spends it beside its new leaf, which its pair would have
+			// to name; `sync` refreshes it too.
 			match CoinRecord::from_bytes(&c.record) {
-				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none() => out.push(c),
+				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none()
+					&& record.template == arca_covenant::Template::Vtxo1 => out.push(c),
 				_ => {},
 			}
 		}

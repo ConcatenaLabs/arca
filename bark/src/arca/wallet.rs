@@ -82,6 +82,28 @@ pub struct Config {
 	pub expect: Option<super::registry::Expected>,
 }
 
+/// The template of the leaf a coin record names: what `coins` shows of it.
+fn template_of(r: &CoinRecord) -> Option<Template> {
+	Some(match r {
+		CoinRecord::Leaf { record, .. } => record.template,
+		CoinRecord::Accumulator { record, .. } => record.template,
+		CoinRecord::Board(_) => Template::Board1,
+		CoinRecord::Transfer(t) => match (&t.leaf.htlc, &t.leaf.landing, t.leaf.v2) {
+			(Some(_), _, _) => Template::Htlc1,
+			(None, Some(_), _) => Template::Landing1,
+			(None, None, true) => Template::Vtxo2,
+			(None, None, false) => Template::Vtxo1,
+		},
+		CoinRecord::Fill(f) => match &f.leaf {
+			arca_covenant::transfer::FillLeaf::Rest { .. } => Template::Order2,
+			_ => Template::Vtxo1,
+		},
+	})
+}
+
+/// The store key of the template the wallet asks for its own leaves.
+pub(crate) const LEAF_TEMPLATE: &str = "leaf_template";
+
 impl Config {
 	/// The specification's delays: leaves asked for at 36 hours, accepted from
 	/// 36 to 48 hours.
@@ -742,6 +764,30 @@ impl Wallet {
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default() })
+	}
+
+	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
+	/// for its change and in its receive requests ([`Wallet::leaf_template`]).
+	pub(crate) fn asks_vtxo2(&self) -> bool {
+		matches!(self.store.meta(LEAF_TEMPLATE), Ok(Some(t)) if t == "vtxo-2")
+	}
+
+	/// The template of the wallet's own new leaves, after setting it to `set`
+	/// when given: `vtxo-1`, whose collaborative path is tapscript, or
+	/// `vtxo-2`, whose collaborative path is the Simplicity program
+	/// `arca/collab-2`, which also binds the coin's index and the inputs its
+	/// signers name. Both exit alike. A leaf of a supervised asset is
+	/// `landing-1` whatever is set. Coins already held keep their template
+	/// until they are refreshed.
+	pub fn leaf_template(&mut self, set: Option<&str>) -> Result<Value, Error> {
+		if let Some(t) = set {
+			match t {
+				"vtxo-1" | "vtxo-2" => self.store.set_meta(LEAF_TEMPLATE, t)?,
+				_ => return Err(Error::Refused(format!("template {:?}: the wallet's own leaves are vtxo-1 or vtxo-2", t))),
+			}
+		}
+		let t = if self.asks_vtxo2() { "vtxo-2" } else { "vtxo-1" };
+		Ok(json!({"leaf_template": t}))
 	}
 
 	/// The binding of the leaf whose key is `key` to the wallet's mailbox
@@ -2632,6 +2678,9 @@ impl Wallet {
 		let mut out = vec![];
 		for c in self.store.coins()? {
 			let mut v = Self::coin_json(&c);
+			if let Some(t) = CoinRecord::from_bytes(&c.record).ok().as_ref().and_then(template_of) {
+				v["template"] = json!(t.to_string());
+			}
 			if alone && c.kind == "transfer" && HELD.contains(&c.state.as_str()) {
 				v["record_held"] = json!(NO_KEEPER);
 			}

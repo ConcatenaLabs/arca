@@ -154,6 +154,9 @@ impl Out {
 		if let Some(l) = self.leaf.landing.and_then(|t| t.landing(self.asset, self.value).ok()) {
 			v["landing"] = arca_covenant::record_json::landing_json(&l);
 		}
+		if self.leaf.v2 {
+			v["template"] = json!("vtxo-2");
+		}
 		v
 	}
 
@@ -175,7 +178,8 @@ impl Out {
 				exit_delay: RelativeTime::from_units(v["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
-				landing, v2: false,
+				v2: landing.is_none() && v["template"].as_str() == Some("vtxo-2"),
+				landing,
 			},
 			mailbox: XOnlyPublicKey::from_slice(&unhex(v["mailbox"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 			until: v["until"].as_u64().map(|u| u32::try_from(u).map_err(|_| Error::Parse(format!("an output's lapse {}", u)))).transpose()?,
@@ -297,6 +301,11 @@ impl Wallet {
 		if let Some(v) = value {
 			req["value"] = json!(v.to_string());
 		}
+		// The template the wallet asks its leaves in; a sender that does not
+		// read it pays a vtxo-1 leaf, which the wallet takes as well.
+		if self.asks_vtxo2() {
+			req["template"] = json!("vtxo-2");
+		}
 		let mut out = json!({"request": encode(&self.spelling.request, &req), "details": req});
 		if let Some(n) = bond_note {
 			out["bond"] = json!(n);
@@ -323,7 +332,8 @@ impl Wallet {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
-		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None, v2: false })
+		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
+			v2: self.asks_vtxo2() })
 	}
 
 	/// [`Self::own_leaf`] of `value` of `asset`: for a supervised asset a
@@ -566,7 +576,10 @@ impl Wallet {
 				exit_delay: RelativeTime::from_units(req["exit_delay_units"].as_u64().unwrap_or(0) as u16)
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
-				landing: theirs, v2: false,
+				// The leaf the request asks for: vtxo-2 when it names it, and
+				// never for a supervised asset, whose leaves are landing-1.
+				v2: theirs.is_none() && req["template"].as_str() == Some("vtxo-2"),
+				landing: theirs,
 			},
 			mailbox: xonly(req["mailbox"].as_str().unwrap_or(""))?,
 			// The server records no payment to the request past its lapse,

@@ -420,10 +420,12 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option<&[u8; 32]>) -> Result<(), String> {
 	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
 	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
+	let asked_v2 = w.get("template").and_then(|t| t.as_str()) == Some("vtxo-2");
 	let want = match (receive, asked_order, asked_landing) {
 		(Some(_), _, _) => Template::Htlc1,
 		(None, true, _) => Template::Order2,
 		(None, false, true) => Template::Landing1,
+		(None, false, false) if asked_v2 => Template::Vtxo2,
 		(None, false, false) => Template::Vtxo1,
 	};
 	if record.template() != want {
@@ -727,12 +729,21 @@ impl Wallet {
 		let nonce = super::random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
-		let template = if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		let template = if landing.is_some() {
+			Template::Landing1
+		} else if self.asks_vtxo2() {
+			Template::Vtxo2
+		} else {
+			Template::Vtxo1
+		};
 		let wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
 			order: None, landing }];
 		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
 		if let Some(l) = &landing {
 			entry["landing"] = arca_covenant::record_json::landing_json(l);
+		}
+		if template == Template::Vtxo2 {
+			entry["template"] = json!("vtxo-2");
 		}
 		let nonces = vec![entry];
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
