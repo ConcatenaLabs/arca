@@ -259,12 +259,21 @@ def leaf_taptree(a_x, s_x, delay, expiry):
 # Framework base
 # --------------------------------------------------------------------------
 
+SCRIPT_FAILURE_POLICY = "mempool-script-verify-flag-failed"
+
+
 def block_reason(mempool_reason):
     """What a block refused by a node checking scripts inline (-par=1) reports
     for a transaction the mempool refused with `mempool_reason`: the same
-    script failure, or bad-txns-nonfinal for a lock not yet reached."""
+    script failure, or bad-txns-nonfinal for a lock not yet reached. A
+    script failure is the same error under another label: the mempool's
+    reads mempool-script-verify-flag-failed (policy), a block's
+    mandatory-script-verify-flag-failed (consensus), so the part both share
+    is compared."""
     if mempool_reason in ("non-final", "non-BIP68-final"):
         return "bad-txns-nonfinal"
+    if mempool_reason.startswith(SCRIPT_FAILURE_POLICY):
+        return mempool_reason[len("mempool"):]
     return mempool_reason
 
 

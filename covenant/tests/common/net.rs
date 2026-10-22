@@ -332,7 +332,11 @@ pub fn block_reason(mempool: &str) -> String {
 	match mempool {
 		"non-final" | "non-BIP68-final" => "bad-txns-nonfinal".into(),
 		"missing-inputs" => "bad-txns-inputs-missingorspent".into(),
-		other => other.into(),
+		// The same script failure under the block's label: the mempool's
+		// reads `mempool-script-verify-flag-failed` (policy), a block's
+		// `mandatory-script-verify-flag-failed` (consensus); the part both
+		// share is compared.
+		other => other.strip_prefix("mempool").filter(|r| r.starts_with("-script-verify-flag-failed")).unwrap_or(other).into(),
 	}
 }
 
