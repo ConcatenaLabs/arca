@@ -215,7 +215,8 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let (chain, genesis) = (net.chain, net.genesis);
 	let leaf = |salt: &str| LeafPolicy {
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
-		landing: Some(landing.terms(sup.z, V).unwrap()), v2: false,
+		landing: Some(landing.terms(sup.z, V).unwrap()),
+		channel: None, v2: false,
 	};
 	assert_eq!(leaf("x").template(), Template::Landing1);
 	println!("landing script {} bytes, collaborative script {} bytes", leaf("x").exit_script().len(), leaf("x").collab_script().len());
@@ -332,6 +333,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 			owner_nonce: label32(&format!("batch {} owner nonce", i)), operator_nonce: label32(&format!("batch {} operator nonce", i)),
 			exit_delay: delay(), unlock_hash: label32(&format!("batch {} unlock", i)), htlc: None, order: None,
 			landing: Some(Landing { program: [i as u8 + 1; 20], allowance: ALLOWANCE }),
+			channel: None,
 		}
 	}).collect();
 	let blinder = keypair("blinding key").public_key();

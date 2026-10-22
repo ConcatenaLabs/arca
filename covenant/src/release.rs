@@ -44,6 +44,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Transaction};
 
+use crate::accumulator::ValidAccumulatorLeaf;
 use crate::forfeit::{connector_asset, ConnectorPolicy};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::OffboardPolicy;
@@ -78,6 +79,17 @@ impl Release {
 			return Err(SpendError::NotTheRound);
 		}
 		if old.branch.leaf.operator != new.branch.leaf.operator {
+			return Err(SpendError::OtherOperator);
+		}
+		Release::from_round(old, round, c)
+	}
+
+	/// [`Release::for_refresh`] for `new`, a leaf of an accumulator batch.
+	pub fn for_accumulator_refresh(old: &ValidLeaf, new: &ValidAccumulatorLeaf, round: &Transaction, c: u32) -> Result<Release, SpendError> {
+		if round.txid() != new.round_txid {
+			return Err(SpendError::NotTheRound);
+		}
+		if old.branch.leaf.operator != new.leaf.operator {
 			return Err(SpendError::OtherOperator);
 		}
 		Release::from_round(old, round, c)

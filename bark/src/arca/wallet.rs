@@ -444,10 +444,11 @@ pub fn reserve_floor(floor_per_kvb: Option<u64>) -> arca_covenant::ReserveFloor 
 	}
 }
 
-/// A coin record's kind, as the store names it.
+/// A coin record's kind, as the store names it, and as the server does: a
+/// round's leaf is `batch` whichever kind of batch holds it.
 pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 	match record {
-		CoinRecord::Leaf { .. } => "batch",
+		CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => "batch",
 		CoinRecord::Transfer(_) => "transfer",
 		CoinRecord::Board(_) => "board",
 		CoinRecord::Fill(_) => "fill",
@@ -458,6 +459,7 @@ pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 	match record {
 		CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce),
+		CoinRecord::Accumulator { record, .. } => (record.owner, record.owner_nonce),
 		CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce),
 		CoinRecord::Board(b) => (b.owner, b.owner_nonce),
 		// A fill's coin: a record whose order names no order names the NUMS
@@ -470,6 +472,7 @@ pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirection> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.htlc.map(|t| t.direction),
+		CoinRecord::Accumulator { record, .. } => record.htlc.map(|t| t.direction),
 		CoinRecord::Transfer(t) => t.leaf.htlc.map(|t| t.direction),
 		CoinRecord::Board(_) | CoinRecord::Fill(_) => None,
 	}
@@ -481,6 +484,9 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 	match record {
 		CoinRecord::Leaf { record, .. } => {
 			out.push(record.branch().map_err(|e| Error::Refused(e.to_string()))?.batch_output().txout());
+		},
+		CoinRecord::Accumulator { record, .. } => {
+			out.push(record.batch_output().map_err(|e| Error::Refused(e.to_string()))?.txout());
 		},
 		CoinRecord::Board(b) => out.push(b.output().txout()),
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
@@ -510,6 +516,7 @@ pub const BOARD_LIFETIME: u32 = 28 * 86_400;
 pub(crate) fn batch_profile(record: &CoinRecord) -> Option<&'static str> {
 	match record {
 		CoinRecord::Leaf { record, .. } => Some(if record.burn { "issuer-operated" } else { "open" }),
+		CoinRecord::Accumulator { record, .. } => Some(if record.burn { "issuer-operated" } else { "open" }),
 		CoinRecord::Board(_) => None,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
 			let all: Vec<&'static str> = record.parents().into_iter().filter_map(batch_profile).collect();
@@ -526,7 +533,7 @@ pub(crate) fn batch_profile(record: &CoinRecord) -> Option<&'static str> {
 pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
 	match record {
 		CoinRecord::Board(_) => true,
-		CoinRecord::Leaf { .. } => false,
+		CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => false,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().any(rests_on_board),
 	}
 }
@@ -2012,8 +2019,9 @@ impl Wallet {
 
 	/// Checks a whole published batch of a supervised asset, the batch at
 	/// output `vout` of round `txid`, as its issuer or an auditor reads one:
-	/// from the published tree and the chain alone. The tree is rebuilt from
-	/// its parts ([`super::round::rebuild`]) and its batch output compared
+	/// from the published batch and the chain alone. The batch, of either
+	/// kind, is rebuilt from its parts ([`super::round::rebuild_batch`]) and
+	/// its batch output compared
 	/// with the round's on the wallet's node; then the asset must be
 	/// supervised on the wallet's node, every leaf `landing-1` with the
 	/// allowance the operator publishes for the asset, and every output of
@@ -2025,8 +2033,11 @@ impl Wallet {
 		if t["round_txid"].as_str() != Some(txid.to_string().as_str()) || t["batch_vout"].as_u64() != Some(vout as u64) {
 			return Err(Error::Refused(format!("the server published the tree of another batch than {}:{}", txid, vout)));
 		}
-		let tree = super::round::rebuild(&t)?;
-		let asset = tree.params().asset;
+		let tree = super::round::rebuild_batch(&t)?;
+		let asset = match &tree {
+			arca_covenant::Batch::Tree(t) => t.params().asset,
+			arca_covenant::Batch::Accumulator(a) => a.params().asset,
+		};
 		let round = self.chain.transaction(&txid)?
 			.ok_or_else(|| Error::Refused(format!("round {} is not on the chain the wallet's node holds", txid)))?;
 		let mut problems: Vec<String> = vec![];
@@ -2052,10 +2063,11 @@ impl Wallet {
 			problems.push(format!("round {}: {}", txid, e));
 		}
 		let mut leaves = vec![];
-		for (i, r) in tree.records().iter().enumerate() {
-			let Some(l) = r.landing.filter(|_| r.template == Template::Landing1) else {
-				problems.push(format!("leaf {} is {}, not landing-1", i, r.template));
-				leaves.push(json!({"index": i, "template": r.template.to_string(), "value": r.value.to_string()}));
+		use super::round::{LeafTerms, NewRecord};
+		for (i, r) in (0..tree.len()).map(|i| NewRecord::of(&tree, i)).enumerate() {
+			let Some(l) = r.landing().copied().filter(|_| r.template() == Template::Landing1) else {
+				problems.push(format!("leaf {} is {}, not landing-1", i, r.template()));
+				leaves.push(json!({"index": i, "template": r.template().to_string(), "value": r.value().to_string()}));
 				continue;
 			};
 			if let Some(a) = allowance.filter(|a| *a != l.allowance) {
@@ -2063,7 +2075,7 @@ impl Wallet {
 			}
 			let spk = l.script_pubkey();
 			let (frozen, paused) = if supervised { self.chain.freeze_status(asset, &spk)? } else { (false, false) };
-			leaves.push(json!({"index": i, "template": r.template.to_string(), "value": r.value.to_string(),
+			leaves.push(json!({"index": i, "template": r.template().to_string(), "value": r.value().to_string(),
 				"landing": self.chain.address(&spk)?.unwrap_or_else(|| hex(spk.as_bytes())), "landing_program": hex(&l.program),
 				"allowance": l.allowance.to_string(), "frozen": frozen, "paused": paused}));
 		}
@@ -2191,7 +2203,7 @@ impl Wallet {
 		fn boards(r: &CoinRecord, out: &mut Vec<TxOut>) {
 			match r {
 				CoinRecord::Board(b) => out.push(b.output().txout()),
-				CoinRecord::Leaf { .. } => {},
+				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
 			}
 		}
@@ -3448,6 +3460,7 @@ mod tests {
 			htlc: None,
 			order: None,
 			landing: None,
+			channel: None,
 		}).collect();
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();

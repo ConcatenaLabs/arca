@@ -136,7 +136,7 @@ impl F {
 	}
 
 	fn leaf(&self, owner: &Keypair, salt: &str) -> LeafPolicy {
-		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, v2: false }
+		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, channel: None , v2: false }
 	}
 
 	fn r_coin(&self) -> TxOut {
@@ -1222,7 +1222,8 @@ fn htlc_cases(f: &F, book: &mut Book) {
 		owner: xonly(&f.a), operator: xonly(&f.s), salt: label32(salt), chain: f.chain, exit_delay: f.delay,
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout, operator_delay: opd }),
 		order: None,
-		landing: None, v2: false,
+		landing: None,
+		channel: None, v2: false,
 	};
 	let tx = |h: &LeafPolicy, lock: u32, seq: u32, outs: Vec<TxOut>| {
 		Spend::new(lock).fake_input("htlc", explicit(f.x, LEAF, h.script_pubkey()), seq).outputs(outs)

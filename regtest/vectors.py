@@ -44,7 +44,7 @@ accumulator.py generates: six leaves behind their entries, each slot's
 record, the Merkle-sum root and the batch's weight, the state's data leaf,
 the batch output's tree, scriptPubKey and control block, and two exits, by
 an owner and then by the operator, each with its digest, signature, witness
-value and the state it leaves.
+value and the state it leaves, and every leaf's record and coin record.
 
 vectors/bond.json holds the equivocation bond's vectors, which bond.py
 generates: its three scripts, the bond's and the notice output's

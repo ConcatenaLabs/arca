@@ -22,7 +22,8 @@
 use elements::hashes::Hash;
 use elements::Transaction;
 
-use arca_covenant::{CoinRecord, LeafId, TransferError, ValidCoin, WalletPolicy};
+use arca_covenant::{CoinRecord, LeafId, MedianTime, TransferError, ValidCoin, WalletPolicy};
+use elements::secp256k1_zkp::schnorr::Signature;
 
 use crate::params::Params;
 use crate::store::{BoardState, LeafState, RoundState, Store, StoreError};
@@ -73,10 +74,46 @@ pub enum CoinError {
 	#[error("leaf {leaf} rests on a board whose service ends at median time {expiry}: it is taken here only until {horizon} s before \
 		that, its exit deadline, for a transfer and a refresh alike)")]
 	PastBoardDate { leaf: LeafId, expiry: u32, horizon: u32 },
+	/// A `channel-1` coin, given up only in a round's participation and
+	/// paid from only by a state of its channel ([`crate::channels`]): its
+	/// collaborative spend would move the operator's side too.
+	#[error("leaf {0} is a channel-1 coin: it is given up in a round's participation, and paid from by its channel's states alone")]
+	Channel(LeafId),
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
 	Internal(String),
+}
+
+/// The coin record of the batch leaf `row`, from its record in the batch and
+/// what its owner handed over: the entry's preimage and its authorisations,
+/// one per node of a tree leaf's path, or the one exit authorisation of an
+/// accumulator leaf.
+pub fn batch_coin(row: &crate::store::BatchLeafRow, preimage: [u8; 32], auths: Vec<(Signature, MedianTime)>) -> Result<CoinRecord, String> {
+	match row.kind {
+		arca_covenant::BatchKind::Tree => Ok(CoinRecord::Leaf {
+			record: arca_covenant::LeafRecord::from_bytes(&row.record).map_err(|e| e.to_string())?, preimage, auths,
+		}),
+		arca_covenant::BatchKind::Accumulator => {
+			let auth = match auths[..] {
+				[a] => a,
+				_ => return Err(format!("{} authorisations for a leaf of an accumulator batch; it takes its exit authorisation alone",
+					auths.len())),
+			};
+			Ok(CoinRecord::Accumulator {
+				record: arca_covenant::AccumulatorRecord::from_bytes(&row.record).map_err(|e| e.to_string())?, preimage, auth,
+			})
+		},
+	}
+}
+
+/// The first expiry of the batch leaf `row`, from its record in the batch.
+pub fn batch_leaf_expiry(row: &crate::store::BatchLeafRow) -> Option<u32> {
+	match row.kind {
+		arca_covenant::BatchKind::Tree => arca_covenant::LeafRecord::from_bytes(&row.record).ok().map(|r| r.schedule.expiries()[0]),
+		arca_covenant::BatchKind::Accumulator =>
+			arca_covenant::AccumulatorRecord::from_bytes(&row.record).ok().map(|r| r.schedule.expiries()[0]),
+	}.map(|e| e.to_consensus_u32())
 }
 
 /// The transactions a coin record's bases came from: each board's, as
@@ -100,8 +137,12 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 				Box::pin(bases(store, &i.coin, out)).await?;
 			}
 		},
-		CoinRecord::Leaf { record, .. } => {
-			let id = record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?;
+		CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {
+			let id = match record {
+				CoinRecord::Leaf { record, .. } => record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?,
+				CoinRecord::Accumulator { record, .. } => record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?,
+				_ => unreachable!("matched above"),
+			};
 			let leaf = store.batch_leaf(&id.0).await?
 				.ok_or_else(|| CoinError::Internal(format!("leaf {} of a known coin is in no batch the server built", id)))?;
 			let round = store.round(leaf.round_id).await?
@@ -127,7 +168,7 @@ pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u
 	fn collect(r: &CoinRecord, out: &mut Vec<[u8; 32]>) {
 		match r {
 			CoinRecord::Board(b) => out.push(b.leaf_id().0),
-			CoinRecord::Leaf { .. } => {},
+			CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out)),
 			CoinRecord::Fill(f) => {
 				collect(&f.fill.order, out);
@@ -234,4 +275,17 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 		}
 	}
 	Ok(Checked { record, coin, bases: found, board_expiry })
+}
+
+/// [`check`] for a coin given up anywhere but a round's participation (a
+/// transfer, a take, a plan, a distribution, an order's fill): a
+/// `channel-1` coin is refused ([`CoinError::Channel`]).
+pub async fn check_plain(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
+	-> Result<Checked, CoinError>
+{
+	let c = check(store, policy, id, holder, dates).await?;
+	if c.coin.leaf.channel.is_some() {
+		return Err(CoinError::Channel(*id));
+	}
+	Ok(c)
 }

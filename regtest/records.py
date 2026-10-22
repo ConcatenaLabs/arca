@@ -39,9 +39,9 @@ All integers are little-endian. Asset ids and the genesis hash are in internal
 byte order.
 
     u8    format version, 2
-    u8    template, 1 (vtxo), 3 (htlc), 4 (order) or 5 (landing)
-    u8    template version, 1 (vtxo, htlc, landing) or 2 (order; and vtxo-2, a
-          vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
+    u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
+    u8    template version, 1 (vtxo, htlc, landing, channel) or 2 (order; and vtxo-2,
+          a vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
     [32]  operator nonce
@@ -63,6 +63,9 @@ byte order.
     [20]  P, the landing program: hash160 of the owner's landing key L
     u64   the fee allowance: the exit's output 0 holds at least the value
           less this; below the value
+          channel-1 only (a leaf with a balance for each side, channel.py):
+    u64   the operator's opening balance, below the value
+    u16   the credit window, 512-second units, no shorter than the exit delay
     [32]  asset                       the leaf and its entry
     u64   value
     [32]  unlock hash h
@@ -95,7 +98,8 @@ The JSON form has the same fields; an htlc-1 record's terms are one object,
 `htlc`: {"direction": "send" or "receive", "payment_hash", "timeout",
 "operator_delay_units"}, and an order-2 record's `order`: {"asset_b",
 "rate_num", "rate_den", "min_lot", "maker", "expiry", "refund_key",
-"credits"}, and a landing-1 record's `landing`: {"program", "allowance"}.
+"credits"}, and a landing-1 record's `landing`: {"program", "allowance"},
+and a channel-1 record's `channel`: {"capacity", "window_units"}.
 Its canonical text has its keys sorted and
 no whitespace. Asset ids, the token and the genesis hash are hex in display
 order (the order the node's RPCs print), every other byte string hex in its
@@ -110,12 +114,13 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
                                      CAssetIssuance, uint256_from_str)
 
 FORMAT_VERSION = 2
-TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4, "landing": 5}   # name -> template id; a board record names board
+TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4, "landing": 5, "channel": 7}   # name -> template id; a board record names board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
 TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
 TEMPLATE_ORDER, TEMPLATE_ORDER_VERSION = 4, 2
 TEMPLATE_LANDING, TEMPLATE_LANDING_VERSION = 5, 1
+TEMPLATE_CHANNEL, TEMPLATE_CHANNEL_VERSION = 7, 1
 TEMPLATE_VTXO2_VERSION = 2
 
 
@@ -270,6 +275,12 @@ class Batch:
             h = lf.get("htlc")
             if lf.get("order") is not None:
                 tap = order_leaf_tap(lf, S, salt, ctag, p["asset"])
+            elif lf.get("channel") is not None:
+                import channel as channel_py
+                c = lf["channel"]
+                ch = channel_py.Channel(p["genesis"], salt, lf["owner"], S, SEQ_TIME | lf["exit_delay"], lf["value"],
+                                        c["capacity"], SEQ_TIME | c["window"])
+                tap, _ = ch.tap(ch.opening())
             elif lf.get("landing") is not None:
                 g = lf["landing"]
                 tap, _ = landing_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], g["program"], p["asset"],
@@ -342,13 +353,15 @@ class Batch:
         h = lf.get("htlc")
         o = lf.get("order")
         g = lf.get("landing")
+        c = lf.get("channel")
         return {
             "template": ("order", TEMPLATE_ORDER_VERSION) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
-            else ("landing", TEMPLATE_LANDING_VERSION) if g
+            else ("landing", TEMPLATE_LANDING_VERSION) if g else ("channel", TEMPLATE_CHANNEL_VERSION) if c
             else ("vtxo", TEMPLATE_VTXO2_VERSION) if lf.get("v2") else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
             "order": o,
             "landing": g,
+            "channel": c,
             "owner": lf["owner"], "owner_nonce": lf["owner_nonce"], "operator_nonce": lf["operator_nonce"],
             "exit_delay": lf["exit_delay"],
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
@@ -377,6 +390,9 @@ def encode(rec):
     if name == "landing":
         g = rec["landing"]
         b += g["program"] + le64(g["allowance"])
+    if name == "channel":
+        c = rec["channel"]
+        b += le64(c["capacity"]) + le16(c["window"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
     b += bytes([1 if rec["burn"] else 0])
@@ -425,6 +441,9 @@ def to_json(rec):
     if name == "landing":
         g = rec["landing"]
         o["landing"] = {"program": g["program"].hex(), "allowance": str(g["allowance"])}
+    if name == "channel":
+        c = rec["channel"]
+        o["channel"] = {"capacity": str(c["capacity"]), "window_units": c["window"]}
     return o
 
 
@@ -475,7 +494,7 @@ def txout(asset, value, spk):
 
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
-                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, landing=None, v2=None):
+                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, landing=None, channel=None, v2=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -506,6 +525,10 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     # landing: [leaf index]; each such leaf is a landing-1 leaf of a supervised asset.
     for i in (landing or []):
         leaves[i]["landing"] = {"program": label_hash("landing", "%s leaf %d" % (name, i))[:20], "allowance": 2_000 + i}
+    # channel: {leaf index: capacity}; each such leaf is a channel-1 leaf, the
+    # operator's opening balance that part of its value.
+    for i, capacity in (channel or {}).items():
+        leaves[i]["channel"] = {"capacity": capacity, "window": 2 * EXIT_DELAY}
     # v2: [leaf index]; each such leaf is a vtxo-2 leaf.
     for i in (v2 or []):
         leaves[i]["v2"] = True
@@ -557,6 +580,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                             **({"order": order_json(lf["order"])} if "order" in lf else {}),
                             **({"landing": {"program": lf["landing"]["program"].hex(),
                                             "allowance": lf["landing"]["allowance"]}} if "landing" in lf else {}),
+                            **({"channel": {"capacity": lf["channel"]["capacity"],
+                                            "window_units": lf["channel"]["window"]}} if "channel" in lf else {}),
                             **({"template": "vtxo-2"} if lf.get("v2") else {}))
                        for lf in leaves],
         },
@@ -706,6 +731,40 @@ def invalid_landing_vectors(valid_binary, valid_json):
             [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
 
 
+def invalid_channel_vectors(valid_binary, valid_json):
+    """channel-1 records a decoder must refuse."""
+    v = bytes.fromhex(valid_binary)
+    CAP = 3 + 32 + 32 + 32 + 2
+    WINDOW = CAP + 8
+    VALUE = WINDOW + 2 + 32
+    value = struct.unpack("<Q", v[VALUE:VALUE + 8])[0]
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [
+        ("channel-1: a capacity as large as the value", put(CAP, le64(value)), "channel"),
+        ("channel-1: a window one unit shorter than the exit delay", put(WINDOW, le16(EXIT_DELAY - 1)), "channel"),
+        ("channel-1, version 2", put(2, b"\x02"), "template_version"),
+    ]
+
+    def edit(f):
+        o = json.loads(valid_json)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("channel-1 without its terms", edit(lambda o: o.pop("channel")), "field"),
+        ("channel-1 terms on a vtxo-1 record", edit(lambda o: o.update({"template": "vtxo-1"})), "field"),
+        ("channel-1: a capacity as a number", edit(lambda o: o["channel"].update({"capacity": 1000})), "type"),
+        ("channel-1: a capacity as large as the value", edit(lambda o: o["channel"].update({"capacity": o["value"]})),
+         "channel"),
+        ("channel-1: an unknown field in its terms", edit(lambda o: o["channel"].update({"extra": 1})), "field"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
 def generate():
     batches = [
         batch_vector("one leaf", 1, 4),
@@ -718,18 +777,23 @@ def generate():
         batch_vector("five leaves, two of them htlc-1", 5, 4, htlc={1: "receive", 3: "send"}),
         batch_vector("five leaves, two of them order-2", 5, 4, order=[0, 3]),
         batch_vector("five leaves of a supervised asset, every one landing-1", 5, 4, landing=[0, 1, 2, 3, 4]),
+        batch_vector("five leaves, two of them channel-1", 5, 4, channel={1: 4_000_000, 4: 0}),
         batch_vector("five leaves, two of them vtxo-2", 5, 4, v2=[1, 2]),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
-    h = batches[-4]["records"][1]
+    h = batches[7]["records"][1]
     hi, hj = invalid_htlc_vectors(h["binary"], h["json"])
     invalid += hi
     invalid_json += hj
-    g = batches[-2]["records"][2]
+    g = batches[9]["records"][2]
     gi, gj = invalid_landing_vectors(g["binary"], g["json"])
     invalid += gi
     invalid_json += gj
+    c = batches[10]["records"][1]
+    ci, cj = invalid_channel_vectors(c["binary"], c["json"])
+    invalid += ci
+    invalid_json += cj
     return {
         "about": "Golden vectors for Arca's leaf record, its id and its encodings. Generated by "
                  "regtest/vectors.py from regtest/records.py; do not edit.",

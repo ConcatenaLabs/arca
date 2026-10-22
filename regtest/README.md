@@ -27,7 +27,9 @@ and the block is refused for the mempool's reason. Relay policy can hide a
 consensus flaw, so no negative case rests on the mempool alone, and a negative
 case refused for an unrelated reason would be a test that cannot fail. The node
 runs with `-par=1`, checking scripts inline, so a block refused for a script
-names the failure, as the mempool does; a lock not yet reached reads
+names the failure, as the mempool does, under the consensus label
+(`mandatory-script-verify-flag-failed` where the mempool's reads
+`mempool-script-verify-flag-failed`); a lock not yet reached reads
 `bad-txns-nonfinal` in a block. A few spends that relay policy refuses but consensus accepts are mined on
 purpose with `generateblock`, to show what a block producer could do.
 
@@ -102,7 +104,8 @@ batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
 second and fourth leaves are `htlc-1`, one whose first and fourth are
 `order-2`, one of a supervised asset whose five leaves are all
-`landing-1`, and one whose second and third are `vtxo-2`, it holds the inputs, the
+`landing-1`, one whose second and fifth leaves are `channel-1` (the
+fifth with no opening balance for the operator), and one whose second and third are `vtxo-2`, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds
@@ -171,8 +174,9 @@ leaves behind the entries a tree would pay them through, each slot's record,
 the Merkle-sum root and the batch's weight, the state's data leaf, the batch
 output's merkle root, scriptPubKey and control block, and two exits, by an
 owner and then by the operator, each with its path, digest, signature, witness
-value and the state it leaves. The Simplicity commitment root is
-sequentia-contracts' (`arca/accumulator-1`).
+value and the state it leaves; and every leaf's record and coin record in
+binary form, with its leaf id, and records a reader must refuse. The
+Simplicity commitment root is sequentia-contracts' (`arca/accumulator-1`).
 
 `vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
@@ -187,7 +191,7 @@ sample spend, every input, with the node's own interpreter, and
 `covenant/tests/vectors.rs` rebuilds every output and every witness with the Rust
 builders and compares them byte for byte; `covenant/tests/record.rs` decodes,
 re-encodes and validates every record; `covenant/tests/transactions.rs` rebuilds
-every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature; `covenant/tests/accumulator_vectors.rs` rebuilds every accumulator vector and checks each exit's signature.
+every off-chain transaction byte for byte and verifies it; `covenant/tests/order_vectors.rs` rebuilds every `order-2` vector and verifies the fill signature; `covenant/tests/accumulator_vectors.rs` rebuilds every accumulator vector, checks each exit's signature, and encodes and decodes every record and coin record.
 
 ## In CI
 

@@ -49,7 +49,7 @@ use rand::RngCore;
 
 use arca_covenant::script::sha256 as sha256_bytes;
 use arca_covenant::sign::verify_digest;
-use arca_covenant::{CoinRecord, Distribution, LeafId, LeafRecord, MedianTime, Template};
+use arca_covenant::{Distribution, LeafId, MedianTime, Template};
 
 use super::{forfeit_margin, ParticipationError, Participations, Status, MAX_DEFER};
 use crate::coins::{self, CoinError};
@@ -184,7 +184,7 @@ impl Participations {
 		let mut dated = Vec::with_capacity(d.inputs.len());
 		let mut last_times = Vec::with_capacity(d.inputs.len());
 		for (k, (leaf, att)) in d.inputs.iter().zip(&req.attestations).enumerate() {
-			let c = coins::check(&self.store, &policy, leaf, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
+			let c = coins::check_plain(&self.store, &policy, leaf, &id, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
 			if c.coin.leaf.htlc.is_some() {
 				return Err(ParticipationError::HtlcInput(k, *leaf));
 			}
@@ -276,6 +276,7 @@ impl Participations {
 					htlc: None,
 					order: None,
 					landing: None,
+					channel: None,
 				},
 				leaf_id: None,
 			}).collect(),
@@ -323,8 +324,8 @@ impl Participations {
 			.ok_or_else(|| ParticipationError::Internal(format!("the round of claim leaf {} is not recorded", leaf)))?;
 		let round_tx: elements::Transaction = elements::encode::deserialize(&round.tx)
 			.map_err(|e| ParticipationError::Internal(e.to_string()))?;
-		let record = LeafRecord::from_bytes(&row.record).map_err(|e| ParticipationError::Internal(e.to_string()))?;
-		let coin = CoinRecord::Leaf { record, preimage: p.preimage, auths };
+		let coin = crate::coins::batch_coin(&row, p.preimage, auths)
+			.map_err(|e| ParticipationError::Internal(format!("claim leaf {}: {}", leaf, e)))?;
 		let policy = self.params.taken_policy(self.now().await?);
 		let valid = coin.resolve(std::slice::from_ref(&round_tx), &policy)
 			.map_err(|e| ParticipationError::Coin(CoinError::InvalidCoin { leaf: *leaf, error: e }))?;

@@ -12,9 +12,9 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `vtxo-2` leaf; 5 a checkpoint, 11 a `vtxo-2` coin's checkpoint), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 a `vtxo-2` leaf; 5 a checkpoint, 12 a `vtxo-2` coin's checkpoint), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64) |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
@@ -275,6 +275,11 @@ impl Encoding for LeafPolicy {
 			w.extend(asset_bytes(l.asset));
 			w.extend(l.min_value.to_le_bytes());
 		}
+		if let Some(c) = &self.channel {
+			w.extend(c.value.to_le_bytes());
+			w.extend(c.capacity.to_le_bytes());
+			w.extend(c.window.units().to_le_bytes());
+		}
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<LeafPolicy, DecodeError> {
@@ -286,7 +291,8 @@ impl Encoding for LeafPolicy {
 			exit_delay: r.relative_time()?,
 			htlc: None,
 			order: None,
-			landing: None, v2: false,
+			landing: None,
+			channel: None, v2: false,
 		})
 	}
 }
@@ -482,13 +488,14 @@ impl Encoding for Policy {
 		w.push(VERSION);
 		match self {
 			Policy::Leaf(p) => {
-				w.push(if p.order.is_some() { 8 } else if p.landing.is_some() { 9 } else if p.htlc.is_some() { 6 } else if p.v2 { 10 } else { 1 });
+				w.push(if p.channel.is_some() { 10 } else if p.order.is_some() { 8 } else if p.landing.is_some() { 9 }
+					else if p.htlc.is_some() { 6 } else if p.v2 { 11 } else { 1 });
 				p.encode_to(w)
 			},
 			Policy::Node(p) => { w.push(2); p.encode_to(w) },
 			Policy::Entry(p) => { w.push(3); p.encode_to(w) },
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
-			Policy::Checkpoint(p) => { w.push(if p.v2 { 11 } else { 5 }); p.encode_to(w) },
+			Policy::Checkpoint(p) => { w.push(if p.v2 { 12 } else { 5 }); p.encode_to(w) },
 			Policy::Offboard(p) => { w.push(7); p.encode_to(w) },
 		}
 	}
@@ -532,8 +539,17 @@ impl Encoding for Policy {
 				p.landing = Some(crate::landing::LandingTerms { program, asset, min_value });
 				Policy::Leaf(p)
 			},
-			10 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
-			11 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
+			10 => {
+				let mut p = LeafPolicy::decode_from(r)?;
+				let t = crate::channel::ChannelTerms { value: r.u64()?, capacity: r.u64()?, window: r.relative_time()? };
+				if t.check(p.exit_delay).is_err() {
+					return Err(DecodeError::Count(t.capacity));
+				}
+				p.channel = Some(t);
+				Policy::Leaf(p)
+			},
+			11 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
+			12 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}

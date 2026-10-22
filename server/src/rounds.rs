@@ -13,11 +13,15 @@
 //! (what the round pays for them, the batch output with its reserves and
 //! offboard outputs, then its own fee and connector; one that does not fit
 //! waits, saying why, and delays no other), and builds the asset's tree
-//! with `arca-covenant`'s builder ([`Tree::build`]): balanced
+//! with `arca-covenant`'s builder ([`arca_covenant::Tree::build`]): balanced
 //! at radix 4, every node gated, RECLAIM on the lowest nodes, each leaf
 //! behind its participation's hash-locked entry, the reserve at four times the
 //! node's floor in the batch asset (one atom where the node does not accept
-//! the asset for fees, so whoever unrolls attaches a fee coin). Each batch has
+//! the asset for fees, so whoever unrolls attaches a fee coin). With
+//! [`RoundConfig::accumulator_exit_rate_ppm`] set, a batch whose expected
+//! exits cost less from one output is built as an accumulator batch instead
+//! ([`BatchKind::choose`]): the same entries under one output, from which each
+//! leaf leaves in one transaction. Each batch has
 //! a sweep token of its own, issued as one explicit atom with no reissuance
 //! token by one of the operator's coins, and a clock schedule of three steps
 //! (28, 56 and 84 days after the round) with a notice of 36 hours.
@@ -219,11 +223,12 @@ use tokio::sync::{broadcast, Mutex};
 
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::FeeSource;
-use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
+use arca_covenant::tree::{LeafSpec, ReserveRule, TreeParams};
 use arca_covenant::{
-	connector_asset, ClockSchedule, ConnectorPolicy, ExplicitOutput, FillOrder, FillPlan, LeafId, MedianTime, OffboardPolicy, RelativeTime,
-	Template, WalletPolicy,
+	connector_asset, AccumulatorRecord, Batch, BatchKind, ClockSchedule, ConnectorPolicy, ExplicitOutput, FillOrder, FillPlan, LeafId,
+	MedianTime, OffboardPolicy, RelativeTime, Template, WalletPolicy,
 };
+use elements::Script;
 use sequentia_ext::AssetAmount;
 
 use crate::chain::{ChainEvent, FinalityService};
@@ -254,6 +259,12 @@ pub struct RoundConfig {
 	pub steps: usize,
 	/// The most leaves one batch holds.
 	pub max_batch_leaves: usize,
+	/// The share of a batch's leaves, in millionths, the operator expects to
+	/// leave on the chain on their own. When it is set, a batch whose
+	/// expected exits cost less as an accumulator batch than as a tree is
+	/// built as one ([`BatchKind::choose`]); when it is not, every batch is a
+	/// tree.
+	pub accumulator_exit_rate_ppm: Option<u32>,
 }
 
 impl Default for RoundConfig {
@@ -266,6 +277,7 @@ impl Default for RoundConfig {
 			lifetime: 28 * 86_400,
 			steps: 3,
 			max_batch_leaves: 1024,
+			accumulator_exit_rate_ppm: None,
 		}
 	}
 }
@@ -320,14 +332,16 @@ pub struct Built {
 	pub broadcast: String,
 }
 
-/// A batch as the operator publishes it: everything [`Tree::build`] takes,
-/// and where the round put it.
+/// A batch as the operator publishes it: its kind and everything
+/// [`Batch::build`] takes, and where the round put it.
 #[derive(Debug, Clone)]
 pub struct PublishedTree {
 	pub round_txid: Txid,
 	pub batch_vout: u32,
 	pub token_vout: u32,
 	pub connector_vout: u32,
+	/// A tree, or an accumulator batch (whose `params.radix` is 0).
+	pub kind: BatchKind,
 	pub params: TreeParams,
 	pub leaves: Vec<LeafSpec>,
 	/// The latest entry of the signer's record, its running hash and the
@@ -485,6 +499,16 @@ impl Rounds {
 
 	pub fn config(&self) -> &RoundConfig {
 		&self.config
+	}
+
+	/// The kind of batch the runner builds `specs` of `asset` as: an
+	/// accumulator batch when the operator expects few enough of them to
+	/// leave on their own ([`BatchKind::choose`]); a tree for an
+	/// issuer-operated asset, whose batches the mint's signer rebuilds as
+	/// trees.
+	fn kind_of(&self, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
+		let issuer = self.params.assets.get(asset).is_some_and(|a| a.issuer.is_some());
+		BatchKind::choose(specs, self.config.radix, self.config.accumulator_exit_rate_ppm, issuer)
 	}
 
 	async fn now(&self) -> Result<MedianTime, RoundError> {
@@ -1197,8 +1221,9 @@ impl Rounds {
 				asset, chain: self.params.chain, schedule, burn: false, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
-			let tree = Tree::build(params, &specs).map_err(|e| RoundError::Internal(format!("the tree of asset {}: {}", asset, e)))?;
-			*pays.entry(asset).or_default() += tree.batch_output().value;
+			let batch = Batch::build(self.kind_of(&asset, &specs), params, &specs)
+				.map_err(|e| RoundError::Internal(format!("the batch of asset {}: {}", asset, e)))?;
+			*pays.entry(asset).or_default() += batch.batch_output().value;
 		}
 		Ok(pays)
 	}
@@ -1278,7 +1303,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel } => Ok(LeafSpec {
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -1289,6 +1314,7 @@ impl Rounds {
 				htlc: *htlc,
 				order: *order,
 				landing: *landing,
+				channel: *channel,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -1437,6 +1463,10 @@ impl Rounds {
 				None => ExplicitOutput::new(f.terms.asset_b, gap_value(f.terms.asset_b, fee_asset), self.wallet.change_script().await?),
 			});
 		}
+		// Each batch's kind, chosen before the tokens: a tree or an
+		// accumulator batch.
+		let kinds: BTreeMap<AssetId, BatchKind> = groups.iter()
+			.map(|(a, leaves)| (*a, self.kind_of(a, &leaves.iter().map(|l| l.spec).collect::<Vec<_>>()))).collect();
 		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, minted, |tokens| {
 			let mut outputs: Vec<ExplicitOutput> = successor.iter().cloned().collect();
 			outputs.extend(fill_outputs.iter().cloned());
@@ -1449,10 +1479,10 @@ impl Rounds {
 					asset: *asset, chain, schedule, burn: Some(*asset) == minted, radix, reserve: reserves[asset],
 					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
-				let tree = Tree::build(params, &specs).map_err(|e| format!("the tree of asset {}: {}", asset, e))?;
+				let tree = Batch::build(kinds[asset], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
 				outputs.push(tree.batch_output());
 				outputs.push(ExplicitOutput::new(*token, 1, tree.clock0_script_pubkey()));
-				trees.push(tree);
+				trees.push((tree, params));
 			}
 			for o in &offboards {
 				outputs.push(o.policy.output(o.margin));
@@ -1475,9 +1505,12 @@ impl Rounds {
 		// other's witness.
 		if let Some((asset, i, room, amount, _)) = &mint {
 			let mut batches = vec![];
-			for (k, (tree, (_, leaves))) in trees.iter().zip(&groups).enumerate() {
+			for (k, ((tree, params), (_, leaves))) in trees.iter().zip(&groups).enumerate() {
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
-				match crate::issuer::WireBatch::of(base + 2 * k as u32, tree.params(), &specs) {
+				if tree.kind() != BatchKind::Tree {
+					return release(RoundError::Internal("an issuer-operated asset's batch is a tree".into())).await;
+				}
+				match crate::issuer::WireBatch::of(base + 2 * k as u32, params, &specs) {
 					Ok(b) => batches.push(b),
 					Err(e) => return release(RoundError::Internal(e)).await,
 				}
@@ -1502,22 +1535,43 @@ impl Rounds {
 			..WalletPolicy::new(chain, s, now)
 		};
 		let mut new_batches = vec![];
-		for (i, (tree, (asset, leaves))) in trees.iter().zip(&groups).enumerate() {
+		for (i, ((batch, tp), (asset, leaves))) in trees.iter().zip(&groups).enumerate() {
 			let vout = base + 2 * i as u32;
+			// Each leaf's id, script and record, as its owner's wallet checks
+			// it: a tree leaf's path, or an accumulator leaf's slot.
+			let mut checked: Vec<(LeafId, Script, Result<Vec<u8>, String>)> = Vec::with_capacity(leaves.len());
+			let mut failed = None;
+			match batch {
+				Batch::Tree(tree) => for (j, record) in tree.records().into_iter().enumerate() {
+					match record.validate_round(&tx, &accept) {
+						Ok(v) if v.batch_vout == vout =>
+							checked.push((v.leaf_id, v.branch.leaf.script_pubkey(), record.to_bytes().map_err(|e| e.to_string()))),
+						Ok(v) => failed = failed.or(Some(format!("batch {} is at output {}, not {}", i, v.batch_vout, vout))),
+						Err(e) => failed = failed.or(Some(format!("leaf {} of batch {}: {}", j, i, e))),
+					}
+				},
+				Batch::Accumulator(acc) => for (j, record) in acc.records().into_iter().enumerate() {
+					match record.validate_round(&tx, &accept) {
+						Ok(v) if v.batch_vout == vout =>
+							checked.push((v.leaf_id, v.leaf.script_pubkey(), record.to_bytes().map_err(|e| e.to_string()))),
+						Ok(v) => failed = failed.or(Some(format!("batch {} is at output {}, not {}", i, v.batch_vout, vout))),
+						Err(e) => failed = failed.or(Some(format!("leaf {} of batch {}: {}", j, i, e))),
+					}
+				},
+			}
+			if let Some(why) = failed {
+				return release(RoundError::Check(why)).await;
+			}
 			let mut new_leaves = vec![];
-			for (j, (record, l)) in tree.records().into_iter().zip(leaves).enumerate() {
-				let valid = match record.validate_round(&tx, &accept) {
-					Ok(v) => v,
-					Err(e) => return release(RoundError::Check(format!("leaf {} of batch {}: {}", j, i, e))).await,
-				};
-				if valid.batch_vout != vout {
-					return release(RoundError::Check(format!("batch {} is at output {}, not {}", i, valid.batch_vout, vout))).await;
-				}
+			for (j, ((leaf_id, leaf_spk, record), l)) in checked.into_iter().zip(leaves).enumerate() {
 				let row = &chosen[l.participation];
-				let leaf_spk = valid.branch.leaf.script_pubkey();
+				let record = match record {
+					Ok(b) => b,
+					Err(e) => return release(RoundError::Internal(e)).await,
+				};
 				new_leaves.push(NewBatchLeaf {
 					coin: NewCoin {
-						leaf_id: valid.leaf_id.0,
+						leaf_id: leaf_id.0,
 						kind: LeafKind::Batch,
 						asset: asset.into_inner().to_byte_array(),
 						value: l.spec.value,
@@ -1546,47 +1600,47 @@ impl Rounds {
 					exit_delay_units: l.spec.exit_delay.units(),
 					value: l.spec.value,
 					unlock_hash: l.spec.unlock_hash,
-					record: match record.to_bytes() {
-						Ok(b) => b,
-						Err(e) => return release(RoundError::Internal(e.to_string())).await,
-					},
+					record,
 				});
 			}
-			// Every node and entry, so their outputs are seen once unrolled.
+			// Every node and entry, so their outputs are seen once unrolled:
+			// an accumulator batch has no nodes, and each exit pays an entry.
 			let mut scripts = vec![];
-			for (level, nodes) in tree.levels().iter().enumerate() {
-				for (k, nd) in nodes.iter().enumerate() {
-					scripts.push(NewTreeScript {
-						script_pubkey: nd.output().script_pubkey.to_bytes(), kind: TreeScriptKind::Node,
-						level: level as i16, idx: k as u32, value: nd.value,
-					});
+			if let Batch::Tree(tree) = batch {
+				for (level, nodes) in tree.levels().iter().enumerate() {
+					for (k, nd) in nodes.iter().enumerate() {
+						scripts.push(NewTreeScript {
+							script_pubkey: nd.output().script_pubkey.to_bytes(), kind: TreeScriptKind::Node,
+							level: level as i16, idx: k as u32, value: nd.value,
+						});
+					}
 				}
 			}
-			for (k, l) in tree.leaves().iter().enumerate() {
+			for (k, l) in batch.leaves().iter().enumerate() {
 				scripts.push(NewTreeScript {
 					script_pubkey: l.entry.script_pubkey().to_bytes(), kind: TreeScriptKind::Entry,
 					level: -1, idx: k as u32, value: l.entry_value,
 				});
 			}
-			let tp = tree.params();
 			new_batches.push(NewBatch {
 				batch: BatchRow {
 					round_id: 0,
 					vout,
 					asset: asset.into_inner().to_byte_array(),
-					value: tree.batch_output().value,
+					value: batch.batch_output().value,
 					token: tp.schedule.token.into_inner().to_byte_array(),
 					token_vout: vout + 1,
 					issuer: (tx.input[foreign.len() + i].previous_output.txid.to_byte_array(),
 						tx.input[foreign.len() + i].previous_output.vout),
 					schedule: tp.schedule.encode(),
 					burn: tp.burn,
-					radix: tp.radix as u16,
+					radix: if batch.kind() == BatchKind::Tree { tp.radix as u16 } else { 0 },
 					reserve: match tp.reserve {
 						ReserveRule::FeeRate { floor_per_kvb, multiple } => StoredReserve::FeeRate { floor_per_kvb, multiple },
 						ReserveRule::Fixed { node, entry } => StoredReserve::Fixed { node, entry },
 					},
 					min_leaf: tp.min_leaf,
+					kind: batch.kind(),
 				},
 				leaves: new_leaves,
 				scripts,
@@ -2666,6 +2720,19 @@ impl Rounds {
 		};
 		let mut specs = Vec::with_capacity(leaves.len());
 		for l in &leaves {
+			// An htlc-1, order-2, landing-1 or channel-1 leaf's terms, from the
+			// record the builder gave it: a tree leaf record, or an
+			// accumulator record (which carries no channel).
+			let (htlc, order, landing, channel) = match b.kind {
+				BatchKind::Tree => {
+					let r = arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
+					(r.htlc, r.order, r.landing, r.channel)
+				},
+				BatchKind::Accumulator => {
+					let r = AccumulatorRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
+					(r.htlc, r.order, r.landing, None)
+				},
+			};
 			specs.push(LeafSpec {
 				template: l.template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&l.owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
@@ -2674,17 +2741,17 @@ impl Rounds {
 				operator_nonce: l.operator_nonce,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: l.unlock_hash,
-				// An htlc-1, order-2 or landing-1 leaf's terms, from the record the builder gave it.
-				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
-				order: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.order,
-				landing: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.landing,
+				htlc,
+				order,
+				landing,
+				channel,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;
 		let preimages = self.store.released_preimages(b.round_id, b.vout).await?;
 		Ok(Some(PublishedTree {
-			round_txid: *txid, batch_vout: b.vout, token_vout: b.token_vout, connector_vout: round.connector_vout, params, leaves: specs,
-			signer_head, round_state: round.state, preimages,
+			round_txid: *txid, batch_vout: b.vout, token_vout: b.token_vout, connector_vout: round.connector_vout, kind: b.kind, params,
+			leaves: specs, signer_head, round_state: round.state, preimages,
 		}))
 	}
 

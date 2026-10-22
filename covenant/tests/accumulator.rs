@@ -31,8 +31,14 @@
 //!   entry to the owner's key, no rest.
 //!
 //! A 1,024-leaf tree of the same leaves is unrolled to one leaf beside it,
-//! for the sizes. Needs `SEQUENTIAD_EXEC`; run with `--nocapture` for the
-//! table.
+//! for the sizes.
+//!
+//! Beside it, a batch of 32 leaves: 25 exits chained in the mempool confirm
+//! in one block while the 26th waits for it (the mempool's chain limit), and
+//! an exit mined in a block anchored to a parent block that is orphaned
+//! leaves the chain with it and confirms again under the new branch.
+//!
+//! Needs `SEQUENTIAD_EXEC`; run with `--nocapture` for the table.
 
 mod common;
 
@@ -163,6 +169,26 @@ fn accumulator_batch_on_regtest() {
 	// outpoint and no bitmap in it.
 	let t0 = mt(a.net.mtp() - 1);
 	let auths: Vec<ExitAuth> = (0..LEAVES).map(|i| auth(valid[i].exit_digest(t0), &owners[i], false, t0)).collect();
+
+	// The coin a holder keeps: the record, the preimage and its exit
+	// authorisation, through its binary form; refused with another preimage,
+	// a stranger's authorisation or one not yet good.
+	let coin = |i: usize, pre: [u8; 32], au: &ExitAuth| CoinRecord::Accumulator {
+		record: acc.record(i), preimage: pre, auth: (au.signature, au.time),
+	};
+	let held = CoinRecord::from_bytes(&coin(700, preimages[700], &auths[700]).to_bytes().unwrap()).unwrap();
+	let vc = held.validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]), &specs[700].owner_nonce).unwrap();
+	assert_eq!(vc.id, valid[700].leaf_id);
+	assert!(matches!(&vc.origin, ValidOrigin::Accumulator { auth, .. } if *auth == auths[700]));
+	assert_eq!(coin(700, preimages[699], &auths[700]).validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]),
+		&specs[700].owner_nonce).unwrap_err(), TransferError::Preimage);
+	assert_eq!(coin(700, preimages[700], &auths[699]).validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]),
+		&specs[700].owner_nonce).unwrap_err(), TransferError::AuthSignature(0));
+	let later = mt(a.net.mtp() + 3600);
+	assert_eq!(coin(700, preimages[700], &auth(valid[700].exit_digest(later), &owners[700], false, later))
+		.validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]), &specs[700].owner_nonce).unwrap_err(),
+		TransferError::AuthTime(0));
+	println!("slot 700's coin record resolves to its leaf; another preimage, another owner's authorisation and one not yet good are refused");
 
 	// --- Exit 1: slot 341 by its owner -----------------------------------
 	let x1 = RawExit::new(&state0, batch0, acc.total(), &valid[341].exit, &valid[341].entry_output(), auths[341]);
@@ -414,6 +440,98 @@ fn tree_beside(a: &mut Arca, s: &Keypair, owners: &[Keypair], preimages: &[[u8; 
 	a.net.wait_csv(&at.txid, v.branch.leaf.exit_delay);
 	a.net.pass("tree, slot 341: the leaf's exit after its delay (claim)", &claim);
 	assert_eq!(v.round_txid, id);
+}
+
+/// Exits are serial: each spends the rest the one before it left. 25 exits
+/// of one batch, chained in the mempool, go into one block; the 26th is
+/// refused by the mempool's chain limit while they wait (it is valid in a
+/// block, and goes in the next). Then an exit mined in a block anchored to a
+/// parent block that is orphaned leaves the chain with it: the batch output
+/// it spent is unspent again in the chain, the exit returns to the mempool,
+/// and it confirms again under the new parent branch, the same transaction.
+#[test]
+fn chained_exits_in_one_block_and_an_exit_reorganised_by_its_anchor() {
+	const N: usize = 32;
+	let mut a = Arca::start();
+	let s = keypair("accumulator chain operator");
+	let (issuer, sched) = a.schedule(&s);
+	let owners: Vec<Keypair> = (0..N).map(|i| keypair(&format!("accumulator chain owner {}", i))).collect();
+	let preimages: Vec<[u8; 32]> = (0..N).map(|i| label32(&format!("accumulator chain preimage {}", i))).collect();
+	let specs: Vec<LeafSpec> = (0..N)
+		.map(|i| spec(&owners[i], &format!("accumulator chain leaf {}", i), VALUE, hash(&preimages[i])))
+		.collect();
+	let params = AccumulatorParams {
+		asset: a.net.x, chain: a.net.chain, schedule: sched.clone(), burn: false,
+		reserve: ReserveRule::FeeRate { floor_per_kvb: a.floor_per_kvb, multiple: 4 }, min_leaf: 1,
+	};
+	let acc = Accumulator::build(params, &specs).unwrap();
+	let (round, _) = round_tx(&a.net, &issuer, &[], &acc.batch_output(), &sched);
+	let id = a.net.pass("round: a 32-leaf accumulator batch", &round);
+	let policy = a.policy(&s);
+	let valid: Vec<ValidAccumulatorLeaf> = (0..N)
+		.map(|i| acc.record(i).validate(&round, &policy, &xonly(&owners[i]), &specs[i].owner_nonce).unwrap())
+		.collect();
+	let t = mt(a.net.mtp() - 1);
+	let auths: Vec<ExitAuth> = (0..N).map(|i| auth(valid[i].exit_digest(t), &owners[i], false, t)).collect();
+
+	// 25 exits chained in the mempool, then the 26th.
+	let (mut state, mut at, mut held) = (*acc.policy(), OutPoint::new(id, 0), acc.total());
+	let next = |state: &mut AccumulatorPolicy, at: &mut OutPoint, held: &mut u64, i: usize| -> Transaction {
+		let x = valid[i].exit_tx(state, *at, *held, &auths[i], &FeeSource::Reserve).unwrap().tx;
+		*state = state.after(valid[i].exit.slot);
+		*at = OutPoint::new(x.txid(), 1);
+		*held = x.output[1].value.explicit().unwrap();
+		x
+	};
+	let mut chain = vec![];
+	for i in 0..25 {
+		let x = next(&mut state, &mut at, &mut held, i);
+		a.net.rt.client().send_raw_transaction(&x).unwrap_or_else(|e| panic!("exit {} of the chain: {}", i + 1, e));
+		chain.push(x);
+	}
+	let after25 = state;
+	let x26 = next(&mut state, &mut at, &mut held, 25);
+	let r = a.net.rt.client().test_mempool_accept(&[&x26]).unwrap().remove(0);
+	assert!(!r.allowed, "the 26th exit of one unconfirmed chain is refused by the mempool");
+	let why = r.reject_reason.unwrap_or_default();
+	assert!(why.contains("too-long-mempool-chain"), "{}", why);
+	println!("25 exits of one batch chained in the mempool; the 26th refused while they wait: {}", why);
+	a.net.mine(1);
+	let blocks: std::collections::BTreeSet<String> = chain.iter()
+		.map(|x| a.net.rpc("getrawtransaction", serde_json::json!([x.txid().to_string(), true]))["blockhash"].as_str().unwrap().to_string())
+		.collect();
+	assert_eq!(blocks.len(), 1, "the 25 exits are in one block");
+	let exits: Vec<(&Transaction, usize)> = chain.iter().map(|x| (x, 0)).collect();
+	assert_eq!(follow(acc.policy(), &exits).unwrap(), Some(after25), "the state read back from the 25 witnesses");
+	println!("the 25 exits confirmed in one block {}, {} vB each; the state read back from their witnesses is the state built",
+		blocks.iter().next().unwrap(), chain[0].vsize());
+	a.net.pass("exit 26, after the block", &x26);
+
+	// An exit in a block anchored to a parent block that is then orphaned.
+	a.net.rt.mine_parent(1).unwrap();
+	a.net.rt.anchor_to_parent_tip().unwrap();
+	let p = a.net.rt.parent.client().block_count().unwrap();
+	let x27 = next(&mut state, &mut at, &mut held, 26);
+	let spent = x27.input[0].previous_output;
+	let id27 = a.net.rt.client().send_raw_transaction(&x27).unwrap();
+	a.net.mine(1);
+	assert_eq!(a.net.rt.client().confirmations(&id27).unwrap(), 1);
+	let gone = a.net.rt.orphan_parent_from(p).unwrap();
+	let in_chain = |net: &Net, op: &OutPoint| -> bool {
+		!net.rpc("gettxout", serde_json::json!([op.txid.to_string(), op.vout, false])).is_null()
+	};
+	assert!(a.net.rt.client().confirmations(&id27).unwrap_or(0) < 1, "exit 27 left the chain with its anchor");
+	assert!(in_chain(&a.net, &spent), "the batch output exit 27 spent is unspent again in the chain");
+	let pool: Vec<String> = serde_json::from_value(a.net.rpc("getrawmempool", serde_json::json!([]))).unwrap();
+	assert!(pool.contains(&id27.to_string()), "exit 27 is back in the mempool");
+	println!("parent block(s) {:?} orphaned: exit 27 left the chain, the batch output it spent is unspent there again, and the exit \
+		waits in the mempool", gone);
+	a.net.rt.mine_parent(1).unwrap();
+	a.net.rt.anchor_to_parent_tip().unwrap();
+	a.net.mine(1);
+	assert!(a.net.rt.client().confirmations(&id27).unwrap() >= 1, "exit 27 confirms again under the new parent branch");
+	assert!(!in_chain(&a.net, &spent));
+	println!("exit 27 confirmed again under the new parent branch, the same transaction {}", id27);
 }
 
 fn hex(b: &[u8]) -> String {

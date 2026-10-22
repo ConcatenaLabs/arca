@@ -58,6 +58,28 @@
 //!   creates the children its node pins, and the reserves are the
 //!   operator's.
 //!
+//! - `{"op":"channel_state","channel":{…},"state":{…},"owner_sig":…}`: `S`'s
+//!   signature over a state of a `channel-1` coin ([`arca_covenant::channel`]),
+//!   `SHA256(Q ‖ le8(n) ‖ P_n)`, which the signer builds itself from the
+//!   channel's terms (the owner key, the salt, the exit delay, the leaf's
+//!   value, the operator's opening balance and the credit window) and the
+//!   state: so the program a state moves the coin to is always this
+//!   channel's own output for that state, which carries the coin's
+//!   collaborative leaf under `K`, and a state message can never take the
+//!   coin anywhere a `K` message, which the record governs, would not. The
+//!   owner's signature over the same message comes with it;
+//! - `{"op":"channel_note","channel":{…},"state":{…},"owner_sig":…,"credit":…}`:
+//!   `S`'s signature over a credit note of the cumulative amount `credit`,
+//!   `SHA256(N ‖ le8(credit))`, for the channel, when `credit` is within the
+//!   cap `s + F` of a state the owner signed (`owner_sig`), or of the
+//!   channel's opening, which needs no signature: the operator's balance
+//!   covers every credit not folded.
+//!
+//!   Neither is recorded: a newer state replaces an older one by consensus,
+//!   a note is cumulative, and neither is under the forms the equivocation
+//!   bond reads. Both are refused once the record holds any entry under the
+//!   coin's salt (its forfeit or a spend: the coin was given up or paid on),
+//!   and while the signer is stopped;
 //! - `{"op":"reissue","reissue":{…}}`: for an issuer-operated asset whose
 //!   mint limiter the signer was started with, the witness of the limiter's
 //!   coin at input 0 of a round, once the signer has checked the round's
@@ -194,6 +216,65 @@ impl WireOutput {
 	}
 }
 
+/// A `channel-1` coin's terms, from which the signer rebuilds its channel:
+/// the owner's key, the salt, the exit delay and the credit window in
+/// 512-second units, the leaf's value and the operator's opening balance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireChannel {
+	pub owner: String,
+	pub salt: String,
+	pub exit_delay_units: u16,
+	pub value: String,
+	pub capacity: String,
+	pub window_units: u16,
+}
+
+impl WireChannel {
+	pub fn from_policy(p: &arca_covenant::ChannelPolicy) -> WireChannel {
+		WireChannel {
+			owner: hex(&p.owner.serialize()), salt: hex(&p.salt), exit_delay_units: p.exit_delay.units(),
+			value: p.terms.value.to_string(), capacity: p.terms.capacity.to_string(), window_units: p.terms.window.units(),
+		}
+	}
+
+	/// The channel, under `operator` on `chain`, its terms checked.
+	pub fn to_policy(&self, operator: XOnlyPublicKey, chain: arca_covenant::Chain) -> Result<arca_covenant::ChannelPolicy, String> {
+		let exit_delay = RelativeTime::from_units(self.exit_delay_units).map_err(|e| format!("exit_delay_units: {}", e))?;
+		let terms = arca_covenant::ChannelTerms {
+			value: parse_amount(&self.value)?, capacity: parse_amount(&self.capacity)?,
+			window: RelativeTime::from_units(self.window_units).map_err(|e| format!("window_units: {}", e))?,
+		};
+		terms.check(exit_delay).map_err(|e| e.to_string())?;
+		Ok(arca_covenant::ChannelPolicy {
+			owner: XOnlyPublicKey::from_slice(&unhex(&self.owner)?).map_err(|e| format!("owner: {}", e))?,
+			operator, salt: unhex32(&self.salt)?, chain, exit_delay, terms,
+		})
+	}
+}
+
+/// A channel's state on the wire: its number and the three amounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireState {
+	pub number: String,
+	pub owner: String,
+	pub operator: String,
+	pub folded: String,
+}
+
+impl WireState {
+	pub fn from_state(s: &arca_covenant::State) -> WireState {
+		WireState { number: s.number.to_string(), owner: s.owner.to_string(), operator: s.operator.to_string(),
+			folded: s.folded.to_string() }
+	}
+
+	pub fn to_state(&self) -> Result<arca_covenant::State, String> {
+		Ok(arca_covenant::State { number: parse_amount(&self.number)?, owner: parse_amount(&self.owner)?,
+			operator: parse_amount(&self.operator)?, folded: parse_amount(&self.folded)? })
+	}
+}
+
 /// The parts of a forfeit output, from which the signer rebuilds it: the
 /// owner's key, the unlock hash, the connector asset (display order), the
 /// refund delay in 512-second units and the id of the leaf given up.
@@ -280,6 +361,11 @@ pub enum Request {
 	/// The operator's unroll authorisation for the node whose children hash
 	/// is `children_hash` (32 bytes, hex), from the median time `time` on.
 	Unroll { children_hash: String, time: u32 },
+	/// The operator's exit authorisation for the slot whose record is
+	/// `record` in the accumulator batch of root `root` (32 bytes each, hex),
+	/// from the median time `time` on: the operator's path out of an
+	/// accumulator batch, as an unroll authorisation is out of a tree.
+	AccumulatorExit { root: String, record: String, time: u32 },
 	/// An issuer-operated asset's mint at input 0 of a round: the witness of
 	/// the limiter's coin, once the signer has checked the round
 	/// ([`crate::issuer::check_reissue`]) and the limiter's tool signed it.
@@ -297,6 +383,18 @@ pub enum Request {
 		outputs: Vec<WireOutput>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		known: Option<WireEntryRef>,
+	},
+	/// A state of the `channel-1` coin `channel` names, with the owner's
+	/// signature over the state message the signer rebuilds.
+	ChannelState { channel: WireChannel, state: WireState, owner_sig: String },
+	/// A credit note of the cumulative `credit` for the channel, within the
+	/// cap of `state`, which the owner signed (`owner_sig`), or which is the
+	/// channel's opening, which needs no signature.
+	ChannelNote {
+		channel: WireChannel, state: WireState,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		owner_sig: Option<String>,
+		credit: String,
 	},
 }
 
@@ -2170,6 +2268,29 @@ impl SignerClient {
 		Ok((sig, head))
 	}
 
+	/// `S`'s signature over `state` of the channel `policy`, which the owner
+	/// signed (`owner_sig`): the signer rebuilds the state message itself.
+	pub async fn channel_state(&self, policy: &arca_covenant::ChannelPolicy, state: &arca_covenant::State, owner_sig: &Signature)
+		-> Result<Signature, SignerError>
+	{
+		let r = self.ask(&Request::ChannelState { channel: WireChannel::from_policy(policy), state: WireState::from_state(state),
+			owner_sig: hex(owner_sig.as_ref()) }).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s credit note of the cumulative `credit` for the channel `policy`,
+	/// within the cap of `state`, which the owner signed (`owner_sig`), or
+	/// which is the channel's opening.
+	pub async fn channel_note(&self, policy: &arca_covenant::ChannelPolicy, state: &arca_covenant::State, owner_sig: Option<&Signature>,
+		credit: u64) -> Result<Signature, SignerError>
+	{
+		let r = self.ask(&Request::ChannelNote { channel: WireChannel::from_policy(policy), state: WireState::from_state(state),
+			owner_sig: owner_sig.map(|s| hex(s.as_ref())), credit: credit.to_string() }).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
 	/// `S`'s signature over the spend of input `input` of `tx` by `leaf`,
 	/// `prevouts` the outputs every input spends. The transaction goes without
 	/// its witnesses, which the signature hash does not cover.
@@ -2196,6 +2317,16 @@ impl SignerClient {
 	/// builds itself.
 	pub async fn unroll(&self, children_hash: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
 		let r = self.ask(&Request::Unroll { children_hash: hex(children_hash), time: t.to_consensus_u32() }).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s exit authorisation for the slot of record `record` in the
+	/// accumulator batch of root `root`, usable from the median time `t`: its
+	/// signature over [`arca_covenant::accumulator::exit_digest`], which the
+	/// signer builds itself.
+	pub async fn accumulator_exit(&self, root: &[u8; 32], record: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
+		let r = self.ask(&Request::AccumulatorExit { root: hex(root), record: hex(record), time: t.to_consensus_u32() }).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
 	}

@@ -48,9 +48,14 @@ sequentia-contracts (`accumulator_programs`).
 | `limiter` | No output of Arca's: the mint limiter of sequentia-contracts (`templates/mint_limiter`), which holds an issuer-operated asset's reissuance token (`LimiterParams`, read from the instance file the limiter's tool writes, and `LimiterState`) | None of Arca's: the coin's script in each state (`script_pubkey`, rebuilt from the template's root and the data leaf, equal to the template's address vectors), the state a mint leads to by the program's own rule (`mint`, `room`), what a spend of the coin did (`follow`: a mint, the brake applied or lifted, the recovery), and the reissuance a round's input 0 carries (`reissuance`). The limiter's tool signs and satisfies a mint (`mint-limiter sign`) |
 | `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `bond` | The operator's equivocation bond (`BondPolicy`: the chain, `S`, the withdrawal key `W`, the notice delay `D`), and the notice output a withdrawal waits in | SLASH, in both outputs: the salt, two messages `S` signed under it (each a form, `Rebind` for a collaborative path's message `SHA256(K ‖ rest)` or `Fill` for an `order-2` fill's `SHA256(F ‖ salt ‖ rest)`, its rest in three chunks of at most 80 bytes, and `S`'s signature), the digests computed in the script and required to differ, and the output at the input's own index a bare `OP_RETURN` of its whole amount, so a slash pays no one; NOTICE, `W`'s signature, the bond whole to the notice output; WITHDRAW, on the notice output, `W`'s signature `D` after the notice confirmed. `slash_tx`, `notice_tx` and `withdraw_tx` build the three spends, a fee coin paying; `check` judges evidence as SLASH will; `rebind_signed_in` reads `S`'s signature and its message from a collaborative spend found on the chain, and `collab2_signed_in` from a `vtxo-2` spend given the outputs its named inputs spend; `cosigned_by` lists every message `S` signed that a coin's lineage rests on, each under its salt, which a holder hands a watcher |
-| `channel` | `channel-1`'s outputs: the channel output of each state (`ChannelPolicy`, `State`: the number, the owner's and the operator's balances, the credit already folded into the owner's), the leaf in the tree being the output of state 0, and the credit output the operator's balance settles into | The leaf's collaborative path under the salt's `K`, the same in every state, so a pair made for the coin spends it in any state; UPDATE(n), a state `m > n` signed by owner and operator over `SHA256(Q ‖ le8(m) ‖ P)` (`state_message`), `Q` the salt's state constant and `P` the program of the output at the input's own index, which keeps the input's asset and value; SETTLE(n), after the exit delay, exactly the owner's balance to `OP_1 <A>` and the operator's to the state's credit output, a zero balance's half left out. The credit output's CLAIM pays the owner, at the input's own index, what the operator's cumulative note (`note_message`, `SHA256(N ‖ le8(c))`) credits beyond what was paid, capped at the state's `s + F`, the rest returning to the same script; PROVIDER, `S`'s after the window. `update_tx`, `settle_tx`, `claim_tx` and `provider_tx` build the spends, a fee coin paying; `claim_amounts` computes a claim as the script does |
+| `channel` | `channel-1`'s outputs: the channel output of each state (`ChannelPolicy`, `State`: the number, the owner's and the operator's balances, the credit already folded into the owner's), the leaf in the tree being the output of state 0, and the credit output the operator's balance settles into | The leaf's collaborative path under the salt's `K`, the same in every state, so a pair made for the coin spends it in any state; UPDATE(n), a state `m > n` signed by owner and operator over `SHA256(Q ‖ le8(m) ‖ P)` (`state_message`), `Q` the salt's state constant and `P` the program of the output at the input's own index, which keeps the input's asset and value; SETTLE(n), after the exit delay, exactly the owner's balance to `OP_1 <A>` and the operator's to the state's credit output, a zero balance's half left out. The credit output's CLAIM pays the owner, at the input's own index, what the operator's cumulative note (`note_message`, `SHA256(N ‖ le8(c))`) credits beyond what was paid, capped at the state's `s + F`, the rest returning to the same script; PROVIDER, `S`'s after the window. A `channel-1` leaf's `LeafPolicy` carries its terms (`ChannelTerms`: the value, the operator's opening balance, the credit window) and `channel_policy` gives its channel. `collab_tx` (the coin's pair at any state), `update_tx`, `settle_tx`, `claim_tx` and `provider_tx` build the spends, a fee coin paying; `claim_amounts` computes a claim as the script does |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
+`batch` holds a batch of either kind (`Batch`: a tree or an accumulator
+batch, built from the same parameters and leaves) and the operator's rule for
+choosing between them (`BatchKind::choose`: an accumulator batch when the
+share of leaves expected to leave on their own costs less from one output,
+never for a batch with a resting order or a channel, or a burn-only one).
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
@@ -92,8 +97,9 @@ the leaf against the chain and to take it on-chain alone, and nothing secret.
 It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
 payment hash, timeout, direction and operator delay; `order-2` with its
 order's terms: the asset it is paid in, the price and lot, the landed order's
-maker script hash, REFUND time and key, and the four credit keys; or
-`landing-1` with its landing program and fee allowance; `vtxo-2`, a `vtxo-1`
+maker script hash, REFUND time and key, and the four credit keys;
+`landing-1` with its landing program and fee allowance; `channel-1` with
+the operator's opening balance and the credit window; or `vtxo-2`, a `vtxo-1`
 leaf whose collaborative path is `arca/collab-2`), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
@@ -335,7 +341,8 @@ operator's signature, then `OP_INSPECTINPUTISSUANCE` on its own input requiring
 a new issuance with a zero contract hash of exactly one explicit atom and no
 reissuance token. So nobody, the operator included, can spend it without issuing
 `M`, which would strand every claim of the round. The owner signs only a
-forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`), which
+forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`; for a new
+leaf of an accumulator batch, `ValidAccumulatorLeaf::forfeit_for`), which
 takes `h` from the new leaf it validated and `M` from that round, and refuses a
 round other than the one the leaf was validated against, an output `c` that is
 not the operator's connector, and an old leaf under another operator.
@@ -390,7 +397,8 @@ that confirmed is disconnected with that round and cannot return without it.
 Owners who refreshed in different rounds each name their own; owners of one
 round share one input. The operator reuses one atom of each `M` across that
 round's claims and reclaims, paying it back to itself each time. A wallet signs
-only a release built by `Release::for_refresh` (or `Release::for_offboard`),
+only a release built by `Release::for_refresh` (or `Release::for_offboard`;
+`Release::for_accumulator_refresh` for a new leaf of an accumulator batch),
 which takes `H` from the old leaf it holds and `M` from the round its new leaf
 was validated against, and refuses another round, an output that is not the
 operator's connector and an old leaf under another operator; it signs once it
@@ -510,7 +518,9 @@ nonce.
 A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
 the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
 and its owner's unroll authorisations, so anyone holding the record can bring it
-on-chain; for a board, its board record (the board is on-chain already, and a
+on-chain; for a leaf of an accumulator batch, its `AccumulatorRecord` with its
+entry's preimage and its owner's exit authorisation, to the same end; for a
+board, its board record (the board is on-chain already, and a
 checkpoint of it spends the board output itself, `board_checkpoint_tx`); for a
 coin a reassignment created, the reassignment's inputs (each a
 coin record, with its checkpoint's value and both pairs), its outputs, the
@@ -612,6 +622,14 @@ with every bit clear), with the five checks on the token and its clock. Every
 exit publishes the whole state it spends, so `read_exit` reads the bitmap of a
 batch from its latest exit, and `follow` replays a batch's exits from its
 round; a builder checks the state it spends against the batch output's script.
+
+A holder keeps such a leaf as `CoinRecord::Accumulator`: the record, the
+entry's preimage and its own exit authorisation (signature and time), so the
+record alone takes the leaf out. Its binary form is tag 6 of the coin record
+(`AccumulatorRecord::to_bytes`, layout in the `accumulator` module), and
+`CoinRecord::validate` checks it as the wallet does a leaf of its own, then the
+preimage against the entry's unlock hash and the authorisation as the owner's,
+good now (`ValidOrigin::Accumulator`).
 
 Exits are serial: each spends the batch output and re-creates it, so a batch
 takes 25 exits a block from one unconfirmed chain. An exit is 976 vB with its
@@ -975,7 +993,7 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   spend confirms, and every negative case is refused by the mempool and again
   when forced into a block with `generateblock`, the block for the same reason
   (the node runs with `-par=1`, so a block refused by a script names the
-  failure). It also funds the review's attacks, turned around: a batch whose
+  failure, under the consensus label `mandatory-script-verify-flag-failed`). It also funds the review's attacks, turned around: a batch whose
   key holds two leaves and a leaf built from a salt the owner signed under
   before; validation refuses each owner's record against the confirmed round.
 

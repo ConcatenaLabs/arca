@@ -100,4 +100,4 @@ jobs:
           echo "MINT_LIMITER=$HOME/.mint-limiter/bin/mint-limiter" >> "$GITHUB_ENV"
 
       - name: Scenarios
-        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised -- --nocapture
+        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator -- --nocapture

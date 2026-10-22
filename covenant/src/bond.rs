@@ -442,7 +442,7 @@ fn cosigned_inputs(inputs: &[crate::ValidInput], outputs: &[ExplicitOutput], bef
 
 fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 	match &coin.origin {
-		crate::ValidOrigin::Leaf { .. } | crate::ValidOrigin::Board { .. } => {},
+		crate::ValidOrigin::Leaf { .. } | crate::ValidOrigin::Board { .. } | crate::ValidOrigin::Accumulator { .. } => {},
 		crate::ValidOrigin::Transfer { inputs, outputs, .. } => cosigned_inputs(inputs, outputs, &[], out),
 		crate::ValidOrigin::Fill { order, signature, inputs, outputs, .. } => {
 			let txouts: Vec<TxOut> = outputs.iter().map(|o| o.txout()).collect();

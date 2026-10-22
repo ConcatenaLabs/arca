@@ -432,6 +432,7 @@ impl WireBatch {
 				htlc: None,
 				order: None,
 				landing: None,
+				channel: None,
 			});
 		}
 		let params = TreeParams {

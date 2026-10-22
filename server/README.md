@@ -1120,7 +1120,20 @@ it) holds back no other's. For an asset, it gathers that asset's pending
 participations whose earliest round time has come, checks each coin they give
 up again, and builds the asset's tree with `arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
 the lowest nodes, each leaf behind its participation's hash-locked entry, the
-reserve at four times the node's floor in the batch asset. A batch in an asset
+reserve at four times the node's floor in the batch asset. With
+`[batches] accumulator_exit_rate_ppm` set (the share of a batch's leaves, in
+millionths, the operator expects to leave on the chain on their own), a batch
+whose expected exits cost less from one output than through a tree is built
+as an accumulator batch instead (`arca_covenant::BatchKind::choose`): one
+output of up to 1,024 leaves, each behind the same entry, from which one
+owner leaves in one transaction (`arca-covenant`'s `accumulator`). That holds
+for up to about 78 expected exits of 1,024. A batch with a resting order or a
+channel, and an issuer-operated asset's batch, is always a tree. An
+accumulator leaf's owner hands over one exit authorisation for it (its
+signature over the exit digest, and the time) where a tree leaf's owner hands
+over one unroll authorisation per node, and its coin record is
+`CoinRecord::Accumulator`. Its old leaves are never released, since an
+accumulator batch has no lowest node to reclaim. A batch in an asset
 the node does not accept for fees carries a reserve of one atom on every node
 and every entry, so whoever unrolls it attaches a fee coin in an asset that is
 accepted. A coin is checked again under the horizon it was taken under, its
@@ -1551,6 +1564,75 @@ the coin's script does, and refuses (`frozen`) while its node shows the landing 
 paused. A signer started without a node signs nothing for a `landing-1`
 coin, so an operator serving a supervised asset runs its signer with one.
 
+## Channel leaves
+
+A `channel-1` leaf (`arca-covenant`'s `channel`) holds a balance for each of
+its owner and the operator. The leaf in the tree is the channel's state 0;
+every later state both sides sign moves the coin, on the chain, to that
+state's output at once, and the latest state settles after the exit delay,
+the owner's balance to `OP_1 <A>` and the operator's to a credit output from
+which the owner claims what the operator's cumulative credit note credits.
+`src/channels.rs` serves them.
+
+**Making one.** An asset whose section sets `channel_capacity` (atoms) or
+`channel_capacity_value` (a value at the asset's rate) has channel leaves;
+`info` publishes the capacity and the credit window
+(`assets[].channels`: `capacity`, `window_units`), and lists `channel-1` among
+the templates. The window is twice the longest exit delay. A participation
+wants a channel leaf as any leaf, with `template` `channel-1` and `channel`
+(`{"capacity", "window_units"}`, the leaf record's JSON form): its value is
+the owner's side plus the operator's, the operator's at most the capacity and
+below the value, the window the operator's. Only the owner's side counts
+against the coins it gives up; the operator funds its side from the asset's
+pool in the round. Anything else is refused (`out_of_bounds`); a supervised
+asset has no channel leaves.
+
+**Paying.** `POST channel_update` takes state `n + 1` of a channel its owner
+signed (`state`: `number`, `owner`, `operator`, `folded`; `owner_sig` over its
+state message) and, for a payment, `pay` (`to`, another channel leaf of the
+operator in the same asset, and `amount`). The state must follow the
+channel's latest: one number higher, the owner's balance down by the amount
+and up by any credit it folds, the operator's the other way, never folding
+more than the channel's latest note. The server records the state and the
+receiver's next note (its latest credit plus the amount, which the operator's
+side of the receiver's latest state must cover), has the signer sign the note
+and then the state, and answers both (`operator_sig`; `note`: `leaf_id`,
+`credit`, `signature`). The receiver's payment is final then: the note is
+enforceable on the chain with nobody's help, against capacity already in its
+leaf, and its owner need not be online. A request repeated after a lost
+answer is answered from what was recorded; a request with no `pay` folds the
+channel's credit into its owner's balance. Both channels must be live coins
+of final rounds, held by no participation; while a state or a note of a
+channel waits for the signer nothing else of it moves (`conflict`), and a
+state that does not follow is refused (`channel_state`).
+
+**Reading one.** `POST channel_state`, authenticated by the channel owner's
+key over the leaf id, answers the asset, the value, the operator's opening
+side and the window, the latest state both sides signed with both
+signatures (the opening, with none, before there is one), the latest note,
+and whether anything of it waits for the signer (`pending`).
+
+**Closing into a round.** A channel coin given up in a participation counts
+as its owner's side: the latest state's balance and every credit not
+folded. The participation is taken only while that state and note are still
+the latest and nothing of the channel is in flight, in the same transaction
+that gives the coin up, so nothing slips between. From then on no state or
+payment of the channel, in or out, is taken (`in_use`). Its forfeit gives up
+the whole coin as any coin's does; every state output carries the coin's
+collaborative leaf, so the forfeit answers the coin on the chain whatever
+state it reaches before its settle's delay, as the watcher does (see The
+watcher). A channel coin is given up nowhere else: a transfer, a take, a plan, a distribution or a fill refuses
+it (`template`).
+
+**The signer** signs a channel state only for a program it rebuilds itself
+from the channel's terms and the state, with the owner's signature over the
+same message, so every output a state leads to carries the coin's
+collaborative leaf under `K`; and a note only within the cap of a state the
+owner signed, or of the opening. Neither is recorded, and neither is under a
+form the equivocation bond reads. Both are refused once the signer's record
+holds anything under the coin's salt (its forfeit or a spend), and while it is
+stopped.
+
 ## The forfeit swap
 
 Once its round is final, an owner validates each new leaf from the published
@@ -1673,6 +1755,15 @@ signature (it is stopped, say), those coins go back to the wallet, so a
 signer outage holds none of them, and the operator's rounds stay funded
 meanwhile.
 
+- **Channel states.** Every state the operator co-signs registers its output's
+  script as the channel coin's, so the chain's outputs paying any state are
+  sighted as the coin's own. A live channel coin seen on the chain unspent at
+  a state older than its latest both sides signed (its leaf, state 0, among
+  them) is answered at once by the latest state, published over it, its fee
+  from the operator's wallet: an older state's settle would pay the owner what
+  it paid out since. A channel coin given up is answered by its forfeit at
+  whatever state output it reached: every state output carries the coin's
+  collaborative leaf, which the forfeit's pair spends.
 - **Stale exits.** A coin the server holds as given up, by a participation
   whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on
   the chain unspent, in a block or the mempool, is answered at once: by its
@@ -1748,7 +1839,12 @@ meanwhile.
   sweep takes every output of the batch still unspent whose own notice has
   passed (the batch output, a node or an entry someone unrolled, a checkpoint
   of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
-  the token to `R`. A leaf on the chain is its owner's and is never swept.
+  the token to `R`. An accumulator batch's output moves with every exit: the
+  watcher follows it from the round through each exit the chain holds (every
+  exit pays an entry, whose script it watches, and publishes the whole state
+  it spends) and sweeps it where the last exit left it, with every entry an
+  exit paid that is still unspent. A leaf on the chain is its owner's and is
+  never swept.
   A burn-only batch's sweep burns each output it takes whole, at its own
   index, several in one transaction, and a coin of another asset pays its
   fee (see Issuer-operated assets). A batch that holds
@@ -1815,7 +1911,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`, `landing-1`, `vtxo-2`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`, `landing-1`, `vtxo-2`, and `channel-1` while an asset has channel leaves), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -1827,6 +1923,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST lightning_receive_status` | A payment into the tree by its payment hash: `open`, `accepted` with its participation and the leaf's timeout, `claimed` and whether the node has settled it, or `cancelled` with the reason |
 | `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
 | `POST submit_participation` | Accepts a participation in a round |
+| `POST channel_update` | Co-signs a channel state its owner signed and, for a payment into another channel, signs the receiver's next note (see Channel leaves) |
+| `POST channel_state` | What the server holds of a channel, for its owner's key: its terms, latest signed state with both signatures, latest note, and whether anything waits for the signer |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
@@ -1844,7 +1942,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
-| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
+| `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
@@ -1964,8 +2062,13 @@ the mint at input 0 of a round (`reissue`), which it checks as Issuer-operated
 assets says before the limiter's own tool (`--mint-limiter`) signs it with the
 limiter's operator key, never `S`; it answers the witness of the limiter's
 coin. For such an asset it signs no spend that pays a unit of it anywhere
-but a bare `OP_RETURN`. It signs no digest it is handed and no release, and
-nothing by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
+but a bare `OP_RETURN`. For a `channel-1` coin it signs a state of the
+channel (`channel_state`) and a credit note (`channel_note`), each message
+built by itself from the channel's terms, a state with its owner's signature
+over it and a note within the cap of a state its owner signed or of the
+opening, neither recorded and both refused once its record holds anything
+under the coin's salt (see Channel leaves). It signs no digest it is handed and no release, and
+nothing else by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
 message for a `landing-1` coin, the leaf of a supervised asset, names the
 coin's landing program: the signer builds the message over the constant
 that binds it, and signs only while a node of its own
@@ -2923,6 +3026,16 @@ through the reorganisations both ways (R lost and A run again in Y, R back,
 R lost again, Y back): the next round never issues from a coin whose token
 names a batch, and A's leaf of Y is the one credited while Y stands, none
 while R does.
+
+`tests/accumulator.rs` sets `accumulator_exit_rate_ppm` and refreshes twenty
+boards in one round: the round pays one accumulator batch, published with its
+kind and no nodes; each owner rebuilds it from the published parts,
+validates its leaf, hands over its forfeit and its exit authorisation, and
+holds an accumulator coin record that resolves. One owner leaves on its own
+(the exit, the entry, the leaf's exit after its delay), every other owner's
+coin and authorisation still good against the new state; then the release at
+the expiry, no sweep during the notice, and the sweep of the batch output
+where the exit left it.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards

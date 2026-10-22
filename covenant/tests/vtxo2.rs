@@ -58,7 +58,7 @@ const FEE: u64 = 2_000;
 fn leaf(net: &Net, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp256k1_zkp::Keypair, salt: &str, v2: bool) -> LeafPolicy {
 	LeafPolicy {
 		owner: xonly(owner), operator: xonly(s), salt: label32(salt), chain: net.chain, exit_delay: delay(), htlc: None, order: None,
-		landing: None, v2,
+		landing: None, channel: None, v2,
 	}
 }
 
@@ -219,7 +219,7 @@ fn the_bindings_vtxo_2_adds_refuse_what_vtxo_1_allowed() {
 			let reason = r.reject_reason.clone().unwrap_or_default();
 			assert!(!r.allowed && reason.contains("Assertion failed inside jet"), "testmempoolaccept said {:?}", reason);
 			let block = format!("{:?}", block.expect_err("a block took a blinding key on a vtxo-2 committed output"));
-			assert!(block.contains(&reason), "the block was refused with {}, not for {:?}", block, reason);
+			assert!(block.contains(&block_reason(&reason)), "the block was refused with {}, not for {:?}", block, reason);
 			assert_eq!(net.height(), h0);
 			net.refused += 1;
 			net.rows.push(Row { name: "vtxo-2: a blinding key put on the committed output".into(), vsize: String::new(),

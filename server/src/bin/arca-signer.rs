@@ -1,6 +1,6 @@
 //! `arca-signer`: holds the operator key `S` and signs the rebindable messages
 //! of collaborative paths, the spends of the operator's own paths and the
-//! operator's unroll authorisations, each built by the signer itself, and
+//! operator's unroll and accumulator exit authorisations, each built by the signer itself, and
 //! nothing else, for the server on a Unix socket. See `server::signer` for
 //! the protocol.
 //!
@@ -145,7 +145,7 @@ use arca_covenant::Chain;
 use server::keeper::{reached, start_quorum, Held, KeeperAddr, KeeperClient, WireAck, KEEPERS_UNAVAILABLE};
 use server::signer::{
 	check_spend, hex, parse_amount, record_end_digest, record_head_digest, unhex, unhex32, RecordKeepers, Request, Response, Signed,
-	SpendRecord,
+	SpendRecord, WireChannel, WireState,
 	WireEntryRef, WireKeepers, WireStopProof, ALREADY_SIGNED, MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS,
 	STOPPED,
 };
@@ -1146,6 +1146,40 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the mint: {}", e)), ..none },
 			}
 		},
+		Request::ChannelState { channel, state: wire_state, owner_sig } => {
+			match channel_digest(state, &channel, &wire_state, Some(&owner_sig), None) {
+				Ok((digest, what)) => {
+					let mut aux = [0u8; 32];
+					rand::rngs::OsRng.fill_bytes(&mut aux);
+					let sig = sign_digest(key, &digest, &aux);
+					eprintln!("arca-signer: signed {}", what);
+					Response { signature: Some(hex(sig.as_ref())), ..none }
+				},
+				Err(e) => {
+					eprintln!("arca-signer: refused a channel state: {}", e);
+					Response { error: Some(e), ..none }
+				},
+			}
+		},
+		Request::ChannelNote { channel, state: wire_state, owner_sig, credit } => {
+			let credit = match parse_amount(&credit) {
+				Ok(c) => c,
+				Err(e) => return Response { error: Some(format!("credit: {}", e)), ..none },
+			};
+			match channel_digest(state, &channel, &wire_state, owner_sig.as_deref(), Some(credit)) {
+				Ok((digest, what)) => {
+					let mut aux = [0u8; 32];
+					rand::rngs::OsRng.fill_bytes(&mut aux);
+					let sig = sign_digest(key, &digest, &aux);
+					eprintln!("arca-signer: signed {}", what);
+					Response { signature: Some(hex(sig.as_ref())), ..none }
+				},
+				Err(e) => {
+					eprintln!("arca-signer: refused a channel note: {}", e);
+					Response { error: Some(e), ..none }
+				},
+			}
+		},
 		Request::Unroll { children_hash, time } => {
 			let parsed = (|| -> Result<_, String> {
 				let h = unhex32(&children_hash).map_err(|e| format!("children_hash: {}", e))?;
@@ -1162,6 +1196,78 @@ async fn answer(state: &State, line: &str) -> Response {
 			let sig = sign_digest(key, &message.digest, &aux);
 			eprintln!("arca-signer: signed the unroll authorisation of the node with children hash {} from {}", hex(&h), time);
 			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+		Request::AccumulatorExit { root, record: slot_record, time } => {
+			let parsed = (|| -> Result<_, String> {
+				let root = unhex32(&root).map_err(|e| format!("root: {}", e))?;
+				let rec = unhex32(&slot_record).map_err(|e| format!("record: {}", e))?;
+				let t = arca_covenant::MedianTime::from_consensus(time).map_err(|e| format!("time: {}", e))?;
+				Ok((root, rec, t))
+			})();
+			let (root, rec, t) = match parsed {
+				Ok(p) => p,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			let digest = arca_covenant::accumulator::exit_digest(chain, &root, &rec, t);
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &digest, &aux);
+			eprintln!("arca-signer: signed the exit authorisation of slot record {} of the accumulator batch {} from {}", hex(&rec),
+				hex(&root), time);
+			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+	}
+}
+
+/// What the signer signs for a `channel-1` coin: the state message of
+/// `wire_state`, or with `credit` the note of that cumulative credit, each
+/// rebuilt from the channel's terms under the signer's own key and chain,
+/// with what it is in words. Refused unless the owner signed the state, the
+/// state's balances add up to the channel's value, a note keeps within the
+/// state's cap, the signer is not stopped, and its record holds nothing under
+/// the coin's salt (a coin given up or paid on takes no new state).
+fn channel_digest(state: &State, channel: &WireChannel, wire_state: &WireState, owner_sig: Option<&str>, credit: Option<u64>)
+	-> Result<([u8; 32], String), String>
+{
+	let policy = channel.to_policy(state.key.x_only_public_key().0, state.chain)?;
+	let st = wire_state.to_state()?;
+	let message = policy.state_message(&st).map_err(|e| e.to_string())?;
+	// A state is the owner's own doing; a note may stand on the channel's
+	// opening, which its leaf's script carries and nobody signs.
+	match (owner_sig, credit) {
+		(None, Some(_)) if st == policy.opening() => {},
+		(None, _) => return Err(format!("state {} of the channel under salt {} comes without its owner's signature", st.number,
+			hex(&policy.salt))),
+		(Some(s), _) => {
+			let owner_sig = Signature::from_slice(&unhex(s)?).map_err(|e| format!("owner_sig: {}", e))?;
+			if st.number == 0 || !verify_digest(&owner_sig, &message.digest, &policy.owner) {
+				return Err(format!("the owner's signature over state {} of the channel under salt {} does not verify under the key {}",
+					st.number, hex(&policy.salt), hex(&policy.owner.serialize())));
+			}
+		},
+	}
+	{
+		let r = state.record.lock().unwrap_or_else(|e| e.into_inner());
+		if let Some(why) = r.stopped() {
+			return Err(format!("the signer is stopped: {}", why));
+		}
+		let under = r.entries_under(&policy.salt).map_err(|e| format!("the record could not be read: {}", e))?;
+		if let Some(e) = under.first() {
+			return Err(format!("the record holds entry {} under salt {}: the coin was given up or paid on, and takes no new state \
+				or note", e.n, hex(&policy.salt)));
+		}
+	}
+	match credit {
+		None => Ok((message.digest, format!("state {} of the channel under salt {} ({} to the owner, {} to the operator)", st.number,
+			hex(&policy.salt), st.owner, st.operator))),
+		Some(c) => {
+			if c == 0 || c > st.credit_cap() {
+				return Err(format!("a note of {} for state {}, whose cap is {}: the operator's balance covers no more", c, st.number,
+					st.credit_cap()));
+			}
+			let note = policy.note_message(c).map_err(|e| e.to_string())?;
+			Ok((note.digest, format!("a credit note of {} for the channel under salt {} (state {}, cap {})", c, hex(&policy.salt),
+				st.number, st.credit_cap())))
 		},
 	}
 }

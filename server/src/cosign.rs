@@ -194,6 +194,9 @@ pub enum CosignError {
 	/// Lightning, and given up only once that payment failed.
 	#[error("{0}")]
 	Htlc(String),
+	/// A coin of a template no transfer spends.
+	#[error("{0}")]
+	Template(String),
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error(transparent)]
@@ -233,6 +236,7 @@ impl CosignError {
 			Mergeable(_) => "merge",
 			RequestLapsed { .. } => "request_lapsed",
 			Htlc(_) => "htlc",
+			Template(_) => "template",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(_) => "signer_unavailable",
@@ -266,6 +270,8 @@ impl From<CoinError> for CosignError {
 			CoinError::OnChain { leaf, what } => CosignError::OnChain { leaf, what },
 			CoinError::InvalidCoin { leaf, error } => CosignError::InvalidCoin { leaf, error },
 			CoinError::PastBoardDate { leaf, expiry, .. } => CosignError::PastBoardDate { leaf, expiry },
+			CoinError::Channel(id) => CosignError::Template(format!("coin {} is a channel-1 coin: it pays by its channel's states, and \
+				is given up only in a round", id)),
 			CoinError::Store(e) => e.into(),
 			CoinError::Internal(m) => CosignError::Internal(m),
 		}
@@ -362,7 +368,7 @@ impl Cosigner {
 		if let Some(why) = crate::plans::blocks_transfer(&self.store, &id.0).await? {
 			return Err(CosignError::Planned(why));
 		}
-		Ok(coins::check(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
+		Ok(coins::check_plain(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 
 	/// The freeze check of the supervised profile on the coins `leaves`
@@ -959,6 +965,7 @@ impl Cosigner {
 pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
+		CoinRecord::Accumulator { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
 		CoinRecord::Board(_) => None,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().filter_map(first_expiry).min(),
 	}

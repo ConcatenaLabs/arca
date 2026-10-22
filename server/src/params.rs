@@ -87,6 +87,9 @@ pub struct AssetParams {
 	/// can freeze holdings by consensus rule, and the operator serves it
 	/// under the supervised profile ([`crate::supervision`]).
 	pub supervised: Option<Supervised>,
+	/// The most the operator puts on its own side of a `channel-1` leaf in
+	/// the asset ([`crate::channels`]); zero, the default, makes none.
+	pub channel_capacity: Amount,
 }
 
 /// What the operator serves of a supervised asset beside the rest.
@@ -295,6 +298,11 @@ pub struct Params {
 	/// pending wakes before its round is built; 0 when the runner builds
 	/// rounds only when it is asked to.
 	pub round_interval_seconds: u64,
+	/// The credit window of every `channel-1` leaf the operator makes: how
+	/// long, after a channel settles on the chain, its owner has to claim a
+	/// credit not yet folded before the operator may take its own side
+	/// ([`crate::channels`]). Twice the longest exit delay.
+	pub channel_window: RelativeTime,
 }
 
 /// The default [`Params::fill_forfeit_window_seconds`]: ten minutes.
@@ -331,6 +339,7 @@ impl Params {
 			order_block_seconds: ORDER_BLOCK_SECONDS,
 			fill_forfeit_window_seconds: FILL_FORFEIT_WINDOW_SECONDS,
 			round_interval_seconds: 0,
+			channel_window: spec.max_exit_delay,
 		};
 		p.set_delays();
 		p
@@ -344,6 +353,8 @@ impl Params {
 		self.refund_delay = self.max_exit_delay;
 		let units = 2 * self.max_exit_delay.units() as u32 + (2 * 86_400u32).div_ceil(512);
 		self.offboard_reclaim_delay = RelativeTime::from_units(units.min(u16::MAX as u32) as u16).expect("a relative time");
+		let window = 2 * self.max_exit_delay.units() as u32;
+		self.channel_window = RelativeTime::from_units(window.min(u16::MAX as u32) as u16).expect("a relative time");
 	}
 
 	/// The assets the operator pays a round's fee in, in order of
@@ -432,6 +443,40 @@ impl Params {
 				l.terms(asset, value).map(|_| ()).map_err(|e| e.to_string())
 			},
 		}
+	}
+
+	/// The most the operator puts on its own side of a `channel-1` leaf of
+	/// `asset`, in its atoms: zero when it makes none.
+	pub fn channel_capacity(&self, asset: &AssetId) -> Result<u64, String> {
+		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
+		a.channel_capacity.atoms(self.rates.last(asset)).ok_or_else(|| format!("asset {}'s channel capacity is a value in the \
+			reference unit, and the operator has no rate for it yet", asset))
+	}
+
+	/// Why a new `channel-1` leaf of `asset`, `value` and `channel` is
+	/// outside what the operator makes, if it is: the operator's side at most
+	/// the asset's channel capacity, the owner's side at least one atom, and
+	/// the operator's credit window; a supervised asset's leaves are
+	/// `landing-1`.
+	pub fn check_channel(&self, asset: AssetId, value: u64, channel: &arca_covenant::Channel) -> Result<(), String> {
+		if self.supervised(&asset).is_some() {
+			return Err(format!("asset {} is supervised: every leaf of it is landing-1", asset));
+		}
+		let cap = self.channel_capacity(&asset)?;
+		if cap == 0 {
+			return Err(format!("the operator makes no channel-1 leaf of asset {}", asset));
+		}
+		if channel.capacity > cap {
+			return Err(format!("an opening balance of {} on the operator's side of a channel of asset {}; it puts {} at most", channel.capacity,
+				asset, cap));
+		}
+		if channel.capacity >= value {
+			return Err(format!("a channel of {} with {} on the operator's side leaves its owner nothing", value, channel.capacity));
+		}
+		if channel.window != self.channel_window {
+			return Err(format!("a credit window of {} units; the operator's is {}", channel.window.units(), self.channel_window.units()));
+		}
+		Ok(())
 	}
 
 	/// Why a leaf of `asset` and `value` is outside the published bounds, if

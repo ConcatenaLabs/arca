@@ -1,8 +1,11 @@
 //! The unilateral exit, from the coin's record alone, and `sync`.
 //!
-//! A coin goes on-chain without the operator: for a leaf of a batch, every
+//! A coin goes on-chain without the operator: for a leaf of a tree, every
 //! node from the batch output down by the owner's own unroll authorisations,
-//! then the entry with the preimage; for a board, the owner's conversion; for
+//! then the entry with the preimage; for a leaf of an accumulator batch, its
+//! exit from the batch output where the last exit left it (followed from the
+//! round through each exit's witness) by its one exit authorisation, then
+//! the entry with the preimage; for a board, the owner's conversion; for
 //! a coin a reassignment made, each coin it rests on, its checkpoint and the
 //! reassignment, all from the pairs in the record. Then, once the exit delay
 //! has run from the leaf's confirmation, the owner's claim to an on-chain
@@ -49,8 +52,9 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{AssetId, OutPoint, Script, Transaction, TxOut};
 use serde_json::{json, Value};
 
+use arca_covenant::accumulator::read_exit;
 use arca_covenant::spend::{FeeSource, KeySpend};
-use arca_covenant::{CoinRecord, ExplicitOutput, HtlcDirection, UnrollTx, ValidCoin, ValidOrigin};
+use arca_covenant::{AccumulatorPolicy, CoinRecord, ExplicitOutput, HtlcDirection, UnrollTx, ValidAccumulatorLeaf, ValidCoin, ValidOrigin};
 
 use super::chain::hex;
 use super::keys::CHANGE;
@@ -78,6 +82,21 @@ impl Here {
 			txs.iter().find_map(|u| u.tx.output.iter().position(|x| *x == o).map(|j| OutPoint::new(u.tx.txid(), j as u32)))
 		})
 	}
+}
+
+/// Where an accumulator batch's output is now, followed from the round
+/// through each exit that spent it ([`Wallet::accumulator_now`]).
+enum BatchNow {
+	/// Unspent, on the chain, in the mempool or paid by a transaction the
+	/// exit built already: the state it holds, where, and how much.
+	At(AccumulatorPolicy, OutPoint, u64),
+	/// Spent by a transaction that is no exit of it, the operator's sweep,
+	/// when it held `state`.
+	Swept(AccumulatorPolicy, OutPoint, Transaction),
+	/// The last leaf's exit took all of it.
+	Emptied,
+	/// Nothing pays it: its round is in no block and not in the mempool.
+	Missing,
 }
 
 /// Who pays the fees an output's own reserve cannot.
@@ -484,8 +503,10 @@ impl Wallet {
 	}
 
 	/// Every output on the way from the chain to `coin`'s leaf, the leaf's
-	/// own last: for a leaf of a batch, the batch output, each node's and the
-	/// entry's; for a board, the board output; for a coin a reassignment made,
+	/// own last: for a leaf of a tree, the batch output, each node's and the
+	/// entry's; for a leaf of an accumulator batch, the entry's (the batch
+	/// output changes with each exit, and is followed through them apart);
+	/// for a board, the board output; for a coin a reassignment made,
 	/// those of each coin it spends, that coin's leaf and its checkpoint; for
 	/// a coin a fill made, the order coin's path and its leaf, then the same
 	/// for each taker's coin.
@@ -496,6 +517,7 @@ impl Wallet {
 				out.push(valid.branch.entry_output().txout());
 			},
 			ValidOrigin::Board { record, .. } => out.push(record.output().txout()),
+			ValidOrigin::Accumulator { valid, .. } => out.push(valid.entry_output().txout()),
 			ValidOrigin::Transfer { inputs, .. } => {
 				for i in inputs {
 					Self::path_outputs(&i.coin, out);
@@ -525,6 +547,38 @@ impl Wallet {
 			return Ok(at);
 		}
 		match &coin.origin {
+			ValidOrigin::Accumulator { valid, preimage, auth } => {
+				// The entry, once an exit paid it; else this leaf's exit from
+				// the batch output where the last exit left it, by the
+				// authorisation the wallet signed when it accepted the leaf
+				// (it names no state, so it is good for whichever).
+				let at = match here.or_built(txs, &valid.entry_output()) {
+					Some(at) => at,
+					None => {
+						let (state, batch_at, held) = match self.accumulator_now(valid, txs)? {
+							BatchNow::At(state, at, held) => (state, at, held),
+							BatchNow::Swept(_, at, sp) => return Err(Error::Refused(format!("the accumulator batch of leaf {} at {} is spent by \
+								{}, which is no exit of it: the operator's sweep, past its expiry and notice", coin.id, at, sp.txid()))),
+							BatchNow::Emptied => return Err(Error::Refused(format!("every leaf has left the accumulator batch of leaf {}, and \
+								its entry is spent", coin.id))),
+							BatchNow::Missing => return Err(Error::Refused(format!("nothing pays the accumulator batch of leaf {}: its round \
+								{} is in no block and not in the mempool", coin.id, valid.round_txid))),
+						};
+						if state.bitmap.is_left(valid.exit.slot) {
+							return Err(Error::Refused(format!("leaf {} has left its accumulator batch, and its entry is spent, not by its \
+								unlock into the leaf", coin.id)));
+						}
+						let u = self.with_fee(payer, &|f| valid.exit_tx(&state, batch_at, held, auth, f).map_err(|e| Error::Refused(e.to_string())))?;
+						let at = OutPoint::new(u.tx.txid(), 0);
+						txs.push(u);
+						at
+					},
+				};
+				let u = self.with_fee(payer, &|f| valid.entry_tx(at, preimage, f).map_err(|e| Error::Refused(e.to_string())))?;
+				let leaf = OutPoint::new(u.tx.txid(), 0);
+				txs.push(u);
+				Ok(leaf)
+			},
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let b = &valid.branch;
 				let n = b.nodes.len();
@@ -575,6 +629,55 @@ impl Wallet {
 				txs.push(u);
 				Ok(leaf)
 			},
+		}
+	}
+
+	/// Where `valid`'s accumulator batch output is now: followed from the
+	/// round's batch output through each exit that spent it, read from its
+	/// witness (every exit publishes the state it spends), on the chain, in
+	/// the mempool, or among `built`, the transactions an exit built already
+	/// (two coins of one transfer can rest on one batch). An exit whose
+	/// witness names another state than the one before it is refused.
+	fn accumulator_now(&self, valid: &ValidAccumulatorLeaf, built: &[UnrollTx]) -> Result<BatchNow, Error> {
+		let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
+		let mut state = valid.policy;
+		let mut held = valid.total;
+		let mut from = match self.chain.finality(&valid.round_txid)?.height() {
+			Some(h) => h,
+			None => self.chain.tip()?.height,
+		};
+		loop {
+			let spent_here = built.iter().map(|u| &u.tx).find(|t| t.input.iter().any(|i| i.previous_output == at)).cloned();
+			let sp = match spent_here {
+				Some(t) => t,
+				None if built.iter().any(|u| u.tx.txid() == at.txid) || self.chain.unspent(&at)? => {
+					return Ok(BatchNow::At(state, at, held));
+				},
+				None => match self.chain.spender(&at, from)? {
+					Some((t, h)) => {
+						if let Some(h) = h {
+							from = h;
+						}
+						t
+					},
+					None => return Ok(BatchNow::Missing),
+				},
+			};
+			let k = sp.input.iter().position(|i| i.previous_output == at).expect("spends it");
+			let Some(seen) = read_exit(&sp.input[k].witness.script_witness) else {
+				return Ok(BatchNow::Swept(state, at, sp));
+			};
+			if seen.root != state.root || seen.operator != state.operator.serialize() || seen.bitmap != state.bitmap {
+				return Err(Error::Refused(format!("{} spends the accumulator batch at {} from another state than the one before it", sp.txid(), at)));
+			}
+			if seen.last {
+				return Ok(BatchNow::Emptied);
+			}
+			state = state.after(seen.slot);
+			let rest = 2 * k + 1;
+			held = sp.output.get(rest).filter(|o| o.script_pubkey == state.script_pubkey()).and_then(|o| o.value.explicit())
+				.ok_or_else(|| Error::Refused(format!("exit {} of the accumulator batch leaves no rest at its output {}", sp.txid(), rest)))?;
+			at = OutPoint::new(sp.txid(), rest as u32);
 		}
 	}
 
@@ -1043,7 +1146,7 @@ impl Wallet {
 		let (order, inputs) = match &coin.origin {
 			ValidOrigin::Transfer { inputs, .. } => (None, inputs),
 			ValidOrigin::Fill { order, inputs, .. } => (Some(order), inputs),
-			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return Ok(None),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Accumulator { .. } => return Ok(None),
 		};
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 		let mine = coin.output().txout();
@@ -1105,6 +1208,31 @@ impl Wallet {
 	/// sweep).
 	pub(crate) fn swept(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
 		match &coin.origin {
+			ValidOrigin::Accumulator { valid, .. } => {
+				// The batch output, followed through its exits, spent while
+				// this leaf was still in it by a transaction that is no exit.
+				if let BatchNow::Swept(state, at, sp) = self.accumulator_now(valid, &[])? {
+					if !state.bitmap.is_left(valid.exit.slot) {
+						return Ok(Some((format!("coin {} rests on output {} of its accumulator batch, which {} spent on the chain: no exit \
+							from the batch, but the operator's sweep of it past its expiry and notice", coin.id, at, sp.txid()), sp.txid())));
+					}
+				}
+				// The entry an exit paid, spent by something other than its
+				// unlock into the leaf: its sweep after the notice.
+				let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+				let entry = valid.entry_output().txout();
+				if let Some((tx, h)) = self.chain.find_payment(&entry, from)? {
+					let vout = tx.output.iter().position(|o| *o == entry).expect("pays it") as u32;
+					if let Some((sp, _)) = self.chain.spender(&OutPoint::new(tx.txid(), vout), h)? {
+						if !sp.output.contains(&coin.output().txout()) {
+							return Ok(Some((format!("coin {} rests on its entry {}:{}, which {} spent on the chain: not its unlock into the \
+								leaf, but the operator's sweep past the batch's expiry and notice", coin.id, tx.txid(), vout, sp.txid()),
+								sp.txid())));
+						}
+					}
+				}
+				Ok(None)
+			},
 			ValidOrigin::Leaf { valid, .. } => {
 				let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 				let b = &valid.branch;
@@ -1481,6 +1609,8 @@ impl Wallet {
 		let detail = match &r {
 			CoinRecord::Leaf { record, .. } => record.to_json().map_err(|e| Error::Refused(e.to_string()))?,
 			CoinRecord::Board(b) => b.to_json().map_err(|e| Error::Refused(e.to_string()))?,
+			CoinRecord::Accumulator { record, .. } => json!({"accumulator_slot": record.slot, "template": record.template.to_string(),
+				"value": record.value.to_string(), "asset": record.asset.to_string()}),
 			CoinRecord::Transfer(t) => json!({"inputs": t.inputs.len(), "outputs": t.outputs.len(), "index": t.index}),
 			CoinRecord::Fill(f) => json!({"fill_of_order": true, "inputs": f.fill.inputs.len(), "outputs": f.fill.outputs.len(),
 				"index": f.index, "partial": f.fill.partial}),

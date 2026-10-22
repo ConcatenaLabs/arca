@@ -94,7 +94,7 @@ fn vtxo_2_matches_the_regtest_suites_vectors() {
 	let l = &v["leaf"];
 	let leaf = LeafPolicy {
 		owner: key(&keys["A"]), operator: key(&keys["S"]), salt: h32(&l["salt"]), chain, exit_delay: delay,
-		htlc: None, order: None, landing: None, v2: true,
+		htlc: None, order: None, landing: None, channel: None, v2: true,
 	};
 	assert_eq!(leaf.template(), Template::Vtxo2);
 	same("leaf params", &leaf.collab2().data_bytes(), &l["params"]);

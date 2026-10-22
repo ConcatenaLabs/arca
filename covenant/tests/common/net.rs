@@ -307,7 +307,7 @@ impl Net {
 
 	pub fn leaf(&self, owner: &Keypair, operator: &Keypair, salt: &str) -> LeafPolicy {
 		LeafPolicy { owner: xonly(owner), operator: xonly(operator), salt: label32(salt), chain: self.chain,
-			exit_delay: delay(), htlc: None, order: None, landing: None, v2: false }
+			exit_delay: delay(), htlc: None, order: None, landing: None, channel: None , v2: false }
 	}
 
 	pub fn witness_of(&self, txid: &Txid, vin: usize) -> Vec<Vec<u8>> {
@@ -332,7 +332,11 @@ pub fn block_reason(mempool: &str) -> String {
 	match mempool {
 		"non-final" | "non-BIP68-final" => "bad-txns-nonfinal".into(),
 		"missing-inputs" => "bad-txns-inputs-missingorspent".into(),
-		other => other.into(),
+		// The same script failure under the block's label: the mempool's
+		// reads `mempool-script-verify-flag-failed` (policy), a block's
+		// `mandatory-script-verify-flag-failed` (consensus); the part both
+		// share is compared.
+		other => other.strip_prefix("mempool").filter(|r| r.starts_with("-script-verify-flag-failed")).unwrap_or(other).into(),
 	}
 }
 

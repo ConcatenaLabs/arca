@@ -73,6 +73,7 @@ fn fx() -> Fx {
 fn bring(coin: &ValidCoin, out: &mut Vec<(String, UnrollTx)>) -> OutPoint {
 	match &coin.origin {
 		ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
+		ValidOrigin::Accumulator { .. } => unreachable!("these records hold no accumulator leaf"),
 		ValidOrigin::Leaf { valid, preimage, auths } => {
 			let txs = valid.branch.unroll(OutPoint::new(valid.round_txid, valid.batch_vout), auths,
 				&vec![FeeSource::Reserve; auths.len()]).unwrap();

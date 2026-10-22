@@ -163,7 +163,8 @@ fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (Lea
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
 		order: None,
-		landing: None, v2: false,
+		landing: None,
+		channel: None, v2: false,
 	};
 	let coin = net.fund(vec![explicit(net.x, LEAF, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();
@@ -238,6 +239,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let second_owner = keypair("refresh second owner, new leaf");
 	let preimage_b = label32("second owner refresh preimage");
@@ -248,6 +250,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let tree = c.tree(&sched, &[spec, spec_b]);
 	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
@@ -396,6 +399,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let tree3 = c.tree(&sched, &[spec3]);
 	let (round3, cv3) = round_tx(&c.net, &issuer, Some(&tree3), vec![], &s);
@@ -647,6 +651,7 @@ enum Event<'a> {
 fn bring(c: &mut Ctx, coin: &ValidCoin, label: &str, hook: &mut dyn FnMut(&mut Ctx, Event)) -> OutPoint {
 	match &coin.origin {
 		ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
+		ValidOrigin::Accumulator { .. } => unreachable!("these records hold no accumulator leaf"),
 		ValidOrigin::Leaf { valid, preimage, auths } => {
 			let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
 			for (level, (node, auth)) in valid.branch.nodes.iter().zip(auths).enumerate() {

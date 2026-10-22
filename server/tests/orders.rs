@@ -94,6 +94,7 @@ fn want_order(m: &Maker, value: u64, asset: elements::AssetId) -> (OutputRequest
 		asset, value, template: Template::Order2, owner: xonly(&m.key), owner_nonce: nonce, exit_delay: exit_delay(),
 		order: Some(m.terms),
 		landing: None,
+		channel: None,
 	}, nonce)
 }
 
