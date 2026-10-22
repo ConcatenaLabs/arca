@@ -1047,10 +1047,15 @@ What the server does with a plan once it holds it:
 
 ### Resting orders
 
-A resting order is an `order-2` leaf (`arca-covenant`'s `order`): an order of
+A resting order is an `order-3` leaf (`arca-covenant`'s `order`): an order of
 SeqDEX's, selling the leaf's asset at a fixed rate and lot, that takers fill
 in the tree while its maker is away, and that lands on the chain as SeqDEX's
-own order (`seqdex/order`, for the same terms) if anyone brings it there. Each
+own order (`seqdex/order` version 2, for the same terms) if anyone brings it
+there. Neither program takes an annex on a fill: nothing a fill carries signs
+one, so a relay could otherwise pad the fill down to the floor fee rate. An
+`order-2` leaf, landing as `seqdex/order` version 1, is the same without that
+rule; the server still fills and lands one resting from before `order-3`, and
+refuses to make a new one (`order`). Each
 fill is co-signed by the operator alone, and the leaf's program holds every
 co-signed fill to the order's terms: the maker's credit at output 0, a `vtxo-1`
 leaf under the order's next credit key paying at least the price, and for a
@@ -1059,9 +1064,9 @@ rest. An order fills at most four times along its lineage, one credit key a
 fill.
 
 A maker asks a round for the leaf as for any leaf, its wanted leaf naming the
-template `order-2` and the order's terms (`order`: the asset it is paid in,
+template `order-3` and the order's terms (`order`: the asset it is paid in,
 the rate, the lot, the landed order's maker script hash, REFUND time and
-refund key, and four credit keys). The server takes it only when the terms
+refund key, four credit keys, and `"version": 3`). The server takes it only when the terms
 hold (`order`): the asset it is paid in is one it serves, its four credit keys
 are distinct, own no leaf and are not the operator's or the leaf's key, and
 its REFUND time is more than the order margin (`fills.order_margin_seconds`)
@@ -1998,7 +2003,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`, `landing-1`, `vtxo-2`, and `channel-1` while an asset has channel leaves), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |

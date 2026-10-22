@@ -40,8 +40,8 @@ byte order.
 
     u8    format version, 2
     u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
-    u8    template version, 1 (vtxo, htlc, landing, channel) or 2 (order; and vtxo-2,
-          a vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
+    u8    template version, 1 (vtxo, htlc, landing, channel), 2 or 3 (order), or 2
+          (vtxo-2, a vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
     [32]  operator nonce
@@ -52,7 +52,7 @@ byte order.
     [32]  payment hash
     u32   timeout, a median time
     u16   operator delay, 512-second units; shorter than the exit delay
-          order-2 only (a resting order, order.py; it sells the leaf's asset):
+          order-2 and order-3 only (a resting order, order.py; it sells the leaf's asset):
     [32]  asset B, what it is paid in
     u64   rate numerator   u64 rate denominator   u64 minimum lot
     [32]  SHA256 of the scriptPubKey the landed order's fills pay
@@ -96,9 +96,9 @@ The leaf id is the BIP340 tagged hash, tag "Arca/leaf-id", of
 
 The JSON form has the same fields; an htlc-1 record's terms are one object,
 `htlc`: {"direction": "send" or "receive", "payment_hash", "timeout",
-"operator_delay_units"}, and an order-2 record's `order`: {"asset_b",
-"rate_num", "rate_den", "min_lot", "maker", "expiry", "refund_key",
-"credits"}, and a landing-1 record's `landing`: {"program", "allowance"},
+"operator_delay_units"}, and an order-2 or order-3 record's `order`:
+{"asset_b", "rate_num", "rate_den", "min_lot", "maker", "expiry",
+"refund_key", "credits"}, with "version": 3 for order-3, and a landing-1 record's `landing`: {"program", "allowance"},
 and a channel-1 record's `channel`: {"capacity", "window_units"}.
 Its canonical text has its keys sorted and
 no whitespace. Asset ids, the token and the genesis hash are hex in display
@@ -136,12 +136,13 @@ def vtxo2_leaf_tap(lf, S, salt, ctag):
 
 
 def order_leaf_tap(lf, S, salt, ctag, asset):
-    """An order-2 leaf, through order.py's own derivation."""
+    """An order-3 or order-2 leaf (by its terms' version), through order.py's own derivation."""
     import order as order_py
     o = lf["order"]
     terms = {"asset_a": asset, "asset_b": o["asset_b"], "num": o["num"], "den": o["den"], "min_lot": o["min_lot"],
              "maker": o["maker"], "expiry": o["expiry"], "refund_key": o["refund_key"]}
-    return _Spk(order_py.Order(terms, lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], o["credits"]).spk)
+    return _Spk(order_py.Order(terms, lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], o["credits"],
+                               o.get("version", 2)).spk)
 DIRECTIONS = {"send": 0, "receive": 1}
 LEAF_ID_TAG = b"Arca/leaf-id"
 SALT_TAG = b"Arca/salt"
@@ -355,7 +356,7 @@ class Batch:
         g = lf.get("landing")
         c = lf.get("channel")
         return {
-            "template": ("order", TEMPLATE_ORDER_VERSION) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
+            "template": ("order", o.get("version", TEMPLATE_ORDER_VERSION)) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
             else ("landing", TEMPLATE_LANDING_VERSION) if g else ("channel", TEMPLATE_CHANNEL_VERSION) if c
             else ("vtxo", TEMPLATE_VTXO2_VERSION) if lf.get("v2") else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
@@ -448,9 +449,13 @@ def to_json(rec):
 
 
 def order_json(t):
-    return {"asset_b": display(t["asset_b"]), "rate_num": str(t["num"]), "rate_den": str(t["den"]),
-            "min_lot": str(t["min_lot"]), "maker": t["maker"].hex(), "expiry": t["expiry"],
-            "refund_key": t["refund_key"].hex(), "credits": [c.hex() for c in t["credits"]]}
+    """An order's terms; an order-3 leaf's carry "version": 3, an order-2 leaf's none."""
+    o = {"asset_b": display(t["asset_b"]), "rate_num": str(t["num"]), "rate_den": str(t["den"]),
+         "min_lot": str(t["min_lot"]), "maker": t["maker"].hex(), "expiry": t["expiry"],
+         "refund_key": t["refund_key"].hex(), "credits": [c.hex() for c in t["credits"]]}
+    if t.get("version", 2) == 3:
+        o["version"] = 3
+    return o
 
 
 def json_text(obj):
@@ -494,7 +499,8 @@ def txout(asset, value, spk):
 
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
-                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, landing=None, channel=None, v2=None):
+                 expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
+                 v2=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -516,9 +522,10 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     for i, direction in (htlc or {}).items():
         leaves[i]["htlc"] = {"direction": direction, "payment_hash": sha256(label_hash("preimage", "%s payment %d" % (name, i))),
                              "timeout": CREATED + 2 * DAY, "operator_delay": EXIT_DELAY // 3}
-    # order: [leaf index]; each such leaf is an order-2 leaf selling the batch's asset.
+    # order: [leaf index]; each such leaf is an order leaf selling the batch's
+    # asset, order-2, or order-3 with order_version 3.
     for i in (order or []):
-        leaves[i]["order"] = {"asset_b": label_hash("asset", "%s paid in %d" % (name, i)), "num": 3, "den": 2,
+        leaves[i]["order"] = {**({"version": 3} if order_version == 3 else {}),"asset_b": label_hash("asset", "%s paid in %d" % (name, i)), "num": 3, "den": 2,
                               "min_lot": 1_000, "maker": sha256(b"\x51\x20" + xonly("%s maker %d" % (name, i))),
                               "expiry": CREATED + 10 * DAY, "refund_key": xonly("%s refund %d" % (name, i)),
                               "credits": [xonly("%s credit %d.%d" % (name, i, k)) for k in range(4)]}
@@ -765,6 +772,30 @@ def invalid_channel_vectors(valid_binary, valid_json):
             [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
 
 
+def invalid_order_vectors(valid_binary, valid_json, order_2_json):
+    """order-3 records a decoder must refuse, and an order-2 record claiming order-3's terms."""
+    v = bytes.fromhex(valid_binary)
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [("order, version 4", put(2, b"\x04"), "template_version")]
+
+    def edit(f, text=valid_json):
+        o = json.loads(text)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("order-3 terms without their version", edit(lambda o: o["order"].pop("version")), "template"),
+        ("order-2 terms that name version 3", edit(lambda o: o["order"].update({"version": 3}), order_2_json), "template"),
+        ("order terms naming version 2", edit(lambda o: o["order"].update({"version": 2})), "type"),
+        ("order-4", edit(lambda o: o.update({"template": "order-4"})), "template_version"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
 def generate():
     batches = [
         batch_vector("one leaf", 1, 4),
@@ -776,6 +807,7 @@ def generate():
         batch_vector("sixty-four leaves", 64, 4, export=[0, 5, 21, 42, 63]),
         batch_vector("five leaves, two of them htlc-1", 5, 4, htlc={1: "receive", 3: "send"}),
         batch_vector("five leaves, two of them order-2", 5, 4, order=[0, 3]),
+        batch_vector("five leaves, two of them order-3", 5, 4, order=[1, 4], order_version=3),
         batch_vector("five leaves of a supervised asset, every one landing-1", 5, 4, landing=[0, 1, 2, 3, 4]),
         batch_vector("five leaves, two of them channel-1", 5, 4, channel={1: 4_000_000, 4: 0}),
         batch_vector("five leaves, two of them vtxo-2", 5, 4, v2=[1, 2]),
@@ -786,11 +818,15 @@ def generate():
     hi, hj = invalid_htlc_vectors(h["binary"], h["json"])
     invalid += hi
     invalid_json += hj
-    g = batches[9]["records"][2]
+    o3, o2 = batches[9]["records"][1], batches[8]["records"][0]
+    oi, oj = invalid_order_vectors(o3["binary"], o3["json"], o2["json"])
+    invalid += oi
+    invalid_json += oj
+    g = batches[10]["records"][2]
     gi, gj = invalid_landing_vectors(g["binary"], g["json"])
     invalid += gi
     invalid_json += gj
-    c = batches[10]["records"][1]
+    c = batches[11]["records"][1]
     ci, cj = invalid_channel_vectors(c["binary"], c["json"])
     invalid += ci
     invalid_json += cj

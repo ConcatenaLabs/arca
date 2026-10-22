@@ -218,7 +218,7 @@ and a board whose registration never reached the server, are not recovered.
   leaf and again when it takes the leaf, that every exit of it needs a fee coin
   in an accepted asset. Only once the round is final, and only when the operator's status
   shows exactly the leaves the wallet asked for, in order, each validated, each
-  of the template it asked for (`vtxo-1`; a resting order, `order-2`, only
+  of the template it asked for (`vtxo-1`; a resting order, `order-3`, only
   where it asked for one and on exactly its terms; `htlc-1` only for a payment
   it receives over Lightning, locked to that payment's hash), all under the
   participation's one unlock hash, and exactly the coins it gave up. The same
@@ -949,7 +949,7 @@ hands out again after a relay restart or before it expires.
 
 ### Resting an order in the tree
 
-An order can also rest in the tree, as a leaf of its own (`order-2`), where
+An order can also rest in the tree, as a leaf of its own (`order-3`), where
 takers fill it while the wallet is away. Each fill is co-signed by the
 operator alone, and the leaf's program holds every fill to the order's terms:
 the maker's credit, a leaf of the asset the order is paid in under the next of

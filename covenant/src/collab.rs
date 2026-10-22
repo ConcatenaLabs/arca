@@ -261,7 +261,7 @@ mod test {
 		};
 		assert!(cp.names_inputs() && l.names_inputs() && !leaf(false).names_inputs());
 		let b = Policy::Checkpoint(cp).encode();
-		assert_eq!(b[1], 13);
+		assert_eq!(b[1], 14);
 		assert_eq!(Policy::decode(&b).unwrap(), Policy::Checkpoint(cp));
 	}
 }

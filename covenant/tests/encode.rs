@@ -99,8 +99,8 @@ fn malformed_encodings_are_refused() {
 	b[0] = 2;
 	assert_eq!(Policy::decode(&b), Err(DecodeError::Version(2)));
 	let mut b = leaf.clone();
-	b[1] = 14;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(14)));
+	b[1] = 15;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(15)));
 	// a key that is not on the curve: x = 0xff..ff is above the field size
 	let mut b = leaf.clone();
 	b[2..34].copy_from_slice(&[0xff; 32]);

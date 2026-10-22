@@ -1,9 +1,9 @@
-//! Resting orders in the tree: an `order-2` leaf ([`arca_covenant::order`])
+//! Resting orders in the tree: an `order-3` leaf ([`arca_covenant::order`])
 //! the wallet rests and then leaves, which takers fill in the tree while it
 //! is away, under the operator's signature alone.
 //!
 //! **Resting.** [`Wallet::order_rest`] gives up leaves of the asset the order
-//! sells in a participation that wants one `order-2` leaf of exactly the
+//! sells in a participation that wants one `order-3` leaf of exactly the
 //! order's amount (and a change leaf where the coins hold more). The leaf's
 //! terms are SeqDEX's (the asset it is paid in, the rate, the lot), the
 //! order it lands as on the chain (its fills on the chain pay the order key's
@@ -91,7 +91,7 @@ struct RestPlan {
 	change: u64,
 }
 
-/// Whether `row` is a resting order's coin (an `order-2` leaf): such a coin
+/// Whether `row` is a resting order's coin (an `order-3` leaf, or an `order-2` leaf from before it): such a coin
 /// is the order, and is spent only by a fill, a cancel or its landing.
 pub(crate) fn is_order_coin(row: &CoinRow) -> bool {
 	CoinRecord::from_bytes(&row.record).ok().and_then(|r| r.order_policy()).is_some()
@@ -207,6 +207,7 @@ impl Wallet {
 			maker: sha256(pays.as_bytes()),
 			expiry: ask.expiry,
 			refund_key: self.keys.order(index)?.x_only_public_key().0,
+			version: arca_covenant::order::SeqdexVersion::V2,
 		};
 		let terms = OrderLeafTerms { landed, credits };
 		terms.check(ask.sell, &owner, &self.operator).map_err(|e| Error::Refused(e.to_string()))?;
@@ -215,7 +216,7 @@ impl Wallet {
 			self.store.put_nonce(n, &credits[i], "order credit")?;
 		}
 		let terms_json = order_terms_json(&terms);
-		let mut wanted = vec![Wanted::Leaf { asset: ask.sell, value: ask.amount, template: Template::Order2, owner, owner_nonce: nonce,
+		let mut wanted = vec![Wanted::Leaf { asset: ask.sell, value: ask.amount, template: Template::Order3, owner, owner_nonce: nonce,
 			exit_delay: self.exit_delay(), order: Some(terms), landing: None, channel: None }];
 		let mut wanted_json = vec![json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": ask.amount.to_string(),
 			"order": terms_json})];

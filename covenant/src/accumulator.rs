@@ -1123,9 +1123,9 @@ impl AccumulatorRecord {
 			Template::Htlc1 => Some(HtlcTerms::decode_from(r)?),
 			_ => None,
 		};
-		let order_bytes = match template {
-			Template::Order2 => Some(r.bytes(ORDER_TERMS_BYTES)?),
-			_ => None,
+		let order_bytes = match crate::order::SeqdexVersion::of(template) {
+			Some(v) => Some((r.bytes(ORDER_TERMS_BYTES)?, v)),
+			None => None,
 		};
 		let landing = match template {
 			Template::Landing1 => {
@@ -1137,7 +1137,7 @@ impl AccumulatorRecord {
 		};
 		let asset = r.asset()?;
 		let order = match order_bytes {
-			Some(b) => Some(OrderLeafTerms::decode_from(&mut Reader::new(b), asset)?),
+			Some((b, v)) => Some(OrderLeafTerms::decode_from(&mut Reader::new(b), asset, v)?),
 			None => None,
 		};
 		let value = r.u64()?;
