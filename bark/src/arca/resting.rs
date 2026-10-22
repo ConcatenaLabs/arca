@@ -47,7 +47,7 @@ use serde_json::{json, Value};
 use arca_covenant::order::{publish_digest, OrderLeafTerms, OrderPolicy, OrderTerms, SeqdexOrder, CREDIT_KEYS};
 use arca_covenant::record_json::{order_terms_from_json, order_terms_json};
 use arca_covenant::script::sha256;
-use arca_covenant::spend::{FeeSource, Pair};
+use arca_covenant::spend::{FeeSource, Pair, Rebindable};
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, NewLeaf, RelativeTime, Template, TransferPlan, ValidInput};
 
 use super::chain::{hex, unhex, unhex32};
@@ -474,8 +474,10 @@ impl Wallet {
 			},
 			None => self.served_order(order)?,
 		};
-		let got = self.own_leaf_for("resting order fill")?;
-		let change_leaf = self.own_leaf_for("change")?;
+		// The fill request names no template: the operator makes the
+		// taker's leaves vtxo-1.
+		let got = self.own_vtxo1_leaf_for("resting order fill")?;
+		let change_leaf = self.own_vtxo1_leaf_for("change")?;
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
 		if let Some(s) = shown {
 			let q = f.quote(order, &o);
@@ -489,11 +491,17 @@ impl Wallet {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let outputs = fill_outputs(&plan, &policy, (&got, filled), (change > 0).then_some((&change_leaf, asset_b, change)), self);
 		let tplan = TransferPlan { inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
+		// The fill spends the order's coin at input 0 and the checkpoints
+		// after it: a vtxo-2 checkpoint's pair names them all, its own index
+		// one past its place among the checkpoints (`fill_tx`).
+		let mut named = vec![oc.output().txout()];
+		named.extend((0..chosen.len()).map(|j| tplan.checkpoint_output(j).txout()));
 		let mut inputs = vec![];
 		for (k, c) in chosen.iter().enumerate() {
 			let key = self.coin_key(&c.row.owner_nonce)?;
 			let cp = sign(&key, &tplan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
-			let re = sign(&key, &tplan.reassignment_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
+			let re = sign(&key, &tplan.checkpoint(k).message_in(k as u32 + 1, &named, &outputs)
+				.map_err(|e| Error::Refused(e.to_string()))?.digest);
 			inputs.push(json!({"leaf_id": c.row.leaf_id, "checkpoint_value": c.checkpoint_value.to_string(), "checkpoint_sig": hex(cp.as_ref()),
 				"reassignment_sig": hex(re.as_ref())}));
 		}

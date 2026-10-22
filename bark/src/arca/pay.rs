@@ -154,7 +154,7 @@ impl Out {
 		if let Some(l) = self.leaf.landing.and_then(|t| t.landing(self.asset, self.value).ok()) {
 			v["landing"] = arca_covenant::record_json::landing_json(&l);
 		}
-		if self.leaf.v2 {
+		if self.leaf.v2 && self.leaf.landing.is_none() {
 			v["template"] = json!("vtxo-2");
 		}
 		v
@@ -342,12 +342,21 @@ impl Wallet {
 		let mut leaf = self.own_leaf(purpose)?;
 		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose()
 			.map_err(|e| Error::Refused(e.to_string()))?;
+		// A leaf of a supervised asset is landing-1, never vtxo-2.
+		leaf.v2 &= leaf.landing.is_none();
 		Ok(leaf)
 	}
 
 	/// [`Self::own_leaf`], for the other modules.
 	pub(crate) fn own_leaf_for(&self, purpose: &str) -> Result<NewLeaf, Error> {
 		self.own_leaf(purpose)
+	}
+
+	/// [`Self::own_leaf`] as `vtxo-1` whatever the wallet asks, for a request
+	/// that names no template: an in-tree fill's taker leaves, which the
+	/// operator builds as `vtxo-1`.
+	pub(crate) fn own_vtxo1_leaf_for(&self, purpose: &str) -> Result<NewLeaf, Error> {
+		Ok(NewLeaf { v2: false, ..self.own_leaf(purpose)? })
 	}
 
 	/// Coins of `asset` to pay `paid` into `out` (and change): see
@@ -592,6 +601,7 @@ impl Wallet {
 		if change > 0 {
 			let mut leaf = self.own_leaf("change")?;
 			leaf.landing = rule.map(|own| own.terms(asset, change)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
+			leaf.v2 &= leaf.landing.is_none();
 			outs.push(Out { asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0, until: None });
 		}
 		let answer = self.transfer(&inputs, &outs, &[])?;
@@ -1862,6 +1872,7 @@ impl Wallet {
 		let info = self.server_info()?;
 		leaf.landing = self.landing_rule(&info, asset)?.map(|l| l.terms(asset, value)).transpose()
 			.map_err(|e| Error::Refused(e.to_string()))?;
+		leaf.v2 &= leaf.landing.is_none();
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
 	}
