@@ -235,6 +235,16 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 	add("notice".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, x.schedule.operator,
 		RelativeTime::from_units(x.schedule.notice.units() + 1).unwrap(), x.schedule.expiries().to_vec()).unwrap());
 	add("burn".into(), &|x| x.burn = !x.burn);
+	if r.landing.is_some() {
+		add("landing program".into(), &|x| x.landing.as_mut().unwrap().program[0] ^= 1);
+		add("landing allowance + 1".into(), &|x| x.landing.as_mut().unwrap().allowance += 1);
+		add("landing-1 as vtxo-1".into(), &|x| { x.landing = None; x.template = arca_covenant::Template::Vtxo1; });
+	} else if r.template == arca_covenant::Template::Vtxo1 {
+		add("vtxo-1 as landing-1".into(), &|x| {
+			x.landing = Some(arca_covenant::Landing { program: [7; 20], allowance: 1 });
+			x.template = arca_covenant::Template::Landing1;
+		});
+	}
 	for k in 0..r.schedule.expiries().len() {
 		add(format!("expiry {} later", k), &|x| x.schedule = schedule_with(&x.schedule, |e| {
 			e[k] = MedianTime::from_consensus(e[k].to_consensus_u32() + 1).unwrap()

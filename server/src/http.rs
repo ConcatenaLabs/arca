@@ -772,6 +772,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 				htlc,
+				landing: None,
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,

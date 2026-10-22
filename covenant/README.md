@@ -30,7 +30,8 @@ built with no compiler.
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
-| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value |
+| `landing` | `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays output 0 to P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
+| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a `landing-1` leaf for a board of a supervised asset) |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
@@ -79,9 +80,10 @@ tx.input[i].witness.script_witness = w;
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
 It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
-payment hash, timeout, direction and operator delay; or `order-2` with its
+payment hash, timeout, direction and operator delay; `order-2` with its
 order's terms: the asset it is paid in, the price and lot, the landed order's
-maker script hash, REFUND time and key, and the four credit keys), the owner's key, the two
+maker script hash, REFUND time and key, and the four credit keys; or
+`landing-1` with its landing program and fee allowance), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
 clock schedule
@@ -833,6 +835,20 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   template's eight address vectors, an instance file read as the limiter's
   tool writes it, the program's rule for the state a mint leads to, and the
   following of a mint, the brake, its release and the recovery.
+- `tests/landing.rs`: on an anchored regtest chain, a supervised asset issued
+  under the supervision descriptor with the pause capability, and `landing-1`
+  leaves of it. The collaborative path signed over the plain constant, and
+  over another landing's, and the landing before its delay, to another key's
+  P2WPKH, to a taproot output, in another asset and one atom below the value
+  less the allowance: each refused by the mempool and in a block, for its
+  reason. Under a pause, with the leaf's own script named in a freeze, the
+  landing confirms (`isassetfrozen` says frozen for that tree script, whose
+  script-path spends no freeze reaches); the landed coin is refused under the
+  pause and under a freeze of its address (`bad-txns-asset-frozen`) and spent
+  once that is lifted. A round of the asset with a blinded output is refused in
+  a block (`bad-txns-supervised-blinded`) beside the same round all explicit,
+  whose `landing-1` leaves' records validate against it, and the same blinding
+  in a round of an open asset confirms.
 - `tests/claim.rs`: on an anchored regtest chain, a batch of four claim
   leaves, each owned by the claim key of an address key (two of each parity)
   and its nonce. Each record validates for its claim key and not for the named

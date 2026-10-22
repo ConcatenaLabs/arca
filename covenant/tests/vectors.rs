@@ -148,6 +148,7 @@ impl Ctx {
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
 			order: None,
+			landing: None,
 		};
 		assert_eq!(leaf.leaf_constant(), h32(&p["K"]));
 		leaf
@@ -160,6 +161,7 @@ impl Ctx {
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
 			order: None,
+			landing: None,
 		};
 		assert_eq!(leaf.program(), h32(&p["leaf_program"]));
 		BoardPolicy { leaf, asset: AssetId::from_byte_array(h32(&p["asset"])), value: p["value"].as_u64().unwrap() }
@@ -219,6 +221,7 @@ impl Ctx {
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
 			order: None,
+			landing: None,
 		};
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
 		assert_eq!(h.leaf_constant(), h32(&p["K"]));
@@ -227,6 +230,25 @@ impl Ctx {
 		assert_eq!(terms.claim_delay(exit_delay), rel(&p["claim_delay"]));
 		assert_eq!(terms.refund_delay(exit_delay), rel(&p["refund_delay"]));
 		h
+	}
+
+	fn landing(&self) -> LeafPolicy {
+		let p = &self.output("landing")["params"];
+		let mut program = [0u8; 20];
+		program.copy_from_slice(&hex(&p["landing_program"]));
+		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap() };
+		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
+		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
+		let l = LeafPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
+			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: Some(terms),
+		};
+		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
+		assert_eq!(l.leaf_constant(), h32(&p["K"]), "landing-1's K is the salt's own");
+		assert_eq!(l.collab_prefix(), hex(&p["collab_prefix"]), "its collaborative script pushes K ‖ P");
+		assert_eq!(l.collab_prefix(), [&h32(&p["K"])[..], &program[..]].concat());
+		assert_eq!(l.template(), arca_covenant::Template::Landing1);
+		l
 	}
 
 	/// The Rust output for a vector output, with its leaves by name.
@@ -283,6 +305,10 @@ impl Ctx {
 					("refund", h.refund_script().unwrap()),
 				]))
 			},
+			"landing" => {
+				let l = self.landing();
+				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("landing", l.exit_script())]))
+			},
 			other => panic!("no builder for vector output {}", other),
 		}
 	}
@@ -292,7 +318,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 18);
+	assert_eq!(outputs.len(), 19);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -332,7 +358,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 32);
+	assert_eq!(spends.len(), 34);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -475,6 +501,19 @@ fn every_spend_matches_its_vector_and_verifies() {
 					},
 					p => panic!("unknown htlc path {}", p),
 				}
+			},
+			("landing", "landing") => {
+				let l = ctx.landing();
+				let terms = l.landing.unwrap();
+				terms.check_output(&ExplicitOutput::from_txout(&tx.output[0]).unwrap()).unwrap();
+				l.exit_witness(&checksig(ctx.label_of(&l.owner)))
+			},
+			("landing", "collab") => {
+				let l = ctx.landing();
+				let owner = ctx.label_of(&l.owner).to_string();
+				let outs = committed(s["m"].as_u64().unwrap() as usize);
+				let msg = l.collab_message(asset_in, value_in, &outs).unwrap();
+				l.collab_witness(&csfs(&msg, "S"), &csfs(&msg, &owner), outs.len() as u8)
 			},
 			other => panic!("{}: no witness builder for {:?}", name, other),
 		};

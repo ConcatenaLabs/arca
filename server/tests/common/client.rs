@@ -33,6 +33,7 @@ pub fn board_record(owner: &Keypair, operator_nonce: [u8; 32], asset: AssetId, v
 		operator_nonce,
 		exit_delay: exit_delay(),
 		asset, value, chain, operator,
+		landing: None,
 	}
 }
 
@@ -164,7 +165,7 @@ pub struct Held {
 /// fresh for this leaf.
 pub fn new_leaf(key: &Keypair) -> (NewLeaf, [u8; 32]) {
 	let nonce = random32();
-	(NewLeaf { owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None }, nonce)
+	(NewLeaf { owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
 }
 
 /// Resolves `held` under `policy` against `bases`, as its owner would before
@@ -373,6 +374,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
 		htlc: htlc_of(&l["htlc"]),
 		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
+		landing: None,
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }

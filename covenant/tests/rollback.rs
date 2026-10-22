@@ -364,6 +364,7 @@ fn a_boards_forfeit_rolled_back_still_wins() {
 		template: Template::Board1, owner: xonly(&a), owner_nonce: label32("d4 board nonce"),
 		operator_nonce: label32("d4 board operator nonce"), exit_delay: delay(), asset: x, value: LEAF,
 		chain: c.net.chain, operator: xonly(&s),
+		landing: None,
 	};
 	let board = rec.policy();
 	let coin = c.net.fund(vec![rec.output().txout()]).remove(0);

@@ -114,6 +114,7 @@ fn step_round(c: &mut Arca, p: &P, i: usize, label: &str) -> (Tree, Transaction,
 		template: Template::Vtxo1, owner: st.owner, value: st.value, owner_nonce: st.owner_nonce,
 		operator_nonce: st.operator_nonce, exit_delay: st.exit_delay, unlock_hash: st.unlock_hash, htlc: None,
 		order: None,
+		landing: None,
 	};
 	let others: Vec<LeafSpec> = (0..2).map(|k| spec(&keypair(&format!("{} other {}", label, k)), &format!("{} other {}", label, k),
 		LEAF, sha256(&label32(&format!("{} other preimage {}", label, k))))).collect();

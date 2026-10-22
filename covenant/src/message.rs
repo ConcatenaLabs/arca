@@ -6,7 +6,9 @@
 //! - the rebindable message of the collaborative paths, bound to the coin
 //!   being spent and to the chain,
 //!   `SHA256(K ‖ asset_in ‖ 0x01 ‖ 0x01 ‖ value_in ‖ m ‖ SHA256(record 0) ‖ … ‖ SHA256(record m-1))`
-//!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis_hash) ‖ salt)`;
+//!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis_hash) ‖ salt)`; a
+//!   `landing-1` leaf's script pushes `K ‖ P`, `P` its landing program, so its
+//!   message is `SHA256(K ‖ P ‖ asset_in ‖ …)` ([`Chain::landing_prefix`]);
 //! - the unroll authorisation, `SHA256("Arca/unroll" ‖ H ‖ t)`;
 //! - the release each owner under a lowest node signs,
 //!   `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset
@@ -79,6 +81,21 @@ impl Chain {
 		sha256(&b)
 	}
 
+	/// What a `landing-1` leaf's collaborative script pushes where another
+	/// leaf's pushes `K`: `K ‖ P`, the salt's own `K` followed by the leaf's
+	/// landing program `P` (20 bytes), 52 bytes. Its rebindable message is
+	/// `SHA256(K ‖ P ‖ asset_in ‖ …)`, so a pair made for one landing spends
+	/// only a leaf that lands there ([`crate::landing`]). `K` is the salt's
+	/// as for any coin, so two messages the operator signs under the salt are
+	/// evidence to its bond as for any coin ([`crate::bond`]), the rest after
+	/// `K` 20 bytes longer. A landing message's preimage is 95 + 32m bytes, a
+	/// plain one's 75 + 32m, so the two never meet.
+	pub fn landing_prefix(&self, salt: &[u8; 32], program: &[u8; crate::landing::PROGRAM_BYTES]) -> Vec<u8> {
+		let mut b = self.leaf_constant(salt).to_vec();
+		b.extend(program);
+		b
+	}
+
 	/// The fixed part of every release of the lowest node whose children hash
 	/// is `children_hash`: `"Arca/release" ‖ genesis_hash ‖ H`, 76 bytes. Its
 	/// RECLAIM pushes it and appends each owner's `M`.
@@ -99,14 +116,15 @@ impl Chain {
 }
 
 /// The rebindable message for a spend of a coin of `asset_in` and `value_in`
-/// that commits to `outputs` at indices `0..m`. `k` is the script's constant
-/// ([`Chain::leaf_constant`]). The format carries `m` in one byte; the scripts
+/// that commits to `outputs` at indices `0..m`. `k` is what the script pushes:
+/// `K` ([`Chain::leaf_constant`]), or a `landing-1` leaf's `K ‖ P`
+/// ([`Chain::landing_prefix`]). The format carries `m` in one byte; the scripts
 /// take 1 to 4 outputs ([`crate::leaf::MAX_OUTPUTS`]), `htlc-1` exactly one.
-pub fn rebind_message(k: &[u8; 32], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+pub fn rebind_message(k: &[u8], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
 	if outputs.is_empty() || outputs.len() > 255 {
 		return Err(Error::OutputCount(outputs.len()));
 	}
-	let mut b = Vec::with_capacity(32 + 42 + 1 + 32 * outputs.len());
+	let mut b = Vec::with_capacity(k.len() + 42 + 1 + 32 * outputs.len());
 	b.extend(k);
 	b.extend(asset_bytes(asset_in));
 	b.extend([0x01, 0x01]);

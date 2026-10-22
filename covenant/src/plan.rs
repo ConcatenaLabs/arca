@@ -249,6 +249,7 @@ impl Plan {
 			exit_delay: s.exit_delay,
 			htlc: None,
 			order: None,
+			landing: None,
 		})
 	}
 
@@ -354,7 +355,7 @@ mod tests {
 		let chain = Chain::new(BlockHash::from_raw_hash(sha256d::Hash::hash(b"genesis")));
 		let operator = key("S");
 		let first = LeafPolicy { owner: key("A0"), operator, salt: n("salt 0"), chain, exit_delay: RelativeTime::from_units(254).unwrap(),
-			htlc: None, order: None };
+			htlc: None, order: None, landing: None };
 		Plan {
 			chain, operator, coin: LeafId(n("coin")), first, asset: AssetId::from_slice(&n("asset")).unwrap(), value: 1_000_000,
 			steps: (1..=steps).map(|i| PlanStep {

@@ -12,7 +12,7 @@ from arklib import *                      # noqa: F401,F403
 from arklib import _csfs_2of2
 import os as _os
 from test_framework.messages import CAssetIssuance, CTxOutValue as _Val
-from test_framework.script import OP_INSPECTINPUTISSUANCE, OP_INSPECTINPUTSCRIPTPUBKEY
+from test_framework.script import OP_INSPECTINPUTISSUANCE, OP_INSPECTINPUTSCRIPTPUBKEY, OP_GREATERTHANOREQUAL64
 
 TAG = b"ArcaRbd1"
 UTAG = b"Arca/unroll"
@@ -70,22 +70,37 @@ def leaf_const(ctag, salt, fold=False):
     return sha256(ctag + salt) if fold else ctag + salt
 
 
-def rebind_msg3(ctag, salt, asset_in, value_in, outs, fold=False):
+def landing_prefix(ctag, salt, program):
+    """What landing-1's collaborative script pushes where another leaf's pushes
+    K: K || P, the salt's own folded constant SHA256(chain_tag || salt)
+    followed by the landing program P = hash160(L) (20 bytes). The message is
+    SHA256(K || P || ...), so a pair made for one landing spends only a leaf
+    that lands there, and K stays the salt's, as the operator's equivocation
+    bond reads it (bond.py)."""
+    assert len(ctag) == 32 and len(salt) == 32 and len(program) == 20
+    return leaf_const(ctag, salt, fold=True) + program
+
+
+def rebind_msg3(ctag, salt, asset_in, value_in, outs, fold=False, const=None):
     """msg = SHA256(chain_tag || salt || asset_in || 01 || 01 || value_in || m || SHA256(rec_0) ..)
-    folded: chain_tag || salt is replaced by SHA256(chain_tag || salt)."""
+    folded: chain_tag || salt is replaced by SHA256(chain_tag || salt). `const`
+    replaces the constant whole (landing-1's, landing_prefix)."""
     assert len(ctag) == 32 and len(salt) == 32 and 1 <= len(outs) <= 255
-    acc = leaf_const(ctag, salt, fold) + input_record(asset_in, value_in) + bytes([len(outs)])
+    k = const if const is not None else leaf_const(ctag, salt, fold)
+    acc = k + input_record(asset_in, value_in) + bytes([len(outs)])
     for a, v, spk in outs:
         acc += sha256(record(a, v, spk))
     return sha256(acc)
 
 
-def collab3_loop(a_x, s_x, salt, ctag, M=M_MAX, fold=False):
+def collab3_loop(a_x, s_x, salt, ctag, M=M_MAX, fold=False, const=None):
     """T10 loop with the coin and the chain in the message.
-    Witness (bottom -> top): <sig_S> <sig_A> <m>."""
+    Witness (bottom -> top): <sig_S> <sig_A> <m>. `const` replaces the
+    constant whole (landing-1's, landing_prefix)."""
+    k = const if const is not None else leaf_const(ctag, salt, fold)
     s = [OP_SIZE, OP_1, OP_EQUALVERIFY]
     s += [OP_DUP, OP_1, M + 1, OP_WITHIN, OP_VERIFY]
-    s += [OP_DUP, leaf_const(ctag, salt, fold)] + input_record_ops() + [OP_CAT, OP_SWAP, OP_CAT, OP_SWAP]
+    s += [OP_DUP, k] + input_record_ops() + [OP_CAT, OP_SWAP, OP_CAT, OP_SWAP]
     for j in range(M):
         slot = record_ops(j) + [OP_SHA256, OP_ROT, OP_SWAP, OP_CAT, OP_SWAP]
         s += slot if j == 0 else [OP_DUP, j, OP_GREATERTHAN, OP_IF] + slot + [OP_ENDIF]
@@ -95,6 +110,31 @@ def collab3_loop(a_x, s_x, salt, ctag, M=M_MAX, fold=False):
 
 def exit_leaf(a_x, delay):
     return CScript([delay, OP_CHECKSEQUENCEVERIFY, OP_DROP, a_x, OP_CHECKSIG])
+
+
+def landing_exit(a_x, delay, program, asset_id, min_value):
+    """landing-1's exit: after the delay, output 0 must be P2WPKH(P) (witness
+    version 0, program P = hash160(L)), explicitly in `asset_id` (internal byte
+    order), holding at least `min_value` (the leaf's value less the fee
+    allowance); then A's signature. Witness: <sig_A>."""
+    assert len(program) == 20 and len(asset_id) == 32
+    return CScript([delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                    0, OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_0, OP_EQUALVERIFY, program, OP_EQUALVERIFY,
+                    0, OP_INSPECTOUTPUTASSET, OP_1, OP_EQUALVERIFY, asset_id, OP_EQUALVERIFY,
+                    0, OP_INSPECTOUTPUTVALUE, OP_1, OP_EQUALVERIFY, le8(min_value), OP_GREATERTHANOREQUAL64, OP_VERIFY,
+                    a_x, OP_CHECKSIG])
+
+
+def landing_taptree(a_x, s_x, salt, ctag, delay, program, asset_id, value, allowance):
+    """landing-1: [collab, landing], both at depth 1. collab is the leaf's
+    collaborative path, its script pushing K || P (landing_prefix); landing is
+    the exit forced into the owner's single-owner output, P2WPKH(L), where a
+    freeze of the asset binds."""
+    assert 0 <= allowance < value
+    collab = collab3_loop(a_x, s_x, salt, ctag, fold=True, const=landing_prefix(ctag, salt, program))
+    land = landing_exit(a_x, delay, program, asset_id, value - allowance)
+    tap = taproot_construct(NUMS, [("collab", collab), ("landing", land)])
+    return tap, {"collab": collab, "landing": land}
 
 
 def leaf3_taptree(a_x, s_x, salt, ctag, delay, sweep=None, fold=False):

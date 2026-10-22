@@ -14,6 +14,7 @@
 //! order              order-2 only: {"asset_b": hex, display order, "rate_num", "rate_den",
 //!                    "min_lot": decimal strings, "maker": hex, "expiry": median time,
 //!                    "refund_key": hex, "credits": [4 × hex, zero once used]}
+//! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
 //! asset              hex, display order
 //! value              decimal string
 //! unlock_hash        hex
@@ -54,6 +55,7 @@ use serde_json::{Map, Value};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::gate::{MemberProof, MAX_DEPTH};
 use crate::htlc::{HtlcDirection, HtlcTerms};
+use crate::landing::{Landing, PROGRAM_BYTES};
 use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder};
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
@@ -126,6 +128,9 @@ impl LeafRecord {
 		if let Some(o) = &self.order {
 			m.insert("order".into(), order_terms_json(o));
 		}
+		if let Some(l) = &self.landing {
+			m.insert("landing".into(), landing_json(l));
+		}
 		m.insert("asset".into(), Value::String(display(asset_bytes(self.asset))));
 		m.insert("value".into(), Value::String(self.value.to_string()));
 		m.insert("unlock_hash".into(), Value::String(hex(&self.unlock_hash)));
@@ -166,6 +171,9 @@ impl LeafRecord {
 		if named == Some(Template::Order2) {
 			fields.push("order");
 		}
+		if named == Some(Template::Landing1) {
+			fields.push("landing");
+		}
 		let m = object(v, "record", &fields)?;
 		let version = int(m, "version", u64::MAX)?;
 		if version != RECORD_VERSION as u64 {
@@ -196,6 +204,7 @@ impl LeafRecord {
 			None => None,
 			Some(o) => Some(order_terms_from_json(o, asset)?),
 		};
+		let landing = m.get("landing").map(landing_from_json).transpose()?;
 		let value = amount(m, "value")?;
 		let unlock_hash = bytes32(m, "unlock_hash")?;
 		let entry_reserve = amount(m, "entry_reserve")?;
@@ -242,10 +251,36 @@ impl LeafRecord {
 			schedule, burn,
 			upper, lowest: LowestLevel { index, reserve, siblings, owners },
 			order,
+			landing,
 		};
 		record.check()?;
 		Ok(record)
 	}
+}
+
+/// `landing-1`'s landing as the record's JSON form and the server's interface
+/// write it: `{"program": hex, "allowance": decimal string}`.
+pub fn landing_json(l: &Landing) -> Value {
+	let mut m = Map::new();
+	m.insert("program".into(), Value::String(hex(&l.program)));
+	m.insert("allowance".into(), Value::String(l.allowance.to_string()));
+	Value::Object(m)
+}
+
+/// Reads [`landing_json`].
+pub fn landing_from_json(v: &Value) -> Result<Landing, RecordError> {
+	let o = object(v, "landing", &["program", "allowance"])?;
+	let p = string(o, "program").map_err(|_| RecordError::Type("landing.program".into()))?;
+	let b = (p.len() == 2 * PROGRAM_BYTES && p.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+		.then(|| (0..PROGRAM_BYTES).map(|i| u8::from_str_radix(&p[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<u8>>())
+		.ok_or_else(|| RecordError::Hex("landing.program".into()))?;
+	let mut program = [0u8; PROGRAM_BYTES];
+	program.copy_from_slice(&b);
+	let allowance = match &o["allowance"] {
+		Value::String(_) => amount(o, "allowance").map_err(|_| RecordError::Amount("landing.allowance".into()))?,
+		_ => return Err(RecordError::Type("landing.allowance".into())),
+	};
+	Ok(Landing { program, allowance })
 }
 
 /// `v` as an object with exactly the keys `keys`.

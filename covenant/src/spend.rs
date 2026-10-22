@@ -85,6 +85,10 @@ pub enum SpendError {
 	NoLowestNode,
 	#[error("{0} holds nothing for a fee: attach a fee coin")]
 	NeedsFeeCoin(&'static str),
+	#[error(transparent)]
+	Landing(crate::LandingError),
+	#[error("a landing pays its fee from the coin, naming the amount (a split), or from a coin attached")]
+	LandingFee,
 	#[error("the schedule has no clock {step}; it has {steps}")]
 	ClockStep { step: usize, steps: usize },
 	#[error("clock {0} is the last: it has no roll")]
@@ -284,7 +288,7 @@ impl Rebindable for LeafPolicy {
 	}
 
 	fn message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
-		two_party_message(&self.leaf_constant(), asset_in, value_in, outputs)
+		two_party_message(&self.collab_prefix(), asset_in, value_in, outputs)
 	}
 }
 
@@ -398,15 +402,39 @@ impl LeafPolicy {
 	/// The exit claim of `coin`, this leaf on-chain holding `value` of
 	/// `asset`, into `outputs`: input 0's sequence is the exit delay, so it
 	/// confirms only that long after the leaf did. The owner signs
-	/// [`KeySpend::sighash`] and finishes it with its signature.
+	/// [`KeySpend::sighash`] and finishes it with its signature. A
+	/// `landing-1` leaf's exit is its landing: output 0 must be P2WPKH of its
+	/// landing program in its asset, holding at least the minimum
+	/// ([`Self::landing_tx`] builds it).
 	pub fn exit_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
 		-> Result<KeySpend, SpendError>
 	{
 		if self.htlc.is_some() {
 			return Err(Error::HtlcHasNoExit.into());
 		}
+		if let Some(l) = &self.landing {
+			let first = outputs.first().ok_or(SpendError::Landing(crate::LandingError::Output { min: l.min_value }))?;
+			l.check_output(first).map_err(SpendError::Landing)?;
+		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
 		KeySpend::build(self.taproot(), self.exit_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee)
+	}
+
+	/// The landing of `coin`, this `landing-1` leaf on-chain holding `value`
+	/// of `asset`: output 0 pays P2WPKH of the landing program everything
+	/// but the fee. With [`FeeSource::Split`] the coin pays its own `fee`,
+	/// which must be within the allowance, and nothing goes to change; with a
+	/// coin of the broadcaster's ([`FeeSource::Coin`]) output 0 holds the
+	/// whole value. The owner signs [`KeySpend::sighash`] and finishes it with
+	/// its signature.
+	pub fn landing_tx(&self, coin: OutPoint, asset: AssetId, value: u64, fee: &FeeSource) -> Result<KeySpend, SpendError> {
+		let l = self.landing.ok_or(SpendError::Landing(crate::LandingError::Output { min: 0 }))?;
+		let (paid, fee) = match fee {
+			FeeSource::Split { fee, .. } => (value.checked_sub(*fee).ok_or(SpendError::Margin { margin: *fee, value })?, FeeSource::Reserve),
+			FeeSource::Coin { .. } => (value, fee.clone()),
+			FeeSource::Reserve | FeeSource::Burning { .. } => return Err(SpendError::LandingFee),
+		};
+		self.exit_tx(coin, asset, value, &[l.output(paid)], &fee)
 	}
 
 	/// The claim of `coin`, this `htlc-1` leaf on-chain holding `value` of

@@ -67,6 +67,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T20 | The notice on the sweep token: no node of any age is swept earlier than the notice after the release |
 | T21 | Every frozen construction together in a 16-leaf tree in an asset that is not the policy asset |
 | T22 | The operator's equivocation bond (`bond.py`): a payment and a second spend of one leaf, both co-signed by the operator, burn the bond whole; refused beside it one signature twice, two signatures over one digest, two salts, another key and a burn short; a fill beside a payment under one salt burns another; the notice keeps the bond whole and is W's alone; the withdrawal waits the notice's delay |
+| T23 | `landing-1`, the leaf of a supervised asset: the collaborative path over its prefix `K ‖ P`, which binds the landing program, refused over the plain constant and over another landing's prefix; the landing refused before its delay, to another key's P2WPKH, to a taproot output, in another asset and one atom below the value less the allowance; under a pause, with the leaf's own script named in a freeze, the landing confirms, the landed coin is refused by the pause and by a freeze of its address, and spent once the freeze is lifted |
 
 The node runs on a custom chain with the arguments in `ArkBase.ark_params`
 (`arklib.py`): transparent addresses, fees in any accepted asset, and an issued
@@ -86,7 +87,7 @@ sample spend of every path:
   round's connector output), the round's connector output (spent only by the
   operator's issuance of that asset), the board output (`board-1`: the leaf's
   collaborative path and the owner's conversion), the checkpoint output and
-  `htlc-1` in both directions): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
+  `htlc-1` in both directions, `landing-1`): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
   times, children), each script leaf with its opcodes, depth, leaf hash and
   control block, the merkle root, the output key and the scriptPubKey;
 - for each spend: a transaction, the outputs it spends, the signature hash or the
@@ -98,8 +99,9 @@ sample spend of every path:
 forms and the leaf id, which its docstring states in full. For each of seven
 batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
-second and fourth leaves are `htlc-1`, and one whose first and fourth are
-`order-2`, it holds the inputs, the
+second and fourth leaves are `htlc-1`, one whose first and fourth are
+`order-2`, and one of a supervised asset whose five leaves are all
+`landing-1`, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds
@@ -109,7 +111,9 @@ encodings a reader must refuse, each with the kind of reason.
 by `offchain.py`, the reference for their shapes, which its docstring states in
 full: the board, its record in both forms with refusal vectors, the owner's
 conversion, the exit of the converted leaf, and one pair spending the board
-output and the converted leaf alike; the forfeit, the round's connector output and the operator's issuance
+output and the converted leaf alike; a board of a supervised asset, whose
+record (format 3) carries the landing program and allowance, its conversion
+into a `landing-1` leaf and that leaf's landing; the forfeit, the round's connector output and the operator's issuance
 of its connector asset, the claim and the refund; the offboard output, its unlock and its reclaim; and a transfer
 chain three hops deep from two batches (one hop a swap of two owners' coins in
 two assets) and a coin paid out of round from the board: the rounds and the

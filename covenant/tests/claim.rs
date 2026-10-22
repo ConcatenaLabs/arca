@@ -57,6 +57,7 @@ fn a_claim_leaf_is_spent_by_its_claim_key_and_by_no_other() {
 		owner_nonce: *n, operator_nonce: label32(&format!("claim operator nonce {}", i)),
 		exit_delay: delay(), unlock_hash: h, htlc: None,
 		order: None,
+		landing: None,
 	}).collect();
 	let t = c.tree(&sched, &specs);
 	let (round, _) = round_tx(&c.net, &issuer, &[], &t.batch_output(), &sched);

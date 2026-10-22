@@ -60,6 +60,11 @@
 //!   operator fills with the maker offline under a Simplicity program, which
 //!   pays each credit to a leaf of its own, and which lands, one exit delay
 //!   after it reaches the chain, as SeqDEX's own order for the same terms;
+//! - the leaf of a supervised asset ([`landing`]): `landing-1`, whose exit
+//!   pays only P2WPKH of the owner's landing key, where a freeze of the asset
+//!   binds, and whose collaborative constant commits to that key too; and
+//!   the check that a round of a supervised asset keeps every output
+//!   explicit;
 //! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
@@ -95,6 +100,7 @@ pub mod forfeit;
 pub mod gate;
 pub mod htlc;
 pub mod issuer;
+pub mod landing;
 pub mod leaf;
 pub mod limiter;
 pub mod message;
@@ -131,6 +137,7 @@ pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLea
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
+pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
 pub use message::{Chain, CsfsMessage};
