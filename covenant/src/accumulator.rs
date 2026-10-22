@@ -676,6 +676,11 @@ impl Accumulator {
 		if let Some(i) = params.schedule.backwards_at() {
 			return Err(TreeError::ScheduleBackwards(i));
 		}
+		// A channel-1 leaf's terms are not in an accumulator record: a
+		// channel goes in a tree.
+		if let Some(i) = leaves.iter().position(|l| l.template == Template::Channel1 || l.channel.is_some()) {
+			return Err(TreeError::Template { leaf: i });
+		}
 		let tree_leaves = build_leaves(&params.as_tree(), leaves)?;
 		let operator = params.schedule.operator;
 		let sweep = params.schedule.sweep(false, params.burn);
