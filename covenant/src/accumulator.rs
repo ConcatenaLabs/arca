@@ -477,8 +477,8 @@ impl AccumulatorPolicy {
 	/// Judges a transaction whose input `k` spends `spent` by this state's
 	/// exit, by the program's rules, naming the first one it breaks: `spent`
 	/// is this state's output, explicit; the slot and the authorisation
-	/// ([`AccumulatorPolicy::check_slot`]); the lock time; the entry at `2k`
-	/// and the rest at `2k+1`.
+	/// ([`AccumulatorPolicy::check_slot`]); the lock time; no annex on input
+	/// `k`; the entry at `2k` and the rest at `2k+1`.
 	pub fn check(&self, chain: &Chain, tx: &Transaction, k: usize, spent: &TxOut, exit: &Exit, auth: &ExitAuth)
 		-> Result<(), AccumulatorError>
 	{
@@ -493,6 +493,9 @@ impl AccumulatorPolicy {
 		let lock = tx.lock_time.to_consensus_u32();
 		if !(lock >= 500_000_000 && lock >= t && tx.input.iter().any(|i| i.sequence.0 != 0xffff_ffff)) && t != 0 {
 			return rule("the lock time is not a time at or after the authorisation's, with a non-final input");
+		}
+		if tx.input.get(k).is_some_and(|i| crate::witness::annex(&i.witness.script_witness).is_some()) {
+			return rule("the batch input carries an annex, which the authorisation does not name");
 		}
 		let out = |i: usize| tx.output.get(i).and_then(|o| {
 			if !o.nonce.is_null() {
@@ -576,7 +579,7 @@ pub fn read_exit(witness: &[Vec<u8>]) -> Option<SeenExit> {
 /// The size of an exit whose fee comes from the slot's reserve, in vbytes, as
 /// measured on regtest (`covenant/tests/accumulator.rs`): the same at every
 /// slot and in every batch.
-pub const EXIT_VBYTES: u64 = 976;
+pub const EXIT_VBYTES: u64 = 979;
 /// The size of a gated node's unroll in a tree, in vbytes: the mean of the
 /// five levels of a 1,024-leaf radix-4 tree measured beside it (615, 592,
 /// 571, 549 and 527).
@@ -605,7 +608,7 @@ pub fn exit_costs(n: usize, radix: usize, exits: f64) -> (f64, f64) {
 /// Whether the operator should build a batch of `n` leaves as an accumulator
 /// rather than a tree at `radix`, when it expects `exits` of them to leave on
 /// the chain: when it fits (two to 1,024 leaves) and costs less to leave. At
-/// 1,024 leaves and radix 4 that is up to 78 exits (20 of 256, 5 of 64, one of
+/// 1,024 leaves and radix 4 that is up to 77 exits (19 of 256, 4 of 64, one of
 /// 16); past that, or on a run, the tree wins, because its exits share nodes
 /// and run in parallel.
 pub fn prefer_accumulator(n: usize, radix: usize, exits: f64) -> bool {
@@ -1197,10 +1200,10 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn the_choice_breaks_even_at_79_exits_of_1024() {
+	fn the_choice_breaks_even_at_78_exits_of_1024() {
 		assert!(prefer_accumulator(1024, 4, 1.0));
-		assert!(prefer_accumulator(1024, 4, 78.0));
-		assert!(!prefer_accumulator(1024, 4, 79.0));
+		assert!(prefer_accumulator(1024, 4, 77.0));
+		assert!(!prefer_accumulator(1024, 4, 78.0));
 		assert!(prefer_accumulator(256, 4, 19.0));
 		assert!(!prefer_accumulator(256, 4, 20.0));
 		assert!(!prefer_accumulator(1024, 4, 1024.0));
