@@ -226,6 +226,79 @@ participation's leaf, offboard or fee in it. Adding an asset takes its entry
 in the configuration and coins of it paid to the operator's wallet, and no
 restart: `arcad` takes the assets anew on SIGHUP (see Running).
 
+### The equivocation bond
+
+The operator key `S` co-signs every out-of-round spend, and the signer signs
+one message under a coin's salt, ever (see "The signer"). Two different
+messages `S` signed under one salt are therefore proof that `S` signed twice,
+and the bond is a coin that anyone holding that proof burns
+(`arca_covenant::bond`). The slash pays no one: it burns the whole bond with
+a bare `OP_RETURN`, and its fee comes from a coin its broadcaster attaches.
+A slash needs no key, so any holder or watcher who has the two signatures
+can send it.
+
+The bond is posted in any asset the operator chooses, and is withdrawn only
+in two steps, both signed by the withdrawal key `W` (never `S`, since the
+signer signs whatever path names `S` for the server). First comes a notice,
+which moves the bond whole into a second output that still carries the slash.
+The withdrawal can confirm only a delay `D` after that notice, by median time.
+`D` is at least a coin's lifetime (28 days) plus the longest exit delay plus
+a day. That gives the holder of every coin paid out of round before the
+notice the time to have it refreshed in a round, or to take it home on the
+chain, while the bond still stands. The server refuses to start with a
+shorter `D`, and with `W` equal to `S`.
+
+`[bond]` in the configuration holds its terms:
+
+- `withdraw_key`: `W`.
+- `notice_units`: `D`, in 512-second units.
+- `outpoint`: the bond coin, once it is posted.
+- `notice`: the notice output, once a notice is given.
+
+`info.bond` names the bond as the server's node shows it, read again every
+ten seconds:
+
+- `state`, one of:
+  - `unposted`: no coin is configured;
+  - `missing`: the coin is not at the bond's script, explicit;
+  - `unconfirmed`: in no block yet;
+  - `bonded`: unspent;
+  - `noticed`: the configured notice output takes it whole and is unspent;
+  - `spent`: anything else, a notice the configuration does not name included.
+- The coin: its `outpoint`, `asset` and `value`.
+- `reference_value`: the value at the operator's rate for the asset.
+- `operator`: `S`, the key the bond binds.
+- `withdraw_key`, `notice_units`, and both scripts.
+- `final`: whether the coin that stands is final.
+- `why`: what the state rests on.
+- In notice: `notice` and `withdrawable_at`, the median time from which the
+  withdrawal can confirm.
+
+The section is absent when no bond is configured. A wallet trusts none of
+this until it has checked the coin on its own node.
+
+The commands that work the bond each print JSON:
+
+    arcad bond-key /etc/arca/bond-withdraw.key        # draws W into a new file (0600); prints its key
+    arcad <config> bond-address                       # the bond's address and terms (needs the signer, for S)
+    arcad <config> bond-post <node wallet> <asset> <atoms> [<fee asset>]
+    arcad <config> bond-notice <key file>
+    arcad <config> bond-withdraw <key file> <address>
+
+- `bond-post` pays the bond from a node wallet the operator names. It refuses
+  a wallet whose name marks it a treasury, a reserve, a bridge's, an escrow or
+  another service's. The fee is in the bond's own asset unless another is
+  named, and never falls back to another. It prints the `outpoint` line for
+  `[bond]`; add it and restart `arcad`.
+- `bond-notice` and `bond-withdraw` sign with `W`'s key from its file. Their
+  fee comes from the operator's on-chain wallet: the bond's asset first, then
+  the fee assets, then the served assets.
+- `bond-notice` prints the `notice` line for `[bond]`. Until that line is
+  added, `info` reads the bond as `spent`.
+- `bond-withdraw` is refused by the node until the delay has run.
+
+Keep `W`'s file off the server, with a backup: it alone ends a bond.
+
 ### Listing the operator in the registry
 
 Wallets find an operator in the Sequentia registry
@@ -1235,7 +1308,14 @@ credited, its releases good again, and every forfeit naming the round
 followed by the nursery again, so the watcher publishes and claims them as
 for any final round. Nothing runs a third time for a participation whose
 first round stands; a participation a retired round ran that was never in the
-restored one runs again as after any lost round. A participation one of
+restored one runs again as after any lost round. A participation one of whose
+coins' salts holds another message the signer co-signed (a forfeit for the
+round that ran it again while this one was out, given before this round's
+forfeit came) is not brought back: the signer co-signs one message under a
+salt, ever, so its forfeit for this round can never be signed, its leaves of
+the round are never credited and their preimage never goes out, and the coin
+is its owner's on the chain, by its exit or that other forfeit's refund. A
+participation one of
 whose coins was spent on the chain otherwise than by its forfeit for the
 round is not brought back: that forfeit refunded while the round was out,
 the coin's last output on the chain (its board output, the leaf its
@@ -1264,7 +1344,13 @@ it can be made then. The participation is voided and its status says why
 (`void_reason`); its coins stay given up (the signer co-signs no spend under
 a salt it signed a forfeit under), so each is its owner's on the chain, by
 that forfeit's refund or by its exit, unless the round returns first and the
-watcher claims the forfeit. Any other re-run completes as an ordinary
+watcher claims the forfeit. Nor is a coin under whose salt the signer has
+co-signed anything, the lost round's forfeit included: the signer co-signs
+one message under a salt, ever, and a forfeit for the re-run would be a
+second, which burns the operator's bond ("The equivocation bond"). Such a
+participation is voided the same way, its coins their owners' on the chain by
+their exits unless the round returns. Any other re-run (its forfeits never
+made whole before the round was lost) completes as an ordinary
 participation: its forfeit for the new round is taken and checked, the
 preimage released against it, and the coin left like any forfeited coin (a
 board lineage to the board's dates, a batch leaf to its batch's expiry,
@@ -1806,14 +1892,16 @@ needs that owner's own signature over the message, so an entry under a key is
 always its holder's doing. The rule is kept per salt: `S`'s signature commits
 to the salt and not to the owner key, so a signature given for one leaf is
 valid on every coin of the same salt, asset and value. Under each salt it
-signs one spend, a message into anything but a forfeit output, or forfeits,
-one for each round's connector asset: a forfeit request names the forfeit's
-parts, and the signer rebuilds the forfeit output from them and checks it is
-the one output committed to. The same message again is signed again, so a
-request repeated after a signer outage completes; a spend when any entry
-under the salt carries another message, a forfeit after a spend, and a second
-forfeit for one round are refused (`already_signed`), whatever the database
-holds. The server refuses a second leaf under a salt it has seen, so two
+signs one message, ever: a spend (a message into anything but a forfeit
+output, or a fill of a resting order) or a forfeit. A forfeit request names
+the forfeit's parts, and the signer rebuilds the forfeit output from them and
+checks it is the one output committed to. The same message again is signed
+again, so a request repeated after a signer outage completes; any other
+message under a salt that has an entry is refused (`already_signed`),
+whatever the database holds: a second spend, a spend after a forfeit, a
+forfeit after a spend, and a second forfeit, for any round. Two messages
+under one salt are what burns the operator's bond ("The equivocation bond"),
+so the signer never makes them. The server refuses a second leaf under a salt it has seen, so two
 leaves share a salt only where its database has forgotten one; there the
 first to spend takes the salt and the other's holder is refused, and can
 exit, while a second signature, which would also spend the first coin, is
@@ -2645,67 +2733,70 @@ once and a transfer of it refused, a release refused, the round broadcast
 again by the server to a node restarted with an empty mempool, final again
 with its txid, the leaf credited again and paid on. Then a round that is lost, the
 operator's coin it spent taken by another transaction that becomes final and
-pays the operator back: the round is retired, its leaves lost, and its participations run
-again in a new round under new unlock hashes and operator nonces, as ordinary
-participations. The one whose preimage had gone out (giving up a leaf whose
-lowest node its owner had released) has its release retired, its old forfeit
-does not verify for the new round, and its new forfeit is taken and its new
-preimage released against it; no release is taken and no answer carries that
-preimage before. The release is void on the chain as well: the lost round's
-connector asset cannot be issued, and the node refuses the reclaim of the
-released node with the release and the new round's connector asset, or with
-none, so the node stays its owner's. The coins given up stay given up. A third,
-also released in the lost round, never hands over its forfeit for the new
-round: a day after that round is final it expires, and its coin, under a
-forfeit signed for the lost round, stays given up, its status saying so. Last,
-the owner of the first brings its old coin on the chain after its re-run
-completed (its node unrolled by its own authorisation, its entry unlocked):
-the watcher answers with its forfeit for the new round, never the lost
-round's, and claims it.
+pays the operator back: the round is retired and its leaves lost. The two
+participations whose forfeits for it the signer co-signed are never run
+again, void, their coins given up for good (a transfer of one refused), since
+the signer co-signs one message under a coin's salt, ever; one of them had
+its preimage out (giving up a leaf whose lowest node its owner had
+released), and its release is retired. The third, whose forfeit never came,
+runs again in a new round under a new unlock hash and operator nonce, as an
+ordinary participation, and completes. The release is void on the chain as
+well: the lost round's connector asset cannot be issued, and the node
+refuses the reclaim of the released node with the release and the new
+round's connector asset, or with none, so the node stays its owner's. Last,
+the owner of the first brings its old coin on the chain (its node unrolled by
+its own authorisation, its entry unlocked), and nothing answers it: its only
+forfeit names the lost round.
 
 `tests/rerun.rs` holds a lost round to its participations' coins. A board
 whose forfeit for the lost round the watcher published is never taken into
 its re-run: void, saying why, its coin not given back, the server's copy of
 that forfeit never broadcast again, no preimage for the re-run; the forfeit,
 sent by whoever saw it, confirms and is refunded by its owner once its delay
-has run, while the other participation of the round, whose forfeit was never
-published, completes in the next round with its preimage. A forfeit for the
-lost round the watcher logged and never got onto the chain is given up: not
-broadcast on a pass, once the node takes its fee asset again or after a
-restart; the log refuses another naming the round; an exit of a coin given up
-in it is answered with no forfeit, and that coin, its output spent, is never
-taken into its re-run. A sender's change on a board's lineage, and on a batch
+has run. A board whose forfeit the signer co-signed and nobody published is
+not run again either, its void saying that the signer co-signs one message
+under a salt, ever. A participation of the round whose forfeit never came
+completes in the next round with its preimage. A forfeit for the lost round
+the watcher logged and never got onto the chain is given up: not broadcast on
+a pass, once the node takes its fee asset again or after a restart; the log
+refuses another naming the round; an exit of a coin given up in it is
+answered with no forfeit, and that coin, its output spent, is never taken
+into its re-run. A sender's change on a board's lineage, and on a batch
 leaf's, stays live off the chain after the receiver's re-run completes,
 nothing of the lineage published, and the sender pays with it.
 
 `tests/rerun_returns.rs` brings a lost round back, every reorganisation driven
 through the parent chain: the round R goes out with its Bitcoin block, another
-transaction X takes its input, and its participations run again in Y; then
-the parent chain takes X out and R, sent again, confirms in its place, and
-every other transaction of the disconnected blocks is sent again after it,
-in its order, as a node puts them back in its mempool. Where Y
-spends an input of R that was still unspent, and where it spends X's output
-(R's only input taken), the node refuses Y once R is in the chain
-(`missing-inputs`), the server restores R and retires Y, A's participation is
-back in R, its leaf of R live and its leaf of Y lost (the first unroll of the
-one taken, of the other refused), and the watcher claims A's board with its
-forfeit for R. Where X pays the
-operator nothing and R had no other input, the participation is voided,
-saying so, and restored when R returns, its board claimed with its forfeit
-for R. A participant whose forfeit for R the watcher published while R was
-final, voided while R is out, is restored with R and its forfeit claimed with
-R's connector asset; one that refunded that forfeit while R was out keeps the
-refund, and its leaf of R is never credited, though its first unroll is
-valid. Where A's board's forfeit for Y was published and claimed before the
-reorganisation, that forfeit comes back with it and confirms beside R, Y's
-claim never can, A is left void with its leaf of R never credited (its first
-unroll valid, A's refund of Y's forfeit opening after its delay); and where A,
-voided while R was out, exited its board below X, the same. After each
-restore an ordinary round is built; and the same, with a round built after
-each, through four reorganisations both ways (R lost, R back, R lost again
-and run again in Z, Y back): the next round never issues from a coin whose
-token names a batch, and exactly one of A's leaves can reach the chain at
-every step.
+transaction X takes its input, and the participations whose forfeits for R
+never came run again in Y, while those whose forfeits the signer co-signed
+are void, the signer co-signing one message under a salt, ever. Then the
+parent chain takes X out and R, sent again, confirms in its place, and every
+other transaction of the disconnected blocks is sent again after it, in its
+order, as a node puts them back in its mempool. Where Y spends an input of R
+that was still unspent, and where it spends X's output (R's only input
+taken), the node refuses Y once R is in the chain (`missing-inputs`), the
+server restores R and retires Y: A, released in R, is back in R with its leaf
+live (its first unroll taken) and its board claimed with its forfeit for R;
+C, run again in Y, is left void, its forfeit for R never signable beside its
+forfeit for Y, its leaf of Y lost and its board its own. Where X pays the
+operator nothing and R had no other input, A is voided and restored when R
+returns, its board claimed with its forfeit for R, and a participant that
+gave no forfeit is voided, no coin of the operator's keeping a re-run apart,
+its coin given back. A participant whose forfeit for R the watcher published
+while R was final, voided while R is out, is restored with R and its forfeit
+claimed with R's connector asset; one that refunded that forfeit while R was
+out keeps the refund, and its leaf of R is never credited, though its first
+unroll is valid. Where A's board's forfeit for Y was published and claimed
+before the reorganisation, that forfeit comes back with it and confirms
+beside R, Y's claim never can, and A is left void with its leaf of R never
+credited and its preimage never out (A's refund of Y's forfeit opening after
+its delay); and where A, voided while R was out, exited its board below X,
+its leaf of R is never credited, its first unroll valid. After each restore
+an ordinary round is built; and the same, with a round built after each,
+through the reorganisations both ways (R lost and A run again in Y, R back,
+R lost again, Y back): the next round never issues from a coin whose token
+names a batch, and A's leaf of Y is the one credited while Y stands, none
+while R does.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards
@@ -2807,6 +2898,19 @@ deadline a coin is refused; and a participation accepted before the deadline
 whose coin passes its exit deadline with no round taking it is voided by the
 next pass over the rounds, no round built, its coin live again.
 
+`tests/bond.rs` posts and names the equivocation bond on the
+proof-of-stake chain: `info.bond` reads `unposted` with its terms, and the
+address `bond-address` prints is its script; `bond-post` refuses a treasury's,
+a reserve's, an escrow's and a faucet's wallet by name and pays the bond from
+an operating node wallet, its fee in the bond's own asset; named in `[bond]`
+it reads `bonded`, final, valued at the node's rate; `bond-notice` gives the
+notice from the operator's wallet's fee coin, which reads `spent` until the
+configuration names it and `noticed` after, with the median time from which
+it can be withdrawn; a second notice and a withdrawal before the delay are
+refused (`non-BIP68-final`); and a server with a notice one unit short of a
+lifetime, the longest exit delay and a day, or with the operator key as the
+withdrawal key, does not start.
+
 `tests/signer.rs` runs `arca-signer` as its own process: its key, a
 rebindable message, and the spend of a clock's release whose signature verifies
 over the signature hash the library builds; it refuses a raw digest, a stray
@@ -2816,9 +2920,9 @@ missing, and an input that spends no taproot output. Its record: a spend
 signed again when asked again and a second spend refused; another holder's
 leaf under the same salt refused another message once the first leaf spent
 under it, and signed the same message; an owner signature by another key,
-over another message or for another salt refused and not recorded; forfeits of one coin for two rounds
-signed and a second forfeit for one round refused; a spend after forfeits and
-a forfeit after a spend refused; forfeit parts that do not make the output
+over another message or for another salt refused and not recorded; a forfeit
+of one coin signed, and a second forfeit, for the same round or another,
+refused; a spend after a forfeit and a forfeit after a spend refused; forfeit parts that do not make the output
 refused and not recorded; the same refusals after a restart; a last line cut
 short dropped, and a line that does not read, or a record kept by salt alone,
 refusing the start. And the record's integrity: no start where there is no

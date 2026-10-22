@@ -106,6 +106,11 @@ pub struct App {
 	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
 	/// The signer's record head `info` last published, signed, and when.
 	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
+	/// The operator's equivocation bond, when the configuration names one.
+	pub bond: Option<crate::bond::Bond>,
+	/// Where `info` last read the bond to stand, and when: read from the
+	/// node at most once every [`BOND_FOR`].
+	pub bond_view: tokio::sync::Mutex<Option<(Instant, crate::bond::View)>>,
 	/// The keepers the signer's record names, as `info` publishes them: the
 	/// set the server pinned in its database, which the signer named at
 	/// start. Read from the signer again whenever `info` asks it for its
@@ -590,9 +595,55 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 	head.as_ref().map(record_head_json)
 }
 
+/// How long `info` keeps the bond's state it read from the node.
+pub const BOND_FOR: Duration = Duration::from_secs(10);
+
+/// The bond as `info` names it: read from the node at most once every
+/// [`BOND_FOR`]; `None` when the configuration names no bond.
+async fn bond_info(app: &App) -> Option<api::BondInfo> {
+	let bond = app.bond.as_ref()?;
+	let view = {
+		let mut cached = app.bond_view.lock().await;
+		match cached.as_ref() {
+			Some((at, v)) if at.elapsed() < BOND_FOR => v.clone(),
+			_ => {
+				let v = match crate::bond::view(app.cosigner.finality(), bond).await {
+					Ok(v) => v,
+					Err(e) => {
+						log::warn!("info: the bond: {}", e);
+						crate::bond::View { state: "missing", asset: None, value: None, final_: false, withdrawable_at: None,
+							why: format!("the node did not answer: {}", e) }
+					},
+				};
+				*cached = Some((Instant::now(), v.clone()));
+				v
+			},
+		}
+	};
+	let p = &bond.policy;
+	let rate = view.asset.and_then(|a| app.params.rates.view(&a, crate::rates::unix_now())).and_then(|r| r.rate);
+	Some(api::BondInfo {
+		state: view.state.into(),
+		outpoint: bond.outpoint.as_ref().map(crate::bond::outpoint_text),
+		asset: view.asset.map(|a| a.to_string()),
+		value: view.value.map(|v| v.to_string()),
+		reference_value: view.value.zip(rate).map(|(v, r)| crate::rates::value_of(v, r).to_string()),
+		operator: hex(&p.operator.serialize()),
+		withdraw_key: hex(&p.withdraw.serialize()),
+		notice_units: p.notice.units(),
+		script_pubkey: hex(p.script_pubkey().as_bytes()),
+		notice_script_pubkey: hex(p.notice_script_pubkey().as_bytes()),
+		notice: (view.state == "noticed").then(|| bond.notice.as_ref().map(crate::bond::outpoint_text)).flatten(),
+		withdrawable_at: view.withdrawable_at,
+		final_: view.final_,
+		why: view.why,
+	})
+}
+
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let floors = floors(&app).await;
 	let signer_record = record_head(&app).await;
+	let bond = bond_info(&app).await;
 	let p = &app.params;
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
@@ -679,6 +730,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			round_interval_seconds: app.params.round_interval_seconds,
 			shared: true,
 		},
+		bond,
 	})
 }
 

@@ -151,6 +151,7 @@ impl Running {
 			},
 			metrics_listen: None,
 			fills: Default::default(),
+			bond: None,
 			lightning: Default::default(),
 		};
 		tune(&mut config, x, y);

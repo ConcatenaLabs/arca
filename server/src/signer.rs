@@ -80,22 +80,22 @@
 //! board's or a checkpoint's, whose owner is its coin's). The rule, though, is
 //! kept per salt: `S`'s signature commits to the salt (`K` above) and not to
 //! the owner key, so a signature given for one leaf is valid on every coin of
-//! the same salt, asset and value. Under each salt it signs:
-//!
-//! - one **spend**: a message into anything but a forfeit output (a leaf
-//!   into its checkpoint, a checkpoint into its reassignment). A spend
-//!   message is refused (`already_signed`) when any entry under the salt,
-//!   whatever its owner, carries another message, whatever the database
-//!   says; the same message again is signed again, so a request repeated
-//!   after a signer outage completes;
-//! - or any number of **forfeits**, one for each round's connector asset `M`:
-//!   a leaf given up in a round, and again in a later round after the first
-//!   could never return. A forfeit is a rebind request that
-//!   names the forfeit's parts (`forfeit`), from which the signer rebuilds
-//!   the forfeit output and checks it is the one output committed to; it is
-//!   refused once the salt has a spend, and a second forfeit message for the
-//!   same `M` under the salt is refused. A spend is refused once the salt
-//!   has a forfeit.
+//! the same salt, asset and value. Under each salt it signs one message,
+//! ever: a **spend** (a leaf into its checkpoint, a checkpoint into its
+//! reassignment, a fill of a resting order), or a **forfeit** (a leaf given
+//! up in a round). A forfeit is a rebind request that names the forfeit's
+//! parts (`forfeit`), from which the signer rebuilds the forfeit output and
+//! checks it is the one output committed to, and its entry names the round's
+//! connector asset `M`. A message is refused (`already_signed`) when any
+//! entry under the salt, whatever its owner and kind, carries another
+//! message, whatever the database says: a second forfeit for a later round as
+//! much as a spend after a forfeit. The same message again is signed again,
+//! so a request repeated after a signer outage completes. Two messages `S`
+//! signed under one salt are what burns the operator's equivocation bond
+//! ([`arca_covenant::bond`]), so an honest signer never makes a second; a
+//! coin whose forfeit `S` signed for a round that could never return is not
+//! given up again in a later one, and its owner's way home is its exit
+//! ([`crate::rounds`]).
 //!
 //! Every rebind request names the leaf's owner key and carries the owner's
 //! own signature over the very message `S` is to sign (the checkpoint, the
@@ -1594,10 +1594,9 @@ impl SpendRecord {
 	/// disk, before this returns, and its entry is returned. The rule is the
 	/// salt's: `S`'s signature commits to the salt and not to the owner, so
 	/// what was signed for another leaf under the same salt counts here. The
-	/// same message again under the salt is the entry already recorded; a
-	/// spend is refused when any entry under the salt carries another
-	/// message; a forfeit when the salt has a spend, or a forfeit for the
-	/// same round with another message.
+	/// same message again under the salt is the entry already recorded; any
+	/// other message is refused when the salt has an entry, whatever its kind:
+	/// one message under a salt, ever.
 	pub fn admit(&mut self, owner: &[u8; 32], salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<Entry, String> {
 		use std::io::Write;
 		if let Some(why) = self.refusing() {
@@ -1608,16 +1607,11 @@ impl SpendRecord {
 			return Ok(*e);
 		}
 		for e in &had {
-			let clash = match (kind, e.kind) {
-				(Signed::Spend, _) => e.digest != *digest,
-				(Signed::Forfeit(_), Signed::Spend) => true,
-				(Signed::Forfeit(m), Signed::Forfeit(n)) => m == n && e.digest != *digest,
-			};
-			if clash {
+			if e.digest != *digest {
 				return Err(format!(
 					"{}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one \
-					 spend under a salt, or its forfeits, one for each round, since its signature commits to the salt and \
-					 not to the owner",
+					 message under a salt, ever, since its signature commits to the salt and not to the owner, and two \
+					 messages under one salt burn the operator's bond",
 					ALREADY_SIGNED, match e.kind { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(&e.digest),
 					hex(salt), e.n, hex(&e.owner),
 				));

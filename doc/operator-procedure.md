@@ -45,6 +45,38 @@ every command as written, with these choices:
   key is guarded as the operator key is: whoever holds it can make the
   keeper name a head it held before.
 
+## Posting the equivocation bond
+
+An operator that holds other people's coins posts a bond before it serves a
+payment out of round
+([The equivocation bond](../server/README.md#the-equivocation-bond)).
+
+- **Draw the withdrawal key on a machine of its own:**
+  `arcad bond-key <file>`. Put the key it prints in `[bond] withdraw_key`,
+  and keep the file and an offline backup off the server. It is the only key
+  that ends a bond. Never use the operator key for it: the server refuses to
+  start with one.
+- **Set `[bond] notice_units` to at least 5,232** (a coin's 28-day lifetime,
+  the 48-hour longest exit delay, and a day). The server refuses to start with
+  less.
+- **Choose the asset and the size.** Any asset may bond. Size it above the
+  most a holder keeps out of round: a double-sign must cost the operator more
+  than it could take.
+- **Post it from an operating wallet:**
+  `arcad <config> bond-post <node wallet> <asset> <atoms>`. Never use a
+  treasury, a reserve, a bridge's, an escrow or another service's wallet; the
+  command refuses one by its name. Add the `outpoint` line it prints to
+  `[bond]`, restart `arcad`, and check that `info.bond.state` reads `bonded`
+  and `final` reads `true`.
+- **To withdraw, give the notice first:** `arcad <config> bond-notice <key
+  file>`, then add the `notice` line it prints to `[bond]` and restart. The bond
+  can be withdrawn at `info.bond.withdrawable_at`:
+  `arcad <config> bond-withdraw <key file> <address>`.
+- **Never co-sign anything outside the signer.** The signer signs one message
+  under a coin's salt, ever. A second signature made any other way, with a
+  copy of the key or by a signer started on another record, burns the bond in
+  the hands of whoever holds both.
+
 ## What is never done
 
 The keepers rest on these rules, and no code can keep them for the
@@ -222,6 +254,7 @@ issuer sets it up so:
 ## What holders are told
 
 Every holder receives these rules before the operator holds their coins:
+
 
 - **Run a wallet built from the same revision of this repository as the
   operator's server.** An older wallet does not keep its coins alive by

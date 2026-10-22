@@ -281,14 +281,18 @@ and a board whose registration never reached the server, are not recovered.
   before its first expiry) it takes on the chain at once, whatever command
   started it, since the operator co-signs no spend of it any more. A board
   held as `lost` whose transaction the chain holds is followed again once the
-  server reports it credited. Every participation such a round ran, the
-  operator runs again, under the same keys and owner nonces, in a round that
-  cannot stand in the chain beside the lost one, and the wallet follows it as
-  any participation: it hands over its forfeit for the new round and takes its
-  new leaves. One the operator will never take (a coin of it whose forfeit for
-  the lost round the operator published, or whose output is spent on the
-  chain, or with no coin of the operator's to keep a re-run apart from the
-  lost round) is `void`, with the operator's reason shown. A lost round can
+  server reports it credited. A participation such a round ran whose forfeit
+  the wallet had not yet handed over, the operator runs again, under the same
+  keys and owner nonces, in a round that cannot stand in the chain beside the
+  lost one, and the wallet follows it as any participation: it hands over its
+  forfeit for the new round and takes its new leaves. One the operator will
+  never take is `void`, with the operator's reason shown: a coin of it whose
+  forfeit for the lost round the operator's signer co-signed (the signer
+  co-signs one message under a coin's salt, ever, since two burn the
+  operator's bond), or published, or whose output is spent on the chain, or
+  with no coin of the operator's to keep a re-run apart from the lost round.
+  A coin given up for good so, its forfeit not on the chain, the wallet takes
+  on the chain at once. A lost round can
   return with the parent chain, however deep: a participation follows
   whichever of its rounds is final in the chain, its leaves of that round
   live again and its leaves of the other `lost`, so the wallet holds one leaf
@@ -1615,20 +1619,19 @@ and holding it there, with the reason shown:
 - a preimage withheld and a participation called void after its forfeit, the
   preimage then read from the operator's claim on the chain;
 - a lost round, which refreshed two boards and a leaf of an
-  earlier round, both boards' forfeits published: the leaf's participation,
-  run again, is taken into the next round and the wallet takes its new leaf;
-  each board's is `void`, the operator's reason shown, the wallet waiting on
-  it no more; the board whose forfeit someone sent again is refunded after
+  earlier round, both boards' forfeits published: every participation is
+  `void`, each board's for its published forfeit and the leaf's because the
+  signer co-signed its forfeit, the operator's reason shown, the wallet
+  waiting on none of them, and the leaf taken on the chain at once; the board whose forfeit someone sent again is refunded after
   its delay, `exited` once the refund is final, and the other, its forfeit
   not on the chain, is exited at once (its conversion's fee paid with a coin
   of the wallet's it chooses) and claimed;
 - a lost round that returns: a leaf refreshed in round R, which goes out of
   the chain with its Bitcoin parent block while another transaction of the
-  operator's takes R's input; the participation run again in Y, which spends
-  that transaction's output, the wallet taking Y's leaf; then the parent
-  chain takes that transaction out and R confirms in its place: the node
-  refuses Y, and the wallet holds its leaf of R, live, and its leaf of Y
-  `lost`, one leaf for the coin it gave up;
+  operator's takes R's input; the participation, its forfeit for R co-signed,
+  is `void` and nothing runs again; then the parent chain takes that
+  transaction out and R confirms in its place, and the wallet holds its leaf
+  of R, live, one leaf for the coin it gave up;
 - a coin paid out of a lost round's leaf: B pays M out of its leaf of a round
   that is then lost; the server holds M's coin `lost` and voids B's re-run,
   saying B's leaf of the round was paid on; M's wallet shows the coin `lost`,

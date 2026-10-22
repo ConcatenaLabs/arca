@@ -11,9 +11,12 @@
 //!    coin stays given up. The server never broadcasts that forfeit again and
 //!    no preimage goes out for the re-run; the forfeit, as anyone who saw it
 //!    holds it, confirms, and its owner refunds it once its delay has run.
-//!    Another participation of the round, whose forfeit was never published,
-//!    runs again as an ordinary one: its forfeit for the new round taken and
-//!    its preimage released, and nothing of it goes on the chain.
+//!    A participation whose forfeit for the round the signer co-signed, and
+//!    never published, is not run again either: the signer co-signs one
+//!    message under a coin's salt, ever, since two burn the operator's bond.
+//!    Another participation of the round, which had not yet handed over its
+//!    forfeit, runs again as an ordinary one: its forfeit for the new round
+//!    taken and its preimage released, and nothing of it goes on the chain.
 //! 2. A forfeit for the lost round that the watcher logged and never got onto
 //!    the chain is given up: it is not broadcast on a pass, nor once the node
 //!    takes its fee asset again, nor after a restart; the log refuses another
@@ -22,7 +25,9 @@
 //!    its re-run.
 //! 3. The reviewer's D2 turned around: a sender's change on a board's lineage
 //!    stays live off the chain after the receiver's re-run completes, and the
-//!    sender pays with it.
+//!    sender pays with it. (The receiver's forfeit for the lost round was not
+//!    yet handed over: one the signer co-signed keeps the coin out of any
+//!    re-run.)
 //! 4. The same for a transfer made on a batch leaf.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
@@ -131,17 +136,20 @@ fn forfeit_of(l: &[WatcherTxRow], c: &Coin) -> Option<WatcherTxRow> {
 async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again() {
 	let mut r = start().await;
 	let x = r.x;
-	let (a, b) = (keypair("G1 A"), keypair("G1 B"));
+	let (a, b, c) = (keypair("G1 A"), keypair("G1 B"), keypair("G1 C"));
 	let (ha, ta) = credited_board(&mut r, &a, x).await;
 	let (hb, tb) = credited_board(&mut r, &b, x).await;
+	let (hc, tc) = credited_board(&mut r, &c, x).await;
 	let (ca, cb) = (Coin { held: ha, bases: vec![ta] }, Coin { held: hb, bases: vec![tb] });
-	let (a2, b2) = (keypair("G1 A2"), keypair("G1 B2"));
+	let cc = Coin { held: hc, bases: vec![tc] };
+	let (a2, b2, c2) = (keypair("G1 A2"), keypair("G1 B2"), keypair("G1 C2"));
 	let (pa, a2_nonce) = participate(&r, &ca, &a2);
 	let (pb, b2_nonce) = participate(&r, &cb, &b2);
+	let (pc, c2_nonce) = participate(&r, &cc, &c2);
 
 	// Round R, final. A hands over its forfeit, and the watcher publishes it
-	// from A's board output; B hands over its forfeit after that pass, and
-	// nothing of B's is published.
+	// from A's board output; C hands over its forfeit after that pass, and
+	// nothing of C's is published; B hands over nothing before R is lost.
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	let lost = built.tx.txid();
 	r.produce().await;
@@ -155,8 +163,8 @@ async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again(
 	let seen: Transaction = r.rt.client().raw_transaction(&fa_txid).unwrap();
 	assert!(seen.output.contains(&fa_r.output().txout()) && in_a_block(&r, &fa_txid));
 	println!("G1 the watcher published A's forfeit for R: {}, in a block", fa_txid);
-	let (_, done_b) = hand_over(&r, &pb, &cb, &b2, &b2_nonce);
-	assert_eq!(done_b["state"], "released");
+	let (_, done_c) = hand_over(&r, &pc, &cc, &c2, &c2_nonce);
+	assert_eq!(done_c["state"], "released");
 
 	lose(&mut r, &built.tx, |_| {}).await;
 
@@ -168,6 +176,14 @@ async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again(
 	assert!(why.contains(&fa_txid.to_string()) && why.contains("refund"), "{}", why);
 	assert_eq!(sa["inputs"][0]["returned"], false, "its forfeit for R may still confirm: the coin is not given back");
 	assert!(sa.get("forfeit_first").is_none());
+	// Nor is C's: S co-signed C's forfeit for R, and a forfeit for a re-run
+	// would be a second message under the coin's salt, which with the first
+	// burns the operator's bond. Its coin stays given up, C's on the chain.
+	let sc = wait_state(&r, &pc, "void").await;
+	println!("G1 C after R is lost: {} attempt {}: {}", sc["state"], sc["attempt"], sc["void_reason"]);
+	let why = sc["void_reason"].as_str().unwrap();
+	assert!(why.contains("one message under a salt, ever") && why.contains("its exit"), "{}", why);
+	assert_eq!(sc["inputs"][0]["returned"], false, "the coin's forfeit for R stands: it is not given back");
 	// B's runs again as an ordinary participation.
 	let sb = status(&r, &pb);
 	println!("G1 B after R is lost: {} attempt {}", sb["state"], sb["attempt"]);
@@ -193,7 +209,7 @@ async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again(
 
 	// Round Y takes B alone: its forfeit for Y taken, the preimage released.
 	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
-	assert_eq!(built_y.participations, 1, "A's re-run is not in Y");
+	assert_eq!(built_y.participations, 1, "neither A's re-run nor C's is in Y");
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &built_y.tx.txid()).await;
@@ -238,13 +254,17 @@ async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again(
 async fn a_lost_rounds_forfeit_is_never_published_again_by_any_path() {
 	let mut r = start().await;
 	let x = r.x;
-	let (a, b) = (keypair("G2 A"), keypair("G2 B"));
+	let (a, b, c) = (keypair("G2 A"), keypair("G2 B"), keypair("G2 C"));
 	let (ha, ta) = credited_board(&mut r, &a, x).await;
 	let (hb, tb) = credited_board(&mut r, &b, x).await;
+	let (hc, tc) = credited_board(&mut r, &c, x).await;
 	let (ca, cb) = (Coin { held: ha, bases: vec![ta] }, Coin { held: hb, bases: vec![tb] });
-	let (a2, b2) = (keypair("G2 A2"), keypair("G2 B2"));
+	let cc = Coin { held: hc, bases: vec![tc] };
+	let (a2, b2, c2) = (keypair("G2 A2"), keypair("G2 B2"), keypair("G2 C2"));
 	let (pa, a2_nonce) = participate(&r, &ca, &a2);
 	let (pb, b2_nonce) = participate(&r, &cb, &b2);
+	// C hands over nothing before R is lost.
+	let (pc, _) = participate(&r, &cc, &c2);
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	r.produce().await;
 	r.bury().await;
@@ -315,28 +335,35 @@ async fn a_lost_rounds_forfeit_is_never_published_again_by_any_path() {
 		other => panic!("B's forfeit for R logged: {:?}", other),
 	}
 
-	// B exits its board: no forfeit naming R answers it, and B's re-run,
+	// B's re-run is never taken: S co-signed B's forfeit for R, the one
+	// message under the coin's salt.
+	let sb = status(&r, &pb);
+	println!("G2 B after R is lost: {}: {}", sb["state"], sb["void_reason"]);
+	assert_eq!(sb["state"], "void");
+	assert!(sb["void_reason"].as_str().unwrap().contains("one message under a salt, ever"));
+	assert!(!node::in_mempool(&r.rt, &fb_tx.txid()) && !in_a_block(&r, &fb_tx.txid()));
+
+	// C exits its board: no forfeit naming R answers it, and C's re-run,
 	// its coin's output spent, is never taken.
-	assert_eq!(status(&r, &pb)["state"], "pending");
-	let (policy, at) = cb.valid(&r).board().unwrap();
+	assert_eq!(status(&r, &pc)["state"], "pending");
+	let (policy, at) = cc.valid(&r).board().unwrap();
 	let fee_coin = r.purse.take_coin(x);
 	let conv = policy.conversion(at, &FeeSource::Coin { outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 3_000, change: node::op_true() })
 		.unwrap();
-	let sig = sign_digest(&b, &conv.sighash(r.chain.genesis_hash()).unwrap(), &random32());
+	let sig = sign_digest(&c, &conv.sighash(r.chain.genesis_hash()).unwrap(), &random32());
 	let conv = conv.finish(vec![sig.as_ref().to_vec()]);
 	r.rt.client().send_raw_transaction(&conv.tx).unwrap();
 	r.produce().await;
 	r.bury().await;
 	passes(&r, 3).await;
 	let l = log(&r).await;
-	assert!(forfeit_of(&l, &cb).is_none(), "no forfeit answers B's exit: {:?}", l.iter().map(|w| (&w.kind, &w.detail)).collect::<Vec<_>>());
-	assert!(r.unspent(&OutPoint::new(conv.tx.txid(), 0)), "B's conversion stands, its leaf B's");
+	assert!(forfeit_of(&l, &cc).is_none(), "no forfeit answers C's exit: {:?}", l.iter().map(|w| (&w.kind, &w.detail)).collect::<Vec<_>>());
+	assert!(r.unspent(&OutPoint::new(conv.tx.txid(), 0)), "C's conversion stands, its leaf C's");
 	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "no participation to run");
-	let sb = status(&r, &pb);
-	println!("G2 B after its exit: {}: {}", sb["state"], sb["void_reason"]);
-	assert_eq!(sb["state"], "void");
-	assert!(sb["void_reason"].as_str().unwrap().contains("spent on the chain"));
-	assert!(!node::in_mempool(&r.rt, &fb_tx.txid()) && !in_a_block(&r, &fb_tx.txid()));
+	let sc = status(&r, &pc);
+	println!("G2 C after its exit: {}: {}", sc["state"], sc["void_reason"]);
+	assert_eq!(sc["state"], "void");
+	assert!(sc["void_reason"].as_str().unwrap().contains("spent on the chain"));
 	let _ = mtp(&r);
 }
 
@@ -361,10 +388,12 @@ async fn paid_from(r: &mut Running, from: &Coin, tag: &str) -> (Coin, Coin, Vec<
 	(cb, ca2, transfer)
 }
 
-/// B refreshes `cb` in round R, released; R is lost; B's re-run
-/// completes in round Y as an ordinary participation. Nothing of the
-/// lineage `subjects` name goes on the chain, and A pays with its change
-/// `ca2`, live off the chain.
+/// B refreshes `cb` in round R, and R is lost before B hands over its
+/// forfeit; B's re-run completes in round Y as an ordinary participation.
+/// Nothing of the lineage `subjects` name goes on the chain, and A pays with
+/// its change `ca2`, live off the chain. (A forfeit for R the signer had
+/// co-signed would keep the coin out of any re-run: one message under a
+/// salt, ever.)
 async fn rerun_then_pay_on(r: &mut Running, cb: &Coin, ca2: &Coin, subjects: &[Vec<u8>], tag: &str) {
 	let x = r.x;
 	let b2 = keypair(&format!("{} B, refreshed", tag));
@@ -373,8 +402,6 @@ async fn rerun_then_pay_on(r: &mut Running, cb: &Coin, ca2: &Coin, subjects: &[V
 	r.produce().await;
 	r.bury().await;
 	round_final(r, &built.tx.txid()).await;
-	let (_, done) = hand_over(r, &pb, cb, &b2, &b2_nonce);
-	assert_eq!(done["state"], "released");
 	passes(r, 3).await;
 	lose(r, &built.tx, |_| {}).await;
 	r.server.rounds.pass().await.unwrap();

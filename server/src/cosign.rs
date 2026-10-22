@@ -833,8 +833,8 @@ impl Cosigner {
 			crate::signer::Signed::Forfeit(_) => "the forfeit",
 		};
 		let refused = SignerError::AlreadySigned(format!(
-			"{}: coin {}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one spend \
-			 under a salt, or its forfeits, one for each round, so it signs nothing of this transfer",
+			"{}: coin {}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one message \
+			 under a salt, ever, so it signs nothing of this transfer",
 			crate::signer::ALREADY_SIGNED, leaf, what, crate::signer::hex(&e.digest), crate::signer::hex(&e.salt), e.n,
 			crate::signer::hex(&e.owner)));
 		if signed_part {

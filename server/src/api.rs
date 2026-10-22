@@ -73,6 +73,51 @@ pub struct Info {
 	pub lightning: LightningInfo,
 	/// How takes of on-chain orders are bounded (`take_order`).
 	pub fills: FillsInfo,
+	/// The operator's equivocation bond, as the server's node shows it now
+	/// ([`crate::bond`]); absent when the operator configures none. A wallet
+	/// checks it on its own node before it takes a payment out of round.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bond: Option<BondInfo>,
+}
+
+/// The operator's equivocation bond ([`crate::bond`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondInfo {
+	/// `unposted`, `missing`, `unconfirmed`, `bonded`, `noticed` or `spent`.
+	pub state: String,
+	/// The bond coin, `txid:vout`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outpoint: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub asset: Option<String>,
+	/// In the asset's atoms.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub value: Option<String>,
+	/// The value in atoms of the reference unit, at the operator's rate for
+	/// the asset; absent without one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reference_value: Option<String>,
+	/// The key it binds: the operator key `S`.
+	pub operator: String,
+	/// `W`, the only key that gives the notice and withdraws.
+	pub withdraw_key: String,
+	/// `D`, how long after the notice confirmed the bond can be withdrawn,
+	/// in 512-second units.
+	pub notice_units: u16,
+	pub script_pubkey: String,
+	pub notice_script_pubkey: String,
+	/// In notice: the notice output, `txid:vout`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notice: Option<String>,
+	/// In notice: the median time from which a withdrawal can confirm.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub withdrawable_at: Option<u64>,
+	/// Whether the coin that stands is final: certified, its anchor buried.
+	#[serde(rename = "final")]
+	pub final_: bool,
+	/// What the state rests on.
+	pub why: String,
 }
 
 /// How takes of on-chain orders are bounded.

@@ -162,8 +162,8 @@ fn owner_sig(owner: &Keypair, genesis: BlockHash, salt: &[u8; 32], asset: AssetI
 	sign_digest(owner, &m.digest, &[0; 32])
 }
 
-/// The one-spend record: one spend under a salt, or forfeits one per round,
-/// kept on disk across restarts, whatever asks; an entry names its leaf (its
+/// The one-spend record: one message under a salt, ever, a spend or a
+/// forfeit, kept on disk across restarts, whatever asks; an entry names its leaf (its
 /// owner key and its salt) and is always the owner's doing, but the rule is
 /// the salt's, since `S`'s signature commits to the salt and not to the
 /// owner: another leaf under the same salt is refused another message.
@@ -222,7 +222,8 @@ async fn the_signers_record() {
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A's signature for another salt: {}", e);
 
-	// Forfeits of A's leaf under salt 2: one per connector asset.
+	// A forfeit of A's leaf under salt 2, for one round: the one message
+	// under the salt, as a spend would be.
 	let forfeit = |m: u8, h: u8| ForfeitPolicy {
 		unlock_hash: [h; 32], owner: xonly(&a), operator: xonly(&s),
 		refund_delay: RelativeTime::from_units(338).unwrap(), leaf_id: LeafId([2; 32]), connector: AssetId::from_slice(&[m; 32]).unwrap(),
@@ -241,10 +242,14 @@ async fn the_signers_record() {
 	let e = give([2; 32], f1b, fout(&f1b)).await.unwrap_err();
 	println!("salt 2: a second forfeit for the same round: {}", e);
 	refused_twice(e);
-	give([2; 32], f2, fout(&f2)).await.unwrap();
-	println!("salt 2: a forfeit for another round's connector is signed");
+	// A forfeit for a later round, after the first could never return: a
+	// second message under the salt, which with the first would burn the
+	// operator's bond. Refused.
+	let e = give([2; 32], f2, fout(&f2)).await.unwrap_err();
+	println!("salt 2: a forfeit for another round's connector: {}", e);
+	refused_twice(e);
 	let e = spend(&a, [2; 32], out(9_000, 1)).await.unwrap_err();
-	println!("salt 2: a spend after its forfeits: {}", e);
+	println!("salt 2: a spend after its forfeit: {}", e);
 	refused_twice(e);
 	// Another owner's forfeit under salt 2 for a round already forfeited
 	// there, and its spend: refused, the rule being the salt's.
@@ -269,25 +274,26 @@ async fn the_signers_record() {
 	// The record outlives the process: after a restart, the same refusals.
 	let lines = std::fs::read_to_string(p.record()).unwrap();
 	println!("the record, {} line(s):\n{}", lines.lines().count(), lines.trim_end());
-	assert_eq!(lines.lines().count(), 1 + 4,
-		"the header, the one message under salt 1, two forfeits of salt 2, a spend of salt 3");
+	assert_eq!(lines.lines().count(), 1 + 3,
+		"the header, the one message under salt 1, the forfeit of salt 2, a spend of salt 3");
 	p.restart(&s, genesis);
 	refused_twice(spend(&a, [1; 32], out(9_000, 2)).await.unwrap_err());
 	refused_twice(spend(&b, [1; 32], out(9_000, 2)).await.unwrap_err());
 	spend(&b, [1; 32], out(9_000, 1)).await.unwrap();
 	refused_twice(give([2; 32], f1b, fout(&f1b)).await.unwrap_err());
+	refused_twice(give([2; 32], f2, fout(&f2)).await.unwrap_err());
 	spend(&a, [1; 32], out(9_000, 1)).await.unwrap();
-	println!("after a restart: the same second spends and second forfeit refused; the first spend signed again");
+	println!("after a restart: the same second spends and second forfeits refused; the first spend signed again");
 
 	// A last line cut short by a crash was never answered: it is dropped.
 	p.kill();
 	let mut f = std::fs::OpenOptions::new().append(true).open(p.record()).unwrap();
-	std::io::Write::write_all(&mut f, b"6 spend 0404").unwrap();
+	std::io::Write::write_all(&mut f, b"5 spend 0404").unwrap();
 	drop(f);
 	p.restart(&s, genesis);
 	spend(&a, [4; 32], out(9_000, 4)).await.unwrap();
 	let lines = std::fs::read_to_string(p.record()).unwrap();
-	assert_eq!(lines.lines().count(), 1 + 5, "the cut line dropped, the new one whole: {}", lines);
+	assert_eq!(lines.lines().count(), 1 + 4, "the cut line dropped, the new one whole: {}", lines);
 	// Any other line that does not read stops the signer from starting, and
 	// so does a record kept by salt alone, which has no header.
 	let start = |p: &SignerProcess| Command::new(env!("CARGO_BIN_EXE_arca-signer"))
