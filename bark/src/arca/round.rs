@@ -1226,7 +1226,7 @@ impl Wallet {
 	pub(crate) fn forfeit_of(&self, row: &super::store::CoinRow, f: &ForfeitRow) -> Result<Forfeit, Error> {
 		let record = Self::record_of(row)?;
 		let policy = self.followed_policy(row.expiry, self.now()?);
-		let coin = record.resolve(&self.accepted_bases(&record)?, &policy).map_err(|e| Error::Refused(e.to_string()))?;
+		let coin = self.resolve(&record, &self.accepted_bases(&record)?, &policy).map_err(|e| Error::Refused(e.to_string()))?;
 		let round = Txid::from_str(&f.round).map_err(|e| Error::Store(e.to_string()))?;
 		let refund = RelativeTime::from_units(f.refund_units).map_err(|e| Error::Store(e.to_string()))?;
 		Forfeit::new(coin.leaf, (coin.asset, coin.value), coin.id, unhex32(&f.unlock_hash)?, connector_asset(round, f.connector_vout), refund, f.margin)
@@ -1582,7 +1582,7 @@ impl Wallet {
 			for c in leaves.iter().filter(|c| c.state == "lost") {
 				let record = Self::record_of(c)?;
 				let Ok(bases) = self.accepted_bases(&record) else { continue };
-				let Ok(valid) = record.resolve(&bases, &self.followed_policy(c.expiry, now)) else { continue };
+				let Ok(valid) = self.resolve(&record, &bases, &self.followed_policy(c.expiry, now)) else { continue };
 				if self.cut_by_final_spend(&valid)? {
 					continue;
 				}
@@ -1613,7 +1613,7 @@ impl Wallet {
 		for c in self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "transfer") {
 			let record = Self::record_of(&c)?;
 			let Ok(bases) = self.accepted_bases(&record) else { continue };
-			let Ok(valid) = record.resolve(&bases, &self.followed_policy(c.expiry, now)) else { continue };
+			let Ok(valid) = self.resolve(&record, &bases, &self.followed_policy(c.expiry, now)) else { continue };
 			let mut fin = true;
 			for t in &bases {
 				fin &= self.chain.finality(&t.txid())?.is_final();

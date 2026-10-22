@@ -655,7 +655,7 @@ impl Wallet {
 		let record = Self::record_of(&c)?;
 		let now = self.now()?;
 		let Ok(bases) = self.accepted_bases(&record) else { return Ok(false) };
-		let Ok(valid) = record.resolve(&bases, &self.followed_policy(c.expiry, now)) else { return Ok(false) };
+		let Ok(valid) = self.resolve(&record, &bases, &self.followed_policy(c.expiry, now)) else { return Ok(false) };
 		if self.cut_by_final_spend(&valid)? {
 			return Ok(false);
 		}

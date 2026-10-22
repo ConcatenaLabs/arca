@@ -129,7 +129,19 @@ pub struct Wallet {
 	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
 	pub(crate) exit_watch: std::cell::RefCell<Option<u32>>,
 	pub(crate) exits_done: std::cell::RefCell<(Vec<Value>, Vec<Value>)>,
+	/// What [`CoinRecord::resolve`] answered, by the record, the transactions
+	/// it was resolved against and the policy ([`Wallet::resolve`]).
+	pub(crate) resolved: std::cell::RefCell<Resolved>,
 }
+
+/// The answers of [`CoinRecord::resolve`], a pure function of a record, the
+/// transactions it rests on and a policy: by a digest of the record and the
+/// transactions, then by the policy, which holds the median time the wallet
+/// takes as now.
+pub(crate) type Resolved = std::collections::HashMap<[u8; 32], Vec<(WalletPolicy, Result<ValidCoin, arca_covenant::TransferError>)>>;
+
+/// The most answers [`Wallet::resolve`] keeps: past it, it starts again.
+const RESOLVED_MAX: usize = 4096;
 
 /// How a client spells, in what the wallet says, its own commands and the
 /// prefixes of the texts the wallet hands out (a receive request, a swap
@@ -721,7 +733,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
-			exits_done: Default::default() })
+			exits_done: Default::default(), resolved: Default::default() })
 	}
 
 	/// The binding of the leaf whose key is `key` to the wallet's mailbox
@@ -2054,7 +2066,7 @@ impl Wallet {
 		let txs = self.base_txs(record)?;
 		let valid = match owner {
 			Some((k, n)) => record.validate(&txs, policy, k, n),
-			None => record.resolve(&txs, policy),
+			None => self.resolve(record, &txs, policy),
 		}.map_err(|e| Error::Refused(e.to_string()))?;
 		let mut bases = vec![];
 		for t in txs {
@@ -2109,6 +2121,38 @@ impl Wallet {
 			state: state.into(), note: note.into(), expiry: self.service_expiry(record, a)?,
 			bases: a.bases.iter().map(|(t, _)| t.txid().to_string()).collect(), spent_by: None,
 		})
+	}
+
+	/// [`CoinRecord::resolve`]: every check of `record` against `txs`, the
+	/// transactions it rests on, under `policy`. The answer depends on those
+	/// three alone, so the wallet keeps it and answers again from it when all
+	/// three are the same: the checks are those of a fresh resolve, and the
+	/// transactions are as the chain holds them when they are read
+	/// ([`super::chain`]).
+	pub(crate) fn resolve(&self, record: &CoinRecord, txs: &[Transaction], policy: &WalletPolicy)
+		-> Result<ValidCoin, arca_covenant::TransferError>
+	{
+		let Ok(bytes) = record.to_bytes() else { return record.resolve(txs, policy) };
+		let mut e = elements::hashes::sha256::Hash::engine();
+		use elements::hashes::HashEngine;
+		e.input(&(bytes.len() as u64).to_le_bytes());
+		e.input(&bytes);
+		for t in txs {
+			let raw = elements::encode::serialize(t);
+			e.input(&(raw.len() as u64).to_le_bytes());
+			e.input(&raw);
+		}
+		let key = elements::hashes::sha256::Hash::from_engine(e).to_byte_array();
+		if let Some(r) = self.resolved.borrow().get(&key).and_then(|l| l.iter().find(|(p, _)| p == policy)) {
+			return r.1.clone();
+		}
+		let r = record.resolve(txs, policy);
+		let mut kept = self.resolved.borrow_mut();
+		if kept.values().map(Vec::len).sum::<usize>() >= RESOLVED_MAX {
+			kept.clear();
+		}
+		kept.entry(key).or_default().push((*policy, r.clone()));
+		r
 	}
 
 	/// A held coin's record, decoded.
@@ -2259,7 +2303,7 @@ impl Wallet {
 			}
 			let record = Self::record_of(&c)?;
 			let Ok(txs) = self.accepted_bases(&record) else { continue };
-			let Ok(coin) = record.resolve(&txs, &policy) else { continue };
+			let Ok(coin) = self.resolve(&record, &txs, &policy) else { continue };
 			held.push((c, coin));
 		}
 		let mut outputs = vec![];
@@ -2315,7 +2359,7 @@ impl Wallet {
 			.map(|(t, f)| format!("{} is {}", t.txid(), f.word())).collect::<Vec<_>>().join("; ");
 		// The bases that are not the ones the wallet stored for the coin.
 		let replaced: Vec<String> = txs.iter().map(|t| t.txid().to_string()).filter(|t| !c.bases.contains(t)).collect();
-		let valid = match record.resolve(&txs, policy) {
+		let valid = match self.resolve(record, &txs, policy) {
 			Ok(v) => v,
 			Err(e) if bases.iter().all(|(_, f)| f.in_chain()) => {
 				return Ok(Checked::Fails(if replaced.is_empty() {

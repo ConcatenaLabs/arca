@@ -233,6 +233,11 @@ the node takes them (some fifty single calls for twenty coins where it does
 not). The checks themselves run as often as before. The command line reads
 the chain the same way, within the one command each of its processes runs.
 
+**What is computed once.** Checking a coin's record against the transactions
+it rests on is a pure function of the record, those transactions and the
+wallet's policy (which holds the chain's median time): the wallet keeps its
+answer for the same three, and works it out again when any of them differs.
+
 ## Building
 
 Needs the `wasm32-unknown-unknown` target, `wasm-pack`, and `protoc` (the
