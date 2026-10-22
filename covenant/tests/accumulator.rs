@@ -534,6 +534,82 @@ fn chained_exits_in_one_block_and_an_exit_reorganised_by_its_anchor() {
 	println!("exit 27 confirmed again under the new parent branch, the same transaction {}", id27);
 }
 
+/// Exits whose witnesses end with an annex (BIP341). The owner's
+/// authorisation commits to no annex, so whoever broadcasts or mines an exit
+/// can add one, and it is the same transaction, the same txid. The node
+/// relays an annex on a Simplicity leaf (up to its standard size), so the
+/// mempool takes these; a node that refuses them would leave them to a block
+/// producer (`generateblock`), which is tried then. The state read back
+/// from the chain is the state the plain exits leave: an annexed exit, a
+/// plain one from its rest, and an annexed last exit, which empties the
+/// batch.
+#[test]
+fn annexed_exits_are_read_as_the_plain_ones() {
+	const N: usize = 3;
+	let mut a = Arca::start();
+	let s = keypair("accumulator annex operator");
+	let (issuer, sched) = a.schedule(&s);
+	let owners: Vec<Keypair> = (0..N).map(|i| keypair(&format!("accumulator annex owner {}", i))).collect();
+	let preimages: Vec<[u8; 32]> = (0..N).map(|i| label32(&format!("accumulator annex preimage {}", i))).collect();
+	let specs: Vec<LeafSpec> = (0..N)
+		.map(|i| spec(&owners[i], &format!("accumulator annex leaf {}", i), VALUE, hash(&preimages[i])))
+		.collect();
+	let params = AccumulatorParams {
+		asset: a.net.x, chain: a.net.chain, schedule: sched.clone(), burn: false,
+		reserve: ReserveRule::FeeRate { floor_per_kvb: a.floor_per_kvb, multiple: 4 }, min_leaf: 1,
+	};
+	let acc = Accumulator::build(params, &specs).unwrap();
+	let (round, _) = round_tx(&a.net, &issuer, &[], &acc.batch_output(), &sched);
+	let id = a.net.pass("round: a 3-leaf accumulator batch", &round);
+	let policy = a.policy(&s);
+	let valid: Vec<ValidAccumulatorLeaf> = (0..N)
+		.map(|i| acc.record(i).validate(&round, &policy, &xonly(&owners[i]), &specs[i].owner_nonce).unwrap())
+		.collect();
+	let t = mt(a.net.mtp() - 1);
+	let auths: Vec<ExitAuth> = (0..N).map(|i| auth(valid[i].exit_digest(t), &owners[i], false, t)).collect();
+	let annex = vec![0x50, 0x0a, 0x11];
+	let (mut state, mut at, mut held) = (*acc.policy(), OutPoint::new(id, 0), acc.total());
+	let mut mined = vec![];
+	for i in 0..N {
+		let plain = valid[i].exit_tx(&state, at, held, &auths[i], &FeeSource::Reserve).unwrap().tx;
+		let last = i == N - 1;
+		let txid = if i == 1 {
+			a.net.pass("exit 2: slot 1 from the rest exit 1 left, plain", &plain)
+		} else {
+			let mut x = plain.clone();
+			x.input[0].witness.script_witness.push(annex.clone());
+			assert_eq!(x.txid(), plain.txid(), "the annex is witness data: the txid is the plain exit's");
+			let name = if last { "exit 3: the last slot, an annex on its witness" } else { "exit 1: slot 0, an annex on its witness" };
+			let r = a.net.rt.client().test_mempool_accept(&[&x]).unwrap().remove(0);
+			println!("{}: testmempoolaccept {}", name, if r.allowed { "accepts it".to_string() } else { format!("{:?}", r.reject_reason) });
+			a.net.pass_or_mine(name, &x, "bad-witness-nonstandard")
+		};
+		let tx = a.net.rt.client().raw_transaction(&txid).unwrap();
+		let w = &tx.input[0].witness.script_witness;
+		println!("exit {} on the chain: {} witness items{}", i + 1, w.len(),
+			if w.len() == 5 { format!(", the last {}", hex(&w[4])) } else { String::new() });
+		let seen = read_exit(w);
+		println!("  read_exit: {:?}", seen.map(|e| (e.slot, e.last)));
+		let so_far: Vec<(&Transaction, usize)> = mined.iter().chain(std::iter::once(&tx)).map(|t| (t, 0)).collect();
+		println!("  follow from the round through exit {}: {:?}", i + 1, follow(acc.policy(), &so_far).map(|s| s.map(|s| s.bitmap.count())));
+		let seen = seen.unwrap_or_else(|| panic!("exit {} is not read as an exit", i + 1));
+		assert_eq!(Some(seen), read_exit(&plain.input[0].witness.script_witness), "the same as the plain exit's");
+		assert_eq!((seen.slot as usize, seen.last, seen.bitmap), (valid[i].exit.slot as usize, last, state.bitmap));
+		state = state.after(valid[i].exit.slot);
+		if !last {
+			at = OutPoint::new(txid, 1);
+			held = tx.output[1].value.explicit().unwrap();
+		}
+		mined.push(tx);
+	}
+	let exits: Vec<(&Transaction, usize)> = mined.iter().map(|x| (x, 0)).collect();
+	let after_two = follow(acc.policy(), &exits[..2]);
+	println!("follow over exits 1 and 2: {:?}", after_two.as_ref().map(|s| s.map(|s| s.bitmap.count())));
+	assert_eq!(after_two.unwrap(), Some(acc.policy().after(valid[0].exit.slot).after(valid[1].exit.slot)));
+	assert_eq!(follow(acc.policy(), &exits).unwrap(), None, "the annexed last exit empties the batch");
+	a.net.print();
+}
+
 fn hex(b: &[u8]) -> String {
 	b.iter().map(|x| format!("{:02x}", x)).collect()
 }
