@@ -21,7 +21,8 @@
 //! Beside them: the swap with both legs, mined; what `vtxo-2` still allows,
 //! a coin funded twice spent alone a second time into the same outputs; the
 //! operator alone, the two signatures swapped, a pair under another salt and
-//! a `vtxo-1` pair under the same `K`, refused; the exit, refused before its
+//! a `vtxo-1` pair under the same `K`, and an annex (which a block takes on a
+//! co-signed `vtxo-1` spend), refused; the exit, refused before its
 //! delay and mined after it at `vtxo-1`'s size; and the equivocation bond
 //! burned in a block with a `vtxo-2` co-signature read from the chain beside
 //! a second one under the same salt.
@@ -255,6 +256,22 @@ fn the_bindings_vtxo_2_adds_refuse_what_vtxo_1_allowed() {
 	net.refuse("vtxo-2: a vtxo-1 pair under the same K", &spend_with(&net, Pair { operator: sig(&s, &vd), owner: sig(&a, &vd) }),
 		"Assertion failed inside jet");
 	let collab = spend_with(&net, Pair { operator: sig(&s, &d), owner: sig(&a, &d) });
+	// An annex, which neither path's signed message covers: whoever holds a
+	// co-signed vtxo-1 spend can attach one that a block takes (relay refuses
+	// it on a tapscript leaf); arca/collab-2 refuses any.
+	let annex = [vec![0x50u8], vec![0xab; 999]].concat();
+	let mut annexed = collab.clone();
+	annexed.input[0].witness.script_witness.push(annex.clone());
+	net.refuse("vtxo-2: the honest pair with a 1,000-byte annex attached", &annexed, "(Assertion failed)");
+	{
+		let l1 = leaf(&net, &a, &s, "annex vtxo-1", false);
+		let c1 = net.fund(vec![explicit(x, V, l1.script_pubkey())]).remove(0);
+		let p1 = pair(&l1, &a, &s, 0, &[c1.txout.clone()], &outs);
+		let mut w = l1.witness_in(&p1, 1, 1);
+		w.push(annex.clone());
+		let t = tx(&net, &[(&c1, w)], vec![outs[0].txout()]);
+		net.mine_policy_refused("vtxo-1, mined by a block: the co-signed spend with a 1,000-byte annex attached", &t, "");
+	}
 	let spent_at = net.pass("vtxo-2: the honest pair", &collab);
 
 	// ---- the bond burns on a vtxo-2 double-sign ----------------------------
