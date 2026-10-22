@@ -140,7 +140,7 @@ async fn participation_accepted_and_refused() {
 	let mut t = participation_body(&[&b_coin], std::slice::from_ref(&want_b2), &[(x, fee)], None, s, chain).0;
 	t["outputs"][0]["leaf"]["template"] = json!("board-1");
 	refused(r.http.post("submit_participation", &t), 422, "template");
-	t["outputs"][0]["leaf"]["template"] = json!("vtxo-2");
+	t["outputs"][0]["leaf"]["template"] = json!("vtxo-3");
 	refused(r.http.post("submit_participation", &t), 422, "template");
 
 	// Outside the bounds: an exit delay, an asset not served, a leaf too small,

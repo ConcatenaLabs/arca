@@ -714,7 +714,7 @@ impl Participations {
 			match o {
 				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, channel, .. } => {
 					match (template, order, landing, channel) {
-						(Template::Vtxo1, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+						(Template::Vtxo1 | Template::Vtxo2, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
 						(Template::Order3, Some(o), None, None) if o.template() == Template::Order3 =>
 							self.check_order_terms(j, o, *asset, owner, now).await?,
 						// order-2's fill takes an annex nobody signs, so a relay

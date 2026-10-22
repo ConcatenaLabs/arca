@@ -72,7 +72,7 @@ use elements::{AssetId, Transaction};
 
 use arca_covenant::order::OrderPolicy;
 use arca_covenant::sign::verify_digest;
-use arca_covenant::spend::margin_for;
+use arca_covenant::spend::{margin_for, Rebindable};
 use arca_covenant::transfer::{fill_hash, FillCoin, FillLeaf, OrderFill, SeenReassignments, TransferInput, MAX_INPUTS};
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, Pair, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
@@ -675,10 +675,15 @@ impl Orders {
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
+		// The fill spends the order's coin at input 0 and the checkpoints
+		// after it: a vtxo-2 checkpoint's pair names them all, its own index
+		// one past its place among the checkpoints (`fill_tx`).
+		let mut named = vec![oc.coin.output().txout()];
+		named.extend((0..n).map(|j| tplan.checkpoint_output(j).txout()));
 		let mut messages = Vec::with_capacity(n);
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp = tplan.checkpoint_message(k).map_err(internal)?.digest;
-			let re = tplan.reassignment_message(k).map_err(internal)?.digest;
+			let re = tplan.checkpoint(k).message_in(k as u32 + 1, &named, &outputs).map_err(internal)?.digest;
 			if !verify_digest(&i.checkpoint_sig, &cp, &c.coin.leaf.owner) {
 				return Err(OrderError::Cosign(CosignError::BadSignature { input: k, which: "checkpoint" }));
 			}
@@ -814,11 +819,18 @@ impl Orders {
 			let cp_out = tplan.checkpoint_output(k);
 			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
 				c.coin.asset, c.coin.value,
-				std::slice::from_ref(&cp_out)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
+			// A vtxo-2 checkpoint's pair names the fill's inputs: the order's
+			// coin at 0, then every taker checkpoint.
+			let named = checkpoint.v2.then(|| {
+				let mut ins = vec![oc.coin.output()];
+				ins.extend((0..n).map(|j| tplan.checkpoint_output(j)));
+				crate::signer::WireNamed::new(k as u32 + 1, &ins)
+			});
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
-				i.checkpoint_value, &outputs).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
+				i.checkpoint_value, &outputs, named).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(internal("the signer signed another message than the server built"));

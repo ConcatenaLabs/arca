@@ -976,7 +976,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig, named } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -1008,6 +1008,22 @@ async fn answer(state: &State, line: &str) -> Response {
 					Some(l) => Some(<[u8; 20]>::try_from(unhex(l)?.as_slice()).map_err(|_| "landing: 20 bytes".to_string())?),
 					None => None,
 				};
+				// A vtxo-2 coin: the inputs its message names, the coin's own
+				// at its index, of the asset and value it spends.
+				let named = match &named {
+					Some(n) => {
+						if landing.is_some() {
+							return Err("a vtxo-2 coin has no landing".into());
+						}
+						let inputs = n.inputs.iter().map(|o| o.to_output().map(|o| o.txout())).collect::<Result<Vec<_>, _>>()?;
+						match inputs.get(n.index as usize) {
+							Some(o) if o.asset.explicit() == Some(asset_in) && o.value.explicit() == Some(value_in) => {},
+							_ => return Err(format!("named input {} is not the coin spent, {} of {}", n.index, value_in, asset_in)),
+						}
+						Some((n.index, inputs))
+					},
+					None => None,
+				};
 				let enclave = match &enclave {
 					Some(h) => Some(XOnlyPublicKey::from_slice(&unhex(h)?).map_err(|e| format!("enclave: {}", e))?),
 					None => None,
@@ -1031,9 +1047,15 @@ async fn answer(state: &State, line: &str) -> Response {
 					(Some(holder), Some((policy, clawback))) => Some(arca_covenant::Enclave { holder, policy, clawback }),
 					_ => None,
 				};
-				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig))
+				// A vtxo-2 coin is of an open asset: a restricted asset's coins
+				// are enclave-1 leaves and their checkpoints, under vtxo-1's path.
+				if named.is_some() && restricted.is_some() {
+					return Err(format!("{}: asset {} is restricted: its coins are enclave-1, never vtxo-2", server::restricted::RESTRICTED,
+						asset_in));
+				}
+				Ok((owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig, named))
 			})();
-			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig) = match parsed {
+			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig, named) = match parsed {
 				Ok(p) => p,
 				Err(e) => return Response { error: Some(e), ..none },
 			};
@@ -1057,7 +1079,15 @@ async fn answer(state: &State, line: &str) -> Response {
 				(None, Some(e)) => chain.enclave_prefix(&salt, &e.digest()),
 				(None, None) => chain.leaf_constant(&salt).to_vec(),
 			};
-			let message = match rebind_message(&k, asset_in, value_in, &outputs) {
+			let built = match &named {
+				Some((index, inputs)) => {
+					let c = arca_covenant::collab::Collab2 { owner, operator: key.x_only_public_key().0, salt, chain: *chain };
+					let txouts: Vec<elements::TxOut> = outputs.iter().map(|o| o.txout()).collect();
+					c.message(*index, inputs, &txouts)
+				},
+				None => rebind_message(&k, asset_in, value_in, &outputs),
+			};
+			let message = match built {
 				Ok(m) => m,
 				Err(e) => return Response { error: Some(e.to_string()), ..none },
 			};
