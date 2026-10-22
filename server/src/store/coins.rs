@@ -360,6 +360,13 @@ impl Store {
 		rows.iter().map(leaf_row).collect()
 	}
 
+	/// The salt of the leaf `leaf_id`, if the server holds the leaf.
+	pub async fn salt_of_leaf(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let row = conn.query_opt("SELECT salt FROM leaf_salt WHERE leaf_id = $1", &[&&leaf_id[..]]).await?;
+		row.map(|r| array32(r.get(0), "salt")).transpose()
+	}
+
 	/// Which of `salts` the server has seen, on a leaf or promised to one.
 	pub async fn known_salts(&self, salts: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;

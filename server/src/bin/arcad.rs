@@ -3,6 +3,11 @@
 //!     arcad <config.toml>
 //!     arcad <config.toml> address
 //!     arcad <config.toml> expired-salts
+//!     arcad bond-key <file>
+//!     arcad <config.toml> bond-address
+//!     arcad <config.toml> bond-post <node wallet> <asset> <atoms> [<fee asset>]
+//!     arcad <config.toml> bond-notice <withdrawal key file>
+//!     arcad <config.toml> bond-withdraw <withdrawal key file> <address>
 //!
 //! The configuration is `server::server::Config`; `server/arcad.example.toml`
 //! shows every setting. The operator key lives in `arca-signer`, which must be
@@ -19,6 +24,20 @@
 //! `arca-signer --compact-into … --drop-salts` drops. It needs the database
 //! alone.
 //!
+//! The `bond-` commands work the operator's equivocation bond
+//! (`server::bond`, the `[bond]` section; the server's README, "The
+//! equivocation bond"), each printing JSON. `bond-key` draws the withdrawal
+//! key `W` into a new file only its owner can read and prints its public key,
+//! which `[bond] withdraw_key` names. `bond-address` prints the bond's
+//! address and terms; it needs the node and the signer, for `S`. `bond-post`
+//! pays the bond from a node wallet the operator names, never a treasury's, a
+//! reserve's, a bridge's, an escrow's or another service's, and prints the
+//! `outpoint` line for `[bond]`. `bond-notice` gives the notice and prints the
+//! `notice` line; `bond-withdraw` takes the bond to an address once the
+//! notice's delay has run. Those two sign with `W`'s key from its file and
+//! pay their fee from the operator's on-chain wallet; they need the
+//! database, the mnemonic file, the node and the signer.
+//!
 //! Running, it reads its configuration again on SIGHUP and takes the assets
 //! it serves, with their smallest leaves and rate sources, and the assets a
 //! round's fee is paid in, without a restart
@@ -27,15 +46,44 @@
 //! served now, is refused whole and the server runs on as it was; any other
 //! setting that changed takes a restart, and the log says which.
 
-use server::server::{expired_salts, receive_address, Config, Server};
+use std::str::FromStr;
+
+use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, expired_salts, receive_address, Config, Server};
+
+const USAGE: &str = "usage: arcad <config.toml> [address | expired-salts | bond-address | bond-post <node wallet> <asset> <atoms> \
+	[<fee asset>] | bond-notice <key file> | bond-withdraw <key file> <address>], or arcad bond-key <file>";
+
+/// Prints `r` as JSON, or the error, and exits.
+fn done(r: Result<serde_json::Value, String>) -> ! {
+	match r {
+		Ok(v) => {
+			println!("{}", v);
+			std::process::exit(0);
+		},
+		Err(e) => {
+			eprintln!("arcad: {}", e);
+			std::process::exit(1);
+		},
+	}
+}
 
 #[tokio::main]
 async fn main() {
 	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+	let args: Vec<String> = std::env::args().collect();
+	if args.get(1).map(String::as_str) == Some("bond-key") {
+		match args.get(2) {
+			Some(f) => done(server::bond::new_key(std::path::Path::new(f)).map(|k| serde_json::json!({"withdraw_key": k.to_string(), "file": f}))),
+			None => {
+				eprintln!("{}", USAGE);
+				std::process::exit(2);
+			},
+		}
+	}
 	let path = match std::env::args().nth(1) {
 		Some(p) => p,
 		None => {
-			eprintln!("usage: arcad <config.toml> [address | expired-salts]");
+			eprintln!("{}", USAGE);
 			std::process::exit(2);
 		},
 	};
@@ -78,8 +126,39 @@ async fn main() {
 				std::process::exit(1);
 			},
 		},
+		Some("bond-address") => done(bond_address(&config).await.map_err(|e| e.to_string())),
+		Some("bond-post") => {
+			let (Some(wallet), Some(asset), Some(atoms)) = (args.get(3), args.get(4), args.get(5)) else {
+				eprintln!("{}", USAGE);
+				std::process::exit(2);
+			};
+			let parsed = (|| -> Result<_, String> {
+				let asset = elements::AssetId::from_str(asset).map_err(|e| format!("asset {:?}: {}", asset, e))?;
+				let atoms: u64 = atoms.parse().map_err(|e| format!("atoms {:?}: {}", atoms, e))?;
+				let fee = args.get(6).map(|f| elements::AssetId::from_str(f).map_err(|e| format!("fee asset {:?}: {}", f, e))).transpose()?;
+				Ok((asset, atoms, fee))
+			})();
+			match parsed {
+				Ok((asset, atoms, fee)) => done(bond_post(&config, wallet, asset, atoms, fee).await.map_err(|e| e.to_string())),
+				Err(e) => done(Err(e)),
+			}
+		},
+		Some("bond-notice") => match args.get(3) {
+			Some(k) => done(bond_notice(&config, std::path::Path::new(k)).await.map_err(|e| e.to_string())),
+			None => {
+				eprintln!("{}", USAGE);
+				std::process::exit(2);
+			},
+		},
+		Some("bond-withdraw") => match (args.get(3), args.get(4)) {
+			(Some(k), Some(to)) => done(bond_withdraw(&config, std::path::Path::new(k), to).await.map_err(|e| e.to_string())),
+			_ => {
+				eprintln!("{}", USAGE);
+				std::process::exit(2);
+			},
+		},
 		Some(other) => {
-			eprintln!("arcad: unknown command {:?}; usage: arcad <config.toml> [address | expired-salts]", other);
+			eprintln!("arcad: unknown command {:?}; {}", other, USAGE);
 			std::process::exit(2);
 		},
 	}

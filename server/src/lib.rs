@@ -20,6 +20,7 @@
 pub mod api;
 pub mod auth;
 pub mod boards;
+pub mod bond;
 pub mod chain;
 pub mod coins;
 pub mod cosign;

@@ -103,6 +103,12 @@
 //! releases and its forfeits for the round good again), and each round that
 //! ran them again, which can now never confirm beside it, is retired with it;
 //! nothing runs a third time for a participation whose first round stands.
+//! A participation one of whose coins' salts holds another message the
+//! signer co-signed (a forfeit for the round that ran it again, given before
+//! its forfeit for this one came) is not brought back: the signer co-signs
+//! one message under a salt, ever, so its forfeit for this round can never be
+//! signed; its leaves of the round are never credited and their preimage
+//! never goes out, and the coin is its owner's on the chain.
 //! A participation one of whose coins was spent on the chain otherwise than
 //! by its forfeit for the round (that forfeit refunded while the round was
 //! out, the coin exited by its owner, or taken by another round's forfeit
@@ -123,8 +129,14 @@
 //! lost round's coins in the watcher's log is given up by the nursery while
 //! the round is out, and the log refuses a new one naming it, so the server
 //! publishes no forfeit naming a lost round, by any path, a restart
-//! included. Any other re-run completes as an ordinary participation: its
-//! forfeit for the new round is taken and checked, the preimage released
+//! included. Nor is a coin under whose salt the signer has co-signed a
+//! message, the lost round's forfeit among them: the signer co-signs one
+//! message under a salt, ever, since two burn the operator's bond, so such a
+//! participation is voided and its coins are their owners' on the chain, by
+//! their exits, unless the round returns. Any other re-run (one whose forfeits
+//! the signer never co-signed: the round lost before they were whole)
+//! completes as an ordinary participation: its forfeit for the new round is
+//! taken and checked, the preimage released
 //! against it, and the coin left like any forfeited coin (a board lineage to
 //! the board's dates, a batch leaf to its batch's expiry, either answered at
 //! once if its owner exits). Nothing goes on the chain for a re-run that an
@@ -2312,10 +2324,17 @@ impl Rounds {
 			}
 			retire.push(y);
 		}
-		// A participation one of whose coins was spent on the chain otherwise
-		// than by its forfeit for the round is its owner's again: its leaves
-		// of the round are never credited.
-		let uncredited = self.spent_otherwise(r.round_id).await?;
+		// A participation one of whose coins' salts holds another message the
+		// signer co-signed (a re-run's forfeit) can never be given its
+		// forfeit for this round; one whose coin was spent on the chain
+		// otherwise than by its forfeit for the round is its owner's again.
+		// The leaves of the round of either are never credited.
+		let mut uncredited = self.cosigned_elsewhere(r).await?;
+		for (p, why) in self.spent_otherwise(r.round_id).await? {
+			if !uncredited.iter().any(|(q, _)| *q == p) {
+				uncredited.push((p, why));
+			}
+		}
 		let now = self.now().await?.to_consensus_u32();
 		let Some(done) = self.store.restore_round(r.round_id, &retire, now, &uncredited).await? else { return Ok(()) };
 		for y in &done.retired {
@@ -2349,6 +2368,36 @@ impl Rounds {
 	/// round's forfeit that came back with the reorganisation). Their leaves
 	/// of the round are never credited: their owners hold the records, so the
 	/// leaves are theirs to take on the chain, and the loss is the operator's.
+	/// The participations of round `r`, final in the chain again, one of
+	/// whose coins' salts holds a message the signer co-signed other than
+	/// its forfeit for `r` (a forfeit for a round that ran it again while `r`
+	/// was out), each with why it is not brought back. The signer co-signs
+	/// one message under a salt, ever, so that coin's forfeit for `r` can
+	/// never be signed: the participation's new leaves of `r` are never
+	/// credited and no preimage of them goes out, and the coin is its owner's
+	/// on the chain, by its exit or by that other forfeit's refund.
+	async fn cosigned_elsewhere(&self, r: &RoundRow) -> Result<Vec<([u8; 32], String)>, RoundError> {
+		let m = arca_covenant::connector_asset(Txid::from_byte_array(r.txid), r.connector_vout).into_inner().to_byte_array();
+		let mut out = vec![];
+		'participation: for (pid, _) in self.store.earlier_in(r.round_id).await? {
+			let Some(p) = self.store.participation(&pid).await? else { continue };
+			for i in &p.inputs {
+				let Some(salt) = self.store.salt_of_leaf(&i.leaf_id).await? else { continue };
+				let held = self.signer.under(&salt).await.map_err(|e| RoundError::Internal(format!("the signer's record: {}", e)))?;
+				if let Some(e) = held.iter().find(|e| !matches!(e.kind, crate::signer::Signed::Forfeit(c) if c == m)) {
+					out.push((pid, format!("coin {} it gave up is under {} {} the signer co-signed (entry {}) while round {} was out of the \
+						chain, and the signer co-signs one message under a salt, ever: its forfeit for round {} can never be signed, so its \
+						new leaves of the round are never credited and their preimage never goes out; the coin is its owner's on the chain, \
+						by its exit or by that forfeit's refund", LeafId(i.leaf_id),
+						match e.kind { crate::signer::Signed::Spend => "a spend", crate::signer::Signed::Forfeit(_) => "a forfeit" },
+						crate::signer::hex(&e.digest), e.n, r.round_id, r.round_id)));
+					continue 'participation;
+				}
+			}
+		}
+		Ok(out)
+	}
+
 	async fn spent_otherwise(&self, round_id: i64) -> Result<Vec<([u8; 32], String)>, RoundError> {
 		let chain = |e: crate::chain::ChainError| RoundError::Chain(e.to_string());
 		let forfeits = self.store.forfeits_naming(round_id).await?;
@@ -2485,6 +2534,20 @@ impl Rounds {
 			}
 			if let Some(at) = self.spent_on_chain(&i.leaf_id).await? {
 				return Ok(Some(format!("coin {}'s output {} is spent on the chain: the coin is not taken into a round again", id, at)));
+			}
+			// S signs one message under a salt, ever: a forfeit it signed for
+			// a round that went out of the chain is that message, and a
+			// forfeit for this re-run would be a second, which burns the
+			// operator's bond whoever holds the two.
+			if let Some(salt) = self.store.salt_of_leaf(&i.leaf_id).await? {
+				let held = self.signer.under(&salt).await.map_err(|e| RoundError::Internal(format!("the signer's record: {}", e)))?;
+				if let Some(e) = held.first() {
+					return Ok(Some(format!("coin {}: the operator's signer has co-signed {} {} under its salt (entry {}), and co-signs \
+						one message under a salt, ever: the coin is not given up again in a re-run; its owner's way home is its exit, \
+						and if the round returns the participation is restored as it stood in it", id,
+						match e.kind { crate::signer::Signed::Spend => "a spend", crate::signer::Signed::Forfeit(_) => "a forfeit" },
+						crate::signer::hex(&e.digest), e.n)));
+				}
 			}
 		}
 		Ok(None)

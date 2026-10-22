@@ -98,6 +98,9 @@ pub struct Config {
 	/// How takes of on-chain orders are bounded; the defaults when absent.
 	#[serde(default)]
 	pub fills: FillsSection,
+	/// The operator's equivocation bond ([`crate::bond`]); none when absent.
+	#[serde(default)]
+	pub bond: Option<crate::bond::BondSection>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -740,6 +743,235 @@ pub async fn receive_address(config: &Config) -> Result<(u32, elements::Script, 
 	Ok((index, script, address.to_string()))
 }
 
+/// The bond the configuration names, for the operator key the signer holds,
+/// on the node's chain: what the bond commands work on.
+async fn configured_bond(config: &Config) -> Result<(crate::bond::Bond, Client), StartError> {
+	let section = config.bond.as_ref().ok_or_else(|| StartError("the configuration has no [bond] section".into()))?;
+	let client = node_client(config)?;
+	let c = client.clone();
+	let genesis = tokio::task::spawn_blocking(move || c.genesis_hash()).await.map_err(err("the node"))?.map_err(err("the node"))?;
+	let operator = SignerClient::new(&config.signer_socket).pubkey().await.map_err(err("the signer"))?;
+	let max_exit = match config.exit_delay_units {
+		Some((_, max)) => RelativeTime::from_units(max).map_err(err("exit_delay_units"))?,
+		None => Params::new(Chain::new(genesis), operator, BTreeMap::new()).max_exit_delay,
+	};
+	let bond = crate::bond::Bond::from_section(section, Chain::new(genesis), operator,
+		RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME), max_exit).map_err(|e| StartError(format!("bond: {}", e)))?;
+	Ok((bond, client))
+}
+
+/// The address the node writes for `script` (unblinded).
+async fn address_of(client: &Client, script: &elements::Script) -> Result<String, StartError> {
+	let hex: String = script.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+	let c = client.clone();
+	let decoded = tokio::task::spawn_blocking(move || c.call::<serde_json::Value>("decodescript", &[serde_json::json!(hex)]))
+		.await.map_err(err("the node"))?.map_err(err("the node"))?;
+	decoded["address"].as_str().or_else(|| decoded["segwit"]["address"].as_str()).map(str::to_string)
+		.ok_or_else(|| StartError(format!("the node gave no address for the script: {}", decoded)))
+}
+
+/// `arcad <config> bond-address`: the bond's terms and the address that
+/// posts it, as JSON. It needs the node and the signer (for `S`).
+pub async fn bond_address(config: &Config) -> Result<serde_json::Value, StartError> {
+	let (bond, client) = configured_bond(config).await?;
+	let p = bond.policy;
+	let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+	Ok(serde_json::json!({
+		"address": address_of(&client, &p.script_pubkey()).await?,
+		"script_pubkey": hex(p.script_pubkey().as_bytes()),
+		"notice_script_pubkey": hex(p.notice_script_pubkey().as_bytes()),
+		"operator": hex(&p.operator.serialize()),
+		"withdraw_key": hex(&p.withdraw.serialize()),
+		"notice_units": p.notice.units(),
+		"notice_seconds": p.notice.seconds(),
+	}))
+}
+
+/// `arcad <config> bond-post <wallet> <asset> <atoms> [<fee asset>]`: pays
+/// `atoms` of `asset` to the bond's address from the node wallet `wallet`,
+/// explicitly, the fee in `fee_asset` (the bond's own asset when not named,
+/// as a wallet pays: never a fall-back to another), and returns the bond
+/// coin and the line that names it in `[bond]`. A treasury's, a reserve's,
+/// a bridge's, an escrow's or another service's wallet is refused by name.
+pub async fn bond_post(config: &Config, wallet: &str, asset: AssetId, atoms: u64, fee_asset: Option<AssetId>)
+	-> Result<serde_json::Value, StartError>
+{
+	if let Some(why) = crate::bond::refused_wallet(wallet) {
+		return Err(StartError(format!("{} is {} wallet: a bond is never posted from one; name an operating wallet", wallet, why)));
+	}
+	if atoms == 0 {
+		return Err(StartError("a bond holds at least one atom".into()));
+	}
+	let (bond, client) = configured_bond(config).await?;
+	let spk = bond.policy.script_pubkey();
+	let address = address_of(&client, &spk).await?;
+	let auth = match (&config.node.cookie_file, &config.node.rpc_user, &config.node.rpc_password) {
+		(Some(c), _, _) => Auth::CookieFile(c.clone()),
+		(None, Some(u), Some(p)) => Auth::UserPass(u.clone(), p.clone()),
+		_ => return Err(StartError("the node needs cookie_file, or rpc_user and rpc_password".into())),
+	};
+	let url = format!("{}/wallet/{}", config.node.rpc_url.trim_end_matches('/'), wallet);
+	let w = Client::new(url, auth);
+	let amount = format!("{}.{:08}", atoms / 100_000_000, atoms % 100_000_000);
+	let fee = fee_asset.unwrap_or(asset).to_string();
+	let params = vec![serde_json::json!(address), serde_json::json!(amount), serde_json::json!(""), serde_json::json!(""),
+		serde_json::json!(false), serde_json::Value::Null, serde_json::Value::Null, serde_json::json!("unset"), serde_json::Value::Null,
+		serde_json::json!(asset.to_string()), serde_json::json!(true), serde_json::Value::Null, serde_json::json!(fee)];
+	let txid: String = tokio::task::spawn_blocking(move || w.call::<String>("sendtoaddress", &params))
+		.await.map_err(err("the node"))?.map_err(err(&format!("the node wallet {}", wallet)))?;
+	let txid = elements::Txid::from_str(&txid).map_err(err("the node's txid"))?;
+	let c = client.clone();
+	let tx = tokio::task::spawn_blocking(move || c.raw_transaction(&txid)).await.map_err(err("the node"))?.map_err(err("the node"))?;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == spk && o.asset.explicit() == Some(asset) && o.value.explicit() == Some(atoms))
+		.ok_or_else(|| StartError(format!("{} pays no explicit {} of {} to the bond's script", txid, atoms, asset)))?;
+	let outpoint = format!("{}:{}", txid, vout);
+	Ok(serde_json::json!({"txid": txid.to_string(), "vout": vout, "outpoint": outpoint, "asset": asset.to_string(),
+		"value": atoms.to_string(), "address": address, "wallet": wallet, "fee_asset": fee,
+		"config": format!("outpoint = \"{}\"", outpoint)}))
+}
+
+/// What the notice and the withdrawal need: the store, the chain, the
+/// operator's on-chain wallet (which pays their fees) and the bond.
+async fn bond_spender(config: &Config) -> Result<(crate::bond::Bond, Arc<FinalityService>, Wallet), StartError> {
+	let (bond, client) = configured_bond(config).await?;
+	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(client));
+	let certification = match config.finality.certification.as_str() {
+		"required" => Certification::Required,
+		"none" => Certification::NotOnThisChain,
+		other => return Err(StartError(format!("finality.certification {:?}: required or none", other))),
+	};
+	let finality = FinalityService::new(store.clone(), source, FinalityConfig {
+		anchor_depth: config.finality.anchor_depth, certification, start_height: config.finality.start_height,
+		poll_interval: Duration::from_millis(config.finality.poll_interval_ms), cert_lookback: 144,
+	}).await.map_err(err("the finality service"))?;
+	let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file).map_err(err("wallet_mnemonic_file"))?.trim().to_string();
+	// This process follows no chain of its own, so it reads the running
+	// server's view from the database and takes a fee coin once its block is
+	// in the chain: the operator's own transaction.
+	let wallet = Wallet::new(store, finality.clone(), bond.policy.operator,
+		WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Confirmed }).map_err(err("the wallet"))?;
+	Ok((bond, finality, wallet))
+}
+
+/// The fee assets the bond's spends pay in, in order: the bond's own asset,
+/// then the configuration's fee assets, then the served assets.
+fn bond_fee_assets(config: &Config, asset: AssetId) -> Vec<AssetId> {
+	let mut out = vec![asset];
+	let listed = config.fee_assets.clone().unwrap_or_default().into_iter().chain(config.assets.iter().map(|a| a.asset.clone()));
+	for a in listed.filter_map(|a| AssetId::from_str(&a).ok()) {
+		if !out.contains(&a) {
+			out.push(a);
+		}
+	}
+	out
+}
+
+/// Signs input 0 of `k` with `w`, gives input 1 a stand-in for the wallet's
+/// signature, and returns the transaction, its id and its virtual size once
+/// signed.
+fn bond_spend_signed(k: arca_covenant::spend::KeySpend, w: &elements::secp256k1_zkp::Keypair, genesis: elements::BlockHash)
+	-> Result<(elements::Transaction, elements::Txid, u64), String>
+{
+	let mut aux = [0u8; 32];
+	rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut aux);
+	let sig = arca_covenant::sign::sign_digest(w, &k.sighash(genesis).map_err(|e| e.to_string())?, &aux);
+	let u = k.finish(vec![sig.as_ref().to_vec()]);
+	let mut sized = u.tx.clone();
+	if sized.input.len() > 1 {
+		sized.input[1].witness.script_witness = vec![vec![0; 72], vec![0; 33]];
+	}
+	let vsize = (sized.weight() as u64).div_ceil(4);
+	Ok((u.tx.clone(), u.tx.txid(), vsize))
+}
+
+/// Reads `W`'s key from its file, which only its owner may read, and checks
+/// it is the bond's.
+fn withdraw_key(path: &std::path::Path, bond: &crate::bond::Bond) -> Result<elements::secp256k1_zkp::Keypair, StartError> {
+	use std::os::unix::fs::PermissionsExt;
+	let meta = std::fs::metadata(path).map_err(err(&path.display().to_string()))?;
+	if meta.permissions().mode() & 0o077 != 0 {
+		return Err(StartError(format!("{} is readable by others than its owner; chmod 600 it", path.display())));
+	}
+	let text = std::fs::read_to_string(path).map_err(err(&path.display().to_string()))?;
+	let secret = crate::signer::unhex32(text.trim()).map_err(err(&path.display().to_string()))?;
+	let key = elements::secp256k1_zkp::Keypair::from_seckey_slice(&elements::secp256k1_zkp::Secp256k1::new(), &secret)
+		.map_err(err(&path.display().to_string()))?;
+	if key.x_only_public_key().0 != bond.policy.withdraw {
+		return Err(StartError(format!("{} holds the key {}, and the bond's withdrawal key is {}", path.display(),
+			key.x_only_public_key().0, bond.policy.withdraw)));
+	}
+	Ok(key)
+}
+
+/// Builds the spend `make` makes with a fee coin of the operator's wallet,
+/// signs it and broadcasts it.
+async fn bond_spend<F>(config: &Config, finality: &Arc<FinalityService>, wallet: &Wallet, asset: AssetId, w: &elements::secp256k1_zkp::Keypair,
+	make: F) -> Result<elements::Transaction, StartError>
+where
+	F: Fn(&arca_covenant::FeeSource) -> Result<arca_covenant::spend::KeySpend, String>,
+{
+	let genesis = finality.call(|c| c.genesis()).await.map_err(err("the node"))?;
+	let (mut tx, coin, _) = wallet.with_fee_coin(&bond_fee_assets(config, asset), |fee| bond_spend_signed(make(fee)?, w, genesis))
+		.await.map_err(err("the operator's wallet"))?;
+	wallet.sign_input(&mut tx, 1, &coin).map_err(err("the operator's wallet"))?;
+	let t = tx.clone();
+	if let Err(e) = finality.call(move |c| c.broadcast(&t)).await {
+		let _ = wallet.release(&tx.txid()).await;
+		return Err(StartError(format!("the node refused {}: {}", tx.txid(), e)));
+	}
+	Ok(tx)
+}
+
+/// `arcad <config> bond-notice <key file>`: the notice of the configured
+/// bond coin, signed with `W`'s key from `key_file`, its fee from the
+/// operator's wallet, broadcast. Returns its id, the notice output and the
+/// line that names it in `[bond]`. From then on the bond reads as in notice
+/// (once the configuration names it), and wallets take no payment out of
+/// round from the operator.
+pub async fn bond_notice(config: &Config, key_file: &std::path::Path) -> Result<serde_json::Value, StartError> {
+	let (bond, finality, wallet) = bond_spender(config).await?;
+	let w = withdraw_key(key_file, &bond)?;
+	let b = bond.clone();
+	let view = finality.call(move |c| crate::bond::read(c, &b)).await.map_err(err("the node"))?;
+	if view.state != "bonded" {
+		return Err(StartError(format!("the bond is {}, not bonded: {}", view.state, view.why)));
+	}
+	let (op, asset, value) = (bond.outpoint.expect("bonded"), view.asset.expect("bonded"), view.value.expect("bonded"));
+	let p = bond.policy;
+	let tx = bond_spend(config, &finality, &wallet, asset, &w, |fee| p.notice_tx(op, asset, value, fee).map_err(|e| e.to_string())).await?;
+	let notice = format!("{}:0", tx.txid());
+	Ok(serde_json::json!({"txid": tx.txid().to_string(), "notice": notice, "notice_seconds": p.notice.seconds(),
+		"config": format!("notice = \"{}\"", notice)}))
+}
+
+/// `arcad <config> bond-withdraw <key file> <address>`: once the notice's
+/// delay has run, the whole bond to `address`, signed with `W`'s key, its
+/// fee from the operator's wallet, broadcast.
+pub async fn bond_withdraw(config: &Config, key_file: &std::path::Path, to: &str) -> Result<serde_json::Value, StartError> {
+	let (bond, finality, wallet) = bond_spender(config).await?;
+	let w = withdraw_key(key_file, &bond)?;
+	let b = bond.clone();
+	let view = finality.call(move |c| crate::bond::read(c, &b)).await.map_err(err("the node"))?;
+	if view.state != "noticed" {
+		return Err(StartError(format!("the bond is {}, not in notice: {}", view.state, view.why)));
+	}
+	let client = node_client(config)?;
+	let addr = to.to_string();
+	let info = tokio::task::spawn_blocking(move || client.call::<serde_json::Value>("validateaddress", &[serde_json::json!(addr)]))
+		.await.map_err(err("the node"))?.map_err(err("the node"))?;
+	if info["isvalid"] != serde_json::json!(true) {
+		return Err(StartError(format!("{} is not an address of this chain", to)));
+	}
+	let spk = elements::Script::from(crate::signer::unhex(info["scriptPubKey"].as_str().unwrap_or_default()).map_err(err("the address's script"))?);
+	let (n, asset, value) = (bond.notice.expect("noticed"), view.asset.expect("noticed"), view.value.expect("noticed"));
+	let p = bond.policy;
+	let out = arca_covenant::ExplicitOutput::new(asset, value, spk);
+	let tx = bond_spend(config, &finality, &wallet, asset, &w,
+		|fee| p.withdraw_tx(n, asset, value, std::slice::from_ref(&out), fee).map_err(|e| e.to_string())).await?;
+	Ok(serde_json::json!({"txid": tx.txid().to_string(), "to": to, "asset": asset.to_string(), "value": value.to_string()}))
+}
+
 /// Deletes, every `every`, the operator nonces no board took within
 /// `nonce_ttl`.
 fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandle<()> {
@@ -1121,6 +1353,13 @@ impl Server {
 			params.set_delays();
 		}
 		let params = Arc::new(params);
+		// The bond binds S; its notice outlasts every coin paid out of round
+		// before it.
+		let bond = match &config.bond {
+			Some(b) => Some(crate::bond::Bond::from_section(b, params.chain, operator, RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME),
+				params.max_exit_delay).map_err(|e| StartError(format!("bond: {}", e)))?),
+			None => None,
+		};
 
 		let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file)
 			.map_err(err("wallet_mnemonic_file"))?.trim().to_string();
@@ -1275,6 +1514,8 @@ impl Server {
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			floors: tokio::sync::Mutex::new(None),
 			record_head: tokio::sync::Mutex::new(None),
+			bond,
+			bond_view: tokio::sync::Mutex::new(None),
 			keepers: std::sync::Mutex::new(keepers),
 			replaced,
 			gateway: gateway.clone(),

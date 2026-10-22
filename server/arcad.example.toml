@@ -236,6 +236,21 @@ min_leaf = "1000"
 # coin = "<txid>:<vout>"
 # state = "0,0,0"
 
+# The operator's equivocation bond (README, "The equivocation bond"): a coin
+# anyone burns with two different messages the operator key signed under one
+# coin's salt. withdraw_key is W, the only key that gives the notice and
+# withdraws, never the operator key (arcad bond-key draws one). notice_units
+# is the delay a withdrawal waits after its notice, in 512-second units: at
+# least a coin's lifetime, the longest exit delay and a day (5,232 units at
+# the default exit-delay bounds). outpoint is the bond coin once posted
+# (arcad <config> bond-post prints it), notice the notice output once given
+# (arcad <config> bond-notice prints it). No bond when absent.
+# [bond]
+# withdraw_key = "<x-only key>"
+# notice_units = 5232
+# outpoint = "<txid>:<vout>"
+# notice = "<txid>:<vout>"
+
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order
 # locked to a height counted at block_seconds a block. A round that fills

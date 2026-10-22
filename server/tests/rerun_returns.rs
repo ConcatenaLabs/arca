@@ -5,27 +5,32 @@
 //! goes out of the chain with it, however deep. The watcher is driven a pass
 //! at a time, as the scenario needs it.
 //!
-//! The round R is final and its participations released. Its block goes out
-//! with its parent block; the node forgets its mempool and another
-//! transaction X takes R's first input, buried: R is lost. Its
-//! participations run again in Y, which spends a coin that keeps it apart
-//! from R. Then a deeper reorganisation takes X out, R (sent by anyone who
-//! holds it) confirms in its place, and the server restores R and retires Y.
-//! Every transaction of the blocks that reorganisation disconnects is sent
+//! The round R is final. Its block goes out with its parent block; the node
+//! forgets its mempool and another transaction X takes R's first input,
+//! buried: R is lost. A participation whose forfeit for R the signer
+//! co-signed is never run again (the signer co-signs one message under a
+//! coin's salt, ever, since two burn the operator's bond): it is void, its
+//! coin given up, and it is restored as it stood in R should R return. One
+//! whose forfeit never came runs again in Y, which spends a coin that keeps it
+//! apart from R. Then a deeper reorganisation takes X out, R (sent by anyone
+//! who holds it) confirms in its place, and the server restores R and retires
+//! Y. Every transaction of the blocks that reorganisation disconnects is sent
 //! again after R, in its order, as a node puts them back in its mempool:
-//! those that conflict with R are refused, the rest confirm beside it.
-//! After every restore an ordinary round is built for a fresh participant.
+//! those that conflict with R are refused, the rest confirm beside it. After
+//! every restore an ordinary round is built for a fresh participant.
 //!
 //! 1. Y spends an input of R that was still unspent: after the deeper
 //!    reorganisation R is in the chain and Y never can be (its input is
-//!    spent by R); A holds one leaf, R's; the operator claims A's board with
-//!    its forfeit for R; nothing of Y's was published.
+//!    spent by R). A, released in R, holds one leaf, R's, and the operator
+//!    claims A's board with its forfeit for R; C, run again in Y, holds no
+//!    leaf (its forfeit for R can never be signed beside its forfeit for Y),
+//!    and its board is its own; nothing of Y's was published.
 //! 2. R had one input, which X took; X pays the operator: Y spends X's
 //!    output, and once X is out, Y's input does not exist.
-//! 3. X pays the operator nothing and R had no other input: the
-//!    participation is voided, saying so, and its coin stays given up; when
-//!    R returns the participation is restored as it stood in R, and the
-//!    watcher claims its board with its forfeit for R.
+//! 3. X pays the operator nothing and R had no other input: the participation
+//!    (its forfeit not yet given) is voided, saying so; when R returns it is
+//!    restored as it stood in R, its forfeit for R is taken, and the watcher
+//!    claims its board with it.
 //! 4. The participant whose forfeit for R the watcher published while R was
 //!    final (barred from a re-run): with R back, the watcher claims that
 //!    forfeit with R's connector asset; when the owner refunded it while R
@@ -36,8 +41,8 @@
 //!    before the deeper reorganisation: that forfeit spends the board alone,
 //!    so it comes back with the disconnected blocks and confirms beside R,
 //!    and Y's claim of it never can. The server leaves A's leaf of R
-//!    uncredited, A's to take on the chain, the loss the operator's; A's
-//!    refund of Y's forfeit opens after its delay.
+//!    uncredited, its preimage never released, since A's forfeit for R can
+//!    never be signed; A's refund of Y's forfeit opens after its delay.
 //! 6. A voided while R is out exits the board it gave up before X: when R
 //!    returns, the board is spent on the chain by A's exit, and the server
 //!    leaves A's leaf of R uncredited, A's to take, the loss the operator's.
@@ -123,6 +128,16 @@ fn hand_over(r: &Running, p: &[u8; 32], c: &Coin, key: &Keypair, nonce: &[u8; 32
 	assert_eq!(done["state"], "released", "{}", done);
 	let preimage: [u8; 32] = unhex(done["preimage"].as_str().unwrap()).try_into().unwrap();
 	Released { forfeit, preimage, leaf, record, round }
+}
+
+/// The leaf the round participation `p` is in now gives the owner of `c`,
+/// validated, its forfeit built and never handed over: what the owner holds
+/// of a round before it gives its forfeit (no preimage).
+fn seen(r: &Running, p: &[u8; 32], c: &Coin, key: &Keypair, nonce: &[u8; 32]) -> Released {
+	let st = status(r, p);
+	let (leaf, record, round) = validate_new_leaf(r, p, 0, key, nonce);
+	let forfeit = forfeit_for(&c.valid(r), &leaf, &round, &st);
+	Released { forfeit, preimage: [0; 32], leaf, record, round }
 }
 
 /// The first transaction of the owner `key` bringing its leaf `x` onto the
@@ -289,9 +304,11 @@ fn missing_or_spent(v: &Result<(), String>) -> bool {
 	v.as_ref().err().is_some_and(|e| e.contains("missing") || e.contains("missingorspent"))
 }
 
-/// Follows a refresh of A's board through R, its loss, its re-run in Y, and
-/// R's return, for the taker `taker`, with `funds` the operator's coins.
-/// Returns what the test checks after.
+/// Follows two refreshes through R, its loss and its return, for the taker
+/// `taker`, with `funds` the operator's coins: A's board, released in R,
+/// voided at the loss and restored with R; C's, whose forfeit for R never
+/// came, run again in Y and released there, and left with no leaf once R
+/// returns.
 async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	let mut r = match funds {
 		Some(c) => start_funded(c).await,
@@ -306,7 +323,8 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	let (pa, a2n) = participate(&r, &ca, &a2);
 	let (pc, c2n) = participate(&r, &cc, &c2);
 
-	// Round R, alone in a parent block of its own; final; both released.
+	// Round R, alone in a parent block of its own; final; A released, C's
+	// forfeit not yet given.
 	let p_r = own_anchor(&r).await;
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	let rtx = built.tx.clone();
@@ -314,17 +332,22 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	r.bury().await;
 	round_final(&r, &rtx.txid()).await;
 	let a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
-	let _c_r = hand_over(&r, &pc, &cc, &c2, &c2n);
-	println!("{} R = {} final, {} input(s); A released (leaf {}), C released", tag, rtx.txid(), rtx.input.len(), a_r.leaf.leaf_id);
+	println!("{} R = {} final, {} input(s); A released (leaf {}), C's forfeit not yet given", tag, rtx.txid(), rtx.input.len(),
+		a_r.leaf.leaf_id);
 
 	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, taker, |_| {}).await;
 	r.server.rounds.pass().await.unwrap();
-	let sa = wait_state(&r, &pa, "pending").await;
-	println!("{} after R is lost: A {} attempt {}", tag, sa["state"], sa["attempt"]);
-	assert_eq!((sa["state"].as_str(), sa["attempt"].as_u64()), (Some("pending"), Some(1)), "{}", sa);
+	let sa = wait_state(&r, &pa, "void").await;
+	println!("{} after R is lost: A {}: {}", tag, sa["state"], sa["void_reason"]);
+	assert!(sa["void_reason"].as_str().unwrap().contains("one message under a salt, ever"), "{}", sa);
+	assert_eq!(sa["inputs"][0]["returned"], false, "its forfeit for R stays good should R return");
+	let sc = wait_state(&r, &pc, "pending").await;
+	println!("{} after R is lost: C {} attempt {}", tag, sc["state"], sc["attempt"]);
+	assert_eq!((sc["state"].as_str(), sc["attempt"].as_u64()), (Some("pending"), Some(1)), "{}", sc);
 
-	// Y runs both again, and spends the coin that keeps it apart from R.
+	// Y runs C again, and spends the coin that keeps it apart from R.
 	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
+	assert_eq!(built_y.participations, 1, "A is not run again");
 	let ytx = built_y.tx.clone();
 	let ties = r.server.store.replaced_by(built_y.round_id).await.unwrap();
 	assert_eq!(ties.len(), 1, "Y records the round it replaces");
@@ -346,9 +369,8 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &ytx.txid()).await;
-	let a_y = hand_over(&r, &pa, &ca, &a2, &a2n);
-	let _c_y = hand_over(&r, &pc, &cc, &c2, &c2n);
-	println!("{} Y final; A released again (leaf {}); nothing of Y's published", tag, a_y.leaf.leaf_id);
+	let c_y = hand_over(&r, &pc, &cc, &c2, &c2n);
+	println!("{} Y final; C released there (leaf {}); nothing of Y's published", tag, c_y.leaf.leaf_id);
 
 	// The deeper reorganisation; R returns in X's place.
 	r_returns(&mut r, tag, &rtx, &xtx, p_x, None, |_| {}).await;
@@ -358,7 +380,8 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	println!("{} in a block now: R {}, Y {}, X {}", tag, in_a_block(&r, &rtx.txid()), in_a_block(&r, &ytx.txid()), in_a_block(&r, &xtx.txid()));
 	assert!(in_a_block(&r, &rtx.txid()) && !in_a_block(&r, &ytx.txid()) && !in_a_block(&r, &xtx.txid()));
 
-	// The server: R restored, Y retired, A back as it stood in R.
+	// The server: R restored, Y retired, A back as it stood in R; C, whose
+	// forfeit for R can never be signed beside its forfeit for Y, not back.
 	r.wait("Y retired", || tokio::runtime::Handle::current().block_on(r.server.store.round(built_y.round_id)).unwrap()
 		.is_some_and(|y| y.state == RoundState::Lost)).await;
 	let sa = status(&r, &pa);
@@ -366,15 +389,20 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	assert_eq!((sa["state"].as_str(), sa["attempt"].as_u64(), sa["round"]["txid"].as_str()),
 		(Some("released"), Some(0), Some(rtx.txid().to_string().as_str())));
 	assert_eq!(sa["unlock_hash"].as_str().unwrap(), hex(&arca_covenant::script::sha256(&a_r.preimage)));
+	let sc = status(&r, &pc);
+	println!("{} C at the server: {}: {}", tag, sc["state"], sc["void_reason"]);
+	assert_eq!(sc["state"], "void");
+	let why = sc["void_reason"].as_str().unwrap();
+	assert!(why.contains("can never be signed") && why.contains("never credited"), "{}", why);
 	let leaf_state = |id: &arca_covenant::LeafId| tokio::runtime::Handle::current().block_on(r.server.store.leaf(&id.0)).unwrap().unwrap().state;
-	let (lr, ly) = tokio::task::block_in_place(|| (leaf_state(&a_r.leaf.leaf_id), leaf_state(&a_y.leaf.leaf_id)));
-	println!("{} A's leaf of R {:?}, of Y {:?}", tag, lr, ly);
+	let (lr, ly) = tokio::task::block_in_place(|| (leaf_state(&a_r.leaf.leaf_id), leaf_state(&c_y.leaf.leaf_id)));
+	println!("{} A's leaf of R {:?}; C's leaf of Y {:?}", tag, lr, ly);
 	assert_eq!((lr, ly), (LeafState::Live, LeafState::Lost));
 
-	// A holds one leaf: its leaf of R comes onto the chain, its leaf of Y
-	// never can.
-	let (ur, uy) = (verdict(&r, &first_unroll(&a_r, &a2)), verdict(&r, &first_unroll(&a_y, &a2)));
-	println!("{} the node's verdict on the first unroll of A's leaf of R: {:?}; of Y: {:?}", tag, ur, uy);
+	// A holds one leaf, its leaf of R, which comes onto the chain; C's leaf
+	// of Y never can, and C's board is C's.
+	let (ur, uy) = (verdict(&r, &first_unroll(&a_r, &a2)), verdict(&r, &first_unroll(&c_y, &c2)));
+	println!("{} the node's verdict on the first unroll of A's leaf of R: {:?}; of C's leaf of Y: {:?}", tag, ur, uy);
 	assert_eq!(ur, Ok(()));
 	assert!(missing_or_spent(&uy), "{:?}", uy);
 
@@ -388,8 +416,9 @@ async fn rerun_then_return(tag: &str, funds: Option<&[u64]>, taker: Taker) {
 	let claim = claim_spending(&l, &f_r).unwrap();
 	assert!(in_a_block(&r, &txid(&claim)) && claim.detail.contains(&format!("round {}", built.round_id)));
 	println!("{} the operator's forfeit for R {} claimed by {}; its forfeits for Y: {:?}", tag, f_r, txid(&claim),
-		forfeit_naming(&l, &ca, built_y.round_id).map(|f| txid(&f)));
-	assert!(forfeit_naming(&l, &ca, built_y.round_id).is_none(), "nothing of Y's is published");
+		forfeit_naming(&l, &cc, built_y.round_id).map(|f| txid(&f)));
+	assert!(forfeit_naming(&l, &cc, built_y.round_id).is_none(), "nothing of Y's is published");
+	assert!(r.unspent(&cc.valid(&r).board().unwrap().1), "C's board is C's on the chain");
 	let _ = ordinary_round(&mut r, tag, "B").await;
 }
 
@@ -409,11 +438,13 @@ async fn a_rerun_nothing_keeps_apart_from_its_round_is_voided_and_restored_when_
 	let tag = "Rc";
 	let mut r = start().await;
 	let x = r.x;
-	let a = keypair("Rc A");
+	let (a, d) = (keypair("Rc A"), keypair("Rc D"));
 	let (ha, ta) = credited_board(&mut r, &a, x).await;
-	let ca = Coin { held: ha, bases: vec![ta] };
-	let a2 = keypair("Rc A2");
+	let (hd, td) = credited_board(&mut r, &d, x).await;
+	let (ca, cd) = (Coin { held: ha, bases: vec![ta] }, Coin { held: hd, bases: vec![td] });
+	let (a2, d2) = (keypair("Rc A2"), keypair("Rc D2"));
 	let (pa, a2n) = participate(&r, &ca, &a2);
+	let (pd, _) = participate(&r, &cd, &d2);
 	let p_r = own_anchor(&r).await;
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	let rtx = built.tx.clone();
@@ -421,25 +452,33 @@ async fn a_rerun_nothing_keeps_apart_from_its_round_is_voided_and_restored_when_
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &rtx.txid()).await;
+	// A is released in R; D gives no forfeit before R is lost.
 	let a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
 
-	// X takes R's only input and pays the operator nothing.
+	// X takes R's only input and pays the operator nothing. A is not run
+	// again, its forfeit for R being the one message under its coin's salt;
+	// D, whose forfeit never came, is not either, since no coin of the
+	// operator's can keep a re-run apart from R, and its coin, under no
+	// forfeit, is given back.
 	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, Taker::Elsewhere, |_| {}).await;
 	let sa = wait_state(&r, &pa, "void").await;
 	println!("{} after R is lost: A {}: {}", tag, sa["state"], sa["void_reason"]);
-	assert_eq!(sa["state"], "void");
-	let why = sa["void_reason"].as_str().unwrap();
-	assert!(why.contains("no coin of the operator's can keep a re-run apart from round") && why.contains(&rtx.txid().to_string()), "{}", why);
+	assert!(sa["void_reason"].as_str().unwrap().contains("one message under a salt, ever"), "{}", sa);
 	assert_eq!(sa["inputs"][0]["returned"], false, "its forfeit for R stays good should R return");
+	let sd = wait_state(&r, &pd, "void").await;
+	println!("{} after R is lost: D {}: {}", tag, sd["state"], sd["void_reason"]);
+	let why = sd["void_reason"].as_str().unwrap();
+	assert!(why.contains("no coin of the operator's can keep a re-run apart from round") && why.contains(&rtx.txid().to_string()), "{}", why);
 	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "nothing runs again");
 
 	// R returns: A is back as it stood in R, and the operator claims A's
-	// board with its forfeit for R.
+	// board with its forfeit for R. D's void stands: it gave no forfeit.
 	r_returns(&mut r, tag, &rtx, &xtx, p_x, None, |_| {}).await;
 	r.server.rounds.pass().await.unwrap();
 	let sa = status(&r, &pa);
 	println!("{} with R back: A {} attempt {}, void reason {}", tag, sa["state"], sa["attempt"], sa["void_reason"]);
 	assert_eq!((sa["state"].as_str(), sa["attempt"].as_u64()), (Some("released"), Some(0)));
+	println!("{} with R back: D {}", tag, status(&r, &pd)["state"]);
 	assert_eq!(r.server.store.leaf(&a_r.leaf.leaf_id.0).await.unwrap().unwrap().state, LeafState::Live);
 	drive(&r, "Rc A's board claimed for R", 12, |l| forfeit_naming(l, &ca, built.round_id)
 		.is_some_and(|f| claim_spending(l, &txid(&f)).is_some())).await;
@@ -455,8 +494,9 @@ async fn a_rerun_nothing_keeps_apart_from_its_round_is_voided_and_restored_when_
 
 /// The participant P whose forfeit for R the watcher published while R was
 /// final, and A, whose was not. R is lost with P's forfeit confirmed below
-/// X; A runs again in Y; R returns. With `refund`, P refunds its forfeit
-/// once its delay has run, while R is out, before X.
+/// X; neither runs again (A's forfeit for R is the one message under its
+/// coin's salt); R returns. With `refund`, P refunds its forfeit once its
+/// delay has run, while R is out, before X.
 async fn barred(tag: &str, refund: bool) {
 	let mut r = start().await;
 	let x = r.x;
@@ -520,13 +560,12 @@ async fn barred(tag: &str, refund: bool) {
 	assert_eq!(sp["state"], "void");
 	assert!(sp["void_reason"].as_str().unwrap().contains(&fp.to_string()));
 
-	// A runs again in Y.
-	let built_y = r.server.rounds.run_round().await.unwrap().unwrap();
-	assert_eq!(built_y.participations, 1, "P is not taken again");
-	r.produce().await;
-	r.bury().await;
-	round_final(&r, &built_y.tx.txid()).await;
-	let _a_y = hand_over(&r, &pa, &ca, &a2, &a2n);
+	// Nor is A run again: the signer co-signed A's forfeit for R, the one
+	// message under its coin's salt.
+	let sa = wait_state(&r, &pa, "void").await;
+	println!("{} after R is lost: A {}: {}", tag, sa["state"], sa["void_reason"]);
+	assert!(sa["void_reason"].as_str().unwrap().contains("one message under a salt, ever"), "{}", sa);
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "neither P nor A runs again");
 
 	// R returns in X's place; P's forfeit, below X, stays.
 	r_returns(&mut r, tag, &rtx, &xtx, p_x, mock, |_| {}).await;
@@ -669,7 +708,7 @@ async fn the_next_round_after_a_return_issues_from_another_coin() {
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &rtx.txid()).await;
-	let _a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
+	// A's forfeit for R not yet given: A runs again in Y.
 	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, Taker::ToOperator, |_| {}).await;
 	r.server.rounds.pass().await.unwrap();
 	wait_state(&r, &pa, "pending").await;
@@ -696,13 +735,15 @@ async fn the_next_round_after_a_return_issues_from_another_coin() {
 	assert!(tokens_of(&btx).iter().all(|t| !y_tokens.contains(t)), "its token is not Y's");
 }
 
-/// R7f Z1 with a round built after each of its four parent-chain
+/// R7f Z1 with a round built after each of its parent-chain
 /// reorganisations, the operator's wallet funded once, at the start, and the
-/// four fresh participants' boards made then, below every reorganisation: R lost
-/// (X takes its input) and A run again in Y; R returns (X and Y out); R lost
-/// again (X back) and A run again in Z; Y returns (Z out). After each, an
-/// ordinary round for a fresh participant is built and final, and exactly
-/// one of A's leaves can reach the chain, the one the server credits.
+/// fresh participants' boards made then, below every reorganisation: R lost
+/// (X takes its input) and A, whose forfeit for R was not yet given, run again
+/// in Y; R returns (X and Y out), and A's forfeit for R can never be signed
+/// beside its forfeit for Y; R lost again (X back); Y, sent by anyone who
+/// holds it, returns. After each, an ordinary round for a fresh participant
+/// is built and final, and never from a re-run's issuing coin; A's leaf of Y
+/// is the one the server credits while Y stands, and none while R does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_round_is_built_after_each_reorganisation() {
 	let tag = "Z1";
@@ -712,7 +753,7 @@ async fn a_round_is_built_after_each_reorganisation() {
 	let (ha, ta) = credited_board(&mut r, &a, x).await;
 	let ca = Coin { held: ha, bases: vec![ta] };
 	let mut fresh = vec![];
-	for k in 1..=4 {
+	for k in 1..=3 {
 		fresh.push(fresh_board(&mut r, tag, &format!("B{}", k)).await.0);
 	}
 	let (pa, a2n) = participate(&r, &ca, &a2);
@@ -722,24 +763,24 @@ async fn a_round_is_built_after_each_reorganisation() {
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &rtx.txid()).await;
-	let a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
+	let a_r = seen(&r, &pa, &ca, &a2, &a2n);
 	let leaf = |r: &Running, x: &Released| {
 		let id = x.leaf.leaf_id.0;
 		tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(r.server.store.leaf(&id))).unwrap().map(|l| l.state)
 	};
-	// Exactly one of A's leaves comes onto the chain, the one credited.
-	let one = |r: &Running, step: &str, leaves: &[(&str, &Released)], live: &str| {
-		let mut seen = vec![];
+	// The leaf the server credits, if any, and that it comes onto the chain.
+	let credited = |r: &Running, step: &str, leaves: &[(&str, &Released)], live: Option<&str>| {
+		let mut seen_now = vec![];
 		for (n, x) in leaves {
 			let (st, v) = (leaf(r, x), verdict(r, &first_unroll(x, &a2)));
-			seen.push(format!("leaf of {}: server {:?}, its unroll {:?}", n, st, v.as_ref().map_err(|e| e.chars().take(40).collect::<String>())));
-			if *n == live {
+			seen_now.push(format!("leaf of {}: server {:?}, its unroll {:?}", n, st, v.as_ref().map_err(|e| e.chars().take(40).collect::<String>())));
+			if Some(*n) == live {
 				assert_eq!((st, v.is_ok()), (Some(LeafState::Live), true), "{} {}: the leaf of {}", tag, step, n);
 			} else {
-				assert!(st != Some(LeafState::Live) && missing_or_spent(&v), "{} {}: the leaf of {}: {:?} {:?}", tag, step, n, st, v);
+				assert!(st != Some(LeafState::Live), "{} {}: the leaf of {}: {:?}", tag, step, n, st);
 			}
 		}
-		println!("{} {}: {}", tag, step, seen.join("; "));
+		println!("{} {}: {}", tag, step, seen_now.join("; "));
 	};
 
 	// 1. R lost: X takes its input, paying the operator; A runs again in Y.
@@ -752,7 +793,7 @@ async fn a_round_is_built_after_each_reorganisation() {
 	r.bury().await;
 	round_final(&r, &ytx.txid()).await;
 	let a_y = hand_over(&r, &pa, &ca, &a2, &a2n);
-	one(&r, "(1) R lost, Y final", &[("R", &a_r), ("Y", &a_y)], "Y");
+	credited(&r, "(1) R lost, Y final", &[("R", &a_r), ("Y", &a_y)], Some("Y"));
 	let (_, i1) = ordinary_round_of(&mut r, tag, "B1", &fresh[0]).await;
 
 	// 2. R returns: X (and Y, and B1's round, with it) out, R confirmed in
@@ -769,68 +810,54 @@ async fn a_round_is_built_after_each_reorganisation() {
 	round_state(&r, &rtx.txid(), RoundState::Final).await;
 	r.server.rounds.pass().await.unwrap();
 	assert_eq!(r.server.store.round(built_y.round_id).await.unwrap().map(|x| x.state), Some(RoundState::Lost), "Y retired");
-	one(&r, "(2) R returned", &[("R", &a_r), ("Y", &a_y)], "R");
+	credited(&r, "(2) R returned", &[("R", &a_r), ("Y", &a_y)], None);
+	let sa = status(&r, &pa);
+	println!("{} (2) A {}: {}", tag, sa["state"], sa["void_reason"]);
+	assert_eq!(sa["state"], "void");
+	assert!(sa["void_reason"].as_str().unwrap().contains("can never be signed"), "{}", sa);
 	let (_, i2) = ordinary_round_of(&mut r, tag, "B2", &fresh[1]).await;
 	assert_ne!(i2, ytx.input[0].previous_output, "not from Y's issuing coin");
 
-	// 3. R lost again: R's block out, X sent again and confirmed; A runs
-	// again in Z.
-	let (_, p_x2) = {
-		r.server.stop();
-		let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r2)).unwrap();
-		tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
-		println!("{} (3) {} parent block(s) from height {} orphaned; the node restarted with an empty mempool", tag, orphaned.len(), p_r2);
-		let p = own_anchor(&r).await;
-		println!("{} (3) X sent again: {:?}", tag, r.rt.client().send_raw_transaction(&xtx).map(|t| t.to_string()).map_err(|e| e.to_string()));
-		r.produce().await;
-		r.bury().await;
-		r.restart_server().await;
-		round_state(&r, &rtx.txid(), RoundState::Lost).await;
-		((), p)
-	};
-	r.server.rounds.pass().await.unwrap();
-	let sa = wait_state(&r, &pa, "pending").await;
-	println!("{} (3) A {} attempt {}", tag, sa["state"], sa["attempt"]);
-	let p_z = own_anchor(&r).await;
-	let built_z = r.server.rounds.run_round().await.unwrap().expect("Z is built, from the coins the wallet holds");
-	let ztx = built_z.tx.clone();
-	println!("{} (3) Z = {} ties: {:?}", tag, ztx.txid(), r.server.store.replaced_by(built_z.round_id).await.unwrap());
-	r.produce().await;
-	r.bury().await;
-	round_final(&r, &ztx.txid()).await;
-	let a_z = hand_over(&r, &pa, &ca, &a2, &a2n);
-	one(&r, "(3) Z final", &[("R", &a_r), ("Y", &a_y), ("Z", &a_z)], "Z");
-	let (_, i3) = ordinary_round_of(&mut r, tag, "B3", &fresh[2]).await;
-	let _ = p_x2;
-
-	// 4. Y returns: Z (and B3's round) out, Y sent by anyone who holds it.
+	// 3. R lost again: R's block out (B2's round with it), X sent again and
+	// confirmed.
 	r.server.stop();
-	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_z)).unwrap();
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r2)).unwrap();
 	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
-	println!("{} (4) {} parent block(s) from height {} orphaned; X in a block {}", tag, orphaned.len(), p_z, in_a_block(&r, &xtx.txid()));
-	println!("{} (4) Y sent again: {:?}", tag, r.rt.client().send_raw_transaction(&ytx).map(|t| t.to_string()).map_err(|e| e.to_string()));
+	println!("{} (3) {} parent block(s) from height {} orphaned; the node restarted with an empty mempool", tag, orphaned.len(), p_r2);
+	let _ = own_anchor(&r).await;
+	println!("{} (3) X sent again: {:?}", tag, r.rt.client().send_raw_transaction(&xtx).map(|t| t.to_string()).map_err(|e| e.to_string()));
 	r.produce().await;
 	r.bury().await;
 	r.restart_server().await;
+	round_state(&r, &rtx.txid(), RoundState::Lost).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(status(&r, &pa)["state"], "void", "A, given up in Y, is not run again");
+
+	// 4. Y, sent by anyone who holds it, returns: its tie, X's output, is in
+	// the chain again.
+	println!("{} (4) Y sent again: {:?}", tag, r.rt.client().send_raw_transaction(&ytx).map(|t| t.to_string()).map_err(|e| e.to_string()));
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
 	round_state(&r, &ytx.txid(), RoundState::Final).await;
 	r.server.rounds.pass().await.unwrap();
-	one(&r, "(4) Y returned", &[("R", &a_r), ("Y", &a_y), ("Z", &a_z)], "Y");
-	let (_, i4) = ordinary_round_of(&mut r, tag, "B4", &fresh[3]).await;
-	println!("{} the four rounds after each reorganisation issued from {}, {}, {}, {}", tag, i1, i2, i3, i4);
-	let issued = [ytx.input[0].previous_output, ztx.input[0].previous_output];
-	assert!([i1, i2, i3, i4].iter().all(|i| !issued.contains(i)), "never a re-run's issuing coin");
+	credited(&r, "(4) Y returned", &[("R", &a_r), ("Y", &a_y)], Some("Y"));
+	let (_, i3) = ordinary_round_of(&mut r, tag, "B3", &fresh[2]).await;
+	println!("{} the rounds after each reorganisation issued from {}, {}, {}", tag, i1, i2, i3);
+	assert!([i1, i2, i3].iter().all(|i| *i != ytx.input[0].previous_output), "never a re-run's issuing coin");
 }
 
-/// R7f F5, its Z2 turned around. A's board, given up in R, is run again in
-/// Y, and the watcher publishes and claims its forfeit for Y. The deeper
-/// reorganisation brings R back, and the node puts the disconnected
-/// transactions back in its mempool: Y's forfeit spends A's board alone, so
-/// it confirms beside R, while Y's claim of it never can. The server leaves
-/// A uncredited: void, saying that its leaf of R is its owner's to take and
-/// the loss the operator's, the leaf `expired` at the server. On the chain:
-/// A's first unroll of its leaf of R is valid, the operator has no forfeit
-/// for R of A's board, and A's refund of Y's forfeit opens after its delay.
-/// The next round is built.
+/// R7f F5, its Z2 turned around. A's board, given up in R (its forfeit for
+/// R not yet given), is run again in Y, and the watcher publishes and claims
+/// its forfeit for Y. The deeper reorganisation brings R back, and the node
+/// puts the disconnected transactions back in its mempool: Y's forfeit
+/// spends A's board alone, so it confirms beside R, while Y's claim of it
+/// never can. The server leaves A uncredited: void, saying that its forfeit
+/// for R can never be signed beside its forfeit for Y, so its leaf of R is
+/// never credited and its preimage never goes out, the leaf `expired` at the
+/// server. On the chain: the operator has no forfeit for R of A's board, and
+/// A's refund of Y's forfeit opens after its delay. The next round is built.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reruns_forfeit_back_with_the_reorganisation_leaves_the_returning_leaf_uncredited() {
 	let tag = "Z2";
@@ -846,7 +873,7 @@ async fn a_reruns_forfeit_back_with_the_reorganisation_leaves_the_returning_leaf
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &rtx.txid()).await;
-	let a_r = hand_over(&r, &pa, &ca, &a2, &a2n);
+	let a_r = seen(&r, &pa, &ca, &a2, &a2n);
 	let (xtx, p_x) = lose(&mut r, tag, &rtx, p_r, Taker::ToOperator, |_| {}).await;
 	r.server.rounds.pass().await.unwrap();
 	wait_state(&r, &pa, "pending").await;
@@ -873,14 +900,11 @@ async fn a_reruns_forfeit_back_with_the_reorganisation_leaves_the_returning_leaf
 	assert!(missing_or_spent(&verdict(&r, &c_y)), "Y's claim can never confirm");
 	let sa = status(&r, &pa);
 	let leaf_r = r.server.store.leaf(&a_r.leaf.leaf_id.0).await.unwrap().unwrap().state;
-	let unroll = verdict(&r, &first_unroll(&a_r, &a2));
-	println!("{} A at the server: {} ({}); its leaf of R {:?}, its first unroll {:?}", tag, sa["state"], sa["void_reason"], leaf_r, unroll);
+	println!("{} A at the server: {} ({}); its leaf of R {:?}", tag, sa["state"], sa["void_reason"], leaf_r);
 	assert_eq!(sa["state"], "void");
 	let why = sa["void_reason"].as_str().unwrap();
-	assert!(why.contains(&f_y.to_string()) && why.contains(&format!("a forfeit for round {}", built_y.round_id))
-		&& why.contains("its owner's to take on the chain") && why.contains("the loss is the operator's"), "{}", why);
+	assert!(why.contains("can never be signed") && why.contains("never credited") && why.contains("preimage never goes out"), "{}", why);
 	assert_eq!(leaf_r, LeafState::Expired);
-	assert_eq!(unroll, Ok(()), "the leaf is A's to take");
 	assert_eq!(r.server.store.leaf(&a_y.leaf.leaf_id.0).await.unwrap().unwrap().state, LeafState::Lost);
 	passes(&r, 4).await;
 	let l = log(&r).await;
