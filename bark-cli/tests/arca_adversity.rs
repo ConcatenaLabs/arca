@@ -536,7 +536,7 @@ async fn a_withheld_preimage_is_read_from_the_claim_and_void_frees_no_forfeited_
 /// refunded once its delay has run; the other, whose forfeit is not on the
 /// chain, is exited at once.
 #[tokio::test(flavor = "multi_thread")]
-async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
+async fn after_a_lost_round_the_wallet_follows_each_participation_given_up() {
 	let mut r = Running::start().await;
 	let url = r.url();
 	let x = r.x;
@@ -597,8 +597,9 @@ async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	r.synced().await;
 	r.round_state(&r1.txid(), RoundState::Lost).await;
 
-	// The wallet follows: the leaf's run again is pending; each board's is
-	// void, with the operator's reason.
+	// The wallet follows: every participation is void, the boards' with the
+	// operator's reason (their forfeits for R in its log), the leaf's because
+	// the signer co-signed its forfeit for R, the one message under its salt.
 	let s = c.ok(&["sync"]);
 	println!("D50c the wallet's sync after R is lost: recheck {} participations {}", s["recheck"]["changes"], s["participations"]);
 	let of = |s: &Value, pid: &str| s["participations"].as_array().unwrap().iter().find(|p| p["participation"] == pid).cloned()
@@ -619,22 +620,16 @@ async fn after_a_lost_round_the_wallet_follows_each_participation_run_again() {
 	assert!(tried["error"].is_null() && tried["state"] == "unrolling", "{}", tried);
 	assert!(tried["broadcast"][0]["fee"][0]["asset"] == x.to_string().as_str(), "{}", tried);
 	assert_eq!(coin_of(&c, &boards[2])["state"], "exiting");
-	assert_eq!(of(&s, &pids[2])["state"], "pending", "the leaf's run again waits for a round: {}", s["participations"]);
+	let p = of(&s, &pids[2]);
+	println!("D50c the leaf's participation: {}", p);
+	assert!(p["void_reason"].as_str().is_some_and(|w| w.contains("one message under a salt, ever")), "{}", s["participations"]);
+	// Its coin is given up for good: the wallet takes it on the chain.
+	assert_ne!(coin_of(&c, &leaf)["state"], "live", "{}", coin_of(&c, &leaf));
 	let s = c.ok(&["sync"]);
-	for pid in &pids[..2] {
+	for pid in &pids {
 		assert!(of(&s, pid).is_null(), "a void participation is not followed again: {}", s["participations"]);
 	}
-
-	// Round Y takes the leaf's: the wallet hands over its forfeit for Y and
-	// takes its new leaf.
-	final_round(&r).await;
-	let s = c.ok(&["sync"]);
-	let p = of(&s, &pids[2]);
-	println!("D50c the leaf's participation in Y: {}", p);
-	assert_eq!(p["state"], "released", "{}", s["participations"]);
-	let new = p["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	assert_eq!(coin_of(&c, &new)["state"], "live");
-	assert_eq!(coin_of(&c, &leaf)["state"], "spent");
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "nothing runs again");
 
 	// The second board is exited and claimed.
 	let claim = exit_and_claim(&r, &c, &boards[2], Some(&x.to_string())).await;
@@ -671,12 +666,11 @@ async fn own_anchor(r: &Running) -> u64 {
 /// A lost round that returns, with the wallet following. A leaf of the
 /// wallet's is refreshed in round R, which goes out of the chain with its
 /// parent block while another transaction X of the operator's takes R's
-/// input (paying the operator back), buried. The operator runs the
-/// participation again in Y, which spends X's output; the wallet takes Y's
-/// leaf. Then the parent chain takes X out and R, sent by anyone who holds
-/// it, confirms in its place: Y never can. The wallet follows R: its leaf of
-/// R is live again and its leaf of Y lost, so it holds one leaf for the coin
-/// it gave up, as it did at every step.
+/// input (paying the operator back), buried. The participation is not run
+/// again: the signer co-signed its forfeit for R, the one message under the
+/// coin's salt. Then the parent chain takes X out and R, sent by anyone who
+/// holds it, confirms in its place. The wallet follows R: its leaf of R is
+/// live again, so it holds one leaf for the coin it gave up.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rerun() {
 	let mut r = Running::start().await;
@@ -724,20 +718,14 @@ async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rer
 	let s = c.ok(&["sync"]);
 	println!("D53w after R is lost: the participation {}; the wallet holds {:?}", of(&s), held(&c));
 	assert_eq!(coin_of(&c, &leaf_r)["state"], "lost");
-	assert_eq!(of(&s)["state"], "pending", "{}", s["participations"]);
-
-	// Y runs it again, spending X's output; the wallet takes Y's leaf.
-	let ytx = final_round(&r).await;
-	assert!(ytx.input.iter().any(|i| i.previous_output == elements::OutPoint::new(xtx.txid(), 0)), "Y spends X's output");
-	let s = c.ok(&["sync"]);
-	let leaf_y = of(&s)["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	println!("D53w Y = {}; the wallet holds {:?}", ytx.txid(), held(&c));
-	assert_eq!(held(&c), vec![(leaf_y.clone(), "live".to_string(), coin_of(&c, &leaf_y)["value"].as_str().unwrap().to_string())]);
+	assert_eq!(of(&s)["state"], "void", "{}", s["participations"]);
+	assert!(of(&s)["void_reason"].as_str().is_some_and(|w| w.contains("one message under a salt, ever")), "{}", of(&s));
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "nothing runs again");
 
 	// The parent chain takes X out; R confirms in its place.
 	r.server.stop();
 	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_x)).unwrap();
-	assert!(confirmations(&r, &xtx.txid()) < 1 && confirmations(&r, &ytx.txid()) < 1);
+	assert!(confirmations(&r, &xtx.txid()) < 1);
 	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
 	r.rt.client().send_raw_transaction(&rtx).unwrap();
 	r.produce().await;
@@ -745,16 +733,13 @@ async fn a_lost_round_that_returns_is_followed_by_the_wallet_in_place_of_its_rer
 	r.restart_server().await;
 	r.synced().await;
 	r.round_state(&rtx.txid(), RoundState::Final).await;
-	let y_verdict = r.rt.client().test_mempool_accept(&[&ytx]).unwrap().remove(0);
-	println!("D53w R back in the chain; the node's verdict on Y: {:?}", y_verdict.reject_reason);
-	assert!(!y_verdict.allowed);
+	println!("D53w R back in the chain");
 
 	// The wallet follows R: one leaf for the coin it gave up.
 	let s = c.ok(&["sync"]);
 	println!("D53w the wallet's sync: recheck {}", s["recheck"]["changes"]);
 	println!("D53w the wallet holds {:?}", held(&c));
 	assert_eq!(coin_of(&c, &leaf_r)["state"], "live", "{}", coin_of(&c, &leaf_r));
-	assert_eq!(coin_of(&c, &leaf_y)["state"], "lost", "{}", coin_of(&c, &leaf_y));
 	assert_eq!(held(&c).len(), 1);
 	let bal = c.ok(&["balance"]);
 	println!("D53w balance {}", bal);
