@@ -72,7 +72,7 @@ use elements::{AssetId, Transaction};
 
 use arca_covenant::order::OrderPolicy;
 use arca_covenant::sign::verify_digest;
-use arca_covenant::spend::margin_for;
+use arca_covenant::spend::{margin_for, Rebindable};
 use arca_covenant::transfer::{fill_hash, FillCoin, FillLeaf, OrderFill, SeenReassignments, TransferInput, MAX_INPUTS};
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, Pair, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
@@ -675,10 +675,15 @@ impl Orders {
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
+		// The fill spends the order's coin at input 0 and the checkpoints
+		// after it: a vtxo-2 checkpoint's pair names them all, its own index
+		// one past its place among the checkpoints (`fill_tx`).
+		let mut named = vec![oc.coin.output().txout()];
+		named.extend((0..n).map(|j| tplan.checkpoint_output(j).txout()));
 		let mut messages = Vec::with_capacity(n);
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp = tplan.checkpoint_message(k).map_err(internal)?.digest;
-			let re = tplan.reassignment_message(k).map_err(internal)?.digest;
+			let re = tplan.checkpoint(k).message_in(k as u32 + 1, &named, &outputs).map_err(internal)?.digest;
 			if !verify_digest(&i.checkpoint_sig, &cp, &c.coin.leaf.owner) {
 				return Err(OrderError::Cosign(CosignError::BadSignature { input: k, which: "checkpoint" }));
 			}
