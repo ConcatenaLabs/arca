@@ -1569,6 +1569,86 @@ the coin's script does, and refuses (`frozen`) while its node shows the landing 
 paused. A signer started without a node signs nothing for a `landing-1`
 coin, so an operator serving a supervised asset runs its signer with one.
 
+## Restricted assets
+
+A restricted asset is an OpenAMP asset: on the chain it lives only in its
+holders' enclaves, each `P2TR(NUMS, [<H> CHECKSIGVERIFY <Kp> CHECKSIG,
+<Ki> CHECKSIGVERIFY <Kp> CHECKSIG])` for the holder's registered key `H`,
+the asset's policy key `Kp`, and the issuer's key `Ki` where the asset
+elected clawback, so every move needs the policy key and its policy server
+(`openampd`, in the openamp repository) applies the asset's rules to each:
+freeze, categories, lock-in, velocity, holder caps, vesting. Its issuer runs
+an operator and serves the asset in its own tree, where a transfer between
+registered holders settles at once without a transaction, under the same
+rules:
+
+**The issuer names the operator.** A section names the asset's policy
+server and the file holding the issuer's token for it:
+
+    [[assets]]
+    asset = "<asset id>"
+    min_leaf = "1"
+    [assets.restricted]
+    policy_server = "http://127.0.0.1:8722"
+    token_file = "/etc/arca/openampd.token"
+
+At start and at every reload the server reads the asset's tree terms from
+the policy server (`GET /v1/assets/<id>`: `tree.operator`, `tree.policy`,
+`tree.clawback`), and serves the asset only when the tree's operator is its
+own `S`, which the issuer sets at the policy server (`POST /v1/issuer/tree`).
+A restricted asset is not also supervised, issuer-operated or served over
+Lightning. `info` publishes the profile (`assets[].restricted`: `policy`,
+`clawback`, `policy_server`).
+
+**Every leaf is `enclave-1`.** A leaf of the asset, on a board or from a
+reassignment, is `enclave-1` (`arca-covenant`'s `enclave`): its owner key is
+the holder's enclave key for the leaf's owner nonce (only the holder of `H`
+signs for it), its exit pays only the holder's enclave, in full, and where
+the asset elected clawback it carries the enclave's own claw leaf. A board's
+record, and a transfer's output, carry `enclave` (`{"holder", "policy",
+"clawback"}`, the leaf record's JSON form) with the keys `info` publishes;
+any other template, other keys, or an owner key that is not the holder's is
+refused (`out_of_bounds`), and `enclave` on a leaf of any other asset too.
+A holder boards from its enclave: the policy server co-signs the board
+transaction once it reads the board output as an `enclave-1` board of the
+asset's tree for that holder.
+
+**The policy server co-signs beside the operator.** Margins are zero: each
+checkpoint keeps the whole coin and the reassignment commits every atom,
+since a remainder of the asset could go anywhere, a fee output included;
+whoever brings a coin on the chain pays its fees with a coin of another
+asset, and the watcher does from the operator's own. A transfer of the asset
+moves that asset alone and gives up one holder's coins. Before its signer
+signs anything of it, the server asks the policy server to co-sign it
+(`POST /v1/issuer/tree/transfer`, with each input's coin record and
+checkpoint value and each new leaf's holder, value, nonces and exit delay):
+it applies the asset's rules, records the move in its register of leaves,
+and answers the policy key's signature over each message `S` is to sign. A
+refusal is the policy server's own words (`policy`, 403); a policy server
+that does not answer is `policy_unavailable` (503). A transfer the server
+then fails to record is dropped at the policy server
+(`POST /v1/issuer/tree/transfer/<id>/drop`).
+
+**The signer checks on its own.** `arca-signer --restricted
+<asset>=<policy key>[:<clawback key>]` signs a rebindable message of the
+asset only beside the policy key's signature over that very message, tagged
+(`arca_covenant::enclave::policy_cosign_digest`); the signer request carries
+it (`policy_sig`), and for an `enclave-1` coin names its holder
+(`enclave`), from which the signer builds the message with the digest of the
+holder's enclave after `K`, as the coin's script does. Without the flag it
+signs no `enclave-1` message; it signs no forfeit of the asset at all.
+
+**What the issuer can do, and what it cannot.** It can refuse to co-sign
+(a freeze, or any rule), and, where the asset elected clawback, take back a
+leaf once it is on the chain, by its claw leaf, with the policy server
+signing the policy half. It cannot move a holder's leaf without the holder's
+signature, nor stop the holder's exit to its own enclave. Not served in the
+asset: rounds (a refresh, an offboard, a round paying the asset), swaps,
+takes and resting orders, distributions, offline-refresh plans and
+Lightning, each refused before anything else (`restricted`, 422). A coin
+rests on its board, whose service dates bind it as any board coin's: its
+holder takes it home before its exit deadline.
+
 ## Channel leaves
 
 A `channel-1` leaf (`arca-covenant`'s `channel`) holds a balance for each of
@@ -2072,7 +2152,10 @@ channel (`channel_state`) and a credit note (`channel_note`), each message
 built by itself from the channel's terms, a state with its owner's signature
 over it and a note within the cap of a state its owner signed or of the
 opening, neither recorded and both refused once its record holds anything
-under the coin's salt (see Channel leaves). It signs no digest it is handed and no release, and
+under the coin's salt (see Channel leaves). For a restricted asset it was
+started with (`--restricted <asset>=<policy key>[:<clawback key>]`) it signs a
+rebindable message only beside the asset's policy key's approval of that very
+message, and no forfeit of the asset (see Restricted assets). It signs no digest it is handed and no release, and
 nothing else by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
 message for a `landing-1` coin, the leaf of a supervised asset, names the
 coin's landing program: the signer builds the message over the constant
@@ -2673,6 +2756,35 @@ refuses it too). The other holder still pays the frozen one. A pause
 refuses the other holder until its lifting is final, as the freeze's lifting
 does the first; a participation taken before a freeze is voided when its
 round is built.
+
+`tests/restricted.rs` serves a restricted asset in its issuer's tree beside a
+stand-in for its policy server, which publishes the asset's tree terms and
+co-signs a transfer as openampd does (each message computed by
+`arca-covenant`'s own code and signed by the policy key, unless the policy
+refuses the receiver). A policy server naming another operator is refused at
+reload; a board of the asset that is not `enclave-1`, or for another policy
+key, is refused; a transfer leaving a margin, paying a `vtxo-1` leaf, or a
+leaf without the asset's clawback is refused, and one to a receiver the
+policy server refuses is refused with its words (`policy`); a refresh is
+refused (`restricted`); the signer, asked directly, signs no message of the
+asset without the policy key's approval of that very message. A holder pays
+another out of round from its board and then converts the board: the watcher
+answers with the checkpoint and the reassignment, paying every fee from its
+own coins of another asset, the sender's exit is refused, and the receiver's
+exit pays its enclave the whole value.
+
+`tests/restricted_openampd.rs` runs the same with the real policy server, and
+does nothing unless `OPENAMPD_EXEC` (openampd), `ARCA_ENCLAVE_EXEC`
+(`arca-enclave`) and `TOKEN_COVENANTS_EXEC` (sequentia-contracts'
+`token-covenants`) are set: openampd issues the asset with clawback to a
+holder's enclave and names this operator the operator of its tree; the holder
+boards from its enclave, openampd co-signing the board once it reads the
+board output, the holder's wallet checking the signature hash itself; a
+transfer is refused for each of the asset's rules (category, lock-in,
+velocity, holder cap, vesting), each in openampd's words, and one settles at
+once; the receiver takes its coin home to its enclave, which openampd counts;
+and the sender's change, on the chain with it, is clawed back into the
+issuer's enclave, openampd signing the policy half.
 
 `tests/issuer.rs` also needs the mint limiter's tool, named by
 `MINT_LIMITER` (sequentia-contracts `tools/mint-limiter`, with its `sign`

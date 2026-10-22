@@ -386,6 +386,8 @@ pub fn status_of(code: &str) -> StatusCode {
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
 			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" =>
 			StatusCode::CONFLICT,
+		"policy" => StatusCode::FORBIDDEN,
+		"policy_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
 		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" | "lightning_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
@@ -679,6 +681,9 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			channels: p.channel_capacity(a).ok().filter(|c| *c > 0).map(|c| api::ChannelsInfo {
 				capacity: c.to_string(), window_units: p.channel_window.units(),
 			}),
+			restricted: ap.restricted.as_ref().map(|r| api::RestrictedInfo {
+				policy: hex(&r.policy.serialize()), clawback: r.clawback.map(|k| hex(&k.serialize())), policy_server: r.server.clone(),
+			}),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -830,6 +835,9 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
 			leaf: NewLeaf {
+				enclave: o.enclave.as_ref().map(|v| arca_covenant::record_json::enclave_from_json(v)
+					.map_err(|e| Refusal::malformed(format!("enclave: {}", e)))).transpose()?
+					.map(|e| Ok::<_, Refusal>(e.terms(asset(&o.asset)?, amount(&o.value)?))).transpose()?,
 				owner: key(&o.owner)?,
 				owner_nonce: unhex32(&o.owner_nonce).map_err(Refusal::malformed)?,
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,

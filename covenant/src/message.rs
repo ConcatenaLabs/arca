@@ -96,6 +96,18 @@ impl Chain {
 		b
 	}
 
+	/// What an `enclave-1` leaf's collaborative script pushes where another
+	/// leaf's pushes `K`: `K ‖ D`, `D` the 20-byte digest of the holder's
+	/// enclave ([`crate::enclave::Enclave::digest`]). It has a `landing-1`
+	/// constant's shape, 52 bytes, and its message is
+	/// `SHA256(K ‖ D ‖ asset_in ‖ …)`, so a pair made for one holder's
+	/// enclave spends only a leaf that exits there.
+	pub fn enclave_prefix(&self, salt: &[u8; 32], digest: &[u8; crate::enclave::DIGEST_BYTES]) -> Vec<u8> {
+		let mut b = self.leaf_constant(salt).to_vec();
+		b.extend(digest);
+		b
+	}
+
 	/// The fixed part of every release of the lowest node whose children hash
 	/// is `children_hash`: `"Arca/release" ‖ genesis_hash ‖ H`, 76 bytes. Its
 	/// RECLAIM pushes it and appends each owner's `M`.

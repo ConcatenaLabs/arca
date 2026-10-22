@@ -49,8 +49,12 @@ impl Watcher {
 			.collect();
 		let mut due = vec![];
 		let mut value: u64 = 0;
+		// Each output's sweep is read once for the whole distribution: the
+		// nursery may find a sweep final while the claims are gone through,
+		// and every leaf that one sweep took is returned in one payment.
+		let mut seen = HashMap::new();
 		for c in open {
-			if self.swept_final(&c.leaf_id.expect("filtered")).await? {
+			if self.swept_final(&c.leaf_id.expect("filtered"), &mut seen).await? {
 				due.push(c.idx);
 				value = value.checked_add(c.value).ok_or_else(|| WatcherError::Build("a return above 2^64 atoms".into()))?;
 			}
@@ -91,8 +95,9 @@ impl Watcher {
 
 	/// Whether a sweep of the watcher's that is final took the value of the
 	/// batch leaf `leaf`: it spent the batch output, a node of the tree whose
-	/// leaves include it, or its entry.
-	async fn swept_final(&self, leaf: &[u8; 32]) -> Result<bool, WatcherError> {
+	/// leaves include it, or its entry. Each output's sweep is read once into
+	/// `seen`, so the leaves of one sweep get one answer.
+	async fn swept_final(&self, leaf: &[u8; 32], seen: &mut HashMap<OutPoint, bool>) -> Result<bool, WatcherError> {
 		let Some(bl) = self.store.batch_leaf(leaf).await? else { return Ok(false) };
 		let Some(round) = self.store.round(bl.round_id).await? else { return Ok(false) };
 		let idx = bl.idx as usize;
@@ -126,10 +131,17 @@ impl Watcher {
 			}
 		}
 		for op in above {
-			if let Some(w) = self.store.watcher_spend(&op.txid.to_byte_array(), op.vout).await? {
-				if w.kind == "sweep" && w.state == NurseryState::Final {
-					return Ok(true);
-				}
+			let swept = match seen.get(&op) {
+				Some(s) => *s,
+				None => {
+					let s = self.store.watcher_spend(&op.txid.to_byte_array(), op.vout).await?
+						.is_some_and(|w| w.kind == "sweep" && w.state == NurseryState::Final);
+					seen.insert(op, s);
+					s
+				},
+			};
+			if swept {
+				return Ok(true);
 			}
 		}
 		Ok(false)

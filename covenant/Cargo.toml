@@ -13,6 +13,12 @@ publish = false
 [lib]
 name = "arca_covenant"
 
+# What a restricted asset's policy server checks of an enclave-1 board or
+# transfer: `cargo install --path covenant --bin arca-enclave`.
+[[bin]]
+name = "arca-enclave"
+required-features = [ "json" ]
+
 [features]
 default = [ "json" ]
 # The leaf record's JSON form (record_json).

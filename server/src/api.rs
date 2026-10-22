@@ -324,6 +324,25 @@ pub struct AssetInfo {
 	/// credit window every one carries.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub channels: Option<ChannelsInfo>,
+	/// Set when the operator serves the asset as a restricted asset in its
+	/// issuer's tree: every leaf of it is `enclave-1` for these keys, and
+	/// every transfer of it is co-signed by its policy server beside the
+	/// operator.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub restricted: Option<RestrictedInfo>,
+}
+
+/// What the operator serves of a restricted asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestrictedInfo {
+	/// The asset's policy key, x-only, hex.
+	pub policy: String,
+	/// The issuer's clawback key, x-only, hex; `null` when the asset elected
+	/// no clawback.
+	pub clawback: Option<String>,
+	/// The policy server, where a holder registers.
+	pub policy_server: String,
 }
 
 /// What the operator makes of `channel-1` leaves in an asset.
@@ -697,6 +716,12 @@ pub struct TransferOutput {
 	/// it, and the operator's published allowance.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
+	/// The enclave of an `enclave-1` leaf, for a leaf of a restricted asset,
+	/// in the leaf record's JSON form (`{"holder", "policy", "clawback"}`):
+	/// the receiver's registered key, as its receive request names it, and
+	/// the asset's keys the operator publishes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enclave: Option<serde_json::Value>,
 }
 
 /// An `htlc-1` leaf's terms beside its owner's key, nonces and exit delay.

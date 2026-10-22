@@ -41,12 +41,15 @@
 //!   path, nor by a fill that pays anyone but the maker, nor by the landing.
 //! - **No annex.** The operator's signed fill of A and the on-chain fill of
 //!   A's landed order (`seqdex/order` version 2), each with an annex of 3 and
-//!   of 1,000 bytes on the order's input, are refused (`Assertion failed`),
-//!   beside the same fills without one, which are mined.
-//! - **O. An `order-2` leaf.** It is filled by the operator's signature as
-//!   before, its remainder resting as `order-2`. Its program takes an
-//!   annex: the mempool accepts the same fill with a 100,000-byte annex,
-//!   which is why new orders rest as `order-3`.
+//!   of 1,000 bytes and a zero annex of 1,000 bytes on the order's input, are refused at relay and in a block
+//!   by the program (`Assertion failed`), beside the same fills without one,
+//!   which are mined.
+//! - **O. An `order-2` leaf.** Its program takes an annex nobody signed,
+//!   which is why new orders rest as `order-3`: its fill with a 1,000-byte
+//!   annex is mined (through the mempool on a node before Sequentia 25.2.4,
+//!   which relays it; by `generateblock` on one from it, whose relay refuses
+//!   a nonzero annex). The order fills as before: the remainder rests as
+//!   `order-2`, and its own fill is mined.
 //!
 //! Needs `SEQUENTIAD_EXEC`; run with `--nocapture` for the table.
 
@@ -265,6 +268,36 @@ fn collab(net: &mut Net, o: &OrderPolicy, oc: &Coin, outs: &[ExplicitOutput], s_
 	s.tx
 }
 
+/// An annex on a Simplicity leaf the program does not need: relay refuses a
+/// nonzero one before the program runs on a node from Sequentia 25.2.4,
+/// which relays an annex only when it is zeros and as large as the program's
+/// cost needs. On an older node relay runs the program.
+const ANNEX_NONZERO: &str = "Simplicity annex must be zeros after its tag";
+/// The same node's refusal of a zero annex the program's cost does not need.
+const ANNEX_UNNEEDED: &str = "Simplicity annex is larger than the program's cost needs";
+/// The program's own refusal of an annex (`current_annex_hash` is none), the
+/// block's reason on every node.
+const ANNEX_REFUSED: &str = "(Assertion failed)";
+
+/// Refused at relay (for the annex on a node from 25.2.4, by the program on
+/// an older one) and by the program in a block.
+fn refuse_annexed(net: &mut Net, name: &str, tx: &Transaction) {
+	let r = net.rt.client().test_mempool_accept(&[tx]).unwrap().remove(0);
+	let reason = r.reject_reason.unwrap_or_default();
+	let relay = if reason.contains(ANNEX_NONZERO) { ANNEX_NONZERO } else if reason.contains(ANNEX_UNNEEDED) { ANNEX_UNNEEDED }
+		else { ANNEX_REFUSED };
+	net.refuse_relay_and_block(name, tx, relay, ANNEX_REFUSED);
+}
+
+/// `tx` with an annex of `n` bytes (0x50, then zeros) on input `k`'s witness.
+fn zero_annexed(tx: &Transaction, k: usize, n: usize) -> Transaction {
+	let mut t = tx.clone();
+	let mut a = vec![0; n];
+	a[0] = 0x50;
+	t.input[k].witness.script_witness.push(a);
+	t
+}
+
 /// `tx` with an annex of `n` bytes (0x50, then 0xab) on input `k`'s witness.
 fn annexed(tx: &Transaction, k: usize, n: usize) -> Transaction {
 	let mut t = tx.clone();
@@ -443,8 +476,9 @@ fn order_3_on_regtest() {
 	println!("A/fill 1: {}", judged(&a.order, &t, N, 4, true));
 	// The operator's signature covers no annex, so a relay could add one: order-3 refuses it.
 	assert_eq!(t.input[0].witness.script_witness.len(), 4);
-	net.refuse("A/neg the operator's signed fill with a 3-byte annex", &annexed(&t, 0, 3), "(Assertion failed)");
-	net.refuse("A/neg the operator's signed fill with a 1,000-byte annex", &annexed(&t, 0, 1_000), "(Assertion failed)");
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 3-byte annex", &annexed(&t, 0, 3));
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 1,000-byte annex", &annexed(&t, 0, 1_000));
+	refuse_annexed(&mut net, "A/neg the operator's signed fill with a 1,000-byte zero annex", &zero_annexed(&t, 0, 1_000));
 	let a1 = net.pass("A/fill 1: 3,000,000 X for 6,000,000 Y; credit 0 to its leaf, the rest under the next salt", &t);
 	let credit_a1 = coin_of(a1, 0, &t);
 	let ra = coin_of(a1, 1, &t);
@@ -523,9 +557,10 @@ fn order_3_on_regtest() {
 	net.refuse("A/neg an on-chain fill of the landed order one atom short", &short.tx, jet);
 	// The fill signs nothing, so anyone could add an annex: seqdex/order version 2 refuses it.
 	assert_eq!(a.order.landed.version, SeqdexVersion::V2);
-	net.refuse("A/neg the on-chain fill of the landed order with a 3-byte annex", &annexed(&sx.tx, 0, 3), "(Assertion failed)");
-	net.refuse("A/neg the on-chain fill of the landed order with a 1,000-byte annex", &annexed(&sx.tx, 0, 1_000),
-		"(Assertion failed)");
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 3-byte annex", &annexed(&sx.tx, 0, 3));
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 1,000-byte annex", &annexed(&sx.tx, 0, 1_000));
+	refuse_annexed(&mut net, "A/neg the on-chain fill of the landed order with a 1,000-byte zero annex",
+		&zero_annexed(&sx.tx, 0, 1_000));
 	net.pass("A/an on-chain taker fills the landed order by seqdex/order version 2 (no signature)", &sx.tx);
 
 	// ---------------------------------------------------------------- O
@@ -540,18 +575,24 @@ fn order_3_on_regtest() {
 	let t = fill(&mut net, &old.order, &oo, good_o.clone(), &good_o, 4, true, &s, payers(&pay_o));
 	println!("O/fill: {}", judged(&old.order, &t, N, 4, true));
 	assert_eq!(t.input[0].witness.script_witness[2], Vec::<u8>::from_hex(arca_covenant::order_programs::ORDER_CMR).unwrap());
-	// order-2 takes an annex the operator never signed: the mempool accepts
-	// the fill with the largest one relay allows on a Simplicity leaf. It is
-	// not broadcast.
-	for n in [1_000, 100_000] {
-		let r = net.rt.client().test_mempool_accept(&[&annexed(&t, 0, n)]).unwrap().remove(0);
-		assert!(r.allowed, "O: order-2's fill with a {}-byte annex: {:?}", n, r.reject_reason);
-		println!("O/order-2's fill with a {}-byte annex: accepted by testmempoolaccept (not broadcast)", n);
-	}
-	let fo = net.pass("O/fill of the order-2 leaf: 3,000,000 X for 6,000,000 Y, the rest resting as order-2", &t);
+	// order-2 takes an annex the operator never signed. A node before
+	// Sequentia 25.2.4 relays the fill with one; a node from it refuses the
+	// annex at relay (it is not zeros), and a block producer can still mine
+	// it: the block takes the padded fill either way, and the order fills.
+	let padded = annexed(&t, 0, 1_000);
+	assert_eq!(padded.txid(), t.txid(), "the annex is witness data");
+	let fo = net.pass_or_mine("O/fill of the order-2 leaf with a 1,000-byte annex nobody signed: 3,000,000 X for 6,000,000 Y, \
+		the rest resting as order-2", &padded, ANNEX_NONZERO);
+	assert_eq!(net.witness_of(&fo, 0).len(), 5, "the block keeps the annex");
 	assert_eq!(coin_of(fo, 1, &t).txout.script_pubkey, old.order.next().script_pubkey());
 	assert_eq!(old.order.next().leaf().template(), Template::Order2);
 	assert_eq!(coin_of(fo, 0, &t).txout.script_pubkey, old.order.credit_leaf().unwrap().script_pubkey());
+	// Its remainder, an order-2 leaf too, fills as it always did.
+	let o2n = old.order.next();
+	let pay_o2 = net.fund(vec![explicit(net.y, 2 * 2_000_000, op_true_spk())]).remove(0);
+	let outs = outputs(&o2n, N - f1, 2_000_000, &taker_x, None);
+	let t = fill(&mut net, &o2n, &coin_of(fo, 1, &t), outs.clone(), &outs, 3, true, &s, payers(&pay_o2));
+	net.pass("O/fill of the order-2 remainder: 2,000,000 X, m = 3, the rest resting as order-2", &t);
 
 	// The takers' Y tree, down to the lowest nodes, by the operator: the
 	// lineage it publishes to answer an order brought to the chain.
