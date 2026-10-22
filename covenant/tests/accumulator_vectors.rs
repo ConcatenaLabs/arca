@@ -1,9 +1,10 @@
 //! The accumulator batch's builders against `regtest/vectors/accumulator.json`,
 //! which `regtest/accumulator.py` derives independently: every slot's entry
 //! and record, the Merkle-sum root and the batch's weight, the state's data
-//! leaf, the batch output's tree, scriptPubKey and control block, and two
+//! leaf, the batch output's tree, scriptPubKey and control block, two
 //! exits, each with its digest, signature, witness value and the state it
-//! leaves.
+//! leaves, and every leaf's record and coin record in binary form with its
+//! leaf id, and records a reader refuses.
 
 use elements::hashes::Hash;
 use elements::hex::FromHex;
@@ -12,7 +13,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, BlockHash};
 use serde_json::Value;
 
-use arca_covenant::accumulator::{exit_digest, read_exit, Exit, ExitAuth};
+use arca_covenant::accumulator::{exit_digest, read_exit, AccumulatorRecord, Exit, ExitAuth};
 use arca_covenant::tree::{LeafSpec, ReserveRule};
 use arca_covenant::*;
 
@@ -100,5 +101,26 @@ fn accumulator_matches_the_regtest_suites_vectors() {
 		at = at.after(j as u16);
 		same(&format!("exit {j}: next bitmap"), &at.bitmap.to_bytes(), &e["next_bitmap"]);
 		same(&format!("exit {j}: next scriptPubKey"), at.script_pubkey().as_bytes(), &e["next_script_pubkey"]);
+	}
+
+	// Every leaf's record and coin record, both ways.
+	for h in v["held"].as_array().unwrap() {
+		let j = h["slot"].as_u64().unwrap() as usize;
+		let rec = acc.record(j);
+		same(&format!("slot {j}: record"), &rec.to_bytes().unwrap(), &h["record"]);
+		assert_eq!(AccumulatorRecord::from_bytes(&hex(&h["record"])).unwrap(), rec, "slot {j}: the record decodes to the built one");
+		same(&format!("slot {j}: leaf program"), &rec.leaf().program(), &h["leaf_program"]);
+		same(&format!("slot {j}: leaf id"), &rec.leaf_id().unwrap().0, &h["leaf_id"]);
+		let t = MedianTime::from_consensus(h["auth_time"].as_u64().unwrap() as u32).unwrap();
+		let coin = CoinRecord::Accumulator {
+			record: rec.clone(), preimage: h32(&h["preimage"]),
+			auth: (Signature::from_slice(&hex(&h["auth_signature"])).unwrap(), t),
+		};
+		same(&format!("slot {j}: coin record"), &coin.to_bytes().unwrap(), &h["coin"]);
+		assert_eq!(CoinRecord::from_bytes(&hex(&h["coin"])).unwrap(), coin, "slot {j}: the coin record decodes");
+	}
+	for r in v["refuse"].as_array().unwrap() {
+		let e = AccumulatorRecord::from_bytes(&hex(&r["record"])).expect_err(r["why"].as_str().unwrap());
+		println!("refused, {}: {}", r["why"].as_str().unwrap(), e);
 	}
 }

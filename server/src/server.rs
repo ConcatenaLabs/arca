@@ -723,6 +723,7 @@ pub async fn expired_salts(config: &Config) -> Result<Vec<[u8; 32]>, StartError>
 		match r {
 			CoinRecord::Board(_) => None,
 			CoinRecord::Leaf { record, .. } => Some(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX)),
+			CoinRecord::Accumulator { record, .. } => Some(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX)),
 			CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().map(last_expiry).try_fold(0u32, |m, e| e.map(|e| m.max(e))),
 		}
 	}
