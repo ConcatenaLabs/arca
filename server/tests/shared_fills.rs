@@ -400,7 +400,7 @@ async fn the_covenant_judges_a_shared_fill_by_its_sum() {
 	};
 	assert_eq!(r.rt.client().block_count().unwrap(), h0);
 	println!("a credit of {} (the first share's price) for a fill of 500000: refused in a block: {}", sale.price(300_000).unwrap(), e);
-	assert!(e.contains("TestBlockValidity failed: mempool-script-verify-flag-failed (Script evaluated without error but finished with a \
+	assert!(e.contains("TestBlockValidity failed: ") && e.contains("-script-verify-flag-failed (Script evaluated without error but finished with a \
 		false/empty top stack element)"), "{}", e);
 
 	// The round as built, its forfeits in, forced the same way: mined.

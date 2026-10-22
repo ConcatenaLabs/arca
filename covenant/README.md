@@ -964,7 +964,7 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   spend confirms, and every negative case is refused by the mempool and again
   when forced into a block with `generateblock`, the block for the same reason
   (the node runs with `-par=1`, so a block refused by a script names the
-  failure). It also funds the review's attacks, turned around: a batch whose
+  failure, under the consensus label `mandatory-script-verify-flag-failed`). It also funds the review's attacks, turned around: a batch whose
   key holds two leaves and a leaf built from a salt the owner signed under
   before; validation refuses each owner's record against the confirmed round.
 

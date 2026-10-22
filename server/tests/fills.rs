@@ -446,12 +446,12 @@ async fn the_covenant_refuses_a_wrong_round_in_a_block_and_an_order_taken_after_
 	let v1 = variant(&r, &tx, 2, |o| o.swap(2, 4)).await;
 	println!("  check: {}", o2.check(&v1, 1, 400_000).unwrap_err());
 	refused_in_block(&r, "order 2's credit at the wrong index (4), the batch at 2", &v1,
-		"TestBlockValidity failed: mempool-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)");
+		"-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)");
 	// The batch output, in X, at order 2's 2k+1, where the full fill put Z.
 	let v2 = variant(&r, &tx, 2, |o| o.swap(3, 4)).await;
 	println!("  check: {}", o2.check(&v2, 1, 400_000).unwrap_err());
 	refused_in_block(&r, "a batch output at order 2's 2k+1 (3)", &v2,
-		"TestBlockValidity failed: mempool-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)");
+		"-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)");
 	// Order 1's credit one atom short, the atom to the operator's change in Y.
 	let change_y = tx.output.iter().enumerate().skip(6)
 		.position(|(_, o)| o.asset.explicit() == Some(y) && !o.is_fee()).map(|p| p + 6).expect("the operator's change in Y");
@@ -461,7 +461,7 @@ async fn the_covenant_refuses_a_wrong_round_in_a_block_and_an_order_taken_after_
 	}).await;
 	println!("  check: {}", o1.check(&v3, 0, 600_000).unwrap_err());
 	refused_in_block(&r, "order 1's credit one atom under its price", &v3,
-		"TestBlockValidity failed: mempool-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)");
+		"-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)");
 	// And the round itself, its takes' forfeits in, forced the same way:
 	// taken in a block.
 	broadcast_after(&r, &tx.txid(), &[(&id1, &c1, &[b1.clone()], &k1, &n1), (&id2, &c2, &[b2.clone()], &k2, &n2)]).await;
