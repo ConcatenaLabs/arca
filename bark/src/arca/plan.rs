@@ -273,12 +273,17 @@ impl Wallet {
 			}
 			// A supervised asset's leaf (`landing-1`) is not planned: its
 			// operator runs no plans for it, and `sync` refreshes it. Nor is
-			// a leaf of an accumulator batch, nor a `vtxo-2` leaf: a step's
-			// refund spends it beside its new leaf, which its pair would have
-			// to name; `sync` refreshes it too.
+			// a channel leaf (`channel-1`): `care` closes a channel into a
+			// round once its expiry is within reach, for a plain leaf a plan
+			// starts from; nor a `vtxo-2` leaf: a step's refund spends it
+			// beside its new leaf, which its pair would have to name, and
+			// `sync` refreshes it. A plain leaf of a tree or of an
+			// accumulator batch is.
 			match CoinRecord::from_bytes(&c.record) {
 				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none()
-					&& record.template == arca_covenant::Template::Vtxo1 => out.push(c),
+					&& record.channel.is_none() && record.template == arca_covenant::Template::Vtxo1 => out.push(c),
+				Ok(CoinRecord::Accumulator { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none()
+					=> out.push(c),
 				_ => {},
 			}
 		}
@@ -368,10 +373,12 @@ impl Wallet {
 	}
 
 	fn make_plan(&mut self, c: &CoinRow, steps: usize, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
-		let record = match CoinRecord::from_bytes(&c.record).map_err(|e| Error::Store(e.to_string()))? {
-			CoinRecord::Leaf { record, .. } => record,
-			_ => return Err(Error::Refused(format!("coin {} is not a leaf of a round's tree: a plan starts from a tree's leaf (an accumulator \
-				batch's leaf is refreshed by sync)", c.leaf_id))),
+		// The coin's leaf, of a tree or of an accumulator batch: its policy,
+		// owner key, salt and exit delay.
+		let (first, owner, salt, exit_delay) = match CoinRecord::from_bytes(&c.record).map_err(|e| Error::Store(e.to_string()))? {
+			CoinRecord::Leaf { record, .. } => (record.leaf(), record.owner, record.salt(), record.exit_delay),
+			CoinRecord::Accumulator { record, .. } => (record.leaf(), record.owner, record.salt(), record.exit_delay),
+			_ => return Err(Error::Refused(format!("coin {} is not a leaf of a round", c.leaf_id))),
 		};
 		let key = self.coin_key(&c.owner_nonce)?;
 		let mailbox = self.keys.mailbox()?;
@@ -407,7 +414,7 @@ impl Wallet {
 			indices.push(index);
 			preimages.push(preimage);
 		}
-		let plan = Plan { chain: self.genesis, operator: self.operator, coin, first: record.leaf(), asset, value: c.value, steps: plan_steps };
+		let plan = Plan { chain: self.genesis, operator: self.operator, coin, first, asset, value: c.value, steps: plan_steps };
 		plan.check().map_err(|e| Error::Refused(format!("the plan: {}", e)))?;
 		let id = plan.id();
 		let kd = key_proof_digest(&id);
@@ -447,7 +454,7 @@ impl Wallet {
 			return Err(Error::Refused(format!("the operator answers for another plan than the wallet made: {}", st)));
 		}
 		let kept = json!({"plan_id": hex(&id), "coin": c.leaf_id, "asset": c.asset, "value": c.value.to_string(), "expiry": c.expiry,
-			"first": {"owner": hex(&record.owner.serialize()), "salt": hex(&record.salt()), "exit_delay_units": record.exit_delay.units()},
+			"first": {"owner": hex(&owner.serialize()), "salt": hex(&salt), "exit_delay_units": exit_delay.units()},
 			"steps": kept_steps, "covered_until": covered_until(c.expiry, steps), "sync_by": sync_by(c.expiry, steps),
 			"made_at": self.now()?.to_consensus_u32()});
 		let state = st["state"].as_str().unwrap_or("open").to_string();

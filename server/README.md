@@ -1134,7 +1134,7 @@ whose expected exits cost less from one output than through a tree is built
 as an accumulator batch instead (`arca_covenant::BatchKind::choose`): one
 output of up to 1,024 leaves, each behind the same entry, from which one
 owner leaves in one transaction (`arca-covenant`'s `accumulator`). That holds
-for up to about 78 expected exits of 1,024. A batch with a resting order or a
+for up to about 77 expected exits of 1,024. A batch with a resting order or a
 channel, and an issuer-operated asset's batch, is always a tree. An
 accumulator leaf's owner hands over one exit authorisation for it (its
 signature over the exit digest, and the time) where a tree leaf's owner hands

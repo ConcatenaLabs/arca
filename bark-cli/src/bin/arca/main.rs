@@ -323,6 +323,10 @@ enum Cmd {
 	/// time has passed.
 	#[command(subcommand)]
 	Order(OrderCmd),
+	/// Channel leaves: a leaf with a balance for the wallet and one for the
+	/// operator, paid between at once with no round.
+	#[command(subcommand)]
+	Channel(ChannelCmd),
 	/// Every order the wallet placed, as the chain shows it now: where it
 	/// rests (and its terms as SeqDEX's relay serves them), each fill and
 	/// what it credited, and the credits at its key. Asks the node only.
@@ -454,6 +458,49 @@ enum Cmd {
 	Bitcoin {
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
 		args: Vec<String>,
+	},
+}
+
+#[derive(Subcommand)]
+enum ChannelCmd {
+	/// Every channel leaf the wallet holds, with its latest state, its
+	/// balance (the latest state's and every credit not folded) and the
+	/// credit it was paid, asking nothing.
+	List,
+	/// Opens a channel: gives up the coins named by `--leaf` (every live coin
+	/// of one asset when none is named) in the operator's next round for a channel leaf
+	/// holding what they hold, less the refresh fee, on the wallet's side and
+	/// `--capacity` on the operator's, which lets it be paid that much.
+	/// `sync` takes it once the round is final.
+	Open {
+		#[arg(long = "leaf")]
+		leaves: Vec<String>,
+		/// The operator's side, in the asset's atoms: at most what the
+		/// operator's `info` publishes (`assets[].channels.capacity`).
+		#[arg(long)]
+		capacity: u64,
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
+	/// Reads a channel from the operator: every state and credit note newer
+	/// than the wallet's, each checked; a state sent and never answered is
+	/// sent again.
+	Sync { leaf_id: String },
+	/// Pays `AMOUNT` from the channel `LEAF_ID` into the channel `TO` of
+	/// another holder of the same operator, in the same asset: final for the
+	/// receiver at once. Every credit not yet folded is folded in the same
+	/// state.
+	Pay { leaf_id: String, to: String, amount: u64 },
+	/// Folds every credit the channel was paid into its balance.
+	Fold { leaf_id: String },
+	/// Closes the channel on the chain, one step a run: unrolls it, publishes
+	/// its latest state, settles it after the exit delay, claims its credit
+	/// not folded and sweeps the wallet's side home. Run again to go on.
+	Exit {
+		leaf_id: String,
+		/// The asset to pay fees in.
+		#[arg(long)]
+		fee_asset: Option<String>,
 	},
 }
 
@@ -1159,6 +1206,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
+		| Cmd::Channel(ChannelCmd::List) | Cmd::Channel(ChannelCmd::Exit { .. })
 		| Cmd::Distributions | Cmd::Plans)
 	{
 		match w.witness() {
@@ -1279,6 +1327,12 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Sync { exits_only: true } => w.sync_exits(),
 		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
+		Cmd::Channel(ChannelCmd::List) => w.channels(),
+		Cmd::Channel(ChannelCmd::Open { leaves, capacity, max_fee_ppm }) => w.channel_open(&leaves, capacity, max_fee_ppm),
+		Cmd::Channel(ChannelCmd::Sync { leaf_id }) => w.channel_sync(&leaf_id),
+		Cmd::Channel(ChannelCmd::Pay { leaf_id, to, amount }) => w.channel_pay(&leaf_id, &to, amount),
+		Cmd::Channel(ChannelCmd::Fold { leaf_id }) => w.channel_fold(&leaf_id),
+		Cmd::Channel(ChannelCmd::Exit { leaf_id, fee_asset }) => w.channel_exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Exit { leaf_id, fee_asset, quote: true, .. } => w.exit_quote(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Exit { leaf_id, fee_asset, quote: false, shown } => {
 			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)

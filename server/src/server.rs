@@ -1116,7 +1116,7 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 		};
 		let at = elements::OutPoint::new(elements::Txid::from_byte_array(txid), vout);
 		let script = spender.input.iter().find(|i| i.previous_output == at)
-			.and_then(|i| i.witness.script_witness.iter().rev().nth(1).cloned());
+			.and_then(|i| arca_covenant::witness::without_annex(&i.witness.script_witness).iter().rev().nth(1).cloned());
 		// The owner's conversion is its own; any other path needs S, and the
 		// server co-signed it only as the checkpoint of the board's transfer.
 		if script.as_deref() == Some(record.policy().convert_script().as_bytes())

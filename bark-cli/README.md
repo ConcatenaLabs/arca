@@ -555,6 +555,14 @@ and a board whose registration never reached the server, are not recovered.
   is refreshed, since a restore of that machine can let its sender spend it
   twice.
 
+- **A spend read from the chain** (a claim that reveals a preimage, a fill
+  of an order, an exit from an accumulator batch, a collaborative spend
+  `watch-bond` reads) is read with its annex (BIP341) set aside, the last
+  witness item when it starts with `0x50`. Consensus ignores an annex, and
+  on most of these paths no signature covers it, so whoever relays or mines
+  a spend can add one; the wallet reads an annexed spend the same as the
+  plain one.
+
 ### Fees
 
 Fees are paid in the asset being moved unless another is named
@@ -1245,6 +1253,59 @@ watchers, or run your own. A watcher learns the salts and messages it is
 given, not who holds the coins; it cannot take a coin, and a slash pays no
 one. Run `watch-bond` beside `sync`, at least as often.
 
+### Channel leaves
+
+A channel leaf (`channel-1`) holds a balance for the wallet and one for the
+operator. Paid from, it moves the wallet's balance to the operator's; paid
+into, it moves the operator's balance to the wallet's, so it can be paid only
+as much as the operator's side holds. A payment between two channels of one
+operator is final for the receiver at once, with no round between and nothing
+asked of the receiver: the operator signs the receiver's channel a note, a
+cumulative credit the receiver can take on the chain with nobody's help.
+`info` shows each asset the operator makes channels of (`assets[].channels`:
+the most it puts on its side, `capacity`, and its credit window).
+
+    arca channel open --capacity 1000000           # every live coin of one asset into a channel
+    arca sync                                      # once the round is final: the channel is live
+    arca channel list                              # each channel: its balance, its credit, the operator's side
+    arca channel pay LEAF RECEIVER_LEAF 400000     # final for the receiver at once
+    arca channel sync LEAF                         # the operator's latest state and note, checked
+    arca channel fold LEAF                         # the credit paid in, into the balance
+    arca participate --leaf LEAF                   # close into a round: a leaf of the wallet's side
+    arca channel exit LEAF                         # close on the chain alone; run until `exited`
+
+A channel's address is its leaf id: a payer names the receiver's channel
+leaf. The wallet's side of a channel is its latest balance and every credit
+not yet folded, which `balance` counts and a refresh gives up; the leaf's
+value beyond it is the operator's. Paying folds every credit not yet folded in
+the same state. The wallet keeps every state both sides signed, the latest
+note, and a state it sent and never saw answered, which `channel sync` sends
+again; a wallet restored from its mnemonic takes its channel coin as any leaf
+and reads its states and note with `channel sync`.
+
+`channel exit` runs one step a run, as far as the chain allows: the coin's
+path unrolled as any leaf's, the latest state published over whatever state
+the coin is in, its settle once the exit delay has run from that state's
+block, the credit not folded claimed from the operator's side, and the
+wallet's outputs swept to an address of its own. Fees come from an on-chain
+coin of the wallet's, in the asset named (`--fee-asset`) or chosen as for an
+exit. An older state the operator publishes never pays the wallet less than
+the latest: the wallet's latest note takes the rest from the operator's side.
+
+Credit not folded has a deadline that a balance does not. Once any state of
+the channel is settled on the chain, by whoever published it, the operator
+may take back what the note's claim has not taken after the channel's credit
+window (`window_units` in `info`, in units of 512 seconds). `sync` does not
+notice a channel closed by someone else: a wallet holding credit not folded
+either folds it (`channel fold`, or any payment from the channel), after
+which nothing of it has a deadline, or runs `channel exit` within the window
+of any close.
+
+A channel leaf expires with its round, as any leaf. No plan starts from it:
+`care` closes it into a round once its expiry is within reach, for a plain
+leaf of the wallet's side, and a new channel is opened from that leaf with
+`channel open`.
+
 ### Holding a supervised asset
 
 A supervised asset is one whose issuer can freeze holdings by a rule of the
@@ -1376,6 +1437,12 @@ asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
+| `channel list` | Every channel leaf the wallet holds: its latest state, its balance (the latest state's and every credit not folded), its credit and what of it is not folded, the operator's side, and whether a state waits for the operator's answer (see Channel leaves) |
+| `channel open [--leaf LEAF]… --capacity N [--max-fee-ppm P]` | Gives up the coins named (every live coin of one asset when none is) in the operator's next round for a channel leaf: what they hold, less the refresh fee, on the wallet's side and `N` on the operator's, at most the capacity `info` publishes; `sync` takes it once the round is final |
+| `channel sync LEAF` | Reads the channel from the operator and takes every newer state and note, each checked by the wallet's and the operator's keys; a state sent and never answered is sent again |
+| `channel pay LEAF TO AMOUNT` | Pays `AMOUNT` from the channel `LEAF` into the operator's channel `TO`, in the same asset: the next state signed, every credit not folded folded in it, and the answer the operator's signature and the receiver's note (`receipt`). Refused beyond the wallet's side, beyond what the receiver's operator side can take, or into the channel itself |
+| `channel fold LEAF` | Folds every credit the channel was paid into its balance |
+| `channel exit LEAF [--fee-asset A]` | Closes the channel on the chain, one step a run (see Channel leaves); `exited` once the wallet's side is swept home |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit left it, followed from the round through each exit's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
@@ -1455,16 +1522,30 @@ the new round. Every
 refusal is asserted by its reason.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
-accumulator batches (`[batches] accumulator_exit_rate_ppm`): five wallets
+accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets
 refresh in one round into one accumulator batch, each holding its leaf with
-one exit authorisation; one pays another out of round from its leaf; one
+one exit authorisation; one pays another out of round from its leaf; a
+wallet restored from one holder's mnemonic finds its leaf; one
 takes its leaf out (the exit, the entry, the claim), its exit and entry
 mined in a block anchored to a parent block that is then orphaned, and goes
 on once they are back; another's exit, by the authorisation it signed before,
-spends the batch output where the first left it; the payment is taken out
+spends the batch output where the first left it; one refreshes its leaf in
+a round of its own; the payment is taken out
 through the payer's leaf, its checkpoint and its reassignment; and the last
 holder, away past the expiry and the notice, finds its coin `lost` to the
-operator's sweep of the batch output where the last exit left it.
+operator's sweep of the batch output where the last exit left it. A second
+test makes an offline-refresh plan from a leaf of an accumulator batch: its
+first step runs in the leaf's free window, and the holder, back, takes up the
+step's leaf.
+
+`tests/arca_channel.rs` runs the same way: two wallets open channel leaves
+in one round, the operator funding its side of each; they pay each other,
+each payment final at once with no round between, the refusals worded as the
+wallet words them (more than its side, more than the receiver can take, into
+itself, a channel given up); one, offline while paid, reads its credit on
+return and folds it; one closes into a round for a leaf of its side; the
+other closes on the chain alone, its latest state published, settled after
+the exit delay, its credit claimed and its side swept home.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when

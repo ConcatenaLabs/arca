@@ -320,6 +320,54 @@ fn the_equivocation_bond() {
 	b.net.print();
 }
 
+/// A conflicting spend whose witness ends with an annex (BIP341): the
+/// mempool refuses it (`bad-witness-nonstandard`), a block producer mines it,
+/// and its signatures, built over messages that commit to no annex, stay
+/// valid. It is the same transaction as the spend without it, the same txid.
+/// A watcher reads S's signature from it as from the plain spend, and the
+/// slash burns the bond.
+#[test]
+fn an_annexed_conflicting_spend_is_evidence_as_the_plain_one() {
+	let mut b = Bonds::start();
+	let x = b.net.x;
+	let p = b.policy;
+	let a = keypair("annex bond leaf owner");
+	let leaf = b.net.leaf(&a, &b.s, "annex bond leaf salt");
+	let salt = leaf.salt;
+	let value = 500_000;
+	let l = b.net.fund(vec![explicit(x, value, leaf.script_pubkey())]).remove(0);
+	let bob_spk = elements::script::Builder::new().push_int(1).push_slice(&label32("annex Bob's checkpoint")).into_script();
+	let to_bob = [ExplicitOutput::new(x, value - 1_000, bob_spk)];
+	let to_a = [ExplicitOutput::new(x, value - 1_000, op_true_spk())];
+	let m_bob = leaf.message(x, value, &to_bob).unwrap();
+	let m_a = leaf.message(x, value, &to_a).unwrap();
+	let pair = |m: &arca_covenant::CsfsMessage| Pair { operator: sig(&b.s, &m.digest), owner: sig(&a, &m.digest) };
+	let bob_holds = Signed { form: Form::Rebind, rest: bond::rebind_rest(&m_bob.preimage).unwrap(), signature: pair(&m_bob).operator };
+	let plain = collab_tx(&leaf, l.outpoint, x, value, &to_a, &pair(&m_a), &FeeSource::Reserve).unwrap().tx;
+	let mut annexed = plain.clone();
+	annexed.input[0].witness.script_witness.push(vec![0x50, 0xa4, 0x07]);
+	assert_eq!(annexed.txid(), plain.txid(), "the annex is witness data: the txid is the plain spend's");
+	assert_ne!(annexed.wtxid(), plain.wtxid());
+	let id = b.net.mine_policy_refused("the conflicting spend of A's leaf, an annex on its witness", &annexed, "bad-witness-nonstandard");
+	let mined = b.net.rt.client().raw_transaction(&id).unwrap();
+	let w = &mined.input[0].witness.script_witness;
+	assert_eq!(w.len(), 6, "the block carries the annex");
+	assert_eq!(w[5], vec![0x50, 0xa4, 0x07]);
+	println!("mined {} with a {}-item witness, the last {}", id, w.len(), hex(&w[5]));
+	let seen = rebind_signed_in(&p.chain, &salt, &mined, 0, &l.txout);
+	println!("the watcher reads from it: {:?}", seen.as_ref().map(|s| hex(s.signature.as_ref())));
+	let seen = seen.expect("S's signature on the annexed spend is read as on the plain one");
+	assert_eq!(Some(seen.clone()), rebind_signed_in(&p.chain, &salt, &plain, 0, &l.txout), "the same evidence as the plain spend's");
+	assert!(p.verify(&salt, &seen));
+	let evidence = Evidence { salt, a: bob_holds, b: seen };
+	assert_eq!(p.check(&evidence), Ok(()));
+	let bond = b.post(x, BOND);
+	let fee = b.x_coin();
+	let slashed = b.net.pass("slash: Bob's message and the annexed spend's burn the bond", &b.slash(&[&bond], &evidence, &fee));
+	assert_eq!(arca_covenant::issuer::burned(&b.net.rt.client().raw_transaction(&slashed).unwrap(), x), BOND);
+	b.net.print();
+}
+
 fn hex(b: &[u8]) -> String {
 	b.iter().map(|x| format!("{:02x}", x)).collect()
 }

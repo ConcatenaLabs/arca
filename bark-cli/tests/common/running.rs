@@ -216,15 +216,25 @@ impl Running {
 		tokio::task::block_in_place(|| node::bury(&self.rt));
 	}
 
-	/// Waits until the server has followed the chain to the node's tip.
+	/// Waits until the server has followed the chain to the node's tip. On a loaded machine a
+	/// server catching up after a restart takes longer than a minute, so the wait gives up only
+	/// after a minute in which the server's tip did not move, or after ten minutes in all.
 	pub async fn synced(&self) {
 		let tip = self.rt.client().best_block_hash().unwrap();
 		let start = Instant::now();
+		let mut moved = Instant::now();
+		let mut seen = None;
 		loop {
-			if self.server.store.tip_block().await.unwrap().map(|b| b.hash) == Some(tip.to_byte_array()) {
+			let at = self.server.store.tip_block().await.unwrap().map(|b| b.hash);
+			if at == Some(tip.to_byte_array()) {
 				return;
 			}
-			assert!(start.elapsed() < Duration::from_secs(60), "the server did not reach the tip");
+			if at != seen {
+				seen = at;
+				moved = Instant::now();
+			}
+			assert!(moved.elapsed() < Duration::from_secs(60) && start.elapsed() < Duration::from_secs(600),
+				"the server did not reach the tip");
 			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
 	}

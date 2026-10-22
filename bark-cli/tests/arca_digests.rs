@@ -76,7 +76,7 @@ fn the_wallets_digests_are_the_servers() {
 		(vec![], None, Template::Landing1, None, Some(landing)),
 	] {
 		let mine = participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template, owner: k,
-			owner_nonce: [3; 32], exit_delay: d, order: terms, landing: land }], &fees, nb);
+			owner_nonce: [3; 32], exit_delay: d, order: terms, landing: land, channel: None }], &fees, nb);
 		let theirs = server::participations::participation_id(&chain, &s, &ids, &[OutputRequest::Leaf { asset: a, value: 5_000,
 			template, owner: k, owner_nonce: [3; 32], exit_delay: d, order: terms, landing: land, channel: None }], &fees, nb);
 		assert_eq!(mine, theirs);
@@ -87,10 +87,10 @@ fn the_wallets_digests_are_the_servers() {
 	let mut other = order;
 	other.credits[3] = key("another credit").x_only_public_key().0.serialize();
 	assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Order2, owner: k,
-		owner_nonce: [3; 32], exit_delay: d, order: Some(other), landing: None }], &[], None), ids_seen[2], "an order's credit keys are bound");
+		owner_nonce: [3; 32], exit_delay: d, order: Some(other), landing: None, channel: None }], &[], None), ids_seen[2], "an order's credit keys are bound");
 	for other in [arca_covenant::Landing { program: [0x2c; 20], ..landing }, arca_covenant::Landing { allowance: 301, ..landing }] {
 		assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Landing1, owner: k,
-			owner_nonce: [3; 32], exit_delay: d, order: None, landing: Some(other) }], &[], None), ids_seen[3], "a landing is bound");
+			owner_nonce: [3; 32], exit_delay: d, order: None, landing: Some(other), channel: None }], &[], None), ids_seen[3], "a landing is bound");
 	}
 	// The publication of a resting order binds its credit nonces.
 	let mailbox = key("mailbox").x_only_public_key().0;
