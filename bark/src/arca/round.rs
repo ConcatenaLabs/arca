@@ -1751,9 +1751,8 @@ impl Wallet {
 				let spent_by = spender.txid();
 				let finality = self.chain.finality(&spent_by)?;
 				let unlock = unhex32(&f.unlock_hash)?;
-				let preimage = spender.input.iter().filter(|i| i.previous_output == at).flat_map(|i| i.witness.script_witness.iter())
-					.find(|w| w.len() == 32 && sha256::Hash::hash(w).to_byte_array() == unlock)
-					.map(|w| <[u8; 32]>::try_from(w.as_slice()).expect("32 bytes"));
+				let preimage = spender.input.iter().filter(|i| i.previous_output == at)
+					.find_map(|i| arca_covenant::witness::find_preimage(&i.witness.script_witness, &unlock));
 				if let Some(pre) = preimage {
 					// The preimage is the wallet's from the moment it is seen,
 					// whatever becomes of the claim: the new leaves are kept.
