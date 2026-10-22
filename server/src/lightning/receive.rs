@@ -290,7 +290,10 @@ impl Receives {
 			}
 		}
 		let a = AssetId::from_byte_array(*asset);
-		let balance = self.wallet.balance().await.map_err(|e| ReceiveError::Malformed(format!("the operator's wallet: {}", e)))?
+		// The operator's coins in the asset, final or not (D64): what it can
+		// spend this moment leaves out every round's change until it is
+		// final, and would read the pool as a fraction of it.
+		let balance = self.wallet.holdings().await.map_err(|e| ReceiveError::Malformed(format!("the operator's wallet: {}", e)))?
 			.get(&a).copied().unwrap_or(0) as u128;
 		let pool = balance + issued;
 		let cap = pool * self.config.cap_ppm as u128 / 1_000_000;

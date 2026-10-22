@@ -59,7 +59,9 @@
 //! `ARCA_OPERATOR_MORE_ASSETS` set to a count `n`, the chain issues `n`
 //! plain assets beyond X and Y (listed for fees at 1:1) and the operator
 //! serves them; `/state` names them `more`, and every asset served in
-//! `assets`. With
+//! `assets`. With `ARCA_OPERATOR_LIGHTNING` as well, each of them gets a
+//! Lightning leg as X has (a channel of 10^12 atoms between the same two
+//! nodes). With
 //! `ARCA_OPERATOR_ISSUER` set (and `MINT_LIMITER`, the mint limiter's tool
 //! of `sequentia-contracts` with `sign`), the chain runs Simplicity and the
 //! operator serves an asset I issuer-operated, its reissuance token in a
@@ -644,6 +646,39 @@ async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNo
 	(r, vec![ox, px])
 }
 
+/// The operator's Lightning leg in each of `more` too, on the same two
+/// nodes as X's: a channel of 10^12 atoms of the asset from its node to the
+/// other, 3·10^11 of it pushed, so that it both receives and pays in it.
+async fn legs_in(r: &mut Running, nodes: &[LightningNode], more: &[AssetId]) {
+	let [ox, px] = nodes else { return };
+	for m in more {
+		let to = ox.receive_script(&r.rt);
+		r.pay_to(to, *m, 2_000_000_000_000);
+		r.produce().await;
+		tokio::task::block_in_place(|| {
+			ox.wait("its funds in the asset", |n| n.ok("listfunds", json!({}))["outputs"].as_array().map(|o| o.iter()
+				.any(|x| x["status"] == "confirmed" && x["asset"].as_str() == Some(&m.to_string()))).unwrap_or(false));
+			ox.open_channel(&r.rt, px, *m, 1_000_000_000_000, 300_000_000_000);
+		});
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if more.iter().any(|m| a.asset == m.to_string()) {
+			a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	for m in more {
+		let g = r.server.gateway.clone();
+		let m = *m;
+		r.wait("the asset's leg up", || g.leg(&m, true).is_ok()).await;
+	}
+}
+
 /// The Bitcoin side of a trade of BTC over Lightning: a Bitcoin regtest
 /// chain, a hub node and a node for each wallet, each with a channel from
 /// the hub. Stopped, and their directories deleted, on drop.
@@ -703,6 +738,11 @@ async fn operator_for_browsers() {
 	};
 	let mut profiles = Profiles::default();
 	serve_profiles(&mut r, &mut profiles).await;
+	// With Lightning, the plain assets beyond X and Y get legs of their own.
+	if !_nodes.is_empty() && !profiles.more.is_empty() {
+		let more = profiles.more.clone();
+		legs_in(&mut r, &_nodes, &more).await;
+	}
 	let btc = std::env::var("ARCA_OPERATOR_BTC_LIGHTNING").ok().map(|n| {
 		let n = n.parse::<usize>().expect("ARCA_OPERATOR_BTC_LIGHTNING is a count of wallets' nodes");
 		tokio::task::block_in_place(|| bitcoin_side(n))
