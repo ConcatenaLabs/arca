@@ -202,6 +202,9 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 		if let Some(t) = &l.landing {
 			o["landing"] = arca_covenant::record_json::landing_json(&t.landing(*a, *v).unwrap());
 		}
+		if let Some(t) = &l.enclave {
+			o["enclave"] = arca_covenant::record_json::enclave_json(&t.enclave);
+		}
 		o
 	}).collect();
 	json!({"inputs": inputs, "outputs": outs})
