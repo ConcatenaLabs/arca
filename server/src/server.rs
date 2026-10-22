@@ -788,15 +788,24 @@ pub async fn bond_address(config: &Config) -> Result<serde_json::Value, StartErr
 }
 
 /// What shows the operator key has already signed two messages under one
-/// salt: the salts the signer's record holds two different digests under,
-/// and the leaves the database holds operator-signed forfeits of for more
-/// than one round. A signer that let a lost round's participation run again
-/// with a second forfeit, before it kept one message per salt, left both.
-/// Each such pair burns any bond under the key, in the hands of whoever
-/// holds the database or a backup of it. Empty when there is none.
+/// salt, or that its signer would: the salts the signer's record holds two
+/// different digests under, and the leaves the database holds
+/// operator-signed forfeits of for more than one round (a signer that let a
+/// lost round's participation run again with a second forfeit, before it
+/// kept one message per salt, left both), each such pair burning any bond
+/// under the key in the hands of whoever holds the database or a backup of
+/// it; and a record an older signer compacted, which kept no salt it
+/// dropped, so the signer would sign under one again. Empty when there is
+/// none.
 pub async fn signed_twice(config: &Config) -> Result<Vec<String>, StartError> {
 	let mut out = vec![];
 	let signer = SignerClient::new(&config.signer_socket);
+	let record = signer.record().await.map_err(err("the signer"))?;
+	if record.salts_lost {
+		out.push(format!("the signer's record is a compaction of format {} by an older signer, which kept no salt it dropped, so the \
+			signer would sign again under one: compact it again (arca-signer --compact-into, with arcad expired-salts), which keeps \
+			them", record.format));
+	}
 	let mut seen: std::collections::HashMap<[u8; 32], [u8; 32]> = std::collections::HashMap::new();
 	let mut twice: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
 	let mut after = 0u64;
@@ -850,8 +859,8 @@ pub async fn bond_post(config: &Config, wallet: &str, asset: AssetId, atoms: u64
 	let (bond, client) = configured_bond(config).await?;
 	let twice = signed_twice(config).await?;
 	if !twice.is_empty() {
-		return Err(StartError(format!("the operator key has already signed two messages under one salt: {}; a bond under this key \
-			is anyone's to burn who holds them, so none is posted: post one under a new operator key", twice.join("; "))));
+		return Err(StartError(format!("the operator key has already signed two messages under one salt, or its signer would: {}; \
+			a bond under this key would be anyone's to burn who holds them, so none is posted", twice.join("; "))));
 	}
 	let spk = bond.policy.script_pubkey();
 	let address = address_of(&client, &spk).await?;

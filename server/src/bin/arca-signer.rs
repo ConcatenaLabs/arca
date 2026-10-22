@@ -60,7 +60,10 @@
 //! carried over, and the new record goes on from the old one's latest entry.
 //! It locks the record, so it runs with the signer stopped; the operator then
 //! puts the new file in the record's place and starts the signer on it. The
-//! new record keeps the running hash of every entry it drops.
+//! new record keeps the running hash of every entry it drops, and its salt:
+//! the signer refuses any message under a kept salt, as it refuses a second
+//! under any other. A record an older signer compacted kept no salt; the
+//! signer says so at start, and compacted again it keeps every salt listed.
 //!
 //! Every head of the record the signer hands out is signed with `S`, and so
 //! is every running hash a witness is answered with, and the record's end
@@ -877,6 +880,10 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
+		Request::Record {} => {
+			let r = record.lock().unwrap_or_else(|e| e.into_inner());
+			Response { record: Some(r.info()), ..none }
+		},
 		Request::Under { salt } => {
 			let salt = match unhex32(&salt) {
 				Ok(s) => s,
@@ -1183,9 +1190,9 @@ async fn main() {
 			},
 		};
 		match SpendRecord::compact(&args.record, into, &operator, &args.genesis, &drop) {
-			Ok((carried, dropped, (n, hash))) => {
-				eprintln!("arca-signer: compacted {} into {}: {} entries carried over, {} dropped; it goes on from entry {} ({})",
-					args.record.display(), into.display(), carried, dropped, n, hex(&hash));
+			Ok((carried, dropped, kept, (n, hash))) => {
+				eprintln!("arca-signer: compacted {} into {}: {} entries carried over, {} dropped; it goes on from entry {} ({}); \
+					{} salt(s) kept, under which it signs nothing", args.record.display(), into.display(), carried, dropped, n, hex(&hash), kept);
 				std::process::exit(0);
 			},
 			Err(e) => {
@@ -1309,6 +1316,14 @@ async fn main() {
 		let r = state.record.lock().unwrap_or_else(|e| e.into_inner());
 		eprintln!("arca-signer: S = {} on {}; {} message(s) in the record {}, its latest entry {}", hex(&operator.serialize()),
 			socket.display(), r.len(), args.record.display(), r.head().0);
+		let info = r.info();
+		if info.dropped_salts > 0 {
+			eprintln!("arca-signer: {} salt(s) kept from compactions, under which it signs nothing", info.dropped_salts);
+		}
+		if info.salts_lost {
+			eprintln!("arca-signer: the record is a compaction of format {} by an older signer, which kept no salt it dropped: it \
+				would sign again under one. Compact it again (--compact-into, with arcad expired-salts) before posting a bond", info.format);
+		}
 		if let Some(why) = r.stopped() {
 			eprintln!("arca-signer: STOPPED: {}", why);
 		}
