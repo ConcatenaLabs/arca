@@ -41,7 +41,9 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}";
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
+	capacity, max_fee_ppm?}, channel_sync {leaf_id}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
+	fee_asset?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -198,6 +200,18 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.participate(quote, not_before)
 		},
 		"participations" => w.participations(),
+		"channels" => w.channels(),
+		"channel_open" => {
+			let capacity = opt_u64(&a["capacity"], "the operator's side")?.ok_or_else(|| Error::Parse("the capacity is missing".into()))?;
+			w.channel_open(&leaves(a)?, capacity, opt_u64(&a["max_fee_ppm"], "the fee bound")?)
+		},
+		"channel_sync" => w.channel_sync(req_str(&a["leaf_id"], "the channel")?),
+		"channel_pay" => {
+			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
+			w.channel_pay(req_str(&a["leaf_id"], "the channel")?, req_str(&a["to"], "the receiving channel")?, amount)
+		},
+		"channel_fold" => w.channel_fold(req_str(&a["leaf_id"], "the channel")?),
+		"channel_exit" => w.channel_exit(req_str(&a["leaf_id"], "the channel")?, a["fee_asset"].as_str().map(asset).transpose()?),
 		// The fee of refreshing a coin the wallet is about to receive, before
 		// it holds it (a swap's coin, its expiry from `swap_read`'s dates).
 		"settle_quote" => {

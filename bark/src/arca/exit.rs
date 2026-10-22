@@ -62,9 +62,9 @@ use super::wallet::{sign, Home, Wallet};
 use super::Error;
 
 /// Where each output of a coin's path is now, from the chain's `locate`.
-struct Here {
-	outputs: Vec<TxOut>,
-	at: Vec<Option<OutPoint>>,
+pub(crate) struct Here {
+	pub(crate) outputs: Vec<TxOut>,
+	pub(crate) at: Vec<Option<OutPoint>>,
 }
 
 impl Here {
@@ -101,7 +101,7 @@ enum BatchNow {
 
 /// Who pays the fees an output's own reserve cannot.
 pub(crate) struct Payer {
-	asset: Option<AssetId>,
+	pub(crate) asset: Option<AssetId>,
 	/// The asset the exit moves, from which the wallet chooses the fee asset
 	/// when none is named; `None` where nothing is to be chosen.
 	pub(crate) moved: Option<AssetId>,
@@ -510,7 +510,7 @@ impl Wallet {
 	/// those of each coin it spends, that coin's leaf and its checkpoint; for
 	/// a coin a fill made, the order coin's path and its leaf, then the same
 	/// for each taker's coin.
-	fn path_outputs(coin: &ValidCoin, out: &mut Vec<TxOut>) {
+	pub(crate) fn path_outputs(coin: &ValidCoin, out: &mut Vec<TxOut>) {
 		match &coin.origin {
 			ValidOrigin::Leaf { valid, .. } => {
 				out.extend(valid.branch.nodes.iter().map(|n| n.output().txout()));
@@ -542,7 +542,7 @@ impl Wallet {
 	/// whichever round now pays the batch output, a board's conversion, and
 	/// every step someone else has already published; a step the plan has
 	/// built already (a lineage reaching it twice) is not built again.
-	fn bring(&self, coin: &ValidCoin, payer: &mut Payer, txs: &mut Vec<UnrollTx>, here: &Here) -> Result<OutPoint, Error> {
+	pub(crate) fn bring(&self, coin: &ValidCoin, payer: &mut Payer, txs: &mut Vec<UnrollTx>, here: &Here) -> Result<OutPoint, Error> {
 		if let Some(at) = here.or_built(txs, &coin.output()) {
 			return Ok(at);
 		}

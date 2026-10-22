@@ -105,6 +105,9 @@ const FEE_COIN_NOTE: &str = "the node does not accept these assets for fees, so 
 /// and what each costs, checked against the wallet's bound.
 pub struct RefreshQuote {
 	info: Value,
+	/// The operator's side of a channel leaf wanted in place of a plain one
+	/// ([`Wallet::channel_open`]); `None` for a refresh.
+	pub(crate) channel: Option<u64>,
 	rows: Vec<super::store::CoinRow>,
 	ids: Vec<arca_covenant::LeafId>,
 	/// The asset of each coin of `rows`.
@@ -141,6 +144,8 @@ pub(crate) trait LeafTerms {
 	fn order(&self) -> Option<&OrderLeafTerms>;
 	fn asset(&self) -> AssetId;
 	fn burn(&self) -> bool;
+	/// A `channel-1` leaf's terms; an accumulator batch takes none.
+	fn channel(&self) -> Option<&arca_covenant::Channel>;
 }
 
 impl LeafTerms for LeafRecord {
@@ -149,6 +154,7 @@ impl LeafTerms for LeafRecord {
 	fn order(&self) -> Option<&OrderLeafTerms> { self.order.as_ref() }
 	fn asset(&self) -> AssetId { self.asset }
 	fn burn(&self) -> bool { self.burn }
+	fn channel(&self) -> Option<&arca_covenant::Channel> { self.channel.as_ref() }
 }
 
 /// A new leaf as the wallet rebuilds it from a published batch: a tree's
@@ -175,6 +181,9 @@ impl LeafTerms for NewRecord {
 	}
 	fn burn(&self) -> bool {
 		match self { NewRecord::Tree(r) => r.burn, NewRecord::Accumulator(r) => r.burn }
+	}
+	fn channel(&self) -> Option<&arca_covenant::Channel> {
+		match self { NewRecord::Tree(r) => r.channel.as_ref(), NewRecord::Accumulator(_) => None }
 	}
 }
 
@@ -399,7 +408,13 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 					.map_err(|e| Error::Parse(format!("a published leaf's landing: {}", e)))?),
 				None => None,
 			},
-			channel: None,
+			// A channel leaf's terms, another holder's or the wallet's own:
+			// its script, and so the tree, follow from them.
+			channel: match l.get("channel").filter(|c| !c.is_null()) {
+				Some(c) => Some(arca_covenant::record_json::channel_from_json(c)
+					.map_err(|e| Error::Parse(format!("a published leaf's channel terms: {}", e)))?),
+				None => None,
+			},
 		});
 	}
 	Ok((params, leaves))
@@ -420,12 +435,21 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option<&[u8; 32]>) -> Result<(), String> {
 	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
 	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
-	let want = match (receive, asked_order, asked_landing) {
-		(Some(_), _, _) => Template::Htlc1,
-		(None, true, _) => Template::Order2,
-		(None, false, true) => Template::Landing1,
-		(None, false, false) => Template::Vtxo1,
+	let asked_channel = w.get("channel").filter(|c| !c.is_null());
+	let want = match (receive, asked_order, asked_landing, asked_channel) {
+		(Some(_), ..) => Template::Htlc1,
+		(None, true, ..) => Template::Order2,
+		(None, false, true, _) => Template::Landing1,
+		(None, false, false, Some(_)) => Template::Channel1,
+		(None, false, false, None) => Template::Vtxo1,
 	};
+	// A channel leaf on exactly the terms asked: the operator's side and
+	// the credit window; and no channel where none was asked.
+	let served = record.channel().map(arca_covenant::record_json::channel_json);
+	if asked_channel != served.as_ref() {
+		return Err(format!("its channel terms are {}, and the wallet asked for {}", served.map_or("none".into(), |c| c.to_string()),
+			asked_channel.map_or("none".into(), |c| c.to_string())));
+	}
 	if record.template() != want {
 		return Err(format!("it is a leaf of template {}, and the wallet asked for one of template {}: the template is part of what a \
 			coin is, and the wallet signs nothing for a leaf of another template than it asked", record.template(), want));
@@ -607,7 +631,17 @@ impl Wallet {
 			// A coin resting on a board counts from the board's dates, and is
 			// taken into a refresh until its exit deadline, three days before
 			// the board's expiry.
-			let (value, expiry) = (a.valid.value, self.service_expiry(&record, &a)?);
+			// A channel coin gives up the wallet's side of it: its latest
+			// balance and every credit not folded, read from the operator
+			// first, as the operator counts it.
+			let value = match self.channel_worth(r)? {
+				Some(_) => {
+					self.channel_sync(&r.leaf_id)?;
+					self.channel_worth(r)?.expect("a channel")
+				},
+				None => a.valid.value,
+			};
+			let expiry = self.service_expiry(&record, &a)?;
 			if let Some(b) = self.board_expiry(&record, &a.bases)? {
 				if now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= b as u64 {
 					return Err(Error::Refused(format!("coin {} rests on a board whose service ends at median time {}: the operator takes \
@@ -642,7 +676,7 @@ impl Wallet {
 				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 			}
 		}
-		Ok(RefreshQuote { info, rows, ids, assets, per, coins })
+		Ok(RefreshQuote { info, channel: None, rows, ids, assets, per, coins })
 	}
 
 	/// What refreshing a coin of `value` of `asset` whose expiry is median
@@ -677,14 +711,14 @@ impl Wallet {
 	/// refused or did not take now with its `error` (one not taken stands,
 	/// and sync posts it again); it is an error only when none was taken.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
-		let RefreshQuote { info, rows, ids, assets, per, coins } = quote;
+		let RefreshQuote { info, channel, rows, ids, assets, per, coins } = quote;
 		let mut out = vec![];
 		let mut first_error = None;
 		for (asset, (total, fee)) in &per {
 			let mine: Vec<usize> = (0..rows.len()).filter(|k| assets[*k] == *asset).collect();
 			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
 			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
-			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before) {
+			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel) {
 				Ok(v) => out.push(v),
 				Err(e) => {
 					let mut entry = json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
@@ -712,8 +746,9 @@ impl Wallet {
 	/// Gives up `rows`, all of `asset` and worth `total`, for one new leaf of
 	/// `asset` in a round, paying `fee` of it.
 	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments)]
 	fn participate_in(&mut self, info: &Value, asset: AssetId, total: u64, fee: u64, rows: &[&super::store::CoinRow],
-		ids: &[arca_covenant::LeafId], not_before: Option<u32>) -> Result<Value, Error>
+		ids: &[arca_covenant::LeafId], not_before: Option<u32>, capacity: Option<u64>) -> Result<Value, Error>
 	{
 		let needs_fee_coin = self.chain.floor_per_kvb(asset)?.is_none();
 		let value = total.checked_sub(fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
@@ -727,12 +762,22 @@ impl Wallet {
 		let nonce = super::random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
-		let template = if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		// A channel leaf: the operator's side on top of the wallet's, with
+		// the operator's credit window.
+		let channel = match capacity {
+			Some(c) => Some(Self::channel_terms(info, asset, c)?),
+			None => None,
+		};
+		let template = if channel.is_some() { Template::Channel1 } else if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		let value = value.checked_add(capacity.unwrap_or(0)).ok_or_else(|| Error::Refused("the channel's value overflows".into()))?;
 		let wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
-			order: None, landing }];
+			order: None, landing, channel }];
 		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
 		if let Some(l) = &landing {
 			entry["landing"] = arca_covenant::record_json::landing_json(l);
+		}
+		if let Some(c) = &channel {
+			entry["channel"] = arca_covenant::record_json::channel_json(c);
 		}
 		let nonces = vec![entry];
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
