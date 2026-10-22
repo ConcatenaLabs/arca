@@ -1276,6 +1276,15 @@ coin of the wallet's, in the asset named (`--fee-asset`) or chosen as for an
 exit. An older state the operator publishes never pays the wallet less than
 the latest: the wallet's latest note takes the rest from the operator's side.
 
+Credit not folded has a deadline that a balance does not. Once any state of
+the channel is settled on the chain, by whoever published it, the operator
+may take back what the note's claim has not taken after the channel's credit
+window (`window_units` in `info`, in units of 512 seconds). `sync` does not
+notice a channel closed by someone else: a wallet holding credit not folded
+either folds it (`channel fold`, or any payment from the channel), after
+which nothing of it has a deadline, or runs `channel exit` within the window
+of any close.
+
 A channel leaf expires with its round, as any leaf. No plan starts from it:
 `care` closes it into a round once its expiry is within reach, for a plain
 leaf of the wallet's side, and a new channel is opened from that leaf with
