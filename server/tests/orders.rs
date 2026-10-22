@@ -481,3 +481,58 @@ async fn a_resting_order_fills_with_its_maker_away_and_every_exit_of_it_is_answe
 	r.produce().await;
 	assert!(r.rt.client().confirmations(&tx.txid()).unwrap() >= 1);
 }
+
+/// The order rests at M's coin; T1's fill of 300,000 X reaches the signer,
+/// which signs T1's checkpoint and reassignment and then goes away before it
+/// signs the fill. Returns the running server, the order's id, the taker's
+/// fill request and the tap on the signer's socket, still cutting fills.
+async fn a_fill_left_half_signed() -> (Running, LeafId, Value, common::signer::SignerTap) {
+	let mut r = start().await;
+	let (x, y) = (r.x, r.y);
+	let m = maker(&r, "M");
+	let t1 = keypair("T1");
+	let mut boards = vec![];
+	for (label, asset) in [("M, board", x), ("T1, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &t1, w1, n1)]).await;
+	let (om, c1) = (&got[0], &got[1]);
+	r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	let p = policy_of(&r, &st, &om.bases);
+	let (l1, _) = new_leaf(&keypair("T1, X"));
+	let (ch1, _) = new_leaf(&keypair("T1, change"));
+	let good = fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None);
+	let tap = common::signer::SignerTap::on(&r.signer);
+	tap.cut(Some("order_fill"));
+	let a = r.http.post("order_fill", &good);
+	println!("T1's fill with the signer gone before the fill's signature: {} {}", a.status, a.json);
+	assert_ne!(a.status, 200, "the fill is not signed: {}", a.json);
+	(r, om.held.id, good, tap)
+}
+
+/// While a fill of the coin an order rests at is recorded and not signed,
+/// `order_state` reads `filling`, not `filled`: the fill is either signed
+/// (and the order rests at its remainder) or dropped (and it rests where it
+/// was). Each fill names whether it is signed. Once the taker sends the fill
+/// again and it is signed, the order rests at the remainder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_reads_filling_while_a_fill_of_it_is_not_signed() {
+	let (r, order, good, tap) = a_fill_left_half_signed().await;
+	let st = order_state(&r, &[order])[0].clone();
+	println!("mid fill, order_state: state {} coin {} value {} fills {}", st["state"], st["coin"], st["value"], st["fills"]);
+	assert_eq!(st["fills"].as_array().unwrap().len(), 1);
+	assert_eq!(st["fills"][0]["signed"], false, "the fill is recorded and not signed");
+	assert_eq!(st["state"], "filling", "a fill not yet signed is not a fill: the order is not filled");
+	tap.cut(None);
+	let done = r.http.post("order_fill", &good).ok();
+	let st = order_state(&r, &[order])[0].clone();
+	println!("the fill sent again and signed: state {} coin {} value {}", st["state"], st["coin"], st["value"]);
+	assert_eq!((st["state"].as_str(), st["value"].as_str()), (Some("resting"), Some("700000")));
+	assert_eq!(st["coin"], done["outputs"][1]["leaf_id"], "the order rests at the fill's remainder");
+	assert_eq!(st["fills"][0]["signed"], true);
+	drop(tap);
+}

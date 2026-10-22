@@ -158,3 +158,84 @@ impl Drop for SignerProcess {
 		let _ = std::fs::remove_dir_all(&self.dir);
 	}
 }
+
+/// A tap on a signer's socket: the server's requests pass through it to the
+/// signer, one request and one answer a connection, as the server asks. While
+/// [`SignerTap::cut`] names an operation, a request of it is dropped
+/// unanswered, as when the signer goes away in the middle of a call; the
+/// requests before it in the same piece of work have been signed and
+/// recorded. Dropping the tap puts the signer's own socket back.
+pub struct SignerTap {
+	at: PathBuf,
+	real: PathBuf,
+	cut: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SignerTap {
+	pub fn on(signer: &SignerProcess) -> SignerTap {
+		use std::io::{BufRead, BufReader, Write};
+		use std::os::unix::net::{UnixListener, UnixStream};
+		let at = signer.socket.clone();
+		let real = signer.dir.join("signer.real.sock");
+		std::fs::rename(&at, &real).unwrap();
+		let listener = UnixListener::bind(&at).unwrap();
+		listener.set_nonblocking(true).unwrap();
+		let cut = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let (c, s, r) = (cut.clone(), stop.clone(), real.clone());
+		let thread = std::thread::spawn(move || {
+			while !s.load(Ordering::SeqCst) {
+				let (client, _) = match listener.accept() {
+					Ok(x) => x,
+					Err(_) => {
+						std::thread::sleep(Duration::from_millis(10));
+						continue;
+					},
+				};
+				let (c, r) = (c.clone(), r.clone());
+				std::thread::spawn(move || {
+					client.set_nonblocking(false).unwrap();
+					let mut reader = BufReader::new(client.try_clone().unwrap());
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 {
+						return;
+					}
+					let op = serde_json::from_str::<serde_json::Value>(&line).ok()
+						.and_then(|v| v["op"].as_str().map(String::from)).unwrap_or_default();
+					if c.lock().unwrap().as_deref() == Some(op.as_str()) {
+						println!("signer tap: request {} dropped unanswered", op);
+						return;
+					}
+					let Ok(mut up) = UnixStream::connect(&r) else { return };
+					if up.write_all(line.as_bytes()).is_err() {
+						return;
+					}
+					let mut answer = String::new();
+					let _ = BufReader::new(up).read_line(&mut answer);
+					let mut client = client;
+					let _ = client.write_all(answer.as_bytes());
+				});
+			}
+		});
+		SignerTap { at, real, cut, stop, thread: Some(thread) }
+	}
+
+	/// Drops every request of operation `op` unanswered from now; `None`
+	/// passes everything again.
+	pub fn cut(&self, op: Option<&str>) {
+		*self.cut.lock().unwrap() = op.map(String::from);
+	}
+}
+
+impl Drop for SignerTap {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::SeqCst);
+		if let Some(t) = self.thread.take() {
+			let _ = t.join();
+		}
+		let _ = std::fs::remove_file(&self.at);
+		let _ = std::fs::rename(&self.real, &self.at);
+	}
+}

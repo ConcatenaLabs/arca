@@ -845,8 +845,11 @@ pub struct OrderStates {
 pub struct OrderState {
 	pub order: String,
 	/// `resting` (a taker can fill it), `exhausted` (it rests, and fills no
-	/// more: its credit keys are used), `filled` (filled whole), `cancelled`
-	/// (its maker gave its coin up otherwise), `pending`, or `unknown`.
+	/// more: its credit keys are used), `filling` (a fill of the coin it
+	/// rests at is recorded and not yet signed: it takes no other fill, and
+	/// the fill is either signed or dropped), `filled` (filled whole, the fill
+	/// signed), `cancelled` (its maker gave its coin up otherwise),
+	/// `pending`, or `unknown`.
 	pub state: String,
 	/// The coin it rests at now, and what of the asset it sells it holds.
 	pub coin: String,
