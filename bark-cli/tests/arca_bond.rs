@@ -8,7 +8,11 @@
 //! paid out of, a second time on the chain: the receiver's `watch-bond`
 //! reads the operator's signature from that spend, finds it beside the one
 //! the receiver's coin carries under the same salt, and burns the bond in a
-//! block. With the bond gone, and with a second bond in notice, the wallet
+//! block. That second spend ends its witness with an annex (BIP341), which
+//! the operator's signature does not cover: relay policy refuses it, a block
+//! producer that takes non-standard transactions (this chain's node, started
+//! with `-acceptnonstdtxn=1`) mines it, and the watcher reads it as the plain
+//! spend. With the bond gone, and with a second bond in notice, the wallet
 //! takes no payment out of round.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
@@ -67,7 +71,9 @@ async fn post(r: &mut Running, policy: &BondPolicy, w: &elements::secp256k1_zkp:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bond_covers_payments_out_of_round_and_a_double_spend_burns_it() {
-	let mut r = Running::start().await;
+	// A block producer that takes non-standard transactions: the annexed
+	// double spend below reaches a block through its mempool.
+	let mut r = Running::start_on(&["-acceptnonstdtxn=1"], |_, _, _| {}).await;
 	let x = r.x.to_string();
 	let (url, node) = (r.url(), r.node_url());
 	let a = Arca::new("bond A");
@@ -141,11 +147,19 @@ async fn a_bond_covers_payments_out_of_round_and_a_double_spend_burns_it() {
 	let m = bp.message(board.asset, board.value, std::slice::from_ref(&back)).unwrap();
 	let sign = |k: &elements::secp256k1_zkp::Keypair| arca_covenant::sign::sign_digest(k, &m.digest, &[3; 32]);
 	let pair = Pair { operator: sign(&s_key), owner: sign(&a_key) };
-	let theft = collab_tx(&bp, board_at, board.asset, board.value, std::slice::from_ref(&back), &pair, &FeeSource::Reserve).unwrap();
+	let mut theft = collab_tx(&bp, board_at, board.asset, board.value, std::slice::from_ref(&back), &pair, &FeeSource::Reserve).unwrap();
+	// An annex on the witness: the signatures commit to no annex, so it
+	// changes nothing the covenant checks, and not the txid.
+	let plain_txid = theft.tx.txid();
+	theft.tx.input[0].witness.script_witness.push(vec![0x50, 0xb0, 0x4d]);
+	assert_eq!(theft.tx.txid(), plain_txid);
 	let stolen = r.rt.client().send_raw_transaction(&theft.tx).unwrap();
 	r.produce().await;
 	r.bury().await;
-	println!("A and the rule-breaking signer spend A's board again: {}", stolen);
+	let mined: Transaction = r.rt.client().raw_transaction(&stolen).unwrap();
+	let w = &mined.input[0].witness.script_witness;
+	assert_eq!((w.len(), w[w.len() - 1].clone()), (6, vec![0x50, 0xb0, 0x4d]), "the block carries the annex");
+	println!("A and the rule-breaking signer spend A's board again, an annex on its witness ({} items): {}", w.len(), stolen);
 	assert!(lines.iter().any(|l| l["salt"] == hex(&board.salt())), "B's evidence names the board's salt");
 
 	// --- B's watcher burns the bond ---

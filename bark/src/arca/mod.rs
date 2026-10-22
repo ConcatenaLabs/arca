@@ -102,6 +102,7 @@
 pub mod bond;
 pub mod btc_swap;
 pub mod chain;
+mod channel;
 pub mod claim;
 pub mod client;
 pub mod command;

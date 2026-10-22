@@ -461,11 +461,13 @@ fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 /// output it spends: the message rebuilt from the transaction and the coin,
 /// and the operator's signature, the witness's first item. `None` when the
 /// input is no such spend: its script pushes no `K` of `salt` (nor a
-/// `landing-1` leaf's `K ‖ P`), its witness is
-/// not `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
-/// explicit. The caller checks the signature ([`BondPolicy::verify`]).
+/// `landing-1` leaf's `K ‖ P`), its witness, an annex (BIP341) set aside
+/// ([`crate::witness::without_annex`]), is not
+/// `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
+/// explicit. The caller checks the signature ([`BondPolicy::verify`]). The
+/// signatures commit to no annex, so a spend with one is the same spend.
 pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, prevout: &TxOut) -> Option<Signed> {
-	let w = &tx.input.get(input)?.witness.script_witness;
+	let w = crate::witness::without_annex(&tx.input.get(input)?.witness.script_witness);
 	if w.len() != 5 || w[0].len() != 64 || w[1].len() != 64 || w[2].len() != 1 {
 		return None;
 	}

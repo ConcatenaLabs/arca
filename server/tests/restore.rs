@@ -5,7 +5,11 @@
 //! the signer's record it does not know; and on a database that does not
 //! know what the chain shows of the operator's: a round, or a board spent by
 //! its collaborative path. A forfeit recorded and never given the
-//! operator's half is completed at start.
+//! operator's half is completed at start. A board its owner converted is the
+//! owner's own spend, whatever its witness ends with: one whose witness ends
+//! with an annex (BIP341), which the owner's signature covers and a block
+//! producer that takes non-standard transactions mines, does not stop the
+//! start.
 //!
 //! The copy is taken as an operator's backup would be, with the server
 //! stopped, by PostgreSQL itself (`CREATE DATABASE … TEMPLATE`), so the test
@@ -136,6 +140,45 @@ async fn a_restored_database_that_forgot_a_transfer_does_not_start() {
 	println!("start after the chain shows the forgotten spend: {}", e);
 	assert!(e.to_string().contains(&format!("spends board {} by its collaborative path, which the database has no record", a_held.id)), "{}", e);
 	assert!(e.to_string().contains(&cpt.to_string()), "it names the spend: {}", e);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owners_conversion_with_an_annex_does_not_stop_the_start() {
+	use elements::hashes::Hash;
+	use elements::sighash::{Annex, Prevouts, SighashCache};
+	// A block producer that takes non-standard transactions: the annexed
+	// conversion reaches a block through its mempool.
+	let mut r = Running::start_on(&["-acceptnonstdtxn=1"], |_, _| {}).await;
+	let x = r.x;
+	let a = keypair("A converts with an annex");
+	let (held, board_tx) = credited_board(&mut r, &a, x).await;
+	let CoinRecord::Board(board) = &held.record else { unreachable!() };
+	let bp = board.policy();
+	let vout = board_tx.output.iter().position(|o| o.script_pubkey == bp.script_pubkey()).unwrap() as u32;
+	let fee_coin = r.purse.take_coin(x);
+	let ks = bp.conversion(OutPoint::new(board_tx.txid(), vout), &FeeSource::Coin {
+		outpoint: fee_coin.0, coin: fee_coin.1.clone(), fee: 2_000, change: common::node::op_true(),
+	}).unwrap();
+	// The owner signs over the annex it adds.
+	let annex = vec![0x50, 0xc0, 0x4e];
+	let h = SighashCache::new(&ks.tx).taproot_sighash(0, &Prevouts::All(&ks.prevouts), Some(Annex::new(&annex).unwrap()),
+		Some((arca_covenant::taptree::leaf_hash(&ks.script), 0xFFFF_FFFF)), elements::SchnorrSighashType::Default,
+		r.chain.genesis_hash()).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&a, &h.to_byte_array(), &[0; 32]);
+	let mut u = ks.finish(vec![sig.as_ref().to_vec()]);
+	u.tx.input[0].witness.script_witness.push(annex.clone());
+	let conv = r.rt.client().send_raw_transaction(&u.tx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let w = r.rt.client().raw_transaction(&conv).unwrap().input[0].witness.script_witness.clone();
+	assert_eq!((w.len(), w[w.len() - 1].clone()), (4, annex), "the block carries the annex");
+	println!("A converted its board {} by {}, the witness {} items, the last 50c04e", held.id, conv, w.len());
+	r.server.stop();
+	let started = Server::start(&r.config).await;
+	println!("the server started again: {}", match &started { Ok(_) => "started".to_string(), Err(e) => e.to_string() });
+	let s = started.expect("the owner's annexed conversion is the owner's own spend");
+	s.stop();
 }
 
 #[tokio::test(flavor = "multi_thread")]

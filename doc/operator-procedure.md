@@ -113,6 +113,32 @@ paid twice.
 - **Never restore the database to anything but its latest commit**
   ([Keeping the database](../server/README.md#keeping-the-database)).
 
+## Spends whose witness ends with an annex
+
+A taproot spend may end its witness with an annex (BIP341). Consensus sets
+it aside before the script runs, so the spend is the same spend with or
+without it. Sequentia's relay policy takes an annex on a Simplicity leaf, up
+to 100,000 bytes, and refuses one elsewhere, which a block producer can
+still mine. Where an Arca coin's spend is authorised by a signature over a
+message of its own (a collaborative path, an `order-2` fill) or by no
+signature at all (an entry's unlock, a landing, an on-chain order's FILL
+leaf), nothing covers the annex, so whoever relays or mines the spend can add
+one without changing its txid. An exit from an accumulator batch and a
+`vtxo-2` coin's collaborative spend are the exceptions: their programs
+refuse an annex.
+
+The server, its watcher and the wallets read every spend found on the chain
+with its annex set aside: a forfeit or `htlc-1` claim, a fill, an exit, a
+collaborative spend `watch-bond` reads for evidence, an owner's conversion of
+a board. An annexed spend is read the same as the plain one; the operator has
+nothing to do about one.
+
+An annex does make a spend larger and so lowers its fee rate, and a node
+holding one copy of a transaction keeps it against another copy with a
+different witness. A relay that adds an annex to a transaction on its way can
+therefore hold it at a lower fee rate than was paid for. Leave fee margin on
+transactions the operator broadcasts, and watch that they confirm.
+
 ## Storage and restore
 
 - **The database** runs with its durability settings on, and keeps every
