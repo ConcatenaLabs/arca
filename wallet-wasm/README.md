@@ -37,7 +37,10 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   moved since its last command (a few, among some fifty calls, for a wallet of
   twenty coins after a new block), and not at all while it has not (see What
   is checked when): a limit that lets a caller make a few dozen in a row, then
-  about one a second, keeps the wallet working.
+  about one a second, keeps the wallet working. The node runs one scan at a
+  time for all its clients: a scan it refuses as busy with another's waits on
+  the pause and is asked again, for two minutes at most, and the refusal is
+  never kept as the chain's answer.
 - **The pause** waits on the clock: a worker blocked in the library has nothing
   else to do, and `Atomics.wait` needs a cross-origin-isolated page.
 - **The store** is the same SQLite schema, on SQLite's OPFS storage
