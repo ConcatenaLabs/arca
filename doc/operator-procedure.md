@@ -122,7 +122,8 @@ to 100,000 bytes, and refuses one elsewhere, which a block producer can
 still mine. Where an Arca coin's spend is authorised by a signature over a
 message of its own (a collaborative path, an `order-2` fill) or by no
 signature at all (an entry's unlock, a landing, an on-chain order's FILL
-leaf), nothing covers the annex, so whoever relays or mines the spend can add
+leaf), nothing covers the annex (`order-3` and `seqdex/order` version 2,
+which every new order uses, refuse one), so whoever relays or mines the spend can add
 one without changing its txid. An exit from an accumulator batch is the
 exception: its program refuses an annex.
 

@@ -187,7 +187,7 @@ pub fn lightning_receive_digest(chain: &Chain, operator: &XOnlyPublicKey, asset:
 /// An output a participation wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wanted {
-	/// A leaf; for `order-2`, a resting order, with its terms.
+	/// A leaf; for `order-3` (or `order-2`), a resting order, with its terms.
 	Leaf {
 		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
 		order: Option<arca_covenant::OrderLeafTerms>,

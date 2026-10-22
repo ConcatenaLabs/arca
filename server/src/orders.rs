@@ -1,8 +1,9 @@
-//! Resting orders in the tree: an `order-2` leaf ([`arca_covenant::order`])
+//! Resting orders in the tree: an `order-3` leaf ([`arca_covenant::order`])
 //! that its maker rests and leaves, and that takers fill out of round with
-//! the maker offline.
+//! the maker offline. An `order-2` leaf resting from before `order-3` is
+//! published, filled and landed the same way; no round makes a new one.
 //!
-//! **Resting.** A maker asks a round for an `order-2` leaf as for any leaf
+//! **Resting.** A maker asks a round for an `order-3` leaf as for any leaf
 //! (a participation whose wanted leaf names the template and carries the
 //! order's terms; [`crate::participations`] checks them), completes the
 //! participation, then publishes the order ([`Orders::publish`]): the coin's
@@ -387,7 +388,7 @@ impl Orders {
 			return Err(OrderError::NotAnOrder("a resting order is published by the record of the coin a round made of it".into()));
 		};
 		if record.order.is_none() {
-			return Err(OrderError::NotAnOrder(format!("the coin's template is {}, not order-2", record.template)));
+			return Err(OrderError::NotAnOrder(format!("the coin's template is {}, not an order", record.template)));
 		}
 		let id = record.leaf_id().map_err(|e| OrderError::Malformed(e.to_string()))?;
 		if self.store.resting_order(&id.0).await?.is_some() {

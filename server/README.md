@@ -1040,10 +1040,15 @@ What the server does with a plan once it holds it:
 
 ### Resting orders
 
-A resting order is an `order-2` leaf (`arca-covenant`'s `order`): an order of
+A resting order is an `order-3` leaf (`arca-covenant`'s `order`): an order of
 SeqDEX's, selling the leaf's asset at a fixed rate and lot, that takers fill
 in the tree while its maker is away, and that lands on the chain as SeqDEX's
-own order (`seqdex/order`, for the same terms) if anyone brings it there. Each
+own order (`seqdex/order` version 2, for the same terms) if anyone brings it
+there. Neither program takes an annex on a fill: nothing a fill carries signs
+one, so a relay could otherwise pad the fill down to the floor fee rate. An
+`order-2` leaf, landing as `seqdex/order` version 1, is the same without that
+rule; the server still fills and lands one resting from before `order-3`, and
+refuses to make a new one (`order`). Each
 fill is co-signed by the operator alone, and the leaf's program holds every
 co-signed fill to the order's terms: the maker's credit at output 0, a `vtxo-1`
 leaf under the order's next credit key paying at least the price, and for a
@@ -1052,9 +1057,9 @@ rest. An order fills at most four times along its lineage, one credit key a
 fill.
 
 A maker asks a round for the leaf as for any leaf, its wanted leaf naming the
-template `order-2` and the order's terms (`order`: the asset it is paid in,
+template `order-3` and the order's terms (`order`: the asset it is paid in,
 the rate, the lot, the landed order's maker script hash, REFUND time and
-refund key, and four credit keys). The server takes it only when the terms
+refund key, four credit keys, and `"version": 3`). The server takes it only when the terms
 hold (`order`): the asset it is paid in is one it serves, its four credit keys
 are distinct, own no leaf and are not the operator's or the leaf's key, and
 its REFUND time is more than the order margin (`fills.order_margin_seconds`)

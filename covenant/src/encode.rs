@@ -12,7 +12,7 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 13 an `order-3` leaf), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
 //! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
@@ -254,7 +254,7 @@ impl Encoding for ClockSchedule {
 }
 
 /// A leaf: `vtxo-1`'s fields, then `htlc-1`'s terms when it carries them,
-/// or `order-2`'s: the asset it sells and its terms. Decoding reads a
+/// or an order's (`order-3`, `order-2`): the asset it sells and its terms. Decoding reads a
 /// `vtxo-1` leaf; [`Policy`] reads any, by its type byte.
 impl Encoding for LeafPolicy {
 	fn encode_to(&self, w: &mut Vec<u8>) {
@@ -460,7 +460,8 @@ impl Encoding for OffboardPolicy {
 /// Any of the output policies, tagged with its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
-	/// A leaf, `vtxo-1`, `htlc-1` or `order-2`.
+	/// A leaf, `vtxo-1`, `htlc-1`, `order-3`, `order-2`, `landing-1` or
+	/// `channel-1`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -488,7 +489,9 @@ impl Encoding for Policy {
 		w.push(VERSION);
 		match self {
 			Policy::Leaf(p) => {
-				w.push(if p.channel.is_some() { 10 } else if p.order.is_some() { 8 } else if p.landing.is_some() { 9 }
+				w.push(if p.channel.is_some() { 10 }
+					else if let Some(o) = &p.order { if o.template() == crate::Template::Order3 { 13 } else { 8 } }
+					else if p.landing.is_some() { 9 }
 					else if p.htlc.is_some() { 6 } else { 1 });
 				p.encode_to(w)
 			},
@@ -519,10 +522,11 @@ impl Encoding for Policy {
 				Policy::Leaf(p)
 			},
 			7 => Policy::Offboard(OffboardPolicy::decode_from(r)?),
-			8 => {
+			t @ (8 | 13) => {
 				let mut p = LeafPolicy::decode_from(r)?;
 				let asset = r.asset()?;
-				let o = OrderLeafTerms::decode_from(r, asset)?;
+				let version = if t == 13 { crate::order::SeqdexVersion::V2 } else { crate::order::SeqdexVersion::V1 };
+				let o = OrderLeafTerms::decode_from(r, asset, version)?;
 				o.check(asset, &p.owner, &p.operator).map_err(|e| DecodeError::Policy(crate::Error::OrderTerms(e.to_string())))?;
 				p.order = Some(o);
 				Policy::Leaf(p)

@@ -28,10 +28,11 @@ offchain.py generates: the board and its record, the forfeit with the
 issuance of the connector asset, its claim and refund, and the offboard's
 unlock and reclaim, each transaction whole, witnesses included.
 
-vectors/order.json holds the order-2 leaf's vectors, which order.py
-generates: an order's parameters, its three spendable leaves and their
-control blocks, its remainder after a fill, the credit that fill pays, the
-SeqDEX order it lands as, and the operator's fill digest and signature.
+vectors/order.json holds the order-2 leaf's vectors, and under `order_3`
+the same order's as an order-3 leaf, which order.py generates: an order's
+parameters, its three spendable leaves and their control blocks, its
+remainder after a fill, the credit that fill pays, the SeqDEX order it lands
+as, and the operator's fill digest and signature.
 
 vectors/accumulator.json holds the accumulator batch's vectors, which
 accumulator.py generates: six leaves behind their entries, each slot's

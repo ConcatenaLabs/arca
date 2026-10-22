@@ -66,7 +66,7 @@
 //! ```text
 //! u8    format version, 2
 //! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
-//! u8    template version, 1 (vtxo, htlc, landing, channel) or 2 (order)
+//! u8    template version, 1 (vtxo, htlc, landing, channel), or 2 or 3 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -76,7 +76,8 @@
 //! [32]  payment hash
 //! u32   timeout, a median time
 //! u16   operator delay, 512-second units
-//!       for order-2 only (the order sells the leaf's asset):
+//!       for order-2 and order-3 only (the order sells the leaf's asset; it
+//!       lands as seqdex/order version 1 for order-2, version 2 for order-3):
 //! [32]  asset B, what it is paid in
 //! u64   rate numerator, u64 rate denominator, u64 minimum lot
 //! [32]  SHA256 of the scriptPubKey the landed order's fills pay
@@ -161,7 +162,8 @@ use crate::{EntryPolicy, LeafPolicy};
 /// The record format this crate writes and reads.
 pub const RECORD_VERSION: u8 = 2;
 
-/// The length of `order-2`'s terms in the binary form.
+/// The length of an order leaf's terms (`order-2`, `order-3`) in the binary
+/// form.
 pub const ORDER_TERMS_BYTES: usize = 32 + 8 + 8 + 8 + 32 + 4 + 32 + 4 * 32;
 
 /// The most levels a record's path has.
@@ -195,8 +197,13 @@ pub enum Template {
 	Htlc1,
 	/// `order-2`, a resting order: the operator fills it with the maker
 	/// offline, and one exit delay after it reaches the chain it lands as
-	/// SeqDEX's own order ([`crate::order`]).
+	/// SeqDEX's own order, `seqdex/order` version 1 ([`crate::order`]). Its
+	/// fills take an annex, which nothing signs; new orders rest as
+	/// `order-3`, and this is read and filled for the orders resting under it.
 	Order2,
+	/// `order-3`, a resting order: `order-2` whose fill refuses an annex,
+	/// landing as `seqdex/order` version 2 ([`crate::order`]).
+	Order3,
 	/// `landing-1`, the leaf of a supervised asset: its exit pays only P2WPKH
 	/// of the owner's landing key, where a freeze of the asset binds
 	/// ([`crate::landing`]).
@@ -210,8 +217,8 @@ pub enum Template {
 impl Template {
 	/// Every template this crate knows, in the order of their ids: the
 	/// operator's published list (`info.templates`).
-	pub const ALL: [Template; 6] =
-		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1, Template::Channel1];
+	pub const ALL: [Template; 7] =
+		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Order3, Template::Landing1, Template::Channel1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -232,7 +239,7 @@ impl Template {
 			Template::Vtxo1 => Template::VTXO,
 			Template::Board1 => Template::BOARD,
 			Template::Htlc1 => Template::HTLC,
-			Template::Order2 => Template::ORDER,
+			Template::Order2 | Template::Order3 => Template::ORDER,
 			Template::Landing1 => Template::LANDING,
 			Template::Channel1 => Template::CHANNEL,
 		}
@@ -243,6 +250,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Channel1 => 1,
 			Template::Order2 => 2,
+			Template::Order3 => 3,
 		}
 	}
 
@@ -252,7 +260,7 @@ impl Template {
 			Template::Vtxo1 => "vtxo",
 			Template::Board1 => "board",
 			Template::Htlc1 => "htlc",
-			Template::Order2 => "order",
+			Template::Order2 | Template::Order3 => "order",
 			Template::Landing1 => "landing",
 			Template::Channel1 => "channel",
 		}
@@ -265,6 +273,7 @@ impl Template {
 			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
 			(Template::ORDER, 2) => Ok(Template::Order2),
+			(Template::ORDER, 3) => Ok(Template::Order3),
 			(Template::LANDING, 1) => Ok(Template::Landing1),
 			(Template::CHANNEL, 1) => Ok(Template::Channel1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
@@ -295,17 +304,18 @@ impl FromStr for Template {
 		if !canonical {
 			return Err(RecordError::Template(s.into()));
 		}
-		let known = match name {
-			"vtxo" => Template::Vtxo1,
-			"board" => Template::Board1,
-			"htlc" => Template::Htlc1,
-			"order" => Template::Order2,
-			"landing" => Template::Landing1,
-			"channel" => Template::Channel1,
+		let known: &[Template] = match name {
+			"vtxo" => &[Template::Vtxo1],
+			"board" => &[Template::Board1],
+			"htlc" => &[Template::Htlc1],
+			"order" => &[Template::Order2, Template::Order3],
+			"landing" => &[Template::Landing1],
+			"channel" => &[Template::Channel1],
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
-			Ok(v) if v == known.version() as u64 => Ok(known),
+			Ok(v) if known.iter().any(|t| v == t.version() as u64) =>
+				Ok(*known.iter().find(|t| v == t.version() as u64).expect("found")),
 			Ok(v) => Err(RecordError::TemplateVersion { template: name.into(), version: v }),
 			Err(_) => Err(RecordError::TemplateVersion { template: name.into(), version: u64::MAX }),
 		}
@@ -358,7 +368,8 @@ pub struct LeafRecord {
 	pub exit_delay: RelativeTime,
 	/// `htlc-1`'s terms: present exactly when the template is `htlc-1`.
 	pub htlc: Option<HtlcTerms>,
-	/// `order-2`'s terms: present exactly when the template is `order-2`.
+	/// An order's terms: present exactly when the template is `order-3` or
+	/// `order-2`, and landing as the version the template names.
 	pub order: Option<OrderLeafTerms>,
 	/// `landing-1`'s landing: present exactly when the template is
 	/// `landing-1`.
@@ -498,7 +509,7 @@ pub enum RecordError {
 	EntryReserve { reserve: u64, min: u64 },
 	#[error("the clock schedule: {0}")]
 	Schedule(crate::Error),
-	#[error("the order-2 terms: {0}")]
+	#[error("the order terms: {0}")]
 	Order(String),
 	#[error("the htlc-1 terms: {0}")]
 	Htlc(crate::Error),
@@ -593,13 +604,15 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 	match (template, htlc, order, landing) {
 		(Template::Vtxo1, None, None, None) => {},
 		(Template::Htlc1, Some(t), None, None) => t.check(exit_delay).map_err(RecordError::Htlc)?,
-		(Template::Order2, None, Some(o), None) => o.check(asset, owner, operator)
+		(Template::Order2 | Template::Order3, None, Some(o), None) if o.template() == template => o.check(asset, owner, operator)
 			.map_err(|e| RecordError::Order(e.to_string()))?,
+		(Template::Order2 | Template::Order3, None, Some(o), None) =>
+			return Err(RecordError::Template(format!("{} with the terms of {}", template, o.template()))),
 		(Template::Landing1, None, None, Some(l)) => {
 			l.terms(asset, value).map_err(RecordError::Landing)?;
 		},
 		(Template::Htlc1, None, ..) => return Err(RecordError::Template("htlc-1 without its terms".into())),
-		(Template::Order2, _, None, _) => return Err(RecordError::Template("order-2 without its terms".into())),
+		(Template::Order2 | Template::Order3, _, None, _) => return Err(RecordError::Template(format!("{} without its terms", template))),
 		(Template::Landing1, _, _, None) => return Err(RecordError::Template("landing-1 without its terms".into())),
 		(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
 		(t, ..) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
@@ -949,11 +962,11 @@ impl LeafRecord {
 			Template::Htlc1 => Some(HtlcTerms::decode_from(&mut r)?),
 			_ => None,
 		};
-		// order-2's terms come before the asset they sell, which the leaf's
+		// An order's terms come before the asset they sell, which the leaf's
 		// own asset field names: read them, then put the asset in.
-		let order_bytes = match template {
-			Template::Order2 => Some(r.bytes(ORDER_TERMS_BYTES)?),
-			_ => None,
+		let order_bytes = match crate::order::SeqdexVersion::of(template) {
+			Some(v) => Some((r.bytes(ORDER_TERMS_BYTES)?, v)),
+			None => None,
 		};
 		let landing = match template {
 			Template::Landing1 => {
@@ -969,9 +982,9 @@ impl LeafRecord {
 		};
 		let asset = r.asset()?;
 		let order = match order_bytes {
-			Some(b) => {
+			Some((b, v)) => {
 				let mut or = Reader::new(b);
-				Some(OrderLeafTerms::decode_from(&mut or, asset)?)
+				Some(OrderLeafTerms::decode_from(&mut or, asset, v)?)
 			},
 			None => None,
 		};

@@ -3,7 +3,7 @@
 //! PostgreSQL, the minimal client playing every maker and taker, the watcher
 //! driven a pass at a time.
 //!
-//! One round makes two `order-2` leaves (makers M and N, each selling X for
+//! One round makes two `order-3` leaves (makers M and N, each selling X for
 //! Y at 2 Y an X, lots of 10,000) and the takers' coins. Then:
 //!
 //! 1. M publishes its order and stops; the state view shows it resting. A
@@ -79,6 +79,7 @@ fn maker(r: &Running, label: &str) -> Maker {
 		maker: sha256(node::op_true().as_bytes()),
 		expiry: mtp(r).to_consensus_u32() + 60 * 86_400,
 		refund_key: xonly(&keypair(&format!("{}, refund", label))),
+		version: arca_covenant::order::SeqdexVersion::V2,
 	};
 	Maker {
 		key: keypair(label), credits, credit_nonces: [random32(), random32(), random32(), random32()],
@@ -91,7 +92,7 @@ fn want_order(m: &Maker, value: u64, asset: elements::AssetId) -> (OutputRequest
 	hold_key(&m.key);
 	let nonce = random32();
 	(OutputRequest::Leaf {
-		asset, value, template: Template::Order2, owner: xonly(&m.key), owner_nonce: nonce, exit_delay: exit_delay(),
+		asset, value, template: Template::Order3, owner: xonly(&m.key), owner_nonce: nonce, exit_delay: exit_delay(),
 		order: Some(m.terms),
 		landing: None,
 		channel: None,
@@ -283,6 +284,20 @@ async fn a_resting_order_fills_with_its_maker_away_and_every_exit_of_it_is_answe
 	let a = r.http.post("submit_participation", &body);
 	println!("refused, an order whose REFUND opens within the margin: {} {:?}", a.status, a.refusal());
 	assert_eq!(a.refusal().0, "order");
+
+	// An order-2 leaf, whose fill takes an annex nobody signs: the round
+	// refuses to make one. Leaves already resting as order-2 are still filled.
+	let mut old = maker(&r, "M, order-2");
+	old.terms.landed.version = arca_covenant::order::SeqdexVersion::V1;
+	let (mut w, _) = want_order(&old, VALUE, x);
+	if let OutputRequest::Leaf { template, .. } = &mut w {
+		*template = Template::Order2;
+	}
+	let (body, _) = participation_body(&[&bm.held], &[w], &[], None, s, r.chain);
+	let a = r.http.post("submit_participation", &body);
+	println!("refused, a new order-2 leaf: {} {:?}", a.status, a.refusal());
+	assert_eq!(a.refusal().0, "order");
+	assert!(a.refusal().1.contains("order-2") && a.refusal().1.contains("order-3"), "{:?}", a.refusal());
 
 	let (wm, nm) = want_order(&m, VALUE, x);
 	let (wn, nn) = want_order(&n, VALUE, x);
