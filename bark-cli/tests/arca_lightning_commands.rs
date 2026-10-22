@@ -153,6 +153,9 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	println!("LC the payment's quote: {}", pq);
 	assert_eq!((pq["payment_hash"].as_str(), num(&pq["amount"]), num(&pq["fee"])), (Some(hash.as_str()), 100_000, 100));
 	assert_eq!(num(&pq["spends"]), 100_000 + 100 + num(&pq["margins"]), "what leaves the wallet: the amount, the fee and the margins");
+	let given: u64 = pq["gives"].as_array().unwrap().iter().map(|l| num(&p.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|c| c["leaf_id"] == *l).unwrap()["value"])).sum();
+	assert_eq!(given, num(&pq["spends"]) + num(&pq["change"]), "the coins it gives are what it spends and the change");
 	assert_eq!((p.ok(&["coins"]), ok(&p, "lightning_payments", json!({}))), before, "the quote signed and kept nothing");
 	let mut lower = pq.clone();
 	lower["spends"] = json!((num(&pq["spends"]) - 1).to_string());
