@@ -841,7 +841,7 @@ impl Wallet {
 		MedianTime::from_consensus(self.chain.tip()?.median_time).map_err(|e| Error::Node(e.to_string()))
 	}
 
-	fn delay(units: u16) -> RelativeTime {
+	pub(crate) fn delay(units: u16) -> RelativeTime {
 		RelativeTime::from_units(units).expect("checked when the wallet was created")
 	}
 
@@ -1633,12 +1633,16 @@ impl Wallet {
 		// The current coin of an open offline-refresh plan is refreshed by the
 		// plan's step, which the operator runs in the same window.
 		let planned: Vec<String> = self.plan_currents()?.into_iter().map(|(_, c, _)| c).collect();
+		// A coin resting on an out-of-round lineage the operator's bond does
+		// not cover is refreshed at once, its window or not: a coin that has
+		// been through a round has no such lineage left.
+		let uncovered = self.uncovered()?;
 		for c in self.store.coins_in("live")? {
 			if planned.contains(&c.leaf_id) {
 				continue;
 			}
 			let Some(d) = CoinDates::of(c.expiry) else { continue };
-			if now < d.refresh_from || now >= d.home_from {
+			if (now < d.refresh_from && !uncovered.contains(&c.leaf_id)) || now >= d.home_from {
 				continue;
 			}
 			// A refresh the operator refused is asked for again six hours

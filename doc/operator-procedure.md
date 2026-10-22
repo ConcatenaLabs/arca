@@ -255,6 +255,13 @@ issuer sets it up so:
 
 Every holder receives these rules before the operator holds their coins:
 
+- **A payment out of round is covered by the operator's bond.** The wallet
+  checks the bond on its own node before it takes one, and refuses while the
+  bond is missing, is in notice, or is worth less than what the wallet would
+  then hold out of round; the refusal names which. A coin refreshed in a round
+  needs no bond. Run `arca watch-bond` beside `arca sync`, and hand your
+  `arca bond-evidence` to watchers you trust: whichever of them sees a
+  double-sign first burns the bond.
 
 - **Run a wallet built from the same revision of this repository as the
   operator's server.** An older wallet does not keep its coins alive by
