@@ -201,6 +201,8 @@ pub enum CosignError {
 	Signer(#[from] SignerError),
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
+	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	#[error(transparent)]
@@ -242,6 +244,7 @@ impl CosignError {
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -375,7 +378,55 @@ impl Cosigner {
 	/// names ([`crate::supervision::gate`]), for a caller that checks it
 	/// before its own rules.
 	pub async fn gate(&self, leaves: &[LeafId]) -> Result<(), CosignError> {
-		Ok(crate::supervision::gate(&self.store, &self.finality, &self.params, leaves).await?)
+		crate::supervision::gate(&self.store, &self.finality, &self.params, leaves).await?;
+		Ok(crate::restricted::gate(&self.store, &self.params, leaves, "a payment over Lightning").await?)
+	}
+
+	/// The restricted profile's rules for a transfer: `None` when it moves
+	/// no restricted asset; else the asset and what the operator serves of
+	/// it, once every input is an `enclave-1` coin of one holder for the
+	/// asset's keys, every checkpoint keeps the whole coin, and the outputs
+	/// take every atom the checkpoints keep (each output is checked as a leaf
+	/// beside the others). A transfer of a restricted asset moves that asset
+	/// alone.
+	fn restricted_transfer(&self, checked: &[Checked], req: &TransferRequest)
+		-> Result<Option<(AssetId, crate::restricted::Restricted)>, CosignError>
+	{
+		let assets: std::collections::BTreeSet<AssetId> = checked.iter().map(|c| c.coin.asset)
+			.chain(req.outputs.iter().map(|o| o.asset)).collect();
+		let Some((asset, terms)) = assets.iter().find_map(|a| self.params.restricted(a).map(|r| (*a, r))) else {
+			return Ok(None);
+		};
+		if assets.len() != 1 {
+			return Err(CosignError::OutOfBounds(format!("asset {} is restricted: a transfer of it moves that asset alone, so it is \
+				not swapped in the tree", asset)));
+		}
+		let mut holder = None;
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+			let e = c.coin.leaf.enclave.ok_or_else(|| CosignError::OutOfBounds(format!("input {} is a coin of restricted asset {} of \
+				template {}, not enclave-1", k, asset, c.coin.leaf.template())))?;
+			if e.enclave.policy != terms.policy || e.enclave.clawback != terms.clawback {
+				return Err(CosignError::OutOfBounds(format!("input {} is an enclave-1 coin of other keys than asset {}'s", k, asset)));
+			}
+			match holder {
+				None => holder = Some(e.enclave.holder),
+				Some(h) if h != e.enclave.holder => return Err(CosignError::OutOfBounds(format!("asset {} is restricted: a transfer of \
+					it gives up one holder's coins, and input {} is another holder's", asset, k))),
+				Some(_) => {},
+			}
+			if i.checkpoint_value != c.coin.value {
+				return Err(CosignError::Value(format!("input {}: a checkpoint of restricted asset {} keeps the whole coin, {}, not {}: \
+					no part of the asset is left for a fee, which a coin of another asset pays when the transfer is brought on the chain",
+					k, asset, c.coin.value, i.checkpoint_value)));
+			}
+		}
+		let kept: u64 = req.inputs.iter().map(|i| i.checkpoint_value).sum();
+		let paid: u64 = req.outputs.iter().map(|o| o.value).sum();
+		if paid != kept {
+			return Err(CosignError::Value(format!("the outputs take {} of restricted asset {}, and the checkpoints keep {}: a transfer of \
+				it commits every atom", paid, asset, kept)));
+		}
+		Ok(Some((asset, terms)))
 	}
 
 	/// Co-signs `req`: see the [module documentation](self). An output of the
@@ -440,6 +491,17 @@ impl Cosigner {
 			let landing = o.leaf.landing.map(|t| t.landing(o.asset, o.value)).transpose()
 				.map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
 			self.params.check_landing(o.asset, o.value, landing.as_ref()).map_err(CosignError::OutOfBounds)?;
+			// The restricted profile: a leaf of a restricted asset is
+			// enclave-1 for the asset's keys and its holder's key, exiting with
+			// its whole value; nothing else holds it.
+			if let Some(t) = &o.leaf.enclave {
+				t.check_leaf(o.asset, o.value).map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
+			}
+			if o.leaf.htlc.is_some() && self.params.restricted(&o.asset).is_some() {
+				return Err(CosignError::OutOfBounds(format!("asset {} is restricted: no htlc-1 leaf holds it", o.asset)));
+			}
+			self.params.check_enclave(o.asset, &o.leaf.owner, &o.leaf.owner_nonce, o.leaf.enclave.as_ref().map(|t| &t.enclave))
+				.map_err(CosignError::OutOfBounds)?;
 			if !self.params.exit_delay_ok(o.leaf.exit_delay) {
 				return Err(CosignError::OutOfBounds(format!(
 					"an exit delay of {} units; the operator takes {} to {}", o.leaf.exit_delay.units(),
@@ -523,9 +585,12 @@ impl Cosigner {
 			}
 		}
 
-		// A transfer recorded passed this check when it was recorded, against
-		// the floor of that moment; the same bytes are judged as they were.
-		if !recorded {
+		// A restricted asset's transfer leaves no margin; any other's margins
+		// are bounded. A transfer recorded passed this check when it was
+		// recorded, against the floor of that moment; the same bytes are
+		// judged as they were.
+		let restricted = self.restricted_transfer(&checked, req)?;
+		if !recorded && restricted.is_none() {
 			self.check_margins(req, &checked, &outputs).await?;
 		}
 
@@ -552,6 +617,23 @@ impl Cosigner {
 			.map(|(k, c)| (c.coin.id, plan.checkpoint(k).taproot().program())).collect();
 		let new_ids: Vec<LeafId> = req.outputs.iter().enumerate()
 			.map(|(j, o)| transfer_id(&parts, &outputs, j as u8, &o.leaf.policy(s, chain).program())).collect();
+
+		// A restricted asset's policy server co-signs first, after its rules:
+		// its signature over each message goes to the signer beside the
+		// request. The same request again gets the same answer from it.
+		let approval = match &restricted {
+			None => None,
+			Some((asset, terms)) => {
+				let ins: Vec<(&CoinRecord, u64)> = checked.iter().zip(&req.inputs).map(|(c, i)| (&c.record, i.checkpoint_value)).collect();
+				let outs: Vec<(AssetId, u64, NewLeaf)> = req.outputs.iter().map(|o| (o.asset, o.value, o.leaf)).collect();
+				let a = crate::restricted::approve(terms, *asset, &ins, &outs).await?;
+				for (cp, re) in &messages {
+					a.over(cp)?;
+					a.over(re)?;
+				}
+				Some((terms.clone(), a))
+			},
+		};
 
 		// Recorded before anything is signed; a repeated request finds it.
 		match self.store.transfer(&transfer).await? {
@@ -618,11 +700,18 @@ impl Cosigner {
 						SignerMessage { owner: cp.owner.serialize(), salt: cp.salt, digest: messages[k].1, forfeit: false },
 					]
 				}).collect();
-				self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs, &signer_messages).await.map_err(|e| match e {
+				let recorded = self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs, &signer_messages).await.map_err(|e| match e {
 					StoreError::LeafSpent(id) => CosignError::DoubleSpend(id.parse().unwrap_or(req.inputs[0].leaf_id)),
 					StoreError::LeafNotLive(id, state) => CosignError::NotLive(id.parse().unwrap_or(req.inputs[0].leaf_id), state),
 					other => other.into(),
-				})?;
+				});
+				if let Err(e) = recorded {
+					// Not recorded here: the policy server gives the inputs back.
+					if let Some((terms, a)) = &approval {
+						crate::restricted::drop(terms, &a.id).await;
+					}
+					return Err(e);
+				}
 			},
 		}
 
@@ -648,8 +737,13 @@ impl Cosigner {
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
-			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
-				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await;
+			let cp = match &approval {
+				Some((_, a)) => self.signer.rebind_cosigned(&owner, &i.checkpoint_sig, &c.coin.leaf.salt,
+					c.coin.leaf.enclave.map(|e| e.enclave.holder), &a.over(&messages[k].0)?, c.coin.asset, c.coin.value,
+					std::slice::from_ref(&cp_out)).await,
+				None => self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+					c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out)).await,
+			};
 			let (cp, h) = match cp {
 				Ok(x) => x,
 				// The first message of the transfer refused: nothing of it is
@@ -659,8 +753,12 @@ impl Cosigner {
 			};
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
-			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
-				plan.inputs[k].1, &outputs).await.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let (re, h) = match &approval {
+				Some((_, a)) => self.signer.rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
+					&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, &outputs).await,
+				None => self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
+					plan.inputs[k].1, &outputs).await,
+			}.map_err(|e| lost_spend(e, &c.coin.id))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
@@ -1075,7 +1173,7 @@ mod test {
 		OutputRequest {
 			asset: AssetId::from_byte_array([0xff; 32]),
 			value: 1_000,
-			leaf: NewLeaf {
+			leaf: NewLeaf { enclave: None,
 				owner: key.x_only_public_key().0, owner_nonce: [seed; 32], creator_nonce: [seed; 32],
 				exit_delay: RelativeTime::from_units(254).unwrap(), htlc,
 				landing: None, v2: false,

@@ -217,7 +217,7 @@ fn a_board_is_paid_out_of_round() {
 	let a = keypair("lineage board owner");
 	let policy = c.policy(&s);
 	let board = |c: &mut Arca, label: &str| {
-		let rec = BoardRecord {
+		let rec = BoardRecord { enclave: None,
 			template: Template::Board1, owner: xonly(&a), owner_nonce: label32(&format!("{} nonce", label)),
 			operator_nonce: label32(&format!("{} operator nonce", label)), exit_delay: delay(), asset: x, value: LEAF,
 			chain: c.net.chain, operator: xonly(&s),

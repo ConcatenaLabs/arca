@@ -97,7 +97,7 @@ async fn claims_keep_up(n: usize) {
 	for (i, coin) in coins.into_iter().enumerate() {
 		let key = keypair(&format!("board {} of {}", i, n));
 		let nonce = r.http.operator_nonce();
-		let record = BoardRecord { template: Template::Board1, owner: xonly(&key), owner_nonce: random32(), operator_nonce: nonce,
+		let record = BoardRecord { enclave: None, template: Template::Board1, owner: xonly(&key), owner_nonce: random32(), operator_nonce: nonce,
 			exit_delay: one, asset: x, value: VALUE, chain: r.chain, operator: s, landing: None };
 		let tx = record.tx(&[coin], x, 2_000, &op_true()).unwrap().tx;
 		r.rt.client().send_raw_transaction(&tx).unwrap();

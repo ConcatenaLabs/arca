@@ -136,7 +136,7 @@ impl F {
 	}
 
 	fn leaf(&self, owner: &Keypair, salt: &str) -> LeafPolicy {
-		LeafPolicy { owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, channel: None , v2: false }
+		LeafPolicy { enclave: None, owner: xonly(owner), operator: xonly(&self.s), salt: label32(salt), chain: self.chain, exit_delay: self.delay, htlc: None, order: None, landing: None, channel: None , v2: false}
 	}
 
 	fn r_coin(&self) -> TxOut {
@@ -1218,7 +1218,7 @@ fn htlc_cases(f: &F, book: &mut Book) {
 	let timeout = MedianTime::from_consensus(f.created.to_consensus_u32() + 2 * 86_400).unwrap();
 	let lt = timeout.to_consensus_u32();
 	let opd = RelativeTime::from_units(f.delay.units() / 3).unwrap();
-	let mk = |direction, salt: &str| LeafPolicy {
+	let mk = |direction, salt: &str| LeafPolicy { enclave: None,
 		owner: xonly(&f.a), operator: xonly(&f.s), salt: label32(salt), chain: f.chain, exit_delay: f.delay,
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout, operator_delay: opd }),
 		order: None,

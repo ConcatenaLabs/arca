@@ -235,7 +235,7 @@ impl FillRequest {
 				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
 			};
 			outputs.push(OutputRequest {
-				asset, value, leaf: arca_covenant::NewLeaf { owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None, v2: false },
+				asset, value, leaf: arca_covenant::NewLeaf { enclave: None, v2: false, owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
 				mailbox, until,
 			});
 		}
@@ -536,6 +536,7 @@ impl Orders {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, &self.params, &given).await.map_err(CosignError::from)?;
+		crate::restricted::gate(&self.store, &self.params, &given, "a fill of a resting order").await.map_err(CosignError::from)?;
 		let order = self.store.resting_order(&req.order.0).await?.ok_or_else(|| OrderError::UnknownOrder(req.order.to_string()))?;
 		let recorded = self.store.order_fill_by_transfer(&transfer).await?.is_some();
 		if !recorded && order.current_leaf != req.coin.0 {

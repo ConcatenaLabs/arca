@@ -76,7 +76,7 @@ struct Taker {
 
 fn taker(label: &str) -> Taker {
 	let key = keypair(&format!("order-fill taker {}", label));
-	let leaf = |what: &str| NewLeaf {
+	let leaf = |what: &str| NewLeaf { enclave: None,
 		owner: xonly(&key), owner_nonce: label32(&format!("order-fill taker {} {} owner nonce", label, what)),
 		creator_nonce: label32(&format!("order-fill taker {} {} creator nonce", label, what)), exit_delay: delay(), htlc: None,
 		landing: None, v2: false,

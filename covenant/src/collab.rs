@@ -200,7 +200,7 @@ mod test {
 	fn leaf(v2: bool) -> LeafPolicy {
 		LeafPolicy {
 			owner: key("A"), operator: key("S"), salt: [3; 32], chain: Chain::new(BlockHash::from_byte_array([7; 32])),
-			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, v2,
+			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, enclave: None, v2,
 		}
 	}
 
@@ -233,7 +233,7 @@ mod test {
 	fn policies_encode_and_decode_with_their_type() {
 		for p in [Policy::Leaf(leaf(true)), Policy::Leaf(leaf(false))] {
 			let b = p.encode();
-			assert_eq!(b[1], if matches!(&p, Policy::Leaf(l) if l.v2) { 11 } else { 1 });
+			assert_eq!(b[1], if matches!(&p, Policy::Leaf(l) if l.v2) { 12 } else { 1 });
 			assert_eq!(Policy::decode(&b).unwrap(), p);
 		}
 	}
@@ -261,7 +261,7 @@ mod test {
 		};
 		assert!(cp.names_inputs() && l.names_inputs() && !leaf(false).names_inputs());
 		let b = Policy::Checkpoint(cp).encode();
-		assert_eq!(b[1], 12);
+		assert_eq!(b[1], 13);
 		assert_eq!(Policy::decode(&b).unwrap(), Policy::Checkpoint(cp));
 	}
 }

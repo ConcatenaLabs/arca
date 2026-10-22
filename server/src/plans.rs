@@ -140,6 +140,8 @@ pub enum PlanError {
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
 	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
+	#[error(transparent)]
 	Coin(CoinError),
 	#[error("{0}")]
 	BadSignature(String),
@@ -186,6 +188,7 @@ impl PlanError {
 			Rate(_) => "rate_stale",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Store(StoreError::KeyReused) => "key_reused",
 			Store(StoreError::SaltReused(_)) => "salt",
 			Store(StoreError::NonceUnknown) => "nonce_unknown",
@@ -437,6 +440,7 @@ impl Plans {
 	/// on-chain script, not its landing.
 	async fn supervised_coin(&self, coin: &LeafId) -> Result<(), PlanError> {
 		crate::supervision::gate(&self.store, &self.finality, &self.params, std::slice::from_ref(coin)).await?;
+		crate::restricted::gate(&self.store, &self.params, std::slice::from_ref(coin), "a plan of offline refresh").await?;
 		if let Some(row) = self.store.leaf(&coin.0).await? {
 			let asset = AssetId::from_byte_array(row.asset);
 			if self.params.supervised(&asset).is_some() {
@@ -953,7 +957,7 @@ pub async fn release_given_up(store: &Store) -> Result<usize, StoreError> {
 /// The covenant plan a stored plan is, rebuilt from what the server keeps.
 pub fn plan_of(row: &PlanRow, params: &Params) -> Result<Plan, String> {
 	let key = |b: &[u8; 32]| XOnlyPublicKey::from_slice(b).map_err(|e| e.to_string());
-	let first = LeafPolicy {
+	let first = LeafPolicy { enclave: None,
 		owner: key(&row.first_owner)?, operator: params.operator, salt: row.first_salt, chain: params.chain,
 		exit_delay: RelativeTime::from_units(row.first_delay).map_err(|e| e.to_string())?, htlc: None,
 		order: None,

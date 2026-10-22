@@ -12,9 +12,9 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 a `vtxo-2` leaf; 5 a checkpoint, 12 a `vtxo-2` coin's checkpoint), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf; 5 a checkpoint, 13 a `vtxo-2` coin's checkpoint), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16) |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
@@ -162,6 +162,15 @@ impl<'a> Reader<'a> {
 	pub fn chain(&mut self) -> Result<Chain, DecodeError> {
 		Ok(Chain::new(BlockHash::from_byte_array(self.array32()?)))
 	}
+
+	/// An `enclave-1` leaf's enclave: `H`, `Kp`, a clawback flag, and `Ki`
+	/// when it is set ([`crate::enclave::Enclave::write`]).
+	pub fn enclave(&mut self) -> Result<crate::enclave::Enclave, DecodeError> {
+		let holder = self.key()?;
+		let policy = self.key()?;
+		let clawback = if self.flag()? { Some(self.key()?) } else { None };
+		Ok(crate::enclave::Enclave { holder, policy, clawback })
+	}
 }
 
 pub(crate) fn write_compact_size(w: &mut Vec<u8>, n: u64) {
@@ -280,10 +289,15 @@ impl Encoding for LeafPolicy {
 			w.extend(c.capacity.to_le_bytes());
 			w.extend(c.window.units().to_le_bytes());
 		}
+		if let Some(e) = &self.enclave {
+			e.enclave.write(w);
+			w.extend(asset_bytes(e.asset));
+			w.extend(e.value.to_le_bytes());
+		}
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<LeafPolicy, DecodeError> {
-		Ok(LeafPolicy {
+		Ok(LeafPolicy { enclave: None,
 			owner: r.key()?,
 			operator: r.key()?,
 			salt: r.array32()?,
@@ -488,14 +502,22 @@ impl Encoding for Policy {
 		w.push(VERSION);
 		match self {
 			Policy::Leaf(p) => {
-				w.push(if p.channel.is_some() { 10 } else if p.order.is_some() { 8 } else if p.landing.is_some() { 9 }
-					else if p.htlc.is_some() { 6 } else if p.v2 { 11 } else { 1 });
+				// The type follows the leaf's template, so the two never disagree.
+				w.push(match p.template() {
+					crate::Template::Channel1 => 10,
+					crate::Template::Order2 => 8,
+					crate::Template::Landing1 => 9,
+					crate::Template::Enclave1 => 11,
+					crate::Template::Htlc1 => 6,
+					crate::Template::Vtxo2 => 12,
+					_ => 1,
+				});
 				p.encode_to(w)
 			},
 			Policy::Node(p) => { w.push(2); p.encode_to(w) },
 			Policy::Entry(p) => { w.push(3); p.encode_to(w) },
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
-			Policy::Checkpoint(p) => { w.push(if p.v2 { 12 } else { 5 }); p.encode_to(w) },
+			Policy::Checkpoint(p) => { w.push(if p.v2 { 13 } else { 5 }); p.encode_to(w) },
 			Policy::Offboard(p) => { w.push(7); p.encode_to(w) },
 		}
 	}
@@ -548,8 +570,19 @@ impl Encoding for Policy {
 				p.channel = Some(t);
 				Policy::Leaf(p)
 			},
-			11 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
-			12 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
+			11 => {
+				let mut p = LeafPolicy::decode_from(r)?;
+				let enclave = r.enclave()?;
+				let asset = r.asset()?;
+				let value = r.u64()?;
+				if value == 0 {
+					return Err(DecodeError::Count(0));
+				}
+				p.enclave = Some(enclave.terms(asset, value));
+				Policy::Leaf(p)
+			},
+			12 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
+			13 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}
