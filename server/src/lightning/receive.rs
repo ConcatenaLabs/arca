@@ -798,14 +798,10 @@ impl Receives {
 				},
 			};
 			let Some(tx) = tx else { continue };
-			for i in tx.input.iter().filter(|i| i.previous_output == at) {
-				for w in &i.witness.script_witness {
-					if let Ok(p) = <[u8; 32]>::try_from(&w[..]) {
-						if arca_covenant::script::sha256(&p) == *hash {
-							return Ok(Some(p));
-						}
-					}
-				}
+			if let Some(p) = tx.input.iter().filter(|i| i.previous_output == at)
+				.find_map(|i| arca_covenant::witness::find_preimage(&i.witness.script_witness, hash))
+			{
+				return Ok(Some(p));
 			}
 		}
 		Ok(None)

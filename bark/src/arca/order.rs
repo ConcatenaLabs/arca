@@ -313,7 +313,7 @@ impl Wallet {
 			let owner = self.keys.leaf_xonly(&nonce)?;
 			self.store.put_nonce(&nonce, &owner.serialize(), "order change")?;
 			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner, owner_nonce: nonce,
-				exit_delay: self.exit_delay(), order: None, landing: None });
+				exit_delay: self.exit_delay(), order: None, landing: None, channel: None });
 			wanted_json.push(json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
 		}
 		let fees = vec![(ask.sell, plan.fee)];
@@ -467,7 +467,9 @@ impl Wallet {
 				return Ok(Standing { state: "spent", at: Some((here, held)), fills, note: Some("spent by a transaction the node no longer has".into()) });
 			};
 			let k = tx.input.iter().position(|x| x.previous_output == here).expect("it spends it");
-			let w = &tx.input[k].witness.script_witness;
+			// The leaf it spent by: the script before the control block, an
+			// annex (BIP341) set aside, which neither leaf covers.
+			let w = arca_covenant::witness::without_annex(&tx.input[k].witness.script_witness);
 			let leaf = if w.len() >= 2 { w[w.len() - 2].as_slice() } else { &[] };
 			let finality = self.chain.finality(&tx.txid())?.word();
 			if leaf == t.refund_leaf().as_bytes() {

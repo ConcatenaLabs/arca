@@ -341,12 +341,13 @@ impl Plans {
 	}
 
 	/// The coin a plan may start from: it passes what a refresh's coins pass
-	/// now, is a `vtxo-1` leaf of a round, and the signer holds nothing under
-	/// its salt; with its first expiry.
+	/// now, is a `vtxo-1` leaf of a round (of a tree or an accumulator
+	/// batch), and the signer holds nothing under its salt; with its first
+	/// expiry.
 	async fn first_coin(&self, coin: &LeafId, holder: &[u8; 32], now: MedianTime) -> Result<coins::Checked, PlanError> {
 		let policy = self.params.participation_policy(now);
 		let c = coins::check_plain(&self.store, &policy, coin, holder, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
-		if !matches!(c.record, CoinRecord::Leaf { .. }) || c.coin.leaf.htlc.is_some() {
+		if !matches!(c.record, CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. }) || c.coin.leaf.htlc.is_some() {
 			return Err(PlanError::OutOfBounds(format!("coin {} is not a vtxo-1 leaf of a round: a plan starts from a coin of a round, \
 				so refresh a board or a received coin in a round first", coin)));
 		}
@@ -466,6 +467,7 @@ impl Plans {
 		let first_record = CoinRecord::from_bytes(&row.record).map_err(|e| PlanError::Coin(CoinError::InvalidCoin { leaf: req.coin, error: e }))?;
 		let first = match &first_record {
 			CoinRecord::Leaf { record, .. } => record.leaf(),
+			CoinRecord::Accumulator { record, .. } => record.leaf(),
 			_ => return Err(PlanError::OutOfBounds(format!("coin {} is not a vtxo-1 leaf of a round", req.coin))),
 		};
 		let plan = Plan {

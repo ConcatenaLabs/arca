@@ -33,7 +33,11 @@
 //!   once its round's offboard output is known, that output. Where the order
 //!   rests and what filled it are read from the chain each time, never kept,
 //!   so a rollback undoes a fill in what the wallet says as it does on the
-//!   chain.
+//!   chain;
+//! - **every channel leaf's latest state** ([`super::channel`]): the state
+//!   both sides signed with both signatures, the latest credit note with the
+//!   operator's signature, and a state it signed and sent whose answer it has
+//!   not seen, so the same request goes again.
 //!
 //! The mnemonic is not here; it is the `mnemonic` file beside the database.
 
@@ -139,6 +143,7 @@ CREATE TABLE IF NOT EXISTS maker_order (
 	unlock_after INTEGER,
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS channel (leaf_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resting_order (
 	id TEXT PRIMARY KEY,
 	nonce BLOB NOT NULL,
@@ -843,6 +848,20 @@ impl Store {
 		self.conn.execute("INSERT INTO exit (leaf_id, state, txs, claim) VALUES (?1, ?2, ?3, ?4)
 			ON CONFLICT(leaf_id) DO UPDATE SET state = ?2, txs = ?3, claim = COALESCE(?4, claim)",
 			params![leaf_id, state, txs, claim]).map_err(db)?;
+		Ok(())
+	}
+
+	// --- channel leaves ---
+
+	/// What the wallet keeps of channel `leaf_id` ([`super::channel`]), as
+	/// JSON; `None` before its first state.
+	pub fn channel(&self, leaf_id: &str) -> Result<Option<String>, Error> {
+		self.conn.query_row("SELECT data FROM channel WHERE leaf_id = ?1", params![leaf_id], |r| r.get(0)).optional().map_err(db)
+	}
+
+	pub fn put_channel(&self, leaf_id: &str, data: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT INTO channel (leaf_id, data) VALUES (?1, ?2) ON CONFLICT(leaf_id) DO UPDATE SET data = ?2",
+			params![leaf_id, data]).map_err(db)?;
 		Ok(())
 	}
 

@@ -37,7 +37,10 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   moved since its last command (a few, among some fifty calls, for a wallet of
   twenty coins after a new block), and not at all while it has not (see What
   is checked when): a limit that lets a caller make a few dozen in a row, then
-  about one a second, keeps the wallet working.
+  about one a second, keeps the wallet working. The node runs one scan at a
+  time for all its clients: a scan it refuses as busy with another's waits on
+  the pause and is asked again, for two minutes at most, and the refusal is
+  never kept as the chain's answer.
 - **The pause** waits on the clock: a worker blocked in the library has nothing
   else to do, and `Atomics.wait` needs a cross-origin-isolated page.
 - **The store** is the same SQLite schema, on SQLite's OPFS storage
@@ -130,7 +133,9 @@ holding a supervised asset), which a page shows only in developer mode, while ea
 `landing` and `frozen` in `coins` in either mode; `supply {asset}`, the operator's supply report for an asset
 it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` in `coins`
 (`issuer-operated` when its batch's sweep can only burn, `open` when it pays the operator), both of which a page shows only in
-developer mode; and `care {scan?, expiries?, max_fee_ppm?, plan_within?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within `plan_within` seconds (ten days unless named; `4294967295` plans every leaf of a round at once) but a coin of a supervised asset, which `sync` refreshes, refreshing a coin of no round in a round first once within ten days (see the CLI README's offline refresh section for the gap the default reach leaves). A page that plans every leaf of a round pays from a planned coin through `plan_release`: a payment, take, swap, order or fill that the unplanned coins cannot cover and the planned ones can is refused with `kind` `planned`, naming the `asset` and the coins to `release`; the page releases them, runs `sync` until their round is final and the new leaf held, and asks again. Its answer is `{"result", "start"}`: the
+developer mode; the channel leaves (`channels`, `channel_open {leaves?, capacity, max_fee_ppm?}`, `channel_sync {leaf_id}`,
+`channel_pay {leaf_id, to, amount}`, `channel_fold {leaf_id}`, `channel_exit {leaf_id, fee_asset?}`, the CLI README's "Channel
+leaves"), whose payments are final for the receiver at once; and `care {scan?, expiries?, max_fee_ppm?, plan_within?}`, which a page runs by itself after a sync in either mode: it takes up every open claim under the wallet's receive keys, cancels each plan whose coin has moved, and plans each coin whose first step could run within `plan_within` seconds (ten days unless named; `4294967295` plans every leaf of a round at once) but a coin of a supervised asset, which `sync` refreshes, refreshing a coin of no round in a round first once within ten days (see the CLI README's offline refresh section for the gap the default reach leaves). A page that plans every leaf of a round pays from a planned coin through `plan_release`: a payment, take, swap, order or fill that the unplanned coins cannot cover and the planned ones can is refused with `kind` `planned`, naming the `asset` and the coins to `release`; the page releases them, runs `sync` until their round is final and the new leaf held, and asks again. Its answer is `{"result", "start"}`: the
 command's JSON, and what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
