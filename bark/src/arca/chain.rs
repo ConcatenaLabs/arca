@@ -44,6 +44,12 @@
 //! A node behind a proxy that takes one call at a time refuses the first
 //! batch, and the source makes each read on its own from then on. A read
 //! ahead changes no answer, only the number of requests that make it.
+//!
+//! **A busy node.** The node runs one scan of its set of unspent outputs at
+//! a time for all its clients, and refuses a scan while another runs (two
+//! wallets on one node, or two commands of one wallet). That refusal is no
+//! answer of the view: it is never kept, and the read waits for the other
+//! scan to end and asks again, for two minutes at most.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
@@ -209,9 +215,21 @@ fn keep_of(method: &str, params: &[Value]) -> Keep {
 	}
 }
 
+/// Whether the node refused a read only because it is busy: it runs one scan
+/// of its set of unspent outputs at a time, for every client it has, and
+/// refuses another while one runs. That says nothing of the chain.
+fn busy(code: i64, message: &str) -> bool {
+	code == -8 && message.starts_with("Scan already in progress")
+}
+
+/// How long a read waits for the node to be free of another client's scan.
+pub const BUSY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn kept_of(r: Result<Value, RpcError>) -> Result<Kept, RpcError> {
 	match r {
 		Ok(v) => Ok(Ok(v)),
+		// Busy is no answer of the view: never kept.
+		Err(RpcError::Rpc { code, message }) if busy(code, &message) => Err(RpcError::Rpc { code, message }),
 		Err(RpcError::Rpc { code, message }) => Ok(Err((code, message))),
 		Err(e) => Err(e),
 	}
@@ -342,7 +360,7 @@ impl ChainSource {
 		let keep = keep_of(method, params);
 		if matches!(keep, Keep::Never) {
 			// A broadcast changes the mempool: the next read looks again.
-			let r = self.client.call::<Value>(method, params);
+			let r = self.ask(method, params);
 			let mut m = self.memo.lock().expect("the chain memo");
 			m.asked += 1;
 			m.looked_this_command = false;
@@ -362,7 +380,7 @@ impl ChainSource {
 				return answer_of(&a);
 			}
 		}
-		let a = kept_of(self.client.call::<Value>(method, params))?;
+		let a = kept_of(self.ask(method, params))?;
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.asked += 1;
 		match (&keep, &a) {
@@ -371,6 +389,24 @@ impl ChainSource {
 			_ => { m.command.insert(k, a.clone()); },
 		}
 		answer_of(&a)
+	}
+
+	/// One call to the node. While the node is busy with another client's
+	/// scan of its set of unspent outputs ([`busy`]), the call waits for it
+	/// and is made again, for [`BUSY_PATIENCE`] at most: two wallets, or two
+	/// commands of one wallet, share a node.
+	fn ask(&self, method: &str, params: &[Value]) -> Result<Value, RpcError> {
+		let start = web_time::Instant::now();
+		let mut pause = std::time::Duration::from_millis(50);
+		loop {
+			match self.client.call::<Value>(method, params) {
+				Err(RpcError::Rpc { code, message }) if busy(code, &message) && start.elapsed() < BUSY_PATIENCE => {
+					sequentia_ext::platform::sleep(pause);
+					pause = (pause * 2).min(std::time::Duration::from_secs(1));
+				},
+				r => return r,
+			}
+		}
 	}
 
 	/// Reads `reads` of the node at once, where it takes a batch (one request
@@ -940,5 +976,82 @@ mod test {
 		assert_eq!(kept_of(Err(RpcError::Rpc { code: -5, message: "No such transaction".into() })).unwrap(), Err((-5, "No such transaction".into())));
 		assert!(kept_of(Err(RpcError::Transport("refused".into()))).is_err(), "no answer is no answer of the view");
 		assert!(matches!(answer_of(&Err((-8, "out of range".into()))), Err(RpcError::Rpc { code: -8, .. })));
+		let busy = RpcError::Rpc { code: -8, message: "Scan already in progress, use action \"abort\" or \"status\"".into() };
+		assert!(kept_of(Err(busy)).is_err(), "a node busy with another scan gave no answer of the view");
+	}
+
+	/// A node on a local port that answers the view's three reads the same
+	/// every time and refuses the first `busy` scans of its set of unspent
+	/// outputs as a node does while another client's scan runs; it counts
+	/// the scans it was asked for.
+	fn busy_node(busy: u64) -> (String, Arc<AtomicU64>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let scans = Arc::new(AtomicU64::new(0));
+		let counted = scans.clone();
+		std::thread::spawn(move || {
+			let answer = |call: &Value| -> Value {
+				let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or(""));
+				let result = match method {
+					"getblockchaininfo" => json!({"bestblockhash": "11".repeat(32), "blocks": 1}),
+					"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
+					"getrawmempool" => json!([]),
+					"scantxoutset" => {
+						if counted.fetch_add(1, Ordering::SeqCst) < busy {
+							return json!({"id": id, "result": null, "error": {"code": -8,
+								"message": "Scan already in progress, use action \"abort\" or \"status\""}});
+						}
+						json!({"success": true, "unspents": []})
+					},
+					_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
+				};
+				json!({"id": id, "result": result, "error": null})
+			};
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let mut length = 0usize;
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let out = match &req {
+					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+					call => answer(call),
+				}.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					out.len(), out);
+			}
+		});
+		(url, scans)
+	}
+
+	/// The node runs one scan of its set of unspent outputs at a time, for
+	/// every client it has: while another wallet's scan runs, it refuses
+	/// this one. That refusal says nothing of the chain, so it is never kept
+	/// as the view's answer: the scan waits for the other one to end and is
+	/// asked again, and the answer is the chain's.
+	#[test]
+	fn a_scan_waits_while_another_clients_scan_runs() {
+		let (url, scans) = busy_node(3);
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let script = Script::from(vec![0x51]);
+		let found = chain.coins_at(std::slice::from_ref(&script));
+		assert!(matches!(found, Ok(ref v) if v.is_empty()), "the scan answers once the other one is over: {:?}", found);
+		assert_eq!(scans.load(Ordering::SeqCst), 4, "three refused while busy, then the one answered");
+		// The view stands: the answer is kept, and the node not asked again.
+		assert!(chain.coins_at(std::slice::from_ref(&script)).is_ok());
+		assert_eq!(scans.load(Ordering::SeqCst), 4);
 	}
 }
