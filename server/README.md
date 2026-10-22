@@ -1467,7 +1467,10 @@ Lightning leg (refused in the configuration).
 issuance of it, each reissuance a spend of the limiter's coin, less every
 bare `OP_RETURN` of it. `issuer_supply` lists the operator's part of it,
 transaction by transaction, and the value live under its burn-only sweeps,
-counting only what the active chain holds.
+output by output, counting only what the active chain holds: a reader checks
+each output unspent on its own node and in its batch's published tree
+(`tree`), which is how a bridge backing the asset elsewhere tells units a
+sweep will burn from units in circulation.
 
 ## Supervised assets
 
@@ -1827,7 +1830,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
-| `POST issuer_supply` | What the operator minted and burned of an issuer-operated asset (see Issuer-operated assets): every round's mint and every burn of the watcher's the active chain holds, each with its txid, kind, amount and finality, their sums and those of the final ones, the value live under its burn-only sweeps (`in_batches`), and the limiter's coin and state, or why it mints nothing now. Not authenticated: everything in it is on the chain |
+| `POST issuer_supply` | What the operator minted and burned of an issuer-operated asset (see Issuer-operated assets): every round's mint and every burn of the watcher's the active chain holds, each with its txid, kind, amount and finality, their sums and those of the final ones, the value live under its burn-only sweeps (`in_batches`) with each output it counts (`in_batches_outputs`: its outpoint and value, its batch's round and output, whether it is the `batch` output, a `node` or an `entry`, and a node's level and index or an entry's leaf index in the published tree), and the limiter's coin and state, or why it mints nothing now. Not authenticated: everything in it is on the chain |
 | `POST distribute` | Accepts a distribution (see Distributions: claim trees), answered as `participation_status` answers |
 | `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |

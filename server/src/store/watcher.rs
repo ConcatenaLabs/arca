@@ -16,7 +16,7 @@ pub enum TreeScriptKind {
 }
 
 impl TreeScriptKind {
-	pub(crate) fn as_str(self) -> &'static str {
+	pub fn as_str(self) -> &'static str {
 		match self {
 			TreeScriptKind::Node => "node",
 			TreeScriptKind::Entry => "entry",
