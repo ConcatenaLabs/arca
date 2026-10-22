@@ -48,13 +48,13 @@ use elements::secp256k1_zkp::{Keypair, XOnlyPublicKey};
 use elements::{AssetId, Script, Transaction, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{claim_key, claim_keypair, Claim, CoinRecord, Distribution, ExplicitOutput, LeafId, MedianTime};
+use arca_covenant::{claim_key, claim_keypair, Claim, Distribution, ExplicitOutput, LeafId, MedianTime};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::auth_digest;
 use super::keys::RECEIVE;
 use super::pay::Out;
-use super::round::{fee_within, refresh_fee, rebuild, schedule_of};
+use super::round::{fee_within, rebuild_batch, refresh_fee, schedule_of, LeafTerms, NewRecord};
 use super::store::CoinRow;
 use super::wallet::{amount, sign, Wallet};
 use super::{random32, Error, DEFAULT_MAX_FEE_PPM};
@@ -546,13 +546,13 @@ impl Wallet {
 			return Err(Error::Refused("the server published the tree of another round".into()));
 		}
 		self.witness_record(&tree["signer_record"], false)?;
-		let tree = rebuild(&tree)?;
+		let batch = rebuild_batch(&tree)?;
 		let at = c["leaf_index"].as_u64().ok_or_else(|| Error::Parse("the claim names no place in its tree".into()))? as usize;
-		if at >= tree.records().len() {
+		if at >= batch.len() {
 			return Err(Error::Refused("the operator names a leaf the published tree does not have".into()));
 		}
-		let record = tree.record(at);
-		if c["record"].as_str() != Some(&hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?)) {
+		let record = NewRecord::of(&batch, at);
+		if c["record"].as_str() != Some(&hex(&record.to_bytes()?)) {
 			return Err(Error::Refused("the record the operator serves for the claim is not the published tree's".into()));
 		}
 		// Checked as a leaf of the wallet's own refresh: its acceptance horizon
@@ -562,21 +562,21 @@ impl Wallet {
 			Some(h) => self.chain.median_time_at(h)?.and_then(|t| MedianTime::from_consensus(t).ok()).map_or(now, |t| t.min(now)),
 			None => now,
 		};
-		let (policy, _) = self.leaf_policy(record.asset, as_of)?;
+		let (policy, _) = self.leaf_policy(record.asset(), as_of)?;
 		let valid = record.validate(&round, &policy, &owner, &nonce)
 			.map_err(|e| Error::Refused(format!("the claim leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
 		super::round::leaf_as_asked(&json!({}), &record, None)
 			.map_err(|why| Error::Refused(format!("the claim leaf in round {}: {}", round_txid, why)))?;
-		if Some(valid.leaf_id.to_string().as_str()) != c["leaf_id"].as_str() {
+		if Some(valid.leaf_id().to_string().as_str()) != c["leaf_id"].as_str() {
 			return Err(Error::Refused("the operator names the claim leaf by another id than its record gives".into()));
 		}
-		if record.value.to_string() != c["value"].as_str().unwrap_or("") || record.asset.to_string() != c["asset"].as_str().unwrap_or("") {
-			return Err(Error::Refused(format!("the claim leaf holds {} of {}; the operator says {} of {}", record.value, record.asset,
+		if record.value().to_string() != c["value"].as_str().unwrap_or("") || record.asset().to_string() != c["asset"].as_str().unwrap_or("") {
+			return Err(Error::Refused(format!("the claim leaf holds {} of {}; the operator says {} of {}", record.value(), record.asset(),
 				c["value"], c["asset"])));
 		}
 		let preimage = unhex32(c["preimage"].as_str().unwrap_or(""))
 			.map_err(|_| Error::Refused("the operator serves no preimage for the claim: its distribution is not released".into()))?;
-		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash() {
 			return Err(Error::Refused("the preimage the operator serves does not open the claim leaf's entry".into()));
 		}
 		// The claim key, and its unroll authorisations, usable at once.
@@ -585,11 +585,11 @@ impl Wallet {
 			return Err(Error::Keys("the wallet's claim key is not the leaf's".into()));
 		}
 		let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3600)).map_err(|e| Error::Node(e.to_string()))?;
-		let auths: Vec<_> = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(t).digest), t)).collect();
-		let answer = self.server.post("claim_leaf", &json!({"leaf_id": valid.leaf_id.to_string(),
+		let auths = valid.sign_auths(&key, t);
+		let answer = self.server.post("claim_leaf", &json!({"leaf_id": valid.leaf_id().to_string(),
 			"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))?;
-		let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
-		let first = record.schedule.expiries()[0].to_consensus_u32();
+		let coin = record.coin(preimage, auths)?;
+		let first = record.first_expiry();
 		let a = self.assess(&coin, &self.followed_policy(first, now), Some((&owner, &nonce)))?;
 		let state = if a.all_final() { "live" } else { "pending" };
 		let note = format!("claim {} of distribution {}, named under {}", c["index"], c["distribution_id"].as_str().unwrap_or(""), from);
