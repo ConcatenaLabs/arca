@@ -577,3 +577,72 @@ async fn a_fill_the_signer_left_half_done_is_completed_by_the_server() {
 	assert_eq!(again["transfer_id"].as_str(), Some(id.to_string().as_str()));
 	drop(tap);
 }
+
+/// M rests an order, T1 fills 300,000 X of it, and M never comes back. At
+/// the remainder's exit deadline the operator brings it on the chain (the
+/// order's first coin unrolled, T1's coin brought on and checkpointed, the
+/// fill published), and once the remainder has waited its exit delay in a
+/// block, lands it whole as SeqDEX's order for the same terms: the order
+/// rests on the chain, its maker's, and is not swept with its batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_absent_makers_order_is_landed_by_the_operator_at_its_exit_deadline() {
+	let mut r = start().await;
+	let (x, y) = (r.x, r.y);
+	let m = maker(&r, "M");
+	let t1 = keypair("T1");
+	let mut boards = vec![];
+	for (label, asset) in [("M, board", x), ("T1, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &t1, w1, n1)]).await;
+	let (om, c1) = (&got[0], &got[1]);
+	r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	let p = policy_of(&r, &st, &om.bases);
+	let (l1, _) = new_leaf(&keypair("T1, X"));
+	let (ch1, _) = new_leaf(&keypair("T1, change"));
+	let done = r.http.post("order_fill", &fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None)).ok();
+	let fill1: Vec<u8> = unhex(done["transfer_id"].as_str().unwrap());
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	assert_eq!((st["state"].as_str(), st["value"].as_str()), (Some("resting"), Some("700000")));
+	let rest = st["coin"].as_str().unwrap().to_string();
+	let rest_policy = p.next();
+	let expiry = st["expiry"].as_u64().unwrap() as u32;
+	let deadline = expiry - arca_covenant::WalletPolicy::EXIT_DEADLINE;
+	println!("M rests 700,000 X at {} after T1's fill, and goes away; the coin's expiry {}, its exit deadline {}", rest, expiry, deadline);
+
+	// Before the exit deadline the operator leaves the order where it rests.
+	drive(&r, "a pass before the exit deadline", 1, |_| true).await;
+	assert!(!log(&r).await.iter().any(|w| w.kind == "unroll" || w.kind == "landing"), "nothing is brought on before the deadline");
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, deadline + 600 - now).await;
+	r.bury().await;
+	r.synced().await;
+	println!("the median time is past the exit deadline: {}", mtp(&r).to_consensus_u32());
+	drive(&r, "the operator brings M's order on the chain, with T1's fill", 60, |l| l.iter().any(|w| w.kind == "fill" && w.subject == fill1)).await;
+	settle(&r).await;
+	assert!(!log(&r).await.iter().any(|w| w.kind == "landing"), "no landing before the remainder has waited its exit delay");
+	advance_mtp(&r, 37 * HOUR).await;
+	r.bury().await;
+	r.synced().await;
+	drive(&r, "the operator lands M's order", 30, |l| l.iter().any(|w| w.kind == "landing")).await;
+	settle(&r).await;
+	let l = log(&r).await;
+	let w = l.iter().find(|w| w.kind == "landing").unwrap();
+	assert!(final_of(&l, "landing", &om.held.id.0), "the landing is final");
+	let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+	println!("the landing {} ({} vB): output 0 {} of {} to SeqDEX's order", tx.txid(), tx.vsize(), tx.output[0].value.explicit().unwrap(),
+		tx.output[0].asset.explicit().unwrap());
+	assert_eq!(tx.output[0].script_pubkey, rest_policy.landed.script_pubkey(), "SeqDEX's order for the same terms");
+	assert_eq!((tx.output[0].asset.explicit(), tx.output[0].value.explicit()), (Some(x), Some(700_000)), "the remainder, whole");
+	let landed = OutPoint::new(tx.txid(), 0);
+	let out: Value = r.rt.client().call("gettxout", &[json!(landed.txid.to_string()), json!(landed.vout), json!(false)]).unwrap();
+	assert!(!out.is_null(), "the landed order rests on the chain");
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("order_state after the landing: {}", st["state"]);
+	assert_eq!(st["state"], "landed", "the order takes no fill in the tree");
+	let _ = y;
+}

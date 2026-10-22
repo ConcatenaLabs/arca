@@ -1546,6 +1546,17 @@ meanwhile.
   preimage never out, is reclaimed by the operator once its reclaim delay has
   passed since it confirmed. An offboard whose preimage went out is never
   reclaimed. A stale exit of the coin it gave up is answered as any other.
+- **Absent makers' orders.** A resting order whose coin is live at its exit
+  deadline (three days before the earliest expiry in its lineage), its maker
+  not back to refresh it or take it home, is landed by the operator, so it is
+  not swept with its batch: the coin is brought on the chain (its path
+  unrolled by the authorisations its record carries; for a coin a fill made,
+  the order's first coin and each taker's coin brought on and the fill
+  published, as stale exits are answered), and once it has waited its exit
+  delay in a block, the landing moves it whole into SeqDEX's order for the
+  same terms, its fee from a coin of the wallet's. The order then rests on the
+  chain, its maker's to refund or SeqDEX's takers' to fill, and `order_state`
+  reads `landed`. A coin the signer holds a spend of is left alone.
 - **Expiry.** At the expiry of the clock that holds a batch's token, the
   release moves the token to `R`. Once it has waited the notice there, each
   sweep takes every output of the batch still unspent whose own notice has
@@ -1646,7 +1657,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`) |
-| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
+| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |

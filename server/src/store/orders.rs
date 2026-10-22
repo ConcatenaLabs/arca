@@ -126,6 +126,16 @@ impl Store {
 		r.map(|r| order_row(&r)).transpose()
 	}
 
+	/// Every resting order whose coin it rests at now is live: one a taker
+	/// could fill, and one its maker could still cancel, refresh or land.
+	pub async fn live_resting_orders(&self) -> Result<Vec<RestingOrderRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!(
+			"SELECT {} FROM resting_order r WHERE EXISTS (SELECT 1 FROM leaf l WHERE l.leaf_id = r.current_leaf AND l.state = 'live')
+			 ORDER BY r.order_id", ORDER_COLUMNS.split(", ").map(|c| format!("r.{}", c)).collect::<Vec<_>>().join(", ")), &[]).await?;
+		rows.iter().map(order_row).collect()
+	}
+
 	/// The resting order a coin is a coin of: its first coin, a coin a fill of
 	/// it spent, or the coin it rests at now.
 	pub async fn resting_order_of_leaf(&self, leaf_id: &[u8; 32]) -> Result<Option<RestingOrderRow>, StoreError> {
