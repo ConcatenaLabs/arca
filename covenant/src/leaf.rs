@@ -63,7 +63,7 @@ use crate::enclave::EnclaveTerms;
 use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
-use crate::order::{order_cmr, OrderLeafTerms, OrderPolicy};
+use crate::order::{OrderLeafTerms, OrderPolicy};
 use crate::taptree::{TapNode, TapOutput};
 use crate::time::RelativeTime;
 use crate::Error;
@@ -224,7 +224,8 @@ impl LeafPolicy {
 	/// `vtxo-1`: `[collab, exit]`, both at depth 1; `landing-1`: `[collab,
 	/// landing]`, the same; `enclave-1`: `[collab, exit]`, or `[collab, [exit,
 	/// claw]]` where the asset elected clawback. `htlc-1`: `[collab, [claim,
-	/// refund]]`. `order-2`: `[[collab, land], [fill, data]]` ([`crate::order`]).
+	/// refund]]`. `order-3` and `order-2`: `[[collab, land], [fill, data]]`
+	/// ([`crate::order`]), the fill the template's program.
 	/// `channel-1`: `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(c) = self.channel_policy() {
@@ -234,7 +235,7 @@ impl LeafPolicy {
 			return TapOutput::with_nodes(vec![
 				(2, TapNode::Tapscript(o.collab_script())),
 				(2, TapNode::Tapscript(o.landing_script())),
-				(2, TapNode::Simplicity(order_cmr())),
+				(2, TapNode::Simplicity(o.cmr())),
 				(2, TapNode::Hidden(o.data_leaf())),
 			]);
 		}
@@ -251,13 +252,13 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, `htlc-1`, `order-2`, `landing-1`
-	/// or `channel-1`.
+	/// The template it follows: `vtxo-1`, `htlc-1`, `order-3` (or `order-2`),
+	/// `landing-1` or `channel-1`.
 	pub fn template(&self) -> crate::Template {
 		if self.channel.is_some() {
 			crate::Template::Channel1
-		} else if self.order.is_some() {
-			crate::Template::Order2
+		} else if let Some(o) = &self.order {
+			o.template()
 		} else if self.landing.is_some() {
 			crate::Template::Landing1
 		} else if self.enclave.is_some() {
@@ -276,7 +277,8 @@ impl LeafPolicy {
 		})
 	}
 
-	/// The order an `order-2` leaf rests as; `None` for any other template.
+	/// The order an `order-3` or `order-2` leaf rests as; `None` for any
+	/// other template.
 	pub fn order_policy(&self) -> Option<OrderPolicy> {
 		self.order.map(|t| t.policy(self.owner, self.operator, self.salt, self.chain, self.exit_delay))
 	}

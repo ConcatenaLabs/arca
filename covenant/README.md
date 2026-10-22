@@ -11,11 +11,15 @@ Elements tags. Amounts are explicit and always name their asset. Every lock is
 time based: `MedianTime` for `OP_CHECKLOCKTIMEVERIFY`, `RelativeTime` (512-second
 units) for `OP_CHECKSEQUENCEVERIFY`; a height is refused. The one script here
 that is not Arca's, SeqDEX's fill covenant (`fill`), is read as SeqDEX builds
-it: its REFUND lock may be a height, and Arca only reads it. The `order-2` leaf
+it: its REFUND lock may be a height, and Arca only reads it. The `order-3` leaf
 (`order`) carries one Simplicity leaf (`0xbe`), the fill program
-`arca/order-2`, and a hidden data leaf beside its tapscript leaves; its pruned
-programs come from sequentia-contracts (`order_programs`), so its spends are
-built with no compiler.
+`arca/order-3`, and a hidden data leaf beside its tapscript leaves; it lands as
+`seqdex/order` version 2. Both programs refuse an annex, which nothing a fill
+carries signs. An `order-2` leaf is the same with `arca/order-2` and
+`seqdex/order` version 1, which take one; it is read and filled for the orders
+resting under it, and new orders rest as `order-3` (`SeqdexVersion`). The
+pruned programs come from sequentia-contracts (`order_programs`), so the spends
+are built with no compiler.
 An accumulator batch (`accumulator`) holds its leaves as a fixed root of leaf
 records and a bitmap of the leaves that have left, under the Simplicity
 program `arca/accumulator-1`, whose two pruned forms also come from
@@ -39,7 +43,7 @@ sequentia-contracts (`accumulator_programs`).
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a `landing-1` leaf for a board of a supervised asset; an `enclave-1` leaf for one of a restricted asset, whose board carries the asset's claw leaf too where it elected clawback) |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
-| `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
+| `order` | `order-3` (and `order-2`): an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
 | `accumulator` | An accumulator batch output (`AccumulatorPolicy`): up to 1,024 leaves of one asset as a fixed Merkle-sum root of slot records (`Slot`: the owner key, the SHA256 of the leaf's entry's scriptPubKey, the entry's value and the reserve of the slot's exit), the operator's key and a bitmap of the slots that have left, in a hidden data leaf beside the program | EXIT (`arca/accumulator-1`, Simplicity): one slot out in one transaction, under the owner's or the operator's signature over `exit_digest` (chain, root, record and a not-before time, no outpoint and no bitmap) with the lock time at or after that time; the slot's entry at `2k`, the rest at `2k+1` under the same state with the slot's bit set (`exit_tx`; `check` mirrors the program); SWEEP, the tree's batch-output sweep behind the token. `read_exit` and `follow` read the state from the exits on the chain |
 | `limiter` | No output of Arca's: the mint limiter of sequentia-contracts (`templates/mint_limiter`), which holds an issuer-operated asset's reissuance token (`LimiterParams`, read from the instance file the limiter's tool writes, and `LimiterState`) | None of Arca's: the coin's script in each state (`script_pubkey`, rebuilt from the template's root and the data leaf, equal to the template's address vectors), the state a mint leads to by the program's own rule (`mint`, `room`), what a spend of the coin did (`follow`: a mint, the brake applied or lifted, the recovery), and the reissuance a round's input 0 carries (`reissuance`). The limiter's tool signs and satisfies a mint (`mint-limiter sign`) |
@@ -92,7 +96,7 @@ tx.input[i].witness.script_witness = w;
 A `LeafRecord` is what the holder of a leaf keeps: everything needed to check
 the leaf against the chain and to take it on-chain alone, and nothing secret.
 It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
-payment hash, timeout, direction and operator delay; `order-2` with its
+payment hash, timeout, direction and operator delay; `order-3` or `order-2` with its
 order's terms: the asset it is paid in, the price and lot, the landed order's
 maker script hash, REFUND time and key, and the four credit keys;
 `landing-1` with its landing program and fee allowance; `enclave-1` with its
@@ -644,7 +648,7 @@ both (`covenant/tests/accumulator.rs`).
 
 ## In-tree fills of a resting order
 
-An `order-2` leaf (`order`) is filled off the chain by a transaction that
+An `order-3` leaf (`order`), or an `order-2` leaf, is filled off the chain by a transaction that
 spends the order's coin by its fill path, under the operator's signature over
 the fill's outputs, and each of the taker's coins through a checkpoint, as a
 transfer does. The outputs (2 to 4, all committed by every signature) are the

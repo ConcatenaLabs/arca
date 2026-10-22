@@ -123,7 +123,8 @@ cost needs; it refuses every other annex, which a block producer can still
 mine. Where an Arca coin's spend is authorised by a signature over a
 message of its own (a collaborative path, an `order-2` fill) or by no
 signature at all (an entry's unlock, a landing, an on-chain order's FILL
-leaf), nothing covers the annex, so whoever mines the spend, or relays it
+leaf), nothing covers the annex (`order-3` and `seqdex/order` version 2,
+which every new order uses, refuse one), so whoever mines the spend, or relays it
 through a node that does not apply that rule, can add one without changing
 its txid. An exit from an accumulator batch is the
 exception: its program refuses an annex.

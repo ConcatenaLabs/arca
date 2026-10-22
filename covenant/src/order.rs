@@ -1,6 +1,7 @@
-//! A resting order in the tree: the `order-2` leaf.
+//! A resting order in the tree: the `order-3` leaf, and the `order-2` leaf
+//! it replaces.
 //!
-//! An `order-2` leaf holds an order's coin of `asset_a` while it rests in an
+//! An `order-3` leaf holds an order's coin of `asset_a` while it rests in an
 //! Arca tree. The operator fills it with the maker offline; nobody fills it
 //! without the operator, the maker included; and one exit delay after it
 //! reaches the chain anyone may land it as SeqDEX's own order for the same
@@ -14,7 +15,7 @@
 //! land    <exit delay> OP_CHECKSEQUENCEVERIFY OP_DROP, then output 0 is the
 //!         `seqdex/order` output for the same terms, in asset_a, explicit, no
 //!         nonce, worth at least what the coin holds (tapscript, no signature)
-//! fill    the Simplicity program `arca/order-2` (one commitment root for
+//! fill    the Simplicity program `arca/order-3` (one commitment root for
 //!         every order)
 //! data    the hidden leaf H_TapData(parameters)
 //! ```
@@ -34,7 +35,7 @@
 //! rate_den)`, to the `vtxo-1` leaf of the next credit key under a salt that
 //! descends from the coin's, [`OrderPolicy::credit_leaf`]) and, for a partial
 //! fill, output `2k+1` the remainder (`asset_a`, at least `min_lot`, at the
-//! `order-2` leaf of the next salt with the credit keys moved up one,
+//! `order-3` leaf of the next salt with the credit keys moved up one,
 //! [`OrderPolicy::next`]). A fill is at least `min_lot`. The program refuses
 //! a fill once the credit keys are used up, so an order fills at most four
 //! times along one lineage.
@@ -47,6 +48,16 @@
 //! The witnesses are built with no compiler: each pruned program is one
 //! constant per path ([`crate::order_programs`]), and the Simplicity witness
 //! is the parameters, the signature, `m` and the path bit.
+//!
+//! A fill carries no annex: `arca/order-3` and `seqdex/order` version 2
+//! refuse one. Nothing a fill carries signs an annex (the operator's digest
+//! names the outputs; the landed order's fill signs nothing), so on a program
+//! that took one, whoever relayed a fill could attach one up to the size relay
+//! allows and bring its fee rate down to the floor, where the mempool keeps
+//! it. `order-2`, which lands as `seqdex/order` version 1, is that program; an
+//! `order-2` leaf is the same in every other respect, and is read and filled
+//! here for as long as one rests ([`SeqdexVersion`]). New orders rest as
+//! `order-3`.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -88,14 +99,63 @@ fn hash32(s: &str) -> [u8; 32] {
 	unhex(s).try_into().expect("a 32-byte constant")
 }
 
-/// `arca/order-2`'s commitment root.
-pub fn order_cmr() -> [u8; 32] {
-	hash32(programs::ORDER_CMR)
+/// Which `seqdex/order` an order lands as, and so which program fills its
+/// leaf in the tree: version 1 for an `order-2` leaf, version 2 for an
+/// `order-3` leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeqdexVersion {
+	/// `seqdex/order` version 1, landed by `arca/order-2`. Both take an annex
+	/// on a fill; kept for the orders resting under them.
+	V1,
+	/// `seqdex/order` version 2, landed by `arca/order-3`. Both refuse an
+	/// annex. Every new order.
+	V2,
 }
 
-/// `seqdex/order`'s commitment root.
+impl SeqdexVersion {
+	/// The landed program's commitment root.
+	pub fn seqdex_cmr(self) -> [u8; 32] {
+		hash32(match self {
+			SeqdexVersion::V1 => programs::SEQDEX_ORDER_CMR,
+			SeqdexVersion::V2 => programs::SEQDEX_ORDER_2_CMR,
+		})
+	}
+
+	/// The commitment root of the tree's fill program, `arca/order-2` or
+	/// `arca/order-3`.
+	pub fn order_cmr(self) -> [u8; 32] {
+		hash32(match self {
+			SeqdexVersion::V1 => programs::ORDER_CMR,
+			SeqdexVersion::V2 => programs::ORDER3_CMR,
+		})
+	}
+
+	/// The template of a leaf resting as this order.
+	pub fn template(self) -> crate::Template {
+		match self {
+			SeqdexVersion::V1 => crate::Template::Order2,
+			SeqdexVersion::V2 => crate::Template::Order3,
+		}
+	}
+
+	/// The version a leaf of `template` lands as, if it is an order.
+	pub fn of(template: crate::Template) -> Option<SeqdexVersion> {
+		match template {
+			crate::Template::Order2 => Some(SeqdexVersion::V1),
+			crate::Template::Order3 => Some(SeqdexVersion::V2),
+			_ => None,
+		}
+	}
+}
+
+/// `arca/order-3`'s commitment root, the program of every new order.
+pub fn order_cmr() -> [u8; 32] {
+	SeqdexVersion::V2.order_cmr()
+}
+
+/// `seqdex/order` version 2's commitment root, what every new order lands as.
 pub fn seqdex_cmr() -> [u8; 32] {
-	hash32(programs::SEQDEX_ORDER_CMR)
+	SeqdexVersion::V2.seqdex_cmr()
 }
 
 fn tagged(tag: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -224,7 +284,8 @@ impl OrderTerms {
 }
 
 /// SeqDEX's own order, `seqdex/order` (sequentia-contracts): the output an
-/// `order-2` leaf lands as, for the same terms.
+/// `order-3` leaf lands as (version 2), or an `order-2` leaf (version 1), for
+/// the same terms.
 ///
 /// `P2TR(NUMS, TapBranch(TapLeaf_0xbe(CMR), H_TapData(terms)))`, the terms
 /// 156 bytes: `asset_a ‖ asset_b ‖ rate_num ‖ rate_den ‖ min_lot ‖
@@ -239,6 +300,8 @@ pub struct SeqdexOrder {
 	/// The refund's lock time: a median time at or above 500,000,000.
 	pub expiry: u32,
 	pub refund_key: XOnlyPublicKey,
+	/// Which program: version 2 refuses an annex, version 1 takes one.
+	pub version: SeqdexVersion,
 }
 
 impl SeqdexOrder {
@@ -257,7 +320,7 @@ impl SeqdexOrder {
 	}
 
 	pub fn root(&self) -> [u8; 32] {
-		tapbranch(tapleaf(SIMPLICITY, &seqdex_cmr()), tapdata(&self.data_bytes()))
+		tapbranch(tapleaf(SIMPLICITY, &self.version.seqdex_cmr()), tapdata(&self.data_bytes()))
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -277,15 +340,21 @@ impl SeqdexOrder {
 	/// terms and the path bits, the pruned program, the root, the control
 	/// block. It signs nothing and depends on nothing in the transaction.
 	pub fn fill_witness(&self, partial: bool) -> Vec<Vec<u8>> {
-		let program = if partial { programs::SEQDEX_FILL } else { programs::SEQDEX_FILL_WHOLE };
-		vec![pack(&self.data_bytes(), &[false, partial]), unhex(program), seqdex_cmr().to_vec(), self.control_block()]
+		let program = match (self.version, partial) {
+			(SeqdexVersion::V1, true) => programs::SEQDEX_FILL,
+			(SeqdexVersion::V1, false) => programs::SEQDEX_FILL_WHOLE,
+			(SeqdexVersion::V2, true) => programs::SEQDEX_2_FILL,
+			(SeqdexVersion::V2, false) => programs::SEQDEX_2_FILL_WHOLE,
+		};
+		vec![pack(&self.data_bytes(), &[false, partial]), unhex(program), self.version.seqdex_cmr().to_vec(), self.control_block()]
 	}
 }
 
-/// What an `order-2` leaf carries beyond the fields every leaf has (owner,
-/// salt, exit delay, asset and value): the order it lands as, which holds the
-/// price and lot every fill pays and the maker's on-chain terms, and the keys
-/// of its next credits, the next first, zero once used.
+/// What an order leaf carries beyond the fields every leaf has (owner, salt,
+/// exit delay, asset and value): the order it lands as, which holds the price
+/// and lot every fill pays and the maker's on-chain terms, and the keys of its
+/// next credits, the next first, zero once used. The landed order's version
+/// is the leaf's template: `order-3` for version 2, `order-2` for version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderLeafTerms {
 	pub landed: SeqdexOrder,
@@ -293,6 +362,11 @@ pub struct OrderLeafTerms {
 }
 
 impl OrderLeafTerms {
+	/// `order-3`, or `order-2` for an order landing as version 1.
+	pub fn template(&self) -> crate::Template {
+		self.landed.version.template()
+	}
+
 	/// The policy of the leaf these terms are part of.
 	pub fn policy(&self, owner: XOnlyPublicKey, operator: XOnlyPublicKey, salt: [u8; 32], chain: Chain, exit_delay: RelativeTime)
 		-> OrderPolicy
@@ -352,8 +426,11 @@ impl OrderLeafTerms {
 		}
 	}
 
-	/// Reads the binary form of a leaf holding `asset_a`.
-	pub fn decode_from(r: &mut crate::encode::Reader, asset_a: AssetId) -> Result<OrderLeafTerms, crate::encode::DecodeError> {
+	/// Reads the binary form of a leaf holding `asset_a`, of the template its
+	/// record or policy names.
+	pub fn decode_from(r: &mut crate::encode::Reader, asset_a: AssetId, version: SeqdexVersion)
+		-> Result<OrderLeafTerms, crate::encode::DecodeError>
+	{
 		let asset_b = r.asset()?;
 		let rate_num = r.u64()?;
 		let rate_den = r.u64()?;
@@ -366,7 +443,7 @@ impl OrderLeafTerms {
 			*c = r.array32()?;
 		}
 		Ok(OrderLeafTerms {
-			landed: SeqdexOrder { terms: OrderTerms { asset_a, asset_b, rate_num, rate_den, min_lot }, maker, expiry, refund_key },
+			landed: SeqdexOrder { terms: OrderTerms { asset_a, asset_b, rate_num, rate_den, min_lot }, maker, expiry, refund_key, version },
 			credits,
 		})
 	}
@@ -378,14 +455,15 @@ impl OrderPolicy {
 		OrderLeafTerms { landed: self.landed, credits: self.credits }
 	}
 
-	/// The `order-2` leaf policy of this coin, as every other leaf's.
+	/// The `order-3` (or `order-2`) leaf policy of this coin, as every other
+	/// leaf's.
 	pub fn leaf(&self) -> LeafPolicy {
 		LeafPolicy { enclave: None, owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay,
 			htlc: None, order: Some(self.leaf_terms()), landing: None, channel: None }
 	}
 }
 
-/// A leaf of an `order-2` output.
+/// A leaf of an order output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderPath {
 	Collab,
@@ -393,10 +471,11 @@ pub enum OrderPath {
 	Fill,
 }
 
-/// An `order-2` leaf's policy: everything its scriptPubKey commits to.
+/// An order leaf's policy: everything its scriptPubKey commits to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderPolicy {
-	/// The landed order: the terms every fill pays, and where the leaf lands.
+	/// The landed order: the terms every fill pays, where the leaf lands, and
+	/// by its version which program fills the leaf.
 	pub landed: SeqdexOrder,
 	/// The maker's leaf key `A`, in the collaborative path.
 	pub owner: XOnlyPublicKey,
@@ -546,7 +625,13 @@ impl OrderPolicy {
 	}
 
 	pub fn root(&self) -> [u8; 32] {
-		tapbranch(tapbranch(self.collab_leaf(), self.land_leaf()), tapbranch(tapleaf(SIMPLICITY, &order_cmr()), self.data_leaf()))
+		tapbranch(tapbranch(self.collab_leaf(), self.land_leaf()), tapbranch(tapleaf(SIMPLICITY, &self.cmr()), self.data_leaf()))
+	}
+
+	/// The fill program's commitment root: `arca/order-3`'s, or
+	/// `arca/order-2`'s for an order landing as version 1.
+	pub fn cmr(&self) -> [u8; 32] {
+		self.landed.version.order_cmr()
 	}
 
 	pub fn output_key(&self) -> XOnlyPublicKey {
@@ -563,7 +648,7 @@ impl OrderPolicy {
 
 	/// The control block that proves `path`.
 	pub fn control_block(&self, path: OrderPath) -> Vec<u8> {
-		let right = tapbranch(tapleaf(SIMPLICITY, &order_cmr()), self.data_leaf());
+		let right = tapbranch(tapleaf(SIMPLICITY, &self.cmr()), self.data_leaf());
 		let left = tapbranch(self.collab_leaf(), self.land_leaf());
 		match path {
 			OrderPath::Collab => control_block(TAPSCRIPT, self.root(), &[self.land_leaf(), right]),
@@ -671,19 +756,20 @@ impl OrderPolicy {
 	/// The fill's witness: the parameters, the operator's signature, `m` and
 	/// the path bit, then the pruned program, the root and the control block.
 	pub fn fill_witness(&self, operator_sig: &Signature, m: u8, partial: bool) -> Result<Vec<Vec<u8>>, OrderError> {
+		let v3 = self.landed.version == SeqdexVersion::V2;
 		let program = match (partial, m) {
-			(true, 2) => programs::ORDER_FILL_M2,
-			(true, 3) => programs::ORDER_FILL_M3,
-			(true, 4) => programs::ORDER_FILL_M4,
-			(false, 2) => programs::ORDER_FILL_WHOLE_M2,
-			(false, 3) => programs::ORDER_FILL_WHOLE_M3,
-			(false, 4) => programs::ORDER_FILL_WHOLE_M4,
+			(true, 2) => if v3 { programs::ORDER3_FILL_M2 } else { programs::ORDER_FILL_M2 },
+			(true, 3) => if v3 { programs::ORDER3_FILL_M3 } else { programs::ORDER_FILL_M3 },
+			(true, 4) => if v3 { programs::ORDER3_FILL_M4 } else { programs::ORDER_FILL_M4 },
+			(false, 2) => if v3 { programs::ORDER3_FILL_WHOLE_M2 } else { programs::ORDER_FILL_WHOLE_M2 },
+			(false, 3) => if v3 { programs::ORDER3_FILL_WHOLE_M3 } else { programs::ORDER_FILL_WHOLE_M3 },
+			(false, 4) => if v3 { programs::ORDER3_FILL_WHOLE_M4 } else { programs::ORDER_FILL_WHOLE_M4 },
 			_ => return Err(OrderError::Amount(format!("a fill commits to 2 to {} outputs, not {}", MAX_FILL_OUTPUTS, m))),
 		};
 		let mut w = self.data_bytes();
 		w.extend(operator_sig.as_ref());
 		w.push(m);
-		Ok(vec![pack(&w, &[partial]), unhex(program), order_cmr().to_vec(), self.control_block(OrderPath::Fill)])
+		Ok(vec![pack(&w, &[partial]), unhex(program), self.cmr().to_vec(), self.control_block(OrderPath::Fill)])
 	}
 
 	/// The fill of `filled` atoms of a coin holding `locked`: the credit at
@@ -811,6 +897,7 @@ mod test {
 				maker: sha256(b"maker"),
 				expiry: 1_800_000_000,
 				refund_key: x("refund"),
+				version: SeqdexVersion::V2,
 			},
 			owner: x("maker"),
 			operator: x("operator"),
@@ -835,11 +922,47 @@ mod test {
 		assert_ne!(o.credit_leaf().unwrap().script_pubkey(), n.credit_leaf().unwrap().script_pubkey());
 	}
 
+	/// The same order landing as `seqdex/order` version 1: an `order-2` leaf.
+	fn order_2() -> OrderPolicy {
+		let mut o = order();
+		o.landed.version = SeqdexVersion::V1;
+		o
+	}
+
 	#[test]
-	fn an_order_2_leaf_policy_is_the_orders_own_output() {
-		let o = order();
+	fn order_3_and_order_2_are_two_programs_and_two_outputs() {
+		let (o3, o2) = (order(), order_2());
+		assert_eq!(o3.leaf().template(), crate::Template::Order3);
+		assert_eq!(o2.leaf().template(), crate::Template::Order2);
+		assert_eq!(o3.cmr(), hash32(programs::ORDER3_CMR));
+		assert_eq!(o2.cmr(), hash32(programs::ORDER_CMR));
+		assert_ne!(o3.landed.script_pubkey(), o2.landed.script_pubkey(), "they land as two programs");
+		assert_ne!(o3.land_leaf(), o2.land_leaf());
+		assert_ne!(o3.script_pubkey(), o2.script_pubkey());
+		// A remainder rests under its own program; a credit is a vtxo-1 leaf either way.
+		assert_eq!(o3.next().leaf().template(), crate::Template::Order3);
+		assert_eq!(o2.next().leaf().template(), crate::Template::Order2);
+		assert_eq!(o3.credit_leaf(), o2.credit_leaf());
+		let sig = Signature::from_slice(&[1; 64]).unwrap();
+		let w3 = o3.fill_witness(&sig, 2, true).unwrap();
+		let w2 = o2.fill_witness(&sig, 2, true).unwrap();
+		assert_eq!(w3[1], unhex(programs::ORDER3_FILL_M2));
+		assert_eq!(w2[1], unhex(programs::ORDER_FILL_M2));
+		assert_eq!(o3.landed.fill_witness(true)[1], unhex(programs::SEQDEX_2_FILL));
+		assert_eq!(o2.landed.fill_witness(false)[1], unhex(programs::SEQDEX_FILL_WHOLE));
+		assert_eq!(o3.landed.fill_witness(true)[2], hash32(programs::SEQDEX_ORDER_2_CMR).to_vec());
+	}
+
+	#[test]
+	fn an_order_leaf_policy_is_the_orders_own_output() {
+		for o in [order(), order_2()] {
+			an_order_leaf_policy_is(o);
+		}
+	}
+
+	fn an_order_leaf_policy_is(o: OrderPolicy) {
 		let leaf = o.leaf();
-		assert_eq!(leaf.template(), crate::Template::Order2);
+		assert_eq!(leaf.template(), o.landed.version.template());
 		assert_eq!(leaf.program(), o.program());
 		assert_eq!(leaf.order_policy(), Some(o));
 		assert_eq!(leaf.taproot().control_block(&o.collab_script()).unwrap(), o.control_block(OrderPath::Collab));
@@ -871,18 +994,20 @@ mod test {
 		let mut e = Vec::new();
 		t.encode_to(&mut e);
 		assert_eq!(e.len(), crate::record::ORDER_TERMS_BYTES);
-		assert_eq!(OrderLeafTerms::decode_from(&mut crate::encode::Reader::new(&e), a).unwrap(), t);
+		assert_eq!(OrderLeafTerms::decode_from(&mut crate::encode::Reader::new(&e), a, SeqdexVersion::V2).unwrap(), t);
+		let t2 = order_2().leaf_terms();
+		assert_eq!(OrderLeafTerms::decode_from(&mut crate::encode::Reader::new(&e), a, SeqdexVersion::V1).unwrap(), t2);
 		// A remainder's terms, with its keys moved up, still pass.
 		o.next().next().leaf_terms().check(a, &o.owner, &o.operator).unwrap();
 	}
 
 	#[test]
 	fn every_path_has_a_control_block_that_proves_it() {
-		let o = order();
+		for o in [order(), order_2()] {
 		for (path, version, leaf) in [
 			(OrderPath::Collab, TAPSCRIPT, o.collab_leaf()),
 			(OrderPath::Land, TAPSCRIPT, o.land_leaf()),
-			(OrderPath::Fill, SIMPLICITY, tapleaf(SIMPLICITY, &order_cmr())),
+			(OrderPath::Fill, SIMPLICITY, tapleaf(SIMPLICITY, &o.cmr())),
 		] {
 			let cb = o.control_block(path);
 			assert_eq!(cb[0] & 0xfe, version);
@@ -892,6 +1017,7 @@ mod test {
 				node = tapbranch(node, p.try_into().unwrap());
 			}
 			assert_eq!(node, o.root());
+		}
 		}
 	}
 }
