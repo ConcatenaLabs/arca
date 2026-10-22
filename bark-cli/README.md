@@ -555,6 +555,14 @@ and a board whose registration never reached the server, are not recovered.
   is refreshed, since a restore of that machine can let its sender spend it
   twice.
 
+- **A spend read from the chain** (a claim that reveals a preimage, a fill
+  of an order, an exit from an accumulator batch, a collaborative spend
+  `watch-bond` reads) is read with its annex (BIP341) set aside, the last
+  witness item when it starts with `0x50`. Consensus ignores an annex, and
+  on most of these paths no signature covers it, so whoever relays or mines
+  a spend can add one; the wallet reads an annexed spend the same as the
+  plain one.
+
 ### Fees
 
 Fees are paid in the asset being moved unless another is named
