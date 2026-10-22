@@ -927,7 +927,11 @@ publishes the order to the operator; the wallet may then stop. On its return,
 `sync` takes up each credit and the order resting again from the wallet's
 mailbox, and the coin each fill spent is shown spent. `arca order resting`
 shows each order as the operator does: where it rests, what is left, its fills,
-and the credits the wallet holds of it. An order's coin is never paid on,
+and the credits the wallet holds of it. A maker that stays away past its
+order coin's exit deadline (three days before the coin's expiry) finds the
+order landed by the operator: on the chain whole as SeqDEX's order for the
+same terms, refundable by its key and fillable there, not swept with its
+batch. An order's coin is never paid on,
 refreshed by default or planned: `arca order cancel-resting` cancels it, a
 transfer of what rests into a leaf of the wallet's own. With `--quote` it
 only says what the cancel gives back and its fee (the transfer's margin);

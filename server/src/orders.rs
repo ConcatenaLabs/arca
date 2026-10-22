@@ -280,13 +280,18 @@ pub struct OrderView {
 	/// either signed (the order then rests at its remainder, or is filled
 	/// whole) or dropped (the order rests where it was).
 	pub filling: bool,
+	/// Whether the coin it rests at, live, is on the chain: brought there to
+	/// land, by its maker or by the operator at its exit deadline.
+	pub landed: bool,
 }
 
 impl OrderView {
-	/// `resting`, `filling`, `filled`, `cancelled`, `exhausted`, `pending`
-	/// or `unknown`. `filled` is said only of a fill the operator signed.
+	/// `resting`, `filling`, `filled`, `cancelled`, `exhausted`, `landed`,
+	/// `pending` or `unknown`. `filled` is said only of a fill the operator
+	/// signed.
 	pub fn state(&self) -> &'static str {
 		match self.coin_state {
+			LeafState::Live if self.landed => "landed",
 			LeafState::Live if self.policy.fills_left() == 0 => "exhausted",
 			LeafState::Live => "resting",
 			LeafState::Spent if self.given_up => "cancelled",
@@ -417,9 +422,10 @@ impl Orders {
 		let fills = self.store.order_fills(&id.0).await?;
 		let whole = fills.iter().any(|f| f.order_leaf == order.current_leaf);
 		let filling = fills.iter().any(|f| f.order_leaf == order.current_leaf && f.signature.is_none());
+		let landed = row.state == LeafState::Live && !self.store.sightings_of(&row.script_pubkey).await?.is_empty();
 		Ok(Some(OrderView {
 			value: row.value, coin_state: row.state, expiry: cosign::first_expiry(&record),
-			given_up: row.state == LeafState::Spent && !whole, filling,
+			given_up: row.state == LeafState::Spent && !whole, filling, landed,
 			order, policy, fills,
 		}))
 	}

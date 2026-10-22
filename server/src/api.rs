@@ -848,8 +848,11 @@ pub struct OrderState {
 	/// more: its credit keys are used), `filling` (a fill of the coin it
 	/// rests at is recorded and not yet signed: it takes no other fill, and
 	/// the fill is either signed or dropped), `filled` (filled whole, the fill
-	/// signed), `cancelled` (its maker gave its coin up otherwise),
-	/// `pending`, or `unknown`.
+	/// signed), `cancelled` (its maker gave its coin up otherwise), `landed`
+	/// (the coin it rests at is on the chain, brought there by its maker or
+	/// by the operator at its exit deadline, and moves whole into SeqDEX's
+	/// order for the same terms: it takes no fill in the tree), `pending`, or
+	/// `unknown`.
 	pub state: String,
 	/// The coin it rests at now, and what of the asset it sells it holds.
 	pub coin: String,

@@ -59,7 +59,18 @@
 //!    records, so a fully refreshed batch comes back before it expires; a
 //!    node with an owner who has not released is never unrolled by the
 //!    watcher.
-//! 7. **Returns.** A claim leaf of a distribution that a final sweep took
+//! 7. **Absent makers' orders.** A resting order whose coin is live at its
+//!    exit deadline (three days before the earliest expiry in its lineage),
+//!    its maker not back to refresh or take it home, is landed by the
+//!    operator: the coin is brought on the chain (its path unrolled by the
+//!    authorisations of its record, and, for a coin a fill made, the fills
+//!    published as their stale exits are answered), and once it has waited
+//!    its exit delay in a block, the landing moves it whole into SeqDEX's
+//!    order for the same terms, the fee from a coin of the wallet's. The
+//!    order then rests on the chain, its maker's to refund, and is not swept
+//!    with its batch. A coin the signer holds a spend of (a fill, a cancel,
+//!    a forfeit) is left alone.
+//! 8. **Returns.** A claim leaf of a distribution that a final sweep took
 //!    with no spend of it recorded (its holder never took it up) is paid back
 //!    to the distribution's return script, with every other such leaf of the
 //!    distribution, from the operator's own coins (`returns.rs`).
@@ -340,6 +351,7 @@ impl Watcher {
 		self.recover_board_transfers(now).await?;
 		self.answer_stale_exits().await?;
 		self.offboards().await?;
+		self.land_orders(now).await?;
 		self.expiries(now).await?;
 		self.reclaims(now).await?;
 		self.returns().await?;
@@ -550,7 +562,13 @@ impl Watcher {
 				log::info!("watcher: {} for {} not published: round {} is lost", kind, hex(&w.subject), round);
 				return Ok(None);
 			},
-			Err(e) => return Err(WatcherError::Nursery(e.to_string())),
+			// Whatever kept the transaction out of the nursery, the wallet's
+			// coins it reserved are free again: kept, every such failure
+			// would take a fee coin out of the wallet for good.
+			Err(e) => {
+				self.wallet.release(&txid).await?;
+				return Err(WatcherError::Nursery(e.to_string()));
+			},
 		};
 		// Its change, for the watcher's next transaction.
 		self.store.record_pending_outputs(&r.tx).await?;
@@ -1593,6 +1611,65 @@ impl Watcher {
 				Ok(())
 			},
 		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Absent makers' orders
+	// -----------------------------------------------------------------------
+
+	/// Lands every resting order whose maker is not back by its coin's exit
+	/// deadline: see the [module documentation](self).
+	async fn land_orders(&self, now: MedianTime) -> Result<(), WatcherError> {
+		for order in self.store.live_resting_orders().await? {
+			let r = self.land_order(&order, now).await;
+			Self::item(&format!("the landing of resting order {}", hex(&order.order_id)), r)?;
+		}
+		Ok(())
+	}
+
+	/// One step of [`Watcher::land_orders`] for `order`: the coin it rests at
+	/// brought a step nearer the chain, or, on the chain and its exit delay
+	/// waited, landed.
+	async fn land_order(&self, order: &crate::store::RestingOrderRow, now: MedianTime) -> Result<(), WatcherError> {
+		let Some(row) = self.store.leaf(&order.current_leaf).await? else { return Ok(()) };
+		if row.state != LeafState::Live {
+			return Ok(());
+		}
+		let record = CoinRecord::from_bytes(&row.record).map_err(build("the coin record"))?;
+		let Some(expiry) = crate::cosign::first_expiry(&record) else { return Ok(()) };
+		if now.to_consensus_u32() < expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE) {
+			return Ok(());
+		}
+		let coin = self.coin(&order.current_leaf).await?;
+		let policy = coin.leaf.order_policy().ok_or_else(|| WatcherError::Build(format!("coin {} is not an order's", coin.id)))?;
+		// A spend of the coin co-signed (a fill, a cancel, a forfeit) is its
+		// own way on, answered as a stale exit should the coin come on.
+		if !self.signer.under(&policy.salt).await?.is_empty() {
+			return Ok(());
+		}
+		let script = coin.leaf.script_pubkey();
+		let Some(at) = self.unspent_at(&script).await? else {
+			// On the chain and spent (landed, or filled there): nothing more.
+			if !self.store.sightings_of(script.as_bytes()).await?.is_empty() {
+				return Ok(());
+			}
+			log::info!("resting order {}: its coin {} is live at its exit deadline, its maker away: brought on the chain to land",
+				hex(&order.order_id), coin.id);
+			return self.bring_on_chain(&coin, now).await;
+		};
+		if self.spending(&at).await? || !self.confirmed(at).await? || !self.waited(at.txid, policy.exit_delay).await? {
+			return Ok(());
+		}
+		let (u, fee_coin, fee) = self.margin_or_coin(coin.asset, 0, |fee| {
+			let u = policy.landing_tx(at, coin.value, fee).map_err(|e| e.to_string())?;
+			let t = u.tx.clone();
+			Ok((u, t))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		self.publish(Ready { tx: u.tx, wallet, fee }, "landing", order.order_id.to_vec(),
+			format!("resting order {}, its maker away at its exit deadline: its coin {} at {} landed whole as SeqDEX's order", hex(&order.order_id),
+				coin.id, at)).await?;
+		Ok(())
 	}
 
 	// -----------------------------------------------------------------------
