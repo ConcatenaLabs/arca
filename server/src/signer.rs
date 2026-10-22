@@ -11,7 +11,13 @@
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis) ‖ salt)`, for 1 to 4
 //!   committed outputs; with the entry of the record it was recorded as.
 //!   `known` names the latest entry of the record the server's database
-//!   knows (`{"entry":…,"hash":…}`);
+//!   knows (`{"entry":…,"hash":…}`). For a coin of a restricted asset the
+//!   signer was started to serve (`--restricted`), the request also carries
+//!   `policy_sig`, the asset's policy key's approval of that very message
+//!   ([`crate::restricted`]), without which nothing of the asset is signed,
+//!   and, for an `enclave-1` coin, `enclave`, its holder's key, from which
+//!   the signer builds the message with the digest of the holder's enclave
+//!   after `K`;
 //! - `{"op":"head"}` and `{"op":"entries","after":…,"limit":…}`: the record's
 //!   latest entry, signed ([`record_head_digest`]), and its entries after
 //!   one, for the server to check its database against at start;
@@ -216,6 +222,22 @@ impl WireOutput {
 	}
 }
 
+/// Where a `vtxo-2` coin's spend sits in its transaction: the coin's input
+/// index and the outputs the first inputs spend, the coin's among them,
+/// which `arca/collab-2`'s message names ([`arca_covenant::collab`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireNamed {
+	pub index: u32,
+	pub inputs: Vec<WireOutput>,
+}
+
+impl WireNamed {
+	pub fn new(index: u32, inputs: &[ExplicitOutput]) -> WireNamed {
+		WireNamed { index, inputs: inputs.iter().map(WireOutput::from_output).collect() }
+	}
+}
+
 /// A `channel-1` coin's terms, from which the signer rebuilds its channel:
 /// the owner's key, the salt, the exit delay and the credit window in
 /// 512-second units, the leaf's value and the operator's opening balance.
@@ -330,10 +352,29 @@ pub enum Request {
 		/// coin, a checkpoint included.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		landing: Option<String>,
+		/// A `vtxo-2` coin or its checkpoint: the coin's input index and the
+		/// inputs the spend names. The signer builds `arca/collab-2`'s
+		/// message, which names them, in place of the tapscript path's;
+		/// absent for any other coin.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		named: Option<WireNamed>,
 		/// The latest entry of the signer's record the server's database
 		/// knows; absent when it knows none.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		known: Option<WireEntryRef>,
+		/// The holder of an `enclave-1` coin (its registered key, x-only,
+		/// hex), the leaf of a restricted asset: the signer builds the message
+		/// with the digest of the holder's enclave after `K`, as the coin's
+		/// script does, from the asset's keys it was started with
+		/// ([`crate::restricted`]). Absent for any other coin, a checkpoint
+		/// included.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		enclave: Option<String>,
+		/// For a message of a restricted asset, its policy key's signature
+		/// over `arca_covenant::enclave::policy_cosign_digest` of the message,
+		/// without which the signer signs nothing of the asset.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		policy_sig: Option<String>,
 	},
 	/// The latest entry of the record: its number and running hash, signed.
 	Head {},
@@ -2184,18 +2225,29 @@ impl SignerClient {
 	/// `landing` is the coin's landing program, for a `landing-1` coin.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>, asset_in: AssetId,
-		value_in: u64, outputs: &[ExplicitOutput]) -> Result<Signature, SignerError>
+		value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>) -> Result<Signature, SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None).await.map(|(s, _)| s)
+		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named).await.map(|(s, _)| s)
 	}
 
 	/// [`Self::rebind`], with the entry of the record the signature was
 	/// recorded as, signed.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn rebind_recorded(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>,
-		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(Signature, Option<SignedHead>), SignerError>
+		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>)
+		-> Result<(Signature, Option<SignedHead>), SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None).await
+		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named).await
+	}
+
+	/// [`Self::rebind_recorded`] for a coin of a restricted asset: `enclave`
+	/// names the holder of an `enclave-1` coin (none for its checkpoint), and
+	/// `policy_sig` is the asset's policy key's approval of the message.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn rebind_cosigned(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], enclave: Option<XOnlyPublicKey>,
+		policy_sig: &Signature, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(Signature, Option<SignedHead>), SignerError>
+	{
+		self.rebind_as(owner, owner_sig, salt, None, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None).await
 	}
 
 	/// `S`'s signature over the rebindable message of the leaf of `owner`
@@ -2204,15 +2256,18 @@ impl SignerClient {
 	/// forfeit for its round. `owner_sig` is the owner's forfeit signature.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn rebind_forfeit(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>,
-		asset_in: AssetId, value_in: u64, forfeit: &ForfeitPolicy, output: &ExplicitOutput) -> Result<Signature, SignerError>
+		asset_in: AssetId, value_in: u64, forfeit: &ForfeitPolicy, output: &ExplicitOutput, named: Option<WireNamed>)
+		-> Result<Signature, SignerError>
 	{
 		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, std::slice::from_ref(output),
-			Some(WireForfeit::from_policy(forfeit))).await.map(|(s, _)| s)
+			Some(WireForfeit::from_policy(forfeit)), None, named).await.map(|(s, _)| s)
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	async fn rebind_as(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>, asset_in: AssetId,
-		value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>) -> Result<(Signature, Option<SignedHead>), SignerError>
+		value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>, restricted: Option<(Option<XOnlyPublicKey>, Signature)>,
+		named: Option<WireNamed>)
+		-> Result<(Signature, Option<SignedHead>), SignerError>
 	{
 		let known = match &self.store {
 			Some(store) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
@@ -2223,6 +2278,8 @@ impl SignerClient {
 			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
 			landing: landing.map(|p| hex(&p)),
+			enclave: restricted.and_then(|(h, _)| h).map(|h| hex(&h.serialize())),
+			policy_sig: restricted.map(|(_, s)| hex(s.as_ref())), named,
 		}).await?;
 		let head = SignedHead::from_answer(&r)?;
 		if let (Some(store), Some(h)) = (&self.store, &head) {

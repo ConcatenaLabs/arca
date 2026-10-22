@@ -385,8 +385,8 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 	};
 	let mut leaves = vec![];
 	for l in t["leaves"].as_array().cloned().unwrap_or_default() {
-		// A resting order's terms (`order-2`), another holder's or the
-		// wallet's own: the tree does not build without them.
+		// A resting order's terms (`order-3`, or `order-2`), another holder's
+		// or the wallet's own: the tree does not build without them.
 		let order = match l.get("order").filter(|o| !o.is_null()) {
 			Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, params.asset)
 				.map_err(|e| Error::Parse(format!("a published leaf's order terms: {}", e)))?),
@@ -424,9 +424,9 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 /// whose terms are not the ones it asked for. The template is part of what
 /// a leaf is: the same owner key, nonce, asset and value under another
 /// template is another coin. An `htlc-1` leaf locked to a hash its operator
-/// knows can be claimed out of the tree by the operator; an `order-2` leaf is
+/// knows can be claimed out of the tree by the operator; an order leaf is
 /// filled under the operator's signature alone. So a leaf is `vtxo-1` unless
-/// the wallet asked for something else: `order-2` on the terms of a resting
+/// the wallet asked for something else: `order-3` (or `order-2`, as the terms name) on the terms of a resting
 /// order it asked for (`w["order"]`), `landing-1` for a supervised asset at
 /// the landing it asked for (`w["landing"]`, which the caller compares with
 /// the leaf's), or `htlc-1` in the one participation that names one, a
@@ -438,7 +438,10 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 	let asked_channel = w.get("channel").filter(|c| !c.is_null());
 	let want = match (receive, asked_order, asked_landing, asked_channel) {
 		(Some(_), ..) => Template::Htlc1,
-		(None, true, ..) => Template::Order2,
+		// The terms name their version: order-3, or order-2 for a leaf from
+		// before it, restored or taken up as it is.
+		(None, true, ..) => w.get("order").and_then(|o| arca_covenant::record_json::order_terms_from_json(o, record.asset()).ok())
+			.map_or(Template::Order3, |o| o.template()),
 		(None, false, true, _) => Template::Landing1,
 		(None, false, false, Some(_)) => Template::Channel1,
 		(None, false, false, None) => Template::Vtxo1,
@@ -479,13 +482,13 @@ pub(crate) fn landing_text(l: Option<&arca_covenant::Landing>) -> String {
 }
 
 /// Refuses a new leaf that is a resting order where the wallet's wanted leaf
-/// `w` asked for none, or one on other terms than it asked: an `order-2`
-/// leaf is filled under the operator's signature alone, at the price and to
+/// `w` asked for none, or one on other terms than it asked: an order leaf
+/// is filled under the operator's signature alone, at the price and to
 /// the credit keys its terms name.
 fn order_as_asked(w: &Value, template: Template, order: Option<&arca_covenant::OrderLeafTerms>) -> Result<(), String> {
 	let asked = w.get("order").filter(|o| !o.is_null());
 	let served = order.map(arca_covenant::record_json::order_terms_json);
-	if asked == served.as_ref() && (template == Template::Order2) == asked.is_some() {
+	if asked == served.as_ref() && matches!(template, Template::Order2 | Template::Order3) == asked.is_some() {
 		return Ok(());
 	}
 	let say = |o: Option<&Value>| o.map_or("no resting order".to_string(), |o| format!("a resting order on terms {}", o));
@@ -2170,23 +2173,26 @@ mod tests {
 		let (a, b) = (AssetId::from_slice(&[1; 32]).unwrap(), AssetId::from_slice(&[2; 32]).unwrap());
 		let terms = OrderLeafTerms {
 			landed: SeqdexOrder { terms: OrderTerms { asset_a: a, asset_b: b, rate_num: 2, rate_den: 1, min_lot: 10 }, maker: [7; 32],
-				expiry: 1_800_000_000, refund_key: key(3) },
+				expiry: 1_800_000_000, refund_key: key(3), version: arca_covenant::order::SeqdexVersion::V2 },
 			credits: [key(4).serialize(), key(5).serialize(), key(6).serialize(), key(8).serialize()],
 		};
 		let plain = json!({"nonce": "00", "asset": a.to_string(), "value": "1"});
 		let asked = json!({"nonce": "00", "asset": a.to_string(), "value": "1", "order": arca_covenant::record_json::order_terms_json(&terms)});
 		assert!(order_as_asked(&plain, Template::Vtxo1, None).is_ok(), "a plain leaf where a plain leaf was asked for");
 		assert!(order_as_asked(&asked, Template::Vtxo1, None).is_err(), "a plain leaf where an order was asked for");
-		assert!(order_as_asked(&asked, Template::Order2, Some(&terms)).is_ok(), "the order asked for");
-		let e = order_as_asked(&plain, Template::Order2, Some(&terms)).unwrap_err();
+		assert!(order_as_asked(&asked, Template::Order3, Some(&terms)).is_ok(), "the order asked for");
+		let mut old = terms;
+		old.landed.version = arca_covenant::order::SeqdexVersion::V1;
+		assert!(order_as_asked(&asked, Template::Order2, Some(&old)).is_err(), "an order-2 leaf where order-3 was asked for");
+		let e = order_as_asked(&plain, Template::Order3, Some(&terms)).unwrap_err();
 		println!("an order the wallet did not ask for: {}", e);
 		assert!(e.contains("a resting order on terms"), "{}", e);
 		let mut other = terms;
 		other.credits[0] = key(9).serialize();
-		assert!(order_as_asked(&asked, Template::Order2, Some(&other)).is_err(), "an order with another credit key");
+		assert!(order_as_asked(&asked, Template::Order3, Some(&other)).is_err(), "an order with another credit key");
 		other = terms;
 		other.landed.terms.rate_num = 1;
-		assert!(order_as_asked(&asked, Template::Order2, Some(&other)).is_err(), "an order at another price");
+		assert!(order_as_asked(&asked, Template::Order3, Some(&other)).is_err(), "an order at another price");
 	}
 
 	#[test]

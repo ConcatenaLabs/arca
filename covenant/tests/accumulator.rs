@@ -126,9 +126,15 @@ fn refuse(net: &mut Net, name: &str, raw: &RawExit, expect: &str) {
 const INSIDE_JET: &str = "mempool-script-verify-flag-failed (Assertion failed inside jet)";
 /// An `unwrap` of nothing: the program reads an output that is not there.
 const NO_OUTPUT: &str = "mempool-script-verify-flag-failed (Assertion failed)";
-/// An annex where the program requires none: `is_none` of the input's annex
-/// hash fails as an assertion the compiler makes, as an `unwrap` does.
-const ANNEX: &str = "mempool-script-verify-flag-failed (Assertion failed)";
+/// An annex where the program requires none: in a block, `is_none` of the
+/// input's annex hash fails as an assertion the compiler makes, as an
+/// `unwrap` does.
+const ANNEX: &str = "mandatory-script-verify-flag-failed (Assertion failed)";
+/// Relay refuses the same spends before the program runs: an annex on a
+/// Simplicity leaf relays only when it is zeros and as large as the
+/// program's cost needs, which an exit's never does.
+const ANNEX_NONZERO: &str = "mempool-script-verify-flag-failed (Simplicity annex must be zeros after its tag)";
+const ANNEX_UNNEEDED: &str = "mempool-script-verify-flag-failed (Simplicity annex is larger than the program's cost needs)";
 
 fn auth(digest: [u8; 32], key: &Keypair, by_operator: bool, t: MedianTime) -> ExitAuth {
 	ExitAuth { by_operator, time: t, signature: sig(key, &digest) }
@@ -541,12 +547,13 @@ fn chained_exits_in_one_block_and_an_exit_reorganised_by_its_anchor() {
 }
 
 /// Exits whose witnesses end with an annex (BIP341). The authorisation names
-/// no annex, and the node relays an annex on a Simplicity spend, so whoever
-/// holds an authorisation could add one to the exit, the same txid: the
-/// program refuses it (`current_annex_hash` must be none), in the mempool
-/// and in a block, for the owner's exit, the operator's and the last leaf's,
-/// each beside the same exit with no annex, which confirms. A reader strips
-/// an annex all the same (`read_exit`): an annexed witness reads as the plain
+/// no annex, so whoever holds an authorisation, or mines the exit, could add
+/// one to it, the same txid: the program refuses it (`current_annex_hash`
+/// must be none) in a block, for the owner's exit, the operator's and the
+/// last leaf's, each beside the same exit with no annex, which confirms.
+/// Relay refuses each annex before the program runs, a nonzero one for its
+/// bytes and a zero one as more than the program needs. A reader strips an
+/// annex all the same (`read_exit`): an annexed witness reads as the plain
 /// one.
 #[test]
 fn an_annexed_exit_is_refused_in_a_block_beside_the_plain_one() {
@@ -578,18 +585,23 @@ fn an_annexed_exit_is_refused_in_a_block_beside_the_plain_one() {
 		auth(valid[i].exit_digest(t), &owners[i], false, t)
 	}).collect();
 	let names = ["exit 1: slot 0 by its owner", "exit 2: slot 1 by the operator", "exit 3: the last slot by its owner"];
-	let annexes = [vec![0x50, 0x0a, 0x11], [vec![0x50], vec![0xaa; 999]].concat()];
+	let annexes = [
+		(vec![0x50, 0x0a, 0x11], ANNEX_NONZERO),
+		([vec![0x50], vec![0xaa; 999]].concat(), ANNEX_NONZERO),
+		(vec![0x50, 0x00, 0x00], ANNEX_UNNEEDED),
+		([vec![0x50], vec![0x00; 999]].concat(), ANNEX_UNNEEDED),
+	];
 	let (mut state, mut at, mut held) = (*acc.policy(), OutPoint::new(id, 0), acc.total());
 	let mut mined = vec![];
 	for i in 0..N {
 		let plain = valid[i].exit_tx(&state, at, held, &auths[i], &FeeSource::Reserve).unwrap().tx;
-		for annex in &annexes {
+		for (annex, relay) in &annexes {
 			let mut x = plain.clone();
 			x.input[0].witness.script_witness.push(annex.clone());
 			assert_eq!(x.txid(), plain.txid(), "the annex is witness data: the txid is the plain exit's");
 			assert_eq!(read_exit(&x.input[0].witness.script_witness), read_exit(&plain.input[0].witness.script_witness),
 				"an annexed witness reads as the plain one");
-			a.net.refuse(&format!("neg {}, a {}-byte annex on its witness", names[i], annex.len()), &x, ANNEX);
+			a.net.refuse_relay_and_block(&format!("neg {}, a {}-byte annex on its witness", names[i], annex.len()), &x, relay, ANNEX);
 		}
 		let txid = a.net.pass(&format!("{}, no annex", names[i]), &plain);
 		let tx = a.net.rt.client().raw_transaction(&txid).unwrap();

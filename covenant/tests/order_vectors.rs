@@ -1,4 +1,4 @@
-//! The `order-2` builders against `regtest/vectors/order.json`, which
+//! The `order-2` and `order-3` builders against `regtest/vectors/order.json`, which
 //! `regtest/order.py` derives independently: the parameters, every script
 //! leaf, control block, merkle root and scriptPubKey of an order, of its
 //! remainder after a fill and of the credit that fill pays, the SeqDEX order
@@ -11,7 +11,7 @@ use elements::secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey};
 use elements::{AssetId, BlockHash, Script};
 use serde_json::Value;
 
-use arca_covenant::order::{OrderPath, OrderPolicy, OrderTerms, SeqdexOrder};
+use arca_covenant::order::{OrderPath, OrderPolicy, OrderTerms, SeqdexOrder, SeqdexVersion};
 use arca_covenant::*;
 
 const VECTORS: &str = include_str!("../../regtest/vectors/order.json");
@@ -48,13 +48,27 @@ fn check_order(name: &str, o: &OrderPolicy, v: &Value) {
 #[test]
 fn order_2_matches_the_regtest_suites_vectors() {
 	let v: Value = serde_json::from_str(VECTORS).unwrap();
+	matches_version(&v, &v, SeqdexVersion::V1);
+}
+
+#[test]
+fn order_3_matches_the_regtest_suites_vectors() {
+	let v: Value = serde_json::from_str(VECTORS).unwrap();
+	matches_version(&v, &v["order_3"], SeqdexVersion::V2);
+	assert_ne!(v["order"]["script_pubkey"], v["order_3"]["order"]["script_pubkey"]);
+}
+
+/// The vectors in `w` (the whole file for `order-2`, `order_3` for
+/// `order-3`), whose keys, terms, chain and salt are the file's.
+fn matches_version(v: &Value, w: &Value, version: SeqdexVersion) {
 	let t = &v["terms"];
 	let terms = OrderTerms { asset_a: AssetId::from_byte_array(h32(&t["asset_a"])), asset_b: AssetId::from_byte_array(h32(&t["asset_b"])),
 		rate_num: t["rate_num"].as_u64().unwrap(), rate_den: t["rate_den"].as_u64().unwrap(), min_lot: t["min_lot"].as_u64().unwrap() };
 	let keys = &v["keys"];
-	let landed = SeqdexOrder { terms, maker: h32(&t["maker"]), expiry: t["expiry"].as_u64().unwrap() as u32, refund_key: key(&keys["refund"]) };
-	same("landed params", &landed.data_bytes(), &v["landed"]["params"]);
-	same("landed scriptPubKey", landed.script_pubkey().as_bytes(), &v["landed"]["script_pubkey"]);
+	let landed = SeqdexOrder { terms, maker: h32(&t["maker"]), expiry: t["expiry"].as_u64().unwrap() as u32, refund_key: key(&keys["refund"]),
+		version };
+	same("landed params", &landed.data_bytes(), &w["landed"]["params"]);
+	same("landed scriptPubKey", landed.script_pubkey().as_bytes(), &w["landed"]["script_pubkey"]);
 	let chain = Chain::new(BlockHash::from_byte_array(h32(&v["genesis"])));
 	let o = OrderPolicy {
 		landed,
@@ -65,14 +79,15 @@ fn order_2_matches_the_regtest_suites_vectors() {
 		exit_delay: RelativeTime::from_sequence(v["exit_delay_sequence"].as_u64().unwrap() as u32).unwrap(),
 		credits: [0, 1, 2, 3].map(|i| key(&keys[format!("credit{}", i)]).serialize()),
 	};
-	check_order("order", &o, &v["order"]);
+	assert_eq!(o.leaf().template(), version.template());
+	check_order("order", &o, &w["order"]);
 	let n = o.next();
-	same("remainder salt", &n.salt, &v["remainder"]["salt"]);
-	check_order("remainder", &n, &v["remainder"]);
-	same("credit salt", &o.credit_salt(), &v["credit"]["salt"]);
-	same("credit scriptPubKey", o.credit_leaf().unwrap().script_pubkey().as_bytes(), &v["credit"]["script_pubkey"]);
+	same("remainder salt", &n.salt, &w["remainder"]["salt"]);
+	check_order("remainder", &n, &w["remainder"]);
+	same("credit salt", &o.credit_salt(), &w["credit"]["salt"]);
+	same("credit scriptPubKey", o.credit_leaf().unwrap().script_pubkey().as_bytes(), &w["credit"]["script_pubkey"]);
 
-	let f = &v["fill"];
+	let f = &w["fill"];
 	let outs: Vec<elements::TxOut> = f["outputs"].as_array().unwrap().iter().map(|x| {
 		ExplicitOutput::new(AssetId::from_byte_array(h32(&x["asset"])), x["value"].as_u64().unwrap(),
 			Script::from(hex(&x["script_pubkey"]))).txout()

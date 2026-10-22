@@ -25,7 +25,8 @@
 //!   request;
 //! - every leaf wanted is a template the round builds (`vtxo-1`; `landing-1`
 //!   with the published allowance for a supervised asset, whose leaves are
-//!   all `landing-1`; `order-2` for a resting order), within the
+//!   all `landing-1`; `order-3` for a resting order, never `order-2`, whose
+//!   fill takes an annex nothing signs), within the
 //!   published bounds (an asset served, a value within its bounds, an exit
 //!   delay within the bounds), under a key that owns no leaf, is wanted by no
 //!   other participation and is not the operator's `S`; every offboard pays a served asset within its
@@ -61,7 +62,7 @@
 //! body = n, each leaf id given up
 //!      ‖ m, each output: kind (0 leaf, 1 offboard), asset, value (u64),
 //!          then for a leaf: template id, template version, owner key, owner nonce, exit delay units (u16),
-//!          and for an order-2 leaf its terms (the leaf record's binary form of them, 252 bytes)
+//!          and for an order-3 (or order-2) leaf its terms (the leaf record's binary form of them, 252 bytes)
 //!          and for a landing-1 leaf its landing (the program, 20 bytes, and the allowance, u64)
 //!          and for an offboard: script length (u16), script
 //!      ‖ f, each fee: asset, amount (u64)
@@ -149,7 +150,7 @@ pub struct InputRequest {
 pub enum OutputRequest {
 	Leaf {
 		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
-		/// `order-2`'s terms, for a resting order.
+		/// An order's terms, for a resting order (`order-3`).
 		order: Option<arca_covenant::OrderLeafTerms>,
 		/// `landing-1`'s landing, for a leaf of a supervised asset.
 		landing: Option<arca_covenant::Landing>,
@@ -368,6 +369,8 @@ pub enum ParticipationError {
 	SignedAlready(String),
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
+	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
 	#[error("the signer: {0}")]
 	Signer(SignerError),
 	/// The operator's rate for the participation's asset is stale, or
@@ -429,6 +432,7 @@ impl ParticipationError {
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Rate(_) => "rate_stale",
 			Order(_) => "order",
 			OrderSpent(_) => "order_spent",
@@ -624,7 +628,7 @@ impl Participations {
 		fees::floor_per_kvb(&self.finality, asset).await.map_err(|e| ParticipationError::Internal(e.to_string()))
 	}
 
-	/// The terms of an `order-2` leaf wanted at output `j`, of `asset` under
+	/// The terms of an `order-3` leaf wanted at output `j`, of `asset` under
 	/// `owner`: terms a leaf may carry ([`arca_covenant::OrderLeafTerms::check`]),
 	/// all four credit keys present, each owning no leaf now (a fill makes a
 	/// leaf under each), paid in an asset the operator serves (each credit is
@@ -686,6 +690,10 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
+		crate::restricted::gate(&self.store, p, &given, "a refresh or an offboard").await?;
+		if let Some(a) = req.outputs.iter().map(|o| o.asset()).find(|a| p.restricted(a).is_some()) {
+			return Err(crate::restricted::RestrictedError::NotServed { asset: a, coin: None, what: "a round".into() }.into());
+		}
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -706,8 +714,16 @@ impl Participations {
 			match o {
 				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, channel, .. } => {
 					match (template, order, landing, channel) {
-						(Template::Vtxo1, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
-						(Template::Order2, Some(o), None, None) => self.check_order_terms(j, o, *asset, owner, now).await?,
+						(Template::Vtxo1 | Template::Vtxo2, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+						(Template::Order3, Some(o), None, None) if o.template() == Template::Order3 =>
+							self.check_order_terms(j, o, *asset, owner, now).await?,
+						// order-2's fill takes an annex nobody signs, so a relay
+						// could pin it at the floor fee rate. Leaves already
+						// resting as order-2 are still filled; new ones are not
+						// made.
+						(Template::Order2, Some(_), None, None) => return Err(ParticipationError::Order(format!(
+							"output {}: an order-2 leaf, whose fill takes an annex that nothing signs: the operator rests new orders as \
+							order-3", j))),
 						(Template::Channel1, None, None, Some(c)) => p.check_channel(*asset, *value, c)
 							.map_err(|e| ParticipationError::OutOfBounds(format!("output {}: {}", j, e)))?,
 						_ => return Err(ParticipationError::Template(j, template.to_string())),
@@ -984,6 +1000,7 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
+		crate::restricted::gate(&self.store, p, &given, "a take of an order").await?;
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {

@@ -467,8 +467,8 @@ impl CoinRecordOf {
 		let rec = arca_covenant::CoinRecord::from_bytes(&unhex(w.ok(&["record", leaf])["record"].as_str().unwrap())).unwrap();
 		let arca_covenant::CoinRecord::Leaf { record, .. } = rec else { panic!("a round's leaf") };
 		let s = common::running::keypair("operator");
-		let policy = arca_covenant::LeafPolicy { owner: record.owner, operator: s.x_only_public_key().0, salt: record.salt(),
-			chain: record.chain, exit_delay: record.exit_delay, htlc: record.htlc, order: None, landing: None, channel: None };
+		let policy = arca_covenant::LeafPolicy { enclave: None, owner: record.owner, operator: s.x_only_public_key().0, salt: record.salt(),
+			chain: record.chain, exit_delay: record.exit_delay, htlc: record.htlc, order: None, landing: None, channel: None , v2: false};
 		CoinRecordOf(policy.script_pubkey(), policy)
 	}
 
@@ -849,6 +849,47 @@ async fn d64_unclaimed_receives_are_capped_and_a_refresh_runs() {
 	for w in [&m, &h] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+/// D64's pool is the operator's coins in the asset, final or not. Paid ten
+/// times what it can spend now, in a block not yet buried deep enough to be
+/// final, the operator takes a receive of a fifth of what it could spend: a
+/// cap of a tenth read from its final coins alone would refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn d64_the_pool_counts_coins_not_yet_final() {
+	let Some(lnd) = lightningd("d64_the_pool_counts_coins_not_yet_final") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+		c.lightning.receive_cap_ppm = 100_000;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d64f").await;
+	let spendable = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	assert!(spendable > 0, "the operator holds X");
+	let to = r.server.wallet.receive_script().await.unwrap();
+	r.pay_to(to, x, spendable * 10);
+	r.produce().await;
+	r.synced().await;
+	let now = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	let held = r.server.wallet.holdings().await.unwrap().get(&x).copied().unwrap_or(0);
+	println!("D64 the operator's X: {} spendable before, {} spendable now, {} held", spendable, now, held);
+	assert!(now < spendable * 10, "the new coin is in a block and not final yet: {}", now);
+	assert!(held >= spendable * 10, "but it is the operator's: {}", held);
+	let ask = spendable / 5;
+	let m = wallet_at("D64F", &r.url(), &r);
+	let (ok, v) = m.run(&["lightning", "receive", &xs, &ask.to_string(), "--max-fee-ppm", "10000"]);
+	println!("D64 M asks to receive {}: ok={} {}", ask, ok, if ok { v["payment_hash"].clone() } else { v["error"].clone() });
+	assert!(ok, "a receive within a tenth of the operator's coins is taken: {}", v);
+	drop((ox, px));
+	let _ = std::fs::remove_dir_all(&m.dir);
 }
 
 // ---------------------------------------------------------------------------

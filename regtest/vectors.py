@@ -28,10 +28,17 @@ offchain.py generates: the board and its record, the forfeit with the
 issuance of the connector asset, its claim and refund, and the offboard's
 unlock and reclaim, each transaction whole, witnesses included.
 
-vectors/order.json holds the order-2 leaf's vectors, which order.py
-generates: an order's parameters, its three spendable leaves and their
-control blocks, its remainder after a fill, the credit that fill pays, the
-SeqDEX order it lands as, and the operator's fill digest and signature.
+vectors/order.json holds the order-2 leaf's vectors, and under `order_3`
+the same order's as an order-3 leaf, which order.py generates: an order's
+parameters, its three spendable leaves and their control blocks, its
+remainder after a fill, the credit that fill pays, the SeqDEX order it lands
+as, and the operator's fill digest and signature.
+
+vectors/collab2.json holds the vtxo-2 leaf's vectors, which collab2.py
+generates: a leaf and its checkpoint (parameters, data leaf, program leaf,
+the exit or the sweep, control blocks, merkle root and scriptPubKey), and a
+spend of each by arca/collab-2: the signed bytes, the digest, both
+signatures and the Simplicity witness.
 
 vectors/accumulator.json holds the accumulator batch's vectors, which
 accumulator.py generates: six leaves behind their entries, each slot's
@@ -68,6 +75,7 @@ OUT = os.path.join(HERE, "vectors", "arca.json")
 RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
 TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
 ORDER_OUT = os.path.join(HERE, "vectors", "order.json")
+COLLAB2_OUT = os.path.join(HERE, "vectors", "collab2.json")
 BOND_OUT = os.path.join(HERE, "vectors", "bond.json")
 CHANNEL_OUT = os.path.join(HERE, "vectors", "channel.json")
 ACCUMULATOR_OUT = os.path.join(HERE, "vectors", "accumulator.json")
@@ -738,6 +746,7 @@ def generate():
 def main():
     import accumulator
     import bond
+    import collab2
     import channel
     import offchain
     import order
@@ -749,6 +758,8 @@ def main():
              (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n"),
              (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n"),
              (ORDER_OUT, json.dumps(order.generate(GENESIS, order_keys, label_hash, DELAY), indent=1) + "\n"),
+             (COLLAB2_OUT, json.dumps(collab2.generate(GENESIS, {"S": S, "A": A, "B": B}, label_hash, DELAY,
+                                                       sweep_token(T_ID, R_PROG, S.x, W), T_ID, R_PROG, W), indent=1) + "\n"),
              (BOND_OUT, json.dumps(bond.generate(GENESIS, {"S": S, "W": Key("bond W"), "A": A, "B": B}, label_hash,
                                                  rel_time(32 * DAY)), indent=1) + "\n"),
              (CHANNEL_OUT, json.dumps(channel.generate(GENESIS, {"A": A, "S": S}, label_hash, DELAY, rel_time(48 * H)),
