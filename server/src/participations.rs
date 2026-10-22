@@ -368,6 +368,8 @@ pub enum ParticipationError {
 	SignedAlready(String),
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
+	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
 	#[error("the signer: {0}")]
 	Signer(SignerError),
 	/// The operator's rate for the participation's asset is stale, or
@@ -429,6 +431,7 @@ impl ParticipationError {
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Rate(_) => "rate_stale",
 			Order(_) => "order",
 			OrderSpent(_) => "order_spent",
@@ -686,6 +689,10 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
+		crate::restricted::gate(&self.store, p, &given, "a refresh or an offboard").await?;
+		if let Some(a) = req.outputs.iter().map(|o| o.asset()).find(|a| p.restricted(a).is_some()) {
+			return Err(crate::restricted::RestrictedError::NotServed { asset: a, coin: None, what: "a round".into() }.into());
+		}
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -984,6 +991,7 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
+		crate::restricted::gate(&self.store, p, &given, "a take of an order").await?;
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {

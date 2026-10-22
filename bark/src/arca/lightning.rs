@@ -238,7 +238,7 @@ impl Wallet {
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash, timeout: p.default_timeout()?,
 			operator_delay: p.operator_delay };
 		let exit_delay = self.exit_delay().max(p.owner_delay);
-		let leaf = NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None, v2: false };
+		let leaf = NewLeaf { enclave: None, v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let htlc = Out { asset: p.asset, value: p.value + p.fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(&p.info, p.asset)?;
@@ -280,7 +280,7 @@ impl Wallet {
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: inv.payment_hash, timeout, operator_delay };
 		let exit_delay = self.exit_delay().max(owner_delay);
-		let leaf = NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None, v2: false };
+		let leaf = NewLeaf { enclave: None, v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
 		terms.check(exit_delay).map_err(|e| Error::Refused(e.to_string()))?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
@@ -689,8 +689,8 @@ impl Wallet {
 			.map_err(|e| Error::Refused(e.to_string()))?;
 		let probe_leaf = |htlc: Option<HtlcTerms>| -> Result<NewLeaf, Error> {
 			let nonce = random32();
-			Ok(NewLeaf { owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
-				htlc, landing: None, v2: false })
+			Ok(NewLeaf { enclave: None, v2: false, owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
+				htlc, landing: None })
 		};
 		let terms = HtlcTerms { direction: HtlcDirection::Receive, payment_hash: [0; 32], timeout, operator_delay: units };
 		let leaf = probe_leaf(Some(terms))?.policy(self.operator, self.genesis);

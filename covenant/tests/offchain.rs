@@ -157,7 +157,7 @@ fn pair(f: &Forfeit, owner: &Keypair, operator: &Keypair) -> Pair {
 
 /// A leaf funded directly (as a board pays it), its id the board form's.
 fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy {
+	let leaf = LeafPolicy { enclave: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),
@@ -206,7 +206,7 @@ fn board_and_refresh(c: &mut Ctx) {
 	let a1 = keypair("board owner, the board leaf's key");
 	let a2 = keypair("board owner, the new leaf's key");
 	let x = c.net.x;
-	let rec = BoardRecord {
+	let rec = BoardRecord { enclave: None,
 		template: Template::Board1, owner: xonly(&a1), owner_nonce: label32("board owner nonce"),
 		operator_nonce: label32("board operator nonce"), exit_delay: delay(), asset: x, value: 20_000_000,
 		chain: c.net.chain, operator: xonly(&s),

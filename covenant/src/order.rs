@@ -380,8 +380,8 @@ impl OrderPolicy {
 
 	/// The `order-2` leaf policy of this coin, as every other leaf's.
 	pub fn leaf(&self) -> LeafPolicy {
-		LeafPolicy { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay,
-			htlc: None, order: Some(self.leaf_terms()), landing: None, channel: None , v2: false }
+		LeafPolicy { enclave: None, owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay,
+			htlc: None, order: Some(self.leaf_terms()), landing: None, channel: None , v2: false}
 	}
 }
 
@@ -597,8 +597,8 @@ impl OrderPolicy {
 	/// `None` once the credit keys are used up.
 	pub fn credit_leaf(&self) -> Option<LeafPolicy> {
 		let key = XOnlyPublicKey::from_slice(&self.credits[0]).ok()?;
-		Some(LeafPolicy { owner: key, operator: self.operator, salt: self.credit_salt(), chain: self.chain, exit_delay: self.exit_delay,
-			htlc: None, order: None, landing: None, channel: None , v2: false })
+		Some(LeafPolicy { enclave: None, owner: key, operator: self.operator, salt: self.credit_salt(), chain: self.chain, exit_delay: self.exit_delay,
+			htlc: None, order: None, landing: None, channel: None , v2: false})
 	}
 
 	/// The message maker and operator sign to spend the coin by the

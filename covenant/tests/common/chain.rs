@@ -36,7 +36,7 @@ impl Party {
 	pub fn new(label: &str, delay: RelativeTime) -> Party {
 		let key = keypair(&format!("chain {} key", label));
 		Party {
-			leaf: NewLeaf {
+			leaf: NewLeaf { enclave: None,
 				owner: xonly(&key), owner_nonce: label32(&format!("chain {} owner nonce", label)),
 				creator_nonce: label32(&format!("chain {} creator nonce", label)), exit_delay: delay,
 				htlc: None,

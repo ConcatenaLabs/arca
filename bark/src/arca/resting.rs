@@ -371,7 +371,7 @@ impl Wallet {
 		let o = self.served_order(order)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
-			Ok(NewLeaf { owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None, v2: false })
+			Ok(NewLeaf { enclave: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;

@@ -39,7 +39,8 @@ sequentia-contracts (`accumulator_programs`).
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
 | `landing` | `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays output 0 to P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
-| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a `landing-1` leaf for a board of a supervised asset) |
+| `enclave` | `enclave-1`: the leaf of a restricted asset (an OpenAMP asset, whose every move needs its issuer's policy key), held only in its holders' enclaves | The leaf's collaborative path, its script pushing `K ‖ D` (`D = HASH160(Q)`, `Q` the holder's enclave program), so a pair made for one holder spends only a leaf that exits to that holder's enclave; the exit, which after the delay pays output 0 `OP_1 <Q>` explicitly in the leaf's asset, holding exactly its value (130 bytes with a 36-hour delay), the fee from a coin attached (`enclave_exit_tx`); where the asset elected clawback, the enclave's own claw leaf `<Ki> CHECKSIGVERIFY <Kp> CHECKSIG`, at once (`claw_tx`). The owner key is the holder's enclave key for the owner nonce (`enclave_key`: `lift_x(H) + t·G`, `t = SHA256(T ‖ T ‖ H ‖ n)`, `T = SHA256("Arca/enclave-key")`). `Enclave` builds the holder's enclave as openampd does; `policy_cosign_digest` is what the policy key signs beside the operator |
+| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a `landing-1` leaf for a board of a supervised asset; an `enclave-1` leaf for one of a restricted asset, whose board carries the asset's claw leaf too where it elected clawback) |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-2`: an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
@@ -98,9 +99,11 @@ It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
 payment hash, timeout, direction and operator delay; `order-2` with its
 order's terms: the asset it is paid in, the price and lot, the landed order's
 maker script hash, REFUND time and key, and the four credit keys;
-`landing-1` with its landing program and fee allowance; `channel-1` with
-the operator's opening balance and the credit window; or `vtxo-2`, a `vtxo-1`
-leaf whose collaborative path is `arca/collab-2`), the owner's key, the two
+`landing-1` with its landing program and fee allowance; `enclave-1` with its
+holder's key, the asset's policy key and its clawback key, though no batch holds
+an `enclave-1` leaf: it rests on a board or comes from a reassignment; or
+`channel-1` with the operator's opening balance and the credit window; or
+`vtxo-2`, a `vtxo-1` leaf whose collaborative path is `arca/collab-2`), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
 clock schedule
@@ -719,6 +722,24 @@ The crate depends on `elements`, `thiserror` and, for the JSON form, `serde` and
 wasm as well, with the Rust it pins: the crate builds with the `rust-version`
 in its `Cargo.toml` and uses no newer standard-library API.
 
+The crate has one binary, `arca-enclave`, for a restricted asset's policy
+server (OpenAMP's `openampd`, which names it with `-arcaenclave`):
+`cargo install --path covenant --bin arca-enclave`. It reads one JSON request
+on stdin and answers one JSON object on stdout, exit 1 with `{"error": ...}`
+for a refusal. `arca-enclave board {"record"}` answers a board record's board
+output and leaf scripts, its holder, policy key, clawback key, operator,
+chain, salt, value and claw control blocks; `arca-enclave transfer` takes the
+chain, the operator, the asset's policy and clawback keys, each input coin's
+record with its checkpoint's value, and each new leaf's asset, value, holder,
+nonces and exit delay, and answers each input's salt, holder and value with
+the two digests its owner and the operator sign (into its checkpoint, and from
+it into the outputs) and each new leaf's salt, holder, script and claw control
+block. Every input must be an `enclave-1` coin of that operator, chain and
+asset resting on a board, and every output an `enclave-1` leaf of theirs. The
+policy server signs those digests, after the asset's rules, under the tag
+`policy_cosign_digest` names; the operator's signer signs a message of a
+restricted asset only beside that signature.
+
 ## Testing
 
 The tests verify through the node's own interpreter (`arca-consensus`), so they
@@ -974,6 +995,26 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
 - `tests/collab_vectors.rs`: the `vtxo-2` leaf and checkpoint, their spends'
   signed bytes, digests, signatures and Simplicity witnesses, against
   `regtest/vectors/collab2.json`.
+- `tests/enclave.rs`: the enclave built byte for byte as openampd's golden
+  vectors (`tests/openamp_enclave_vectors.json`, with and without clawback);
+  the board record format 4, its JSON and the policy encoding round-trip; and,
+  on an anchored regtest chain, an `enclave-1` board of a restricted asset.
+  The collaborative path signed over the plain constant and over another
+  holder's `K ‖ D`; the exit before its delay, to another holder's enclave, to
+  a script that is no enclave, one atom short, in another asset, and signed by
+  the holder's registered key in place of its leaf key; the landed enclave
+  coin spent without the policy key; the clawback without the policy key; and
+  the clawback of a board and of a leaf of an asset that elected none
+  (`Witness program hash mismatch`): each refused by the mempool and in a
+  block, for its reason. Beside them confirm the collaborative spend into
+  another holder's leaf, its exit into that holder's enclave, the landed coin
+  spent by its enclave's own transfer leaf, two conversions and a clawback of
+  a board and of a leaf into the issuer's enclave.
+- `tests/enclave_tool.rs`: `arca-enclave`, the tool a restricted asset's
+  policy server runs, answers the board's scripts and terms, and for a
+  transfer of a board coin, and of a coin two hops from it, the very digests
+  `TransferPlan` builds; it refuses another operator, another policy key, a
+  missing clawback key, a `vtxo-1` board or coin, and an unknown command.
 - `tests/claim.rs`: on an anchored regtest chain, a batch of four claim
   leaves, each owned by the claim key of an address key (two of each parity)
   and its nonce. Each record validates for its claim key and not for the named
