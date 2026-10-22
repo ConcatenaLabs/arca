@@ -154,6 +154,12 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 	// board's service expiry comes before the order's coin expires, so the
 	// operator takes no fill paid with it, and the wallet does not offer one.
 	let t0 = holder(&mut r, "RT0", y, 1_000_000, 0).await;
+	// The board's service expiry and the order coin's expiry are both 28 days
+	// after the median time of their blocks: the chain's clock moves on an
+	// hour first, so the board's comes earlier by that hour, not by however
+	// far the clock moved between the two blocks (which can be nothing).
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 3600));
+	r.synced().await;
 
 	// M rests its order, and stops.
 	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
