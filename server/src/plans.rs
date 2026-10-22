@@ -44,11 +44,15 @@
 //!   finds its coin unswept, refreshed or not.
 //! - A coin a plan names carries its holder's refund halves while its script
 //!   is unspent, so the operator co-signs no transfer of it
-//!   ([`blocks_transfer`]); a holder refreshes it in a round first. A coin a
-//!   step made is taken into no participation until the coin it replaced is
-//!   swept, the sweep final ([`blocks_participation`]): the refund that
-//!   answers that coin needs the signer's one spend under the new coin's
-//!   salt.
+//!   ([`blocks_transfer`]); a holder gives it up in a round first, by a
+//!   participation of its own, which the operator takes for the current coin
+//!   of an open or stopped plan unless a step of it is in a round
+//!   ([`blocks_participation`]). While that participation holds the coin no
+//!   step runs from it ([`apply`]); once it is released the plan ends
+//!   ([`release_given_up`]); should it never complete, the plan stands. A
+//!   coin a step made is taken into no participation until the coin it
+//!   replaced is swept, the sweep final: the refund that answers that coin
+//!   needs the signer's one spend under the new coin's salt.
 //! - A coin a step gave up that comes on the chain is answered by the
 //!   step's refund ([`crate::watcher`]).
 
@@ -70,7 +74,8 @@ use crate::fees;
 use crate::params::{FeeSchedule, Params};
 use crate::signer::{hex, Signed, SignerClient};
 use crate::store::{
-	LeafState, NewParticipation, NewPlan, NewPlanStep, ParticipationInput, ParticipationOutput, ParticipationRow, PlanRow, PlanState,
+	LeafRow, LeafState, NewParticipation, NewPlan, NewPlanStep, ParticipationInput, ParticipationOutput, ParticipationRow, ParticipationState,
+	PlanRow, PlanState,
 	StepState, Store, StoreError, WantedKind,
 };
 use crate::wallet::Wallet;
@@ -677,6 +682,9 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 		};
 		match row.state {
 			LeafState::Live => {},
+			// Its holder's own participation holds it: no step runs from it,
+			// and the plan ends once that participation is released.
+			LeafState::Spent if holders_participation(store, &row).await?.is_some() => continue,
 			LeafState::Spent => {
 				void(format!("coin {} is spent by {}", LeafId(coin), row.spent_by.as_deref().map(hex).unwrap_or_default())).await?;
 				continue;
@@ -730,7 +738,15 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 			},
 			Ok(false) => {},
 			Err(e @ (StoreError::LeafSpent(_) | StoreError::LeafNotLive(..) | StoreError::KeyReused | StoreError::SaltReused(_))) => {
-				void(e.to_string()).await?;
+				// Taken meanwhile by its holder's own participation: that
+				// holds the plan, as above.
+				let held = match store.leaf(&coin).await? {
+					Some(r) => holders_participation(store, &r).await?.is_some(),
+					None => false,
+				};
+				if !held {
+					void(e.to_string()).await?;
+				}
 			},
 			Err(e) => return Err(e),
 		}
@@ -820,23 +836,34 @@ pub async fn holds_batch(store: &Store, round_id: i64, vout: u32) -> Result<Opti
 /// is unspent, so the operator alone could void a reassignment of it.
 pub async fn blocks_transfer(store: &Store, leaf: &[u8; 32]) -> Result<Option<String>, StoreError> {
 	Ok(store.plans_naming(leaf).await?.first().map(|(id, _)| format!(
-		"coin {} is named by offline-refresh plan {}, and its holder's refund halves stay valid while its script is unspent: it is \
-		refreshed in a round before it is paid out of round", LeafId(*leaf), hex(id))))
+		"coin {} is named by offline-refresh plan {}, and its holder's refund halves stay valid while its script is unspent: its \
+		holder gives it up in a round, for a leaf no plan names, before paying out of round", LeafId(*leaf), hex(id))))
 }
 
-/// Why no participation takes the coin `leaf` now, or `None`: a plan that
-/// is open or stopped names it (it is cancelled first), or a step made it and
-/// the coin that step gave up is not yet swept with the sweep final.
+/// Why no participation takes the coin `leaf` now, or `None`. A holder's
+/// participation may give up the current coin of a plan that is open or
+/// stopped: it holds the plan, no step runs from the coin while it does, and
+/// the plan ends once that participation is released ([`release_given_up`]);
+/// should it never complete, the plan stands. It is refused while the plan's
+/// next step is in a round (that step gives the coin up), for a coin a plan
+/// names that is not its current coin, and for a coin a step made whose
+/// predecessor is not yet swept with the sweep final (the step's refund, which
+/// answers that coin, needs this coin's one co-signed spend).
 pub async fn blocks_participation(store: &Store, leaf: &[u8; 32], participation: &[u8; 32]) -> Result<Option<String>, StoreError> {
 	for (id, how) in store.plans_naming(leaf).await? {
 		let Some(plan) = store.plan(&id).await? else { continue };
-		if let Some(s) = plan.steps.iter().find(|s| s.participation == Some(*participation)) {
-			let _ = s;
+		if plan.steps.iter().any(|s| s.participation == Some(*participation)) {
 			return Ok(None);
 		}
 		if matches!(plan.state, PlanState::Open | PlanState::Stopped) {
-			return Ok(Some(format!("coin {} is the current coin of offline-refresh plan {}, which is {}: cancel the plan first",
-				LeafId(*leaf), hex(&id), plan.state.as_str())));
+			if plan.current_coin() != Some(*leaf) {
+				return Ok(Some(format!("coin {} is named by offline-refresh plan {}, which is {}, and is not its current coin",
+					LeafId(*leaf), hex(&id), plan.state.as_str())));
+			}
+			if let Some(s) = plan.next().filter(|s| s.state == StepState::Running) {
+				return Ok(Some(format!("coin {} is being given up by step {} of offline-refresh plan {}, in a round now: its new leaf is \
+					the holder's at its next sync", LeafId(*leaf), s.step.idx, hex(&id))));
+			}
 		}
 		if how == "made" {
 			let Some(s) = plan.steps.iter().find(|s| s.leaf_id == Some(*leaf)) else { continue };
@@ -852,6 +879,48 @@ pub async fn blocks_participation(store: &Store, leaf: &[u8; 32], participation:
 		}
 	}
 	Ok(None)
+}
+
+/// The participation of its holder's that holds the coin `row`, when it is
+/// spent by one that is no plan's step: the coin is then the holder's to give
+/// up in that participation's round, and no step runs from it.
+async fn holders_participation(store: &Store, row: &LeafRow) -> Result<Option<ParticipationRow>, StoreError> {
+	let Some(by) = row.spent_by.as_deref().and_then(|b| <[u8; 32]>::try_from(b).ok()) else { return Ok(None) };
+	if store.plan_step_of(&by).await?.is_some() {
+		return Ok(None);
+	}
+	store.participation(&by).await
+}
+
+/// Ends every plan, open or stopped, whose current coin its holder gave up
+/// in a participation of its own that is now released: its round final and
+/// its forfeits handed over, the coin is given up for good, and the new
+/// leaf is the holder's, named by no plan. A participation that never
+/// completes leaves the plan as it was. Returns how many plans ended.
+pub async fn release_given_up(store: &Store) -> Result<usize, StoreError> {
+	let mut ended = 0;
+	for id in store.unfinished_plans().await? {
+		let Some(plan) = store.plan(&id).await? else { continue };
+		let Some(coin) = plan.current_coin() else { continue };
+		let Some(row) = store.leaf(&coin).await? else { continue };
+		if row.state != LeafState::Spent {
+			continue;
+		}
+		let Some(p) = holders_participation(store, &row).await? else { continue };
+		if p.state != ParticipationState::Released {
+			continue;
+		}
+		let round = match p.round_id {
+			Some(r) => store.round(r).await?.map(|r| Txid::from_byte_array(r.txid).to_string()).unwrap_or_default(),
+			None => String::new(),
+		};
+		let why = format!("released: its holder gave its coin {} up in participation {}, round {}", LeafId(coin), hex(&p.id), round);
+		if store.cancel_plan(&id, &why).await? {
+			ended += 1;
+			log::info!("plan {}: {}", hex(&id), why);
+		}
+	}
+	Ok(ended)
 }
 
 /// The covenant plan a stored plan is, rebuilt from what the server keeps.

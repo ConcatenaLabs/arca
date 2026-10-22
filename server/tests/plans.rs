@@ -19,6 +19,11 @@
 //! 3. Every refusal of a quote and of a plan, printed verbatim.
 //! 4. A step whose round is lost: void, the plan stopped, the coin it gave up
 //!    its holder's again, unreleased past its expiry, and taken home.
+//! 5. A planned coin given up in a round by its holder's own participation:
+//!    no step runs from it while the participation holds it, the plan ends
+//!    once it is released, and the new leaf is paid out of round. Another
+//!    planned coin whose holder's participation never completes keeps its
+//!    plan, whose step then runs.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -183,15 +188,11 @@ async fn a_plan_refreshes_a_coin_twice_without_its_holder_and_answers_a_coin_it_
 	// The same plan again: its status.
 	assert_eq!(r.http.post("submit_plan", &m.body).ok()["plan_id"], json!(hex(&m.id)));
 
-	// The coin the plan starts from is paid out of round by nobody, and taken
-	// into no refresh while the plan stands.
+	// The coin the plan starts from is paid out of round by nobody.
 	let v0 = c0.valid(&r);
 	let (to, _) = new_leaf(&keypair("P someone"));
 	refused(r.http.post("cosign_transfer", &transfer_body(&[(&c0.held, v0.clone(), v0.value - 2_000)], &[(x, v0.value - 4_000, to)],
 		xonly(&r.s), r.chain)), "planned", "a transfer of the coin a plan starts from");
-	let (w, _) = want_leaf(&keypair("P a refresh of its own"), x, v0.value);
-	let (body, _) = participation_body(&[&c0.held], &[w], &[], None, xonly(&r.s), r.chain);
-	refused(r.http.post("submit_participation", &body), "planned", "a refresh of the coin a plan starts from");
 
 	// Nothing runs before the coin's free window.
 	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "no step before the free window");
@@ -476,4 +477,92 @@ async fn a_step_whose_round_is_lost_is_void_and_the_coin_it_gave_up_stays_its_ho
 	r.produce().await;
 	assert!(r.rt.client().confirmations(&txid).unwrap() >= 1, "the holder's exit confirms");
 	println!("the holder took its coin home: {} ({} vB)", txid, exit.vsize());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_planned_coin_given_up_by_its_holder_in_a_round_ends_its_plan_and_one_never_given_up_keeps_it() {
+	let mut r = common::rounds::start().await;
+	let (x, s, chain) = (r.x, xonly(&r.s), r.chain);
+	let (cq, cr) = (round_coin(&mut r, "Q").await, round_coin(&mut r, "R").await);
+	let (mq, mr) = (make_plan(&r, &cq, "Q", 1), make_plan(&r, &cr, "R", 1));
+	for m in [&mq, &mr] {
+		assert_eq!(r.http.post("submit_plan", &m.body).ok()["state"], "open");
+	}
+	let (vq, vr) = (cq.valid(&r), cr.valid(&r));
+	let e0 = expiry_of(&cq).min(expiry_of(&cr));
+	println!("plans {} (coin Q {}) and {} (coin R {}) open", hex(&mq.id), cq.held.id, hex(&mr.id), cr.held.id);
+
+	// Out of round, still no.
+	let (to, _) = new_leaf(&keypair("Q someone"));
+	refused(r.http.post("cosign_transfer", &transfer_body(&[(&cq.held, vq.clone(), vq.value - 2_000)], &[(x, vq.value - 4_000, to)], s,
+		chain)), "planned", "a transfer of a planned coin");
+
+	// Q's holder gives Q up in the next round, for a leaf of its own; R's
+	// holder gives R up in a participation that waits a week first.
+	let kq = keypair("Q released");
+	let (wq, nq) = want_leaf(&kq, x, vq.value);
+	let (bq, pq) = participation_body(&[&cq.held], &[wq], &[], None, s, chain);
+	let a = r.http.post("submit_participation", &bq);
+	println!("Q's holder gives Q up in a participation of its own: {} {}", a.status, a.json);
+	assert_eq!(a.ok()["state"], "pending", "a holder's participation of a planned coin is taken");
+	let (wr, _) = want_leaf(&keypair("R released"), x, vr.value);
+	let later = mtp(&r).to_consensus_u32() + 7 * DAY - HOUR;
+	let (br, pr) = participation_body(&[&cr.held], &[wr], &[], Some(later), s, chain);
+	assert_eq!(r.http.post("submit_participation", &br).ok()["state"], "pending");
+
+	// Into both coins' free windows: no step runs from a coin its holder's
+	// participation holds.
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, e0 - 5 * DAY + HOUR - now).await;
+	r.synced().await;
+	let built = r.server.rounds.run_round().await.unwrap().expect("Q's participation's round");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	r.server.rounds.pass().await.unwrap();
+	for m in [&mq, &mr] {
+		let st = plan_status(&r, &m.id);
+		println!("plan {} in the free window, its coin held: {} step 1 {}", hex(&m.id), st["state"], st["steps"][0]["state"]);
+		assert_eq!((st["state"].as_str(), st["steps"][0]["state"].as_str()), (Some("open"), Some("waiting")), "no step runs: {}", st);
+	}
+	let st = common::rounds::status(&r, &pq);
+	assert_eq!(st["round"]["txid"], json!(built.tx.txid().to_string()), "the round is Q's holder's participation");
+
+	// Q's holder hands over its forfeit: the participation is released, and
+	// the plan ends with it.
+	let (new_q, record, round_q) = common::rounds::validate_new_leaf(&r, &pq, 0, &kq, &nq);
+	let f = common::flow::forfeit_for(&vq, &new_q, &round_q, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&pq),
+		"forfeits": [{"leaf_id": cq.held.id.to_string(), "signature": common::client::forfeit_sig(&f, &cq.held.key)}],
+		"leaves": [common::client::auths_json(&new_q, &kq, common::rounds::created(&record))]})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	r.server.rounds.pass().await.unwrap();
+	let st = plan_status(&r, &mq.id);
+	println!("plan {} after Q's participation is released: {} ({})", hex(&mq.id), st["state"], st["reason"]);
+	assert_eq!(st["state"], "cancelled");
+	assert!(st["reason"].as_str().unwrap().contains(&hex(&pq)), "the reason names the participation: {}", st);
+	assert_eq!(st["steps"][0]["state"], "waiting", "its step never ran");
+
+	// The new leaf is named by no plan: paid out of round.
+	let held = common::flow::held_by(&r, &kq, nq, new_q.leaf_id);
+	let c = held.record.resolve(&[round_q.clone()], &r.policy()).unwrap();
+	let (to, _) = new_leaf(&keypair("Q's payee"));
+	let paid = r.http.post("cosign_transfer", &transfer_body(&[(&held, c.clone(), c.value - 2_000)], &[(x, c.value - 4_000, to)], s, chain)).ok();
+	println!("the leaf Q's participation made, {}, paid out of round: transfer {}", new_q.leaf_id, paid["transfer_id"]);
+
+	// R's participation never runs: past R's exit deadline it lapses, R is
+	// its holder's again, and R's plan, which stood all along, runs its step.
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, expiry_of(&cr) - 3 * DAY + HOUR - now).await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let st = common::rounds::status(&r, &pr);
+	println!("R's participation past R's exit deadline: {}", st["state"]);
+	assert!(matches!(st["state"].as_str(), Some("void") | Some("expired")), "R's participation never completes: {}", st["state"]);
+	assert_eq!(plan_status(&r, &mr.id)["state"], "open", "R's plan stands");
+	let round_r = round(&mut r).await;
+	let st = plan_status(&r, &mr.id);
+	println!("R's plan after its step's round {}: {} step 1 {}", round_r, st["state"], st["steps"][0]["state"]);
+	assert_eq!(st["steps"][0]["state"], "done");
+	assert_eq!(st["steps"][0]["gives_up"], json!(cr.held.id.to_string()));
 }

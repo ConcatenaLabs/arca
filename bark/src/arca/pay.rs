@@ -468,7 +468,8 @@ impl Wallet {
 			.filter(|c| c.asset == asset.to_string() && planned.contains(&c.leaf_id)).map(|c| c.value).sum();
 		let note = if held_planned > 0 {
 			format!("; {} more is in coins an offline-refresh plan names, which carry refund halves the wallet signed and are paid out of \
-				round only once refreshed in a round ({})", held_planned, self.spelling.say("{refresh}"))
+				round only once given up in a round for a leaf no plan names ({}, which ends the coin's plan)", held_planned,
+				self.spelling.say("{plan_release}"))
 		} else {
 			String::new()
 		};
