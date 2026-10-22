@@ -53,7 +53,9 @@
 //!
 //! **The state view** ([`Orders::state`]) says, per order, where it rests,
 //! what it has filled and what is left, and the terms a taker builds a fill
-//! from; anyone may read it.
+//! from; anyone may read it. A fill recorded and not yet signed is not a
+//! fill: the order reads `filling` until it is signed or dropped, and the
+//! fill is listed with `signed` false.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -171,15 +173,21 @@ pub struct OrderView {
 	/// Whether a spend of the coin other than a fill (a cancel, a forfeit)
 	/// is recorded.
 	pub given_up: bool,
+	/// Whether a fill of the coin is recorded and not yet signed: it is
+	/// either signed (the order then rests at its remainder, or is filled
+	/// whole) or dropped (the order rests where it was).
+	pub filling: bool,
 }
 
 impl OrderView {
-	/// `resting`, `filled`, `cancelled`, `exhausted`, `pending` or `unknown`.
+	/// `resting`, `filling`, `filled`, `cancelled`, `exhausted`, `pending`
+	/// or `unknown`. `filled` is said only of a fill the operator signed.
 	pub fn state(&self) -> &'static str {
 		match self.coin_state {
 			LeafState::Live if self.policy.fills_left() == 0 => "exhausted",
 			LeafState::Live => "resting",
 			LeafState::Spent if self.given_up => "cancelled",
+			LeafState::Spent if self.filling => "filling",
 			LeafState::Spent => "filled",
 			LeafState::Pending => "pending",
 			_ => "unknown",
@@ -305,9 +313,10 @@ impl Orders {
 		let policy = record.order_policy().ok_or_else(|| internal("an order's coin is not an order"))?;
 		let fills = self.store.order_fills(&id.0).await?;
 		let whole = fills.iter().any(|f| f.order_leaf == order.current_leaf);
+		let filling = fills.iter().any(|f| f.order_leaf == order.current_leaf && f.signature.is_none());
 		Ok(Some(OrderView {
 			value: row.value, coin_state: row.state, expiry: cosign::first_expiry(&record),
-			given_up: row.state == LeafState::Spent && !whole,
+			given_up: row.state == LeafState::Spent && !whole, filling,
 			order, policy, fills,
 		}))
 	}
