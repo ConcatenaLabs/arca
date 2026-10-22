@@ -107,6 +107,7 @@ use arca_covenant::encode::Encoding;
 use arca_covenant::node::{connector_index, reclaim_items};
 use arca_covenant::sign::{script_spend_sighash, verify_digest};
 use arca_covenant::spend::{FeeSource, KeySpend, Rebindable};
+use arca_covenant::accumulator::{read_exit, Accumulator, AccumulatorParams, AccumulatorPolicy, ExitAuth};
 use arca_covenant::tree::Tree;
 use arca_covenant::{
 	connector_asset, sweep_tx, ClaimTx, Clock, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, MedianTime,
@@ -305,6 +306,8 @@ pub struct Watcher {
 	running: Mutex<()>,
 	/// Each batch's tree, rebuilt once from its published form.
 	trees: Mutex<HashMap<(i64, u32), Arc<Tree>>>,
+	/// Each accumulator batch, rebuilt once from its published form.
+	accumulators: Mutex<HashMap<(i64, u32), Arc<Accumulator>>>,
 	/// The wallet's script everything the watcher takes for the operator
 	/// is paid to, handed out once: a step the node refuses, and takes again
 	/// on a later pass, hands out no new script each time.
@@ -319,7 +322,7 @@ impl Watcher {
 	{
 		Arc::new(Watcher {
 			store, finality, params, wallet, nursery, signer, rounds, config,
-			running: Mutex::new(()), trees: Mutex::new(HashMap::new()), pay_to: Mutex::new(None),
+			running: Mutex::new(()), trees: Mutex::new(HashMap::new()), accumulators: Mutex::new(HashMap::new()), pay_to: Mutex::new(None),
 			status: std::sync::Mutex::new(FeeStatus::default()),
 		})
 	}
@@ -767,9 +770,74 @@ impl Watcher {
 		}
 		let p = self.rounds.tree(&txid_of(&round.txid), vout).await.map_err(build("the published tree"))?
 			.ok_or_else(|| WatcherError::Build(format!("round {} has no batch at {}", round.round_id, vout)))?;
+		if p.kind != arca_covenant::BatchKind::Tree {
+			return Err(WatcherError::Build(format!("the batch at output {} of round {} is an accumulator batch, not a tree", vout,
+				round.round_id)));
+		}
 		let t = Arc::new(Tree::build(p.params, &p.leaves).map_err(build("the tree"))?);
 		self.trees.lock().await.insert((round.round_id, vout), t.clone());
 		Ok(t)
+	}
+
+	/// The accumulator batch, rebuilt from its published form.
+	async fn accumulator(&self, round: &RoundRow, vout: u32) -> Result<Arc<Accumulator>, WatcherError> {
+		if let Some(a) = self.accumulators.lock().await.get(&(round.round_id, vout)) {
+			return Ok(a.clone());
+		}
+		let p = self.rounds.tree(&txid_of(&round.txid), vout).await.map_err(build("the published batch"))?
+			.ok_or_else(|| WatcherError::Build(format!("round {} has no batch at {}", round.round_id, vout)))?;
+		if p.kind != arca_covenant::BatchKind::Accumulator {
+			return Err(WatcherError::Build(format!("the batch at output {} of round {} is a tree", vout, round.round_id)));
+		}
+		let a = Arc::new(Accumulator::build(AccumulatorParams::from(&p.params), &p.leaves).map_err(build("the accumulator batch"))?);
+		self.accumulators.lock().await.insert((round.round_id, vout), a.clone());
+		Ok(a)
+	}
+
+	/// Where an accumulator batch is now: its output, the state it holds and
+	/// its value, after every exit the chain (a block or the mempool) holds,
+	/// followed from the round's output through each exit's rest. Every
+	/// exit pays a slot's entry, whose script the watcher sees, so the exits
+	/// are the transactions that paid an entry of the batch. `None` once an
+	/// exit took the last of it.
+	async fn accumulator_now(&self, round: &RoundRow, vout: u32, acc: &Accumulator)
+		-> Result<Option<(OutPoint, AccumulatorPolicy, u64)>, WatcherError>
+	{
+		let mut txids: Vec<Txid> = vec![];
+		for s in self.store.tree_sightings(round.round_id, vout).await? {
+			if s.kind == TreeScriptKind::Entry {
+				let t = txid_of(&s.txid);
+				if !txids.contains(&t) {
+					txids.push(t);
+				}
+			}
+		}
+		let mut exits: Vec<Transaction> = Vec::with_capacity(txids.len());
+		for t in txids {
+			let tx = self.finality.call(move |c| c.transaction(&t)).await.map_err(|e| WatcherError::Chain(e.to_string()))?;
+			exits.extend(tx);
+		}
+		let mut at = OutPoint::new(txid_of(&round.txid), vout);
+		let mut state = *acc.policy();
+		let mut value = acc.total();
+		loop {
+			let next = exits.iter().find_map(|t| t.input.iter().position(|i| i.previous_output == at).map(|k| (t, k)));
+			let Some((t, k)) = next else { break };
+			let seen = read_exit(&t.input[k].witness.script_witness)
+				.ok_or_else(|| WatcherError::Build(format!("{} spends the batch at {} and is no exit", t.txid(), at)))?;
+			if seen.root != state.root || seen.bitmap != state.bitmap {
+				return Err(WatcherError::Build(format!("{} spends the batch at {} from another state", t.txid(), at)));
+			}
+			if seen.last {
+				return Ok(None);
+			}
+			state = state.after(seen.slot);
+			let rest = 2 * k as u32 + 1;
+			value = t.output.get(rest as usize).and_then(|o| o.value.explicit())
+				.ok_or_else(|| WatcherError::Build(format!("exit {} has no rest at {}", t.txid(), rest)))?;
+			at = OutPoint::new(t.txid(), rest);
+		}
+		Ok(Some((at, state, value)))
 	}
 
 	/// Logs an item's failure and carries on with the next.
@@ -1098,6 +1166,25 @@ impl Watcher {
 		let b = self.store.batch_leaf(leaf).await?.ok_or_else(|| WatcherError::Build(format!("leaf {} is in no batch", hex(leaf))))?;
 		let round = self.store.round(b.round_id).await?.ok_or_else(|| WatcherError::Build(format!("round {} is not recorded", b.round_id)))?;
 		let round_tx: Transaction = deserialize(&round.tx).map_err(build("the round"))?;
+		if b.kind == arca_covenant::BatchKind::Accumulator {
+			// The operator's own exit authorisation: the operator's path out
+			// of an accumulator batch.
+			let record = arca_covenant::AccumulatorRecord::from_bytes(&b.record).map_err(build("the leaf's record"))?;
+			let any_time = MedianTime::from_consensus(500_000_000).map_err(build("a time"))?;
+			let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
+			let valid = record.validate_round(&round_tx, &policy).map_err(build("the leaf's record"))?;
+			let now = self.now().await?;
+			let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(1)).map_err(build("a time"))?;
+			let signature = self.signer.accumulator_exit(&valid.policy.root, &valid.exit.record.record(valid.exit.slot), t).await?;
+			if !verify_digest(&signature, &valid.exit_digest(t), &self.params.operator) {
+				return Err(WatcherError::Build("the signer signed another exit authorisation than the server built".into()));
+			}
+			return Ok(ValidCoin {
+				id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
+				sweep: record.schedule.sweep(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
+				origin: ValidOrigin::Accumulator { valid, preimage, auth: ExitAuth { by_operator: true, time: t, signature } },
+			});
+		}
 		let record = arca_covenant::LeafRecord::from_bytes(&b.record).map_err(build("the leaf's record"))?;
 		let any_time = MedianTime::from_consensus(500_000_000).map_err(build("a time"))?;
 		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
@@ -1117,6 +1204,64 @@ impl Watcher {
 			id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
 			expiry: record.schedule.expiries()[0], hops: 0, origin: ValidOrigin::Leaf { valid, preimage, auths },
 		})
+	}
+
+	/// Takes the next step that brings a leaf of an accumulator batch onto
+	/// the chain: its entry's unlock with the preimage, once an exit has paid
+	/// the entry; otherwise the exit of its slot from where the batch is now,
+	/// by `auth` (its owner's, or the operator's own).
+	async fn bring_accumulator_leaf(&self, coin: &ValidCoin, valid: &arca_covenant::ValidAccumulatorLeaf, preimage: &[u8; 32],
+		auth: &ExitAuth, now: MedianTime) -> Result<(), WatcherError>
+	{
+		for (txid, vout) in self.store.sightings_of(valid.leaf.script_pubkey().as_bytes()).await? {
+			if self.unspent(OutPoint::new(txid_of(&txid), vout)).await?.is_some() {
+				return Ok(());
+			}
+		}
+		let round = self.store.round_by_txid(&valid.round_txid.to_byte_array()).await?
+			.ok_or_else(|| WatcherError::Build("a leaf of a round the server did not build".into()))?;
+		let entry = valid.entry_output();
+		for s in self.store.tree_sightings(round.round_id, valid.batch_vout).await? {
+			if s.script_pubkey != entry.script_pubkey.as_bytes() {
+				continue;
+			}
+			let op = OutPoint::new(txid_of(&s.txid), s.vout);
+			if self.unspent(op).await?.is_none() {
+				continue;
+			}
+			if self.spending(&op).await? {
+				return Ok(());
+			}
+			let (u, fee_coin, fee) = self.margin_or_coin(entry.asset, valid.entry_value - valid.entry.value, |fee| {
+				let u = valid.entry_tx(op, preimage, fee).map_err(|e| e.to_string())?;
+				let t = u.tx.clone();
+				Ok((u, t))
+			}).await?;
+			let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+			self.publish(Ready { tx: u.tx, wallet, fee }, "entry", coin.id.0.to_vec(),
+				format!("the entry of coin {} unlocked into its leaf", coin.id)).await?;
+			return Ok(());
+		}
+		if auth.time.to_consensus_u32() > now.to_consensus_u32() {
+			return Err(WatcherError::Build("the exit authorisation is not usable yet".into()));
+		}
+		let acc = self.accumulator(&round, valid.batch_vout).await?;
+		let Some((at, state, held)) = self.accumulator_now(&round, valid.batch_vout, &acc).await? else {
+			return Err(WatcherError::Build(format!("the accumulator batch of coin {} has no output left", coin.id)));
+		};
+		if state.bitmap.is_left(valid.exit.slot) || self.spending(&at).await? || self.unspent(at).await?.is_none() {
+			return Ok(());
+		}
+		let (u, fee_coin, fee) = self.margin_or_coin(entry.asset, valid.exit.record.reserve, |fee| {
+			let u = valid.exit_tx(&state, at, held, auth, fee).map_err(|e| e.to_string())?;
+			let t = u.tx.clone();
+			Ok((u, t))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		self.publish(Ready { tx: u.tx, wallet, fee }, "unroll", state.root.to_vec(),
+			format!("slot {} of coin {} out of its accumulator batch, by {}'s authorisation", valid.exit.slot, coin.id,
+				if auth.by_operator { "the operator" } else { "its owner" })).await?;
+		Ok(())
 	}
 
 	/// The inputs and committed outputs of the transfer `transfer_id`, from
@@ -1585,8 +1730,7 @@ impl Watcher {
 	async fn bring_on_chain(&self, coin: &ValidCoin, now: MedianTime) -> Result<(), WatcherError> {
 		match &coin.origin {
 			ValidOrigin::Board { .. } => Ok(()),
-			ValidOrigin::Accumulator { .. } => Err(WatcherError::Build("a leaf of an accumulator batch is not brought on the chain here \
-				yet".into())),
+			ValidOrigin::Accumulator { valid, preimage, auth } => self.bring_accumulator_leaf(coin, valid, preimage, auth, now).await,
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let branch = &valid.branch;
 				// The leaf itself on the chain: the rest is the answer's.
@@ -2084,6 +2228,9 @@ impl Watcher {
 	/// every node, entry and checkpoint of it on the chain, unspent, past its
 	/// own notice, that no transaction of the watcher's spends.
 	async fn sweepable(&self, round: &RoundRow, b: &crate::store::BatchRow, schedule: &ClockSchedule) -> Result<Vec<Sweepable>, WatcherError> {
+		if b.kind == arca_covenant::BatchKind::Accumulator {
+			return self.accumulator_sweepable(round, b, schedule).await;
+		}
 		let tree = self.tree(round, b.vout).await?;
 		let mut out: Vec<Sweepable> = vec![];
 		let mut seen: HashSet<OutPoint> = HashSet::new();
@@ -2108,6 +2255,45 @@ impl Watcher {
 			};
 			out.extend(item);
 		}
+		self.checkpoints_sweepable(schedule, &mut out, &mut seen).await?;
+		Ok(out)
+	}
+
+	/// The outputs of an accumulator batch a sweep can take now: the batch
+	/// output where its exits have left it, and every entry an exit paid,
+	/// unspent, past its own notice, and the checkpoints of its coins; none
+	/// that a transaction of the watcher's spends.
+	async fn accumulator_sweepable(&self, round: &RoundRow, b: &crate::store::BatchRow, schedule: &ClockSchedule)
+		-> Result<Vec<Sweepable>, WatcherError>
+	{
+		let acc = self.accumulator(round, b.vout).await?;
+		let mut out: Vec<Sweepable> = vec![];
+		let mut seen: HashSet<OutPoint> = HashSet::new();
+		if let Some((at, state, value)) = self.accumulator_now(round, b.vout, &acc).await? {
+			if self.confirmed(at).await? && !self.spending(&at).await? {
+				out.push(state.sweepable(at, (acc.params().asset, value)));
+			}
+			seen.insert(at);
+		}
+		for s in self.store.tree_sightings(round.round_id, b.vout).await? {
+			let op = OutPoint::new(txid_of(&s.txid), s.vout);
+			if out.len() >= self.config.max_sweep_inputs || s.kind != TreeScriptKind::Entry || !seen.insert(op) {
+				continue;
+			}
+			if !self.confirmed(op).await? || self.spending(&op).await? || !self.waited(op.txid, schedule.notice).await? {
+				continue;
+			}
+			out.extend(acc.leaves().get(s.idx as usize).map(|l| l.entry.sweepable(op, l.entry_value)));
+		}
+		self.checkpoints_sweepable(schedule, &mut out, &mut seen).await?;
+		Ok(out)
+	}
+
+	/// Adds to `out` every checkpoint of a coin from the batch of
+	/// `schedule`'s token that a sweep can take now.
+	async fn checkpoints_sweepable(&self, schedule: &ClockSchedule, out: &mut Vec<Sweepable>, seen: &mut HashSet<OutPoint>)
+		-> Result<(), WatcherError>
+	{
 		// Checkpoints of coins from this batch.
 		for (kind, leaf_id, txid, vout) in self.store.spent_coin_sightings().await? {
 			if kind != ScriptKind::Checkpoint || out.len() >= self.config.max_sweep_inputs {
@@ -2130,7 +2316,7 @@ impl Watcher {
 				out.push(cp.sweepable(op, coin.asset, v));
 			}
 		}
-		Ok(out)
+		Ok(())
 	}
 
 	// -----------------------------------------------------------------------

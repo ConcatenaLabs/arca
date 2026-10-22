@@ -95,6 +95,8 @@ pub struct BatchRow {
 	pub radix: u16,
 	pub reserve: StoredReserve,
 	pub min_leaf: u64,
+	/// A tree, or an accumulator batch (whose radix is 0).
+	pub kind: arca_covenant::BatchKind,
 }
 
 /// A batch to record, with its leaves in tree order and the scripts of its
@@ -123,7 +125,11 @@ pub struct BatchLeafRow {
 	pub exit_delay_units: u16,
 	pub value: u64,
 	pub unlock_hash: [u8; 32],
+	/// The leaf's record: a tree leaf record, or an accumulator record in a
+	/// batch of that kind.
 	pub record: Vec<u8>,
+	/// The kind of the leaf's batch.
+	pub kind: arca_covenant::BatchKind,
 }
 
 /// An offboard output of a round, as stored.
@@ -246,7 +252,11 @@ fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 }
 
 const BATCH_COLUMNS: &str = "round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn, radix,
-	reserve_kind, reserve_a, reserve_b, min_leaf";
+	reserve_kind, reserve_a, reserve_b, min_leaf, kind";
+
+fn batch_kind(s: &str) -> Result<arca_covenant::BatchKind, StoreError> {
+	arca_covenant::BatchKind::parse(s).ok_or_else(|| StoreError::Corrupt(format!("batch kind {}", s)))
+}
 
 fn mint_row(r: &tokio_postgres::Row) -> Result<MintRow, StoreError> {
 	let n = |i: usize, what: &str| -> Result<u64, StoreError> {
@@ -285,11 +295,13 @@ fn batch_row(r: &tokio_postgres::Row) -> Result<BatchRow, StoreError> {
 			other => return Err(StoreError::Corrupt(format!("reserve kind {}", other))),
 		},
 		min_leaf: u64_of(r.get(14), "min leaf")?,
+		kind: batch_kind(r.get(15))?,
 	})
 }
 
 const LEAF_COLUMNS: &str = "leaf_id, round_id, vout, idx, participation_id, output_idx, attempt, template, owner_key, owner_nonce,
-	operator_nonce, exit_delay_units, value, unlock_hash, record";
+	operator_nonce, exit_delay_units, value, unlock_hash, record,
+	(SELECT b.kind FROM batch b WHERE b.round_id = batch_leaf.round_id AND b.vout = batch_leaf.vout)";
 
 fn batch_leaf_row(r: &tokio_postgres::Row) -> Result<BatchLeafRow, StoreError> {
 	Ok(BatchLeafRow {
@@ -308,6 +320,7 @@ fn batch_leaf_row(r: &tokio_postgres::Row) -> Result<BatchLeafRow, StoreError> {
 		value: u64_of(r.get(12), "value")?,
 		unlock_hash: array32(r.get(13), "unlock hash")?,
 		record: r.get(14),
+		kind: batch_kind(r.get(15))?,
 	})
 }
 
@@ -365,11 +378,11 @@ impl Store {
 			};
 			t.execute(
 				"INSERT INTO batch (round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn,
-				 radix, reserve_kind, reserve_a, reserve_b, min_leaf)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+				 radix, reserve_kind, reserve_a, reserve_b, min_leaf, kind)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
 				&[&round_id, &(x.vout as i32), &&x.asset[..], &i64_of(x.value)?, &&x.token[..], &(x.token_vout as i32),
 					&&x.issuer.0[..], &(x.issuer.1 as i32), &x.schedule, &x.burn, &(x.radix as i16), &kind, &i64_of(a)?,
-					&i64_of(bb)?, &i64_of(x.min_leaf)?],
+					&i64_of(bb)?, &i64_of(x.min_leaf)?, &x.kind.as_str()],
 			).await?;
 			for sc in &b.scripts {
 				t.execute(

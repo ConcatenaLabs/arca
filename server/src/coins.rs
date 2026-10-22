@@ -22,7 +22,8 @@
 use elements::hashes::Hash;
 use elements::Transaction;
 
-use arca_covenant::{CoinRecord, LeafId, TransferError, ValidCoin, WalletPolicy};
+use arca_covenant::{CoinRecord, LeafId, MedianTime, TransferError, ValidCoin, WalletPolicy};
+use elements::secp256k1_zkp::schnorr::Signature;
 
 use crate::params::Params;
 use crate::store::{BoardState, LeafState, RoundState, Store, StoreError};
@@ -82,6 +83,37 @@ pub enum CoinError {
 	Store(#[from] StoreError),
 	#[error("{0}")]
 	Internal(String),
+}
+
+/// The coin record of the batch leaf `row`, from its record in the batch and
+/// what its owner handed over: the entry's preimage and its authorisations,
+/// one per node of a tree leaf's path, or the one exit authorisation of an
+/// accumulator leaf.
+pub fn batch_coin(row: &crate::store::BatchLeafRow, preimage: [u8; 32], auths: Vec<(Signature, MedianTime)>) -> Result<CoinRecord, String> {
+	match row.kind {
+		arca_covenant::BatchKind::Tree => Ok(CoinRecord::Leaf {
+			record: arca_covenant::LeafRecord::from_bytes(&row.record).map_err(|e| e.to_string())?, preimage, auths,
+		}),
+		arca_covenant::BatchKind::Accumulator => {
+			let auth = match auths[..] {
+				[a] => a,
+				_ => return Err(format!("{} authorisations for a leaf of an accumulator batch; it takes its exit authorisation alone",
+					auths.len())),
+			};
+			Ok(CoinRecord::Accumulator {
+				record: arca_covenant::AccumulatorRecord::from_bytes(&row.record).map_err(|e| e.to_string())?, preimage, auth,
+			})
+		},
+	}
+}
+
+/// The first expiry of the batch leaf `row`, from its record in the batch.
+pub fn batch_leaf_expiry(row: &crate::store::BatchLeafRow) -> Option<u32> {
+	match row.kind {
+		arca_covenant::BatchKind::Tree => arca_covenant::LeafRecord::from_bytes(&row.record).ok().map(|r| r.schedule.expiries()[0]),
+		arca_covenant::BatchKind::Accumulator =>
+			arca_covenant::AccumulatorRecord::from_bytes(&row.record).ok().map(|r| r.schedule.expiries()[0]),
+	}.map(|e| e.to_consensus_u32())
 }
 
 /// The transactions a coin record's bases came from: each board's, as

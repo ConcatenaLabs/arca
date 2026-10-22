@@ -47,6 +47,11 @@ sequentia-contracts (`accumulator_programs`).
 | `channel` | `channel-1`'s outputs: the channel output of each state (`ChannelPolicy`, `State`: the number, the owner's and the operator's balances, the credit already folded into the owner's), the leaf in the tree being the output of state 0, and the credit output the operator's balance settles into | The leaf's collaborative path under the salt's `K`, the same in every state, so a pair made for the coin spends it in any state; UPDATE(n), a state `m > n` signed by owner and operator over `SHA256(Q ‖ le8(m) ‖ P)` (`state_message`), `Q` the salt's state constant and `P` the program of the output at the input's own index, which keeps the input's asset and value; SETTLE(n), after the exit delay, exactly the owner's balance to `OP_1 <A>` and the operator's to the state's credit output, a zero balance's half left out. The credit output's CLAIM pays the owner, at the input's own index, what the operator's cumulative note (`note_message`, `SHA256(N ‖ le8(c))`) credits beyond what was paid, capped at the state's `s + F`, the rest returning to the same script; PROVIDER, `S`'s after the window. A `channel-1` leaf's `LeafPolicy` carries its terms (`ChannelTerms`: the value, the operator's opening balance, the credit window) and `channel_policy` gives its channel. `collab_tx` (the coin's pair at any state), `update_tx`, `settle_tx`, `claim_tx` and `provider_tx` build the spends, a fee coin paying; `claim_amounts` computes a claim as the script does |
 | `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
 
+`batch` holds a batch of either kind (`Batch`: a tree or an accumulator
+batch, built from the same parameters and leaves) and the operator's rule for
+choosing between them (`BatchKind::choose`: an accumulator batch when the
+share of leaves expected to leave on their own costs less from one output,
+never for a batch with a resting order or a channel, or a burn-only one).
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
@@ -331,7 +336,8 @@ operator's signature, then `OP_INSPECTINPUTISSUANCE` on its own input requiring
 a new issuance with a zero contract hash of exactly one explicit atom and no
 reissuance token. So nobody, the operator included, can spend it without issuing
 `M`, which would strand every claim of the round. The owner signs only a
-forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`), which
+forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`; for a new
+leaf of an accumulator batch, `ValidAccumulatorLeaf::forfeit_for`), which
 takes `h` from the new leaf it validated and `M` from that round, and refuses a
 round other than the one the leaf was validated against, an output `c` that is
 not the operator's connector, and an old leaf under another operator.
@@ -386,7 +392,8 @@ that confirmed is disconnected with that round and cannot return without it.
 Owners who refreshed in different rounds each name their own; owners of one
 round share one input. The operator reuses one atom of each `M` across that
 round's claims and reclaims, paying it back to itself each time. A wallet signs
-only a release built by `Release::for_refresh` (or `Release::for_offboard`),
+only a release built by `Release::for_refresh` (or `Release::for_offboard`;
+`Release::for_accumulator_refresh` for a new leaf of an accumulator batch),
 which takes `H` from the old leaf it holds and `M` from the round its new leaf
 was validated against, and refuses another round, an output that is not the
 operator's connector and an old leaf under another operator; it signs once it
@@ -957,7 +964,7 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   spend confirms, and every negative case is refused by the mempool and again
   when forced into a block with `generateblock`, the block for the same reason
   (the node runs with `-par=1`, so a block refused by a script names the
-  failure). It also funds the review's attacks, turned around: a batch whose
+  failure, under the consensus label `mandatory-script-verify-flag-failed`). It also funds the review's attacks, turned around: a batch whose
   key holds two leaves and a leaf built from a salt the owner signed under
   before; validation refuses each owner's record against the confirmed round.
 

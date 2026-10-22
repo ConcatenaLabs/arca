@@ -56,13 +56,13 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::tree::Tree;
-use arca_covenant::{connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
+use arca_covenant::{connector_asset, Batch, CoinRecord, Forfeit, LeafId, MedianTime, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::{participation_id, Wanted, LEAF_DATA_PAGES, LEAF_PAGE};
 use super::store::ForfeitRow;
-use super::wallet::{amount, kind_of, owner_of, sign, Wallet};
+use super::round::NewRecord;
+use super::wallet::{amount, kind_of, owner_of, Wallet};
 use super::Error;
 
 /// Where the wallet keeps the median time until which its schedule holds at
@@ -156,7 +156,7 @@ impl Wallet {
 		let mut not_recovered: Vec<Value> = vec![];
 		let mut restored: Vec<Value> = vec![];
 		let mut taken: BTreeMap<String, Taken> = BTreeMap::new();
-		let mut trees: BTreeMap<(String, u32), (Value, Tree)> = BTreeMap::new();
+		let mut trees: BTreeMap<(String, u32), (Value, Batch)> = BTreeMap::new();
 
 		// Every coin served with a record, checked; the same leaf served twice
 		// is looked at once, its first copy.
@@ -386,11 +386,11 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// The published tree of the batch at output `vout` of round `txid`,
+	/// The published batch at output `vout` of round `txid`, of either kind,
 	/// fetched once, rebuilt from its parts and refused unless it lists what
-	/// they build ([`super::round::rebuild`]).
-	fn published_tree<'a>(&self, trees: &'a mut BTreeMap<(String, u32), (Value, Tree)>, txid: &str, vout: u32)
-		-> Result<&'a (Value, Tree), String>
+	/// they build ([`super::round::rebuild_batch`]).
+	fn published_tree<'a>(&self, trees: &'a mut BTreeMap<(String, u32), (Value, Batch)>, txid: &str, vout: u32)
+		-> Result<&'a (Value, Batch), String>
 	{
 		let key = (txid.to_string(), vout);
 		if !trees.contains_key(&key) {
@@ -398,7 +398,7 @@ impl Wallet {
 			if t["round_txid"].as_str() != Some(txid) || t["batch_vout"].as_u64() != Some(vout as u64) {
 				return Err(format!("the server published the tree of another batch than {}:{}", txid, vout));
 			}
-			let tree = super::round::rebuild(&t).map_err(|e| e.to_string())?;
+			let tree = super::round::rebuild_batch(&t).map_err(|e| e.to_string())?;
 			trees.insert(key.clone(), (t, tree));
 		}
 		Ok(&trees[&key])
@@ -409,35 +409,35 @@ impl Wallet {
 	/// chain under the wallet's key of `nonce`, with `preimage` (checked to
 	/// open it) and unroll authorisations the mnemonic signs again: what the
 	/// wallet holds of the leaf, the server's copy of its record not needed.
-	fn leaf_from_tree(&self, trees: &mut BTreeMap<(String, u32), (Value, Tree)>, txid: &str, vout: u32, index: usize, nonce: &[u8; 32],
-		preimage: Option<[u8; 32]>, now: MedianTime) -> Result<(CoinRecord, LeafRecord), String>
+	fn leaf_from_tree(&self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, txid: &str, vout: u32, index: usize, nonce: &[u8; 32],
+		preimage: Option<[u8; 32]>, now: MedianTime) -> Result<(CoinRecord, NewRecord), String>
 	{
 		let (t, tree) = self.published_tree(trees, txid, vout)?;
-		if index >= tree.records().len() {
+		if index >= tree.len() {
 			return Err(format!("the published tree of {}:{} has no leaf {}", txid, vout, index));
 		}
-		let record = tree.record(index);
+		let record = NewRecord::of(tree, index);
 		let published = t["leaves"][index]["preimage"].as_str().and_then(|p| unhex32(p).ok());
 		let preimage = preimage.or(published).ok_or_else(|| format!("its preimage has not gone out: the published tree of {}:{} shows none \
 			for leaf {}, and the server serves no record of it", txid, vout, index))?;
-		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash() {
 			return Err(format!("the preimage of leaf {} of {}:{} does not open its unlock hash", index, txid, vout));
 		}
 		let owner = self.keys.leaf_xonly(nonce).map_err(|e| e.to_string())?;
-		if record.owner != owner || record.owner_nonce != *nonce {
+		if record.owner() != owner || record.owner_nonce() != *nonce {
 			return Err(format!("leaf {} of the published tree of {}:{} is not under the key this wallet derives from owner nonce {}", index, txid,
 				vout, hex(nonce)));
 		}
 		let round_txid = Txid::from_str(txid).map_err(|e| e.to_string())?;
 		let round = self.chain.transaction(&round_txid).map_err(|e| e.to_string())?
 			.ok_or_else(|| format!("round {} is not on the chain the node holds", txid))?;
-		let first = record.schedule.expiries()[0].to_consensus_u32();
+		let first = record.first_expiry();
 		let valid = record.validate(&round, &self.followed_policy(first, now), &owner, nonce)
 			.map_err(|e| format!("the leaf in round {} fails the wallet's checks: {}", txid, e))?;
 		let key = self.keys.leaf(nonce).map_err(|e| e.to_string())?;
 		let at = auth_time(first, now)?;
-		let auths = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(at).digest), at)).collect();
-		Ok((CoinRecord::Leaf { record: record.clone(), preimage, auths }, record))
+		let auths = valid.sign_auths(&key, at);
+		Ok((record.coin(preimage, auths).map_err(|e| e.to_string())?, record))
 	}
 
 	/// Restores one coin the server serves (`e`), checked: its record, its
@@ -446,7 +446,7 @@ impl Wallet {
 	/// `pending` as the chain stands; how it was given up is looked at next.
 	/// `None` for a round's leaf served without its record (its participation
 	/// is followed instead); `Err` with the reason it is not taken.
-	fn restore_coin(&mut self, e: &Value, trees: &mut BTreeMap<(String, u32), (Value, Tree)>, now: MedianTime)
+	fn restore_coin(&mut self, e: &Value, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, now: MedianTime)
 		-> Result<Option<(String, ValidCoin)>, String>
 	{
 		let id = e["leaf_id"].as_str().unwrap_or("").to_string();
@@ -480,18 +480,18 @@ impl Wallet {
 		}
 		// A round's leaf: as the published tree builds it, with its
 		// authorisations signed again.
-		let record = match &served {
-			CoinRecord::Leaf { record, preimage, .. } => {
+		let record = match NewRecord::of_coin(&served) {
+			Some((record, preimage, _)) => {
 				let b = &e["batch"];
 				let txid = b["round_txid"].as_str().ok_or("a round's leaf served without its round")?.to_string();
 				let (vout, index) = (b["batch_vout"].as_u64().unwrap_or(u64::MAX) as u32, b["leaf_index"].as_u64().unwrap_or(u64::MAX) as usize);
-				let (coin, built) = self.leaf_from_tree(trees, &txid, vout, index, &nonce, Some(*preimage), now)?;
-				if built != *record {
+				let (coin, built) = self.leaf_from_tree(trees, &txid, vout, index, &nonce, Some(preimage), now)?;
+				if built != record {
 					return Err(format!("the record served is not leaf {} of the published tree of {}:{}", index, txid, vout));
 				}
 				coin
 			},
-			_ => served.clone(),
+			None => served.clone(),
 		};
 		// A coin made out of round rests on the operator's machine until the
 		// head of its signer's record is held outside it.
@@ -1039,7 +1039,7 @@ impl Wallet {
 	/// from the published tree, and said so), the coins it gave up spent.
 	/// Without the preimage the coins stay given up under their forfeits,
 	/// followed on the chain, and `sync` completes it once the preimage is out.
-	fn restore_participations(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Tree)>, now: MedianTime, restored: &mut Vec<Value>,
+	fn restore_participations(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, now: MedianTime, restored: &mut Vec<Value>,
 		not_recovered: &mut Vec<Value>) -> Result<Vec<Value>, Error>
 	{
 		let mut notes = vec![];
@@ -1079,10 +1079,7 @@ impl Wallet {
 				let leaf_id = o["leaf_id"].as_str().unwrap_or("").to_string();
 				let held = self.store.coin(&leaf_id)?;
 				let served_preimage = match &held {
-					Some(c) => match Self::record_of(c)? {
-						CoinRecord::Leaf { preimage, .. } => Some(preimage),
-						_ => None,
-					},
+					Some(c) => NewRecord::of_coin(&Self::record_of(c)?).map(|(_, p, _)| p),
 					None => None,
 				};
 				// The leaf as the wallet validated it before signing: its
@@ -1098,24 +1095,26 @@ impl Wallet {
 						continue;
 					},
 				};
-				let (record, auths, p) = match built {
-					Some((CoinRecord::Leaf { record, preimage, auths }, _)) => (record, auths, Some(preimage)),
-					_ => {
+				let (record, auths, p) = match built.as_ref().and_then(|(c, _)| NewRecord::of_coin(c)) {
+					Some((record, preimage, auths)) => (record, auths, Some(preimage)),
+					None => {
 						// No preimage anywhere: the leaf as the tree builds it,
 						// validated, its authorisations signed, to be opened
 						// by a preimage the chain or the operator gives later.
 						let (_, tree) = self.published_tree(trees, &rtx, vout as u32).map_err(Error::Refused)?;
-						let record = tree.record(index as usize);
+						if index as usize >= tree.len() {
+							return Err(Error::Refused(format!("the published batch of {}:{} has no leaf {}", rtx, vout, index)));
+						}
+						let record = NewRecord::of(tree, index as usize);
 						let round_tx = round_tx.clone()
 							.ok_or_else(|| Error::Missing(format!("round {} is not on the chain the node holds", rtx)))?;
 						let owner = self.keys.leaf_xonly(&nonce)?;
-						let first = record.schedule.expiries()[0].to_consensus_u32();
+						let first = record.first_expiry();
 						let valid = record.validate(&round_tx, &self.followed_policy(first, now), &owner, &nonce)
 							.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", rtx, e)))?;
 						let key = self.keys.leaf(&nonce)?;
 						let at = auth_time(first, now).map_err(Error::Node)?;
-						let auths = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(at).digest), at)).collect();
-						(record, auths, None)
+						(record, valid.sign_auths(&key, at), None)
 					},
 				};
 				if p.is_some() {
@@ -1125,7 +1124,7 @@ impl Wallet {
 					withheld.push(leaf_id.clone());
 				}
 				news.push((leaf_id.clone(), held.is_some(), nonce, record.clone(), auths.clone(),
-					json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(&nonce),
+					json!({"record": hex(&record.to_bytes()?), "nonce": hex(&nonce),
 					"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()})));
 			}
 			if let Some(round_tx) = &round_tx {
@@ -1147,8 +1146,8 @@ impl Wallet {
 					let mut kept_news = vec![];
 					for (leaf_id, held, nonce, record, auths, entry) in &news {
 						if !held {
-							let coin = CoinRecord::Leaf { record: record.clone(), preimage: p, auths: auths.clone() };
-							if let Err(why) = self.checked_as_held(&coin, &record.owner, nonce, now) {
+							let coin = record.coin(p, auths.clone())?;
+							if let Err(why) = self.checked_as_held(&coin, &record.owner(), nonce, now) {
 								not_recovered.push(missed(leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
 								withheld.retain(|w| w != leaf_id);
 								continue;

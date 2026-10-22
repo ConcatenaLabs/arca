@@ -158,7 +158,8 @@ the operator's fee, and the margins of a payment to itself (`pays_itself`, with 
 when no coin holds exactly the price and the fee. A payment
 over Lightning works the same way: `lightning_pay_quote` answers what paying an
 invoice leaves the wallet in all (`spends`: the amount, the operator's fee and
-the margins of the coins it spends), and `lightning_pay` with `shown` set to
+the margins of the coins it spends), the coins it spends (`gives`) and the
+change it leaves (`change`), and `lightning_pay` with `shown` set to
 that answer pays only on it. `lightning_receive_quote` answers what a receive's
 leaf will hold once claimed (`claimed`: the amount less the operator's fee and
 the margins of the claim), asking the operator nothing. A receive under a hash

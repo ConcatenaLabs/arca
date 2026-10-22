@@ -92,7 +92,7 @@ use elements::{AssetId, Transaction, Txid};
 
 use arca_covenant::sign::verify_digest;
 use arca_covenant::{
-	connector_asset, CoinRecord, Forfeit, LeafId, LeafRecord, MedianTime, Pair, RelativeTime, Release, WalletPolicy,
+	connector_asset, CoinRecord, Forfeit, LeafId, MedianTime, Pair, RelativeTime, Release, WalletPolicy,
 };
 
 use crate::chain::FinalityService;
@@ -370,8 +370,7 @@ impl Forfeits {
 		for (_, leaf, _, _) in at.leaves.iter().filter(|(_, l, _, _)| new_ids.contains(&LeafId(*l))) {
 			let leaf = LeafId(*leaf);
 			let row = self.store.batch_leaf(&leaf.0).await?.ok_or_else(|| ForfeitError::Internal(format!("leaf {} is not in a batch", leaf)))?;
-			let record = LeafRecord::from_bytes(&row.record).map_err(|e| ForfeitError::Internal(e.to_string()))?;
-			let coin = CoinRecord::Leaf { record, preimage: p.preimage, auths: auths[&leaf].clone() };
+			let coin = coins::batch_coin(&row, p.preimage, auths[&leaf].clone()).map_err(|e| ForfeitError::LeafSet(format!("leaf {}: {}", leaf, e)))?;
 			let valid = coin.resolve(std::slice::from_ref(&round_tx), &receipt).map_err(|error| ForfeitError::InvalidLeaf { leaf, error })?;
 			if valid.id != leaf {
 				return Err(ForfeitError::Internal(format!("the record of leaf {} gives the id {}", leaf, valid.id)));

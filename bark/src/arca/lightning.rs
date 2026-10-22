@@ -227,7 +227,7 @@ impl Wallet {
 	/// What paying the BOLT11 `invoice` would take, with nothing signed and
 	/// nothing kept: the amount, the operator's fee, the margins of the
 	/// coins it would spend, and what leaves the wallet in all (`spends`:
-	/// the coins less the change). A program shows it, then pays with
+	/// the coins less the change), with the coins (`gives`) and the change. A program shows it, then pays with
 	/// `shown` ([`Self::lightning_pay_shown`]).
 	pub fn lightning_pay_quote(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
@@ -253,7 +253,10 @@ impl Wallet {
 		let checkpoints: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
 		json!({"payment_hash": hex(&p.inv.payment_hash), "asset": p.asset.to_string(), "amount": p.value.to_string(),
 			"fee": p.fee.to_string(), "margins": (checkpoints + margin).to_string(), "spends": total.saturating_sub(change).to_string(),
-			"expires_at": p.inv.timestamp.saturating_add(p.inv.expiry), "description": p.inv.description})
+			"expires_at": p.inv.timestamp.saturating_add(p.inv.expiry), "description": p.inv.description,
+			// The coins it would spend and the change it would leave: a program that settles that
+			// change in the operator's next round prices it from these.
+			"gives": inputs.iter().map(|i| i.row.leaf_id.clone()).collect::<Vec<_>>(), "change": change.to_string()})
 	}
 
 	/// [`Self::lightning_pay_until`], going ahead, with `shown`, only on the
@@ -1154,6 +1157,8 @@ impl Wallet {
 	{
 		let steps = match &coin.origin {
 			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
+			// The exit from the batch, the entry and the claim.
+			arca_covenant::ValidOrigin::Accumulator { .. } => 3,
 			_ => 2,
 		};
 		let confirmed = match bases.iter().filter_map(|(_, f)| f.height()).min() {

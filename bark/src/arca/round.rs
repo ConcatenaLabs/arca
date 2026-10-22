@@ -6,13 +6,15 @@
 //! a fresh key) and the fee the operator's schedule asks, in the coins' own
 //! asset. Then, once the
 //! round holding the participation is final, the wallet rebuilds each new
-//! leaf from the published tree, validates it against the round transaction
+//! leaf from the published batch (a tree, or an accumulator batch, as it
+//! names its kind), validates it against the round transaction
 //! with the five checks on its sweep token and clock and every bound of its
 //! policy, and requires the status to show exactly the leaves it asked for,
 //! in order, all under the participation's one unlock hash, and exactly the
 //! coins it gave up. Only then does it sign the forfeit of each coin it gave
 //! up, built from the validated leaf of the coin's own asset and its round,
-//! and its unroll authorisations. The server
+//! and its authorisations to take the leaf out (one per node of a tree's
+//! branch; one exit from an accumulator batch). The server
 //! answers with the preimage that opens the new leaves; the wallet checks it
 //! against their unlock hash, keeps them, and releases the lowest node of each
 //! old batch leaf.
@@ -26,8 +28,11 @@ use serde_json::{json, Value};
 
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::{margin_for, FeeSource};
-use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
-use arca_covenant::{connector_asset, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit, LeafRecord, MedianTime, OffboardPolicy, Release, RelativeTime, Template, ValidLeaf, WalletPolicy};
+use arca_covenant::tree::{LeafSpec, ReserveRule, TreeParams};
+use arca_covenant::accumulator::ACCUMULATOR_RECORD_VERSION;
+use arca_covenant::{connector_asset, AccumulatorRecord, Batch, BatchKind, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit,
+	HtlcTerms, Landing, LeafId, LeafPolicy, LeafRecord, MedianTime, OffboardPolicy, OrderLeafTerms, Release, RelativeTime, SpendError,
+	Template, ValidAccumulatorLeaf, ValidLeaf, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::ForfeitRow;
@@ -127,8 +132,206 @@ impl RefreshQuote {
 /// burn-only batch in another is an operator whose statement and scripts
 /// disagree. A round that mints the batch's asset is refused unless the
 /// batch is burn-only whatever `info` says (check 5).
-pub(crate) fn check_profile(info: &Value, record: &LeafRecord) -> Result<(), String> {
-	profile_agrees(info, record.asset, record.burn)
+pub(crate) fn check_profile<R: LeafTerms>(info: &Value, record: &R) -> Result<(), String> {
+	profile_agrees(info, record.asset(), record.burn())
+}
+
+/// The terms of a new leaf the wallet checks against what it asked for,
+/// whichever kind of batch holds it.
+pub(crate) trait LeafTerms {
+	fn template(&self) -> Template;
+	fn htlc(&self) -> Option<&HtlcTerms>;
+	fn order(&self) -> Option<&OrderLeafTerms>;
+	fn asset(&self) -> AssetId;
+	fn burn(&self) -> bool;
+	/// A `channel-1` leaf's terms; an accumulator batch takes none.
+	fn channel(&self) -> Option<&arca_covenant::Channel>;
+}
+
+impl LeafTerms for LeafRecord {
+	fn template(&self) -> Template { self.template }
+	fn htlc(&self) -> Option<&HtlcTerms> { self.htlc.as_ref() }
+	fn order(&self) -> Option<&OrderLeafTerms> { self.order.as_ref() }
+	fn asset(&self) -> AssetId { self.asset }
+	fn burn(&self) -> bool { self.burn }
+	fn channel(&self) -> Option<&arca_covenant::Channel> { self.channel.as_ref() }
+}
+
+/// A new leaf as the wallet rebuilds it from a published batch: a tree's
+/// leaf record or an accumulator batch's. The two binary forms open with
+/// different version bytes, so one reads back as the kind it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NewRecord {
+	Tree(LeafRecord),
+	Accumulator(AccumulatorRecord),
+}
+
+impl LeafTerms for NewRecord {
+	fn template(&self) -> Template {
+		match self { NewRecord::Tree(r) => r.template, NewRecord::Accumulator(r) => r.template }
+	}
+	fn htlc(&self) -> Option<&HtlcTerms> {
+		match self { NewRecord::Tree(r) => r.htlc.as_ref(), NewRecord::Accumulator(r) => r.htlc.as_ref() }
+	}
+	fn order(&self) -> Option<&OrderLeafTerms> {
+		match self { NewRecord::Tree(r) => r.order.as_ref(), NewRecord::Accumulator(r) => r.order.as_ref() }
+	}
+	fn asset(&self) -> AssetId {
+		match self { NewRecord::Tree(r) => r.asset, NewRecord::Accumulator(r) => r.asset }
+	}
+	fn burn(&self) -> bool {
+		match self { NewRecord::Tree(r) => r.burn, NewRecord::Accumulator(r) => r.burn }
+	}
+	fn channel(&self) -> Option<&arca_covenant::Channel> {
+		match self { NewRecord::Tree(r) => r.channel.as_ref(), NewRecord::Accumulator(_) => None }
+	}
+}
+
+impl NewRecord {
+	/// Leaf `i` of `batch`.
+	pub(crate) fn of(batch: &Batch, i: usize) -> NewRecord {
+		match batch {
+			Batch::Tree(t) => NewRecord::Tree(t.record(i)),
+			Batch::Accumulator(a) => NewRecord::Accumulator(a.record(i)),
+		}
+	}
+
+	pub(crate) fn value(&self) -> u64 {
+		match self { NewRecord::Tree(r) => r.value, NewRecord::Accumulator(r) => r.value }
+	}
+
+	pub(crate) fn unlock_hash(&self) -> [u8; 32] {
+		match self { NewRecord::Tree(r) => r.unlock_hash, NewRecord::Accumulator(r) => r.unlock_hash }
+	}
+
+	pub(crate) fn landing(&self) -> Option<&Landing> {
+		match self { NewRecord::Tree(r) => r.landing.as_ref(), NewRecord::Accumulator(r) => r.landing.as_ref() }
+	}
+
+	pub(crate) fn owner(&self) -> elements::secp256k1_zkp::XOnlyPublicKey {
+		match self { NewRecord::Tree(r) => r.owner, NewRecord::Accumulator(r) => r.owner }
+	}
+
+	pub(crate) fn owner_nonce(&self) -> [u8; 32] {
+		match self { NewRecord::Tree(r) => r.owner_nonce, NewRecord::Accumulator(r) => r.owner_nonce }
+	}
+
+	pub(crate) fn operator_nonce(&self) -> [u8; 32] {
+		match self { NewRecord::Tree(r) => r.operator_nonce, NewRecord::Accumulator(r) => r.operator_nonce }
+	}
+
+	pub(crate) fn exit_delay(&self) -> RelativeTime {
+		match self { NewRecord::Tree(r) => r.exit_delay, NewRecord::Accumulator(r) => r.exit_delay }
+	}
+
+	pub(crate) fn schedule(&self) -> &ClockSchedule {
+		match self { NewRecord::Tree(r) => &r.schedule, NewRecord::Accumulator(r) => &r.schedule }
+	}
+
+	/// The batch's first expiry.
+	pub(crate) fn first_expiry(&self) -> u32 {
+		self.schedule().expiries()[0].to_consensus_u32()
+	}
+
+	pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+		match self {
+			NewRecord::Tree(r) => r.to_bytes().map_err(|e| Error::Refused(e.to_string())),
+			NewRecord::Accumulator(r) => r.to_bytes().map_err(|e| Error::Refused(e.to_string())),
+		}
+	}
+
+	/// Reads [`NewRecord::to_bytes`], of either kind.
+	pub(crate) fn from_bytes(b: &[u8]) -> Result<NewRecord, String> {
+		match b.first() {
+			Some(&ACCUMULATOR_RECORD_VERSION) => AccumulatorRecord::from_bytes(b).map(NewRecord::Accumulator).map_err(|e| e.to_string()),
+			_ => LeafRecord::from_bytes(b).map(NewRecord::Tree).map_err(|e| e.to_string()),
+		}
+	}
+
+	/// The wallet's check of the leaf against `round`, for `owner` and the
+	/// nonce it picked, within `policy`.
+	pub(crate) fn validate(&self, round: &Transaction, policy: &WalletPolicy, owner: &elements::secp256k1_zkp::XOnlyPublicKey,
+		nonce: &[u8; 32]) -> Result<NewValid, String>
+	{
+		match self {
+			NewRecord::Tree(r) => r.validate(round, policy, owner, nonce).map(NewValid::Tree).map_err(|e| e.to_string()),
+			NewRecord::Accumulator(r) => r.validate(round, policy, owner, nonce).map(NewValid::Accumulator).map_err(|e| e.to_string()),
+		}
+	}
+
+	/// The coin record of the leaf, opened by `preimage`, with the owner's
+	/// authorisations to take it out (one per node of a tree's branch; one
+	/// exit for an accumulator batch).
+	pub(crate) fn coin(&self, preimage: [u8; 32], auths: Vec<(elements::secp256k1_zkp::schnorr::Signature, MedianTime)>)
+		-> Result<CoinRecord, Error>
+	{
+		Ok(match self {
+			NewRecord::Tree(record) => CoinRecord::Leaf { record: record.clone(), preimage, auths },
+			NewRecord::Accumulator(record) => {
+				let [auth] = auths[..] else {
+					return Err(Error::Refused(format!("an accumulator leaf is taken out by one authorisation, and {} are given", auths.len())));
+				};
+				CoinRecord::Accumulator { record: record.clone(), preimage, auth }
+			},
+		})
+	}
+
+	/// The leaf a coin record of a batch's leaf holds, its preimage and its
+	/// authorisations as [`NewRecord::coin`] takes them; `None` for a coin of
+	/// another kind.
+	#[allow(clippy::type_complexity)]
+	pub(crate) fn of_coin(c: &CoinRecord) -> Option<(NewRecord, [u8; 32], Vec<(elements::secp256k1_zkp::schnorr::Signature, MedianTime)>)> {
+		match c {
+			CoinRecord::Leaf { record, preimage, auths } => Some((NewRecord::Tree(record.clone()), *preimage, auths.clone())),
+			CoinRecord::Accumulator { record, preimage, auth } => Some((NewRecord::Accumulator(record.clone()), *preimage, vec![*auth])),
+			_ => None,
+		}
+	}
+}
+
+/// A new leaf the wallet validated, of either kind of batch.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum NewValid {
+	Tree(ValidLeaf),
+	Accumulator(ValidAccumulatorLeaf),
+}
+
+impl NewValid {
+	pub(crate) fn leaf_id(&self) -> LeafId {
+		match self { NewValid::Tree(v) => v.leaf_id, NewValid::Accumulator(v) => v.leaf_id }
+	}
+
+	/// The owner's authorisations to take the leaf out from `t`, signed with
+	/// `key`: one per node of a tree's branch, or the one exit from an
+	/// accumulator batch.
+	pub(crate) fn sign_auths(&self, key: &elements::secp256k1_zkp::Keypair, t: MedianTime)
+		-> Vec<(elements::secp256k1_zkp::schnorr::Signature, MedianTime)>
+	{
+		match self {
+			NewValid::Tree(v) => v.branch.nodes.iter().map(|n| (sign(key, &n.unroll_authorisation(t).digest), t)).collect(),
+			NewValid::Accumulator(v) => vec![(sign(key, &v.exit_digest(t)), t)],
+		}
+	}
+
+	/// The forfeit of `old`, given up for this leaf of `round`.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn forfeit_for(&self, old: LeafPolicy, held: (AssetId, u64), old_id: LeafId, round: &Transaction, c: u32,
+		refund: RelativeTime, margin: u64) -> Result<Forfeit, SpendError>
+	{
+		match self {
+			NewValid::Tree(v) => Forfeit::for_refresh(old, held, old_id, v, round, c, refund, margin),
+			NewValid::Accumulator(v) => v.forfeit_for(old, held, old_id, round, c, refund, margin),
+		}
+	}
+
+	/// The release of the lowest node above `old`, given up for this leaf.
+	pub(crate) fn release(&self, old: &ValidLeaf, round: &Transaction, c: u32) -> Result<Release, SpendError> {
+		match self {
+			NewValid::Tree(v) => Release::for_refresh(old, v, round, c),
+			NewValid::Accumulator(v) => Release::for_accumulator_refresh(old, v, round, c),
+		}
+	}
 }
 
 /// [`check_profile`] for a batch of `asset` whose sweep burns (`burn`) or
@@ -146,9 +349,24 @@ fn profile_agrees(info: &Value, asset: AssetId, burn: bool) -> Result<(), String
 	}
 }
 
-/// The tree a published batch describes, rebuilt by the wallet from the
-/// published parts alone.
-pub fn rebuild(t: &Value) -> Result<Tree, Error> {
+/// The batch a published batch describes, of the kind it names (a tree when
+/// it names none), rebuilt by the wallet from the published parts alone and
+/// refused unless it lists what they build ([`check_published`]).
+pub fn rebuild_batch(t: &Value) -> Result<Batch, Error> {
+	let kind = match t.get("kind").and_then(Value::as_str) {
+		None => BatchKind::Tree,
+		Some(k) => BatchKind::parse(k).ok_or_else(|| Error::Refused(format!("the published batch is of kind {}, which the wallet does not \
+			know", k)))?,
+	};
+	let (params, leaves) = published_parts(t)?;
+	let batch = Batch::build(kind, params, &leaves).map_err(|e| Error::Refused(format!("the published {} does not build: {}", kind, e)))?;
+	check_published(t, &batch)?;
+	Ok(batch)
+}
+
+/// What a published batch is built from: its parameters (the radix read by
+/// a tree alone) and its leaves.
+fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 	let s = |k: &str| t[k].as_str().map(|s| s.to_string()).ok_or_else(|| Error::Parse(format!("the published tree has no {}", k)));
 	let reserve = if let Some(r) = t["reserve"].get("fee_rate") {
 		ReserveRule::FeeRate { floor_per_kvb: amount(&r["floor_per_kvb"], "floor_per_kvb")?, multiple: amount(&r["multiple"], "multiple")? }
@@ -199,9 +417,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 			},
 		});
 	}
-	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;
-	check_published(t, &tree)?;
-	Ok(tree)
+	Ok((params, leaves))
 }
 
 /// Refuses a new leaf whose template is not the one the wallet asked for, or
@@ -216,7 +432,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 /// the leaf's), or `htlc-1` in the one participation that names one, a
 /// payment received over Lightning, locked to that payment's hash
 /// (`receive`) in the receiving direction.
-pub(crate) fn leaf_as_asked(w: &Value, record: &LeafRecord, receive: Option<&[u8; 32]>) -> Result<(), String> {
+pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option<&[u8; 32]>) -> Result<(), String> {
 	let asked_order = w.get("order").is_some_and(|o| !o.is_null());
 	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
 	let asked_channel = w.get("channel").filter(|c| !c.is_null());
@@ -229,27 +445,27 @@ pub(crate) fn leaf_as_asked(w: &Value, record: &LeafRecord, receive: Option<&[u8
 	};
 	// A channel leaf on exactly the terms asked: the operator's side and
 	// the credit window; and no channel where none was asked.
-	let served = record.channel.as_ref().map(arca_covenant::record_json::channel_json);
+	let served = record.channel().map(arca_covenant::record_json::channel_json);
 	if asked_channel != served.as_ref() {
 		return Err(format!("its channel terms are {}, and the wallet asked for {}", served.map_or("none".into(), |c| c.to_string()),
 			asked_channel.map_or("none".into(), |c| c.to_string())));
 	}
-	if record.template != want {
+	if record.template() != want {
 		return Err(format!("it is a leaf of template {}, and the wallet asked for one of template {}: the template is part of what a \
-			coin is, and the wallet signs nothing for a leaf of another template than it asked", record.template, want));
+			coin is, and the wallet signs nothing for a leaf of another template than it asked", record.template(), want));
 	}
 	match want {
 		Template::Htlc1 => {
 			let hash = receive.expect("asked");
-			match &record.htlc {
-				Some(h) if h.direction == arca_covenant::HtlcDirection::Receive && &h.payment_hash == hash && record.order.is_none() => Ok(()),
+			match record.htlc() {
+				Some(h) if h.direction == arca_covenant::HtlcDirection::Receive && &h.payment_hash == hash && record.order().is_none() => Ok(()),
 				Some(h) => Err(format!("it is an htlc-1 leaf {} under hash {}, and the wallet asked for the leaf receiving payment hash {}",
 					h.direction.name(), hex(&h.payment_hash), hex(hash))),
 				None => Err("it is an htlc-1 leaf with no terms".into()),
 			}
 		},
-		_ if record.htlc.is_some() => Err(format!("it carries htlc-1 terms, and the wallet asked for a leaf of template {}", want)),
-		_ => order_as_asked(w, record.template, record.order.as_ref()),
+		_ if record.htlc().is_some() => Err(format!("it carries htlc-1 terms, and the wallet asked for a leaf of template {}", want)),
+		_ => order_as_asked(w, record.template(), record.order()),
 	}
 }
 
@@ -277,15 +493,31 @@ fn order_as_asked(w: &Value, template: Template, order: Option<&arca_covenant::O
 		say(asked)))
 }
 
-/// What a published tree says beyond the parts it is built from, against
-/// the tree the wallet built from those parts: every node it lists (its
-/// value, reserve, script and children, level by level), each leaf's id and
-/// script, and each preimage it publishes, which must open its leaf's
-/// unlock hash. The wallet takes the operator's word for none of it: a tree
-/// that says one thing and builds to another is refused.
-fn check_published(t: &Value, tree: &Tree) -> Result<(), Error> {
-	let wrong = |what: String| Error::Refused(format!("the published tree is not the tree its parts build: {}", what));
-	if let Some(levels) = t["nodes"].as_array() {
+/// What a published batch says beyond the parts it is built from, against
+/// the batch the wallet built from those parts: every node a tree lists (its
+/// value, reserve, script and children, level by level; an accumulator
+/// batch lists none), each leaf's id and script, and each preimage it
+/// publishes, which must open its leaf's unlock hash. The wallet takes the
+/// operator's word for none of it: a batch that says one thing and builds to
+/// another is refused.
+fn check_published(t: &Value, batch: &Batch) -> Result<(), Error> {
+	let kind = batch.kind();
+	let name = if kind == BatchKind::Tree { "tree" } else { "batch" };
+	let wrong = |what: String| Error::Refused(format!("the published {} is not the {} its parts build: {}", name, name, what));
+	let records: Vec<(Result<LeafId, String>, [u8; 32])> = match batch {
+		Batch::Tree(tree) => tree.records().iter().map(|r| (r.leaf_id().map_err(|e| e.to_string()), r.unlock_hash)).collect(),
+		Batch::Accumulator(acc) => acc.records().iter().map(|r| (r.leaf_id().map_err(|e| e.to_string()), r.unlock_hash)).collect(),
+	};
+	let tree = match batch {
+		Batch::Tree(tree) => Some(tree),
+		Batch::Accumulator(_) => {
+			if t["nodes"].as_array().is_some_and(|n| !n.is_empty()) {
+				return Err(wrong("it lists nodes, and an accumulator batch has none".into()));
+			}
+			None
+		},
+	};
+	if let (Some(levels), Some(tree)) = (t["nodes"].as_array(), tree) {
 		if levels.len() != tree.levels().len() {
 			return Err(wrong(format!("it lists {} levels of nodes, its parts build {}", levels.len(), tree.levels().len())));
 		}
@@ -305,21 +537,21 @@ fn check_published(t: &Value, tree: &Tree) -> Result<(), Error> {
 		}
 	}
 	let shown = t["leaves"].as_array().cloned().unwrap_or_default();
-	for (i, (l, r)) in shown.iter().zip(tree.records()).enumerate() {
+	for (i, (l, (id_built, unlock_hash))) in shown.iter().zip(records).enumerate() {
 		if let Some(id) = l["leaf_id"].as_str() {
-			let built = r.leaf_id().map_err(|e| Error::Refused(e.to_string()))?;
+			let built = id_built.map_err(Error::Refused)?;
 			if id != built.to_string() {
 				return Err(wrong(format!("leaf {} is named {}, its parts make it {}", i, id, built)));
 			}
 		}
 		if let Some(spk) = l["script_pubkey"].as_str() {
-			if spk != hex(tree.leaves()[i].leaf.script_pubkey().as_bytes()) {
+			if spk != hex(batch.leaves()[i].leaf.script_pubkey().as_bytes()) {
 				return Err(wrong(format!("leaf {}'s script is listed as {}", i, spk)));
 			}
 		}
 		if let Some(p) = l["preimage"].as_str() {
 			let p = unhex32(p)?;
-			if sha256::Hash::hash(&p).to_byte_array() != r.unlock_hash {
+			if sha256::Hash::hash(&p).to_byte_array() != unlock_hash {
 				return Err(wrong(format!("the preimage published for leaf {} does not open its unlock hash", i)));
 			}
 		}
@@ -948,7 +1180,7 @@ impl Wallet {
 		// Each new leaf, rebuilt from the published tree and validated
 		// against the round before anything is signed for it: the leaves the
 		// wallet asked for, all of them, in order, and nothing else.
-		let mut news: Vec<(ValidLeaf, LeafRecord, [u8; 32])> = vec![];
+		let mut news: Vec<(NewValid, NewRecord, [u8; 32])> = vec![];
 		// Which of them are a distribution's claims, under keys the wallet
 		// does not hold: it signs no authorisation for them and keeps none.
 		let mut claim_leaf: Vec<bool> = vec![];
@@ -977,12 +1209,12 @@ impl Wallet {
 				return Err(Error::Refused("the server published the tree of another round".into()));
 			}
 			self.witness_record(&tree["signer_record"], false)?;
-			let tree = rebuild(&tree)?;
+			let batch = rebuild_batch(&tree)?;
 			let index = o["leaf_index"].as_u64().ok_or_else(|| Error::Parse("no leaf_index".into()))? as usize;
-			if index >= tree.records().len() {
-				return Err(Error::Refused("the server names a leaf the published tree does not have".into()));
+			if index >= batch.len() {
+				return Err(Error::Refused("the server names a leaf the published batch does not have".into()));
 			}
-			let record = tree.record(index);
+			let record = NewRecord::of(&batch, index);
 			// A distribution's leaves are its claims, owned by the claim key of
 			// the key the wallet named and the nonce it drew; every other leaf
 			// the wallet asks for is its own.
@@ -995,9 +1227,9 @@ impl Wallet {
 			};
 			// The reserves, at four times the node's floor in the leaf's asset
 			// when it accepts that asset for fees, one atom when it does not.
-			let (accept, fee_coin) = self.leaf_policy(record.asset, as_of)?;
+			let (accept, fee_coin) = self.leaf_policy(record.asset(), as_of)?;
 			if fee_coin {
-				needs_fee_coin.push(record.asset.to_string());
+				needs_fee_coin.push(record.asset().to_string());
 			}
 			let valid = record.validate(&round, &accept, &owner, &nonce)
 				.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
@@ -1015,31 +1247,31 @@ impl Wallet {
 				Some(l) => Some(arca_covenant::record_json::landing_from_json(l).map_err(|e| Error::Store(format!("a wanted landing: {}", e)))?),
 				None => None,
 			};
-			let supervised = self.chain.supervised_assets()?.contains(&record.asset);
+			let supervised = self.chain.supervised_assets()?.contains(&record.asset());
 			if w.get("claim").is_none() && supervised != asked.is_some() {
 				return Err(Error::Refused(format!("the new leaf in round {} is of asset {}, which the wallet's node {} supervised, and the \
-					wallet asked for {}: it signs nothing for it", round_txid, record.asset, if supervised { "lists as" } else { "does not list as" },
+					wallet asked for {}: it signs nothing for it", round_txid, record.asset(), if supervised { "lists as" } else { "does not list as" },
 					landing_text(asked.as_ref()))));
 			}
-			if record.landing != asked {
+			if record.landing() != asked.as_ref() {
 				return Err(Error::Refused(format!("the new leaf in round {} lands at {}, and the wallet asked for {}: a leaf of a supervised \
-					asset lands only where its owner asked", round_txid, landing_text(record.landing.as_ref()), landing_text(asked.as_ref()))));
+					asset lands only where its owner asked", round_txid, landing_text(record.landing()), landing_text(asked.as_ref()))));
 			}
 			if asked.is_some() {
 				arca_covenant::landing::check_explicit(&round).map_err(|e| Error::Refused(format!("round {}: {}", round_txid, e)))?;
 			}
-			if record.asset.to_string() != w["asset"].as_str().unwrap_or("") || record.value.to_string() != w["value"].as_str().unwrap_or("") {
-				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value, record.asset,
+			if record.asset().to_string() != w["asset"].as_str().unwrap_or("") || record.value().to_string() != w["value"].as_str().unwrap_or("") {
+				return Err(Error::Refused(format!("the new leaf holds {} of {}; the wallet asked for {} of {}", record.value(), record.asset(),
 					w["value"], w["asset"])));
 			}
-			if Some(valid.leaf_id.to_string().as_str()) != o["leaf_id"].as_str() {
+			if Some(valid.leaf_id().to_string().as_str()) != o["leaf_id"].as_str() {
 				return Err(Error::Refused("the server names the new leaf by another id than its record gives".into()));
 			}
 			// One unlock hash opens every new leaf of the participation: a
 			// forfeit can be claimed only by releasing all of them.
-			if record.unlock_hash != unlock_hash {
+			if record.unlock_hash() != unlock_hash {
 				return Err(Error::Refused(format!("the new leaf in asset {} is locked to another unlock hash than the participation's \
-					{}: a forfeit is claimable only by releasing every leaf the wallet asked for", record.asset, hex(&unlock_hash))));
+					{}: a forfeit is claimable only by releasing every leaf the wallet asked for", record.asset(), hex(&unlock_hash))));
 			}
 			news.push((valid, record, nonce));
 			claim_leaf.push(w.get("claim").is_some());
@@ -1051,7 +1283,7 @@ impl Wallet {
 		// deadline, or withholding the preimage strands the owner.
 		let refund = RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?;
 		if !news.is_empty() {
-			let deadline = news.iter().map(|(_, r, _)| r.schedule.expiries()[0].to_consensus_u32()).min().unwrap_or(0)
+			let deadline = news.iter().map(|(_, r, _)| r.first_expiry()).min().unwrap_or(0)
 				.saturating_sub(WalletPolicy::EXIT_DEADLINE);
 			if now.to_consensus_u32() as u64 + refund.seconds() >= deadline as u64 {
 				return Err(Error::Refused(format!("the forfeits' refund delay of {} s would end after the new leaves' exit deadline", refund.seconds())));
@@ -1088,7 +1320,7 @@ impl Wallet {
 			// The new leaf of the coin's own asset; a take's one leaf, in the
 			// asset its order sells, for the coins it gives up in the asset the
 			// order is paid in.
-			let new = news.iter().find(|(_, r, _)| r.asset == old.asset || take).map(|n| &n.0);
+			let new = news.iter().find(|(_, r, _)| r.asset() == old.asset || take).map(|n| &n.0);
 			let offboard = offboards.iter().find(|(p, _)| p.destination.asset == old.asset).map(|o| &o.0);
 			if new.is_none() && offboard.is_none() {
 				return Err(Error::Refused(format!("the participation has no new leaf and no offboard in the asset of coin {}", l)));
@@ -1109,7 +1341,7 @@ impl Wallet {
 			// Against the new leaf of the coin's asset, or its offboard: one
 			// unlock hash opens both.
 			let f = match (new, offboard) {
-				(Some(new), _) => Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, refund, margin),
+				(Some(new), _) => new.forfeit_for(old.leaf, (old.asset, old.value), old.id, &round, c, refund, margin),
 				(None, Some(p)) => Forfeit::for_offboard(old.leaf, (old.asset, old.value), old.id, p, &round, c, refund, margin),
 				(None, None) => unreachable!("refused above"),
 			}.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
@@ -1122,7 +1354,7 @@ impl Wallet {
 			if let (CoinRecord::Leaf { .. }, arca_covenant::ValidOrigin::Leaf { valid, .. }) = (&record, &old.origin) {
 				if valid.branch.nodes.last().is_some_and(|n| n.reclaim.is_some()) {
 					let rel = match (new, offboard) {
-						(Some(new), _) => Release::for_refresh(valid, new, &round, c),
+						(Some(new), _) => new.release(valid, &round, c),
 						(None, Some(p)) => Release::for_offboard(valid, p, &round, c),
 						(None, None) => unreachable!("refused above"),
 					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
@@ -1136,8 +1368,8 @@ impl Wallet {
 		let mut auths_of = vec![];
 		for ((valid, _, nonce), _) in news.iter().zip(&claim_leaf).filter(|(_, c)| !**c) {
 			let key = self.keys.leaf(nonce)?;
-			let sigs: Vec<_> = valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(t).digest), t)).collect();
-			leaves.push(json!({"leaf_id": valid.leaf_id.to_string(),
+			let sigs = valid.sign_auths(&key, t);
+			leaves.push(json!({"leaf_id": valid.leaf_id().to_string(),
 				"auths": sigs.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}));
 			auths_of.push(sigs);
 		}
@@ -1145,16 +1377,15 @@ impl Wallet {
 		// round it is bound to, and the new leaves it validated, so that it
 		// can follow every forfeit on the chain and complete the leaves with a
 		// preimage the chain publishes, whatever the server does next.
-		let mine: Vec<&(ValidLeaf, LeafRecord, [u8; 32])> = news.iter().zip(&claim_leaf).filter(|(_, c)| !**c).map(|(n, _)| n).collect();
+		let mine: Vec<&(NewValid, NewRecord, [u8; 32])> = news.iter().zip(&claim_leaf).filter(|(_, c)| !**c).map(|(n, _)| n).collect();
 		let mut news_json = json!({"round": round_txid.to_string(), "leaves": mine.iter().zip(&auths_of).map(|((_, record, nonce), auths)| {
-			Ok(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(nonce),
+			Ok(json!({"record": hex(&record.to_bytes()?), "nonce": hex(nonce),
 				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))
 		}).collect::<Result<Vec<_>, Error>>()?});
 		// A distribution's claim leaves, as validated: the preimage that comes
 		// back must open them.
 		let claims_json: Vec<Value> = news.iter().zip(&claim_leaf).filter(|(_, c)| **c).map(|((v, r, n), _)| {
-			Ok(json!({"record": hex(&r.to_bytes().map_err(|e| Error::Refused(e.to_string()))?), "nonce": hex(n),
-				"leaf_id": v.leaf_id.to_string()}))
+			Ok(json!({"record": hex(&r.to_bytes()?), "nonce": hex(n), "leaf_id": v.leaf_id().to_string()}))
 		}).collect::<Result<Vec<_>, Error>>()?;
 		if !claims_json.is_empty() {
 			news_json["claims"] = json!(claims_json);
@@ -1250,8 +1481,8 @@ impl Wallet {
 		// (a distribution's claim leaves, for a distribution).
 		let mut unlock = None;
 		for n in news["leaves"].as_array().cloned().unwrap_or_default().into_iter().chain(news["claims"].as_array().cloned().unwrap_or_default()) {
-			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
-			unlock = Some(record.unlock_hash);
+			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
+			unlock = Some(record.unlock_hash());
 		}
 		let Some(unlock) = unlock else { return Ok(None) };
 		let mut preimage = None;
@@ -1291,16 +1522,16 @@ impl Wallet {
 		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 		let now = self.now()?;
 		for n in news["claims"].as_array().cloned().unwrap_or_default() {
-			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
-			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
+			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash() {
 				return Err(Error::Refused("the preimage does not open the distribution's claim leaves".into()));
 			}
 		}
 		let mut kept = vec![];
 		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
-			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
+			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
 			let nonce = unhex32(n["nonce"].as_str().unwrap_or(""))?;
-			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+			if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash() {
 				return Err(Error::Refused("the preimage does not open the new leaves".into()));
 			}
 			let mut auths = vec![];
@@ -1310,22 +1541,22 @@ impl Wallet {
 				let t = MedianTime::from_consensus(a["time"].as_u64().unwrap_or(0) as u32).map_err(|e| Error::Store(e.to_string()))?;
 				auths.push((sig, t));
 			}
-			let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
+			let coin = record.coin(preimage, auths)?;
 			// The leaf was accepted before any forfeit left the wallet. A
 			// claim publishes the preimage at any time the forfeit's output
 			// lives, and the operator takes the forfeits until the coins' exit
 			// deadline, so the leaf is completed when it is, in its last days
 			// or past its expiry as well: as an exit checks a coin held.
-			let first = record.schedule.expiries()[0].to_consensus_u32();
-			let a = self.assess(&coin, &self.followed_policy(first, now), Some((&record.owner, &nonce)))?;
+			let first = record.first_expiry();
+			let a = self.assess(&coin, &self.followed_policy(first, now), Some((&record.owner(), &nonce)))?;
 			// A leaf received over Lightning is held apart until its owner
 			// claims it with the payment's preimage (`lightning`).
-			let state = if record.htlc.is_some() { "receiving" } else if a.all_final() { "live" } else { "pending" };
+			let state = if record.htlc().is_some() { "receiving" } else if a.all_final() { "live" } else { "pending" };
 			let row = self.row(&coin, &a, state, "")?;
 			// Bound to the mailbox key when the act that wanted it named the
 			// key: a refresh does; a receive over Lightning does when it was
 			// asked for with the key.
-			let bound = match record.htlc {
+			let bound = match record.htlc() {
 				Some(t) => self.receives()?.get(&hex(&t.payment_hash)).is_some_and(|r| !r["request"]["mailbox"].is_null()),
 				None => true,
 			};
@@ -1336,8 +1567,8 @@ impl Wallet {
 					s.use_nonce(&nonce, &id)
 				})?;
 			}
-			let mut k = json!({"leaf_id": row.leaf_id, "asset": record.asset.to_string(), "value": record.value.to_string(),
-				"expiry": record.schedule.expiries()[0].to_consensus_u32()});
+			let mut k = json!({"leaf_id": row.leaf_id, "asset": record.asset().to_string(), "value": record.value().to_string(),
+				"expiry": first});
 			if let Some(f) = self.exit_fee(&row, &mut None)? {
 				k["exit_fee"] = f;
 			}
@@ -1429,8 +1660,8 @@ impl Wallet {
 		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
 		let mut last = 0u32;
 		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
-			let record = LeafRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(|e| Error::Store(e.to_string()))?;
-			last = last.max(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX));
+			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
+			last = last.max(record.schedule().expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX));
 		}
 		Ok(last != 0 && self.now()?.to_consensus_u32() > last)
 	}
@@ -1623,8 +1854,8 @@ impl Wallet {
 		let mut changes = vec![];
 		let coins = self.store.coins()?;
 		let opens = |c: &super::store::CoinRow, round: &str, h: &str| -> bool {
-			c.kind == "batch" && c.bases.iter().any(|b| b == round) && matches!(Self::record_of(c),
-				Ok(CoinRecord::Leaf { record, .. }) if hex(&record.unlock_hash) == h)
+			c.kind == "batch" && c.bases.iter().any(|b| b == round)
+				&& Self::record_of(c).ok().and_then(|r| NewRecord::of_coin(&r)).is_some_and(|(record, _, _)| hex(&record.unlock_hash()) == h)
 		};
 		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
 			if matches!(state.as_str(), "submitting" | "withdrawn" | "refused") {
@@ -1676,12 +1907,12 @@ impl Wallet {
 					continue;
 				}
 			}
-			let CoinRecord::Leaf { preimage, .. } = Self::record_of(leaves[0])? else { continue };
+			let Some((_, preimage, _)) = NewRecord::of_coin(&Self::record_of(leaves[0])?) else { continue };
 			if !already {
 				let mut news = vec![];
 				for c in &leaves {
-					let CoinRecord::Leaf { record, auths, .. } = Self::record_of(c)? else { continue };
-					news.push(json!({"record": hex(&record.to_bytes().map_err(|e| Error::Store(e.to_string()))?), "nonce": hex(&c.owner_nonce),
+					let Some((record, _, auths)) = NewRecord::of_coin(&Self::record_of(c)?) else { continue };
+					news.push(json!({"record": hex(&record.to_bytes()?), "nonce": hex(&c.owner_nonce),
 						"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}));
 				}
 				let news = json!({"round": k, "leaves": news});
