@@ -60,6 +60,25 @@ pub(crate) fn landing_bytes(l: &arca_covenant::Landing) -> Vec<u8> {
 	b
 }
 
+/// A channel's terms as the store keeps them: the operator's opening
+/// balance (u64 LE), then the credit window's units (u16 LE).
+pub(crate) fn channel_bytes(c: &arca_covenant::Channel) -> Vec<u8> {
+	let mut b = c.capacity.to_le_bytes().to_vec();
+	b.extend(c.window.units().to_le_bytes());
+	b
+}
+
+pub(crate) fn channel_of(b: &[u8]) -> Result<arca_covenant::Channel, StoreError> {
+	if b.len() != 10 {
+		return Err(StoreError::Corrupt(format!("channel terms of {} bytes", b.len())));
+	}
+	Ok(arca_covenant::Channel {
+		capacity: u64::from_le_bytes(b[..8].try_into().expect("8 bytes")),
+		window: arca_covenant::RelativeTime::from_units(u16::from_le_bytes(b[8..].try_into().expect("2 bytes")))
+			.map_err(|e| StoreError::Corrupt(format!("a channel's window: {}", e)))?,
+	})
+}
+
 pub(crate) fn landing_of(b: &[u8]) -> Result<arca_covenant::Landing, StoreError> {
 	if b.len() != 28 {
 		return Err(StoreError::Corrupt(format!("a landing of {} bytes", b.len())));
@@ -82,6 +101,8 @@ pub enum WantedKind {
 		order: Option<arca_covenant::OrderLeafTerms>,
 		/// `landing-1`'s landing, for a leaf of a supervised asset.
 		landing: Option<arca_covenant::Landing>,
+		/// `channel-1`'s terms, for a channel leaf.
+		channel: Option<arca_covenant::Channel>,
 	},
 	/// An offboard's on-chain output: the destination script, the margin the
 	/// round's output holds for its unlock, the operator's reclaim delay.
@@ -318,7 +339,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	}
 	for r in c.query(
 		"SELECT kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, leaf_id,
-		        script, margin, reclaim_delay_units, htlc, order_terms, landing
+		        script, margin, reclaim_delay_units, htlc, order_terms, landing, channel
 		 FROM participation_output WHERE participation_id = $1 ORDER BY idx",
 		&[&&id[..]],
 	).await? {
@@ -343,6 +364,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 					None => None,
 				},
 				landing: r.get::<_, Option<Vec<u8>>>(14).map(|b| landing_of(&b)).transpose()?,
+				channel: r.get::<_, Option<Vec<u8>>>(15).map(|b| channel_of(&b)).transpose()?,
 			},
 			"offboard" => WantedKind::Offboard {
 				script: r.get(9),
@@ -388,8 +410,18 @@ impl Store {
 	/// is wanted by another participation. A participation already recorded
 	/// under the same id is [`StoreError::ParticipationExists`].
 	pub async fn insert_participation(&self, p: &NewParticipation) -> Result<(), StoreError> {
+		self.insert_participation_seen(p, &[]).await
+	}
+
+	/// [`Self::insert_participation`] for a participation that gives up
+	/// channel coins: each still at the state and note it read of it, and
+	/// nothing of it in flight ([`StoreError::ChannelBusy`]), in the same
+	/// transaction, so no state or payment slips between the read and the
+	/// coin's being given up.
+	pub async fn insert_participation_seen(&self, p: &NewParticipation, seen: &[super::ChannelSeen]) -> Result<(), StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		super::channels::check_seen(&t, seen).await?;
 		insert_participation_in(&t, p, false).await?;
 		t.commit().await?;
 		Ok(())
@@ -1308,7 +1340,7 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 	}
 	for (k, o) in p.outputs.iter().enumerate() {
 		let r = match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce, order, landing } => {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce, order, landing, channel } => {
 				if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state NOT IN ('lost', 'expired')", &[&&owner_key[..]]).await?.is_some() {
 					return Err(StoreError::KeyReused);
 				}
@@ -1329,13 +1361,14 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 					b
 				});
 				let landing = landing.map(|l| landing_bytes(&l));
+				let channel = channel.map(|c| channel_bytes(&c));
 				t.execute(
 					"INSERT INTO participation_output
 					 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc,
-					  order_terms, landing)
-					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+					  order_terms, landing, channel)
+					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
 					&[&&p.id[..], &(k as i16), &&o.asset[..], &i64_of(o.value)?, template, &&owner_key[..], &&owner_nonce[..],
-						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing],
+						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing, &channel],
 				).await
 			},
 			WantedKind::Offboard { script, margin, reclaim_delay_units } => t.execute(

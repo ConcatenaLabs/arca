@@ -242,7 +242,7 @@ pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [
 	let nonce = random32();
 	(OutputRequest::Leaf {
 		asset, value, template: arca_covenant::Template::Vtxo1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
-		order: None, landing: None,
+		order: None, landing: None, channel: None,
 	}, nonce)
 }
 
@@ -253,14 +253,27 @@ pub fn want_landing(key: &Keypair, asset: AssetId, value: u64, landing: arca_cov
 	let nonce = random32();
 	(OutputRequest::Leaf {
 		asset, value, template: arca_covenant::Template::Landing1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
-		order: None, landing: Some(landing),
+		order: None, landing: Some(landing), channel: None,
+	}, nonce)
+}
+
+/// [`want_leaf`] for a `channel-1` leaf of `value`, `capacity` of it the
+/// operator's side, with the operator's credit `window`.
+pub fn want_channel(key: &Keypair, asset: AssetId, value: u64, capacity: u64, window: arca_covenant::RelativeTime)
+	-> (OutputRequest, [u8; 32])
+{
+	hold_key(key);
+	let nonce = random32();
+	(OutputRequest::Leaf {
+		asset, value, template: arca_covenant::Template::Channel1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
+		order: None, landing: None, channel: Some(arca_covenant::Channel { capacity, window }),
 	}, nonce)
 }
 
 /// The JSON of one output wanted.
 pub fn output_json(o: &OutputRequest) -> Value {
 	match o {
-		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing } => {
+		OutputRequest::Leaf { asset, value, template, owner, owner_nonce, exit_delay, order, landing, channel } => {
 			let mut j = json!({"leaf": {
 				"asset": asset.to_string(), "value": value.to_string(), "template": template.to_string(),
 				"owner": hex(&owner.serialize()), "owner_nonce": hex(owner_nonce), "exit_delay_units": exit_delay.units(),
@@ -270,6 +283,9 @@ pub fn output_json(o: &OutputRequest) -> Value {
 			}
 			if let Some(l) = landing {
 				j["leaf"]["landing"] = arca_covenant::record_json::landing_json(l);
+			}
+			if let Some(c) = channel {
+				j["leaf"]["channel"] = arca_covenant::record_json::channel_json(c);
 			}
 			j
 		},
@@ -405,7 +421,7 @@ fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 		htlc: htlc_of(&l["htlc"]),
 		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
 		landing: (!l["landing"].is_null()).then(|| arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap()),
-		channel: None,
+		channel: (!l["channel"].is_null()).then(|| arca_covenant::record_json::channel_from_json(&l["channel"]).unwrap()),
 	}).collect();
 	Ok((params, leaves))
 }
