@@ -64,6 +64,9 @@
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
 //!   holder first;
+//! - the operator's equivocation bond ([`bond`]): a coin anyone burns with
+//!   two different messages the operator key signed under one coin's salt,
+//!   and which the operator withdraws only a delay after a public notice;
 //! - the operator record ([`operator_record`]): what an operator publishes
 //!   about itself in the Sequentia registry, its canonical form and the
 //!   signature of the operator key over it.
@@ -80,6 +83,7 @@
 pub extern crate elements;
 
 pub mod board;
+pub mod bond;
 pub mod checkpoint;
 pub mod checks;
 pub mod claim;
@@ -117,6 +121,7 @@ pub mod unroll;
 pub mod witness;
 
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
+pub use bond::{BondError, BondPolicy, BondState, Evidence, Form, Signed};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};

@@ -458,6 +458,14 @@ pub fn publish_digest(chain: &Chain, operator: &XOnlyPublicKey, order: &crate::L
 	sha256(&b)
 }
 
+/// `T = SHA256(SHA256("Arca/order-fill") ‖ genesis)`, the constant a fill
+/// digest's preimage starts with, before the order's salt.
+pub fn fill_prefix(chain: &Chain) -> [u8; 32] {
+	let mut t = sha256(FILL_TAG).to_vec();
+	t.extend(chain.genesis_bytes());
+	sha256(&t)
+}
+
 /// The chain's commitment to an output (Simplicity's `output_hash`):
 /// `SHA256(asset ‖ value ‖ nonce ‖ SHA256(scriptPubKey) ‖ SHA256(range
 /// proof))`, the asset, value and nonce as the transaction encodes them (a
@@ -639,12 +647,17 @@ impl OrderPolicy {
 	/// `SHA256(T ‖ salt ‖ asset_a ‖ value_in ‖ m ‖ output_hash(0) ‖ … )`,
 	/// `T = SHA256(SHA256("Arca/order-fill") ‖ genesis)`.
 	pub fn fill_digest(&self, value_in: u64, outputs: &[TxOut]) -> Result<[u8; 32], OrderError> {
+		Ok(sha256(&self.fill_preimage(value_in, outputs)?))
+	}
+
+	/// The bytes [`Self::fill_digest`] hashes: `T ‖ salt ‖ rest`. What
+	/// follows the salt is what an equivocation bond's slash takes for a fill
+	/// ([`crate::bond`]).
+	pub fn fill_preimage(&self, value_in: u64, outputs: &[TxOut]) -> Result<Vec<u8>, OrderError> {
 		if !(2..=MAX_FILL_OUTPUTS as usize).contains(&outputs.len()) {
 			return Err(OrderError::Amount(format!("a fill commits to 2 to {} outputs, not {}", MAX_FILL_OUTPUTS, outputs.len())));
 		}
-		let mut t = sha256(FILL_TAG).to_vec();
-		t.extend(self.chain.genesis_bytes());
-		let mut b = sha256(&t).to_vec();
+		let mut b = fill_prefix(&self.chain).to_vec();
 		b.extend(self.salt);
 		b.extend(asset_bytes(self.landed.terms.asset_a));
 		b.extend(value_in.to_be_bytes());
@@ -652,7 +665,7 @@ impl OrderPolicy {
 		for o in outputs {
 			b.extend(output_hash(o));
 		}
-		Ok(sha256(&b))
+		Ok(b)
 	}
 
 	/// The fill's witness: the parameters, the operator's signature, `m` and

@@ -32,6 +32,12 @@ vectors/order.json holds the order-2 leaf's vectors, which order.py
 generates: an order's parameters, its three spendable leaves and their
 control blocks, its remainder after a fill, the credit that fill pays, the
 SeqDEX order it lands as, and the operator's fill digest and signature.
+
+vectors/bond.json holds the equivocation bond's vectors, which bond.py
+generates: its three scripts, the bond's and the notice output's
+scriptPubKeys and control blocks, and a slash's evidence: two messages S
+signed under one salt, and a fill beside one, with their digests and the
+items the slash takes.
 """
 import json
 import os
@@ -49,6 +55,7 @@ OUT = os.path.join(HERE, "vectors", "arca.json")
 RECORDS_OUT = os.path.join(HERE, "vectors", "records.json")
 TRANSACTIONS_OUT = os.path.join(HERE, "vectors", "transactions.json")
 ORDER_OUT = os.path.join(HERE, "vectors", "order.json")
+BOND_OUT = os.path.join(HERE, "vectors", "bond.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -690,6 +697,7 @@ def generate():
 
 
 def main():
+    import bond
     import offchain
     import order
     import records
@@ -698,7 +706,9 @@ def main():
     files = [(OUT, json.dumps(generate(), indent=1) + "\n"),
              (RECORDS_OUT, json.dumps(records.generate(), indent=1) + "\n"),
              (TRANSACTIONS_OUT, json.dumps(offchain.generate(), indent=1) + "\n"),
-             (ORDER_OUT, json.dumps(order.generate(GENESIS, order_keys, label_hash, DELAY), indent=1) + "\n")]
+             (ORDER_OUT, json.dumps(order.generate(GENESIS, order_keys, label_hash, DELAY), indent=1) + "\n"),
+             (BOND_OUT, json.dumps(bond.generate(GENESIS, {"S": S, "W": Key("bond W"), "A": A, "B": B}, label_hash,
+                                                 rel_time(32 * DAY)), indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:

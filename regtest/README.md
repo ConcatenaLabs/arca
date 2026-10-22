@@ -66,6 +66,7 @@ the constructions T0 to T15 measure; `arklib3.py` holds the frozen constructions
 | T19 | The reclaim of a lowest node by all its owners and the operator, each owner's release naming the connector asset `M` of the round of its new leaf, issued for real from a connector output: confirmed with an atom of `M` (and with an atom of each of two rounds), refused without it, with another round's `M`, with another asset, with three releases of four and with releases over the message that named no round |
 | T20 | The notice on the sweep token: no node of any age is swept earlier than the notice after the release |
 | T21 | Every frozen construction together in a 16-leaf tree in an asset that is not the policy asset |
+| T22 | The operator's equivocation bond (`bond.py`): a payment and a second spend of one leaf, both co-signed by the operator, burn the bond whole; refused beside it one signature twice, two signatures over one digest, two salts, another key and a burn short; a fill beside a payment under one salt burns another; the notice keeps the bond whole and is W's alone; the withdrawal waits the notice's delay |
 
 The node runs on a custom chain with the arguments in `ArkBase.ark_params`
 (`arklib.py`): transparent addresses, fees in any accepted asset, and an issued
@@ -131,6 +132,14 @@ remainder after one fill; the credit leaf that fill pays; the SeqDEX order it
 lands as; and the operator's digest over a fill's outputs with its signature.
 The two Simplicity commitment roots are sequentia-contracts' (`arca/order-2`,
 `seqdex/order`).
+
+`vectors/bond.json` holds the equivocation bond's vectors, written by
+`bond.py`: its keys and notice delay, its three scripts, the bond's and the
+notice output's scriptPubKeys, merkle roots and control blocks, and a slash's
+evidence: two messages the operator signed under one leaf salt (a payment and
+a second spend of the same leaf), and a fill beside the first, each with its
+rest, digest and signature, and the witness items the slash takes for each
+pair.
 
 `vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every
