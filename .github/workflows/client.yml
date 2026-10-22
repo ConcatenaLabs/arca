@@ -109,3 +109,70 @@ jobs:
 
       - name: Scenarios
         run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel -- --nocapture
+
+  # The wallet's orders and fills, which the scenarios do not carry, and the
+  # server kept running for a browser wallet (tests/arca_operator_for_browsers.rs),
+  # started, driven through its control address and told to stop.
+  order-tests:
+    name: the arca wallet's orders and fills, and the server for browsers
+    needs: node-build
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: arca
+          POSTGRES_PASSWORD: arca
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arca"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ARCA_TEST_POSTGRES: postgres://arca:arca@127.0.0.1:5432/postgres
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Download sequentiad
+        run: |
+          gh run download ${{ needs.node-build.outputs.run }} -R ConcatenaLabs/Sequentia \
+            -n sequentia-dev-x86_64-pc-linux-gnu -D "$RUNNER_TEMP/node"
+          tar -xf "$RUNNER_TEMP/node/sequentia-dev-linux.tar" -C "$RUNNER_TEMP/node"
+          echo "SEQUENTIAD_EXEC=$RUNNER_TEMP/node/sequentia-dev-linux/bin/sequentiad" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the signer and the keeper
+        run: cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
+
+      - name: Orders and fills
+        run: cargo test --locked -p arca-cli --test arca_fills --test arca_orders --test arca_resting --test arca_shared_fills -- --nocapture
+
+      - name: The server for browsers
+        run: |
+          cargo test --locked -p arca-cli --test arca_operator_for_browsers --no-run
+          export ARCA_OPERATOR_CONTROL=127.0.0.1:18640
+          cargo test --locked -p arca-cli --test arca_operator_for_browsers -- --ignored --nocapture > "$RUNNER_TEMP/browsers.log" 2>&1 &
+          pid=$!
+          c=http://$ARCA_OPERATOR_CONTROL
+          for i in $(seq 120); do curl -sf "$c/state" > "$RUNNER_TEMP/state.json" && break; sleep 2; done
+          jq -e '.server and .node_url and .genesis_hash' "$RUNNER_TEMP/state.json"
+          tip=$(jq .tip "$RUNNER_TEMP/state.json")
+          curl -sf -X POST "$c/produce" -d '{}'
+          curl -sf -X POST "$c/bury" -d '{}'
+          jq -e '.round == null' <<<"$(curl -sf -X POST "$c/round" -d '{}')"
+          jq -e --argjson t "$tip" '.tip > $t' <<<"$(curl -sf "$c/state")"
+          curl -sf -X POST "$c/quit" -d '{}'
+          wait "$pid" || { tail -n 100 "$RUNNER_TEMP/browsers.log"; exit 1; }
+          grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/browsers.log" || { tail -n 100 "$RUNNER_TEMP/browsers.log"; exit 1; }
