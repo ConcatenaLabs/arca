@@ -741,6 +741,7 @@ impl Watcher {
 		fn latest(r: &CoinRecord) -> u32 {
 			match r {
 				CoinRecord::Leaf { auths, .. } => auths.iter().map(|(_, t)| t.to_consensus_u32()).max().unwrap_or(0),
+				CoinRecord::Accumulator { auth, .. } => auth.1.to_consensus_u32(),
 				CoinRecord::Board(_) => 0,
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().map(latest).max().unwrap_or(0),
 			}
@@ -1456,7 +1457,7 @@ impl Watcher {
 		fn boards_alone(r: &CoinRecord) -> bool {
 			match r {
 				CoinRecord::Board(_) => true,
-				CoinRecord::Leaf { .. } => false,
+				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => false,
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().all(boards_alone),
 			}
 		}
@@ -1562,6 +1563,7 @@ impl Watcher {
 		fn batches(r: &CoinRecord, out: &mut Vec<u32>) {
 			match r {
 				CoinRecord::Leaf { record, .. } => out.extend(record.schedule.expiries().first().map(|e| e.to_consensus_u32())),
+				CoinRecord::Accumulator { record, .. } => out.extend(record.schedule.expiries().first().map(|e| e.to_consensus_u32())),
 				CoinRecord::Board(_) => {},
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| batches(p, out)),
 			}
@@ -1583,6 +1585,8 @@ impl Watcher {
 	async fn bring_on_chain(&self, coin: &ValidCoin, now: MedianTime) -> Result<(), WatcherError> {
 		match &coin.origin {
 			ValidOrigin::Board { .. } => Ok(()),
+			ValidOrigin::Accumulator { .. } => Err(WatcherError::Build("a leaf of an accumulator batch is not brought on the chain here \
+				yet".into())),
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let branch = &valid.branch;
 				// The leaf itself on the chain: the rest is the answer's.

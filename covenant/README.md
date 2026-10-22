@@ -506,7 +506,9 @@ nonce.
 A `CoinRecord` is what the holder of a coin keeps, and what a receiver gets from
 the mailbox: for a leaf of a batch, its leaf record with its entry's preimage
 and its owner's unroll authorisations, so anyone holding the record can bring it
-on-chain; for a board, its board record (the board is on-chain already, and a
+on-chain; for a leaf of an accumulator batch, its `AccumulatorRecord` with its
+entry's preimage and its owner's exit authorisation, to the same end; for a
+board, its board record (the board is on-chain already, and a
 checkpoint of it spends the board output itself, `board_checkpoint_tx`); for a
 coin a reassignment created, the reassignment's inputs (each a
 coin record, with its checkpoint's value and both pairs), its outputs, the
@@ -608,6 +610,14 @@ with every bit clear), with the five checks on the token and its clock. Every
 exit publishes the whole state it spends, so `read_exit` reads the bitmap of a
 batch from its latest exit, and `follow` replays a batch's exits from its
 round; a builder checks the state it spends against the batch output's script.
+
+A holder keeps such a leaf as `CoinRecord::Accumulator`: the record, the
+entry's preimage and its own exit authorisation (signature and time), so the
+record alone takes the leaf out. Its binary form is tag 6 of the coin record
+(`AccumulatorRecord::to_bytes`, layout in the `accumulator` module), and
+`CoinRecord::validate` checks it as the wallet does a leaf of its own, then the
+preimage against the entry's unlock hash and the authorisation as the owner's,
+good now (`ValidOrigin::Accumulator`).
 
 Exits are serial: each spends the batch output and re-creates it, so a batch
 takes 25 exits a block from one unconfirmed chain. An exit is 976 vB with its

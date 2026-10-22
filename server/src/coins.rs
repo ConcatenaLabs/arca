@@ -105,8 +105,12 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 				Box::pin(bases(store, &i.coin, out)).await?;
 			}
 		},
-		CoinRecord::Leaf { record, .. } => {
-			let id = record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?;
+		CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {
+			let id = match record {
+				CoinRecord::Leaf { record, .. } => record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?,
+				CoinRecord::Accumulator { record, .. } => record.leaf_id().map_err(|e| CoinError::Internal(e.to_string()))?,
+				_ => unreachable!("matched above"),
+			};
 			let leaf = store.batch_leaf(&id.0).await?
 				.ok_or_else(|| CoinError::Internal(format!("leaf {} of a known coin is in no batch the server built", id)))?;
 			let round = store.round(leaf.round_id).await?
@@ -132,7 +136,7 @@ pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u
 	fn collect(r: &CoinRecord, out: &mut Vec<[u8; 32]>) {
 		match r {
 			CoinRecord::Board(b) => out.push(b.leaf_id().0),
-			CoinRecord::Leaf { .. } => {},
+			CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out)),
 			CoinRecord::Fill(f) => {
 				collect(&f.fill.order, out);

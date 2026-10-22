@@ -496,6 +496,7 @@ impl Wallet {
 				out.push(valid.branch.entry_output().txout());
 			},
 			ValidOrigin::Board { record, .. } => out.push(record.output().txout()),
+			ValidOrigin::Accumulator { valid, .. } => out.push(valid.entry_output().txout()),
 			ValidOrigin::Transfer { inputs, .. } => {
 				for i in inputs {
 					Self::path_outputs(&i.coin, out);
@@ -525,6 +526,7 @@ impl Wallet {
 			return Ok(at);
 		}
 		match &coin.origin {
+			ValidOrigin::Accumulator { .. } => Err(Error::Refused(format!("coin {}: accumulator coins are not handled here yet", coin.id))),
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let b = &valid.branch;
 				let n = b.nodes.len();
@@ -1043,7 +1045,7 @@ impl Wallet {
 		let (order, inputs) = match &coin.origin {
 			ValidOrigin::Transfer { inputs, .. } => (None, inputs),
 			ValidOrigin::Fill { order, inputs, .. } => (Some(order), inputs),
-			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return Ok(None),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Accumulator { .. } => return Ok(None),
 		};
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 		let mine = coin.output().txout();
@@ -1105,6 +1107,7 @@ impl Wallet {
 	/// sweep).
 	pub(crate) fn swept(&self, coin: &ValidCoin) -> Result<Option<(String, elements::Txid)>, Error> {
 		match &coin.origin {
+			ValidOrigin::Accumulator { .. } => Err(Error::Refused(format!("coin {}: accumulator coins are not handled here yet", coin.id))),
 			ValidOrigin::Leaf { valid, .. } => {
 				let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
 				let b = &valid.branch;
@@ -1481,6 +1484,8 @@ impl Wallet {
 		let detail = match &r {
 			CoinRecord::Leaf { record, .. } => record.to_json().map_err(|e| Error::Refused(e.to_string()))?,
 			CoinRecord::Board(b) => b.to_json().map_err(|e| Error::Refused(e.to_string()))?,
+			CoinRecord::Accumulator { record, .. } => json!({"accumulator_slot": record.slot, "template": record.template.to_string(),
+				"value": record.value.to_string(), "asset": record.asset.to_string()}),
 			CoinRecord::Transfer(t) => json!({"inputs": t.inputs.len(), "outputs": t.outputs.len(), "index": t.index}),
 			CoinRecord::Fill(f) => json!({"fill_of_order": true, "inputs": f.fill.inputs.len(), "outputs": f.fill.outputs.len(),
 				"index": f.index, "partial": f.fill.partial}),

@@ -651,6 +651,7 @@ enum Event<'a> {
 fn bring(c: &mut Ctx, coin: &ValidCoin, label: &str, hook: &mut dyn FnMut(&mut Ctx, Event)) -> OutPoint {
 	match &coin.origin {
 		ValidOrigin::Fill { .. } => unreachable!("these records hold no fill"),
+		ValidOrigin::Accumulator { .. } => unreachable!("these records hold no accumulator leaf"),
 		ValidOrigin::Leaf { valid, preimage, auths } => {
 			let mut at = OutPoint::new(valid.round_txid, valid.batch_vout);
 			for (level, (node, auth)) in valid.branch.nodes.iter().zip(auths).enumerate() {
