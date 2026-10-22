@@ -28,7 +28,10 @@
 //!   release, and after the release before `W` has passed at `R`;
 //! - signatures and outputs: a stranger's signature, the operator's without
 //!   its flag, the rest one atom short, the rest under the old state, the
-//!   entry to the owner's key, no rest.
+//!   entry to the owner's key, no rest;
+//! - an annex on the exit's witness, which the authorisation does not name:
+//!   the owner's exit, the operator's and the last leaf's, a 3-byte and a
+//!   1,000-byte annex, each beside the same exit with none.
 //!
 //! A 1,024-leaf tree of the same leaves is unrolled to one leaf beside it,
 //! for the sizes.
@@ -123,6 +126,15 @@ fn refuse(net: &mut Net, name: &str, raw: &RawExit, expect: &str) {
 const INSIDE_JET: &str = "mempool-script-verify-flag-failed (Assertion failed inside jet)";
 /// An `unwrap` of nothing: the program reads an output that is not there.
 const NO_OUTPUT: &str = "mempool-script-verify-flag-failed (Assertion failed)";
+/// An annex where the program requires none: in a block, `is_none` of the
+/// input's annex hash fails as an assertion the compiler makes, as an
+/// `unwrap` does.
+const ANNEX: &str = "mandatory-script-verify-flag-failed (Assertion failed)";
+/// Relay refuses the same spends before the program runs: an annex on a
+/// Simplicity leaf relays only when it is zeros and as large as the
+/// program's cost needs, which an exit's never does.
+const ANNEX_NONZERO: &str = "mempool-script-verify-flag-failed (Simplicity annex must be zeros after its tag)";
+const ANNEX_UNNEEDED: &str = "mempool-script-verify-flag-failed (Simplicity annex is larger than the program's cost needs)";
 
 fn auth(digest: [u8; 32], key: &Keypair, by_operator: bool, t: MedianTime) -> ExitAuth {
 	ExitAuth { by_operator, time: t, signature: sig(key, &digest) }
@@ -534,17 +546,17 @@ fn chained_exits_in_one_block_and_an_exit_reorganised_by_its_anchor() {
 	println!("exit 27 confirmed again under the new parent branch, the same transaction {}", id27);
 }
 
-/// Exits whose witnesses end with an annex (BIP341). The owner's
-/// authorisation commits to no annex, so whoever broadcasts or mines an exit
-/// can add one, and it is the same transaction, the same txid. The node
-/// relays an annex on a Simplicity leaf (up to its standard size), so the
-/// mempool takes these; a node that refuses them would leave them to a block
-/// producer (`generateblock`), which is tried then. The state read back
-/// from the chain is the state the plain exits leave: an annexed exit, a
-/// plain one from its rest, and an annexed last exit, which empties the
-/// batch.
+/// Exits whose witnesses end with an annex (BIP341). The authorisation names
+/// no annex, so whoever holds an authorisation, or mines the exit, could add
+/// one to it, the same txid: the program refuses it (`current_annex_hash`
+/// must be none) in a block, for the owner's exit, the operator's and the
+/// last leaf's, each beside the same exit with no annex, which confirms.
+/// Relay refuses each annex before the program runs, a nonzero one for its
+/// bytes and a zero one as more than the program needs. A reader strips an
+/// annex all the same (`read_exit`): an annexed witness reads as the plain
+/// one.
 #[test]
-fn annexed_exits_are_read_as_the_plain_ones() {
+fn an_annexed_exit_is_refused_in_a_block_beside_the_plain_one() {
 	const N: usize = 3;
 	let mut a = Arca::start();
 	let s = keypair("accumulator annex operator");
@@ -566,47 +578,45 @@ fn annexed_exits_are_read_as_the_plain_ones() {
 		.map(|i| acc.record(i).validate(&round, &policy, &xonly(&owners[i]), &specs[i].owner_nonce).unwrap())
 		.collect();
 	let t = mt(a.net.mtp() - 1);
-	let auths: Vec<ExitAuth> = (0..N).map(|i| auth(valid[i].exit_digest(t), &owners[i], false, t)).collect();
-	let annex = vec![0x50, 0x0a, 0x11];
+	// Slot 0 by its owner, slot 1 by the operator, slot 2 (the last) by its owner.
+	let auths: Vec<ExitAuth> = (0..N).map(|i| if i == 1 {
+		auth(valid[i].exit_digest(t), &s, true, t)
+	} else {
+		auth(valid[i].exit_digest(t), &owners[i], false, t)
+	}).collect();
+	let names = ["exit 1: slot 0 by its owner", "exit 2: slot 1 by the operator", "exit 3: the last slot by its owner"];
+	let annexes = [
+		(vec![0x50, 0x0a, 0x11], ANNEX_NONZERO),
+		([vec![0x50], vec![0xaa; 999]].concat(), ANNEX_NONZERO),
+		(vec![0x50, 0x00, 0x00], ANNEX_UNNEEDED),
+		([vec![0x50], vec![0x00; 999]].concat(), ANNEX_UNNEEDED),
+	];
 	let (mut state, mut at, mut held) = (*acc.policy(), OutPoint::new(id, 0), acc.total());
 	let mut mined = vec![];
 	for i in 0..N {
 		let plain = valid[i].exit_tx(&state, at, held, &auths[i], &FeeSource::Reserve).unwrap().tx;
-		let last = i == N - 1;
-		let txid = if i == 1 {
-			a.net.pass("exit 2: slot 1 from the rest exit 1 left, plain", &plain)
-		} else {
+		for (annex, relay) in &annexes {
 			let mut x = plain.clone();
 			x.input[0].witness.script_witness.push(annex.clone());
 			assert_eq!(x.txid(), plain.txid(), "the annex is witness data: the txid is the plain exit's");
-			let name = if last { "exit 3: the last slot, an annex on its witness" } else { "exit 1: slot 0, an annex on its witness" };
-			let r = a.net.rt.client().test_mempool_accept(&[&x]).unwrap().remove(0);
-			println!("{}: testmempoolaccept {}", name, if r.allowed { "accepts it".to_string() } else { format!("{:?}", r.reject_reason) });
-			a.net.pass_or_mine(name, &x, "bad-witness-nonstandard")
-		};
+			assert_eq!(read_exit(&x.input[0].witness.script_witness), read_exit(&plain.input[0].witness.script_witness),
+				"an annexed witness reads as the plain one");
+			a.net.refuse_relay_and_block(&format!("neg {}, a {}-byte annex on its witness", names[i], annex.len()), &x, relay, ANNEX);
+		}
+		let txid = a.net.pass(&format!("{}, no annex", names[i]), &plain);
 		let tx = a.net.rt.client().raw_transaction(&txid).unwrap();
-		let w = &tx.input[0].witness.script_witness;
-		println!("exit {} on the chain: {} witness items{}", i + 1, w.len(),
-			if w.len() == 5 { format!(", the last {}", hex(&w[4])) } else { String::new() });
-		let seen = read_exit(w);
-		println!("  read_exit: {:?}", seen.map(|e| (e.slot, e.last)));
-		let so_far: Vec<(&Transaction, usize)> = mined.iter().chain(std::iter::once(&tx)).map(|t| (t, 0)).collect();
-		println!("  follow from the round through exit {}: {:?}", i + 1, follow(acc.policy(), &so_far).map(|s| s.map(|s| s.bitmap.count())));
-		let seen = seen.unwrap_or_else(|| panic!("exit {} is not read as an exit", i + 1));
-		assert_eq!(Some(seen), read_exit(&plain.input[0].witness.script_witness), "the same as the plain exit's");
-		assert_eq!((seen.slot as usize, seen.last, seen.bitmap), (valid[i].exit.slot as usize, last, state.bitmap));
+		let seen = read_exit(&tx.input[0].witness.script_witness).unwrap_or_else(|| panic!("exit {} is not read as an exit", i + 1));
+		assert_eq!((seen.slot as usize, seen.last, seen.by_operator, seen.bitmap), (valid[i].exit.slot as usize, i == N - 1, i == 1, state.bitmap));
 		state = state.after(valid[i].exit.slot);
-		if !last {
+		if i < N - 1 {
 			at = OutPoint::new(txid, 1);
 			held = tx.output[1].value.explicit().unwrap();
 		}
 		mined.push(tx);
 	}
 	let exits: Vec<(&Transaction, usize)> = mined.iter().map(|x| (x, 0)).collect();
-	let after_two = follow(acc.policy(), &exits[..2]);
-	println!("follow over exits 1 and 2: {:?}", after_two.as_ref().map(|s| s.map(|s| s.bitmap.count())));
-	assert_eq!(after_two.unwrap(), Some(acc.policy().after(valid[0].exit.slot).after(valid[1].exit.slot)));
-	assert_eq!(follow(acc.policy(), &exits).unwrap(), None, "the annexed last exit empties the batch");
+	assert_eq!(follow(acc.policy(), &exits[..2]).unwrap(), Some(acc.policy().after(valid[0].exit.slot).after(valid[1].exit.slot)));
+	assert_eq!(follow(acc.policy(), &exits).unwrap(), None, "the last exit empties the batch");
 	a.net.print();
 }
 

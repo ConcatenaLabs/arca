@@ -37,6 +37,7 @@ pub mod params;
 pub mod participations;
 pub mod plans;
 pub mod rates;
+pub mod restricted;
 pub mod rounds;
 pub mod server;
 pub mod signer;

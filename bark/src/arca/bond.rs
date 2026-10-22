@@ -399,7 +399,9 @@ impl Wallet {
 		let mut from_chain = 0usize;
 		for tx in &txs {
 			for (i, input) in tx.input.iter().enumerate() {
-				let w = &input.witness.script_witness;
+				// The items without an annex (BIP341), which the operator's
+				// signature does not cover: a spend with one is the same.
+				let w = arca_covenant::witness::without_annex(&input.witness.script_witness);
 				if w.len() != 5 {
 					continue;
 				}

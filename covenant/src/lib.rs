@@ -16,7 +16,9 @@
 //!   ([`sweep::sweep_tx`]) that takes a batch's outputs behind the token;
 //! - the leaf ([`leaf`]): the rebindable collaborative path and the exit,
 //!   or, for `htlc-1` ([`htlc`]), a claim with a preimage and a refund after a
-//!   timeout in place of the exit;
+//!   timeout in place of the exit; for `vtxo-2` ([`collab`]) the
+//!   collaborative path is the Simplicity program `arca/collab-2`, which also
+//!   binds the coin's index and the inputs its signers name;
 //! - the outputs around it: the hash-locked entry ([`entry`]), the forfeit
 //!   bound to the leaf it gives up and to its round ([`forfeit`]), the
 //!   checkpoint ([`checkpoint`]), the offboard output with the margin its
@@ -65,6 +67,10 @@
 //!   binds, and whose collaborative constant commits to that key too; and
 //!   the check that a round of a supervised asset keeps every output
 //!   explicit;
+//! - the leaf of a restricted asset ([`enclave`]): `enclave-1`, whose exit
+//!   pays only its holder's enclave, in full, whose owner key is derived from
+//!   the holder's registered key, and which carries the asset's claw leaf
+//!   where the asset elected clawback;
 //! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
 //!   without the holder, and each step's refund, which spends the coin given
 //!   up and the new leaf together by their collaborative paths and pays the
@@ -99,6 +105,7 @@ pub mod bond;
 pub mod channel;
 pub mod checkpoint;
 pub mod checks;
+pub mod collab;
 pub mod claim;
 pub mod clock;
 pub mod encode;
@@ -108,6 +115,7 @@ pub mod forfeit;
 pub mod gate;
 pub mod htlc;
 pub mod issuer;
+pub mod enclave;
 pub mod landing;
 pub mod leaf;
 pub mod limiter;
@@ -151,6 +159,7 @@ pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLea
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
 pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
+pub use enclave::{enclave_key, enclave_keypair, Enclave, EnclaveError, EnclaveTerms};
 pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
@@ -208,4 +217,8 @@ pub enum Error {
 	HtlcHasNoExit,
 	#[error("a vtxo-1 leaf has no {0} path")]
 	NotAnHtlc(&'static str),
+	#[error("a vtxo-2 pair names {0} inputs; it names 1 to {max}", max = collab::MAX_NAMED)]
+	NamedCount(usize),
+	#[error("named input {0}'s asset or amount is not explicit")]
+	NamedNotExplicit(usize),
 }

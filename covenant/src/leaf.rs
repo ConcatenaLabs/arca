@@ -50,6 +50,12 @@
 //! A `channel-1` leaf ([`crate::channel`]) holds a balance for each of owner
 //! and operator: it is the output of the channel's state 0,
 //! `[collab, [update(0), settle(0)]]`, its collaborative path this very one.
+//!
+//! A `vtxo-2` leaf ([`crate::collab`]) keeps the exit and replaces the
+//! collaborative script with the Simplicity program `arca/collab-2` and its
+//! data leaf, `[[program, data], exit]`: owner and operator sign the coin's
+//! index and the inputs they name as well as the outputs, still never the
+//! outpoint. Its salt, keys and exit are a `vtxo-1` leaf's.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -58,11 +64,13 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::channel::{ChannelPolicy, ChannelTerms};
+use crate::collab::Collab2;
 use crate::htlc::{HtlcPath, HtlcTerms};
+use crate::enclave::EnclaveTerms;
 use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
-use crate::order::{order_cmr, OrderLeafTerms, OrderPolicy};
+use crate::order::{OrderLeafTerms, OrderPolicy};
 use crate::taptree::{TapNode, TapOutput};
 use crate::time::RelativeTime;
 use crate::Error;
@@ -157,6 +165,14 @@ pub struct LeafPolicy {
 	/// `channel-1`'s terms: the leaf is the output of the channel's state 0
 	/// ([`crate::channel`]); `None` otherwise.
 	pub channel: Option<ChannelTerms>,
+	/// `enclave-1`'s terms: the exit pays only the holder's enclave, in full,
+	/// and the asset's issuer may claw the coin back where it elected to
+	/// ([`crate::enclave`]); `None` otherwise.
+	pub enclave: Option<EnclaveTerms>,
+	/// `vtxo-2`: the collaborative path is the Simplicity program
+	/// `arca/collab-2` ([`crate::collab`]) in place of the tapscript path. Only
+	/// a leaf with no `htlc`, `order` or `landing` terms is `vtxo-2`.
+	pub v2: bool,
 }
 
 impl LeafPolicy {
@@ -166,25 +182,41 @@ impl LeafPolicy {
 	}
 
 	/// What the collaborative script pushes and its message starts with:
-	/// `K`, or for `landing-1` `K ‖ P` ([`Chain::landing_prefix`]).
+	/// `K`, for `landing-1` `K ‖ P` ([`Chain::landing_prefix`]), for
+	/// `enclave-1` `K ‖ D` ([`Chain::enclave_prefix`]).
 	pub fn collab_prefix(&self) -> Vec<u8> {
-		match &self.landing {
-			Some(l) => self.chain.landing_prefix(&self.salt, &l.program),
-			None => self.leaf_constant().to_vec(),
+		match (&self.landing, &self.enclave) {
+			(Some(l), _) => self.chain.landing_prefix(&self.salt, &l.program),
+			(None, Some(e)) => self.chain.enclave_prefix(&self.salt, &e.enclave.digest()),
+			(None, None) => self.leaf_constant().to_vec(),
 		}
 	}
 
+	/// The tapscript collaborative path. A `vtxo-2` leaf's tree does not
+	/// carry it: its path is [`Self::collab2`].
 	pub fn collab_script(&self) -> Script {
 		rebindable_two_party(&self.owner, &self.operator, &self.collab_prefix())
+	}
+
+	/// The parameters of `arca/collab-2` for this leaf: what a `vtxo-2`
+	/// leaf's data leaf holds.
+	pub fn collab2(&self) -> Collab2 {
+		Collab2 { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain }
 	}
 
 	/// The exit of a `vtxo-1` leaf, or the landing of a `landing-1` leaf. An
 	/// `htlc-1` leaf has none: its tree does not carry this script.
 	pub fn exit_script(&self) -> Script {
-		match &self.landing {
-			Some(l) => l.script(&self.owner, self.exit_delay),
-			None => exit_script(&self.owner, self.exit_delay),
+		match (&self.landing, &self.enclave) {
+			(Some(l), _) => l.script(&self.owner, self.exit_delay),
+			(None, Some(e)) => e.exit_script(&self.owner, self.exit_delay),
+			(None, None) => exit_script(&self.owner, self.exit_delay),
 		}
+	}
+
+	/// The claw leaf of an `enclave-1` leaf whose asset elected clawback.
+	pub fn claw_script(&self) -> Result<Script, crate::EnclaveError> {
+		self.enclave.and_then(|e| e.enclave.claw_script()).ok_or(crate::EnclaveError::NoClawback)
 	}
 
 	/// The claim of an `htlc-1` leaf.
@@ -209,20 +241,29 @@ impl LeafPolicy {
 	}
 
 	/// `vtxo-1`: `[collab, exit]`, both at depth 1; `landing-1`: `[collab,
-	/// landing]`, the same. `htlc-1`: `[collab, [claim, refund]]`. `order-2`:
-	/// `[[collab, land], [fill, data]]` ([`crate::order`]). `channel-1`:
-	/// `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
+	/// landing]`, the same; `enclave-1`: `[collab, exit]`, or `[collab, [exit,
+	/// claw]]` where the asset elected clawback. `htlc-1`: `[collab, [claim,
+	/// refund]]`. `order-3` and `order-2`: `[[collab, land], [fill, data]]`
+	/// ([`crate::order`]), the fill the template's program.
+	/// `channel-1`: `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
+	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
+		}
+		if self.v2 {
+			return self.collab2().taproot(self.exit_script());
 		}
 		if let Some(o) = self.order_policy() {
 			return TapOutput::with_nodes(vec![
 				(2, TapNode::Tapscript(o.collab_script())),
 				(2, TapNode::Tapscript(o.landing_script())),
-				(2, TapNode::Simplicity(order_cmr())),
+				(2, TapNode::Simplicity(o.cmr())),
 				(2, TapNode::Hidden(o.data_leaf())),
 			]);
+		}
+		if let Some(claw) = self.enclave.and_then(|e| e.enclave.claw_script()) {
+			return TapOutput::new(vec![(1, self.collab_script()), (2, self.exit_script()), (2, claw)]);
 		}
 		match self.htlc {
 			None => TapOutput::new(vec![(1, self.collab_script()), (1, self.exit_script())]),
@@ -234,15 +275,19 @@ impl LeafPolicy {
 		}
 	}
 
-	/// The template it follows: `vtxo-1`, `htlc-1`, `order-2`, `landing-1`
-	/// or `channel-1`.
+	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
+	/// `order-2`), `landing-1`, `enclave-1` or `channel-1`.
 	pub fn template(&self) -> crate::Template {
 		if self.channel.is_some() {
 			crate::Template::Channel1
-		} else if self.order.is_some() {
-			crate::Template::Order2
+		} else if self.v2 {
+			crate::Template::Vtxo2
+		} else if let Some(o) = &self.order {
+			o.template()
 		} else if self.landing.is_some() {
 			crate::Template::Landing1
+		} else if self.enclave.is_some() {
+			crate::Template::Enclave1
 		} else if self.htlc.is_some() {
 			crate::Template::Htlc1
 		} else {
@@ -257,7 +302,8 @@ impl LeafPolicy {
 		})
 	}
 
-	/// The order an `order-2` leaf rests as; `None` for any other template.
+	/// The order an `order-3` or `order-2` leaf rests as; `None` for any
+	/// other template.
 	pub fn order_policy(&self) -> Option<OrderPolicy> {
 		self.order.map(|t| t.policy(self.owner, self.operator, self.salt, self.chain, self.exit_delay))
 	}
@@ -272,12 +318,23 @@ impl LeafPolicy {
 
 	/// The message owner and operator sign to spend a coin of this leaf,
 	/// holding `value_in` of `asset_in`, into `outputs` at indices `0..m`.
+	/// For a `vtxo-2` leaf it is the spend of the coin alone, at input 0 and
+	/// the only input named ([`crate::Rebindable::message_in`] names more).
 	pub fn collab_message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		if self.v2 {
+			let coin = ExplicitOutput::new(asset_in, value_in, self.script_pubkey()).txout();
+			let outs: Vec<elements::TxOut> = outputs.iter().map(|o| o.txout()).collect();
+			return self.collab2().message(0, &[coin], &outs);
+		}
 		two_party_message(&self.collab_prefix(), asset_in, value_in, outputs)
 	}
 
-	/// The full collaborative witness for `m` committed outputs.
+	/// The full collaborative witness for `m` committed outputs; for a
+	/// `vtxo-2` leaf, of the coin alone at input 0.
 	pub fn collab_witness(&self, operator_sig: &Signature, owner_sig: &Signature, m: u8) -> Vec<Vec<u8>> {
+		if self.v2 {
+			return self.collab2().witness(self.exit_script(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
+		}
 		self.taproot().witness(&self.collab_script(), two_party_items(operator_sig, owner_sig, m))
 	}
 
@@ -286,6 +343,12 @@ impl LeafPolicy {
 	/// `landing-1` leaf it is the landing's witness.
 	pub fn exit_witness(&self, owner_sig: &Signature) -> Vec<Vec<u8>> {
 		self.taproot().witness(&self.exit_script(), vec![owner_sig.as_ref().to_vec()])
+	}
+
+	/// The full claw witness of an `enclave-1` leaf: the policy key's
+	/// signature below the issuer's, each over the claw's signature hash.
+	pub fn claw_witness(&self, issuer_sig: &Signature, policy_sig: &Signature) -> Result<Vec<Vec<u8>>, crate::EnclaveError> {
+		Ok(self.taproot().witness(&self.claw_script()?, vec![policy_sig.as_ref().to_vec(), issuer_sig.as_ref().to_vec()]))
 	}
 
 	/// The full claim witness of an `htlc-1` leaf: the claimer's signature

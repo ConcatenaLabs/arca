@@ -218,7 +218,7 @@ and a board whose registration never reached the server, are not recovered.
   leaf and again when it takes the leaf, that every exit of it needs a fee coin
   in an accepted asset. Only once the round is final, and only when the operator's status
   shows exactly the leaves the wallet asked for, in order, each validated, each
-  of the template it asked for (`vtxo-1`; a resting order, `order-2`, only
+  of the template it asked for (`vtxo-1`; a resting order, `order-3`, only
   where it asked for one and on exactly its terms; `htlc-1` only for a payment
   it receives over Lightning, locked to that payment's hash), all under the
   participation's one unlock hash, and exactly the coins it gave up. The same
@@ -554,6 +554,14 @@ and a board whose registration never reached the server, are not recovered.
   (`record_held`): such a coin rests on the operator's machine alone until it
   is refreshed, since a restore of that machine can let its sender spend it
   twice.
+
+- **A spend read from the chain** (a claim that reveals a preimage, a fill
+  of an order, an exit from an accumulator batch, a collaborative spend
+  `watch-bond` reads) is read with its annex (BIP341) set aside, the last
+  witness item when it starts with `0x50`. Consensus ignores an annex, and
+  on most of these paths no signature covers it, so whoever relays or mines
+  a spend can add one; the wallet reads an annexed spend the same as the
+  plain one.
 
 ### Fees
 
@@ -941,7 +949,7 @@ hands out again after a relay restart or before it expires.
 
 ### Resting an order in the tree
 
-An order can also rest in the tree, as a leaf of its own (`order-2`), where
+An order can also rest in the tree, as a leaf of its own (`order-3`), where
 takers fill it while the wallet is away. Each fill is co-signed by the
 operator alone, and the leaf's program holds every fill to the order's terms:
 the maker's credit, a leaf of the asset the order is paid in under the next of
@@ -1515,16 +1523,21 @@ the new round. Every
 refusal is asserted by its reason.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
-accumulator batches (`[batches] accumulator_exit_rate_ppm`): five wallets
+accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets
 refresh in one round into one accumulator batch, each holding its leaf with
-one exit authorisation; one pays another out of round from its leaf; one
+one exit authorisation; one pays another out of round from its leaf; a
+wallet restored from one holder's mnemonic finds its leaf; one
 takes its leaf out (the exit, the entry, the claim), its exit and entry
 mined in a block anchored to a parent block that is then orphaned, and goes
 on once they are back; another's exit, by the authorisation it signed before,
-spends the batch output where the first left it; the payment is taken out
+spends the batch output where the first left it; one refreshes its leaf in
+a round of its own; the payment is taken out
 through the payer's leaf, its checkpoint and its reassignment; and the last
 holder, away past the expiry and the notice, finds its coin `lost` to the
-operator's sweep of the batch output where the last exit left it.
+operator's sweep of the batch output where the last exit left it. A second
+test makes an offline-refresh plan from a leaf of an accumulator batch: its
+first step runs in the leaf's free window, and the holder, back, takes up the
+step's leaf.
 
 `tests/arca_channel.rs` runs the same way: two wallets open channel leaves
 in one round, the operator funding its side of each; they pay each other,

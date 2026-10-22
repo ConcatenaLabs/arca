@@ -290,7 +290,10 @@ impl Receives {
 			}
 		}
 		let a = AssetId::from_byte_array(*asset);
-		let balance = self.wallet.balance().await.map_err(|e| ReceiveError::Malformed(format!("the operator's wallet: {}", e)))?
+		// The operator's coins in the asset, final or not (D64): what it can
+		// spend this moment leaves out every round's change until it is
+		// final, and would read the pool as a fraction of it.
+		let balance = self.wallet.holdings().await.map_err(|e| ReceiveError::Malformed(format!("the operator's wallet: {}", e)))?
 			.get(&a).copied().unwrap_or(0) as u128;
 		let pool = balance + issued;
 		let cap = pool * self.config.cap_ppm as u128 / 1_000_000;
@@ -798,14 +801,10 @@ impl Receives {
 				},
 			};
 			let Some(tx) = tx else { continue };
-			for i in tx.input.iter().filter(|i| i.previous_output == at) {
-				for w in &i.witness.script_witness {
-					if let Ok(p) = <[u8; 32]>::try_from(&w[..]) {
-						if arca_covenant::script::sha256(&p) == *hash {
-							return Ok(Some(p));
-						}
-					}
-				}
+			if let Some(p) = tx.input.iter().filter(|i| i.previous_output == at)
+				.find_map(|i| arca_covenant::witness::find_preimage(&i.witness.script_witness, hash))
+			{
+				return Ok(Some(p));
 			}
 		}
 		Ok(None)

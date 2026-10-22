@@ -140,7 +140,7 @@ impl Ctx {
 
 	fn leaf(&self) -> LeafPolicy {
 		let p = &self.output("leaf")["params"];
-		let leaf = LeafPolicy {
+		let leaf = LeafPolicy { enclave: None,
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
@@ -149,7 +149,7 @@ impl Ctx {
 			htlc: None,
 			order: None,
 			landing: None,
-			channel: None,
+			channel: None, v2: false,
 		};
 		assert_eq!(leaf.leaf_constant(), h32(&p["K"]));
 		leaf
@@ -157,13 +157,13 @@ impl Ctx {
 
 	fn board(&self) -> BoardPolicy {
 		let p = &self.output("board")["params"];
-		let leaf = LeafPolicy {
+		let leaf = LeafPolicy { enclave: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
 			order: None,
 			landing: None,
-			channel: None,
+			channel: None, v2: false,
 		};
 		assert_eq!(leaf.program(), h32(&p["leaf_program"]));
 		BoardPolicy { leaf, asset: AssetId::from_byte_array(h32(&p["asset"])), value: p["value"].as_u64().unwrap() }
@@ -204,6 +204,7 @@ impl Ctx {
 			salt: h32(&p["salt"]),
 			chain: self.chain,
 			sweep: self.sweep_of(p, false),
+			v2: false,
 		};
 		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
 		cp
@@ -219,12 +220,12 @@ impl Ctx {
 			timeout: time(&p["timeout"]),
 			operator_delay: rel(&p["operator_delay"]),
 		};
-		let h = LeafPolicy {
+		let h = LeafPolicy { enclave: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
 			order: None,
 			landing: None,
-			channel: None,
+			channel: None, v2: false,
 		};
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
 		assert_eq!(h.leaf_constant(), h32(&p["K"]));
@@ -242,10 +243,10 @@ impl Ctx {
 		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap() };
 		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy {
+		let l = LeafPolicy { enclave: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: Some(terms),
-			channel: None,
+			channel: None, v2: false,
 		};
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
 		assert_eq!(l.leaf_constant(), h32(&p["K"]), "landing-1's K is the salt's own");

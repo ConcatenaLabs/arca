@@ -3149,7 +3149,7 @@ impl Wallet {
 		// are those of the board itself, every key being 32 bytes.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let change = p2wpkh(&dummy);
-		let record = BoardRecord {
+		let record = BoardRecord { enclave: None,
 			template: Template::Board1, owner: dummy.x_only_public_key().0, owner_nonce: [1; 32], operator_nonce: [2; 32],
 			exit_delay: self.exit_delay(), asset, value, chain: self.genesis, operator: self.operator,
 			landing: None,
@@ -3190,7 +3190,7 @@ impl Wallet {
 		// A board of a supervised asset converts into a landing-1 leaf at the
 		// wallet's landing key.
 		let landing = self.landing_rule(&info, asset)?;
-		let record = BoardRecord {
+		let record = BoardRecord { enclave: None,
 			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
 			asset, value, chain: self.genesis, operator: self.operator,
 			landing,

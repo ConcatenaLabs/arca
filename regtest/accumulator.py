@@ -36,7 +36,7 @@ The leaves sit behind the entries a tree's lowest node would pay
 from arklib3 import *                      # noqa: F401,F403
 from order import be8, control_block, spk_of, tapbranch, tapdata, tapleaf, LEAF_SIMPLICITY, LEAF_TAPSCRIPT
 
-ACC_CMR = bytes.fromhex("a85d27ba922892647b3fe4435fa05e4197d1c6096a14f9f665a92574b0d2a874")
+ACC_CMR = bytes.fromhex("9b6467a1f9d787f6e93ac2422194e61fc56638db63735c6f24ba2c7a86bc0b96")
 EXIT_TAG = b"Arca/accumulator-exit"
 DEPTH = 10
 SLOTS = 1 << DEPTH

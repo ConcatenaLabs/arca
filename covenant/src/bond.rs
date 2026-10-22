@@ -9,7 +9,9 @@
 //!
 //! - the rebindable message of a collaborative path ([`crate::message`]),
 //!   `SHA256(K ‖ r)`, `K = SHA256(C ‖ salt)`, `C = SHA256("ArcaRbd1" ‖ genesis)`
-//!   (a `landing-1` leaf's `r` starts with its landing program);
+//!   (a `landing-1` leaf's `r` starts with its landing program, an
+//!   `enclave-1` leaf's with its enclave's digest; a `vtxo-2` coin's `r` is
+//!   the 70 bytes `k ‖ n ‖ I ‖ m ‖ O` of [`crate::collab`]);
 //! - an `order-2` fill ([`crate::order`]), `SHA256(F ‖ salt ‖ r)`,
 //!   `F = SHA256(SHA256("Arca/order-fill") ‖ genesis)`.
 //!
@@ -420,15 +422,17 @@ pub fn cosigned_by(coin: &crate::ValidCoin) -> Vec<Cosigned> {
 	out
 }
 
-fn cosigned_inputs(inputs: &[crate::ValidInput], outputs: &[ExplicitOutput], out: &mut Vec<Cosigned>) {
+fn cosigned_inputs(inputs: &[crate::ValidInput], outputs: &[ExplicitOutput], before: &[TxOut], out: &mut Vec<Cosigned>) {
 	use crate::Rebindable;
-	for i in inputs {
+	let mut named = before.to_vec();
+	named.extend(inputs.iter().map(|i| i.checkpoint_output().txout()));
+	for (k, i) in inputs.iter().enumerate() {
 		if let Ok(m) = i.coin.leaf.message(i.coin.asset, i.coin.value, &[i.checkpoint_output()]) {
 			if let Some(rest) = rebind_rest(&m.preimage) {
 				out.push(Cosigned { salt: i.coin.leaf.salt, signed: Signed { form: Form::Rebind, rest, signature: i.checkpoint_pair.operator } });
 			}
 		}
-		if let Ok(m) = i.checkpoint.message(i.coin.asset, i.checkpoint_value, outputs) {
+		if let Ok(m) = i.checkpoint.message_in((before.len() + k) as u32, &named, outputs) {
 			if let Some(rest) = rebind_rest(&m.preimage) {
 				out.push(Cosigned { salt: i.checkpoint.salt, signed: Signed { form: Form::Rebind, rest, signature: i.reassignment_pair.operator } });
 			}
@@ -440,14 +444,14 @@ fn cosigned_inputs(inputs: &[crate::ValidInput], outputs: &[ExplicitOutput], out
 fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 	match &coin.origin {
 		crate::ValidOrigin::Leaf { .. } | crate::ValidOrigin::Board { .. } | crate::ValidOrigin::Accumulator { .. } => {},
-		crate::ValidOrigin::Transfer { inputs, outputs, .. } => cosigned_inputs(inputs, outputs, out),
+		crate::ValidOrigin::Transfer { inputs, outputs, .. } => cosigned_inputs(inputs, outputs, &[], out),
 		crate::ValidOrigin::Fill { order, signature, inputs, outputs, .. } => {
 			let txouts: Vec<TxOut> = outputs.iter().map(|o| o.txout()).collect();
 			if let Some(rest) = order.leaf.order_policy().and_then(|p| p.fill_preimage(order.value, &txouts).ok()).and_then(|b| fill_rest(&b)) {
 				out.push(Cosigned { salt: order.leaf.salt, signed: Signed { form: Form::Fill, rest, signature: *signature } });
 			}
 			cosigned_into(order, out);
-			cosigned_inputs(inputs, outputs, out);
+			cosigned_inputs(inputs, outputs, &[order.output().txout()], out);
 		},
 	}
 }
@@ -458,18 +462,21 @@ fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 /// output it spends: the message rebuilt from the transaction and the coin,
 /// and the operator's signature, the witness's first item. `None` when the
 /// input is no such spend: its script pushes no `K` of `salt` (nor a
-/// `landing-1` leaf's `K ‖ P`), its witness is
-/// not `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
-/// explicit. The caller checks the signature ([`BondPolicy::verify`]).
+/// `landing-1` leaf's `K ‖ P`, an `enclave-1` leaf's `K ‖ D`), its witness, an annex (BIP341) set aside
+/// ([`crate::witness::without_annex`]), is not
+/// `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
+/// explicit. The caller checks the signature ([`BondPolicy::verify`]). The
+/// signatures commit to no annex, so a spend with one is the same spend.
 pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, prevout: &TxOut) -> Option<Signed> {
-	let w = &tx.input.get(input)?.witness.script_witness;
+	let w = crate::witness::without_annex(&tx.input.get(input)?.witness.script_witness);
 	if w.len() != 5 || w[0].len() != 64 || w[1].len() != 64 || w[2].len() != 1 {
 		return None;
 	}
 	let k = chain.leaf_constant(salt);
 	let script = Script::from(w[3].clone());
 	// What the script pushes for its message: `K`, or a `landing-1` leaf's
-	// `K ‖ P` ([`Chain::landing_prefix`]).
+	// `K ‖ P` ([`Chain::landing_prefix`]), or an `enclave-1` leaf's `K ‖ D`
+	// ([`Chain::enclave_prefix`]), both 52 bytes.
 	let k = script.instructions().find_map(|i| match i {
 		Ok(elements::script::Instruction::PushBytes(b))
 			if b.starts_with(&k) && (b.len() == 32 || b.len() == 32 + crate::landing::PROGRAM_BYTES) => Some(b.to_vec()),
@@ -483,6 +490,45 @@ pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input:
 	let (asset, value) = (prevout.asset.explicit()?, prevout.value.explicit()?);
 	let message = crate::message::rebind_message(&k, asset, value, &outputs).ok()?;
 	Some(Signed { form: Form::Rebind, rest: rebind_rest(&message.preimage)?, signature: Signature::from_slice(&w[0]).ok()? })
+}
+
+/// A spend by `arca/collab-2` ([`crate::collab`]), read from its witness:
+/// the salt its data leaf names, how many inputs it names and how many
+/// outputs it commits to. `None` when the witness is no such spend.
+pub fn collab2_spend(witness: &[Vec<u8>]) -> Option<([u8; 32], u8, u8)> {
+	// Read as the program sees it, past any annex (BIP341's rule): a valid
+	// spend carries none, since the program refuses one.
+	let w = crate::witness::without_annex(witness);
+	if w.len() != 4 || w[2] != crate::collab::collab_cmr() || w[0].len() != crate::collab::DATA_BYTES + 2 + 128 {
+		return None;
+	}
+	let salt: [u8; 32] = w[0][64..96].try_into().ok()?;
+	Some((salt, w[0][96], w[0][97]))
+}
+
+/// What `S` signed for input `input` of `tx`, a spend under `salt` by
+/// `arca/collab-2` (a `vtxo-2` leaf or its checkpoint) found on the chain or
+/// in a mempool, `named` the outputs its first `n` inputs spend: the message
+/// rebuilt from the transaction, and the operator's signature, the last 64
+/// bytes of the Simplicity witness. `None` when the input is no such spend
+/// under `salt`, `named` is not its first `n` inputs' outputs, or what it
+/// commits to cannot be read. The caller checks the signature
+/// ([`BondPolicy::verify`]).
+pub fn collab2_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, named: &[TxOut]) -> Option<Signed> {
+	let w = crate::witness::without_annex(&tx.input.get(input)?.witness.script_witness);
+	let (found, n, m) = collab2_spend(w)?;
+	if found != *salt || named.len() != n as usize || tx.output.len() < m as usize || m == 0 {
+		return None;
+	}
+	let mut owner = [0u8; 32];
+	owner.copy_from_slice(&w[0][..32]);
+	let mut operator = [0u8; 32];
+	operator.copy_from_slice(&w[0][32..64]);
+	let c = crate::collab::Collab2 {
+		owner: XOnlyPublicKey::from_slice(&owner).ok()?, operator: XOnlyPublicKey::from_slice(&operator).ok()?, salt: *salt, chain: *chain,
+	};
+	let message = c.message(input as u32, named, &tx.output[..m as usize]).ok()?;
+	Some(Signed { form: Form::Rebind, rest: rebind_rest(&message.preimage)?, signature: Signature::from_slice(&w[0][162..226]).ok()? })
 }
 
 #[cfg(test)]

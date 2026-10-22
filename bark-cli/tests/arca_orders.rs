@@ -19,8 +19,12 @@
 //! wallet hands out, and each taker reads the order from the relay's book,
 //! the second at the outpoint the relay re-points it to. A wallet made from the
 //! maker's mnemonic alone finds the credits at the order's key and the coin
-//! it gave up as spent. The maker comes back: `arca orders` reads both fills
-//! from the chain, and the maker boards its credits from the order's key. Its
+//! it gave up as spent. A taker on the chain then fills it a third time with
+//! no operator, its witness ending with an annex (BIP341), which nothing in
+//! the FILL leaf covers: relay policy refuses it and a block producer that
+//! takes non-standard transactions (this chain's node, started with
+//! `-acceptnonstdtxn=1`) mines it. The maker comes back: `arca orders` reads
+//! the three fills from the chain, the annexed one as any other, and the maker boards its credits from the order's key. Its
 //! REFUND is refused by the wallet and by the node before the order's expiry,
 //! and mined after it, taking the rest home.
 //!
@@ -83,7 +87,8 @@ async fn leaves_only(r: &mut Running, name: &str, asset: AssetId, paid: u64) -> 
 /// Boards all of the wallet's `held` of `asset` on the chain but the board's
 /// own fee: the amount whose board, at its fee, leaves no change.
 fn board_all(w: &Arca, asset: AssetId, held: u64) -> u64 {
-	let mut amount = held / 2;
+	// Near the whole, so the first quote already spends every coin.
+	let mut amount = held - held / 100;
 	for _ in 0..4 {
 		let q = w.ok(&["board", &asset.to_string(), &amount.to_string(), "--quote"]);
 		let fee: u64 = q["fee"]["amount"].as_str().unwrap().parse().unwrap();
@@ -249,7 +254,9 @@ async fn fill_round(r: &mut Running, takers: &[&Arca]) -> Transaction {
 async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	// X carries an offboard fee of 1,000 atoms. Both X and Y are taken for
 	// fees, each paying its own.
-	let mut r = Running::start_with(|c, x, _| {
+	// A block producer that takes non-standard transactions: the annexed
+	// fill below reaches a block through its mempool.
+	let mut r = Running::start_on(&["-acceptnonstdtxn=1"], |c, x, _| {
 		c.assets[0] = AssetSection::new(x, 1_000);
 		c.assets[0].offboard_base = Some("1000".into());
 	}).await;
@@ -391,6 +398,40 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	assert_eq!(live_of(&t1, x).iter().map(|c| c["value"].clone()).collect::<Vec<_>>(), vec![json!("400000")]);
 	assert_eq!(live_of(&t2, x).iter().map(|c| c["value"].clone()).collect::<Vec<_>>(), vec![json!("300000")]);
 
+	// A taker on the chain fills 100,000 X of what rests, no operator and no
+	// signature, an annex on the order input's witness.
+	let rest2 = OutPoint::new(r2.txid(), 1);
+	let p3 = terms.plan(300_000, 100_000).unwrap();
+	let pay = r.pay_to(common::node::op_true(), y, 1_000_000);
+	let fee = r.pay_to(common::node::op_true(), x, 100_000);
+	r.produce().await;
+	// The purse pays each at output 0.
+	let (pay_at, fee_at) = (OutPoint::new(pay.txid(), 0), OutPoint::new(fee.txid(), 0));
+	let mut fill3 = Transaction {
+		version: 2, lock_time: elements::LockTime::ZERO,
+		input: [rest2, pay_at, fee_at].iter()
+			.map(|o| elements::TxIn { previous_output: *o, sequence: elements::Sequence(0xffff_ffff), ..Default::default() }).collect(),
+		output: vec![
+			p3.credit.txout(), p3.rest.clone().unwrap().txout(),
+			ExplicitOutput::new(x, 100_000, common::node::op_true()).txout(),
+			ExplicitOutput::new(y, 1_000_000 - p3.credit.value, common::node::op_true()).txout(),
+			ExplicitOutput::new(x, 100_000 - 3_000, common::node::op_true()).txout(), elements::TxOut::new_fee(3_000, x),
+		],
+	};
+	let mut w = terms.witness();
+	w.push(vec![0x50, 0xf1, 0x11]);
+	fill3.input[0].witness.script_witness = w;
+	let r3 = r.rt.client().send_raw_transaction(&fill3).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mined = r.rt.client().raw_transaction(&r3).unwrap();
+	let w = &mined.input[0].witness.script_witness;
+	assert_eq!((w.len(), w[w.len() - 1].clone()), (3, vec![0x50, 0xf1, 0x11]), "the block carries the annex");
+	println!("a taker on the chain filled 100,000 X of the order at {}: {} ({} vB), its witness {} items, the last 50f111", rest2, r3,
+		mined.vsize(), w.len());
+	let rest3 = OutPoint::new(r3, 1);
+
 	// A wallet made from the maker's mnemonic alone: the coin given up is
 	// spent, and the credits at the order's key are on the chain.
 	let mnemonic = std::fs::read_to_string(maker.dir.join("mnemonic")).unwrap();
@@ -403,20 +444,22 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	mr.ok(&["sync"]);
 	assert!(mr.ok(&["coins"]).as_array().unwrap().iter().any(|c| c["leaf_id"] == json!(coin_id) && c["state"] == "spent"),
 		"the coin given up for the order is spent in the restored wallet");
-	assert_eq!(mr.ok(&["balance", "--without-bitcoin"])["sequentia_onchain"][y.to_string()], json!("1050000"),
+	assert_eq!(mr.ok(&["balance", "--without-bitcoin"])["sequentia_onchain"][y.to_string()], json!("1200000"),
 		"the credits at the order's key");
 
 	// The maker comes back.
 	let os = maker.ok(&["orders"]);
 	let o = &os[0];
-	assert_eq!((o["state"].as_str(), o["rests_at"].as_str(), o["holds"].as_str()), (Some("resting"), Some(format!("{}:1", r2.txid()).as_str()),
-		Some("300000")));
+	println!("OM $ arca orders\n{}", serde_json::to_string(o).unwrap());
+	assert_eq!((o["state"].as_str(), o["rests_at"].as_str(), o["holds"].as_str()), (Some("resting"), Some(format!("{}:1", r3).as_str()),
+		Some("200000")), "the order read through the annexed fill: {}", o);
 	assert_eq!(o["fills"].as_array().unwrap().iter().map(|f| (f["filled"].clone(), f["credited"].clone(), f["k"].clone()))
-		.collect::<Vec<_>>(), vec![(json!("400000"), json!("600000"), json!(0)), (json!("300000"), json!("450000"), json!(0))]);
-	assert_eq!(o["credits"].as_array().unwrap().len(), 2);
-	assert_eq!(o["relay"], terms.to_relay(&OutPoint::new(r2.txid(), 1)), "the relay's form at its new outpoint");
-	assert_eq!(maker.ok(&["balance", "--without-bitcoin"])["sequentia_onchain"][y.to_string()], json!("1050000"));
-	let boarded = board_all(&maker, y, 1_050_000);
+		.collect::<Vec<_>>(), vec![(json!("400000"), json!("600000"), json!(0)), (json!("300000"), json!("450000"), json!(0)),
+		(json!("100000"), json!("150000"), json!(0))]);
+	assert_eq!(o["credits"].as_array().unwrap().len(), 3);
+	assert_eq!(o["relay"], terms.to_relay(&rest3), "the relay's form at its new outpoint");
+	assert_eq!(maker.ok(&["balance", "--without-bitcoin"])["sequentia_onchain"][y.to_string()], json!("1200000"));
+	let boarded = board_all(&maker, y, 1_200_000);
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;
@@ -429,7 +472,7 @@ async fn a_maker_holding_only_leaves_places_an_order_two_takers_fill() {
 	// The REFUND: refused before the expiry, by the wallet and by the node.
 	maker.refused(&["order", "refund", &order], "REFUND opens once the chain's median time passes");
 	let keys = bark::arca::keys::Keys::new(mnemonic.trim(), 0, 1).unwrap();
-	let early = terms.refund_tx(OutPoint::new(r2.txid(), 1), 300_000, &[ExplicitOutput::new(x, 297_000, common::node::op_true())],
+	let early = terms.refund_tx(rest3, 200_000, &[ExplicitOutput::new(x, 197_000, common::node::op_true())],
 		&FeeSource::Reserve).unwrap();
 	assert_eq!(xonly_bytes(&keys.order(0).unwrap()), terms.maker_x, "the order's REFUND key is its order key");
 	let sg = arca_covenant::sign::sign_digest(&keys.order(0).unwrap(), &early.sighash(r.rt.client().genesis_hash().unwrap()).unwrap(), &[0; 32]);
