@@ -212,6 +212,7 @@ struct OfferChecked {
 pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
+		CoinRecord::Accumulator { record, .. } => record.schedule.expiries().first().map(|e| e.to_consensus_u32()),
 		CoinRecord::Board(_) => None,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().filter_map(first_expiry).min(),
 	}

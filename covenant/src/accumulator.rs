@@ -39,6 +39,31 @@
 //! The batch output's sweep is a tree's: no notice of its own, the token's
 //! wait at `R` after the release being the notice; every entry carries the
 //! notice from its own confirmation.
+//!
+//! # The record's binary form, version 1
+//!
+//! [`AccumulatorRecord`] is a leaf record whose path is a slot. Integers are
+//! little-endian; asset ids, the token and the genesis hash are in internal
+//! byte order. Up to the clock it is a tree leaf record's layout
+//! ([`crate::record`]):
+//!
+//! ```text
+//! u8    format version, 1
+//! u8    template, u8 template version          as a leaf record's
+//! [32]  owner key, [32] owner nonce, [32] operator nonce, u16 exit delay
+//!       the template's terms (htlc-1, order-2, landing-1) as a leaf record's
+//! [32]  asset, u64 value, [32] unlock hash, u64 entry reserve
+//! [32]  genesis hash, [32] operator key S, [32] token T, u16 notice W
+//! u8    flags: bit 0, the sweeps are burn-only
+//! u8    expiry count, 1 to 64, then each expiry as u32
+//! u16   slot, below 1,024
+//! u64   the reserve of the slot's exit
+//! 10 ×  ([32] sibling, u64 its weight), from the slot up
+//! ```
+//!
+//! Every field has one encoding, so a record has one binary form. A reader
+//! refuses another version, an unknown template, trailing bytes and a record
+//! [`AccumulatorRecord::check`] refuses.
 
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
@@ -46,15 +71,16 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxOut
 
 use crate::accumulator_programs as programs;
 use crate::checks::{check_reissue, check_round};
-use crate::clock::ClockSchedule;
+use crate::clock::{ClockSchedule, MAX_STEPS};
+use crate::encode::{DecodeError, Encoding, Reader};
 use crate::entry::EntryPolicy;
 use crate::htlc::HtlcTerms;
 use crate::landing::Landing;
 use crate::leaf::{leaf_salt, LeafPolicy};
 use crate::message::Chain;
 use crate::order::{control_block, tapbranch, tapdata, tapleaf, OrderLeafTerms};
-use crate::record::{check_template, leaf_policy, LeafId, RecordError, ReserveFloor, Template, WalletPolicy, MAX_VALUE};
-use crate::script::{sha256, ExplicitOutput};
+use crate::record::{check_template, leaf_policy, LeafId, RecordError, ReserveFloor, Template, WalletPolicy, MAX_VALUE, ORDER_TERMS_BYTES};
+use crate::script::{asset_bytes, sha256, ExplicitOutput};
 use crate::sign::verify_digest;
 use crate::spend::{assemble, FeeSource, SpendError, UnrollTx, FEE_COIN_SEQUENCE};
 use crate::sweep::{Sweep, Sweepable};
@@ -989,6 +1015,127 @@ impl AccumulatorRecord {
 		Ok(ValidAccumulatorLeaf {
 			leaf_id: self.leaf_id()?, round_txid: round.txid(), batch_vout, policy: state, total, exit,
 			leaf: self.leaf(), entry, entry_value: self.entry_value()?,
+		})
+	}
+}
+
+/// The format version of [`AccumulatorRecord`]'s binary form.
+pub const ACCUMULATOR_RECORD_VERSION: u8 = 1;
+
+impl AccumulatorRecord {
+	/// The binary form; see the [module documentation](self). Refuses a
+	/// record that [`AccumulatorRecord::check`] refuses.
+	pub fn to_bytes(&self) -> Result<Vec<u8>, AccumulatorError> {
+		self.check()?;
+		let mut w = Vec::with_capacity(320 + 40 * DEPTH);
+		w.extend([ACCUMULATOR_RECORD_VERSION, self.template.id(), self.template.version()]);
+		w.extend(self.owner.serialize());
+		w.extend(self.owner_nonce);
+		w.extend(self.operator_nonce);
+		w.extend(self.exit_delay.units().to_le_bytes());
+		if let Some(t) = &self.htlc {
+			t.encode_to(&mut w);
+		}
+		if let Some(o) = &self.order {
+			o.encode_to(&mut w);
+		}
+		if let Some(l) = &self.landing {
+			w.extend(l.program);
+			w.extend(l.allowance.to_le_bytes());
+		}
+		w.extend(asset_bytes(self.asset));
+		w.extend(self.value.to_le_bytes());
+		w.extend(self.unlock_hash);
+		w.extend(self.entry_reserve.to_le_bytes());
+		w.extend(self.chain.genesis_bytes());
+		w.extend(self.schedule.operator.serialize());
+		w.extend(asset_bytes(self.schedule.token));
+		w.extend(self.schedule.notice.units().to_le_bytes());
+		w.push(self.burn as u8);
+		w.push(self.schedule.expiries().len() as u8);
+		for e in self.schedule.expiries() {
+			w.extend(e.to_consensus_u32().to_le_bytes());
+		}
+		w.extend(self.slot.to_le_bytes());
+		w.extend(self.exit_reserve.to_le_bytes());
+		for (h, weight) in &self.path {
+			w.extend(h);
+			w.extend(weight.to_le_bytes());
+		}
+		Ok(w)
+	}
+
+	/// Reads the binary form, which must hold exactly one record.
+	pub fn from_bytes(data: &[u8]) -> Result<AccumulatorRecord, AccumulatorError> {
+		let mut r = Reader::new(data);
+		let version = r.u8().map_err(RecordError::from)?;
+		if version != ACCUMULATOR_RECORD_VERSION {
+			return Err(RecordError::Version(version as u64).into());
+		}
+		let rec = Self::read_fields(&mut r).map_err(AccumulatorError::from)?;
+		if r.remaining() != 0 {
+			return Err(RecordError::from(DecodeError::TrailingBytes(r.remaining())).into());
+		}
+		rec.check()?;
+		Ok(rec)
+	}
+
+	fn read_fields(r: &mut Reader) -> Result<AccumulatorRecord, RecordError> {
+		let template = Template::from_id(r.u8()?, r.u8()?)?;
+		let owner = r.key()?;
+		let owner_nonce = r.array32()?;
+		let operator_nonce = r.array32()?;
+		let exit_delay = r.relative_time()?;
+		let htlc = match template {
+			Template::Htlc1 => Some(HtlcTerms::decode_from(r)?),
+			_ => None,
+		};
+		let order_bytes = match template {
+			Template::Order2 => Some(r.bytes(ORDER_TERMS_BYTES)?),
+			_ => None,
+		};
+		let landing = match template {
+			Template::Landing1 => {
+				let mut program = [0u8; crate::landing::PROGRAM_BYTES];
+				program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
+				Some(Landing { program, allowance: r.u64()? })
+			},
+			_ => None,
+		};
+		let asset = r.asset()?;
+		let order = match order_bytes {
+			Some(b) => Some(OrderLeafTerms::decode_from(&mut Reader::new(b), asset)?),
+			None => None,
+		};
+		let value = r.u64()?;
+		let unlock_hash = r.array32()?;
+		let entry_reserve = r.u64()?;
+		let chain = r.chain()?;
+		let operator = r.key()?;
+		let token = r.asset()?;
+		let notice = r.relative_time()?;
+		let flags = r.u8()?;
+		if flags & !1 != 0 {
+			return Err(DecodeError::Flag(flags).into());
+		}
+		let steps = r.u8()? as usize;
+		if steps == 0 || steps > MAX_STEPS {
+			return Err(DecodeError::Count(steps as u64).into());
+		}
+		let mut expiries = Vec::with_capacity(steps);
+		for _ in 0..steps {
+			expiries.push(r.median_time()?);
+		}
+		let schedule = ClockSchedule::new_unchecked(token, operator, notice, expiries).map_err(RecordError::Schedule)?;
+		let slot = r.u16()?;
+		let exit_reserve = r.u64()?;
+		let mut path = Vec::with_capacity(DEPTH);
+		for _ in 0..DEPTH {
+			path.push((r.array32()?, r.u64()?));
+		}
+		Ok(AccumulatorRecord {
+			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, order, landing, asset, value, unlock_hash, entry_reserve,
+			chain, schedule, burn: flags & 1 != 0, slot, exit_reserve, path,
 		})
 	}
 }

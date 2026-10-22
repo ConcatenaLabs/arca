@@ -22,6 +22,13 @@ specification's sentences:
 - The exit's witness value is ROOT, OPERATOR, BITMAP, j, OWNER, SPK, VALUE,
   RESERVE, each sibling and its weight, t, then the operator's flag as one bit
   and the signature, padded to a whole byte.
+- A leaf's record (version 1) is a tree leaf record's fields up to the clock,
+  little-endian, then the slot (u16), the reserve of its exit (u64) and its
+  ten siblings with their weights (32 bytes and a u64 each); its coin record
+  (tag 6) is the record's length (u16) and bytes, the entry's preimage, the
+  owner's exit signature and its time (u32). Its leaf id is the tagged hash
+  "Arca/leaf-id" of the batch output's program, the byte 2, the slot
+  big-endian and the leaf's program.
 
 The leaves sit behind the entries a tree's lowest node would pay
 (records.Batch builds them), each slot's record naming its entry.
@@ -99,6 +106,30 @@ def exit_witness(state, j, slot, path, t, by_operator, sig):
     return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
 
 
+RECORD_VERSION = 1
+COIN_RECORD_VERSION = 1
+COIN_TAG = 6
+
+
+def encode_record(p, lf, slot, exit_reserve, path):
+    """A vtxo-1 leaf's record in an accumulator batch."""
+    import records as R
+    b = bytes([RECORD_VERSION, R.TEMPLATES["vtxo"], 1])
+    b += lf["owner"] + lf["owner_nonce"] + lf["operator_nonce"] + R.le16(lf["exit_delay"])
+    b += p["asset"] + R.le64(lf["value"]) + lf["unlock_hash"] + R.le64(p["entry_reserve"])
+    b += p["genesis"] + p["operator"] + p["token"] + R.le16(p["notice"]) + bytes([1 if p["burn"] else 0])
+    b += bytes([len(p["expiries"])]) + b"".join(R.le32(e) for e in p["expiries"])
+    b += R.le16(slot) + R.le64(exit_reserve)
+    for h, w in path:
+        b += h + R.le64(w)
+    return b
+
+
+def encode_coin(rec, preimage, sig, t):
+    import records as R
+    return bytes([COIN_RECORD_VERSION, COIN_TAG]) + R.le16(len(rec)) + rec + preimage + sig + R.le32(t)
+
+
 def generate(genesis, keys):
     """A batch of six leaves behind their entries, its state and output, and
     two exits: one by an owner, then one by the operator from the state the
@@ -148,6 +179,28 @@ def generate(genesis, keys):
     t = records.CREATED + records.DAY
     e1, s1 = exit_vector(s0, 3, keys["owner3"], False, t)
     e2, _ = exit_vector(s1, 0, keys["S"], True, t + 600)
+
+    # Each leaf's record, its coin record (the owner's exit authorisation at
+    # t) and its leaf id; and records a reader must refuse.
+    batch_prog = s0.spk()[2:]
+    held = []
+    for j, lf in enumerate(leaves):
+        rec = encode_record(p, lf, j, exit_reserve, tree.path(j))
+        pre = records.label_hash("preimage", "accumulator entry %d" % j)
+        sig = keys["owner%d" % j].sign(exit_digest(genesis, root, recs[j][0], t))
+        lprog = bytes(b.leaf_taps[j].scriptPubKey)[2:]
+        held.append({"slot": j, "preimage": pre.hex(), "auth_time": t, "auth_signature": sig.hex(),
+                     "leaf_program": lprog.hex(),
+                     "leaf_id": records.tagged_hash(records.LEAF_ID_TAG, batch_prog + bytes([2]) + j.to_bytes(2, "big") + lprog).hex(),
+                     "record": rec.hex(), "coin": encode_coin(rec, pre, sig, t).hex()})
+    good = bytes.fromhex(held[0]["record"])
+    refuse = [
+        {"why": "version 2", "record": (bytes([2]) + good[1:]).hex()},
+        {"why": "a byte past the end", "record": (good + b"\x00").hex()},
+        {"why": "slot 1,024", "record": (good[:-(2 + 8 + 400)] + records.le16(1024) + good[-(8 + 400):]).hex()},
+        {"why": "template 7", "record": (good[:1] + bytes([7]) + good[2:]).hex()},
+        {"why": "one sibling short", "record": good[:-40].hex()},
+    ]
     return {
         "genesis": genesis.hex(),
         "cmr": ACC_CMR.hex(),
@@ -172,4 +225,6 @@ def generate(genesis, keys):
         "script_pubkey": s0.spk().hex(),
         "control_block": s0.control_block().hex(),
         "exits": [e1, e2],
+        "held": held,
+        "refuse": refuse,
     }

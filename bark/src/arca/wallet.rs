@@ -448,6 +448,7 @@ pub fn reserve_floor(floor_per_kvb: Option<u64>) -> arca_covenant::ReserveFloor 
 pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 	match record {
 		CoinRecord::Leaf { .. } => "batch",
+		CoinRecord::Accumulator { .. } => "accumulator",
 		CoinRecord::Transfer(_) => "transfer",
 		CoinRecord::Board(_) => "board",
 		CoinRecord::Fill(_) => "fill",
@@ -458,6 +459,7 @@ pub(crate) fn kind_of(record: &CoinRecord) -> &'static str {
 pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 	match record {
 		CoinRecord::Leaf { record, .. } => (record.owner, record.owner_nonce),
+		CoinRecord::Accumulator { record, .. } => (record.owner, record.owner_nonce),
 		CoinRecord::Transfer(t) => (t.leaf.owner, t.leaf.owner_nonce),
 		CoinRecord::Board(b) => (b.owner, b.owner_nonce),
 		// A fill's coin: a record whose order names no order names the NUMS
@@ -470,6 +472,7 @@ pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirection> {
 	match record {
 		CoinRecord::Leaf { record, .. } => record.htlc.map(|t| t.direction),
+		CoinRecord::Accumulator { record, .. } => record.htlc.map(|t| t.direction),
 		CoinRecord::Transfer(t) => t.leaf.htlc.map(|t| t.direction),
 		CoinRecord::Board(_) | CoinRecord::Fill(_) => None,
 	}
@@ -481,6 +484,9 @@ fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> 
 	match record {
 		CoinRecord::Leaf { record, .. } => {
 			out.push(record.branch().map_err(|e| Error::Refused(e.to_string()))?.batch_output().txout());
+		},
+		CoinRecord::Accumulator { record, .. } => {
+			out.push(record.batch_output().map_err(|e| Error::Refused(e.to_string()))?.txout());
 		},
 		CoinRecord::Board(b) => out.push(b.output().txout()),
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
@@ -510,6 +516,7 @@ pub const BOARD_LIFETIME: u32 = 28 * 86_400;
 pub(crate) fn batch_profile(record: &CoinRecord) -> Option<&'static str> {
 	match record {
 		CoinRecord::Leaf { record, .. } => Some(if record.burn { "issuer-operated" } else { "open" }),
+		CoinRecord::Accumulator { record, .. } => Some(if record.burn { "issuer-operated" } else { "open" }),
 		CoinRecord::Board(_) => None,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => {
 			let all: Vec<&'static str> = record.parents().into_iter().filter_map(batch_profile).collect();
@@ -526,7 +533,7 @@ pub(crate) fn batch_profile(record: &CoinRecord) -> Option<&'static str> {
 pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
 	match record {
 		CoinRecord::Board(_) => true,
-		CoinRecord::Leaf { .. } => false,
+		CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => false,
 		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => record.parents().into_iter().any(rests_on_board),
 	}
 }
@@ -2191,7 +2198,7 @@ impl Wallet {
 		fn boards(r: &CoinRecord, out: &mut Vec<TxOut>) {
 			match r {
 				CoinRecord::Board(b) => out.push(b.output().txout()),
-				CoinRecord::Leaf { .. } => {},
+				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
 			}
 		}

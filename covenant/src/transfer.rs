@@ -66,7 +66,9 @@
 //! A [`CoinRecord`] is what the holder of a coin keeps: for a leaf of a batch,
 //! its [`LeafRecord`] with the preimage of its entry and its owner's unroll
 //! authorisations for every node on its path, so that anyone holding the record
-//! can bring it on-chain; for a board, its [`BoardRecord`] (the board is
+//! can bring it on-chain; for a leaf of an accumulator batch
+//! ([`crate::accumulator`]), its [`AccumulatorRecord`] with the preimage and its
+//! owner's exit authorisation, to the same end; for a board, its [`BoardRecord`] (the board is
 //! on-chain already); for a coin a reassignment created, the reassignment's
 //! inputs (each a coin record in turn, with its checkpoint's value and both
 //! pairs), the committed outputs, the coin's index among them, and the coin's
@@ -134,6 +136,10 @@
 //!              its owner's unroll authorisation for each node, from the batch output down
 //!   u8  2, a board:
 //!         u16  length L, then L bytes: its BoardRecord, binary form
+//!   u8  6, a leaf of an accumulator batch:
+//!         u16  length L, then L bytes: its AccumulatorRecord, binary form
+//!         [32] the preimage of its entry's unlock hash
+//!         [64] signature, u32 time: its owner's exit authorisation
 //!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, or 5 one
 //!       whose leaf is landing-1:
 //!         u8   input count, 1 to 16, then per input:
@@ -170,6 +176,7 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, LockTime, OutPoint, Script, Transaction, TxOut};
 
+use crate::accumulator::{AccumulatorError, AccumulatorRecord, ExitAuth, ValidAccumulatorLeaf};
 use crate::board::{BoardPolicy, BoardRecord, ValidBoard};
 use crate::checkpoint::CheckpointPolicy;
 use crate::clock::ClockSchedule;
@@ -280,6 +287,15 @@ pub enum CoinRecord {
 	Board(BoardRecord),
 	/// An output of an in-tree fill of a resting order.
 	Fill(Box<FillCoin>),
+	/// A leaf of an accumulator batch ([`crate::accumulator`]).
+	Accumulator {
+		record: AccumulatorRecord,
+		/// The preimage of the entry's unlock hash.
+		preimage: [u8; 32],
+		/// The owner's authorisation to take the leaf's slot out of the batch:
+		/// its signature over the exit digest for the time, and the time.
+		auth: (Signature, MedianTime),
+	},
 }
 
 /// An in-tree fill of a resting order ([`crate::order`]): the order's coin,
@@ -384,6 +400,8 @@ pub enum TransferError {
 	#[error(transparent)]
 	Record(#[from] RecordError),
 	#[error(transparent)]
+	Accumulator(#[from] AccumulatorError),
+	#[error(transparent)]
 	Spend(#[from] SpendError),
 	#[error("unknown coin record format version {0}")]
 	Version(u8),
@@ -459,6 +477,8 @@ impl TransferError {
 			Decode(_) | Version(_) | Tag(_) | TooDeep | Inputs(_) | Outputs(_) | Index { .. } => "decode",
 			Landing(_) => "landing",
 			Record(e) => e.kind(),
+			Accumulator(AccumulatorError::Record(e)) => e.kind(),
+			Accumulator(_) => "accumulator",
 			Spend(_) => "spend",
 			DepthLimit { .. } => "depth",
 			RoundMissing => "round",
@@ -515,6 +535,14 @@ pub enum ValidOrigin {
 	/// signature, the taker's inputs, the outputs and the coin's index.
 	Fill { order: Box<ValidCoin>, signature: Signature, partial: bool, inputs: Vec<ValidInput>, outputs: Vec<ExplicitOutput>,
 		index: usize },
+	/// A leaf of an accumulator batch, checked against its round.
+	Accumulator {
+		valid: ValidAccumulatorLeaf,
+		preimage: [u8; 32],
+		/// The owner's exit authorisation, ready for
+		/// [`ValidAccumulatorLeaf::exit_tx`].
+		auth: ExitAuth,
+	},
 }
 
 /// One checked input of a reassignment.
@@ -579,7 +607,7 @@ impl ValidCoin {
 				out.push(LineageOutput { kind: LineageKind::Leaf, output: order.output() });
 				inputs
 			},
-			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } => return,
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Accumulator { .. } => return,
 		};
 		for i in inputs {
 			i.coin.lineage_into(out);
@@ -596,7 +624,7 @@ impl ValidCoin {
 			ValidOrigin::Board { valid, .. } => vec![valid.outpoint()],
 			ValidOrigin::Transfer { inputs, .. } => inputs.iter().flat_map(|i| i.coin.boards()).collect(),
 			ValidOrigin::Fill { order, inputs, .. } => order.boards().into_iter().chain(inputs.iter().flat_map(|i| i.coin.boards())).collect(),
-			ValidOrigin::Leaf { .. } => vec![],
+			ValidOrigin::Leaf { .. } | ValidOrigin::Accumulator { .. } => vec![],
 		}
 	}
 
@@ -650,7 +678,8 @@ impl ValidCoin {
 	pub fn reassignment_tx(&self, checkpoints: &[OutPoint], fee: &FeeSource) -> Result<UnrollTx, TransferError> {
 		let (inputs, outputs) = match &self.origin {
 			ValidOrigin::Transfer { inputs, outputs, .. } => (inputs, outputs),
-			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Fill { .. } => return Err(TransferError::NotATransfer),
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Fill { .. } | ValidOrigin::Accumulator { .. } =>
+				return Err(TransferError::NotATransfer),
 		};
 		reassignment_tx(inputs, outputs, checkpoints, fee)
 	}
@@ -999,7 +1028,7 @@ impl CoinRecord {
 	/// or a board, which rest on the chain's own transactions.
 	pub fn parents(&self) -> Vec<&CoinRecord> {
 		match self {
-			CoinRecord::Leaf { .. } | CoinRecord::Board(_) => vec![],
+			CoinRecord::Leaf { .. } | CoinRecord::Board(_) | CoinRecord::Accumulator { .. } => vec![],
 			CoinRecord::Transfer(t) => t.inputs.iter().map(|i| &i.coin).collect(),
 			CoinRecord::Fill(f) => std::iter::once(&f.fill.order).chain(f.fill.inputs.iter().map(|i| &i.coin)).collect(),
 		}
@@ -1011,6 +1040,7 @@ impl CoinRecord {
 	pub fn order_policy(&self) -> Option<crate::OrderPolicy> {
 		match self {
 			CoinRecord::Leaf { record, .. } => record.leaf().order_policy(),
+			CoinRecord::Accumulator { record, .. } => record.leaf().order_policy(),
 			CoinRecord::Fill(f) if matches!(f.leaf, FillLeaf::Rest { .. }) => f.fill.order.order_policy().map(|o| o.next()),
 			_ => None,
 		}
@@ -1024,6 +1054,7 @@ impl CoinRecord {
 	pub fn landing(&self) -> Option<LandingTerms> {
 		match self {
 			CoinRecord::Leaf { record, .. } => record.leaf().landing,
+			CoinRecord::Accumulator { record, .. } => record.leaf().landing,
 			CoinRecord::Board(b) => b.leaf().landing,
 			CoinRecord::Transfer(t) => t.leaf.landing,
 			CoinRecord::Fill(_) => None,
@@ -1036,6 +1067,7 @@ impl CoinRecord {
 	pub fn owner(&self) -> Option<(XOnlyPublicKey, [u8; 32])> {
 		match self {
 			CoinRecord::Leaf { record, .. } => Some((record.owner, record.owner_nonce)),
+			CoinRecord::Accumulator { record, .. } => Some((record.owner, record.owner_nonce)),
 			CoinRecord::Transfer(t) => Some((t.leaf.owner, t.leaf.owner_nonce)),
 			CoinRecord::Board(b) => Some((b.owner, b.owner_nonce)),
 			CoinRecord::Fill(f) => match &f.leaf {
@@ -1058,6 +1090,7 @@ impl CoinRecord {
 	{
 		let (key, nonce, delay) = match self {
 			CoinRecord::Leaf { record, .. } => (record.owner, Some(record.owner_nonce), record.exit_delay),
+			CoinRecord::Accumulator { record, .. } => (record.owner, Some(record.owner_nonce), record.exit_delay),
 			CoinRecord::Transfer(t) => (t.leaf.owner, Some(t.leaf.owner_nonce), t.leaf.exit_delay),
 			CoinRecord::Board(b) => (b.owner, Some(b.owner_nonce), b.exit_delay),
 			// A fill's credit and remainder have their keys from the order's
@@ -1138,6 +1171,28 @@ impl CoinRecord {
 					id, leaf, asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
 					expiry: record.schedule.expiries()[0], hops: 0,
 					origin: ValidOrigin::Leaf { valid, preimage: *preimage, auths: unroll },
+				})
+			},
+			CoinRecord::Accumulator { record, preimage, auth } => {
+				let out = record.batch_output()?;
+				let round = rounds.iter()
+					.find(|r| r.output.iter().any(|o| ExplicitOutput::from_txout(o).as_ref() == Some(&out)))
+					.ok_or(TransferError::RoundMissing)?;
+				let valid = record.validate_round(round, policy)?;
+				if sha256(preimage) != record.unlock_hash {
+					return Err(TransferError::Preimage);
+				}
+				let (signature, time) = *auth;
+				if !verify_digest(&signature, &valid.exit_digest(time), &record.owner) {
+					return Err(TransferError::AuthSignature(0));
+				}
+				if time.to_consensus_u32() > policy.now.to_consensus_u32() {
+					return Err(TransferError::AuthTime(0));
+				}
+				Ok(ValidCoin {
+					id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
+					sweep: record.schedule.sweep(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
+					origin: ValidOrigin::Accumulator { valid, preimage: *preimage, auth: ExitAuth { by_operator: false, time, signature } },
 				})
 			},
 			CoinRecord::Board(record) => {
@@ -1312,6 +1367,16 @@ impl CoinRecord {
 					w.extend(t.to_consensus_u32().to_le_bytes());
 				}
 			},
+			CoinRecord::Accumulator { record, preimage, auth } => {
+				w.push(6);
+				let b = record.to_bytes()?;
+				let len = u16::try_from(b.len()).map_err(|_| DecodeError::Count(b.len() as u64))?;
+				w.extend(len.to_le_bytes());
+				w.extend(b);
+				w.extend(preimage);
+				w.extend(auth.0.as_ref());
+				w.extend(auth.1.to_consensus_u32().to_le_bytes());
+			},
 			CoinRecord::Board(record) => {
 				w.push(2);
 				let b = record.to_bytes()?;
@@ -1446,6 +1511,13 @@ impl CoinRecord {
 			2 => {
 				let len = r.u16()? as usize;
 				Ok(CoinRecord::Board(BoardRecord::from_bytes(r.bytes(len)?)?))
+			},
+			6 => {
+				let len = r.u16()? as usize;
+				let record = AccumulatorRecord::from_bytes(r.bytes(len)?)?;
+				let preimage = r.array32()?;
+				let s = Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?;
+				Ok(CoinRecord::Accumulator { record, preimage, auth: (s, r.median_time()?) })
 			},
 			4 => {
 				let order = CoinRecord::read(r, depth + 1)?;

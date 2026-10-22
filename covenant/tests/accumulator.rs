@@ -164,6 +164,26 @@ fn accumulator_batch_on_regtest() {
 	let t0 = mt(a.net.mtp() - 1);
 	let auths: Vec<ExitAuth> = (0..LEAVES).map(|i| auth(valid[i].exit_digest(t0), &owners[i], false, t0)).collect();
 
+	// The coin a holder keeps: the record, the preimage and its exit
+	// authorisation, through its binary form; refused with another preimage,
+	// a stranger's authorisation or one not yet good.
+	let coin = |i: usize, pre: [u8; 32], au: &ExitAuth| CoinRecord::Accumulator {
+		record: acc.record(i), preimage: pre, auth: (au.signature, au.time),
+	};
+	let held = CoinRecord::from_bytes(&coin(700, preimages[700], &auths[700]).to_bytes().unwrap()).unwrap();
+	let vc = held.validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]), &specs[700].owner_nonce).unwrap();
+	assert_eq!(vc.id, valid[700].leaf_id);
+	assert!(matches!(&vc.origin, ValidOrigin::Accumulator { auth, .. } if *auth == auths[700]));
+	assert_eq!(coin(700, preimages[699], &auths[700]).validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]),
+		&specs[700].owner_nonce).unwrap_err(), TransferError::Preimage);
+	assert_eq!(coin(700, preimages[700], &auths[699]).validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]),
+		&specs[700].owner_nonce).unwrap_err(), TransferError::AuthSignature(0));
+	let later = mt(a.net.mtp() + 3600);
+	assert_eq!(coin(700, preimages[700], &auth(valid[700].exit_digest(later), &owners[700], false, later))
+		.validate(std::slice::from_ref(&round), &policy, &xonly(&owners[700]), &specs[700].owner_nonce).unwrap_err(),
+		TransferError::AuthTime(0));
+	println!("slot 700's coin record resolves to its leaf; another preimage, another owner's authorisation and one not yet good are refused");
+
 	// --- Exit 1: slot 341 by its owner -----------------------------------
 	let x1 = RawExit::new(&state0, batch0, acc.total(), &valid[341].exit, &valid[341].entry_output(), auths[341]);
 	let built = valid[341].exit_tx(&state0, batch0, acc.total(), &auths[341], &FeeSource::Reserve).unwrap();
