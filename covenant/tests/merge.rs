@@ -168,11 +168,11 @@ fn two_payments_to_one_request_make_two_leaves() {
 	// the creator nonce of the leaf it creates.
 	let r = keypair("merge 1 receiver");
 	let request = (xonly(&r), label32("merge 1 receive request nonce"));
-	let leaf = |i: usize| NewLeaf {
+	let leaf = |i: usize| NewLeaf { enclave: None,
 		owner: request.0, owner_nonce: request.1, creator_nonce: label32(&format!("merge 1 sender {} creator nonce", i)),
 		exit_delay: delay(),
 		htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	let v = LEAF - 2 * MARGIN;
 	let mut seen = SeenReassignments::new();
@@ -243,11 +243,11 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 	let v = LEAF - 2 * MARGIN;
 	let chain = c.net.chain;
 	let r = keypair("merge 2 receiver");
-	let new_leaf = |owner: &Keypair, label: &str| NewLeaf {
+	let new_leaf = |owner: &Keypair, label: &str| NewLeaf { enclave: None,
 		owner: xonly(owner), owner_nonce: label32(&format!("merge 2 {} owner nonce", label)),
 		creator_nonce: label32(&format!("merge 2 {} creator nonce", label)), exit_delay: delay(),
 		htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	// Sender 1's wallet repeats the creator nonce of sender 0's leaf.
 	let same = new_leaf(&r, "receive request");
@@ -364,11 +364,11 @@ fn a_leaf_rebuilt_under_a_spent_salt_follows_the_old_pairs() {
 
 	// Sender 0 pays R; R pays its coin on to D, signing pairs over its leaf.
 	let r = keypair("merge 3 receiver");
-	let leaf = NewLeaf {
+	let leaf = NewLeaf { enclave: None,
 		owner: xonly(&r), owner_nonce: label32("merge 3 receive request nonce"),
 		creator_nonce: label32("merge 3 sender 0 creator nonce"), exit_delay: delay(),
 		htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	let out = ExplicitOutput::new(c.net.x, v, leaf.policy(xonly(&s), chain).script_pubkey());
 	let (_, rec0) = pay(&sd[0], &s, vec![out.clone()], 0, leaf);

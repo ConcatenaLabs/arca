@@ -46,13 +46,13 @@ impl BatchKind {
 	/// [`prefer_accumulator`] says it is cheaper for that many exits, it holds
 	/// them all, and every leaf is one an accumulator record carries (no
 	/// `channel-1`) and one the operator never brings on the chain by a path
-	/// of its own (no `order-2`, which it lands for an absent maker), and the
+	/// of its own (no `order-3` or `order-2`, which it lands for an absent maker), and the
 	/// batch's sweep is not burn-only (an issuer-operated asset's batches are
 	/// rebuilt by the mint's signer, which builds trees). Otherwise a tree.
 	pub fn choose(leaves: &[LeafSpec], radix: usize, exit_rate_ppm: Option<u32>, burn: bool) -> BatchKind {
 		let Some(ppm) = exit_rate_ppm else { return BatchKind::Tree };
 		let n = leaves.len();
-		if burn || n > SLOTS || leaves.iter().any(|l| matches!(l.template, Template::Order2 | Template::Channel1) || l.channel.is_some()) {
+		if burn || n > SLOTS || leaves.iter().any(|l| matches!(l.template, Template::Order2 | Template::Order3 | Template::Channel1) || l.channel.is_some()) {
 			return BatchKind::Tree;
 		}
 		let exits = n as f64 * ppm as f64 / 1_000_000.0;

@@ -44,6 +44,11 @@ impl CsfsMessage {
 		let digest = sha256(&preimage);
 		CsfsMessage { preimage, digest }
 	}
+
+	/// The message whose bytes are `preimage`.
+	pub(crate) fn from_preimage(preimage: Vec<u8>) -> CsfsMessage {
+		CsfsMessage::new(preimage)
+	}
 }
 
 /// The chain a policy is bound to, named by its genesis block hash.
@@ -93,6 +98,18 @@ impl Chain {
 	pub fn landing_prefix(&self, salt: &[u8; 32], program: &[u8; crate::landing::PROGRAM_BYTES]) -> Vec<u8> {
 		let mut b = self.leaf_constant(salt).to_vec();
 		b.extend(program);
+		b
+	}
+
+	/// What an `enclave-1` leaf's collaborative script pushes where another
+	/// leaf's pushes `K`: `K ‖ D`, `D` the 20-byte digest of the holder's
+	/// enclave ([`crate::enclave::Enclave::digest`]). It has a `landing-1`
+	/// constant's shape, 52 bytes, and its message is
+	/// `SHA256(K ‖ D ‖ asset_in ‖ …)`, so a pair made for one holder's
+	/// enclave spends only a leaf that exits there.
+	pub fn enclave_prefix(&self, salt: &[u8; 32], digest: &[u8; crate::enclave::DIGEST_BYTES]) -> Vec<u8> {
+		let mut b = self.leaf_constant(salt).to_vec();
+		b.extend(digest);
 		b
 	}
 

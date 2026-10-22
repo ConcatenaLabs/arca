@@ -57,12 +57,13 @@ fn the_wallets_digests_are_the_servers() {
 	let a = AssetId::from_slice(&[0x28; 32]).unwrap();
 	let d = RelativeTime::from_units(253).unwrap();
 	let ids = [LeafId([1; 32]), LeafId([2; 32])];
-	// A resting order's leaf (`order-2`): its id covers its terms too.
+	// A resting order's leaf (`order-3`): its id covers its terms too.
 	let order = arca_covenant::OrderLeafTerms {
 		landed: arca_covenant::order::SeqdexOrder {
 			terms: arca_covenant::order::OrderTerms { asset_a: a, asset_b: AssetId::from_slice(&[0x29; 32]).unwrap(), rate_num: 3,
 				rate_den: 2, min_lot: 1_000 },
 			maker: [0x2a; 32], expiry: 1_800_000_000, refund_key: key("refund").x_only_public_key().0,
+			version: arca_covenant::order::SeqdexVersion::V2,
 		},
 		credits: [1, 2, 3, 4].map(|i| key(&format!("credit {}", i)).x_only_public_key().0.serialize()),
 	};
@@ -72,7 +73,7 @@ fn the_wallets_digests_are_the_servers() {
 	for (fees, nb, template, terms, land) in [
 		(vec![], None, Template::Vtxo1, None, None),
 		(vec![(a, 17u64)], Some(MedianTime::from_consensus(1_800_000_000).unwrap()), Template::Vtxo1, None, None),
-		(vec![], None, Template::Order2, Some(order), None),
+		(vec![], None, Template::Order3, Some(order), None),
 		(vec![], None, Template::Landing1, None, Some(landing)),
 	] {
 		let mine = participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template, owner: k,
@@ -86,7 +87,7 @@ fn the_wallets_digests_are_the_servers() {
 	}
 	let mut other = order;
 	other.credits[3] = key("another credit").x_only_public_key().0.serialize();
-	assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Order2, owner: k,
+	assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Order3, owner: k,
 		owner_nonce: [3; 32], exit_delay: d, order: Some(other), landing: None, channel: None }], &[], None), ids_seen[2], "an order's credit keys are bound");
 	for other in [arca_covenant::Landing { program: [0x2c; 20], ..landing }, arca_covenant::Landing { allowance: 301, ..landing }] {
 		assert_ne!(participation_id(&chain, &s, &ids, &[Wanted::Leaf { asset: a, value: 5_000, template: Template::Landing1, owner: k,

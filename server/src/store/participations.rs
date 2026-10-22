@@ -97,7 +97,8 @@ pub enum WantedKind {
 	Leaf {
 		template: String, owner_key: [u8; 32], owner_nonce: [u8; 32], exit_delay_units: u16, operator_nonce: [u8; 32],
 		htlc: Option<arca_covenant::HtlcTerms>,
-		/// `order-2`'s terms, for a resting order.
+		/// An order's terms (`order-3`, or `order-2` from before it), for a
+		/// resting order.
 		order: Option<arca_covenant::OrderLeafTerms>,
 		/// `landing-1`'s landing, for a leaf of a supervised asset.
 		landing: Option<arca_covenant::Landing>,
@@ -357,9 +358,13 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 				order: match r.get::<_, Option<Vec<u8>>>(13) {
 					Some(b) => {
 						let asset = elements::AssetId::from_byte_array(array32(r.get(1), "asset")?);
+						let template: arca_covenant::Template = r.get::<_, &str>(3).parse()
+							.map_err(|e| StoreError::Corrupt(format!("an output's template: {}", e)))?;
+						let version = arca_covenant::order::SeqdexVersion::of(template)
+							.ok_or_else(|| StoreError::Corrupt(format!("order terms on an output of template {}", template)))?;
 						let mut rd = arca_covenant::encode::Reader::new(&b);
-						Some(arca_covenant::OrderLeafTerms::decode_from(&mut rd, asset)
-							.map_err(|e| StoreError::Corrupt(format!("an output's order-2 terms: {}", e)))?)
+						Some(arca_covenant::OrderLeafTerms::decode_from(&mut rd, asset, version)
+							.map_err(|e| StoreError::Corrupt(format!("an output's order terms: {}", e)))?)
 					},
 					None => None,
 				},

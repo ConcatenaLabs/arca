@@ -11,9 +11,10 @@
 //! exit_delay_units   512-second units
 //! htlc               htlc-1 only: {"direction": "send" or "receive", "payment_hash": hex,
 //!                    "timeout": median time, "operator_delay_units": 512-second units}
-//! order              order-2 only: {"asset_b": hex, display order, "rate_num", "rate_den",
-//!                    "min_lot": decimal strings, "maker": hex, "expiry": median time,
-//!                    "refund_key": hex, "credits": [4 × hex, zero once used]}
+//! order              order-3 and order-2 only: {"asset_b": hex, display order, "rate_num",
+//!                    "rate_den", "min_lot": decimal strings, "maker": hex, "expiry": median
+//!                    time, "refund_key": hex, "credits": [4 × hex, zero once used]}, and
+//!                    for order-3 "version": 3 (absent for order-2)
 //! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
 //! channel            channel-1 only: {"capacity": decimal string, "window_units": 512-second units}
 //! asset              hex, display order
@@ -58,7 +59,7 @@ use crate::gate::{MemberProof, MAX_DEPTH};
 use crate::htlc::{HtlcDirection, HtlcTerms};
 use crate::channel::Channel;
 use crate::landing::{Landing, PROGRAM_BYTES};
-use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder};
+use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder, SeqdexVersion};
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
 use crate::record::{
@@ -173,7 +174,7 @@ impl LeafRecord {
 		if named == Some(Template::Htlc1) {
 			fields.push("htlc");
 		}
-		if named == Some(Template::Order2) {
+		if matches!(named, Some(Template::Order2 | Template::Order3)) {
 			fields.push("order");
 		}
 		if named == Some(Template::Landing1) {
@@ -313,10 +314,34 @@ pub fn channel_from_json(v: &Value) -> Result<Channel, RecordError> {
 	Ok(Channel { capacity, window })
 }
 
+/// An `enclave-1` leaf's enclave as the record's JSON form and the server's
+/// interface write it: `{"holder": hex, "policy": hex, "clawback": hex or null}`.
+pub fn enclave_json(e: &crate::enclave::Enclave) -> Value {
+	let mut m = Map::new();
+	m.insert("holder".into(), Value::String(hex(&e.holder.serialize())));
+	m.insert("policy".into(), Value::String(hex(&e.policy.serialize())));
+	m.insert("clawback".into(), e.clawback.map_or(Value::Null, |k| Value::String(hex(&k.serialize()))));
+	Value::Object(m)
+}
+
+/// Reads [`enclave_json`].
+pub fn enclave_from_json(v: &Value) -> Result<crate::enclave::Enclave, RecordError> {
+	let o = object(v, "enclave", &["holder", "policy", "clawback"])?;
+	let holder = key(o, "holder")?;
+	let policy = key(o, "policy")?;
+	let clawback = match &o["clawback"] {
+		Value::Null => None,
+		_ => Some(key(o, "clawback")?),
+	};
+	Ok(crate::enclave::Enclave { holder, policy, clawback })
+}
+
 /// `v` as an object with exactly the keys `keys`.
-/// `order-2`'s terms as the record's JSON form and the server's interface
+/// An order leaf's terms as the record's JSON form and the server's interface
 /// write them: the asset it is paid in, the price and lot, the landed order's
-/// maker script hash, REFUND time and key, and the four credit keys.
+/// maker script hash, REFUND time and key, the four credit keys, and for an
+/// `order-3` leaf `"version": 3`. An `order-2` leaf's terms have no
+/// `version`, so they read as they always have.
 pub fn order_terms_json(o: &OrderLeafTerms) -> Value {
 	let t = &o.landed.terms;
 	let mut m = Map::new();
@@ -328,19 +353,36 @@ pub fn order_terms_json(o: &OrderLeafTerms) -> Value {
 	m.insert("expiry".into(), o.landed.expiry.into());
 	m.insert("refund_key".into(), Value::String(hex(&o.landed.refund_key.serialize())));
 	m.insert("credits".into(), Value::Array(o.credits.iter().map(|c| Value::String(hex(c))).collect()));
+	if o.template() == Template::Order3 {
+		m.insert("version".into(), 3.into());
+	}
 	Value::Object(m)
 }
 
-/// Reads [`order_terms_json`] for a leaf holding `asset_a`.
+/// Reads [`order_terms_json`] for a leaf holding `asset_a`: `order-3`'s with
+/// `"version": 3`, `order-2`'s without one. Any other version is refused.
 pub fn order_terms_from_json(v: &Value, asset_a: AssetId) -> Result<OrderLeafTerms, RecordError> {
-	let o = object(v, "order", &["asset_b", "rate_num", "rate_den", "min_lot", "maker", "expiry", "refund_key", "credits"])?;
+	let mut keys = vec!["asset_b", "rate_num", "rate_den", "min_lot", "maker", "expiry", "refund_key", "credits"];
+	let versioned = v.as_object().is_some_and(|m| m.contains_key("version"));
+	if versioned {
+		keys.push("version");
+	}
+	let o = object(v, "order", &keys)?;
+	let version = if versioned {
+		match o.get("version").and_then(|n| n.as_u64()) {
+			Some(3) => SeqdexVersion::V2,
+			_ => return Err(RecordError::Type("order.version: 3, or absent for order-2".into())),
+		}
+	} else {
+		SeqdexVersion::V1
+	};
 	let credits = array(o, "credits", crate::order::CREDIT_KEYS)?;
 	if credits.len() != crate::order::CREDIT_KEYS {
 		return Err(RecordError::Type("order.credits".into()));
 	}
-	let mut keys = [[0u8; 32]; crate::order::CREDIT_KEYS];
+	let mut credit_keys = [[0u8; 32]; crate::order::CREDIT_KEYS];
 	for (i, c) in credits.iter().enumerate() {
-		keys[i] = c.as_str().and_then(hex32).ok_or_else(|| RecordError::Hex("order.credits".into()))?;
+		credit_keys[i] = c.as_str().and_then(hex32).ok_or_else(|| RecordError::Hex("order.credits".into()))?;
 	}
 	Ok(OrderLeafTerms {
 		landed: SeqdexOrder {
@@ -354,8 +396,9 @@ pub fn order_terms_from_json(v: &Value, asset_a: AssetId) -> Result<OrderLeafTer
 			maker: bytes32(o, "maker")?,
 			expiry: int(o, "expiry", u32::MAX as u64)? as u32,
 			refund_key: key(o, "refund_key")?,
+			version,
 		},
-		credits: keys,
+		credits: credit_keys,
 	})
 }
 

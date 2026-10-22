@@ -205,11 +205,11 @@ pub fn one_hop(prev: &CoinRecord, coin: &ValidCoin, owner: &Keypair, s: &Keypair
 /// and owner nonce it publishes, and the creator nonce the sender draws.
 pub fn party(label: &str, d: RelativeTime) -> (Keypair, NewLeaf) {
 	let k = keypair(&format!("party {} key", label));
-	let leaf = NewLeaf {
+	let leaf = NewLeaf { enclave: None,
 		owner: xonly(&k), owner_nonce: label32(&format!("party {} owner nonce", label)),
 		creator_nonce: label32(&format!("party {} creator nonce", label)), exit_delay: d,
 		htlc: None,
-		landing: None,
+		landing: None, v2: false,
 	};
 	(k, leaf)
 }
@@ -225,14 +225,14 @@ pub fn inputs(coin: &ValidCoin) -> Vec<ValidInput> {
 /// A leaf funded straight on-chain, standing for an old leaf being given
 /// up, and its id in the board form.
 pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, value: u64) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy {
+	let leaf = LeafPolicy { enclave: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),
 		htlc: None,
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let coin = net.fund(vec![explicit(net.x, value, leaf.script_pubkey())]).remove(0);
 	let p = leaf.program();

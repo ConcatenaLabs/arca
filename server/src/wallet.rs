@@ -304,6 +304,21 @@ impl Wallet {
 		Ok(b)
 	}
 
+	/// The operator's coins, per asset: every unspent coin whose transaction
+	/// is in a block of the active chain, final or not. A round's change is
+	/// the operator's from the block it is in, though the wallet spends it
+	/// only once it is final ([`Wallet::balance`]); the pool a cap is a share
+	/// of (D64) counts it from then.
+	pub async fn holdings(&self) -> Result<BTreeMap<AssetId, u64>, WalletError> {
+		let mut b = BTreeMap::new();
+		for c in self.store.wallet_coins(None).await? {
+			if c.in_chain && c.spent_by.is_none() {
+				*b.entry(AssetId::from_byte_array(c.asset)).or_insert(0) += c.value;
+			}
+		}
+		Ok(b)
+	}
+
 	/// The fee for `vsize` vbytes in `asset`'s own atoms, from the node's relay
 	/// floor and its rate for `asset` now; the asset must be accepted.
 	async fn fee_for(&self, asset: AssetId, vsize: u64) -> Result<u64, WalletError> {

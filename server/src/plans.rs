@@ -140,6 +140,8 @@ pub enum PlanError {
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
 	#[error(transparent)]
+	Restricted(#[from] crate::restricted::RestrictedError),
+	#[error(transparent)]
 	Coin(CoinError),
 	#[error("{0}")]
 	BadSignature(String),
@@ -186,6 +188,7 @@ impl PlanError {
 			Rate(_) => "rate_stale",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
+			Restricted(e) => e.code(),
 			Store(StoreError::KeyReused) => "key_reused",
 			Store(StoreError::SaltReused(_)) => "salt",
 			Store(StoreError::NonceUnknown) => "nonce_unknown",
@@ -341,12 +344,13 @@ impl Plans {
 	}
 
 	/// The coin a plan may start from: it passes what a refresh's coins pass
-	/// now, is a `vtxo-1` leaf of a round, and the signer holds nothing under
-	/// its salt; with its first expiry.
+	/// now, is a `vtxo-1` leaf of a round (of a tree or an accumulator
+	/// batch), and the signer holds nothing under its salt; with its first
+	/// expiry.
 	async fn first_coin(&self, coin: &LeafId, holder: &[u8; 32], now: MedianTime) -> Result<coins::Checked, PlanError> {
 		let policy = self.params.participation_policy(now);
 		let c = coins::check_plain(&self.store, &policy, coin, holder, coins::BoardDates::Within(Params::PARTICIPATION_HORIZON)).await?;
-		if !matches!(c.record, CoinRecord::Leaf { .. }) || c.coin.leaf.htlc.is_some() {
+		if !matches!(c.record, CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. }) || c.coin.leaf.htlc.is_some() {
 			return Err(PlanError::OutOfBounds(format!("coin {} is not a vtxo-1 leaf of a round: a plan starts from a coin of a round, \
 				so refresh a board or a received coin in a round first", coin)));
 		}
@@ -397,6 +401,7 @@ impl Plans {
 		let now = self.now().await?;
 		let digest = quote_digest(&self.params.chain, &self.params.operator, &req.coin, &req.owner_nonces, req.exit_delay);
 		let c = self.first_coin(&req.coin, &digest, now).await?;
+		vtxo1_only(&c.coin)?;
 		if !verify_digest(&req.attestation, &digest, &c.coin.leaf.owner) {
 			return Err(PlanError::BadSignature("the attestation is not the coin's owner's signature over the quote request".into()));
 		}
@@ -436,6 +441,7 @@ impl Plans {
 	/// on-chain script, not its landing.
 	async fn supervised_coin(&self, coin: &LeafId) -> Result<(), PlanError> {
 		crate::supervision::gate(&self.store, &self.finality, &self.params, std::slice::from_ref(coin)).await?;
+		crate::restricted::gate(&self.store, &self.params, std::slice::from_ref(coin), "a plan of offline refresh").await?;
 		if let Some(row) = self.store.leaf(&coin.0).await? {
 			let asset = AssetId::from_byte_array(row.asset);
 			if self.params.supervised(&asset).is_some() {
@@ -465,6 +471,7 @@ impl Plans {
 		let first_record = CoinRecord::from_bytes(&row.record).map_err(|e| PlanError::Coin(CoinError::InvalidCoin { leaf: req.coin, error: e }))?;
 		let first = match &first_record {
 			CoinRecord::Leaf { record, .. } => record.leaf(),
+			CoinRecord::Accumulator { record, .. } => record.leaf(),
 			_ => return Err(PlanError::OutOfBounds(format!("coin {} is not a vtxo-1 leaf of a round", req.coin))),
 		};
 		let plan = Plan {
@@ -477,6 +484,7 @@ impl Plans {
 		}
 		plan.check().map_err(PlanError::Plan)?;
 		let c = self.first_coin(&req.coin, &id, now).await?;
+		vtxo1_only(&c.coin)?;
 		if c.coin.leaf != first {
 			return Err(PlanError::Internal("the coin's record gives another leaf".into()));
 		}
@@ -906,6 +914,18 @@ pub async fn blocks_participation(store: &Store, leaf: &[u8; 32], participation:
 	Ok(None)
 }
 
+/// A plan's coin is spent by the tapscript collaborative path: each step's
+/// refund spends the coin and its new leaf in one transaction, and a
+/// `vtxo-2` pair names the inputs it is spent beside, which the refund the
+/// holder signs does not. A `vtxo-2` coin is refreshed by its holder.
+fn vtxo1_only(coin: &arca_covenant::ValidCoin) -> Result<(), PlanError> {
+	if coin.leaf.v2 {
+		return Err(PlanError::OutOfBounds(format!("coin {} is vtxo-2: offline refresh plans vtxo-1 coins, as a step's refund spends \
+			the coin beside its new leaf, which a vtxo-2 pair names; its holder refreshes it", coin.id)));
+	}
+	Ok(())
+}
+
 /// The participation of its holder's that holds the coin `row`, when it is
 /// spent by one that is no plan's step: the coin is then the holder's to give
 /// up in that participation's round, and no step runs from it.
@@ -951,12 +971,12 @@ pub async fn release_given_up(store: &Store) -> Result<usize, StoreError> {
 /// The covenant plan a stored plan is, rebuilt from what the server keeps.
 pub fn plan_of(row: &PlanRow, params: &Params) -> Result<Plan, String> {
 	let key = |b: &[u8; 32]| XOnlyPublicKey::from_slice(b).map_err(|e| e.to_string());
-	let first = LeafPolicy {
+	let first = LeafPolicy { enclave: None,
 		owner: key(&row.first_owner)?, operator: params.operator, salt: row.first_salt, chain: params.chain,
 		exit_delay: RelativeTime::from_units(row.first_delay).map_err(|e| e.to_string())?, htlc: None,
 		order: None,
 		landing: None,
-		channel: None,
+		channel: None, v2: false,
 	};
 	let mut steps = Vec::with_capacity(row.steps.len());
 	for s in &row.steps {
