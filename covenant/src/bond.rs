@@ -398,6 +398,59 @@ impl BondPolicy {
 	}
 }
 
+/// A message `S` signed under a salt, as a holder or a watcher keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Cosigned {
+	pub salt: [u8; 32],
+	pub signed: Signed,
+}
+
+/// Every message `S` co-signed that `coin` rests on, down its whole lineage:
+/// for each input of each reassignment, the spend of its coin into its
+/// checkpoint (under the coin's salt) and of the checkpoint into the
+/// reassignment's outputs (under the checkpoint's salt); for an in-tree fill,
+/// the fill itself (under the order coin's salt) and its taker inputs' two
+/// each. A round's leaf and a board rest on no such message. What a holder
+/// hands a watcher: one of these beside another message `S` signed under the
+/// same salt is a slash ([`BondPolicy::check`]).
+pub fn cosigned_by(coin: &crate::ValidCoin) -> Vec<Cosigned> {
+	let mut out = vec![];
+	cosigned_into(coin, &mut out);
+	out
+}
+
+fn cosigned_inputs(inputs: &[crate::ValidInput], outputs: &[ExplicitOutput], out: &mut Vec<Cosigned>) {
+	use crate::Rebindable;
+	for i in inputs {
+		if let Ok(m) = i.coin.leaf.message(i.coin.asset, i.coin.value, &[i.checkpoint_output()]) {
+			if let Some(rest) = rebind_rest(&m.preimage) {
+				out.push(Cosigned { salt: i.coin.leaf.salt, signed: Signed { form: Form::Rebind, rest, signature: i.checkpoint_pair.operator } });
+			}
+		}
+		if let Ok(m) = i.checkpoint.message(i.coin.asset, i.checkpoint_value, outputs) {
+			if let Some(rest) = rebind_rest(&m.preimage) {
+				out.push(Cosigned { salt: i.checkpoint.salt, signed: Signed { form: Form::Rebind, rest, signature: i.reassignment_pair.operator } });
+			}
+		}
+		cosigned_into(&i.coin, out);
+	}
+}
+
+fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
+	match &coin.origin {
+		crate::ValidOrigin::Leaf { .. } | crate::ValidOrigin::Board { .. } => {},
+		crate::ValidOrigin::Transfer { inputs, outputs, .. } => cosigned_inputs(inputs, outputs, out),
+		crate::ValidOrigin::Fill { order, signature, inputs, outputs, .. } => {
+			let txouts: Vec<TxOut> = outputs.iter().map(|o| o.txout()).collect();
+			if let Some(rest) = order.leaf.order_policy().and_then(|p| p.fill_preimage(order.value, &txouts).ok()).and_then(|b| fill_rest(&b)) {
+				out.push(Cosigned { salt: order.leaf.salt, signed: Signed { form: Form::Fill, rest, signature: *signature } });
+			}
+			cosigned_into(order, out);
+			cosigned_inputs(inputs, outputs, out);
+		},
+	}
+}
+
 /// What `S` signed for input `input` of `tx`, a collaborative spend of a
 /// coin under `salt` (a leaf, a checkpoint, a board, `htlc-1` or `order-2`'s
 /// collaborative path) found on the chain or in a mempool, `prevout` the
