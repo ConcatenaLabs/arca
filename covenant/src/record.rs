@@ -205,13 +205,18 @@ pub enum Template {
 	/// replaced by a newer state both sign and settled after the exit delay
 	/// ([`crate::channel`]).
 	Channel1,
+	/// `enclave-1`, the leaf of a restricted asset: its exit pays only its
+	/// holder's enclave, in full, and it carries the asset's claw leaf where
+	/// the asset elected clawback ([`crate::enclave`]). It rests on a board or
+	/// comes from a reassignment; no batch holds it.
+	Enclave1,
 }
 
 impl Template {
 	/// Every template this crate knows, in the order of their ids: the
 	/// operator's published list (`info.templates`).
-	pub const ALL: [Template; 6] =
-		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1, Template::Channel1];
+	pub const ALL: [Template; 7] = [Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1,
+		Template::Enclave1, Template::Channel1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -223,6 +228,8 @@ impl Template {
 	pub const ORDER: u8 = 4;
 	/// The template id of `landing`.
 	pub const LANDING: u8 = 5;
+	/// The template id of `enclave`.
+	pub const ENCLAVE: u8 = 6;
 	/// The template id of `channel`.
 	pub const CHANNEL: u8 = 7;
 
@@ -235,13 +242,14 @@ impl Template {
 			Template::Order2 => Template::ORDER,
 			Template::Landing1 => Template::LANDING,
 			Template::Channel1 => Template::CHANNEL,
+			Template::Enclave1 => Template::ENCLAVE,
 		}
 	}
 
 	/// Its version.
 	pub fn version(self) -> u8 {
 		match self {
-			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Channel1 => 1,
+			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Enclave1 | Template::Channel1 => 1,
 			Template::Order2 => 2,
 		}
 	}
@@ -255,6 +263,7 @@ impl Template {
 			Template::Order2 => "order",
 			Template::Landing1 => "landing",
 			Template::Channel1 => "channel",
+			Template::Enclave1 => "enclave",
 		}
 	}
 
@@ -267,12 +276,14 @@ impl Template {
 			(Template::ORDER, 2) => Ok(Template::Order2),
 			(Template::LANDING, 1) => Ok(Template::Landing1),
 			(Template::CHANNEL, 1) => Ok(Template::Channel1),
+			(Template::ENCLAVE, 1) => Ok(Template::Enclave1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
 			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
 			(Template::HTLC, v) => Err(RecordError::TemplateVersion { template: "htlc".into(), version: v as u64 }),
 			(Template::ORDER, v) => Err(RecordError::TemplateVersion { template: "order".into(), version: v as u64 }),
 			(Template::LANDING, v) => Err(RecordError::TemplateVersion { template: "landing".into(), version: v as u64 }),
 			(Template::CHANNEL, v) => Err(RecordError::TemplateVersion { template: "channel".into(), version: v as u64 }),
+			(Template::ENCLAVE, v) => Err(RecordError::TemplateVersion { template: "enclave".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -302,6 +313,7 @@ impl FromStr for Template {
 			"order" => Template::Order2,
 			"landing" => Template::Landing1,
 			"channel" => Template::Channel1,
+			"enclave" => Template::Enclave1,
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
@@ -506,6 +518,8 @@ pub enum RecordError {
 	Landing(crate::landing::LandingError),
 	#[error("the channel-1 terms: {0}")]
 	Channel(ChannelError),
+	#[error("the enclave-1 terms: {0}")]
+	Enclave(crate::enclave::EnclaveError),
 	#[error("not JSON: {0}")]
 	Json(String),
 	#[error("JSON field {0}: missing, unknown or misplaced")]
@@ -556,6 +570,7 @@ impl RecordError {
 			Htlc(_) => "htlc",
 			Landing(_) => "landing",
 			Channel(_) => "channel",
+			Enclave(_) => "enclave",
 			Order(_) => "order",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
@@ -601,6 +616,8 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 		(Template::Htlc1, None, ..) => return Err(RecordError::Template("htlc-1 without its terms".into())),
 		(Template::Order2, _, None, _) => return Err(RecordError::Template("order-2 without its terms".into())),
 		(Template::Landing1, _, _, None) => return Err(RecordError::Template("landing-1 without its terms".into())),
+		(Template::Enclave1, ..) => return Err(RecordError::Template(
+			"enclave-1 in a batch: a leaf of a restricted asset rests on its board or comes from a reassignment".into())),
 		(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
 		(t, ..) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
 	}
@@ -616,6 +633,8 @@ pub(crate) fn leaf_policy(template_terms: (&Option<HtlcTerms>, &Option<OrderLeaf
 	let (htlc, order, landing) = template_terms;
 	LeafPolicy {
 		owner, operator, salt, chain, exit_delay,
+		// No batch holds an enclave-1 leaf (check_template).
+		enclave: None,
 		htlc: *htlc,
 		order: *order,
 		// check_template() refuses an allowance not below the value; built

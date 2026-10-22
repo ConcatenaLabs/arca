@@ -26,7 +26,7 @@ pub fn exit_delay() -> RelativeTime {
 pub fn board_record(owner: &Keypair, operator_nonce: [u8; 32], asset: AssetId, value: u64, chain: Chain,
 	operator: elements::secp256k1_zkp::XOnlyPublicKey) -> BoardRecord
 {
-	BoardRecord {
+	BoardRecord { enclave: None,
 		template: Template::Board1,
 		owner: xonly(owner),
 		owner_nonce: random32(),
@@ -165,7 +165,7 @@ pub struct Held {
 /// fresh for this leaf.
 pub fn new_leaf(key: &Keypair) -> (NewLeaf, [u8; 32]) {
 	let nonce = random32();
-	(NewLeaf { owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
+	(NewLeaf { enclave: None, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
 }
 
 /// Resolves `held` under `policy` against `bases`, as its owner would before
