@@ -250,6 +250,11 @@ wallet crate compiles Bark's gRPC protocol).
 The package is `pkg/leaf_wallet.js` with `pkg/leaf_wallet_bg.wasm`. The web
 wallet carries a copy in its `leaves/pkg/`.
 
+`.cargo/config.toml` builds libsecp256k1 with its 32-bit-limb field
+(`USE_FORCE_WIDEMUL_INT64`): wasm32 has no 64-by-64-bit multiply, and the
+64-bit-limb field spends most of a coin's check in that multiply's emulation.
+Both are libsecp256k1's own field implementations.
+
 ## Testing against an operator
 
 `bark-cli/tests/arca_operator_for_browsers.rs` keeps a whole Arca server running
