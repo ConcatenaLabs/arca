@@ -122,7 +122,23 @@ jobs:
         run: cargo test --locked -p arca-server --test lightning_legs --test lightning_pay --test lightning_receive --test lightning_internal -- --nocapture
 
       # The wallet's scenario runs the operator's signer as its own process.
+      # The server's log goes with the test's output, its Lightning legs in
+      # full, so a payment that stalls says where.
       - name: The wallet's scenario
+        env:
+          RUST_LOG: warn,server::lightning=info
+          ARCA_KEEP_LIGHTNING: "1"
         run: |
           cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
           cargo test --locked -p arca-cli --test arca_lightning --test arca_lightning_hash --test arca_lightning_commands -- --nocapture
+
+      # The SeqLN nodes the wallet's scenario kept, each one's log ending.
+      - name: The Lightning nodes' logs
+        if: failure()
+        run: |
+          for f in target/tmp/cln*/log; do echo "=== $f"; tail -n 80 "$f"; done
+
+      # Kept only to be read above: none goes into the build cache.
+      - name: Drop the kept nodes
+        if: always()
+        run: rm -rf target/tmp/cln*
