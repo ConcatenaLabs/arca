@@ -83,7 +83,7 @@ fn the_builder_rebuilds_every_record_vector() {
 				window: RelativeTime::from_units(c["window_units"].as_u64().unwrap() as u16).unwrap(),
 			});
 			LeafSpec {
-				template: if order.is_some() { Template::Order2 } else if htlc.is_some() { Template::Htlc1 }
+				template: if let Some(o) = &order { o.template() } else if htlc.is_some() { Template::Htlc1 }
 					else if landing.is_some() { Template::Landing1 } else if channel.is_some() { Template::Channel1 }
 					else if l.get("template") == Some(&serde_json::json!("vtxo-2")) { Template::Vtxo2 } else { Template::Vtxo1 },
 				owner: key_of(&l["owner"]),

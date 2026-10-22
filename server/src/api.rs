@@ -1332,7 +1332,7 @@ pub struct ServedWantedLeaf {
 	/// An `htlc-1` leaf's terms (a payment received over Lightning).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
-	/// An `order-2` leaf's terms, a resting order.
+	/// An order leaf's terms (`order-3`, or `order-2`), a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
 	/// A `landing-1` leaf's landing, a leaf of a supervised asset.
@@ -1445,7 +1445,7 @@ pub struct WantedLeaf {
 	pub mailbox: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mailbox_proof: Option<String>,
-	/// `order-2`'s terms, for a resting order (template `order-2`), in the
+	/// An order's terms, for a resting order (template `order-3`), in the
 	/// leaf record's JSON form of them (`arca_covenant::record_json::order_terms_json`):
 	/// covered by the participation's id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1989,7 +1989,7 @@ pub struct TreeLeaf {
 	/// An `htlc-1` leaf's terms (a payment received over Lightning).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
-	/// An `order-2` leaf's terms, a resting order.
+	/// An order leaf's terms (`order-3`, or `order-2`), a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
 	/// A `landing-1` leaf's landing (`{"program", "allowance"}`): where its
