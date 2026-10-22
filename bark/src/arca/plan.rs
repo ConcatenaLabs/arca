@@ -48,12 +48,12 @@ use elements::{AssetId, Script, Txid};
 use serde_json::{json, Value};
 
 use arca_covenant::plan::{key_proof_digest, Plan, PlanStep, MAX_STEPS};
-use arca_covenant::{CoinRecord, LeafId, LeafRecord, MedianTime, RelativeTime, WalletPolicy};
+use arca_covenant::{CoinRecord, LeafId, MedianTime, RelativeTime, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::mailbox_binding_digest;
 use super::keys::{p2wpkh, RECEIVE};
-use super::round::{fee_within, FREE_WINDOW};
+use super::round::{fee_within, LeafTerms, NewRecord, FREE_WINDOW};
 use super::store::CoinRow;
 use super::wallet::{amount, sign, Wallet};
 use super::{random32, Error, DEFAULT_MAX_FEE_PPM};
@@ -271,7 +271,8 @@ impl Wallet {
 				continue;
 			}
 			// A supervised asset's leaf (`landing-1`) is not planned: its
-			// operator runs no plans for it, and `sync` refreshes it.
+			// operator runs no plans for it, and `sync` refreshes it. Nor is
+			// a leaf of an accumulator batch.
 			match CoinRecord::from_bytes(&c.record) {
 				Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.order.is_none() && record.landing.is_none() => out.push(c),
 				_ => {},
@@ -365,7 +366,8 @@ impl Wallet {
 	fn make_plan(&mut self, c: &CoinRow, steps: usize, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let record = match CoinRecord::from_bytes(&c.record).map_err(|e| Error::Store(e.to_string()))? {
 			CoinRecord::Leaf { record, .. } => record,
-			_ => return Err(Error::Refused(format!("coin {} is not a leaf of a round", c.leaf_id))),
+			_ => return Err(Error::Refused(format!("coin {} is not a leaf of a round's tree: a plan starts from a tree's leaf (an accumulator \
+				batch's leaf is refreshed by sync)", c.leaf_id))),
 		};
 		let key = self.coin_key(&c.owner_nonce)?;
 		let mailbox = self.keys.mailbox()?;
@@ -886,7 +888,7 @@ impl Wallet {
 		let nonce = unhex32(want["owner_nonce"].as_str().unwrap_or(""))?;
 		let key = self.keys.leaf(&nonce)?;
 		let preimage = self.plan_preimage(&nonce)?;
-		let record = LeafRecord::from_bytes(&unhex(s["record"].as_str().unwrap_or(""))?)
+		let record = NewRecord::from_bytes(&unhex(s["record"].as_str().unwrap_or(""))?)
 			.map_err(|e| Error::Refused(format!("the record the operator serves for step {}: {}", j + 1, e)))?;
 		let round_txid = Txid::from_str(s["round_txid"].as_str().unwrap_or("")).map_err(|e| Error::Parse(e.to_string()))?;
 		let finality = self.chain.finality(&round_txid)?;
@@ -896,7 +898,7 @@ impl Wallet {
 		}
 		let round = self.chain.transaction(&round_txid)?.ok_or_else(|| Error::Node(format!("the node does not have round {}", round_txid)))?;
 		let now = self.now()?;
-		let first = record.schedule.expiries()[0].to_consensus_u32();
+		let first = record.first_expiry();
 		let policy = self.followed_policy(first, now);
 		let valid = record.validate(&round, &policy, &key.x_only_public_key().0, &nonce)
 			.map_err(|e| Error::Refused(format!("step {}'s leaf does not check out: {}", j + 1, e)))?;
@@ -904,13 +906,13 @@ impl Wallet {
 		super::round::check_profile(&info, &record).map_err(|why| Error::Refused(format!("step {}'s leaf: {}", j + 1, why)))?;
 		super::round::leaf_as_asked(&json!({}), &record, None).map_err(|why| Error::Refused(format!("step {}'s leaf: {}", j + 1, why)))?;
 		let named = |k: &str| want[k].as_str().map(|v| v.to_string());
-		if Some(hex(&record.operator_nonce)) != named("operator_nonce") || Some(record.value.to_string()) != named("value")
-			|| Some(hex(&record.unlock_hash)) != named("unlock_hash") || record.exit_delay.units() as u64 != want["exit_delay_units"].as_u64().unwrap_or(0)
-			|| record.asset.to_string() != body["asset"].as_str().unwrap_or("") || record.htlc.is_some()
+		if Some(hex(&record.operator_nonce())) != named("operator_nonce") || Some(record.value().to_string()) != named("value")
+			|| Some(hex(&record.unlock_hash())) != named("unlock_hash") || record.exit_delay().units() as u64 != want["exit_delay_units"].as_u64().unwrap_or(0)
+			|| record.asset().to_string() != body["asset"].as_str().unwrap_or("") || record.htlc().is_some()
 		{
 			return Err(Error::Refused(format!("step {}'s leaf is not the leaf the plan names", j + 1)));
 		}
-		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash {
+		if sha256::Hash::hash(&preimage).to_byte_array() != record.unlock_hash() {
 			return Err(Error::Refused(format!("step {}'s preimage does not open its leaf's entry", j + 1)));
 		}
 		// When the step ran: no earlier than the start of the free window of
@@ -922,18 +924,17 @@ impl Wallet {
 		let before_expiry = if j == 0 { body["expiry"].as_u64().unwrap_or(0) as u32 } else { body["steps"][j - 1]["expiry"].as_u64().unwrap_or(0) as u32 };
 		let early = before_expiry > 0 && as_of < before_expiry.saturating_sub(STEP_FROM);
 		let t = MedianTime::from_consensus(as_of.min(now.to_consensus_u32())).map_err(|e| Error::Parse(e.to_string()))?;
-		let auths: Vec<(elements::secp256k1_zkp::schnorr::Signature, MedianTime)> =
-			valid.branch.nodes.iter().map(|n| (sign(&key, &n.unroll_authorisation(t).digest), t)).collect();
+		let auths = valid.sign_auths(&key, t);
 		// The operator holds the full record of the leaf the wallet keeps: the
 		// last step done. A leaf a later step gave up again is the operator's
 		// to answer with that step's refund, whose record it built itself.
 		let kept_on = s_next_done(body, j);
 		if !kept_on {
-			self.server.post("plan_leaf", &json!({"leaf_id": valid.leaf_id.to_string(), "auths": auths.iter().map(|(sg, t)|
+			self.server.post("plan_leaf", &json!({"leaf_id": valid.leaf_id().to_string(), "auths": auths.iter().map(|(sg, t)|
 				json!({"signature": hex(sg.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))?;
 		}
-		let coin = CoinRecord::Leaf { record: record.clone(), preimage, auths };
-		let a = self.assess(&coin, &policy, Some((&record.owner, &nonce)))?;
+		let coin = record.coin(preimage, auths)?;
+		let a = self.assess(&coin, &policy, Some((&record.owner(), &nonce)))?;
 		let state = if a.all_final() { "live" } else { "pending" };
 		let note = format!("made by step {} of plan {}: given up in a round before it is paid out of round", j + 1, id);
 		let row = self.row(&coin, &a, state, &note)?;
@@ -954,7 +955,7 @@ impl Wallet {
 			}
 			st.update_plan_body(id, &kept.to_string())
 		})?;
-		let mut v = json!({"step": j + 1, "leaf_id": leaf, "gave_up": gave_up, "round": round_txid.to_string(), "value": record.value.to_string(),
+		let mut v = json!({"step": j + 1, "leaf_id": leaf, "gave_up": gave_up, "round": round_txid.to_string(), "value": record.value().to_string(),
 			"expiry": first});
 		if early {
 			v["note"] = json!(format!("the operator ran this step at median time {}, before the free window of the coin it gave up (from {}): \

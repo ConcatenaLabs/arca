@@ -1154,6 +1154,8 @@ impl Wallet {
 	{
 		let steps = match &coin.origin {
 			arca_covenant::ValidOrigin::Leaf { valid, .. } => valid.branch.nodes.len() as u64 + 2,
+			// The exit from the batch, the entry and the claim.
+			arca_covenant::ValidOrigin::Accumulator { .. } => 3,
 			_ => 2,
 		};
 		let confirmed = match bases.iter().filter_map(|(_, f)| f.height()).min() {

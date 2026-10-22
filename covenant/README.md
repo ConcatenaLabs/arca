@@ -336,7 +336,8 @@ operator's signature, then `OP_INSPECTINPUTISSUANCE` on its own input requiring
 a new issuance with a zero contract hash of exactly one explicit atom and no
 reissuance token. So nobody, the operator included, can spend it without issuing
 `M`, which would strand every claim of the round. The owner signs only a
-forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`), which
+forfeit built by `Forfeit::for_refresh` (or `Forfeit::for_offboard`; for a new
+leaf of an accumulator batch, `ValidAccumulatorLeaf::forfeit_for`), which
 takes `h` from the new leaf it validated and `M` from that round, and refuses a
 round other than the one the leaf was validated against, an output `c` that is
 not the operator's connector, and an old leaf under another operator.
@@ -391,7 +392,8 @@ that confirmed is disconnected with that round and cannot return without it.
 Owners who refreshed in different rounds each name their own; owners of one
 round share one input. The operator reuses one atom of each `M` across that
 round's claims and reclaims, paying it back to itself each time. A wallet signs
-only a release built by `Release::for_refresh` (or `Release::for_offboard`),
+only a release built by `Release::for_refresh` (or `Release::for_offboard`;
+`Release::for_accumulator_refresh` for a new leaf of an accumulator batch),
 which takes `H` from the old leaf it holds and `M` from the round its new leaf
 was validated against, and refuses another round, an output that is not the
 operator's connector and an old leaf under another operator; it signs once it

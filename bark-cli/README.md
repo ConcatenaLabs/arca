@@ -195,18 +195,24 @@ and a board whose registration never reached the server, are not recovered.
 
 ### What it checks
 
-- **A leaf from a round** is rebuilt from the tree the operator publishes and
-  validated against the round transaction under the wallet's policy before the
-  wallet signs anything for it. A tree that lists a node, a leaf's id or
-  script other than its parts build, or a preimage that does not open its
+- **A leaf from a round** is rebuilt from the batch the operator publishes,
+  of the kind it names (a tree, or an accumulator batch: one output from
+  which each leaf leaves in one transaction), and validated against the round
+  transaction under the wallet's policy before the wallet signs anything for
+  it. A batch that lists a node (an accumulator batch lists none), a leaf's id
+  or script other than its parts build, or a preimage that does not open its
   leaf's unlock hash, is refused before anything else is looked at. Then: the five checks on the sweep token and its
   clock, the batch output paid exactly once, the notice, a first expiry at
   least 27 days after the median time of the round's block (so a refresh
   completed a day or two after its round, as the operator allows until the
   coin's exit date, takes the same leaf), the exit delay within the wallet's
   bounds, the depth,
-  and reserves on every node and on the entry of at least four times the
-  node's relay floor in the leaf's asset, so the leaf pays its own way out.
+  and reserves on every node (an accumulator batch: on the slot's exit) and on
+  the entry of at least four times the node's relay floor in the leaf's
+  asset, so the leaf pays its own way out. The wallet hands the operator its
+  authorisations to take the leaf out, signed when it takes the leaf: one per
+  node of a tree's branch, or one exit from an accumulator batch, which names
+  no state of the batch and so stays good whoever leaves before it.
   Where the node does not accept the asset for fees, one atom is the rule (the
   operator's own), and the wallet says, when it gives up a coin for such a
   leaf and again when it takes the leaf, that every exit of it needs a fee coin
@@ -1367,7 +1373,7 @@ asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
-| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf, a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
+| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit left it, followed from the round through each exit's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
 | `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
@@ -1444,6 +1450,18 @@ each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
 refusal is asserted by its reason.
+
+`tests/arca_accumulator.rs` runs the same way, its operator building
+accumulator batches (`[batches] accumulator_exit_rate_ppm`): five wallets
+refresh in one round into one accumulator batch, each holding its leaf with
+one exit authorisation; one pays another out of round from its leaf; one
+takes its leaf out (the exit, the entry, the claim), its exit and entry
+mined in a block anchored to a parent block that is then orphaned, and goes
+on once they are back; another's exit, by the authorisation it signed before,
+spends the batch output where the first left it; the payment is taken out
+through the payer's leaf, its checkpoint and its reassignment; and the last
+holder, away past the expiry and the notice, finds its coin `lost` to the
+operator's sweep of the batch output where the last exit left it.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when
