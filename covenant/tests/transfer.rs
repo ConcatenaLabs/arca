@@ -670,3 +670,49 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::HtlcDelays { .. }))), "{}", e);
 	assert!(matches!(CoinRecord::from_bytes(&rec.to_bytes().unwrap()), Err(TransferError::Decode(_))));
 }
+
+#[test]
+fn a_coin_carries_every_message_the_operator_signed_down_its_lineage() {
+	use arca_covenant::bond::{self, cosigned_by, rebind_signed_in, BondPolicy};
+	let f = fx();
+	let d = &f.hops.d;
+	let coin = f.hops.d_record.validate(&f.rounds, &f.policy, &d.leaf.owner, &d.leaf.owner_nonce).unwrap();
+	let s = xonly(&f.b.s);
+	let p = BondPolicy::new(f.policy.chain, s, xonly(&keypair("bond W")), RelativeTime::from_units(5_232).unwrap()).unwrap();
+	let all = cosigned_by(&coin);
+	// Three hops: one input, then two (the swap), then one; each input's
+	// coin into its checkpoint and the checkpoint into the outputs.
+	assert_eq!(all.len(), 2 * (1 + 2 + 1));
+	for c in &all {
+		assert!(p.verify(&c.salt, &c.signed), "S's signature under salt {:?}", c.salt);
+	}
+	let salts: std::collections::BTreeSet<[u8; 32]> = all.iter().map(|c| c.salt).collect();
+	assert_eq!(salts.len(), all.len(), "each message under a salt of its own");
+	// A round's leaf carries none.
+	let a = f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap();
+	assert!(cosigned_by(&a).is_empty());
+	// What the chain shows of each checkpoint and reassignment that brings
+	// D's coin home is the message D's record carries, under the same salt.
+	let mut txs = vec![];
+	bring(&coin, &mut txs);
+	let mut seen = 0;
+	for (_, u) in &txs {
+		for (k, prev) in u.prevouts.iter().enumerate() {
+			for c in &all {
+				if let Some(found) = rebind_signed_in(&f.policy.chain, &c.salt, &u.tx, k, prev) {
+					assert_eq!(found, c.signed, "the chain's message under salt {:?}", c.salt);
+					seen += 1;
+				}
+			}
+		}
+	}
+	assert_eq!(seen, all.len(), "every co-signed spend is read back from its transaction");
+	// Beside a second message S signed under one of those salts, it is a
+	// slash; beside itself, signed again, it is not.
+	let other = bond::digest(&p.chain, bond::Form::Rebind, &all[0].salt, &[7; 75]);
+	let second = bond::Signed { form: bond::Form::Rebind, rest: vec![7; 75], signature: sig(&f.b.s, &other) };
+	assert_eq!(p.check(&bond::Evidence { salt: all[0].salt, a: all[0].signed.clone(), b: second }), Ok(()));
+	let again = bond::Signed { signature: arca_covenant::sign::sign_digest(&f.b.s, &p.digest_of(&all[0].salt, &all[0].signed), &[9; 32]),
+		..all[0].signed.clone() };
+	assert_eq!(p.check(&bond::Evidence { salt: all[0].salt, a: all[0].signed.clone(), b: again }), Err(BondError::SameDigest));
+}

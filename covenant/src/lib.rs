@@ -121,7 +121,7 @@ pub mod unroll;
 pub mod witness;
 
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
-pub use bond::{BondError, BondPolicy, BondState, Evidence, Form, Signed};
+pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};
