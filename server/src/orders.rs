@@ -39,12 +39,16 @@
 //!   its fee as a transfer's does.
 //!
 //! The fill is recorded (a transfer of the taker's coins, the order coin spent
-//! by it, and its row) before anything is signed; the signer co-signs each
+//! by it, its row and the request) before anything is signed; the signer co-signs each
 //! taker coin's checkpoint and the fill's reassignment pair, and the fill
 //! itself, recorded as the one spend under the order coin's salt. Each coin it
 //! makes has a `CoinRecord::Fill`, checked as its receiver checks it: the
 //! taker's leaves go to the taker's mailbox, the credit and the remainder to
-//! the maker's, and the order then rests at the remainder.
+//! the maker's, and the order then rests at the remainder. A fill whose call
+//! ends before the signer has signed all of it (the server stopped, the
+//! signer gone after the taker's pairs) is completed by the server from the
+//! request it kept, at start and every minute ([`Orders::finish_unsigned`]),
+//! as it is when its taker sends it again.
 //!
 //! **Cancel.** The maker gives up the order coin as any coin, by its
 //! collaborative path: a transfer into a leaf of its own (or a forfeit in a
@@ -139,6 +143,105 @@ impl FillRequest {
 			e.input(&o.until.unwrap_or(0).to_le_bytes());
 		}
 		sha256::Hash::from_engine(e).to_byte_array()
+	}
+
+	/// The request in the form the server keeps it with its fill, so that a
+	/// fill the signer left half done is completed from it
+	/// ([`Orders::finish_unsigned`]): a version byte (1), the order, the
+	/// coin and the amount filled, then each taker coin (its id, its
+	/// checkpoint's value and its owner's two signatures) and each taker leaf
+	/// (asset, value, owner, owner nonce, creator nonce, exit delay units,
+	/// its mailbox and lapse when named), integers little-endian. A taker
+	/// leaf of a fill is `vtxo-1`, so no `htlc-1` terms are kept.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		let mut b = vec![1u8];
+		b.extend_from_slice(&self.order.0);
+		b.extend_from_slice(&self.coin.0);
+		b.extend_from_slice(&self.filled.to_le_bytes());
+		b.push(self.inputs.len() as u8);
+		for i in &self.inputs {
+			b.extend_from_slice(&i.leaf_id.0);
+			b.extend_from_slice(&i.checkpoint_value.to_le_bytes());
+			b.extend_from_slice(i.checkpoint_sig.as_ref());
+			b.extend_from_slice(i.reassignment_sig.as_ref());
+		}
+		b.push(self.outputs.len() as u8);
+		for o in &self.outputs {
+			b.extend_from_slice(&o.asset.into_inner().to_byte_array());
+			b.extend_from_slice(&o.value.to_le_bytes());
+			b.extend_from_slice(&o.leaf.owner.serialize());
+			b.extend_from_slice(&o.leaf.owner_nonce);
+			b.extend_from_slice(&o.leaf.creator_nonce);
+			b.extend_from_slice(&o.leaf.exit_delay.units().to_le_bytes());
+			match o.mailbox {
+				Some(m) => {
+					b.push(1);
+					b.extend_from_slice(&m.serialize());
+				},
+				None => b.push(0),
+			}
+			match o.until {
+				Some(u) => {
+					b.push(1);
+					b.extend_from_slice(&u.to_le_bytes());
+				},
+				None => b.push(0),
+			}
+		}
+		b
+	}
+
+	/// The request [`FillRequest::to_bytes`] kept.
+	pub fn from_bytes(b: &[u8]) -> Result<FillRequest, String> {
+		let mut at = 0usize;
+		let mut take = |n: usize| -> Result<&[u8], String> {
+			let s = b.get(at..at + n).ok_or_else(|| "a fill request cut short".to_string())?;
+			at += n;
+			Ok(s)
+		};
+		let a32 = |s: &[u8]| -> [u8; 32] { s.try_into().expect("32 bytes") };
+		let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8 bytes"));
+		if take(1)?[0] != 1 {
+			return Err("a fill request of an unknown version".into());
+		}
+		let order = LeafId(a32(take(32)?));
+		let coin = LeafId(a32(take(32)?));
+		let filled = u64_of(take(8)?);
+		let n = take(1)?[0] as usize;
+		let mut inputs = Vec::with_capacity(n);
+		for _ in 0..n {
+			let leaf_id = LeafId(a32(take(32)?));
+			let checkpoint_value = u64_of(take(8)?);
+			let checkpoint_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
+			let reassignment_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
+			inputs.push(InputRequest { leaf_id, checkpoint_value, checkpoint_sig, reassignment_sig });
+		}
+		let m = take(1)?[0] as usize;
+		let mut outputs = Vec::with_capacity(m);
+		for _ in 0..m {
+			let asset = AssetId::from_slice(take(32)?).map_err(|e| e.to_string())?;
+			let value = u64_of(take(8)?);
+			let owner = XOnlyPublicKey::from_slice(take(32)?).map_err(|e| e.to_string())?;
+			let owner_nonce = a32(take(32)?);
+			let creator_nonce = a32(take(32)?);
+			let units = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes"));
+			let exit_delay = arca_covenant::RelativeTime::from_units(units).map_err(|e| e.to_string())?;
+			let mailbox = match take(1)?[0] {
+				0 => None,
+				_ => Some(XOnlyPublicKey::from_slice(take(32)?).map_err(|e| e.to_string())?),
+			};
+			let until = match take(1)?[0] {
+				0 => None,
+				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
+			};
+			outputs.push(OutputRequest {
+				asset, value, leaf: arca_covenant::NewLeaf { owner, owner_nonce, creator_nonce, exit_delay, htlc: None }, mailbox, until,
+			});
+		}
+		if at != b.len() {
+			return Err("a fill request with bytes after its end".into());
+		}
+		Ok(FillRequest { order, coin, filled, inputs, outputs })
 	}
 }
 
@@ -350,6 +453,47 @@ impl Orders {
 			transfer_id: *transfer, fill_signature: Signature::from_slice(&sig).map_err(internal)?, signatures, outputs,
 			signer_head: t.signer_head,
 		})
+	}
+
+	/// Completes every fill recorded and not signed whose request the server
+	/// kept: one whose call ended before the signer's answer to the fill
+	/// itself (the server stopped, or the signer went away after it signed
+	/// the taker's pairs). Each is co-signed as [`Orders::fill`] co-signs a
+	/// fill sent again, judged as it was when recorded; its coins are posted
+	/// to their mailboxes, and the order rests at its remainder. The taker
+	/// signed its pairs over exactly these outputs, so completing the fill
+	/// takes nothing from anyone, and the order's coin is no longer held
+	/// until its taker comes back. A fill the signer refuses (its record
+	/// holds another spend of a coin) is dropped there, its coins live
+	/// again; one that fails otherwise stays recorded, and is tried again
+	/// at the next pass. Returns how many were completed.
+	pub async fn finish_unsigned(&self) -> Result<usize, OrderError> {
+		let mut done = 0;
+		for (transfer, request) in self.store.unsigned_order_fills().await? {
+			let Some(bytes) = request else {
+				log::info!("fill {} is recorded and not signed, and was recorded with no request kept: it waits for its taker", hex(&transfer));
+				continue;
+			};
+			let req = match FillRequest::from_bytes(&bytes) {
+				Ok(r) if r.hash() == transfer => r,
+				Ok(_) => {
+					log::error!("fill {}: the request kept with it is not the fill's", hex(&transfer));
+					continue;
+				},
+				Err(e) => {
+					log::error!("fill {}: the request kept with it does not read: {}", hex(&transfer), e);
+					continue;
+				},
+			};
+			match self.fill(&req).await {
+				Ok(_) => {
+					done += 1;
+					log::info!("fill {} of order {}, left unsigned, completed by the server", hex(&transfer), req.order);
+				},
+				Err(e) => log::warn!("fill {} of order {} stays unsigned for now: {}", hex(&transfer), req.order, e),
+			}
+		}
+		Ok(done)
 	}
 
 	/// The least margin of a transaction of `vsize` vbytes in `asset`: four
@@ -613,7 +757,7 @@ impl Orders {
 			}
 			let new_fill = NewOrderFill {
 				order_id: order.order_id, order_leaf: req.coin.0, seq, filled: req.filled, credited: price, partial: plan.rest.is_some(),
-				m: m as u8,
+				m: m as u8, request: req.to_bytes(),
 			};
 			self.store.record_order_fill(&transfer, &reassignment, admit, &ins, &outs, &signer_messages, &new_fill).await
 				.map_err(|e| match e {

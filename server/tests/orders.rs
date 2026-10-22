@@ -536,3 +536,44 @@ async fn an_order_reads_filling_while_a_fill_of_it_is_not_signed() {
 	assert_eq!(st["fills"][0]["signed"], true);
 	drop(tap);
 }
+
+/// A fill the signer left half done (the taker's pairs signed, the fill not)
+/// is completed by the server once the signer is back, with no call from
+/// the taker: within the server's minute pass the fill is signed, its coins
+/// live with their records, the taker's leaves and the maker's credit and
+/// remainder in their mailboxes, and the order resting at the remainder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_the_signer_left_half_done_is_completed_by_the_server() {
+	let (r, order, good, tap) = a_fill_left_half_signed().await;
+	let transfer: [u8; 32] = unhex(order_state(&r, &[order])[0]["fills"][0]["transfer_id"].as_str().unwrap()).try_into().unwrap();
+	let id = LeafId(transfer);
+	println!("fill {} recorded, unsigned; the signer is back, and the taker does not call again", id);
+	tap.cut(None);
+	let start = std::time::Instant::now();
+	let mut st = order_state(&r, &[order])[0].clone();
+	while st["fills"][0]["signed"] != true && start.elapsed() < std::time::Duration::from_secs(150) {
+		tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+		st = order_state(&r, &[order])[0].clone();
+	}
+	println!("after {} s: state {} coin {} value {} fill signed {}", start.elapsed().as_secs(), st["state"], st["coin"], st["value"],
+		st["fills"][0]["signed"]);
+	assert_eq!(st["fills"][0]["signed"], true, "the server completed the fill its signer left half done");
+	assert_eq!((st["state"].as_str(), st["value"].as_str()), (Some("resting"), Some("700000")), "the order rests at the remainder");
+	let t = r.server.store.transfer(&transfer).await.unwrap().unwrap();
+	assert_eq!(t.outputs.len(), 4, "the credit, the remainder, the taker's leaf and its change");
+	for (leaf, _) in &t.outputs {
+		let row = r.server.store.leaf(leaf).await.unwrap().unwrap();
+		println!("  coin {}: {:?}, record of {} bytes", LeafId(*leaf), row.state, row.record.len());
+		assert_eq!(row.state, server::store::LeafState::Live);
+		assert!(!row.record.is_empty());
+	}
+	let maker = r.http.mailbox(&keypair("M, mailbox"), &r.chain, 0);
+	let taker = r.http.mailbox(&keypair("T1, X"), &r.chain, 0);
+	println!("the maker's mailbox: {} coin(s); the taker's leaf's: {}", maker.len(), taker.len());
+	assert_eq!(maker.len(), 2, "the credit and the remainder");
+	assert!(!taker.is_empty(), "the taker's leaf");
+	// The taker sending it again gets the same fill.
+	let again = r.http.post("order_fill", &good).ok();
+	assert_eq!(again["transfer_id"].as_str(), Some(id.to_string().as_str()));
+	drop(tap);
+}
