@@ -50,6 +50,7 @@ fn accumulator_matches_the_regtest_suites_vectors() {
 		owner_nonce: h32(&l["owner_nonce"]), operator_nonce: h32(&l["operator_nonce"]),
 		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
 		unlock_hash: h32(&l["unlock_hash"]), htlc: None, order: None, landing: None,
+		channel: None,
 	}).collect();
 	let params = AccumulatorParams {
 		asset, chain, schedule, burn: false,

@@ -61,10 +61,10 @@ use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, LockTime, OutPoint, Script, Sequence};
 
-use crate::leaf::rebindable_two_party;
+use crate::leaf::{rebindable_two_party, two_party_items};
 use crate::message::{Chain, CsfsMessage};
 use crate::script::{sha256, BuilderExt, ExplicitOutput};
-use crate::spend::{assemble, explicit_txout, KeySpend, SpendError, FINAL};
+use crate::spend::{assemble, explicit_txout, KeySpend, Pair, SpendError, FINAL};
 use crate::taptree::TapOutput;
 use crate::time::RelativeTime;
 use crate::unroll::{FeeSource, UnrollTx};
@@ -377,6 +377,28 @@ impl ChannelPolicy {
 			v.push(ExplicitOutput::new(asset, state.operator, self.credit_taproot(state).script_pubkey()));
 		}
 		v
+	}
+
+	/// The collaborative witness at the output of `state`: the pair owner and
+	/// operator made for the coin (its forfeit, a checkpoint) over `m`
+	/// outputs, which spends the coin in any state it reached.
+	pub fn collab_witness(&self, state: &State, pair: &Pair, m: u8) -> Vec<Vec<u8>> {
+		self.taproot(state).witness(&self.collab_script(), two_party_items(&pair.operator, &pair.owner, m))
+	}
+
+	/// The spend of `coin`, the channel's output of `state`, by its
+	/// collaborative path into `outputs`, signed by `pair` over the coin's
+	/// rebindable message ([`crate::LeafPolicy::collab_message`] of the leaf).
+	pub fn collab_tx(&self, coin: OutPoint, asset: AssetId, state: &State, outputs: &[ExplicitOutput], pair: &Pair,
+		fee: &FeeSource) -> Result<UnrollTx, SpendError>
+	{
+		if outputs.is_empty() || outputs.len() > crate::leaf::MAX_OUTPUTS as usize {
+			return Err(crate::Error::OutputCount(outputs.len()).into());
+		}
+		let spent = explicit_txout(asset, self.terms.value, self.script_pubkey(state));
+		let mut u = assemble(LockTime::ZERO, vec![(coin, spent, FINAL)], outputs, fee, FINAL)?;
+		u.tx.input[0].witness.script_witness = self.collab_witness(state, pair, outputs.len() as u8);
+		Ok(u)
 	}
 
 	/// The update witness from the output of `from` to the output of `to`.

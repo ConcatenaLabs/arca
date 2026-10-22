@@ -3448,6 +3448,7 @@ mod tests {
 			htlc: None,
 			order: None,
 			landing: None,
+			channel: None,
 		}).collect();
 		let params = TreeParams { asset, chain, schedule, burn: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1000 };
 		let tree = Tree::build(params, &leaves).unwrap();

@@ -187,6 +187,7 @@ pub fn rebuild(t: &Value) -> Result<Tree, Error> {
 					.map_err(|e| Error::Parse(format!("a published leaf's landing: {}", e)))?),
 				None => None,
 			},
+			channel: None,
 		});
 	}
 	let tree = Tree::build(params, &leaves).map_err(|e| Error::Refused(format!("the published tree does not build: {}", e)))?;

@@ -1289,6 +1289,7 @@ impl Rounds {
 				htlc: *htlc,
 				order: *order,
 				landing: *landing,
+				channel: None,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -2678,6 +2679,7 @@ impl Rounds {
 				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
 				order: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.order,
 				landing: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.landing,
+				channel: None,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

@@ -954,6 +954,7 @@ pub fn plan_of(row: &PlanRow, params: &Params) -> Result<Plan, String> {
 		exit_delay: RelativeTime::from_units(row.first_delay).map_err(|e| e.to_string())?, htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	};
 	let mut steps = Vec::with_capacity(row.steps.len());
 	for s in &row.steps {

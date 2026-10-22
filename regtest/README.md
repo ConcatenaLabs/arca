@@ -101,8 +101,9 @@ forms and the leaf id, which its docstring states in full. For each of seven
 batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 3; seven at radix 6 with no reserves; sixty-four) and an eighth of five whose
 second and fourth leaves are `htlc-1`, one whose first and fourth are
-`order-2`, and one of a supervised asset whose five leaves are all
-`landing-1`, it holds the inputs, the
+`order-2`, one of a supervised asset whose five leaves are all
+`landing-1`, and one whose second and fifth leaves are `channel-1` (the
+fifth with no opening balance for the operator), it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds

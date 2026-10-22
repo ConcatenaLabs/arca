@@ -392,6 +392,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		htlc: htlc_of(&l["htlc"]),
 		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
 		landing: (!l["landing"].is_null()).then(|| arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap()),
+		channel: None,
 	}).collect();
 	Tree::build(params, &leaves).map_err(|e| e.to_string())
 }

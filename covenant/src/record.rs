@@ -65,8 +65,8 @@
 //!
 //! ```text
 //! u8    format version, 2
-//! u8    template, 1 (vtxo), 3 (htlc), 4 (order) or 5 (landing)
-//! u8    template version, 1 (vtxo, htlc, landing) or 2 (order)
+//! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
+//! u8    template version, 1 (vtxo, htlc, landing, channel) or 2 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -87,6 +87,9 @@
 //! [20]  P, the landing program: hash160 of the owner's landing key L
 //! u64   the fee allowance: the landing's output 0 holds at least the value
 //!       less this; below the value
+//!       for channel-1 only (a leaf with a balance for each side, [`crate::channel`]):
+//! u64   the operator's opening balance, below the value
+//! u16   the credit window, 512-second units, no shorter than the exit delay
 //! [32]  asset                         the leaf and its entry
 //! u64   value
 //! [32]  unlock hash h
@@ -140,6 +143,7 @@ use elements::{AssetId, Script, Transaction, TxOut, Txid};
 use crate::checks::{check_reissue, check_round, RoundCheckFailure};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Encoding, Reader};
+use crate::channel::{Channel, ChannelError};
 use crate::htlc::HtlcTerms;
 use crate::landing::{Landing, PROGRAM_BYTES};
 use crate::order::OrderLeafTerms;
@@ -197,12 +201,17 @@ pub enum Template {
 	/// of the owner's landing key, where a freeze of the asset binds
 	/// ([`crate::landing`]).
 	Landing1,
+	/// `channel-1`, a leaf with a balance for each of owner and operator,
+	/// replaced by a newer state both sign and settled after the exit delay
+	/// ([`crate::channel`]).
+	Channel1,
 }
 
 impl Template {
 	/// Every template this crate knows, in the order of their ids: the
 	/// operator's published list (`info.templates`).
-	pub const ALL: [Template; 5] = [Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1];
+	pub const ALL: [Template; 6] =
+		[Template::Vtxo1, Template::Board1, Template::Htlc1, Template::Order2, Template::Landing1, Template::Channel1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -214,6 +223,8 @@ impl Template {
 	pub const ORDER: u8 = 4;
 	/// The template id of `landing`.
 	pub const LANDING: u8 = 5;
+	/// The template id of `channel`.
+	pub const CHANNEL: u8 = 7;
 
 	/// Its id in the binary form.
 	pub fn id(self) -> u8 {
@@ -223,13 +234,14 @@ impl Template {
 			Template::Htlc1 => Template::HTLC,
 			Template::Order2 => Template::ORDER,
 			Template::Landing1 => Template::LANDING,
+			Template::Channel1 => Template::CHANNEL,
 		}
 	}
 
 	/// Its version.
 	pub fn version(self) -> u8 {
 		match self {
-			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 => 1,
+			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Channel1 => 1,
 			Template::Order2 => 2,
 		}
 	}
@@ -242,6 +254,7 @@ impl Template {
 			Template::Htlc1 => "htlc",
 			Template::Order2 => "order",
 			Template::Landing1 => "landing",
+			Template::Channel1 => "channel",
 		}
 	}
 
@@ -253,11 +266,13 @@ impl Template {
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
 			(Template::ORDER, 2) => Ok(Template::Order2),
 			(Template::LANDING, 1) => Ok(Template::Landing1),
+			(Template::CHANNEL, 1) => Ok(Template::Channel1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
 			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
 			(Template::HTLC, v) => Err(RecordError::TemplateVersion { template: "htlc".into(), version: v as u64 }),
 			(Template::ORDER, v) => Err(RecordError::TemplateVersion { template: "order".into(), version: v as u64 }),
 			(Template::LANDING, v) => Err(RecordError::TemplateVersion { template: "landing".into(), version: v as u64 }),
+			(Template::CHANNEL, v) => Err(RecordError::TemplateVersion { template: "channel".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -286,6 +301,7 @@ impl FromStr for Template {
 			"htlc" => Template::Htlc1,
 			"order" => Template::Order2,
 			"landing" => Template::Landing1,
+			"channel" => Template::Channel1,
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
@@ -347,6 +363,8 @@ pub struct LeafRecord {
 	/// `landing-1`'s landing: present exactly when the template is
 	/// `landing-1`.
 	pub landing: Option<Landing>,
+	/// `channel-1`'s terms: present exactly when the template is `channel-1`.
+	pub channel: Option<Channel>,
 	/// The batch's asset.
 	pub asset: AssetId,
 	/// The leaf's value.
@@ -486,6 +504,8 @@ pub enum RecordError {
 	Htlc(crate::Error),
 	#[error("the landing-1 terms: {0}")]
 	Landing(crate::landing::LandingError),
+	#[error("the channel-1 terms: {0}")]
+	Channel(ChannelError),
 	#[error("not JSON: {0}")]
 	Json(String),
 	#[error("JSON field {0}: missing, unknown or misplaced")]
@@ -535,6 +555,7 @@ impl RecordError {
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",
 			Htlc(_) => "htlc",
 			Landing(_) => "landing",
+			Channel(_) => "channel",
 			Order(_) => "order",
 			Index { .. } | MemberIndex { .. } => "index",
 			DuplicateChild { .. } => "duplicate",
@@ -602,6 +623,7 @@ pub(crate) fn leaf_policy(template_terms: (&Option<HtlcTerms>, &Option<OrderLeaf
 		landing: landing.map(|l| crate::landing::LandingTerms {
 			program: l.program, asset, min_value: value.saturating_sub(l.allowance),
 		}),
+		channel: None,
 	}
 }
 
@@ -643,8 +665,17 @@ impl LeafRecord {
 	/// Checks the record's shape: counts, indices and value bounds. Every
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
-		check_template(self.template, &self.htlc, &self.order, &self.landing, self.asset, self.value, &self.owner,
-			&self.schedule.operator, self.exit_delay)?;
+		match (self.template, &self.channel) {
+			(Template::Channel1, None) => return Err(RecordError::Template("channel-1 without its terms".into())),
+			(Template::Channel1, Some(c)) if self.htlc.is_none() && self.order.is_none() && self.landing.is_none() => {
+				c.terms(self.value).check(self.exit_delay).map_err(RecordError::Channel)?;
+			},
+			(t, Some(_)) | (t @ Template::Channel1, None) => {
+				return Err(RecordError::Template(format!("{} with another template's terms", t)))
+			},
+			_ => check_template(self.template, &self.htlc, &self.order, &self.landing, self.asset, self.value, &self.owner,
+				&self.schedule.operator, self.exit_delay)?,
+		}
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value));
 		}
@@ -691,8 +722,11 @@ impl LeafRecord {
 
 	/// The leaf's policy.
 	pub fn leaf(&self) -> LeafPolicy {
-		leaf_policy((&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
-			self.exit_delay, self.asset, self.value)
+		LeafPolicy {
+			channel: self.channel.map(|c| c.terms(self.value)),
+			..leaf_policy((&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
+				self.exit_delay, self.asset, self.value)
+		}
 	}
 
 	/// Rebuilds every output on the path, from the leaf up to the batch output.
@@ -856,6 +890,10 @@ impl LeafRecord {
 			w.extend(l.program);
 			w.extend(l.allowance.to_le_bytes());
 		}
+		if let Some(c) = &self.channel {
+			w.extend(c.capacity.to_le_bytes());
+			w.extend(c.window.units().to_le_bytes());
+		}
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
 		w.extend(self.unlock_hash);
@@ -923,6 +961,10 @@ impl LeafRecord {
 				program.copy_from_slice(r.bytes(PROGRAM_BYTES)?);
 				Some(Landing { program, allowance: r.u64()? })
 			},
+			_ => None,
+		};
+		let channel = match template {
+			Template::Channel1 => Some(Channel { capacity: r.u64()?, window: r.relative_time()? }),
 			_ => None,
 		};
 		let asset = r.asset()?;
@@ -996,7 +1038,8 @@ impl LeafRecord {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
 		}
 		let record = LeafRecord {
-			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, order, landing, asset, value, unlock_hash, entry_reserve, chain,
+			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, order, landing, channel, asset, value, unlock_hash,
+			entry_reserve, chain,
 			schedule, burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;

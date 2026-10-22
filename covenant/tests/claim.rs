@@ -58,6 +58,7 @@ fn a_claim_leaf_is_spent_by_its_claim_key_and_by_no_other() {
 		exit_delay: delay(), unlock_hash: h, htlc: None,
 		order: None,
 		landing: None,
+		channel: None,
 	}).collect();
 	let t = c.tree(&sched, &specs);
 	let (round, _) = round_tx(&c.net, &issuer, &[], &t.batch_output(), &sched);
