@@ -49,7 +49,7 @@ use rand::RngCore;
 
 use arca_covenant::script::sha256 as sha256_bytes;
 use arca_covenant::sign::verify_digest;
-use arca_covenant::{CoinRecord, Distribution, LeafId, LeafRecord, MedianTime, Template};
+use arca_covenant::{Distribution, LeafId, MedianTime, Template};
 
 use super::{forfeit_margin, ParticipationError, Participations, Status, MAX_DEFER};
 use crate::coins::{self, CoinError};
@@ -323,8 +323,8 @@ impl Participations {
 			.ok_or_else(|| ParticipationError::Internal(format!("the round of claim leaf {} is not recorded", leaf)))?;
 		let round_tx: elements::Transaction = elements::encode::deserialize(&round.tx)
 			.map_err(|e| ParticipationError::Internal(e.to_string()))?;
-		let record = LeafRecord::from_bytes(&row.record).map_err(|e| ParticipationError::Internal(e.to_string()))?;
-		let coin = CoinRecord::Leaf { record, preimage: p.preimage, auths };
+		let coin = crate::coins::batch_coin(&row, p.preimage, auths)
+			.map_err(|e| ParticipationError::Internal(format!("claim leaf {}: {}", leaf, e)))?;
 		let policy = self.params.taken_policy(self.now().await?);
 		let valid = coin.resolve(std::slice::from_ref(&round_tx), &policy)
 			.map_err(|e| ParticipationError::Coin(CoinError::InvalidCoin { leaf: *leaf, error: e }))?;

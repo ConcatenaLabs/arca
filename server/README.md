@@ -1120,7 +1120,20 @@ it) holds back no other's. For an asset, it gathers that asset's pending
 participations whose earliest round time has come, checks each coin they give
 up again, and builds the asset's tree with `arca-covenant`'s builder: balanced at radix 4, every node gated, RECLAIM on
 the lowest nodes, each leaf behind its participation's hash-locked entry, the
-reserve at four times the node's floor in the batch asset. A batch in an asset
+reserve at four times the node's floor in the batch asset. With
+`[batches] accumulator_exit_rate_ppm` set (the share of a batch's leaves, in
+millionths, the operator expects to leave on the chain on their own), a batch
+whose expected exits cost less from one output than through a tree is built
+as an accumulator batch instead (`arca_covenant::BatchKind::choose`): one
+output of up to 1,024 leaves, each behind the same entry, from which one
+owner leaves in one transaction (`arca-covenant`'s `accumulator`). That holds
+for up to about 78 expected exits of 1,024. A batch with a resting order or a
+channel, and an issuer-operated asset's batch, is always a tree. An
+accumulator leaf's owner hands over one exit authorisation for it (its
+signature over the exit digest, and the time) where a tree leaf's owner hands
+over one unroll authorisation per node, and its coin record is
+`CoinRecord::Accumulator`. Its old leaves are never released, since an
+accumulator batch has no lowest node to reclaim. A batch in an asset
 the node does not accept for fees carries a reserve of one atom on every node
 and every entry, so whoever unrolls it attaches a fee coin in an asset that is
 accepted. A coin is checked again under the horizon it was taken under, its
@@ -1748,7 +1761,12 @@ meanwhile.
   sweep takes every output of the batch still unspent whose own notice has
   passed (the batch output, a node or an entry someone unrolled, a checkpoint
   of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
-  the token to `R`. A leaf on the chain is its owner's and is never swept.
+  the token to `R`. An accumulator batch's output moves with every exit: the
+  watcher follows it from the round through each exit the chain holds (every
+  exit pays an entry, whose script it watches, and publishes the whole state
+  it spends) and sweeps it where the last exit left it, with every entry an
+  exit paid that is still unspent. A leaf on the chain is its owner's and is
+  never swept.
   A burn-only batch's sweep burns each output it takes whole, at its own
   index, several in one transaction, and a coin of another asset pays its
   fee (see Issuer-operated assets). A batch that holds
@@ -1844,7 +1862,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
-| `POST tree` | The published tree of a batch, by its round's txid and output, with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
+| `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |
 | `POST release_leaves` | Takes an owner's release of the lowest node of each coin it gave up, each naming the connector asset of the participation's round |
@@ -2923,6 +2941,16 @@ through the reorganisations both ways (R lost and A run again in Y, R back,
 R lost again, Y back): the next round never issues from a coin whose token
 names a batch, and A's leaf of Y is the one credited while Y stands, none
 while R does.
+
+`tests/accumulator.rs` sets `accumulator_exit_rate_ppm` and refreshes twenty
+boards in one round: the round pays one accumulator batch, published with its
+kind and no nodes; each owner rebuilds it from the published parts,
+validates its leaf, hands over its forfeit and its exit authorisation, and
+holds an accumulator coin record that resolves. One owner leaves on its own
+(the exit, the entry, the leaf's exit after its delay), every other owner's
+coin and authorisation still good against the new state; then the release at
+the expiry, no sweep during the notice, and the sweep of the batch output
+where the exit left it.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards

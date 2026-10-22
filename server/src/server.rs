@@ -101,6 +101,22 @@ pub struct Config {
 	/// The operator's equivocation bond ([`crate::bond`]); none when absent.
 	#[serde(default)]
 	pub bond: Option<crate::bond::BondSection>,
+	/// How batches are built; trees alone when absent.
+	#[serde(default)]
+	pub batches: BatchesSection,
+}
+
+/// How batches are built.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BatchesSection {
+	/// The share of a batch's leaves, in millionths, the operator expects to
+	/// leave on the chain on their own. Set, a batch is built as an
+	/// accumulator batch when that many exits cost less from one than through
+	/// a tree (up to about 7.6 % of 1,024 leaves); absent, every batch is a
+	/// tree.
+	#[serde(default)]
+	pub accumulator_exit_rate_ppm: Option<u32>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -1502,7 +1518,7 @@ impl Server {
 		let plans = crate::plans::Plans::new(store.clone(), finality.clone(), params.clone(), signer.clone(), wallet.clone());
 		let orders = crate::orders::Orders::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer.clone(),
-			RoundConfig::default());
+			RoundConfig { accumulator_exit_rate_ppm: config.batches.accumulator_exit_rate_ppm, ..RoundConfig::default() });
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {

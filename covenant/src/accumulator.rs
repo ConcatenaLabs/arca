@@ -74,6 +74,7 @@ use crate::checks::{check_reissue, check_round};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::encode::{DecodeError, Encoding, Reader};
 use crate::entry::EntryPolicy;
+use crate::forfeit::{connector_asset, ConnectorPolicy, Forfeit};
 use crate::htlc::HtlcTerms;
 use crate::landing::Landing;
 use crate::leaf::{leaf_salt, LeafPolicy};
@@ -861,6 +862,28 @@ impl ValidAccumulatorLeaf {
 	/// What the owner or the operator signs to take this leaf out from `t`.
 	pub fn exit_digest(&self, time: MedianTime) -> [u8; 32] {
 		exit_digest(&self.leaf.chain, &self.policy.root, &self.exit.record.record(self.exit.slot), time)
+	}
+
+	/// The forfeit a wallet signs for `old`, given up in a refresh for this
+	/// new leaf of `round`, whose connector output is `c`: as
+	/// [`Forfeit::for_refresh`] does for a tree leaf, the unlock hash is this
+	/// leaf's entry's and `M` the round's connector asset. Refuses a `round`
+	/// other than the one this leaf was validated against, an output `c` that
+	/// is not the operator's connector, and an old leaf under another
+	/// operator.
+	#[allow(clippy::too_many_arguments)]
+	pub fn forfeit_for(&self, old: LeafPolicy, (asset, value): (AssetId, u64), old_id: LeafId, round: &Transaction, c: u32,
+		refund_delay: RelativeTime, margin: u64) -> Result<Forfeit, SpendError>
+	{
+		let round_txid = round.txid();
+		if round_txid != self.round_txid {
+			return Err(SpendError::NotTheRound);
+		}
+		if old.operator != self.leaf.operator {
+			return Err(SpendError::OtherOperator);
+		}
+		ConnectorPolicy { operator: old.operator }.check(round, c)?;
+		Forfeit::new(old, (asset, value), old_id, self.entry.unlock_hash, connector_asset(round_txid, c), refund_delay, margin)
 	}
 }
 

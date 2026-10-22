@@ -363,6 +363,19 @@ pub fn rebuild(t: &Value) -> Tree {
 
 /// [`rebuild`], or why the builder refuses the parts.
 pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
+	let (params, leaves) = parts(t)?;
+	Tree::build(params, &leaves).map_err(|e| e.to_string())
+}
+
+/// A published batch of either kind, rebuilt from its parts alone.
+pub fn rebuild_batch(t: &Value) -> arca_covenant::Batch {
+	let kind = arca_covenant::BatchKind::parse(t["kind"].as_str().unwrap_or("tree")).unwrap();
+	let (params, leaves) = parts(t).unwrap();
+	arca_covenant::Batch::build(kind, params, &leaves).unwrap()
+}
+
+/// What a published batch is built from: its parameters and its leaves.
+fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 	let s = |k: &str| t[k].as_str().unwrap_or_else(|| panic!("{} in {}", k, t)).to_string();
 	let num = |v: &Value| v.as_str().unwrap().parse::<u64>().unwrap();
 	let reserve = if let Some(r) = t["reserve"].get("fee_rate") {
@@ -394,7 +407,7 @@ pub fn try_rebuild(t: &Value) -> Result<Tree, String> {
 		landing: (!l["landing"].is_null()).then(|| arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap()),
 		channel: None,
 	}).collect();
-	Tree::build(params, &leaves).map_err(|e| e.to_string())
+	Ok((params, leaves))
 }
 
 /// The `htlc-1` terms a published leaf carries, if any.

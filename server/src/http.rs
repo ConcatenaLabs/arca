@@ -1170,14 +1170,30 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 	let t = app.rounds.tree(&txid, req.vout).await?
 		.ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "unknown_batch", format!("no batch is paid by {}:{}", txid, req.vout)))?;
 	use arca_covenant::encode::Encoding;
-	// The tree as the server built it: every node, and each leaf's id and
-	// script, for a reader to compare with what it rebuilds.
-	let built = arca_covenant::tree::Tree::build(t.params.clone(), &t.leaves)
+	// The batch as the server built it: a tree's every node, and each leaf's
+	// id and script, for a reader to compare with what it rebuilds.
+	let built = arca_covenant::Batch::build(t.kind, t.params.clone(), &t.leaves)
 		.map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("the batch's own tree does not build: {}", e)))?;
-	let records: Vec<(LeafId, elements::Script)> = built.records().iter().zip(built.leaves()).map(|(r, l)| {
-		r.leaf_id().map(|id| (id, l.leaf.script_pubkey()))
-	}).collect::<Result<_, _>>().map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+	let internal = |e: String| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
+	let records: Vec<(LeafId, elements::Script)> = match &built {
+		arca_covenant::Batch::Tree(tree) => tree.records().iter().zip(tree.leaves()).map(|(r, l)| {
+			r.leaf_id().map(|id| (id, l.leaf.script_pubkey())).map_err(|e| e.to_string())
+		}).collect::<Result<_, _>>().map_err(internal)?,
+		arca_covenant::Batch::Accumulator(acc) => acc.records().iter().zip(acc.leaves()).map(|(r, l)| {
+			r.leaf_id().map(|id| (id, l.leaf.script_pubkey())).map_err(|e| e.to_string())
+		}).collect::<Result<_, _>>().map_err(internal)?,
+	};
+	let nodes: Vec<Vec<api::PublishedNode>> = match &built {
+		arca_covenant::Batch::Tree(tree) => tree.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
+			value: n.value.to_string(),
+			reserve: n.reserve.to_string(),
+			script_pubkey: hex(n.output().script_pubkey.as_bytes()),
+			children: [n.children.start as u32, n.children.end as u32],
+		}).collect()).collect(),
+		arca_covenant::Batch::Accumulator(_) => vec![],
+	};
 	Ok(Json(api::PublishedTree {
+		kind: t.kind.as_str().into(),
 		round_txid: t.round_txid.to_string(),
 		batch_vout: t.batch_vout,
 		token_vout: t.token_vout,
@@ -1216,12 +1232,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			landing: l.landing.as_ref().map(arca_covenant::record_json::landing_json),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
-		nodes: built.levels().iter().map(|level| level.iter().map(|n| api::PublishedNode {
-			value: n.value.to_string(),
-			reserve: n.reserve.to_string(),
-			script_pubkey: hex(n.output().script_pubkey.as_bytes()),
-			children: [n.children.start as u32, n.children.end as u32],
-		}).collect()).collect(),
+		nodes,
 	}))
 }
 

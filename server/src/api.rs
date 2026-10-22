@@ -1633,11 +1633,17 @@ pub struct TreeRequest {
 	pub vout: u32,
 }
 
-/// A batch as the operator publishes it: everything the tree builder takes,
-/// so anyone rebuilds every script of the tree, and where the round put it.
+/// A batch as the operator publishes it: its kind and everything its builder
+/// takes, so anyone rebuilds every script of the batch, and where the round
+/// put it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishedTree {
+	/// `tree`, or `accumulator` for an accumulator batch, whose radix is 0
+	/// and which has no nodes; a reader that does not know the kind refuses
+	/// the batch.
+	#[serde(default = "tree_kind")]
+	pub kind: String,
 	pub round_txid: String,
 	pub batch_vout: u32,
 	/// The output holding the batch's sweep token, at its first clock.
@@ -1667,6 +1673,10 @@ pub struct PublishedTree {
 	/// refuses one whose nodes differ from what it rebuilt.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub nodes: Vec<Vec<PublishedNode>>,
+}
+
+fn tree_kind() -> String {
+	"tree".into()
 }
 
 /// A node of a published tree: its output (its value, the reserve in it,

@@ -16,7 +16,7 @@
 //! `schema/V25__shared_fills.sql`, `schema/V26__plans.sql`,
 //! `schema/V27__resting_orders.sql`, `schema/V28__issuer_operated.sql`,
 //! `schema/V29__fill_requests.sql`, `schema/V30__order_landings.sql`,
-//! `schema/V31__supervised.sql`),
+//! `schema/V31__supervised.sql`, `schema/V33__accumulator_batches.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -119,6 +119,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(29, include_str!("../../schema/V29__fill_requests.sql")),
 	(30, include_str!("../../schema/V30__order_landings.sql")),
 	(31, include_str!("../../schema/V31__supervised.sql")),
+	(33, include_str!("../../schema/V33__accumulator_batches.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

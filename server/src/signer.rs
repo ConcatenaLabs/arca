@@ -280,6 +280,11 @@ pub enum Request {
 	/// The operator's unroll authorisation for the node whose children hash
 	/// is `children_hash` (32 bytes, hex), from the median time `time` on.
 	Unroll { children_hash: String, time: u32 },
+	/// The operator's exit authorisation for the slot whose record is
+	/// `record` in the accumulator batch of root `root` (32 bytes each, hex),
+	/// from the median time `time` on: the operator's path out of an
+	/// accumulator batch, as an unroll authorisation is out of a tree.
+	AccumulatorExit { root: String, record: String, time: u32 },
 	/// An issuer-operated asset's mint at input 0 of a round: the witness of
 	/// the limiter's coin, once the signer has checked the round
 	/// ([`crate::issuer::check_reissue`]) and the limiter's tool signed it.
@@ -2196,6 +2201,16 @@ impl SignerClient {
 	/// builds itself.
 	pub async fn unroll(&self, children_hash: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
 		let r = self.ask(&Request::Unroll { children_hash: hex(children_hash), time: t.to_consensus_u32() }).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s exit authorisation for the slot of record `record` in the
+	/// accumulator batch of root `root`, usable from the median time `t`: its
+	/// signature over [`arca_covenant::accumulator::exit_digest`], which the
+	/// signer builds itself.
+	pub async fn accumulator_exit(&self, root: &[u8; 32], record: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
+		let r = self.ask(&Request::AccumulatorExit { root: hex(root), record: hex(record), time: t.to_consensus_u32() }).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
 	}

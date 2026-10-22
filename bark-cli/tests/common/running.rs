@@ -153,6 +153,7 @@ impl Running {
 			fills: Default::default(),
 			bond: None,
 			lightning: Default::default(),
+			batches: Default::default(),
 		};
 		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();

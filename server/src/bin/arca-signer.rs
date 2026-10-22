@@ -1,6 +1,6 @@
 //! `arca-signer`: holds the operator key `S` and signs the rebindable messages
 //! of collaborative paths, the spends of the operator's own paths and the
-//! operator's unroll authorisations, each built by the signer itself, and
+//! operator's unroll and accumulator exit authorisations, each built by the signer itself, and
 //! nothing else, for the server on a Unix socket. See `server::signer` for
 //! the protocol.
 //!
@@ -1161,6 +1161,25 @@ async fn answer(state: &State, line: &str) -> Response {
 			rand::rngs::OsRng.fill_bytes(&mut aux);
 			let sig = sign_digest(key, &message.digest, &aux);
 			eprintln!("arca-signer: signed the unroll authorisation of the node with children hash {} from {}", hex(&h), time);
+			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+		Request::AccumulatorExit { root, record: slot_record, time } => {
+			let parsed = (|| -> Result<_, String> {
+				let root = unhex32(&root).map_err(|e| format!("root: {}", e))?;
+				let rec = unhex32(&slot_record).map_err(|e| format!("record: {}", e))?;
+				let t = arca_covenant::MedianTime::from_consensus(time).map_err(|e| format!("time: {}", e))?;
+				Ok((root, rec, t))
+			})();
+			let (root, rec, t) = match parsed {
+				Ok(p) => p,
+				Err(e) => return Response { error: Some(e), ..none },
+			};
+			let digest = arca_covenant::accumulator::exit_digest(chain, &root, &rec, t);
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &digest, &aux);
+			eprintln!("arca-signer: signed the exit authorisation of slot record {} of the accumulator batch {} from {}", hex(&rec),
+				hex(&root), time);
 			Response { signature: Some(hex(sig.as_ref())), ..none }
 		},
 	}
