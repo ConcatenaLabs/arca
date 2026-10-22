@@ -138,6 +138,8 @@ pub enum PlanError {
 	#[error("the request is malformed: {0}")]
 	Malformed(String),
 	#[error(transparent)]
+	Supervision(#[from] crate::supervision::SupervisionError),
+	#[error(transparent)]
 	Coin(CoinError),
 	#[error("{0}")]
 	BadSignature(String),
@@ -183,6 +185,7 @@ impl PlanError {
 			NotSynced => "not_synced",
 			Rate(_) => "rate_stale",
 			Signer(_) => "signer_unavailable",
+			Supervision(e) => e.code(),
 			Store(StoreError::KeyReused) => "key_reused",
 			Store(StoreError::SaltReused(_)) => "salt",
 			Store(StoreError::NonceUnknown) => "nonce_unknown",
@@ -377,6 +380,7 @@ impl Plans {
 	/// refund's margin; and the script the operator's share of every refund
 	/// pays to.
 	pub async fn quote(&self, req: &QuoteRequest) -> Result<Quote, PlanError> {
+		self.supervised_coin(&req.coin).await?;
 		let n = req.owner_nonces.len();
 		if n == 0 || n > MAX_STEPS {
 			return Err(PlanError::Malformed(format!("{} steps; a plan holds 1 to {}", n, MAX_STEPS)));
@@ -425,9 +429,27 @@ impl Plans {
 		Ok(Quote { quote: quote_id, coin: req.coin, asset, value: c.coin.value, expiry, operator_script, steps, earliest })
 	}
 
+	/// The supervised profile, before anything else about a plan: a coin
+	/// whose holder is frozen is refused for the freeze
+	/// ([`crate::supervision::gate`]), and a plan is not served in a
+	/// supervised asset at all, as a step's refund pays the holder a fresh
+	/// on-chain script, not its landing.
+	async fn supervised_coin(&self, coin: &LeafId) -> Result<(), PlanError> {
+		crate::supervision::gate(&self.store, &self.finality, &self.params, std::slice::from_ref(coin)).await?;
+		if let Some(row) = self.store.leaf(&coin.0).await? {
+			let asset = AssetId::from_byte_array(row.asset);
+			if self.params.supervised(&asset).is_some() {
+				return Err(PlanError::OutOfBounds(format!("asset {} is supervised: offline refresh is not served in it, as a step's \
+					refund pays the holder a script a freeze does not follow", asset)));
+			}
+		}
+		Ok(())
+	}
+
 	/// Takes a plan: see the [module documentation](self). A plan taken
 	/// before is answered with its status.
 	pub async fn submit(&self, req: &SubmitRequest) -> Result<PlanStatus, PlanError> {
+		self.supervised_coin(&req.coin).await?;
 		let n = req.steps.len();
 		if n == 0 || n > MAX_STEPS {
 			return Err(PlanError::Malformed(format!("{} steps; a plan holds 1 to {}", n, MAX_STEPS)));
@@ -724,6 +746,7 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 				kind: WantedKind::Leaf {
 					template: Template::Vtxo1.to_string(), owner_key: s.owner_key, owner_nonce: s.owner_nonce,
 					exit_delay_units: s.exit_delay_units, operator_nonce: s.operator_nonce, htlc: None, order: None,
+					landing: None,
 				},
 				leaf_id: None,
 			}],

@@ -533,6 +533,9 @@ impl Orders {
 				return self.answer(&transfer, &f).await;
 			}
 		}
+		// A coin whose holder is frozen is refused before anything else.
+		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
+		crate::supervision::gate(&self.store, &self.finality, &self.params, &given).await.map_err(CosignError::from)?;
 		let order = self.store.resting_order(&req.order.0).await?.ok_or_else(|| OrderError::UnknownOrder(req.order.to_string()))?;
 		let recorded = self.store.order_fill_by_transfer(&transfer).await?.is_some();
 		if !recorded && order.current_leaf != req.coin.0 {
@@ -807,11 +810,12 @@ impl Orders {
 		let mut sigs = Vec::with_capacity(n);
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = tplan.checkpoint_output(k);
-			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.asset, c.coin.value,
+			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+				c.coin.asset, c.coin.value,
 				std::slice::from_ref(&cp_out)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
-			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, c.coin.asset,
+			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
 				i.checkpoint_value, &outputs).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {

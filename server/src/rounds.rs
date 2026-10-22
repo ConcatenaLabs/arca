@@ -504,6 +504,25 @@ impl Rounds {
 	/// since it was accepted): no round of this operator makes that leaf or
 	/// takes that coin.
 	async fn still_good(&self, p: &ParticipationRow, now: MedianTime) -> Result<bool, RoundError> {
+		// A coin of a supervised asset whose holder was frozen since the
+		// participation was taken: nothing has moved, as no forfeit was
+		// taken, and none is (`crate::supervision`). Its coins are given back.
+		let given: Vec<LeafId> = p.inputs.iter().map(|i| LeafId(i.leaf_id)).collect();
+		match crate::supervision::gate(&self.store, &self.finality, &self.params, &given).await {
+			Ok(()) => {},
+			Err(e @ (crate::supervision::SupervisionError::Frozen { .. } | crate::supervision::SupervisionError::NotLanding { .. })) => {
+				let why = e.to_string();
+				let voided = self.store.void_participation(&p.id, &why).await?;
+				log::warn!("participation {} is voided (voided: {}): {}", crate::signer::hex(&p.id), voided, why);
+				return Ok(false);
+			},
+			Err(crate::supervision::SupervisionError::Store(e)) => return Err(e.into()),
+			Err(e) => {
+				log::warn!("participation {} waits: {}", crate::signer::hex(&p.id), e);
+				self.store.set_waiting(&p.id, Some(&format!("the freeze of its coins could not be read: {}", e))).await?;
+				return Ok(false);
+			},
+		}
 		if p.attempt > 0 {
 			if let Some(why) = self.barred(p).await? {
 				let voided = self.store.void_participation(&p.id, &why).await?;
@@ -1259,7 +1278,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing } => Ok(LeafSpec {
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -1269,7 +1288,7 @@ impl Rounds {
 				unlock_hash: row.unlock_hash,
 				htlc: *htlc,
 				order: *order,
-				landing: None,
+				landing: *landing,
 			}),
 			WantedKind::Offboard { .. } => Err(RoundError::Internal("an offboard is not a leaf".into())),
 		}
@@ -2655,10 +2674,10 @@ impl Rounds {
 				operator_nonce: l.operator_nonce,
 				exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| RoundError::Internal(e.to_string()))?,
 				unlock_hash: l.unlock_hash,
-				// An htlc-1 or order-2 leaf's terms, from the record the builder gave it.
+				// An htlc-1, order-2 or landing-1 leaf's terms, from the record the builder gave it.
 				htlc: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.htlc,
 				order: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.order,
-				landing: None,
+				landing: arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?.landing,
 			});
 		}
 		let signer_head = self.store.round_signer_head(b.round_id).await?;

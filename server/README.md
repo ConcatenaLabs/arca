@@ -45,7 +45,10 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V25__shared_fills.sql`](schema/V25__shared_fills.sql),
 [`schema/V26__plans.sql`](schema/V26__plans.sql),
 [`schema/V27__resting_orders.sql`](schema/V27__resting_orders.sql),
-[`schema/V28__issuer_operated.sql`](schema/V28__issuer_operated.sql)). `Store::connect` builds it
+[`schema/V28__issuer_operated.sql`](schema/V28__issuer_operated.sql),
+[`schema/V29__fill_requests.sql`](schema/V29__fill_requests.sql),
+[`schema/V30__order_landings.sql`](schema/V30__order_landings.sql),
+[`schema/V31__supervised.sql`](schema/V31__supervised.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -1466,6 +1469,85 @@ bare `OP_RETURN` of it. `issuer_supply` lists the operator's part of it,
 transaction by transaction, and the value live under its burn-only sweeps,
 counting only what the active chain holds.
 
+## Supervised assets
+
+A supervised asset is one whose issuer can freeze holdings by consensus
+rule: its supervision descriptor (an operational and a recovery key, and
+whether the asset can be paused) is committed in its asset id at issuance,
+so it can never be added or removed (the node's
+`doc/sequentia/supervised-assets.md`). A freeze names a script, and binds
+only a single-owner spend of it (P2WPKH, a taproot key path); a pause
+freezes every single-owner holding of the asset. Every Arca output is spent
+by a script path, so no freeze ever reaches the tree itself. The operator
+serves such an asset so that a frozen holder can neither move nor escape:
+
+**The profile is the chain's.** The server reads `getsupervisedassets` from
+its node at start and at every reload, and serves every asset listed there
+under this profile, whatever its section says. A section may set the
+profile's one setting:
+
+    [[assets]]
+    asset = "<asset id>"
+    min_leaf = "1000"
+    [assets.supervised]
+    landing_allowance = "10000"   # atoms; default: four times the node's floor for a landing
+
+and one that names `[assets.supervised]` for an asset the node does not
+list, or serves a supervised asset issuer-operated or over Lightning, is
+refused at start and on reload. `info` publishes the profile
+(`assets[].supervised.landing_allowance`).
+
+**Every leaf is `landing-1`.** A leaf of the asset, in a batch, a board or a
+reassignment, is `landing-1` (`arca-covenant`'s `landing`): its exit, the
+landing, pays only P2WPKH of the owner's own landing key, explicitly in the
+asset, all but the published allowance, and its collaborative constant
+commits to that key's program as well. Its owner names the landing when the
+leaf is asked for: a participation's wanted leaf, a transfer's output and a
+board's record carry `landing` (`{"program", "allowance"}`, the leaf
+record's JSON form), with the allowance `info` publishes; any other
+template, a missing landing or another allowance is refused
+(`out_of_bounds`), and a landing is refused on a leaf of any other asset.
+The published tree (`tree`) carries each leaf's landing, so anyone, the
+issuer included, rebuilds every leaf of a batch and reads where each lands.
+Every output of every round and transfer of the asset is explicit, as
+consensus requires of a transaction that moves it. Not served in the asset:
+takes of on-chain orders, resting orders (either asset), distributions,
+offline-refresh plans and Lightning legs, whose leaves or refunds would pay
+a key a freeze cannot follow.
+
+**The operator mirrors freezes.** Before it co-signs anything that spends a
+coin of the asset, the server asks its node whether the coin's landing is
+frozen (`isassetfrozen` on the landing's P2WPKH, never on an Arca script,
+which the node calls frozen once named although its script-path spends
+confirm). A coin whose landing is frozen, or whose asset is paused, is
+refused with `frozen` (409), checked before anything else about the
+request, naming the coin, its landing and why: a transfer, a swap, a
+refresh, an offboard, a take, a resting-order fill, a distribution, a plan,
+a Lightning payment, and a forfeit handed over for a participation taken
+before the freeze; a participation whose coin is frozen when its round is
+built is voided with the reason. A freeze binds as soon as its record is in
+a block of the node. Its lifting binds only once final: the server keeps a
+hold (`supervision_hold`) on every script a freeze record names, and on the
+asset's pause, from the block at which the node first shows it free until
+that block is certified and its anchor buried, so an anchor reorganisation
+that restores the freeze on the chain finds it still held. It reads every
+freeze and pause of the assets it serves after each pass over the chain, as
+well as at every request, so a freeze that no request met while it lasted is
+held to its final lifting too; only one recorded and lifted within a single
+pass, or while the server is stopped, goes unseen. Paying a frozen landing is co-signed: the coin arrives frozen, as on
+the chain. A frozen holder's coin leaves the tree only by its landing,
+unroll and exit by script paths that confirm under any freeze, into its own
+key, where the freeze binds; a frozen coin not landed by its batch's exit
+deadline is swept with the batch.
+
+**The signer checks on its own.** `arca-signer --supervision-node <url>
+--supervision-cookie <file>` reads freezes from a node of its own. A
+co-signature for a `landing-1` coin names its landing (the signer request's
+`landing`): the signer builds the message with that landing after `K`, as
+the coin's script does, and refuses (`frozen`) while its node shows the landing frozen or the asset
+paused. A signer started without a node signs nothing for a `landing-1`
+coin, so an operator serving a supervised asset runs its signer with one.
+
 ## The forfeit swap
 
 Once its round is final, an owner validates each new leaf from the published
@@ -1730,7 +1812,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), the template list and its version (every leaf template the covenant crate knows: `vtxo-1`, `board-1`, `htlc-1`, `order-2`, `landing-1`), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -1880,7 +1962,12 @@ assets says before the limiter's own tool (`--mint-limiter`) signs it with the
 limiter's operator key, never `S`; it answers the witness of the limiter's
 coin. For such an asset it signs no spend that pays a unit of it anywhere
 but a bare `OP_RETURN`. It signs no digest it is handed and no release, and
-nothing by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. The server
+nothing by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
+message for a `landing-1` coin, the leaf of a supervised asset, names the
+coin's landing program: the signer builds the message over the constant
+that binds it, and signs only while a node of its own
+(`--supervision-node`) shows that landing free and the asset not paused (see
+Supervised assets). The server
 checks each signature it gets back against the message or signature hash it
 built.
 Beside those it answers reads of its record: its latest head, its entries
@@ -2459,6 +2546,22 @@ with `strace`, which must be on the `PATH`.
 
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server
+
+`tests/supervised.rs` issues an asset under the supervision descriptor,
+with the pause capability, and serves it supervised after a reload (a
+configuration naming another asset supervised is refused). Its signer reads
+freezes from the test's node. A board and a refresh of the asset into a
+`vtxo-1` leaf, and a board or a transfer with another allowance, are refused;
+a holder boards, refreshes into a batch every leaf of which is `landing-1`,
+read back from the published tree, and pays another out of round. A freeze
+of the first holder's landing is mirrored at once: its transfer, a swap with
+it, its refresh, offboard, take of an on-chain order, resting-order fill,
+distribution, plan and Lightning payment are each refused with `frozen`, and
+the signer refuses the coin on its own node (a signer reading no node
+refuses it too). The other holder still pays the frozen one. A pause
+refuses the other holder until its lifting is final, as the freeze's lifting
+does the first; a participation taken before a freeze is voided when its
+round is built.
 
 `tests/issuer.rs` also needs the mint limiter's tool, named by
 `MINT_LIMITER` (sequentia-contracts `tools/mint-limiter`, with its `sign`

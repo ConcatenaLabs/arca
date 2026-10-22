@@ -110,6 +110,8 @@ impl Participations {
 		if self.store.participation(&id).await?.is_some() {
 			return self.status(&id).await;
 		}
+		// A coin whose holder is frozen is refused before anything else.
+		crate::supervision::gate(&self.store, &self.finality, p, &d.inputs).await?;
 		let now = self.now().await?;
 		if let Some(t) = d.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -128,6 +130,12 @@ impl Participations {
 		if p.assets.get(&asset).is_some_and(|x| x.issuer.is_some()) {
 			return Err(ParticipationError::OutOfBounds(format!("asset {} is issuer-operated here: the operator keeps no unit of it, and a \
 				distribution's unclaimed value is paid back from the operator's coins", asset)));
+		}
+		// A claim leaf is vtxo-1, owned by a key derived from the one the
+		// payer names, which names no landing: out of a freeze's reach.
+		if p.supervised(&asset).is_some() {
+			return Err(ParticipationError::OutOfBounds(format!("asset {} is supervised: a distribution is not served in it, as its \
+				claim leaves would be vtxo-1, out of a freeze's reach", asset)));
 		}
 		if let Some((a, _)) = d.fees.iter().find(|(a, _)| *a != asset) {
 			return Err(ParticipationError::Assets(format!("a fee in asset {}: a distribution pays its fee in its own asset, {}", a, asset)));
@@ -267,6 +275,7 @@ impl Participations {
 					operator_nonce: [0; 32],
 					htlc: None,
 					order: None,
+					landing: None,
 				},
 				leaf_id: None,
 			}).collect(),

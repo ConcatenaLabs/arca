@@ -55,7 +55,7 @@ async fn the_signer_process() {
 	let outs = vec![ExplicitOutput::new(asset, 9_000, Script::from(vec![0x51]))];
 	let owner = keypair("owner");
 	let msg = leaf.collab_message(asset, 10_000, &outs).unwrap();
-	let sig = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, asset, 10_000, &outs).await.unwrap();
+	let sig = client.rebind(&xonly(&owner), &sign_digest(&owner, &msg.digest, &[0; 32]), &leaf.salt, None, asset, 10_000, &outs).await.unwrap();
 	assert!(verify_digest(&sig, &msg.digest, &xonly(&s)));
 	// The same parts on another chain give another message: this signature
 	// means nothing there.
@@ -78,7 +78,7 @@ async fn the_signer_process() {
 		assert!(v["error"].is_string() && v["signature"].is_null(), "{}: {}", what, answer);
 		println!("refused, {}: {}", what, v["error"].as_str().unwrap());
 	}
-	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &[0; 32], &[0; 32]), &[0; 32], asset, 1, &[]).await.unwrap_err();
+	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &[0; 32], &[0; 32]), &[0; 32], None, asset, 1, &[]).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 
 	// The spend of one of the operator's own paths: a clock's release. The
@@ -181,7 +181,7 @@ async fn the_signers_record() {
 	let spend = |k: &Keypair, salt: [u8; 32], o: ExplicitOutput| {
 		let client = client.clone();
 		let k = *k;
-		async move { client.rebind(&xonly(&k), &owner_sig(&k, genesis, &salt, asset, 10_000, &[o.clone()]), &salt, asset, 10_000, &[o]).await }
+		async move { client.rebind(&xonly(&k), &owner_sig(&k, genesis, &salt, asset, 10_000, &[o.clone()]), &salt, None, asset, 10_000, &[o]).await }
 	};
 
 	// A spend of A's leaf under salt 1, the same again, and a second spend
@@ -210,15 +210,15 @@ async fn the_signers_record() {
 	// refused, and nothing recorded under that key.
 	let o = out(9_000, 5);
 	let wrong_key = owner_sig(&b, genesis, &[5; 32], asset, 10_000, &[o.clone()]);
-	let e = client.rebind(&xonly(&a), &wrong_key, &[5; 32], asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_key, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A named, B's signature: {}", e);
 	let wrong_message = owner_sig(&a, genesis, &[5; 32], asset, 10_000, &[out(9_000, 6)]);
-	let e = client.rebind(&xonly(&a), &wrong_message, &[5; 32], asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_message, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A's signature over another message: {}", e);
 	let wrong_salt = owner_sig(&a, genesis, &[6; 32], asset, 10_000, &[o.clone()]);
-	let e = client.rebind(&xonly(&a), &wrong_salt, &[5; 32], asset, 10_000, &[o.clone()]).await.unwrap_err();
+	let e = client.rebind(&xonly(&a), &wrong_salt, &[5; 32], None, asset, 10_000, &[o.clone()]).await.unwrap_err();
 	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
 	println!("A's signature for another salt: {}", e);
 
@@ -233,7 +233,7 @@ async fn the_signers_record() {
 		let client = client.clone();
 		async move {
 			let sig = owner_sig(&a, genesis, &salt, asset, 10_000, &[o.clone()]);
-			client.rebind_forfeit(&xonly(&a), &sig, &salt, asset, 10_000, &f, &o).await
+			client.rebind_forfeit(&xonly(&a), &sig, &salt, None, asset, 10_000, &f, &o).await
 		}
 	};
 	let (f1, f1b, f2) = (forfeit(7, 1), forfeit(7, 2), forfeit(8, 1));
@@ -256,7 +256,7 @@ async fn the_signers_record() {
 	let fb = ForfeitPolicy { owner: xonly(&b), ..forfeit(7, 3) };
 	let ob = fout(&fb);
 	let sig = owner_sig(&b, genesis, &[2; 32], asset, 10_000, &[ob.clone()]);
-	let e = client.rebind_forfeit(&xonly(&b), &sig, &[2; 32], asset, 10_000, &fb, &ob).await.unwrap_err();
+	let e = client.rebind_forfeit(&xonly(&b), &sig, &[2; 32], None, asset, 10_000, &fb, &ob).await.unwrap_err();
 	println!("salt 2: B's forfeit for the round A's forfeit was signed for: {}", e);
 	refused_twice(e);
 	refused_twice(spend(&b, [2; 32], out(9_000, 1)).await.unwrap_err());

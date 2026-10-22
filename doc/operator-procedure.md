@@ -260,6 +260,40 @@ issuer sets it up so:
   burn-only sweeps, which `issuer_supply` lists, or they read the mint as
   inflation.
 
+## Serving a supervised asset
+
+A supervised asset's issuer can freeze holdings by consensus rule. The
+operator serves one so that a frozen holder can neither move nor escape
+([Supervised assets](../server/README.md#supervised-assets)):
+
+- **The node says which assets are supervised.** `arcad` reads
+  `getsupervisedassets` at start and on every reload and serves each one so,
+  whatever its section says; there is nothing to switch on. Name
+  `[assets.supervised]` only to set the landing allowance, and keep it at the
+  size of a landing's fee: it is the most of a frozen coin its exit can send
+  anywhere but its owner's key.
+- **The signer reads freezes from a node of its own.** Start the signer with
+  `--supervision-node <url> --supervision-cookie <file>`, a node with the
+  supervision registry (any current `sequentiad`), the cookie readable by the
+  signer alone. A signer without one signs nothing for the asset's coins,
+  and its holders' refreshes and transfers fail with `frozen` until it has
+  one. A node of its own, not `arcad`'s, so that a fault in either one alone
+  cannot let a frozen coin move.
+- **Freezes bind at once; liftings once final.** A freeze binds in the tree
+  as soon as its record is in a block of the node; a lifting binds only once
+  the block that shows it is final. Nothing is to be done by hand: the hold
+  is kept in the database and clears itself.
+- **No Lightning leg, no takes of on-chain orders, no resting orders, no
+  distributions and no plans in the asset, and not issuer-operated.** The
+  server refuses each, at start or per request.
+- **What the issuer can and cannot do, said plainly.** A freeze stops every
+  co-signed spend of a frozen holder's coin in the tree: a transfer, a swap,
+  a refresh, an offboard, a take, a fill, a distribution, a plan, a Lightning
+  payment. It never stops the holder taking the coin home by its landing,
+  into its own key, where the freeze binds on the chain; and a coin not taken
+  home before its batch's exit deadline is swept with the batch, as any coin
+  neither refreshed nor taken home.
+
 ## What holders are told
 
 Every holder receives these rules before the operator holds their coins:
