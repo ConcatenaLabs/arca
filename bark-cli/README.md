@@ -1241,9 +1241,16 @@ hand a watcher. `watch-bond` is that watcher. It takes the wallet's own lines
 and every file given with `--evidence` (what another wallet's `bond-evidence`
 printed, or one line a line), counts only the lines whose signature the
 operator key made (`evidence.refused` counts the rest), and reads the chain
-from where it last read it, and the mempool, for every spend of a script that
-carries a watched salt's constant, reading the operator's signature and its
-message from the transaction. Two different messages under one salt are a
+and the mempool for every spend of a script that carries a watched salt's
+constant, reading the operator's signature and its message from the
+transaction. A wallet with no lines to watch reads nothing. A salt read before
+is read on from where the last run stopped; a salt of the wallet's own coins
+is read from the block of the oldest transaction those coins rest on, since no
+spend of them comes before it; a salt only another wallet's file names is read
+from 20,000 blocks back, and none further back than that (`scanned` says from
+where, to where, and how many blocks). The chain is read 500 blocks at a time,
+and the signatures found are kept before the height is noted, so a run cut
+short goes on where it stopped. Two different messages under one salt are a
 conflict: the wallet builds the slash, which burns the whole bond with a bare
 `OP_RETURN` and pays its fee from an on-chain coin of the wallet's own (the
 bond's asset first, or `--fee-asset`, as for an exit), and sends it, and sends
