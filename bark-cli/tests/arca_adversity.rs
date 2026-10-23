@@ -1199,6 +1199,56 @@ async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() 
 	}
 }
 
+/// A payment the operator's signer refuses for what it asks is final: the
+/// server answers 422 `declined` before it records anything, and the
+/// wallet puts its coin back (live, not `sending`), keeps the refusal once
+/// among its refusals, and posts nothing again on `sync`. The signer here
+/// holds the asset restricted, which the server serves open: it co-signs no
+/// message of the asset, a refusal it repeats however often it is asked.
+/// The signer as it was, the same coin pays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_the_signer_declines_is_refused_once_and_its_coin_comes_back() {
+	let mut r = Running::start().await;
+	let url = r.url();
+	let x = r.x;
+	let (a, w) = (Arca::new("SDA"), Arca::new("SDW"));
+	let p = Proxy::start(&url);
+	let boards = boarded(&mut r, &a, &p.url.clone(), &[(x, 2_000_000)]).await;
+	w.ok(&create_args(&url, &r.node_url()));
+	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let policy_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+	r.signer.halt();
+	r.signer.set_extra(vec!["--restricted".into(), format!("{}={}", x, policy_key)]);
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("A pays W, the signer declining it: ok={} {}", ok, v);
+	assert!(!ok);
+	assert_eq!((v["error"]["kind"].as_str(), v["error"]["code"].as_str(), v["error"]["status"].as_i64()),
+		(Some("server_refused"), Some("declined"), Some(422)), "a refusal for good: {}", v);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "live", "the coin is back, not in flight");
+	let s = a.ok(&["sync"]);
+	println!("A's sync after the refusal: transfers {}", s["transfers"]);
+	let calls = p.calls().into_iter().filter(|(path, ..)| path == "/v1/cosign_transfer").count();
+	assert_eq!(calls, 1, "nothing posted again");
+	let refusals = a.ok(&["refusals"]);
+	let of_it: Vec<&Value> = refusals.as_array().unwrap().iter()
+		.filter(|f| f["reason"].as_str().unwrap_or("").contains("declined")).collect();
+	println!("A's refusals: {:?}", of_it);
+	assert_eq!(of_it.len(), 1, "kept once: {}", refusals);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "live");
+	// The signer as it was: the same coin pays.
+	r.signer.halt();
+	r.signer.set_extra(vec![]);
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let done = a.ok(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
+	println!("A pays W, the signer as it was: transfer {}", done["transfer"]["transfer_id"]);
+	assert_eq!(coin_of(&a, &boards[0])["state"], "spent");
+	for c in [&a, &w] {
+		let _ = std::fs::remove_dir_all(&c.dir);
+	}
+}
+
 /// A payment asked for while the signer is away: the server records the
 /// transfer, its coin spent by it, and answers 503 before anything is
 /// signed; the sender's wallet keeps the request standing. The board's exit

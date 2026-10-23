@@ -64,6 +64,49 @@ fn participate(r: &Running, old: &Held, new_key: &Keypair) -> ([u8; 32], [u8; 32
 	(id, nonce)
 }
 
+/// A forfeit the signer declines for what it asks is refused for good, 422
+/// `declined`, and it records nothing: the participation is not released and
+/// no preimage goes out. The signer here holds the coin's asset restricted,
+/// which the server serves open, so it signs no forfeit of it. Once the
+/// signer signs again, the same forfeit releases the participation. A signer
+/// that cannot be reached is answered `signer_unavailable` (503), the
+/// forfeit recorded with its owner's half, and the same request completes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forfeit_the_signer_declines_is_refused_for_good() {
+	let mut r = start().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
+	let a2 = keypair("A, new");
+	let (pa, a2_nonce) = participate(&r, &a_board, &a2);
+	let a_old = coin_of(&r, &a_board, std::slice::from_ref(&a_tx));
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &pa);
+	let (a2_valid, a2_record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
+	let f = forfeit_for(&a_old, &a2_valid, &round, &st, 0);
+	let good = forfeit_body(&pa, &[(a_board.id, forfeit_sig(&f, &a))], &[auths_json(&a2_valid, &a2, created(&a2_record))]);
+	let entries = r.signer_entries().await.len();
+	let genesis = r.chain.genesis_hash();
+	let key = r.s;
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &["--restricted".to_string(),
+		format!("{}={}", x, hex(&xonly(&keypair("P")).serialize()))]));
+	for _ in 0..2 {
+		refused(r.http.post("forfeit_leaves", &good), 422, "declined");
+	}
+	assert_eq!(status(&r, &pa)["state"], "issued", "not released");
+	assert_eq!(r.signer_entries().await.len(), entries, "the signer recorded nothing");
+	r.signer.kill();
+	refused(r.http.post("forfeit_leaves", &good), 503, "signer_unavailable");
+	tokio::task::block_in_place(|| r.signer.restart(&key, genesis));
+	let done = r.http.post("forfeit_leaves", &good).ok();
+	println!("the same forfeit once the signer signs: {} {}", done["state"], done["preimage"]);
+	assert_eq!(done["state"], "released", "{}", done);
+	assert_eq!(r.signer_entries().await.len(), entries + 1, "the forfeit, recorded once");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refresh_end_to_end_and_every_refusal() {
 	let mut r = start().await;
