@@ -37,6 +37,7 @@
 //! the whole of it becomes SeqDEX's own order for the same terms, which any
 //! taker fills on the chain.
 
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use elements::secp256k1_zkp::schnorr::Signature;
@@ -58,6 +59,17 @@ use super::round::{fee_within, refresh_fee, schedule_of, DEFAULT_MAX_FEE_PPM};
 use super::store::{CoinRow, RestingRow};
 use super::wallet::{sign, Wallet};
 use super::{random32, Error};
+
+/// The most orders one `order_state` read may name: the operator refuses a
+/// read of more.
+pub const ORDERS_PER_READ: usize = 100;
+
+/// The orders of `ask`, each once, in reads of at most [`ORDERS_PER_READ`].
+fn order_state_reads(ask: &[String]) -> Vec<Vec<String>> {
+	let mut seen = BTreeSet::new();
+	let once: Vec<String> = ask.iter().filter(|o| seen.insert(o.to_ascii_lowercase())).cloned().collect();
+	once.chunks(ORDERS_PER_READ).map(|c| c.to_vec()).collect()
+}
 
 /// How long, beyond the operator's order margin, an order's REFUND must lie
 /// ahead when it is rested: an hour, for its round and its forfeits. The
@@ -333,9 +345,13 @@ impl Wallet {
 		let mine = self.store.restings()?;
 		let mut ask: Vec<String> = mine.iter().filter_map(|r| r.order_leaf.clone()).collect();
 		ask.extend(ids.iter().cloned());
-		let served = if ask.is_empty() { Value::Array(vec![]) } else {
-			self.server.post("order_state", &json!({"orders": ask}))?["orders"].clone()
-		};
+		// Every order the wallet ever rested is asked after, so a busy maker
+		// soon names more than one read may: they are read a chunk at a time.
+		let mut states = vec![];
+		for read in order_state_reads(&ask) {
+			states.extend(self.server.post("order_state", &json!({"orders": read}))?["orders"].as_array().cloned().unwrap_or_default());
+		}
+		let served = Value::Array(states);
 		let mut out = vec![];
 		for r in &mine {
 			let mut v = json!({"order": r.order_leaf, "rested_by": r.id, "state": r.state, "amount": r.amount.to_string()});
@@ -687,4 +703,24 @@ fn fill_margin(oc: &arca_covenant::ValidCoin, plan: &arca_covenant::order::Order
 	let u = arca_covenant::transfer::fill_tx(oc, &dummy, plan.rest.is_some(), &sized, outputs, at, &vec![at; sized.len()],
 		&FeeSource::Reserve).map_err(|e| Error::Refused(e.to_string()))?;
 	Ok(m.margin(u.tx.vsize()))
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn order_states_are_read_once_each_in_reads_of_at_most_a_hundred() {
+		let mut ask: Vec<String> = (0..113).map(|i| format!("{:064x}", i)).collect();
+		// The wallet's own orders asked again by id, one in capitals.
+		ask.extend((0..10).map(|i| format!("{:064x}", i)));
+		ask.push(format!("{:064X}", 10u32));
+		let reads = order_state_reads(&ask);
+		assert_eq!(reads.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![100, 13]);
+		let all: Vec<&String> = reads.iter().flatten().collect();
+		assert_eq!(all.len(), 113, "each order once");
+		assert!(reads.iter().all(|r| r.len() <= ORDERS_PER_READ));
+		assert!(order_state_reads(&[]).is_empty(), "nothing asked, nothing read");
+		assert_eq!(order_state_reads(&ask[..100]).len(), 1, "a hundred in one read");
+	}
 }

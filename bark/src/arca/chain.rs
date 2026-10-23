@@ -560,7 +560,7 @@ impl ChainSource {
 	}
 
 	/// The active-chain block holding `txid`, and its height.
-	fn tx_block(&self, txid: &Txid) -> Result<Option<(BlockHash, u64)>, Error> {
+	pub(crate) fn tx_block(&self, txid: &Txid) -> Result<Option<(BlockHash, u64)>, Error> {
 		let v: Value = match self.call("getrawtransaction", &[json!(txid.to_string()), json!(true)]) {
 			Ok(v) => v,
 			Err(e) if not_found(&e) => return Ok(None),
