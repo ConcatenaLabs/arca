@@ -286,9 +286,14 @@ impl Wallet {
 			Ok(a) => a,
 			// Not answered: the state stands, and is sent again.
 			Err(Error::Unreachable(why)) => return Err(Error::Unreachable(format!("channel {} state {}: {}", leaf_id, s.number, why))),
+			// Refused: the state is dropped, never sent again, and a refusal
+			// of the server's is kept once, beside the others.
 			Err(e) => {
 				k.pending = None;
 				self.keep(leaf_id, &k)?;
+				if matches!(e, Error::Server { .. }) {
+					self.store.refused(&format!("channel {} state {}", leaf_id, s.number), &e.to_string())?;
+				}
 				return Err(e);
 			},
 		};

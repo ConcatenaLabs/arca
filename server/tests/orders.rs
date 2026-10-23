@@ -534,6 +534,61 @@ async fn a_fill_left_half_signed() -> (Running, LeafId, Value, common::signer::S
 	(r, om.held.id, good, tap)
 }
 
+/// A fill the signer declines for what it asks is refused for good, 422
+/// `declined`, before anything of it is recorded: the order rests where it
+/// was with no fill, the taker's coin is its own, and the signer recorded
+/// nothing. The signer here holds the taker's asset restricted, which the
+/// server serves open, so it co-signs no message of it. Once the signer signs
+/// again, the same fill completes. A fill the signer cannot reach is
+/// recorded and completed later (`a_fill_the_signer_left_half_done_is_completed_by_the_server`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_the_signer_declines_is_refused_for_good() {
+	let mut r = start().await;
+	let (x, y) = (r.x, r.y);
+	let m = maker(&r, "M");
+	let t1 = keypair("T1");
+	let mut boards = vec![];
+	for (label, asset) in [("M, board", x), ("T1, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &t1, w1, n1)]).await;
+	let (om, c1) = (&got[0], &got[1]);
+	r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	let p = policy_of(&r, &st, &om.bases);
+	let (l1, _) = new_leaf(&keypair("T1, X"));
+	let (ch1, _) = new_leaf(&keypair("T1, change"));
+	let good = fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None);
+	let entries = r.signer_entries().await.len();
+	let genesis = r.chain.genesis_hash();
+	let restricted = vec!["--restricted".to_string(), format!("{}={}", y, hex(&xonly(&keypair("P")).serialize()))];
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &restricted));
+	for _ in 0..2 {
+		let a = r.http.post("order_fill", &good);
+		let (code, message) = a.refusal();
+		println!("T1's fill, the signer declining it: {} {}: {}", a.status, code, message);
+		assert_eq!((a.status, code.as_str()), (422, "declined"), "{}", a.json);
+	}
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("after the refusals: state {} value {} fills {}", st["state"], st["value"], st["fills"]);
+	assert_eq!((st["state"].as_str(), st["value"].as_str()), (Some("resting"), Some("1000000")));
+	assert!(st["fills"].as_array().is_none_or(|f| f.is_empty()), "no fill recorded: {}", st);
+	let taker = r.server.store.leaf(&c1.held.id.0).await.unwrap().unwrap();
+	assert_eq!(taker.state, server::store::LeafState::Live, "the taker's coin is its own");
+	assert_eq!(r.signer_entries().await.len(), entries, "the signer recorded nothing");
+	// The signer as it was: the same fill completes.
+	let key = r.s;
+	tokio::task::block_in_place(|| r.signer.restart(&key, genesis));
+	let done = r.http.post("order_fill", &good).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("the same fill once the signer signs: transfer {}, the order resting at {} of value {}", done["transfer_id"], st["coin"],
+		st["value"]);
+	assert_eq!((st["state"].as_str(), st["value"].as_str()), (Some("resting"), Some("700000")));
+}
+
 /// While a fill of the coin an order rests at is recorded and not signed,
 /// `order_state` reads `filling`, not `filled`: the fill is either signed
 /// (and the order rests at its remainder) or dropped (and it rests where it

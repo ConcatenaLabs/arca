@@ -567,12 +567,14 @@ impl Wallet {
 				forget(self)?;
 				Ok(json!({"transfer_id": done["transfer_id"], "coins": taken}))
 			},
+			// Refused, and not taken: the coins are the wallet's again, and
+			// the refusal is kept once, beside the others.
 			Err(e @ Error::Server { .. }) => {
 				self.store.atomically(|s| {
 					for l in given {
 						s.set_coin_state(l, "live", "")?;
 					}
-					Ok(())
+					s.refused(&format!("a fill of resting order {}", body["order"].as_str().unwrap_or("")), &e.to_string())
 				})?;
 				forget(self)?;
 				Err(e)

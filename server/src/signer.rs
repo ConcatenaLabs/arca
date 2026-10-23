@@ -375,6 +375,11 @@ pub enum Request {
 		/// without which the signer signs nothing of the asset.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		policy_sig: Option<String>,
+		/// Asks only whether the signer would sign it: it makes every check
+		/// of the request and of its record, and records and signs nothing.
+		/// An answer without an error says it would.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		check: bool,
 	},
 	/// The latest entry of the record: its number and running hash, signed.
 	Head {},
@@ -424,10 +429,18 @@ pub enum Request {
 		outputs: Vec<WireOutput>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		known: Option<WireEntryRef>,
+		/// As `rebind`'s: only whether the signer would sign it.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		check: bool,
 	},
 	/// A state of the `channel-1` coin `channel` names, with the owner's
-	/// signature over the state message the signer rebuilds.
-	ChannelState { channel: WireChannel, state: WireState, owner_sig: String },
+	/// signature over the state message the signer rebuilds; with `check`,
+	/// only whether the signer would sign it.
+	ChannelState {
+		channel: WireChannel, state: WireState, owner_sig: String,
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		check: bool,
+	},
 	/// A credit note of the cumulative `credit` for the channel, within the
 	/// cap of `state`, which the owner signed (`owner_sig`), or which is the
 	/// channel's opening, which needs no signature.
@@ -538,7 +551,8 @@ pub struct Response {
 	pub error: Option<String>,
 	/// `already_signed` when the record holds another message for the leaf;
 	/// `record_behind` or `record_differs` when the database knows a later
-	/// entry, or another.
+	/// entry, or another; `declined` (or a restricted asset's `restricted`
+	/// or `policy`) when it refuses what the request asks ([`DECLINED`]).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<String>,
 	/// The entry a rebindable signature was recorded as, or the record's
@@ -603,6 +617,13 @@ pub struct WireKeepers {
 
 /// The refusal code of a message the one-spend record does not admit.
 pub const ALREADY_SIGNED: &str = "already_signed";
+
+/// The refusal code of a request the signer refuses for what it asks: a
+/// message it does not sign as the request builds it, whatever its record or
+/// its keepers hold, so it refuses the same request again however often it is
+/// asked. A refusal without a code is the signer's own failure (its record
+/// not read or written), which the same request may get past later.
+pub const DECLINED: &str = "declined";
 
 /// What a rebindable message the signer signed is, for its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1850,29 +1871,8 @@ impl SpendRecord {
 	/// one message under a salt, ever.
 	pub fn admit(&mut self, owner: &[u8; 32], salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<Entry, String> {
 		use std::io::Write;
-		if let Some(why) = self.refusing() {
-			return Err(why.to_string());
-		}
-		if self.dropped(salt) {
-			return Err(format!(
-				"{}: S co-signed a message under salt {} before the record was compacted, which dropped its entries (its \
-				 batch expired) and kept the salt; the signer co-signs one message under a salt, ever, and two messages \
-				 under one salt burn the operator's bond", ALREADY_SIGNED, hex(salt)));
-		}
-		let had = self.under(salt).map_err(|e| format!("the record could not be read: {}", e))?;
-		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
-			return Ok(*e);
-		}
-		for e in &had {
-			if e.digest != *digest {
-				return Err(format!(
-					"{}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one \
-					 message under a salt, ever, since its signature commits to the salt and not to the owner, and two \
-					 messages under one salt burn the operator's bond",
-					ALREADY_SIGNED, match e.kind { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(&e.digest),
-					hex(salt), e.n, hex(&e.owner),
-				));
-			}
+		if let Some(e) = self.admissible(salt, kind, digest)? {
+			return Ok(e);
 		}
 		let (n, prev) = self.head;
 		let mut e = Entry { n: n + 1, kind, owner: *owner, salt: *salt, digest: *digest, hash: [0; 32] };
@@ -1895,6 +1895,40 @@ impl SpendRecord {
 		self.head = (e.n, e.hash);
 		self.keep(e.n, &e.salt, e.hash, at, true);
 		Ok(e)
+	}
+
+	/// Whether [`Self::admit`] would admit `digest`, a message of `kind`
+	/// under `salt`, reading the record and writing nothing: the entry
+	/// already recorded for the same message, none for a message it would
+	/// record, or why it refuses: the signer refuses everything
+	/// ([`Self::refusing`]), or another message is held under the salt
+	/// (`already_signed`).
+	pub fn admissible(&self, salt: &[u8; 32], kind: Signed, digest: &[u8; 32]) -> Result<Option<Entry>, String> {
+		if let Some(why) = self.refusing() {
+			return Err(why.to_string());
+		}
+		if self.dropped(salt) {
+			return Err(format!(
+				"{}: S co-signed a message under salt {} before the record was compacted, which dropped its entries (its \
+				 batch expired) and kept the salt; the signer co-signs one message under a salt, ever, and two messages \
+				 under one salt burn the operator's bond", ALREADY_SIGNED, hex(salt)));
+		}
+		let had = self.under(salt).map_err(|e| format!("the record could not be read: {}", e))?;
+		if let Some(e) = had.iter().find(|e| e.kind == kind && e.digest == *digest) {
+			return Ok(Some(*e));
+		}
+		for e in &had {
+			if e.digest != *digest {
+				return Err(format!(
+					"{}: S has already co-signed {} {} under salt {} (entry {}, for the leaf of {}); the signer co-signs one \
+					 message under a salt, ever, since its signature commits to the salt and not to the owner, and two \
+					 messages under one salt burn the operator's bond",
+					ALREADY_SIGNED, match e.kind { Signed::Spend => "the spend", Signed::Forfeit(_) => "the forfeit" }, hex(&e.digest),
+					hex(salt), e.n, hex(&e.owner),
+				));
+			}
+		}
+		Ok(None)
 	}
 
 	/// Compacts the record at `from` (kept for `operator` on the chain of
@@ -2004,8 +2038,16 @@ impl SpendRecord {
 pub enum SignerError {
 	#[error("cannot reach the signer at {path}: {error}")]
 	Unreachable { path: String, error: String },
-	#[error("the signer refused: {0}")]
-	Refused(String),
+	/// The signer refuses what the request asks ([`DECLINED`], or a
+	/// restricted asset's `restricted` or `policy`): it refuses the same
+	/// request again however often it is asked.
+	#[error("the signer declined: {0}")]
+	Declined(String),
+	/// The signer answered with a failure of its own (its record not read or
+	/// written, too few of its keepers reached): the same request may be
+	/// signed later.
+	#[error("the signer could not answer: {0}")]
+	Failed(String),
 	/// The one-spend record holds another message for the leaf.
 	#[error("the signer refused: {0}")]
 	AlreadySigned(String),
@@ -2029,6 +2071,22 @@ pub enum SignerError {
 	Database(String),
 	#[error("the signer's answer is not understood: {0}")]
 	Answer(String),
+}
+
+impl SignerError {
+	/// Whether the signer refuses the same request again however often it is
+	/// asked: it declines what the request asks, its record holds another
+	/// message under the salt, or the coin's landing is frozen. Every other
+	/// error says nothing of what a later request gets.
+	pub fn is_final(&self) -> bool {
+		matches!(self, SignerError::Declined(_) | SignerError::AlreadySigned(_) | SignerError::Frozen(_))
+	}
+}
+
+/// A signing request's answer, which carries a signature: an answer that
+/// came back without one is not understood.
+fn signed(r: Option<(Signature, Option<SignedHead>)>) -> Result<(Signature, Option<SignedHead>), SignerError> {
+	r.ok_or_else(|| SignerError::Answer("no signature".into()))
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -2138,7 +2196,8 @@ impl SignerClient {
 				Some(RECORD_BEHIND) | Some(RECORD_DIFFERS) => SignerError::Record(e),
 				Some(STOPPED) => SignerError::Stopped(e),
 				Some(crate::supervision::FROZEN) => SignerError::Frozen(e),
-				_ => SignerError::Refused(e),
+				Some(DECLINED) | Some(crate::restricted::RESTRICTED) | Some(crate::restricted::POLICY) => SignerError::Declined(e),
+				_ => SignerError::Failed(e),
 			});
 		}
 		Ok(r)
@@ -2227,7 +2286,7 @@ impl SignerClient {
 	pub async fn rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>, asset_in: AssetId,
 		value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>) -> Result<Signature, SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named).await.map(|(s, _)| s)
+		signed(self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named, false).await?).map(|(s, _)| s)
 	}
 
 	/// [`Self::rebind`], with the entry of the record the signature was
@@ -2237,7 +2296,18 @@ impl SignerClient {
 		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>)
 		-> Result<(Signature, Option<SignedHead>), SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named).await
+		signed(self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named, false).await?)
+	}
+
+	/// Whether the signer would sign what [`Self::rebind_recorded`] asks,
+	/// with nothing recorded or signed: every check it makes of the request
+	/// and of its record. A refusal it would repeat however often it is asked
+	/// is [`SignerError::is_final`].
+	#[allow(clippy::too_many_arguments)]
+	pub async fn check_rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>,
+		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>) -> Result<(), SignerError>
+	{
+		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, outputs, None, None, named, true).await.map(|_| ())
 	}
 
 	/// [`Self::rebind_recorded`] for a coin of a restricted asset: `enclave`
@@ -2247,7 +2317,15 @@ impl SignerClient {
 	pub async fn rebind_cosigned(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], enclave: Option<XOnlyPublicKey>,
 		policy_sig: &Signature, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(Signature, Option<SignedHead>), SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, None, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None).await
+		signed(self.rebind_as(owner, owner_sig, salt, None, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None, false).await?)
+	}
+
+	/// [`Self::check_rebind`] for what [`Self::rebind_cosigned`] asks.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn check_rebind_cosigned(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], enclave: Option<XOnlyPublicKey>,
+		policy_sig: &Signature, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(), SignerError>
+	{
+		self.rebind_as(owner, owner_sig, salt, None, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None, true).await.map(|_| ())
 	}
 
 	/// `S`'s signature over the rebindable message of the leaf of `owner`
@@ -2259,28 +2337,33 @@ impl SignerClient {
 		asset_in: AssetId, value_in: u64, forfeit: &ForfeitPolicy, output: &ExplicitOutput, named: Option<WireNamed>)
 		-> Result<Signature, SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, std::slice::from_ref(output),
-			Some(WireForfeit::from_policy(forfeit)), None, named).await.map(|(s, _)| s)
+		signed(self.rebind_as(owner, owner_sig, salt, landing, asset_in, value_in, std::slice::from_ref(output),
+			Some(WireForfeit::from_policy(forfeit)), None, named, false).await?).map(|(s, _)| s)
 	}
 
+	/// The signature and the head it was recorded as; with `check`, only
+	/// whether the signer would sign it (`None`), nothing recorded.
 	#[allow(clippy::too_many_arguments)]
 	async fn rebind_as(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], landing: Option<[u8; 20]>, asset_in: AssetId,
 		value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>, restricted: Option<(Option<XOnlyPublicKey>, Signature)>,
-		named: Option<WireNamed>)
-		-> Result<(Signature, Option<SignedHead>), SignerError>
+		named: Option<WireNamed>, check: bool)
+		-> Result<Option<(Signature, Option<SignedHead>)>, SignerError>
 	{
-		let known = match &self.store {
-			Some(store) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
+		let known = match (&self.store, check) {
+			(Some(store), false) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
 				.map(|(entry, hash)| WireEntryRef { entry, hash: hex(&hash), signature: None }),
-			None => None,
+			_ => None,
 		};
 		let r = self.ask(&Request::Rebind {
 			owner: hex(&owner.serialize()), owner_sig: hex(owner_sig.as_ref()), salt: hex(salt), asset_in: asset_in.to_string(),
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
 			landing: landing.map(|p| hex(&p)),
 			enclave: restricted.and_then(|(h, _)| h).map(|h| hex(&h.serialize())),
-			policy_sig: restricted.map(|(_, s)| hex(s.as_ref())), named,
+			policy_sig: restricted.map(|(_, s)| hex(s.as_ref())), named, check,
 		}).await?;
+		if check {
+			return Ok(None);
+		}
 		let head = SignedHead::from_answer(&r)?;
 		if let (Some(store), Some(h)) = (&self.store, &head) {
 			self.keep_acks(h).await?;
@@ -2288,7 +2371,7 @@ impl SignerClient {
 		}
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		let sig = Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))?;
-		Ok((sig, head))
+		Ok(Some((sig, head)))
 	}
 
 	/// The witness of the limiter's coin at input 0 of the round `req`
@@ -2305,16 +2388,33 @@ impl SignerClient {
 	pub async fn order_fill(&self, order: &arca_covenant::OrderPolicy, value_in: u64, partial: bool, outputs: &[ExplicitOutput])
 		-> Result<(Signature, Option<SignedHead>), SignerError>
 	{
-		let known = match &self.store {
-			Some(store) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
+		signed(self.order_fill_as(order, value_in, partial, outputs, false).await?)
+	}
+
+	/// Whether the signer would sign what [`Self::order_fill`] asks, with
+	/// nothing recorded or signed ([`Self::check_rebind`]).
+	pub async fn check_order_fill(&self, order: &arca_covenant::OrderPolicy, value_in: u64, partial: bool, outputs: &[ExplicitOutput])
+		-> Result<(), SignerError>
+	{
+		self.order_fill_as(order, value_in, partial, outputs, true).await.map(|_| ())
+	}
+
+	async fn order_fill_as(&self, order: &arca_covenant::OrderPolicy, value_in: u64, partial: bool, outputs: &[ExplicitOutput], check: bool)
+		-> Result<Option<(Signature, Option<SignedHead>)>, SignerError>
+	{
+		let known = match (&self.store, check) {
+			(Some(store), false) => store.signer_head().await.map_err(|e| SignerError::Database(e.to_string()))?
 				.map(|(entry, hash)| WireEntryRef { entry, hash: hex(&hash), signature: None }),
-			None => None,
+			_ => None,
 		};
 		let r = self.ask(&Request::OrderFill {
 			owner: hex(&order.owner.serialize()), salt: hex(&order.salt), asset_in: order.terms().asset_a.to_string(),
 			exit_delay_units: order.exit_delay.units(), order: arca_covenant::record_json::order_terms_json(&order.leaf_terms()),
-			value_in: value_in.to_string(), partial, outputs: outputs.iter().map(WireOutput::from_output).collect(), known,
+			value_in: value_in.to_string(), partial, outputs: outputs.iter().map(WireOutput::from_output).collect(), known, check,
 		}).await?;
+		if check {
+			return Ok(None);
+		}
 		let head = SignedHead::from_answer(&r)?;
 		if let (Some(store), Some(h)) = (&self.store, &head) {
 			self.keep_acks(h).await?;
@@ -2322,7 +2422,7 @@ impl SignerClient {
 		}
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		let sig = Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))?;
-		Ok((sig, head))
+		Ok(Some((sig, head)))
 	}
 
 	/// `S`'s signature over `state` of the channel `policy`, which the owner
@@ -2331,9 +2431,18 @@ impl SignerClient {
 		-> Result<Signature, SignerError>
 	{
 		let r = self.ask(&Request::ChannelState { channel: WireChannel::from_policy(policy), state: WireState::from_state(state),
-			owner_sig: hex(owner_sig.as_ref()) }).await?;
+			owner_sig: hex(owner_sig.as_ref()), check: false }).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// Whether the signer would sign what [`Self::channel_state`] asks,
+	/// with nothing signed: a refusal for good is [`SignerError::is_final`].
+	pub async fn check_channel_state(&self, policy: &arca_covenant::ChannelPolicy, state: &arca_covenant::State, owner_sig: &Signature)
+		-> Result<(), SignerError>
+	{
+		self.ask(&Request::ChannelState { channel: WireChannel::from_policy(policy), state: WireState::from_state(state),
+			owner_sig: hex(owner_sig.as_ref()), check: true }).await.map(|_| ())
 	}
 
 	/// `S`'s credit note of the cumulative `credit` for the channel `policy`,

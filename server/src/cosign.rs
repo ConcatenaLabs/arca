@@ -241,6 +241,7 @@ impl CosignError {
 			Template(_) => "template",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
+			Signer(SignerError::Declined(_)) => "declined",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Supervision(e) => e.code(),
@@ -642,8 +643,30 @@ impl Cosigner {
 			},
 		};
 
+		// A new transfer is first asked of the signer, with nothing recorded
+		// or signed: whether it would sign each message. One it refuses for
+		// what it asks is refused here and recorded nowhere, and the same
+		// request again gets the same answer.
+		let known = self.store.transfer(&transfer).await?;
+		let mut asked_first = false;
+		if known.is_none() {
+			match self.check_messages(&checked, req, &plan, &outputs, approval.as_ref().map(|(_, a)| a), &messages).await? {
+				Ok(()) => asked_first = true,
+				Err((k, e)) if matches!(e, SignerError::Declined(_) | SignerError::Frozen(_)) => {
+					log::warn!("transfer {} refused before it was recorded: the signer refuses coin {}'s message for good: {}",
+						crate::signer::hex(&transfer), checked[k].coin.id, e);
+					if let Some((terms, a)) = &approval {
+						crate::restricted::drop(terms, &a.id).await;
+					}
+					return Err(CosignError::Signer(e));
+				},
+				// Anything else is met again below, the transfer recorded.
+				Err(_) => {},
+			}
+		}
+
 		// Recorded before anything is signed; a repeated request finds it.
-		match self.store.transfer(&transfer).await? {
+		match known {
 			Some(t) if t.signed => return self.answer(&transfer).await,
 			// Recorded, not yet signed: the signer was not reached last time.
 			Some(_) => {},
@@ -725,7 +748,20 @@ impl Cosigner {
 		// Nothing of it is signed while the signer holds anything else under
 		// an input's salt: it would refuse that input, after signing every
 		// input before it, and leave them spent.
-		self.held_under(&checked, &messages, &transfer).await?;
+		let signed_part = self.held_under(&checked, &messages, &transfer).await?;
+
+		// Nor while the signer would refuse any of its messages (asked
+		// again for a transfer recorded earlier, unless this request asked
+		// it already). A refusal it would repeat however often it is asked
+		// is final: with nothing of the transfer signed, its record is
+		// dropped and its inputs given back, so their owner can pay them
+		// again. Any other error leaves the transfer recorded, for the same
+		// request to complete.
+		if !asked_first {
+			if let Err((k, e)) = self.check_messages(&checked, req, &plan, &outputs, approval.as_ref().map(|(_, a)| a), &messages).await? {
+				return Err(self.declined(e, &checked[k].coin.id, signed_part, &transfer, approval.as_ref().map(|(t, a)| (t, a))).await);
+			}
+		}
 
 		// Now S signs, in its own process; each signature is checked against
 		// the message the server built. The latest entry of the record they
@@ -754,13 +790,13 @@ impl Cosigner {
 			let (cp, h) = match cp {
 				Ok(x) => x,
 				// The first message of the transfer refused: nothing of it is
-				// signed, so a refusal for a forfeit drops its record.
-				Err(e) if k == 0 => return Err(self.refused_first(e, &c.coin.id, &transfer).await),
+				// signed, so a final refusal drops its record.
+				Err(e) if k == 0 && !signed_part => return Err(self.refused_first(e, &c.coin.id, &transfer).await),
 				Err(e) => return Err(lost_spend(e, &c.coin.id)),
 			};
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
-			let named = checkpoint.v2.then(|| WireNamed::new(k as u32, &(0..n).map(|j| plan.checkpoint_output(j)).collect::<Vec<_>>()));
+			let named = named_for(&plan, k, n);
 			let (re, h) = match &approval {
 				Some((_, a)) => self.signer.rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
 					&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, &outputs).await,
@@ -963,8 +999,10 @@ impl Cosigner {
 	/// that input (`double_spend`). When nothing of the transfer is signed,
 	/// its record is dropped and its inputs given back, so every other input
 	/// stays payable and refreshable; one the signer has already signed part
-	/// of (asked before this check existed) keeps its record.
-	async fn held_under(&self, checked: &[Checked], messages: &[([u8; 32], [u8; 32])], transfer: &[u8; 32]) -> Result<(), CosignError> {
+	/// of (asked before this check existed) keeps its record. Returns whether
+	/// the signer holds part of the transfer already: its own checkpoint of
+	/// an input, signed when it was asked before.
+	async fn held_under(&self, checked: &[Checked], messages: &[([u8; 32], [u8; 32])], transfer: &[u8; 32]) -> Result<bool, CosignError> {
 		let mut other = None;
 		let mut signed_part = false;
 		for (k, c) in checked.iter().enumerate() {
@@ -976,7 +1014,7 @@ impl Cosigner {
 				}
 			}
 		}
-		let Some((k, e)) = other else { return Ok(()) };
+		let Some((k, e)) = other else { return Ok(signed_part) };
 		let leaf = checked[k].coin.id;
 		let what = match e.kind {
 			crate::signer::Signed::Spend => "the spend",
@@ -1008,7 +1046,8 @@ impl Cosigner {
 	/// holds a forfeit of the coin (given up in a refresh, and given back
 	/// while that forfeit stood in its record), the transfer's record is
 	/// dropped and its inputs given back, and the log names the forfeit: the
-	/// database has lost no spend.
+	/// database has lost no spend. Any other refusal the signer would repeat
+	/// however often it is asked drops it the same way ([`Self::declined`]).
 	async fn refused_first(&self, e: SignerError, leaf: &LeafId, transfer: &[u8; 32]) -> CosignError {
 		if let SignerError::AlreadySigned(m) = &e {
 			if names_forfeit(m) {
@@ -1022,7 +1061,86 @@ impl Cosigner {
 				return CosignError::Signer(e);
 			}
 		}
+		if matches!(e, SignerError::Declined(_) | SignerError::Frozen(_)) {
+			return self.declined(e, leaf, false, transfer, None).await;
+		}
 		lost_spend(e, leaf)
+	}
+
+	/// Asks the signer whether it would sign each message of a transfer
+	/// (each input's checkpoint, then its reassignment), with nothing
+	/// recorded or signed: `Ok(Err((k, e)))` names the first input refused
+	/// and the signer's answer.
+	#[allow(clippy::too_many_arguments)]
+	async fn check_messages(&self, checked: &[Checked], req: &TransferRequest, plan: &TransferPlan, outputs: &[ExplicitOutput],
+		approval: Option<&crate::restricted::Approval>, messages: &[([u8; 32], [u8; 32])])
+		-> Result<Result<(), (usize, SignerError)>, CosignError>
+	{
+		let n = checked.len();
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+			let cp_out = plan.checkpoint_output(k);
+			let checkpoint = plan.checkpoint(k);
+			let asked = match approval {
+				Some(a) => {
+					let cp = self.signer.check_rebind_cosigned(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
+						c.coin.leaf.enclave.map(|e| e.enclave.holder), &a.over(&messages[k].0)?, c.coin.asset, c.coin.value,
+						std::slice::from_ref(&cp_out)).await;
+					match cp {
+						Ok(()) => self.signer.check_rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
+							&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, outputs).await,
+						e => e,
+					}
+				},
+				None => {
+					let cp = self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
+						c.coin.leaf.landing.map(|l| l.program), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
+					match cp {
+						Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
+							plan.inputs[k].1, outputs, named_for(plan, k, n)).await,
+						e => e,
+					}
+				},
+			};
+			if let Err(e) = asked {
+				return Ok(Err((k, e)));
+			}
+		}
+		Ok(Ok(()))
+	}
+
+	/// The signer's answer `e` to the check of transfer `transfer`'s
+	/// message for coin `leaf`, before anything of it is signed now
+	/// (`signed_part` when the signer holds part of it from an earlier
+	/// request). A refusal the signer would repeat however often it is asked
+	/// ([`SignerError::is_final`]), with nothing of the transfer signed,
+	/// drops its record and gives its inputs back, and a restricted asset's
+	/// approval back to its policy server: the transfer is refused for good,
+	/// and its owner may pay the coins again. With part of it signed, the
+	/// record stays (the database never forgets what the signer signed) and
+	/// the refusal is logged: the transfer can no longer complete, and the
+	/// coin the signer holds a spend of goes home on the chain. Any other
+	/// error leaves the record for the same request to complete.
+	async fn declined(&self, e: SignerError, leaf: &LeafId, signed_part: bool, transfer: &[u8; 32],
+		approval: Option<(&crate::restricted::Restricted, &crate::restricted::Approval)>) -> CosignError
+	{
+		if !e.is_final() {
+			return CosignError::Signer(e);
+		}
+		if signed_part {
+			log::error!("transfer {}: the signer refuses coin {}'s message for good ({}), and holds part of the transfer already, signed \
+				when it was asked before: the transfer cannot complete, and its record stays", crate::signer::hex(transfer), leaf, e);
+			return lost_spend(SignerError::Failed(format!("{} (part of the transfer is signed already: it stays recorded)", e)), leaf);
+		}
+		match self.store.drop_transfer(transfer, &format!("{}: {}", CosignError::Signer(e.clone()).code(), e)).await {
+			Ok(back) => log::warn!("transfer {} refused for good before anything of it was signed: coin {}: {}; its record is dropped and \
+				{} input(s) given back", crate::signer::hex(transfer), leaf, e, back.len()),
+			Err(d) => log::error!("transfer {} refused for good before anything of it was signed (coin {}: {}), and its record could not \
+				be dropped: {}", crate::signer::hex(transfer), leaf, e, d),
+		}
+		if let Some((terms, a)) = approval {
+			crate::restricted::drop(terms, &a.id).await;
+		}
+		CosignError::Signer(e)
 	}
 }
 
@@ -1170,6 +1288,12 @@ pub(crate) fn decode_outputs(b: &[u8]) -> Result<Vec<ExplicitOutput>, String> {
 	Ok(out)
 }
 
+/// What the signer is told a `vtxo-2` checkpoint's reassignment names: input
+/// `k` of the `n` checkpoints of `plan`. `None` for a `vtxo-1` checkpoint.
+fn named_for(plan: &TransferPlan, k: usize, n: usize) -> Option<WireNamed> {
+	plan.checkpoint(k).v2.then(|| WireNamed::new(k as u32, &(0..n).map(|j| plan.checkpoint_output(j)).collect::<Vec<_>>()))
+}
+
 /// What the signer is told of a coin spent alone at input 0 (into its
 /// checkpoint, or its forfeit): for a `vtxo-2` coin the one input its
 /// message names, itself; nothing for any other.
@@ -1182,6 +1306,30 @@ mod test {
 	use super::*;
 	use arca_covenant::{HtlcDirection, HtlcTerms, MedianTime, NewLeaf, RelativeTime};
 	use elements::secp256k1_zkp::{Keypair, Secp256k1};
+
+	/// A signer's refusal for what a transfer asks is `declined`, a 4xx the
+	/// wallet takes as final; `double_spend` and `frozen` keep their codes;
+	/// every failure of the signer's own is `signer_unavailable`, a 503.
+	#[test]
+	fn a_signer_refusal_for_good_is_a_4xx_and_any_other_a_503() {
+		let m = || "m".to_string();
+		let cases = [
+			(SignerError::Declined(m()), "declined"),
+			(SignerError::AlreadySigned(m()), "double_spend"),
+			(SignerError::Frozen(m()), "frozen"),
+			(SignerError::Failed(m()), "signer_unavailable"),
+			(SignerError::Stopped(m()), "signer_unavailable"),
+			(SignerError::Record(m()), "signer_unavailable"),
+			(SignerError::Unreachable { path: m(), error: m() }, "signer_unavailable"),
+			(SignerError::Answer(m()), "signer_unavailable"),
+			(SignerError::Database(m()), "signer_unavailable"),
+		];
+		for (e, code) in cases {
+			assert_eq!(CosignError::Signer(e.clone()).code(), code, "{:?}", e);
+			let status = crate::http::status_of(code).as_u16();
+			assert_eq!((400..500).contains(&status), e.is_final(), "{} is answered {}", code, status);
+		}
+	}
 
 	fn output(seed: u8, htlc: Option<HtlcTerms>) -> OutputRequest {
 		let key = Keypair::from_seckey_slice(&Secp256k1::new(), &[seed; 32]).unwrap();

@@ -1688,8 +1688,9 @@ channel's latest: one number higher, the owner's balance down by the amount
 and up by any credit it folds, the operator's the other way, never folding
 more than the channel's latest note. The server records the state and the
 receiver's next note (its latest credit plus the amount, which the operator's
-side of the receiver's latest state must cover), has the signer sign the note
-and then the state, and answers both (`operator_sig`; `note`: `leaf_id`,
+side of the receiver's latest state must cover), asks the signer whether it
+would sign the state, has it sign the note and then the state, and answers
+both (`operator_sig`; `note`: `leaf_id`,
 `credit`, `signature`). The receiver's payment is final then: the note is
 enforceable on the chain with nobody's help, against capacity already in its
 leaf, and its owner need not be online. A request repeated after a lost
@@ -1697,7 +1698,10 @@ answer is answered from what was recorded; a request with no `pay` folds the
 channel's credit into its owner's balance. Both channels must be live coins
 of final rounds, held by no participation; while a state or a note of a
 channel waits for the signer nothing else of it moves (`conflict`), and a
-state that does not follow is refused (`channel_state`).
+state that does not follow is refused (`channel_state`). A state or note the
+signer refuses for good is dropped and refused `channel_state`, so the channel
+moves on; one it could not sign (not reached, or failing on its own) stays,
+answered `signer_unavailable`, and the same request completes it.
 
 **Reading one.** `POST channel_state`, authenticated by the channel owner's
 key over the leaf id, answers the asset, the value, the operator's opening
@@ -2217,6 +2221,34 @@ the server drops the transfer's record, gives its inputs back, answers
 `double_spend` naming the coin and what the signer holds, and logs a
 forfeit as a forfeit, not a lost spend. The wallet then shows that coin as
 given up, and takes it home on the chain.
+
+The signer tells a refusal of what a request asks from a failure of its own.
+A message it does not sign as the request builds it (a restricted asset's
+message without its policy key's approval, a forfeit whose parts do not make
+the output committed to, an owner's signature that does not verify, a
+malformed request) is answered with the code `declined`, or a restricted
+asset's `restricted` or `policy`: it refuses the same request again however
+often it is asked. A failure of its own carries no code (its record not read
+or written) or `keepers_unavailable`, `record_behind`, `record_differs` or
+`stopped`, and the same request may be signed later. Before it asks for any
+signature of a transfer or of a fill of a resting order, the server asks the
+signer whether it would sign each of its messages (a request with `check`
+set, which the signer answers after every check of the request and of its
+record, recording and signing nothing). A refusal the signer would repeat
+however often it is asked (`declined`, `already_signed`, or a landing found
+frozen) is final: with nothing of the request signed, the server drops its
+record, gives its inputs back and answers `declined` (422; `double_spend` and
+`frozen` keep their own codes), and the wallet puts its coins back and reports
+the refusal once. A signer that cannot be reached, or that fails on its own,
+is `signer_unavailable` (503): the request stays recorded, and the same
+request completes once the signer signs. A transfer the signer refuses for
+good after it signed part of it, asked before, can no longer complete: its
+record stays, since the database never forgets a message the signer signed,
+the server logs it as an error and answers `signer_unavailable`, and the coin
+the signer holds a spend of goes home on the chain. A forfeit the signer
+refuses for good is answered `declined`, and the server's pass that fills in
+the operator's half of forfeits recorded without it leaves that one without
+and goes on with the others.
 
 The record cannot be lost, cut back, torn or shared without the signer
 noticing:
