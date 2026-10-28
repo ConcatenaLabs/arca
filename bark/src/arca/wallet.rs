@@ -2203,9 +2203,10 @@ impl Wallet {
 	}
 
 	/// The board transaction paying `o`, the output of a board `record` rests
-	/// on, as the operator names it (`board_status`) and the node holds it, in
-	/// a block of its active chain or in its mempool: one request of each, in
-	/// place of a scan of the node's set of unspent outputs. The operator's
+	/// on, as the operator names it (`board_status`) and the node holds it in
+	/// a block of its active chain, as the scan finds it: one request of each,
+	/// in place of a scan of the node's set of unspent outputs. A board rolled
+	/// back into the mempool is not taken, so its coin waits. The operator's
 	/// answer only says where to look; a transaction that does not pay `o`,
 	/// or that the node does not hold, is not taken, and `None` sends the
 	/// wallet to the scan.
@@ -2224,7 +2225,7 @@ impl Wallet {
 		let (Some(txid), Some(vout)) = (v["txid"].as_str().and_then(|t| Txid::from_str(t).ok()), v["vout"].as_u64()) else { return Ok(None) };
 		self.chain.read_ahead_of(std::slice::from_ref(&txid), &[]);
 		let Some(tx) = self.chain.transaction(&txid)? else { return Ok(None) };
-		if tx.output.get(vout as usize) != Some(o) || self.chain.whereabouts(&txid)? == (false, false) {
+		if tx.output.get(vout as usize) != Some(o) || !self.chain.whereabouts(&txid)?.0 {
 			return Ok(None);
 		}
 		Ok(Some(tx))

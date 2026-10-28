@@ -1410,11 +1410,6 @@ impl Wallet {
 						read ends there", hex(&k), after));
 					break;
 				}
-				// A page shorter than the one asked for is the last: asking
-				// again would only be told so, at the price of two requests.
-				if msgs.len() < 100 {
-					break;
-				}
 			}
 			// A coin waiting for its keepers' acknowledgements is read again
 			// next time: the wallet's own step back, never before where this
