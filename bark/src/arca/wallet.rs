@@ -212,6 +212,7 @@ impl Spelling {
 			.replace("{address}", &command("address").map(|c| format!("an address of {}", c))
 				.unwrap_or_else(|| "the wallet's address".into()))
 			.replace("{orders}", &command("orders").unwrap_or_else(|| "the reading of the wallet's orders".into()))
+			.replace("{offboards}", &command("offboards").unwrap_or_else(|| "the reading of the wallet's offboards".into()))
 			.replace("{refresh}", &command("refresh").unwrap_or_else(|| "a refresh".into()))
 			.replace("{plan_release}", &command("plan-release").unwrap_or_else(|| "a release of the plan's coin through the next round".into()))
 	}

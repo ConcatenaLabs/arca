@@ -871,6 +871,38 @@ failed back. `btc-swap list` shows every swap with its state (`offered`,
 `abandoned`, `btc_failed`, `refunded`, `cancelled`) and what happened when;
 `btc-swap cancel` ends one before the wallet has locked anything.
 
+### Paying an address on the chain
+
+`arca offboard --asset A --amount N --address ADDR` pays `N` of `A` to an
+address on the chain from the wallet's leaves, through the operator's next
+round: the participation gives up coins of `A` and wants one offboard output of
+exactly `N`, paying the address's script, and a change leaf where the coins
+hold more. `--script HEX` names the script in place of an address; a
+confidential address is refused (the output is explicit: name its
+unconfidential form). The fee is in the asset paid (a round carries one asset,
+so `--fee-asset` takes only it): each coin's refresh fee, the offboard's fee by
+the asset's schedule, and the margin the round's offboard output holds to pay
+its unlock. `--quote` shows the fee, the coins and the change before anything
+is signed, and `--shown` pays only on that very fee and those coins. The answer
+says how soon the round is due (`round_within_seconds`, the operator's interval
+between rounds while participations wait) when the operator publishes one.
+
+`sync` hands over the forfeits once the round is final, and the operator then
+unlocks the round's offboard output into the address: its output 0 pays exactly
+the amount there. The wallet unlocks it itself when the operator has not within
+ten minutes of median time. `arca offboards` reads where each stands from the
+chain: `waiting` for its round, `in_round`, `unlocking`, `paid` (the unlock's
+`txid`, and whether it is `final`), `reclaimed` (the operator took the output
+back after its delay) or `not_made` (the participation ended without a round,
+or the operator refused it: the coins are the wallet's again). The operator
+refuses an offboard paying one of its own Arca scripts (`script_reused`), and
+each of its refusals is final: the wallet puts the coins back and posts nothing
+again.
+
+    arca offboard --asset X --amount 300000 --address ADDR --quote   # fee, coins, change
+    arca offboard … --shown '<the quote>'                            # paid in the next round
+    arca offboards                                                   # where each stands
+
 ### Placing an order on the chain
 
 A maker who holds only leaves places an ordinary SeqDEX order: `arca order
@@ -1457,6 +1489,8 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit left it, followed from the round through each exit's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
+| `offboard --asset A --amount N (--address ADDR \| --script HEX) [--fee-asset A] [--max-fee-ppm N] [--quote \| --shown QUOTE]` | Pays an address on the chain from the wallet's leaves through the operator's next round (see Paying an address on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change); with `--shown` (that answer, as JSON) it goes ahead only on that very fee and those coins. Answers the offboard, named by its participation, and `round_within_seconds` |
+| `offboards` | Every offboard the wallet asked for, as the chain shows it now, asking the node only: `waiting`, `in_round`, `unlocking`, `paid` (with the unlock's `txid` and whether it is `final`), `reclaimed` or `not_made` |
 | `orders` | Every order the wallet placed, as the chain shows it now, asking the node only: its state (`waiting` for its round, `in_round`, `unlocking`, `resting`, `filled`, `refunded`, `not_placed`), where it rests and what it holds there, its terms (`relay`, with the outpoint, while it rests) and the unsigned offer for SeqDEX's relay (`offer`, see Listing the order on SeqDEX's relay), each fill with what it credited, the credits unspent at its credit program, and when its REFUND opens (`refund_from`) |
 | `order fill ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown FILL]` | `take` (see Taking an on-chain order), by the name an order's side goes by |
 | `order rest --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--max-fee-ppm N] [--quote \| --shown QUOTE]` | Rests an order in the tree as a leaf of its own (see Resting an order in the tree): with `--quote`, only says what it would cost; with `--shown` it is rested only on that fee and those coins. Answers the participation that rests it and `landed_pays`, the script a landed order's fills pay; `sync` publishes it once its round is final |
