@@ -61,6 +61,7 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 | `covenant/` | `arca-covenant` | `arca_covenant` | Arca's covenant scripts on Sequentia: the tree node, the sweep behind the token, the clock, the leaf (`vtxo-1`; `vtxo-2`, whose collaborative path is the Simplicity program `arca/collab-2`, which also binds the coin's index and the inputs its signers name; `htlc-1`, whose exit is a hash-locked pair; `order-3`, a resting order the operator fills with its maker offline, under a Simplicity fill program that refuses an annex, `order-2` being the same without that rule; `landing-1`, the leaf of a supervised asset, whose exit pays only the owner's own key, where a freeze binds; `enclave-1`, the leaf of a restricted asset, whose exit pays only its holder's enclave, with the asset's claw leaf where it elected clawback, and `arca-enclave`, the tool its policy server checks a board or a transfer with; and `channel-1`, a leaf with a balance for each of owner and operator, replaced at once by a newer state both sign and settled after the exit delay), the entry, the forfeit, the checkpoint, with their messages, witnesses, encodings and the client's checks on a round; the leaf record, its id and its validation; the tree builder and the unroll; the accumulator batch, from which one owner leaves in one transaction under a Simplicity program; the board, the forfeit and its connector asset, the release and the reclaim, the offboard, and the transactions that spend a leaf off the tree; SeqDEX's fill covenant, the on-chain order a round fills; the in-tree fill of a resting order and the records of the coins it makes; and the claim key a claim tree's leaf is owned by, with the distribution that pays many holders in one round ([covenant/README.md](covenant/README.md)) |
 | `consensus/` | `arca-consensus` | `arca_consensus` | Script verification under Sequentia's consensus rules for tests, through the node's own interpreter ([consensus/README.md](consensus/README.md)) |
 | `wallet-wasm/` | `arca-wallet-wasm` | `arca_wallet_wasm` | The Arca wallet built for a browser's dedicated worker: the same library, with the worker's HTTP, its pause, and SQLite on the browser's private file system (a separate workspace) ([wallet-wasm/README.md](wallet-wasm/README.md)) |
+| `bark-wasm/` | `arca-bark-wasm` | `arca_bark_wasm` | Bark's wallet for Bitcoin arks built for a browser's dedicated worker: commands by name over IndexedDB, gRPC-web and Esplora, boarding from the page's own Bitcoin key (a separate workspace) ([bark-wasm/README.md](bark-wasm/README.md)) |
 | `bip321/` | `bip321` | `bip321` | Payment URI parser |
 | `fuzz/` | `arca-fuzz` | | Fuzz targets for the decoders (a separate workspace) |
 
@@ -121,6 +122,9 @@ builds with the Rust version the Sequentia Wallet Kit pins, which is the
 [wallet-wasm.yml](.github/workflows/wallet-wasm.yml) builds the wallet for a
 browser (`wallet-wasm/`, its own workspace and lockfile) for
 `wasm32-unknown-unknown`.
+[bark-wasm.yml](.github/workflows/bark-wasm.yml) builds the Bitcoin ark wallet
+for a browser (`bark-wasm/`, its own workspace and lockfile) for
+`wasm32-unknown-unknown` and runs its command set's tests.
 [lightning.yml](.github/workflows/lightning.yml) builds SeqLN at the commit it
 pins and runs the server's Lightning tests and the wallet's Lightning
 scenario against SeqLN nodes on the chain SeqLN's `sequentia-regtest` network

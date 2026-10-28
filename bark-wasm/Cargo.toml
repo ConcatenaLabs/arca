@@ -1,0 +1,58 @@
+# The Bitcoin ark wallet (Bark's `Wallet`, on Bitcoin) built for a browser: a
+# dedicated worker loads this crate's package and drives the wallet through
+# `BtcArk`. The command set in `src/command.rs` is plain Rust, so a program
+# that links the wallet natively runs the same commands.
+#
+# A workspace of its own, outside the root one: it is built for `wasm32` only
+# and links the wallet with its browser features (gRPC-web, IndexedDB, the
+# browser's locks), which the root workspace's native build does not take.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "arca-bark-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ConcatenaLabs/arca"
+description = "The Bitcoin ark wallet for a browser's dedicated worker"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# A native build of the command set: the wallet's SQLite store and its native
+# gRPC client, as a program that links the wallet directly uses them.
+native = ["arca-wallet/default"]
+
+[dependencies]
+arca-wallet = { path = "../bark", default-features = false }
+anyhow = "1.0"
+serde_json = "1"
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+arca-wallet = { path = "../bark", default-features = false, features = ["wasm-web", "indexed-db"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_log = "1.0"
+console_error_panic_hook = "0.1"
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# As in the root workspace: the kit's crates, and the one Sequentia `elements`.
+[patch.crates-io]
+elements = { git = "https://github.com/ConcatenaLabs/SWK", rev = "87a9f5e7f98356a2c00712884019079566aacfec" }
+lwk_common = { git = "https://github.com/ConcatenaLabs/SWK", rev = "6f432d9584dff5e4b1226d4b32657c52f3d8457b" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
