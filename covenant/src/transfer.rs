@@ -646,6 +646,25 @@ impl ValidCoin {
 		}
 	}
 
+	/// Every output on the chain the coin descends from: the batch output of
+	/// each batch and accumulator batch, and each board, its record rests on,
+	/// its own included. Every output of its lineage ([`ValidCoin::lineage`])
+	/// and the coin's own leaf are made only by a chain of spends that starts
+	/// at one of them (an unroll of a batch's tree, an accumulator exit, a
+	/// board's conversion or checkpoint, then checkpoints and reassignments),
+	/// so while each of them is unspent, in the chain and in the mempool,
+	/// nothing of the lineage is on-chain, and a wallet need read no block to
+	/// know it.
+	pub fn roots(&self) -> Vec<OutPoint> {
+		match &self.origin {
+			ValidOrigin::Leaf { valid, .. } => vec![OutPoint::new(valid.round_txid, valid.batch_vout)],
+			ValidOrigin::Accumulator { valid, .. } => vec![OutPoint::new(valid.round_txid, valid.batch_vout)],
+			ValidOrigin::Board { valid, .. } => vec![valid.outpoint()],
+			ValidOrigin::Transfer { inputs, .. } => inputs.iter().flat_map(|i| i.coin.roots()).collect(),
+			ValidOrigin::Fill { order, inputs, .. } => order.roots().into_iter().chain(inputs.iter().flat_map(|i| i.coin.roots())).collect(),
+		}
+	}
+
 	/// Refuses the coin if any board it descends from is spent, as `unspent`
 	/// reports it (the chain's set of unspent outputs).
 	pub fn check_boards(&self, mut unspent: impl FnMut(&OutPoint) -> bool) -> Result<(), TransferError> {
