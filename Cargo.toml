@@ -17,8 +17,8 @@ members = [
   "covenant",
   "server",
 ]
-# The wallet's browser build is a workspace of its own (its README says why).
-exclude = ["wallet-wasm"]
+# The wallets' browser builds are workspaces of their own (their READMEs say why).
+exclude = ["wallet-wasm", "bark-wasm"]
 
 resolver = "2"
 
