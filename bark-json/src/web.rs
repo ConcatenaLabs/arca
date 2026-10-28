@@ -232,6 +232,8 @@ pub enum BarkNetwork {
 	Signet,
 	/// Mutinynet
 	Mutinynet,
+	/// Bitcoin Core's testnet4
+	Testnet4,
 	/// Any regtest network
 	Regtest,
 }

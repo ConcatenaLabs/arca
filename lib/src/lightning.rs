@@ -1,6 +1,7 @@
 use bitcoin::constants::ChainHash;
 pub use lightning::offers::invoice::Bolt12Invoice;
 pub use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::Currency;
 pub use lightning::offers::offer::{Amount as OfferAmount, Offer};
 
 use std::fmt;
@@ -251,6 +252,18 @@ impl Invoice {
 		}
 	}
 
+	/// Whether this invoice is for the given network.
+	///
+	/// Use this rather than comparing [Invoice::network]: a BOLT11 invoice
+	/// carries only a currency, which testnet3 and testnet4 share (`tb`), so
+	/// its network always reads as testnet3.
+	pub fn is_for_network(&self, network: Network) -> bool {
+		match self {
+			Invoice::Bolt11(invoice) => bolt11_is_for_network(invoice, network),
+			Invoice::Bolt12(invoice) => invoice.chain() == ChainHash::using_genesis_block(network),
+		}
+	}
+
 	pub fn network(&self) -> Network {
 		match self {
 			Invoice::Bolt11(invoice) => invoice.network(),
@@ -482,6 +495,25 @@ pub trait OfferAmountExt: Borrow<OfferAmount> {
 
 impl OfferAmountExt for OfferAmount {}
 
+
+/// The BOLT11 currency of invoices on the given network.
+///
+/// `lightning_invoice`'s own conversion does not know testnet4 and maps it
+/// to regtest. Testnet3 and testnet4 share the `tb` currency.
+pub fn bolt11_currency(network: Network) -> Currency {
+	match network {
+		Network::Bitcoin => Currency::Bitcoin,
+		Network::Testnet | Network::Testnet4 => Currency::BitcoinTestnet,
+		Network::Signet => Currency::Signet,
+		Network::Regtest => Currency::Regtest,
+	}
+}
+
+/// Whether a BOLT11 invoice is for the given network.
+pub fn bolt11_is_for_network(invoice: &Bolt11Invoice, network: Network) -> bool {
+	bolt11_currency(network) == invoice.currency()
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
@@ -700,5 +732,48 @@ mod test {
 		let usd = CurrencyCode::from_str("USD").unwrap();
 		let currency = OfferAmount::Currency { iso4217_code: usd, amount: 100 };
 		assert_eq!(currency.to_bitcoin_amount(), None);
+	}
+
+	#[test]
+	fn bolt11_network_testnet4() {
+		use lightning_invoice::InvoiceBuilder;
+		use std::time::Duration;
+
+		let secp = Secp256k1::new();
+		let key = SecretKey::from_slice(&[2; 32]).unwrap();
+		let invoice = |currency: Currency| {
+			let inv = InvoiceBuilder::new(currency)
+				.description("test".into())
+				.payment_hash(sha256::Hash::hash(b"preimage"))
+				.payment_secret(lightning_invoice::PaymentSecret([42; 32]))
+				.duration_since_epoch(Duration::from_secs(1_700_000_000))
+				.min_final_cltv_expiry_delta(144)
+				.amount_milli_satoshis(1_000_000)
+				.build_signed(|m| secp.sign_ecdsa_recoverable(m, &key))
+				.unwrap();
+			Invoice::Bolt11(inv)
+		};
+
+		// A testnet invoice ("lntb") is for testnet3 and testnet4, though its
+		// network reads as testnet3.
+		let tb = invoice(Currency::BitcoinTestnet);
+		assert!(tb.to_string().starts_with("lntb"));
+		assert_eq!(tb.network(), Network::Testnet);
+		assert!(tb.is_for_network(Network::Testnet4));
+		assert!(tb.is_for_network(Network::Testnet));
+		for other in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+			assert!(!tb.is_for_network(other), "lntb accepted on {}", other);
+		}
+
+		// A testnet4 wallet takes no other network's invoice.
+		for currency in [Currency::Bitcoin, Currency::Signet, Currency::Regtest] {
+			assert!(!invoice(currency).is_for_network(Network::Testnet4));
+		}
+
+		// The networks map to their own currencies.
+		assert_eq!(bolt11_currency(Network::Testnet4), Currency::BitcoinTestnet);
+		assert_eq!(bolt11_currency(Network::Regtest), Currency::Regtest);
+		assert_eq!(bolt11_currency(Network::Signet), Currency::Signet);
+		assert_eq!(bolt11_currency(Network::Bitcoin), Currency::Bitcoin);
 	}
 }

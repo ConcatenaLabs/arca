@@ -385,7 +385,7 @@ impl Wallet {
 	) -> AvailablePaymentMethod {
 		let mut errors = vec![];
 
-		if bolt11.network() != network {
+		if !ark::lightning::bolt11_is_for_network(bolt11, network) {
 			errors.push(PaymentMethodParsingError::NetworkMismatch);
 		}
 

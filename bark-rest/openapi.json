@@ -3626,6 +3626,7 @@
           "mainnet",
           "signet",
           "mutinynet",
+          "testnet4",
           "regtest"
         ]
       },
