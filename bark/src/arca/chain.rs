@@ -807,6 +807,41 @@ impl ChainSource {
 		Ok(found)
 	}
 
+	/// Which of `scripts`, the lineage of a coin that descends from `roots`
+	/// ([`arca_covenant::ValidCoin::roots`]), an output of the active chain or
+	/// of the mempool pays. Every output of the lineage is made only by a
+	/// chain of spends that starts at a root, so a root unspent in the chain
+	/// and in the mempool has nothing of it on-chain, and no block is read for
+	/// it: one batch of `gettxout` answers a coin whose roots all stand, as a
+	/// received coin's do. The blocks are read only from the lowest block
+	/// holding a spent root, where its spender and every descendant are; and
+	/// from `from_height` when a spent root's transaction is in no block of
+	/// the active chain (the node read it for no root it holds).
+	pub fn lineage_seen(&self, scripts: &BTreeSet<Script>, roots: &[OutPoint], from_height: u64) -> Result<BTreeSet<Script>, Error> {
+		if scripts.is_empty() {
+			return Ok(BTreeSet::new());
+		}
+		self.read_ahead(roots.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])).collect());
+		let mut from: Option<u64> = None;
+		for root in roots {
+			if self.unspent(root)? {
+				continue;
+			}
+			let at = match self.tx_block(&root.txid)? {
+				Some((_, h)) => h,
+				// A root made in the mempool is spent there: its descendants
+				// are in the mempool alone.
+				None if self.in_mempool(&root.txid)? => self.tip()?.height.saturating_add(1),
+				None => from_height,
+			};
+			from = Some(from.map_or(at, |f| f.min(at)));
+		}
+		match from {
+			None => Ok(BTreeSet::new()),
+			Some(from) => self.scripts_seen(scripts, from),
+		}
+	}
+
 	/// Which of `scripts` an output of the active chain from `from_height` up,
 	/// or of the mempool, pays: the index of the chain the lineage check asks.
 	pub fn scripts_seen(&self, scripts: &BTreeSet<Script>, from_height: u64) -> Result<BTreeSet<Script>, Error> {
@@ -814,7 +849,6 @@ impl ChainSource {
 		if scripts.is_empty() {
 			return Ok(seen);
 		}
-		let tip = self.tip()?;
 		let mut look = |tx: &Transaction| {
 			for o in &tx.output {
 				if scripts.contains(&o.script_pubkey) {
@@ -822,18 +856,12 @@ impl ChainSource {
 				}
 			}
 		};
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				look(&tx);
-			}
-		}
-		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
-		for id in ids {
-			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
-			if let Some(tx) = self.transaction(&txid)? {
-				look(&tx);
-			}
+		self.each_block(from_height, |_, block| {
+			block.txdata.iter().for_each(&mut look);
+			Ok(false)
+		})?;
+		for tx in self.mempool_txs()? {
+			look(&tx);
 		}
 		Ok(seen)
 	}
@@ -842,42 +870,85 @@ impl ChainSource {
 	/// pays `output` (asset, value and script), if any: what a wallet re-checks
 	/// a leaf against when its round is gone.
 	pub fn find_payment(&self, output: &TxOut, from_height: u64) -> Result<Option<(Transaction, u64)>, Error> {
-		let tip = self.tip()?;
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				if tx.output.iter().any(|o| o == output) {
-					return Ok(Some((tx, h)));
-				}
-			}
-		}
-		Ok(None)
+		let mut found = None;
+		self.each_block(from_height, |h, block| {
+			found = block.txdata.into_iter().find(|tx| tx.output.iter().any(|o| o == output)).map(|tx| (tx, h));
+			Ok(found.is_some())
+		})?;
+		Ok(found)
 	}
 
 	/// The transaction that spends `outpoint`, in the mempool or in a block
 	/// of the active chain from `from_height` up, and its height (`None` for
-	/// the mempool).
+	/// the mempool). An output unspent in the chain and in the mempool has
+	/// none, and no block is read for it; a spent one's spender is in no
+	/// block below the one holding the output.
 	pub fn spender(&self, outpoint: &OutPoint, from_height: u64) -> Result<Option<(Transaction, Option<u64>)>, Error> {
+		if self.unspent(outpoint)? {
+			return Ok(None);
+		}
 		let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *outpoint);
+		if let Some(tx) = self.mempool_txs()?.into_iter().find(|tx| spends(tx)) {
+			return Ok(Some((tx, None)));
+		}
+		let from = match self.tx_block(&outpoint.txid)? {
+			Some((_, h)) => from_height.max(h),
+			None => from_height,
+		};
+		let mut found = None;
+		self.each_block(from, |h, block| {
+			found = block.txdata.into_iter().find(|tx| spends(tx)).map(|tx| (tx, Some(h)));
+			Ok(found.is_some())
+		})?;
+		Ok(found)
+	}
+
+	/// Every block of the active chain from `from_height` to the tip, in
+	/// order, handed to `f` until it answers `true`. Read [`BATCH_MOST`] at a
+	/// time, where the node takes a batch: a node behind a proxy answers each
+	/// request after a round trip, and one read per block made a scan of an
+	/// hour of blocks take minutes.
+	fn each_block(&self, from_height: u64, mut f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
+		let tip = self.tip()?;
+		let mut h = from_height;
+		while h <= tip.height {
+			let end = h.saturating_add(BATCH_MOST as u64 - 1).min(tip.height);
+			self.read_ahead((h..=end).map(|x| ("getblockhash".to_string(), vec![json!(x)])).collect());
+			let mut hashes = Vec::with_capacity((end - h + 1) as usize);
+			for x in h..=end {
+				match self.block_hash(x)? {
+					Some(hash) => hashes.push((x, hash)),
+					None => break,
+				}
+			}
+			self.read_ahead(hashes.iter().map(|(_, hash)| ("getblock".to_string(), vec![json!(hash.to_string()), json!(0)])).collect());
+			let short = hashes.len() as u64 != end - h + 1;
+			for (x, hash) in hashes {
+				if f(x, self.raw_block(&hash).map_err(node)?)? {
+					return Ok(());
+				}
+			}
+			if short {
+				break;
+			}
+			h = end + 1;
+		}
+		Ok(())
+	}
+
+	/// The transactions in the node's mempool, read at once where the node
+	/// takes a batch.
+	fn mempool_txs(&self) -> Result<Vec<Transaction>, Error> {
 		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
+		self.read_ahead(ids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t)])).collect());
+		let mut txs = Vec::with_capacity(ids.len());
 		for id in ids {
 			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
 			if let Some(tx) = self.transaction(&txid)? {
-				if spends(&tx) {
-					return Ok(Some((tx, None)));
-				}
+				txs.push(tx);
 			}
 		}
-		let tip = self.tip()?;
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				if spends(&tx) {
-					return Ok(Some((tx, Some(h))));
-				}
-			}
-		}
-		Ok(None)
+		Ok(txs)
 	}
 
 	/// Whether `tx` can never return to the chain: it is in no block of the
@@ -1053,5 +1124,110 @@ mod test {
 		// The view stands: the answer is kept, and the node not asked again.
 		assert!(chain.coins_at(std::slice::from_ref(&script)).is_ok());
 		assert_eq!(scans.load(Ordering::SeqCst), 4);
+	}
+
+	/// A transaction spending `from` (an output at a bare `OP_TRUE` of
+	/// `asset` holding `value`) into one output at `script`, less a fee.
+	fn spend_to(from: OutPoint, asset: AssetId, value: u64, script: Script) -> Transaction {
+		use elements::confidential;
+		let fee = 10_000;
+		Transaction {
+			version: 2,
+			lock_time: elements::LockTime::ZERO,
+			input: vec![elements::TxIn { previous_output: from, sequence: elements::Sequence::MAX, ..Default::default() }],
+			output: vec![
+				TxOut { asset: confidential::Asset::Explicit(asset), value: confidential::Value::Explicit(value - fee),
+					nonce: confidential::Nonce::Null, script_pubkey: script, witness: Default::default() },
+				TxOut::new_fee(fee, asset),
+			],
+		}
+	}
+
+	/// What a receiver asks of the chain for a coin's lineage, on a regtest
+	/// node: while the batch output the lineage descends from is unspent,
+	/// no block is read and nothing is found; once a transaction spending
+	/// it publishes a lineage output, in the mempool and then in a block, it
+	/// is found, and the batch output's spender with it. The blocks are
+	/// read only from the batch output's own block, a batch at a time.
+	///
+	/// Needs `SEQUENTIAD_EXEC`.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[test]
+	fn a_lineage_is_read_from_the_chain_only_once_its_root_is_spent() {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		// The genesis block's free coins, at a bare `OP_TRUE`.
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let asset = coin.asset.explicit().unwrap();
+		let value = coin.value.explicit().unwrap();
+		// The batch output: a round's, standing in for one.
+		let round = spend_to(free, asset, value, op_true.clone());
+		r.node.client().send_raw_transaction(&round).unwrap();
+		r.produce_block().unwrap();
+		let root = OutPoint::new(round.txid(), 0);
+		for _ in 0..(BATCH_MOST as u64 + 6) {
+			r.produce_block().unwrap();
+		}
+		// Blocks made outside the source: its next read looks again.
+		gap();
+		chain.new_command();
+		let round_height = chain.tx_block(&round.txid()).unwrap().unwrap().1;
+		let tip = chain.tip().unwrap().height;
+		println!("the round at height {}, the tip {} blocks above it", round_height, tip - round_height);
+		// A lineage output: what an unroll of the batch's tree publishes.
+		let leaf = Script::from(vec![0x01, 0xab, 0x75, 0x51]);
+		let lineage: BTreeSet<Script> = [leaf.clone()].into();
+
+		// BEFORE: the root stands, so no block is read and nothing is found.
+		chain.new_command();
+		let (asked, _) = chain.calls();
+		assert!(chain.lineage_seen(&lineage, &[root], round_height).unwrap().is_empty());
+		assert!(chain.spender(&root, round_height).unwrap().is_none());
+		let (after, _) = chain.calls();
+		println!("BEFORE: the root unspent; lineage_seen and spender took {} requests of the node", after - asked);
+		// A look at the view (three calls, the node not yet asked for a
+		// batch) and one gettxout: no block.
+		assert!(after - asked <= 4, "{} requests", after - asked);
+		// What reading every block from the round up costs, for the record.
+		chain.new_command();
+		let (asked, _) = chain.calls();
+		assert!(chain.scripts_seen(&lineage, round_height).unwrap().is_empty());
+		let (after, _) = chain.calls();
+		println!("reading the {} blocks from the round up: {} requests (batches of {})", tip - round_height + 1, after - asked, BATCH_MOST);
+		assert!(after - asked <= 2 * ((tip - round_height) / BATCH_MOST as u64 + 1) + 4, "{} requests", after - asked);
+
+		// AFTER, in the mempool: the root's spender publishes the lineage output.
+		let unroll = spend_to(root, asset, value - 10_000, leaf.clone());
+		r.node.client().send_raw_transaction(&unroll).unwrap();
+		gap();
+		chain.new_command();
+		assert_eq!(chain.lineage_seen(&lineage, &[root], round_height).unwrap(), lineage, "found in the mempool");
+		let (by, at) = chain.spender(&root, round_height).unwrap().expect("the root's spender, in the mempool");
+		assert_eq!((by.txid(), at), (unroll.txid(), None));
+		println!("AFTER (mempool): the lineage output {} is found, the root's spender {}", hex(leaf.as_bytes()), by.txid());
+
+		// AFTER, in a block.
+		r.produce_block().unwrap();
+		gap();
+		chain.new_command();
+		let height = chain.tip().unwrap().height;
+		assert_eq!(chain.lineage_seen(&lineage, &[root], round_height).unwrap(), lineage, "found in a block");
+		assert_eq!(chain.spender(&root, round_height).unwrap().map(|(t, h)| (t.txid(), h)), Some((unroll.txid(), Some(height))));
+		assert_eq!(chain.find_payment(&unroll.output[0], round_height).unwrap().map(|(t, h)| (t.txid(), h)), Some((unroll.txid(), height)));
+		// A spender is found whatever height it is asked from below the
+		// root's block: never below it.
+		assert_eq!(chain.spender(&root, 0).unwrap().map(|(t, _)| t.txid()), Some(unroll.txid()));
+		println!("AFTER (block {}): the lineage output is found, the root's spender {}", height, unroll.txid());
 	}
 }

@@ -271,8 +271,10 @@ and a board whose registration never reached the server, are not recovered.
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
   Its key and nonce must be ones the wallet drew and is waiting on (a receive
   request is single use); no leaf or checkpoint of its lineage may be on the
-  chain; every board it rests on must be unspent, and before its exit
-  deadline. A coin read a day or less from its exit date, or past it, is
+  chain (every one of them descends from a batch output or board the coin
+  rests on, so while each of those is unspent the wallet reads no block; it
+  reads the blocks from that of a spent one up); every board it rests on
+  must be unspent, and before its exit deadline. A coin read a day or less from its exit date, or past it, is
   kept and taken on the chain at once, from wherever its lineage is; one
   read past its batch's expiry is checked as of that expiry and kept and
   taken on the chain at once while the chain still holds its path (the
