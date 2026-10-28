@@ -1513,6 +1513,10 @@ impl Wallet {
 		// and unlocked by the wallet when the operator has not.
 		let orders = self.progress_orders().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		self.exits_meanwhile();
+		// Each offboard: its output recorded once released, and unlocked by
+		// the wallet when the operator has not.
+		let offboards = self.progress_offboards().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		self.exits_meanwhile();
 		// Each order resting in the tree: published once its round is final
 		// and its participation released; each fill the wallet sent and has
 		// no answer to sent again.
@@ -1578,6 +1582,9 @@ impl Wallet {
 		}
 		if lightning.as_array().is_none_or(|l| !l.is_empty()) {
 			out["lightning"] = lightning;
+		}
+		if offboards.as_array().is_none_or(|o| !o.is_empty()) {
+			out["offboards"] = offboards;
 		}
 		if orders.as_array().is_none_or(|o| !o.is_empty()) {
 			out["orders"] = orders;

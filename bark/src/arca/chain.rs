@@ -916,6 +916,13 @@ impl ChainSource {
 		Ok(Script::from(unhex(spk)?))
 	}
 
+	/// Whether `address` is a confidential (blinded) address of the chain the
+	/// node follows: one carrying a blinding key.
+	pub fn is_confidential(&self, address: &str) -> Result<bool, Error> {
+		let v: Value = self.call("validateaddress", &[json!(address)]).map_err(node)?;
+		Ok(v["confidential_key"].as_str().is_some_and(|k| !k.is_empty()) || v["isconfidential"].as_bool() == Some(true))
+	}
+
 	/// The node's address for `script`, unblinded, on its own chain.
 	pub fn address(&self, script: &Script) -> Result<Option<String>, Error> {
 		let v: Value = self.call("decodescript", &[json!(hex(script.as_bytes()))]).map_err(node)?;

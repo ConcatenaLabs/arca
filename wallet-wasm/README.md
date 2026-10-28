@@ -110,7 +110,10 @@ amount?}`, `forget_request {owner}`, `send {request, amount?, asset?}`,
 not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
-shown?}`, `refusals`; a take of an on-chain order and an order placed from
+shown?}`, `refusals`; a payment to an address on the chain from leaves
+(`offboard_quote {asset, amount, address | script, max_fee_ppm?}`, `offboard
+{asset, amount, address | script, fee_asset?, max_fee_ppm?, shown?}`,
+`offboards`); a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); an order resting in the tree (`order_rest_quote`,
 `order_rest`, `order_resting {orders?}`, `order_fill_resting_quote {order,

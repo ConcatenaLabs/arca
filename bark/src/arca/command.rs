@@ -43,7 +43,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, max_fee_ppm?}, channel_sync {leaf_id}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}, leaf_template {template?}";
+	fee_asset?}, leaf_template {template?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
+	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -126,7 +127,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
-		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives");
+		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
@@ -251,6 +252,20 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.order_place(&super::order::ask_of(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
 		},
 		"orders" => w.orders(),
+		"offboard_quote" | "offboard" => {
+			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
+			let asset = asset(req_str(&a["asset"], "the asset")?)?;
+			let script = w.offboard_script(a["address"].as_str(), a["script"].as_str())?;
+			let max_fee_ppm = opt_u64(&a["max_fee_ppm"], "the fee bound")?;
+			if command == "offboard_quote" {
+				return w.offboard_quote(asset, amount, &script, max_fee_ppm);
+			}
+			// With `shown`, the offboard goes ahead only on the fee and the
+			// coins the program showed (an `offboard_quote`'s).
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.offboard(asset, amount, &script, opt_asset(&a["fee_asset"])?, max_fee_ppm, shown)
+		},
+		"offboards" => w.offboards(),
 		// An order resting in the tree (`super::resting`): its terms as an
 		// object, as an order placed on the chain names them.
 		"order_rest_quote" => w.order_rest_quote(&rest_ask(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?),
