@@ -202,9 +202,12 @@ impl SignerTap {
 					if reader.read_line(&mut line).unwrap_or(0) == 0 {
 						return;
 					}
-					let op = serde_json::from_str::<serde_json::Value>(&line).ok()
-						.and_then(|v| v["op"].as_str().map(String::from)).unwrap_or_default();
-					if c.lock().unwrap().as_deref() == Some(op.as_str()) {
+					let v = serde_json::from_str::<serde_json::Value>(&line).unwrap_or_default();
+					let op = v["op"].as_str().map(String::from).unwrap_or_default();
+					// A check signs nothing: it passes, so what is cut is the
+					// request that would sign.
+					let check = v["check"].as_bool().unwrap_or(false);
+					if !check && c.lock().unwrap().as_deref() == Some(op.as_str()) {
 						println!("signer tap: request {} dropped unanswered", op);
 						return;
 					}
@@ -222,8 +225,8 @@ impl SignerTap {
 		SignerTap { at, real, cut, stop, thread: Some(thread) }
 	}
 
-	/// Drops every request of operation `op` unanswered from now; `None`
-	/// passes everything again.
+	/// Drops every request of operation `op` unanswered from now, but a
+	/// check (which signs nothing); `None` passes everything again.
 	pub fn cut(&self, op: Option<&str>) {
 		*self.cut.lock().unwrap() = op.map(String::from);
 	}

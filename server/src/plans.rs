@@ -160,7 +160,7 @@ pub enum PlanError {
 	#[error(transparent)]
 	Rate(crate::rates::RateError),
 	#[error("the signer: {0}")]
-	Signer(String),
+	Signer(crate::signer::SignerError),
 	#[error(transparent)]
 	Store(StoreError),
 	#[error("{0}")]
@@ -186,6 +186,7 @@ impl PlanError {
 			Conflict(_) => "conflict",
 			NotSynced => "not_synced",
 			Rate(_) => "rate_stale",
+			Signer(crate::signer::SignerError::Declined(_)) => "declined",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
 			Restricted(e) => e.code(),
@@ -357,7 +358,7 @@ impl Plans {
 		if let Some((plan, _)) = self.open_plan_naming(&coin.0).await? {
 			return Err(PlanError::Planned(format!("coin {} is named by plan {}, which is open or stopped: cancel it first", coin, hex(&plan))));
 		}
-		let held = self.signer.under(&c.coin.leaf.salt).await.map_err(|e| PlanError::Signer(e.to_string()))?;
+		let held = self.signer.under(&c.coin.leaf.salt).await.map_err(PlanError::Signer)?;
 		if let Some(e) = held.first() {
 			return Err(PlanError::Conflict(format!("coin {}: the operator's signer has already co-signed {} under its salt (entry {}): \
 				it is refreshed in no round, its owner's way home is its exit", coin, match e.kind { Signed::Forfeit(_) => "a forfeit",

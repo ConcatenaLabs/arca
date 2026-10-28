@@ -359,6 +359,37 @@ impl From<SignerError> for OrderError {
 	}
 }
 
+impl Orders {
+	/// Asks the signer whether it would sign each message of a fill (each
+	/// taker coin's checkpoint and reassignment, then the fill), with nothing
+	/// recorded or signed: the first refusal.
+	#[allow(clippy::too_many_arguments)]
+	async fn check_fill(&self, checked: &[Checked], req: &FillRequest, tplan: &TransferPlan, oc: &Checked, op: &OrderPolicy, partial: bool,
+		outputs: &[ExplicitOutput]) -> Result<(), SignerError>
+	{
+		let n = checked.len();
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+			let cp_out = tplan.checkpoint_output(k);
+			self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await?;
+			self.signer.check_rebind(&tplan.checkpoint(k).owner, &i.reassignment_sig, &tplan.checkpoint(k).salt, None, c.coin.asset,
+				i.checkpoint_value, outputs, fill_named(oc, tplan, k, n)).await?;
+		}
+		self.signer.check_order_fill(op, oc.coin.value, partial, outputs).await
+	}
+}
+
+/// What the signer is told a `vtxo-2` taker checkpoint's reassignment names:
+/// the fill's inputs, the order's coin `oc` at 0, then every one of the `n`
+/// taker checkpoints of `tplan`. `None` for a `vtxo-1` checkpoint.
+fn fill_named(oc: &coins::Checked, tplan: &TransferPlan, k: usize, n: usize) -> Option<crate::signer::WireNamed> {
+	tplan.checkpoint(k).v2.then(|| {
+		let mut ins = vec![oc.coin.output()];
+		ins.extend((0..n).map(|j| tplan.checkpoint_output(j)));
+		crate::signer::WireNamed::new(k as u32 + 1, &ins)
+	})
+}
+
 fn internal<E: std::fmt::Display>(e: E) -> OrderError {
 	OrderError::Internal(e.to_string())
 }
@@ -720,6 +751,21 @@ impl Orders {
 			_ => return Err(internal("a resting order's first record is not a round's leaf")),
 		};
 
+		// A new fill is first asked of the signer, with nothing recorded or
+		// signed: whether it would sign each of its messages. One it refuses
+		// for what it asks is refused here and recorded nowhere.
+		let mut asked_first = false;
+		if !recorded {
+			match self.check_fill(&checked, req, &tplan, &oc, &op, plan.rest.is_some(), &outputs).await {
+				Ok(()) => asked_first = true,
+				Err(e) if matches!(e, SignerError::Declined(_) | SignerError::Frozen(_)) => {
+					log::warn!("a fill of order coin {} refused before it was recorded: the signer refuses it for good: {}", req.coin, e);
+					return Err(OrderError::Cosign(CosignError::Signer(e)));
+				},
+				// Anything else is met again below, the fill recorded.
+				Err(_) => {},
+			}
+		}
 		if !recorded {
 			let ins: Vec<NewTransferInput> = req.inputs.iter().enumerate().map(|(k, i)| NewTransferInput {
 				leaf_id: i.leaf_id.0, checkpoint_value: i.checkpoint_value, checkpoint_owner_sig: cosign::sig_bytes(&i.checkpoint_sig),
@@ -784,8 +830,11 @@ impl Orders {
 		}
 
 		// Nothing is signed while the signer holds anything else under the
-		// order coin's salt or a taker coin's.
+		// order coin's salt or a taker coin's. What it holds of this fill,
+		// signed when it was asked before, is part of it signed already.
+		let mut signed_part = false;
 		for e in self.signer.under(&op.salt).await? {
+			signed_part = true;
 			if e.digest != fill_digest {
 				let _ = self.store.drop_order_fill(&transfer, "the signer holds another spend of the order's coin").await;
 				return Err(OrderError::Cosign(CosignError::Signer(SignerError::AlreadySigned(format!("{}: the order's coin {} has \
@@ -800,7 +849,32 @@ impl Orders {
 					return Err(OrderError::Cosign(cosign::lost_spend(SignerError::AlreadySigned(format!("{}: coin {} has another spend \
 						co-signed (entry {})", crate::signer::ALREADY_SIGNED, c.coin.id, e.n)), &c.coin.id)));
 				}
+				signed_part = true;
 			}
+		}
+
+		// Nor while the signer would refuse any message of the fill (asked
+		// again for a fill recorded earlier, unless this request asked it
+		// already). A refusal it would repeat however often it is asked is
+		// final: with nothing of the fill signed, its record is dropped and
+		// the taker's coins given back. Any other error leaves it recorded,
+		// for the same request to complete.
+		let asked = if asked_first { Ok(()) } else { self.check_fill(&checked, req, &tplan, &oc, &op, plan.rest.is_some(), &outputs).await };
+		if let Err(e) = asked {
+			if e.is_final() && !signed_part {
+				match self.store.drop_order_fill(&transfer, &format!("the signer refuses it: {}", e)).await {
+					Ok(()) => log::warn!("the fill {} of order coin {} refused for good before anything of it was signed: {}; its record is \
+						dropped and the taker's coins given back", hex(&transfer), req.coin, e),
+					Err(d) => log::error!("the fill {} of order coin {} refused for good ({}), and its record could not be dropped: {}",
+						hex(&transfer), req.coin, e, d),
+				}
+			} else if e.is_final() {
+				log::error!("the fill {} of order coin {}: the signer refuses it for good ({}), and holds part of it already: it stays \
+					recorded", hex(&transfer), req.coin, e);
+				return Err(OrderError::Cosign(CosignError::Signer(SignerError::Failed(format!("{} (part of the fill is signed already: \
+					it stays recorded)", e)))));
+			}
+			return Err(OrderError::Cosign(CosignError::Signer(e)));
 		}
 
 		// S signs: the taker's two pairs, then the fill.
@@ -822,13 +896,7 @@ impl Orders {
 				std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
-			// A vtxo-2 checkpoint's pair names the fill's inputs: the order's
-			// coin at 0, then every taker checkpoint.
-			let named = checkpoint.v2.then(|| {
-				let mut ins = vec![oc.coin.output()];
-				ins.extend((0..n).map(|j| tplan.checkpoint_output(j)));
-				crate::signer::WireNamed::new(k as u32 + 1, &ins)
-			});
+			let named = fill_named(&oc, &tplan, k, n);
 			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
 				i.checkpoint_value, &outputs, named).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);

@@ -212,6 +212,7 @@ impl ForfeitError {
 			Cosign(e) => e.code(),
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
+			Signer(SignerError::Declined(_)) => "declined",
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Supervision(e) => e.code(),
@@ -498,7 +499,9 @@ impl Forfeits {
 					log::info!("the forfeit of coin {} for round {}: the operator's half filled in", leaf, row.round_id);
 					filled += 1;
 				},
-				Err(SignerError::AlreadySigned(e)) => {
+				// One the signer refuses for good stays without, and the
+				// others are still filled in.
+				Err(e) if e.is_final() => {
 					log::error!("the forfeit of coin {} for round {} stays without the operator's half: {}", leaf, row.round_id, e);
 				},
 				Err(e) => return Err(e.into()),

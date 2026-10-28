@@ -77,10 +77,11 @@ async fn the_signer_process() {
 		let answer = raw(&p.socket, &line).await;
 		let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
 		assert!(v["error"].is_string() && v["signature"].is_null(), "{}: {}", what, answer);
+		assert_eq!(v["code"], "declined", "{}: a refusal of what the request asks: {}", what, answer);
 		println!("refused, {}: {}", what, v["error"].as_str().unwrap());
 	}
 	let e = client.rebind(&xonly(&owner), &sign_digest(&owner, &[0; 32], &[0; 32]), &[0; 32], None, asset, 1, &[], None).await.unwrap_err();
-	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+	assert!(matches!(e, SignerError::Declined(_)), "{}", e);
 
 	// The spend of one of the operator's own paths: a clock's release. The
 	// signer computes the signature hash itself, on its own chain.
@@ -109,7 +110,7 @@ async fn the_signer_process() {
 	];
 	for (what, prevouts, input, script) in cases {
 		let e = client.spend(&release.tx, &prevouts, input, &script).await.unwrap_err();
-		assert!(matches!(e, SignerError::Refused(_)), "{}: {}", what, e);
+		assert!(matches!(e, SignerError::Declined(_)), "{}: {}", what, e);
 		println!("refused, {}: {}", what, e);
 	}
 	let line = format!(r#"{{"op":"spend","tx":"00","prevouts":[],"input":0,"leaf":"51","digest":"{}"}}"#, "00".repeat(32));
@@ -212,15 +213,15 @@ async fn the_signers_record() {
 	let o = out(9_000, 5);
 	let wrong_key = owner_sig(&b, genesis, &[5; 32], asset, 10_000, &[o.clone()]);
 	let e = client.rebind(&xonly(&a), &wrong_key, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
-	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+	assert!(matches!(e, SignerError::Declined(_)), "{}", e);
 	println!("A named, B's signature: {}", e);
 	let wrong_message = owner_sig(&a, genesis, &[5; 32], asset, 10_000, &[out(9_000, 6)]);
 	let e = client.rebind(&xonly(&a), &wrong_message, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
-	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+	assert!(matches!(e, SignerError::Declined(_)), "{}", e);
 	println!("A's signature over another message: {}", e);
 	let wrong_salt = owner_sig(&a, genesis, &[6; 32], asset, 10_000, &[o.clone()]);
 	let e = client.rebind(&xonly(&a), &wrong_salt, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
-	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+	assert!(matches!(e, SignerError::Declined(_)), "{}", e);
 	println!("A's signature for another salt: {}", e);
 
 	// A forfeit of A's leaf under salt 2, for one round: the one message
@@ -268,9 +269,28 @@ async fn the_signers_record() {
 	refused_twice(e);
 	// Parts that do not make the output committed to: refused, not recorded.
 	let e = give([3; 32], f3, out(9_000, 1)).await.unwrap_err();
-	assert!(matches!(e, SignerError::Refused(_)), "{}", e);
+	assert!(matches!(e, SignerError::Declined(_)), "{}", e);
 	println!("salt 3: forfeit parts that do not make the output: {}", e);
-	spend(&a, [3; 32], out(9_000, 3)).await.unwrap();
+
+	// Asked only whether it would sign: every check made, nothing recorded.
+	// A message it would sign answers without an error and leaves the salt
+	// free; one under a salt that holds another is `already_signed`; one it
+	// refuses for what it asks is `declined`. Each refused for good.
+	let before = client.entries(0).await.unwrap().len();
+	let o3 = out(9_000, 3);
+	let sig3 = owner_sig(&a, genesis, &[3; 32], asset, 10_000, &[o3.clone()]);
+	client.check_rebind(&xonly(&a), &sig3, &[3; 32], None, asset, 10_000, &[o3.clone()], None).await.unwrap();
+	assert_eq!(client.entries(0).await.unwrap().len(), before, "a check records nothing");
+	let o4 = out(9_000, 4);
+	let sig1 = owner_sig(&a, genesis, &[1; 32], asset, 10_000, &[o4.clone()]);
+	let e = client.check_rebind(&xonly(&a), &sig1, &[1; 32], None, asset, 10_000, &[o4.clone()], None).await.unwrap_err();
+	assert!(matches!(e, SignerError::AlreadySigned(_)) && e.is_final(), "{}", e);
+	println!("check, another message under salt 1: {}", e);
+	let e = client.check_rebind(&xonly(&a), &wrong_key, &[5; 32], None, asset, 10_000, &[o.clone()], None).await.unwrap_err();
+	assert!(matches!(e, SignerError::Declined(_)) && e.is_final(), "{}", e);
+	println!("check, A named and B's signature: {}", e);
+	spend(&a, [3; 32], o3).await.unwrap();
+	assert_eq!(client.entries(0).await.unwrap().len(), before + 1, "signed after its check: one entry");
 
 	// The record outlives the process: after a restart, the same refusals.
 	let lines = std::fs::read_to_string(p.record()).unwrap();
