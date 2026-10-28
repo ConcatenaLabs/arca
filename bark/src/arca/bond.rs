@@ -167,6 +167,8 @@ impl Wallet {
 		let Some(op) = b["outpoint"].as_str().and_then(|s| parse_outpoint(s).ok()) else {
 			return Ok(Standing::of("missing", Some(policy), format!("the operator names no bond coin ({})", b["state"])));
 		};
+		// Where the bond coin is and whether it stands, read together.
+		self.chain.read_ahead_of(std::slice::from_ref(&op.txid), std::slice::from_ref(&op));
 		let Some(tx) = self.chain.transaction(&op.txid)? else {
 			return Ok(Standing::of("missing", Some(policy), format!("this wallet's node holds no transaction {}", op.txid)));
 		};
