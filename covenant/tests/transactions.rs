@@ -409,6 +409,7 @@ fn the_transfer_chain() {
 	// checkpoint, and the board must still be unspent.
 	let e = &ends["E"];
 	assert_eq!(e.boards(), vec![OutPoint::new(rounds[2].txid(), 0)]);
+	assert_eq!(e.roots(), e.boards(), "it descends from the board output alone");
 	assert_eq!(e.lineage().len(), 2);
 	assert_eq!(e.expiry, MedianTime::MAX, "a coin from a board alone never expires");
 	assert_eq!(n, txs.len(), "every transfer transaction in the vectors was rebuilt");
