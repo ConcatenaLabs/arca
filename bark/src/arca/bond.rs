@@ -26,7 +26,9 @@
 //! "signature"}`. [`Wallet::watch_bond`] takes its own and any other's, counts
 //! only those whose signature the operator key made, compares them under each
 //! salt, and reads every spend on the chain and in the mempool of a script
-//! that carries a watched salt's `K`. Two different messages under one salt
+//! that carries a watched salt's `K`: for a salt of its own coins, only once
+//! an output those coins descend from is spent, since every spend under the
+//! salt starts there, and a few seconds of blocks a run. Two different messages under one salt
 //! burn the bond: the slash, with a fee coin of the wallet's own, is sent, and
 //! sent again on every run until its block is final.
 
@@ -63,7 +65,10 @@ pub const BOND_FOUND: &str = "bond_found";
 /// the oldest transaction its coins rest on, when that is later.
 pub const FIRST_SCAN: u64 = 20_000;
 /// How many blocks `watch-bond` reads before it notes how far it read.
-pub const SCAN_CHUNK: u64 = 500;
+pub const SCAN_CHUNK: u64 = 128;
+/// How long one `watch-bond` reads blocks before it stops and says more is
+/// left (`scanned.more`): the next run reads on from where it stopped.
+pub const SCAN_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A coin's lifetime, the longest a coin the operator makes lives from its
 /// round or board to its first expiry: a bond's notice must outlast it.
@@ -343,16 +348,16 @@ impl Wallet {
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines: what the wallet hands a watcher.
 	pub fn bond_evidence(&self) -> Result<Vec<Value>, Error> {
-		Ok(self.evidence_by_coin()?.into_iter().map(|(line, _)| line).collect())
+		Ok(self.evidence_by_coin()?.into_iter().map(|(line, _, _)| line).collect())
 	}
 
 	/// [`Self::bond_evidence`], each line with the transactions the coins
 	/// that carry it rest on: a spend of a script that pushes the line's
 	/// salt descends from them, so it is in no block before theirs.
-	fn evidence_by_coin(&self) -> Result<Vec<(Value, Vec<Txid>)>, Error> {
+	fn evidence_by_coin(&self) -> Result<Vec<(Value, Vec<Txid>, Vec<OutPoint>)>, Error> {
 		let now = self.now()?;
 		let mut seen: BTreeMap<([u8; 32], Vec<u8>), usize> = BTreeMap::new();
-		let mut out: Vec<(Value, Vec<Txid>)> = vec![];
+		let mut out: Vec<(Value, Vec<Txid>, Vec<OutPoint>)> = vec![];
 		for c in self.store.coins()? {
 			if c.kind != "transfer" && c.kind != "fill" {
 				continue;
@@ -362,12 +367,16 @@ impl Wallet {
 			let policy: WalletPolicy = self.followed_policy(c.expiry, now);
 			let Ok(valid) = self.resolve(&record, &txs, &policy) else { continue };
 			let bases: Vec<Txid> = txs.iter().map(|t| t.txid()).collect();
+			let roots = valid.roots();
 			for e in bond::cosigned_by(&valid) {
 				match seen.get(&(e.salt, e.signed.rest.clone())) {
-					Some(&i) => out[i].1.extend(bases.iter().copied()),
+					Some(&i) => {
+						out[i].1.extend(bases.iter().copied());
+						out[i].2.extend(roots.iter().copied());
+					},
 					None => {
 						seen.insert((e.salt, e.signed.rest.clone()), out.len());
-						out.push((evidence_line(&e.salt, &e.signed), bases.clone()));
+						out.push((evidence_line(&e.salt, &e.signed), bases.clone(), roots.clone()));
 					},
 				}
 			}
@@ -407,12 +416,16 @@ impl Wallet {
 		// The transactions each of the wallet's own salts rests on: its
 		// spends are in no block before theirs.
 		let mut bases: BTreeMap<[u8; 32], Vec<Txid>> = BTreeMap::new();
-		let tagged = own.iter().map(|(v, b)| (v, Some(b))).chain(lines.iter().chain(found.iter()).map(|v| (v, None)));
+		// And the outputs on the chain they descend from: a spend under the
+		// salt is made only by spends that start at one of them.
+		let mut roots: BTreeMap<[u8; 32], Vec<OutPoint>> = BTreeMap::new();
+		let tagged = own.iter().map(|(v, b, r)| (v, Some((b, r)))).chain(lines.iter().chain(found.iter()).map(|v| (v, None)));
 		for (v, b) in tagged {
 			match read_line(v) {
 				Ok((salt, signed)) if policy.verify(&salt, &signed) => {
-					if let Some(b) = b {
+					if let Some((b, r)) = b {
 						bases.entry(salt).or_default().extend(b.iter().copied());
+						roots.entry(salt).or_default().extend(r.iter().copied());
 					}
 					let list = by_salt.entry(salt).or_default();
 					if !list.iter().any(|x| policy.digest_of(&salt, x) == policy.digest_of(&salt, &signed)) {
@@ -450,7 +463,18 @@ impl Wallet {
 				let start = match read_to.filter(|_| covered.contains(&hex(salt))) {
 					Some(h) => h.saturating_add(1),
 					None => match bases.get(salt) {
-						Some(b) => self.lowest_block(b, tip)?,
+						// The wallet's own salt: while every output its coins
+						// descend from stands, nothing spends under it, and no
+						// block is read for it; else from the block of a spent
+						// one.
+						Some(b) => {
+							let lowest = self.lowest_block(b, tip)?;
+							match self.chain.descendants_from(roots.get(salt).map(|r| r.as_slice()).unwrap_or(&[]), lowest)? {
+								None if roots.get(salt).is_some_and(|r| !r.is_empty()) => tip.saturating_add(1),
+								None => lowest,
+								Some(h) => h.max(lowest),
+							}
+						},
 						None => oldest,
 					},
 				};
@@ -464,17 +488,25 @@ impl Wallet {
 			// from there. A salt new to this run lowers the note for the
 			// others while its chunks below it are read: they are read
 			// again, never skipped.
+			// Each run reads for [`SCAN_SLICE`] at most, many blocks a
+			// request, and says when more is left: the wallet is held while it
+			// runs, and a person's command waits behind it.
+			let started = web_time::Instant::now();
 			let mut blocks = 0u64;
 			let mut h = from;
+			let mut more = false;
 			while h <= tip {
+				if blocks > 0 && started.elapsed() >= SCAN_SLICE {
+					more = true;
+					break;
+				}
 				let end = h.saturating_add(SCAN_CHUNK - 1).min(tip);
 				let mut txs: Vec<Transaction> = vec![];
-				for x in h..=end {
-					if let Some(b) = self.chain.block_at(x)? {
-						txs.extend(b.txdata.into_iter().skip(1));
-					}
+				self.chain.each_block_to(h, end, |_, b| {
+					txs.extend(b.txdata.into_iter().skip(1));
 					blocks += 1;
-				}
+					Ok(false)
+				})?;
 				let new = self.read_spends(&txs, &policy, &ks, &mut by_salt)?;
 				from_chain += self.keep_found(new, &mut found)?;
 				self.store.set_meta(BOND_SALTS, &salts)?;
@@ -485,15 +517,11 @@ impl Wallet {
 				self.store.set_meta(BOND_SALTS, &salts)?;
 				self.store.set_meta(BOND_SCANNED, &tip.to_string())?;
 			}
-			let mut txs: Vec<Transaction> = vec![];
-			for t in self.chain.mempool()? {
-				if let Some(tx) = self.chain.transaction(&t)? {
-					txs.push(tx);
-				}
-			}
+			let txs = self.chain.mempool_txs()?;
 			let new = self.read_spends(&txs, &policy, &ks, &mut by_salt)?;
 			from_chain += self.keep_found(new, &mut found)?;
-			json!({"from": if from > tip { Value::Null } else { json!(from) }, "to": tip, "blocks": blocks, "mempool": true})
+			json!({"from": if from > tip { Value::Null } else { json!(from) }, "to": if more { json!(h - 1) } else { json!(tip) }, "blocks": blocks,
+				"mempool": true, "more": more})
 		};
 		let conflicts: Vec<Evidence> = by_salt.iter().filter(|(_, l)| l.len() > 1)
 			.map(|(salt, l)| Evidence { salt: *salt, a: l[0].clone(), b: l[1].clone() }).collect();

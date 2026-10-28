@@ -140,6 +140,19 @@ async fn a_bond_covers_payments_out_of_round_and_a_double_spend_burns_it() {
 	println!("B's evidence: {} line(s)", lines.len());
 	assert!(!lines.is_empty());
 
+	// BEFORE: the board B's coin rests on stands, so nothing can spend under
+	// its salt yet: the watcher reads no block, and finds nothing.
+	let quiet = b.ok(&["watch-bond"]);
+	println!("B's watch-bond while the board stands: {}", quiet["scanned"]);
+	assert_eq!(quiet["scanned"]["blocks"], 0, "no block read while the board stands: {}", quiet["scanned"]);
+	assert!(quiet["scanned"]["from"].is_null(), "{}", quiet["scanned"]);
+	assert_eq!(quiet["conflicts"], serde_json::json!([]), "{}", quiet);
+	// What that run noted as read is set aside, so the run after the theft
+	// starts as a wallet's first does: from the block of the spent board.
+	let db = rusqlite::Connection::open(b.dir.join("arca.sqlite")).unwrap();
+	db.execute("DELETE FROM meta WHERE key IN ('bond_scanned', 'bond_salts')", []).unwrap();
+	drop(db);
+
 	// --- A and a signer that breaks the rule spend A's board again ---
 	let rec = CoinRecord::from_bytes(&unhex(a.ok(&["record", &a_board])["record"].as_str().unwrap())).unwrap();
 	let CoinRecord::Board(board) = rec else { panic!("A's coin is a board") };
