@@ -1281,12 +1281,15 @@ and the mempool for every spend of a script that carries a watched salt's
 constant, reading the operator's signature and its message from the
 transaction. A wallet with no lines to watch reads nothing. A salt read before
 is read on from where the last run stopped; a salt of the wallet's own coins
-is read from the block of the oldest transaction those coins rest on, since no
-spend of them comes before it; a salt only another wallet's file names is read
-from 20,000 blocks back, and none further back than that (`scanned` says from
-where, to where, and how many blocks). The chain is read 500 blocks at a time,
-and the signatures found are kept before the height is noted, so a run cut
-short goes on where it stopped. Two different messages under one salt are a
+needs no block read while every batch output and board those coins rest on is
+unspent, since every spend under it starts by spending one of them, and is
+read from the block of a spent one otherwise; a salt only another wallet's file
+names is read from 20,000 blocks back, and none further back than that
+(`scanned` says from where, to where, and how many blocks). The chain is read
+128 blocks at a time, many to a request, and the signatures found are kept
+before the height is noted, so a run cut short goes on where it stopped. One
+run reads for five seconds at most, since the wallet is held while it runs;
+`scanned.more` says the next run reads on. Two different messages under one salt are a
 conflict: the wallet builds the slash, which burns the whole bond with a bare
 `OP_RETURN` and pays its fee from an on-chain coin of the wallet's own (the
 bond's asset first, or `--fee-asset`, as for an exit), and sends it, and sends

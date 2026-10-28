@@ -1068,8 +1068,14 @@ impl ChainSource {
 	/// time, where the node takes a batch: a node behind a proxy answers each
 	/// request after a round trip, and one read per block made a scan of an
 	/// hour of blocks take minutes.
-	fn each_block(&self, from_height: u64, mut f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
-		let tip = self.tip()?;
+	fn each_block(&self, from_height: u64, f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
+		let tip = self.tip()?.height;
+		self.each_block_to(from_height, tip, f)
+	}
+
+	/// [`Self::each_block`], from `from_height` to `to_height` at most.
+	pub fn each_block_to(&self, from_height: u64, to_height: u64, mut f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
+		let tip = Tip { height: to_height.min(self.tip()?.height), ..self.tip()? };
 		let mut h = from_height;
 		while h <= tip.height {
 			let end = h.saturating_add(BATCH_MOST as u64 - 1).min(tip.height);
@@ -1098,7 +1104,7 @@ impl ChainSource {
 
 	/// The transactions in the node's mempool, read at once where the node
 	/// takes a batch.
-	fn mempool_txs(&self) -> Result<Vec<Transaction>, Error> {
+	pub fn mempool_txs(&self) -> Result<Vec<Transaction>, Error> {
 		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
 		self.read_ahead(ids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t)])).collect());
 		let mut txs = Vec::with_capacity(ids.len());
