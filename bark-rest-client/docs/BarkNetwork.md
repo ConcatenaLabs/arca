@@ -7,6 +7,7 @@
 | Mainnet | mainnet |
 | Signet | signet |
 | Mutinynet | mutinynet |
+| Testnet4 | testnet4 |
 | Regtest | regtest |
 
 

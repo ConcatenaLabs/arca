@@ -316,7 +316,7 @@ pub(crate) async fn start_lightning_send(
 	let tip = wallet.inner.chain.tip().await?;
 
 	let properties = wallet.inner.db.read_properties().await?.context("Missing config")?;
-	if invoice.network() != properties.network {
+	if !invoice.is_for_network(properties.network) {
 		bail!("Invoice is for wrong network: {}", invoice.network());
 	}
 

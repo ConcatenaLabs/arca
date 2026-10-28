@@ -331,6 +331,7 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
 		regtest: req.network == BarkNetwork::Regtest,
 		signet: req.network == BarkNetwork::Signet,
 		mutinynet: req.network == BarkNetwork::Mutinynet,
+		testnet4: req.network == BarkNetwork::Testnet4,
 		mnemonic: mnemonic,
 		birthday_height: req.birthday_height,
 		config: config,

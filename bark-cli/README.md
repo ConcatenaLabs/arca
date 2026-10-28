@@ -6,9 +6,11 @@ The command-line wallets of this workspace:
   Arca coins against an Arca server, and whose Bitcoin side is Bark's wallet
   for Bitcoin arks.
 - `bark` and `barkd`, Bark's own command-line wallet and daemon for Bitcoin
-  arks. `arca bitcoin …` runs a `bark` as Bark ships it, and the Arca client
-  carries one built from Bark's release with testnet4 added
-  (`ConcatenaLabs/arca-client`, `build/make-bark-bundle.sh`).
+  arks, here with testnet4 among their networks (`--testnet4`), whose
+  Lightning invoices carry testnet's `tb` currency. `arca bitcoin …` runs a
+  `bark` as Bark ships it, and the Arca client carries one built from Bark's
+  release with the same testnet4 change (`ConcatenaLabs/arca-client`,
+  `build/make-bark-bundle.sh`).
 
 ## The `arca` wallet
 

@@ -20,6 +20,8 @@ pub enum BarkNetwork {
 	Signet,
 	/// Mutinynet
 	Mutinynet,
+	/// Bitcoin Core's testnet4
+	Testnet4,
 	/// Any regtest network
 	Regtest,
 }
@@ -31,6 +33,7 @@ impl BarkNetwork {
 			Self::Mainnet => Network::Bitcoin,
 			Self::Signet => Network::Signet,
 			Self::Mutinynet => Network::Signet,
+			Self::Testnet4 => Network::Testnet4,
 			Self::Regtest => Network::Regtest,
 		}
 	}
@@ -42,6 +45,7 @@ impl fmt::Display for BarkNetwork {
 			Self::Mainnet => f.write_str("mainnet"),
 			Self::Signet => f.write_str("signet"),
 			Self::Mutinynet => f.write_str("mutinynet"),
+			Self::Testnet4 => f.write_str("testnet4"),
 			Self::Regtest => f.write_str("regtest"),
 		}
 	}
