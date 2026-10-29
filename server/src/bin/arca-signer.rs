@@ -159,8 +159,8 @@ use server::keeper::{reached, start_quorum, Held, KeeperAddr, KeeperClient, Wire
 use server::signer::{
 	check_spend, hex, parse_amount, record_end_digest, record_head_digest, unhex, unhex32, RecordKeepers, Request, Response, Signed,
 	SpendRecord, WireChannel, WireState,
-	WireEntryRef, WireKeepers, WireStopProof, ALREADY_SIGNED, MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND, RECORD_DIFFERS,
-	STOPPED,
+	WireEntryRef, WireKeepers, WireStopProof, ALREADY_SIGNED, DECLINED, MAX_ENTRIES, MAX_REQUEST, MAX_WITNESS, RECORD_BEHIND,
+	RECORD_DIFFERS, STOPPED,
 };
 
 struct Args {
@@ -826,6 +826,20 @@ fn code_of(e: &str) -> Option<String> {
 		.find(|c| e.starts_with(&format!("{}:", c))).map(str::to_string)
 }
 
+/// A refusal of what a request asks (`declined`, or the code `e` starts
+/// with): the signer refuses the same request again however often it is
+/// asked.
+fn declined(e: String) -> Response {
+	Response { code: code_of(&e).or_else(|| Some(DECLINED.into())), error: Some(e), ..Response::default() }
+}
+
+/// A refusal for the record's sake, under the code `e` starts with; without
+/// one, the signer's own failure (its record not read or written), which the
+/// same request may get past later.
+fn failed(e: String) -> Response {
+	Response { code: code_of(&e), error: Some(e), ..Response::default() }
+}
+
 fn load_key(path: &PathBuf) -> Result<Keypair, String> {
 	let meta = std::fs::metadata(path).map_err(|e| format!("{}: {}", path.display(), e))?;
 	if meta.permissions().mode() & 0o077 != 0 {
@@ -843,7 +857,7 @@ async fn answer(state: &State, line: &str) -> Response {
 	let none = Response::default();
 	let req: Request = match serde_json::from_str(line) {
 		Ok(r) => r,
-		Err(e) => return Response { error: Some(format!("not a request: {}", e)), ..none },
+		Err(e) => return declined(format!("not a request: {}", e)),
 	};
 	match req {
 		Request::Pubkey {} => Response {
@@ -883,11 +897,11 @@ async fn answer(state: &State, line: &str) -> Response {
 		},
 		Request::Witness { heads, nonce } => {
 			if heads.len() > MAX_WITNESS {
-				return Response { error: Some(format!("{} heads; a witness names at most {}", heads.len(), MAX_WITNESS)), ..none };
+				return declined(format!("{} heads; a witness names at most {}", heads.len(), MAX_WITNESS));
 			}
 			let nonce = match nonce.as_deref().map(unhex32).transpose() {
 				Ok(n) => n,
-				Err(e) => return Response { error: Some(format!("nonce: {}", e)), ..none },
+				Err(e) => return declined(format!("nonce: {}", e)),
 			};
 			// Every signature is checked before the record is locked, the
 			// ones the signer made or checked before by a look-up alone.
@@ -968,7 +982,7 @@ async fn answer(state: &State, line: &str) -> Response {
 		Request::Under { salt } => {
 			let salt = match unhex32(&salt) {
 				Ok(s) => s,
-				Err(e) => return Response { error: Some(format!("salt: {}", e)), ..none },
+				Err(e) => return declined(format!("salt: {}", e)),
 			};
 			let r = record.lock().unwrap_or_else(|e| e.into_inner());
 			match r.entries_under(&salt) {
@@ -976,7 +990,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig, named } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig, named, check } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -1057,13 +1071,16 @@ async fn answer(state: &State, line: &str) -> Response {
 			})();
 			let (owner, owner_sig, salt, asset_in, value_in, outputs, kind, known, landing, enclave, restricted, policy_sig, named) = match parsed {
 				Ok(p) => p,
-				Err(e) => return Response { error: Some(e), ..none },
+				Err(e) => return declined(e),
 			};
 			// After a start, nothing the record governs is signed before
-			// enough keepers have answered for their latest.
-			if let Err(e) = state.check_keepers().await {
-				eprintln!("arca-signer: refused rebind for the leaf of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
-				return Response { code: code_of(&e), error: Some(e), ..none };
+			// enough keepers have answered for their latest. A check signs
+			// nothing.
+			if !check {
+				if let Err(e) = state.check_keepers().await {
+					eprintln!("arca-signer: refused rebind for the leaf of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
+					return failed(e);
+				}
 			}
 			// A landing-1 coin's freeze, read from the signer's own node,
 			// before anything is recorded; its message carries its landing
@@ -1089,7 +1106,7 @@ async fn answer(state: &State, line: &str) -> Response {
 			};
 			let message = match built {
 				Ok(m) => m,
-				Err(e) => return Response { error: Some(e.to_string()), ..none },
+				Err(e) => return declined(e.to_string()),
 			};
 			// A restricted asset's message is signed only beside its policy
 			// key's approval of that very message.
@@ -1107,10 +1124,16 @@ async fn answer(state: &State, line: &str) -> Response {
 			// The owner signed this very message: an entry under its key is
 			// its own doing, never another holder's.
 			if !verify_digest(&owner_sig, &message.digest, &owner) {
-				return Response {
-					error: Some(format!("the owner's signature over {} does not verify under the key {}: the signer records a message \
-						only under the key of the owner who signed it", hex(&message.digest), hex(&owner.serialize()))),
-					..none
+				return declined(format!("the owner's signature over {} does not verify under the key {}: the signer records a message \
+					only under the key of the owner who signed it", hex(&message.digest), hex(&owner.serialize())));
+			}
+			// Asked only whether it would sign: what the record holds under
+			// the salt, read and not written.
+			if check {
+				let r = record.lock().unwrap_or_else(|e| e.into_inner());
+				return match r.admissible(&salt, kind, &message.digest) {
+					Ok(_) => none,
+					Err(e) => failed(e),
 				};
 			}
 			// The record holds what the database knows, the same; then the
@@ -1146,7 +1169,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				match kind { Signed::Spend => "spend", Signed::Forfeit(_) => "forfeit" }, hex(&owner.serialize()), hex(&salt), entry.n);
 			Response { signature: Some(hex(sig.as_ref())), entry: Some(head), acks, ..none }
 		},
-		Request::OrderFill { owner, salt, asset_in, exit_delay_units, order, value_in, partial, outputs, known } => {
+		Request::OrderFill { owner, salt, asset_in, exit_delay_units, order, value_in, partial, outputs, known, check } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let salt = unhex32(&salt)?;
@@ -1171,11 +1194,18 @@ async fn answer(state: &State, line: &str) -> Response {
 			})();
 			let (owner, salt, digest, known) = match parsed {
 				Ok(p) => p,
-				Err(e) => return Response { error: Some(e), ..none },
+				Err(e) => return declined(e),
 			};
+			if check {
+				let r = record.lock().unwrap_or_else(|e| e.into_inner());
+				return match r.admissible(&salt, Signed::Spend, &digest) {
+					Ok(_) => none,
+					Err(e) => failed(e),
+				};
+			}
 			if let Err(e) = state.check_keepers().await {
 				eprintln!("arca-signer: refused order fill for the order of {} under salt {}: {}", hex(&owner.serialize()), hex(&salt), e);
-				return Response { code: code_of(&e), error: Some(e), ..none };
+				return failed(e);
 			}
 			let admitted = {
 				let mut r = record.lock().unwrap_or_else(|e| e.into_inner());
@@ -1222,7 +1252,7 @@ async fn answer(state: &State, line: &str) -> Response {
 			})();
 			let (txid, digest) = match parsed {
 				Ok(p) => p,
-				Err(e) => return Response { error: Some(e), ..none },
+				Err(e) => return declined(e),
 			};
 			let mut aux = [0u8; 32];
 			rand::rngs::OsRng.fill_bytes(&mut aux);
@@ -1233,11 +1263,11 @@ async fn answer(state: &State, line: &str) -> Response {
 		Request::Reissue { reissue } => {
 			let issuer = match elements::AssetId::from_str(&reissue.asset).ok().and_then(|a| state.issuers.iter().find(|i| i.limiter.asset == a)) {
 				Some(i) => i,
-				None => return Response { error: Some(format!("asset {} is minted by no limiter this signer holds", reissue.asset)), ..none },
+				None => return declined(format!("asset {} is minted by no limiter this signer holds", reissue.asset)),
 			};
 			let checked = match server::issuer::check_reissue(state.chain, state.operator(), &issuer.limiter, &reissue) {
 				Ok(c) => c,
-				Err(e) => return Response { error: Some(format!("the mint: {}", e)), ..none },
+				Err(e) => return declined(format!("the mint: {}", e)),
 			};
 			match mint_witness(state, issuer, &reissue, &checked).await {
 				Ok(w) => {
@@ -1248,8 +1278,9 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the mint: {}", e)), ..none },
 			}
 		},
-		Request::ChannelState { channel, state: wire_state, owner_sig } => {
+		Request::ChannelState { channel, state: wire_state, owner_sig, check } => {
 			match channel_digest(state, &channel, &wire_state, Some(&owner_sig), None) {
+				Ok(_) if check => none,
 				Ok((digest, what)) => {
 					let mut aux = [0u8; 32];
 					rand::rngs::OsRng.fill_bytes(&mut aux);
@@ -1258,15 +1289,15 @@ async fn answer(state: &State, line: &str) -> Response {
 					Response { signature: Some(hex(sig.as_ref())), ..none }
 				},
 				Err(e) => {
-					eprintln!("arca-signer: refused a channel state: {}", e);
-					Response { error: Some(e), ..none }
+					eprintln!("arca-signer: refused a channel state: {}", e.error.as_deref().unwrap_or(""));
+					e
 				},
 			}
 		},
 		Request::ChannelNote { channel, state: wire_state, owner_sig, credit } => {
 			let credit = match parse_amount(&credit) {
 				Ok(c) => c,
-				Err(e) => return Response { error: Some(format!("credit: {}", e)), ..none },
+				Err(e) => return declined(format!("credit: {}", e)),
 			};
 			match channel_digest(state, &channel, &wire_state, owner_sig.as_deref(), Some(credit)) {
 				Ok((digest, what)) => {
@@ -1277,8 +1308,8 @@ async fn answer(state: &State, line: &str) -> Response {
 					Response { signature: Some(hex(sig.as_ref())), ..none }
 				},
 				Err(e) => {
-					eprintln!("arca-signer: refused a channel note: {}", e);
-					Response { error: Some(e), ..none }
+					eprintln!("arca-signer: refused a channel note: {}", e.error.as_deref().unwrap_or(""));
+					e
 				},
 			}
 		},
@@ -1290,7 +1321,7 @@ async fn answer(state: &State, line: &str) -> Response {
 			})();
 			let (h, t) = match parsed {
 				Ok(p) => p,
-				Err(e) => return Response { error: Some(e), ..none },
+				Err(e) => return declined(e),
 			};
 			let message = arca_covenant::message::unroll_authorisation(&h, t);
 			let mut aux = [0u8; 32];
@@ -1308,7 +1339,7 @@ async fn answer(state: &State, line: &str) -> Response {
 			})();
 			let (root, rec, t) = match parsed {
 				Ok(p) => p,
-				Err(e) => return Response { error: Some(e), ..none },
+				Err(e) => return declined(e),
 			};
 			let digest = arca_covenant::accumulator::exit_digest(chain, &root, &rec, t);
 			let mut aux = [0u8; 32];
@@ -1327,36 +1358,38 @@ async fn answer(state: &State, line: &str) -> Response {
 /// with what it is in words. Refused unless the owner signed the state, the
 /// state's balances add up to the channel's value, a note keeps within the
 /// state's cap, the signer is not stopped, and its record holds nothing under
-/// the coin's salt (a coin given up or paid on takes no new state).
+/// the coin's salt (a coin given up or paid on takes no new state). Its
+/// refusal is the answer: `declined` for what the request asks, `stopped`, or
+/// none when the record could not be read.
 fn channel_digest(state: &State, channel: &WireChannel, wire_state: &WireState, owner_sig: Option<&str>, credit: Option<u64>)
-	-> Result<([u8; 32], String), String>
+	-> Result<([u8; 32], String), Response>
 {
-	let policy = channel.to_policy(state.key.x_only_public_key().0, state.chain)?;
-	let st = wire_state.to_state()?;
-	let message = policy.state_message(&st).map_err(|e| e.to_string())?;
+	let policy = channel.to_policy(state.key.x_only_public_key().0, state.chain).map_err(declined)?;
+	let st = wire_state.to_state().map_err(declined)?;
+	let message = policy.state_message(&st).map_err(|e| declined(e.to_string()))?;
 	// A state is the owner's own doing; a note may stand on the channel's
 	// opening, which its leaf's script carries and nobody signs.
 	match (owner_sig, credit) {
 		(None, Some(_)) if st == policy.opening() => {},
-		(None, _) => return Err(format!("state {} of the channel under salt {} comes without its owner's signature", st.number,
-			hex(&policy.salt))),
+		(None, _) => return Err(declined(format!("state {} of the channel under salt {} comes without its owner's signature", st.number,
+			hex(&policy.salt)))),
 		(Some(s), _) => {
-			let owner_sig = Signature::from_slice(&unhex(s)?).map_err(|e| format!("owner_sig: {}", e))?;
+			let owner_sig = Signature::from_slice(&unhex(s).map_err(declined)?).map_err(|e| declined(format!("owner_sig: {}", e)))?;
 			if st.number == 0 || !verify_digest(&owner_sig, &message.digest, &policy.owner) {
-				return Err(format!("the owner's signature over state {} of the channel under salt {} does not verify under the key {}",
-					st.number, hex(&policy.salt), hex(&policy.owner.serialize())));
+				return Err(declined(format!("the owner's signature over state {} of the channel under salt {} does not verify under the \
+					key {}", st.number, hex(&policy.salt), hex(&policy.owner.serialize()))));
 			}
 		},
 	}
 	{
 		let r = state.record.lock().unwrap_or_else(|e| e.into_inner());
 		if let Some(why) = r.stopped() {
-			return Err(format!("the signer is stopped: {}", why));
+			return Err(failed(format!("{}: the signer is stopped: {}", STOPPED, why)));
 		}
-		let under = r.entries_under(&policy.salt).map_err(|e| format!("the record could not be read: {}", e))?;
+		let under = r.entries_under(&policy.salt).map_err(|e| failed(format!("the record could not be read: {}", e)))?;
 		if let Some(e) = under.first() {
-			return Err(format!("the record holds entry {} under salt {}: the coin was given up or paid on, and takes no new state \
-				or note", e.n, hex(&policy.salt)));
+			return Err(declined(format!("the record holds entry {} under salt {}: the coin was given up or paid on, and takes no new \
+				state or note", e.n, hex(&policy.salt))));
 		}
 	}
 	match credit {
@@ -1364,10 +1397,10 @@ fn channel_digest(state: &State, channel: &WireChannel, wire_state: &WireState, 
 			hex(&policy.salt), st.owner, st.operator))),
 		Some(c) => {
 			if c == 0 || c > st.credit_cap() {
-				return Err(format!("a note of {} for state {}, whose cap is {}: the operator's balance covers no more", c, st.number,
-					st.credit_cap()));
+				return Err(declined(format!("a note of {} for state {}, whose cap is {}: the operator's balance covers no more", c,
+					st.number, st.credit_cap())));
 			}
-			let note = policy.note_message(c).map_err(|e| e.to_string())?;
+			let note = policy.note_message(c).map_err(|e| declined(e.to_string()))?;
 			Ok((note.digest, format!("a credit note of {} for the channel under salt {} (state {}, cap {})", c, hex(&policy.salt),
 				st.number, st.credit_cap())))
 		},
@@ -1622,7 +1655,7 @@ async fn main() {
 			let mut reader = BufReader::new(read).take(MAX_REQUEST as u64 + 1);
 			let mut line = String::new();
 			let reply = match reader.read_line(&mut line).await {
-				Ok(n) if n > MAX_REQUEST => Response { error: Some("request too long".into()), ..Response::default() },
+				Ok(n) if n > MAX_REQUEST => declined("request too long".into()),
 				Ok(_) => answer(&state, line.trim_end()).await,
 				Err(e) => Response { error: Some(e.to_string()), ..Response::default() },
 			};

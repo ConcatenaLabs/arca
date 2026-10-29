@@ -119,8 +119,15 @@ fn a_leaf_already_on_chain_is_not_received() {
 	let a_base = base(&tree, 0, &a, preimage, mt(c.net.mtp() - 60));
 	let a_coin = a_base.resolve(&rounds, &c.policy(&s)).unwrap();
 
+	// Before A unrolls, the batch output A's coin descends from is unspent:
+	// nothing of its lineage can be on-chain, and a receiver reads no block.
+	let roots = a_coin.roots();
+	assert_eq!(roots.len(), 1);
+	assert!(c.unspent(&roots[0]), "the batch output stands before the unroll");
+
 	// A unrolls its own leaf and waits out the exit delay.
 	let a_at = c.bring_coin("e3/A's leaf", &a_coin);
+	assert!(!c.unspent(&roots[0]), "the unroll spends the batch output: a receiver reads the chain from its block");
 	c.net.wait_csv(&a_at.txid, delay());
 	println!("e3: A's leaf is on-chain at {} and its exit delay has passed", a_at);
 
@@ -138,6 +145,7 @@ fn a_leaf_already_on_chain_is_not_received() {
 	// B looks its lineage up on the chain, and refuses the coin.
 	let lineage = b_coin.lineage();
 	assert_eq!(lineage.len(), 2);
+	assert_eq!(b_coin.roots(), roots, "B's coin descends from the batch output A's does");
 	assert_eq!(lineage[0].output, a_coin.output());
 	let e = b_coin.check_lineage(|spk| c.on_chain(spk)).unwrap_err();
 	println!("e3: B REFUSES the coin: {} ({})", e, e.kind());
@@ -239,6 +247,7 @@ fn a_board_is_paid_out_of_round() {
 	assert_eq!(CoinRecord::from_bytes(&bytes).unwrap(), b_record);
 	let b_coin = b_record.validate(std::slice::from_ref(&board_tx), &policy.receipt(), &b_leaf.owner, &b_leaf.owner_nonce).unwrap();
 	assert_eq!(b_coin.boards(), vec![OutPoint::new(board_tx.txid(), 0)]);
+	assert_eq!(b_coin.roots(), b_coin.boards(), "a coin from a board alone descends from the board output");
 	b_coin.check_boards(|at| c.unspent(at)).unwrap();
 	b_coin.check_lineage(|spk| c.on_chain(spk)).unwrap();
 	assert_eq!(b_record.validate(&[], &policy.receipt(), &b_leaf.owner, &b_leaf.owner_nonce).unwrap_err().kind(), "round");

@@ -212,6 +212,7 @@ impl Spelling {
 			.replace("{address}", &command("address").map(|c| format!("an address of {}", c))
 				.unwrap_or_else(|| "the wallet's address".into()))
 			.replace("{orders}", &command("orders").unwrap_or_else(|| "the reading of the wallet's orders".into()))
+			.replace("{offboards}", &command("offboards").unwrap_or_else(|| "the reading of the wallet's offboards".into()))
 			.replace("{refresh}", &command("refresh").unwrap_or_else(|| "a refresh".into()))
 			.replace("{plan_release}", &command("plan-release").unwrap_or_else(|| "a release of the plan's coin through the next round".into()))
 	}
@@ -2162,7 +2163,11 @@ impl Wallet {
 					continue;
 				}
 			}
-			match (self.chain_payer(&o)?, stored) {
+			let payer = match self.board_base(record, &o)? {
+				Some(t) => Some(t),
+				None => self.chain_payer(&o)?,
+			};
+			match (payer, stored) {
 				(Some(t), _) => {
 					self.store.put_tx(&t.txid().to_string(), &elements::encode::serialize(&t), "base")?;
 					txs.push(t);
@@ -2195,6 +2200,35 @@ impl Wallet {
 			}
 		}
 		Ok(txs)
+	}
+
+	/// The board transaction paying `o`, the output of a board `record` rests
+	/// on, as the operator names it (`board_status`) and the node holds it in
+	/// a block of its active chain, as the scan finds it: one request of each,
+	/// in place of a scan of the node's set of unspent outputs. A board rolled
+	/// back into the mempool is not taken, so its coin waits. The operator's
+	/// answer only says where to look; a transaction that does not pay `o`,
+	/// or that the node does not hold, is not taken, and `None` sends the
+	/// wallet to the scan.
+	fn board_base(&self, record: &CoinRecord, o: &TxOut) -> Result<Option<Transaction>, Error> {
+		fn boards<'a>(r: &'a CoinRecord, out: &mut Vec<&'a arca_covenant::BoardRecord>) {
+			match r {
+				CoinRecord::Board(b) => out.push(b),
+				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
+			}
+		}
+		let mut all = vec![];
+		boards(record, &mut all);
+		let Some(b) = all.into_iter().find(|b| b.output().txout() == *o) else { return Ok(None) };
+		let Ok(v) = self.server.post("board_status", &json!({"leaf_id": b.leaf_id().to_string()})) else { return Ok(None) };
+		let (Some(txid), Some(vout)) = (v["txid"].as_str().and_then(|t| Txid::from_str(t).ok()), v["vout"].as_u64()) else { return Ok(None) };
+		self.chain.read_ahead_of(std::slice::from_ref(&txid), &[]);
+		let Some(tx) = self.chain.transaction(&txid)? else { return Ok(None) };
+		if tx.output.get(vout as usize) != Some(o) || !self.chain.whereabouts(&txid)?.0 {
+			return Ok(None);
+		}
+		Ok(Some(tx))
 	}
 
 	/// The transaction of the active chain that pays `o`: found in the set of
@@ -2238,6 +2272,13 @@ impl Wallet {
 			Some((k, n)) => record.validate(&txs, policy, k, n),
 			None => self.resolve(record, &txs, policy),
 		}.map_err(|e| Error::Refused(e.to_string()))?;
+		// Where each base is, its block's header, and whether each output the
+		// coin descends from stands, read together: what the finality below
+		// and the receipt's checks of the roots and boards ask.
+		let txids: Vec<Txid> = txs.iter().map(|t| t.txid()).collect();
+		let mut outpoints = valid.roots();
+		outpoints.extend(valid.boards());
+		self.chain.read_ahead_of(&txids, &outpoints);
 		let mut bases = vec![];
 		for t in txs {
 			let f = self.chain.finality(&t.txid())?;

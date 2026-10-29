@@ -1075,7 +1075,10 @@ impl Wallet {
 		let board_expiry = self.board_expiry(&record, &a.bases)?;
 		let past_deadline = board_expiry.is_some_and(|e| now.to_consensus_u32() as u64 + WalletPolicy::EXIT_DEADLINE as u64 >= e as u64);
 		let lineage: BTreeSet<Script> = a.valid.lineage().into_iter().map(|o| o.output.script_pubkey).collect();
-		let seen = self.chain.scripts_seen(&lineage, a.lowest_height())?;
+		// Read from the chain only where a batch output or board the coin
+		// descends from is spent: while each stands, nothing of its lineage
+		// can be on-chain.
+		let seen = self.chain.lineage_seen(&lineage, &a.valid.roots(), a.lowest_height())?;
 		// A coin held off the chain must have nothing of its lineage there,
 		// or the owner of that step could spend it under the receiver. A
 		// coin taken on the chain at once goes on from wherever its lineage

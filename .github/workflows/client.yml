@@ -156,8 +156,8 @@ jobs:
       - name: Build the signer and the keeper
         run: cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
 
-      - name: Orders and fills
-        run: cargo test --locked -p arca-cli --test arca_fills --test arca_orders --test arca_resting --test arca_shared_fills -- --nocapture
+      - name: Orders, fills and offboards
+        run: cargo test --locked -p arca-cli --test arca_fills --test arca_orders --test arca_resting --test arca_shared_fills --test arca_offboard -- --nocapture
 
       - name: The server for browsers
         run: |

@@ -46,6 +46,13 @@ fn hex(b: &[u8]) -> String {
 	b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+/// The height of the block that holds `txid`.
+fn height_of(r: &Running, txid: &str) -> u64 {
+	let tx: Value = r.rt.client().call("getrawtransaction", &[Value::from(txid), Value::from(true)]).unwrap();
+	let header: Value = r.rt.client().call("getblockheader", &[tx["blockhash"].clone()]).unwrap();
+	header["height"].as_u64().unwrap()
+}
+
 const BOND: u64 = 5_000_000;
 
 /// The least notice delay at the default exit-delay bounds, in units.
@@ -133,6 +140,19 @@ async fn a_bond_covers_payments_out_of_round_and_a_double_spend_burns_it() {
 	println!("B's evidence: {} line(s)", lines.len());
 	assert!(!lines.is_empty());
 
+	// BEFORE: the board B's coin rests on stands, so nothing can spend under
+	// its salt yet: the watcher reads no block, and finds nothing.
+	let quiet = b.ok(&["watch-bond"]);
+	println!("B's watch-bond while the board stands: {}", quiet["scanned"]);
+	assert_eq!(quiet["scanned"]["blocks"], 0, "no block read while the board stands: {}", quiet["scanned"]);
+	assert!(quiet["scanned"]["from"].is_null(), "{}", quiet["scanned"]);
+	assert_eq!(quiet["conflicts"], serde_json::json!([]), "{}", quiet);
+	// What that run noted as read is set aside, so the run after the theft
+	// starts as a wallet's first does: from the block of the spent board.
+	let db = rusqlite::Connection::open(b.dir.join("arca.sqlite")).unwrap();
+	db.execute("DELETE FROM meta WHERE key IN ('bond_scanned', 'bond_salts')", []).unwrap();
+	drop(db);
+
 	// --- A and a signer that breaks the rule spend A's board again ---
 	let rec = CoinRecord::from_bytes(&unhex(a.ok(&["record", &a_board])["record"].as_str().unwrap())).unwrap();
 	let CoinRecord::Board(board) = rec else { panic!("A's coin is a board") };
@@ -165,10 +185,28 @@ async fn a_bond_covers_payments_out_of_round_and_a_double_spend_burns_it() {
 	// --- B's watcher burns the bond ---
 	let watched = b.ok(&["watch-bond"]);
 	println!("B's watch-bond: {}", watched);
+	// B's coin rests on A's board: no spend of it is older, so B reads the
+	// chain from the board's block, not from as far back as a first scan
+	// may go.
+	let board_height = height_of(&r, ab["txid"].as_str().unwrap());
+	let tip = r.rt.client().block_count().unwrap();
+	assert_eq!(watched["scanned"]["from"], board_height, "read from the block of the board B's coin rests on: {}", watched["scanned"]);
+	assert_eq!(watched["scanned"]["blocks"], tip - board_height + 1, "{}", watched["scanned"]);
+	assert!(board_height > 1, "a chain older than the board, unread");
 	assert_eq!(watched["evidence"]["from_chain"], 1, "the operator's second signature, read from the chain");
 	assert_eq!(watched["conflicts"].as_array().unwrap().len(), 1);
 	assert_eq!(watched["conflicts"][0]["salt"], hex(&board.salt()));
 	let slash = elements::Txid::from_str(watched["slashed"][0]["txid"].as_str().unwrap()).unwrap();
+	// Run again before the slash's block: the signature read from the chain
+	// is kept, so the conflict stands, and the slash is sent again, never a
+	// second one; the chain is read on from where the first run stopped.
+	let waiting = b.ok(&["watch-bond"]);
+	println!("B's watch-bond while the slash waits: {}", waiting);
+	assert_eq!(waiting["conflicts"].as_array().unwrap().len(), 1, "{}", waiting);
+	assert_eq!(waiting["slashed"], serde_json::json!([]), "no second slash of the one bond: {}", waiting);
+	assert_eq!(waiting["resent"][0]["txid"], slash.to_string(), "{}", waiting);
+	assert_eq!(waiting["evidence"]["from_chain"], 0, "nothing new on the chain: {}", waiting);
+	assert!(waiting["scanned"]["blocks"].as_u64().unwrap() <= 1, "read on, not again: {}", waiting["scanned"]);
 	r.produce().await;
 	r.bury().await;
 	let tx: Transaction = r.rt.client().raw_transaction(&slash).unwrap();
@@ -212,6 +250,13 @@ async fn a_bond_in_notice_takes_no_payment_out_of_round() {
 		RelativeTime::from_units(notice_units()).unwrap()).unwrap();
 	post(&mut r, &policy, &w).await;
 	assert_eq!(b.ok(&["bond"])["state"], "bonded");
+	// B holds no coin that rests on a signature of the operator: its watcher
+	// has no salt to look for, and reads no block.
+	let watched = b.ok(&["watch-bond"]);
+	println!("B's watch-bond with nothing to watch: {}", watched);
+	assert_eq!(watched["scanned"]["blocks"], 0, "{}", watched);
+	assert!(watched["scanned"]["from"].is_null(), "{}", watched);
+	assert_eq!(watched["evidence"]["salts"], 0, "{}", watched);
 	b.ok(&["receive", "--asset", &x, "--amount", "600000"]);
 	// The operator gives the notice, its fee from its on-chain wallet.
 	r.fund_server(r.x, 50_000_000).await;

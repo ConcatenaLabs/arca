@@ -112,6 +112,7 @@ pub mod store;
 
 mod exit;
 pub mod lightning;
+pub mod offboard;
 pub mod order;
 mod pay;
 pub mod plan;

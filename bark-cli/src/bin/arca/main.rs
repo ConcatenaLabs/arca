@@ -337,6 +337,42 @@ enum Cmd {
 	/// rests (and its terms as SeqDEX's relay serves them), each fill and
 	/// what it credited, and the credits at its key. Asks the node only.
 	Orders,
+	/// Pays `amount` of `asset` to an address on the chain from the wallet's
+	/// leaves, through the operator's next round: the coins given up, an
+	/// offboard output paying the address and change as a leaf. `sync` hands
+	/// over the forfeits once the round is final; the operator then pays the
+	/// address. The fee is in the asset paid.
+	Offboard {
+		#[arg(long)]
+		asset: String,
+		/// In the asset's atoms.
+		#[arg(long)]
+		amount: u64,
+		/// An unconfidential address of the chain the node follows.
+		#[arg(long, conflicts_with = "script", required_unless_present = "script")]
+		address: Option<String>,
+		/// The script to pay, hex, in place of an address.
+		#[arg(long)]
+		script: Option<String>,
+		/// The asset the fee is paid in: only the asset paid.
+		#[arg(long)]
+		fee_asset: Option<String>,
+		/// The most the fee may take of the amount, in millionths: 10,000
+		/// unless raised.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what it would cost (the fee, the coins given up, the
+		/// change), signing and asking nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The offboard shown to the user, as `--quote` answered it: it goes
+		/// ahead only on that very fee and those coins.
+		#[arg(long)]
+		shown: Option<String>,
+	},
+	/// Every offboard the wallet asked for, and where it stands on the
+	/// chain. Asks the node only.
+	Offboards,
 	/// Pays many holders in one round (a claim tree): each line of `list`
 	/// (a file, or `-` for standard input) names a holder's key and an amount
 	/// of `asset`, `KEY AMOUNT`; a key is 64 hex digits (x-only), 66 (a
@@ -1228,7 +1264,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
+		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Offboards | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
 		| Cmd::Channel(ChannelCmd::List) | Cmd::Channel(ChannelCmd::Exit { .. })
 		| Cmd::Distributions | Cmd::Plans)
 	{
@@ -1428,6 +1464,17 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.order_cancel_resting(&order, shown.as_ref())
 		},
 		Cmd::Orders => w.orders(),
+		Cmd::Offboard { asset: a, amount, address, script, fee_asset, max_fee_ppm, quote, shown } => {
+			let a = asset(&a)?;
+			let script = w.offboard_script(address.as_deref(), script.as_deref())?;
+			if quote {
+				return w.offboard_quote(a, amount, &script, max_fee_ppm);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the offboard shown: {}", e)))).transpose()?;
+			w.offboard(a, amount, &script, fee_asset.as_deref().map(asset).transpose()?, max_fee_ppm, shown.as_ref())
+		},
+		Cmd::Offboards => w.offboards(),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),

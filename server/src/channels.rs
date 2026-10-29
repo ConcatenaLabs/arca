@@ -98,7 +98,7 @@ impl ChannelError {
 			ChannelError::State(_) => "channel_state",
 			ChannelError::Busy(_) => "conflict",
 			ChannelError::NotSynced => "not_synced",
-			ChannelError::Signer(SignerError::Refused(_)) => "channel_state",
+			ChannelError::Signer(SignerError::Declined(_)) => "channel_state",
 			ChannelError::Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			ChannelError::Signer(_) => "signer_unavailable",
 			ChannelError::Store(_) | ChannelError::Internal(_) => "internal",
@@ -276,6 +276,13 @@ impl Channels {
 			Begun::New(credit) => (None, credit.map(|c| (c, None))),
 			Begun::Again(row, note) => (row.operator_sig, note.map(|n| (n.credit, n.signature))),
 		};
+		// The payer's state is checked with the signer before the note is
+		// signed: a state it refuses for good is dropped with nothing signed.
+		if state_sig.is_none() && u.pay.is_some() {
+			if let Err(e) = self.signer.check_channel_state(&policy, &u.state, &u.owner_sig).await {
+				return Err(self.refused(&u.leaf, u.state.number, e).await);
+			}
+		}
 		// The receiver's note first: a note signed with the payer's state
 		// refused would be the operator's loss, never a holder's.
 		let note = match (&u.pay, receiver, note) {
@@ -321,11 +328,12 @@ impl Channels {
 		})
 	}
 
-	/// The signer refused or could not be reached: a refused state and its
-	/// note are dropped, so the channel moves on; an unreached one stays, and
-	/// the same request again completes it.
+	/// The signer refused the state or its note, or could not sign it: a
+	/// state it refuses for good ([`SignerError::is_final`]) and its note are
+	/// dropped, so the channel moves on (`channel_state`); any other stays,
+	/// and the same request again completes it (`signer_unavailable`).
 	async fn refused(&self, leaf: &LeafId, number: u64, e: SignerError) -> ChannelError {
-		if !matches!(e, SignerError::Unreachable { .. }) {
+		if e.is_final() {
 			if let Err(d) = self.store.drop_channel_state(&leaf.0, number).await {
 				log::error!("channel {} state {}: the signer refused it ({}), and it could not be dropped: {}", leaf, number, e, d);
 			}
@@ -337,6 +345,30 @@ impl Channels {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// A refusal the signer would repeat however often it is asked is final
+	/// (`channel_state` or `double_spend`, a 4xx); every other answer of the
+	/// signer says the same request may be signed later
+	/// (`signer_unavailable`, a 503), and the state waits.
+	#[test]
+	fn a_refusal_for_good_is_final_and_any_other_waits() {
+		let m = || "m".to_string();
+		let cases = [
+			(SignerError::Declined(m()), "channel_state", true),
+			(SignerError::AlreadySigned(m()), "double_spend", true),
+			(SignerError::Failed(m()), "signer_unavailable", false),
+			(SignerError::Stopped(m()), "signer_unavailable", false),
+			(SignerError::Record(m()), "signer_unavailable", false),
+			(SignerError::Unreachable { path: m(), error: m() }, "signer_unavailable", false),
+			(SignerError::Answer(m()), "signer_unavailable", false),
+			(SignerError::Database(m()), "signer_unavailable", false),
+		];
+		for (e, code, fin) in cases {
+			assert_eq!((ChannelError::Signer(e.clone()).code(), e.is_final()), (code, fin), "{:?}", e);
+			let status = crate::http::status_of(code).as_u16();
+			assert_eq!((400..500).contains(&status), fin, "{} is answered {}", code, status);
+		}
+	}
 
 	#[test]
 	fn a_state_follows_by_a_payment_and_a_fold() {

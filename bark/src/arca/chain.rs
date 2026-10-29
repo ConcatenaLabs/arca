@@ -41,9 +41,14 @@
 //! board's output), so the re-check asks for them together, as a JSON-RPC
 //! batch: two requests for a wallet's rounds and boards, and one for the look
 //! at the view, where the node takes a batch ([`ChainSource::read_ahead_of`]).
-//! A node behind a proxy that takes one call at a time refuses the first
-//! batch, and the source makes each read on its own from then on. A read
-//! ahead changes no answer, only the number of requests that make it.
+//! A look that is due carries the read that made it due in the same request,
+//! so over a link where every request costs a round trip a look costs none
+//! of its own; what is kept within a command, or named by an id or a hash,
+//! is answered without a look. A node behind a proxy that takes one call at
+//! a time refuses the first batch, and the source makes each read on its own
+//! from then on; one that refuses only some methods in a batch has those
+//! asked on their own. A read ahead changes no answer, only the number of
+//! requests that make it.
 //!
 //! **A busy node.** The node runs one scan of its set of unspent outputs at
 //! a time for all its clients, and refuses a scan while another runs (two
@@ -176,12 +181,19 @@ struct Memo {
 	/// Whether the node takes a batch of calls in one request: unknown until
 	/// one is tried; a proxy that takes one call at a time is asked one by one.
 	batch: Option<bool>,
+	/// Methods the node refused in a batch although it takes batches (a
+	/// proxy that allows some methods only on their own): asked alone.
+	unbatched: std::collections::HashSet<String>,
 	/// Requests made of the node, and reads answered from what was kept.
 	asked: u64,
 	kept: u64,
 }
 
-/// The most calls one batch carries.
+/// The reads a look at the view makes.
+const LOOK: [&str; 3] = ["getblockchaininfo", "getanchorstatus", "getrawmempool"];
+
+/// The most calls one batch carries: the testnet's RPC proxy refuses a
+/// batch of more.
 pub const BATCH_MOST: usize = 64;
 
 /// How a read is kept.
@@ -209,7 +221,7 @@ fn keep_of(method: &str, params: &[Value]) -> Keep {
 	}
 	match method {
 		"getblockchaininfo" | "getblockhash" | "getblockheader" | "getblock" | "getrawtransaction" | "gettxout" | "scantxoutset"
-		| "getrawmempool" | "getmempoolentry" | "getanchorstatus" | "decodescript" | "validateaddress" => Keep::View,
+		| "getrawmempool" | "getmempoolentry" | "getanchorstatus" | "decodescript" | "validateaddress" | "getsupervisedassets" => Keep::View,
 		"getfeeexchangerates" | "dumpassetlabels" | "getmempoolinfo" => Keep::Command,
 		_ => Keep::Never,
 	}
@@ -219,7 +231,24 @@ fn keep_of(method: &str, params: &[Value]) -> Keep {
 /// of its set of unspent outputs at a time, for every client it has, and
 /// refuses another while one runs. That says nothing of the chain.
 fn busy(code: i64, message: &str) -> bool {
-	code == -8 && message.starts_with("Scan already in progress")
+	(code == -8 && message.starts_with("Scan already in progress")) || slow_down(code, message)
+}
+
+/// Whether a proxy in front of the node refused a call for its rate limit,
+/// which counts every call of a batch: the call is made again after a
+/// pause, and says nothing of the chain.
+fn slow_down(code: i64, message: &str) -> bool {
+	code == -32000 && message.contains("slow down")
+}
+
+/// Whether a batch was refused for the proxy's rate limit (answered with
+/// one error for the whole batch).
+fn batch_slowed(e: &RpcError) -> bool {
+	match e {
+		RpcError::Rpc { code, message } => slow_down(*code, message),
+		RpcError::Http { body, .. } => body.contains("slow down"),
+		_ => false,
+	}
 }
 
 /// How long a read waits for the node to be free of another client's scan.
@@ -285,35 +314,70 @@ impl ChainSource {
 		(m.asked, m.kept)
 	}
 
-	/// Looks at the view again when the command has just started, a gap came
-	/// or a second passed since the last look: the tip, the anchor status and
-	/// the mempool. A change to any drops every answer kept.
+	/// Whether the view is to be looked at again before the next answer: the
+	/// command has just started, a gap came or a second passed since the last
+	/// look.
+	fn look_due(m: &Memo) -> bool {
+		!(m.looked_this_command && m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < VIEW_FOR))
+	}
+
+	/// Looks at the view again when it is due ([`Self::look_due`]): the tip,
+	/// the anchor status and the mempool. A change to any drops every answer
+	/// kept.
 	fn look(&self, m: &mut Memo) -> Result<(), RpcError> {
-		let gaps = GAPS.load(Ordering::SeqCst);
-		if m.looked_this_command && m.gaps == gaps && m.looked.is_some_and(|t| t.elapsed() < VIEW_FOR) {
-			return Ok(());
+		self.look_with(m, &[]).map(|_| ())
+	}
+
+	/// [`Self::look`], with `reads` asked in the same request where the node
+	/// takes a batch (and where it is not yet known whether it does): a look
+	/// then costs no request of its own, which over a proxy that answers each
+	/// request after a round trip halves a command's requests. Their answers
+	/// come back when they were asked with the look (read at the same moment as
+	/// the view they are kept for), `None` when no look was due or the node
+	/// takes no batch, and the caller asks them itself.
+	fn look_with(&self, m: &mut Memo, reads: &[(String, Vec<Value>)]) -> Result<Option<Vec<Result<Value, RpcError>>>, RpcError> {
+		if !Self::look_due(m) {
+			return Ok(None);
 		}
+		let gaps = GAPS.load(Ordering::SeqCst);
 		if m.gaps != gaps {
 			m.command.clear();
 		}
 		// One request where the node takes a batch, three where it does not.
-		let three = ["getblockchaininfo", "getanchorstatus", "getrawmempool"].map(|c| (c.to_string(), vec![]));
+		let mut calls: Vec<(String, Vec<Value>)> = LOOK.map(|c| (c.to_string(), vec![])).to_vec();
+		calls.extend(reads.iter().cloned());
+		let mut extra = None;
 		let batched = match m.batch {
-			Some(true) => match self.client.batch(&three) {
-				Ok(mut a) if a.len() == 3 => {
+			Some(false) => None,
+			_ => match self.batch_patiently(&calls) {
+				Ok(mut a) if a.len() == calls.len() => {
 					m.asked += 1;
+					m.batch = Some(true);
+					let rest = a.split_off(3);
 					let pool = kept_of(a.pop().expect("three"))?;
 					let anchors = kept_of(a.pop().expect("three"))?;
-					Some((kept_of(a.pop().expect("three"))?, anchors, pool))
+					let info = kept_of(a.pop().expect("three"))?;
+					extra = Some(rest);
+					Some((info, anchors, pool))
 				},
 				Err(RpcError::Transport(e)) => return Err(RpcError::Transport(e)),
+				// The node took the look alone before: what it carried was
+				// refused. One read carried alone is a method the node takes
+				// only on its own, asked so from now on; the look is made
+				// again, and the reads are the caller's to ask.
+				_ if !reads.is_empty() && m.batch == Some(true) => {
+					m.asked += 1;
+					if reads.len() == 1 {
+						m.unbatched.insert(reads[0].0.clone());
+					}
+					return self.look_with(m, &[]).map(|_| None);
+				},
 				_ => {
 					m.asked += 1;
 					m.batch = Some(false);
 					None
 				},
 			},
-			_ => None,
 		};
 		let (info, anchors, pool) = match batched {
 			Some(t) => t,
@@ -347,7 +411,7 @@ impl ChainSource {
 		m.looked = Some(web_time::Instant::now());
 		m.looked_this_command = true;
 		m.gaps = gaps;
-		Ok(())
+		Ok(extra)
 	}
 
 	fn read_key(method: &str, params: &[Value]) -> String {
@@ -369,26 +433,84 @@ impl ChainSource {
 		let k = Self::read_key(method, params);
 		{
 			let mut m = self.memo.lock().expect("the chain memo");
-			self.look(&mut m)?;
-			let found = match keep {
-				Keep::Named => m.named.get(&k).cloned().map(Ok).or_else(|| m.view.get(&k).cloned()),
-				Keep::View => m.view.get(&k).cloned(),
-				_ => m.command.get(&k).cloned(),
+			// What an id or a hash names, found before, needs no look: no
+			// view changes it.
+			if matches!(keep, Keep::Named) {
+				if let Some(v) = m.named.get(&k).cloned() {
+					m.kept += 1;
+					return Ok(v);
+				}
+			}
+			// What is kept within a command needs no look either, only that
+			// no gap came since it was read.
+			if matches!(keep, Keep::Command) {
+				if m.gaps != GAPS.load(Ordering::SeqCst) {
+					m.command.clear();
+				}
+				if let Some(a) = m.command.get(&k).cloned() {
+					m.kept += 1;
+					return answer_of(&a);
+				}
+			}
+			// A look that is due carries the read in its own request, unless
+			// the node takes the read only on its own. The three reads of the
+			// look are its own answers.
+			let carried: Vec<(String, Vec<Value>)> = if m.batch != Some(true) || m.unbatched.contains(method) || LOOK.contains(&method) {
+				vec![]
+			} else {
+				vec![(method.to_string(), params.to_vec())]
 			};
-			if let Some(a) = found {
-				m.kept += 1;
-				return answer_of(&a);
+			match self.look_with(&mut m, &carried)?.filter(|_| !carried.is_empty()) {
+				Some(mut answers) => {
+					if let Ok(a) = kept_of(answers.pop().expect("the read")) {
+						Self::keep(&mut m, &keep, k, &a);
+						return answer_of(&a);
+					}
+				},
+				None => {
+					let found = match keep {
+						Keep::Named => m.view.get(&k).cloned(),
+						Keep::View => m.view.get(&k).cloned(),
+						_ => m.command.get(&k).cloned(),
+					};
+					if let Some(a) = found {
+						m.kept += 1;
+						return answer_of(&a);
+					}
+				},
 			}
 		}
 		let a = kept_of(self.ask(method, params))?;
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.asked += 1;
-		match (&keep, &a) {
+		Self::keep(&mut m, &keep, k, &a);
+		answer_of(&a)
+	}
+
+	/// Keeps `a`, the answer to the read `k`, as `keep` says.
+	fn keep(m: &mut Memo, keep: &Keep, k: String, a: &Kept) {
+		match (keep, a) {
 			(Keep::Named, Ok(v)) => { m.named.insert(k, v.clone()); },
 			(Keep::Named | Keep::View, _) => { m.view.insert(k, a.clone()); },
 			_ => { m.command.insert(k, a.clone()); },
 		}
-		answer_of(&a)
+	}
+
+	/// One batch of calls to the node; while a proxy in front of it refuses
+	/// the batch for its rate limit, the batch waits and is sent again, for
+	/// [`BUSY_PATIENCE`] at most, as [`Self::ask`] does for one call.
+	fn batch_patiently(&self, calls: &[(String, Vec<Value>)]) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+		let start = web_time::Instant::now();
+		let mut pause = std::time::Duration::from_millis(250);
+		loop {
+			match self.client.batch(calls) {
+				Err(e) if batch_slowed(&e) && start.elapsed() < BUSY_PATIENCE => {
+					sequentia_ext::platform::sleep(pause);
+					pause = (pause * 2).min(std::time::Duration::from_secs(2));
+				},
+				r => return r,
+			}
+		}
 	}
 
 	/// One call to the node. While the node is busy with another client's
@@ -415,37 +537,53 @@ impl ChainSource {
 	/// batch fails, nothing is kept and each read is made on its own when it
 	/// comes: a read ahead changes no answer, only how many requests make it.
 	fn read_ahead(&self, reads: Vec<(String, Vec<Value>)>) {
-		let todo: Vec<(String, Vec<Value>)> = {
-			let mut m = self.memo.lock().expect("the chain memo");
-			if self.look(&mut m).is_err() || m.batch == Some(false) {
-				return;
-			}
-			let mut seen = std::collections::HashSet::new();
-			reads.into_iter().filter(|(method, params)| {
-				let k = Self::read_key(method, params);
-				let keep = keep_of(method, params);
-				let kept = m.view.contains_key(&k) || m.named.contains_key(&k);
-				matches!(keep, Keep::View | Keep::Named) && !kept && seen.insert(k)
-			}).collect()
-		};
-		if todo.len() < 2 {
+		let mut m = self.memo.lock().expect("the chain memo");
+		if m.batch == Some(false) {
+			drop(m);
+			let _ = self.look(&mut self.memo.lock().expect("the chain memo"));
 			return;
 		}
-		for chunk in todo.chunks(BATCH_MOST) {
-			let answers = self.client.batch(chunk);
+		// Whether the node takes a batch is learnt from a look alone.
+		if m.batch.is_none() && self.look(&mut m).is_err() {
+			return;
+		}
+		if m.batch == Some(false) {
+			return;
+		}
+		let due = Self::look_due(&m);
+		let mut seen = std::collections::HashSet::new();
+		let todo: Vec<(String, Vec<Value>)> = reads.into_iter().filter(|(method, params)| {
+			let k = Self::read_key(method, params);
+			// A look that is due may drop what the view keeps: read it again
+			// in the same request.
+			let kept = m.named.contains_key(&k) || (!due && (m.view.contains_key(&k) || m.command.contains_key(&k)));
+			!matches!(keep_of(method, params), Keep::Never) && !m.unbatched.contains(method) && !kept && seen.insert(k)
+		}).collect();
+		let mut rest: &[(String, Vec<Value>)] = &todo;
+		if due {
+			// The look carries the first reads, within one batch's calls.
+			let first = rest.len().min(BATCH_MOST - LOOK.len());
+			match self.look_with(&mut m, &rest[..first]) {
+				Ok(Some(answers)) => {
+					Self::keep_all(&mut m, &rest[..first], answers);
+					rest = &rest[first..];
+				},
+				Ok(None) if m.batch == Some(true) => {},
+				_ => return,
+			}
+		}
+		if rest.len() < 2 {
+			return;
+		}
+		drop(m);
+		for chunk in rest.chunks(BATCH_MOST) {
+			let answers = self.batch_patiently(chunk);
 			let mut m = self.memo.lock().expect("the chain memo");
 			m.asked += 1;
 			match answers {
 				Ok(answers) => {
 					m.batch = Some(true);
-					for ((method, params), a) in chunk.iter().zip(answers) {
-						let Ok(a) = kept_of(a) else { continue };
-						let k = Self::read_key(method, params);
-						match (keep_of(method, params), a) {
-							(Keep::Named, Ok(v)) => { m.named.insert(k, v); },
-							(_, a) => { m.view.insert(k, a); },
-						}
-					}
+					Self::keep_all(&mut m, chunk, answers);
 				},
 				Err(RpcError::Transport(_)) => return,
 				Err(_) => {
@@ -456,8 +594,18 @@ impl ChainSource {
 		}
 	}
 
+	/// Keeps the answers to `reads`, each as its read is kept; a node busy
+	/// with another scan gave no answer, and none is kept for it.
+	fn keep_all(m: &mut Memo, reads: &[(String, Vec<Value>)], answers: Vec<Result<Value, RpcError>>) {
+		for ((method, params), a) in reads.iter().zip(answers) {
+			let Ok(a) = kept_of(a) else { continue };
+			Self::keep(m, &keep_of(method, params), Self::read_key(method, params), &a);
+		}
+	}
+
 	/// Reads ahead what [`Self::finality`] and [`Self::median_time_at`] read
-	/// of each of `txids` (where it is, its block's header, its height's hash)
+	/// of each of `txids` (its bytes, where it is, its block's header, its
+	/// height's hash)
 	/// and of the tip, in two batches ([`Self::read_ahead`]); and, for each
 	/// of `outpoints`, whether it is unspent ([`Self::unspent`]).
 	pub fn read_ahead_of(&self, txids: &[Txid], outpoints: &[OutPoint]) {
@@ -465,6 +613,7 @@ impl ChainSource {
 		let tip = json!(info.best_block_hash.to_string());
 		let mut first = vec![("getblockheader".to_string(), vec![tip.clone(), json!(true)]), ("getblockheader".to_string(), vec![tip, json!(false)])];
 		first.extend(txids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t.to_string()), json!(true)])));
+		first.extend(txids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t.to_string())])));
 		first.extend(outpoints.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])));
 		self.read_ahead(first);
 		if self.memo.lock().expect("the chain memo").batch != Some(true) {
@@ -560,7 +709,7 @@ impl ChainSource {
 	}
 
 	/// The active-chain block holding `txid`, and its height.
-	fn tx_block(&self, txid: &Txid) -> Result<Option<(BlockHash, u64)>, Error> {
+	pub(crate) fn tx_block(&self, txid: &Txid) -> Result<Option<(BlockHash, u64)>, Error> {
 		let v: Value = match self.call("getrawtransaction", &[json!(txid.to_string()), json!(true)]) {
 			Ok(v) => v,
 			Err(e) if not_found(&e) => return Ok(None),
@@ -661,6 +810,9 @@ impl ChainSource {
 
 	/// The node's fee whitelist now: each accepted fee asset and its rate.
 	pub fn fee_rates(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
+		// What the node values at broadcast, read together: a relay floor
+		// asks all three.
+		self.read_ahead(["getfeeexchangerates", "dumpassetlabels", "getmempoolinfo"].map(|c| (c.to_string(), vec![])).to_vec());
 		let rates: BTreeMap<String, u64> = self.call("getfeeexchangerates", &[]).map_err(node)?;
 		let labels: BTreeMap<String, AssetId> = self.call("dumpassetlabels", &[]).map_err(node)?;
 		rates.into_iter().map(|(name, rate)| {
@@ -807,6 +959,49 @@ impl ChainSource {
 		Ok(found)
 	}
 
+	/// Which of `scripts`, the lineage of a coin that descends from `roots`
+	/// ([`arca_covenant::ValidCoin::roots`]), an output of the active chain or
+	/// of the mempool pays. Every output of the lineage is made only by a
+	/// chain of spends that starts at a root, so a root unspent in the chain
+	/// and in the mempool has nothing of it on-chain, and no block is read for
+	/// it: one batch of `gettxout` answers a coin whose roots all stand, as a
+	/// received coin's do. The blocks are read only from the lowest block
+	/// holding a spent root, where its spender and every descendant are; and
+	/// from `from_height` when a spent root's transaction is in no block of
+	/// the active chain (the node read it for no root it holds).
+	pub fn lineage_seen(&self, scripts: &BTreeSet<Script>, roots: &[OutPoint], from_height: u64) -> Result<BTreeSet<Script>, Error> {
+		if scripts.is_empty() {
+			return Ok(BTreeSet::new());
+		}
+		match self.descendants_from(roots, from_height)? {
+			None => Ok(BTreeSet::new()),
+			Some(from) => self.scripts_seen(scripts, from),
+		}
+	}
+
+	/// The lowest height of the active chain at which an output descending
+	/// from `roots` can be, `None` when none can: every root unspent, in the
+	/// chain and in the mempool, has nothing made from it anywhere. A spent
+	/// root's descendants are at or above its own block, or in the mempool
+	/// alone (above the tip) when the root was made there; `from_height`
+	/// where its transaction is in no block of the active chain.
+	pub fn descendants_from(&self, roots: &[OutPoint], from_height: u64) -> Result<Option<u64>, Error> {
+		self.read_ahead(roots.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])).collect());
+		let mut from: Option<u64> = None;
+		for root in roots {
+			if self.unspent(root)? {
+				continue;
+			}
+			let at = match self.tx_block(&root.txid)? {
+				Some((_, h)) => h,
+				None if self.in_mempool(&root.txid)? => self.tip()?.height.saturating_add(1),
+				None => from_height,
+			};
+			from = Some(from.map_or(at, |f| f.min(at)));
+		}
+		Ok(from)
+	}
+
 	/// Which of `scripts` an output of the active chain from `from_height` up,
 	/// or of the mempool, pays: the index of the chain the lineage check asks.
 	pub fn scripts_seen(&self, scripts: &BTreeSet<Script>, from_height: u64) -> Result<BTreeSet<Script>, Error> {
@@ -814,7 +1009,6 @@ impl ChainSource {
 		if scripts.is_empty() {
 			return Ok(seen);
 		}
-		let tip = self.tip()?;
 		let mut look = |tx: &Transaction| {
 			for o in &tx.output {
 				if scripts.contains(&o.script_pubkey) {
@@ -822,18 +1016,12 @@ impl ChainSource {
 				}
 			}
 		};
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				look(&tx);
-			}
-		}
-		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
-		for id in ids {
-			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
-			if let Some(tx) = self.transaction(&txid)? {
-				look(&tx);
-			}
+		self.each_block(from_height, |_, block| {
+			block.txdata.iter().for_each(&mut look);
+			Ok(false)
+		})?;
+		for tx in self.mempool_txs()? {
+			look(&tx);
 		}
 		Ok(seen)
 	}
@@ -842,42 +1030,91 @@ impl ChainSource {
 	/// pays `output` (asset, value and script), if any: what a wallet re-checks
 	/// a leaf against when its round is gone.
 	pub fn find_payment(&self, output: &TxOut, from_height: u64) -> Result<Option<(Transaction, u64)>, Error> {
-		let tip = self.tip()?;
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				if tx.output.iter().any(|o| o == output) {
-					return Ok(Some((tx, h)));
-				}
-			}
-		}
-		Ok(None)
+		let mut found = None;
+		self.each_block(from_height, |h, block| {
+			found = block.txdata.into_iter().find(|tx| tx.output.iter().any(|o| o == output)).map(|tx| (tx, h));
+			Ok(found.is_some())
+		})?;
+		Ok(found)
 	}
 
 	/// The transaction that spends `outpoint`, in the mempool or in a block
 	/// of the active chain from `from_height` up, and its height (`None` for
-	/// the mempool).
+	/// the mempool). An output unspent in the chain and in the mempool has
+	/// none, and no block is read for it; a spent one's spender is in no
+	/// block below the one holding the output.
 	pub fn spender(&self, outpoint: &OutPoint, from_height: u64) -> Result<Option<(Transaction, Option<u64>)>, Error> {
+		if self.unspent(outpoint)? {
+			return Ok(None);
+		}
 		let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *outpoint);
+		if let Some(tx) = self.mempool_txs()?.into_iter().find(|tx| spends(tx)) {
+			return Ok(Some((tx, None)));
+		}
+		let from = match self.tx_block(&outpoint.txid)? {
+			Some((_, h)) => from_height.max(h),
+			None => from_height,
+		};
+		let mut found = None;
+		self.each_block(from, |h, block| {
+			found = block.txdata.into_iter().find(|tx| spends(tx)).map(|tx| (tx, Some(h)));
+			Ok(found.is_some())
+		})?;
+		Ok(found)
+	}
+
+	/// Every block of the active chain from `from_height` to the tip, in
+	/// order, handed to `f` until it answers `true`. Read [`BATCH_MOST`] at a
+	/// time, where the node takes a batch: a node behind a proxy answers each
+	/// request after a round trip, and one read per block made a scan of an
+	/// hour of blocks take minutes.
+	fn each_block(&self, from_height: u64, f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
+		let tip = self.tip()?.height;
+		self.each_block_to(from_height, tip, f)
+	}
+
+	/// [`Self::each_block`], from `from_height` to `to_height` at most.
+	pub fn each_block_to(&self, from_height: u64, to_height: u64, mut f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
+		let tip = Tip { height: to_height.min(self.tip()?.height), ..self.tip()? };
+		let mut h = from_height;
+		while h <= tip.height {
+			let end = h.saturating_add(BATCH_MOST as u64 - 1).min(tip.height);
+			self.read_ahead((h..=end).map(|x| ("getblockhash".to_string(), vec![json!(x)])).collect());
+			let mut hashes = Vec::with_capacity((end - h + 1) as usize);
+			for x in h..=end {
+				match self.block_hash(x)? {
+					Some(hash) => hashes.push((x, hash)),
+					None => break,
+				}
+			}
+			self.read_ahead(hashes.iter().map(|(_, hash)| ("getblock".to_string(), vec![json!(hash.to_string()), json!(0)])).collect());
+			let short = hashes.len() as u64 != end - h + 1;
+			for (x, hash) in hashes {
+				if f(x, self.raw_block(&hash).map_err(node)?)? {
+					return Ok(());
+				}
+			}
+			if short {
+				break;
+			}
+			h = end + 1;
+		}
+		Ok(())
+	}
+
+	/// The transactions in the node's mempool, read at once where the node
+	/// takes a batch.
+	pub fn mempool_txs(&self) -> Result<Vec<Transaction>, Error> {
 		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
+		self.read_ahead(ids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t)])).collect());
+		let mut txs = Vec::with_capacity(ids.len());
 		for id in ids {
 			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
 			if let Some(tx) = self.transaction(&txid)? {
-				if spends(&tx) {
-					return Ok(Some((tx, None)));
-				}
+				txs.push(tx);
 			}
 		}
-		let tip = self.tip()?;
-		for h in from_height..=tip.height {
-			let Some(hash) = self.block_hash(h)? else { break };
-			for tx in self.raw_block(&hash).map_err(node)?.txdata {
-				if spends(&tx) {
-					return Ok(Some((tx, Some(h))));
-				}
-			}
-		}
-		Ok(None)
+		Ok(txs)
 	}
 
 	/// Whether `tx` can never return to the chain: it is in no block of the
@@ -914,6 +1151,13 @@ impl ChainSource {
 		}
 		let spk = v["scriptPubKey"].as_str().ok_or_else(|| Error::Node(format!("the node reads {} as no script", address)))?;
 		Ok(Script::from(unhex(spk)?))
+	}
+
+	/// Whether `address` is a confidential (blinded) address of the chain the
+	/// node follows: one carrying a blinding key.
+	pub fn is_confidential(&self, address: &str) -> Result<bool, Error> {
+		let v: Value = self.call("validateaddress", &[json!(address)]).map_err(node)?;
+		Ok(v["confidential_key"].as_str().is_some_and(|k| !k.is_empty()) || v["isconfidential"].as_bool() == Some(true))
 	}
 
 	/// The node's address for `script`, unblinded, on its own chain.
@@ -957,7 +1201,8 @@ mod test {
 		// and certificate, an output, the set of unspent outputs, the tip.
 		assert!(matches!(keep_of("getrawtransaction", &[txid.clone(), json!(true)]), Keep::View));
 		assert!(matches!(keep_of("getblockheader", &[txid.clone(), json!(true)]), Keep::View));
-		for m in ["getblockchaininfo", "getblockhash", "gettxout", "scantxoutset", "getrawmempool", "getmempoolentry", "getanchorstatus"] {
+		for m in ["getblockchaininfo", "getblockhash", "gettxout", "scantxoutset", "getrawmempool", "getmempoolentry", "getanchorstatus",
+			"getsupervisedassets"] {
 			assert!(matches!(keep_of(m, &[]), Keep::View), "{}", m);
 		}
 		// What the node values at broadcast changes while the view stands:
@@ -1053,5 +1298,198 @@ mod test {
 		// The view stands: the answer is kept, and the node not asked again.
 		assert!(chain.coins_at(std::slice::from_ref(&script)).is_ok());
 		assert_eq!(scans.load(Ordering::SeqCst), 4);
+	}
+
+	/// A transaction spending `from` (an output at a bare `OP_TRUE` of
+	/// `asset` holding `value`) into one output at `script`, less a fee.
+	fn spend_to(from: OutPoint, asset: AssetId, value: u64, script: Script) -> Transaction {
+		use elements::confidential;
+		let fee = 10_000;
+		Transaction {
+			version: 2,
+			lock_time: elements::LockTime::ZERO,
+			input: vec![elements::TxIn { previous_output: from, sequence: elements::Sequence::MAX, ..Default::default() }],
+			output: vec![
+				TxOut { asset: confidential::Asset::Explicit(asset), value: confidential::Value::Explicit(value - fee),
+					nonce: confidential::Nonce::Null, script_pubkey: script, witness: Default::default() },
+				TxOut::new_fee(fee, asset),
+			],
+		}
+	}
+
+	/// A node behind a proxy that takes batches but refuses `getsupervisedassets`
+	/// in one, answering the whole batch with a single error as the testnet's
+	/// does; it counts the requests it was sent.
+	fn picky_proxy() -> (String, Arc<AtomicU64>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let requests = Arc::new(AtomicU64::new(0));
+		let counted = requests.clone();
+		std::thread::spawn(move || {
+			let answer = |call: &Value| -> Value {
+				let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or(""));
+				let result = match method {
+					"getblockchaininfo" => json!({"bestblockhash": "11".repeat(32), "blocks": 1}),
+					"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
+					"getrawmempool" => json!([]),
+					"getsupervisedassets" => json!([]),
+					"getfeeexchangerates" | "dumpassetlabels" => json!({}),
+					"getmempoolinfo" => json!({"minrelaytxfee": 0.00001}),
+					_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
+				};
+				json!({"id": id, "result": result, "error": null})
+			};
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let mut length = 0usize;
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				counted.fetch_add(1, Ordering::SeqCst);
+				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let out = match &req {
+					Value::Array(calls) if calls.iter().any(|c| c["method"] == "getsupervisedassets") =>
+						json!({"id": 2, "result": null, "error": {"code": -32601, "message": "in a batch: method not allowed here: getsupervisedassets"}}),
+					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+					call => answer(call),
+				}.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					out.len(), out);
+			}
+		});
+		(url, requests)
+	}
+
+	/// Over a link where each request is a round trip, a look at the view
+	/// rides in the request of the read that made it due; a method the node
+	/// refuses in a batch is learnt and asked on its own, and the node is
+	/// still asked in batches for the rest.
+	#[test]
+	fn a_look_rides_with_a_read_and_a_refused_method_is_asked_alone() {
+		let (url, requests) = picky_proxy();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let sent = || requests.load(Ordering::SeqCst);
+		// The first look learns that the node takes a batch: one request.
+		assert!(chain.validates_anchors().unwrap());
+		assert_eq!(sent(), 1);
+		// A new command: the look is due and carries the fee reads.
+		chain.new_command();
+		assert!(chain.fee_rates().unwrap().is_empty());
+		assert_eq!(sent(), 2, "the look and the three fee reads in one request");
+		// Kept within the command: no look, no request.
+		assert!(chain.floor_per_kvb(AssetId::from_slice(&[7; 32]).unwrap()).unwrap().is_none());
+		assert_eq!(sent(), 2);
+		// A look carrying the supervised assets is refused whole; the look is
+		// made again on its own and the read alone.
+		chain.new_command();
+		assert!(chain.supervised_assets().unwrap().is_empty());
+		assert_eq!(sent(), 5, "the refused batch, the look again, the read alone");
+		// From then on it is never carried, and batches go on.
+		chain.new_command();
+		assert!(chain.supervised_assets().unwrap().is_empty());
+		assert_eq!(sent(), 6, "a look alone; the read is kept for the view");
+		chain.new_command();
+		assert!(chain.fee_rates().unwrap().is_empty());
+		assert_eq!(sent(), 7, "the node is still asked in batches");
+	}
+
+	/// What a receiver asks of the chain for a coin's lineage, on a regtest
+	/// node: while the batch output the lineage descends from is unspent,
+	/// no block is read and nothing is found; once a transaction spending
+	/// it publishes a lineage output, in the mempool and then in a block, it
+	/// is found, and the batch output's spender with it. The blocks are
+	/// read only from the batch output's own block, a batch at a time.
+	///
+	/// Needs `SEQUENTIAD_EXEC`.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[test]
+	fn a_lineage_is_read_from_the_chain_only_once_its_root_is_spent() {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		// The genesis block's free coins, at a bare `OP_TRUE`.
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let asset = coin.asset.explicit().unwrap();
+		let value = coin.value.explicit().unwrap();
+		// The batch output: a round's, standing in for one.
+		let round = spend_to(free, asset, value, op_true.clone());
+		r.node.client().send_raw_transaction(&round).unwrap();
+		r.produce_block().unwrap();
+		let root = OutPoint::new(round.txid(), 0);
+		for _ in 0..(BATCH_MOST as u64 + 6) {
+			r.produce_block().unwrap();
+		}
+		// Blocks made outside the source: its next read looks again.
+		gap();
+		chain.new_command();
+		let round_height = chain.tx_block(&round.txid()).unwrap().unwrap().1;
+		let tip = chain.tip().unwrap().height;
+		println!("the round at height {}, the tip {} blocks above it", round_height, tip - round_height);
+		// A lineage output: what an unroll of the batch's tree publishes.
+		let leaf = Script::from(vec![0x01, 0xab, 0x75, 0x51]);
+		let lineage: BTreeSet<Script> = [leaf.clone()].into();
+
+		// BEFORE: the root stands, so no block is read and nothing is found.
+		chain.new_command();
+		let (asked, _) = chain.calls();
+		assert!(chain.lineage_seen(&lineage, &[root], round_height).unwrap().is_empty());
+		assert!(chain.spender(&root, round_height).unwrap().is_none());
+		let (after, _) = chain.calls();
+		println!("BEFORE: the root unspent; lineage_seen and spender took {} requests of the node", after - asked);
+		// A look at the view (three calls, the node not yet asked for a
+		// batch) and one gettxout: no block.
+		assert!(after - asked <= 4, "{} requests", after - asked);
+		// What reading every block from the round up costs, for the record.
+		chain.new_command();
+		let (asked, _) = chain.calls();
+		assert!(chain.scripts_seen(&lineage, round_height).unwrap().is_empty());
+		let (after, _) = chain.calls();
+		println!("reading the {} blocks from the round up: {} requests (batches of {})", tip - round_height + 1, after - asked, BATCH_MOST);
+		assert!(after - asked <= 2 * ((tip - round_height) / BATCH_MOST as u64 + 1) + 4, "{} requests", after - asked);
+
+		// AFTER, in the mempool: the root's spender publishes the lineage output.
+		let unroll = spend_to(root, asset, value - 10_000, leaf.clone());
+		r.node.client().send_raw_transaction(&unroll).unwrap();
+		gap();
+		chain.new_command();
+		assert_eq!(chain.lineage_seen(&lineage, &[root], round_height).unwrap(), lineage, "found in the mempool");
+		let (by, at) = chain.spender(&root, round_height).unwrap().expect("the root's spender, in the mempool");
+		assert_eq!((by.txid(), at), (unroll.txid(), None));
+		println!("AFTER (mempool): the lineage output {} is found, the root's spender {}", hex(leaf.as_bytes()), by.txid());
+
+		// AFTER, in a block.
+		r.produce_block().unwrap();
+		gap();
+		chain.new_command();
+		let height = chain.tip().unwrap().height;
+		assert_eq!(chain.lineage_seen(&lineage, &[root], round_height).unwrap(), lineage, "found in a block");
+		assert_eq!(chain.spender(&root, round_height).unwrap().map(|(t, h)| (t.txid(), h)), Some((unroll.txid(), Some(height))));
+		assert_eq!(chain.find_payment(&unroll.output[0], round_height).unwrap().map(|(t, h)| (t.txid(), h)), Some((unroll.txid(), height)));
+		// A spender is found whatever height it is asked from below the
+		// root's block: never below it.
+		assert_eq!(chain.spender(&root, 0).unwrap().map(|(t, _)| t.txid()), Some(unroll.txid()));
+		println!("AFTER (block {}): the lineage output is found, the root's spender {}", height, unroll.txid());
 	}
 }

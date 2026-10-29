@@ -430,6 +430,7 @@ impl ParticipationError {
 			Planned(_) => "planned",
 			SignedAlready(_) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
+			Signer(SignerError::Declined(_)) => "declined",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
 			Restricted(e) => e.code(),

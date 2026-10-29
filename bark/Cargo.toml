@@ -174,3 +174,5 @@ console_log = "1.0.0"
 # tempfile doesn't work on WASM (no filesystem), only include for native tests
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3"
+# A regtest node for the chain source's tests (`SEQUENTIAD_EXEC`).
+arca-sequentia-ext = { path = "../sequentia-ext", default-features = false, features = [ "regtest", "minreq" ] }

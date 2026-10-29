@@ -531,8 +531,11 @@ impl Wallet {
 	/// `None` for a coin whose output is not on the chain.
 	fn restore_on_chain(&mut self, id: &str, coin: &ValidCoin) -> Result<Option<Value>, Error> {
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+		// The coin's output is made only by spends that start at the batch
+		// outputs and boards it rests on: while each stands, no block is read.
+		let Some(lowest) = self.chain.descendants_from(&coin.roots(), from)? else { return Ok(None) };
 		let out = coin.output().txout();
-		let Some((tx, h)) = self.chain.find_payment(&out, from)? else { return Ok(None) };
+		let Some((tx, h)) = self.chain.find_payment(&out, from.max(lowest))? else { return Ok(None) };
 		let vout = tx.output.iter().position(|o| *o == out).expect("pays it") as u32;
 		let leaf = elements::OutPoint::new(tx.txid(), vout);
 		let mut prior = json!({"txs": [], "leaf": leaf.to_string()});

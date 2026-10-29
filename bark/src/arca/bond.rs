@@ -26,7 +26,9 @@
 //! "signature"}`. [`Wallet::watch_bond`] takes its own and any other's, counts
 //! only those whose signature the operator key made, compares them under each
 //! salt, and reads every spend on the chain and in the mempool of a script
-//! that carries a watched salt's `K`. Two different messages under one salt
+//! that carries a watched salt's `K`: for a salt of its own coins, only once
+//! an output those coins descend from is spent, since every spend under the
+//! salt starts there, and a few seconds of blocks a run. Two different messages under one salt
 //! burn the bond: the slash, with a fee coin of the wallet's own, is sent, and
 //! sent again on every run until its block is final.
 
@@ -53,8 +55,20 @@ pub const BOND_SEEN: &str = "bond_seen";
 pub const BOND_SLASHES: &str = "bond_slashes";
 /// The height `watch-bond` read the chain to.
 pub const BOND_SCANNED: &str = "bond_scanned";
-/// How far back the first `watch-bond` reads the chain.
+/// The salts `watch-bond` has read the chain for, to [`BOND_SCANNED`].
+pub const BOND_SALTS: &str = "bond_salts";
+/// The operator's signatures `watch-bond` read from the chain and the
+/// mempool, as evidence lines.
+pub const BOND_FOUND: &str = "bond_found";
+/// How far back `watch-bond` reads the chain at the most: a salt handed in
+/// by another is read for from there, and the wallet's own from the block of
+/// the oldest transaction its coins rest on, when that is later.
 pub const FIRST_SCAN: u64 = 20_000;
+/// How many blocks `watch-bond` reads before it notes how far it read.
+pub const SCAN_CHUNK: u64 = 128;
+/// How long one `watch-bond` reads blocks before it stops and says more is
+/// left (`scanned.more`): the next run reads on from where it stopped.
+pub const SCAN_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A coin's lifetime, the longest a coin the operator makes lives from its
 /// round or board to its first expiry: a bond's notice must outlast it.
@@ -158,6 +172,8 @@ impl Wallet {
 		let Some(op) = b["outpoint"].as_str().and_then(|s| parse_outpoint(s).ok()) else {
 			return Ok(Standing::of("missing", Some(policy), format!("the operator names no bond coin ({})", b["state"])));
 		};
+		// Where the bond coin is and whether it stands, read together.
+		self.chain.read_ahead_of(std::slice::from_ref(&op.txid), std::slice::from_ref(&op));
 		let Some(tx) = self.chain.transaction(&op.txid)? else {
 			return Ok(Standing::of("missing", Some(policy), format!("this wallet's node holds no transaction {}", op.txid)));
 		};
@@ -332,9 +348,16 @@ impl Wallet {
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines: what the wallet hands a watcher.
 	pub fn bond_evidence(&self) -> Result<Vec<Value>, Error> {
+		Ok(self.evidence_by_coin()?.into_iter().map(|(line, _, _)| line).collect())
+	}
+
+	/// [`Self::bond_evidence`], each line with the transactions the coins
+	/// that carry it rest on: a spend of a script that pushes the line's
+	/// salt descends from them, so it is in no block before theirs.
+	fn evidence_by_coin(&self) -> Result<Vec<(Value, Vec<Txid>, Vec<OutPoint>)>, Error> {
 		let now = self.now()?;
-		let mut seen = BTreeSet::new();
-		let mut out = vec![];
+		let mut seen: BTreeMap<([u8; 32], Vec<u8>), usize> = BTreeMap::new();
+		let mut out: Vec<(Value, Vec<Txid>, Vec<OutPoint>)> = vec![];
 		for c in self.store.coins()? {
 			if c.kind != "transfer" && c.kind != "fill" {
 				continue;
@@ -343,13 +366,35 @@ impl Wallet {
 			let Ok(txs) = self.base_txs(&record) else { continue };
 			let policy: WalletPolicy = self.followed_policy(c.expiry, now);
 			let Ok(valid) = self.resolve(&record, &txs, &policy) else { continue };
+			let bases: Vec<Txid> = txs.iter().map(|t| t.txid()).collect();
+			let roots = valid.roots();
 			for e in bond::cosigned_by(&valid) {
-				if seen.insert((e.salt, e.signed.rest.clone())) {
-					out.push(evidence_line(&e.salt, &e.signed));
+				match seen.get(&(e.salt, e.signed.rest.clone())) {
+					Some(&i) => {
+						out[i].1.extend(bases.iter().copied());
+						out[i].2.extend(roots.iter().copied());
+					},
+					None => {
+						seen.insert((e.salt, e.signed.rest.clone()), out.len());
+						out.push((evidence_line(&e.salt, &e.signed), bases.clone(), roots.clone()));
+					},
 				}
 			}
 		}
 		Ok(out)
+	}
+
+	/// The lowest height of a block that holds one of `bases`; past the tip
+	/// while none is in a block, as nothing that spends what they made can
+	/// be in one either.
+	fn lowest_block(&self, bases: &[Txid], tip: u64) -> Result<u64, Error> {
+		let mut lowest = tip.saturating_add(1);
+		for t in bases {
+			if let Some((_, h)) = self.chain.tx_block(t)? {
+				lowest = lowest.min(h);
+			}
+		}
+		Ok(lowest)
 	}
 
 	/// `arca watch-bond`: see the [module documentation](self). `lines` are
@@ -364,10 +409,24 @@ impl Wallet {
 		// Every line counts only when the operator key signed it.
 		let mut by_salt: BTreeMap<[u8; 32], Vec<Signed>> = BTreeMap::new();
 		let (mut good, mut bad) = (0usize, 0usize);
-		let own = self.bond_evidence()?;
-		for v in own.iter().chain(lines) {
+		let own = self.evidence_by_coin()?;
+		// The signatures read from the chain and the mempool before: kept, so
+		// a stretch of the chain noted as read is never read again.
+		let mut found: Vec<Value> = self.store.meta(BOND_FOUND)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		// The transactions each of the wallet's own salts rests on: its
+		// spends are in no block before theirs.
+		let mut bases: BTreeMap<[u8; 32], Vec<Txid>> = BTreeMap::new();
+		// And the outputs on the chain they descend from: a spend under the
+		// salt is made only by spends that start at one of them.
+		let mut roots: BTreeMap<[u8; 32], Vec<OutPoint>> = BTreeMap::new();
+		let tagged = own.iter().map(|(v, b, r)| (v, Some((b, r)))).chain(lines.iter().chain(found.iter()).map(|v| (v, None)));
+		for (v, b) in tagged {
 			match read_line(v) {
 				Ok((salt, signed)) if policy.verify(&salt, &signed) => {
+					if let Some((b, r)) = b {
+						bases.entry(salt).or_default().extend(b.iter().copied());
+						roots.entry(salt).or_default().extend(r.iter().copied());
+					}
 					let list = by_salt.entry(salt).or_default();
 					if !list.iter().any(|x| policy.digest_of(&salt, x) == policy.digest_of(&salt, &signed)) {
 						list.push(signed);
@@ -377,86 +436,106 @@ impl Wallet {
 				_ => bad += 1,
 			}
 		}
-		// The chain and the mempool: every spend of a script that pushes a
-		// watched salt's K (or K ‖ P).
-		let ks: BTreeMap<[u8; 32], [u8; 32]> = by_salt.keys().map(|salt| (policy.chain.leaf_constant(salt), *salt)).collect();
-		let tip = self.chain.tip()?.height;
-		let from = match self.store.meta(BOND_SCANNED)?.and_then(|v| v.parse::<u64>().ok()) {
-			Some(h) => h.saturating_add(1),
-			None => tip.saturating_sub(FIRST_SCAN),
-		};
-		let mut txs: Vec<Transaction> = vec![];
-		for h in from..=tip {
-			if let Some(b) = self.chain.block_at(h)? {
-				txs.extend(b.txdata.into_iter().skip(1));
-			}
-		}
-		for t in self.chain.mempool()? {
-			if let Some(tx) = self.chain.transaction(&t)? {
-				txs.push(tx);
-			}
-		}
 		let mut from_chain = 0usize;
-		for tx in &txs {
-			for (i, input) in tx.input.iter().enumerate() {
-				// The items without an annex (BIP341), which the operator's
-				// signature does not cover: a spend with one is the same.
-				let w = arca_covenant::witness::without_annex(&input.witness.script_witness);
-				// A vtxo-2 spend (arca/collab-2) names its salt in its data
-				// leaf's bytes and signs the outputs its first n inputs spend,
-				// read from the node.
-				if let Some((salt, n, _)) = bond::collab2_spend(w).filter(|(salt, ..)| by_salt.contains_key(salt)) {
-					let mut named = Vec::with_capacity(n as usize);
-					for j in tx.input.iter().take(n as usize) {
-						let prev = self.chain.transaction(&j.previous_output.txid)?
-							.and_then(|t| t.output.get(j.previous_output.vout as usize).cloned());
-						match prev {
-							Some(o) => named.push(o),
-							None => break,
-						}
-					}
-					if let Some(signed) = bond::collab2_signed_in(&policy.chain, &salt, tx, i, &named) {
-						if policy.verify(&salt, &signed) {
-							let list = by_salt.get_mut(&salt).expect("watched");
-							if !list.iter().any(|x| policy.digest_of(&salt, x) == policy.digest_of(&salt, &signed)) {
-								list.push(signed);
-								from_chain += 1;
+		let scanned = if by_salt.is_empty() {
+			// No salt to watch: no block is read, and none is noted as read,
+			// so the first coin the wallet takes is watched from its own base.
+			json!({"from": null, "to": null, "blocks": 0, "mempool": false})
+		} else {
+			// The chain and the mempool: every spend of a script that pushes a
+			// watched salt's K (or K ‖ P). A salt read before is read on from
+			// where the last run stopped; a new one from the block of the
+			// oldest transaction its coins rest on, a salt handed in by
+			// another from `FIRST_SCAN` blocks back, and none further back.
+			let ks: BTreeMap<[u8; 32], [u8; 32]> = by_salt.keys().map(|salt| (policy.chain.leaf_constant(salt), *salt)).collect();
+			let tip = self.chain.tip()?.height;
+			let oldest = tip.saturating_sub(FIRST_SCAN);
+			let read_to = self.store.meta(BOND_SCANNED)?.and_then(|v| v.parse::<u64>().ok());
+			let covered: BTreeSet<String> = match (read_to, self.store.meta(BOND_SALTS)?) {
+				(None, _) => BTreeSet::new(),
+				(Some(_), Some(v)) => serde_json::from_str(&v).unwrap_or_default(),
+				// Read to a height by a wallet that noted no salts: the salts
+				// it watches now are the ones it read for.
+				(Some(_), None) => by_salt.keys().map(|s| hex(s)).collect(),
+			};
+			let mut from = tip.saturating_add(1);
+			for salt in by_salt.keys() {
+				let start = match read_to.filter(|_| covered.contains(&hex(salt))) {
+					Some(h) => h.saturating_add(1),
+					None => match bases.get(salt) {
+						// The wallet's own salt: while every output its coins
+						// descend from stands, nothing spends under it, and no
+						// block is read for it; else from the block of a spent
+						// one.
+						Some(b) => {
+							let lowest = self.lowest_block(b, tip)?;
+							match self.chain.descendants_from(roots.get(salt).map(|r| r.as_slice()).unwrap_or(&[]), lowest)? {
+								None if roots.get(salt).is_some_and(|r| !r.is_empty()) => tip.saturating_add(1),
+								None => lowest,
+								Some(h) => h.max(lowest),
 							}
-						}
-					}
-					continue;
-				}
-				if w.len() != 5 {
-					continue;
-				}
-				let script = elements::Script::from(w[3].clone());
-				for ins in script.instructions().flatten() {
-					let elements::script::Instruction::PushBytes(p) = ins else { continue };
-					let Some(salt) = watched_push(p, &ks) else { continue };
-					let Some((asset, value)) = by_salt[salt].iter().find(|x| x.form == Form::Rebind).and_then(|x| coin_of_rest(&x.rest)) else {
-						continue;
-					};
-					let prevout = TxOut::new_fee(value, asset);
-					if let Some(signed) = bond::rebind_signed_in(&policy.chain, salt, tx, i, &prevout) {
-						if policy.verify(salt, &signed) {
-							let list = by_salt.get_mut(salt).expect("watched");
-							if !list.iter().any(|x| policy.digest_of(salt, x) == policy.digest_of(salt, &signed)) {
-								list.push(signed);
-								from_chain += 1;
-							}
-						}
-					}
-				}
+						},
+						None => oldest,
+					},
+				};
+				from = from.min(start.max(oldest));
 			}
-		}
-		self.store.set_meta(BOND_SCANNED, &tip.to_string())?;
+			let mut salts = covered;
+			salts.extend(by_salt.keys().map(|s| hex(s)));
+			let salts = serde_json::to_string(&salts).expect("a set");
+			// A chunk at a time: its spends read, and what they show kept,
+			// before its last height is noted, so a scan cut short goes on
+			// from there. A salt new to this run lowers the note for the
+			// others while its chunks below it are read: they are read
+			// again, never skipped.
+			// Each run reads for [`SCAN_SLICE`] at most, many blocks a
+			// request, and says when more is left: the wallet is held while it
+			// runs, and a person's command waits behind it.
+			let started = web_time::Instant::now();
+			let mut blocks = 0u64;
+			let mut h = from;
+			let mut more = false;
+			while h <= tip {
+				if blocks > 0 && started.elapsed() >= SCAN_SLICE {
+					more = true;
+					break;
+				}
+				let end = h.saturating_add(SCAN_CHUNK - 1).min(tip);
+				let mut txs: Vec<Transaction> = vec![];
+				self.chain.each_block_to(h, end, |_, b| {
+					txs.extend(b.txdata.into_iter().skip(1));
+					blocks += 1;
+					Ok(false)
+				})?;
+				let new = self.read_spends(&txs, &policy, &ks, &mut by_salt)?;
+				from_chain += self.keep_found(new, &mut found)?;
+				self.store.set_meta(BOND_SALTS, &salts)?;
+				self.store.set_meta(BOND_SCANNED, &end.to_string())?;
+				h = end + 1;
+			}
+			if from > tip {
+				self.store.set_meta(BOND_SALTS, &salts)?;
+				self.store.set_meta(BOND_SCANNED, &tip.to_string())?;
+			}
+			let txs = self.chain.mempool_txs()?;
+			let new = self.read_spends(&txs, &policy, &ks, &mut by_salt)?;
+			from_chain += self.keep_found(new, &mut found)?;
+			json!({"from": if from > tip { Value::Null } else { json!(from) }, "to": if more { json!(h - 1) } else { json!(tip) }, "blocks": blocks,
+				"mempool": true, "more": more})
+		};
 		let conflicts: Vec<Evidence> = by_salt.iter().filter(|(_, l)| l.len() > 1)
 			.map(|(salt, l)| Evidence { salt: *salt, a: l[0].clone(), b: l[1].clone() }).collect();
-		// A slash for the first conflict, if the bond still stands, and every
-		// slash sent before again until final.
+		// A slash for the first conflict, if the bond still stands and no
+		// slash sent before spends it, and every slash sent before again
+		// until final: the signatures read from the chain are kept, so the
+		// conflict is found again on every run while the first slash waits.
 		let mut slashes: BTreeMap<String, String> = self.store.meta(BOND_SLASHES)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let spent_by_a_slash = |op: &OutPoint| slashes.values().any(|raw| unhex(raw).ok()
+			.and_then(|b| elements::encode::deserialize::<Transaction>(&b).ok())
+			.is_some_and(|t| t.input.iter().any(|i| i.previous_output == *op)));
+		let bond_coin = s.coin.clone().filter(|(op, _)| !spent_by_a_slash(op));
 		let mut slashed = vec![];
-		if let (Some(e), Some((op, out))) = (conflicts.first(), s.coin.clone()) {
+		if let (Some(e), Some((op, out))) = (conflicts.first(), bond_coin) {
 			policy.check(e).map_err(|x| Error::Refused(x.to_string()))?;
 			let mut payer = Payer::new(fee_asset);
 			payer.moved = s.asset;
@@ -480,11 +559,81 @@ impl Wallet {
 		self.store.set_meta(BOND_SLASHES, &serde_json::to_string(&slashes).expect("a map"))?;
 		Ok(json!({
 			"state": s.state, "why": s.why, "evidence": {"lines": good, "refused": bad, "from_chain": from_chain, "salts": by_salt.len()},
-			"scanned": {"from": from, "to": tip, "mempool": true},
+			"scanned": scanned,
 			"conflicts": conflicts.iter().map(|e| json!({"salt": hex(&e.salt), "a": evidence_line(&e.salt, &e.a), "b": evidence_line(&e.salt, &e.b)}))
 				.collect::<Vec<_>>(),
 			"slashed": slashed, "resent": resent,
 		}))
+	}
+
+	/// The operator's signatures under a watched salt that `txs` show and
+	/// `by_salt` did not hold yet: each added to it, and answered.
+	fn read_spends(&self, txs: &[Transaction], policy: &BondPolicy, ks: &BTreeMap<[u8; 32], [u8; 32]>,
+		by_salt: &mut BTreeMap<[u8; 32], Vec<Signed>>) -> Result<Vec<([u8; 32], Signed)>, Error> {
+		let mut found = vec![];
+		for tx in txs {
+			for (i, input) in tx.input.iter().enumerate() {
+				// The items without an annex (BIP341), which the operator's
+				// signature does not cover: a spend with one is the same.
+				let w = arca_covenant::witness::without_annex(&input.witness.script_witness);
+				// A vtxo-2 spend (arca/collab-2) names its salt in its data
+				// leaf's bytes and signs the outputs its first n inputs spend,
+				// read from the node.
+				if let Some((salt, n, _)) = bond::collab2_spend(w).filter(|(salt, ..)| by_salt.contains_key(salt)) {
+					let mut named = Vec::with_capacity(n as usize);
+					for j in tx.input.iter().take(n as usize) {
+						let prev = self.chain.transaction(&j.previous_output.txid)?
+							.and_then(|t| t.output.get(j.previous_output.vout as usize).cloned());
+						match prev {
+							Some(o) => named.push(o),
+							None => break,
+						}
+					}
+					if let Some(signed) = bond::collab2_signed_in(&policy.chain, &salt, tx, i, &named) {
+						if policy.verify(&salt, &signed) {
+							let list = by_salt.get_mut(&salt).expect("watched");
+							if !list.iter().any(|x| policy.digest_of(&salt, x) == policy.digest_of(&salt, &signed)) {
+								list.push(signed.clone());
+								found.push((salt, signed));
+							}
+						}
+					}
+					continue;
+				}
+				if w.len() != 5 {
+					continue;
+				}
+				let script = elements::Script::from(w[3].clone());
+				for ins in script.instructions().flatten() {
+					let elements::script::Instruction::PushBytes(p) = ins else { continue };
+					let Some(salt) = watched_push(p, &ks) else { continue };
+					let Some((asset, value)) = by_salt[salt].iter().find(|x| x.form == Form::Rebind).and_then(|x| coin_of_rest(&x.rest)) else {
+						continue;
+					};
+					let prevout = TxOut::new_fee(value, asset);
+					if let Some(signed) = bond::rebind_signed_in(&policy.chain, salt, tx, i, &prevout) {
+						if policy.verify(salt, &signed) {
+							let list = by_salt.get_mut(salt).expect("watched");
+							if !list.iter().any(|x| policy.digest_of(salt, x) == policy.digest_of(salt, &signed)) {
+								list.push(signed.clone());
+								found.push((*salt, signed));
+							}
+						}
+					}
+				}
+			}
+		}
+		Ok(found)
+	}
+
+	/// Keeps `new`, signatures read from the chain or the mempool, among
+	/// `found` and in the store; answers how many.
+	fn keep_found(&self, new: Vec<([u8; 32], Signed)>, found: &mut Vec<Value>) -> Result<usize, Error> {
+		if !new.is_empty() {
+			found.extend(new.iter().map(|(salt, signed)| evidence_line(salt, signed)));
+			self.store.set_meta(BOND_FOUND, &serde_json::to_string(found).expect("lines"))?;
+		}
+		Ok(new.len())
 	}
 }
 

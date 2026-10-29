@@ -85,6 +85,8 @@ impl Running {
 	async fn start_at<F: FnOnce(&mut Config, AssetId, AssetId)>(rt: Regtest, keepers: usize, required: Option<usize>, tune: F)
 		-> Running
 	{
+		// The server's log, at the level RUST_LOG names.
+		let _ = env_logger::builder().is_test(true).try_init();
 		let db = TestDb::new().await;
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
 		let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));

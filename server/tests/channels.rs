@@ -228,8 +228,63 @@ async fn channels_pay_each_other_at_once_and_close_into_a_round() {
 	let e = signer.channel_state(&a.policy, &a2, &owner_sig).await.unwrap_err();
 	println!("the signer refuses: {}", e);
 	assert!(e.to_string().contains("given up or paid on"), "{}", e);
+	assert!(matches!(e, server::signer::SignerError::Declined(_)) && e.is_final(), "refused for good: {}", e);
 	let e = signer.channel_note(&a.policy, &a1, None, 40_000).await.unwrap_err();
 	println!("the signer refuses a note: {}", e);
+}
+
+/// What the server holds of channel `c`, read by its owner.
+fn view(r: &Running, c: &Chan) -> Value {
+	r.http.post("channel_state", &json!({"auth": r.http.auth_for("channel_state", &c.key, &r.chain, &c.id().0),
+		"leaf_id": c.id().to_string()})).ok()
+}
+
+/// A state the signer cannot sign now is kept: the signer away, A's payment
+/// to B is answered `signer_unavailable` (503), the state waits for the
+/// signer, and the same request completes it once the signer is back. A state
+/// the signer refuses for good is dropped: with a spend of A's coin in the
+/// signer's record (one the database never heard of), A's next payment is
+/// refused `channel_state` (422), the same request again is refused the same
+/// way, and nothing of it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_state_the_signer_cannot_sign_now_waits_and_one_it_refuses_is_dropped() {
+	let mut r = start().await;
+	let ch = open(&mut r, &[keypair("carol"), keypair("dave")]).await;
+	let (a, b) = (&ch[0], &ch[1]);
+	let genesis = r.chain.genesis_hash();
+	let key = r.s;
+	let a1 = a.policy.opening().pay(100_000, 0).unwrap();
+	r.signer.kill();
+	let e = update(&r, a, &a1, Some((b, 100_000)));
+	let (code, message) = e.refusal();
+	println!("A -> B with the signer away: {} {}: {}", e.status, code, message);
+	assert_eq!((e.status, code.as_str()), (503, "signer_unavailable"));
+	assert_eq!(view(&r, a)["pending"], true, "the state waits for the signer");
+	tokio::task::block_in_place(|| r.signer.restart(&key, genesis));
+	let ans = update(&r, a, &a1, Some((b, 100_000))).ok();
+	assert_eq!(ans["note"]["credit"], "100000");
+	assert_eq!((view(&r, a)["state"]["number"].as_str(), view(&r, a)["pending"].as_bool()), (Some("1"), Some(false)));
+	println!("the signer back: the same request completed, state 1 and B's note of 100000");
+
+	// A spend of A's coin in the signer's record.
+	let signer = SignerClient::new(&r.signer.socket);
+	let v = a.coin.valid(&r);
+	let out = arca_covenant::ExplicitOutput::new(v.asset, v.value - 1_000, elements::Script::from(vec![0x51]));
+	let m = arca_covenant::message::rebind_message(&r.chain.leaf_constant(&a.policy.salt), v.asset, v.value, std::slice::from_ref(&out))
+		.unwrap();
+	signer.rebind(&a.policy.owner, &sign_digest(&a.key, &m.digest, &random32()), &a.policy.salt, None, v.asset, v.value,
+		std::slice::from_ref(&out), None).await.unwrap();
+	let a2 = a1.pay(50_000, 0).unwrap();
+	for _ in 0..2 {
+		let e = update(&r, a, &a2, Some((b, 50_000)));
+		let (code, message) = e.refusal();
+		println!("A -> B with a spend of A's coin in the signer's record: {} {}: {}", e.status, code, message);
+		assert_eq!((e.status, code.as_str()), (422, "channel_state"));
+		assert!(message.contains("given up or paid on"), "{}", message);
+	}
+	let after = view(&r, a);
+	assert_eq!((after["state"]["number"].as_str(), after["pending"].as_bool()), (Some("1"), Some(false)), "dropped: {}", after);
+	assert_eq!(view(&r, b)["note"]["credit"], "100000", "B's note is the one signed before");
 }
 
 /// The unroll of channel `c`'s path and its entry, each broadcast (a level

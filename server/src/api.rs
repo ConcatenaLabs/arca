@@ -31,7 +31,7 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
+	"declined", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
