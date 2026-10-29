@@ -23,7 +23,7 @@ use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
-	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, \
+	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
@@ -37,13 +37,13 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?}, \
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
-	capacity, max_fee_ppm?}, channel_sync {leaf_id}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}, leaf_template {template?}";
+	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
+	fee_asset?}, channel_code {address?}, leaf_template {template?}";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -180,7 +180,9 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"boards" => w.boards(),
 		"receive" => w.receive(opt_asset(&a["asset"])?, opt_u64(&a["amount"], "the amount")?),
 		"forget_request" => w.forget_request(req_str(&a["owner"], "the request's key")?),
-		"send" => w.send(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?),
+		"send" => w.send_routed(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?,
+			a["route"].as_str()),
+		"channel_code" => w.channel_code(a["address"].as_str()),
 		"mailbox" => w.mailbox(),
 		"restore" => w.restore(),
 		"quote" => {
@@ -204,9 +206,12 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"channels" => w.channels(),
 		"channel_open" => {
 			let capacity = opt_u64(&a["capacity"], "the operator's side")?.ok_or_else(|| Error::Parse("the capacity is missing".into()))?;
-			w.channel_open(&leaves(a)?, capacity, opt_u64(&a["max_fee_ppm"], "the fee bound")?)
+			w.channel_open(&leaves(a)?, capacity, opt_u64(&a["keep"], "what is kept beside the channel")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)
 		},
-		"channel_sync" => w.channel_sync(req_str(&a["leaf_id"], "the channel")?),
+		"channel_sync" => match a["leaf_id"].as_str().filter(|l| !l.is_empty()) {
+			Some(l) => w.channel_sync(l),
+			None => w.channel_sync_all(),
+		},
 		"channel_pay" => {
 			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
 			w.channel_pay(req_str(&a["leaf_id"], "the channel")?, req_str(&a["to"], "the receiving channel")?, amount)
@@ -368,8 +373,19 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"plans" => w.plans(),
 		"care" => {
 			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
-			w.care(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32), steps,
-				opt_u64(&a["max_fee_ppm"], "the bound")?, opt_u64(&a["plan_within"], "the planning reach")?.map(|n| n.min(u32::MAX as u64) as u32))
+			// Channels first: a coin a plan names is not put into a channel.
+			let bound = opt_u64(&a["max_fee_ppm"], "the bound")?;
+			let channels = match a["channels"].as_bool() {
+				Some(true) => Some(w.care_channels(Some(bound.unwrap_or(super::plan::CARE_MAX_FEE_PPM)))
+					.unwrap_or_else(|e| json!({"error": e.to_string()}))),
+				_ => None,
+			};
+			let mut v = w.care(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32), steps,
+				bound, opt_u64(&a["plan_within"], "the planning reach")?.map(|n| n.min(u32::MAX as u64) as u32))?;
+			if let Some(c) = channels {
+				v["channels"] = c;
+			}
+			Ok(v)
 		},
 		"plan_cancel" => w.plan_cancel(req_str(&a["plan"], "the plan")?),
 		"plan_release" => {

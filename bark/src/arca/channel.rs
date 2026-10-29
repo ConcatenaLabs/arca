@@ -24,6 +24,7 @@
 //!   credit claimed from the operator's side, and the wallet's outputs swept
 //!   home with the leaf's key.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use elements::secp256k1_zkp::schnorr::Signature;
@@ -39,6 +40,9 @@ use super::exit::{Here, Payer};
 use super::store::CoinRow;
 use super::wallet::{sign, Wallet};
 use super::Error;
+
+/// What a channel code says it is ([`Wallet::channel_code`]).
+pub(crate) const CODE_KIND: &str = "channel-code";
 
 /// What the wallet keeps of a channel.
 #[derive(Debug, Clone, Default)]
@@ -153,11 +157,156 @@ impl Wallet {
 	/// Opens a channel: gives up the coins `leaf_ids` (every live coin of
 	/// one asset when empty) in a round for a channel leaf holding what they
 	/// hold less the refresh fee on the wallet's side and `capacity` on the
-	/// operator's.
-	pub fn channel_open(&mut self, leaf_ids: &[String], capacity: u64, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+	/// operator's; with `keep`, that much of it goes to a plain leaf of the
+	/// wallet's beside the channel instead.
+	pub fn channel_open(&mut self, leaf_ids: &[String], capacity: u64, keep: Option<u64>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let mut quote = self.refresh_quote(leaf_ids, max_fee_ppm)?;
 		quote.channel = Some(capacity);
+		quote.keep = keep;
 		self.participate(quote, None)
+	}
+
+	/// The wallet's channels that can pay and be paid now, one for each
+	/// asset (the one holding most): a live coin whose round is final.
+	pub(crate) fn usable_channels(&self) -> Result<BTreeMap<AssetId, (String, u64)>, Error> {
+		let mut out: BTreeMap<AssetId, (String, u64)> = BTreeMap::new();
+		for c in self.store.coins_in("live")? {
+			let Ok((row, _, asset)) = self.channel_coin(&c.leaf_id) else { continue };
+			let Ok((_, a)) = self.held(&row) else { continue };
+			if !a.all_final() {
+				continue;
+			}
+			let worth = self.channel_worth(&row)?.unwrap_or(0);
+			if out.get(&asset).is_none_or(|(_, w)| *w < worth) {
+				out.insert(asset, (row.leaf_id.clone(), worth));
+			}
+		}
+		Ok(out)
+	}
+
+	/// The wallet's channels that can be paid now, by asset, as a text a
+	/// payer reads (`kind` "channel-code"): the chain, the operator, a
+	/// channel for each asset and, when given, an address of the wallet's
+	/// for a payment on the chain instead. It names no key of the wallet's
+	/// and lapses never; a channel closed since is refused by the operator,
+	/// and the payer pays otherwise.
+	pub fn channel_code(&self, address: Option<&str>) -> Result<Value, Error> {
+		let ch = self.usable_channels()?;
+		if ch.is_empty() {
+			return Err(Error::Refused("the wallet holds no channel that can be paid now".into()));
+		}
+		let mut v = json!({"kind": CODE_KIND, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
+			"channels": ch.iter().map(|(a, (l, _))| (a.to_string(), json!(l))).collect::<serde_json::Map<_, _>>()});
+		if let Some(a) = address.filter(|a| !a.is_empty()) {
+			v["address"] = json!(a);
+		}
+		Ok(json!({"code": format!("{}{}", self.spelling.request, hex(v.to_string().as_bytes())), "details": v}))
+	}
+
+	/// Reads every live channel of the wallet's from the operator, as
+	/// [`Self::channel_sync`] reads one: the notes it was paid, and a state
+	/// sent and never answered sent again.
+	pub fn channel_sync_all(&self) -> Result<Value, Error> {
+		let mut out = vec![];
+		for c in self.store.coins_in("live")? {
+			if self.channel_coin(&c.leaf_id).is_err() {
+				continue;
+			}
+			out.push(self.channel_sync(&c.leaf_id).unwrap_or_else(|e| json!({"leaf_id": c.leaf_id, "error": e.to_string()})));
+		}
+		Ok(Value::Array(out))
+	}
+
+	/// What a wallet does for its channels by itself (`care` with
+	/// `channels`): reads every channel, folds the credit it was paid into
+	/// its balance, and, for each asset the operator makes channels of and
+	/// the wallet holds leaves of but no channel, opens one in the next
+	/// round from those leaves, half of what they hold (after the refresh
+	/// fee, under `max_fee_ppm`) in the channel with the operator's whole
+	/// capacity on its side, the other half in a plain leaf beside it. Coins
+	/// a plan names, resting orders, coins awaiting a preimage and coins of a
+	/// supervised asset stay as they are; so do coins too small to split into
+	/// two leaves of the operator's smallest.
+	pub fn care_channels(&mut self, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let mut synced = vec![];
+		let mut folded = vec![];
+		for c in self.store.coins_in("live")? {
+			if self.channel_coin(&c.leaf_id).is_err() {
+				continue;
+			}
+			match self.channel_sync(&c.leaf_id) {
+				Ok(v) => {
+					let unfolded = num(&v["credit_not_folded"], "credit").unwrap_or(0);
+					if unfolded > 0 && v["pending"] != json!(true) {
+						folded.push(match self.channel_fold(&c.leaf_id) {
+							Ok(f) => json!({"leaf_id": c.leaf_id, "folded": unfolded.to_string(), "state": f["state"]}),
+							Err(e) => json!({"leaf_id": c.leaf_id, "error": e.to_string()}),
+						});
+					}
+					synced.push(json!({"leaf_id": c.leaf_id, "balance": v["balance"]}));
+				},
+				Err(e) => synced.push(json!({"leaf_id": c.leaf_id, "error": e.to_string()})),
+			}
+		}
+		let info = self.server_info()?;
+		let planned = self.planned_coins()?;
+		let awaiting = self.awaiting_preimage()?;
+		let mut with_channel: BTreeSet<String> = BTreeSet::new();
+		for c in self.store.coins()? {
+			if !matches!(c.state.as_str(), "spent" | "exited" | "lost") && self.channel_coin(&c.leaf_id).is_ok() {
+				with_channel.insert(c.asset.clone());
+			}
+		}
+		let mut opened = vec![];
+		for a in info["assets"].as_array().cloned().unwrap_or_default() {
+			let Some(capacity) = a["channels"]["capacity"].as_str().and_then(|c| c.parse::<u64>().ok()).filter(|c| *c > 0) else { continue };
+			let Some(asset) = a["asset"].as_str().and_then(|s| AssetId::from_str(s).ok()) else { continue };
+			if with_channel.contains(&asset.to_string()) || !matches!(self.landing_rule(&info, asset), Ok(None)) {
+				continue;
+			}
+			let mut coins = vec![];
+			for c in self.store.coins_in("live")? {
+				if c.asset != asset.to_string() || planned.contains(&c.leaf_id) || awaiting.contains(&c.leaf_id)
+					|| super::resting::is_order_coin(&c)
+				{
+					continue;
+				}
+				match Self::record_of(&c) {
+					Ok(CoinRecord::Leaf { record, .. }) if record.htlc.is_none() && record.channel.is_none() => {},
+					Ok(CoinRecord::Leaf { .. }) | Err(_) => continue,
+					Ok(_) => {},
+				}
+				if self.held(&c).is_ok_and(|(_, h)| h.all_final()) {
+					coins.push(c.leaf_id.clone());
+				}
+			}
+			if coins.is_empty() {
+				continue;
+			}
+			let min = Self::min_leaf(&info, asset)?;
+			let mut q = match self.refresh_quote(&coins, max_fee_ppm) {
+				Ok(q) => q,
+				Err(e) => {
+					opened.push(json!({"asset": asset.to_string(), "error": e.to_string()}));
+					continue;
+				},
+			};
+			let after = q.after(&asset).unwrap_or(0);
+			let keep = after - after / 2;
+			if after / 2 < min || keep < min {
+				opened.push(json!({"asset": asset.to_string(), "left": format!("{} after the fee is too little for a channel and a leaf beside 					it, each at least {}", after, min)}));
+				continue;
+			}
+			q.channel = Some(capacity);
+			q.keep = Some(keep);
+			opened.push(match self.participate(q, None) {
+				Ok(v) => json!({"asset": asset.to_string(), "capacity": capacity.to_string(), "kept": keep.to_string(),
+					"participation": v["participations"][0]["participation"], "state": v["participations"][0]["state"],
+					"error": v["participations"][0].get("error")}),
+				Err(e) => json!({"asset": asset.to_string(), "error": e.to_string()}),
+			});
+		}
+		Ok(json!({"synced": synced, "folded": folded, "opened": opened}))
 	}
 
 	/// The channel coin `leaf_id`: its row, its channel and its asset.
@@ -170,6 +319,10 @@ impl Wallet {
 		}.ok_or_else(|| Error::Refused(format!("coin {} is not a channel-1 leaf", leaf_id)))?;
 		let asset = AssetId::from_str(&row.asset).map_err(|e| Error::Store(e.to_string()))?;
 		Ok((row, policy, asset))
+	}
+
+	pub(crate) fn channel_pending(&self, leaf_id: &str) -> Result<bool, Error> {
+		Ok(self.kept(leaf_id)?.pending.is_some())
 	}
 
 	fn kept(&self, leaf_id: &str) -> Result<Kept, Error> {
@@ -219,6 +372,8 @@ impl Wallet {
 			if let Ok((_, policy, asset)) = self.channel_coin(&c.leaf_id) {
 				let mut v = self.channel_view(&c.leaf_id, &policy, asset, &self.kept(&c.leaf_id)?);
 				v["coin_state"] = json!(c.state);
+				// Paid and paying only once its round is final.
+				v["final"] = json!(self.held(&c).is_ok_and(|(_, a)| a.all_final()));
 				out.push(v);
 			}
 		}
