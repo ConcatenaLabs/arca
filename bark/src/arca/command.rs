@@ -137,6 +137,15 @@ fn start(w: &mut Wallet, command: &str) -> Value {
 		};
 	}
 	if !matches!(command, "recheck" | "sync" | "schedule") {
+		// Every coin's bases once a tip; the lineage watch, which a spend in
+		// the mempool calls for, before every command.
+		if let Ok(Some(tip)) = w.tip_rechecked() {
+			out["recheck"] = match w.recheck_lineages() {
+				Ok(mut v) => { v["tip"] = json!(tip); v },
+				Err(e) => json!({"error": {"kind": e.kind(), "message": format!("the re-check on start could not run: {}", e)}}),
+			};
+			return out;
+		}
 		out["recheck"] = match w.recheck() {
 			Ok(v) => v,
 			Err(e) => json!({"error": {"kind": e.kind(), "message": format!("the re-check on start could not run: {}", e)}}),
