@@ -21,6 +21,8 @@ pub struct FakeBlock {
 
 pub struct FakeChain {
 	inner: Mutex<Inner>,
+	/// How long reading one transaction takes, as a busy node's would.
+	tx_delay: Mutex<std::time::Duration>,
 }
 
 struct Inner {
@@ -61,7 +63,7 @@ impl FakeChain {
 			rates: Default::default(),
 		};
 		inner.push(None, 100, true, vec![]);
-		FakeChain { inner: Mutex::new(inner) }
+		FakeChain { inner: Mutex::new(inner), tx_delay: Mutex::new(std::time::Duration::ZERO) }
 	}
 
 	/// Appends a block anchored at `anchor`, certified or not, holding `txs`,
@@ -96,6 +98,11 @@ impl FakeChain {
 
 	pub fn to_mempool(&self, tx: Transaction) {
 		self.inner.lock().unwrap().mempool.push(tx);
+	}
+
+	/// Makes every read of one transaction take `d`.
+	pub fn set_transaction_delay(&self, d: std::time::Duration) {
+		*self.tx_delay.lock().unwrap() = d;
 	}
 
 	pub fn set_rate(&self, asset: AssetId, rate: u64) {
@@ -153,6 +160,10 @@ impl ChainSource for FakeChain {
 	}
 
 	fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, ChainError> {
+		let d = *self.tx_delay.lock().unwrap();
+		if !d.is_zero() {
+			std::thread::sleep(d);
+		}
 		let i = self.inner.lock().unwrap();
 		Ok(i.mempool.iter().chain(i.blocks.values().flat_map(|b| b.txs.iter())).find(|t| t.txid() == *txid).cloned())
 	}
