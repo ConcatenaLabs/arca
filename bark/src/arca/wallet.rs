@@ -2500,12 +2500,40 @@ impl Wallet {
 	}
 
 	/// Whether the chain's tip is the one the last complete re-check ran at,
-	/// so a command starting now needs no re-check first. A rollback
-	/// or any new block changes the tip, so a coin is never spent on a base
-	/// the chain gave up; a base that became final without a new block (its
-	/// certificate came) is seen at the next block or `sync`. Every command
-	/// otherwise pays a read of every coin's bases, which for a wallet of a
-	/// hundred coins is half a minute. -> the tip when it is, else `None`.
+	/// so a command starting now needs only the lineage watch
+	/// ([`Self::recheck_lineages`]), not every coin's bases read again. A
+	/// rollback or any new block changes the tip, so a coin is never spent on
+	/// a base the chain gave up; a base that became final without a new block
+	/// (its certificate came) is seen at the next block or `sync`. Every
+	/// command otherwise pays a read of every coin's bases, which for a wallet
+	/// of a hundred coins is half a minute. -> the tip when it is, else `None`.
+	/// The part of the re-check that a spend in the mempool can call for,
+	/// run when the tip has not moved since the last complete one: every coin
+	/// the wallet holds against the chain and the mempool for anything of its
+	/// lineage ([`Self::watch_lineages`]), each board it rests on looked up
+	/// unspent in one read ahead. A coin someone has started to bring on-chain
+	/// is taken on-chain at once, as the complete re-check takes it.
+	pub(crate) fn recheck_lineages(&mut self) -> Result<Value, Error> {
+		let mut outpoints = vec![];
+		for c in self.store.coins()? {
+			if !Self::homeward(&c.state) {
+				continue;
+			}
+			for t in c.bases.iter().filter_map(|t| Txid::from_str(t).ok()) {
+				if let Some(tx) = self.store.tx(&t.to_string())?.and_then(|raw| elements::encode::deserialize::<Transaction>(&raw).ok()) {
+					if tx.output.len() <= 4 {
+						outpoints.extend((0..tx.output.len() as u32).map(|i| OutPoint::new(t, i)));
+					}
+				}
+			}
+		}
+		outpoints.sort();
+		outpoints.dedup();
+		self.chain.read_ahead_of(&[], &outpoints);
+		let changes = self.watch_lineages()?;
+		Ok(json!({"lineages_only": "the chain's tip is the one the last complete re-check ran at", "changes": changes}))
+	}
+
 	pub(crate) fn tip_rechecked(&self) -> Result<Option<String>, Error> {
 		let Some(last) = self.rechecked_at.borrow().clone() else { return Ok(None) };
 		let tip = self.chain.tip()?;
