@@ -43,6 +43,63 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
+/// `GET /v1/chain`: where the operator's finality service stands, so an
+/// operator or a monitor can tell a follower that keeps up from one that has
+/// fallen behind or stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainProgress {
+	/// The height of the highest block the service has followed.
+	pub height: u64,
+	/// The node's tip height, as the service's last pass read it.
+	pub node_height: u64,
+	/// How long its last complete pass took.
+	pub last_pass_ms: u64,
+	/// Seconds since its last complete pass ended; `None` before the first.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_pass_age_seconds: Option<u64>,
+	/// Whether the node reports its tip's anchor as validated and in the
+	/// parent's active chain: nothing becomes final while it does not.
+	pub anchor_ok: bool,
+	/// Mempool transactions its scan has not reached yet.
+	pub mempool_behind: u64,
+	/// Passes that failed or panicked in a row: the error is in the server's
+	/// log, and every pass is tried again.
+	pub failing_passes: u32,
+	/// The Bitcoin height the followed tip's anchor commits to.
+	pub anchor_height: u64,
+	/// How long the tip's anchor has stood at that height. Nothing new is
+	/// buried while it stands still: it does while the parent chain is
+	/// contested above it, the node anchoring at its last uncontested height.
+	pub anchor_unchanged_seconds: u64,
+	/// What finality waits on now, in this order: `follower` (the service
+	/// trails the node, or its passes fail), `anchor_status` (the node does
+	/// not report its tip's anchor as ok), `certificates` (a waiting round's
+	/// block is not certified yet), `anchor` (each waiting round is
+	/// certified and waits for Bitcoin blocks to bury its anchor), or
+	/// `nothing`.
+	pub waiting_on: String,
+	/// The rounds broadcast and not yet final, oldest first (at most 20).
+	pub rounds_waiting: Vec<RoundWaiting>,
+	/// How many rounds are broadcast and not yet final.
+	pub rounds_waiting_count: u64,
+}
+
+/// A round broadcast and not yet final, and where finality has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundWaiting {
+	pub txid: String,
+	/// `not_in_chain`, `unsettled`, `settled` or `final`.
+	pub finality: String,
+	/// The height of its block, when it is in one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub height: Option<u64>,
+	/// The Bitcoin blocks burying its block's anchor, once it is certified.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub anchor_depth: Option<u64>,
+}
+
 /// `GET /v1/info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

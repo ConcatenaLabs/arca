@@ -5,11 +5,11 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::db::TestDb;
 use common::fake::{tx, FakeChain};
-use server::chain::finality::FinalityError;
+use server::chain::finality::{FinalityError, MEMPOOL_BUDGET};
 use server::chain::{Certification, ChainEvent, ChainSource, Finality, FinalityConfig, FinalityService};
 
 fn config(certification: Certification) -> FinalityConfig {
@@ -256,5 +256,85 @@ async fn refuses_a_node_without_finality() {
 	chain.mine(100, false, vec![t.clone()]);
 	chain.mine(102, false, vec![]);
 	f.sync().await.unwrap();
+	assert!(f.status(&t.txid()).await.unwrap().is_final());
+}
+
+/// A mempool of thousands of transactions behind a slow node delays only the
+/// sightings: each pass reads the mempool for at most its budget, so blocks
+/// are followed and finality advances in every pass, the rest of the mempool
+/// is read over the next ones, and the service says how far behind it is.
+#[tokio::test]
+async fn a_flooded_mempool_never_holds_finality_back() {
+	let db = TestDb::new().await;
+	let chain = Arc::new(FakeChain::new(true));
+	let f = service(&db, &chain).await;
+	for i in 0..5_000 {
+		chain.to_mempool(tx(&format!("flood {}", i)));
+	}
+	// 5 ms a read: 25 s to read the whole mempool.
+	chain.set_transaction_delay(Duration::from_millis(5));
+	let t = tx("round");
+	let txid = t.txid();
+	f.watch(txid, "round").await.unwrap();
+	chain.mine(100, true, vec![t]);
+	chain.mine(102, true, vec![]);
+
+	let t0 = Instant::now();
+	f.sync().await.unwrap();
+	let took = t0.elapsed();
+	assert!(took < MEMPOOL_BUDGET + Duration::from_secs(3), "a pass took {:?}", took);
+	assert!(f.status(&txid).await.unwrap().is_final(), "the round is final after the first pass");
+	let p = f.progress();
+	assert_eq!((p.height, p.node_height, p.anchor_ok), (2, 2, true));
+	assert!(p.mempool_behind > 1_000 && p.mempool_behind < 5_000, "{} left of the mempool", p.mempool_behind);
+	assert!(p.last_pass_ms >= MEMPOOL_BUDGET.as_millis() as u64);
+
+	// A block mined while the mempool is still being read is followed by the
+	// next pass, at once.
+	let t2 = tx("round 2");
+	f.watch(t2.txid(), "round").await.unwrap();
+	chain.mine(104, true, vec![t2.clone()]);
+	f.sync().await.unwrap();
+	assert_eq!(f.progress().height, 3);
+	assert!(matches!(f.status(&t2.txid()).await.unwrap(), Finality::Settled { .. }));
+
+	for _ in 0..10 {
+		if f.progress().mempool_behind == 0 {
+			break;
+		}
+		f.sync().await.unwrap();
+	}
+	assert_eq!(f.progress().mempool_behind, 0, "the whole mempool is read over the following passes");
+}
+
+/// While the tip's anchor stands at one Bitcoin height (the parent chain
+/// contested above it, the node anchoring at its last uncontested height), a
+/// certified round stays settled and the service says since when the anchor
+/// has not moved; once it moves two blocks the round is final.
+#[tokio::test]
+async fn an_anchor_standing_still_is_reported() {
+	let db = TestDb::new().await;
+	let chain = Arc::new(FakeChain::new(true));
+	let f = service(&db, &chain).await;
+	let t = tx("round in a contested hour");
+	f.watch(t.txid(), "round").await.unwrap();
+	chain.mine(158096, true, vec![t.clone()]);
+	f.sync().await.unwrap();
+	let first = f.progress();
+	assert_eq!(first.anchor_height, 158096);
+	// many Sequentia blocks, every one anchored at the same Bitcoin height
+	for _ in 0..5 {
+		chain.mine(158096, true, vec![]);
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		f.sync().await.unwrap();
+	}
+	let p = f.progress();
+	assert_eq!((p.height, p.anchor_height), (6, 158096));
+	assert_eq!(p.anchor_since, first.anchor_since, "the anchor has not moved since the round's block");
+	assert!(matches!(f.status(&t.txid()).await.unwrap(), Finality::Settled { depth: 0, .. }));
+	// Bitcoin settles: two blocks over the anchor
+	chain.mine(158098, true, vec![]);
+	f.sync().await.unwrap();
+	assert!(f.progress().anchor_since > first.anchor_since);
 	assert!(f.status(&t.txid()).await.unwrap().is_final());
 }

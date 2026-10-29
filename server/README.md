@@ -217,6 +217,26 @@ node that does not validate its anchors, since that node has no notion of
 finality, and refuses to leave certification out on a chain whose node reports
 certificates.
 
+Each pass reads the mempool for at most five seconds and leaves the rest for
+the next, so a busy mempool or a slow node delays a sighting, never the blocks
+or finality. A pass that fails, or panics, is logged and the next one runs. A
+pass that takes longer than ten seconds, or that starts three or more blocks
+behind the node, is logged at info.
+
+`GET /v1/chain` says where the service stands and what finality waits on: the
+height it has followed to and the node's, how long its last pass took and how
+long ago it ended, passes failing in a row, whether the node reports its tip's
+anchor as ok, the Bitcoin height the tip's anchor commits to and how long it
+has stood there, and the rounds broadcast and not yet final, each with its
+block and its anchor's burial. `waiting_on` names the first thing finality
+waits on: `follower` (the service trails the node or its passes fail),
+`anchor_status`, `certificates`, `anchor` (every waiting round is certified and
+waits for Bitcoin blocks to bury its anchor) or `nothing`. While the parent
+chain is contested above some height, the node anchors at its last uncontested
+height, the tip's anchor stands still, and `waiting_on` reads `anchor` until
+Bitcoin settles: the anchoring rule at work, which the operator waits out on
+the coins already final.
+
 ## Published parameters
 
 The operator publishes its chain (the genesis hash), its key `S`, the bounds on

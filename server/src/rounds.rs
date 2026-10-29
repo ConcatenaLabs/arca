@@ -483,6 +483,23 @@ impl Rounds {
 			going_out: Mutex::new(()), fundable_seen: Mutex::new(None) })
 	}
 
+	/// The finality service this operator follows the chain with.
+	pub fn finality(&self) -> &Arc<FinalityService> {
+		&self.finality
+	}
+
+	/// The rounds broadcast and not yet final, oldest first, each with where
+	/// the finality service has it: what an operator reads to see whether
+	/// finality keeps up.
+	pub async fn waiting(&self) -> Result<Vec<(Txid, crate::chain::Finality)>, RoundError> {
+		let mut out = vec![];
+		for r in self.store.rounds_in(RoundState::Broadcast).await? {
+			let txid = Txid::from_byte_array(r.txid);
+			out.push((txid, self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?));
+		}
+		Ok(out)
+	}
+
 	/// What a round can pay now of each asset the operator serves, as a
 	/// round's own check counts it ([`Self::fundable`]): what the wallet can
 	/// spend of the asset, or, for an issuer-operated asset, what its mint

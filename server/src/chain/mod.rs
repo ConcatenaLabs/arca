@@ -18,7 +18,7 @@ use sequentia_ext::{BitcoinAnchor, BlockHeaderExt};
 
 pub mod finality;
 
-pub use finality::{Certification, ChainEvent, Finality, FinalityConfig, FinalityService};
+pub use finality::{Certification, ChainEvent, Finality, FinalityConfig, FinalityService, Progress};
 
 /// Why the chain could not be read or did not accept something.
 #[derive(Debug, Clone, thiserror::Error)]

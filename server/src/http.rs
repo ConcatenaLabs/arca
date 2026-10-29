@@ -646,6 +646,43 @@ async fn bond_info(app: &App) -> Option<api::BondInfo> {
 	})
 }
 
+async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainProgress>, Refusal> {
+	use crate::chain::Finality;
+	let p = app.rounds.finality().progress();
+	let waiting = app.rounds.waiting().await.map_err(|e| {
+		log::warn!("the rounds waiting for finality: {}", e);
+		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the rounds waiting for finality could not be read")
+	})?;
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+	let waiting_on = if p.failing_passes > 0 || p.node_height.saturating_sub(p.height) >= crate::chain::finality::LAG_BLOCKS {
+		"follower"
+	} else if !p.anchor_ok {
+		"anchor_status"
+	} else if waiting.iter().any(|(_, f)| matches!(f, Finality::Unsettled { .. })) {
+		"certificates"
+	} else if waiting.iter().any(|(_, f)| matches!(f, Finality::Settled { .. })) {
+		"anchor"
+	} else {
+		"nothing"
+	};
+	Ok(Json(api::ChainProgress {
+		height: p.height, node_height: p.node_height, last_pass_ms: p.last_pass_ms,
+		last_pass_age_seconds: (p.last_pass_at > 0).then(|| now.saturating_sub(p.last_pass_at)),
+		anchor_ok: p.anchor_ok, mempool_behind: p.mempool_behind, failing_passes: p.failing_passes,
+		anchor_height: p.anchor_height, anchor_unchanged_seconds: if p.anchor_since > 0 { now.saturating_sub(p.anchor_since) } else { 0 },
+		waiting_on: waiting_on.into(),
+		rounds_waiting_count: waiting.len() as u64,
+		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
+			let (height, depth) = match f {
+				Finality::NotInChain => (None, None),
+				Finality::Unsettled { height, .. } => (Some(*height), None),
+				Finality::Settled { height, depth, .. } | Finality::Final { height, depth, .. } => (Some(*height), Some(*depth)),
+			};
+			api::RoundWaiting { txid: t.to_string(), finality: f.name().into(), height, anchor_depth: depth }
+		}).collect(),
+	}))
+}
+
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let floors = floors(&app).await;
 	let signer_record = record_head(&app).await;
@@ -1773,6 +1810,7 @@ pub fn router(app: Arc<App>) -> Router {
 	let limit = app.max_request;
 	Router::new()
 		.route("/v1/info", get(info))
+		.route("/v1/chain", get(chain_progress))
 		.route("/v1/operator_nonce", post(operator_nonce))
 		.route("/v1/challenge", post(challenge))
 		.route("/v1/register_board", post(register_board))
