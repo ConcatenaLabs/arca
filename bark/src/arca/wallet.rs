@@ -2,7 +2,7 @@
 //! holds against the chain, the re-check after a rollback, its on-chain coins
 //! and the board.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -2394,15 +2394,41 @@ impl Wallet {
 	/// chain first: when another transaction now pays a batch output the
 	/// wallet's coin rests on, the checks run on that one, and a coin that
 	/// fails them on a base the chain holds goes into its exit at once. Run on
-	/// start and after any reorganisation. Returns what changed, and whether
-	/// the tip the wallet last saw has been reorganised away.
+	/// start and after any reorganisation. While the chain has only grown
+	/// since the last re-check (the tip it ran at still in the active chain,
+	/// the node's anchor status the same), a live coin is read again only when
+	/// an output it descends from no longer stands (one `gettxout` batch for
+	/// every coin) or its exit date is near; every other coin is read again
+	/// every time. Returns what changed, how many coins were read again
+	/// (`read_again`), and whether the tip the wallet last saw has been
+	/// reorganised away.
 	pub fn recheck(&mut self) -> Result<Value, Error> {
 		let tip = self.chain.tip()?;
+		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
+		let last_hash = self.store.meta("tip_hash")?;
+		let reorg = match (last_h, &last_hash) {
+			(Some(h), Some(hash)) => self.chain.block_hash(h)?.map(|b| b.to_string()).as_ref() != Some(hash),
+			_ => false,
+		};
+		let anchors = self.chain.anchor_word()?;
+		// Since the tip the last complete re-check ran at, the chain has only
+		// grown: no base left it, no final block stopped being final (its
+		// certificate stands and its anchor only gets deeper while the node's
+		// anchor status is as it was). A live coin can then change only by a
+		// spend of an output it descends from, or by its exit date coming; the
+		// others are read again in full. After a rollback, a changed anchor
+		// status or with no earlier re-check, every coin is.
+		let grown = last_h.is_some() && !reorg && self.store.meta("tip_anchors")?.as_deref() == Some(anchors.as_str());
+		let now_s = tip.median_time;
+		let coins = self.store.coins()?;
+		let moved = if grown { self.coins_with_moved_roots(&coins.iter().filter(|c| c.state == "live").cloned().collect::<Vec<_>>())? } else { BTreeSet::new() };
+		let settled = |c: &CoinRow| grown && c.state == "live" && !moved.contains(&c.leaf_id)
+			&& (now_s as u64) + WalletPolicy::EXIT_DEADLINE as u64 + 600 < c.expiry as u64;
 		// What the checks below read of each coin's rounds and boards, read
 		// ahead in a few requests where the node takes a batch.
 		let mut bases: Vec<Txid> = vec![];
-		for c in self.store.coins()? {
-			if Self::homeward(&c.state) {
+		for c in &coins {
+			if Self::homeward(&c.state) && !settled(c) {
 				bases.extend(c.bases.iter().filter_map(|t| Txid::from_str(t).ok()));
 			}
 		}
@@ -2420,12 +2446,7 @@ impl Wallet {
 			}
 		}
 		self.chain.read_ahead_of(&bases, &outpoints);
-		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
-		let last_hash = self.store.meta("tip_hash")?;
-		let reorg = match (last_h, last_hash) {
-			(Some(h), Some(hash)) => self.chain.block_hash(h)?.map(|b| b.to_string()) != Some(hash),
-			_ => false,
-		};
+		let skip: BTreeSet<String> = coins.iter().filter(|c| settled(c)).map(|c| c.leaf_id.clone()).collect();
 		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
 		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
 		// A step of an offline-refresh plan the wallet took up whose round can
@@ -2435,6 +2456,9 @@ impl Wallet {
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		for c in self.store.coins()? {
 			if !matches!(c.state.as_str(), "pending" | "live") && !revived.contains(&c.leaf_id) {
+				continue;
+			}
+			if skip.contains(&c.leaf_id) && !revived.contains(&c.leaf_id) {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
@@ -2495,8 +2519,11 @@ impl Wallet {
 		}
 		self.store.set_meta("tip_height", &tip.height.to_string())?;
 		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
+		self.store.set_meta("tip_anchors", &anchors)?;
 		*self.rechecked_at.borrow_mut() = Some(tip.hash.to_string());
-		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes}))
+		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes,
+			"read_again": if grown { json!(coins.iter().filter(|c| matches!(c.state.as_str(), "pending" | "live")).count() - skip.len()) }
+				else { json!("all") }}))
 	}
 
 	/// Whether the chain's tip is the one the last complete re-check ran at,
@@ -2540,6 +2567,66 @@ impl Wallet {
 		Ok((tip.hash.to_string() == last).then_some(last))
 	}
 
+	/// The outputs on the chain coin `c` descends from (its batch outputs
+	/// and boards, [`arca_covenant::ValidCoin::roots`]), read from the base
+	/// transactions the wallet stored for it, without asking the node;
+	/// `None` when a base it rests on is not among them.
+	fn roots_of_row(&self, c: &CoinRow) -> Result<Option<Vec<OutPoint>>, Error> {
+		let Ok(record) = Self::record_of(c) else { return Ok(None) };
+		let mut outs = vec![];
+		if base_outputs(&record, &mut outs).is_err() {
+			return Ok(None);
+		}
+		let mut txs = vec![];
+		for t in &c.bases {
+			if let Some(tx) = self.store.tx(t)?.and_then(|raw| elements::encode::deserialize::<Transaction>(&raw).ok()) {
+				txs.push(tx);
+			}
+		}
+		let mut roots = vec![];
+		for o in outs {
+			let before = roots.len();
+			for tx in &txs {
+				roots.extend(tx.output.iter().enumerate().filter(|(_, x)| **x == o).map(|(i, _)| OutPoint::new(tx.txid(), i as u32)));
+			}
+			if roots.len() == before {
+				return Ok(None);
+			}
+		}
+		Ok(Some(roots))
+	}
+
+	/// The coins among `coins` with an output they descend from that does not
+	/// stand now (spent in the chain or the mempool, or made by a transaction
+	/// the node no longer holds), or whose outputs the wallet cannot name:
+	/// one batch of `gettxout` for all of them.
+	fn coins_with_moved_roots(&self, coins: &[CoinRow]) -> Result<BTreeSet<String>, Error> {
+		let mut moved = BTreeSet::new();
+		let mut by_coin = vec![];
+		let mut all = vec![];
+		for c in coins {
+			match self.roots_of_row(c)? {
+				Some(r) => {
+					all.extend(r.iter().copied());
+					by_coin.push((c.leaf_id.clone(), r));
+				},
+				None => { moved.insert(c.leaf_id.clone()); },
+			}
+		}
+		all.sort();
+		all.dedup();
+		self.chain.read_ahead_of(&[], &all);
+		for (id, roots) in by_coin {
+			for r in roots {
+				if !self.chain.unspent(&r)? {
+					moved.insert(id);
+					break;
+				}
+			}
+		}
+		Ok(moved)
+	}
+
 	/// Every coin the wallet still holds, live or handed over, against the
 	/// chain, for anything of its lineage there: a leaf or checkpoint it
 	/// descends from, its own leaf, or a board it rests on spent. Any of them
@@ -2552,9 +2639,16 @@ impl Wallet {
 	/// any exit delay runs out. One look at the chain covers every coin.
 	fn watch_lineages(&mut self) -> Result<Vec<Value>, Error> {
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
+		let coins: Vec<CoinRow> = self.store.coins()?.into_iter().filter(|c| Self::homeward(&c.state)).collect();
+		// Everything this watch looks for (a leaf or checkpoint of a coin's
+		// lineage, its own leaf, a board it rests on spent) is made only by
+		// spends that start at an output the coin descends from: a coin whose
+		// roots all stand, in the chain and in the mempool, has nothing to
+		// find, and only the others are looked for.
+		let moved = self.coins_with_moved_roots(&coins)?;
 		let mut held = vec![];
-		for c in self.store.coins()? {
-			if !matches!(c.state.as_str(), "live" | "pending" | "given" | "forfeited" | "offered" | "sending" | "paying" | "receiving") {
+		for c in coins {
+			if !moved.contains(&c.leaf_id) {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
