@@ -1078,8 +1078,11 @@ side), the late-refresh fee and the sweep. The late-refresh fee is the
 asset's refresh fee at its full charge, its `refresh_ppm` of the value,
 rounded up, and its `refresh_base` (`owed::late_fee`), priced when the sweep is
 counted; a sweep of an asset whose rate the operator does not hold yet is
-counted at a later pass. Entries never expire, and are kept as the rest of
-the state is kept.
+counted at a later pass. A coin whose record no longer resolves is owed as
+its row holds it (its owner key, asset and value), so one coin never keeps a
+sweep from being counted. A server whose database holds final sweeps from
+before it counted them counts each of them at its first pass. Entries never
+expire, and are kept as the rest of the state is kept.
 
 A rollback that takes a counted sweep out of finality (Sequentia follows its
 Bitcoin anchor however deep) withdraws its entries, `withdrawn`, while the
