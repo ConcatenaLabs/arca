@@ -647,6 +647,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let floors = floors(&app).await;
 	let signer_record = record_head(&app).await;
 	let bond = bond_info(&app).await;
+	let fundable = app.rounds.fundable_now().await.map_err(|e| log::warn!("what a round can pay now: {}", e)).ok();
 	let p = &app.params;
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
@@ -684,6 +685,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			restricted: ap.restricted.as_ref().map(|r| api::RestrictedInfo {
 				policy: hex(&r.policy.serialize()), clawback: r.clawback.map(|k| hex(&k.serialize())), policy_server: r.server.clone(),
 			}),
+			fundable: fundable.as_ref().map(|f| f.get(a).copied().unwrap_or(0).to_string()),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,

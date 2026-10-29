@@ -330,6 +330,13 @@ pub struct AssetInfo {
 	/// operator.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub restricted: Option<RestrictedInfo>,
+	/// What a round can pay of the asset now, in its atoms: what the
+	/// operator's wallet can spend of it, or what the mint limiter of an
+	/// issuer-operated asset allows. A participation whose round would pay
+	/// more waits until it can. Read every few seconds, and absent when the
+	/// operator could not read it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fundable: Option<String>,
 }
 
 /// What the operator serves of a restricted asset.
