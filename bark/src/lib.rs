@@ -421,7 +421,7 @@ pub use self::daemon::{tip_watcher, DaemonHandle};
 pub use self::fees::FeeEstimate;
 pub use self::import::{ImportVtxoArgs, ImportVtxoError};
 pub use self::notification::{WalletNotification, NotificationStream};
-pub use self::recovery::{RecoveryReport, RecoveryReportEntry, RecoveryStatus};
+pub use self::recovery::{CatchUpReport, RecoveryReport, RecoveryReportEntry, RecoveryStatus};
 pub use self::vtxo::WalletVtxo;
 
 use std::borrow::Cow;

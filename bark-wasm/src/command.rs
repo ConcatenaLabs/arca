@@ -24,7 +24,7 @@ use bark::{Config, Wallet, WalletSeed};
 pub const COMMANDS: &[&str] = &[
 	"info", "balance", "address", "board_address", "board_psbt", "send", "send_fee",
 	"pay", "pay_status", "pay_fee", "invoice", "receive_status", "receive_fee",
-	"offboard", "offboard_fee", "refresh", "sync", "history", "coins",
+	"offboard", "offboard_fee", "refresh", "sync", "catch_up", "history", "coins",
 ];
 
 /// The Bitcoin network a name stands for. Testnet4 is the network the
@@ -290,6 +290,19 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		"sync" => {
 			wallet.sync().await;
 			Ok(json!({}))
+		},
+		// What other wallets of the phrase did since this store was made: coins
+		// they made or received, from the server's recovery mailbox, and coins of
+		// this store they spent.
+		"catch_up" => {
+			let r = wallet.catch_up_from_server().await?;
+			Ok(json!({
+				"recovered": r.recovery.recovered().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
+				"recovered_sat": sat(r.recovery.recovered().total_amount()),
+				"spent_elsewhere": r.spent_elsewhere.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+				"failed": r.recovery.failed().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
+				"complete": r.recovery.is_complete(),
+			}))
 		},
 		"history" => Ok(serde_json::to_value(wallet.history().await?)?),
 		"coins" => {

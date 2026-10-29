@@ -11,7 +11,10 @@ signature and refusal is the wallet's or its server's.
 The wallet is made from the web wallet's own phrase, under Bark's own key path,
 so the phrase restores it anywhere Bark runs (the Arca client's Bitcoin side
 is the same wallet). A wallet made anew from a phrase that held coins in the
-ark takes back what the server's recovery mailbox kept for it.
+ark takes back what the server's recovery mailbox kept for it. A store made
+before, on a second device, learns what the phrase's other wallets did since
+with `catch_up`: the coins they made or received (a board once its wallet has
+registered it), and which of its own coins they spent.
 
 Boarding takes the funding from whoever holds the coins: `board_address`
 answers the address under a fresh key of the wallet's, the holder builds the
@@ -55,6 +58,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `offboard`, `offboard_fee` | `address` (Bitcoin), `sats` or `all` | `txid` / `fee` |
 | `refresh` | | `refreshed` |
 | `sync` | | |
+| `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
 | `history` | | the wallet's movements |
 | `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `state` |
 
