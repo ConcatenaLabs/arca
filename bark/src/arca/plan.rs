@@ -743,7 +743,13 @@ impl Wallet {
 	/// calls a step void while its round stands frees no coin.
 	pub(crate) fn plan_rounds_gone(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		for (id, coin, body, _, _) in self.plan_rows()? {
+		let rows = self.plan_rows()?;
+		// Where every step's round is, read ahead together.
+		let rounds: Vec<elements::Txid> = rows.iter().flat_map(|(_, _, body, _, _)| body["steps"].as_array().cloned().unwrap_or_default())
+			.filter_map(|s| s["round"].as_str().and_then(|r| elements::Txid::from_str(r).ok()))
+			.collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+		self.chain.read_ahead_of(&rounds, &[]);
+		for (id, coin, body, _, _) in rows {
 			let steps = body["steps"].as_array().cloned().unwrap_or_default();
 			for (j, s) in steps.iter().enumerate() {
 				let (Some(round), Some(leaf)) = (s["round"].as_str(), s["leaf_id"].as_str()) else { break };

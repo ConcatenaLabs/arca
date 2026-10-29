@@ -149,6 +149,12 @@ pub fn gap() {
 	GAPS.fetch_add(1, Ordering::SeqCst);
 }
 
+/// How many gaps came since the program started: every request to the
+/// operator is one ([`gap`]).
+pub fn gaps() -> u64 {
+	GAPS.load(Ordering::SeqCst)
+}
+
 /// What fixes every answer kept for a view: the tip, the node's anchor
 /// status, and the mempool's transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -159,9 +159,20 @@ pub struct Wallet {
 	/// What [`CoinRecord::resolve`] answered, by the record, the transactions
 	/// it was resolved against and the policy ([`Wallet::resolve`]).
 	pub(crate) resolved: std::cell::RefCell<Resolved>,
+	/// The base transactions the wallet stored for its coins, each read
+	/// from the store once, and the output each pays ([`Wallet::known_base`]).
+	pub(crate) base_index: std::cell::RefCell<BaseIndex>,
 	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
 	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
+}
+
+/// The base transactions a wallet stored, by txid, and the transaction that
+/// pays each output (its serialisation), first stored first.
+#[derive(Default)]
+pub(crate) struct BaseIndex {
+	txs: std::collections::HashMap<String, Transaction>,
+	by_output: std::collections::HashMap<Vec<u8>, String>,
 }
 
 /// The answers of [`CoinRecord::resolve`], a pure function of a record, the
@@ -772,7 +783,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
-			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default() })
+			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default() })
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -2250,18 +2261,31 @@ impl Wallet {
 	}
 
 	fn known_base(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
-		// The wallet's few base transactions, scanned.
+		// The wallet's base transactions, each read from the store once and
+		// indexed by the outputs it pays: a wallet that rests many orders
+		// asks this for every base of every coin it checks, and read afresh
+		// each time it decoded every round it holds, again and again.
+		let key = elements::encode::serialize(o);
+		let found = |idx: &BaseIndex| idx.by_output.get(&key).and_then(|t| idx.txs.get(t)).cloned();
+		if let Some(t) = found(&self.base_index.borrow()) {
+			return Ok(Some(t));
+		}
+		let mut idx = self.base_index.borrow_mut();
 		for c in self.store.coins()? {
 			for txid in &c.bases {
+				if idx.txs.contains_key(txid) {
+					continue;
+				}
 				if let Some(raw) = self.store.tx(txid)? {
 					let t: Transaction = elements::encode::deserialize(&raw).map_err(|e| Error::Store(e.to_string()))?;
-					if t.output.contains(o) {
-						return Ok(Some(t));
+					for out in &t.output {
+						idx.by_output.entry(elements::encode::serialize(out)).or_insert_with(|| txid.clone());
 					}
+					idx.txs.insert(txid.clone(), t);
 				}
 			}
 		}
-		Ok(None)
+		Ok(found(&idx))
 	}
 
 	/// Checks `record` against the chain under `policy`, owned by the wallet
@@ -2452,6 +2476,13 @@ impl Wallet {
 		// A step of an offline-refresh plan the wallet took up whose round can
 		// never return did not happen: the coin it gave up is the wallet's
 		// again, and is checked with the others below.
+		let phase = web_time::Instant::now();
+		let mut ms = serde_json::Map::new();
+		let mut lap = |name: &str, at: &mut web_time::Instant| {
+			ms.insert(name.to_string(), json!(at.elapsed().as_millis() as u64));
+			*at = web_time::Instant::now();
+		};
+		let mut at = phase;
 		let mut changes = self.plan_rounds_gone()?;
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		for c in self.store.coins()? {
@@ -2493,10 +2524,21 @@ impl Wallet {
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
 		}
+		lap("coins", &mut at);
 		// A round a participation was released in that can never return,
 		// whatever became of its new leaves (one paid on, say): the
 		// operator runs the participation again, and the wallet follows it.
-		for (pid, _, _, _, state, _, pround) in self.store.participations()? {
+		// Where each such round is, read ahead together.
+		let mut parts = vec![];
+		for p in self.store.participations()? {
+			if p.4 == "released" && p.6.is_some() && !self.new_leaves_expired(&p.0)? {
+				parts.push(p);
+			}
+		}
+		let released: Vec<Txid> = parts.iter().filter_map(|p| p.6.as_deref()).filter_map(|r| Txid::from_str(r).ok())
+			.collect::<BTreeSet<_>>().into_iter().collect();
+		self.chain.read_ahead_of(&released, &[]);
+		for (pid, _, _, _, state, _, pround) in parts {
 			let Some(r) = pround.filter(|_| state == "released") else { continue };
 			if self.new_leaves_expired(&pid)? {
 				continue;
@@ -2508,8 +2550,10 @@ impl Wallet {
 				changes.push(json!({"round": r, "can_never_return": true, "participations": back}));
 			}
 		}
+		lap("participations", &mut at);
 		// Each participation follows the one of its rounds that stands.
 		changes.extend(self.follow_standing_rounds()?);
+		lap("rounds", &mut at);
 		// What the lineage watch does to a coin is the coin's one change.
 		for mut ch in self.watch_lineages()? {
 			let id = ch["leaf_id"].as_str().unwrap_or("").to_string();
@@ -2517,11 +2561,12 @@ impl Wallet {
 			ch["from"] = json!(before.get(&id));
 			changes.push(ch);
 		}
+		lap("lineages", &mut at);
 		self.store.set_meta("tip_height", &tip.height.to_string())?;
 		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
 		self.store.set_meta("tip_anchors", &anchors)?;
 		*self.rechecked_at.borrow_mut() = Some(tip.hash.to_string());
-		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes,
+		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes, "ms": ms,
 			"read_again": if grown { json!(coins.iter().filter(|c| matches!(c.state.as_str(), "pending" | "live")).count() - skip.len()) }
 				else { json!("all") }}))
 	}

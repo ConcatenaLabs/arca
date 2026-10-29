@@ -5,10 +5,12 @@
 //! their arguments, what runs before each, and the shape of a refusal are
 //! these, so that every embedding says the same things in the same words.
 //!
-//! [`run`] answers `{"result", "start"}`: the command's JSON, and what the
+//! [`run`] answers `{"result", "start", "cost"}`: the command's JSON, what the
 //! start of the command found (the witness of the operator's signer's record,
 //! and the re-check of every coin against the chain), which the command line
-//! runs on every start and prints when it changed something. A refusal is
+//! runs on every start and prints when it changed something, and what each
+//! part cost (`{"start", "command"}`, each `{"ms", "node", "operator"}`: the
+//! milliseconds and the requests made of the node and of the operator). A refusal is
 //! [`refusal`]: the JSON the command line prints, `{"error": {"kind",
 //! "message"}}`, with the server's `code` and `status` when the server refused.
 
@@ -112,14 +114,26 @@ pub fn operators(registry: &str, genesis: Option<&str>) -> Result<Value, Error> 
 }
 
 /// Runs one command, as `arca <command>` does, `args` a JSON object of its
-/// arguments ([`COMMANDS`]). The answer is `{"result", "start"}`.
+/// arguments ([`COMMANDS`]). The answer is `{"result", "start", "cost"}`.
 pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> {
 	// Every command reads the chain as it is when it starts: the view the
 	// chain source keeps is looked at again before its first read.
 	w.chain.new_command();
+	// What the command cost, in time and in requests of the node and of the
+	// operator, the part before it (the witness and the re-check) apart: what
+	// a program logs of a slow command.
+	let t0 = web_time::Instant::now();
+	let (n0, _) = w.chain.calls();
+	let g0 = super::chain::gaps();
 	let start = start(w, command);
+	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let result = command_of(w, command, args)?;
-	Ok(json!({"result": result, "start": start}))
+	let (n2, _) = w.chain.calls();
+	let cost = json!({
+		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
+		"command": {"ms": t1.elapsed().as_millis() as u64, "node": n2 - n1, "operator": super::chain::gaps() - g1},
+	});
+	Ok(json!({"result": result, "start": start, "cost": cost}))
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
