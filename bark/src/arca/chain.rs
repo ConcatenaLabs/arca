@@ -177,6 +177,11 @@ struct Memo {
 	looked_this_command: bool,
 	/// Answers fixed by the view.
 	view: HashMap<String, Kept>,
+	/// Answers fixed by the view's mempool as well (a mempool entry, an
+	/// output looked up with the mempool's spends, a transaction in no
+	/// block): dropped when the mempool changes, while what is fixed by the
+	/// tip and the anchors alone stays ([`pooled`]).
+	pool: HashMap<String, Kept>,
 	/// Answers fixed by what they name, whatever the view: a transaction's
 	/// bytes by its id, a header's or a block's bytes by its hash, a script's
 	/// address. Only what the node found is kept so.
@@ -230,6 +235,25 @@ fn keep_of(method: &str, params: &[Value]) -> Keep {
 		| "getrawmempool" | "getmempoolentry" | "getanchorstatus" | "decodescript" | "validateaddress" | "getsupervisedassets" => Keep::View,
 		"getfeeexchangerates" | "dumpassetlabels" | "getmempoolinfo" => Keep::Command,
 		_ => Keep::Never,
+	}
+}
+
+/// Whether the answer `a` to the read keyed `k` ([`ChainSource::read_key`])
+/// depends on the mempool, not only on the tip and the anchors: the mempool
+/// itself and its entries, an output looked up with the mempool's spends,
+/// and a transaction the node holds in no block (or does not hold, while one
+/// could enter the mempool).
+fn pooled(k: &str, a: &Kept) -> bool {
+	let method = k.split(' ').next().unwrap_or("");
+	match method {
+		"getrawmempool" | "getmempoolentry" => true,
+		"gettxout" => k.ends_with(",true]"),
+		"getrawtransaction" => match a {
+			Ok(v) if k.ends_with(",true]") => !v["blockhash"].is_string(),
+			Ok(_) => false,
+			Err(_) => true,
+		},
+		_ => false,
 	}
 }
 
@@ -407,13 +431,21 @@ impl ChainSource {
 		};
 		mempool.sort();
 		let key = ViewKey { tip, anchors: anchors_word, mempool };
-		if m.key.as_ref() != Some(&key) {
-			m.view.clear();
-			m.key = Some(key);
+		match &m.key {
+			// The same tip and anchors, another mempool: only what the mempool
+			// fixes is read again. On a busy chain the mempool changes between
+			// nearly every two looks, and the headers and confirmed
+			// transactions a command reads stay as they were.
+			Some(k) if k.tip == key.tip && k.anchors == key.anchors => if k.mempool != key.mempool { m.pool.clear() },
+			_ => {
+				m.view.clear();
+				m.pool.clear();
+			},
 		}
+		m.key = Some(key);
 		m.view.insert(Self::read_key("getblockchaininfo", &[]), info);
 		m.view.insert(Self::read_key("getanchorstatus", &[]), anchors);
-		m.view.insert(Self::read_key("getrawmempool", &[]), pool);
+		m.pool.insert(Self::read_key("getrawmempool", &[]), pool);
 		m.looked = Some(web_time::Instant::now());
 		m.looked_this_command = true;
 		m.gaps = gaps;
@@ -461,7 +493,10 @@ impl ChainSource {
 			// A look that is due carries the read in its own request, unless
 			// the node takes the read only on its own. The three reads of the
 			// look are its own answers.
-			let carried: Vec<(String, Vec<Value>)> = if m.batch != Some(true) || m.unbatched.contains(method) || LOOK.contains(&method) {
+			// A read the view already holds goes in no look: the look alone
+			// says whether that answer still stands.
+			let held = m.view.contains_key(&k) || m.pool.contains_key(&k);
+			let carried: Vec<(String, Vec<Value>)> = if held || m.batch != Some(true) || m.unbatched.contains(method) || LOOK.contains(&method) {
 				vec![]
 			} else {
 				vec![(method.to_string(), params.to_vec())]
@@ -475,8 +510,7 @@ impl ChainSource {
 				},
 				None => {
 					let found = match keep {
-						Keep::Named => m.view.get(&k).cloned(),
-						Keep::View => m.view.get(&k).cloned(),
+						Keep::Named | Keep::View => m.view.get(&k).or_else(|| m.pool.get(&k)).cloned(),
 						_ => m.command.get(&k).cloned(),
 					};
 					if let Some(a) = found {
@@ -497,6 +531,7 @@ impl ChainSource {
 	fn keep(m: &mut Memo, keep: &Keep, k: String, a: &Kept) {
 		match (keep, a) {
 			(Keep::Named, Ok(v)) => { m.named.insert(k, v.clone()); },
+			(Keep::Named | Keep::View, _) if pooled(&k, a) => { m.pool.insert(k, a.clone()); },
 			(Keep::Named | Keep::View, _) => { m.view.insert(k, a.clone()); },
 			_ => { m.command.insert(k, a.clone()); },
 		}
@@ -562,7 +597,7 @@ impl ChainSource {
 			let k = Self::read_key(method, params);
 			// A look that is due may drop what the view keeps: read it again
 			// in the same request.
-			let kept = m.named.contains_key(&k) || (!due && (m.view.contains_key(&k) || m.command.contains_key(&k)));
+			let kept = m.named.contains_key(&k) || (!due && (m.view.contains_key(&k) || m.pool.contains_key(&k) || m.command.contains_key(&k)));
 			!matches!(keep_of(method, params), Keep::Never) && !m.unbatched.contains(method) && !kept && seen.insert(k)
 		}).collect();
 		let mut rest: &[(String, Vec<Value>)] = &todo;
@@ -1417,6 +1452,80 @@ mod test {
 		chain.new_command();
 		assert!(chain.fee_rates().unwrap().is_empty());
 		assert_eq!(sent(), 7, "the node is still asked in batches");
+	}
+
+	/// A node whose mempool changes at every look and whose tip does not; it
+	/// counts the calls of each method it was asked.
+	fn busy_mempool() -> (String, Arc<Mutex<HashMap<String, u64>>>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let counts: Arc<Mutex<HashMap<String, u64>>> = Default::default();
+		let counted = counts.clone();
+		std::thread::spawn(move || {
+			let mut looks = 0u64;
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let mut length = 0usize;
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let mut answer = |call: &Value| -> Value {
+					let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or("").to_string());
+					*counted.lock().unwrap().entry(method.clone()).or_default() += 1;
+					let result = match method.as_str() {
+						"getblockchaininfo" => json!({"bestblockhash": "11".repeat(32), "blocks": 1}),
+						"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
+						"getrawmempool" => { looks += 1; json!([format!("{:064x}", looks)]) },
+						"getblockheader" => json!({"confirmations": 1, "height": 1}),
+						"gettxout" => json!({"value": 1}),
+						_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
+					};
+					json!({"id": id, "result": result, "error": null})
+				};
+				let out = match &req {
+					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+					call => answer(call),
+				}.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					out.len(), out);
+			}
+		});
+		(url, counts)
+	}
+
+	/// On a busy chain the mempool changes between nearly every two looks:
+	/// what the tip fixes (a block's header) is kept across such a change,
+	/// and what the mempool fixes (an output looked up with its spends) is
+	/// read again.
+	#[test]
+	fn a_change_of_the_mempool_keeps_what_the_tip_fixes() {
+		let (url, counts) = busy_mempool();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let asked = |m: &str| counts.lock().unwrap().get(m).copied().unwrap_or(0);
+		let hash = BlockHash::from_str(&"22".repeat(32)).unwrap();
+		let op = OutPoint::new(Txid::from_str(&"33".repeat(32)).unwrap(), 0);
+		for _ in 0..3 {
+			chain.new_command();
+			let h: Value = chain.call("getblockheader", &[json!(hash.to_string()), json!(true)]).unwrap();
+			assert_eq!(h["height"], 1);
+			assert!(chain.unspent(&op).unwrap());
+		}
+		assert!(asked("getrawmempool") >= 3, "a look in each command, the mempool another each time");
+		assert_eq!(asked("getblockheader"), 1, "the header is read once: the tip did not move");
+		assert_eq!(asked("gettxout"), 3, "the output with the mempool's spends is read again in each view");
 	}
 
 	/// What a receiver asks of the chain for a coin's lineage, on a regtest

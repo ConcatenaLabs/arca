@@ -149,7 +149,8 @@ node) and the re-check of every coin against the chain (unless the command is
 `recheck`, `sync` or `schedule`), as `arca` runs them on every start, and what
 each cost (`cost.start` and `cost.command`, each `{ms, node, operator}`: the
 milliseconds and the requests made of the node and of the operator; the
-re-check's own parts are under `start.recheck.ms`).
+re-check's own parts are under `start.recheck.ms`, and a `sync` answers what
+each of its steps cost under `cost_by_step`).
 
 An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the

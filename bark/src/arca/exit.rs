@@ -1469,11 +1469,15 @@ impl Wallet {
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
 	fn sync_asking(&mut self, recheck: Value) -> Result<Value, Error> {
+		// What each step cost (milliseconds, and requests of the node and of
+		// the operator): `cost_by_step`, for a program that logs a slow sync.
+		let mut steps = Steps::start(self);
 		// The witness first, patiently: after a rollback of the operator's
 		// signer's record the wallet does only what it does on the chain, and
 		// while no witness succeeds it takes no coin and signs no spend
 		// through the operator: it does only what it does on the chain.
 		let (witness, info_failed, tries) = self.reach_operator();
+		steps.lap(self, "witness");
 		self.exits_meanwhile();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
@@ -1486,13 +1490,16 @@ impl Wallet {
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});
 		let boards = if talk { self.retry_boards()? } else { vec![] };
+		steps.lap(self, "boards");
 		self.exits_meanwhile();
 		let transfers = if talk { self.retry_transfers()? } else { vec![] };
+		steps.lap(self, "transfers");
 		self.exits_meanwhile();
 		// Payments over Lightning the operator has not decided: a paid one
 		// closed with its preimage, a failed one taken back.
 		let mut lightning = if talk { self.progress_lightning().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		steps.lap(self, "lightning");
 		self.exits_meanwhile();
 		// Payments received over Lightning: a held one's participation taken
 		// up as the wallet's own, a leaf the wallet holds claimed.
@@ -1504,38 +1511,46 @@ impl Wallet {
 		}
 		self.exits_meanwhile();
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
+		steps.lap(self, "mailbox");
 		self.exits_meanwhile();
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
 		let bound = if talk { self.bind_unbound().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
+		steps.lap(self, "bound");
 		self.exits_meanwhile();
 		// Every coin a sweep took from the wallet, owed by the operator:
 		// claimed, its repayment taken up as a participation of the wallet's.
 		let owed = if talk { self.progress_owed().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		steps.lap(self, "owed");
 		self.exits_meanwhile();
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
+		steps.lap(self, "participations");
 		self.exits_meanwhile();
 		// Offline-refresh plans: each step whose round is final taken up, a
 		// stopped plan cancelled.
 		let plans = if talk { self.progress_plans().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		steps.lap(self, "plans");
 		self.exits_meanwhile();
 		// Each order placed on the chain: its offboard recorded once released,
 		// and unlocked by the wallet when the operator has not.
 		let orders = self.progress_orders().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "orders");
 		self.exits_meanwhile();
 		// Each offboard: its output recorded once released, and unlocked by
 		// the wallet when the operator has not.
 		let offboards = self.progress_offboards().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "offboards");
 		self.exits_meanwhile();
 		// Each order resting in the tree: published once its round is final
 		// and its participation released; each fill the wallet sent and has
 		// no answer to sent again.
 		let resting = if talk { self.progress_resting().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		steps.lap(self, "resting");
 		self.exits_meanwhile();
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
@@ -1550,8 +1565,10 @@ impl Wallet {
 		let refresh = if talk && info_failed.is_none() {
 			self.refresh_due().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Array(vec![]) };
+		steps.lap(self, "refresh");
 		self.exits_meanwhile();
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "forfeits");
 		// D57: a coin the wallet cannot have refreshed goes home before its
 		// date, whatever the reason: every coin whose refresh has not
 		// completed a day before its exit date, and after a stop every coin
@@ -1591,6 +1608,8 @@ impl Wallet {
 		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
+		steps.lap(self, "home and schedule");
+		out["cost_by_step"] = steps.done();
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
 		}
@@ -1656,5 +1675,32 @@ mod test {
 		assert_eq!(bid_share_ppm(1_000, 2_000, 2_000), 1_000_000, "the whole value at the timeout");
 		assert_eq!(bid_share_ppm(1_000, 2_000, 9_000), 1_000_000, "and after it");
 		assert_eq!(bid_share_ppm(2_000, 1_000, 900), 0, "an opening after the timeout bids nothing before the timeout");
+	}
+}
+
+/// The cost of each step of a command, as [`super::command::run`] counts a
+/// command's: milliseconds, and requests of the node and of the operator.
+struct Steps {
+	at: web_time::Instant,
+	node: u64,
+	operator: u64,
+	out: serde_json::Map<String, Value>,
+}
+
+impl Steps {
+	fn start(w: &Wallet) -> Steps {
+		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), out: serde_json::Map::new() }
+	}
+
+	/// The step `name` ends here.
+	fn lap(&mut self, w: &Wallet, name: &str) {
+		let (node, operator) = (w.chain.calls().0, super::chain::gaps());
+		self.out.insert(name.to_string(), json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node,
+			"operator": operator - self.operator}));
+		*self = Steps { at: web_time::Instant::now(), node, operator, out: std::mem::take(&mut self.out) };
+	}
+
+	fn done(self) -> Value {
+		Value::Object(self.out)
 	}
 }
