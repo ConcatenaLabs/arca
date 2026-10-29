@@ -1509,6 +1509,11 @@ impl Wallet {
 		// it, so that a restore from the mnemonic finds it.
 		let bound = if talk { self.bind_unbound().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
 		self.exits_meanwhile();
+		// Every coin a sweep took from the wallet, owed by the operator:
+		// claimed, its repayment taken up as a participation of the wallet's.
+		let owed = if talk { self.progress_owed().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
+		self.exits_meanwhile();
 		let participations = if talk {
 			self.progress_participations().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if gone { Value::Array(vec![]) } else { waiting() };
@@ -1594,6 +1599,9 @@ impl Wallet {
 		}
 		if offboards.as_array().is_none_or(|o| !o.is_empty()) {
 			out["offboards"] = offboards;
+		}
+		if owed.as_array().is_none_or(|o| !o.is_empty()) {
+			out["owed"] = owed;
 		}
 		if orders.as_array().is_none_or(|o| !o.is_empty()) {
 			out["orders"] = orders;

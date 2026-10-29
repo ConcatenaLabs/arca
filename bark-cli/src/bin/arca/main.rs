@@ -425,6 +425,10 @@ enum Cmd {
 	/// state and leaf, until when it covers the coin at the earliest, and the
 	/// date the wallet must sync by.
 	Plans,
+	/// What the operator owes this wallet for coins its sweeps took after
+	/// their expiry: each coin, its value, the late-refresh fee, what is owed
+	/// and how it stands. `sync` claims each and takes the new coin home.
+	Owed,
 	/// Cancels the steps of an offline-refresh plan that have not started.
 	PlanCancel {
 		plan: String,
@@ -1501,6 +1505,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.plan(&coins, expiries, max_fee_ppm)
 		},
 		Cmd::Plans => w.plans(),
+		Cmd::Owed => w.owed(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
 		Cmd::Care { scan, expiries, max_fee_ppm, plan_within, channels } => {

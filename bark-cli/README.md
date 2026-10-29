@@ -478,7 +478,8 @@ and a board whose registration never reached the server, are not recovered.
   exit date, and past its expiry, the wallet goes on bringing a coin home
   until the chain says it is gone: a batch is swept only once its token has
   waited its notice, and a coin whose batch was swept, once the sweep is
-  final, is shown as lost, with the sweep. A payment the wallet waits for
+  final, is shown as lost, with the sweep, and claimed back from the
+  operator (see Swept coins). A payment the wallet waits for
   is read only by `sync` too, and its sender may have paid with a coin days
   from its exit date. So run `sync` at least once a day while the wallet
   holds a coin off the chain or waits for a payment, whatever `next_sync_at`
@@ -1154,6 +1155,26 @@ as any.
     arca claims                                         # on a holder's wallet
     arca claim                                          # taken up
 
+### Swept coins
+
+A coin the wallet neither refreshed nor took home before its batch was swept
+is owed back by the operator, less the late-refresh fee (the asset's refresh
+fee at its full charge), as the operator publishes (`info`'s `swept`; the
+server's [Swept coins are repaid](../server/README.md#swept-coins-are-repaid)).
+`sync` asks the operator what it owes the wallet's mailbox key and claims
+each coin by itself: signed by the swept coin's key, for one new coin of
+exactly what is owed, which the operator makes in the asset's next round and
+`sync` completes as it completes a refresh. The swept coin is shown `lost`,
+its note saying it is being repaid; until the new coin is held, `balance`
+counts what is owed as `returning`. `owed` lists each such coin.
+
+The new coin's key follows from the mnemonic and the swept coin, so a wallet
+restored from its mnemonic finds both what is owed and a claim made before
+it was restored, and completes it. While a rollback holds the sweep out of
+finality the claim waits (`withdrawn`), the coin back in its batch. A
+repayment the operator voids (the wallet not back within a day of its round
+being final) is claimed again at the next sync, under a new key.
+
 ### Refreshing while the wallet stays closed: plans
 
 A wallet that will be closed past a coin's expiry pre-signs an offline-refresh
@@ -1232,8 +1253,9 @@ taken from the coin, in the coin's own asset; a coin the operator will not
 plan stays unplanned, with its reason, and `sync` refreshes it while the
 wallet is open. At the default reach a younger coin is left unplanned so that it stays free
 to pay out of round. That leaves a gap: a wallet closed within a coin's first
-two weeks or so and kept closed through that coin's step window can lose the
-coin to the operator's sweep, as any holder who stays away past an expiry can.
+two weeks or so and kept closed through that coin's step window can find the
+coin swept, as any holder who stays away past an expiry can, and claims it
+back, less the late-refresh fee, at its next sync (see Swept coins).
 Planning every leaf of a round closes it, at the price that a payment the
 unplanned coins cannot cover waits for one round (`plan-release`).
 
@@ -1256,8 +1278,9 @@ and the refusal then names the next coin). The new leaf costs the refresh fee th
 asset's schedule asks then (none in the coin's free window), and `care` leaves
 it unplanned for a day. The operator takes a coin a step made into a round once
 the batch of the coin that step gave up is swept and the sweep final. The operator applies a plan, as it refreshes any coin: one that
-applies no step, or sweeps a coin whose holder is away, takes that coin as it
-can take any coin whose holder stays away past its expiry. A stopped operator,
+applies no step, or sweeps a coin whose holder is away, owes that coin back as it
+owes any coin it sweeps (see Swept coins), and only an operator that turns
+against its holders keeps it. A stopped operator,
 a step's round replaced, or an operator that co-signs nothing leave the coin
 the wallet knows its own, and the wallet takes it home.
 
@@ -1504,7 +1527,7 @@ registry for both commands.
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`) |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `openamp-key` | The wallet's OpenAMP account key (`m/5/0`, as every wallet on the kit derives it): the key an OpenAMP account and a SeqPal ID are, which a payer may name to pay the wallet a claim |
-| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
+| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total; what the operator owes for a coin its sweep took, until the coin that repays it is held, as `returning`, counted in the row and the total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
 | `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
@@ -1523,7 +1546,7 @@ registry for both commands.
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset: each asset's coins are refreshed in that asset's next round. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
-| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window (but the current coin of an open offline-refresh plan, which its step refreshes), takes up each step of a plan whose round is final, holds again the coin a step gave up whose round can never return, and cancels a plan the operator stopped while its coin can be refreshed or once it is home (`plans`), follows on the chain every forfeit whose preimage it does not hold, follows
+| `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), claims back every coin the operator's sweep took and takes up a claim made before a restore (`owed`; see Swept coins), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset; one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again), asks for the refresh of every live coin in its free window (but the current coin of an open offline-refresh plan, which its step refreshes), takes up each step of a plan whose round is final, holds again the coin a step gave up whose round can never return, and cancels a plan the operator stopped while its coin can be refreshed or once it is home (`plans`), follows on the chain every forfeit whose preimage it does not hold, follows
 every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
@@ -1554,6 +1577,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `claims [--scan N]` | The claims paid to the wallet, found by asking the operator under its OpenAMP account key and each address key: each claim's distribution, the key it was named under and what that key is (`named_as`: `address`, with the `address`, or `openamp`), value, state, deadline, and the coin the wallet holds of it |
 | `claim [CLAIM]… [--scan N]` | Takes up the open claims named (`DISTRIBUTION:INDEX` or a leaf id), or every one: each checked, its authorisations handed over, kept as a coin, and paid out of round to a fresh leaf of the wallet's own; a claim not open says its state |
 | `plan [LEAF]… [--expiries N] [--quote] [--max-fee-ppm N]` | Pre-signs an offline-refresh plan for each coin named (every live coin of a round that no plan names when none is), one step per expiry the wallet will be away for (1 to 6, 2 by default), quoted by the operator, signed and handed over: each step's leaf under a key from the mnemonic, the refund halves that pay the wallet the step's value at a fresh address of its own, the attestation, the key proofs and their bindings to the mailbox key. A step that costs anything is refused before anything is signed unless `--max-fee-ppm` raises the bound for this command. Each plan answers `covered_until` and `sync_by`; one the operator refused answers its `error`. `--quote` answers what each plan would cost and those dates, signing and keeping nothing (see Refreshing while the wallet stays closed) |
+| `owed` | What the operator owes the wallet for coins its sweeps took (see Swept coins): each coin, its value, the late-refresh fee, what is owed, the sweep, its state (`owed`, `claimed`, `repaid`, `withdrawn`) and its repayment participation |
 | `plans` | Every plan the wallet made or restored: its coin, its state, each step's value, fee, state and leaf once taken up, `covered_until` and `sync_by`, and the operator's reason for a plan it stopped |
 | `plan-cancel PLAN` | Cancels the steps of plan `PLAN` that have not started, signed with the mailbox key; refused while a step is running. Every coin the plan named stays out of out-of-round payments until it is refreshed in a round |
 | `plan-release COIN… [--max-fee-ppm N]` | Gives up each named coin, the current coin of an open or stopped plan, in the next round for a leaf of the wallet's own that no plan names; the plan ends once the round is final and the forfeit handed over, and stands should the round never complete. The new leaf is paid out of round like any coin |
@@ -1714,6 +1738,15 @@ resting` shows both fills. It cancels what rests, as quoted, and a fill after
 is refused.
 A second maker's order is brought on with `arca exit`, lands after the exit
 delay as SeqDEX's order, and a taker on the chain fills it with no signature.
+
+`tests/arca_owed.rs` runs a swept coin with the `arca` binary: A boards X
+under an operator charging a refresh fee of 5,000 parts per million,
+refreshes it into a round leaf and is lost; the batch is swept with A's coin
+in it, and the server owes A the coin less that fee. A wallet restored from
+A's mnemonic claims it at its first sync and counts it as `returning`; that
+wallet is lost too, a third restored from the mnemonic takes the claim up as
+its own, and once the repayment's round is final its sync holds a new coin of
+exactly the coin's value less the fee, nothing returning any more.
 
 `tests/arca_claims.rs` runs the same way: a payer boards its X and pays 20
 holders in one round with `arca distribute` (the wallet first paying itself a

@@ -36,8 +36,9 @@
 //! batch expires no sooner than the acceptance horizon after its round. The
 //! wallet must sync before the last coin's refresh window, which is when
 //! `next_sync_at` names for it. The operator applies the plan: one that applies
-//! no step, applies one early, or sweeps a coin whose holder is away, takes
-//! that coin, as it can take any coin whose holder stays away past its expiry.
+//! no step, or applies one early, and sweeps the coin owes it back, less the
+//! late-refresh fee, as it owes any coin it sweeps ([`super::owed`]); only an
+//! operator that turns against its holders keeps it.
 //! What the wallet hands over gives it nothing more.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -129,8 +130,9 @@ pub fn covered_until(expiry: u32, steps: usize) -> u32 {
 /// free to spend out of round (a coin a plan names is not), and is planned at
 /// the first `care` once it comes this near. The gap this leaves, in plain
 /// words: a wallet closed within a coin's first two weeks or so and kept
-/// closed through that coin's step window can lose the coin to the
-/// operator's sweep, as any holder who stays away past an expiry can.
+/// closed through that coin's step window can find the coin swept, as any
+/// holder who stays away past an expiry can, and claims it back, less the
+/// late-refresh fee, at its next sync ([`super::owed`]).
 pub const PLAN_WITHIN: u32 = 10 * 86_400;
 
 /// The planning reach that plans every leaf of a round at the first `care`
@@ -985,8 +987,8 @@ fn s_next_done(body: &Value, j: usize) -> bool {
 
 /// What the wallet says of every plan.
 pub const PLAN_NOTE: &str = "a plan lets the operator refresh a coin while the wallet stays closed, until covered_until at the earliest; \
-	the wallet must sync by sync_by. The operator applies it: one that applies no step, applies one early, or sweeps a coin whose holder \
-	is away takes that coin, as it can take any coin whose holder stays away past its expiry. What the wallet hands over gives it nothing \
+	the wallet must sync by sync_by. The operator applies it: one that applies no step, or applies one early, and sweeps the coin owes it \
+	back, less the late-refresh fee, as it owes any coin it sweeps; only an operator that turns against its holders keeps it. What the wallet hands over gives it nothing \
 	more: every pre-signed refund pays the wallet the step's value. A coin a plan names is paid out of round only once given up in a \
 	round for a leaf no plan names (plan_release), which ends its plan.";
 

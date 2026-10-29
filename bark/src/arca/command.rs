@@ -37,7 +37,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
-	plan {leaves?, expiries?, max_fee_ppm?}, plans, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
+	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
@@ -395,6 +395,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			if command == "plan" { w.plan(&leaves, steps, bound) } else { w.plan_quote(&leaves, steps, bound) }
 		},
 		"plans" => w.plans(),
+		"owed" => w.owed(),
 		"care" => {
 			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
 			// Channels first: a coin a plan names is not put into a channel.
