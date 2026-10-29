@@ -491,6 +491,13 @@ impl Rounds {
 	/// The rounds broadcast and not yet final, oldest first, each with where
 	/// the finality service has it: what an operator reads to see whether
 	/// finality keeps up.
+	/// What the operator's wallet holds of each asset, final or not: every unspent coin in a
+	/// block of the active chain. A round's change is held from the block it is in; `fundable`
+	/// counts it only once it is final.
+	pub async fn holdings(&self) -> Result<BTreeMap<AssetId, u64>, RoundError> {
+		self.wallet.holdings().await.map_err(|e| RoundError::Chain(e.to_string()))
+	}
+
 	pub async fn waiting(&self) -> Result<Vec<(Txid, crate::chain::Finality)>, RoundError> {
 		let mut out = vec![];
 		for r in self.store.rounds_in(RoundState::Broadcast).await? {
