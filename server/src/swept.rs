@@ -86,35 +86,59 @@ impl Watcher {
 			if !self.store.sightings_of(&row.script_pubkey).await?.is_empty() {
 				continue;
 			}
-			let c = coins::resolve(&self.store, &policy, &LeafId(leaf)).await.map_err(|e| WatcherError::Build(format!("coin {}: {}", LeafId(leaf), e)))?;
-			if c.coin.leaf.htlc.is_some() {
-				log::info!("watcher: the sweep {} took htlc-1 leaf {}, which its payment's own paths settle: nothing is owed for it",
-					Txid::from_byte_array(*sweep), LeafId(leaf));
-				continue;
-			}
-			let value = match crate::channels::owner_share(&self.store, &LeafId(leaf), &c.coin.leaf).await? {
-				Some((share, _)) => share,
-				None => c.coin.value,
+			// The coin as its record resolves; a record that does not resolve
+			// (the round's bounds have changed since, say) is read from its
+			// row, so one coin never keeps a sweep from being counted.
+			let (owner, asset, value, owner_nonce) = match coins::resolve(&self.store, &policy, &LeafId(leaf)).await {
+				Ok(c) => {
+					if c.coin.leaf.htlc.is_some() {
+						log::info!("watcher: the sweep {} took htlc-1 leaf {}, which its payment's own paths settle: nothing is owed for it",
+							Txid::from_byte_array(*sweep), LeafId(leaf));
+						continue;
+					}
+					let value = match crate::channels::owner_share(&self.store, &LeafId(leaf), &c.coin.leaf).await? {
+						Some((share, _)) => share,
+						None => c.coin.value,
+					};
+					let Some(nonce) = owner_nonce_of(&c.record) else { continue };
+					(c.coin.leaf.owner.serialize(), c.coin.asset, value, nonce)
+				},
+				Err(coins::CoinError::Store(e)) => return Err(e.into()),
+				Err(e) => {
+					let Ok(record) = CoinRecord::from_bytes(&row.record) else {
+						log::warn!("watcher: the sweep {} took coin {}, whose record cannot be read ({}): nothing is recorded for it",
+							Txid::from_byte_array(*sweep), LeafId(leaf), e);
+						continue;
+					};
+					if htlc_of(&record) || channel_of(&record) {
+						log::warn!("watcher: the sweep {} took coin {}, whose record does not resolve ({}), an htlc-1 or channel-1 leaf: \
+							nothing is recorded for it", Txid::from_byte_array(*sweep), LeafId(leaf), e);
+						continue;
+					}
+					let Some(nonce) = owner_nonce_of(&record) else { continue };
+					log::warn!("watcher: the sweep {} took coin {}, whose record does not resolve ({}): owed as its row holds it",
+						Txid::from_byte_array(*sweep), LeafId(leaf), e);
+					(row.owner_key, AssetId::from_byte_array(row.asset), row.value, nonce)
+				},
 			};
 			if value == 0 {
 				continue;
 			}
-			let Some(owner_nonce) = owner_nonce_of(&c.record) else { continue };
-			let schedule = match fees.get(&c.coin.asset) {
+			let schedule = match fees.get(&asset) {
 				Some(s) => s.clone(),
 				None => {
 					// Priced at the asset's rate now; with no rate yet the sweep
 					// is counted at a later pass, whole.
-					let s = self.params.fees(&c.coin.asset).map_err(WatcherError::Build)?;
-					fees.insert(c.coin.asset, s.clone());
+					let s = self.params.fees(&asset).map_err(WatcherError::Build)?;
+					fees.insert(asset, s.clone());
 					s
 				},
 			};
 			entries.push(NewOwed {
 				leaf_id: leaf,
-				owner_key: c.coin.leaf.owner.serialize(),
+				owner_key: owner,
 				owner_nonce,
-				asset: c.coin.asset.into_inner().to_byte_array(),
+				asset: asset.into_inner().to_byte_array(),
 				value,
 				fee: crate::owed::late_fee(&schedule, value),
 			});
@@ -130,6 +154,22 @@ impl Watcher {
 		}
 		Ok(())
 	}
+}
+
+/// Whether a coin's own leaf is an `htlc-1` leaf, as its record names it.
+fn htlc_of(record: &CoinRecord) -> bool {
+	match record {
+		CoinRecord::Leaf { record, .. } => record.htlc.is_some(),
+		CoinRecord::Accumulator { record, .. } => record.htlc.is_some(),
+		CoinRecord::Transfer(t) => t.leaf.htlc.is_some(),
+		CoinRecord::Fill(_) | CoinRecord::Board(_) => false,
+	}
+}
+
+/// Whether a coin is a `channel-1` leaf, whose owner's side only its
+/// resolved policy gives.
+fn channel_of(record: &CoinRecord) -> bool {
+	matches!(record, CoinRecord::Leaf { record, .. } if record.channel.is_some())
 }
 
 /// The nonce a coin's owner key comes from, as its record names it.
