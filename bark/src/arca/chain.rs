@@ -773,6 +773,14 @@ impl ChainSource {
 		}
 	}
 
+	/// The node's anchor status in a word (whether it validates anchors and
+	/// how it finds them): a block's finality counts on it, so a change of it
+	/// is a change of what the wallet read as final.
+	pub fn anchor_word(&self) -> Result<String, Error> {
+		let v: Value = self.call("getanchorstatus", &[]).map_err(node)?;
+		Ok(format!("{} {}", v["validateanchor"], v["anchorstatus"]))
+	}
+
 	/// Whether the node validates its anchors against the parent chain.
 	pub fn validates_anchors(&self) -> Result<bool, Error> {
 		let v: Value = self.call("getanchorstatus", &[]).map_err(node)?;

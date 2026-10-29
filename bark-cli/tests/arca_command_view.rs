@@ -196,6 +196,59 @@ async fn an_open_wallet_answers_from_the_view_and_sees_every_change_before_it_si
 	let (fresh, _) = afresh(&a, "balance", json!({}));
 	assert_eq!(fresh.unwrap(), bal1, "as a wallet opened afresh counts it");
 
+	// --- A spend of a coin's root in a block between two commands ---
+	// B boards again and pays A from that board, then converts the board
+	// with its own key, and the conversion is in a block before A's next
+	// command: the wallet never sees it in the mempool. The new tip's re-check
+	// finds the board spent and takes the coin on the chain at once.
+	let mnemonic = std::fs::read_to_string(b.dir.join("mnemonic")).unwrap();
+	let b_keys = bark::arca::keys::Keys::new(mnemonic.trim(), 0, 1).unwrap();
+	r.pay_to(script(&b.ok(&["address"])), x, 13_000_000);
+	r.produce().await;
+	let b_board2 = b.ok(&["board", &xs, "10000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("B's second board to be credited", || b.ok(&["boards"]).as_array().unwrap().iter().all(|x| x["server"]["state"] == "credited")).await;
+	b.ok(&["sync"]);
+	let (rq2, _) = library(&mut w, "receive", json!({"asset": xs, "amount": "5000000"}));
+	let rq2 = rq2.unwrap()["request"].as_str().unwrap().to_string();
+	b.ok(&["send", &rq2, "--amount", "5000000", "--asset", &xs]);
+	let (s2, _) = library(&mut w, "sync", json!({}));
+	let got2 = s2.unwrap()["mailbox"]["accepted"].as_array().cloned().unwrap_or_default();
+	assert_eq!(got2.len(), 1, "A takes B's second payment");
+	let coin2 = got2[0]["leaf_id"].as_str().unwrap().to_string();
+	let CoinRecord::Board(rec2) = record_of(&b, &b_board2) else { panic!("a board") };
+	let leaf_key2 = b_keys.leaf(&rec2.owner_nonce).unwrap();
+	let found2 = rpc(&r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(rec2.output().txout().script_pubkey.as_bytes()))])]);
+	let u2 = &found2["unspents"][0];
+	let board2_at = OutPoint::new(u2["txid"].as_str().unwrap().parse().unwrap(), u2["vout"].as_u64().unwrap() as u32);
+	let fee_key2 = common::running::keypair("sender fee coin 2");
+	let fee_script2 = bark::arca::keys::p2wpkh(&fee_key2);
+	let paid2 = r.pay_to(fee_script2.clone(), x, 100_000);
+	r.produce().await;
+	let (c, _) = library(&mut w, "coins", json!({}));
+	assert_eq!(state_of(&c.unwrap(), &coin2), "live", "the second coin, before B goes back on it");
+	let j2 = paid2.output.iter().position(|o| o.script_pubkey == fee_script2).unwrap();
+	let fee_coin2 = (OutPoint::new(paid2.txid(), j2 as u32), paid2.output[j2].clone());
+	let genesis2 = r.rt.client().genesis_hash().unwrap();
+	let ks2 = rec2.policy().conversion(board2_at, &FeeSource::Coin { outpoint: fee_coin2.0, coin: fee_coin2.1.clone(), fee: 2_000,
+		change: fee_script2.clone() }).unwrap();
+	let sig2 = arca_covenant::sign::sign_digest(&leaf_key2, &ks2.sighash(genesis2).unwrap(), &[0; 32]);
+	let mut conv2 = ks2.finish(vec![sig2.as_ref().to_vec()]).tx;
+	let fi2 = conv2.input.iter().position(|i| i.previous_output == fee_coin2.0).unwrap();
+	sign_p2wpkh(&mut conv2, fi2, &fee_coin2.1, &fee_key2);
+	// The operator stopped, so that its watcher does not answer first.
+	r.server.stop();
+	let conv2_id = r.rt.client().send_raw_transaction(&conv2).expect("the conversion relays");
+	r.produce().await;
+	assert!(rpc(&r, "getrawtransaction", &[json!(conv2_id.to_string()), json!(true)])["blockhash"].is_string(), "the conversion is in a block");
+	let (c, n) = library(&mut w, "coins", json!({}));
+	let c = c.unwrap();
+	println!("coins after B's conversion {} was mined ({} node calls): the coin {}", conv2_id, n, state_of(&c, &coin2));
+	assert_eq!(state_of(&c, &coin2), "exiting", "the new tip's re-check finds the board spent and takes the coin on the chain: {}", c);
+	r.restart_server().await;
+
 	// --- A spend of the coin's lineage in the mempool between two commands ---
 	// B converts the board it paid from with its own key: the transaction
 	// sits in the mempool; the chain's tip has not moved.
