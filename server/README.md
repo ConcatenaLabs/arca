@@ -227,8 +227,11 @@ behind the node, is logged at info.
 height it has followed to and the node's, how long its last pass took and how
 long ago it ended, passes failing in a row, whether the node reports its tip's
 anchor as ok, the Bitcoin height the tip's anchor commits to and how long it
-has stood there, and the rounds broadcast and not yet final, each with its
-block and its anchor's burial. `waiting_on` names the first thing finality
+has stood there, the rounds broadcast and not yet final, each with its
+block and its anchor's burial, and what the wallet holds of each asset, final or
+not (`holdings`): a round takes the wallet's largest coin first, and until its
+change is final `fundable` leaves it out, so right after a deposit `fundable` can
+read almost nothing while the pool is whole. `waiting_on` names the first thing finality
 waits on: `follower` (the service trails the node or its passes fail),
 `anchor_status`, `certificates`, `anchor` (every waiting round is certified and
 waits for Bitcoin blocks to bury its anchor) or `nothing`. While the parent

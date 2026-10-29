@@ -79,6 +79,11 @@ pub struct ChainProgress {
 	/// certified and waits for Bitcoin blocks to bury its anchor), or
 	/// `nothing`.
 	pub waiting_on: String,
+	/// What the operator's wallet holds of each asset it serves (atoms), final or not: its
+	/// pool including the change of rounds not yet final, which `fundable` (in `/v1/info`)
+	/// leaves out until they are. A round takes the wallet's largest coin first, so right after
+	/// a deposit `fundable` can fall to almost nothing while the pool is whole.
+	pub holdings: std::collections::BTreeMap<String, String>,
 	/// The rounds broadcast and not yet final, oldest first (at most 20).
 	pub rounds_waiting: Vec<RoundWaiting>,
 	/// How many rounds are broadcast and not yet final.

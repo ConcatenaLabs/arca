@@ -671,6 +671,7 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 		anchor_ok: p.anchor_ok, mempool_behind: p.mempool_behind, failing_passes: p.failing_passes,
 		anchor_height: p.anchor_height, anchor_unchanged_seconds: if p.anchor_since > 0 { now.saturating_sub(p.anchor_since) } else { 0 },
 		waiting_on: waiting_on.into(),
+		holdings: app.rounds.holdings().await.map(|h| h.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect()).unwrap_or_default(),
 		rounds_waiting_count: waiting.len() as u64,
 		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
 			let (height, depth) = match f {
