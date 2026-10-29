@@ -1899,9 +1899,14 @@ impl Wallet {
 	pub(crate) fn follow_standing_rounds(&mut self) -> Result<Vec<Value>, Error> {
 		let mut changes = vec![];
 		let coins = self.store.coins()?;
-		let opens = |c: &super::store::CoinRow, round: &str, h: &str| -> bool {
-			c.kind == "batch" && c.bases.iter().any(|b| b == round)
-				&& Self::record_of(c).ok().and_then(|r| NewRecord::of_coin(&r)).is_some_and(|(record, _, _)| hex(&record.unlock_hash()) == h)
+		// Each batch coin's unlock hash, read from its record once: a
+		// participation's rounds are matched against every coin, and a wallet
+		// that rests many orders holds hundreds of both.
+		let unlocks: Vec<Option<String>> = coins.iter().map(|c| (c.kind == "batch").then(|| Self::record_of(c).ok()
+			.and_then(|r| NewRecord::of_coin(&r)).map(|(record, _, _)| hex(&record.unlock_hash()))).flatten()).collect();
+		let opens = |i: usize, round: &str, h: &str| -> bool {
+			let c = &coins[i];
+			c.kind == "batch" && c.bases.iter().any(|b| b == round) && unlocks[i].as_deref() == Some(h)
 		};
 		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
 			if matches!(state.as_str(), "submitting" | "withdrawn" | "refused") {
@@ -1919,7 +1924,7 @@ impl Wallet {
 					}
 				}
 			}
-			let held_of = |k: &str| -> Vec<&super::store::CoinRow> { coins.iter().filter(|c| opens(c, k, &rounds[k])).collect() };
+			let held_of = |k: &str| -> Vec<&super::store::CoinRow> { (0..coins.len()).filter(|i| opens(*i, k, &rounds[k])).map(|i| &coins[i]).collect() };
 			// One round, released in it, its leaves not lost: nothing to follow.
 			if rounds.len() == 1 && state == "released" && pround.as_deref().is_some_and(|r| rounds.contains_key(r))
 				&& held_of(pround.as_deref().unwrap_or("")).iter().all(|c| c.state != "lost")
@@ -2010,7 +2015,7 @@ impl Wallet {
 				changes.push(json!({"leaf_id": c.leaf_id, "from": "lost", "to": to, "why": why}));
 			}
 			for (j, h) in rounds.iter().filter(|(j, _)| *j != k) {
-				for c in coins.iter().filter(|c| opens(c, j, h) && matches!(c.state.as_str(), "live" | "pending")) {
+				for c in (0..coins.len()).filter(|i| opens(*i, j, h)).map(|i| &coins[i]).filter(|c| matches!(c.state.as_str(), "live" | "pending")) {
 					let why = format!("round {} is out of the chain: round {} of the same participation stands, and the wallet holds its \
 						leaves in their place", j, k);
 					self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
