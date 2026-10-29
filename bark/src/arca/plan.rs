@@ -659,11 +659,25 @@ impl Wallet {
 	/// cancelled, its coin the wallet's to refresh or take home.
 	pub(crate) fn progress_plans(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		for (id, _, body, state, _) in self.plan_rows()? {
-			if state == "cancelled" || (state == "done" && Self::all_taken(&body)) {
-				continue;
-			}
-			let st = match self.server.post("plan_status", &json!({"plan_id": id})) {
+		let rows: Vec<_> = self.plan_rows()?.into_iter()
+			.filter(|(_, _, body, state, _)| !(state == "cancelled" || (state == "done" && Self::all_taken(body)))).collect();
+		// Every plan the wallet made is bound to its mailbox key, and the
+		// operator serves them all to that key in one read: a wallet that
+		// plans every coin asks once, not once a plan. A plan the read leaves
+		// out, or a read that fails, is asked on its own.
+		let listed: HashMap<String, Value> = if rows.len() > 2 {
+			let read = || -> Result<Value, Error> {
+				let mailbox = self.keys.mailbox()?;
+				let auth = self.server.auth("plans", &mailbox, &self.genesis, &[])?;
+				self.server.post("plans", &json!({"auth": auth}))
+			};
+			read().map(|v| v["plans"].as_array().cloned().unwrap_or_default().into_iter()
+				.filter_map(|p| p["plan_id"].as_str().map(|id| (id.to_string(), p.clone()))).collect()).unwrap_or_default()
+		} else {
+			HashMap::new()
+		};
+		for (id, _, body, state, _) in rows {
+			let st = match listed.get(&id).cloned().map(Ok).unwrap_or_else(|| self.server.post("plan_status", &json!({"plan_id": id}))) {
 				Ok(s) => s,
 				Err(e) => {
 					out.push(json!({"plan_id": id, "error": e.to_string()}));

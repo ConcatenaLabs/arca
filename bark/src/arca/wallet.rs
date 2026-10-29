@@ -162,6 +162,9 @@ pub struct Wallet {
 	/// The base transactions the wallet stored for its coins, each read
 	/// from the store once, and the output each pays ([`Wallet::known_base`]).
 	pub(crate) base_index: std::cell::RefCell<BaseIndex>,
+	/// Each coin's roots, by leaf id, with the bases they were read from
+	/// ([`Wallet::roots_of_row`]).
+	pub(crate) roots_cache: std::cell::RefCell<std::collections::HashMap<String, (Vec<String>, Vec<OutPoint>)>>,
 	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
 	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
@@ -783,7 +786,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
-			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default() })
+			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default() })
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -1440,8 +1443,9 @@ impl Wallet {
 	/// entry it was never given; `why` is noted on each.
 	fn exit_after(&mut self, at: u64, why: &str) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
+		let given_up = self.given_up_set()?;
 		for c in self.store.coins()? {
-			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) || self.given_up_for_held_leaves(&c)? {
+			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
 			let entry = self.store.coin_entry(&c.leaf_id)?;
@@ -1471,11 +1475,21 @@ impl Wallet {
 	/// cost. One given up for a leaf whose round is out of the chain is not
 	/// refreshed: `sync` takes it home by its date.
 	pub(crate) fn given_up_for_held_leaves(&self, c: &CoinRow) -> Result<bool, Error> {
-		if c.state != "forfeited" {
-			return Ok(false);
-		}
-		for (pid, _, given, wanted, state, _, _) in self.store.participations()? {
-			if state != "released" || !given.contains(&format!("\"{}\"", c.leaf_id)) {
+		Ok(c.state == "forfeited" && self.given_up_set()?.contains(&c.leaf_id))
+	}
+
+	/// Every coin given up in a released participation whose new leaves the
+	/// wallet all holds ([`Self::given_up_for_held_leaves`]), read once: a
+	/// wallet that rests many orders has as many participations as coins, and
+	/// asking per coin read every participation for each.
+	pub(crate) fn given_up_set(&self) -> Result<std::collections::HashSet<String>, Error> {
+		let mut out = std::collections::HashSet::new();
+		for (_, _, given, wanted, state, _, _) in self.store.participations()? {
+			if state != "released" {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			if given.is_empty() {
 				continue;
 			}
 			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
@@ -1492,13 +1506,15 @@ impl Wallet {
 				// (`pending`), is not held: the coin given up for it is not
 				// refreshed until it is.
 				held &= row.is_some_and(|r| !matches!(r.state.as_str(), "lost" | "spent" | "pending"));
+				if !held {
+					break;
+				}
 			}
 			if held {
-				let _ = pid;
-				return Ok(true);
+				out.extend(given);
 			}
 		}
-		Ok(false)
+		Ok(out)
 	}
 
 	/// D57: the coins `sync` takes on the chain because it cannot have them
@@ -1546,8 +1562,9 @@ impl Wallet {
 		let claims = self.receive_home_dates()?;
 		let mut coins = self.store.coins()?;
 		coins.sort_by_key(|c| !claims.get(&c.leaf_id).is_some_and(|h| now >= *h as u64));
+		let given_up = self.given_up_set()?;
 		for c in coins {
-			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
+			if !Self::homeward(&c.state) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
 			let dates = CoinDates::of(c.expiry);
@@ -1802,8 +1819,9 @@ impl Wallet {
 		// as any coin (D57), but a wallet that follows the schedule stays
 		// closed until then.
 		let currents = self.plan_currents()?;
+		let given_up = self.given_up_set()?;
 		for c in self.store.coins()? {
-			if !Self::homeward(&c.state) || self.given_up_for_held_leaves(&c)? {
+			if !Self::homeward(&c.state) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
 			if let Some((pid, _, by)) = currents.iter().find(|(_, l, _)| *l == c.leaf_id) {
@@ -2617,27 +2635,27 @@ impl Wallet {
 	/// transactions the wallet stored for it, without asking the node;
 	/// `None` when a base it rests on is not among them.
 	fn roots_of_row(&self, c: &CoinRow) -> Result<Option<Vec<OutPoint>>, Error> {
+		// A coin's record never changes, and its bases only when the chain
+		// pays its batch output from another round: its roots are kept for
+		// the bases they were read from.
+		if let Some((bases, roots)) = self.roots_cache.borrow().get(&c.leaf_id) {
+			if *bases == c.bases {
+				return Ok(Some(roots.clone()));
+			}
+		}
 		let Ok(record) = Self::record_of(c) else { return Ok(None) };
 		let mut outs = vec![];
 		if base_outputs(&record, &mut outs).is_err() {
 			return Ok(None);
 		}
-		let mut txs = vec![];
-		for t in &c.bases {
-			if let Some(tx) = self.store.tx(t)?.and_then(|raw| elements::encode::deserialize::<Transaction>(&raw).ok()) {
-				txs.push(tx);
-			}
-		}
 		let mut roots = vec![];
 		for o in outs {
-			let before = roots.len();
-			for tx in &txs {
-				roots.extend(tx.output.iter().enumerate().filter(|(_, x)| **x == o).map(|(i, _)| OutPoint::new(tx.txid(), i as u32)));
-			}
-			if roots.len() == before {
-				return Ok(None);
-			}
+			// The base transactions, each decoded once ([`Self::known_base`]).
+			let Some(tx) = self.known_base(&o)?.filter(|t| c.bases.contains(&t.txid().to_string())) else { return Ok(None) };
+			let txid = tx.txid();
+			roots.extend(tx.output.iter().enumerate().filter(|(_, x)| **x == o).map(|(i, _)| OutPoint::new(txid, i as u32)));
 		}
+		self.roots_cache.borrow_mut().insert(c.leaf_id.clone(), (c.bases.clone(), roots.clone()));
 		Ok(Some(roots))
 	}
 
@@ -2904,6 +2922,7 @@ impl Wallet {
 		let stopped = self.rolled_back()?.is_some();
 		let unreachable = self.unreachable()?;
 		let refused = self.refused_refreshes()?;
+		let given_up = self.given_up_set()?;
 		let mut fee_view: Option<Vec<FeeHolding>> = None;
 		let mut out = vec![];
 		for c in self.store.coins()? {
@@ -2931,7 +2950,7 @@ impl Wallet {
 					}
 				}
 			}
-			if Self::homeward(&c.state) && !self.given_up_for_held_leaves(&c)? {
+			if Self::homeward(&c.state) && !(c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				if let Some(d) = CoinDates::of(c.expiry) {
 					v["sync_daily_from"] = json!(d.sync_daily_from);
 					v["refresh_from"] = json!(d.refresh_from);
