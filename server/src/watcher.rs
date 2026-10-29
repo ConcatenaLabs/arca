@@ -130,6 +130,8 @@ use crate::wallet::{Wallet, WalletError};
 
 #[path = "returns.rs"]
 mod returns;
+#[path = "swept.rs"]
+mod swept;
 
 /// How the watcher works.
 #[derive(Debug, Clone)]
@@ -359,6 +361,7 @@ impl Watcher {
 		self.expiries(now).await?;
 		self.reclaims(now).await?;
 		self.returns().await?;
+		self.owed().await?;
 		Ok(())
 	}
 

@@ -36,7 +36,8 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
-	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
+	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
+	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
 	"unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
@@ -79,6 +80,8 @@ pub struct Info {
 	/// checks it on its own node before it takes a payment out of round.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub bond: Option<BondInfo>,
+	/// What becomes of a coin the operator's sweep takes from its holder.
+	pub swept: SweptInfo,
 }
 
 /// The operator's equivocation bond ([`crate::bond`]).
@@ -337,6 +340,35 @@ pub struct AssetInfo {
 	/// operator could not read it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub fundable: Option<String>,
+	/// What the operator owes in the asset for coins its final sweeps took
+	/// from their holders, not repaid yet ([`crate::owed`]); absent when
+	/// nothing is owed. `fundable` leaves it out.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owed: Option<OwedInfo>,
+}
+
+/// What the operator owes in an asset for swept coins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwedInfo {
+	/// The sum owed, in the asset's atoms, after the late-refresh fee.
+	pub total: String,
+	/// How many coins that is.
+	pub coins: u64,
+}
+
+/// What the operator does with a coin its sweep takes from its holder
+/// ([`crate::owed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweptInfo {
+	/// `repaid`: a live coin a final sweep took is owed to its holder and
+	/// repaid as a new leaf in the asset's next round, once the holder's
+	/// wallet claims it; it is never kept.
+	pub policy: String,
+	/// The fee taken from it: `refresh`, the asset's refresh fee at its full
+	/// charge (its `refresh_ppm` of the coin's value and its `refresh_base`).
+	pub late_fee: String,
 }
 
 /// What the operator serves of a restricted asset.
@@ -2416,4 +2448,58 @@ pub struct CancelPlan {
 pub struct PlanLeaf {
 	pub leaf_id: String,
 	pub auths: Vec<UnrollAuth>,
+}
+
+/// `POST /v1/owed`: what the operator owes for swept coins of the keys
+/// named, each proven by its signature over a fresh challenge (`auth`, as a
+/// `claims` lookup): a mailbox key finds every coin bound or posted to it,
+/// an owner key the coin it owns.
+pub type OwedRequest = ClaimsRequest;
+
+/// The answer to `owed`: every entry found, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Owed {
+	pub owed: Vec<OwedFound>,
+}
+
+/// One coin a final sweep took from its holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwedFound {
+	/// The coin swept.
+	pub leaf_id: String,
+	pub owner: String,
+	/// The nonce its owner key comes from.
+	pub owner_nonce: String,
+	pub asset: String,
+	/// What the coin held.
+	pub value: String,
+	/// The late-refresh fee taken from it.
+	pub fee: String,
+	/// What is repaid: the value less the fee.
+	pub owed: String,
+	/// The sweep that took it.
+	pub sweep_txid: String,
+	/// `owed`, `claimed`, `repaid`, or `withdrawn` while its sweep is not
+	/// final.
+	pub state: String,
+	/// The repayment participation, once claimed: its new leaf is the coin
+	/// repaid ([`crate::owed`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub participation_id: Option<String>,
+}
+
+/// `POST /v1/owed_claim`: the holder of a swept coin claims what is owed for
+/// it as the one new leaf it wants, signed by the swept coin's owner key over
+/// `owed::claim_digest` of the coin and the repayment participation's id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwedClaim {
+	pub leaf_id: String,
+	/// The leaf wanted, as a participation's: in the coin's asset, holding
+	/// exactly what is owed, with its key proof and, optionally, its binding
+	/// to the wallet's mailbox key.
+	pub leaf: WantedLeaf,
+	pub signature: String,
 }

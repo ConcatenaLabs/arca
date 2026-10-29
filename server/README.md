@@ -48,7 +48,10 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V28__issuer_operated.sql`](schema/V28__issuer_operated.sql),
 [`schema/V29__fill_requests.sql`](schema/V29__fill_requests.sql),
 [`schema/V30__order_landings.sql`](schema/V30__order_landings.sql),
-[`schema/V31__supervised.sql`](schema/V31__supervised.sql)). `Store::connect` builds it
+[`schema/V31__supervised.sql`](schema/V31__supervised.sql),
+[`schema/V32__channels.sql`](schema/V32__channels.sql),
+[`schema/V33__accumulator_batches.sql`](schema/V33__accumulator_batches.sql),
+[`schema/V34__owed.sql`](schema/V34__owed.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -105,6 +108,9 @@ requests can race past them:
 - **The chain as the server saw it**, participations and forfeits,
   mailboxes, the on-chain wallet's coins and the
   server's own transactions.
+- **What the operator owes for swept coins**: every sweep whose coins were
+  counted, and an entry per coin it took from its holder (see Swept coins
+  are repaid). Entries never expire.
 - **Every node and entry of every batch**, by script, so the outputs a holder
   unrolls are seen, and **everything the watcher published**, with what it
   acts for and the outpoints it spends.
@@ -1046,6 +1052,78 @@ What the server does with a plan once it holds it:
 - A coin a step gave up that comes on the chain is answered by the step's
   refund (see the watcher).
 
+### Swept coins are repaid
+
+A coin whose holder neither refreshed it nor took it home before its batch
+was swept is never the operator's to keep: the operator owes it back, less
+the late-refresh fee, and repays it as a new leaf in the asset's next round.
+Expiry can delay a holder's coin and costs it that fee, nothing more. This
+is the operator's policy, kept by the server and published (`info.swept`:
+`{"policy": "repaid", "late_fee": "refresh"}`), not a script: a guarantee in
+script would need every abandoned leaf brought on the chain, which is the
+cost expiry exists to avoid.
+
+**What is owed.** When a sweep of the watcher's is final, the watcher counts
+what it took from holders (see The watcher): every leaf of the swept batch
+whose value a final sweep took (the batch output, a node above the leaf, or
+its entry), and every coin resting on one through out-of-round transfers,
+that is live: not given up in a participation, forfeited, released,
+offboarded or spent. A coin whose own output is on the chain is its holder's
+there and is owed nothing; nor is an `htlc-1` leaf, which its payment's own
+paths settle, or a claim leaf of a distribution nobody took up, which goes
+back to its payer (see Distributions: claim trees). In one database
+transaction it records the sweep and an entry for each coin: its owner key
+and the nonce it comes from, its asset, its value (a channel coin's owner's
+side), the late-refresh fee and the sweep. The late-refresh fee is the
+asset's refresh fee at its full charge, its `refresh_ppm` of the value,
+rounded up, and its `refresh_base` (`owed::late_fee`), priced when the sweep is
+counted; a sweep of an asset whose rate the operator does not hold yet is
+counted at a later pass. Entries never expire, and are kept as the rest of
+the state is kept.
+
+A rollback that takes a counted sweep out of finality (Sequentia follows its
+Bitcoin anchor however deep) withdraws its entries, `withdrawn`, while the
+coins are back in their batch, their holders' there: nothing is claimed or
+completed meanwhile. Once the sweep is final again, its entries are owed
+again; a coin another sweep takes instead moves its entry to that sweep.
+
+**Finding and claiming.** `owed` serves the entries of the keys a wallet
+proves, as a `claims` lookup does: a mailbox key finds every coin bound or
+posted to it, an owner key its own coin. Each entry carries the coin, its
+owner key and nonce, its asset, value, fee and what is owed, the sweep, its
+state (`owed`, `claimed`, `repaid`, `withdrawn`) and, once claimed, its
+repayment participation. A wallet claims an entry with `owed_claim`: the one
+leaf it wants (`vtxo-1`, `vtxo-2`, or `landing-1` in a supervised asset, in
+the coin's asset, holding exactly what is owed, under a key it proves as a
+participation's leaf, optionally bound to its mailbox key) and the swept
+coin's owner key's signature over
+`SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ coin ‖ participation id)`,
+`T = SHA256("Arca/owed-claim")` (`owed::claim_digest`). The participation id
+is an ordinary participation's with no coin given up, that one leaf wanted
+and no fee, so the signature claims that coin into that leaf and nothing
+else. The server records, in one database transaction, a participation of
+its own making wanting that leaf and the entry claimed by it, as it does for
+a payment received over Lightning, and answers as `participation_status`
+does; the same claim again gets the same answer. Refused: a coin with no
+entry (`unknown_leaf`), an entry whose sweep is not final now
+(`owed_withdrawn`), one claimed by another participation or repaid
+(`owed_claimed`), a signature that is not the coin's owner key's
+(`bad_signature`), a leaf in another asset or of another value, or outside
+the bounds (`out_of_bounds`), another template (`template`), and a key that
+owns a leaf or is wanted (`key_reused`).
+
+**The repayment.** The participation runs in the asset's ordinary round,
+funded by its pool as every participation is (an issuer-operated asset's by
+its mint limiter, so it repays as its rounds are funded), and its owner
+completes it with `forfeit_leaves`, handing over no forfeit and its unroll
+authorisations for the new leaf, while the sweep is final
+(`owed_withdrawn` otherwise). Once it is released the entry is `repaid`; a
+participation that is void or expires (its owner not back within a day of
+its round being final) leaves the entry owed again, to be claimed anew under
+another key. `info` shows each asset's owed total (`assets[].owed`: `total`
+and `coins`, absent when nothing is owed), and `fundable` leaves it out of
+what the pool can promise.
+
 ### Resting orders
 
 A resting order is an `order-3` leaf (`arca-covenant`'s `order`): an order of
@@ -1941,7 +2019,9 @@ meanwhile.
   exit pays an entry, whose script it watches, and publishes the whole state
   it spends) and sweeps it where the last exit left it, with every entry an
   exit paid that is still unspent. A leaf on the chain is its owner's and is
-  never swept.
+  never swept. A coin a sweep takes from its holder is owed back to it, less
+  the late-refresh fee, once the sweep is final (see Swept coins are
+  repaid).
   A burn-only batch's sweep burns each output it takes whole, at its own
   index, several in one transaction, and a coin of another asset pays its
   fee (see Issuer-operated assets). A batch that holds
@@ -1955,6 +2035,13 @@ meanwhile.
   the chain, so a fully refreshed batch comes back before it expires; the
   watcher never unrolls a node with an owner who has not released.
 
+- **What a sweep owes.** Each sweep of its own that is final is counted
+  once: every coin it took from its holder is recorded owed, the sweep with
+  them, in one database transaction (see Swept coins are repaid). A counted
+  sweep that a rollback takes out of finality has its entries withdrawn
+  until it is final again. Each claimed entry then follows its repayment:
+  repaid once that participation is released, owed again once it is void or
+  expired.
 - **Returns.** A claim leaf of a distribution whose value a final sweep took
   (the batch output, a node above the leaf, or its entry), with no spend of
   it recorded, is a claim nobody took up. The watcher pays every such leaf of
@@ -2008,7 +2095,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -2030,6 +2117,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
 | `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it |
+| `POST owed` | What the operator owes for coins its final sweeps took (see Swept coins are repaid), for up to 64 keys, each proven under one challenge (the call `owed`, an empty request): a mailbox key finds every coin bound or posted to it, an owner key its own coin. Each entry: the coin, its owner key and nonce, asset, value, the late-refresh fee, what is owed, the sweep, its state (`owed`, `claimed`, `repaid`, `withdrawn`) and its repayment participation once claimed |
+| `POST owed_claim` | Claims what is owed for a swept coin as one new leaf, signed by the coin's owner key; answered as `participation_status` answers the repayment participation |
 | `POST plan_quote` | A quote for an offline-refresh plan from a coin (see Offline refresh: plans): the quote's id, the coin's asset, value and first expiry, the earliest time of step 1's round, the operator's script for every refund, and for each step its operator nonce, fee and refund margin |
 | `POST submit_plan` | Accepts a plan, answered as `plan_status` answers |
 | `POST plan_status` | A plan by its id: `open`, `done`, `cancelled` or `stopped` (with the reason), and each step: `waiting`, `running`, `done` or `void` (with the reason), the leaf it makes as the plan names it (value, fee, owner key, both nonces, exit delay, unlock hash, the holder's address), the coin it gives up, its participation, its round and the round's state, and its leaf with its place in the tree and, once its round is final, its record. Not authenticated: the id names the plan |
@@ -2074,6 +2163,8 @@ preimage and the owners' signatures over the transfer;
 and `distribute` by each coin's owner's attestation over the distribution;
 `claims` by a proof of each key it names, as a mailbox read is;
 `claim_leaf` by the claim key's signatures over the authorisations themselves;
+`owed` by a proof of each key it names, and `owed_claim` by the swept coin's
+owner key's signature over the claim;
 `distribution_status` needs only the distribution's id;
 `participation_status` needs only the participation's id, which is a hash
 of its request, and `tree` and `rounds` are public. `bind_mailbox` is authenticated by
@@ -3023,6 +3114,23 @@ watcher passes once a block, and after each block the test checks every
 forfeit in a block whose claim is not: its refund must not be open (the tip's
 median time short of the refund delay past that of the block before the
 forfeit's), and its owner's refund is refused. Every forfeit is claimed.
+
+`tests/owed.rs` runs swept coins: with X charging a refresh fee of 5,000
+parts per million and 200 atoms, B refreshes into a round leaf and stays
+away, A pays its leaf out of round to C, who stays away too, and D takes its
+leaf home on the chain. After the batch's expiry, release and notice the
+sweep, in a block anchored to a parent block of its own, is final, and the
+server owes B and C each its coin less the refresh fee at its full charge,
+exactly, nothing for A's spent coin or D's coin on the chain; `info` shows X's
+owed total and a `fundable` figure that leaves it out. The parent chain then
+reorganises that block away: the sweep leaves the chain, every output it took
+is unspent in the chain again, the entries are withdrawn (`info` owes
+nothing, a claim is refused `owed_withdrawn`), and once the same sweep is
+final again they are owed again. A claim signed by A's key (`bad_signature`),
+one an atom over what is owed (`out_of_bounds`) and a second claim
+(`owed_claimed`) are refused; C's claim runs in X's next round as a
+participation that gives up no coin, C completes it with no forfeit and holds
+a new leaf of exactly what is owed, its entry `repaid`, B's still owed.
 
 `tests/plans.rs` runs offline refresh against the whole server: a plan of
 two steps from a coin of a round, each step run in its coin's free window

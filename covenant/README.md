@@ -291,6 +291,17 @@ outputs paid is the fee, in the batch asset, or a fee coin pays. A burn-only
 sweep pays every input whole to an `OP_RETURN` at its own index, and takes a
 fee coin. The operator signs each input's signature hash.
 
+The sweep takes whatever is left in the batch, and the scripts do not say
+whose it was. What the operator does with it is its policy: Arca's server
+repays every coin a final sweep took from its holder as a new leaf in the
+asset's next round, less the late-refresh fee, once the holder's wallet
+claims it, and publishes that it does
+([Swept coins are repaid](../server/README.md#swept-coins-are-repaid)). A
+script guarantee would need every abandoned leaf brought on the chain, which
+is the cost expiry exists to avoid, so expiry delays a holder's coin and
+costs it that fee, and a holder who wants no reliance on the operator for it
+refreshes or exits before the exit deadline.
+
 A batch run by its asset's issuer is burn-only: the round that makes it
 reissues its value through the asset's mint limiter (`limiter`), and its sweep
 destroys whatever it takes, so the units minted for a refresh exist only while

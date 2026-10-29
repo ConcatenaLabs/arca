@@ -153,6 +153,10 @@ pub enum ForfeitError {
 	NotInRound(&'static str),
 	#[error("the participation's round {0} is not final yet")]
 	RoundNotFinal(Txid),
+	/// A repayment of a swept coin ([`crate::owed`]) whose sweep a rollback
+	/// took out of finality: the sweep's txid.
+	#[error("the participation repays a swept coin, and its sweep {0} is not final now: it completes once the sweep is final again")]
+	SweepNotFinal(String),
 	#[error("the forfeits are not exactly the coins the participation gave up: {0}")]
 	ForfeitSet(String),
 	#[error("the forfeit of coin {0} does not verify: it is not the owner's signature over the move into the forfeit output for this participation's unlock hash, this round's connector asset and this coin")]
@@ -195,6 +199,7 @@ impl ForfeitError {
 			Unknown(_) => "unknown_participation",
 			NotInRound(_) => "not_in_round",
 			RoundNotFinal(_) => "round_not_final",
+			SweepNotFinal(_) => "owed_withdrawn",
 			ForfeitSet(_) => "forfeit_set",
 			BadForfeit(_) => "bad_forfeit",
 			LeafSet(_) => "leaf_set",
@@ -276,6 +281,14 @@ impl Forfeits {
 			other => return Err(ForfeitError::NotInRound(other.as_str())),
 		}
 		let round_id = p.round_id.ok_or_else(|| ForfeitError::Internal("an issued participation without a round".into()))?;
+		// A repayment of a swept coin completes only while the sweep that
+		// took the coin is final: while a rollback holds it out, the coin is
+		// back in its batch, its holder's there.
+		if let Some(o) = self.store.owed_repaid_by(&id).await? {
+			if o.state == crate::store::OwedState::Withdrawn {
+				return Err(ForfeitError::SweepNotFinal(Txid::from_byte_array(o.sweep_txid).to_string()));
+			}
+		}
 		let round = self.store.round(round_id).await?.ok_or_else(|| ForfeitError::Internal(format!("round {} is not recorded", round_id)))?;
 		let round_txid = Txid::from_byte_array(round.txid);
 		// A take hands its forfeits over before its round is broadcast: the
