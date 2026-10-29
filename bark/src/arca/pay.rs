@@ -1760,6 +1760,9 @@ impl Wallet {
 			"pays": {"asset": o.want_asset.to_string(), "margins": margins.to_string()},
 			"maker_pays": {"asset": o.give_asset.to_string(), "margin": o.margin.to_string()},
 			"change": {"asset": o.want_asset.to_string(), "value": change.to_string()},
+			// The reassignments since a round of what the swap makes (the coin the taker gets, its
+			// change): one more than the deepest coin it spends, the maker's and the taker's.
+			"hops": 1 + o.theirs.iter().chain(mine).map(|i| i.coin.hops).max().unwrap_or(0),
 			"coins_spent": mine.len(), "dates": dates})
 	}
 

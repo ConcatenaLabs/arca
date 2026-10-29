@@ -134,7 +134,7 @@ need_seconds}`, `lightning_receives`, `lightning_lookup {hash}`,
 themselves; `supervised_check {txid, vout}`, the check of a whole published batch of a supervised asset (see the CLI README's section on
 holding a supervised asset), which a page shows only in developer mode, while each coin of a supervised asset carries its
 `landing` and `frozen` in `coins` in either mode; `supply {asset}`, the operator's supply report for an asset
-it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` in `coins`
+it serves issuer-operated, each mint and burn read again from the wallet's node, and each coin's `batch_profile` and `hops` (reassignments since a round) in `coins`
 (`issuer-operated` when its batch's sweep can only burn, `open` when it pays the operator), both of which a page shows only in
 developer mode; the channel leaves (`channels`, each with `final`, `channel_open {leaves?, capacity, keep?, max_fee_ppm?}`,
 `channel_sync {leaf_id?}` (every live channel when none is named), `channel_pay {leaf_id, to, amount}`, `channel_fold {leaf_id}`,
@@ -156,7 +156,9 @@ An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the
 reassignment's margin and its checkpoints' margins). The taker's `swap_read`
 checks the offer as `swap_accept` does and answers what it gives, gets and pays,
-signing, holding and storing nothing; `swap_accept` with `shown` (that answer)
+and the `hops` of what the swap makes (reassignments since a round, against the
+operator's `depth_limit`), signing, holding and storing nothing; `swap_accept`
+with `shown` (that answer)
 signs only on those terms. The maker's `swap_complete` signs its side and has the
 operator co-sign; `swaps` lists each swap with where it stands.
 

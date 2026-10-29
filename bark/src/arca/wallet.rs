@@ -170,6 +170,16 @@ pub struct Wallet {
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
 }
 
+/// How many reassignments a coin's record has made since a round, board or
+/// accumulator batch: one more than the deepest record it spends, as the
+/// library's validation counts a coin's `hops`.
+pub(crate) fn record_hops(r: &CoinRecord) -> usize {
+	match r {
+		CoinRecord::Transfer(_) | CoinRecord::Fill(_) => 1 + r.parents().into_iter().map(record_hops).max().unwrap_or(0),
+		CoinRecord::Leaf { .. } | CoinRecord::Board(_) | CoinRecord::Accumulator { .. } => 0,
+	}
+}
+
 /// The base transactions a wallet stored, by txid, and the transaction that
 /// pays each output (its serialisation), first stored first.
 #[derive(Default)]
@@ -2898,8 +2908,9 @@ impl Wallet {
 	/// exit deadline, three days before; a coin resting on a board carries
 	/// the board's ([`BOARD_LIFETIME`]).
 	fn coin_json(c: &CoinRow) -> Value {
-		let on_board = Self::record_of(c).map(|r| rests_on_board(&r)).unwrap_or(false);
-		let profile = Self::record_of(c).ok().and_then(|r| batch_profile(&r));
+		let record = Self::record_of(c).ok();
+		let on_board = record.as_ref().map(rests_on_board).unwrap_or(false);
+		let profile = record.as_ref().and_then(batch_profile);
 		let (expiry, deadline) = if c.expiry == u32::MAX { (Value::Null, Value::Null) } else {
 			(json!(c.expiry), json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)))
 		};
@@ -2907,6 +2918,9 @@ impl Wallet {
 			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
 			"standing": Self::standing(c), "note": c.note, "expiry": expiry, "exit_deadline": deadline, "rests_on_board": on_board,
 			"spent_by": c.spent_by, "batch_profile": profile,
+			// Reassignments since a round, as validation counts them: the operator co-signs no
+			// out-of-round spend past its `depth_limit`, and a refresh starts the count again.
+			"hops": record.as_ref().map(record_hops),
 		})
 	}
 
