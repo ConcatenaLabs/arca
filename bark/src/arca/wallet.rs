@@ -3042,6 +3042,12 @@ impl Wallet {
 		for (a, v) in &onchain {
 			*held.entry(a.clone()).or_default() += *v as u128;
 		}
+		// What a sweep took and the operator owes, until the coin that repays
+		// it is held: the wallet's still, and on its way back.
+		for (a, v) in self.returning()? {
+			*held.entry(a.clone()).or_default() += v as u128;
+			*per.entry(a).or_default().entry("returning".to_string()).or_default() += v;
+		}
 		let total = self.total_value(&held);
 		let arca: Value = per.into_iter().map(|(a, m)| (a, json!(m.into_iter().map(|(s, v)| (s, json!(v.to_string()))).collect::<serde_json::Map<_, _>>())))
 			.collect::<serde_json::Map<_, _>>().into();

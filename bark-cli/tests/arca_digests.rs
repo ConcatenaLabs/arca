@@ -40,6 +40,27 @@ fn the_wallet_knows_every_refusal_the_server_answers_with() {
 }
 
 #[test]
+fn the_wallets_owed_claim_is_the_servers() {
+	let chain = Chain::new(BlockHash::from_str("3ce8ab6c8f9836c0cebca304f3cbed3e824e6c53f4cacd2822f6f8441eed1a3e").unwrap());
+	let s = key("operator").x_only_public_key().0;
+	let k = key("repaid").x_only_public_key().0;
+	let a = AssetId::from_slice(&[0x28; 32]).unwrap();
+	let coin = LeafId([5; 32]);
+	let nonce = bark::arca::owed::repayment_nonce(&coin, 0);
+	assert_ne!(nonce, bark::arca::owed::repayment_nonce(&coin, 1), "each attempt its own nonce");
+	assert_ne!(nonce, bark::arca::owed::repayment_nonce(&LeafId([6; 32]), 0), "each coin its own nonce");
+	let d = RelativeTime::from_units(253).unwrap();
+	let mine = participation_id(&chain, &s, &[], &[Wanted::Leaf { asset: a, value: 4_000, template: Template::Vtxo1, owner: k,
+		owner_nonce: nonce, exit_delay: d, order: None, landing: None, channel: None }], &[], None);
+	let theirs = server::owed::repayment_id(&chain, &s, &server::participations::OutputRequest::Leaf { asset: a, value: 4_000,
+		template: Template::Vtxo1, owner: k, owner_nonce: nonce, exit_delay: d, order: None, landing: None, channel: None });
+	assert_eq!(mine, theirs, "the repayment participation's id");
+	assert_eq!(bark::arca::owed::claim_digest(&chain, &s, &coin, &mine), server::owed::claim_digest(&chain, &s, &coin, &mine));
+	assert_ne!(bark::arca::owed::claim_digest(&chain, &s, &coin, &mine), bark::arca::owed::claim_digest(&chain, &s, &LeafId([6; 32]), &mine),
+		"the coin is bound");
+}
+
+#[test]
 fn the_wallets_digests_are_the_servers() {
 	let chain = Chain::new(BlockHash::from_str("3ce8ab6c8f9836c0cebca304f3cbed3e824e6c53f4cacd2822f6f8441eed1a3e").unwrap());
 	let k = key("owner").x_only_public_key().0;

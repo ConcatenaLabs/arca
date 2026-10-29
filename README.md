@@ -11,7 +11,9 @@ one asset, and every asset issued on Sequentia can have batches of its own.
 
 A batch expires 28 days after its round, and after a public notice the operator
 may then sweep what is left in it, so a holder moves each leaf into a new batch
-before then: a refresh. The holder submits a participation once, naming the leaves
+before then: a refresh. A coin the operator sweeps from a holder who stayed away
+is not the operator's to keep: its server owes it back, less the late-refresh fee,
+and repays it as a new leaf once the holder's wallet claims it. The holder submits a participation once, naming the leaves
 it gives up and the leaves it wants, and the operator runs it in the next round
 without the holder online. The operator takes a leaf in a participation only up to
 its exit deadline, three days before its batch's expiry, and a refresh is free in

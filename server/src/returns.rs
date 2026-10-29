@@ -97,7 +97,7 @@ impl Watcher {
 	/// batch leaf `leaf`: it spent the batch output, a node of the tree whose
 	/// leaves include it, or its entry. Each output's sweep is read once into
 	/// `seen`, so the leaves of one sweep get one answer.
-	async fn swept_final(&self, leaf: &[u8; 32], seen: &mut HashMap<OutPoint, bool>) -> Result<bool, WatcherError> {
+	pub(super) async fn swept_final(&self, leaf: &[u8; 32], seen: &mut HashMap<OutPoint, bool>) -> Result<bool, WatcherError> {
 		let Some(bl) = self.store.batch_leaf(leaf).await? else { return Ok(false) };
 		let Some(round) = self.store.round(bl.round_id).await? else { return Ok(false) };
 		let idx = bl.idx as usize;

@@ -70,6 +70,8 @@ mod claims;
 mod plans;
 #[path = "http_orders.rs"]
 mod orders;
+#[path = "http_owed.rs"]
+mod owed;
 
 /// What the HTTP handlers reach.
 pub struct App {
@@ -382,6 +384,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"malformed" | "invalid_record" | "invalid_transaction" => StatusCode::BAD_REQUEST,
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
+		"owed_claimed" | "owed_withdrawn" => StatusCode::CONFLICT,
 		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
 			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" =>
@@ -648,6 +651,8 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let signer_record = record_head(&app).await;
 	let bond = bond_info(&app).await;
 	let fundable = app.rounds.fundable_now().await.map_err(|e| log::warn!("what a round can pay now: {}", e)).ok();
+	let owed = app.store.owed_totals().await.map_err(|e| log::warn!("what is owed for swept coins: {}", e)).ok();
+	let owed_of = |a: &AssetId| owed.as_ref().and_then(|o| o.get(&a.into_inner().to_byte_array()).copied());
 	let p = &app.params;
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
@@ -685,7 +690,10 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			restricted: ap.restricted.as_ref().map(|r| api::RestrictedInfo {
 				policy: hex(&r.policy.serialize()), clawback: r.clawback.map(|k| hex(&k.serialize())), policy_server: r.server.clone(),
 			}),
-			fundable: fundable.as_ref().map(|f| f.get(a).copied().unwrap_or(0).to_string()),
+			// What the pool can promise leaves out what is owed for swept
+			// coins, which their holders' claims will draw on.
+			fundable: fundable.as_ref().map(|f| f.get(a).copied().unwrap_or(0).saturating_sub(owed_of(a).map_or(0, |o| o.0)).to_string()),
+			owed: owed_of(a).filter(|o| o.1 > 0).map(|(total, coins)| api::OwedInfo { total: total.to_string(), coins }),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -750,6 +758,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			shared: true,
 		},
 		bond,
+		swept: api::SweptInfo { policy: "repaid".into(), late_fee: "refresh".into() },
 	})
 }
 
@@ -1784,6 +1793,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/distribution_status", post(claims::distribution_status))
 		.route("/v1/claims", post(claims::claims))
 		.route("/v1/claim_leaf", post(claims::claim_leaf))
+		.route("/v1/owed", post(owed::owed))
+		.route("/v1/owed_claim", post(owed::owed_claim))
 		.route("/v1/plan_quote", post(plans::plan_quote))
 		.route("/v1/submit_plan", post(plans::submit_plan))
 		.route("/v1/plan_status", post(plans::plan_status))

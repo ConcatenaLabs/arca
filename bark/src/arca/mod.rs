@@ -114,6 +114,7 @@ mod exit;
 pub mod lightning;
 pub mod offboard;
 pub mod order;
+pub mod owed;
 mod pay;
 pub mod plan;
 mod restore;
