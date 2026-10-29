@@ -137,6 +137,11 @@ fn start(w: &mut Wallet, command: &str) -> Value {
 		};
 	}
 	if !matches!(command, "recheck" | "sync" | "schedule") {
+		// Once a tip: the chain is as the last re-check left it.
+		if let Ok(Some(tip)) = w.tip_rechecked() {
+			out["recheck"] = json!({"skipped": "the chain's tip is the one the last re-check ran at", "tip": tip});
+			return out;
+		}
 		out["recheck"] = match w.recheck() {
 			Ok(v) => v,
 			Err(e) => json!({"error": {"kind": e.kind(), "message": format!("the re-check on start could not run: {}", e)}}),

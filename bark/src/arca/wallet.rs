@@ -159,6 +159,9 @@ pub struct Wallet {
 	/// What [`CoinRecord::resolve`] answered, by the record, the transactions
 	/// it was resolved against and the policy ([`Wallet::resolve`]).
 	pub(crate) resolved: std::cell::RefCell<Resolved>,
+	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
+	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
+	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
 }
 
 /// The answers of [`CoinRecord::resolve`], a pure function of a record, the
@@ -769,7 +772,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
-			exits_done: Default::default(), resolved: Default::default() })
+			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default() })
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -2492,7 +2495,21 @@ impl Wallet {
 		}
 		self.store.set_meta("tip_height", &tip.height.to_string())?;
 		self.store.set_meta("tip_hash", &tip.hash.to_string())?;
+		*self.rechecked_at.borrow_mut() = Some(tip.hash.to_string());
 		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes}))
+	}
+
+	/// Whether the chain's tip is the one the last complete re-check ran at,
+	/// so a command starting now needs no re-check first. A rollback
+	/// or any new block changes the tip, so a coin is never spent on a base
+	/// the chain gave up; a base that became final without a new block (its
+	/// certificate came) is seen at the next block or `sync`. Every command
+	/// otherwise pays a read of every coin's bases, which for a wallet of a
+	/// hundred coins is half a minute. -> the tip when it is, else `None`.
+	pub(crate) fn tip_rechecked(&self) -> Result<Option<String>, Error> {
+		let Some(last) = self.rechecked_at.borrow().clone() else { return Ok(None) };
+		let tip = self.chain.tip()?;
+		Ok((tip.hash.to_string() == last).then_some(last))
 	}
 
 	/// Every coin the wallet still holds, live or handed over, against the
