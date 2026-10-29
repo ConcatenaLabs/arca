@@ -140,8 +140,8 @@ impl Wallet {
 			let state = e["state"].as_str().unwrap_or("");
 			if matches!(state, "owed" | "claimed" | "repaid") {
 				if let Some(c) = self.store.coin(&leaf)? {
-					if !matches!(c.state.as_str(), "spent" | "exited") && !c.note.starts_with("swept") {
-						self.store.set_coin_state(&leaf, "lost", &format!("swept by {} after its expiry: the operator repays it as a new coin, \
+					if !matches!(c.state.as_str(), "spent" | "exited") && !c.note.starts_with("lost to the operator's sweep") {
+						self.store.set_coin_state(&leaf, "lost", &format!("lost to the operator's sweep {} after its expiry: the operator repays it as a new coin, \
 							less the late-refresh fee of {}", e["sweep_txid"].as_str().unwrap_or(""), e["fee"].as_str().unwrap_or("")))?;
 					}
 				}

@@ -5934,16 +5934,24 @@ async fn a_coin_past_its_exit_date_is_taken_home_by_the_next_command() {
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
+/// Whether `bal` counts `value` in no standing but `returning`, what the
+/// operator owes back for a swept coin.
+fn only_returning(bal: &Value, value: u64) -> bool {
+	bal["arca"].as_object().is_none_or(|m| m.values().all(|states| states.as_object().is_none_or(|s| s.iter()
+		.all(|(k, v)| k == "returning" || v.as_str() != Some(&value.to_string())))))
+}
+
 /// D58.2 at the operator's sweep, R7h's SM shape. A's leaf L of an early
 /// round; B boards ten days later. In L's free window B hands A a receive
 /// request, and A pays B 600,000 out of L. Past L's expiry and notice the
 /// operator's watcher sweeps L's batch, and only then does B read its
 /// mailbox. With the sweep final, B refuses the coin, its note naming the
-/// sweep, and counts it nowhere. With the sweep in a block not yet final,
+/// sweep, and holds nothing of it. With the sweep in a block not yet final,
 /// B keeps the coin and says so, naming the sweep (a rollback could still
 /// undo it), its exit refused naming the sweep, and counts it as exiting;
-/// once the sweep is final the coin is lost, shown with the sweep and
-/// counted nowhere.
+/// once the sweep is final the coin is lost, shown with the sweep. Either
+/// way the operator owes it back: the balance counts it only as
+/// `returning`, never as a coin held.
 #[tokio::test(flavor = "multi_thread")]
 async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_final() {
 	for final_first in [true, false] {
@@ -6011,7 +6019,7 @@ async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_
 			assert!(s["mailbox"]["accepted"].as_array().is_none_or(|a| a.is_empty()), "the coin is refused: {}", s["mailbox"]);
 			assert!(refused.contains("its path is gone") && refused.contains(&sweep.to_string()), "naming the sweep: {}", refused);
 			assert!(got.is_empty(), "nothing of it held: {:?}", got);
-			assert!(!bal["arca"].to_string().contains("600000"), "counted nowhere: {}", bal["arca"]);
+			assert!(only_returning(&bal, 600_000), "counted nowhere but as returning: {}", bal["arca"]);
 		} else {
 			let accepted = s["mailbox"]["accepted"].to_string();
 			assert!(accepted.contains(&sweep.to_string()) && accepted.contains("not final"), "kept, the sweep named: {}", accepted);
@@ -6027,7 +6035,7 @@ async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_
 				c["note"], bal["arca"]);
 			assert_eq!(c["state"], "lost");
 			assert!(c["note"].as_str().unwrap_or("").contains(&sweep.to_string()));
-			assert!(!bal["arca"].to_string().contains("600000"), "counted nowhere once lost: {}", bal["arca"]);
+			assert!(only_returning(&bal, 600_000), "counted nowhere once lost but as returning: {}", bal["arca"]);
 		}
 		for w in [&a, &b] {
 			let _ = std::fs::remove_dir_all(&w.dir);
