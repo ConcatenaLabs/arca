@@ -593,6 +593,82 @@ impl Wallet {
 	}
 }
 
+/// What [`Wallet::catch_up_from_server`] changed in a store opened before.
+#[derive(Debug, Default)]
+pub struct CatchUpReport {
+	/// Coins the store held as spendable that the server says were spent,
+	/// by another wallet of the same phrase: now marked spent.
+	pub spent_elsewhere: Vec<VtxoId>,
+	/// The recovery scan over the ids in the recovery mailbox this store had
+	/// never seen (coins another wallet of the phrase made or received).
+	pub recovery: RecoveryReport,
+}
+
+impl Wallet {
+	/// Brings a wallet whose store was made before up to date with what other
+	/// wallets of the same phrase did since, from the server alone.
+	///
+	/// [`Wallet::open`] recovers from the recovery mailbox only when it creates
+	/// the store, so a second device that opened the phrase before the first
+	/// one boarded or received never learns of those coins. This reads the
+	/// recovery mailbox again and imports, as recovery does, only the ids the
+	/// store does not know; and it asks the server for the spend state of each
+	/// coin the store holds as spendable, marking spent those another device
+	/// spent. A coin of a board still in flight on another device is posted to
+	/// the mailbox once that device registers the board, and is found by the
+	/// next call after that. Coins the store knows are never imported again, so
+	/// a coin locked here by an action in progress stays as it is.
+	pub async fn catch_up_from_server(&self) -> anyhow::Result<CatchUpReport> {
+		let mut out = CatchUpReport::default();
+
+		for v in self.spendable_vtxos().await? {
+			let id = v.vtxo.id();
+			let key = match self.get_vtxo_key(&v).await {
+				Ok(k) => k,
+				Err(e) => {
+					warn!("No key for spendable vtxo {id}: {:#}", e);
+					continue;
+				},
+			};
+			match self.fetch_vtxo_spend_state(id, &key).await {
+				Ok(VtxoSpendState::Spent) => out.spent_elsewhere.push(id),
+				Ok(_) => {},
+				Err(e) => warn!("Could not get status for vtxo {id}: {:#}", e),
+			}
+		}
+		if !out.spent_elsewhere.is_empty() {
+			info!("{} vtxo(s) of this store were spent by another wallet of the phrase", out.spent_elsewhere.len());
+			self.mark_vtxos_as_spent(out.spent_elsewhere.iter().copied()).await
+				.context("failed to mark vtxos spent elsewhere")?;
+		}
+
+		// One lookup per id: the batch read refuses a set naming an id the
+		// store lacks, which is the very case here.
+		let mut new = vec![];
+		for id in self.read_mailbox_recovery_vtxo_ids().await? {
+			if self.inner.db.get_wallet_vtxo(id).await?.is_none() {
+				new.push(id);
+			}
+		}
+		if new.is_empty() {
+			return Ok(out);
+		}
+		debug!("{} vtxo id(s) in the recovery mailbox are new to this store", new.len());
+		let gap_limit = self.inner.config.vtxo_key_gap_limit;
+		self.inner_recover_vtxos(&mut out.recovery, new, gap_limit).await?;
+		for _ in 0..3 {
+			if out.recovery.failed.is_empty() {
+				break;
+			}
+			let ids = out.recovery.failed.ids().collect::<Vec<_>>();
+			self.inner_recover_vtxos(&mut out.recovery, ids, gap_limit).await?;
+		}
+		info!("Caught up from the server: {} vtxo(s) recovered, {} spent elsewhere",
+			out.recovery.recovered.len(), out.spent_elsewhere.len());
+		Ok(out)
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
