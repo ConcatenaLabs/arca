@@ -445,7 +445,12 @@ pub struct Rounds {
 	/// One pass at a time over the rounds built and not yet broadcast, so a
 	/// round one pass hands to the node is never dropped by another.
 	going_out: Mutex<()>,
+	/// What [`Rounds::fundable_now`] last answered, and when.
+	fundable_seen: Mutex<Option<(std::time::Instant, BTreeMap<AssetId, u64>)>>,
 }
+
+/// How long [`Rounds::fundable_now`] serves what it last read.
+pub const FUNDABLE_FOR: Duration = Duration::from_secs(10);
 
 /// How the orders of a fill round not yet broadcast stand at the node, each
 /// checked again ([`Rounds::orders_now`]).
@@ -475,7 +480,34 @@ impl Rounds {
 		signer: SignerClient, config: RoundConfig) -> Arc<Rounds>
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
-			going_out: Mutex::new(()) })
+			going_out: Mutex::new(()), fundable_seen: Mutex::new(None) })
+	}
+
+	/// What a round can pay now of each asset the operator serves, as a
+	/// round's own check counts it ([`Self::fundable`]): what the wallet can
+	/// spend of the asset, or, for an issuer-operated asset, what its mint
+	/// limiter allows (0 while it allows none). A round that would pay more
+	/// of an asset waits until it can; what other participations already
+	/// wait for is not taken off. Read again at most every [`FUNDABLE_FOR`].
+	pub async fn fundable_now(&self) -> Result<BTreeMap<AssetId, u64>, RoundError> {
+		let mut seen = self.fundable_seen.lock().await;
+		if let Some((at, m)) = seen.as_ref() {
+			if at.elapsed() < FUNDABLE_FOR {
+				return Ok(m.clone());
+			}
+		}
+		let balance = self.wallet.balance().await?;
+		let mut out = BTreeMap::new();
+		for (asset, _) in self.params.assets.all() {
+			let v = match self.mint_room(asset).await? {
+				Some(Ok(m)) => m.room,
+				Some(Err(_)) => 0,
+				None => balance.get(&asset).copied().unwrap_or(0),
+			};
+			out.insert(asset, v);
+		}
+		*seen = Some((std::time::Instant::now(), out.clone()));
+		Ok(out)
 	}
 
 	/// What the operator minted and burned of the issuer-operated `asset`,

@@ -3,9 +3,19 @@
 //! rounds and its own pool, so Y's pool running short holds back no round of
 //! X built in the same pass.
 //!
+//! The server publishes, per asset, what a round can pay of it now
+//! (`fundable` in `/v1/info`), so a wallet can see before it asks that a
+//! participation would wait.
+//!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
 mod common;
+
+/// What `/v1/info` says a round can pay of `asset` now.
+fn fundable(http: &common::client::Http, asset: elements::AssetId) -> Option<u64> {
+	let info = http.get("info").json;
+	info["assets"].as_array()?.iter().find(|a| a["asset"] == asset.to_string())?["fundable"].as_str()?.parse().ok()
+}
 
 use common::client::{participation_body, want_leaf, Held};
 use common::keys::{keypair, xonly};
@@ -28,6 +38,13 @@ async fn an_unfundable_participation_delays_no_other() {
 	let bid = rec.leaf_id();
 	r.wait("B's board credited", || http.board_status(&bid).json["state"] == "credited").await;
 	let b_held = Held { key: b, nonce: rec.owner_nonce, id: bid, record: CoinRecord::Board(rec) };
+
+	// The server says what a round can pay of each asset: all the wallet
+	// holds of Y is less than B's leaf.
+	let (fx, fy) = (fundable(&r.http, x), fundable(&r.http, y));
+	println!("fundable before: X {:?}, Y {:?}", fx, fy);
+	assert_eq!(fy, Some(50_000_000), "Y: what the wallet can spend of it");
+	assert!(fx.is_some_and(|v| v >= VALUE), "X: {:?}", fx);
 
 	// B first: the round still takes A.
 	let (wb, _) = want_leaf(&keypair("B new"), y, 60_000_000);
@@ -57,6 +74,11 @@ async fn an_unfundable_participation_delays_no_other() {
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;
+	// Read again within seconds: Y's figure now covers B's leaf.
+	let http = r.http.clone();
+	tokio::time::sleep(server::rounds::FUNDABLE_FOR).await;
+	r.wait("Y's fundable figure covers B", || fundable(&http, y).is_some_and(|v| v >= 60_000_000)).await;
+	println!("fundable after funding: Y {:?}", fundable(&r.http, y));
 	let built = r.server.rounds.run_round().await.unwrap().expect("a round, with B");
 	println!("round {}: {} participation(s), batches {:?}", built.tx.txid(), built.participations, built.batches);
 	let sb = status(&r, &id_b);
