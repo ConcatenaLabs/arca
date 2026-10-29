@@ -1312,16 +1312,40 @@ cumulative credit the receiver can take on the chain with nobody's help.
 the most it puts on its side, `capacity`, and its credit window).
 
     arca channel open --capacity 1000000           # every live coin of one asset into a channel
+    arca channel open --capacity 1000000 --keep 1500000   # the same, 1500000 kept in a plain leaf beside it
+    arca care --channels                           # or by itself: a channel in each asset the operator makes them of
     arca sync                                      # once the round is final: the channel is live
     arca channel list                              # each channel: its balance, its credit, the operator's side
-    arca channel pay LEAF RECEIVER_LEAF 400000     # final for the receiver at once
-    arca channel sync LEAF                         # the operator's latest state and note, checked
+    arca channel code --address ADDR               # a text a payer pays at once
+    arca send CODE --asset X --amount 400000       # over the payer's channel into the receiver's
+    arca channel pay LEAF RECEIVER_LEAF 400000     # the same, by the receiver's leaf id
+    arca channel sync [LEAF]                       # the operator's latest state and note, checked
     arca channel fold LEAF                         # the credit paid in, into the balance
     arca participate --leaf LEAF                   # close into a round: a leaf of the wallet's side
     arca channel exit LEAF                         # close on the chain alone; run until `exited`
 
 A channel's address is its leaf id: a payer names the receiver's channel
-leaf. The wallet's side of a channel is its latest balance and every credit
+leaf. A receiver hands it out in two texts, both of which `send` takes. A
+receive request (`receive`) names the wallet's channels that can be paid now
+(live, their round final) under `channels`, by asset, beside the leaf it
+asks for. A channel code (`channel code`, kind `channel-code`) names those
+channels and nothing else: no key and no lapse, so it can be handed out
+again, with an address for a payment on the chain when `--address` gives
+one. `send` pays over the payer's channel in the asset into the receiver's
+when the text names one in that asset and the payer's channel, its round
+final, holds the amount (`route: "channel"` in the answer, with the
+operator's receipt); otherwise it pays a receive request to its leaf, as
+before (`route: "leaf"`, and why not by a channel under `not_by_channel`),
+and refuses a code, naming the code's address for a payment on the chain.
+The operator's refusal of the channel payment (the receiver's channel cannot
+take that much, or it was closed) leaves nothing standing, and the same
+fallback follows. A state sent and not answered stands: `send` refuses it as
+unreachable and pays nothing another way, since the next `channel sync`
+sends it again. `--route channel` or `--route leaf` takes one way alone.
+
+The payer relies on the operator for the one request a channel payment is:
+the operator could co-sign the payer's new state and keep the receiver's
+note back. The receiver's payment is final once it holds the note. The wallet's side of a channel is its latest balance and every credit
 not yet folded, which `balance` counts and a refresh gives up; the leaf's
 value beyond it is the operator's. Paying folds every credit not yet folded in
 the same state. The wallet keeps every state both sides signed, the latest
@@ -1354,7 +1378,26 @@ of any close.
 A channel leaf expires with its round, as any leaf. No plan starts from it:
 `care` closes it into a round once its expiry is within reach, for a plain
 leaf of the wallet's side, and a new channel is opened from that leaf with
-`channel open`.
+`channel open`, or by the next `care --channels`.
+
+`care --channels` cares for channels first: it reads each channel (the notes
+it was paid, a state sent and unanswered sent again) and folds the credit it
+was paid into its balance; then, for each asset the operator makes channels
+of in which the wallet holds leaves but no channel, it opens one in the next
+round, half of what those leaves hold after the refresh fee in the channel
+with the operator's whole capacity on its side, and the other half in a
+plain leaf beside it. Leaves a plan names, resting orders, coins awaiting a
+preimage and leaves of a supervised asset are left as they are, and so are
+leaves too small to split into two of the operator's smallest (`opened`
+says so). Since it runs before planning, the leaves it opens a channel from
+are not planned.
+
+An exit of a channel coin is the channel's exit: `exit LEAF` runs `channel
+exit`, and so does a wallet taking the coin home by itself (`sync`, when the
+coin cannot be refreshed in time or its path is found on the chain), so a
+channel closed by someone else is followed to its settle and its credit
+claimed. `exit --quote` refuses a channel coin: each step of its exit is
+priced as it is taken.
 
 ### Holding a supervised asset
 
@@ -1465,9 +1508,9 @@ registry for both commands.
 | `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
-| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
+| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
-| `send REQUEST [--amount N] [--asset A]` | Pays a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes |
+| `send REQUEST [--amount N] [--asset A] [--route any\|channel\|leaf]` | Pays a receive request or a channel code: over the wallet's channel into the receiver's when the text names one in the asset and the wallet's can pay it (see Channel leaves); otherwise a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes. `route` in the answer says which |
 | `mailbox` | Reads the mailbox and validates every coin in it; each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; the read's cursor never moves back (a message at or before what was read is not read again, a page with nothing past it ends the read, and one read takes at most a hundred pages of a key, `MAILBOX_PAGES`, the rest left to the next, each said in `note`); a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
 | `lightning pay INVOICE [--asset A] [--max-fee-ppm N] [--timeout T] [--wait S]` | Pays a BOLT11 invoice out of the wallet's coins in its asset (see Paying and receiving over Lightning): the coins given up, the margins, the change, the transfer, and the payment as it stands after `--wait` seconds (`paid` with its preimage, `returned`, or `paying`, followed by `sync`) |
 | `lightning payments` | Every payment over Lightning the wallet made, by payment hash: the invoice, asset, amount, fee, the `htlc-1` leaf, its state and its preimage or reason |
@@ -1488,8 +1531,9 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now, starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `channel list` | Every channel leaf the wallet holds: its latest state, its balance (the latest state's and every credit not folded), its credit and what of it is not folded, the operator's side, and whether a state waits for the operator's answer (see Channel leaves) |
-| `channel open [--leaf LEAF]… --capacity N [--max-fee-ppm P]` | Gives up the coins named (every live coin of one asset when none is) in the operator's next round for a channel leaf: what they hold, less the refresh fee, on the wallet's side and `N` on the operator's, at most the capacity `info` publishes; `sync` takes it once the round is final |
-| `channel sync LEAF` | Reads the channel from the operator and takes every newer state and note, each checked by the wallet's and the operator's keys; a state sent and never answered is sent again |
+| `channel open [--leaf LEAF]… --capacity N [--keep K] [--max-fee-ppm P]` | Gives up the coins named (every live coin of one asset when none is) in the operator's next round for a channel leaf: what they hold, less the refresh fee (and less `K`, kept in a plain leaf of the wallet's beside it), on the wallet's side and `N` on the operator's, at most the capacity `info` publishes; `sync` takes it once the round is final |
+| `channel sync [LEAF]` | Reads the channel (every live one when none is named) from the operator and takes every newer state and note, each checked by the wallet's and the operator's keys; a state sent and never answered is sent again |
+| `channel code [--address ADDR]` | A channel code: the wallet's channels that can be paid now, one for each asset, and `ADDR` for a payment on the chain instead, for a payer's `send` (see Channel leaves). Refused while the wallet holds none |
 | `channel pay LEAF TO AMOUNT` | Pays `AMOUNT` from the channel `LEAF` into the operator's channel `TO`, in the same asset: the next state signed, every credit not folded folded in it, and the answer the operator's signature and the receiver's note (`receipt`). Refused beyond the wallet's side, beyond what the receiver's operator side can take, or into the channel itself |
 | `channel fold LEAF` | Folds every credit the channel was paid into its balance |
 | `channel exit LEAF [--fee-asset A]` | Closes the channel on the chain, one step a run (see Channel leaves); `exited` once the wallet's side is swept home |
@@ -1513,7 +1557,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `plans` | Every plan the wallet made or restored: its coin, its state, each step's value, fee, state and leaf once taken up, `covered_until` and `sync_by`, and the operator's reason for a plan it stopped |
 | `plan-cancel PLAN` | Cancels the steps of plan `PLAN` that have not started, signed with the mailbox key; refused while a step is running. Every coin the plan named stays out of out-of-round payments until it is refreshed in a round |
 | `plan-release COIN… [--max-fee-ppm N]` | Gives up each named coin, the current coin of an open or stopped plan, in the next round for a leaf of the wallet's own that no plan names; the plan ends once the round is final and the forfeit handed over, and stands should the round never complete. The new leaf is paid out of round like any coin |
-| `care [--scan N] [--expiries N] [--max-fee-ppm N]` | Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first; a coin of a supervised asset is left to `sync`'s refresh and counted under `supervised`); what a wallet does by itself at a sync |
+| `care [--scan N] [--expiries N] [--max-fee-ppm N] [--plan-within S] [--channels]` | With `--channels`, first reads every channel, folds its credit and opens one in each asset the operator makes them of (see Channel leaves; under `channels`). Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first; a coin of a supervised asset is left to `sync`'s refresh and counted under `supervised`); what a wallet does by itself at a sync |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives) |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side and signs it (`arca-accept:…`). Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
 | `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
@@ -1589,6 +1633,16 @@ operator's sweep of the batch output where the last exit left it. A second
 test makes an offline-refresh plan from a leaf of an accumulator batch: its
 first step runs in the leaf's free window, and the holder, back, takes up the
 step's leaf.
+
+`tests/arca_channel_route.rs` runs the same way: `care --channels` opens a
+channel in two wallets, half of each one's leaves in it and half kept beside
+it, and opens no second one; payments to a channel code and to a receive
+request go over the channels, folding credit in the payer's state; a request
+of a wallet holding no channel is paid to its leaf, a code is never paid to a
+leaf, and a payment beyond the receiver's channel is refused there with
+nothing standing (a code's refusal names its address) and paid to a
+request's leaf instead; `care` folds what a channel was paid; and `exit` of a
+channel coin runs the channel's exit.
 
 `tests/arca_channel.rs` runs the same way: two wallets open channel leaves
 in one round, the operator funding its side of each; they pay each other,

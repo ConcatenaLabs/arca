@@ -108,6 +108,9 @@ pub struct RefreshQuote {
 	/// The operator's side of a channel leaf wanted in place of a plain one
 	/// ([`Wallet::channel_open`]); `None` for a refresh.
 	pub(crate) channel: Option<u64>,
+	/// With a channel: what the wallet keeps in a plain leaf of its own
+	/// beside it, out of what the coins hold after the fee.
+	pub(crate) keep: Option<u64>,
 	rows: Vec<super::store::CoinRow>,
 	ids: Vec<arca_covenant::LeafId>,
 	/// The asset of each coin of `rows`.
@@ -121,6 +124,11 @@ impl RefreshQuote {
 	/// the bound it was checked against.
 	pub fn coins(&self) -> &[Value] {
 		&self.coins
+	}
+
+	/// What the coins of `asset` hold after the refresh fee.
+	pub(crate) fn after(&self, asset: &AssetId) -> Option<u64> {
+		self.per.get(asset).map(|(total, fee)| total.saturating_sub(*fee))
 	}
 }
 
@@ -681,7 +689,7 @@ impl Wallet {
 				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 			}
 		}
-		Ok(RefreshQuote { info, channel: None, rows, ids, assets, per, coins })
+		Ok(RefreshQuote { info, channel: None, keep: None, rows, ids, assets, per, coins })
 	}
 
 	/// What refreshing a coin of `value` of `asset` whose expiry is median
@@ -716,14 +724,14 @@ impl Wallet {
 	/// refused or did not take now with its `error` (one not taken stands,
 	/// and sync posts it again); it is an error only when none was taken.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
-		let RefreshQuote { info, channel, rows, ids, assets, per, coins } = quote;
+		let RefreshQuote { info, channel, keep, rows, ids, assets, per, coins } = quote;
 		let mut out = vec![];
 		let mut first_error = None;
 		for (asset, (total, fee)) in &per {
 			let mine: Vec<usize> = (0..rows.len()).filter(|k| assets[*k] == *asset).collect();
 			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
 			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
-			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel) {
+			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel, keep) {
 				Ok(v) => out.push(v),
 				Err(e) => {
 					let mut entry = json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
@@ -749,11 +757,12 @@ impl Wallet {
 	}
 
 	/// Gives up `rows`, all of `asset` and worth `total`, for one new leaf of
-	/// `asset` in a round, paying `fee` of it.
-	#[allow(clippy::too_many_arguments)]
+	/// `asset` in a round, paying `fee` of it: a channel leaf with `capacity`
+	/// on the operator's side when given, and then, with `keep`, a plain leaf
+	/// of `keep` beside it, the channel taking the rest.
 	#[allow(clippy::too_many_arguments)]
 	fn participate_in(&mut self, info: &Value, asset: AssetId, total: u64, fee: u64, rows: &[&super::store::CoinRow],
-		ids: &[arca_covenant::LeafId], not_before: Option<u32>, capacity: Option<u64>) -> Result<Value, Error>
+		ids: &[arca_covenant::LeafId], not_before: Option<u32>, capacity: Option<u64>, keep: Option<u64>) -> Result<Value, Error>
 	{
 		let needs_fee_coin = self.chain.floor_per_kvb(asset)?.is_none();
 		let value = total.checked_sub(fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
@@ -782,8 +791,17 @@ impl Wallet {
 		} else {
 			Template::Vtxo1
 		};
+		// What stays in a plain leaf beside a channel: refused unless both
+		// leaves hold at least the operator's smallest.
+		let kept = match keep.filter(|_| channel.is_some()) {
+			Some(k) if k >= min && value.saturating_sub(k) >= min => Some(k),
+			Some(k) => return Err(Error::Refused(format!("keeping {} of {} beside the channel leaves a leaf below the operator's smallest, {}",
+				k, value, min))),
+			None => None,
+		};
+		let value = value - kept.unwrap_or(0);
 		let value = value.checked_add(capacity.unwrap_or(0)).ok_or_else(|| Error::Refused("the channel's value overflows".into()))?;
-		let wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
+		let mut wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
 			order: None, landing, channel }];
 		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
 		if let Some(l) = &landing {
@@ -795,7 +813,20 @@ impl Wallet {
 		if template == Template::Vtxo2 {
 			entry["template"] = json!("vtxo-2");
 		}
-		let nonces = vec![entry];
+		let mut nonces = vec![entry];
+		if let Some(k) = kept {
+			let n2 = super::random32();
+			let o2 = self.keys.leaf_xonly(&n2)?;
+			self.store.put_nonce(&n2, &o2.serialize(), "refresh")?;
+			let t2 = if self.asks_vtxo2() { Template::Vtxo2 } else { Template::Vtxo1 };
+			wanted.push(Wanted::Leaf { asset, value: k, template: t2, owner: o2, owner_nonce: n2, exit_delay: self.exit_delay(),
+				order: None, landing: None, channel: None });
+			let mut e2 = json!({"nonce": hex(&n2), "asset": asset.to_string(), "value": k.to_string()});
+			if t2 == Template::Vtxo2 {
+				e2["template"] = json!("vtxo-2");
+			}
+			nonces.push(e2);
+		}
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
 		let nb = not_before.map(MedianTime::from_consensus).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 		let id = participation_id(&self.genesis, &self.operator, ids, &wanted, &fees, nb);

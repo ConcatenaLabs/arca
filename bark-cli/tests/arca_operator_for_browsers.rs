@@ -67,6 +67,10 @@
 //! operator serves an asset I issuer-operated, its reissuance token in a
 //! mint limiter the signer mints through; `/state` names it `issuer`.
 //!
+//! With `ARCA_OPERATOR_CHANNELS` set to a capacity in atoms, the operator
+//! makes channel leaves (`channel-1`) of every plain asset it serves, with up
+//! to that much on its side of each.
+//!
 //! With `ARCA_OPERATOR_LIGHTNING` set (and `LIGHTNINGD_EXEC`, a SeqLN
 //! `lightningd`), the chain is the one SeqLN's `sequentia-regtest` network
 //! assumes and the operator runs a SeqLN node in X that receives, with a
@@ -738,6 +742,19 @@ async fn operator_for_browsers() {
 	};
 	let mut profiles = Profiles::default();
 	serve_profiles(&mut r, &mut profiles).await;
+	// Channel leaves in every plain asset, up to the capacity asked.
+	if let Ok(c) = std::env::var("ARCA_OPERATOR_CHANNELS") {
+		let c: u64 = c.trim().parse().expect("ARCA_OPERATOR_CHANNELS is a capacity in atoms");
+		let mut config = r.config.clone();
+		for a in config.assets.iter_mut() {
+			let id = AssetId::from_str(&a.asset).unwrap();
+			if !profiles.supervised_all.contains(&id) && Some(id) != profiles.issuer {
+				a.channel_capacity = Some(c.to_string());
+			}
+		}
+		r.server.reload(&config).await.unwrap();
+		r.config = config;
+	}
 	// With Lightning, the plain assets beyond X and Y get legs of their own.
 	if !_nodes.is_empty() && !profiles.more.is_empty() {
 		let more = profiles.more.clone();

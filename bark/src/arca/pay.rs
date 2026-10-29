@@ -94,6 +94,7 @@ struct Kind {
 const REQUEST_KIND: Kind = Kind { name: "request", older: "arca_request" };
 const OFFER_KIND: Kind = Kind { name: "swap-offer", older: "arca_swap_offer" };
 const ACCEPT_KIND: Kind = Kind { name: "swap-accept", older: "arca_swap_accept" };
+const CODE: Kind = Kind { name: super::channel::CODE_KIND, older: super::channel::CODE_KIND };
 
 fn encode(prefix: &str, v: &Value) -> String {
 	format!("{}{}", prefix, hex(v.to_string().as_bytes()))
@@ -306,6 +307,14 @@ impl Wallet {
 		if self.asks_vtxo2() {
 			req["template"] = json!("vtxo-2");
 		}
+		// The wallet's channels that can be paid now, in the asset named or
+		// in every asset: a payer holding a channel in the asset pays over
+		// it at once, and otherwise to the leaf this request names.
+		let channels: serde_json::Map<String, Value> = self.usable_channels()?.into_iter()
+			.filter(|(a, _)| asset.is_none_or(|x| x == *a)).map(|(a, (l, _))| (a.to_string(), json!(l))).collect();
+		if !channels.is_empty() {
+			req["channels"] = Value::Object(channels);
+		}
 		let mut out = json!({"request": encode(&self.spelling.request, &req), "details": req});
 		if let Some(n) = bond_note {
 			out["bond"] = json!(n);
@@ -412,6 +421,11 @@ impl Wallet {
 			if super::resting::is_order_coin(&row) {
 				continue;
 			}
+			// A channel coin pays by its channel's states, and is given up
+			// only in a round: no transfer spends it.
+			if self.channel_worth(&row)?.is_some() {
+				continue;
+			}
 			let (_, a) = self.held(&row)?;
 			if !a.all_final() {
 				continue;
@@ -515,6 +529,106 @@ impl Wallet {
 		let need = paid + total_live.saturating_sub(kept) + margin;
 		Err(self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
 			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?)
+	}
+
+	/// Pays `value` of `asset` to `text`, a receive request or a channel code
+	/// ([`Wallet::channel_code`]), by the way it can: over the wallet's
+	/// channel in the asset into the receiver's, at once and with no round,
+	/// when the text names a channel of the receiver's in the asset and the
+	/// wallet holds a channel there that can pay it; otherwise, to a receive
+	/// request, as [`Self::send`] pays it. `route` `"leaf"` takes the second
+	/// way alone, `"channel"` the first alone. A channel code names no leaf
+	/// to pay otherwise: not paid over a channel, it is refused, naming the
+	/// address the code carries for a payment on the chain. A channel's
+	/// state sent and not answered stands (the operator unreachable): it is
+	/// refused as unreachable, and nothing is paid another way, since the
+	/// state is sent again at the next sync of the channel.
+	///
+	/// The payer relies on the operator for the one request of a channel
+	/// payment: an operator could co-sign the payer's state and withhold the
+	/// receiver's note. The receiver's payment is final once it holds the
+	/// note.
+	pub fn send_routed(&mut self, text: &str, value: Option<u64>, asset: Option<AssetId>, route: Option<&str>) -> Result<Value, Error> {
+		let route = route.unwrap_or("any");
+		if !matches!(route, "any" | "channel" | "leaf") {
+			return Err(Error::Parse(format!("the route {:?}: any, channel or leaf", route)));
+		}
+		let code = decode(CODE, text, "the channel code").ok();
+		let req = match &code {
+			Some(c) => c.clone(),
+			None => decode(REQUEST_KIND, text, "the receive request or channel code")?,
+		};
+		let tried = if route == "leaf" {
+			if code.is_some() {
+				return Err(Error::Refused("a channel code is paid over a channel or on the chain, never to a leaf".into()));
+			}
+			None
+		} else {
+			Some(self.by_channel(&req, value, asset)?)
+		};
+		match tried {
+			Some(Ok(v)) => Ok(v),
+			Some(Err(why)) if code.is_some() || route == "channel" => {
+				let mut msg = format!("not paid over a channel: {}", why);
+				if let Some(a) = req["address"].as_str() {
+					msg.push_str(&format!("; the code names address {} for a payment on the chain", a));
+				}
+				Err(Error::Refused(msg))
+			},
+			other => {
+				let mut v = self.send(text, value, asset)?;
+				v["route"] = json!("leaf");
+				if let Some(Err(why)) = other {
+					v["not_by_channel"] = json!(why);
+				}
+				Ok(v)
+			},
+		}
+	}
+
+	/// A payment over the wallet's channel into the one `req` names: the
+	/// answer, or why it was not made with nothing standing (`Ok(Err)`), or
+	/// the error of a state sent and not answered, which stands.
+	fn by_channel(&mut self, req: &Value, value: Option<u64>, asset: Option<AssetId>) -> Result<Result<Value, String>, Error> {
+		if let Err(e) = self.check_chain(req, "text") {
+			return Ok(Err(e.to_string()));
+		}
+		let req_asset = match req.get("asset").map(|a| asset_of(a, "the request's asset")).transpose() {
+			Ok(a) => a,
+			Err(e) => return Ok(Err(e.to_string())),
+		};
+		let asset = match (asset, req_asset) {
+			(Some(a), Some(r)) if a != r => return Ok(Err(format!("the request asks for asset {}, not {}", r, a))),
+			(Some(a), _) | (None, Some(a)) => a,
+			(None, None) => return Ok(Err("no asset is named".into())),
+		};
+		let value = match (value, req.get("value").map(|v| amount(v, "the request's value"))) {
+			(Some(v), _) => v,
+			(None, Some(Ok(v))) => v,
+			_ => return Ok(Err("no amount is named".into())),
+		};
+		let Some(theirs) = req["channels"][asset.to_string()].as_str().map(str::to_string) else {
+			return Ok(Err(format!("the receiver names no channel in asset {}", asset)));
+		};
+		let mine = match self.usable_channels() {
+			Ok(m) => m,
+			Err(e) => return Ok(Err(e.to_string())),
+		};
+		let Some((leaf, worth)) = mine.get(&asset).cloned() else {
+			return Ok(Err(format!("the wallet holds no channel in asset {} that can pay now", asset)));
+		};
+		if leaf == theirs {
+			return Ok(Err("the receiver's channel is the wallet's own".into()));
+		}
+		if worth < value {
+			return Ok(Err(format!("the wallet's channel in asset {} holds {}, less than {}", asset, worth, value)));
+		}
+		match self.channel_pay(&leaf, &theirs, value) {
+			Ok(v) => Ok(Ok(json!({"route": "channel", "sent": {"asset": asset.to_string(), "value": value.to_string(), "to": theirs},
+				"channel": v}))),
+			Err(e) if self.channel_pending(&leaf)? => Err(e),
+			Err(e) => Ok(Err(e.to_string())),
+		}
 	}
 
 	/// Pays `value` of `asset` to the receive request `request`, out of round:

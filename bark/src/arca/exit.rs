@@ -736,6 +736,10 @@ impl Wallet {
 		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
+		if self.channel_worth(&row)?.is_some() {
+			return Err(Error::Refused(format!("coin {} is a channel leaf: it closes on the chain by its own steps (channel_exit), whose fees \
+				come from a coin of the wallet's, each step priced as it is taken", leaf_id)));
+		}
 		// An exit whose claim is out has nothing left to pay: `exit` follows
 		// the claim until it is final.
 		if let Some((state, _, Some(claim))) = self.store.exit(leaf_id)? {
@@ -831,6 +835,11 @@ impl Wallet {
 		// co-signed spend is `spent`, and is not exited.
 		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving") {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
+		}
+		// A channel leaf closes on the chain by its own steps: its latest
+		// state published, its settle, its credit claimed.
+		if self.channel_worth(&row)?.is_some() {
+			return self.channel_exit(leaf_id, fee_asset);
 		}
 		// A leaf received under a hash the wallet did not make is claimed only
 		// with that hash's preimage: before the wallet holds it, an exit

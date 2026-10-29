@@ -208,12 +208,18 @@ enum Cmd {
 	ForgetRequest { owner: String },
 	/// Pays a receive request out of round; one past its lapse is refused.
 	Send {
+		/// A receive request, or a channel code (`arca channel code`).
 		request: String,
 		#[arg(long)]
 		amount: Option<u64>,
 		/// The asset to send, when the request does not name it.
 		#[arg(long)]
 		asset: Option<String>,
+		/// How to pay: `any` (over the wallet's channel into the receiver's
+		/// when both hold one in the asset, else to the request's leaf),
+		/// `channel` or `leaf`.
+		#[arg(long)]
+		route: Option<String>,
 	},
 	/// Reads the mailbox and validates every coin in it.
 	Mailbox,
@@ -458,6 +464,11 @@ enum Cmd {
 		/// whatever this says.
 		#[arg(long)]
 		plan_within: Option<u32>,
+		/// Cares for channels too, first: reads each and folds its credit,
+		/// and opens one in each asset the operator makes channels of and
+		/// the wallet holds leaves of but no channel (half of them in it).
+		#[arg(long)]
+		channels: bool,
 	},
 	/// The claims paid to this wallet, found by asking the operator under its
 	/// OpenAMP account key and each address key: their distribution, value,
@@ -515,13 +526,25 @@ enum ChannelCmd {
 		/// operator's `info` publishes (`assets[].channels.capacity`).
 		#[arg(long)]
 		capacity: u64,
+		/// Keeps this much, of what the coins hold after the fee, in a plain
+		/// leaf beside the channel.
+		#[arg(long)]
+		keep: Option<u64>,
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
 	},
-	/// Reads a channel from the operator: every state and credit note newer
-	/// than the wallet's, each checked; a state sent and never answered is
-	/// sent again.
-	Sync { leaf_id: String },
+	/// Reads a channel from the operator (every live one when none is
+	/// named): every state and credit note newer than the wallet's, each
+	/// checked; a state sent and never answered is sent again.
+	Sync { leaf_id: Option<String> },
+	/// A text naming the wallet's channels that can be paid now, one for
+	/// each asset, for a payer's `arca send`: it pays over its own channel
+	/// at once. `--address` adds an address for a payment on the chain
+	/// instead.
+	Code {
+		#[arg(long)]
+		address: Option<String>,
+	},
 	/// Pays `AMOUNT` from the channel `LEAF_ID` into the channel `TO` of
 	/// another holder of the same operator, in the same asset: final for the
 	/// receiver at once. Every credit not yet folded is folded in the same
@@ -1320,7 +1343,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Boards => w.boards(),
 		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
-		Cmd::Send { request, amount, asset: a } => w.send(&request, amount, a.as_deref().map(asset).transpose()?),
+		Cmd::Send { request, amount, asset: a, route } => w.send_routed(&request, amount, a.as_deref().map(asset).transpose()?, route.as_deref()),
 		Cmd::Mailbox => w.mailbox(),
 		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, timeout, wait }) => {
 			let mut v = w.lightning_pay_until(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm, timeout)?;
@@ -1364,8 +1387,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
 		Cmd::Channel(ChannelCmd::List) => w.channels(),
-		Cmd::Channel(ChannelCmd::Open { leaves, capacity, max_fee_ppm }) => w.channel_open(&leaves, capacity, max_fee_ppm),
-		Cmd::Channel(ChannelCmd::Sync { leaf_id }) => w.channel_sync(&leaf_id),
+		Cmd::Channel(ChannelCmd::Open { leaves, capacity, keep, max_fee_ppm }) => w.channel_open(&leaves, capacity, keep, max_fee_ppm),
+		Cmd::Channel(ChannelCmd::Sync { leaf_id: Some(leaf_id) }) => w.channel_sync(&leaf_id),
+		Cmd::Channel(ChannelCmd::Sync { leaf_id: None }) => w.channel_sync_all(),
+		Cmd::Channel(ChannelCmd::Code { address }) => w.channel_code(address.as_deref()),
 		Cmd::Channel(ChannelCmd::Pay { leaf_id, to, amount }) => w.channel_pay(&leaf_id, &to, amount),
 		Cmd::Channel(ChannelCmd::Fold { leaf_id }) => w.channel_fold(&leaf_id),
 		Cmd::Channel(ChannelCmd::Exit { leaf_id, fee_asset }) => w.channel_exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
@@ -1478,7 +1503,18 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Plans => w.plans(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
-		Cmd::Care { scan, expiries, max_fee_ppm, plan_within } => w.care(scan, expiries, max_fee_ppm, plan_within),
+		Cmd::Care { scan, expiries, max_fee_ppm, plan_within, channels } => {
+			let c = if channels {
+				Some(w.care_channels(Some(max_fee_ppm.unwrap_or(bark::arca::CARE_MAX_FEE_PPM))).unwrap_or_else(|e| json!({"error": e.to_string()})))
+			} else {
+				None
+			};
+			let mut v = w.care(scan, expiries, max_fee_ppm, plan_within)?;
+			if let Some(c) = c {
+				v["channels"] = c;
+			}
+			Ok(v)
+		},
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
 	}
