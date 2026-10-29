@@ -137,11 +137,24 @@ fn start(w: &mut Wallet, command: &str) -> Value {
 		};
 	}
 	if !matches!(command, "recheck" | "sync" | "schedule") {
-		// Every coin's bases once a tip; the lineage watch, which a spend in
-		// the mempool calls for, before every command.
-		if let Ok(Some(tip)) = w.tip_rechecked() {
+		// Every coin's bases once a tip, before a command that signs or asks
+		// the operator (a command that only reads the store signs nothing:
+		// it waits for the next one, or the next `sync`); the lineage watch,
+		// which a spend in the mempool calls for, before every command.
+		let reads = matches!(command, "balance" | "coins" | "record" | "refusals" | "participations" | "orders" | "swaps" | "plans"
+			| "lightning_payments" | "lightning_receives" | "offboards");
+		let same = w.tip_rechecked().ok().flatten();
+		if same.is_some() || reads {
 			out["recheck"] = match w.recheck_lineages() {
-				Ok(mut v) => { v["tip"] = json!(tip); v },
+				Ok(mut v) => {
+					if let Some(tip) = same {
+						v["tip"] = json!(tip);
+					} else {
+						v["lineages_only"] = json!("the command only reads the wallet's store: every coin's bases are read again before the \
+							next command that signs or asks the operator, or at the next sync");
+					}
+					v
+				},
 				Err(e) => json!({"error": {"kind": e.kind(), "message": format!("the re-check on start could not run: {}", e)}}),
 			};
 			return out;
