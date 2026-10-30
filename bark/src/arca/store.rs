@@ -334,6 +334,22 @@ impl Store {
 		Ok(())
 	}
 
+	/// Sets every `(key, value)` of `entries` in one transaction: all of them or,
+	/// should any write fail or the program stop part way, none.
+	pub fn set_metas(&self, entries: &[(&str, String)]) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		for (k, v) in entries {
+			tx.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", params![k, v])
+				.map_err(db)?;
+		}
+		tx.commit().map_err(db)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn conn_for_tests(&self) -> &Connection {
+		&self.conn
+	}
+
 	pub fn delete_meta(&self, key: &str) -> Result<(), Error> {
 		self.conn.execute("DELETE FROM meta WHERE key = ?1", params![key]).map_err(db)?;
 		Ok(())
