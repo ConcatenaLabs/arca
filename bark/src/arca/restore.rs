@@ -500,6 +500,7 @@ impl Wallet {
 				return Err(format!("{}: the coin is not taken (the mailbox read takes it once its head comes with them)", why));
 			}
 		}
+		self.take_served_bases(e);
 		let a = self.checked_as_held(&record, &owner, &nonce, now)?;
 		let (state, note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
 		let row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
@@ -520,6 +521,30 @@ impl Wallet {
 			let _ = self.witness_record(&e["batch"]["signer_record"], false);
 		}
 		Ok(Some((state.to_string(), coin)))
+	}
+
+	/// The transactions the server names for coin `e` (`bases`: the batch
+	/// outputs and boards a coin made out of round descends from; a round
+	/// leaf's round; a board's own transaction), read by txid and taken as
+	/// known bases. Without them a fresh store finds a base by the node's set
+	/// of unspent outputs, and one spent since (a batch reclaimed after its
+	/// leaves moved on) only by reading blocks. Hints only: each is taken
+	/// only from the active chain, and used only where it pays an output the
+	/// record names; one that does not read leaves the search as it was.
+	fn take_served_bases(&mut self, e: &Value) {
+		let mut named: Vec<String> = e["bases"].as_array().into_iter().flatten()
+			.filter_map(|b| b["txid"].as_str().map(str::to_string)).collect();
+		named.extend(e["batch"]["round_txid"].as_str().map(str::to_string));
+		named.extend(e["board"]["txid"].as_str().map(str::to_string));
+		named.sort();
+		named.dedup();
+		for t in named {
+			let Ok(txid) = Txid::from_str(&t) else { continue };
+			match self.chain.transaction(&txid) {
+				Ok(Some(tx)) => { let _ = self.hint_base(&tx); },
+				_ => {},
+			}
+		}
 	}
 
 	/// The coin `id` (`coin`), restored live, whose own output the chain

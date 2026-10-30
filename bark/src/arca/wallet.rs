@@ -2288,6 +2288,27 @@ impl Wallet {
 		}
 	}
 
+	/// Takes `tx` as a base transaction the wallet knows: stored, and indexed
+	/// by the outputs it pays, so `known_base` finds it without asking the
+	/// chain. Only a transaction of the active chain is taken; a coin uses it
+	/// only where it pays an output the coin's record names.
+	pub(crate) fn hint_base(&self, tx: &Transaction) -> Result<bool, Error> {
+		let txid = tx.txid().to_string();
+		if self.base_index.borrow().txs.contains_key(&txid) {
+			return Ok(true);
+		}
+		if !self.chain.whereabouts(&tx.txid())?.0 {
+			return Ok(false);
+		}
+		self.store.put_tx(&txid, &elements::encode::serialize(tx), "base")?;
+		let mut idx = self.base_index.borrow_mut();
+		for out in &tx.output {
+			idx.by_output.entry(elements::encode::serialize(out)).or_insert_with(|| txid.clone());
+		}
+		idx.txs.insert(txid, tx.clone());
+		Ok(true)
+	}
+
 	fn known_base(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
 		// The wallet's base transactions, each read from the store once and
 		// indexed by the outputs it pays: a wallet that rests many orders

@@ -1325,6 +1325,15 @@ pub struct LeafEntry {
 	/// A board: its transaction output and its state there.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub board: Option<LeafBoard>,
+	/// For a coin made out of round, the outputs on the chain it rests on that
+	/// the server knows: the batch output of each round leaf and the output
+	/// of each board its record descends from. A wallet restored from its
+	/// mnemonic reads these transactions by txid, never by searching blocks
+	/// for them (a batch output reclaimed since is no longer in the node's set
+	/// of unspent outputs). Hints only: the wallet takes a transaction only if
+	/// it pays the output the record names, and is in the chain.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub bases: Vec<LeafBase>,
 	/// A transfer's output: the transfer, and the head of the signer's
 	/// record its last signature was recorded at, with the keepers'
 	/// acknowledgements.
@@ -1348,6 +1357,14 @@ pub struct LeafBatch {
 	pub signer_record: Option<RecordHead>,
 }
 
+/// An output on the chain a coin rests on: a round's batch output or a
+/// board's output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafBase {
+	pub txid: String,
+	pub vout: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafBoard {
