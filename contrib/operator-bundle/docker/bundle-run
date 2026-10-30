@@ -54,7 +54,9 @@ full_page_writes = on
 synchronous_commit = on
 wal_level = replica
 archive_mode = on
-archive_command = 'test ! -f $BACKUP_DIR/wal/%f && cp %p $BACKUP_DIR/wal/%f'
+# Each segment compressed as it is archived: a segment closed by the timeout
+# is mostly empty, and compresses to almost nothing. Restore with gunzip -c.
+archive_command = 'test ! -f $BACKUP_DIR/wal/%f.gz && gzip -c %p > $BACKUP_DIR/wal/%f.gz.part && mv $BACKUP_DIR/wal/%f.gz.part $BACKUP_DIR/wal/%f.gz'
 archive_timeout = 300
 EOF
   chown "$USER_:$USER_" "$LIB/pg/conf.d.conf"

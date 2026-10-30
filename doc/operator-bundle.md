@@ -391,7 +391,12 @@ ahead.
 `wallet.mnemonic` (in `/etc/arca-bundle/`, the `etc` volume with Docker),
 `captaind/mnemonic`, and each gateway's `hsm_secret` (`seqln/<network>/` and
 `cln/<network>/`, under `/var/lib/arca-bundle/`, the `lib` volume). The
-signer's record is never restored from a copy.
+signer's record is never restored from a copy. The database archives every
+write-ahead log segment, compressed, into `BACKUP_DIR/wal` (the `backup`
+volume) as it is written, at least every five minutes: take a base backup
+from time to time (`pg_basebackup`), and remove the segments older than it
+with `pg_archivecleanup`, or the archive grows by about the database's write
+rate.
 
 **When it goes down, and how much it carries.**
 [Testing an operator](operator-bundle-tests.md) runs an operator under load to

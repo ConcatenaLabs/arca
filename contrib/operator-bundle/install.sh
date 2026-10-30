@@ -77,7 +77,7 @@ OPT=/opt/$NAME; ETC=/etc/$NAME; LIB=/var/lib/$NAME; LOG=/var/log/$NAME
 BIN=$OPT/bin
 # Downloads, the toolchain and the builds are shared by every bundle on the machine.
 CACHE=/var/cache/arca-bundle
-: "${BACKUP_DIR:=$LIB/backup}"
+: "${BACKUP_DIR:=/var/backups/$NAME}"
 export CARGO_HOME=$CACHE/toolchain/cargo RUSTUP_HOME=$CACHE/toolchain/rustup
 export PATH=$CARGO_HOME/bin:$PATH
 export CARGO_BUILD_JOBS=$BUILD_JOBS CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=symbols
@@ -808,11 +808,17 @@ full_page_writes = on
 synchronous_commit = on
 wal_level = replica
 archive_mode = on
-archive_command = 'test ! -f $BACKUP_DIR/wal/%f && cp %p $BACKUP_DIR/wal/%f'
+# Each segment compressed as it is archived: a segment closed by the timeout
+# is mostly empty, and compresses to almost nothing. Restore with gunzip -c.
+archive_command = 'test ! -f $BACKUP_DIR/wal/%f.gz && gzip -c %p > $BACKUP_DIR/wal/%f.gz.part && mv $BACKUP_DIR/wal/%f.gz.part $BACKUP_DIR/wal/%f.gz'
 archive_timeout = 300
 EOF
 pg_changed=0; cmp -s "$t" "$pgconf" 2>/dev/null || { install -m 644 "$t" "$pgconf"; pg_changed=1; }; rm -f "$t"
-chown postgres:postgres "$BACKUP_DIR/wal"; chmod 750 "$BACKUP_DIR/wal"
+# PostgreSQL writes the archive, so it must reach it: the backup directory
+# lets others pass through (751) and the archive is PostgreSQL's own.
+chmod 751 "$BACKUP_DIR"; chown postgres:postgres "$BACKUP_DIR/wal"; chmod 750 "$BACKUP_DIR/wal"
+x=$(runuser -u postgres -- sh -c "test -w '$BACKUP_DIR/wal' && echo ok" 2>/dev/null || true)
+[ "$x" = ok ] || die "PostgreSQL cannot write $BACKUP_DIR/wal: every directory above it must let others pass through (chmod o+x)"
 systemctl enable -q "$PG_UNIT"
 if [ "$pg_changed" = 1 ] && systemctl is-active --quiet "$PG_UNIT"; then systemctl restart "$PG_UNIT"; else systemctl start "$PG_UNIT"; fi
 psql_su() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -p "$PG_PORT" -d postgres "$@" </dev/null; }
