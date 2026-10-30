@@ -1,0 +1,13 @@
+diff --git a/src/encoder.rs b/src/encoder.rs
+index 7b5262e..7a88d55 100644
+--- a/src/encoder.rs
++++ b/src/encoder.rs
+@@ -114,7 +114,7 @@ impl Encoder {
+     fn parse_network(network: &str) -> Result<Currency> {
+         match network {
+             "bitcoin" => Ok(Currency::Bitcoin),
+-            "testnet" => Ok(Currency::BitcoinTestnet),
++            "testnet" | "testnet4" => Ok(Currency::BitcoinTestnet),
+             "signet" => Ok(Currency::Signet),
+             "regtest" => Ok(Currency::Regtest),
+             _ => Err(NetworkError::InvalidNetwork.into()),

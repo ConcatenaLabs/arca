@@ -1,0 +1,282 @@
+From 34ee31ac95a0de573c1a672139c4e9eb618d2421 Mon Sep 17 00:00:00 2001
+From: GracedEternalKingCabbageMan
+ <151803062+GracedEternalKingCabbageMan@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:43:07 +0200
+Subject: [PATCH] bark: add testnet4 to the client's networks
+
+The library already runs on any rust-bitcoin network, and the server
+accepts testnet4, but the CLI and barkd only offered mainnet, signet,
+mutinynet and regtest.
+
+A testnet4 wallet also could not pay a BOLT11 invoice: such an invoice
+carries the currency "tb", which testnet3 and testnet4 share, and
+lightning-invoice maps it to Network::Testnet. Comparing that with the
+wallet's network refused every testnet4 invoice. Compare currencies
+instead, with a mapping that knows testnet4 (lightning-invoice's own
+From<Network> maps it to regtest).
+---
+ bark-cli/src/bin/barkd/main.rs       |  1 +
+ bark-cli/src/wallet.rs               | 17 ++++---
+ bark-json/src/web.rs                 |  2 +
+ bark-rest-client/docs/BarkNetwork.md |  1 +
+ bark-rest/openapi.json               |  1 +
+ bark/src/actions/lightning/pay.rs    |  2 +-
+ bark/src/config.rs                   |  4 ++
+ bark/src/payment_request.rs          |  2 +-
+ lib/src/lightning.rs                 | 75 ++++++++++++++++++++++++++++
+ 9 files changed, 97 insertions(+), 8 deletions(-)
+
+diff --git a/bark-cli/src/bin/barkd/main.rs b/bark-cli/src/bin/barkd/main.rs
+index 869ab0644..5e1e6f43e 100644
+--- a/bark-cli/src/bin/barkd/main.rs
++++ b/bark-cli/src/bin/barkd/main.rs
+@@ -331,6 +331,7 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
+ 		regtest: req.network == BarkNetwork::Regtest,
+ 		signet: req.network == BarkNetwork::Signet,
+ 		mutinynet: req.network == BarkNetwork::Mutinynet,
++		testnet4: req.network == BarkNetwork::Testnet4,
+ 		mnemonic: mnemonic,
+ 		birthday_height: req.birthday_height,
+ 		config: config,
+diff --git a/bark-cli/src/wallet.rs b/bark-cli/src/wallet.rs
+index 08d231450..637ad9cac 100644
+--- a/bark-cli/src/wallet.rs
++++ b/bark-cli/src/wallet.rs
+@@ -281,6 +281,9 @@ pub struct CreateOpts {
+ 	/// Use mutinynet
+ 	#[arg(long)]
+ 	pub mutinynet: bool,
++	/// Use Bitcoin Core's testnet4
++	#[arg(long)]
++	pub testnet4: bool,
+ 
+ 	/// Recover a wallet with an existing mnemonic.
+ 	/// This currently only works for on-chain funds.
+@@ -360,12 +363,13 @@ pub async fn create_wallet(
+ ) -> anyhow::Result<()> {
+ 	debug!("Creating wallet in {}", datadir.display());
+ 
+-	let net = match (opts.mainnet, opts.signet, opts.regtest, opts.mutinynet) {
+-		(true,  false, false, false) => BarkNetwork::Mainnet,
+-		(false, true,  false, false) => BarkNetwork::Signet,
+-		(false, false, true,  false) => BarkNetwork::Regtest,
+-		(false, false, false, true ) => BarkNetwork::Mutinynet,
+-		_ => bail!("Specify exactly one of --mainnet, --signet, --regtest or --mutinynet"),
++	let net = match (opts.mainnet, opts.signet, opts.regtest, opts.mutinynet, opts.testnet4) {
++		(true,  false, false, false, false) => BarkNetwork::Mainnet,
++		(false, true,  false, false, false) => BarkNetwork::Signet,
++		(false, false, true,  false, false) => BarkNetwork::Regtest,
++		(false, false, false, true,  false) => BarkNetwork::Mutinynet,
++		(false, false, false, false, true ) => BarkNetwork::Testnet4,
++		_ => bail!("Specify exactly one of --mainnet, --signet, --regtest, --mutinynet or --testnet4"),
+ 	};
+ 
+ 	// check for non-config file contents in the datadir and wipe if force
+@@ -601,6 +605,7 @@ mod test {
+ 			regtest: false,
+ 			signet: true,
+ 			mutinynet: false,
++			testnet4: false,
+ 			mnemonic: None,
+ 			birthday_height: None,
+ 			config: ConfigOpts::default(),
+diff --git a/bark-json/src/web.rs b/bark-json/src/web.rs
+index 952fcffd9..6c58f80eb 100644
+--- a/bark-json/src/web.rs
++++ b/bark-json/src/web.rs
+@@ -232,6 +232,8 @@ pub enum BarkNetwork {
+ 	Signet,
+ 	/// Mutinynet
+ 	Mutinynet,
++	/// Bitcoin Core's testnet4
++	Testnet4,
+ 	/// Any regtest network
+ 	Regtest,
+ }
+diff --git a/bark-rest-client/docs/BarkNetwork.md b/bark-rest-client/docs/BarkNetwork.md
+index 07f345ceb..3154f4f52 100644
+--- a/bark-rest-client/docs/BarkNetwork.md
++++ b/bark-rest-client/docs/BarkNetwork.md
+@@ -7,6 +7,7 @@
+ | Mainnet | mainnet |
+ | Signet | signet |
+ | Mutinynet | mutinynet |
++| Testnet4 | testnet4 |
+ | Regtest | regtest |
+ 
+ 
+diff --git a/bark-rest/openapi.json b/bark-rest/openapi.json
+index 80e695b0d..ebcfe07af 100644
+--- a/bark-rest/openapi.json
++++ b/bark-rest/openapi.json
+@@ -3626,6 +3626,7 @@
+           "mainnet",
+           "signet",
+           "mutinynet",
++          "testnet4",
+           "regtest"
+         ]
+       },
+diff --git a/bark/src/actions/lightning/pay.rs b/bark/src/actions/lightning/pay.rs
+index 8cf0162e9..70c9c4c7b 100644
+--- a/bark/src/actions/lightning/pay.rs
++++ b/bark/src/actions/lightning/pay.rs
+@@ -316,7 +316,7 @@ pub(crate) async fn start_lightning_send(
+ 	let tip = wallet.inner.chain.tip().await?;
+ 
+ 	let properties = wallet.inner.db.read_properties().await?.context("Missing config")?;
+-	if invoice.network() != properties.network {
++	if !invoice.is_for_network(properties.network) {
+ 		bail!("Invoice is for wrong network: {}", invoice.network());
+ 	}
+ 
+diff --git a/bark/src/config.rs b/bark/src/config.rs
+index ab353efc8..dd01c4ebe 100644
+--- a/bark/src/config.rs
++++ b/bark/src/config.rs
+@@ -20,6 +20,8 @@ pub enum BarkNetwork {
+ 	Signet,
+ 	/// Mutinynet
+ 	Mutinynet,
++	/// Bitcoin Core's testnet4
++	Testnet4,
+ 	/// Any regtest network
+ 	Regtest,
+ }
+@@ -31,6 +33,7 @@ impl BarkNetwork {
+ 			Self::Mainnet => Network::Bitcoin,
+ 			Self::Signet => Network::Signet,
+ 			Self::Mutinynet => Network::Signet,
++			Self::Testnet4 => Network::Testnet4,
+ 			Self::Regtest => Network::Regtest,
+ 		}
+ 	}
+@@ -42,6 +45,7 @@ impl fmt::Display for BarkNetwork {
+ 			Self::Mainnet => f.write_str("mainnet"),
+ 			Self::Signet => f.write_str("signet"),
+ 			Self::Mutinynet => f.write_str("mutinynet"),
++			Self::Testnet4 => f.write_str("testnet4"),
+ 			Self::Regtest => f.write_str("regtest"),
+ 		}
+ 	}
+diff --git a/bark/src/payment_request.rs b/bark/src/payment_request.rs
+index 564636bfb..40fca5647 100644
+--- a/bark/src/payment_request.rs
++++ b/bark/src/payment_request.rs
+@@ -385,7 +385,7 @@ impl Wallet {
+ 	) -> AvailablePaymentMethod {
+ 		let mut errors = vec![];
+ 
+-		if bolt11.network() != network {
++		if !ark::lightning::bolt11_is_for_network(bolt11, network) {
+ 			errors.push(PaymentMethodParsingError::NetworkMismatch);
+ 		}
+ 
+diff --git a/lib/src/lightning.rs b/lib/src/lightning.rs
+index 3dc3b88bc..35ff9823c 100644
+--- a/lib/src/lightning.rs
++++ b/lib/src/lightning.rs
+@@ -1,6 +1,7 @@
+ use bitcoin::constants::ChainHash;
+ pub use lightning::offers::invoice::Bolt12Invoice;
+ pub use lightning_invoice::Bolt11Invoice;
++use lightning_invoice::Currency;
+ pub use lightning::offers::offer::{Amount as OfferAmount, Offer};
+ 
+ use std::fmt;
+@@ -251,6 +252,18 @@ impl Invoice {
+ 		}
+ 	}
+ 
++	/// Whether this invoice is for the given network.
++	///
++	/// Use this rather than comparing [Invoice::network]: a BOLT11 invoice
++	/// carries only a currency, which testnet3 and testnet4 share (`tb`), so
++	/// its network always reads as testnet3.
++	pub fn is_for_network(&self, network: Network) -> bool {
++		match self {
++			Invoice::Bolt11(invoice) => bolt11_is_for_network(invoice, network),
++			Invoice::Bolt12(invoice) => invoice.chain() == ChainHash::using_genesis_block(network),
++		}
++	}
++
+ 	pub fn network(&self) -> Network {
+ 		match self {
+ 			Invoice::Bolt11(invoice) => invoice.network(),
+@@ -482,6 +495,25 @@ pub trait OfferAmountExt: Borrow<OfferAmount> {
+ 
+ impl OfferAmountExt for OfferAmount {}
+ 
++
++/// The BOLT11 currency of invoices on the given network.
++///
++/// `lightning_invoice`'s own conversion does not know testnet4 and maps it
++/// to regtest. Testnet3 and testnet4 share the `tb` currency.
++pub fn bolt11_currency(network: Network) -> Currency {
++	match network {
++		Network::Bitcoin => Currency::Bitcoin,
++		Network::Testnet | Network::Testnet4 => Currency::BitcoinTestnet,
++		Network::Signet => Currency::Signet,
++		Network::Regtest => Currency::Regtest,
++	}
++}
++
++/// Whether a BOLT11 invoice is for the given network.
++pub fn bolt11_is_for_network(invoice: &Bolt11Invoice, network: Network) -> bool {
++	bolt11_currency(network) == invoice.currency()
++}
++
+ #[cfg(test)]
+ mod test {
+ 	use super::*;
+@@ -701,4 +733,47 @@ mod test {
+ 		let currency = OfferAmount::Currency { iso4217_code: usd, amount: 100 };
+ 		assert_eq!(currency.to_bitcoin_amount(), None);
+ 	}
++
++	#[test]
++	fn bolt11_network_testnet4() {
++		use lightning_invoice::InvoiceBuilder;
++		use std::time::Duration;
++
++		let secp = Secp256k1::new();
++		let key = SecretKey::from_slice(&[2; 32]).unwrap();
++		let invoice = |currency: Currency| {
++			let inv = InvoiceBuilder::new(currency)
++				.description("test".into())
++				.payment_hash(sha256::Hash::hash(b"preimage"))
++				.payment_secret(lightning_invoice::PaymentSecret([42; 32]))
++				.duration_since_epoch(Duration::from_secs(1_700_000_000))
++				.min_final_cltv_expiry_delta(144)
++				.amount_milli_satoshis(1_000_000)
++				.build_signed(|m| secp.sign_ecdsa_recoverable(m, &key))
++				.unwrap();
++			Invoice::Bolt11(inv)
++		};
++
++		// A testnet invoice ("lntb") is for testnet3 and testnet4, though its
++		// network reads as testnet3.
++		let tb = invoice(Currency::BitcoinTestnet);
++		assert!(tb.to_string().starts_with("lntb"));
++		assert_eq!(tb.network(), Network::Testnet);
++		assert!(tb.is_for_network(Network::Testnet4));
++		assert!(tb.is_for_network(Network::Testnet));
++		for other in [Network::Bitcoin, Network::Signet, Network::Regtest] {
++			assert!(!tb.is_for_network(other), "lntb accepted on {}", other);
++		}
++
++		// A testnet4 wallet takes no other network's invoice.
++		for currency in [Currency::Bitcoin, Currency::Signet, Currency::Regtest] {
++			assert!(!invoice(currency).is_for_network(Network::Testnet4));
++		}
++
++		// The networks map to their own currencies.
++		assert_eq!(bolt11_currency(Network::Testnet4), Currency::BitcoinTestnet);
++		assert_eq!(bolt11_currency(Network::Regtest), Currency::Regtest);
++		assert_eq!(bolt11_currency(Network::Signet), Currency::Signet);
++		assert_eq!(bolt11_currency(Network::Bitcoin), Currency::Bitcoin);
++	}
+ }
+-- 
+2.43.0
+
