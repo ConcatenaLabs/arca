@@ -78,7 +78,11 @@
 //! out of the tree time out four to eight days out, which a swap of BTC for
 //! an asset (`arca btc-swap`) needs between wallets with the specification's
 //! 36-hour exit delays against a Bitcoin ark's 88-hour HTLC delays. `/state`
-//! then says `lightning: true`.
+//! then says `lightning: true`, and names the two nodes (`x_lightning:
+//! {operator, peer}`, each its socket `rpc`, its `id` and `addr`), so that a
+//! second operator's SeqLN node can open a channel to them. `/state` names
+//! the chain (`chain`) and the node's data directory (`node_datadir`) in
+//! every mode.
 //!
 //! With `ARCA_OPERATOR_BTC_LIGHTNING` set to a count `n` as well (and
 //! `BITCOIND_EXEC`, a Bitcoin Core `bitcoind` with `bitcoin-cli` beside it),
@@ -799,6 +803,16 @@ async fn operator_for_browsers() {
 					v["assets"] = json!(r.config.assets.iter().map(|a| a.asset.to_string()).collect::<Vec<_>>());
 					v["issuer"] = json!(profiles.issuer.map(|i| i.to_string()));
 					v["bond"] = json!(profiles.bond.as_ref().map(|(_, o)| format!("{}:{}", o.txid, o.vout)));
+					// The chain's name, the node's data directory and the
+					// operator's own SeqLN nodes in X: what a second
+					// operator's SeqLN node needs to run beside them.
+					v["chain"] = json!(r.rt.chain_name());
+					v["node_datadir"] = json!(r.rt.node.datadir().display().to_string());
+					if let [ox, px] = &_nodes[..] {
+						let n = |l: &LightningNode| json!({"rpc": l.rpc_path().display().to_string(), "id": l.id,
+							"addr": format!("127.0.0.1:{}", l.port)});
+						v["x_lightning"] = json!({"operator": n(ox), "peer": n(px)});
+					}
 				}
 				if let (Some(side), "/state") = (&btc, path.as_str()) {
 					v["btc_lightning"] = json!({"hub": side.hub.rpc_path().display().to_string(),
