@@ -1061,9 +1061,21 @@ impl Wallet {
 		let due = CoinDates::of(self.service_expiry(&record, &a)?)
 			.is_some_and(|d| now.to_consensus_u32() >= d.home_from);
 		let boards_spent = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).err();
+		// A coin whose board, or something of whose lineage, is on the chain
+		// before the wallet read it (its sender converting the board it paid
+		// from, or taking home a coin the payment rests on) is answered as a
+		// coin held is answered: kept and taken home at once, publishing what
+		// the wallet holds (the checkpoint, then the reassignment) before the
+		// sender's delay runs out. It is refused only once a spend that is no
+		// step of its path, and is final, has cut that path: then there is
+		// nothing left to take home.
+		let mut answer = false;
 		if let Some(e) = &boards_spent {
 			if !home && !late && !due {
-				return Err(Error::Refused(e.to_string()));
+				if self.cut_by_final_spend(&a.valid)? {
+					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+				}
+				answer = true;
 			}
 		}
 		// A coin resting on a board carries the board's dates. One that
@@ -1086,8 +1098,11 @@ impl Wallet {
 		// step first: refusing it would only lose it.
 		let on_chain = a.valid.check_lineage(|s| seen.contains(s)).err();
 		if let Some(e) = &on_chain {
-			if !late && !home && !due {
-				return Err(Error::Refused(e.to_string()));
+			if !late && !home && !due && !answer {
+				if self.cut_by_final_spend(&a.valid)? {
+					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+				}
+				answer = true;
 			}
 		}
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
@@ -1178,6 +1193,19 @@ impl Wallet {
 		if home && !late {
 			let why = format!("the operator's signer is stopped and co-signs nothing more: the wallet takes the coin on the chain at once{}{}",
 				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default(),
+				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
+			self.store.set_coin_state(&id, &coin.state, &why)?;
+			out["note"] = json!(why);
+			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
+				"note": "exit the coin, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			if let Some(c) = self.store.coin(&id)? {
+				out["state"] = json!(c.state);
+			}
+		}
+		if answer && !due && !late && !home {
+			let why = format!("its lineage is on the chain already, taken there before the wallet read it{}{}: the operator co-signs \
+				no spend of it, and the wallet takes it home at once, publishing its path before any exit delay runs out",
+				on_chain.as_ref().map(|e| format!(" ({})", e)).unwrap_or_default(),
 				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
 			self.store.set_coin_state(&id, &coin.state, &why)?;
 			out["note"] = json!(why);
