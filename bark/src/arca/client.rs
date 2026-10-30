@@ -448,6 +448,13 @@ impl ServerClient {
 		Self::answer(call, self.send("POST", call, Some(body)))
 	}
 
+	/// Forgets the `info` kept, so the next call reads it again: before a
+	/// command that takes a coin, signs or broadcasts, which checks the
+	/// operator's key and terms as the server shows them now.
+	pub fn forget_info(&self) {
+		*self.info.lock().expect("the info memo") = None;
+	}
+
 	/// The server's `info`, read again once [`INFO_FOR`] has passed.
 	pub fn info(&self) -> Result<Value, Error> {
 		if let Some((at, v)) = self.info.lock().expect("the info memo").as_ref() {

@@ -125,6 +125,12 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	if args["shared_view"].as_bool() == Some(true) && reads_only(command) {
 		w.chain.share_view();
 	}
+	// The server's terms a moment old serve a read; a command that takes a
+	// coin, signs or broadcasts reads them again, and sees an operator showing
+	// another key before it signs anything.
+	if !reads_only(command) {
+		w.server.forget_info();
+	}
 	// What the command cost, in time and in requests of the node and of the
 	// operator, the part before it (the witness and the re-check) apart: what
 	// a program logs of a slow command.
