@@ -70,6 +70,9 @@ from Bark applies with few edits; only the package names carry the `arca-` prefi
 [doc/operator-procedure.md](doc/operator-procedure.md) is the procedure an operator that holds other people's
 coins follows: how it is made, what is never done, how its storage is kept and restored, and what its holders
 are told.
+[doc/operator-bundle.md](doc/operator-bundle.md) sets up a whole operator on one machine, on both chains (the
+Sequentia and Bitcoin nodes, `arcad` and its signer, a Bitcoin ark, and a Lightning gateway on each chain), with
+the installer in [contrib/operator-bundle/](contrib/operator-bundle/), and connects it to another operator.
 
 ## Building and testing
 
