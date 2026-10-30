@@ -7054,3 +7054,673 @@ async fn a_new_wallet_that_syncs_only_when_due_reads_its_first_payment() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A coin whose lineage reached the chain before its receiver read it,
+// attacked
+// ---------------------------------------------------------------------------
+//
+// Each test starts from the case the wallet keeps such a coin for: S pays T,
+// which reads its coin, then pays P from its change C1; T takes its coin
+// home, which brings the board and the reassignment that made C1 to the
+// chain. P's coin rests on C1, and the steps from C1 towards P are not on the
+// chain. A test named `pv1_defect_...` asserts what the wallet does wrong
+// and passes only while it does; `pv1_holds_...` asserts what it does right;
+// `pv1_residual_...` shows the race the specification leaves to the
+// receiver after a rollback. The `pv1_fix_...` tests further down assert the
+// outcome a sound wallet reaches against the same attacks.
+
+/// What the attacks on a coin whose lineage reached the chain start from.
+struct OnChainLineage {
+	s: Arca,
+	/// S's wallet as it stood before it paid P: a backup S restores, which
+	/// still holds C1 live.
+	so: Arca,
+	t: Arca,
+	p: Arca,
+	/// S's change after paying T, which P's coins are paid from.
+	c1: String,
+	/// P's coins' own outputs (asset, value and script), in the order paid.
+	outs: Vec<elements::TxOut>,
+	/// P's first mailbox read once C1 is on the chain.
+	first: Value,
+}
+
+fn held_coins(w: &Arca) -> Vec<Value> {
+	w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| matches!(c["state"].as_str(), Some("live" | "pending"))).cloned().collect()
+}
+
+/// S boards 3,000,000 of X, pays T 500,000 and P `payments` times (400,000,
+/// then 10,000 less each time) from its change, a copy of S's wallet taken
+/// before it pays P; T takes its coin home, buried; P reads its mailbox.
+async fn lineage_on_chain(r: &mut Running, tag: &str, payments: usize) -> OnChainLineage {
+	lineage_on_chain_read(r, tag, payments, true).await
+}
+
+/// [`lineage_on_chain`]; P reads its mailbox only when `read`.
+async fn lineage_on_chain_read(r: &mut Running, tag: &str, payments: usize, read: bool) -> OnChainLineage {
+	let url = r.url();
+	let x = r.x;
+	let (s, so, t, p) = (Arca::new(&format!("{}S", tag)), Arca::new(&format!("{}SO", tag)), Arca::new(&format!("{}T", tag)),
+		Arca::new(&format!("{}P", tag)));
+	boarded(r, &s, &url, &[(x, 3_000_000)]).await;
+	t.ok(&create_args(&url, &r.node_url()));
+	p.ok(&create_args(&url, &r.node_url()));
+	let req = t.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	let tc = t.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let held = held_coins(&s);
+	assert_eq!(held.len(), 1, "S holds its change alone: {:?}", held);
+	let c1 = held[0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(std::process::Command::new("cp").arg("-r").arg(&s.dir).arg(&so.dir).status().unwrap().success(), "S's backup");
+	let mut outs = vec![];
+	for i in 0..payments {
+		let amount = 400_000 - 10_000 * i as u64;
+		let req = p.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		s.ok(&["send", &req, "--amount", &amount.to_string(), "--asset", &x.to_string()]);
+		let held = held_coins(&s);
+		assert_eq!(held.len(), 1, "S holds its change alone: {:?}", held);
+		let CoinRecord::Transfer(tr) = record_of(&s, held[0]["leaf_id"].as_str().unwrap()) else { panic!("a transfer's change") };
+		let o = tr.outputs.iter().enumerate().find(|(j, o)| *j != tr.index as usize && o.value == amount && o.asset == x)
+			.map(|(_, o)| o.txout()).expect("P's output beside S's change");
+		outs.push(o);
+	}
+	let e = t.ok(&["exit", &tc]);
+	assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+	r.produce().await;
+	r.bury().await;
+	let first = if read { p.ok(&["mailbox"]) } else { Value::Null };
+	println!("{} P's first read, C1 on the chain: {}", tag, first);
+	OnChainLineage { s, so, t, p, c1, outs, first }
+}
+
+fn waiting_ids(m: &Value) -> Vec<String> {
+	m["waiting"].as_array().cloned().unwrap_or_default().iter().map(|w| w["leaf_id"].as_str().unwrap().to_string()).collect()
+}
+
+/// S's backup takes C1 home by its own exit once C1's delay has run, the
+/// claim mined and buried: C1 is spent by no step towards P.
+async fn backup_takes_c1_home(r: &Running, l: &OnChainLineage, tag: &str) -> elements::Txid {
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let mut e = l.so.ok(&["exit", &l.c1]);
+	for _ in 0..3 {
+		if e["state"] == "claimed" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.so.ok(&["exit", &l.c1]);
+	}
+	println!("{} S's backup takes C1 home by its own exit: {}", tag, e);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	let claim = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+	r.produce().await;
+	r.bury().await;
+	assert!(confirmations(r, &claim) >= 1, "S's claim of C1 confirms");
+	claim
+}
+
+fn cleanup(l: &OnChainLineage) {
+	for w in [&l.s, &l.so, &l.t, &l.p] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A sighting of P's coin's own output that the sender forges and takes
+/// back. With P's coin waiting, the sender pays outputs that match the
+/// coin's output in part, each mined: its value less one atom to its script,
+/// its value in Y to its script, its value in X to another script. P keeps
+/// waiting. Then an output exactly equal to it (asset, value and script),
+/// paid from the sender's own coins, in the mempool only: P takes the coin
+/// and counts it. The sender spends that output's input otherwise (a block
+/// whose proposer never saw the forged one) and its backup takes C1 home:
+/// P's coin is lost, and the sender keeps all it paid.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_defect_a_forged_sighting_in_the_mempool_makes_a_coin_taken_then_lost() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let (x, y) = (r.x, r.y);
+	let l = lineage_on_chain(&mut r, "PV1A", 1).await;
+	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	assert_eq!(l.first["accepted"], json!([]));
+	let out = l.outs[0].clone();
+	let v = out.value.explicit().unwrap();
+	let partial = [("its value less one atom, to its script", out.script_pubkey.clone(), x, v - 1),
+		("its value in asset Y, to its script", out.script_pubkey.clone(), y, v),
+		("its value in X, to another script", Script::from(vec![0x51]), x, v)];
+	for (what, spk, a, val) in partial {
+		let tx = r.pay_to(spk, a, val);
+		r.produce().await;
+		assert!(confirmations(&r, &tx.txid()) >= 1);
+		let m = l.p.ok(&["mailbox"]);
+		println!("PV1A an output matching in part, {} ({}), mined: accepted {} waiting {}", what, tx.txid(), m["accepted"], m["waiting"]);
+		assert_eq!(m["accepted"], json!([]), "{}: {}", what, m);
+		assert_eq!(waiting_ids(&m), vec![coin.clone()], "{}: {}", what, m);
+	}
+
+	// An output exactly equal to the coin's, in the mempool only.
+	let forged = r.pay_to(out.script_pubkey.clone(), x, v);
+	assert!(forged.output.contains(&out));
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1A the forged output {} in the mempool: {}", forged.txid(), m);
+	let got = m["accepted"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("not taken: {}", m));
+	assert!(got["note"].as_str().unwrap().contains("own output is on the chain"), "{}", got);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting");
+	let bal = l.p.ok(&["balance"]);
+	println!("PV1A P's balance on the forged sighting: {}", bal["arca"]);
+	assert_eq!(bal["arca"][x.to_string()]["exiting"], json!(v.to_string()), "{}", bal);
+
+	// The forged output never confirms: its input is spent otherwise, by a
+	// proposer that never saw it. S's backup takes C1 home.
+	r.server.stop();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let pol = r.purse.policy;
+	let (op, prev) = forged.input.iter().map(|i| {
+		let op = i.previous_output;
+		(op, r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone())
+	}).find(|(_, o)| o.asset.explicit() == Some(pol)).unwrap();
+	let other = common::node::spend_op_true(&(op, prev), vec![], 10_000);
+	r.rt.client().send_raw_transaction(&other).expect("the other spend relays");
+	r.produce().await;
+	assert!(confirmations(&r, &other.txid()) >= 1);
+	let claim = backup_takes_c1_home(&r, &l, "PV1A").await;
+	r.restart_server().await;
+	r.synced().await;
+	let s = l.p.ok(&["sync"]);
+	println!("PV1A P's sync after the cut: exits {}", s["exits"]);
+	let c = coin_of(&l.p, &coin);
+	println!("PV1A P's coin: {} ({})", c["state"], c["note"]);
+	assert_eq!(c["state"], "lost", "{}", c);
+	assert!(c["note"].as_str().unwrap().contains(&claim.to_string()), "{}", c);
+	assert!(l.p.ok(&["balance"])["arca"].get(x.to_string()).is_none_or(|a| a.get("exiting").is_none()));
+	cleanup(&l);
+}
+
+/// The real sighting, taken back. With P's coin waiting, S's wallet takes
+/// its change home, which puts the checkpoint of C1 and the reassignment
+/// that makes P's coin in the mempool: P takes the coin on that sighting
+/// and counts it. A block whose proposer never saw them holds instead the
+/// claim of C1 by S's backup: P's coin is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_defect_a_real_sighting_in_the_mempool_replaced_by_a_block_loses_the_coin() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1B", 1).await;
+	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let ss = l.s.ok(&["sync"]);
+	println!("PV1B S's sync, its change taken home: home {} exits {}", ss["home"], ss["exits"]);
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1B P reads with its coin's path in the mempool: {}", m);
+	let got = m["accepted"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("not taken: {}", m));
+	println!("PV1B taken: state {} exit {}", got["state"], got["exit"]);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting");
+	assert_eq!(l.p.ok(&["balance"])["arca"][x.to_string()]["exiting"], json!("400000"));
+
+	r.server.stop();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let claim = backup_takes_c1_home(&r, &l, "PV1B").await;
+	r.restart_server().await;
+	r.synced().await;
+	let s = l.p.ok(&["sync"]);
+	println!("PV1B P's sync after the cut: exits {}", s["exits"]);
+	let c = coin_of(&l.p, &coin);
+	println!("PV1B P's coin: {} ({})", c["state"], c["note"]);
+	assert_eq!(c["state"], "lost", "{}", c);
+	assert!(c["note"].as_str().unwrap().contains(&claim.to_string()), "{}", c);
+	cleanup(&l);
+}
+
+/// Waiting coins whose base is spent otherwise. S pays P three times from
+/// C1's line; T's exit brings C1 to the chain and S's backup takes C1 home,
+/// final: none of P's coins can reach the chain. They still wait, read again
+/// at every mailbox read and sync, with no bound and no end, each read
+/// scanning the blocks from C1's up. Nothing of them is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_defect_coins_whose_base_is_spent_otherwise_wait_for_ever_and_cost_every_sync() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1C", 3).await;
+	assert_eq!(waiting_ids(&l.first).len(), 3, "{}", l.first);
+	let claim = backup_takes_c1_home(&r, &l, "PV1C").await;
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1C P reads once C1 is taken home by {}, final: {}", claim, m);
+	assert_eq!(waiting_ids(&m).len(), 3, "{}", m);
+	assert_eq!(m["refused"], json!([]), "{}", m);
+	for w in m["waiting"].as_array().unwrap() {
+		assert!(w["reason"].as_str().unwrap().contains("not on the chain yet"), "{}", w);
+	}
+	let bal = l.p.ok(&["balance"]);
+	println!("PV1C P's balance: {}", bal);
+	assert!(bal["arca"].get(x.to_string()).is_none(), "nothing of a waiting coin is counted: {}", bal);
+	assert!(held_coins(&l.p).is_empty());
+	let mut costs = vec![];
+	for extra in [0usize, 150, 300] {
+		for _ in 0..extra {
+			r.produce().await;
+		}
+		let tip = r.rt.client().blockchain_info().unwrap().blocks;
+		let s = l.p.ok(&["sync"]);
+		let c = s["cost_by_step"]["mailbox"].clone();
+		println!("PV1C tip {} ({} more blocks): the mailbox step of P's sync {} (waiting {})", tip, extra, c,
+			s["mailbox"]["waiting"].as_array().map(|w| w.len()).unwrap_or(0));
+		assert_eq!(s["mailbox"]["waiting"].as_array().map(|w| w.len()), Some(3), "{}", s["mailbox"]);
+		costs.push(c["node"].as_u64().unwrap());
+	}
+	assert!(costs[2] > costs[0], "each read of a waiting coin reads the chain from its spent base up: {:?}", costs);
+
+	// The wait ends only at the coins' home date (D57), a day before their
+	// exit date: each is taken then, and its exit finds its path cut.
+	let ids = waiting_ids(&l.p.ok(&["mailbox"]));
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 24 * 86_400 + 3_600));
+	r.bury().await;
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1C P reads at its coins' home date: accepted {} waiting {} refused {}", m["accepted"], m["waiting"], m["refused"]);
+	assert!(waiting_ids(&m).is_empty(), "{}", m);
+	for id in &ids {
+		let c = coin_of(&l.p, id);
+		println!("PV1C coin {}: {} ({})", id, c["state"], c["note"]);
+		assert_eq!(c["state"], "lost", "{}", c);
+	}
+	println!("PV1C P's balance: {}", l.p.ok(&["balance"])["arca"]);
+	cleanup(&l);
+}
+
+/// P takes its coin with its own output in a block, which an anchor
+/// rollback then takes out, the mempool forgotten. P's next sync follows
+/// the chain: its exit publishes the checkpoint of C1 and the reassignment
+/// again, from its record, and P claims its coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_holds_after_an_anchor_rollback_the_exit_publishes_the_path_again() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1D", 1).await;
+	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let p_r = own_anchor(&r).await;
+	l.s.ok(&["sync"]);
+	r.produce().await;
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1D P reads with its coin's output in a block anchored to parent block {}: {}", p_r, m);
+	let got = m["accepted"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("not taken: {}", m));
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting", "{}", got);
+	let found = rpc(&r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(l.outs[0].script_pubkey.as_bytes()))])]);
+	assert_eq!(found["unspents"].as_array().unwrap().len(), 1, "P's output is in the chain: {}", found);
+
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let found = rpc(&r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(l.outs[0].script_pubkey.as_bytes()))])]);
+	assert!(found["unspents"].as_array().unwrap().is_empty(), "the rollback took P's output out: {}", found);
+	let mempool: Vec<String> = serde_json::from_value(rpc(&r, "getrawmempool", &[])).unwrap();
+	assert!(mempool.is_empty());
+	r.restart_server().await;
+	r.synced().await;
+	let s = l.p.ok(&["sync"]);
+	println!("PV1D P's sync after the rollback: exits {}", s["exits"]);
+	let mine = s["exits"].as_array().unwrap().iter().find(|e| e["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("the exit moves on: {}", s["exits"]));
+	assert!(mine["broadcast"].as_array().is_some_and(|b| b.len() == 2), "the checkpoint and the reassignment, published again: {}", mine);
+	let mut e = Value::Null;
+	for _ in 0..4 {
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.p.ok(&["exit", &coin]);
+		if e["state"] == "claimed" {
+			break;
+		}
+	}
+	println!("PV1D P's exit: {}", e);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	r.produce().await;
+	r.bury().await;
+	l.p.ok(&["sync"]);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exited");
+	let claim = r.rt.client().raw_transaction(&elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert_eq!(claim.output[0].asset.explicit(), Some(x));
+	println!("PV1D P's claim {} pays {} of X", claim.txid(), claim.output[0].value.explicit().unwrap());
+	assert!(claim.output[0].value.explicit().unwrap() > 399_000);
+	cleanup(&l);
+}
+
+/// As above, but S's backup takes C1 home in the branch that replaces the
+/// one holding P's path, while P does not sync: P had taken and counted the
+/// coin from a block that was not final, and loses it. This is the race the
+/// specification leaves to the receiver ("a rollback that disconnects its
+/// answer does not restart the delay of the leaf it answered"), the same
+/// for a coin held before its lineage showed; it shows the coin counted
+/// until the cut is final.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_residual_a_coin_taken_from_a_block_not_final_is_lost_to_an_anchor_rollback() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1E", 1).await;
+	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let p_r = own_anchor(&r).await;
+	l.s.ok(&["sync"]);
+	r.produce().await;
+	let m = l.p.ok(&["mailbox"]);
+	assert!(m["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == coin.as_str()), "{}", m);
+	let bal = l.p.ok(&["balance"]);
+	println!("PV1E P's balance with its output in a block not final: {}", bal["arca"]);
+	assert_eq!(bal["arca"][x.to_string()]["exiting"], json!("400000"));
+
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	let claim = backup_takes_c1_home(&r, &l, "PV1E").await;
+	r.restart_server().await;
+	r.synced().await;
+	let s = l.p.ok(&["sync"]);
+	println!("PV1E P's sync after the rollback and the cut: exits {}", s["exits"]);
+	let c = coin_of(&l.p, &coin);
+	println!("PV1E P's coin: {} ({})", c["state"], c["note"]);
+	assert_eq!(c["state"], "lost", "{}", c);
+	assert!(c["note"].as_str().unwrap().contains(&claim.to_string()), "{}", c);
+	cleanup(&l);
+}
+
+/// The operator's watcher on: it answers T's exit with the steps it signed,
+/// racing P's wallet for the same outputs. However they interleave, P takes
+/// its coin and claims it.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_holds_with_the_watcher_racing_the_receiver_takes_its_coin_home() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1F", 1).await;
+	let mut coin = l.first["accepted"].as_array().unwrap().first().map(|c| c["leaf_id"].as_str().unwrap().to_string());
+	for i in 0..20 {
+		if coin.is_some() {
+			break;
+		}
+		r.produce().await;
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+		let m = l.p.ok(&["mailbox"]);
+		println!("PV1F P's read {}: accepted {} waiting {} refused {}", i, m["accepted"], m["waiting"], m["refused"]);
+		assert_eq!(m["refused"], json!([]), "{}", m);
+		coin = m["accepted"].as_array().unwrap().first().map(|c| c["leaf_id"].as_str().unwrap().to_string());
+	}
+	let coin = coin.expect("P takes its coin once the watcher's steps reach it");
+	let mut e = Value::Null;
+	for _ in 0..5 {
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.p.ok(&["exit", &coin]);
+		if e["state"] == "claimed" {
+			break;
+		}
+	}
+	println!("PV1F P's exit: {}", e);
+	assert_eq!(e["state"], "claimed", "{}", e);
+	r.produce().await;
+	r.bury().await;
+	l.p.ok(&["sync"]);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exited");
+	let claim = r.rt.client().raw_transaction(&elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert_eq!(claim.output[0].asset.explicit(), Some(x));
+	assert!(claim.output[0].value.explicit().unwrap() > 399_000);
+	cleanup(&l);
+}
+
+/// A look-alike that confirms, then is rolled back. With P's coin waiting,
+/// the sender pays an output exactly equal to the coin's from its own coins,
+/// mined in a block anchored to a parent block of its own: P takes the coin,
+/// and its exit takes the look-alike for its leaf and publishes nothing of
+/// the coin's own path. The parent block is orphaned, the look-alike's input
+/// spent otherwise in the new branch, and S's backup takes C1 home: P's coin
+/// is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_defect_a_look_alike_confirmed_then_rolled_back_loses_the_coin() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, "PV1G", 1).await;
+	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let out = l.outs[0].clone();
+	let v = out.value.explicit().unwrap();
+	let p_r = own_anchor(&r).await;
+	let forged = r.pay_to(out.script_pubkey.clone(), x, v);
+	r.produce().await;
+	assert!(confirmations(&r, &forged.txid()) >= 1, "the look-alike confirms");
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1G P reads with a look-alike {} confirmed in a block anchored to parent block {}: {}", forged.txid(), p_r, m);
+	let got = m["accepted"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
+		.unwrap_or_else(|| panic!("not taken: {}", m));
+	println!("PV1G taken: state {} exit {}", got["state"], got["exit"]);
+	// The exit takes the look-alike for its leaf: it tries the claim at
+	// once, refused only for the exit delay, and publishes nothing of the
+	// coin's own path.
+	assert_eq!(got["exit"]["state"], "waiting", "{}", got);
+	assert!(got["exit"]["next"].as_str().is_some_and(|n| n.contains("non-BIP68-final")), "{}", got);
+	assert!(got["exit"]["broadcast"].as_array().is_none_or(|b| b.is_empty()), "nothing of the coin's path is published: {}", got);
+	let mempool: Vec<String> = serde_json::from_value(rpc(&r, "getrawmempool", &[])).unwrap();
+	assert!(mempool.is_empty(), "no checkpoint of C1 is out: {:?}", mempool);
+	assert_eq!(l.p.ok(&["balance"])["arca"][x.to_string()]["exiting"], json!(v.to_string()));
+
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_r)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	assert!(confirmations(&r, &forged.txid()) < 1, "the rollback took the look-alike out");
+	let pol = r.purse.policy;
+	let (op, prev) = forged.input.iter().map(|i| {
+		let op = i.previous_output;
+		(op, r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone())
+	}).find(|(_, o)| o.asset.explicit() == Some(pol)).unwrap();
+	let other = common::node::spend_op_true(&(op, prev), vec![], 10_000);
+	r.rt.client().send_raw_transaction(&other).expect("the other spend relays");
+	r.produce().await;
+	let claim = backup_takes_c1_home(&r, &l, "PV1G").await;
+	r.restart_server().await;
+	r.synced().await;
+	let s = l.p.ok(&["sync"]);
+	println!("PV1G P's sync after the rollback and the cut: exits {}", s["exits"]);
+	let c = coin_of(&l.p, &coin);
+	println!("PV1G P's coin: {} ({})", c["state"], c["note"]);
+	assert_eq!(c["state"], "lost", "{}", c);
+	assert!(c["note"].as_str().unwrap().contains(&claim.to_string()), "{}", c);
+	cleanup(&l);
+}
+
+// ---------------------------------------------------------------------------
+// The same attacks, asserting what a sound wallet does
+// ---------------------------------------------------------------------------
+//
+// Each `pv1_fix_...` test runs one attack to its end and asserts the outcome
+// a sound wallet reaches whatever its design: P ends with its coin claimed,
+// and S's backup cannot take C1 back. The block after P's reads is made by a
+// proposer that saw only what P's wallet sent (anything the sender sent to
+// P's node alone is not in it), and S's backup then tries to take C1 home.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sighting {
+	/// P reads its coin with C1 on the chain, and nothing else is shown.
+	Nothing,
+	/// A look-alike of P's coin's output, in the mempool only.
+	LookAlikeInMempool,
+	/// S's wallet takes its change home, its path to P's coin in the
+	/// mempool.
+	PathInMempool,
+	/// A look-alike that confirms, its block then rolled back.
+	LookAlikeRolledBack,
+}
+
+struct Outcome {
+	/// Whether P's balance ever counted the coin.
+	counted: bool,
+	/// Whether S's backup took C1 home.
+	s_took_c1: bool,
+	/// P's coin as the wallet shows it at the end (null if never held).
+	end: Value,
+	/// What P's claim paid, if it claimed.
+	paid: Option<u64>,
+}
+
+fn mempool_ids(r: &Running) -> std::collections::BTreeSet<String> {
+	serde_json::from_value::<Vec<String>>(rpc(r, "getrawmempool", &[])).unwrap().into_iter().collect()
+}
+
+/// Keeps every transaction in the mempool now and not in `before`.
+fn keep_new(r: &Running, before: &std::collections::BTreeSet<String>, into: &mut Vec<Transaction>) {
+	for id in mempool_ids(r).difference(before) {
+		let t = r.rt.client().raw_transaction(&elements::Txid::from_str(id).unwrap()).unwrap();
+		if !into.iter().any(|k| k.txid() == t.txid()) {
+			into.push(t);
+		}
+	}
+}
+
+fn counts(p: &Arca, x: AssetId) -> bool {
+	p.ok(&["balance"])["arca"].get(x.to_string()).is_some_and(|a| a.as_object().is_some_and(|o| !o.is_empty()))
+}
+
+/// Spends the policy-asset input of `t` to `OP_TRUE`, so `t` can never
+/// confirm.
+fn spend_otherwise(r: &Running, t: &Transaction) {
+	let pol = r.purse.policy;
+	let (op, prev) = t.input.iter().map(|i| {
+		let op = i.previous_output;
+		(op, r.rt.client().raw_transaction(&op.txid).unwrap().output[op.vout as usize].clone())
+	}).find(|(_, o)| o.asset.explicit() == Some(pol)).unwrap();
+	let other = common::node::spend_op_true(&(op, prev), vec![], 10_000);
+	r.rt.client().send_raw_transaction(&other).expect("the other spend relays");
+}
+
+async fn attack(kind: Sighting, tag: &str) -> Outcome {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain(&mut r, tag, 1).await;
+	let ids = |m: &Value, k: &str| -> Vec<String> {
+		m[k].as_array().cloned().unwrap_or_default().iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect()
+	};
+	let coin = ["accepted", "waiting", "refused"].iter().flat_map(|k| ids(&l.first, *k)).next()
+		.unwrap_or_else(|| panic!("P read its coin: {}", l.first));
+	// What P's wallet sent at its first read (the mempool was empty before).
+	let mut sent: Vec<Transaction> = vec![];
+	keep_new(&r, &Default::default(), &mut sent);
+	let mut counted = counts(&l.p, x);
+	let out = l.outs[0].clone();
+	let v = out.value.explicit().unwrap();
+	let mut forged = None;
+	let mut p_r = None;
+	match kind {
+		Sighting::Nothing => {},
+		Sighting::LookAlikeInMempool => forged = Some(r.pay_to(out.script_pubkey.clone(), x, v)),
+		Sighting::PathInMempool => {
+			l.s.ok(&["sync"]);
+		},
+		Sighting::LookAlikeRolledBack => {
+			p_r = Some(own_anchor(&r).await);
+			forged = Some(r.pay_to(out.script_pubkey.clone(), x, v));
+			r.produce().await;
+		},
+	}
+	if kind != Sighting::Nothing {
+		let before = mempool_ids(&r);
+		let m = l.p.ok(&["mailbox"]);
+		println!("{} P reads after the sighting ({:?}): accepted {} waiting {} refused {}", tag, kind, m["accepted"], m["waiting"],
+			m["refused"]);
+		keep_new(&r, &before, &mut sent);
+		counted |= counts(&l.p, x);
+	}
+	println!("{} P's wallet sent {:?}; counted {}", tag, sent.iter().map(|t| t.txid()).collect::<Vec<_>>(), counted);
+
+	// The next block comes from a proposer that saw only what P sent.
+	r.server.stop();
+	if let Some(h) = p_r {
+		tokio::task::block_in_place(|| r.rt.orphan_parent_from(h)).unwrap();
+	}
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	for t in &sent {
+		let _ = r.rt.client().send_raw_transaction(t);
+	}
+	if let Some(f) = &forged {
+		spend_otherwise(&r, f);
+	}
+	r.produce().await;
+
+	// S's backup tries to take C1 home once its delay has run.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let mut e = l.so.run(&["exit", &l.c1]).1;
+	for _ in 0..3 {
+		if e["state"] == "claimed" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.so.run(&["exit", &l.c1]).1;
+	}
+	println!("{} S's backup tries to take C1 home: {}", tag, e);
+	let s_took_c1 = e["state"] == "claimed";
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+
+	// P goes on as its wallet does.
+	for _ in 0..6 {
+		let s = l.p.ok(&["sync"]);
+		counted |= counts(&l.p, x);
+		let c = coin_of(&l.p, &coin);
+		println!("{} P syncs: coin {} ({}); exits {}", tag, c["state"], c["note"], s["exits"]);
+		if c["state"] == "exited" || c["state"] == "lost" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		r.bury().await;
+	}
+	let end = coin_of(&l.p, &coin);
+	let paid = end["note"].as_str().and_then(|n| n.strip_prefix("claimed by ")).and_then(|n| n.split(',').next())
+		.and_then(|t| elements::Txid::from_str(t).ok())
+		.map(|t| r.rt.client().raw_transaction(&t).unwrap().output[0].value.explicit().unwrap());
+	println!("{} OUTCOME: counted {} s_took_c1 {} end {} ({}) paid {:?}", tag, counted, s_took_c1, end["state"], end["note"], paid);
+	cleanup(&l);
+	Outcome { counted, s_took_c1, end, paid }
+}
+
+/// What a sound wallet reaches: P's coin claimed, nearly all its value
+/// paid to P, and C1 not taken back by S.
+fn sound(o: &Outcome) {
+	assert!(!(o.counted && o.end["state"] == "lost"), "P counted the coin, then lost it: {} ({})", o.end["state"], o.end["note"]);
+	assert!(!o.s_took_c1, "the sender took C1 home: the payment to P is undone");
+	assert_eq!(o.end["state"], "exited", "P's coin ends claimed by P: {}", o.end);
+	assert!(o.paid.is_some_and(|p| p > 399_000), "P's claim pays the payment, less its fee: {:?}", o.paid);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_coin_read_with_its_lineage_on_the_chain_is_answered_and_claimed() {
+	sound(&attack(Sighting::Nothing, "PV1X0").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_look_alike_in_the_mempool_neither_takes_nor_loses_the_coin() {
+	sound(&attack(Sighting::LookAlikeInMempool, "PV1X1").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_the_path_in_the_mempool_dropped_neither_takes_nor_loses_the_coin() {
+	sound(&attack(Sighting::PathInMempool, "PV1X2").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_look_alike_confirmed_then_rolled_back_neither_takes_nor_loses_the_coin() {
+	sound(&attack(Sighting::LookAlikeRolledBack, "PV1X3").await);
+}
+
+/// A coin whose path a final spend cut before P read it: refused for good,
+/// counted nowhere, and not read again at every sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_coin_whose_path_a_final_spend_cut_is_refused() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain_read(&mut r, "PV1X4", 1, false).await;
+	let claim = backup_takes_c1_home(&r, &l, "PV1X4").await;
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1X4 P reads once C1 is taken home by {}, final: {}", claim, m);
+	assert!(!counts(&l.p, x), "nothing of it is counted");
+	assert_eq!(m["accepted"], json!([]), "{}", m);
+	assert_eq!(m["waiting"], json!([]), "a coin whose path is cut for good does not wait: {}", m);
+	assert_eq!(m["refused"].as_array().map(|a| a.len()), Some(1), "{}", m);
+	let again = l.p.ok(&["mailbox"]);
+	assert_eq!(again["waiting"], json!([]), "{}", again);
+	cleanup(&l);
+}
