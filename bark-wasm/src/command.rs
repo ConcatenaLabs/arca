@@ -24,7 +24,8 @@ use bark::{Config, Wallet, WalletSeed};
 pub const COMMANDS: &[&str] = &[
 	"info", "balance", "address", "board_address", "board_psbt", "send", "send_fee",
 	"pay", "pay_status", "pay_fee", "invoice", "receive_status", "receive_fee",
-	"offboard", "offboard_fee", "refresh", "sync", "catch_up", "history", "coins",
+	"offboard", "offboard_fee", "refresh", "schedule_refreshes", "sync", "catch_up", "history",
+	"coins",
 ];
 
 /// The Bitcoin network a name stands for. Testnet4 is the network the
@@ -277,7 +278,8 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			let e = wallet.estimate_send_onchain(&dest, sats_arg(args, "sats")?).await?;
 			Ok(json!({ "fee": sat(e.fee), "gross": sat(e.gross_amount) }))
 		},
-		// Refreshes the coins that are due, in the server's next round.
+		// Refreshes the coins that are due, in the server's next round. A coin whose refresh
+		// is scheduled is left to the server.
 		"refresh" => {
 			let due = wallet.get_vtxos_to_refresh().await?;
 			if due.is_empty() {
@@ -286,6 +288,19 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			let n = due.len();
 			wallet.refresh_vtxos(due).await?;
 			Ok(json!({ "refreshed": n }))
+		},
+		// Schedules with the server the refresh of every coin that has none yet, so the
+		// server renews it with the wallet closed; the wallet takes the new coin in at its
+		// next sync.
+		"schedule_refreshes" => {
+			let s = wallet.schedule_refreshes().await?;
+			Ok(json!({
+				"scheduled": s.iter().map(|r| json!({
+					"height": r.height,
+					"vtxos": r.vtxos.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+					"amount": sat(r.amount),
+				})).collect::<Vec<_>>(),
+			}))
 		},
 		"sync" => {
 			wallet.sync().await;
@@ -307,10 +322,12 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		"history" => Ok(serde_json::to_value(wallet.history().await?)?),
 		"coins" => {
 			let tip = wallet.chain().tip().await.ok();
+			let scheduled = wallet.scheduled_refresh_heights().await?;
 			let coins = wallet.vtxos().await?.into_iter().map(|v| json!({
 				"id": v.vtxo.id().to_string(),
 				"amount": sat(v.vtxo.amount()),
 				"expiry_height": v.vtxo.expiry_height(),
+				"refresh_height": scheduled.get(&v.vtxo.id()),
 				"state": format!("{:?}", v.state.kind()),
 			})).collect::<Vec<_>>();
 			Ok(json!({ "tip": tip, "coins": coins }))
