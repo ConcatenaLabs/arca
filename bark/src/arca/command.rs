@@ -142,6 +142,15 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
+	// What only reads, of the operator or an offer, and takes no coin and signs
+	// nothing: the witness guards the coins the wallet takes and the spends it
+	// signs through the operator, and every command that does either still runs
+	// it first. A read-only command spares a slow or far link that round trip.
+	let reads_only = matches!(command, "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote"
+		| "order_fill_quote" | "order_quote" | "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote"
+		| "offboard_quote" | "lightning_pay_quote" | "lightning_receive_quote" | "distribute_quote" | "plan_quote"
+		| "swap_read" | "btc_swap_read" | "boards");
+	let local = local || reads_only;
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {

@@ -137,6 +137,13 @@ pub struct ChainSource {
 /// How long a view stands, at most, before the source looks at the node again.
 pub const VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a look serves the commands after the one that made it: a burst of
+/// commands (a quote runs several, one after the other) shares one look, so a
+/// wallet on a slow or far link pays one round trip for the view rather than one
+/// a command. A gap the wallet knows of (its own broadcast, say) still calls for
+/// a look at once.
+pub const BURST_VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The moments the chain may have moved without the wallet reading it: a
 /// request to the operator, a pause, a broadcast. Each makes the next read
 /// look at the view again ([`gap`]).
@@ -337,6 +344,13 @@ impl ChainSource {
 		m.command.clear();
 	}
 
+	/// Makes the next read look at the view again, as a command started past
+	/// [`BURST_VIEW_FOR`] would.
+	#[cfg(test)]
+	fn look_again(&self) {
+		self.memo.lock().expect("the chain memo").looked = None;
+	}
+
 	/// The requests this source made of the node (a batch is one), and the
 	/// reads it answered from what it kept for the view, since it was made.
 	pub fn calls(&self) -> (u64, u64) {
@@ -344,11 +358,13 @@ impl ChainSource {
 		(m.asked, m.kept)
 	}
 
-	/// Whether the view is to be looked at again before the next answer: the
-	/// command has just started, a gap came or a second passed since the last
-	/// look.
+	/// Whether the view is to be looked at again before the next answer: a gap
+	/// came, a second passed since this command's look, or the command has just
+	/// started and the last look, another command's, is older than
+	/// [`BURST_VIEW_FOR`].
 	fn look_due(m: &Memo) -> bool {
-		!(m.looked_this_command && m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < VIEW_FOR))
+		let window = if m.looked_this_command { VIEW_FOR } else { BURST_VIEW_FOR };
+		!(m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < window))
 	}
 
 	/// Looks at the view again when it is due ([`Self::look_due`]): the tip,
@@ -1238,6 +1254,27 @@ pub fn unhex32(s: &str) -> Result<[u8; 32], Error> {
 mod test {
 	use super::*;
 
+	/// A burst of commands shares one look: a command started within
+	/// BURST_VIEW_FOR of another's look answers from that view, one started
+	/// later looks again, and a gap calls for a look at once.
+	#[test]
+	fn a_burst_of_commands_shares_one_look() {
+		let mut m = Memo { looked: Some(web_time::Instant::now()), gaps: GAPS.load(Ordering::SeqCst), ..Default::default() };
+		m.looked_this_command = true;
+		assert!(!ChainSource::look_due(&m), "this command's own fresh look stands");
+		m.looked_this_command = false;
+		assert!(!ChainSource::look_due(&m), "the next command shares it");
+		m.looked = Some(web_time::Instant::now() - BURST_VIEW_FOR - std::time::Duration::from_millis(1));
+		assert!(ChainSource::look_due(&m), "a look older than the burst window is not shared");
+		m.looked = Some(web_time::Instant::now() - VIEW_FOR - std::time::Duration::from_millis(1));
+		m.looked_this_command = true;
+		assert!(ChainSource::look_due(&m), "within a command, a view stands a second at most");
+		m.looked = Some(web_time::Instant::now());
+		m.looked_this_command = false;
+		gap();
+		assert!(ChainSource::look_due(&m), "a gap calls for a look at once");
+	}
+
 	#[test]
 	fn what_a_view_keeps_and_what_it_never_keeps() {
 		let txid = json!("00".repeat(32));
@@ -1435,6 +1472,7 @@ mod test {
 		assert_eq!(sent(), 1);
 		// A new command: the look is due and carries the fee reads.
 		chain.new_command();
+		chain.look_again();
 		assert!(chain.fee_rates().unwrap().is_empty());
 		assert_eq!(sent(), 2, "the look and the three fee reads in one request");
 		// Kept within the command: no look, no request.
@@ -1443,13 +1481,16 @@ mod test {
 		// A look carrying the supervised assets is refused whole; the look is
 		// made again on its own and the read alone.
 		chain.new_command();
+		chain.look_again();
 		assert!(chain.supervised_assets().unwrap().is_empty());
 		assert_eq!(sent(), 5, "the refused batch, the look again, the read alone");
 		// From then on it is never carried, and batches go on.
 		chain.new_command();
+		chain.look_again();
 		assert!(chain.supervised_assets().unwrap().is_empty());
 		assert_eq!(sent(), 6, "a look alone; the read is kept for the view");
 		chain.new_command();
+		chain.look_again();
 		assert!(chain.fee_rates().unwrap().is_empty());
 		assert_eq!(sent(), 7, "the node is still asked in batches");
 	}
@@ -1519,6 +1560,7 @@ mod test {
 		let op = OutPoint::new(Txid::from_str(&"33".repeat(32)).unwrap(), 0);
 		for _ in 0..3 {
 			chain.new_command();
+			chain.look_again();
 			let h: Value = chain.call("getblockheader", &[json!(hash.to_string()), json!(true)]).unwrap();
 			assert_eq!(h["height"], 1);
 			assert!(chain.unspent(&op).unwrap());
