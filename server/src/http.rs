@@ -1659,6 +1659,25 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 }
 
 /// One leaf as `leaf_data` serves it.
+/// The leaf ids of the round leaves and boards a coin record descends from:
+/// the coins at the bottom of its lineage, which rest on the chain.
+fn root_leaf_ids(rec: &arca_covenant::CoinRecord, out: &mut Vec<[u8; 32]>) {
+	match rec {
+		arca_covenant::CoinRecord::Leaf { record, .. } => {
+			if let Ok(id) = record.leaf_id() {
+				out.push(id.0);
+			}
+		},
+		arca_covenant::CoinRecord::Accumulator { record, .. } => {
+			if let Ok(id) = record.leaf_id() {
+				out.push(id.0);
+			}
+		},
+		arca_covenant::CoinRecord::Board(b) => out.push(b.leaf_id().0),
+		_ => rec.parents().into_iter().for_each(|p| root_leaf_ids(p, out)),
+	}
+}
+
 async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::LeafEntry, Refusal> {
 	let internal = |e: String| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
 	let l = &r.leaf;
@@ -1770,6 +1789,19 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 			}
 		}
 	}
+	// A coin made out of round: the outputs on the chain its record descends
+	// from, so a wallet restored from its mnemonic reads them by txid.
+	let bases = match arca_covenant::CoinRecord::from_bytes(&l.record) {
+		Ok(rec) if !rec.parents().is_empty() => {
+			let mut ids = vec![];
+			root_leaf_ids(&rec, &mut ids);
+			ids.sort();
+			ids.dedup();
+			app.store.base_outputs_of(&ids).await?.into_iter()
+				.map(|(txid, vout)| api::LeafBase { txid: txid_hex(&txid), vout }).collect()
+		},
+		_ => vec![],
+	};
 	Ok(api::LeafEntry {
 		leaf_id: hex(&l.leaf_id),
 		kind: leaf_kind(l.kind).into(),
@@ -1783,6 +1815,7 @@ async fn served_entry(app: &App, r: crate::store::ServedLeaf) -> Result<api::Lea
 		batch,
 		board: r.board.as_ref().map(|b| api::LeafBoard { txid: txid_hex(&b.txid), vout: b.vout,
 			state: b.state.clone() }),
+		bases,
 		made_by,
 		given,
 	})

@@ -121,9 +121,15 @@ async fn board_transfer_mailbox_and_rules() {
 	assert_eq!(ld["leaves"][0]["leaf_id"], b_id.to_string());
 	assert_eq!(ld["leaves"][0]["state"], "live");
 	assert_eq!(CoinRecord::from_bytes(&unhex(ld["leaves"][0]["record"].as_str().unwrap())).unwrap(), b_coin.record);
+	// It names the output on the chain it rests on, A's board, so a wallet
+	// restored from its mnemonic reads that transaction by txid.
+	let root = a_valid.roots()[0];
+	assert_eq!(root.txid, board_tx.txid());
+	assert_eq!(ld["leaves"][0]["bases"], json!([{"txid": root.txid.to_string(), "vout": root.vout}]), "{}", ld);
 	let ld = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &a, &r.chain)})).ok();
 	assert_eq!(ld["leaves"][0]["state"], "spent");
-	println!("leaf_data: B's leaf live, A's board spent");
+	assert!(ld["leaves"][0].get("bases").is_none(), "a board names its own output: {}", ld);
+	println!("leaf_data: B's leaf live, naming its board; A's board spent");
 
 	// --- Refusals ---
 

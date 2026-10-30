@@ -116,6 +116,23 @@ impl Store {
 	/// leaf's record holds its participation's preimage, so it is served
 	/// empty until that preimage went out, as [`Store::leaves_by_owner`]
 	/// serves it.
+	/// The outputs on the chain the leaves `ids` lie at: each round leaf's
+	/// round txid and batch output, and each board's output, those the server
+	/// holds (a leaf it does not know, or that is neither, adds nothing).
+	pub async fn base_outputs_of(&self, ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u32)>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			"SELECT r.txid, b.vout FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = ANY($1)
+			 UNION SELECT txid, vout FROM board WHERE leaf_id = ANY($1)",
+			&[&ids],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get::<_, i32>(1) as u32))).collect()
+	}
+
 	pub async fn served_leaves(&self, key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<ServedLeaf>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
