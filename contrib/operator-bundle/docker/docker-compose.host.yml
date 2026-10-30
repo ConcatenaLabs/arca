@@ -1,0 +1,11 @@
+# On Linux: the bundle on the host's own network, as the native installer
+# runs it: every daemon on the host's 127.0.0.1 (the gateways and Caddy on all
+# its addresses). For test chains whose nodes listen on the host's loopback,
+# and for a machine whose firewall the operator keeps himself. LISTEN_HOST
+# keeps the operator, the ark and the nodes' RPC on loopback:
+#
+#   LISTEN_HOST=127.0.0.1 docker compose -f docker-compose.yml -f docker-compose.host.yml up -d
+services:
+  net:
+    network_mode: host
+    ports: !reset []

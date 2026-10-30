@@ -312,9 +312,12 @@ host = \"/var/run/postgresql\"
 port = $PG_PORT
 name = \"bark\"
 user = \"$USER_\""
+  # By the bundle's login, not the cookie: the node draws a new cookie each
+  # time it starts, and Bark's server reads its credentials once.
   local node="[bitcoind]
 url = \"http://127.0.0.1:$FEE_PROXY_PORT\"
-cookie = \"$LIB/bitcoin/$BTC_SUB/.cookie\""
+rpc_user = \"$NAME\"
+rpc_pass = \"$(cat "$ETC/btc-rpc.password")\""
   if [ "${1:-}" = watchman ]; then cat <<EOF
 # Bark's watchman: answers exits and sweeps expired rounds back to the
 # server's round wallet. Written by install.sh.
