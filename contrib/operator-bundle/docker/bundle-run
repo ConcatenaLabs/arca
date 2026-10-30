@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# bundle-run <service>: the entrypoint of every container of the operator
+# bundle (docker-compose.yml). Each service writes its own configuration from
+# the settings in its environment, with install.sh's own functions, waits for
+# what it needs, and runs its daemon in the foreground as the bundle's user.
+# All of them share one network namespace (the net service's), so every
+# daemon reaches the others on 127.0.0.1 as on one machine, and the volumes
+# that hold the keys, the chains and the sockets.
+#
+# Any other argument runs install.sh with it: bundle-run status, addresses,
+# connect, register, credentials.
+set -Eeuo pipefail
+svc=${1:-}
+case $svc in
+  init|net|postgres|bitcoind|feeproxy|sequentiad|seqln|cln|arca-signer|captaind|watchmand|arcad|caddy) ;;
+  *) exec /opt/arca-src/contrib/operator-bundle/install.sh "$@" ;;
+esac
+BUNDLE_LIB=1 . /opt/arca-src/contrib/operator-bundle/install.sh
+CMD=$svc
+STEP=$svc
+run_as() { exec runuser -u "$USER_" -- "$@"; }
+until_up() {   # until_up <what> <command...>: waits, saying so every minute
+  local i=0
+  until "${@:2}" >/dev/null 2>&1; do
+    [ $((i % 60)) = 0 ] && echo "$svc: waiting for $1"
+    i=$((i + 1)); sleep 1
+  done
+}
+pg_up() { runuser -u "$USER_" -- psql -X -q -h /var/run/postgresql -p "$PG_PORT" -d postgres -tAc 'select 1' </dev/null; }
+
+case $svc in
+init)
+  # Keys, passwords and the static configurations; the database cluster.
+  for d in "$LIB" "$LIB/sequentia" "$LIB/bitcoin" "$LIB/seqln" "$LIB/cln" "$LIB/arca" "$LIB/captaind" "$LIB/watchmand" "$LIB/www" "$LOG" "$BACKUP_DIR" "$BACKUP_DIR/wal" "/run/$NAME" /var/run/postgresql; do
+    install -d -m 750 -o "$USER_" -g "$USER_" "$d"
+  done
+  chmod 700 "$LIB/captaind" "$LIB/watchmand" "$LIB/arca"; chmod 2775 /var/run/postgresql
+  install -d -m 750 -o root -g "$USER_" "$ETC"
+  draw_keys
+  write_configs
+  if [ ! -s "$LIB/pg/PG_VERSION" ]; then
+    install -d -m 700 -o "$USER_" -g "$USER_" "$LIB/pg"
+    runuser -u "$USER_" -- /usr/lib/postgresql/16/bin/initdb -D "$LIB/pg" -U "$USER_" --auth-local=peer --auth-host=reject >/dev/null
+    say "made the database cluster"
+  fi
+  cat > "$LIB/pg/conf.d.conf" <<EOF
+# The operator's database never loses a commit (arca's doc/operator-procedure.md):
+# durability on, and every WAL segment archived as it is written.
+listen_addresses = '127.0.0.1'
+port = $PG_PORT
+unix_socket_directories = '/var/run/postgresql'
+fsync = on
+full_page_writes = on
+synchronous_commit = on
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f $BACKUP_DIR/wal/%f && cp %p $BACKUP_DIR/wal/%f'
+archive_timeout = 300
+EOF
+  chown "$USER_:$USER_" "$LIB/pg/conf.d.conf"
+  grep -q "^include_if_exists = 'conf.d.conf'" "$LIB/pg/postgresql.conf" || echo "include_if_exists = 'conf.d.conf'" >> "$LIB/pg/postgresql.conf"
+  say "keys, configurations and the database cluster are in place"
+  ;;
+net) exec sleep infinity ;;
+postgres)
+  if [ ! -f "$LIB/pg/.databases" ]; then
+    runuser -u "$USER_" -- /usr/lib/postgresql/16/bin/pg_ctl -D "$LIB/pg" -w -l "$LOG/postgres-setup.log" start >/dev/null
+    for db in arca bark; do
+      [ "$(pg_up >/dev/null; runuser -u "$USER_" -- psql -X -h /var/run/postgresql -p "$PG_PORT" -d postgres -tAc "select 1 from pg_database where datname = '$db'")" = 1 ] \
+        || runuser -u "$USER_" -- psql -X -q -h /var/run/postgresql -p "$PG_PORT" -d postgres -c "create database \"$db\""
+    done
+    runuser -u "$USER_" -- /usr/lib/postgresql/16/bin/pg_ctl -D "$LIB/pg" -w stop >/dev/null
+    touch "$LIB/pg/.databases"
+  fi
+  run_as /usr/lib/postgresql/16/bin/postgres -D "$LIB/pg"
+  ;;
+bitcoind) run_as "$OPT/core/bin/bitcoind" -conf="$ETC/bitcoin.conf" -datadir="$LIB/bitcoin" -daemon=0 -printtoconsole=1 ;;
+feeproxy)
+  until_up "the Bitcoin node's cookie" test -s "$LIB/bitcoin/$BTC_SUB/.cookie"
+  api="https://mempool.space/testnet4/api/v1/fees"; [ "$BTC_CHAIN" = testnet4 ] || api=""
+  run_as /usr/bin/python3 -I "$BIN/fee-proxy.py" --listen "127.0.0.1:$FEE_PROXY_PORT" --upstream "127.0.0.1:$BTC_RPC_PORT" \
+    --cookie "$LIB/bitcoin/$BTC_SUB/.cookie" --floor "$BTC_FEE_FLOOR" --cap 500 --api "$api"
+  ;;
+sequentiad)
+  until_up "the Bitcoin node (the anchors are checked against it)" btc_cli getblockchaininfo
+  run_as "$OPT/sequentia/bin/sequentiad" -conf="$ETC/sequentia.conf" -datadir="$LIB/sequentia" -daemon=0 -printtoconsole=1
+  ;;
+seqln)
+  until_up "the Sequentia node" seq_cli getblockchaininfo
+  run_as "$OPT/seqln/lightningd/lightningd" --lightning-dir="$LIB/seqln"
+  ;;
+cln)
+  until_up "the Bitcoin node" btc_cli getblockchaininfo
+  run_as "$OPT/cln/usr/bin/lightningd" --lightning-dir="$LIB/cln"
+  ;;
+arca-signer)
+  until_up "the Sequentia node" seq_cli getblockhash 0
+  GENESIS=$(seq_cli getblockhash 0)
+  if [ ! -f "$LIB/arca/signer.record" ]; then
+    as_user "$BIN/arca-signer" --key-file "$ETC/operator.key" --genesis "$GENESIS" --record "$LIB/arca/signer.record" --create-record --no-keepers </dev/null
+  fi
+  rm -f "/run/$NAME/signer.sock"
+  run_as "$BIN/arca-signer" --key-file "$ETC/operator.key" --genesis "$GENESIS" --socket "/run/$NAME/signer.sock" --record "$LIB/arca/signer.record"
+  ;;
+captaind)
+  until_up "PostgreSQL" pg_up
+  until_up "the fee proxy" bash -c "exec 3<>/dev/tcp/127.0.0.1/$FEE_PROXY_PORT"
+  for f in ca.pem client.pem client-key.pem hold/ca.pem hold/client.pem hold/client-key.pem; do until_up "the Bitcoin gateway's $f" test -s "$LIB/cln/$BTC_SUB/$f"; done
+  SWEEP_ADDRESS=""
+  write_conf captaind 640 "$ETC/captaind.toml" < <(captaind_toml)
+  if [ ! -f "$LIB/captaind/mnemonic" ]; then
+    as_user "$BIN/captaind" --config "$ETC/captaind.toml" create </dev/null
+  fi
+  export CAPTAIND_LOG=info
+  run_as "$BIN/captaind" --config "$ETC/captaind.toml" start
+  ;;
+watchmand)
+  until_up "captaind's admin interface" captaind_rpc wallet
+  SWEEP_ADDRESS=$(cat "$LIB/captaind/sweep-address" 2>/dev/null || true)
+  if [ -z "$SWEEP_ADDRESS" ]; then
+    SWEEP_ADDRESS=$(captaind_rpc wallet | jq -r '.rounds.address')
+    printf '%s\n' "$SWEEP_ADDRESS" > "$LIB/captaind/sweep-address"; chown "$USER_:$USER_" "$LIB/captaind/sweep-address"
+  fi
+  [ -f "$LIB/watchmand/mnemonic" ] || install -m 600 -o "$USER_" -g "$USER_" "$LIB/captaind/mnemonic" "$LIB/watchmand/mnemonic"
+  write_conf watchmand 640 "$ETC/watchmand.toml" < <(captaind_toml watchman)
+  export WATCHMAND_LOG=info
+  run_as "$BIN/watchmand" --config "$ETC/watchmand.toml" start
+  ;;
+arcad)
+  [ ${#ASSET_IDS[@]} -gt 0 ] || die "name at least one asset to serve (ARCA_ASSETS): none is served by default"
+  until_up "the signer's socket" test -S "/run/$NAME/signer.sock"
+  until_up "PostgreSQL" pg_up
+  until_up "the Sequentia node" seq_cli getblockchaininfo
+  write_arcad_toml
+  export RUST_LOG=info
+  run_as "$BIN/arcad" "$ETC/arcad.toml"
+  ;;
+caddy)
+  [ -n "$DOMAIN" ] || { echo "caddy: no DOMAIN set, so no public route: nothing to serve"; exec sleep infinity; }
+  until_up "the signer's operator key" as_user "$BIN/arca-signer" --key-file "$ETC/operator.key" --pubkey
+  k=$(as_user "$BIN/arca-signer" --key-file "$ETC/operator.key" --pubkey </dev/null)
+  install -d -m 755 "$LIB/www/.well-known"
+  printf 'Authorize linking the domain name %s to the Arca operator key %s' "$DOMAIN" "$k" > "$LIB/www/.well-known/sequentia-operator-proof-$k"
+  caddyfile > "$ETC/Caddyfile"
+  export XDG_DATA_HOME=$LIB/caddy XDG_CONFIG_HOME=$LIB/caddy
+  exec "$BIN/caddy" run --config "$ETC/Caddyfile" --adapter caddyfile
+  ;;
+esac

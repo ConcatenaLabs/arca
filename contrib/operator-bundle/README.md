@@ -1,6 +1,7 @@
 # The operator bundle
 
-Everything an Arca operator runs, on both chains, on one machine: the
+Everything an Arca operator runs, on both chains, on one machine (Linux,
+macOS or Windows): the
 Sequentia and Bitcoin nodes, PostgreSQL, `arcad` and `arca-signer`, Bark's
 `captaind` and `watchmand`, and a Lightning gateway on each chain (SeqLN for
 the assets, Core Lightning for BTC). [doc/operator-bundle.md](../../doc/operator-bundle.md)
@@ -9,7 +10,8 @@ and run it.
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | The installer for an Ubuntu 24.04 machine with systemd (a server, or a WSL2 distro on Windows) |
+| `install.sh` | The installer for an Ubuntu 24.04 machine with systemd (a server, or a WSL2 distro on Windows), and the commands every path uses (`status`, `addresses`, `connect`, `register`, `credentials`) |
+| `docker/Dockerfile`, `docker/docker-compose.yml` | The bundle in containers, one per daemon, for any system with Docker; `docker/bundle-run` is each container's entrypoint, and `docker/docker-compose.host.yml` puts the bundle on a Linux host's own network |
 | `bundle.env.example` | Every setting, with what it does |
 | `pins.env` | The version and checksum of every download and the commit of every build |
 | `fee-proxy.py` | The Bitcoin node's RPC with fee estimates from the live mempool, for `captaind` and `watchmand` |

@@ -1,0 +1,109 @@
+# The operator bundle in containers: one per daemon, from the image
+# Dockerfile builds, all in the network namespace of the net service (so each
+# daemon reaches the others on 127.0.0.1, as on one machine), sharing the
+# volumes that hold the keys, the chains and the sockets.
+#
+#   cp bundle.env.example bundle.env           # then fill in ARCA_ASSETS (and DOMAIN)
+#   docker compose up -d --build
+#   docker compose exec net bundle status
+#
+# Settings come from bundle.env, beside this file, the same settings as the
+# native installer's. Every key is drawn on first start, by the init service,
+# into the etc volume; none is in the image or in this file. A second bundle
+# on one machine is a second project (docker compose -p <name>) with other
+# published ports.
+name: arca-bundle
+
+x-daemon: &daemon
+  image: arca-bundle
+  network_mode: service:net
+  env_file: bundle.env
+  environment:
+    NAME: arca-bundle
+    LISTEN_HOST: ${LISTEN_HOST:-0.0.0.0}
+    BACKUP_DIR: /var/backups/arca-bundle
+  restart: unless-stopped
+  stop_grace_period: 2m
+  volumes:
+    - etc:/etc/arca-bundle
+    - lib:/var/lib/arca-bundle
+    - log:/var/log/arca-bundle
+    - run:/run/arca-bundle
+    - pgsock:/var/run/postgresql
+    - backup:/var/backups/arca-bundle
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+services:
+  net:
+    image: arca-bundle
+    build:
+      context: ../../..
+      dockerfile: contrib/operator-bundle/docker/Dockerfile
+    command: net
+    env_file: bundle.env
+    environment:
+      NAME: arca-bundle
+      LISTEN_HOST: ${LISTEN_HOST:-0.0.0.0}
+      BACKUP_DIR: /var/backups/arca-bundle
+    restart: unless-stopped
+    volumes:
+      - etc:/etc/arca-bundle
+      - lib:/var/lib/arca-bundle
+      - log:/var/log/arca-bundle
+      - run:/run/arca-bundle
+      - pgsock:/var/run/postgresql
+      - backup:/var/backups/arca-bundle
+    ports:
+      # The two gateways take peers from anywhere; Caddy serves the public
+      # route over TLS when DOMAIN is set.
+      - "${SEQLN_PORT:-9835}:${SEQLN_PORT:-9835}"
+      - "${CLN_PORT:-9935}:${CLN_PORT:-9935}"
+      - "80:80"
+      - "443:443"
+      # This machine alone: the operator, the ark and the nodes' RPC, for
+      # wallets and Fulmen on the host.
+      - "127.0.0.1:${ARCAD_PORT:-3535}:${ARCAD_PORT:-3535}"
+      - "127.0.0.1:${CAPTAIND_PORT:-3545}:${CAPTAIND_PORT:-3545}"
+      - "127.0.0.1:${SEQ_RPC_PORT:-18884}:${SEQ_RPC_PORT:-18884}"
+      - "127.0.0.1:${BTC_RPC_PORT:-48332}:${BTC_RPC_PORT:-48332}"
+
+  init:
+    image: arca-bundle
+    command: init
+    network_mode: service:net
+    env_file: bundle.env
+    environment:
+      NAME: arca-bundle
+      LISTEN_HOST: ${LISTEN_HOST:-0.0.0.0}
+      BACKUP_DIR: /var/backups/arca-bundle
+    volumes:
+      - etc:/etc/arca-bundle
+      - lib:/var/lib/arca-bundle
+      - log:/var/log/arca-bundle
+      - run:/run/arca-bundle
+      - pgsock:/var/run/postgresql
+      - backup:/var/backups/arca-bundle
+    depends_on: [net]
+
+  postgres: { <<: *daemon, command: postgres }
+  bitcoind: { <<: *daemon, command: bitcoind, stop_grace_period: 10m }
+  feeproxy: { <<: *daemon, command: feeproxy }
+  sequentiad: { <<: *daemon, command: sequentiad, stop_grace_period: 10m }
+  seqln: { <<: *daemon, command: seqln }
+  cln: { <<: *daemon, command: cln }
+  arca-signer: { <<: *daemon, command: arca-signer }
+  captaind: { <<: *daemon, command: captaind }
+  watchmand: { <<: *daemon, command: watchmand }
+  # arcad stops its tasks and exits on SIGINT.
+  arcad: { <<: *daemon, command: arcad, stop_signal: SIGINT }
+  caddy: { <<: *daemon, command: caddy }
+
+volumes:
+  etc:
+  lib:
+  log:
+  run:
+  pgsock:
+  backup:

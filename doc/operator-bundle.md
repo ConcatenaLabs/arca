@@ -1,40 +1,38 @@
-# Running an operator bundle on Windows
+# Running an operator bundle
 
-This runbook sets up an **operator bundle** on one Windows machine (Windows
-10 or 11, or Windows Server), connects it to the Sequentia testnet's own
-bundle at sequentiatestnet.com, and pays between the two. Every command is
-written out; every value you fill in is named where you need it, and each
-stage ends with the check that shows it worked. The same installer runs on
-any Ubuntu 24.04 server with systemd: there, skip the Windows part and start
-at [Installing the bundle](#installing-the-bundle).
-
-The files it uses live beside it in this repository:
-
-| File | What it is |
-| --- | --- |
-| [`contrib/operator-bundle/windows/setup-wsl.ps1`](../contrib/operator-bundle/windows/setup-wsl.ps1) | The Windows side: WSL2, the Ubuntu 24.04 distro with systemd, the ports, start at boot |
-| [`contrib/operator-bundle/install.sh`](../contrib/operator-bundle/install.sh) | The installer, run inside the distro: installs, configures and starts the whole bundle |
-| [`contrib/operator-bundle/bundle.env.example`](../contrib/operator-bundle/bundle.env.example) | Every setting, with what it does |
-| [`contrib/operator-bundle/pins.env`](../contrib/operator-bundle/pins.env) | The version and checksum of everything the installer downloads or builds |
+This runbook sets up an **operator bundle** — an Arca operator on both chains,
+with its own nodes and Lightning gateways — on Linux, macOS or Windows,
+connects it to the Sequentia testnet's own bundle at sequentiatestnet.com, and
+pays between the two. Every command is written out; every value you fill in is
+named where you need it, and each stage ends with the check that shows it
+worked.
 
 > **Testnet software.** The bundle runs on the Sequentia testnet and Bitcoin
 > testnet4 and refuses Bitcoin's main network. Do not use it with anything of
 > value.
 
-> **The Windows script has not been run on Windows.** `setup-wsl.ps1` is
-> written to Microsoft's documented WSL interfaces but has not been executed
-> on a Windows machine. The Linux half (everything inside the distro) is
-> what runs and is tested; where the Windows script fails, the manual steps in
-> each section below do the same thing.
+## Choose your path
+
+| Your machine | Path |
+| --- | --- |
+| Linux (any distribution with Docker) | [Docker Compose](#path-1-docker-compose) |
+| macOS (Apple silicon or Intel) | [Docker Compose](#path-1-docker-compose), with Docker Desktop |
+| Windows 10, 11 or Server | [Docker Compose](#path-1-docker-compose) with Docker Desktop, or [WSL2](#path-3-windows-with-wsl2) |
+| An Ubuntu 24.04 server | [the native installer](#path-2-the-native-installer-ubuntu-2404), or Docker Compose |
+
+Then, on every path, [the shared steps](#funding-it): funding, connecting to
+sequentiatestnet.com, the registry, paying between operators. Every path runs
+the same programs with the same settings and ends in the same place; only how
+the programs are started differs. Docker Desktop on macOS and Windows, and the
+WSL2 script, have not been run on their own systems yet, and say so where they
+start; the Linux paths are the ones tested.
 
 ## What the bundle is
-
-A bundle runs an operator on both chains:
 
 | Chain | Program | What it does |
 | --- | --- | --- |
 | Sequentia | `sequentiad` (Sequentia Core) | The chain arcad and the gateway read, with `-txindex` and `-validateanchor`: every anchor is checked against the bundle's own Bitcoin node |
-| | PostgreSQL | arcad's state (and captaind's), in a cluster of the bundle's own, every write-ahead log segment archived |
+| | PostgreSQL | arcad's state (and captaind's), every write-ahead log segment archived |
 | | `arca-signer` | Holds the operator key and signs for arcad on a Unix socket |
 | | `arcad` | The Arca operator's server: boards, transfers, rounds, the watcher |
 | | SeqLN (`lightningd`) | The Sequentia gateway: one channel per served asset, with the hold-invoice plugin |
@@ -44,103 +42,130 @@ A bundle runs an operator on both chains:
 | | Core Lightning | The Bitcoin gateway, with Boltz's hold-invoice plugin |
 | Both | Caddy | The public route over TLS: the operator at `https://<your domain>/arca`, the Bitcoin ark at `https://<your domain>` |
 
-Each runs as a systemd unit named `<NAME>-<program>` (`arca-bundle-arcad`,
-`arca-bundle-captaind`, …), as the system user `<NAME>`, and PostgreSQL as
-`postgresql@16-<NAME with underscores>` (`postgresql@16-arca_bundle`), all in
-one systemd slice, `<NAME with underscores>.slice`, whose memory and CPU
-`BUNDLE_MEMORY_MAX` and `BUNDLE_CPU_QUOTA` can bound. Its files:
+Its files are in [`contrib/operator-bundle/`](../contrib/operator-bundle/):
+`install.sh` (the installer, and the commands every path uses: `status`,
+`addresses`, `connect`, `register`, `credentials`), `bundle.env.example` (every
+setting, with what it does), `pins.env` (the version and checksum of everything
+downloaded or built), `docker/` (the image and the compose file) and
+`windows/setup-wsl.ps1`.
 
-| What | Where |
-| --- | --- |
-| Settings | `/etc/arca-bundle/bundle.env` |
-| Keys and configuration: `operator.key`, `wallet.mnemonic`, the nodes' RPC passwords (mode 600) and every daemon's configuration | `/etc/<NAME>/` |
-| Chains, databases' data, the signer's record (`arca/signer.record`), the gateways' wallets (`seqln/`, `cln/`, each with its `hsm_secret`), captaind's key (`captaind/mnemonic`) | `/var/lib/<NAME>/` |
-| Logs | `/var/log/<NAME>/` and `journalctl -u <NAME>-<program>` |
-| Binaries | `/opt/<NAME>/` |
-| Downloads, the Rust toolchain and the builds, shared by every bundle on the machine | `/var/cache/arca-bundle/` |
-
-Its ports. All of them listen on 127.0.0.1 alone, but for the two gateways
-and Caddy:
+Its ports. Each listens on the machine's loopback alone, but for the two
+gateways and Caddy:
 
 | Port | Program | Reached from |
 | --- | --- | --- |
 | 9835 | SeqLN | anywhere: other operators' gateways and wallets open channels to it |
 | 9935 | Core Lightning | anywhere: the same, on Bitcoin |
 | 80, 443 | Caddy | anywhere: the certificate's challenge, and wallets |
-| 48333 | Bitcoin Core peer-to-peer | anywhere (outbound peers are enough; open it to serve others) |
-| 18884, 18885, 48332, 48342, 5433, 3535, 3536, 3545–3547, 9937, 9938 | the nodes' RPC, the fee proxy, PostgreSQL, arcad, captaind, the gateways' gRPC | this machine only |
+| 3535, 3545 | arcad, captaind | this machine; others through Caddy, over TLS |
+| 18884, 48332 | the Sequentia and Bitcoin nodes' RPC | this machine |
+| the rest (`bundle.env.example`) | the fee proxy, PostgreSQL, metrics, the gateways' gRPC | this machine |
 
 Opening the two gateways' ports is safe: a Lightning node's peer port speaks
 an authenticated, encrypted protocol (BOLT 8), and all a stranger can do
 through it is ask for a channel. Commands reach a node only through its RPC
-socket on the machine. arcad and captaind are reached from outside only
-through Caddy, over TLS.
+socket, on the machine.
 
-## What it needs
+### What it needs
 
-- Windows 10 version 2004 or later, Windows 11, or Windows Server 2022 or
-  later, with hardware virtualisation on in the firmware. Mirrored
-  networking (the simplest) needs Windows 11 22H2 or later, or Windows
-  Server 2025; older versions forward ports instead.
-- 4 cores and 8 GB of memory (the first install builds four programs from
-  source; the running bundle uses about 2 GB), and 60 GB of free disk on the
-  drive the distro lives on: Bitcoin testnet4 with its transaction index is
-  the largest part (15 GB).
+- 4 cores, 8 GB of memory, and 60 GB of free disk: Bitcoin testnet4 with its
+  transaction index is the largest part, 15 GB; the Sequentia chain about 1
+  GB. The first install builds four programs from source, which takes an hour
+  or more and about 10 GB of build space.
 - For a public operator: a DNS name pointing at the machine, and TCP 80, 443,
-  9835 and 9935 forwarded to it from the internet (a router's port
-  forwarding at home; a cloud server's security group on a VPS).
-- Testnet coins to fund it: tSEQ or another asset accepted for fees, and the
-  assets you serve, from the [faucet](https://sequentiatestnet.com/), and
-  testnet4 BTC.
+  9835 and 9935 reaching it from the internet (a router's port forwarding at
+  home; a cloud server's security group on a VPS).
+- Testnet coins to fund it: the assets you serve and an asset accepted for
+  fees, from the [faucet](https://sequentiatestnet.com/), and testnet4 BTC.
 
-## The Windows side
+### The settings
 
-In an elevated PowerShell (Run as administrator), as the Windows user the
-bundle will run under, from a copy of this repository's
-`contrib/operator-bundle/windows/` directory:
+Every path reads the same settings, described line by line in
+`bundle.env.example`. What you fill in:
 
-    powershell -ExecutionPolicy Bypass -File setup-wsl.ps1
+- `ARCA_ASSETS`, required: the assets the operator serves, each as
+  `<asset id>:<smallest leaf in atoms>:<rate source>`, separated by spaces.
+  Nothing is served by default, and no asset comes first: list the ones you
+  hold and want to serve. The rate source is `node` (the node's own rate for
+  the asset, the one it values fees in it at) or `none`. An asset's id is in
+  the explorer.
+- `ARCA_FEE_ASSETS`: the assets a round's fee is paid in, each accepted for
+  fees by the node. Empty: those of the served assets the node accepts.
+- `DOMAIN`, `CONTACT_NAME`, `CONTACT_EMAIL`: the public route and who runs it.
+  Without a domain the operator answers only on this machine.
+- `BACKUP_DIR` (native path): where the database's write-ahead log is
+  archived. Put it on other storage than the machine's disk.
+- `PEER_*`, `CHANNEL_ATOMS`, `CHANNEL_SAT`: the peer bundle the gateways open
+  channels to, and their sizes. The defaults name sequentiatestnet.com.
+- `BUILD_JOBS`: 2 unless the machine has more than 8 GB of memory to spare.
 
-It takes these parameters, all optional:
+## Path 1: Docker Compose
 
-| Parameter | Default | What it is |
-| --- | --- | --- |
-| `-Distro` | `ArcaBundle` | The WSL distro's name |
-| `-InstallDir` | `C:\ArcaBundle` | Where the distro's disk lives: put it on the drive with the most room |
-| `-Ports` | `9835, 9935, 80, 443` | The ports opened to the outside: they must match `SEQLN_PORT` and `CLN_PORT` in `bundle.env` |
-| `-Networking` | `auto` | `mirrored` where Windows supports it, otherwise `nat`; `nat` forces the port proxy |
+Every daemon runs in a container of its own, from one image built from this
+repository: all of them share one network namespace (each reaches the others
+on 127.0.0.1) and the named volumes that hold the keys, the chains and the
+sockets. Every key is drawn on the first start, into the `etc` volume; none is
+in the image or in the compose file.
 
-What it does:
+**Docker.** Linux: Docker Engine with the compose plugin
+(`docker compose version`). macOS and Windows: Docker Desktop, with at least 6
+GB of memory and 80 GB of disk given to it (Settings, Resources); on Windows
+with the WSL2 backend. The image is `linux/amd64`, since Sequentia Core, Core
+Lightning and Bark's server publish x86_64 builds: on an Apple-silicon Mac,
+turn on "Use Rosetta for x86_64/amd64 emulation" in Docker Desktop's
+settings, and it runs under emulation.
 
-1. **WSL2.** `wsl --install --no-distribution` when WSL is missing. Restart
-   Windows when it says so, and run the script again.
-2. **The distro.** Downloads Ubuntu 24.04's WSL image from
-   `cloud-images.ubuntu.com/wsl/releases/24.04/current/`, checks it against
-   the `SHA256SUMS` published beside it, imports it (`wsl --import`), and
-   turns systemd on in `/etc/wsl.conf` (`[boot] systemd=true`).
-3. **`%UserProfile%\.wslconfig`.** `vmIdleTimeout=-1` under `[wsl2]`, so the
-   VM never shuts down for being idle, and in mirrored mode
-   `networkingMode=mirrored` and `firewall=true`.
-4. **The ports.** A Windows Firewall rule per port, a Hyper-V firewall rule
-   per port in mirrored mode, and in NAT mode a `netsh interface portproxy`
-   from the host to the distro, renewed at each start since the distro's
-   address changes.
-5. **Start at boot.** A scheduled task named after the distro, run at startup
-   whether you are logged on or not: it starts the distro, whose systemd
-   starts the bundle, and keeps it running (`wsl -d ArcaBundle --exec
-   /bin/sleep infinity`).
+> **Docker Desktop on macOS and Windows has not been run.** The compose
+> bundle is tested on Linux. Docker Desktop runs the same image in a Linux
+> VM, so it is expected to work the same; if it does not, the native path in
+> a Linux VM (Path 2), or WSL2 on Windows (Path 3), reaches the same result.
+
+**1. The source and the settings:**
+
+    git clone https://github.com/ConcatenaLabs/arca
+    cd arca/contrib/operator-bundle/docker
+    cp ../bundle.env.example bundle.env
+
+Edit `bundle.env` as [The settings](#the-settings) says (any text editor).
+
+**2. Build and start.** The build runs the installer's download and build
+steps in the image (an hour or more the first time); `up` then starts every
+service, the `init` service first, which draws the keys and writes each
+daemon's configuration:
+
+    docker compose up -d --build
 
 **Check:**
 
-    wsl -l -v                                          # ArcaBundle, Running, version 2
-    wsl -d ArcaBundle -u root -- systemctl is-system-running   # running (or degraded)
-    Get-ScheduledTask -TaskName ArcaBundle             # State: Running
+    docker compose ps                     # every service running; init exited 0
+    docker compose exec net bundle status
 
-## Installing the bundle
+`status` shows both chains syncing, the operator's key and its assets, the
+ark's round wallet, and both gateways answering. Each daemon's log:
+`docker compose logs -f arcad` (or `sequentiad`, `captaind`, …).
 
-Inside the distro, as root. On Windows, prefix each command with
-`wsl -d ArcaBundle -u root --`, or open a shell in it with
-`wsl -d ArcaBundle -u root`.
+In the shared steps below, `$B` is the bundle's command and `$A` its wallet:
+
+    B="docker compose exec net bundle"
+    A="docker compose exec net /opt/arca-bundle/bin/arca"
+
+Stop and start: `docker compose stop`, `docker compose start`. A changed
+`bundle.env` takes `docker compose up -d --force-recreate`. An update:
+`git pull`, then `docker compose up -d --build`. The volumes keep everything
+across all three; `docker compose down -v` deletes them, keys included.
+
+On Linux, `docker-compose.host.yml` puts the bundle on the host's own network
+instead, as the native installer runs it, for test chains whose nodes listen
+on the host's loopback:
+`LISTEN_HOST=127.0.0.1 docker compose -f docker-compose.yml -f docker-compose.host.yml up -d`.
+
+## Path 2: the native installer (Ubuntu 24.04)
+
+For a server with systemd. Each daemon runs as a systemd unit named
+`<NAME>-<program>` (`arca-bundle-arcad`, `arca-bundle-captaind`, …), as the
+system user `<NAME>`, and PostgreSQL as a cluster of its own
+(`postgresql@16-arca_bundle`), all in one slice (`arca_bundle.slice`) whose
+memory and CPU `BUNDLE_MEMORY_MAX` and `BUNDLE_CPU_QUOTA` can bound. As root:
 
 **1. The installer.** It writes the settings file and stops:
 
@@ -148,138 +173,180 @@ Inside the distro, as root. On Windows, prefix each command with
     git clone https://github.com/ConcatenaLabs/arca /opt/arca-src
     /opt/arca-src/contrib/operator-bundle/install.sh
 
-**2. The settings.** Edit `/etc/arca-bundle/bundle.env`
-(`nano /etc/arca-bundle/bundle.env`). What you fill in:
+**2. The settings.** Edit `/etc/arca-bundle/bundle.env` as
+[The settings](#the-settings) says.
 
-- `ARCA_ASSETS`, required: the assets the operator serves, each as
-  `<asset id>:<smallest leaf in atoms>:<rate source>`, separated by spaces.
-  Nothing is served by default, and no asset comes first: list the ones you
-  hold and want to serve. The rate source is `node` (the node's own rate for
-  the asset, the one it values fees in it at) or `none`. An asset's id is in
-  the explorer, or `sequentia-cli dumpassetlabels` on any wallet node.
-- `ARCA_FEE_ASSETS`: the assets a round's fee is paid in, each accepted for
-  fees by the node. Empty: those of the served assets the node accepts.
-- `DOMAIN`, `CONTACT_NAME`, `CONTACT_EMAIL`: the public route and who runs it.
-  Without a domain the operator answers only on this machine.
-- `BACKUP_DIR`: where the database's write-ahead log is archived. Put it on
-  other storage than the distro's disk, such as a second drive mounted in
-  the distro.
-- `PEER_*`, `CHANNEL_ATOMS`, `CHANNEL_SAT`: the peer bundle the gateways open
-  channels to, and their sizes. The defaults name sequentiatestnet.com.
-- `BUILD_JOBS`: 2 unless the machine has more than 8 GB of memory to spare.
-
-**3. Install and start.** The first run downloads Sequentia Core, Bitcoin
-Core, Core Lightning, Bark's server and Caddy (each checked against its
-checksum), installs the Rust toolchain, and builds arcad and arca-signer,
-Bark's client, the hold-invoice plugin and SeqLN: an hour or more. It then
-draws every key on the machine (the operator key, the operator wallet's
-mnemonic, the nodes' RPC passwords; captaind and the two gateways draw their
-own), writes each daemon's configuration, makes the PostgreSQL cluster and
-starts every unit in order:
+**3. Install and start.** It downloads what has a release (each checked
+against its checksum), builds the rest, draws every key on the machine into
+mode-600 files, writes each daemon's configuration, and starts every unit in
+order (an hour or more the first time):
 
     /opt/arca-src/contrib/operator-bundle/install.sh
 
 Run the same command again after any change to `bundle.env`, or after a
 `git pull` in `/opt/arca-src`, to update: what is done is found done, a key
 is never drawn twice, and a daemon restarts only when its binary or its
-configuration changed. `install.sh build` does only the downloads and the
-builds.
+configuration changed.
 
-While the chains are still syncing it stops before the gateways,
-saying how far the sync is: everything started runs on and keeps syncing, and
-the same command, run again once both have caught up, starts the gateways,
-Bark's server, its watchman and arcad.
+While the chains are still syncing it stops before the gateways, saying how
+far the sync is: the nodes run on and keep syncing, and the same command, run
+again once both have caught up, starts the gateways, Bark's server, its
+watchman and arcad. (A new Sequentia node takes no block until the bundle's
+Bitcoin node has synced past the Bitcoin blocks its anchors name.)
 
 **Check:** it ends with `every unit is running`, and
+`/opt/arca-src/contrib/operator-bundle/install.sh status` shows both chains
+syncing, the operator's key and assets, the ark's round wallet, and both
+gateways answering.
 
-    /opt/arca-src/contrib/operator-bundle/install.sh status
+In the shared steps, as root:
 
-shows every unit `active`, both chains syncing, the operator's key and its
-assets, the ark's round wallet, and both gateways answering.
+    B=/opt/arca-src/contrib/operator-bundle/install.sh
+    A=/opt/arca-bundle/bin/arca
 
-**Sync.** Both nodes now catch up with their chains: the Sequentia node from
-the testnet's public node (it peers with it on its own, with no setting), and
-the Bitcoin node from testnet4's public peers. `status` shows how far each
-is. arcad takes no work until its node is synced; the Bitcoin node takes the
-longest.
+| To | Run |
+| --- | --- |
+| Follow a daemon's log | `journalctl -fu arca-bundle-arcad`, and `/var/log/arca-bundle/` |
+| Stop the operator | `systemctl stop arca-bundle-arcad arca-bundle-arca-signer` |
+| Stop everything | `systemctl stop arca_bundle.slice` |
+| Start everything | `systemctl start postgresql@16-arca_bundle 'arca-bundle-*'` |
+
+Its files: settings `/etc/arca-bundle/bundle.env`; keys and configurations
+`/etc/<NAME>/`; chains, data, the signer's record and the gateways' wallets
+`/var/lib/<NAME>/`; logs `/var/log/<NAME>/`; binaries `/opt/<NAME>/`; the
+downloads, toolchain and builds `/var/cache/arca-bundle/` (shared by every
+bundle on the machine). A second bundle takes its own `NAME` and ports in its
+own settings file: `BUNDLE_ENV=/etc/arca-b/bundle.env install.sh`.
+
+## Path 3: Windows with WSL2
+
+A WSL2 distro of Ubuntu 24.04 with systemd, set up by one PowerShell script,
+then the native installer (Path 2) inside it.
+
+> **The Windows script has not been run on Windows.** `setup-wsl.ps1` is
+> written to Microsoft's documented WSL interfaces. Where it fails, each step
+> below says what it does, to do by hand; or take Path 1 with Docker Desktop.
+
+In an elevated PowerShell (Run as administrator), as the Windows user the
+bundle will run under, from `contrib\operator-bundle\windows\`:
+
+    powershell -ExecutionPolicy Bypass -File setup-wsl.ps1
+
+Its parameters, all optional: `-Distro` (`ArcaBundle`), `-InstallDir`
+(`C:\ArcaBundle`: put it on the drive with the most room), `-Ports`
+(`9835, 9935, 80, 443`, matching `SEQLN_PORT` and `CLN_PORT`), `-Networking`
+(`auto`: `mirrored` where Windows supports it, otherwise `nat`).
+
+1. **WSL2.** `wsl --install --no-distribution` when WSL is missing. Restart
+   Windows when it says so, and run the script again.
+2. **The distro.** Ubuntu 24.04's WSL image from
+   `cloud-images.ubuntu.com/wsl/releases/24.04/current/`, checked against the
+   `SHA256SUMS` published beside it, imported with `wsl --import`, systemd on
+   in `/etc/wsl.conf` (`[boot] systemd=true`).
+3. **`%UserProfile%\.wslconfig`.** `vmIdleTimeout=-1` under `[wsl2]`, so the
+   VM never shuts down for being idle; in mirrored mode also
+   `networkingMode=mirrored` and `firewall=true`.
+4. **The ports.** A Windows Firewall rule per port, a Hyper-V firewall rule
+   per port in mirrored mode, and in NAT mode a `netsh interface portproxy`
+   from the host to the distro, renewed at each start.
+5. **Start at boot.** A scheduled task run at startup whether you are logged
+   on or not: it starts the distro, whose systemd starts the bundle, and keeps
+   it running (`wsl -d ArcaBundle --exec /bin/sleep infinity`).
+
+**Check:** `wsl -l -v` (ArcaBundle, Running, version 2);
+`wsl -d ArcaBundle -u root -- systemctl is-system-running` (running);
+`Get-ScheduledTask -TaskName ArcaBundle` (Running). Then Path 2's steps
+inside the distro, each prefixed with `wsl -d ArcaBundle -u root --`.
 
 ## Funding it
 
-    /opt/arca-src/contrib/operator-bundle/install.sh addresses
+    $B addresses
 
-prints four addresses:
+prints four addresses, each with what it is for:
 
-- **The operator's pools**: pay each served asset to it. Every round is funded
-  from these coins, which stay in batches until they expire and are swept
-  back, weeks later.
-- **The Bitcoin ark's round wallet**: testnet4 BTC its rounds are built from.
-- **The SeqLN gateway**: each asset its channels are opened in, plus a little
-  of a fee asset.
-- **The Bitcoin gateway**: testnet4 BTC for its channel and its fees.
+- **operator-pools**: pay each served asset to it. Every round is funded from
+  these coins, which stay in batches until they expire and are swept back,
+  weeks later.
+- **ark-rounds**: testnet4 BTC the ark's rounds are built from. Keep at least
+  the ark's VTXO pool (`ARK_VTXO_POOL`, 200,000 sat) and fees: a Lightning
+  receive into the ark is paid out of that pool, and with none ready it is
+  failed back.
+- **seqln**: each asset the gateway's channels are opened in, plus a little of
+  a fee asset.
+- **cln**: testnet4 BTC for the Bitcoin gateway's channel, its anchor reserve
+  (25,000 sat) and its fees.
 
-**Check:** `status` shows the ark's `trusted_balance`, and the gateways'
-funds (`lightning-cli listfunds`).
+**Check:** `$B status` shows the ark's `trusted_balance`.
 
 ## Connecting to the sequentiatestnet.com bundle
 
-The two Sequentia nodes already share one chain, and both Bitcoin nodes
-follow public testnet4. What joins the two operators is Lightning: each of
-this bundle's gateways opens a channel to the testnet bundle's gateway, in
-each asset both serve and in BTC, with half of each channel pushed to the
-other side so payments run both ways from the start:
+The two Sequentia nodes already share one chain (a node on the testnet peers
+with its public node on its own), and both Bitcoin nodes follow public
+testnet4. What joins the two operators is Lightning: each of this bundle's
+gateways opens a channel to the testnet bundle's gateway, in each asset both
+serve and in BTC, with half of each channel pushed to the other side so
+payments run both ways from the start:
 
-    /opt/arca-src/contrib/operator-bundle/install.sh connect
+    $B connect
 
-It reads the peer's gateways' keys from its `GET /v1/info`, refuses a peer on
+It reads the peer's gateways from its `GET /v1/info`, refuses a peer on
 another chain, and opens only the channels not open yet.
 
-**Check:** after the funding transactions confirm (a few blocks on each
-chain), `status` lists each channel `CHANNELD_NORMAL`, and arcad's `info`
-shows each asset's Lightning leg `up`:
-
-    curl -s http://127.0.0.1:3535/v1/info | jq '.assets[] | {asset, lightning}'
+**Check:** after the funding transactions confirm, `$B status` lists each
+channel `CHANNELD_NORMAL` and each asset's Lightning leg `up`.
 
 ## Listing the operator in the registry
 
 Wallets find operators in the Sequentia registry. With `DOMAIN` and
 `CONTACT_NAME` set and Caddy serving `https://<DOMAIN>/arca`:
 
-    /opt/arca-src/contrib/operator-bundle/install.sh register
+    $B register
 
-It writes the operator's record from its own `info`
-(sequentia-registry's `tools/operator-record.js`), signs it with the
-operator key (`arca-signer --sign-operator-record`, which signs that record
-and nothing else), and posts it. Caddy serves the domain proof the registry
-may ask for at
-`https://<DOMAIN>/.well-known/sequentia-operator-proof-<operator key>`. A
-change to what the operator serves, charges or names takes a new record:
-run `register` again.
+It writes the operator's record from its own `info` (sequentia-registry's
+`tools/operator-record.js`), signs it with the operator key
+(`arca-signer --sign-operator-record`, which signs that record and nothing
+else), and posts it. Caddy serves the domain proof the registry may ask for
+at `https://<DOMAIN>/.well-known/sequentia-operator-proof-<operator key>`. A
+change to what the operator serves, charges or names takes a new record: run
+`register` again.
 
-**Check:** `arca operators --registry https://sequentiatestnet.com/registry`
+**Check:** `$A operators --registry https://sequentiatestnet.com/registry`
 lists the operator `ok`.
 
 ## Paying between the two operators
 
-Two wallets, one joined to each operator. `arca` is in `/opt/<NAME>/bin`;
-each wallet reads the chain through this bundle's node, as root (who can
-read the node's cookie). The asset is one both operators serve over
-Lightning.
+Two wallets, one joined to each operator, each reading the chain through this
+bundle's node. The asset is one both operators serve over Lightning:
 
-    A=/opt/arca-bundle/bin/arca
+    W=/var/lib/arca-bundle/wallets
     COOKIE=/var/lib/arca-bundle/sequentia/testnet3/.cookie
-    $A --datadir ~/w-mine create --server http://127.0.0.1:3535 \
+    $A --datadir $W/mine create --server http://127.0.0.1:3535 \
         --node-url http://127.0.0.1:18884/ --node-cookie $COOKIE
-    $A --datadir ~/w-theirs create --server https://sequentiatestnet.com/arca \
+    $A --datadir $W/theirs create --server https://sequentiatestnet.com/arca \
         --node-url http://127.0.0.1:18884/ --node-cookie $COOKIE
 
-Fund `w-mine` (`$A --datadir ~/w-mine address`), board it
-(`$A --datadir ~/w-mine board <asset> <atoms>`, spendable once final), then:
+Fund `mine` (`$A --datadir $W/mine address`), board it
+(`$A --datadir $W/mine board <asset> <atoms>`, spendable once final), then:
 
-    $A --datadir ~/w-theirs lightning receive <asset> 100000     # an invoice
-    $A --datadir ~/w-mine lightning pay <invoice> --wait 60      # paid: through this gateway to theirs
-    $A --datadir ~/w-theirs sync                                 # the leaf, claimed
+    $A --datadir $W/theirs lightning receive <asset> 100000000    # an invoice
+    $A --datadir $W/mine lightning pay <invoice> --wait 120       # through this gateway to theirs
+    $A --datadir $W/theirs sync                                   # the leaf, claimed
 
-and back, the other way round.
+and back, the other way round. On Bitcoin, each wallet joins its operator's
+Bitcoin ark, and the receiver claims while the payer pays:
+
+    BCOOKIE=/var/lib/arca-bundle/bitcoin/testnet4/.cookie
+    $A --datadir $W/mine bitcoin create --testnet4 --ark http://127.0.0.1:3545 \
+        --bitcoind http://127.0.0.1:48342 --bitcoind-cookie $BCOOKIE
+    $A --datadir $W/theirs bitcoin create --testnet4 --ark https://sequentiatestnet.com \
+        --bitcoind http://127.0.0.1:48342 --bitcoind-cookie $BCOOKIE
+    $A --datadir $W/theirs lightning receive btc 2000                 # an invoice
+    $A --datadir $W/theirs lightning claim <invoice> --wait 300 &     # claims while the payer pays
+    $A --datadir $W/mine lightning pay <invoice>                      # paid, with its preimage
+
+A Bitcoin ark wallet boards from its own on-chain address first
+(`$A --datadir $W/mine bitcoin -- onchain address`, then
+`$A --datadir $W/mine bitcoin -- board "60000 sat"`).
 
 **What a payment between operators can lock.** An operator's invoice for a
 payment into its tree carries a final lock of about 5,790 blocks (four days at
@@ -293,77 +360,54 @@ payer's wallet shows the payment `paying`, never `failed`, since it follows
 what the operator says. Bitcoin is the same in miniature: a Bark ark lets a
 payment lock up to 258 blocks, which another ark's 184-block invoice needs.
 
-On Bitcoin, each wallet joins its operator's
-Bitcoin ark and pays the other's invoice:
+## A Lightning wallet beside it
 
-    BCOOKIE=/var/lib/arca-bundle/bitcoin/testnet4/.cookie
-    $A --datadir ~/w-mine bitcoin create --testnet4 --ark http://127.0.0.1:3545 \
-        --bitcoind http://127.0.0.1:48332 --bitcoind-cookie $BCOOKIE
-    $A --datadir ~/w-theirs bitcoin create --testnet4 --ark https://sequentiatestnet.com \
-        --bitcoind http://127.0.0.1:48332 --bitcoind-cookie $BCOOKIE
-    $A --datadir ~/w-theirs lightning receive btc 2000          # an invoice
-    $A --datadir ~/w-theirs lightning claim <invoice> --wait 300 &   # claims while the payer pays
-    $A --datadir ~/w-mine lightning pay <invoice>                # paid, with its preimage
+**Fulmen**, the SeqLN desktop wallet, runs its own Lightning node and reads
+the chains through this bundle's nodes, with the logins `$B credentials`
+prints (both nodes' RPC are on this machine's 127.0.0.1 on every path; on
+Windows all WSL2 distros share one network). Installing it and opening its
+channels to an operator's gateways:
+[Fulmen's README](https://github.com/ConcatenaLabs/fulmen#connecting-to-an-operators-gateways).
+Fulmen ships for Linux (AppImage) and Windows (WSL2).
 
-A Bitcoin ark wallet boards from its own on-chain address first
-(`$A --datadir ~/w-mine bitcoin address`, then `bitcoin board`).
-
-## A Lightning wallet beside it: Fulmen
-
-Fulmen, the SeqLN desktop wallet, runs its own Lightning node on Windows in a
-WSL distro of its own, and reads the chains through this bundle's nodes (all
-WSL2 distros share one network, so `127.0.0.1` reaches them). The logins it
-needs:
-
-    /opt/arca-src/contrib/operator-bundle/install.sh credentials
-
-Installing it and opening its channels to an operator's gateways is
-described in [Fulmen's README](https://github.com/ConcatenaLabs/fulmen#connecting-to-an-operators-gateways).
-Where Fulmen does not run, the same channels and payments are made with
-SeqLN and Core Lightning on the command line:
+**Without Fulmen** (macOS, or anywhere else): the same channels and payments
+are made with SeqLN for the assets and Core Lightning for BTC on the command
+line, step by step, natively or in containers of this bundle's image:
 [operator-gateways-cli.md](https://github.com/ConcatenaLabs/fulmen/blob/master/docs/operator-gateways-cli.md).
+Generic Core Lightning interfaces (RTL over clnrest, for one) drive the BTC
+node fully, but cannot show or choose a channel's asset on SeqLN.
 
 ## Running it
 
-| To | Run |
-| --- | --- |
-| See everything | `install.sh status` |
-| Follow a daemon's log | `journalctl -fu arca-bundle-arcad` (or `-sequentiad`, `-captaind`, …), and `/var/log/arca-bundle/` |
-| Stop the operator | `systemctl stop arca-bundle-arcad arca-bundle-arca-signer` (arcad stops on SIGINT, the signer on SIGTERM; the units send each its own) |
-| Stop everything | `systemctl stop arca_bundle.slice` |
-| Start everything | `systemctl start postgresql@16-arca_bundle 'arca-bundle-*'` |
-| Serve another asset | add it to `ARCA_ASSETS` and run `install.sh` (arcad takes it on SIGHUP, without a restart) |
-| Update | `git -C /opt/arca-src pull && /opt/arca-src/contrib/operator-bundle/install.sh` |
-
-**What running it commits you to.** Every round is funded from your own
-coins, locked in batches until they expire. Every payment and refresh needs
-your co-signature, and your watcher answers stale exits: while the operator is
+**What it commits you to.** Every round is funded from your own coins, locked
+in batches until they expire. Every payment and refresh needs your
+co-signature, and your watcher answers stale exits: while the operator is
 down its holders can only take their coins home on the chain. Holders refresh
 or exit each coin before its exit deadline, three days before its batch
 expires: keep the operator running, and announce any end of service far
-ahead. [What happens when an operator goes down](operator-bundle-tests.md)
-shows each case.
+ahead.
 
-**Back up**, to offline media, apart from the machine: `/etc/<NAME>/operator.key`,
-`/etc/<NAME>/wallet.mnemonic`, `/var/lib/<NAME>/captaind/mnemonic`, and each
-gateway's `hsm_secret` (`/var/lib/<NAME>/seqln/<network>/hsm_secret`,
-`/var/lib/<NAME>/cln/<network>/hsm_secret`). The signer's record is never
-restored from a copy.
+**Back up**, to offline media, apart from the machine: `operator.key`,
+`wallet.mnemonic` (in `/etc/arca-bundle/`, the `etc` volume with Docker),
+`captaind/mnemonic`, and each gateway's `hsm_secret` (`seqln/<network>/` and
+`cln/<network>/`, under `/var/lib/arca-bundle/`, the `lib` volume). The
+signer's record is never restored from a copy.
 
-**Keepers.** The installer makes the signer's record without keepers, which
-suits an operator holding its own coins and test operators. An operator that
-holds other people's coins runs with three keepers on machines of their own,
-two required, as [the operator's procedure](operator-procedure.md) sets out.
+**When it goes down, and how much it carries.**
+[Testing an operator](operator-bundle-tests.md) runs an operator under load to
+its first limit, and stops it at chosen moments (idle, mid-payment, mid-round,
+mid-swap, mid cross-chain swap, the Bitcoin ark down): for each, what its
+holders see, what refunds when, and how each takes its coins home alone. The
+tests in `contrib/operator-bundle/test/` run against a bundle, never against
+anyone else's operator.
 
-## Two bundles on one machine, and test chains
+**Keepers.** The bundle makes the signer's record without keepers, which suits
+an operator holding its own coins and test operators. An operator that holds
+other people's coins runs with three keepers on machines of their own, two
+required, as [the operator's procedure](operator-procedure.md) sets out.
 
-Each bundle takes its own `NAME` and its own set of ports in its own settings
-file: `BUNDLE_ENV=/etc/arca-b/bundle.env install.sh`. They share the
-downloads and builds in `/var/cache/arca-bundle/`, and nothing else: their
-users, directories, units and PostgreSQL clusters are their own.
-
-The installer also runs on test chains, which is how it is tested without the
-public networks: `BTC_CHAIN=regtest`, a custom Sequentia chain in `SEQ_CHAIN`
-with its consensus settings in `SEQ_CHAIN_CONF` (one per line, the same on
-every node of that chain), and `SEQ_ADDNODE` / `BTC_ADDNODE` naming a node of
-each chain to connect to.
+**Test chains.** The bundle also runs on test chains, which is how it is
+tested without the public networks: `BTC_CHAIN=regtest`, a custom Sequentia
+chain in `SEQ_CHAIN` with its consensus settings in `SEQ_CHAIN_CONF` (one per
+line, or separated by `;`, the same on every node of that chain), and
+`SEQ_ADDNODE` / `BTC_ADDNODE` naming a node of each chain to connect to.
