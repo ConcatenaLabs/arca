@@ -1061,9 +1061,22 @@ impl Wallet {
 		let due = CoinDates::of(self.service_expiry(&record, &a)?)
 			.is_some_and(|d| now.to_consensus_u32() >= d.home_from);
 		let boards_spent = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)).err();
+		// A coin whose lineage another holder took home before this wallet
+		// read it (its sender's exit of its change, say) has its own output
+		// on the chain already, under this wallet's key, where nobody else
+		// can spend it: it is kept and taken home at once. One whose output
+		// is not on the chain yet waits, read again at every sync: what
+		// stands on the chain of its lineage is spent on towards it by the
+		// pre-signed steps its sender's wallet and the operator's watcher
+		// publish, and a coin refused for good would be left on the chain to
+		// no one once they do.
+		let mut own_on_chain = None;
 		if let Some(e) = &boards_spent {
 			if !home && !late && !due {
-				return Err(Error::Refused(e.to_string()));
+				if !*own_on_chain.get_or_insert(self.own_output_seen(&a.valid, a.lowest_height())?) {
+					return Err(Error::Missing(format!("{}, and the coin's own output is not on the chain yet: it waits for its path to \
+						reach it", e)));
+				}
 			}
 		}
 		// A coin resting on a board carries the board's dates. One that
@@ -1087,9 +1100,13 @@ impl Wallet {
 		let on_chain = a.valid.check_lineage(|s| seen.contains(s)).err();
 		if let Some(e) = &on_chain {
 			if !late && !home && !due {
-				return Err(Error::Refused(e.to_string()));
+				if !*own_on_chain.get_or_insert(self.own_output_seen(&a.valid, a.lowest_height())?) {
+					return Err(Error::Missing(format!("{}, and the coin's own output is not on the chain yet: it waits for its path to \
+						reach it", e)));
+				}
 			}
 		}
+		let own_on_chain = own_on_chain.unwrap_or(false);
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
 		// A coin received out of round from an operator with no keeper rests
 		// on the operator's machine alone until it is refreshed.
@@ -1178,6 +1195,19 @@ impl Wallet {
 		if home && !late {
 			let why = format!("the operator's signer is stopped and co-signs nothing more: the wallet takes the coin on the chain at once{}{}",
 				on_chain.as_ref().map(|e| format!(", going on from its lineage on the chain ({})", e)).unwrap_or_default(),
+				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
+			self.store.set_coin_state(&id, &coin.state, &why)?;
+			out["note"] = json!(why);
+			out["exit"] = self.exit(&id, None).unwrap_or_else(|e| json!({"error": e.to_string(),
+				"note": "exit the coin, naming an asset the wallet holds on the chain for the fees (--fee-asset)"}));
+			if let Some(c) = self.store.coin(&id)? {
+				out["state"] = json!(c.state);
+			}
+		}
+		if own_on_chain && !due && !late && !home {
+			let why = format!("its own output is on the chain already, its lineage taken home before the wallet read it{}{}: the \
+				operator co-signs no spend of it, and the wallet takes it home at once",
+				on_chain.as_ref().map(|e| format!(" ({})", e)).unwrap_or_default(),
 				boards_spent.as_ref().map(|e| format!("; {}", e)).unwrap_or_default());
 			self.store.set_coin_state(&id, &coin.state, &why)?;
 			out["note"] = json!(why);
@@ -2026,6 +2056,21 @@ impl Wallet {
 		let value = kept.checked_sub(margin).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused("the coins do not cover the margins of a transfer to the wallet itself".into()))?;
 		Ok((asset, inputs, value))
+	}
+}
+
+impl Wallet {
+	/// Whether `coin`'s own output (its asset, value and script) is in a
+	/// block of the active chain or in the mempool. It is made only by spends
+	/// that start at the batch outputs and boards the coin rests on, so while
+	/// each stands no block is read.
+	fn own_output_seen(&self, coin: &ValidCoin, from: u64) -> Result<bool, Error> {
+		let Some(lowest) = self.chain.descendants_from(&coin.roots(), from)? else { return Ok(false) };
+		let out = coin.output().txout();
+		if self.chain.find_payment(&out, lowest)?.is_some() {
+			return Ok(true);
+		}
+		Ok(self.chain.mempool_txs()?.iter().any(|tx| tx.output.contains(&out)))
 	}
 }
 

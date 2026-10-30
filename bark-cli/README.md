@@ -274,7 +274,14 @@ and a board whose registration never reached the server, are not recovered.
   chain (every one of them descends from a batch output or board the coin
   rests on, so while each of those is unspent the wallet reads no block; it
   reads the blocks from that of a spent one up); every board it rests on
-  must be unspent, and before its exit deadline. A coin read a day or less from its exit date, or past it, is
+  must be unspent, and before its exit deadline. A coin whose lineage
+  another holder took home before the wallet read it (its sender's exit of
+  its change, say) has its own output on the chain already, under the
+  wallet's key, where nobody else can spend it: it is kept and taken home at
+  once. While its board is spent or its lineage is on the chain and its own
+  output is not, it is neither taken nor refused: it waits, read again at
+  every `mailbox` and `sync`, for the pre-signed steps its sender's wallet or
+  the operator's watcher publish to reach it. A coin read a day or less from its exit date, or past it, is
   kept and taken on the chain at once, from wherever its lineage is; one
   read past its batch's expiry is checked as of that expiry and kept and
   taken on the chain at once while the chain still holds its path (the
