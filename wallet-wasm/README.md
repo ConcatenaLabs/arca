@@ -273,6 +273,13 @@ wallet crate compiles Bark's gRPC protocol).
 The package is `pkg/leaf_wallet.js` with `pkg/leaf_wallet_bg.wasm`. The web
 wallet carries a copy in its `leaves/pkg/`.
 
+The `leaf-wallet-pkg` workflow builds the same package on every change to `master`
+that reaches the wallet, with every build-machine path remapped (as the web wallet's
+`tooling/build-leaf-wallet.sh` does), and keeps it for 90 days as the artifact
+`leaf-wallet-pkg-<commit>`, with its `SHA256SUMS`:
+
+    gh run download -R ConcatenaLabs/arca -n leaf-wallet-pkg-<commit> -D <dir>
+
 `.cargo/config.toml` builds libsecp256k1 with its 32-bit-limb field
 (`USE_FORCE_WIDEMUL_INT64`): wasm32 has no 64-by-64-bit multiply, and the
 64-bit-limb field spends most of a coin's check in that multiply's emulation.
