@@ -65,6 +65,10 @@ fi
 : "${SEQ_CHAIN_CONF:=}" "${SEQ_ADDNODE:=}" "${BTC_ADDNODE:=}" "${SEQ_ANCHOR_RPC:=}" "${SEQ_ANCHOR_AUTH:=}"
 : "${SEQLN_NETWORK:=}" "${BTC_FEE_FLOOR:=30}" "${ARCA_ANCHOR_DEPTH:=2}"
 # Limits on everything the bundle runs together (a systemd slice): empty for none.
+# Where the operator, the ark and the nodes' RPC listen: 127.0.0.1 on a machine;
+# all addresses in a container, whose ports the compose file publishes to the
+# host's loopback alone.
+: "${LISTEN_HOST:=127.0.0.1}"
 : "${BUNDLE_MEMORY_MAX:=}" "${BUNDLE_CPU_QUOTA:=}" "${ARK_VTXO_POOL:=10000sat:10 50000sat:2}"
 
 case "$NAME" in *[!a-z0-9-]*|"") die "NAME is lower-case letters, digits and dashes: $NAME";; esac
@@ -127,11 +131,442 @@ channel_atoms() {   # the channel size for asset $1
 }
 
 # ===========================================================================================
+# What the native installer and the containers (docker/bundle-run) share: the keys, and
+# every daemon's configuration, written from the settings.
+draw_keys() {
+step "keys and passwords, drawn here (made once, never replaced)"
+umask 077
+key_file() {   # key_file <file> <command...>: the command writes the secret to stdout
+  local f=$ETC/$1; shift
+  if [ ! -s "$f" ]; then "$@" > "$f.new"; mv "$f.new" "$f"; say "drew $f"; fi
+  chown "$USER_:$USER_" "$f"; chmod 600 "$f"
+}
+key_file operator.key openssl rand -hex 32
+[ "$(tr -d '\n' < "$ETC/operator.key" | wc -c)" = 64 ] || die "$ETC/operator.key is not 64 hex characters"
+key_file wallet.mnemonic python3 -I - "$CARGO_HOME" <<'PY'
+import glob, hashlib, os, re, sys
+# The BIP39 English list, from the bip39 crate the build fetched, checked
+# against the list's published SHA-256 before use.
+lists = glob.glob(os.path.join(sys.argv[1], "registry/src/*/bip39-*/src/language/english.rs"))
+if not lists: sys.exit("no BIP39 word list under the cargo registry")
+words = re.findall(r'"([a-z]+)"', open(sorted(lists)[-1]).read())
+if len(words) != 2048 or hashlib.sha256(("\n".join(words) + "\n").encode()).hexdigest() != \
+        "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda":
+    sys.exit("the BIP39 word list does not match the standard English list")
+entropy = os.urandom(32)
+bits = int.from_bytes(entropy, "big") << 8 | hashlib.sha256(entropy).digest()[0]
+print(" ".join(words[(bits >> (11 * (23 - i))) & 2047] for i in range(24)))
+PY
+[ "$(wc -w < "$ETC/wallet.mnemonic")" = 24 ] || die "$ETC/wallet.mnemonic is not 24 words"
+key_file seq-rpc.password openssl rand -hex 24
+key_file btc-rpc.password openssl rand -hex 24
+umask 022
+# rpcauth lines: the nodes keep only a salted hash of each login's password.
+rpcauth() { python3 -I - "$1" "$2" <<'PY'
+import hashlib, hmac, os, sys
+salt = os.urandom(16).hex()
+pw = open(sys.argv[2]).read().strip()
+print("%s:%s$%s" % (sys.argv[1], salt, hmac.new(salt.encode(), pw.encode(), hashlib.sha256).hexdigest()))
+PY
+}
+
+}
+
+write_configs() {
+step "configuration"
+changed=""
+# write_conf <unit word> <mode> <file>: stdin is the content; a changed file marks its unit.
+write_conf() {
+  local t; t=$(mktemp); cat > "$t"
+  if [ -f "$3" ] && cmp -s "$t" "$3"; then rm -f "$t"; return 0; fi
+  install -m "$2" -o "$USER_" -g "$USER_" "$t" "$3"; rm -f "$t"; changed+=" $1"
+}
+# An rpcauth line is drawn with a fresh salt, so it is written once and kept.
+for n in seq btc; do
+  if [ ! -s "$ETC/$n-rpcauth" ] || [ "$(cut -d: -f1 "$ETC/$n-rpcauth")" != "$NAME" ]; then rpcauth "$NAME" "$ETC/$n-rpc.password" > "$ETC/$n-rpcauth"; chmod 640 "$ETC/$n-rpcauth"; chgrp "$USER_" "$ETC/$n-rpcauth"; fi
+done
+btc_addnode=""; [ -n "$BTC_ADDNODE" ] && btc_addnode="addnode=$BTC_ADDNODE"
+write_conf bitcoind 640 "$ETC/bitcoin.conf" <<EOF
+# Bitcoin Core for the bundle's Bitcoin ark and its Sequentia node's anchors.
+# Written by install.sh from $BUNDLE_ENV.
+chain=$BTC_CHAIN
+
+[$BTC_CHAIN]
+server=1
+# Bark's server reads any transaction by its id, so the node keeps a full
+# transaction index (and is never pruned).
+txindex=1
+disablewallet=1
+listen=1
+bind=0.0.0.0:$BTC_P2P_PORT
+$btc_addnode
+rpcbind=$LISTEN_HOST
+rpcallowip=$( [ "$LISTEN_HOST" = 127.0.0.1 ] && echo 127.0.0.1 || echo 0.0.0.0/0 )
+rpcport=$BTC_RPC_PORT
+# The cookie is for the bundle's own daemons; the login below is for a
+# Lightning wallet beside them (install.sh credentials).
+rpccookieperms=group
+rpcauth=$(cat "$ETC/btc-rpcauth")
+debuglogfile=$LOG/bitcoind.log
+shrinkdebugfile=0
+dbcache=300
+maxmempool=200
+EOF
+seq_addnode=""; [ -n "$SEQ_ADDNODE" ] && seq_addnode="addnode=$SEQ_ADDNODE"
+if [ -n "$SEQ_ANCHOR_RPC" ]; then
+  anchor="mainchainrpchost=${SEQ_ANCHOR_RPC%:*}
+mainchainrpcport=${SEQ_ANCHOR_RPC##*:}
+mainchainrpcuser=${SEQ_ANCHOR_AUTH%%:*}
+mainchainrpcpassword=${SEQ_ANCHOR_AUTH#*:}"
+else
+  # By the bundle's own login on its Bitcoin node, named outright: the public
+  # testnet's chain settings name a shared gateway's login otherwise, which
+  # would take the place of a cookie.
+  anchor="mainchainrpchost=127.0.0.1
+mainchainrpcport=$BTC_RPC_PORT
+mainchainrpcuser=$NAME
+mainchainrpcpassword=$(cat "$ETC/btc-rpc.password")"
+fi
+testnet_rules=""; [ "$SEQ_CHAIN" = test ] && testnet_rules="# The public testnet's network-wide rules.
+pospubliccommittee=1
+poscommitteesize=250"
+write_conf sequentiad 640 "$ETC/sequentia.conf" <<EOF
+# The Sequentia node: the chain arcad and the SeqLN gateway read. Written by
+# install.sh from $BUNDLE_ENV.
+chain=$SEQ_CHAIN
+
+[$SEQ_CHAIN]
+$testnet_rules
+${SEQ_CHAIN_CONF//;/$'\n'}
+server=1
+txindex=1
+disablewallet=1
+# Every anchor is checked against this machine's Bitcoin node: the chain
+# follows Bitcoin's reorganisations, and arcad's finality waits on them.
+validateanchor=1
+$anchor
+listen=1
+bind=127.0.0.1:$SEQ_P2P_PORT
+$seq_addnode
+rpcbind=$LISTEN_HOST
+rpcallowip=$( [ "$LISTEN_HOST" = 127.0.0.1 ] && echo 127.0.0.1 || echo 0.0.0.0/0 )
+rpcport=$SEQ_RPC_PORT
+rpccookieperms=group
+rpcauth=$(cat "$ETC/seq-rpcauth")
+debuglogfile=$LOG/sequentiad.log
+shrinkdebugfile=0
+EOF
+write_conf cln 640 "$LIB/cln/config" <<EOF
+# The Bitcoin gateway: Core Lightning with the hold-invoice plugin, driven by
+# Bark's server over gRPC. Written by install.sh.
+network=$BTC_CHAIN
+alias=$NAME-btc
+bitcoin-cli=$OPT/core/bin/bitcoin-cli
+bitcoin-datadir=$LIB/bitcoin
+bitcoin-rpcport=$BTC_RPC_PORT
+bitcoin-rpcconnect=127.0.0.1
+# Peers reach it from anywhere: its channels are its route to other
+# operators' gateways and to wallets.
+bind-addr=0.0.0.0:$CLN_PORT
+grpc-port=$CLN_GRPC_PORT
+important-plugin=$BIN/hold
+hold-grpc-port=$HOLD_GRPC_PORT
+log-file=$LOG/cln.log
+log-level=info
+# arcad, in the same group, reads it through its socket.
+rpc-file-mode=0660
+$( [ "$BTC_CHAIN" = testnet4 ] && echo "# testnet4's own fee estimates often say nothing; these fixed rates (sat per
+# 1,000 weight) let it open and close channels. The option exists on test
+# networks only.
+force-feerates=7500/7500/500/7500/7500/7500" )
+EOF
+write_conf seqln 640 "$LIB/seqln/config" <<EOF
+# The Sequentia gateway: SeqLN with the hold-invoice plugin, one channel in
+# each asset served over Lightning. Written by install.sh.
+network=$SEQLN_NETWORK
+alias=$NAME-seq
+bitcoin-cli=$OPT/sequentia/bin/sequentia-cli
+bitcoin-datadir=$LIB/sequentia
+bitcoin-rpcport=$SEQ_RPC_PORT
+bitcoin-rpcconnect=127.0.0.1
+bind-addr=0.0.0.0:$SEQLN_PORT
+plugin=$OPT/seqln/contrib/holdinvoice-seq/holdinvoice.py
+log-file=$LOG/seqln.log
+log-level=info
+rpc-file-mode=0660
+EOF
+
+}
+
+captaind_toml() {   # the server's (no argument) or the watchman's (watchman) configuration
+  local fee="[fee_estimator]
+update_interval = \"1m\"
+history_duration = \"60m\"
+fallback_fee_rate_fast = \"${BTC_FEE_FLOOR}sat/vb\"
+fallback_fee_rate_regular = \"${BTC_FEE_FLOOR}sat/vb\"
+fallback_fee_rate_slow = \"${BTC_FEE_FLOOR}sat/vb\"
+max_fee_rate = \"100sat/vb\""
+  local pg="[postgres]
+host = \"/var/run/postgresql\"
+port = $PG_PORT
+name = \"bark\"
+user = \"$USER_\""
+  local node="[bitcoind]
+url = \"http://127.0.0.1:$FEE_PROXY_PORT\"
+cookie = \"$LIB/bitcoin/$BTC_SUB/.cookie\""
+  if [ "${1:-}" = watchman ]; then cat <<EOF
+# Bark's watchman: answers exits and sweeps expired rounds back to the
+# server's round wallet. Written by install.sh.
+data_dir = "$LIB/watchmand"
+network = "$BARK_NET"
+sync_manager_block_poll_interval = "1s"
+htlc_settlement_poll_interval = "60s"
+min_trusted_confs = 2
+otel_deployment_name = "$NAME-watchman"
+sweep_address = "$SWEEP_ADDRESS"
+
+[watchman]
+reaction_interval = "1m"
+sweep_interval = "2h"
+progress_grace_period = 2
+claim_chunksize = 20
+incremental_relay_fee = "100 sat/kvb"
+min_cpfp_amount = "10000 sat"
+
+$fee
+
+$pg
+max_connections = 5
+
+$node
+EOF
+  return; fi
+  cat <<EOF
+# Bark's server for the bundle's Bitcoin ark. Every value Bark's template
+# names is set, so nothing falls back to a default unseen. Written by install.sh.
+data_dir = "$LIB/captaind"
+network = "$BARK_NET"
+vtxo_lifetime = 2016
+vtxo_exit_delta = 72
+max_vtxo_amount = "5000000 sat"
+min_board_amount = "10000 sat"
+max_board_amount = "5000000 sat"
+max_offboard_amount = "5000000 sat"
+max_arkoor_amount = "5000000 sat"
+max_vtxo_exit_depth = 100
+max_arkoor_fanout = 4
+required_board_confirmations = 2
+min_trusted_confs = 2
+rpc_rich_errors = true
+sync_manager_block_poll_interval = "1s"
+nursery_confirm_target_blocks = 6
+otel_deployment_name = "$NAME"
+max_read_mailbox_items = 100
+round_interval = "30s"
+round_submit_time = "5s"
+round_sign_time = "5s"
+nb_round_nonces = 8
+round_forfeit_nonces_timeout = "30s"
+offboard_session_timeout = "30s"
+offboard_check_interval = "1s"
+offboard_acceptable_fee_rate_duration = "15m"
+cln_reconnect_interval = "10s"
+invoice_check_interval = "3s"
+cln_xpay_timeout = "60s"
+invoice_check_base_delay = "10s"
+max_invoice_check_delay = "10m"
+invoice_poll_interval = "30s"
+htlc_settlement_poll_interval = "60s"
+track_all_base_delay = "1s"
+max_track_all_delay = "60s"
+htlc_expiry_delta = 40
+# A payment out of the ark may lock up to this many blocks. A Bark receive
+# invoice asks a final lock of twice vtxo_exit_delta and htlc_expiry_delta
+# (184 blocks here), so paying another ark's invoice over a channel or two
+# needs well over that: 258 leaves room for the hops.
+htlc_send_expiry_delta = 258
+max_user_invoice_cltv_delta = 250
+invoice_expiry = "48h"
+receive_htlc_forward_timeout = "3min"
+ln_receive_anti_dos_required = false
+max_ln_receive_amount = "1000000 sat"
+max_ln_send_amount = "1000000 sat"
+ln_max_fee_ppm = 900000
+
+[[cln_array]]
+uri = "https://localhost:$CLN_GRPC_PORT"
+priority = 1
+server_cert_path = "$LIB/cln/$BTC_SUB/ca.pem"
+client_cert_path = "$LIB/cln/$BTC_SUB/client.pem"
+client_key_path = "$LIB/cln/$BTC_SUB/client-key.pem"
+hold_invoice.uri = "https://localhost:$HOLD_GRPC_PORT"
+hold_invoice.server_cert_path = "$LIB/cln/$BTC_SUB/hold/ca.pem"
+hold_invoice.client_cert_path = "$LIB/cln/$BTC_SUB/hold/client.pem"
+hold_invoice.client_key_path = "$LIB/cln/$BTC_SUB/hold/client-key.pem"
+
+[fees.board]
+min_fee_sat = 330
+base_fee_sat = 100
+ppm = 1000
+
+[fees.offboard]
+base_fee_sat = 200
+fixed_additional_vb = 221
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[fees.refresh]
+base_fee_sat = 150
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[fees.lightning_receive]
+base_fee_sat = 100
+ppm = 2000
+
+[fees.lightning_send]
+min_fee_sat = 10
+base_fee_sat = 75
+ppm_expiry_table = [
+    { expiry_blocks_threshold = 0, ppm = 0 },
+    { expiry_blocks_threshold = 97, ppm = 1000 },
+    { expiry_blocks_threshold = 199, ppm = 4000 },
+    { expiry_blocks_threshold = 2161, ppm = 8000 },
+]
+
+[vtxopool]
+vtxo_targets = [ $(for t in $ARK_VTXO_POOL; do printf '"%s", ' "$t"; done | sed 's/, $//') ]
+vtxo_target_issue_threshold = 80
+vtxo_lifetime = 432
+vtxo_pre_expiry = 144
+max_vtxo_exit_depth = 3
+
+$fee
+
+[rpc]
+public_address = "$LISTEN_HOST:$CAPTAIND_PORT"
+admin_address = "127.0.0.1:$CAPTAIND_ADMIN_PORT"
+integration_address = "127.0.0.1:$CAPTAIND_INTEGRATION_PORT"
+
+$pg
+max_connections = 10
+
+$node
+EOF
+}
+
+write_arcad_toml() {
+assets_toml=""; fee_assets=""
+rates=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}')
+for id in "${ASSET_IDS[@]}"; do
+  assets_toml+="
+[[assets]]
+asset = \"$id\"
+min_leaf = \"${MIN_LEAF[$id]}\"
+"
+  [ "${RATE[$id]}" = node ] && assets_toml+="[assets.rate]
+source = \"node\"
+"
+  assets_toml+="[assets.lightning]
+rpc = \"$LIB/seqln/$SEQLN_NETWORK/lightning-rpc\"
+"
+  if [ -z "$ARCA_FEE_ASSETS" ] && jq -e --arg a "$id" 'has($a)' <<<"$rates" >/dev/null; then fee_assets+="\"$id\", "; fi
+done
+for id in $ARCA_FEE_ASSETS; do fee_assets+="\"$id\", "; done
+[ -n "$fee_assets" ] || die "no served asset is accepted for fees by the node, so no round could pay its fee: name one in ARCA_FEE_ASSETS"
+read -r dmin dmax <<<"$ARCA_EXIT_DELAY_UNITS"
+write_conf arcad 600 "$ETC/arcad.toml" <<EOF
+# arcad's configuration, written by install.sh from $BUNDLE_ENV. Every
+# setting is described in arca's server/arcad.example.toml.
+listen = "$LISTEN_HOST:$ARCAD_PORT"
+database = "host=/var/run/postgresql port=$PG_PORT user=$USER_ dbname=arca"
+signer_socket = "/run/$NAME/signer.sock"
+wallet_mnemonic_file = "$ETC/wallet.mnemonic"
+fee_multiple = 2
+round_interval_seconds = $ARCA_ROUND_INTERVAL
+exit_delay_units = [$dmin, $dmax]
+metrics_listen = "127.0.0.1:$ARCAD_METRICS_PORT"
+fee_assets = [${fee_assets%, }]
+
+[node]
+rpc_url = "http://127.0.0.1:$SEQ_RPC_PORT/"
+cookie_file = "$LIB/sequentia/$SEQ_SUB/.cookie"
+
+[finality]
+anchor_depth = $ARCA_ANCHOR_DEPTH
+certification = "required"
+poll_interval_ms = 1000
+
+[watcher]
+enabled = true
+reclaim_early = true
+block_interval_seconds = 60
+
+[fees]
+refresh_ppm = 0
+offboard_ppm = 0
+
+[limits]
+trusted_proxies = ["127.0.0.1", "::1"]
+
+[lightning]
+# Another operator's invoice for a payment into its tree locks the payment for
+# about 5,790 blocks at the specification's exit delays, which takes a
+# timeout of about nine days to pay. It binds only a payment that is never
+# settled: its coins come back to the payer after the timeout (up to twice
+# it), and the payer's wallet shows the payment "paying" until then.
+send_timeout_seconds = $ARCA_SEND_TIMEOUT
+receive_cap_ppm = 100000
+
+[lightning.bitcoin]
+rpc = "$LIB/cln/$BTC_SUB/lightning-rpc"
+ark = "$ark_url"
+$assets_toml
+EOF
+}
+
+caddyfile() {
+  cat <<EOF
+# The bundle's public route, written by install.sh: the Arca operator under
+# /arca, the Bitcoin ark by its two gRPC services, and the registry's domain
+# proof. Caddy obtains the certificate itself.
+$DOMAIN {
+	handle_path /arca/* {
+		reverse_proxy 127.0.0.1:$ARCAD_PORT {
+			transport http {
+				keepalive 30s
+			}
+		}
+	}
+	@bitcoinark path /bark_server.ArkService/* /mailbox_server.MailboxService/*
+	handle @bitcoinark {
+		reverse_proxy h2c://127.0.0.1:$CAPTAIND_PORT
+	}
+	handle /.well-known/sequentia-operator-proof-* {
+		root * $LIB/www
+		file_server
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+}
+
+# ===========================================================================================
 prepare() {
 step "the machine"
 os=$(. /etc/os-release; echo "${ID:-}:${VERSION_ID:-}:${PRETTY_NAME:-an unknown system}")
 [ "${os%%:*:*}" = ubuntu ] && [ "$(cut -d: -f2 <<<"$os")" = 24.04 ] || say "this is ${os#*:*:}; the bundle is made for Ubuntu 24.04"
-[ -d /run/systemd/system ] || die "systemd is not running. In WSL2 put [boot] systemd=true in /etc/wsl.conf and restart the distro (wsl --terminate <distro>)"
+[ -d /run/systemd/system ] || [ "$CMD" = build ] || die "systemd is not running. In WSL2 put [boot] systemd=true in /etc/wsl.conf and restart the distro (wsl --terminate <distro>)"
 [ "$(uname -m)" = x86_64 ] || die "the bundle's downloads are for x86_64; this machine is $(uname -m)"
 mem=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo); free_gb=$(df -Pk / | awk 'NR==2 {print int($4/1048576)}')
 say "$(nproc) cores, $mem MB of memory, $free_gb GB free on /"
@@ -227,7 +662,7 @@ rel=https://gitlab.com/api/v4/projects/ark-bitcoin%2Fbark/packages/generic/relea
 fetch "$rel/captaind-${BARK_SERVER_VERSION//./%2E}-linux-x86_64" "captaind-$BARK_SERVER_VERSION" "$CAPTAIND_SHA256"
 fetch "$rel/watchmand-${BARK_SERVER_VERSION//./%2E}-linux-x86_64" "watchmand-$BARK_SERVER_VERSION" "$WATCHMAND_SHA256"
 say "Bark's server and watchman $BARK_SERVER_VERSION"
-if [ -n "$DOMAIN" ]; then
+if [ -n "$DOMAIN" ] || [ "${WITH_CADDY:-}" = 1 ]; then
   fetch "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
     "caddy-$CADDY_VERSION.tar.gz" "sha512:$CADDY_SHA512"
   unpack "caddy-$CADDY_VERSION.tar.gz" "caddy-$CADDY_VERSION"
@@ -261,9 +696,14 @@ clone_at() {   # clone_at <url> <dir> <commit>
 }
 
 step "arcad, arca-signer and arca, from this clone"
-ARCA_COMMIT=$(git -C "$ARCA_SRC" rev-parse HEAD)
-dirty=$(git -C "$ARCA_SRC" status --porcelain --untracked-files=no -- . ':!contrib/operator-bundle' | head -1 || true)
-[ -z "$dirty" ] || die "$ARCA_SRC has changes outside contrib/operator-bundle; the operator is built from a commit"
+if git -C "$ARCA_SRC" rev-parse HEAD >/dev/null 2>&1; then
+  ARCA_COMMIT=$(git -C "$ARCA_SRC" rev-parse HEAD)
+  dirty=$(git -C "$ARCA_SRC" status --porcelain --untracked-files=no -- . ':!contrib/operator-bundle' || true)
+  [ -z "$dirty" ] || die "$ARCA_SRC has changes outside contrib/operator-bundle; the operator is built from a commit"
+else
+  # A source tree without its history (a copy): built as it is, every time.
+  ARCA_COMMIT=${ARCA_COMMIT:-unversioned-$(date +%s)}
+fi
 build arca "$ARCA_SRC" "$ARCA_COMMIT" env CARGO_TARGET_DIR="$CACHE/build/arca-target" \
   sh -c 'cargo build --release --locked -p arca-server --bin arcad --bin arca-signer && cargo build --release --locked -p arca-cli --bin arca'
 say "arca at ${ARCA_COMMIT:0:12}"
@@ -319,7 +759,7 @@ put "$CACHE/build/hold-target/release/hold" hold
 put "$CACHE/dl/captaind-$BARK_SERVER_VERSION" captaind
 put "$CACHE/dl/watchmand-$BARK_SERVER_VERSION" watchmand
 put "$HERE/fee-proxy.py" fee-proxy.py
-[ -n "$DOMAIN" ] && put "$OPT/caddy-$CADDY_VERSION/caddy" caddy
+if [ -n "$DOMAIN" ] || [ "${WITH_CADDY:-}" = 1 ]; then put "$OPT/caddy-$CADDY_VERSION/caddy" caddy; fi
 say "${changed_bins:- nothing changed}"
 printf '%s\n' "$changed_bins" >> "$CACHE/build/.changed-$NAME"
 say "$("$BIN/captaind" --version 2>&1 | head -1); $("$BIN/bark" --version 2>&1 | head -1)"
@@ -329,161 +769,8 @@ say "$("$BIN/captaind" --version 2>&1 | head -1); $("$BIN/bark" --version 2>&1 |
 configure_and_start() {
 [ ${#ASSET_IDS[@]} -gt 0 ] || die "name at least one asset to serve in $BUNDLE_ENV (ARCA_ASSETS): none is served by default"
 changed_bins=$(cat "$CACHE/build/.changed-$NAME" 2>/dev/null || true); rm -f "$CACHE/build/.changed-$NAME"
-step "keys and passwords, drawn here (made once, never replaced)"
-umask 077
-key_file() {   # key_file <file> <command...>: the command writes the secret to stdout
-  local f=$ETC/$1; shift
-  if [ ! -s "$f" ]; then "$@" > "$f.new"; mv "$f.new" "$f"; say "drew $f"; fi
-  chown "$USER_:$USER_" "$f"; chmod 600 "$f"
-}
-key_file operator.key openssl rand -hex 32
-[ "$(tr -d '\n' < "$ETC/operator.key" | wc -c)" = 64 ] || die "$ETC/operator.key is not 64 hex characters"
-key_file wallet.mnemonic python3 -I - "$CARGO_HOME" <<'PY'
-import glob, hashlib, os, re, sys
-# The BIP39 English list, from the bip39 crate the build fetched, checked
-# against the list's published SHA-256 before use.
-lists = glob.glob(os.path.join(sys.argv[1], "registry/src/*/bip39-*/src/language/english.rs"))
-if not lists: sys.exit("no BIP39 word list under the cargo registry")
-words = re.findall(r'"([a-z]+)"', open(sorted(lists)[-1]).read())
-if len(words) != 2048 or hashlib.sha256(("\n".join(words) + "\n").encode()).hexdigest() != \
-        "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda":
-    sys.exit("the BIP39 word list does not match the standard English list")
-entropy = os.urandom(32)
-bits = int.from_bytes(entropy, "big") << 8 | hashlib.sha256(entropy).digest()[0]
-print(" ".join(words[(bits >> (11 * (23 - i))) & 2047] for i in range(24)))
-PY
-[ "$(wc -w < "$ETC/wallet.mnemonic")" = 24 ] || die "$ETC/wallet.mnemonic is not 24 words"
-key_file seq-rpc.password openssl rand -hex 24
-key_file btc-rpc.password openssl rand -hex 24
-umask 022
-# rpcauth lines: the nodes keep only a salted hash of each login's password.
-rpcauth() { python3 -I - "$1" "$2" <<'PY'
-import hashlib, hmac, os, sys
-salt = os.urandom(16).hex()
-pw = open(sys.argv[2]).read().strip()
-print("%s:%s$%s" % (sys.argv[1], salt, hmac.new(salt.encode(), pw.encode(), hashlib.sha256).hexdigest()))
-PY
-}
-
-step "configuration"
-changed=""
-# write_conf <unit word> <mode> <file>: stdin is the content; a changed file marks its unit.
-write_conf() {
-  local t; t=$(mktemp); cat > "$t"
-  if [ -f "$3" ] && cmp -s "$t" "$3"; then rm -f "$t"; return 0; fi
-  install -m "$2" -o "$USER_" -g "$USER_" "$t" "$3"; rm -f "$t"; changed+=" $1"
-}
-# An rpcauth line is drawn with a fresh salt, so it is written once and kept.
-for n in seq btc; do
-  if [ ! -s "$ETC/$n-rpcauth" ]; then rpcauth "$NAME" "$ETC/$n-rpc.password" > "$ETC/$n-rpcauth"; chmod 640 "$ETC/$n-rpcauth"; chgrp "$USER_" "$ETC/$n-rpcauth"; fi
-done
-btc_addnode=""; [ -n "$BTC_ADDNODE" ] && btc_addnode="addnode=$BTC_ADDNODE"
-write_conf bitcoind 640 "$ETC/bitcoin.conf" <<EOF
-# Bitcoin Core for the bundle's Bitcoin ark and its Sequentia node's anchors.
-# Written by install.sh from $BUNDLE_ENV.
-chain=$BTC_CHAIN
-
-[$BTC_CHAIN]
-server=1
-# Bark's server reads any transaction by its id, so the node keeps a full
-# transaction index (and is never pruned).
-txindex=1
-disablewallet=1
-listen=1
-bind=0.0.0.0:$BTC_P2P_PORT
-$btc_addnode
-rpcbind=127.0.0.1
-rpcallowip=127.0.0.1
-rpcport=$BTC_RPC_PORT
-# The cookie is for the bundle's own daemons; the login below is for a
-# Lightning wallet beside them (install.sh credentials).
-rpccookieperms=group
-rpcauth=$(cat "$ETC/btc-rpcauth")
-debuglogfile=$LOG/bitcoind.log
-shrinkdebugfile=0
-dbcache=300
-maxmempool=200
-EOF
-seq_addnode=""; [ -n "$SEQ_ADDNODE" ] && seq_addnode="addnode=$SEQ_ADDNODE"
-if [ -n "$SEQ_ANCHOR_RPC" ]; then
-  anchor="mainchainrpchost=${SEQ_ANCHOR_RPC%:*}
-mainchainrpcport=${SEQ_ANCHOR_RPC##*:}
-mainchainrpcuser=${SEQ_ANCHOR_AUTH%%:*}
-mainchainrpcpassword=${SEQ_ANCHOR_AUTH#*:}"
-else
-  anchor="mainchainrpchost=127.0.0.1
-mainchainrpcport=$BTC_RPC_PORT
-mainchainrpccookiefile=$LIB/bitcoin/$BTC_SUB/.cookie"
-fi
-testnet_rules=""; [ "$SEQ_CHAIN" = test ] && testnet_rules="# The public testnet's network-wide rules.
-pospubliccommittee=1
-poscommitteesize=250"
-write_conf sequentiad 640 "$ETC/sequentia.conf" <<EOF
-# The Sequentia node: the chain arcad and the SeqLN gateway read. Written by
-# install.sh from $BUNDLE_ENV.
-chain=$SEQ_CHAIN
-
-[$SEQ_CHAIN]
-$testnet_rules
-$SEQ_CHAIN_CONF
-server=1
-txindex=1
-disablewallet=1
-# Every anchor is checked against this machine's Bitcoin node: the chain
-# follows Bitcoin's reorganisations, and arcad's finality waits on them.
-validateanchor=1
-$anchor
-listen=1
-bind=127.0.0.1:$SEQ_P2P_PORT
-$seq_addnode
-rpcbind=127.0.0.1
-rpcallowip=127.0.0.1
-rpcport=$SEQ_RPC_PORT
-rpccookieperms=group
-rpcauth=$(cat "$ETC/seq-rpcauth")
-debuglogfile=$LOG/sequentiad.log
-shrinkdebugfile=0
-EOF
-write_conf cln 640 "$LIB/cln/config" <<EOF
-# The Bitcoin gateway: Core Lightning with the hold-invoice plugin, driven by
-# Bark's server over gRPC. Written by install.sh.
-network=$BTC_CHAIN
-alias=$NAME-btc
-bitcoin-cli=$OPT/core/bin/bitcoin-cli
-bitcoin-datadir=$LIB/bitcoin
-bitcoin-rpcport=$BTC_RPC_PORT
-bitcoin-rpcconnect=127.0.0.1
-# Peers reach it from anywhere: its channels are its route to other
-# operators' gateways and to wallets.
-bind-addr=0.0.0.0:$CLN_PORT
-grpc-port=$CLN_GRPC_PORT
-important-plugin=$BIN/hold
-hold-grpc-port=$HOLD_GRPC_PORT
-log-file=$LOG/cln.log
-log-level=info
-# arcad, in the same group, reads it through its socket.
-rpc-file-mode=0660
-$( [ "$BTC_CHAIN" = testnet4 ] && echo "# testnet4's own fee estimates often say nothing; these fixed rates (sat per
-# 1,000 weight) let it open and close channels. The option exists on test
-# networks only.
-force-feerates=7500/7500/500/7500/7500/7500" )
-EOF
-write_conf seqln 640 "$LIB/seqln/config" <<EOF
-# The Sequentia gateway: SeqLN with the hold-invoice plugin, one channel in
-# each asset served over Lightning. Written by install.sh.
-network=$SEQLN_NETWORK
-alias=$NAME-seq
-bitcoin-cli=$OPT/sequentia/bin/sequentia-cli
-bitcoin-datadir=$LIB/sequentia
-bitcoin-rpcport=$SEQ_RPC_PORT
-bitcoin-rpcconnect=127.0.0.1
-bind-addr=0.0.0.0:$SEQLN_PORT
-plugin=$OPT/seqln/contrib/holdinvoice-seq/holdinvoice.py
-log-file=$LOG/seqln.log
-log-level=info
-rpc-file-mode=0660
-EOF
-
+draw_keys
+write_configs
 step "PostgreSQL: a cluster of the bundle's own on port $PG_PORT"
 uchanged=""
 # One slice holds every daemon of the bundle, PostgreSQL included, so its
@@ -656,172 +943,18 @@ done
 say "SeqLN $(seqln getinfo | jq -r '.id + " on " + .network'), port $SEQLN_PORT"
 say "Core Lightning $(cln getinfo | jq -r '.id + " on " + .network'), port $CLN_PORT"
 
+x=$(btc_cli getblockchaininfo)
+if [ "$(jq -r '.initialblockdownload' <<<"$x")" = true ]; then
+  # Bark's server, its watchman and arcad want their chains caught up: the
+  # Sequentia node checks every anchor against this Bitcoin node, so it waits
+  # for it too.
+  printf '\nThe Bitcoin node is still syncing (%s of %s blocks). Everything above runs and\nkeeps syncing; run %s again once it has caught up, to start\nBark'"'"'s server, its watchman and arcad (%s status shows how far it is).\n' \
+    "$(jq -r .blocks <<<"$x")" "$(jq -r .headers <<<"$x")" "$0" "$0"
+  exit 0
+fi
+
 step "Bark's server and watchman"
 ark_url="http://127.0.0.1:$CAPTAIND_PORT"; [ -n "$DOMAIN" ] && ark_url="https://$DOMAIN"
-captaind_toml() {   # the server's (no argument) or the watchman's (watchman) configuration
-  local fee="[fee_estimator]
-update_interval = \"1m\"
-history_duration = \"60m\"
-fallback_fee_rate_fast = \"${BTC_FEE_FLOOR}sat/vb\"
-fallback_fee_rate_regular = \"${BTC_FEE_FLOOR}sat/vb\"
-fallback_fee_rate_slow = \"${BTC_FEE_FLOOR}sat/vb\"
-max_fee_rate = \"100sat/vb\""
-  local pg="[postgres]
-host = \"/var/run/postgresql\"
-port = $PG_PORT
-name = \"bark\"
-user = \"$USER_\""
-  local node="[bitcoind]
-url = \"http://127.0.0.1:$FEE_PROXY_PORT\"
-cookie = \"$LIB/bitcoin/$BTC_SUB/.cookie\""
-  if [ "${1:-}" = watchman ]; then cat <<EOF
-# Bark's watchman: answers exits and sweeps expired rounds back to the
-# server's round wallet. Written by install.sh.
-data_dir = "$LIB/watchmand"
-network = "$BARK_NET"
-sync_manager_block_poll_interval = "1s"
-htlc_settlement_poll_interval = "60s"
-min_trusted_confs = 2
-otel_deployment_name = "$NAME-watchman"
-sweep_address = "$SWEEP_ADDRESS"
-
-[watchman]
-reaction_interval = "1m"
-sweep_interval = "2h"
-progress_grace_period = 2
-claim_chunksize = 20
-incremental_relay_fee = "100 sat/kvb"
-min_cpfp_amount = "10000 sat"
-
-$fee
-
-$pg
-max_connections = 5
-
-$node
-EOF
-  return; fi
-  cat <<EOF
-# Bark's server for the bundle's Bitcoin ark. Every value Bark's template
-# names is set, so nothing falls back to a default unseen. Written by install.sh.
-data_dir = "$LIB/captaind"
-network = "$BARK_NET"
-vtxo_lifetime = 2016
-vtxo_exit_delta = 72
-max_vtxo_amount = "5000000 sat"
-min_board_amount = "10000 sat"
-max_board_amount = "5000000 sat"
-max_offboard_amount = "5000000 sat"
-max_arkoor_amount = "5000000 sat"
-max_vtxo_exit_depth = 100
-max_arkoor_fanout = 4
-required_board_confirmations = 2
-min_trusted_confs = 2
-rpc_rich_errors = true
-sync_manager_block_poll_interval = "1s"
-nursery_confirm_target_blocks = 6
-otel_deployment_name = "$NAME"
-max_read_mailbox_items = 100
-round_interval = "30s"
-round_submit_time = "5s"
-round_sign_time = "5s"
-nb_round_nonces = 8
-round_forfeit_nonces_timeout = "30s"
-offboard_session_timeout = "30s"
-offboard_check_interval = "1s"
-offboard_acceptable_fee_rate_duration = "15m"
-cln_reconnect_interval = "10s"
-invoice_check_interval = "3s"
-cln_xpay_timeout = "60s"
-invoice_check_base_delay = "10s"
-max_invoice_check_delay = "10m"
-invoice_poll_interval = "30s"
-htlc_settlement_poll_interval = "60s"
-track_all_base_delay = "1s"
-max_track_all_delay = "60s"
-htlc_expiry_delta = 40
-# A payment out of the ark may lock up to this many blocks. A Bark receive
-# invoice asks a final lock of twice vtxo_exit_delta and htlc_expiry_delta
-# (184 blocks here), so paying another ark's invoice over a channel or two
-# needs well over that: 258 leaves room for the hops.
-htlc_send_expiry_delta = 258
-max_user_invoice_cltv_delta = 250
-invoice_expiry = "48h"
-receive_htlc_forward_timeout = "3min"
-ln_receive_anti_dos_required = false
-max_ln_receive_amount = "1000000 sat"
-max_ln_send_amount = "1000000 sat"
-ln_max_fee_ppm = 900000
-
-[[cln_array]]
-uri = "https://localhost:$CLN_GRPC_PORT"
-priority = 1
-server_cert_path = "$LIB/cln/$BTC_SUB/ca.pem"
-client_cert_path = "$LIB/cln/$BTC_SUB/client.pem"
-client_key_path = "$LIB/cln/$BTC_SUB/client-key.pem"
-hold_invoice.uri = "https://localhost:$HOLD_GRPC_PORT"
-hold_invoice.server_cert_path = "$LIB/cln/$BTC_SUB/hold/ca.pem"
-hold_invoice.client_cert_path = "$LIB/cln/$BTC_SUB/hold/client.pem"
-hold_invoice.client_key_path = "$LIB/cln/$BTC_SUB/hold/client-key.pem"
-
-[fees.board]
-min_fee_sat = 330
-base_fee_sat = 100
-ppm = 1000
-
-[fees.offboard]
-base_fee_sat = 200
-fixed_additional_vb = 221
-ppm_expiry_table = [
-    { expiry_blocks_threshold = 0, ppm = 0 },
-    { expiry_blocks_threshold = 97, ppm = 1000 },
-    { expiry_blocks_threshold = 199, ppm = 4000 },
-    { expiry_blocks_threshold = 2161, ppm = 8000 },
-]
-
-[fees.refresh]
-base_fee_sat = 150
-ppm_expiry_table = [
-    { expiry_blocks_threshold = 0, ppm = 0 },
-    { expiry_blocks_threshold = 97, ppm = 1000 },
-    { expiry_blocks_threshold = 199, ppm = 4000 },
-    { expiry_blocks_threshold = 2161, ppm = 8000 },
-]
-
-[fees.lightning_receive]
-base_fee_sat = 100
-ppm = 2000
-
-[fees.lightning_send]
-min_fee_sat = 10
-base_fee_sat = 75
-ppm_expiry_table = [
-    { expiry_blocks_threshold = 0, ppm = 0 },
-    { expiry_blocks_threshold = 97, ppm = 1000 },
-    { expiry_blocks_threshold = 199, ppm = 4000 },
-    { expiry_blocks_threshold = 2161, ppm = 8000 },
-]
-
-[vtxopool]
-vtxo_targets = [ $(for t in $ARK_VTXO_POOL; do printf '"%s", ' "$t"; done | sed 's/, $//') ]
-vtxo_target_issue_threshold = 80
-vtxo_lifetime = 432
-vtxo_pre_expiry = 144
-max_vtxo_exit_depth = 3
-
-$fee
-
-[rpc]
-public_address = "127.0.0.1:$CAPTAIND_PORT"
-admin_address = "127.0.0.1:$CAPTAIND_ADMIN_PORT"
-integration_address = "127.0.0.1:$CAPTAIND_INTEGRATION_PORT"
-
-$pg
-max_connections = 10
-
-$node
-EOF
-}
 SWEEP_ADDRESS=""
 write_conf captaind 640 "$ETC/captaind.toml" < <(captaind_toml)
 x=$(as_user "$BIN/captaind" check-config "$ETC/captaind.toml" 2>&1 </dev/null) || die "captaind refuses its configuration: $x"
@@ -846,73 +979,7 @@ restart_if watchmand watchmand
 say "the ark's round wallet: $SWEEP_ADDRESS"
 
 step "arcad"
-assets_toml=""; fee_assets=""
-rates=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}')
-for id in "${ASSET_IDS[@]}"; do
-  assets_toml+="
-[[assets]]
-asset = \"$id\"
-min_leaf = \"${MIN_LEAF[$id]}\"
-"
-  [ "${RATE[$id]}" = node ] && assets_toml+="[assets.rate]
-source = \"node\"
-"
-  assets_toml+="[assets.lightning]
-rpc = \"$LIB/seqln/$SEQLN_NETWORK/lightning-rpc\"
-"
-  if [ -z "$ARCA_FEE_ASSETS" ] && jq -e --arg a "$id" 'has($a)' <<<"$rates" >/dev/null; then fee_assets+="\"$id\", "; fi
-done
-for id in $ARCA_FEE_ASSETS; do fee_assets+="\"$id\", "; done
-[ -n "$fee_assets" ] || die "no served asset is accepted for fees by the node, so no round could pay its fee: name one in ARCA_FEE_ASSETS"
-read -r dmin dmax <<<"$ARCA_EXIT_DELAY_UNITS"
-write_conf arcad 600 "$ETC/arcad.toml" <<EOF
-# arcad's configuration, written by install.sh from $BUNDLE_ENV. Every
-# setting is described in arca's server/arcad.example.toml.
-listen = "127.0.0.1:$ARCAD_PORT"
-database = "host=/var/run/postgresql port=$PG_PORT user=$USER_ dbname=arca"
-signer_socket = "/run/$NAME/signer.sock"
-wallet_mnemonic_file = "$ETC/wallet.mnemonic"
-fee_multiple = 2
-round_interval_seconds = $ARCA_ROUND_INTERVAL
-exit_delay_units = [$dmin, $dmax]
-metrics_listen = "127.0.0.1:$ARCAD_METRICS_PORT"
-fee_assets = [${fee_assets%, }]
-
-[node]
-rpc_url = "http://127.0.0.1:$SEQ_RPC_PORT/"
-cookie_file = "$LIB/sequentia/$SEQ_SUB/.cookie"
-
-[finality]
-anchor_depth = $ARCA_ANCHOR_DEPTH
-certification = "required"
-poll_interval_ms = 1000
-
-[watcher]
-enabled = true
-reclaim_early = true
-block_interval_seconds = 60
-
-[fees]
-refresh_ppm = 0
-offboard_ppm = 0
-
-[limits]
-trusted_proxies = ["127.0.0.1", "::1"]
-
-[lightning]
-# Another operator's invoice for a payment into its tree locks the payment for
-# about 5,790 blocks at the specification's exit delays, which takes a
-# timeout of about nine days to pay. It binds only a payment that is never
-# settled: its coins come back to the payer after the timeout (up to twice
-# it), and the payer's wallet shows the payment "paying" until then.
-send_timeout_seconds = $ARCA_SEND_TIMEOUT
-receive_cap_ppm = 100000
-
-[lightning.bitcoin]
-rpc = "$LIB/cln/$BTC_SUB/lightning-rpc"
-ark = "$ark_url"
-$assets_toml
-EOF
+write_arcad_toml
 restart_if arcad arcad
 syncing=$(seq_cli getblockchaininfo | jq -r '.initialblockdownload or (.blocks < .headers)')
 if [ "$syncing" = true ]; then
@@ -927,32 +994,7 @@ if [ -n "$DOMAIN" ]; then
   install -d -m 755 "$LIB/www/.well-known"
   printf 'Authorize linking the domain name %s to the Arca operator key %s' "$DOMAIN" "$OPERATOR_KEY" > "$LIB/www/.well-known/sequentia-operator-proof-$OPERATOR_KEY"
   chmod 644 "$LIB/www/.well-known/sequentia-operator-proof-$OPERATOR_KEY"
-  t=$(mktemp)
-  cat > "$t" <<EOF
-# The bundle's public route, written by install.sh: the Arca operator under
-# /arca, the Bitcoin ark by its two gRPC services, and the registry's domain
-# proof. Caddy obtains the certificate itself.
-$DOMAIN {
-	handle_path /arca/* {
-		reverse_proxy 127.0.0.1:$ARCAD_PORT {
-			transport http {
-				keepalive 30s
-			}
-		}
-	}
-	@bitcoinark path /bark_server.ArkService/* /mailbox_server.MailboxService/*
-	handle @bitcoinark {
-		reverse_proxy h2c://127.0.0.1:$CAPTAIND_PORT
-	}
-	handle /.well-known/sequentia-operator-proof-* {
-		root * $LIB/www
-		file_server
-	}
-	handle {
-		respond 404
-	}
-}
-EOF
+  t=$(mktemp); caddyfile > "$t"
   c=0; cmp -s "$t" "$ETC/Caddyfile" 2>/dev/null || { install -m 644 "$t" "$ETC/Caddyfile"; c=1; }; rm -f "$t"
   t=$(mktemp)
   cat > "$t" <<EOF
@@ -1105,6 +1147,9 @@ credentials() {
   say "Sequentia node: 127.0.0.1:$SEQ_RPC_PORT, user $NAME, password $(cat "$ETC/seq-rpc.password")"
   say "Bitcoin node:   127.0.0.1:$BTC_RPC_PORT, user $NAME, password $(cat "$ETC/btc-rpc.password")"
 }
+
+# Sourced by docker/bundle-run for the functions above: nothing runs.
+[ "${BUNDLE_LIB:-}" = 1 ] && return 0
 
 case $CMD in
   install) prepare; configure_and_start ;;
