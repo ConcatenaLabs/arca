@@ -196,6 +196,18 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	// The same request again: the same preimage.
 	assert_eq!(r.http.post("forfeit_leaves", &good).ok(), done);
 	assert_eq!(status(&r, &pa)["state"], "released");
+	// The server reads the new round leaf's dates whatever the time, as it does
+	// for a participation that gives it up: under the latest of its unroll
+	// authorisations' times, since a fixed early time refuses every one of
+	// them as not usable yet.
+	let a2_id = a2_valid.leaf_id;
+	let any = server::coins::resolve_any_time(&r.server.store, |t| r.server.params.taken_policy(t), &a2_id).await.unwrap();
+	assert_eq!(any.coin.id, a2_id);
+	let early = MedianTime::from_consensus(500_000_000).unwrap();
+	let fixed = arca_covenant::WalletPolicy { horizon: 0, ..r.server.params.taken_policy(early) };
+	let refused_early = server::coins::resolve(&r.server.store, &fixed, &a2_id).await.err().map(|e| e.to_string()).unwrap_or_default();
+	assert!(refused_early.contains("not usable until later than now"), "{}", refused_early);
+	println!("the new round leaf's dates read whatever the time; a fixed early time refuses it: {}", refused_early);
 	// The forfeit the server holds is both halves over exactly that output.
 	let stored = r.server.store.forfeits(&pa, built.round_id).await.unwrap();
 	assert_eq!(stored.len(), 1);
