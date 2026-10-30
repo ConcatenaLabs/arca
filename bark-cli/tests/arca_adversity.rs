@@ -7660,3 +7660,267 @@ async fn pv1_fix_a_coin_whose_path_a_final_spend_cut_is_refused() {
 	assert_eq!(again["waiting"], json!([]), "{}", again);
 	cleanup(&l);
 }
+
+// ---------------------------------------------------------------------------
+// Attacks on the answer at once
+// ---------------------------------------------------------------------------
+
+/// The sender keeps a look-alike of P's coin's output in P's node's mempool,
+/// where no proposer mines it (a fee asset P's node accepts and the
+/// proposers do not, say): it is there at P's read and before each of P's
+/// syncs, and every block comes from a proposer that never saw it. P must
+/// still publish its coin's path within C1's delay, and S's backup must not
+/// take C1 back.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_look_alike_kept_in_the_receivers_mempool_does_not_stall_the_answer() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain_read(&mut r, "PV1Y1", 1, false).await;
+	let out = l.outs[0].clone();
+	let v = out.value.explicit().unwrap();
+	let look = r.pay_to(out.script_pubkey.clone(), x, v);
+	let before = mempool_ids(&r);
+	let m = l.p.ok(&["mailbox"]);
+	let coin = first_coin(&m);
+	println!("PV1Y1 P reads with a look-alike {} in its node's mempool: accepted {} waiting {} refused {}", look.txid(), m["accepted"],
+		m["waiting"], m["refused"]);
+	let mut sent: Vec<Transaction> = vec![];
+	keep_new(&r, &before, &mut sent);
+	let mut counted = counts(&l.p, x);
+	// Two syncs of P's within C1's delay, the look-alike in its mempool at
+	// each, and blocks from proposers that never saw it between them.
+	for round in 0..2 {
+		r.server.stop();
+		r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+		for t in &sent {
+			let _ = r.rt.client().send_raw_transaction(t);
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 200));
+		r.rt.client().send_raw_transaction(&look).expect("the look-alike again in P's node's mempool");
+		r.restart_server().await;
+		r.synced().await;
+		let before = mempool_ids(&r);
+		let s = l.p.ok(&["sync"]);
+		keep_new(&r, &before, &mut sent);
+		counted |= counts(&l.p, x);
+		println!("PV1Y1 P's sync {} with the look-alike in its mempool: coin {} exits {}", round, coin_of(&l.p, &coin)["state"], s["exits"]);
+	}
+	println!("PV1Y1 P's wallet sent {:?}", sent.iter().map(|t| t.txid()).collect::<Vec<_>>());
+	// S's backup tries to take C1 home once its delay has run.
+	r.server.stop();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	for t in &sent {
+		let _ = r.rt.client().send_raw_transaction(t);
+	}
+	r.produce().await;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let mut e = l.so.run(&["exit", &l.c1]).1;
+	for _ in 0..3 {
+		if e["state"] == "claimed" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.so.run(&["exit", &l.c1]).1;
+	}
+	println!("PV1Y1 S's backup tries to take C1 home: {}", e);
+	let s_took_c1 = e["state"] == "claimed";
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	for _ in 0..6 {
+		let s = l.p.ok(&["sync"]);
+		counted |= counts(&l.p, x);
+		let c = coin_of(&l.p, &coin);
+		println!("PV1Y1 P syncs: coin {} ({}); exits {}", c["state"], c["note"], s["exits"]);
+		if c["state"] == "exited" || c["state"] == "lost" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		r.bury().await;
+	}
+	let end = coin_of(&l.p, &coin);
+	let paid = end["note"].as_str().and_then(|n| n.strip_prefix("claimed by ")).and_then(|n| n.split(',').next())
+		.and_then(|t| elements::Txid::from_str(t).ok())
+		.map(|t| r.rt.client().raw_transaction(&t).unwrap().output[0].value.explicit().unwrap());
+	println!("PV1Y1 OUTCOME: counted {} s_took_c1 {} end {} ({}) paid {:?}", counted, s_took_c1, end["state"], end["note"], paid);
+	cleanup(&l);
+	sound(&Outcome { counted, s_took_c1, end, paid });
+}
+
+/// A coin refused because a final spend cut its path, and a rollback of the
+/// parent chain deeper than that spend's burial that takes the spend out:
+/// the path stands again, and P takes its coin home.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_coin_refused_on_a_final_cut_is_taken_when_a_rollback_undoes_the_cut() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain_read(&mut r, "PV1Y2", 1, false).await;
+	let p_c = own_anchor(&r).await;
+	let claim = backup_takes_c1_home(&r, &l, "PV1Y2").await;
+	let m = l.p.ok(&["mailbox"]);
+	println!("PV1Y2 P reads once S's claim {} of C1 is final: {}", claim, m);
+	let coin = first_coin(&m);
+	assert!(!counts(&l.p, x));
+
+	// The parent chain reorganises from the block S's claim is anchored to:
+	// the claim leaves the chain, and the next blocks come from a proposer
+	// that never saw it.
+	r.server.stop();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p_c)).unwrap();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	assert!(confirmations(&r, &claim) < 1, "the rollback took S's claim out");
+	r.restart_server().await;
+	r.synced().await;
+	for _ in 0..6 {
+		let mb = l.p.ok(&["mailbox"]);
+		let s = l.p.ok(&["sync"]);
+		let c = coin_of(&l.p, &coin);
+		println!("PV1Y2 P after the rollback: mailbox accepted {} refused {}; coin {} ({}); exits {}", mb["accepted"], mb["refused"],
+			c["state"], c["note"], s["exits"]);
+		if c["state"] == "exited" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		r.bury().await;
+	}
+	let end = coin_of(&l.p, &coin);
+	println!("PV1Y2 OUTCOME: end {} ({})", end["state"], end["note"]);
+	cleanup(&l);
+	assert_eq!(end["state"], "exited", "the coin a rollback made good again is P's: {}", end);
+}
+
+/// A coin whose path S's claim of C1 cut, mined and not final yet when P
+/// reads it. While the cut is not final it is not shown as a live coin P
+/// can spend; once the cut is final it is counted nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_probe_a_coin_whose_path_a_spend_not_yet_final_cut() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let x = r.x;
+	let l = lineage_on_chain_read(&mut r, "PV1Y3", 1, false).await;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let mut e = l.so.ok(&["exit", &l.c1]);
+	for _ in 0..3 {
+		if e["state"] == "claimed" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.so.ok(&["exit", &l.c1]);
+	}
+	assert_eq!(e["state"], "claimed", "{}", e);
+	r.produce().await;
+	let m = l.p.ok(&["mailbox"]);
+	let coin = first_coin(&m);
+	let c = coin_of(&l.p, &coin);
+	let bal = l.p.ok(&["balance"]);
+	println!("PV1Y3 P reads with S's claim {} mined, not final: mailbox {}; coin {} standing {} ({}); balance {}", e["claim"]["txid"], m,
+		c["state"], c["standing"], c["note"], bal["arca"]);
+	r.bury().await;
+	let s = l.p.ok(&["sync"]);
+	let c2 = coin_of(&l.p, &coin);
+	println!("PV1Y3 once the claim is final: coin {} ({}); exits {}; balance {}", c2["state"], c2["note"], s["exits"], l.p.ok(&["balance"])["arca"]);
+	let counted_end = counts(&l.p, x);
+	cleanup(&l);
+	assert_ne!(c["state"], "live", "a coin whose path is cut is not shown as a live coin: {}", c);
+	assert!(!counted_end, "nothing is counted once the cut is final: {}", c2);
+}
+
+/// The same stall on a coin P held before its lineage reached the chain: P
+/// reads its coin, then T takes its coin home, which brings C1 to the chain,
+/// and the sender keeps a look-alike of P's coin's output in P's node's
+/// mempool. P's re-check takes the coin home at once; its exit must publish
+/// the path within C1's delay, and S's backup must not take C1 back.
+#[tokio::test(flavor = "multi_thread")]
+async fn pv1_fix_a_look_alike_kept_in_the_holders_mempool_does_not_stall_a_held_coins_answer() {
+	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
+	let url = r.url();
+	let x = r.x;
+	let (s, so, t, p) = (Arca::new("PV1Y4S"), Arca::new("PV1Y4SO"), Arca::new("PV1Y4T"), Arca::new("PV1Y4P"));
+	boarded(&mut r, &s, &url, &[(x, 3_000_000)]).await;
+	t.ok(&create_args(&url, &r.node_url()));
+	p.ok(&create_args(&url, &r.node_url()));
+	let req = t.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	let tc = t.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	let c1 = held_coins(&s)[0]["leaf_id"].as_str().unwrap().to_string();
+	assert!(std::process::Command::new("cp").arg("-r").arg(&s.dir).arg(&so.dir).status().unwrap().success(), "S's backup");
+	let req = p.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "400000", "--asset", &x.to_string()]);
+	let CoinRecord::Transfer(tr) = record_of(&s, held_coins(&s)[0]["leaf_id"].as_str().unwrap()) else { panic!("a transfer's change") };
+	let out = tr.outputs.iter().enumerate().find(|(j, o)| *j != tr.index as usize && o.value == 400_000).map(|(_, o)| o.txout()).unwrap();
+	let coin = p.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	assert_eq!(coin_of(&p, &coin)["state"], "live", "P holds its coin before its lineage reaches the chain");
+	let l = OnChainLineage { s, so, t, p, c1, outs: vec![out.clone()], first: Value::Null };
+	let e = l.t.ok(&["exit", &tc]);
+	assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+	r.produce().await;
+	r.bury().await;
+	let look = r.pay_to(out.script_pubkey.clone(), x, 400_000);
+	let mut sent: Vec<Transaction> = vec![];
+	let mut counted = false;
+	for round in 0..3 {
+		if round > 0 {
+			r.server.stop();
+			r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+			for t in &sent {
+				let _ = r.rt.client().send_raw_transaction(t);
+			}
+			r.produce().await;
+			tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 150));
+			r.rt.client().send_raw_transaction(&look).expect("the look-alike again in P's node's mempool");
+			r.restart_server().await;
+			r.synced().await;
+		}
+		let before = mempool_ids(&r);
+		let s = l.p.ok(&["sync"]);
+		keep_new(&r, &before, &mut sent);
+		counted |= counts(&l.p, x);
+		println!("PV1Y4 P's sync {} with the look-alike {} in its mempool: coin {} recheck {} exits {}", round, look.txid(),
+			coin_of(&l.p, &coin)["state"], s["recheck"]["changes"], s["exits"]);
+	}
+	println!("PV1Y4 P's wallet sent {:?}", sent.iter().map(|t| t.txid()).collect::<Vec<_>>());
+	r.server.stop();
+	r.rt.node.restart(&["-persistmempool=0"]).unwrap();
+	for t in &sent {
+		let _ = r.rt.client().send_raw_transaction(t);
+	}
+	r.produce().await;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+	let mut e = l.so.run(&["exit", &l.c1]).1;
+	for _ in 0..3 {
+		if e["state"] == "claimed" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		e = l.so.run(&["exit", &l.c1]).1;
+	}
+	println!("PV1Y4 S's backup tries to take C1 home: {}", e);
+	let s_took_c1 = e["state"] == "claimed";
+	r.produce().await;
+	r.bury().await;
+	r.restart_server().await;
+	r.synced().await;
+	for _ in 0..6 {
+		l.p.ok(&["sync"]);
+		let c = coin_of(&l.p, &coin);
+		if c["state"] == "exited" || c["state"] == "lost" {
+			break;
+		}
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		r.bury().await;
+	}
+	let end = coin_of(&l.p, &coin);
+	let paid = end["note"].as_str().and_then(|n| n.strip_prefix("claimed by ")).and_then(|n| n.split(',').next())
+		.and_then(|t| elements::Txid::from_str(t).ok())
+		.map(|t| r.rt.client().raw_transaction(&t).unwrap().output[0].value.explicit().unwrap());
+	println!("PV1Y4 OUTCOME: counted {} s_took_c1 {} end {} ({}) paid {:?}", counted, s_took_c1, end["state"], end["note"], paid);
+	cleanup(&l);
+	sound(&Outcome { counted: true, s_took_c1, end, paid });
+}
