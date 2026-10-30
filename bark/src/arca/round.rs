@@ -17,7 +17,11 @@
 //! branch; one exit from an accumulator batch). The server
 //! answers with the preimage that opens the new leaves; the wallet checks it
 //! against their unlock hash, keeps them, and releases the lowest node of each
-//! old batch leaf.
+//! old batch leaf: the releases are signed with the forfeits and kept with
+//! the participation, and handed to the server once the participation is
+//! completed, however it completes (the server's answer, the preimage read
+//! from the published tree or from a claim on the chain), retried at each
+//! `sync` until the server takes them.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -965,7 +969,15 @@ impl Wallet {
 		let mut out = vec![];
 		for (pid, body, given, wanted, state, _, _) in self.store.participations()? {
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
-			if matches!(state.as_str(), "released" | "void" | "expired" | "refused" | "lost") {
+			// A participation completed with its releases not yet taken (the
+			// server was not reached, or its round not final there yet).
+			if state == "released" {
+				if let Some(r) = self.send_releases(&pid)? {
+					out.push(json!({"participation": pid, "state": "released", "released": r}));
+				}
+				continue;
+			}
+			if matches!(state.as_str(), "void" | "expired" | "refused" | "lost") {
 				continue;
 			}
 			if state == "submitting" {
@@ -1437,6 +1449,12 @@ impl Wallet {
 		if !claims_json.is_empty() {
 			news_json["claims"] = json!(claims_json);
 		}
+		// The releases of the old leaves' lowest nodes, kept until the server
+		// takes them: they go to it once the preimage is in hand and the
+		// round final, by whichever way the participation completes.
+		if !releases.is_empty() {
+			news_json["releases"] = json!(releases);
+		}
 		if !offboards.is_empty() {
 			news_json["offboards"] = json!(offboards.iter().map(|(p, vout)| json!({
 				"vout": vout, "asset": p.destination.asset.to_string(), "value": p.destination.value.to_string(),
@@ -1481,14 +1499,7 @@ impl Wallet {
 		let kept = self.finish(pid, preimage, "settled")?;
 		// The release of each old batch leaf's lowest node, now that the
 		// preimage is in hand, the new leaves validated and their round final.
-		let released = if releases.is_empty() {
-			Value::Array(vec![])
-		} else {
-			match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": releases})) {
-				Ok(v) => v["released"].clone(),
-				Err(e) => json!({"error": e.to_string()}),
-			}
-		};
+		let released = self.send_releases(pid)?.unwrap_or(Value::Array(vec![]));
 		let mut out = json!({"participation": pid, "state": "released", "round": round_txid.to_string(), "new_leaves": kept, "released": released});
 		if !needs_fee_coin.is_empty() {
 			out["exit_needs_fee_coin"] = json!({"assets": needs_fee_coin, "note": FEE_COIN_NOTE});
@@ -1550,9 +1561,57 @@ impl Wallet {
 		}
 		let Some(preimage) = preimage else { return Ok(None) };
 		let kept = self.finish(pid, preimage, "settled")?;
-		Ok(Some(json!({"participation": pid, "state": "released", "round": round, "new_leaves": kept,
+		let released = self.send_releases(pid)?.unwrap_or(Value::Array(vec![]));
+		Ok(Some(json!({"participation": pid, "state": "released", "round": round, "new_leaves": kept, "released": released,
 			"note": "released by the server on the forfeits the wallet handed over before: the preimage taken from the published tree, \
 				nothing signed again"})))
+	}
+
+	/// Hands the server the releases participation `pid` signed of the old
+	/// leaves' lowest nodes, once it is completed (the preimage in hand), so
+	/// the operator can reclaim a node every owner of which has moved on. They
+	/// are kept with the participation until the server takes them or refuses
+	/// them for good; a refusal for a round the server does not yet hold as
+	/// final, or a server not reached, leaves them for the next `sync`. Each
+	/// release names the round the participation completed in, so it is void
+	/// should that round leave the chain. `None` when nothing waits to be
+	/// sent; else what the server answered.
+	pub(crate) fn send_releases(&mut self, pid: &str) -> Result<Option<Value>, Error> {
+		let Some(news) = self.store.participation_news(pid)? else { return Ok(None) };
+		// Most participations hold none, or sent them long ago: told apart
+		// without reading the record.
+		if !news.contains("\"releases\"") || news.contains("\"releases_sent\":true") {
+			return Ok(None);
+		}
+		let mut news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+		let pending = news["releases"].as_array().cloned().unwrap_or_default();
+		if pending.is_empty() || news["releases_sent"].as_bool() == Some(true) {
+			return Ok(None);
+		}
+		let later = |code: &str| matches!(code, "release_early" | "round_not_final" | "not_synced" | "internal");
+		let answer = match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": pending})) {
+			Ok(v) => v["released"].clone(),
+			Err(Error::Server { code, .. }) if later(&code) => return Ok(Some(json!({"waiting": code}))),
+			// Refused for good as a set (one coin of it, say, now under an
+			// open reassignment): each is handed over alone, so the others
+			// are still taken.
+			Err(Error::Server { .. }) => {
+				let mut taken = vec![];
+				for r in &pending {
+					match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": [r]})) {
+						Ok(v) => taken.extend(v["released"].as_array().cloned().unwrap_or_default()),
+						Err(Error::Server { code, .. }) if later(&code) => return Ok(Some(json!({"waiting": code}))),
+						Err(e @ Error::Server { .. }) => taken.push(json!({"leaf_id": r["leaf_id"], "refused": e.to_string()})),
+						Err(e) => return Ok(Some(json!({"error": e.to_string()}))),
+					}
+				}
+				Value::Array(taken)
+			},
+			Err(e) => return Ok(Some(json!({"error": e.to_string()}))),
+		};
+		news["releases_sent"] = json!(true);
+		self.store.set_participation_news(pid, &news.to_string())?;
+		Ok(Some(answer))
 	}
 
 	/// Completes participation `pid` with `preimage`: its new leaves, as the

@@ -228,10 +228,19 @@ height it has followed to and the node's, how long its last pass took and how
 long ago it ended, passes failing in a row, whether the node reports its tip's
 anchor as ok, the Bitcoin height the tip's anchor commits to and how long it
 has stood there, the rounds broadcast and not yet final, each with its
-block and its anchor's burial, and what the wallet holds of each asset, final or
-not (`holdings`): a round takes the wallet's largest coin first, and until its
-change is final `fundable` leaves it out, so right after a deposit `fundable` can
-read almost nothing while the pool is whole. `waiting_on` names the first thing finality
+block and its anchor's burial, what the wallet holds of each asset, final or
+not (`holdings`; `fundable` in `info` leaves out the change of rounds not yet
+final), and where each asset's value is besides the wallet (`pool`): what its
+live batches hold until a reclaim or their expiry brings it back (`locked`), of
+that what holders released and is not reclaimed yet (`released`), in batches
+every leaf of which is released and that the watcher reclaims on its next passes
+(`reclaimable`), and in leaves paid on out of round, whose owners can release
+nothing and which come back only at their batch's expiry (`transferred`); and
+over the last hour what rounds drew from the pool (`drawn_last_hour`, their
+batches and offboards), what reclaims and sweeps paid back
+(`reclaimed_last_hour`, `swept_last_hour`) and the difference, the pool's net
+turnover (`net_drawn_last_hour`: positive, the pool runs down by that much an
+hour). `waiting_on` names the first thing finality
 waits on: `follower` (the service trails the node or its passes fail),
 `anchor_status`, `certificates`, `anchor` (every waiting round is certified and
 waits for Bitcoin blocks to bury its anchor) or `nothing`. While the parent
@@ -1258,8 +1267,25 @@ exit deadline, at each round and at every pass over the rounds: a pending
 participation with a coin past its exit deadline can never run and is voided
 then, whether a round is being built or not, its coins given back; from that
 deadline their owner takes them on the chain. A batch holds at most 1,024
-leaves; a participation runs whole in one round. The participations are
-taken against what the operator's wallet can spend of the asset now: what
+leaves; a participation runs whole in one round.
+
+A round's leaves of one asset go to one shared batch, except a holder's that
+moves its coins soon after it gets them: a participation that gives up a
+coin resting on a batch made within `[batches] holder_window_seconds` (three
+days by default) of the round has its leaves in a batch of its own, and so
+does every other participation of the same holder in the round (the mailbox
+key its new leaves are bound to, else the participation itself). At most
+`holder_batches` such batches a round (8 by default; 0 for none), the
+largest by value first, and no more than the wallet has coins to issue their
+tokens; such a batch is always a tree. A market maker that refreshes every
+few minutes so has each refresh in a batch that empties together: once it
+refreshes again and releases, the watcher unrolls the batch and reclaims
+every lowest node, and the batch's value is back in the pool within the
+hour instead of at its expiry (see Reclaim, under The watcher). In the
+shared batch each holder's leaves lie side by side, so a lowest node's
+owners tend to move together.
+
+The participations are taken against what the operator's wallet can spend of the asset now: what
 the round pays on their behalf (the batch output, leaves and reserves as the
 builder makes it, and each offboard output) must fit, and the round's own
 fee and connector after it. A participation that does not fit waits, in
@@ -1273,9 +1299,10 @@ token, one explicit atom with no reissuance token, issued by one of the
 operator's coins, and a clock schedule of three steps, 28, 56 and 84 days
 after the round's median time, with a notice of 36 hours.
 
-The round transaction pays the batch output followed by its token's atom at
+The round transaction pays each batch output followed by its token's atom at
 the batch's first clock, then every offboard output, then the connector
-output, then change per asset and the one fee output. A round of refreshes
+output, then change per asset (in shares of the pool, see The on-chain
+wallet) and the one fee output. A round of refreshes
 spends the operator's coins only: it takes no input of a third party, which
 could be spent elsewhere and keep the round from returning after a rollback;
 only a round of its own that fills on-chain orders spends one (see Rounds
@@ -2059,7 +2086,13 @@ meanwhile.
   `reclaim_early`, a node all of whose lowest nodes are released is unrolled
   first, by a released owner's authorisation, until the lowest nodes are on
   the chain, so a fully refreshed batch comes back before it expires; the
-  watcher never unrolls a node with an owner who has not released.
+  watcher never unrolls a node with an owner who has not released, since a
+  wallet whose lineage appears on the chain takes its coin home at once. A
+  batch so comes back early only when all its leaves are refreshed, which is
+  why a holder that moves its coins soon has a batch of its own (see Rounds).
+  A leaf paid on out of round is never released (a release is its owner's,
+  over the round of its own new leaf), so its batch comes back at its
+  expiry.
 
 - **What a sweep owes.** Each sweep of its own that is final is counted
   once: every coin it took from its holder is recorded owed, the sweep with
@@ -2833,6 +2866,32 @@ signer signs every input.
   the chain until its transaction returns.
 - **Final coins only**, by default: the wallet spends a coin once the finality
   service says its transaction is final.
+- **The pool in many coins.** A transaction spends whole coins, and its
+  change is spendable again only once it is final, so each transaction takes
+  the smallest coin that pays it alone, or else the largest and so on for
+  what is left, and each round issues its sweep tokens from the smallest
+  coins of its fee asset. Change worth two shares of the asset's pool or more
+  (a share is the pool's value, every coin of the asset the wallet holds,
+  over `pool_coins`, 64 by default) is paid as that many shares, each its own
+  coin, at most `pool_coins` of them; a share below 100,000 atoms keeps the
+  change whole, and so does a transaction whose fee, larger for the shares,
+  is more than its fee asset's coins hold. A deposit of the whole pool in one coin is so split by the
+  first round that spends it, and from then on a round takes one share of
+  the pool and leaves every other share spendable while its change waits to
+  be final: an asset's pool funds about `pool_coins` rounds within one wait
+  for finality. A round never spends the change of a round that is not
+  final. Such a round would rest on the other: if that one were lost (its
+  input taken by another transaction after the parent chain reorganised
+  past finality, or, for a round that fills on-chain orders, an order
+  refunded while it was out of a block), the change would never exist, and
+  the nursery calls a round lost only when an input is taken by another
+  transaction, not when the transaction it spends is gone, so the second
+  round's participations would stay issued, never released and never run
+  again. And it gains a wallet nothing: a wallet takes a leaf only once its
+  round is final, which a round resting on another never is before that
+  one. A fee the watcher pays from a coin takes the change of its
+  own transactions still pending first, then the smallest final coin that
+  covers it.
 - **A named fee asset, no fallback.** Every transaction is built by hand and
   names its fee asset. The fee is in that asset's own atoms, priced from the
   node's relay floor and the node's exchange rate for the asset at the moment
@@ -3200,6 +3259,17 @@ go out and every one is claimed.
 participation in Y wants: in one pass X's round takes the participation in
 X, Y's is not built and the one in Y waits and says why, and the next round
 takes it once the wallet is paid more Y.
+
+`tests/pool_capital.rs` pays the wallet its pool in one coin: the first
+round pays its change in shares of the pool, and two more rounds run while
+the second is not final, most of the pool still spendable; a wallet that
+keeps its change whole (`pool_coins` 1) makes the second round wait. A maker
+refreshing four leaves every round beside a one-off user has each refresh in
+a batch of its own, which the watcher reclaims once the next refresh
+releases it: `/v1/chain`'s `pool` shows the locked value growing by the
+users' leaves alone and what reclaims paid back; with `holder_batches` 0
+every round strands the maker's four leaves. A maker leaf paid on out of
+round is counted `transferred`.
 
 `tests/rates.rs` prices X by the node's own rate, Y by a file and, in a
 second server, X by a command: `info` shows each rate, its source and its

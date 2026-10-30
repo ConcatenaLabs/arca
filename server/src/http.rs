@@ -672,6 +672,14 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 		anchor_height: p.anchor_height, anchor_unchanged_seconds: if p.anchor_since > 0 { now.saturating_sub(p.anchor_since) } else { 0 },
 		waiting_on: waiting_on.into(),
 		holdings: app.rounds.holdings().await.map(|h| h.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect()).unwrap_or_default(),
+		pool: app.store.pool_flow().await.map_err(|e| log::warn!("the pool's flow: {}", e)).unwrap_or_default().into_iter()
+			.map(|(a, f)| (AssetId::from_byte_array(a).to_string(), api::PoolFlowInfo {
+				locked: f.locked.to_string(), released: f.released.to_string(), reclaimable: f.reclaimable.to_string(),
+				transferred: f.transferred.to_string(),
+				drawn_last_hour: f.drawn_last_hour.to_string(), reclaimed_last_hour: f.reclaimed_last_hour.to_string(),
+				swept_last_hour: f.swept_last_hour.to_string(),
+				net_drawn_last_hour: (f.drawn_last_hour as i128 - f.reclaimed_last_hour as i128 - f.swept_last_hour as i128).to_string(),
+			})).collect(),
 		rounds_waiting_count: waiting.len() as u64,
 		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
 			let (height, depth) = match f {

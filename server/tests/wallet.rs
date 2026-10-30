@@ -27,7 +27,7 @@ async fn refuses_what_it_cannot_see() {
 	};
 	let finality = FinalityService::new(db.store.clone(), chain.clone() as Arc<dyn ChainSource>, config).await.unwrap();
 	let wallet = Wallet::new(db.store.clone(), finality.clone(), xonly(&keypair("operator")),
-		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 1, spend_from: SpendFrom::Final }).unwrap();
+		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 1, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap();
 	let script = wallet.receive_script().await.unwrap();
 	let x = AssetId::from_slice(&[7; 32]).unwrap();
 

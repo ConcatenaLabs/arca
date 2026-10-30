@@ -56,7 +56,7 @@ async fn nursery_on_regtest() {
 	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
 	let mut rx = finality.subscribe();
 	let wallet = Arc::new(Wallet::new(db.store.clone(), finality.clone(), xonly(&keypair("operator")),
-		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final }).unwrap());
+		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap());
 	let nursery = Nursery::new(db.store.clone(), finality.clone(), Some(wallet.clone()), Duration::ZERO);
 	let mut events = nursery.subscribe();
 	follow(&finality, &nursery, &mut rx).await;

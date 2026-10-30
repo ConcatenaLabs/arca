@@ -81,13 +81,42 @@ pub struct ChainProgress {
 	pub waiting_on: String,
 	/// What the operator's wallet holds of each asset it serves (atoms), final or not: its
 	/// pool including the change of rounds not yet final, which `fundable` (in `/v1/info`)
-	/// leaves out until they are. A round takes the wallet's largest coin first, so right after
-	/// a deposit `fundable` can fall to almost nothing while the pool is whole.
+	/// leaves out until they are.
 	pub holdings: std::collections::BTreeMap<String, String>,
+	/// Where each asset's value is besides the wallet, by asset: what its batches hold until
+	/// they come back, and what flowed out of the pool and back in over the last hour.
+	#[serde(default)]
+	pub pool: std::collections::BTreeMap<String, PoolFlowInfo>,
 	/// The rounds broadcast and not yet final, oldest first (at most 20).
 	pub rounds_waiting: Vec<RoundWaiting>,
 	/// How many rounds are broadcast and not yet final.
 	pub rounds_waiting_count: u64,
+}
+
+/// One asset's pool flow, in atoms as decimal strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolFlowInfo {
+	/// What its live batches hold, less what reclaims paid back: value out of the pool until a
+	/// reclaim or the batch's expiry brings it back.
+	pub locked: String,
+	/// Of `locked`, the leaves whose holders released them, not reclaimed yet.
+	pub released: String,
+	/// Of `released`, the batches every leaf of which is released: the watcher reclaims them
+	/// on its next passes.
+	pub reclaimable: String,
+	/// Of `locked`, the leaves paid on out of round: back only at their batch's expiry, since a
+	/// release comes from a leaf's owner and theirs has moved on to another coin.
+	pub transferred: String,
+	/// What the rounds of the last hour took out of the pool (their batches and offboards).
+	pub drawn_last_hour: String,
+	/// What reclaims paid back in the last hour.
+	pub reclaimed_last_hour: String,
+	/// What sweeps of expired batches paid back in the last hour.
+	pub swept_last_hour: String,
+	/// The pool's turnover: what the last hour drew less what it brought back. Positive, the
+	/// pool runs down by that much an hour; zero or less, it holds its level.
+	pub net_drawn_last_hour: String,
 }
 
 /// A round broadcast and not yet final, and where finality has it.

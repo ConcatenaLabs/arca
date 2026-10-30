@@ -225,7 +225,7 @@ use arca_covenant::encode::Encoding;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::tree::{LeafSpec, ReserveRule, TreeParams};
 use arca_covenant::{
-	connector_asset, AccumulatorRecord, Batch, BatchKind, ClockSchedule, ConnectorPolicy, ExplicitOutput, FillOrder, FillPlan, LeafId,
+	connector_asset, AccumulatorRecord, Batch, BatchKind, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, FillOrder, FillPlan, LeafId,
 	MedianTime, OffboardPolicy, RelativeTime, Template, WalletPolicy,
 };
 use elements::Script;
@@ -265,6 +265,16 @@ pub struct RoundConfig {
 	/// built as one ([`BatchKind::choose`]); when it is not, every batch is a
 	/// tree.
 	pub accumulator_exit_rate_ppm: Option<u32>,
+	/// The most batches of their own a round builds, one for each holder
+	/// that moves its coins soon after it gets them ([`Rounds::holder_of`]),
+	/// the largest by value first; 0 puts every leaf of an asset in one
+	/// batch. Such a batch empties together: once its holder refreshes again
+	/// and releases, the watcher unrolls and reclaims it, and its value is
+	/// back in the pool long before it expires.
+	pub holder_batches: usize,
+	/// How young a coin given up must be, in seconds since its batch's round,
+	/// for its holder to count as one that moves its coins soon.
+	pub holder_window: u32,
 }
 
 impl Default for RoundConfig {
@@ -278,6 +288,8 @@ impl Default for RoundConfig {
 			steps: 3,
 			max_batch_leaves: 1024,
 			accumulator_exit_rate_ppm: None,
+			holder_batches: 8,
+			holder_window: 3 * 86_400,
 		}
 	}
 }
@@ -447,6 +459,82 @@ pub struct Rounds {
 	going_out: Mutex<()>,
 	/// What [`Rounds::fundable_now`] last answered, and when.
 	fundable_seen: Mutex<Option<(std::time::Instant, BTreeMap<AssetId, u64>)>>,
+	/// Each participation's holder, once read ([`Rounds::holder_of`]).
+	holders: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 32]>>>,
+}
+
+/// A batch a round builds: its asset, its leaves (each a participation's
+/// index among the round's and an output's index in it), and whether it is
+/// a holder's own, built as a tree whatever the batch kind rule says.
+#[derive(Debug, Clone)]
+pub struct BatchPlan {
+	pub asset: AssetId,
+	pub leaves: Vec<(usize, usize)>,
+	pub own: bool,
+}
+
+/// The batches of a round, in order: per asset in asset order, a batch of
+/// its own for each holder named in `holders` (the largest by value first,
+/// at most `own_max` across the round), then one for every other leaf of the
+/// asset, a holder's leaves side by side so that a lowest node's owners tend
+/// to move together. `leaves` lists each leaf wanted as (asset, holder or
+/// none, value, participation index, output index), in the round's order.
+pub fn plan_batches(leaves: &[(AssetId, Option<[u8; 32]>, u64, usize, usize)], own_max: usize) -> Vec<BatchPlan> {
+	let mut by_holder: BTreeMap<[u8; 32], (u64, usize)> = BTreeMap::new();
+	for (k, (_, h, v, _, _)) in leaves.iter().enumerate() {
+		if let Some(h) = h {
+			let e = by_holder.entry(*h).or_insert((0, k));
+			e.0 = e.0.saturating_add(*v);
+		}
+	}
+	// The holders that get a batch of their own: the most value first, then
+	// the first seen.
+	let mut ranked: Vec<([u8; 32], (u64, usize))> = by_holder.into_iter().collect();
+	ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.1 .1.cmp(&b.1 .1)));
+	let own: BTreeSet<[u8; 32]> = ranked.iter().take(own_max).map(|(h, _)| *h).collect();
+	let mut out = vec![];
+	let assets: BTreeSet<AssetId> = leaves.iter().map(|l| l.0).collect();
+	for asset in assets {
+		let of_asset: Vec<&(AssetId, Option<[u8; 32]>, u64, usize, usize)> = leaves.iter().filter(|l| l.0 == asset).collect();
+		let mut seen: Vec<[u8; 32]> = vec![];
+		for l in &of_asset {
+			if let Some(h) = l.1.filter(|h| own.contains(h)) {
+				if !seen.contains(&h) {
+					seen.push(h);
+				}
+			}
+		}
+		for h in &seen {
+			out.push(BatchPlan { asset, own: true,
+				leaves: of_asset.iter().filter(|l| l.1 == Some(*h)).map(|l| (l.3, l.4)).collect() });
+		}
+		// The rest, a holder's leaves side by side in the order its first
+		// leaf came.
+		let rest: Vec<&&(AssetId, Option<[u8; 32]>, u64, usize, usize)> = of_asset.iter().filter(|l| !l.1.is_some_and(|h| own.contains(&h))).collect();
+		let mut order: Vec<Option<[u8; 32]>> = vec![];
+		for l in &rest {
+			let key = l.1.or(Some(participation_key(l.3)));
+			if !order.contains(&key) {
+				order.push(key);
+			}
+		}
+		let mut shared = vec![];
+		for key in order {
+			shared.extend(rest.iter().filter(|l| l.1.or(Some(participation_key(l.3))) == key).map(|l| (l.3, l.4)));
+		}
+		if !shared.is_empty() {
+			out.push(BatchPlan { asset, leaves: shared, own: false });
+		}
+	}
+	out
+}
+
+/// A stand-in holder for the leaves of a participation whose holder is not
+/// known, which keeps them side by side and apart from every other's.
+fn participation_key(k: usize) -> [u8; 32] {
+	let mut b = [0xffu8; 32];
+	b[..8].copy_from_slice(&(k as u64).to_le_bytes());
+	b
 }
 
 /// How long [`Rounds::fundable_now`] serves what it last read.
@@ -480,7 +568,7 @@ impl Rounds {
 		signer: SignerClient, config: RoundConfig) -> Arc<Rounds>
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
-			going_out: Mutex::new(()), fundable_seen: Mutex::new(None) })
+			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), holders: Mutex::new(Default::default()) })
 	}
 
 	/// The finality service this operator follows the chain with.
@@ -562,6 +650,74 @@ impl Rounds {
 	/// leave on their own ([`BatchKind::choose`]); a tree for an
 	/// issuer-operated asset, whose batches the mint's signer rebuilds as
 	/// trees.
+	/// The holder of participation `row` when it moves its coins soon after
+	/// it gets them: a coin it gives up rests on a batch made within
+	/// [`RoundConfig::holder_window`] of now. The holder is the mailbox key
+	/// its new leaves are bound to (a wallet binds every leaf it asks for to
+	/// one key), else the participation itself. `None` for any other: its
+	/// leaves go to the asset's shared batch. Read once a participation.
+	async fn holder_of(&self, row: &ParticipationRow, now: MedianTime) -> Result<Option<[u8; 32]>, RoundError> {
+		if self.config.holder_batches == 0 {
+			return Ok(None);
+		}
+		if let Some(h) = self.holders.lock().await.get(&row.id) {
+			return Ok(*h);
+		}
+		// A coin whose first expiry lies this late came from a batch made
+		// within the window.
+		let soon = (now.to_consensus_u32() + self.config.lifetime).saturating_sub(self.config.holder_window);
+		let mut young = false;
+		for i in &row.inputs {
+			let Some(l) = self.store.leaf(&i.leaf_id).await? else { continue };
+			let Ok(record) = CoinRecord::from_bytes(&l.record) else { continue };
+			if crate::cosign::first_expiry(&record).is_some_and(|e| e >= soon) {
+				young = true;
+				break;
+			}
+		}
+		let mut holder = None;
+		if young {
+			holder = Some(row.id);
+			for o in &row.outputs {
+				if let WantedKind::Leaf { owner_key, .. } = &o.kind {
+					if let Some(m) = self.store.mailbox_of(owner_key).await? {
+						holder = Some(m);
+						break;
+					}
+				}
+			}
+		}
+		let mut seen = self.holders.lock().await;
+		if seen.len() > 100_000 {
+			seen.clear();
+		}
+		seen.insert(row.id, holder);
+		Ok(holder)
+	}
+
+	/// The batches a round of `rows` builds ([`plan_batches`]): no batch of
+	/// its own in an asset the operator mints, whose batches are burn-only,
+	/// and no more than the wallet's coins can issue tokens for besides the
+	/// shared batches.
+	async fn batches_of(&self, rows: &[&ParticipationRow], now: MedianTime, reserved: usize) -> Result<Vec<BatchPlan>, RoundError> {
+		let mut leaves = vec![];
+		for (k, row) in rows.iter().enumerate() {
+			let mut holder = None;
+			for (j, o) in row.outputs.iter().enumerate() {
+				if let WantedKind::Leaf { .. } = &o.kind {
+					let asset = AssetId::from_byte_array(o.asset);
+					if holder.is_none() && self.params.assets.get(&asset).is_some_and(|a| a.issuer.is_none()) {
+						holder = Some(self.holder_of(row, now).await?);
+					}
+					leaves.push((asset, holder.flatten(), o.value, k, j));
+				}
+			}
+		}
+		let assets: BTreeSet<AssetId> = leaves.iter().map(|l| l.0).collect();
+		let room = self.config.holder_batches.min(self.wallet.issuing_coins(None).await?.saturating_sub(assets.len() + reserved));
+		Ok(plan_batches(&leaves, room))
+	}
+
 	fn kind_of(&self, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
 		let issuer = self.params.assets.get(asset).is_some_and(|a| a.issuer.is_some());
 		BatchKind::choose(specs, self.config.radix, self.config.accumulator_exit_rate_ppm, issuer)
@@ -1253,19 +1409,18 @@ impl Rounds {
 	/// batch output, its leaves and its reserves as the builder makes them,
 	/// and each offboard output.
 	async fn pays(&self, rows: &[&ParticipationRow], now: MedianTime) -> Result<BTreeMap<AssetId, u64>, RoundError> {
-		let mut leaves: BTreeMap<AssetId, Vec<LeafSpec>> = BTreeMap::new();
 		let mut pays: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for row in rows {
 			for o in &row.outputs {
-				let asset = AssetId::from_byte_array(o.asset);
-				match &o.kind {
-					WantedKind::Leaf { .. } => leaves.entry(asset).or_default().push(Self::spec(row, o)?),
-					WantedKind::Offboard { margin, .. } => *pays.entry(asset).or_default() += o.value + margin,
+				if let WantedKind::Offboard { margin, .. } = &o.kind {
+					*pays.entry(AssetId::from_byte_array(o.asset)).or_default() += o.value + margin;
 				}
 			}
 		}
 		let expiries = self.expiries(now)?;
-		for (asset, specs) in leaves {
+		for plan in self.batches_of(rows, now, 0).await? {
+			let asset = plan.asset;
+			let specs = plan.leaves.iter().map(|(k, j)| Self::spec(rows[*k], &rows[*k].outputs[*j])).collect::<Result<Vec<_>, _>>()?;
 			let reserve = match self.floor(asset).await? {
 				Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
 				None => ReserveRule::Fixed { node: 1, entry: 1 },
@@ -1277,7 +1432,8 @@ impl Rounds {
 				asset, chain: self.params.chain, schedule, burn: false, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
-			let batch = Batch::build(self.kind_of(&asset, &specs), params, &specs)
+			let kind = if plan.own { BatchKind::Tree } else { self.kind_of(&asset, &specs) };
+			let batch = Batch::build(kind, params, &specs)
 				.map_err(|e| RoundError::Internal(format!("the batch of asset {}: {}", asset, e)))?;
 			*pays.entry(asset).or_default() += batch.batch_output().value;
 		}
@@ -1394,17 +1550,23 @@ impl Rounds {
 		let p = self.params.clone();
 		let s = p.operator;
 
-		// The leaves per asset, and the offboards.
-		let mut groups: BTreeMap<AssetId, Vec<Planned>> = BTreeMap::new();
+		// The leaves of each batch ([`Rounds::batches_of`]), and the offboards.
+		let rows: Vec<&ParticipationRow> = chosen.iter().collect();
+		let plan = self.batches_of(&rows, now, ties.len()).await?;
+		let mut groups: Vec<(AssetId, Vec<Planned>)> = Vec::with_capacity(plan.len());
+		for b in &plan {
+			let mut leaves = Vec::with_capacity(b.leaves.len());
+			for (k, j) in &b.leaves {
+				leaves.push(Planned { participation: *k, output: *j as u16, spec: Self::spec(&chosen[*k], &chosen[*k].outputs[*j])? });
+			}
+			groups.push((b.asset, leaves));
+		}
 		let mut offboards: Vec<PlannedOffboard> = vec![];
 		for (k, row) in chosen.iter().enumerate() {
 			for (j, o) in row.outputs.iter().enumerate() {
 				let asset = AssetId::from_byte_array(o.asset);
 				match &o.kind {
-					WantedKind::Leaf { .. } => {
-						let spec = Self::spec(row, o)?;
-						groups.entry(asset).or_default().push(Planned { participation: k, output: j as u16, spec });
-					},
+					WantedKind::Leaf { .. } => {},
 					WantedKind::Offboard { script, margin, reclaim_delay_units } => {
 						let policy = OffboardPolicy {
 							unlock_hash: row.unlock_hash,
@@ -1421,7 +1583,7 @@ impl Rounds {
 		// A round of an issuer-operated asset mints what it pays in the asset
 		// ([`crate::issuer`]): the limiter's coin at input 0, its successor at
 		// output 0. It fills no order: the orders would hold the low inputs.
-		let round_asset = groups.keys().next().copied().or_else(|| offboards.first().map(|o| o.policy.destination.asset));
+		let round_asset = groups.first().map(|g| g.0).or_else(|| offboards.first().map(|o| o.policy.destination.asset));
 		let issuer = round_asset.and_then(|a| p.assets.get(&a).and_then(|x| x.issuer).map(|i| (a, i)));
 		if issuer.is_some() && !fills.is_empty() {
 			return Err(RoundError::Internal("an issuer-operated asset's round fills no on-chain order".into()));
@@ -1437,7 +1599,7 @@ impl Rounds {
 		// keeps nothing.
 		let fee_assets: Vec<AssetId> = p.fee_assets().into_iter().filter(|a| Some(*a) != minted).collect();
 		let mut floors: BTreeMap<AssetId, Option<u64>> = BTreeMap::new();
-		let round_assets: Vec<AssetId> = groups.keys().copied().chain(offboards.iter().map(|o| o.policy.destination.asset)).collect();
+		let round_assets: Vec<AssetId> = groups.iter().map(|g| g.0).chain(offboards.iter().map(|o| o.policy.destination.asset)).collect();
 		for a in round_assets.iter().chain(fee_assets.iter()) {
 			if !floors.contains_key(a) {
 				let f = self.floor(*a).await?;
@@ -1454,7 +1616,7 @@ impl Rounds {
 
 		// The schedule's times and each batch's reserve rule.
 		let expiries = self.expiries(now)?;
-		let reserves: BTreeMap<AssetId, ReserveRule> = groups.keys().map(|a| (*a, match floors[a] {
+		let reserves: BTreeMap<AssetId, ReserveRule> = groups.iter().map(|g| &g.0).map(|a| (*a, match floors[a] {
 			Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
 			None => ReserveRule::Fixed { node: 1, entry: 1 },
 		})).collect();
@@ -1521,13 +1683,15 @@ impl Rounds {
 		}
 		// Each batch's kind, chosen before the tokens: a tree or an
 		// accumulator batch.
-		let kinds: BTreeMap<AssetId, BatchKind> = groups.iter()
-			.map(|(a, leaves)| (*a, self.kind_of(a, &leaves.iter().map(|l| l.spec).collect::<Vec<_>>()))).collect();
+		// A holder's own batch is a tree, so that it can be reclaimed.
+		let kinds: Vec<BatchKind> = groups.iter().zip(&plan)
+			.map(|((a, leaves), b)| if b.own { BatchKind::Tree } else { self.kind_of(a, &leaves.iter().map(|l| l.spec).collect::<Vec<_>>()) })
+			.collect();
 		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, minted, |tokens| {
 			let mut outputs: Vec<ExplicitOutput> = successor.iter().cloned().collect();
 			outputs.extend(fill_outputs.iter().cloned());
 			let mut trees = vec![];
-			for ((asset, leaves), token) in groups.iter().zip(tokens) {
+			for (bi, ((asset, leaves), token)) in groups.iter().zip(tokens).enumerate() {
 				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
 				// An issuer-operated asset's batch is burn-only.
@@ -1535,7 +1699,7 @@ impl Rounds {
 					asset: *asset, chain, schedule, burn: Some(*asset) == minted, radix, reserve: reserves[asset],
 					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
-				let tree = Batch::build(kinds[asset], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
+				let tree = Batch::build(kinds[bi], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
 				outputs.push(tree.batch_output());
 				outputs.push(ExplicitOutput::new(*token, 1, tree.clock0_script_pubkey()));
 				trees.push((tree, params));
@@ -2844,6 +3008,33 @@ impl Rounds {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_holder_that_moves_soon_has_a_batch_of_its_own() {
+		let a = AssetId::from_slice(&[1; 32]).unwrap();
+		let b = AssetId::from_slice(&[2; 32]).unwrap();
+		let (m, n) = (Some([7u8; 32]), Some([8u8; 32]));
+		// A maker's four leaves over two participations, a smaller holder's
+		// one, two leaves of nobody's, and one of another asset.
+		let leaves = vec![(a, None, 10, 0, 0), (a, m, 100, 1, 0), (a, m, 100, 1, 1), (a, n, 5, 2, 0), (a, m, 100, 3, 0),
+			(a, m, 100, 3, 1), (a, None, 10, 4, 0), (b, m, 50, 5, 0)];
+		let p = plan_batches(&leaves, 8);
+		let shape: Vec<(AssetId, bool, Vec<(usize, usize)>)> = p.iter().map(|b| (b.asset, b.own, b.leaves.clone())).collect();
+		assert_eq!(shape, vec![
+			(a, true, vec![(1, 0), (1, 1), (3, 0), (3, 1)]),
+			(a, true, vec![(2, 0)]),
+			(a, false, vec![(0, 0), (4, 0)]),
+			(b, true, vec![(5, 0)]),
+		]);
+		// One batch of its own a round: the holder with the most value.
+		let p = plan_batches(&leaves, 1);
+		assert_eq!(p.iter().filter(|b| b.own).count(), 2, "the maker's, in both its assets");
+		assert_eq!(p.iter().find(|b| b.asset == a && !b.own).unwrap().leaves, vec![(0, 0), (2, 0), (4, 0)]);
+		// None: one batch an asset, every leaf in it, a holder's side by side.
+		let p = plan_batches(&leaves, 0);
+		assert_eq!(p.len(), 2);
+		assert_eq!(p[0].leaves, vec![(0, 0), (1, 0), (1, 1), (3, 0), (3, 1), (2, 0), (4, 0)]);
+	}
 
 	fn order() -> FillOrder {
 		let key = |b: u8| {

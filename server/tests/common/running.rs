@@ -95,6 +95,7 @@ impl Running {
 			signer_socket: signer.socket.clone(),
 			wallet_mnemonic_file: mnemonic,
 			fee_multiple: 2,
+			pool_coins: server::wallet::POOL_COINS,
 			max_request_bytes: 64 * 1024,
 			challenge_ttl_seconds: 120,
 			// The tests build each round by hand.
