@@ -621,8 +621,20 @@ impl Wallet {
 	pub async fn catch_up_from_server(&self) -> anyhow::Result<CatchUpReport> {
 		let mut out = CatchUpReport::default();
 
+		// A coin given up in a delegated participation of this store's own stays
+		// spendable here until the store sees the server issue its round, while the
+		// server already counts it spent by that round: it was spent here, not
+		// elsewhere, and the round's progress takes it up.
+		let mut own_rounds = HashSet::new();
+		for round in self.pending_round_states().await? {
+			own_rounds.extend(round.state().participation().inputs.iter().map(|v| v.id()));
+		}
+
 		for v in self.spendable_vtxos().await? {
 			let id = v.vtxo.id();
+			if own_rounds.contains(&id) {
+				continue;
+			}
 			let key = match self.get_vtxo_key(&v).await {
 				Ok(k) => k,
 				Err(e) => {
