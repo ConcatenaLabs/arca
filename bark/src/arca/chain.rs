@@ -137,11 +137,12 @@ pub struct ChainSource {
 /// How long a view stands, at most, before the source looks at the node again.
 pub const VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long a look serves the commands after the one that made it: a burst of
-/// commands (a quote runs several, one after the other) shares one look, so a
-/// wallet on a slow or far link pays one round trip for the view rather than one
-/// a command. A gap the wallet knows of (its own broadcast, say) still calls for
-/// a look at once.
+/// How long a look serves a command that reads only and asks to share the
+/// view ([`ChainSource::share_view`]): a burst of such commands (a quote runs
+/// several, one after the other) shares one look, so a wallet on a slow or far
+/// link pays one round trip for the view rather than one a command. Every other
+/// command looks when it starts, and a gap the wallet knows of (its own
+/// broadcast, say) calls for a look at once.
 pub const BURST_VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The moments the chain may have moved without the wallet reading it: a
@@ -182,6 +183,9 @@ struct Memo {
 	gaps: u64,
 	/// Whether the view has been looked at since the command started.
 	looked_this_command: bool,
+	/// The command started may answer from another command's look made
+	/// within [`BURST_VIEW_FOR`].
+	shared: bool,
 	/// Answers fixed by the view.
 	view: HashMap<String, Kept>,
 	/// Answers fixed by the view's mempool as well (a mempool entry, an
@@ -341,15 +345,17 @@ impl ChainSource {
 	pub fn new_command(&self) {
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.looked_this_command = false;
+		m.shared = false;
 		m.command.clear();
 	}
 
-	/// Makes the next read look at the view again, as a command started past
-	/// [`BURST_VIEW_FOR`] would.
-	#[cfg(test)]
-	fn look_again(&self) {
-		self.memo.lock().expect("the chain memo").looked = None;
+	/// Lets the command just started answer from another command's look made
+	/// within [`BURST_VIEW_FOR`]: for a command that reads only, of a caller
+	/// that runs it as one of a burst.
+	pub fn share_view(&self) {
+		self.memo.lock().expect("the chain memo").shared = true;
 	}
+
 
 	/// The requests this source made of the node (a batch is one), and the
 	/// reads it answered from what it kept for the view, since it was made.
@@ -358,12 +364,12 @@ impl ChainSource {
 		(m.asked, m.kept)
 	}
 
-	/// Whether the view is to be looked at again before the next answer: a gap
-	/// came, a second passed since this command's look, or the command has just
-	/// started and the last look, another command's, is older than
-	/// [`BURST_VIEW_FOR`].
+	/// Whether the view is to be looked at again before the next answer: the
+	/// command has just started (unless it shares the view and the last look
+	/// is younger than [`BURST_VIEW_FOR`]), a gap came, or a second passed
+	/// since the command's look.
 	fn look_due(m: &Memo) -> bool {
-		let window = if m.looked_this_command { VIEW_FOR } else { BURST_VIEW_FOR };
+		let window = if m.looked_this_command { VIEW_FOR } else if m.shared { BURST_VIEW_FOR } else { return true };
 		!(m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < window))
 	}
 
@@ -1255,8 +1261,8 @@ pub fn unhex32(s: &str) -> Result<[u8; 32], Error> {
 mod test {
 	use super::*;
 
-	/// A burst of commands shares one look: a command started within
-	/// BURST_VIEW_FOR of another's look answers from that view, one started
+	/// A command that shares the view answers from another's look made within
+	/// BURST_VIEW_FOR; one that does not looks when it starts; one started
 	/// later looks again, and a gap calls for a look at once.
 	#[test]
 	fn a_burst_of_commands_shares_one_look() {
@@ -1264,7 +1270,9 @@ mod test {
 		m.looked_this_command = true;
 		assert!(!ChainSource::look_due(&m), "this command's own fresh look stands");
 		m.looked_this_command = false;
-		assert!(!ChainSource::look_due(&m), "the next command shares it");
+		assert!(ChainSource::look_due(&m), "a command that does not share the view looks when it starts");
+		m.shared = true;
+		assert!(!ChainSource::look_due(&m), "the next command that shares it answers from it");
 		m.looked = Some(web_time::Instant::now() - BURST_VIEW_FOR - std::time::Duration::from_millis(1));
 		assert!(ChainSource::look_due(&m), "a look older than the burst window is not shared");
 		m.looked = Some(web_time::Instant::now() - VIEW_FOR - std::time::Duration::from_millis(1));
@@ -1286,6 +1294,8 @@ mod test {
 		let sent = || requests.load(Ordering::SeqCst);
 		assert!(chain.validates_anchors().unwrap());
 		let n = sent();
+		chain.new_command();
+		chain.share_view();
 		let _ = chain.read("sendrawtransaction", &[json!("00")]);
 		assert_eq!(sent(), n + 1, "the broadcast itself");
 		assert!(chain.validates_anchors().unwrap());
@@ -1489,7 +1499,6 @@ mod test {
 		assert_eq!(sent(), 1);
 		// A new command: the look is due and carries the fee reads.
 		chain.new_command();
-		chain.look_again();
 		assert!(chain.fee_rates().unwrap().is_empty());
 		assert_eq!(sent(), 2, "the look and the three fee reads in one request");
 		// Kept within the command: no look, no request.
@@ -1498,16 +1507,13 @@ mod test {
 		// A look carrying the supervised assets is refused whole; the look is
 		// made again on its own and the read alone.
 		chain.new_command();
-		chain.look_again();
 		assert!(chain.supervised_assets().unwrap().is_empty());
 		assert_eq!(sent(), 5, "the refused batch, the look again, the read alone");
 		// From then on it is never carried, and batches go on.
 		chain.new_command();
-		chain.look_again();
 		assert!(chain.supervised_assets().unwrap().is_empty());
 		assert_eq!(sent(), 6, "a look alone; the read is kept for the view");
 		chain.new_command();
-		chain.look_again();
 		assert!(chain.fee_rates().unwrap().is_empty());
 		assert_eq!(sent(), 7, "the node is still asked in batches");
 	}
@@ -1577,7 +1583,6 @@ mod test {
 		let op = OutPoint::new(Txid::from_str(&"33".repeat(32)).unwrap(), 0);
 		for _ in 0..3 {
 			chain.new_command();
-			chain.look_again();
 			let h: Value = chain.call("getblockheader", &[json!(hash.to_string()), json!(true)]).unwrap();
 			assert_eq!(h["height"], 1);
 			assert!(chain.unspent(&op).unwrap());

@@ -119,6 +119,12 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	// Every command reads the chain as it is when it starts: the view the
 	// chain source keeps is looked at again before its first read.
 	w.chain.new_command();
+	// A command that reads only may answer from a look another made a moment
+	// ago, when its caller runs it as one of a burst and says so; one that
+	// takes a coin or signs a spend always looks first.
+	if args["shared_view"].as_bool() == Some(true) && reads_only(command) {
+		w.chain.share_view();
+	}
 	// What the command cost, in time and in requests of the node and of the
 	// operator, the part before it (the witness and the re-check) apart: what
 	// a program logs of a slow command.
@@ -136,21 +142,27 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	Ok(json!({"result": result, "start": start, "cost": cost}))
 }
 
+/// The commands that only read, of the wallet, the node, the operator or an
+/// offer, and take no coin, sign nothing and broadcast nothing.
+fn reads_only(command: &str) -> bool {
+	matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit_quote" | "schedule"
+		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
+		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
+		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards")
+}
+
 /// What `arca` runs before a command: the witness (unless the command stays
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
-	// What only reads, of the operator or an offer, and takes no coin and signs
-	// nothing: the witness guards the coins the wallet takes and the spends it
-	// signs through the operator, and every command that does either still runs
-	// it first. A read-only command spares a slow or far link that round trip.
-	let reads_only = matches!(command, "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote"
-		| "order_fill_quote" | "order_quote" | "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote"
-		| "offboard_quote" | "lightning_pay_quote" | "lightning_receive_quote" | "distribute_quote" | "plan_quote"
-		| "swap_read" | "btc_swap_read" | "boards");
-	let local = local || reads_only;
+	// A command that reads only, of the operator or an offer, skips the
+	// witness: it guards the coins the wallet takes and the spends it signs
+	// through the operator, and every command that does either still runs it
+	// first. A read-only command spares a slow or far link that round trip.
+	let local = local || reads_only(command);
 	let mut out = json!({});
 	if !local {
 		out["witness"] = match w.witness() {
