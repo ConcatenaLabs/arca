@@ -715,6 +715,11 @@ impl Wallet {
 		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string() })
 	}
 
+	/// Writes the pins in one transaction, the genesis last. A store that holds
+	/// the genesis reads as a wallet (`open_in`, the wasm `arcaWalletExists`):
+	/// written one key at a time, a join stopped between the genesis and the
+	/// operator left a store that read as a wallet and would never open
+	/// ("operator is not set"), and that no create would replace.
 	fn write_pins(store: &Store, cfg: &Config, pins: Pins) -> Result<(), Error> {
 		let meta = [
 			("server", cfg.server.clone()), ("node_url", cfg.node_url.clone()),
@@ -722,14 +727,12 @@ impl Wallet {
 			("node_cookie", cfg.node_cookie.clone().unwrap_or_default()),
 			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
 			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
-			("genesis", pins.genesis), ("chain_name", pins.chain_name), ("operator", pins.operator),
+			("chain_name", pins.chain_name), ("operator", pins.operator),
 			("keepers", pins.keepers),
 			("birthday", pins.tip_height.to_string()), ("tip_height", pins.tip_height.to_string()), ("tip_hash", pins.tip_hash),
+			("genesis", pins.genesis),
 		];
-		for (k, v) in meta {
-			store.set_meta(k, &v)?;
-		}
-		Ok(())
+		store.set_metas(&meta)
 	}
 
 	/// Opens the wallet in `datadir`. Contacts neither node nor server.
@@ -3783,6 +3786,33 @@ mod tests {
 		assert_eq!(refused(Wallet::open_in(s, B, None)), "this store holds the wallet of another mnemonic");
 
 		assert!(refused(Wallet::open_in(made(), A, None)).contains("names no mailbox key"));
+	}
+
+	/// The pins are written all or none: a join that fails part way leaves a
+	/// store that holds no wallet, which a create fills, never one that reads
+	/// as a wallet and will not open.
+	#[test]
+	fn an_interrupted_join_leaves_no_wallet() {
+		let s = Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+		let cfg = Config::spec_delays("https://example.org/arca", "http://127.0.0.1:1/");
+		let pins = || Pins { genesis: "00".repeat(32), chain_name: "elementsregtest".into(), operator: key(7).x_only_public_key().0.to_string(),
+			keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32) };
+		// The join stops as it writes the operator.
+		s.conn_for_tests().execute_batch("CREATE TEMP TRIGGER stop_at_operator BEFORE INSERT ON meta WHEN NEW.key = 'operator' \
+			BEGIN SELECT RAISE(ABORT, 'stopped'); END;").unwrap();
+		assert!(Wallet::write_pins(&s, &cfg, pins()).is_err());
+		for k in ["server", "chain_name", "genesis"] {
+			assert_eq!(s.meta(k).unwrap(), None, "{} was written by a join that stopped", k);
+		}
+		match Wallet::open_in(s, "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None) {
+			Err(Error::Refused(why)) => assert_eq!(why, "this store holds no wallet; create one first"),
+			Err(e) => panic!("{}", e),
+			Ok(_) => panic!("opened"),
+		}
+		// A join that runs through writes them all, the genesis among them.
+		let s = Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+		Wallet::write_pins(&s, &cfg, pins()).unwrap();
+		assert!(s.meta("genesis").unwrap().is_some() && s.meta("operator").unwrap().is_some());
 	}
 
 	/// A 16-leaf tree with one-atom reserves on every node and entry, as the
