@@ -1,0 +1,69 @@
+//! Runs one of the wallet's commands natively against a Bitcoin ark on
+//! regtest (`contrib/bitcoin-ark-regtest`), the chain read from its Bitcoin
+//! Core. Each run opens the wallet, runs the command, prints its answer and
+//! closes the wallet again, with no daemon: between two runs the wallet is
+//! closed, as a browser's is when its page is.
+//!
+//!     ARK=http://127.0.0.1:23145 BITCOIND=http://127.0.0.1:23142 \
+//!     COOKIE=$H/btc/regtest/.cookie MNEMONIC="…" \
+//!     cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
+//!
+//! `sync` is the wallet's own sync (what its daemon runs while it is open);
+//! every other command is one of [arca_bark_wasm::command::COMMANDS].
+
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use anyhow::Context;
+
+/// The wallet's log on stderr, at the level `LOG` names (warn by default).
+struct Stderr;
+impl log::Log for Stderr {
+	fn enabled(&self, _: &log::Metadata) -> bool { true }
+	fn log(&self, r: &log::Record) {
+		if self.enabled(r.metadata()) {
+			eprintln!("{} {}: {}", r.level(), r.target(), r.args());
+		}
+	}
+	fn flush(&self) {}
+}
+
+fn env(name: &str) -> anyhow::Result<String> {
+	std::env::var(name).with_context(|| format!("set {}", name))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+	let level = std::env::var("LOG").ok().and_then(|l| l.parse().ok()).unwrap_or(log::LevelFilter::Warn);
+	let _ = log::set_logger(&Stderr);
+	log::set_max_level(level);
+
+	let mut args = std::env::args().skip(1);
+	let datadir = PathBuf::from(args.next().context("name the wallet's data directory")?);
+	let cmd = args.next().context("name a command")?;
+	let json: serde_json::Value = match args.next() {
+		Some(s) => serde_json::from_str(&s).context("the arguments are not JSON")?,
+		None => serde_json::json!({}),
+	};
+
+	let net = bark::ark::bitcoin::Network::Regtest;
+	let mnemonic = bark::bip39::Mnemonic::from_str(env("MNEMONIC")?.trim())?;
+	let seed = bark::WalletSeed::new_from_mnemonic(net, &mnemonic);
+	let mut config = bark::Config::network_default(net);
+	config.server_address = env("ARK")?;
+	config.bitcoind_address = Some(env("BITCOIND")?);
+	config.bitcoind_cookiefile = Some(PathBuf::from(env("COOKIE")?));
+	let mut open = bark::OpenWalletArgs::default();
+	open.run_daemon = false;
+	open.datadir = Some(datadir);
+	let wallet = bark::Wallet::open(net, seed, config, open).await?;
+
+	let out = if cmd == "sync" {
+		wallet.sync().await;
+		serde_json::json!({})
+	} else {
+		arca_bark_wasm::run(&wallet, &cmd, &json).await?
+	};
+	println!("{}", out);
+	Ok(())
+}

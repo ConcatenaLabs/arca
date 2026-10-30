@@ -503,6 +503,16 @@ const MAX_NB_ROUND_NONCES: usize = 16;
 /// to be non-zero so tests and integrator sessions can use short deltas.
 const MIN_MAINNET_VTXO_EXIT_DELTA: BlockDelta = 96;
 
+/// How many blocks past a coin's scheduled refresh height the wallet leaves the refresh
+/// to the server ([Wallet::schedule_refreshes]) before it refreshes the coin itself in a
+/// round it joins.
+pub const SCHEDULED_REFRESH_GRACE: BlockDelta = 6;
+
+/// The fewest blocks before a coin's expiry that [Wallet::schedule_refreshes] schedules its
+/// refresh for: about half a day of Bitcoin blocks, so a server that misses a round or two,
+/// or a burst of blocks, still leaves it time to run the refresh before the coin expires.
+pub const SCHEDULED_REFRESH_MARGIN: BlockDelta = 72;
+
 /// Refuse an [ArkInfo] whose parameters would make participation unsafe:
 /// `vtxo_lifetime` must leave room to board and broadcast a unilateral exit
 /// before the server-only timeout leaf activates; `vtxo_exit_delta` must keep
@@ -595,6 +605,17 @@ pub struct LightningReceiveBalance {
 	pub total: Amount,
 	/// Sum of all invoices for which we received the HTLC VTXOs
 	pub claimable: Amount,
+}
+
+/// A refresh [Wallet::schedule_refreshes] scheduled with the server.
+#[derive(Debug, Clone)]
+pub struct ScheduledRefresh {
+	/// The block height from which the server runs it
+	pub height: BlockHeight,
+	/// The coins it refreshes
+	pub vtxos: Vec<VtxoId>,
+	/// Their total amount, before the refresh fee
+	pub amount: Amount,
 }
 
 /// The different balances of a Bark wallet.
@@ -2311,14 +2332,94 @@ impl Wallet {
 		).await?))
 	}
 
+	/// The coins whose refresh is scheduled with the server and not yet run, each with the
+	/// height it is scheduled for.
+	pub async fn scheduled_refresh_heights(&self) -> anyhow::Result<HashMap<VtxoId, BlockHeight>> {
+		let mut ret = HashMap::new();
+		for round in self.pending_round_states().await? {
+			if let Some(height) = round.state().scheduled_height() {
+				for input in &round.state().participation().inputs {
+					ret.insert(input.id(), height);
+				}
+			}
+		}
+		Ok(ret)
+	}
+
+	/// Schedules the refresh of every spendable coin that has none scheduled yet, so the
+	/// server renews it whether or not the wallet is online.
+	///
+	/// Each refresh is delegated and scheduled for [SCHEDULED_REFRESH_MARGIN] blocks before
+	/// the coin's expiry, or [Config::vtxo_refresh_expiry_threshold] if that is more (the next
+	/// round, once that height has passed). The server runs it in its first
+	/// round at or after that height; the wallet takes the new coin in at its next sync after
+	/// the round, which may be after the old coin's expiry and has until the new coin's own.
+	/// Coins sharing an expiry are refreshed together, for one base fee. A coin spent before
+	/// its refresh runs drops that refresh on the server, and the next call schedules one for
+	/// what replaced it. A coin too small to pay the refresh fee is left out.
+	///
+	/// While a coin's refresh is scheduled, [Wallet::get_vtxos_to_refresh] leaves it to the
+	/// server, until [SCHEDULED_REFRESH_GRACE] blocks past its height.
+	///
+	/// Returns the refreshes scheduled by this call.
+	pub async fn schedule_refreshes(&self) -> anyhow::Result<Vec<ScheduledRefresh>> {
+		let tip = self.inner.chain.tip().await?;
+		let margin = self.inner.config.vtxo_refresh_expiry_threshold
+			.max(SCHEDULED_REFRESH_MARGIN) as BlockHeight;
+		let mut busy = HashSet::new();
+		for round in self.pending_round_states().await? {
+			busy.extend(round.state().participation().inputs.iter().map(|v| v.id()));
+		}
+
+		let mut by_expiry = std::collections::BTreeMap::<BlockHeight, Vec<WalletVtxo>>::new();
+		for v in self.spendable_vtxos().await? {
+			if busy.contains(&v.id())
+				|| v.vtxo.policy_type() != ark::vtxo::VtxoPolicyKind::Pubkey
+				// the server takes a scheduled input only if it outlives the schedule
+				|| v.expiry_height() <= tip.saturating_add(1)
+			{
+				continue;
+			}
+			by_expiry.entry(v.expiry_height()).or_default().push(v);
+		}
+
+		let mut ret = Vec::new();
+		for (expiry, vtxos) in by_expiry {
+			let height = expiry.saturating_sub(margin).max(tip);
+			let ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
+			let amount = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+			match self.refresh_vtxos_scheduled(vtxos, height).await {
+				Ok(Some(_)) => {
+					info!("Scheduled the refresh of {} VTXO(s) ({}) at height {}",
+						ids.len(), amount, height);
+					ret.push(ScheduledRefresh { height, vtxos: ids, amount });
+				},
+				Ok(None) => {},
+				Err(e) => warn!("Could not schedule the refresh of {:?} at height {}: {:#}",
+					ids, height, e),
+			}
+		}
+		Ok(ret)
+	}
+
 	/// This will find all VTXOs that meets must-refresh criteria. Then, if there are some VTXOs to
 	/// refresh, it will also add those that meet should-refresh criteria.
+	///
+	/// A coin whose refresh is scheduled with the server ([Wallet::schedule_refreshes]) is
+	/// left to it until [SCHEDULED_REFRESH_GRACE] blocks past the scheduled height.
 	pub async fn get_vtxos_to_refresh(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		let vtxos = self.spendable_vtxos_with(&RefreshStrategy::should_refresh_if_must(
+		let tip = self.inner.chain.tip().await?;
+		let scheduled = self.scheduled_refresh_heights().await?;
+		let mut vtxos = self.spendable_vtxos().await?;
+		vtxos.retain(|v| match scheduled.get(&v.id()) {
+			Some(h) => tip >= h.saturating_add(SCHEDULED_REFRESH_GRACE as BlockHeight),
+			None => true,
+		});
+		RefreshStrategy::should_refresh_if_must(
 			self,
-			self.inner.chain.tip().await?,
+			tip,
 			self.inner.chain.fee_rates().await.fast,
-		)).await?;
+		).filter_vtxos(&mut vtxos).await.context("error filtering vtxos")?;
 		Ok(vtxos)
 	}
 

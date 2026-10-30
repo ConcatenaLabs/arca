@@ -62,6 +62,7 @@ dependencies = [
  "js-sys",
  "log",
  "serde_json",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

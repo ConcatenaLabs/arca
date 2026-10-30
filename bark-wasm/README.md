@@ -36,6 +36,18 @@ transaction.
   payments the server holds for the wallet, takes in what is sent to it in the
   ark, follows boards to the chain and refreshes coins in the server's rounds.
 
+## Renewal with the page closed
+
+`schedule_refreshes` hands the server, for every coin that has none yet, a
+delegated refresh scheduled for 72 blocks before the coin's expiry (Bark's
+refresh threshold, if that is more): the server runs it in its first round from
+that height, with the page closed, and the wallet takes the new coin in at its
+next sync, after the old coin's expiry too. Coins sharing an expiry go in one
+refresh, for one base fee. A coin spent before its refresh runs drops it on the
+server, and the next call schedules one for what replaced it. While a refresh
+is scheduled, `refresh` and the daemon leave that coin to the server, until six
+blocks past its height. A page calls it when it opens and after each sync.
+
 ## Commands
 
 `BtcArk.open(network, mnemonic, server, esplora)`, then `run(command, json)`.
@@ -56,18 +68,24 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `receive_status` | `hash`, `claim`?, `wait`? | `state` (`paid` with `preimage`, `waiting`, `unknown`) |
 | `receive_fee` | `sats` | `fee`, `net` |
 | `offboard`, `offboard_fee` | `address` (Bitcoin), `sats` or `all` | `txid` / `fee` |
-| `refresh` | | `refreshed` |
+| `refresh` | | `refreshed` (coins whose refresh is scheduled are left to the server) |
+| `schedule_refreshes` | | `scheduled`: each refresh scheduled now, its `height`, `vtxos` (ids) and `amount` |
 | `sync` | | |
 | `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
 | `history` | | the wallet's movements |
-| `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `state` |
+| `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `refresh_height` (its scheduled refresh, or null), `state` |
 
 `pay` refuses before anything moves when the fee would pass `max_fee_sats` or
 the server's longest lock would pass `max_delay`.
 
 A program that links the wallet natively runs the same commands: build with
 the `native` feature, open the wallet with `arca_bark_wasm::open` and call
-`arca_bark_wasm::run`.
+`arca_bark_wasm::run`. `examples/regtest_drive.rs` does so against the regtest
+ark of `contrib/bitcoin-ark-regtest`, one command a run, the wallet closed
+between runs:
+
+    ARK=… BITCOIND=… COOKIE=… MNEMONIC="…" \
+    cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
 
 ## Build
 

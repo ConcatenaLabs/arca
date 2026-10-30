@@ -1857,12 +1857,36 @@ impl Wallet {
 	}
 
 	/// Balance locked in pending rounds
+	///
+	/// A delegated participation counts only once it holds its inputs, which
+	/// is when the server has issued its round. Until then its inputs are
+	/// still spendable and counted as such; a refresh scheduled for a later
+	/// block would otherwise count the same coins twice until it runs.
 	pub async fn pending_round_balance(&self) -> anyhow::Result<Amount> {
 		let mut ret = Amount::ZERO;
 		for round in self.pending_round_states().await? {
-			ret += round.state().pending_balance();
+			let state = round.state();
+			if matches!(state.flow, RoundFlowState::NonInteractivePending { .. })
+				&& !self.round_holds_inputs(state).await?
+			{
+				continue;
+			}
+			ret += state.pending_balance();
 		}
 		Ok(ret)
+	}
+
+	/// Whether every input of the participation is locked by it.
+	async fn round_holds_inputs(&self, state: &RoundState) -> anyhow::Result<bool> {
+		let holder = state.movement_id.map(|id| VtxoLockHolder::Movement { id });
+		for input in &state.participation.inputs {
+			let v = self.get_vtxo_by_id(input.id()).await
+				.context("unknown round input VTXO")?;
+			if !matches!(&v.state, VtxoState::Locked { holder: h } if *h == holder) {
+				return Ok(false);
+			}
+		}
+		Ok(true)
 	}
 
 	/// Returns all VTXOs that are locked in a pending round
