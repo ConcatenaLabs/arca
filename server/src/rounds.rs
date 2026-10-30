@@ -232,6 +232,25 @@ use elements::Script;
 use sequentia_ext::AssetAmount;
 
 use crate::chain::{ChainEvent, FinalityService};
+
+/// Whether `what` is new for participation `id` under `topic`: a reason a
+/// participation is held is logged when it starts or changes, not on every
+/// pass of the loop that finds it again (one held across a day of rounds
+/// wrote thousands of identical lines).
+fn said_anew(id: &[u8; 32], topic: &'static str, what: &str) -> bool {
+	static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<([u8; 32], &'static str), String>>> = std::sync::OnceLock::new();
+	let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+	if said.len() > 10_000 {
+		said.clear();
+	}
+	match said.get(&(*id, topic)) {
+		Some(w) if w == what => false,
+		_ => {
+			said.insert((*id, topic), what.to_string());
+			true
+		},
+	}
+}
 use crate::coins;
 use crate::fees;
 use crate::nursery::{Nursery, NurseryKind};
@@ -2368,8 +2387,11 @@ impl Rounds {
 					None => "every forfeit of it is whole and every coin it gave up off the chain, so the operator can put its \
 						preimage out at will".to_string(),
 					Some(at) => {
-						log::info!("participation {}: every forfeit of it is whole, but {}: it is released once the watcher has \
-							claimed that coin's forfeit", crate::signer::hex(&id), at);
+						// Said when it starts or its reason changes, not every pass.
+						if said_anew(&id, "held", &at) {
+							log::info!("participation {}: every forfeit of it is whole, but {}: it is released once the watcher has \
+								claimed that coin's forfeit", crate::signer::hex(&id), at);
+						}
 						continue;
 					},
 				}
@@ -2413,11 +2435,9 @@ impl Rounds {
 	/// or another step of its lineage), and where. `None` while every coin it
 	/// gave up is off the chain.
 	async fn coin_on_chain(&self, p: &ParticipationRow) -> Result<Option<String>, RoundError> {
-		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
-		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
 		for i in p.inputs.iter().filter(|i| !i.returned) {
 			let leaf = LeafId(i.leaf_id);
-			let c = match coins::resolve(&self.store, &policy, &leaf).await {
+			let c = match coins::resolve_any_time(&self.store, |t| self.params.taken_policy(t), &leaf).await {
 				Ok(c) => c,
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
 				Err(e) => return Ok(Some(format!("coin {} given up cannot be read ({})", leaf, e))),
@@ -2478,15 +2498,16 @@ impl Rounds {
 	pub async fn exit_deadline_of(&self, id: &[u8; 32]) -> Result<Option<u32>, RoundError> {
 		let Some(p) = self.store.participation(id).await? else { return Ok(None) };
 		// Whatever the time: only the coins' dates are asked for.
-		let any_time = MedianTime::from_consensus(500_000_000).map_err(|e| RoundError::Internal(e.to_string()))?;
-		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(any_time) };
 		let mut earliest: Option<u32> = None;
 		for i in &p.inputs {
-			let c = match coins::resolve(&self.store, &policy, &LeafId(i.leaf_id)).await {
+			let c = match coins::resolve_any_time(&self.store, |t| self.params.taken_policy(t), &LeafId(i.leaf_id)).await {
 				Ok(c) => c,
 				Err(coins::CoinError::Store(e)) => return Err(e.into()),
 				Err(e) => {
-					log::error!("participation {}: coin {} has no date the server can read: {}", crate::signer::hex(id), LeafId(i.leaf_id), e);
+					let why = format!("coin {} has no date the server can read: {}", LeafId(i.leaf_id), e);
+					if said_anew(id, "date", &why) {
+						log::error!("participation {}: {} (said once while it stands)", crate::signer::hex(id), why);
+					}
 					return Ok(None);
 				},
 			};

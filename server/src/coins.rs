@@ -188,6 +188,32 @@ pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u
 	Ok(earliest)
 }
 
+/// The latest time any unroll or exit authorisation in `record`'s lineage
+/// is signed for (0 when it carries none): the earliest median time at which
+/// every one of them is usable. A wallet signs each an hour before the
+/// earlier of its own now and the leaf's first expiry, so this time lies
+/// before each leaf's first expiry.
+pub fn latest_auth_time(record: &CoinRecord) -> u32 {
+	match record {
+		CoinRecord::Leaf { auths, .. } => auths.iter().map(|(_, t)| t.to_consensus_u32()).max().unwrap_or(0),
+		CoinRecord::Accumulator { auth, .. } => auth.1.to_consensus_u32(),
+		_ => record.parents().into_iter().map(latest_auth_time).max().unwrap_or(0),
+	}
+}
+
+/// The coin `id` resolved for its dates alone, whatever the time: under a
+/// now at which every authorisation in its lineage is usable and no expiry
+/// has passed (the latest authorisation's time, and never before the first
+/// median time), with no horizon. A fixed early now refused every round's
+/// leaf, whose authorisations are signed for real times.
+pub async fn resolve_any_time(store: &Store, policy_at: impl Fn(MedianTime) -> WalletPolicy, id: &LeafId) -> Result<Checked, CoinError> {
+	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;
+	let record = CoinRecord::from_bytes(&row.record).map_err(|error| CoinError::InvalidCoin { leaf: *id, error })?;
+	let t = MedianTime::from_consensus(latest_auth_time(&record).max(500_000_000))
+		.map_err(|e| CoinError::Internal(e.to_string()))?;
+	resolve(store, &WalletPolicy { horizon: 0, ..policy_at(t) }, id).await
+}
+
 /// The coin `id`, resolved from its record under `policy`, with nothing
 /// checked of its state or of the chain: what a step already taken for it
 /// is verified again against.
