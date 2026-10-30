@@ -150,6 +150,10 @@ pub enum SpendFrom {
 /// unconfirmed ancestors.
 pub const MAX_PENDING_CHAIN: u32 = 20;
 
+/// How many coins the wallet keeps each asset's pool in, unless configured
+/// otherwise ([`WalletConfig::pool_coins`]).
+pub const POOL_COINS: u32 = 64;
+
 #[derive(Debug, Clone)]
 pub struct WalletConfig {
 	/// The BIP39 mnemonic the wallet's keys come from.
@@ -157,6 +161,15 @@ pub struct WalletConfig {
 	/// The multiple of the node's relay floor the wallet pays.
 	pub fee_multiple: u64,
 	pub spend_from: SpendFrom,
+	/// How many coins the wallet keeps each asset's pool in. A transaction
+	/// spends whole coins and its change is spendable again only once that
+	/// transaction is final, so a pool held in one coin is taken whole by a
+	/// round and holds back every other round of its asset meanwhile. Change
+	/// worth two shares of the pool (its value over this) or more is
+	/// therefore paid as shares, each its own coin, at most this many; and
+	/// every transaction takes the fewest and smallest coins that pay it
+	/// ([`select`]). 0 or 1 keeps change whole.
+	pub pool_coins: u32,
 }
 
 /// What to build.
@@ -365,6 +378,23 @@ impl Wallet {
 		self.build_locked(&[], None, fee_asset, &[], &[], std::slice::from_ref(coin)).await
 	}
 
+	/// How many of the wallet's coins can issue a round's sweep token now:
+	/// spendable, no connector asset's atom, none of `exclude` (an asset the
+	/// round mints), and none whose token names a batch already. A round of
+	/// `n` batches needs `n` of them.
+	pub async fn issuing_coins(&self, exclude: Option<AssetId>) -> Result<usize, WalletError> {
+		let connectors = self.store.connector_assets().await?;
+		let mut coins = vec![];
+		for c in self.store.wallet_coins(None).await? {
+			if !connectors.contains(&c.asset) && !exclude.is_some_and(|x| x.into_inner().to_byte_array() == c.asset) && self.spendable(&c).await? {
+				coins.push(c);
+			}
+		}
+		let named = self.store.tokens_naming_batches(&coins.iter().map(|c| token_of(c).into_inner().to_byte_array()).collect::<Vec<_>>())
+			.await?;
+		Ok(coins.iter().filter(|c| !named.contains(&token_of(c).into_inner().to_byte_array())).count())
+	}
+
 	/// Builds and signs a round transaction that creates `batches` batches.
 	/// The wallet chooses one of its spendable coins per batch, each of which
 	/// issues one explicit atom of a new asset, with a zero contract hash and
@@ -416,10 +446,12 @@ impl Wallet {
 		if coins.len() < batches {
 			return Err(WalletError::TooFewCoins { need: batches, have: coins.len() });
 		}
-		// The fee asset's coins first, the largest first: an issuing coin's
-		// value goes on to pay the round like any other.
+		// The fee asset's coins first, the smallest first: an issuing coin's
+		// value goes on to pay the round like any other, and a large coin
+		// taken only to issue a token would leave the pool's bulk in the
+		// round's change, which no other round spends until it is final.
 		let fee = fee_asset.into_inner().to_byte_array();
-		coins.sort_by(|a, b| (b.asset == fee).cmp(&(a.asset == fee)).then(b.value.cmp(&a.value)).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
+		coins.sort_by(|a, b| (b.asset == fee).cmp(&(a.asset == fee)).then(a.value.cmp(&b.value)).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
 		let issuers: Vec<WalletCoin> = coins.into_iter().take(batches).collect();
 		let tokens: Vec<AssetId> = issuers.iter().map(token_of).collect();
 		let (outputs, made) = make(&tokens).map_err(WalletError::Round)?;
@@ -487,29 +519,56 @@ impl Wallet {
 			available.insert(*a, coins);
 		}
 
+		// The share of each asset's pool its change is paid in: the pool as
+		// it stands before this transaction (every coin of the asset the
+		// wallet has not spent, final or not, and those it spends now) over
+		// the coins it is kept in.
+		let mut shares: BTreeMap<AssetId, u64> = BTreeMap::new();
+		if self.config.pool_coins > 1 {
+			let mut assets: Vec<AssetId> = need.keys().copied().collect();
+			assets.extend(issuers.iter().chain(forced).map(|c| AssetId::from_byte_array(c.asset)));
+			for a in assets {
+				if shares.contains_key(&a) {
+					continue;
+				}
+				let unspent: u64 = self.store.wallet_coins(Some(&a.into_inner().to_byte_array())).await?.iter().map(|c| c.value).sum();
+				shares.insert(a, unspent / self.config.pool_coins as u64);
+			}
+		}
+
 		// Choose coins and size the fee until they agree. A fee is never
 		// zero, so the fee asset always gives at least one coin.
 		let mut fee = self.fee_for(fee_asset, 1).await?;
-		let mut change_scripts: BTreeMap<AssetId, Script> = BTreeMap::new();
+		let mut change_scripts: BTreeMap<(AssetId, u32), Script> = BTreeMap::new();
+		let mut short: Option<WalletError> = None;
 		loop {
 			let mut chosen: Vec<WalletCoin> = issuers.iter().chain(forced).cloned().collect();
 			for (a, amount) in &need {
 				let want = amount + if *a == fee_asset { fee } else { 0 };
-				let mut sum: u64 = issuers.iter().chain(forced).filter(|c| AssetId::from_byte_array(c.asset) == *a).map(|c| c.value).sum();
+				let sum: u64 = issuers.iter().chain(forced).filter(|c| AssetId::from_byte_array(c.asset) == *a).map(|c| c.value).sum();
 				let coins = &available[a];
-				for c in coins {
-					if sum >= want {
+				match select(coins, want.saturating_sub(sum)) {
+					Some(picked) => chosen.extend(picked.into_iter().map(|i| coins[i].clone())),
+					None => {
+						let have = sum + coins.iter().map(|c| c.value).sum::<u64>();
+						short = Some(WalletError::Insufficient { asset: *a, need: want, have });
 						break;
-					}
-					sum += c.value;
-					chosen.push(c.clone());
-				}
-				if sum < want {
-					let have = sum.max(coins.iter().map(|c| c.value).sum());
-					return Err(WalletError::Insufficient { asset: *a, need: want, have });
+					},
 				}
 			}
-			let (tx, paid) = self.assemble(foreign, &chosen, issuers.len(), &outputs, fee_asset, fee, &mut change_scripts).await?;
+			if let Some(e) = short.take() {
+				// Change paid in shares makes a larger transaction: when its
+				// fee is more than the fee asset's coins hold, the change
+				// stays whole instead.
+				if matches!(&e, WalletError::Insufficient { asset, .. } if *asset == fee_asset) && !shares.is_empty() {
+					shares.clear();
+					change_scripts.clear();
+					fee = self.fee_for(fee_asset, 1).await?;
+					continue;
+				}
+				return Err(e);
+			}
+			let (tx, paid) = self.assemble(foreign, &chosen, issuers.len(), &outputs, fee_asset, fee, &shares, &mut change_scripts).await?;
 			let vsize = Self::signed_vsize(&tx, foreign.len());
 			let needed = self.fee_for(fee_asset, vsize).await?;
 			if needed <= paid {
@@ -540,19 +599,20 @@ impl Wallet {
 					prevouts,
 				});
 			}
-			fee = needed;
+			// Never lower, so the choice and the fee settle.
+			fee = needed.max(fee + 1);
 		}
 	}
 
 	/// The unsigned transaction: `foreign` in first, with their witnesses,
 	/// then `coins`, the first `issuing` of them each issuing one atom of its
-	/// token, `outputs`, then change per asset to the wallet's change scripts,
-	/// then the fee output. Change in the fee asset smaller than the fee goes
-	/// to the fee rather than make an output too small to relay. Returns the
-	/// fee it pays.
+	/// token, `outputs`, then change per asset to the wallet's change scripts
+	/// (in the shares of `shares`, [`change_pieces`]), then the fee output.
+	/// Change in the fee asset smaller than the fee goes to the fee rather
+	/// than make an output too small to relay. Returns the fee it pays.
 	#[allow(clippy::too_many_arguments)]
 	async fn assemble(&self, foreign: &[Foreign], coins: &[WalletCoin], issuing: usize, outputs: &[TxOut], fee_asset: AssetId, fee: u64,
-		change_scripts: &mut BTreeMap<AssetId, Script>) -> Result<(Transaction, u64), WalletError>
+		shares: &BTreeMap<AssetId, u64>, change_scripts: &mut BTreeMap<(AssetId, u32), Script>) -> Result<(Transaction, u64), WalletError>
 	{
 		let mut held: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for f in foreign {
@@ -584,15 +644,18 @@ impl Wallet {
 				continue;
 			}
 			if left > 0 {
-				let script = match change_scripts.get(&a) {
-					Some(s) => s.clone(),
-					None => {
-						let s = self.new_script(CHANGE).await?;
-						change_scripts.insert(a, s.clone());
-						s
-					},
-				};
-				all.push(explicit_txout(AssetAmount::new(a, left), script));
+				let pieces = change_pieces(left, shares.get(&a).copied().unwrap_or(0), self.config.pool_coins);
+				for (k, piece) in pieces.into_iter().enumerate() {
+					let script = match change_scripts.get(&(a, k as u32)) {
+						Some(s) => s.clone(),
+						None => {
+							let s = self.new_script(CHANGE).await?;
+							change_scripts.insert((a, k as u32), s.clone());
+							s
+						},
+					};
+					all.push(explicit_txout(AssetAmount::new(a, piece), script));
+				}
 			}
 		}
 		all.push(fee_txout(AssetAmount::new(fee_asset, paid)));
@@ -688,7 +751,9 @@ impl Wallet {
 	/// Builds, with `build`, a transaction of the watcher's whose fee a coin
 	/// of the wallet's pays: the first asset of `assets` the node accepts for
 	/// fees now in which the wallet holds a coin of at least twice the fee
-	/// (its largest), with the change to a new change script. The coin is a
+	/// (the smallest of its pending change that covers the fee four times,
+	/// else the smallest such final coin, else its largest), with the change
+	/// to a new change script. The coin is a
 	/// spendable one, or the change of a transaction of the watcher's the
 	/// nursery holds as pending, resting on fewer than
 	/// [`MAX_PENDING_CHAIN`] of the watcher's transactions waiting for a
@@ -712,20 +777,31 @@ impl Wallet {
 				Err(e) => return Err(e),
 			};
 			let a = asset.into_inner().to_byte_array();
-			let mut coins = vec![];
-			for c in self.store.wallet_coins(Some(&a)).await? {
-				if self.spendable(&c).await? {
-					coins.push(c);
-				}
-			}
+			// The change of its own pending transactions first, which no
+			// round can spend before it is final anyway; then the smallest
+			// final coin that covers the fee twice over, so a fee takes no
+			// more of the pool out of the rounds' reach than it must; the
+			// largest when none does.
+			let mut pending = vec![];
 			for (c, depth) in self.store.pending_change(&a).await? {
-				if depth < MAX_PENDING_CHAIN && !coins.iter().any(|k| (k.txid, k.vout) == (c.txid, c.vout)) {
-					coins.push(c);
+				if depth < MAX_PENDING_CHAIN {
+					pending.push(c);
 				}
 			}
-			coins.sort_by(|a, b| b.value.cmp(&a.value).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
-			let coin = match coins.into_iter().next() {
-				Some(c) => c,
+			let mut finals = vec![];
+			for c in self.store.wallet_coins(Some(&a)).await? {
+				if !pending.iter().any(|k| (k.txid, k.vout) == (c.txid, c.vout)) && self.spendable(&c).await? {
+					finals.push(c);
+				}
+			}
+			let order = |v: &mut Vec<WalletCoin>| v.sort_by(|a, b| a.value.cmp(&b.value).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
+			order(&mut pending);
+			order(&mut finals);
+			let enough = fee.saturating_mul(4);
+			let coin = match pending.iter().find(|c| c.value >= enough).or_else(|| finals.iter().find(|c| c.value >= enough))
+				.or_else(|| pending.iter().chain(&finals).max_by_key(|c| c.value))
+			{
+				Some(c) => c.clone(),
 				None => continue,
 			};
 			let change = self.new_script(CHANGE).await?;
@@ -827,5 +903,79 @@ impl Wallet {
 	/// Where a coin's transaction stands, for reports.
 	pub async fn coin_finality(&self, c: &WalletCoin) -> Result<Finality, WalletError> {
 		self.finality.status(&Txid::from_byte_array(c.txid)).await.map_err(|e| WalletError::Finality(e.to_string()))
+	}
+}
+
+/// The coins of `coins` a transaction takes to pay `need`, as indices: the
+/// smallest coin that pays it alone; else the largest, and so on for what
+/// is left. A transaction then spends no more of the pool than it must, and
+/// the fewest coins when no one coin suffices; every coin it leaves stays
+/// spendable while its change waits to be final. `None` when they hold too
+/// little; nothing for a need of 0.
+pub fn select(coins: &[WalletCoin], need: u64) -> Option<Vec<usize>> {
+	let mut order: Vec<usize> = (0..coins.len()).collect();
+	order.sort_by(|&a, &b| coins[a].value.cmp(&coins[b].value).then(coins[a].txid.cmp(&coins[b].txid)).then(coins[a].vout.cmp(&coins[b].vout)));
+	let mut left = need;
+	let mut picked = vec![];
+	while left > 0 {
+		if let Some(pos) = order.iter().position(|&i| coins[i].value >= left) {
+			picked.push(order.remove(pos));
+			return Some(picked);
+		}
+		let i = order.pop()?;
+		left -= coins[i].value;
+		picked.push(i);
+	}
+	Some(picked)
+}
+
+/// The smallest share change is split into, in atoms: below it a pool is
+/// small enough to keep in one coin, and no share comes near an output too
+/// small to relay.
+pub const MIN_SHARE: u64 = 100_000;
+
+/// The outputs change of `left` atoms is paid in: shares of about `share`
+/// each when it is worth two shares or more, at most `pool_coins` of them,
+/// the first taking what does not divide evenly; else one. A share below
+/// [`MIN_SHARE`] keeps the change whole.
+pub fn change_pieces(left: u64, share: u64, pool_coins: u32) -> Vec<u64> {
+	if share < MIN_SHARE || pool_coins <= 1 || left < share.saturating_mul(2) {
+		return vec![left];
+	}
+	let k = (left / share).min(pool_coins as u64).max(1);
+	let each = left / k;
+	let mut out = vec![each; k as usize];
+	out[0] += left - each * k;
+	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn coin(n: u8, value: u64) -> WalletCoin {
+		WalletCoin { txid: [n; 32], vout: 0, asset: [1; 32], value, script_pubkey: vec![], chain: 1, index: 0, in_chain: true, spent_by: None }
+	}
+
+	#[test]
+	fn the_smallest_coin_that_pays_alone_else_the_largest_first() {
+		let coins = vec![coin(1, 100), coin(2, 5_000), coin(3, 1_000_000), coin(4, 300)];
+		assert_eq!(select(&coins, 250), Some(vec![3]), "300 pays 250 alone");
+		assert_eq!(select(&coins, 4_000), Some(vec![1]), "5,000, not the pool's 1,000,000");
+		assert_eq!(select(&coins, 1_000_000), Some(vec![2]));
+		assert_eq!(select(&coins, 1_004_000), Some(vec![2, 1]), "the largest, then the smallest that pays the rest");
+		assert_eq!(select(&coins, 1_005_401), None);
+		assert_eq!(select(&coins, 0), Some(vec![]));
+	}
+
+	#[test]
+	fn change_is_paid_in_shares_of_the_pool() {
+		assert_eq!(change_pieces(199_000_000, 3_125_000, 64).len(), 63);
+		let p = change_pieces(10_000_001, 2_000_000, 64);
+		assert_eq!((p.len(), p.iter().sum::<u64>()), (5, 10_000_001), "the remainder to the first share: {:?}", p);
+		assert_eq!(change_pieces(3_000_000, 2_000_000, 64), vec![3_000_000], "less than two shares stays whole");
+		assert_eq!(change_pieces(1_000_000_000, 2_000_000, 64).len(), 64, "at most pool_coins shares");
+		assert_eq!(change_pieces(5_000, 1_000, 64), vec![5_000], "a share below MIN_SHARE keeps it whole");
+		assert_eq!(change_pieces(500_000_000, 3_000_000, 1), vec![500_000_000], "pool_coins 1 keeps it whole");
 	}
 }

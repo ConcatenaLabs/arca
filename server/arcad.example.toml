@@ -19,6 +19,11 @@ wallet_mnemonic_file = "/etc/arca/wallet.mnemonic"
 # names for each transaction.
 fee_multiple = 2
 
+# How many coins the wallet keeps each asset's pool in: change worth two
+# shares of the pool or more is paid as shares, so one round never takes the
+# whole pool out of reach while its change waits to be final.
+pool_coins = 64
+
 # The largest request body read, in bytes.
 max_request_bytes = 65536
 
@@ -278,8 +283,18 @@ forfeit_window_seconds = 600
 # as an accumulator when that many exits cost less from one (up to about 78
 # of 1,024). Batches with resting orders or channels, and an issuer-operated
 # asset's batches, are trees. Unset, every batch is a tree.
+#
+# A holder that moves its coins soon after it gets them (a coin it gives up
+# rests on a batch made within holder_window_seconds) has its leaves of a
+# round in a batch of its own, up to holder_batches of them a round, the
+# largest by value first. Such a batch empties together: once its holder
+# refreshes again and releases, the watcher unrolls and reclaims it, and its
+# value is back in the pool long before the batch expires. 0 puts every leaf
+# of an asset in one batch.
 [batches]
 # accumulator_exit_rate_ppm = 10000
+holder_batches = 8
+holder_window_seconds = 259200
 
 # The Lightning gateway beside each asset's own node.
 [lightning]

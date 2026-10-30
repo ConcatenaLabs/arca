@@ -580,3 +580,66 @@ fn coin_of(w: &Arca, leaf: &str) -> Value {
 	w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == json!(leaf)).map(|c| json!({"state": c["state"], "note": c["note"]}))
 		.unwrap_or(Value::Null)
 }
+
+/// A take that gives up a batch leaf: the wallet signs the release of the
+/// leaf's lowest node with its forfeit, before the round goes out, and the
+/// preimage comes back only at a later `sync`. The release reaches the
+/// server then, and the operator can reclaim the node once every owner under
+/// it has moved on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_of_a_batch_leaf_hands_over_its_release() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+	}).await;
+	let x = r.x;
+	let t = holder(&mut r, "RT1", 500_000).await;
+	// The board refreshed into a batch leaf.
+	t.ok(&["participate"]);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && built.len() == 1, "{:?}", failed);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	t.ok(&["sync"]);
+	let leaf = live_of(&t, x);
+	assert_eq!(leaf.len(), 1, "{:?}", leaf);
+	let v: u64 = leaf[0]["value"].as_str().unwrap().parse().unwrap();
+
+	// An order selling Y for X one for one; the take gives the leaf up whole.
+	let o = terms(&r, "maker R", 1, 1, 1);
+	let at = rest(&mut r, &o, 2_000_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let f = served("order-r", &o, &at);
+	let mut amount = v;
+	let mut q = Value::Null;
+	for _ in 0..3 {
+		q = t.ok(&["take", &f, "--amount", &amount.to_string(), "--quote"]);
+		let gives: u64 = q["gives"].as_str().unwrap().parse().unwrap();
+		if gives == v {
+			break;
+		}
+		amount -= gives - v;
+	}
+	assert_eq!(q["gives"].as_str(), Some(v.to_string().as_str()), "{}", q);
+	assert_ne!(q["pays_itself_first"].as_bool(), Some(true), "{}", q);
+	let k = t.ok(&["take", &f, "--amount", &amount.to_string(), "--shown", &q.to_string()]);
+	assert_eq!(k["state"], "pending", "{}", k);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && built.len() == 1, "{:?}", failed);
+	let s = t.ok(&["sync"]);
+	println!("the take's forfeits, before its round goes out: {}", s["participations"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	assert!(r.server.store.batches_with_releases().await.unwrap().is_empty(), "nothing released before the take completes");
+	let s = t.ok(&["sync"]);
+	println!("the take completed: {}", s["participations"]);
+	let released = r.server.store.batches_with_releases().await.unwrap();
+	println!("batches with a release at the server: {:?}", released);
+	assert_eq!(released.len(), 1, "the lowest node of the leaf the take gave up is released");
+}

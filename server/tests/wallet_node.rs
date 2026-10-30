@@ -36,7 +36,7 @@ async fn wallet_without_the_policy_asset() {
 	finality.sync().await.unwrap();
 	let s = keypair("operator");
 	let wallet = Wallet::new(db.store.clone(), finality.clone(), xonly(&s),
-		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final }).unwrap();
+		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap();
 
 	// The wallet is paid X and Y, never the policy asset.
 	let r1 = wallet.receive_script().await.unwrap();

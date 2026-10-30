@@ -47,6 +47,11 @@ pub struct Config {
 	/// The multiple of the node's relay floor the wallet pays.
 	#[serde(default = "default_fee_multiple")]
 	pub fee_multiple: u64,
+	/// How many coins the wallet keeps each asset's pool in: a change worth
+	/// two shares of the pool or more is split into shares
+	/// ([`crate::wallet::WalletConfig::pool_coins`]).
+	#[serde(default = "default_pool_coins")]
+	pub pool_coins: u32,
 	/// The largest request body read, in bytes.
 	#[serde(default = "default_max_request")]
 	pub max_request_bytes: usize,
@@ -117,6 +122,16 @@ pub struct BatchesSection {
 	/// tree.
 	#[serde(default)]
 	pub accumulator_exit_rate_ppm: Option<u32>,
+	/// The most batches of their own a round builds for holders that move
+	/// their coins soon after they get them, so that each empties together
+	/// and comes back early ([`RoundConfig::holder_batches`]); 8 when absent,
+	/// 0 for none.
+	#[serde(default)]
+	pub holder_batches: Option<usize>,
+	/// How young, in seconds, a coin given up must be for its holder to
+	/// count as one that moves its coins soon; three days when absent.
+	#[serde(default)]
+	pub holder_window_seconds: Option<u32>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -518,6 +533,10 @@ pub struct FeesSection {
 
 fn default_fee_multiple() -> u64 {
 	2
+}
+
+fn default_pool_coins() -> u32 {
+	crate::wallet::POOL_COINS
 }
 
 fn default_max_request() -> usize {
@@ -971,7 +990,7 @@ async fn bond_spender(config: &Config) -> Result<(crate::bond::Bond, Arc<Finalit
 	// server's view from the database and takes a fee coin once its block is
 	// in the chain: the operator's own transaction.
 	let wallet = Wallet::new(store, finality.clone(), bond.policy.operator,
-		WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Confirmed }).map_err(err("the wallet"))?;
+		WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Confirmed, pool_coins: config.pool_coins }).map_err(err("the wallet"))?;
 	Ok((bond, finality, wallet))
 }
 
@@ -1569,7 +1588,7 @@ impl Server {
 		let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file)
 			.map_err(err("wallet_mnemonic_file"))?.trim().to_string();
 		let wallet = Arc::new(Wallet::new(store.clone(), finality.clone(), operator,
-			WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Final })
+			WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Final, pool_coins: config.pool_coins })
 			.map_err(err("the wallet"))?);
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),
@@ -1580,7 +1599,12 @@ impl Server {
 		let plans = crate::plans::Plans::new(store.clone(), finality.clone(), params.clone(), signer.clone(), wallet.clone());
 		let orders = crate::orders::Orders::new(store.clone(), finality.clone(), params.clone(), signer.clone());
 		let rounds = Rounds::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer.clone(),
-			RoundConfig { accumulator_exit_rate_ppm: config.batches.accumulator_exit_rate_ppm, ..RoundConfig::default() });
+			RoundConfig {
+				accumulator_exit_rate_ppm: config.batches.accumulator_exit_rate_ppm,
+				holder_batches: config.batches.holder_batches.unwrap_or(RoundConfig::default().holder_batches),
+				holder_window: config.batches.holder_window_seconds.unwrap_or(RoundConfig::default().holder_window),
+				..RoundConfig::default()
+			});
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {
