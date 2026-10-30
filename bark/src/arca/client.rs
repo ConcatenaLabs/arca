@@ -354,11 +354,18 @@ pub const LEAF_DATA_PAGES: usize = 1_000;
 /// thousand messages. The rest is read by the next.
 pub const MAILBOX_PAGES: usize = 100;
 
+/// How long an answer of the server's `info` serves the calls after it: a
+/// burst of commands (a quote runs several, each reading the server's terms)
+/// asks once, so a wallet on a slow or far link pays one round trip, not one a
+/// command. The server checks its own terms again on every request that acts.
+pub const INFO_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The server, at its base URL.
 #[derive(Debug, Clone)]
 pub struct ServerClient {
 	base: String,
 	timeout: u64,
+	info: std::sync::Arc<std::sync::Mutex<Option<(web_time::Instant, Value)>>>,
 }
 
 impl ServerClient {
@@ -370,7 +377,7 @@ impl ServerClient {
 		// more than one; one already installed is kept.
 		#[cfg(feature = "arca")]
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60 })
+		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60, info: Default::default() })
 	}
 
 	pub fn base(&self) -> &str {
@@ -441,8 +448,16 @@ impl ServerClient {
 		Self::answer(call, self.send("POST", call, Some(body)))
 	}
 
+	/// The server's `info`, read again once [`INFO_FOR`] has passed.
 	pub fn info(&self) -> Result<Value, Error> {
-		self.get("info")
+		if let Some((at, v)) = self.info.lock().expect("the info memo").as_ref() {
+			if at.elapsed() < INFO_FOR {
+				return Ok(v.clone());
+			}
+		}
+		let v = self.get("info")?;
+		*self.info.lock().expect("the info memo") = Some((web_time::Instant::now(), v.clone()));
+		Ok(v)
 	}
 
 	pub fn operator_nonce(&self) -> Result<[u8; 32], Error> {
