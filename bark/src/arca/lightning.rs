@@ -812,6 +812,14 @@ impl Wallet {
 	/// seconds of median time to its home date (the latest moment it must
 	/// start home to be claimed); `Err` when it never will be.
 	pub(crate) fn received_held(&self, hash: &str) -> Result<Result<(AssetId, u64, u64), String>, Error> {
+		self.received_held_as(hash, true).map(|r| r.map(|(a, v, h, _)| (a, v, h)))
+	}
+
+	/// [`Self::received_held`], and with `require_final` false, a leaf whose
+	/// round is not final yet but whose every base the node holds, in a block
+	/// or its mempool, passes too, every other check made as for one held for
+	/// good; the last field says whether it is final.
+	pub(crate) fn received_held_as(&self, hash: &str, require_final: bool) -> Result<Result<(AssetId, u64, u64, bool), String>, Error> {
 		let r = self.receives()?.get(hash).cloned()
 			.ok_or_else(|| Error::Refused(format!("the wallet receives nothing under hash {}", hash)))?;
 		if r["state"] != "issuing" {
@@ -826,8 +834,12 @@ impl Wallet {
 			return Err(Error::Refused(format!("the received leaf is {}", row.state)));
 		}
 		let (_, a) = self.held(&row)?;
-		if !a.all_final() {
+		let is_final = a.all_final();
+		if !is_final && require_final {
 			return Ok(Err(format!("the received leaf's round is not final: {}", a.waiting())));
+		}
+		if !is_final && a.bases.iter().any(|(_, f)| matches!(f, super::chain::Finality::NotInChain { in_mempool: false })) {
+			return Ok(Err(format!("the received leaf's round is in no block and not in the mempool: {}", a.waiting())));
 		}
 		let coin = a.valid;
 		let t = coin.leaf.htlc.ok_or_else(|| Error::Refused("the received leaf is no htlc-1 leaf".into()))?;
@@ -847,7 +859,7 @@ impl Wallet {
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
 		let (home_at, _) = self.receive_home(&coin, &a.bases, t.timeout.to_consensus_u32() as u64, block)?;
 		let median = self.now()?.to_consensus_u32() as u64;
-		Ok(Ok((coin.asset, coin.value, home_at.saturating_sub(median))))
+		Ok(Ok((coin.asset, coin.value, home_at.saturating_sub(median), is_final)))
 	}
 
 	/// Whether the wallet may hand over the price of the preimage of `hash`
@@ -855,14 +867,18 @@ impl Wallet {
 	/// it receives under it held for good ([`Self::received_held`]), with
 	/// its home date at least `need` seconds away, the time the other side
 	/// can take to reveal the preimage and the wallet to claim with it.
-	/// `{"ready": true, "home_in"}` when it may; `{"ready": false, "why"}`
-	/// while it may not yet; refused when it never will.
-	pub fn lightning_receive_ready(&self, hash: &str, need: u64) -> Result<Value, Error> {
-		match self.received_held(hash)? {
+	/// `{"ready": true, "home_in", "final"}` when it may; `{"ready": false,
+	/// "why"}` while it may not yet; refused when it never will. With
+	/// `require_final` false a leaf whose round the node holds and is not
+	/// final yet is ready too (`"final": false`): a holder that takes the
+	/// risk of that round never becoming final (a market maker paying the
+	/// other side at once, within limits of its own) asks so.
+	pub fn lightning_receive_ready(&self, hash: &str, need: u64, require_final: bool) -> Result<Value, Error> {
+		match self.received_held_as(hash, require_final)? {
 			Err(why) => Ok(json!({"payment_hash": hash, "ready": false, "why": why})),
-			Ok((asset, value, home_in)) if home_in >= need => Ok(json!({"payment_hash": hash, "ready": true, "asset": asset.to_string(),
-				"value": value.to_string(), "home_in": home_in})),
-			Ok((_, _, home_in)) => Err(Error::Refused(format!("the leaf received under hash {} must start home in {} s, and the other \
+			Ok((asset, value, home_in, is_final)) if home_in >= need => Ok(json!({"payment_hash": hash, "ready": true, "asset": asset.to_string(),
+				"value": value.to_string(), "home_in": home_in, "final": is_final})),
+			Ok((_, _, home_in, _)) => Err(Error::Refused(format!("the leaf received under hash {} must start home in {} s, and the other \
 				side can take {} s: nothing is to be handed over for it", hash, home_in, need))),
 		}
 	}

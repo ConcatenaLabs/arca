@@ -178,10 +178,23 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	let not_yet = ok(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 600}));
 	println!("LC before the round: {}", not_yet);
 	assert_eq!(not_yet["ready"], false);
-	leaf_round(&r).await;
+	// The round in a block, not final yet: not held for good, but ready for a
+	// holder that takes that round's risk itself (`final: false`).
+	let built = r.server.rounds.run_round_of(r.x).await.unwrap().expect("a round");
+	r.produce().await;
+	r.synced().await;
+	ok(&q, "sync", json!({}));
+	let strict = ok(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 600}));
+	let early = ok(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 600, "final": false}));
+	println!("LC the round in a block: {} | not final accepted: {}", strict, early);
+	assert_eq!(strict["ready"], false, "{}", strict);
+	assert_eq!((early["ready"].as_bool(), early["final"].as_bool(), early["value"].as_str()), (Some(true), Some(false), rq["value"].as_str()), "{}", early);
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
 	r.synced().await;
 	ok(&q, "sync", json!({}));
 	let ready = ok(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 600}));
+	assert_eq!(ready["final"].as_bool(), Some(true), "{}", ready);
 	println!("LC after the round: {}", ready);
 	assert_eq!((ready["ready"].as_bool(), ready["value"].as_str()), (Some(true), rq["value"].as_str()));
 	let e = library(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 10_000_000})).unwrap_err();

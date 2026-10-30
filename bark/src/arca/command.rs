@@ -37,7 +37,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?}, lightning_pay {invoice, \
 	asset?, max_fee_ppm?, timeout?, shown?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
-	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
+	need_seconds, final?}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
@@ -409,7 +409,8 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"lightning_receive_preimage" => w.lightning_receive_preimage(&req_str(&a["hash"], "the hash")?.to_lowercase(),
 			&super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
 		"lightning_receive_ready" => w.lightning_receive_ready(&req_str(&a["hash"], "the hash")?.to_lowercase(),
-			opt_u64(&a["need_seconds"], "the seconds needed")?.ok_or_else(|| Error::Parse("the seconds needed are missing".into()))?),
+			opt_u64(&a["need_seconds"], "the seconds needed")?.ok_or_else(|| Error::Parse("the seconds needed are missing".into()))?,
+			a["final"].as_bool().unwrap_or(true)),
 		"lightning_receives" => w.lightning_receives(),
 		"lightning_lookup" => w.lightning_lookup(&super::chain::hex(&super::chain::unhex32(req_str(&a["hash"], "the hash")?)?)),
 		"lightning_post_preimage" => w.lightning_post_preimage(&req_str(&a["hash"], "the hash")?.to_lowercase(),

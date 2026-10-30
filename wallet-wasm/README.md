@@ -127,7 +127,7 @@ asset?, max_fee_ppm?, timeout?, shown?}`, `lightning_payments`,
 `lightning_receive_quote {asset, amount, max_fee_ppm?}`, `lightning_receive
 {asset, amount, description?, max_fee_ppm?, hash?}`,
 `lightning_receive_preimage {hash, preimage}`, `lightning_receive_ready {hash,
-need_seconds}`, `lightning_receives`, `lightning_lookup {hash}`,
+need_seconds, final?}`, `lightning_receives`, `lightning_lookup {hash}`,
 `lightning_post_preimage {hash, preimage}`); the offline-refresh plans (`plan_quote`, `plan`,
 `plans`, `plan_cancel`, `plan_release {leaves, max_fee_ppm?}`), which a page shows only in developer mode; the operator's equivocation bond (`bond`, `bond_evidence`,
 `watch_bond {evidence?, fee_asset?}`, the CLI README's "Watching the operator's bond"), whose check `receive` and the swaps run by
@@ -184,7 +184,10 @@ else's) is claimed only once `lightning_receive_preimage` hands the preimage
 over; `lightning_receive_ready` says when its leaf is held for good enough to
 pay that preimage's price: validated, its round final, and its home date at
 least `need_seconds` away (the time the other side may take to reveal the
-preimage, and the wallet to claim with it). `sync` moves every payment and
+preimage, and the wallet to claim with it). With `final: false` a leaf whose round the
+node holds, in a block or its mempool, and is not final yet answers ready too, with
+`final: false`: for a holder that takes the risk of that round never becoming final, a
+market maker paying its other side at once within limits of its own. `sync` moves every payment and
 receive on. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
