@@ -274,7 +274,21 @@ Fund `w-mine` (`$A --datadir ~/w-mine address`), board it
     $A --datadir ~/w-mine lightning pay <invoice> --wait 60      # paid: through this gateway to theirs
     $A --datadir ~/w-theirs sync                                 # the leaf, claimed
 
-and back, the other way round. On Bitcoin, each wallet joins its operator's
+and back, the other way round.
+
+**What a payment between operators can lock.** An operator's invoice for a
+payment into its tree carries a final lock of about 5,790 blocks (four days at
+a minute a block) at the specification's exit delays, so the paying operator
+must let a payment out of its tree stay unresolved that long: the bundle sets
+`ARCA_SEND_TIMEOUT` to nine days. That costs nothing while payments settle,
+as they do in seconds. A payment that gets stuck on its way (a gateway that
+holds the HTLC and never answers) keeps the payer's coins until its timeout,
+up to eighteen days, and then they come back to the payer; meanwhile the
+payer's wallet shows the payment `paying`, never `failed`, since it follows
+what the operator says. Bitcoin is the same in miniature: a Bark ark lets a
+payment lock up to 258 blocks, which another ark's 184-block invoice needs.
+
+On Bitcoin, each wallet joins its operator's
 Bitcoin ark and pays the other's invoice:
 
     BCOOKIE=/var/lib/arca-bundle/bitcoin/testnet4/.cookie

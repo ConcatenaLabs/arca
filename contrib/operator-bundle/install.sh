@@ -52,7 +52,7 @@ fi
 # shellcheck disable=SC1091
 . "$HERE/pins.env"
 : "${NAME:=arca-bundle}" "${SEQ_CHAIN:=test}" "${BTC_CHAIN:=testnet4}" "${BUILD_JOBS:=2}"
-: "${ARCA_ASSETS:=}" "${ARCA_FEE_ASSETS:=}" "${ARCA_EXIT_DELAY_UNITS:=254 338}" "${ARCA_ROUND_INTERVAL:=60}" "${ARCA_SEND_TIMEOUT:=345600}"
+: "${ARCA_ASSETS:=}" "${ARCA_FEE_ASSETS:=}" "${ARCA_EXIT_DELAY_UNITS:=254 338}" "${ARCA_ROUND_INTERVAL:=60}" "${ARCA_SEND_TIMEOUT:=777600}"
 : "${DOMAIN:=}" "${CONTACT_NAME:=}" "${CONTACT_EMAIL:=}" "${REGISTRY_URL:=https://sequentiatestnet.com/registry}"
 : "${PEER_ARCA_URL:=}" "${PEER_HOST:=}" "${PEER_SEQLN_PORT:=19850}" "${PEER_BTC_LN_PORT:=19746}"
 : "${CHANNEL_ATOMS:=2000000000}" "${CHANNEL_SAT:=1000000}" "${PEER_SEQLN_ID:=}" "${PEER_BTC_LN_ID:=}"
@@ -65,7 +65,7 @@ fi
 : "${SEQ_CHAIN_CONF:=}" "${SEQ_ADDNODE:=}" "${BTC_ADDNODE:=}" "${SEQ_ANCHOR_RPC:=}" "${SEQ_ANCHOR_AUTH:=}"
 : "${SEQLN_NETWORK:=}" "${BTC_FEE_FLOOR:=30}" "${ARCA_ANCHOR_DEPTH:=2}"
 # Limits on everything the bundle runs together (a systemd slice): empty for none.
-: "${BUNDLE_MEMORY_MAX:=}" "${BUNDLE_CPU_QUOTA:=}"
+: "${BUNDLE_MEMORY_MAX:=}" "${BUNDLE_CPU_QUOTA:=}" "${ARK_VTXO_POOL:=10000sat:10 50000sat:2}"
 
 case "$NAME" in *[!a-z0-9-]*|"") die "NAME is lower-case letters, digits and dashes: $NAME";; esac
 USER_=$NAME
@@ -803,7 +803,7 @@ ppm_expiry_table = [
 ]
 
 [vtxopool]
-vtxo_targets = [ "10000sat:20", "100000sat:10" ]
+vtxo_targets = [ $(for t in $ARK_VTXO_POOL; do printf '"%s", ' "$t"; done | sed 's/, $//') ]
 vtxo_target_issue_threshold = 80
 vtxo_lifetime = 432
 vtxo_pre_expiry = 144
@@ -900,6 +900,11 @@ offboard_ppm = 0
 trusted_proxies = ["127.0.0.1", "::1"]
 
 [lightning]
+# Another operator's invoice for a payment into its tree locks the payment for
+# about 5,790 blocks at the specification's exit delays, which takes a
+# timeout of about nine days to pay. It binds only a payment that is never
+# settled: its coins come back to the payer after the timeout (up to twice
+# it), and the payer's wallet shows the payment "paying" until then.
 send_timeout_seconds = $ARCA_SEND_TIMEOUT
 receive_cap_ppm = 100000
 
