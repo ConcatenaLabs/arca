@@ -185,10 +185,10 @@ is never drawn twice, and a daemon restarts only when its binary or its
 configuration changed. `install.sh build` does only the downloads and the
 builds.
 
-While the Bitcoin node is still syncing testnet4 it stops after the gateways,
+While the chains are still syncing it stops before the gateways,
 saying how far the sync is: everything started runs on and keeps syncing, and
-the same command, run again once it has caught up, starts Bark's server, its
-watchman and arcad.
+the same command, run again once both have caught up, starts the gateways,
+Bark's server, its watchman and arcad.
 
 **Check:** it ends with `every unit is running`, and
 

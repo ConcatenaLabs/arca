@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 ARCA_SRC=$(cd "$HERE/../.." && pwd)
 BUNDLE_ENV=${BUNDLE_ENV:-/etc/arca-bundle/bundle.env}
 CMD=${1:-install}
@@ -133,6 +133,13 @@ channel_atoms() {   # the channel size for asset $1
 # ===========================================================================================
 # What the native installer and the containers (docker/bundle-run) share: the keys, and
 # every daemon's configuration, written from the settings.
+# write_conf <unit word> <mode> <file>: stdin is the content; a changed file marks its unit.
+write_conf() {
+  local t; t=$(mktemp); cat > "$t"
+  if [ -f "$3" ] && cmp -s "$t" "$3"; then rm -f "$t"; return 0; fi
+  install -m "$2" -o "$USER_" -g "$USER_" "$t" "$3"; rm -f "$t"; changed+=" $1"
+}
+
 draw_keys() {
 step "keys and passwords, drawn here (made once, never replaced)"
 umask 077
@@ -175,12 +182,6 @@ PY
 write_configs() {
 step "configuration"
 changed=""
-# write_conf <unit word> <mode> <file>: stdin is the content; a changed file marks its unit.
-write_conf() {
-  local t; t=$(mktemp); cat > "$t"
-  if [ -f "$3" ] && cmp -s "$t" "$3"; then rm -f "$t"; return 0; fi
-  install -m "$2" -o "$USER_" -g "$USER_" "$t" "$3"; rm -f "$t"; changed+=" $1"
-}
 # An rpcauth line is drawn with a fresh salt, so it is written once and kept.
 for n in seq btc; do
   if [ ! -s "$ETC/$n-rpcauth" ] || [ "$(cut -d: -f1 "$ETC/$n-rpcauth")" != "$NAME" ]; then rpcauth "$NAME" "$ETC/$n-rpc.password" > "$ETC/$n-rpcauth"; chmod 640 "$ETC/$n-rpcauth"; chgrp "$USER_" "$ETC/$n-rpcauth"; fi
@@ -464,6 +465,7 @@ EOF
 }
 
 write_arcad_toml() {
+ark_url="http://127.0.0.1:$CAPTAIND_PORT"; [ -n "$DOMAIN" ] && ark_url="https://$DOMAIN"
 assets_toml=""; fee_assets=""
 rates=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}')
 for id in "${ASSET_IDS[@]}"; do
@@ -932,6 +934,18 @@ restart_if arca-signer arca-signer
 WAIT_UNIT=$(U arca-signer) wait_for 60 "the signer's socket" test -S "/run/$NAME/signer.sock"
 say "operator key $OPERATOR_KEY"
 
+x=$(btc_cli getblockchaininfo); y=$(seq_cli getblockchaininfo)
+if [ "$(jq -r '.initialblockdownload' <<<"$x")" = true ] || [ "$(jq -r '.initialblockdownload' <<<"$y")" = true ]; then
+  # The Sequentia node checks every block's anchor against this Bitcoin node,
+  # so it takes no block (not even a header) anchored above what that node
+  # has: it waits for it. The gateways, Bark's server, its watchman and arcad
+  # want their chains caught up, so they start once both are.
+  for u in seqln cln captaind watchmand arcad; do systemctl stop "$(U "$u")" 2>/dev/null || true; done
+  printf '\nThe chains are still syncing: Bitcoin %s of %s blocks, Sequentia %s of %s (it waits for the\nBitcoin node, whose blocks its anchors name). The nodes run on and keep syncing; run\n%s again once both have caught up (%s status shows how far they are), to\nstart the gateways, Bark'"'"'s server, its watchman and arcad.\n' \
+    "$(jq -r .blocks <<<"$x")" "$(jq -r .headers <<<"$x")" "$(jq -r .blocks <<<"$y")" "$(jq -r .headers <<<"$y")" "$0" "$0"
+  exit 0
+fi
+
 step "the gateways"
 restart_if seqln lightningd
 WAIT_UNIT=$(U seqln) wait_for 600 "SeqLN answering" seqln getinfo
@@ -942,16 +956,6 @@ for f in ca.pem client.pem client-key.pem hold/ca.pem hold/client.pem hold/clien
 done
 say "SeqLN $(seqln getinfo | jq -r '.id + " on " + .network'), port $SEQLN_PORT"
 say "Core Lightning $(cln getinfo | jq -r '.id + " on " + .network'), port $CLN_PORT"
-
-x=$(btc_cli getblockchaininfo)
-if [ "$(jq -r '.initialblockdownload' <<<"$x")" = true ]; then
-  # Bark's server, its watchman and arcad want their chains caught up: the
-  # Sequentia node checks every anchor against this Bitcoin node, so it waits
-  # for it too.
-  printf '\nThe Bitcoin node is still syncing (%s of %s blocks). Everything above runs and\nkeeps syncing; run %s again once it has caught up, to start\nBark'"'"'s server, its watchman and arcad (%s status shows how far it is).\n' \
-    "$(jq -r .blocks <<<"$x")" "$(jq -r .headers <<<"$x")" "$0" "$0"
-  exit 0
-fi
 
 step "Bark's server and watchman"
 ark_url="http://127.0.0.1:$CAPTAIND_PORT"; [ -n "$DOMAIN" ] && ark_url="https://$DOMAIN"
@@ -1052,12 +1056,16 @@ EOF
 
 # ===========================================================================================
 status() {
+  if ! command -v systemctl >/dev/null; then
+    step "containers"; say "each daemon runs in a container of its own: docker compose ps"
+  else
   step "units"
   for u in $UNITS caddy; do
     [ -f "/etc/systemd/system/$(U "$u")" ] || continue
     printf '  %-28s %s\n' "$(U "$u")" "$(systemctl is-active "$(U "$u")" || true)"
   done
   printf '  %-28s %s\n' "$PG_UNIT" "$(systemctl is-active "$PG_UNIT" || true)"
+  fi
   step "chains"
   say "Bitcoin:   $(btc_cli getblockchaininfo 2>/dev/null | jq -r '"\(.chain) \(.blocks)/\(.headers) blocks, \(.verificationprogress * 100 | floor)% verified"' || echo 'not answering')"
   say "Sequentia: $(seq_cli getblockchaininfo 2>/dev/null | jq -r '"\(.chain) \(.blocks)/\(.headers) blocks"' || echo 'not answering'), $(seq_cli getconnectioncount 2>/dev/null || echo 0) peers"
