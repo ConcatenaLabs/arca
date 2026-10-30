@@ -7134,6 +7134,12 @@ async fn lineage_on_chain_read(r: &mut Running, tag: &str, payments: usize, read
 	OnChainLineage { s, so, t, p, c1, outs, first }
 }
 
+/// P's coin as its first read names it: taken, waiting or refused.
+fn first_coin(m: &Value) -> String {
+	["accepted", "waiting", "refused"].iter().flat_map(|k| m[*k].as_array().cloned().unwrap_or_default())
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).next().unwrap_or_else(|| panic!("P read its coin: {}", m))
+}
+
 fn waiting_ids(m: &Value) -> Vec<String> {
 	m["waiting"].as_array().cloned().unwrap_or_default().iter().map(|w| w["leaf_id"].as_str().unwrap().to_string()).collect()
 }
@@ -7335,15 +7341,13 @@ async fn pv1_holds_after_an_anchor_rollback_the_exit_publishes_the_path_again() 
 	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
 	let x = r.x;
 	let l = lineage_on_chain(&mut r, "PV1D", 1).await;
-	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let coin = first_coin(&l.first);
 	let p_r = own_anchor(&r).await;
 	l.s.ok(&["sync"]);
 	r.produce().await;
 	let m = l.p.ok(&["mailbox"]);
 	println!("PV1D P reads with its coin's output in a block anchored to parent block {}: {}", p_r, m);
-	let got = m["accepted"].as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned()
-		.unwrap_or_else(|| panic!("not taken: {}", m));
-	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting", "{}", got);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting", "the coin is taken: {}", m);
 	let found = rpc(&r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(l.outs[0].script_pubkey.as_bytes()))])]);
 	assert_eq!(found["unspents"].as_array().unwrap().len(), 1, "P's output is in the chain: {}", found);
 
@@ -7395,12 +7399,12 @@ async fn pv1_residual_a_coin_taken_from_a_block_not_final_is_lost_to_an_anchor_r
 	let mut r = Running::start_with(|c, _, _| c.watcher.enabled = false).await;
 	let x = r.x;
 	let l = lineage_on_chain(&mut r, "PV1E", 1).await;
-	let coin = waiting_ids(&l.first).pop().unwrap_or_else(|| panic!("P's coin waits: {}", l.first));
+	let coin = first_coin(&l.first);
 	let p_r = own_anchor(&r).await;
 	l.s.ok(&["sync"]);
 	r.produce().await;
 	let m = l.p.ok(&["mailbox"]);
-	assert!(m["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == coin.as_str()), "{}", m);
+	assert_eq!(coin_of(&l.p, &coin)["state"], "exiting", "the coin is taken: {}", m);
 	let bal = l.p.ok(&["balance"]);
 	println!("PV1E P's balance with its output in a block not final: {}", bal["arca"]);
 	assert_eq!(bal["arca"][x.to_string()]["exiting"], json!("400000"));
