@@ -2858,6 +2858,17 @@ signer signs every input.
   output paying it in any block the server connects after that is a coin.
   The wallet knows the scripts it handed out, and no others: a coin paid to a
   key of the mnemonic it never handed out is not found.
+- **Withdrawing.** `arcad <config> withdraw <asset> <atoms> <address> [<fee
+  asset>]` pays `atoms` of `asset` from the wallet to an unconfidential
+  `address`, its fee in the fee asset (the asset itself when none is named),
+  and prints the transaction as JSON: what returns a pool grown past its need
+  to the treasury that funded it. It spends final coins only, as a round
+  does, and never more than the wallet can spend now less what it owes for
+  swept coins (`fundable` in `/v1/info`), so no coin a holder is owed leaves;
+  more is refused before anything is built. The coins it takes are marked
+  spent in the database all or none, so it runs beside the server: a round
+  never takes them, and it never takes a round's. It needs the database, the
+  mnemonic file, the node and the signer.
 - **Coins per asset, explicit only.** The wallet finds its coins as the
   finality service connects blocks: each explicit output paying one of its
   scripts is a coin of that asset. An output paying it that hides its asset or
