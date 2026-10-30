@@ -2015,8 +2015,11 @@ impl Wallet {
 	/// Whether a coin in `state` is one the wallet may still hold off the
 	/// chain, and so brings home when it cannot have it refreshed.
 	fn homeward(state: &str) -> bool {
-		matches!(state, "live" | "pending" | "given" | "forfeited" | "offered" | "sending" | "paying" | "receiving")
+		Self::HOMEWARD.contains(&state)
 	}
+
+	/// The states of a coin the wallet still has to bring home or spend ([`Self::homeward`]).
+	pub(crate) const HOMEWARD: &'static [&'static str] = &["live", "pending", "given", "forfeited", "offered", "sending", "paying", "receiving"];
 
 	/// The coins the wallet holds live whose latest refresh the operator
 	/// refused: given in a participation it refused, voided or let expire,
@@ -2496,7 +2499,8 @@ impl Wallet {
 		// status or with no earlier re-check, every coin is.
 		let grown = last_h.is_some() && !reorg && self.store.meta("tip_anchors")?.as_deref() == Some(anchors.as_str());
 		let now_s = tip.median_time;
-		let coins = self.store.coins()?;
+		// Only the coins the checks below can concern (a spent coin's record is never read).
+		let coins = self.store.coins_in_states(Self::HOMEWARD)?;
 		let moved = if grown { self.coins_with_moved_roots(&coins.iter().filter(|c| c.state == "live").cloned().collect::<Vec<_>>())? } else { BTreeSet::new() };
 		let settled = |c: &CoinRow| grown && c.state == "live" && !moved.contains(&c.leaf_id)
 			&& (now_s as u64) + WalletPolicy::EXIT_DEADLINE as u64 + 600 < c.expiry as u64;
@@ -2524,7 +2528,7 @@ impl Wallet {
 		self.chain.read_ahead_of(&bases, &outpoints);
 		let skip: BTreeSet<String> = coins.iter().filter(|c| settled(c)).map(|c| c.leaf_id.clone()).collect();
 		let now = MedianTime::from_consensus(tip.median_time).map_err(|e| Error::Node(e.to_string()))?;
-		let before: BTreeMap<String, String> = self.store.coins()?.into_iter().map(|c| (c.leaf_id, c.state)).collect();
+		let before: BTreeMap<String, String> = self.store.coin_states()?;
 		// A step of an offline-refresh plan the wallet took up whose round can
 		// never return did not happen: the coin it gave up is the wallet's
 		// again, and is checked with the others below.
@@ -2537,7 +2541,13 @@ impl Wallet {
 		let mut at = phase;
 		let mut changes = self.plan_rounds_gone()?;
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
-		for c in self.store.coins()? {
+		let mut checked = self.store.coins_in_states(&["pending", "live"])?;
+		for id in &revived {
+			if !checked.iter().any(|c| &c.leaf_id == id) {
+				checked.extend(self.store.coin(id)?);
+			}
+		}
+		for c in checked {
 			if !matches!(c.state.as_str(), "pending" | "live") && !revived.contains(&c.leaf_id) {
 				continue;
 			}
@@ -2639,10 +2649,7 @@ impl Wallet {
 	/// is taken on-chain at once, as the complete re-check takes it.
 	pub(crate) fn recheck_lineages(&mut self) -> Result<Value, Error> {
 		let mut outpoints = vec![];
-		for c in self.store.coins()? {
-			if !Self::homeward(&c.state) {
-				continue;
-			}
+		for c in self.store.coins_in_states(Self::HOMEWARD)? {
 			for t in c.bases.iter().filter_map(|t| Txid::from_str(t).ok()) {
 				if let Some(tx) = self.store.tx(&t.to_string())?.and_then(|raw| elements::encode::deserialize::<Transaction>(&raw).ok()) {
 					if tx.output.len() <= 4 {
@@ -2736,7 +2743,7 @@ impl Wallet {
 	/// any exit delay runs out. One look at the chain covers every coin.
 	fn watch_lineages(&mut self) -> Result<Vec<Value>, Error> {
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
-		let coins: Vec<CoinRow> = self.store.coins()?.into_iter().filter(|c| Self::homeward(&c.state)).collect();
+		let coins: Vec<CoinRow> = self.store.coins_in_states(Self::HOMEWARD)?;
 		// Everything this watch looks for (a leaf or checkpoint of a coin's
 		// lineage, its own leaf, a board it rests on spent) is made only by
 		// spends that start at an output the coin descends from: a coin whose

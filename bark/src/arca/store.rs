@@ -41,6 +41,7 @@
 //!
 //! The mnemonic is not here; it is the `mnemonic` file beside the database.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS coin (
 	spent_by TEXT,
 	created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS coin_state ON coin(state);
 CREATE TABLE IF NOT EXISTS tx (txid TEXT PRIMARY KEY, raw BLOB NOT NULL, role TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS participation (
 	id TEXT PRIMARY KEY,
@@ -267,7 +269,10 @@ impl Store {
 	/// program that opens the file itself, as a browser worker does on its
 	/// own storage, hands the connection here.
 	pub fn open_connection(conn: Connection) -> Result<Store, Error> {
-		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;").map_err(db)?;
+		// A page cache of 32 MiB (the default is 2 MiB): a wallet's commands read its coins again and
+		// again, and in a browser worker every page missing from the cache is a read through script.
+		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA cache_size = -32768;")
+			.map_err(db)?;
 		conn.execute_batch(SCHEMA).map_err(db)?;
 		let mut store = Store { conn };
 		store.add_column("participation", "news", "TEXT")?;
@@ -535,8 +540,30 @@ impl Store {
 		Ok(())
 	}
 
+	/// The coins in `state`, in the order [`Self::coins`] gives: read by the
+	/// state's index, so the coins a wallet spent long ago, and their
+	/// records, are not read at all.
 	pub fn coins_in(&self, state: &str) -> Result<Vec<CoinRow>, Error> {
-		Ok(self.coins()?.into_iter().filter(|c| c.state == state).collect())
+		self.coins_in_states(&[state])
+	}
+
+	/// The coins in any of `states`, in the order [`Self::coins`] gives.
+	pub fn coins_in_states(&self, states: &[&str]) -> Result<Vec<CoinRow>, Error> {
+		if states.is_empty() {
+			return Ok(vec![]);
+		}
+		let marks = vec!["?"; states.len()].join(", ");
+		let mut st = self.conn.prepare(&format!("SELECT {} FROM coin WHERE state IN ({}) ORDER BY created_at, leaf_id", Self::COIN_COLS, marks))
+			.map_err(db)?;
+		let rows = st.query_map(rusqlite::params_from_iter(states.iter()), Self::coin_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// Every coin's state, by leaf id, without the coins' records.
+	pub fn coin_states(&self) -> Result<BTreeMap<String, String>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, state FROM coin").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(db)?;
+		rows.collect::<Result<BTreeMap<_, _>, _>>().map_err(db)
 	}
 
 	pub fn set_coin_state(&self, leaf_id: &str, state: &str, note: &str) -> Result<(), Error> {
@@ -968,6 +995,32 @@ impl Store {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The coins in some states, read by the state's index: in the order
+	/// `coins` gives, none in another state, and the query planner uses the
+	/// index (a wallet's spent coins and their records are never read).
+	#[test]
+	fn coins_by_state_read_only_those_coins() {
+		let s = Store::open_connection(Connection::open_in_memory().unwrap()).unwrap();
+		let states = ["spent", "live", "spent", "pending", "offered", "spent", "live", "exited"];
+		for (i, st) in states.iter().enumerate() {
+			let n = [i as u8 + 1; 32];
+			s.put_nonce(&n, &[i as u8 + 100; 32], "test").unwrap();
+			s.put_coin(&CoinRow { leaf_id: format!("leaf{}", i), owner_nonce: n, kind: "transfer".into(), asset: "aa".into(), value: 1,
+				record: vec![7; 4096], salt: [i as u8 + 50; 32], state: st.to_string(), note: String::new(), expiry: 1, bases: vec![], spent_by: None })
+				.unwrap();
+		}
+		let ids = |v: Vec<CoinRow>| v.into_iter().map(|c| c.leaf_id).collect::<Vec<_>>();
+		let all = ids(s.coins().unwrap());
+		assert_eq!(ids(s.coins_in("live").unwrap()), all.iter().filter(|l| ["leaf1", "leaf6"].contains(&l.as_str())).cloned().collect::<Vec<_>>());
+		let some = ids(s.coins_in_states(&["pending", "live", "offered"]).unwrap());
+		assert_eq!(some, all.iter().filter(|l| ["leaf1", "leaf3", "leaf4", "leaf6"].contains(&l.as_str())).cloned().collect::<Vec<_>>());
+		assert!(s.coins_in_states(&[]).unwrap().is_empty());
+		assert_eq!(s.coin_states().unwrap().len(), states.len());
+		assert_eq!(s.coin_states().unwrap()["leaf7"], "exited");
+		let plan: String = s.conn.query_row("EXPLAIN QUERY PLAN SELECT leaf_id FROM coin WHERE state IN ('live', 'pending')", [], |r| r.get(3)).unwrap();
+		assert!(plan.contains("coin_state"), "the query plan reads {}", plan);
+	}
 
 	#[test]
 	fn two_stores_on_one_file_never_take_one_index() {
