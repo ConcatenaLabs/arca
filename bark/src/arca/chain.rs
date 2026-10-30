@@ -137,6 +137,14 @@ pub struct ChainSource {
 /// How long a view stands, at most, before the source looks at the node again.
 pub const VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a look serves a command that reads only and asks to share the
+/// view ([`ChainSource::share_view`]): a burst of such commands (a quote runs
+/// several, one after the other) shares one look, so a wallet on a slow or far
+/// link pays one round trip for the view rather than one a command. Every other
+/// command looks when it starts, and a gap the wallet knows of (its own
+/// broadcast, say) calls for a look at once.
+pub const BURST_VIEW_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The moments the chain may have moved without the wallet reading it: a
 /// request to the operator, a pause, a broadcast. Each makes the next read
 /// look at the view again ([`gap`]).
@@ -175,6 +183,9 @@ struct Memo {
 	gaps: u64,
 	/// Whether the view has been looked at since the command started.
 	looked_this_command: bool,
+	/// The command started may answer from another command's look made
+	/// within [`BURST_VIEW_FOR`].
+	shared: bool,
 	/// Answers fixed by the view.
 	view: HashMap<String, Kept>,
 	/// Answers fixed by the view's mempool as well (a mempool entry, an
@@ -334,8 +345,17 @@ impl ChainSource {
 	pub fn new_command(&self) {
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.looked_this_command = false;
+		m.shared = false;
 		m.command.clear();
 	}
+
+	/// Lets the command just started answer from another command's look made
+	/// within [`BURST_VIEW_FOR`]: for a command that reads only, of a caller
+	/// that runs it as one of a burst.
+	pub fn share_view(&self) {
+		self.memo.lock().expect("the chain memo").shared = true;
+	}
+
 
 	/// The requests this source made of the node (a batch is one), and the
 	/// reads it answered from what it kept for the view, since it was made.
@@ -345,10 +365,12 @@ impl ChainSource {
 	}
 
 	/// Whether the view is to be looked at again before the next answer: the
-	/// command has just started, a gap came or a second passed since the last
-	/// look.
+	/// command has just started (unless it shares the view and the last look
+	/// is younger than [`BURST_VIEW_FOR`]), a gap came, or a second passed
+	/// since the command's look.
 	fn look_due(m: &Memo) -> bool {
-		!(m.looked_this_command && m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < VIEW_FOR))
+		let window = if m.looked_this_command { VIEW_FOR } else if m.shared { BURST_VIEW_FOR } else { return true };
+		!(m.gaps == GAPS.load(Ordering::SeqCst) && m.looked.is_some_and(|t| t.elapsed() < window))
 	}
 
 	/// Looks at the view again when it is due ([`Self::look_due`]): the tip,
@@ -461,11 +483,12 @@ impl ChainSource {
 	fn read(&self, method: &str, params: &[Value]) -> Result<Value, RpcError> {
 		let keep = keep_of(method, params);
 		if matches!(keep, Keep::Never) {
-			// A broadcast changes the mempool: the next read looks again.
+			// A broadcast changes the mempool: the next read looks again,
+			// whatever window the view stands in.
 			let r = self.ask(method, params);
 			let mut m = self.memo.lock().expect("the chain memo");
 			m.asked += 1;
-			m.looked_this_command = false;
+			m.looked = None;
 			return r;
 		}
 		let k = Self::read_key(method, params);
@@ -1237,6 +1260,47 @@ pub fn unhex32(s: &str) -> Result<[u8; 32], Error> {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// A command that shares the view answers from another's look made within
+	/// BURST_VIEW_FOR; one that does not looks when it starts; one started
+	/// later looks again, and a gap calls for a look at once.
+	#[test]
+	fn a_burst_of_commands_shares_one_look() {
+		let mut m = Memo { looked: Some(web_time::Instant::now()), gaps: GAPS.load(Ordering::SeqCst), ..Default::default() };
+		m.looked_this_command = true;
+		assert!(!ChainSource::look_due(&m), "this command's own fresh look stands");
+		m.looked_this_command = false;
+		assert!(ChainSource::look_due(&m), "a command that does not share the view looks when it starts");
+		m.shared = true;
+		assert!(!ChainSource::look_due(&m), "the next command that shares it answers from it");
+		m.looked = Some(web_time::Instant::now() - BURST_VIEW_FOR - std::time::Duration::from_millis(1));
+		assert!(ChainSource::look_due(&m), "a look older than the burst window is not shared");
+		m.looked = Some(web_time::Instant::now() - VIEW_FOR - std::time::Duration::from_millis(1));
+		m.looked_this_command = true;
+		assert!(ChainSource::look_due(&m), "within a command, a view stands a second at most");
+		m.looked = Some(web_time::Instant::now());
+		m.looked_this_command = false;
+		gap();
+		assert!(ChainSource::look_due(&m), "a gap calls for a look at once");
+	}
+
+	/// A broadcast calls for a look before the next read, within a command
+	/// and in a burst alike: a command that sends one exit step and then the
+	/// next must see its own transaction in the mempool.
+	#[test]
+	fn a_broadcast_calls_for_a_look_before_the_next_read() {
+		let (url, requests) = picky_proxy();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let sent = || requests.load(Ordering::SeqCst);
+		assert!(chain.validates_anchors().unwrap());
+		let n = sent();
+		chain.new_command();
+		chain.share_view();
+		let _ = chain.read("sendrawtransaction", &[json!("00")]);
+		assert_eq!(sent(), n + 1, "the broadcast itself");
+		assert!(chain.validates_anchors().unwrap());
+		assert_eq!(sent(), n + 2, "a look before the next read, though the last was a moment ago");
+	}
 
 	#[test]
 	fn what_a_view_keeps_and_what_it_never_keeps() {
