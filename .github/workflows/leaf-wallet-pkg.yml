@@ -1,0 +1,64 @@
+name: leaf-wallet-pkg
+
+on:
+  push:
+    branches: [master]
+    paths: ["wallet-wasm/**", "bark/**", "lib/**", "covenant/**", "sequentia-ext/**", "bark-common/**", "bark-runtime/**", ".github/workflows/leaf-wallet-pkg.yml"]
+  workflow_dispatch:
+
+jobs:
+  # The leaf wallet package (wallet-wasm/ through wasm-pack, `--target web`), as the web wallet's
+  # tooling/build-leaf-wallet.sh builds it: every build-machine path remapped, and refused if the
+  # package still names one. Kept as an artifact, so the package a wallet carries in leaves/pkg can
+  # be taken from here instead of built on a laptop.
+  pkg:
+    name: the leaf wallet package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wallet-wasm
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install --locked wasm-pack --version 0.13.1
+
+      - name: Build
+        run: |
+          src="$GITHUB_WORKSPACE"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          flags=(
+            "--cfg" "getrandom_backend=\"wasm_js\""
+            "--remap-path-prefix=$src=/arca"
+            "--remap-path-prefix=$cargo_home/registry/src=/cargo/registry"
+            "--remap-path-prefix=$cargo_home/git/checkouts=/cargo/git"
+            "--remap-path-prefix=$rustup_home=/rustup"
+          )
+          export CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${flags[*]}")"
+          cd wallet-wasm
+          wasm-pack build --target web --release --out-name leaf_wallet
+          for p in "$HOME" "$src" "$cargo_home"; do
+            if grep -a -q -F "$p" pkg/leaf_wallet_bg.wasm; then
+              echo "pkg/leaf_wallet_bg.wasm still contains $p" >&2
+              exit 1
+            fi
+          done
+          mkdir -p "$RUNNER_TEMP/leaf-wallet-pkg"
+          cp pkg/leaf_wallet.js pkg/leaf_wallet.d.ts pkg/leaf_wallet_bg.wasm "$RUNNER_TEMP/leaf-wallet-pkg/"
+          ( cd "$RUNNER_TEMP/leaf-wallet-pkg" && sha256sum leaf_wallet.js leaf_wallet.d.ts leaf_wallet_bg.wasm > SHA256SUMS && echo "$GITHUB_SHA" > BUILT_FROM )
+          cat "$RUNNER_TEMP/leaf-wallet-pkg/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leaf-wallet-pkg-${{ github.sha }}
+          path: ${{ runner.temp }}/leaf-wallet-pkg/
+          retention-days: 90
