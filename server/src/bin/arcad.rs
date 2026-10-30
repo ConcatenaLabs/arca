@@ -8,6 +8,7 @@
 //!     arcad <config.toml> bond-post <node wallet> <asset> <atoms> [<fee asset>]
 //!     arcad <config.toml> bond-notice <withdrawal key file>
 //!     arcad <config.toml> bond-withdraw <withdrawal key file> <address>
+//!     arcad <config.toml> withdraw <asset> <atoms> <address> [<fee asset>]
 //!
 //! The configuration is `server::server::Config`; `server/arcad.example.toml`
 //! shows every setting. The operator key lives in `arca-signer`, which must be
@@ -38,6 +39,13 @@
 //! pay their fee from the operator's on-chain wallet; they need the
 //! database, the mnemonic file, the node and the signer.
 //!
+//! With `withdraw`, it pays atoms of an asset from the operator's on-chain
+//! wallet to an address, from final coins and never more than the wallet
+//! can spend now less what it owes for swept coins (`server::server::withdraw`),
+//! and prints the transaction as JSON: what returns a pool grown past its need
+//! to the treasury that funded it. It needs the database, the mnemonic file,
+//! the node and the signer, and may run beside the server.
+//!
 //! Running, it reads its configuration again on SIGHUP and takes the assets
 //! it serves, with their smallest leaves and rate sources, and the assets a
 //! round's fee is paid in, without a restart
@@ -48,10 +56,10 @@
 
 use std::str::FromStr;
 
-use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, expired_salts, receive_address, Config, Server};
+use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, expired_salts, receive_address, withdraw, Config, Server};
 
 const USAGE: &str = "usage: arcad <config.toml> [address | expired-salts | bond-address | bond-post <node wallet> <asset> <atoms> \
-	[<fee asset>] | bond-notice <key file> | bond-withdraw <key file> <address>], or arcad bond-key <file>";
+	[<fee asset>] | bond-notice <key file> | bond-withdraw <key file> <address> | withdraw <asset> <atoms> <address> [<fee asset>]], or arcad bond-key <file>";
 
 /// Prints `r` as JSON, or the error, and exits.
 fn done(r: Result<serde_json::Value, String>) -> ! {
@@ -152,6 +160,14 @@ async fn main() {
 		},
 		Some("bond-withdraw") => match (args.get(3), args.get(4)) {
 			(Some(k), Some(to)) => done(bond_withdraw(&config, std::path::Path::new(k), to).await.map_err(|e| e.to_string())),
+			_ => {
+				eprintln!("{}", USAGE);
+				std::process::exit(2);
+			},
+		},
+		Some("withdraw") => match (args.get(3), args.get(4), args.get(5)) {
+			(Some(asset), Some(atoms), Some(to)) => done(withdraw(&config, asset, atoms, to, args.get(6).map(String::as_str)).await
+				.map_err(|e| e.to_string())),
 			_ => {
 				eprintln!("{}", USAGE);
 				std::process::exit(2);

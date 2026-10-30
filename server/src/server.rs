@@ -1063,6 +1063,74 @@ where
 	Ok(tx)
 }
 
+/// `arcad <config> withdraw <asset> <atoms> <address> [<fee asset>]`: pays
+/// `atoms` of `asset` from the operator's on-chain wallet to `address`, its
+/// fee in `fee asset` (the asset itself when not named): what moves a pool
+/// grown past its need back to the treasury that funded it. It spends final
+/// coins only, as a round does, and never more than the wallet can spend now
+/// less what it owes for swept coins (`fundable` in `/v1/info`), so no coin a
+/// holder is owed leaves. The coins it takes are marked spent in the database
+/// all or none, so it runs beside the server: a round never takes them, and
+/// it never takes a round's. Needs the database, the mnemonic file, the node
+/// and the signer.
+pub async fn withdraw(config: &Config, asset: &str, atoms: &str, to: &str, fee_asset: Option<&str>) -> Result<serde_json::Value, StartError> {
+	use crate::wallet::BuildRequest;
+	let asset = AssetId::from_str(asset).map_err(err("the asset"))?;
+	let fee_asset = match fee_asset {
+		Some(f) => AssetId::from_str(f).map_err(err("the fee asset"))?,
+		None => asset,
+	};
+	let atoms: u64 = atoms.parse().map_err(err("the atoms"))?;
+	if atoms == 0 {
+		return Err(StartError("nothing to withdraw: 0 atoms".into()));
+	}
+	let client = node_client(config)?;
+	let addr = to.to_string();
+	let c = client.clone();
+	let info = tokio::task::spawn_blocking(move || c.call::<serde_json::Value>("validateaddress", &[serde_json::json!(addr)]))
+		.await.map_err(err("the node"))?.map_err(err("the node"))?;
+	if info["isvalid"] != serde_json::json!(true) {
+		return Err(StartError(format!("{} is not an address of this chain", to)));
+	}
+	if info.get("confidential_key").and_then(|k| k.as_str()).is_some_and(|k| !k.is_empty()) {
+		return Err(StartError(format!("{} is a confidential address; the wallet pays explicit outputs: give its unconfidential one", to)));
+	}
+	let spk = elements::Script::from(crate::signer::unhex(info["scriptPubKey"].as_str().unwrap_or_default()).map_err(err("the address's script"))?);
+	let operator = SignerClient::new(&config.signer_socket).pubkey().await.map_err(err("the signer"))?;
+	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(client));
+	let certification = match config.finality.certification.as_str() {
+		"required" => Certification::Required,
+		"none" => Certification::NotOnThisChain,
+		other => return Err(StartError(format!("finality.certification {:?}: required or none", other))),
+	};
+	let finality = FinalityService::new(store.clone(), source, FinalityConfig {
+		anchor_depth: config.finality.anchor_depth, certification, start_height: config.finality.start_height,
+		poll_interval: Duration::from_millis(config.finality.poll_interval_ms), cert_lookback: 144,
+	}).await.map_err(err("the finality service"))?;
+	let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file).map_err(err("wallet_mnemonic_file"))?.trim().to_string();
+	let wallet = Wallet::new(store.clone(), finality.clone(), operator,
+		WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Final, pool_coins: config.pool_coins })
+		.map_err(err("the wallet"))?;
+	let can = wallet.balance().await.map_err(err("the operator's wallet"))?.get(&asset).copied().unwrap_or(0);
+	let owed = store.owed_totals().await.map_err(err("the database"))?.get(&asset.into_inner().to_byte_array()).map_or(0, |o| o.0);
+	let room = can.saturating_sub(owed);
+	if atoms > room {
+		return Err(StartError(format!("the wallet can pay {} atoms of {} now and owes {} for swept coins: {} at most may leave, not {}",
+			can, asset, owed, room, atoms)));
+	}
+	let built = wallet.build(&BuildRequest { outputs: vec![arca_covenant::ExplicitOutput::new(asset, atoms, spk)], connector: None, fee_asset })
+		.await.map_err(err("the operator's wallet"))?;
+	let tx = built.tx.clone();
+	let txid = tx.txid();
+	if let Err(e) = finality.call(move |c| c.broadcast(&tx)).await {
+		let _ = wallet.release(&txid).await;
+		return Err(StartError(format!("the node refused {}: {}", txid, e)));
+	}
+	Ok(serde_json::json!({"txid": txid.to_string(), "to": to, "asset": asset.to_string(), "value": atoms.to_string(),
+		"fee": built.fee.amount.to_string(), "fee_asset": built.fee.asset.to_string(), "could_pay": can.to_string(), "owed": owed.to_string()}))
+}
+
 /// `arcad <config> bond-notice <key file>`: the notice of the configured
 /// bond coin, signed with `W`'s key from `key_file`, its fee from the
 /// operator's wallet, broadcast. Returns its id, the notice output and the
