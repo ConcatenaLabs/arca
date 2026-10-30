@@ -702,7 +702,9 @@ clone_at() {   # clone_at <url> <dir> <commit>
 
 step "arcad, arca-signer and arca, from this clone"
 if git -C "$ARCA_SRC" rev-parse HEAD >/dev/null 2>&1; then
-  ARCA_COMMIT=$(git -C "$ARCA_SRC" rev-parse HEAD)
+  # The last commit that changed what is built: an update of the bundle's own
+  # scripts or of the documents rebuilds nothing.
+  ARCA_COMMIT=$(git -C "$ARCA_SRC" log -1 --format=%H -- . ':!contrib/operator-bundle' ':!doc' ':!*.md')
   dirty=$(git -C "$ARCA_SRC" status --porcelain --untracked-files=no -- . ':!contrib/operator-bundle' || true)
   [ -z "$dirty" ] || die "$ARCA_SRC has changes outside contrib/operator-bundle; the operator is built from a commit"
 else
