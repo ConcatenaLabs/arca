@@ -1058,7 +1058,8 @@ connect() {
     have=$(seqln listpeerchannels "$pid" | jq --arg a "$id" '[.channels[] | select((.channel_asset // .asset) == $a and (.state | test("CLOSING|ONCHAIN|CLOSED") | not))] | length')
     if [ "$have" -gt 0 ]; then say "${id:0:12}…: a channel is open already"; continue; fi
     amt=$(channel_atoms "$id"); [ "$amt" -gt 0 ] || { say "${id:0:12}…: no channel size set"; continue; }
-    r=$(seqln -k fundchannel id="$pid" amount="$amt" asset="$id" push_msat="$((amt / 2 * 1000))" announce=false)
+    r=$(seqln -k fundchannel id="$pid" amount="$amt" asset="$id" push_msat="$((amt / 2 * 1000))" announce=false 2>&1) \
+      || die "${id:0:12}…: SeqLN did not open the channel: $(jq -r '.message // empty' <<<"$r" 2>/dev/null || true) ${r:0:300}"
     say "${id:0:12}…: opened $amt atoms, half pushed: $(jq -r .txid <<<"$r")"
   done
   step "Core Lightning: a channel to the peer's Bitcoin gateway"
@@ -1067,7 +1068,8 @@ connect() {
     cln connect "$bid" "$PEER_HOST" "$PEER_BTC_LN_PORT" >/dev/null
     have=$(cln listpeerchannels "$bid" | jq '[.channels[] | select(.state | test("CLOSING|ONCHAIN|CLOSED") | not)] | length')
     if [ "$have" -gt 0 ]; then say "a channel is open already"; else
-      r=$(cln -k fundchannel id="$bid" amount="$CHANNEL_SAT" push_msat="$((CHANNEL_SAT / 2 * 1000))" announce=false)
+      r=$(cln -k fundchannel id="$bid" amount="$CHANNEL_SAT" push_msat="$((CHANNEL_SAT / 2 * 1000))" announce=false 2>&1) \
+        || die "Core Lightning did not open the channel: ${r:0:300}"
       say "opened $CHANNEL_SAT sat, half pushed: $(jq -r .txid <<<"$r")"
     fi
   fi
