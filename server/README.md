@@ -541,9 +541,9 @@ invoice. The invoice's final lock time is twice the leaf's lock, in blocks at
 hand before the leaf's timeout (the claim's margin) and the window stays
 the wallet's to claim the leaf in: with a 36-hour exit delay and the default
 window, 48 hours, about 5,770 blocks. SeqLN accepts lock times
-up to 20,160 blocks on a Sequentia network, but its `pay` adds up to 2,016
-unless the payer raises it (`maxdelay`), so a payer's node needs `maxdelay`
-at least the invoice's final lock time and the route's. A payment from
+up to 20,160 blocks on a Sequentia network, and its `pay` allows that much
+unless the payer sets a lower `maxdelay`; a payer that sets one needs it at
+least the invoice's final lock time and the route's. A payment from
 a leaf of another operator over Lightning is held to half the time to its
 own leaf's timeout, so it pays such an invoice only with a
 `send_timeout_seconds` of about a week or more. A payment from a leaf of this

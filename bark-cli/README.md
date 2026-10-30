@@ -706,9 +706,10 @@ refund lock that a stall cannot leap needs another leaf template.
 The
 invoice locks the payment for twice the leaf's lock, eight sevenths of its
 exit delay and the operator's window (so the window survives the margin),
-about 5,770 blocks with a 36-hour exit delay and a six-hour window: a payer
-whose node pays with SeqLN's `pay` raises its `maxdelay` to that, from 2,016
-blocks.
+about 5,770 blocks with a 36-hour exit delay and a six-hour window. SeqLN's
+`pay` allows up to the network's limit, 20,160 blocks on Sequentia, unless
+the payer sets a lower `maxdelay`; a payer that sets one sets it at least that
+high, with room for the route (Fulmen adds 270 blocks for each of three hops).
 
 `lightning receive ASSET AMOUNT --hash HASH` asks under a payment hash the
 wallet did not make, whose preimage someone else holds and reaches the wallet
