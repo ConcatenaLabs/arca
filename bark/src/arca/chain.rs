@@ -477,11 +477,12 @@ impl ChainSource {
 	fn read(&self, method: &str, params: &[Value]) -> Result<Value, RpcError> {
 		let keep = keep_of(method, params);
 		if matches!(keep, Keep::Never) {
-			// A broadcast changes the mempool: the next read looks again.
+			// A broadcast changes the mempool: the next read looks again,
+			// whatever window the view stands in.
 			let r = self.ask(method, params);
 			let mut m = self.memo.lock().expect("the chain memo");
 			m.asked += 1;
-			m.looked_this_command = false;
+			m.looked = None;
 			return r;
 		}
 		let k = Self::read_key(method, params);
@@ -1273,6 +1274,22 @@ mod test {
 		m.looked_this_command = false;
 		gap();
 		assert!(ChainSource::look_due(&m), "a gap calls for a look at once");
+	}
+
+	/// A broadcast calls for a look before the next read, within a command
+	/// and in a burst alike: a command that sends one exit step and then the
+	/// next must see its own transaction in the mempool.
+	#[test]
+	fn a_broadcast_calls_for_a_look_before_the_next_read() {
+		let (url, requests) = picky_proxy();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let sent = || requests.load(Ordering::SeqCst);
+		assert!(chain.validates_anchors().unwrap());
+		let n = sent();
+		let _ = chain.read("sendrawtransaction", &[json!("00")]);
+		assert_eq!(sent(), n + 1, "the broadcast itself");
+		assert!(chain.validates_anchors().unwrap());
+		assert_eq!(sent(), n + 2, "a look before the next read, though the last was a moment ago");
 	}
 
 	#[test]
