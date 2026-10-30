@@ -377,6 +377,21 @@ line, step by step, natively or in containers of this bundle's image:
 Generic Core Lightning interfaces (RTL over clnrest, for one) drive the BTC
 node fully, but cannot show or choose a channel's asset on SeqLN.
 
+## What it costs
+
+Measured on the runs that test the bundle, with what each figure is:
+
+| | The bundle at rest | Under load |
+| --- | --- | --- |
+| Memory | about 170 MB for every daemon together, on regtest chains (PostgreSQL 55 MB, Core Lightning 26 MB, SeqLN 17 MB, the nodes 12–16 MB each); the two nodes' caches grow with the public chains, and `dbcache=300` bounds the Bitcoin node's | the operator's server 1.0–2.4 GB at 8 to 16 transfers in flight, about 530 MB more per thousand holders ([the load test](operator-bundle-tests.md#load)) |
+| CPU | a sixth of one core (PostgreSQL's WAL timer, arcad's polls) | the operator's server 0.4–2.4 cores; the first limit, at about 15 transfers a second, is the shared node's RPC queue, not the server |
+| Disk | Bitcoin testnet4 with its transaction index 15 GB; the Sequentia chain under 1 GB; the binaries 0.8 GB; the database archive about 200 KB per WAL segment, a segment at least every five minutes | about 36 MB more database per thousand holders |
+| To install | the native build cache 7 GB in `/var/cache/arca-bundle` (delete it once installed); the Docker image 2.1 GB (611 MB compressed) and a build that needs about 10 GB while it runs | |
+
+Fulmen, beside it: its Lightning node is a SeqLN node like the bundle's
+gateways (about 20 MB at rest); the Linux AppImage is about 150 MB, and on
+Windows its WSL distro about 150 MB.
+
 ## Running it
 
 **What it commits you to.** Every round is funded from your own coins, locked
