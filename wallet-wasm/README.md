@@ -190,7 +190,7 @@ an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
 only on it; `exit_quote` is each transaction an exit would broadcast now, with
 its size, its fee and what pays it, their fees by asset (`unroll`) and the
-claim's fee at the floor now, and `exit` with `shown` set to that `unroll`
+claim's fee now, and `exit` with `shown` set to that `unroll`
 broadcasts only on those fees. A quote signs, asks and broadcasts nothing, and a
 `shown` that no longer holds is refused before anything is written or
 broadcast. `schedule` is
