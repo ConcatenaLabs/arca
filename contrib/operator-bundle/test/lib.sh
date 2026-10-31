@@ -96,3 +96,7 @@ board() {
 # What NAME holds of ASSET: its row's total, and its live coins.
 held() { arca "$1" balance --without-bitcoin | jq -r --arg a "$ASSET" '[.rows[]|select(.asset==$a)|.total][0] // "0"'; }
 coins() { arca "$1" coins | jq -c --arg a "$ASSET" '[.[]|select(.asset==$a)|{leaf_id,state,value}]'; }
+# ATOMS [N]: ATOMS, or N times the smallest leaf (LEAF, default N 1) when that
+# is more. A scenario written for a small-leaf regtest operator keeps its
+# amounts there and moves leaf-sized ones on an operator with larger leaves.
+atoms() { local a=$1 m=${2:-1}; local f=$(( ${LEAF:-0} * m )); [ "$a" -ge "$f" ] && echo "$a" || echo "$f"; }

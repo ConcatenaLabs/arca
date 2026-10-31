@@ -58,7 +58,13 @@ fi
 # operator allows (on a regtest stand-in, a few minutes).
 EXIT_UNITS=${EXIT_UNITS:-$(curl -fsS "$OPERATOR_URL/v1/info" | jq -r '.exit_delay_units.min // .exit_delay_units[0] // 254')}
 [ "$EXIT_UNITS" -lt 4 ] && EXIT_UNITS=4
-say "run $RUN: operator $OPERATOR_KEY at $OPERATOR_URL, asset $ASSET, exit delay $EXIT_UNITS units"
+# The operator's smallest leaf in ASSET, and the other operator's for a payment
+# into it: an out-of-round payment or a receive below it is refused, so every
+# amount the scenarios move is at least this (see `atoms`).
+leaf_in() { curl -fsS -m 10 "$1/v1/info" | jq -r --arg a "$ASSET" '[.assets[]? | select(.asset == $a) | .min_leaf | tonumber][0] // 0'; }
+LEAF=$(leaf_in "$OPERATOR_URL")
+if [ -n "${PEER_OPERATOR_URL:-}" ]; then p=$(leaf_in "$PEER_OPERATOR_URL" || echo 0); [ "${p:-0}" -gt "$LEAF" ] && LEAF=$p; fi
+say "run $RUN: operator $OPERATOR_KEY at $OPERATOR_URL, asset $ASSET, exit delay $EXIT_UNITS units, smallest leaf $LEAF"
 
 [ $# -gt 0 ] || { sed -n '2,12p' "$0"; exit 2; }
 for s in "$@"; do
