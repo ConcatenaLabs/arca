@@ -280,12 +280,30 @@ prints four addresses, each with what it is for:
   the ark's VTXO pool (`ARK_VTXO_POOL`, 200,000 sat) and fees: a Lightning
   receive into the ark is paid out of that pool, and with none ready it is
   failed back.
-- **seqln**: each asset the gateway's channels are opened in, plus a little of
-  a fee asset.
+- **seqln**: each asset the gateway's channels are opened in: a channel's size
+  (`CHANNEL_ATOMS`) and a little more of the same asset, since each channel is
+  opened with its fee in its own asset. Given as `<asset id>:<atoms>` pairs,
+  `CHANNEL_ATOMS` needs a pair for every served asset: one without gets no
+  channel (`connect` says `no channel size set`).
 - **cln**: testnet4 BTC for the Bitcoin gateway's channel, its anchor reserve
   (25,000 sat) and its fees.
 
 **Check:** `$B status` shows the ark's `trusted_balance`.
+
+**A payment that does not confirm.** Pay from a Sequentia node of your own,
+and read the payment there:
+
+    sequentia-cli gettransaction <txid>
+
+While it waits, two fields say why: `refused` is the node's reason for not
+holding it (`non-final` for a payment carrying a lock time the chain has not
+reached, which a Bitcoin reorg can cause, since a Bitcoin reorg can cost
+Sequentia height), and `unbroadcast: true` means no peer has fetched it in the
+minute since it was sent. The node offers it to its peers again every 10 to 15
+minutes, and the wallet hands a refused payment back as soon as the node takes
+it, so both clear on their own. A payment that stays `unbroadcast` for long has
+not reached the block producers: `sequentia-cli getpeerinfo` shows whether the
+node has peers.
 
 ## Connecting to the sequentiatestnet.com bundle
 
