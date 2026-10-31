@@ -45,7 +45,7 @@ start; the Linux paths are the ones tested.
 
 Its files are in [`contrib/operator-bundle/`](../contrib/operator-bundle/):
 `install.sh` (the installer, and the commands every path uses: `status`,
-`addresses`, `connect`, `register`, `credentials`), `bundle.env.example` (every
+`addresses`, `connect`, `bond`, `register`, `credentials`), `bundle.env.example` (every
 setting, with what it does), `pins.env` (the version and checksum of everything
 downloaded or built), `docker/` (the image and the compose file) and
 `windows/setup-wsl.ps1`.
@@ -304,6 +304,41 @@ the node has no fee rate for (see `PRICE_FEED_URL`).
 
 **Check:** after the funding transactions confirm, `$B status` lists each
 channel `CHANNELD_NORMAL` and each asset's Lightning leg `up`.
+
+## Posting the equivocation bond
+
+An operator that holds other people's coins posts a bond: a coin it loses if
+it ever co-signs two spends of one coin, which wallets weigh before trusting a
+payment made out of round
+([operator-procedure.md](operator-procedure.md#posting-the-equivocation-bond)).
+One that holds only its own coins can skip it. The bundle walks through it:
+
+    $B bond
+
+Each run says what is still missing and stops there; run it again after each
+step:
+
+1. **What to choose**, in the settings: `BOND_WITHDRAW_KEY`, `BOND_ASSET`,
+   `BOND_ATOMS` (`bundle.env.example` says what each is). The withdrawal key is
+   the only key that can ever end the bond: draw it on another machine, never
+   on the bundle's, with the bundle's `arcad` copied there
+   (`arcad bond-key bond-withdraw.key`), and keep that file and a backup
+   offline. Then run the installer again (on Docker,
+   `docker compose up -d --force-recreate`): it writes `[bond]` into arcad's
+   configuration and turns the Sequentia node's wallet on.
+2. **What to pay:** it makes and loads the operating wallet (`BOND_WALLET`)
+   and prints the address to pay the bond's asset to, and how much: the bond
+   and a thousandth more for its fee.
+3. **The post:** once the wallet holds enough, confirmed, it pays the bond
+   (`arcad bond-post`), writes its coin into `[bond]` (kept in
+   `/etc/<NAME>/bond.outpoint` across runs of the installer) and restarts
+   arcad.
+
+**Check:** `$B bond` (or `$B status`) reads the bond `bonded`, and
+`https://<DOMAIN>/arca/v1/info` shows it under `bond`, `final` once its block
+is final. To end a bond, the notice and the withdrawal are arcad's own
+commands, signed with the withdrawal key's file
+([the server's README](../server/README.md#the-equivocation-bond)).
 
 ## Listing the operator in the registry
 
