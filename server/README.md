@@ -1374,9 +1374,14 @@ participation, nor any other asset's round. Three kinds run whatever the cap:
 one with a coin within six days of its first expiry (a wallet asks for a
 refresh by itself from five days before, and takes the coin on the chain
 from four), so the cap never sends a coin home; one whose coins rest only on
-lowest nodes that already hold fronted value, which opens nothing new and
-without which those nodes never come back; and one larger than a cap above 0
-while nothing of the asset is in flight. A cap of `"0"` fronts nothing, for
+lowest nodes that already hold fronted value and can still come back (every
+coin on them still held, refreshed, or moved with a delegation, within
+RECLAIM-D's 32 steps), which opens nothing new and without which those nodes
+never come back; and one larger than a cap above 0 while nothing of the asset
+is in flight. A refresh on a node that can come back only at its batch's
+expiry (a coin on it moved without a delegation) is held by the cap like any
+other, and a coin on an accumulator batch, which has no lowest node, counts
+in flight and never completes one. A cap of `"0"` fronts nothing, for
 an asset whose pool is empty.
 
 The participations are taken against what the operator's wallet can spend of the asset now: what
@@ -3410,8 +3415,11 @@ maker paying one coin on out of round and refreshing the rest every round has
 its batch reclaimed at the next round, the locked value bounded; without
 RECLAIM-D (the control) it grows by the maker's leaves every round. Under an
 in-flight cap a second refresh waits in plain words, and runs a round later
-once it completes a node the first opened; an asset with a cap of 0 and an
-empty pool waits and holds up no other asset's round.
+once it completes a node the first opened; on a node one of whose coins was
+paid on without a delegation the refreshes past the cap keep waiting; an asset
+with a cap of 0 and an empty pool waits and holds up no other asset's round.
+A transfer refused for good after it was recorded with a delegation is
+dropped whole, its coin live again.
 
 `tests/rates.rs` prices X by the node's own rate, Y by a file and, in a
 second server, X by a command: `info` shows each rate, its source and its

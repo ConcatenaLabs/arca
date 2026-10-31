@@ -130,7 +130,7 @@ jobs:
           ARCA_KEEP_LIGHTNING: "1"
         run: |
           cargo build --locked -p arca-server --bin arca-signer --bin arca-keeper
-          cargo test --locked -p arca-cli --test arca_lightning --test arca_lightning_hash --test arca_lightning_commands -- --nocapture
+          cargo test --locked -p arca-cli --test arca_lightning --test arca_lightning_hash --test arca_lightning_commands --test arca_release_delegation -- --nocapture
 
       # The SeqLN nodes the wallet's scenario kept, each one's log ending.
       - name: The Lightning nodes' logs

@@ -1745,7 +1745,12 @@ batches carry RECLAIM-D: two wallets' leaves share a lowest node, one pays a
 third wallet out of round (its `send` signing the delegation of the coin's
 release to every output), the three refresh and release (the payer's change
 and the payee as holders of coins a reassignment made), and the watcher
-reclaims the node by RECLAIM-D on the chain.
+reclaims the node by RECLAIM-D on the chain. A swap of X for Y delegates both
+sides (the taker's delegation carried in its acceptance); the taker is then
+restored from its mnemonic alone, and once both refresh, the X node and the Y
+node each come back by RECLAIM-D. A payment over Lightning from such a coin
+carries its delegation too (run where `LIGHTNINGD_EXEC` names SeqLN's
+`lightningd`).
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when
