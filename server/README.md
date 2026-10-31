@@ -987,11 +987,21 @@ attestation of a take is one of a refresh.
 
 A distribution pays many holders from one round: a payer gives up its own
 coins in one asset and names, for each holder, a key and an amount, and each
-holder gets an ordinary `vtxo-1` leaf in that asset's round, which it takes
-up when it likes, having never been in contact with the payer or the
-operator before. What no holder takes up goes back to the payer once the
-batch's sweep is final. It serves a dividend or a coupon, a refund at a
-failed closing, a launch allocation, a reward payout.
+holder gets a leaf in that asset's round, which it takes up when it likes
+until the distribution's deadline, having never been in contact with the
+payer or the operator before. What no holder takes up by then goes back to
+the payer. It serves a dividend or a coupon, a refund at a failed closing, a
+launch allocation, a reward payout.
+
+A distribution that names a deadline `D` and a lapse allowance pays
+`claim-1` leaves (`arca_covenant::claim`): `vtxo-1`'s paths under the claim
+key, and a lapse which, once the median time has passed `D` and the leaf has
+waited its exit delay on the chain, pays the leaf back to the return script,
+the fee from the allowance, with no signature. That is the payer's term with
+its payees, on its own money, and it needs no sweep: it is how a batch
+without one returns what nobody took up, and the payer relies on nobody for
+it. A distribution without a deadline pays `vtxo-1` claim leaves, which only
+a batch's sweep returns, from the operator's coins.
 
 The payer names each holder by a 32-byte x-only key `A` (an on-chain address
 key, a taproot address's program, or any key the holder hands over) and
@@ -1026,7 +1036,11 @@ script, and the fee. The server takes it only when:
 - the coins hold exactly the claims and the fee (`unbalanced`), and the fee
   covers the asset's schedule (`fee`): the refresh fee of each coin given
   up, `refresh_base` for each claim leaf, and `offboard_base` once, for the
-  payment of the unclaimed leaves back to the payer.
+  payment of the unclaimed leaves back to the payer;
+- a deadline and a lapse allowance come together (`malformed`); the deadline
+  is 7 to 400 days ahead (`out_of_bounds`); the allowance is below every
+  claim (`malformed`) and, where the node takes the asset for fees, at least
+  the fee of a lapse at the node's floor (`fee`). The id commits to both.
 
 It is recorded as a participation whose outputs are the claim leaves, runs
 in the asset's ordinary round, and completes as a refresh does: once the
@@ -1039,8 +1053,13 @@ forfeits over keeps its coins, and the claim leaves are never opened.
 A holder finds its claims with `claims`, naming each of its keys with a
 proof of it, and gets, once the distribution is released, each claim's leaf,
 round, record, the preimage that opens its entry, its batch's first expiry
-and the deadline, the leaf's exit deadline three days before that expiry, by
-which the operator co-signs its take-up. The published tree carries every
+(none in a batch without a sweep), the lapse deadline of a `claim-1` leaf
+(`lapse_deadline`), and the deadline by which the operator co-signs its
+take-up: the lapse deadline, or the leaf's exit deadline three days before
+its batch's first expiry when that comes first. From the lapse deadline on,
+the server takes no authorisations for the leaf (`claim_leaf` answers
+`lapsed`) and co-signs no spend of it in a transfer, a refresh or anything
+else (`lapsed`): it is the payer's again. The published tree carries every
 leaf's owner key and owner nonce too, so a holder can also find a claim in
 any copy of a tree by testing its keys. To take a claim up, the holder hands
 over its unroll authorisations for the leaf, signed by the claim key
@@ -1051,9 +1070,19 @@ leaf of its own. That spend is the claim, in the signer's record under the
 leaf's salt like every spend.
 
 `distribution_status` shows the payer each claim's state (`pending` until
-the distribution is released, `open`, `claimed`, `returned`), the deadline,
-and each payment back with its state. The return itself is the watcher's
-(see The watcher).
+the distribution is released, `open`, `claimed`, `lapsing` once the deadline
+has passed and the leaf is on its way back, `lapsed` with the lapse's txid,
+`returned`), the deadline, the lapse deadline and allowance, and each
+payment back with its state. Lapses and returns are the watcher's (see The
+watcher): it brings each `claim-1` leaf nobody took up on the chain after the
+deadline, by its own unroll authorisations (it is member 0 of every node) and
+the distribution's preimage, and lapses it once it has waited its exit
+delay, the fee from the allowance where the node takes the asset and from a
+coin of the operator's where it does not, the whole value then going back.
+A holder who took a claim up before the deadline holds a coin resting on the
+leaf: should the leaf reach the chain later, the lapse still waits the exit
+delay, which leaves that holder (or the operator, holding its forfeit) the
+time to publish its pair, as against an exit.
 
 ### Offline refresh: plans
 
@@ -2279,7 +2308,16 @@ meanwhile.
   until it is final again. Each claimed entry then follows its repayment:
   repaid once that participation is released, owed again once it is void or
   expired.
-- **Returns.** A claim leaf of a distribution whose value a final sweep took
+- **Lapses.** A `claim-1` leaf no holder took up by its distribution's
+  deadline (live or pending, the signer holding no spend under its salt) is
+  brought on the chain one step a pass, by the operator's own unroll
+  authorisations and the distribution's preimage; once it has waited its exit
+  delay in a block, its lapse pays the return script, the fee from the
+  leaf's allowance where the node takes the asset, else from a coin of the
+  operator's wallet, the whole value then going back. The lapse is recorded
+  against the claim as it is published. A leaf that left the chain another
+  way (its holder's exit) is its holder's.
+- **Returns.** A `vtxo-1` claim leaf of a distribution whose value a final sweep took
   (the batch output, a node above the leaf, or its entry), with no spend of
   it recorded, is a claim nobody took up. The watcher pays every such leaf of
   a distribution to its return script, an explicit output in its asset, in
@@ -2352,10 +2390,10 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
 | `POST issuer_supply` | What the operator minted and burned of an issuer-operated asset (see Issuer-operated assets): every round's mint and every burn of the watcher's the active chain holds, each with its txid, kind, amount and finality, their sums and those of the final ones, the value live under its burn-only sweeps (`in_batches`) with each output it counts (`in_batches_outputs`: its outpoint and value, its batch's round and output, whether it is the `batch` output, a `node` or an `entry`, and a node's level and index or an entry's leaf index in the published tree), and the limiter's coin and state, or why it mints nothing now. Not authenticated: everything in it is on the chain |
-| `POST distribute` | Accepts a distribution (see Distributions: claim trees), answered as `participation_status` answers |
-| `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry and deadline, each claim's key, claim key, value, leaf and state, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
+| `POST distribute` | Accepts a distribution (see Distributions: claim trees), with `deadline` and `lapse_allowance` for claims that lapse, answered as `participation_status` answers |
+| `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry (none in a batch without a sweep) and take-up deadline, the lapse deadline and allowance, each claim's key, claim key, value, leaf and state, the lapse that paid it back, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
-| `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it |
+| `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it; a `claim-1` leaf past its deadline is refused `lapsed` (422), as is any co-signature of a spend of it |
 | `POST owed` | What the operator owes for coins its final sweeps took (see Swept coins are repaid), for up to 64 keys, each proven under one challenge (the call `owed`, an empty request): a mailbox key finds every coin bound or posted to it, an owner key its own coin. Each entry: the coin, its owner key and nonce, asset, value, the late-refresh fee, what is owed, the sweep, its state (`owed`, `claimed`, `repaid`, `withdrawn`) and its repayment participation once claimed |
 | `POST owed_claim` | Claims what is owed for a swept coin as one new leaf, signed by the coin's owner key; answered as `participation_status` answers the repayment participation |
 | `POST plan_quote` | A quote for an offline-refresh plan from a coin (see Offline refresh: plans): the quote's id, the coin's asset, value and first expiry, the earliest time of step 1's round, the operator's script for every refund, and for each step its operator nonce, fee and refund margin |
@@ -3322,7 +3360,15 @@ in another asset, an Arca script, a script that is no standard address or
 none as the return script, an
 attestation by another key, an asset not served, a claim key another
 distribution wants, authorisations before the distribution is released, and
-a lookup naming no key.
+a lookup naming no key. A distribution with a deadline pays `claim-1` leaves:
+refused with a deadline two days ahead (`out_of_bounds`), an allowance as
+large as a claim and a deadline without an allowance (`malformed`); one
+holder takes its claim up before the deadline, one hands over its
+authorisations and stops, one does nothing; past the deadline the server
+refuses the third's authorisations and the second's take-up (`lapsed`), and
+the watcher brings both leaves on the chain by its own authorisations and
+lapses each to the return script, a 215 vB transaction of one input paying
+the claim less the fee, with no return from the operator's coins.
 
 `tests/reserving.rs` re-serves a wallet's leaves to its mailbox key. A board
 bound to it, a transfer's change posted to it and a leaf a participation

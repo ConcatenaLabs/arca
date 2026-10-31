@@ -3,7 +3,7 @@
 //! found under the wallet's own address keys and taken up.
 //!
 //! **The payer.** [`Wallet::distribute`] gives up the wallet's coins of one
-//! asset for one `vtxo-1` leaf per holder, each owned by the claim key of the
+//! asset for one `claim-1` leaf per holder, each owned by the claim key of the
 //! key the payer names and a nonce the wallet draws
 //! ([`arca_covenant::claim_key`]). The coins must hold exactly the claims and
 //! the operator's fee, so when no coin holds that much, the wallet first pays
@@ -12,12 +12,15 @@
 //! leaf against the round and the published tree once the round is final,
 //! hands over the forfeit of each coin given up, with no authorisation for any
 //! claim leaf (it holds no claim key), and the operator releases the
-//! distribution. What no holder takes up by the deadline (the claim leaves'
-//! exit deadline, three days before their batch's first expiry) is paid back
-//! by the operator to the distribution's return script, by default an
-//! on-chain address of the wallet's, once the sweep that took it is final.
-//! That payment is the operator's, not a script's; [`Wallet::distributions`]
-//! shows it and every claim's state.
+//! distribution. The distribution names a deadline, by default
+//! [`DEFAULT_CLAIM_DAYS`] days ahead, and each claim leaf is `claim-1`
+//! ([`arca_covenant::claim`]): what no holder takes up by then lapses back to
+//! the distribution's return script, by default an on-chain address of the
+//! wallet's, by the leaf's own script, its fee from the allowance the
+//! wallet names (four times a lapse's fee at the node's floor). The operator's
+//! watcher brings each unclaimed leaf on the chain to lapse it.
+//! [`Wallet::distributions`] shows the deadline, every claim's state and
+//! every lapse.
 //!
 //! **The holder.** A wallet named by one of its on-chain receive keys, or by
 //! its OpenAMP account key ([`super::keys::Keys::openamp`], the key a
@@ -32,7 +35,12 @@
 //! with the claim key and hands them to the operator, keeps the leaf as a coin
 //! of its own, and pays it out of round to a fresh leaf under a key of its
 //! own nonce. A claim the operator does not take up is still the wallet's
-//! coin: its exit, its refresh and every date of it run as any coin's.
+//! coin: its exit, its refresh and every date of it run as any coin's. A
+//! `claim-1` leaf has one date more, its distribution's deadline: the wallet
+//! takes up only a claim at least [`TAKE_UP_MARGIN`] seconds before it, pays
+//! on at each sync a claim coin it holds still unpaid before it, and from the
+//! deadline on marks such a coin `lapsed`, back to its payer by the
+//! distribution's terms and counted in nothing the wallet holds.
 //!
 //! The claim key signs for the claim leaf alone: the key named itself (an
 //! address key or the OpenAMP key) signs nothing of the tree, only the proofs
@@ -61,6 +69,13 @@ use super::{random32, Error, DEFAULT_MAX_FEE_PPM};
 
 /// The most claims one distribution names: the operator's bound, a batch.
 pub const MAX_CLAIMS: usize = 1024;
+
+/// How many days ahead a distribution's claims lapse, by default.
+pub const DEFAULT_CLAIM_DAYS: u32 = 30;
+
+/// How long before a claim's deadline the wallet still takes it up: an hour,
+/// so the operator's co-signature comes before the deadline.
+pub const TAKE_UP_MARGIN: u32 = 3_600;
 
 /// The most keys one lookup names: the operator's bound.
 pub const MAX_LOOKUP_KEYS: usize = 64;
@@ -187,6 +202,22 @@ impl Wallet {
 	pub fn distribute(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>)
 		-> Result<Value, Error>
 	{
+		self.distribute_until(asset, claims, return_to, shown, None)
+	}
+
+	/// [`Wallet::distribute`], the claims lapsing `days` days from now.
+	pub fn distribute_days(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>,
+		days: u32) -> Result<Value, Error>
+	{
+		let deadline = self.now()?.to_consensus_u32().saturating_add(days.saturating_mul(86_400));
+		self.distribute_until(asset, claims, return_to, shown, Some(deadline))
+	}
+
+	/// [`Wallet::distribute`], the claims lapsing at the median time
+	/// `deadline`, by default [`DEFAULT_CLAIM_DAYS`] days from now.
+	pub fn distribute_until(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>,
+		deadline: Option<u32>) -> Result<Value, Error>
+	{
 		self.witnessed_now()?;
 		let info = self.server_info()?;
 		let mut plan = self.distribution_plan(&info, asset, claims)?;
@@ -209,11 +240,18 @@ impl Wallet {
 			return Err(Error::Refused(format!("the coins given up hold {} of asset {}, and the claims and the fee take {}", held, asset, need)));
 		}
 		let claims: Vec<Claim> = claims.iter().map(|(k, v)| Claim { named: *k, nonce: random32(), value: *v }).collect();
+		let deadline = match deadline {
+			Some(t) => t,
+			None => self.now()?.to_consensus_u32().saturating_add(DEFAULT_CLAIM_DAYS * 86_400),
+		};
+		let deadline = MedianTime::from_consensus(deadline).map_err(|e| Error::Refused(format!("the deadline: {}", e)))?;
+		let allowance = arca_covenant::claim::lapse_allowance(self.chain.floor_per_kvb(asset)?, 4);
+		let lapse = arca_covenant::DistributionLapse { deadline, allowance };
 		let fees: Vec<(AssetId, u64)> = if plan.fee > 0 { vec![(asset, plan.fee)] } else { vec![] };
 		let d = Distribution {
 			inputs: plan.coins.iter().map(|c| LeafId::from_str(&c.leaf_id).map_err(|e| Error::Store(e.to_string()))).collect::<Result<_, _>>()?,
 			asset, exit_delay: self.exit_delay(), claims: claims.clone(), return_script: return_script.clone(), fees: fees.clone(),
-			not_before: None, lapse: None,
+			not_before: None, lapse: Some(lapse),
 		};
 		d.check().map_err(|e| Error::Refused(e.to_string()))?;
 		let id = d.id(&self.genesis, &self.operator);
@@ -230,11 +268,14 @@ impl Wallet {
 				.collect::<Vec<_>>(),
 			"return_script": hex(return_script.as_bytes()),
 			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(),
+			"deadline": deadline.to_consensus_u32(),
+			"lapse_allowance": allowance.to_string(),
 		});
+		let lapse_json = d.claim_lapse().map(|l| arca_covenant::record_json::claim_json(&l));
 		// Each claim as the wallet's participation record keeps a leaf it
 		// wants: its asset, value and nonce, and the key it was named under.
 		let wanted: Vec<Value> = claims.iter().map(|c| json!({"asset": asset.to_string(), "value": c.value.to_string(),
-			"nonce": hex(&c.nonce), "claim": hex(&c.named.serialize())})).collect();
+			"nonce": hex(&c.nonce), "claim": hex(&c.named.serialize()), "lapse": lapse_json})).collect();
 		let pid = hex(&id);
 		let given: Vec<String> = plan.coins.iter().map(|c| c.leaf_id.clone()).collect();
 		self.store.atomically(|s| {
@@ -252,6 +293,7 @@ impl Wallet {
 		Ok(json!({
 			"distribution": pid, "state": answer["state"], "asset": asset.to_string(), "total": plan.total.to_string(),
 			"fee": plan.fee.to_string(), "gives": given, "return_script": hex(return_script.as_bytes()),
+			"deadline": deadline.to_consensus_u32(), "lapse_allowance": allowance.to_string(),
 			"claims": claims.iter().map(|c| json!({"key": hex(&c.named.serialize()), "value": c.value.to_string(),
 				"claim_key": c.owner().map(|k| hex(&k.serialize())).unwrap_or_default()})).collect::<Vec<_>>(),
 			"note": self.spelling.say("{sync} hands over the forfeits once the round is final; the claims open then"),
@@ -448,6 +490,7 @@ impl Wallet {
 				"distribution": c["distribution_id"], "index": c["index"], "key": c["key"], "address": address, "named_as": named_as,
 				"asset": c["asset"], "value": c["value"], "state": c["state"], "leaf_id": c["leaf_id"], "deadline": c["deadline"],
 				"expiry": c["expiry"], "held": held,
+				"note": claim_note(c),
 			}));
 		}
 		Ok(Value::Array(out))
@@ -473,9 +516,17 @@ impl Wallet {
 				continue;
 			}
 			if c["state"] != "open" {
-				out.push(json!({"claim": name, "state": c["state"], "note": "not open: a claim is taken up once its distribution is \
-					released, and until its holder has claimed it or it went back to its payer"}));
+				out.push(json!({"claim": name, "state": c["state"], "note": claim_note(c).unwrap_or_else(|| "not open: a claim is taken \
+					up once its distribution is released, and until its holder has claimed it or it went back to its payer".into())}));
 				continue;
+			}
+			let now = self.now()?.to_consensus_u32();
+			if let Some(d) = c["lapse_deadline"].as_u64() {
+				if now as u64 + TAKE_UP_MARGIN as u64 >= d {
+					out.push(json!({"claim": name, "state": "lapsing", "deadline": d, "note": "its deadline has come: what was not taken \
+						up by then goes back to its payer, by the distribution's terms"}));
+					continue;
+				}
 			}
 			let nonce = match unhex32(c["nonce"].as_str().unwrap_or("")) {
 				Ok(n) => n,
@@ -565,7 +616,16 @@ impl Wallet {
 		let (policy, _) = self.leaf_policy(record.asset(), as_of)?;
 		let valid = record.validate(&round, &policy, &owner, &nonce)
 			.map_err(|e| Error::Refused(format!("the claim leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
-		super::round::leaf_as_asked(&json!({}), &record, None)
+		// A claim-1 leaf lapses on the terms its record names, which the
+		// operator's answer repeats: its deadline still ahead.
+		let lapse = record.lapse().cloned();
+		if lapse.as_ref().map(|l| l.deadline.to_consensus_u32() as u64) != c["lapse_deadline"].as_u64() {
+			return Err(Error::Refused("the operator names another deadline for the claim than its leaf's record".into()));
+		}
+		if lapse.as_ref().is_some_and(|l| now.to_consensus_u32().saturating_add(TAKE_UP_MARGIN) >= l.deadline.to_consensus_u32()) {
+			return Err(Error::Refused("the claim's deadline has come: it goes back to its payer".into()));
+		}
+		super::round::leaf_as_asked(&json!({"lapse": lapse.as_ref().map(arca_covenant::record_json::claim_json)}), &record, None)
 			.map_err(|why| Error::Refused(format!("the claim leaf in round {}: {}", round_txid, why)))?;
 		if Some(valid.leaf_id().to_string().as_str()) != c["leaf_id"].as_str() {
 			return Err(Error::Refused("the operator names the claim leaf by another id than its record gives".into()));
@@ -602,6 +662,19 @@ impl Wallet {
 		})?;
 		let _ = answer;
 		Ok(row)
+	}
+}
+
+/// What a holder reads of a claim's state, where it has a word to say: a
+/// claim that lapsed, or is lapsing, went back to its payer by the
+/// distribution's terms, which is no loss of the holder's.
+fn claim_note(c: &Value) -> Option<String> {
+	match c["state"].as_str() {
+		Some("lapsing") | Some("lapsed") => Some("not taken up by its deadline: it goes back to its payer, by the distribution's \
+			terms; nothing the wallet held is lost".into()),
+		Some("open") => c["lapse_deadline"].as_u64().map(|d| format!("open until median time {}: take it up before then, or it goes \
+			back to its payer", d)),
+		_ => None,
 	}
 }
 

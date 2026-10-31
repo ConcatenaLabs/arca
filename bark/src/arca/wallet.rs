@@ -2598,6 +2598,7 @@ impl Wallet {
 		let mut changes = self.plan_rounds_gone()?;
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		let mut checked = self.store.coins_in_states(&["pending", "live"])?;
+		let mut unpaid_claims = vec![];
 		for id in &revived {
 			if !checked.iter().any(|c| &c.leaf_id == id) {
 				checked.extend(self.store.coin(id)?);
@@ -2611,6 +2612,21 @@ impl Wallet {
 				continue;
 			}
 			let record = Self::record_of(&c)?;
+			// A claim-1 leaf still held from the deadline on is its payer's
+			// again, by the distribution's terms: no loss of the wallet's, and
+			// nothing more to do. Before it, the claim is paid on below.
+			if let Some(l) = record.lapse() {
+				if c.state == "live" && now.to_consensus_u32() >= l.deadline.to_consensus_u32() {
+					let why = format!("a claim not paid on by its distribution's deadline (median time {}): it goes back to its payer, \
+						by the distribution's terms", l.deadline.to_consensus_u32());
+					self.store.set_coin_state(&c.leaf_id, "lapsed", &why)?;
+					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": "lapsed", "why": why}));
+					continue;
+				}
+				if c.state == "live" {
+					unpaid_claims.push(c.clone());
+				}
+			}
 			// What the chain holds of the coin, checked as of its expiry once
 			// that has passed; its dates are looked at on their own.
 			let policy = self.followed_policy(c.expiry, now);
@@ -2643,6 +2659,15 @@ impl Wallet {
 			}
 		}
 		lap("coins", &mut at);
+		// A claim-1 coin the wallet holds unpaid (an earlier take-up stopped
+		// after the operator took its authorisations) is paid on to a leaf of
+		// the wallet's own before its deadline.
+		for c in unpaid_claims {
+			if self.store.coin(&c.leaf_id)?.is_some_and(|r| r.state == "live") {
+				let r = self.respend_to_self(vec![c.clone()]).unwrap_or_else(|e| json!({"error": e.to_string()}));
+				changes.push(json!({"leaf_id": c.leaf_id, "claim_paid_on": r}));
+			}
+		}
 		// A round a participation was released in that can never return,
 		// whatever became of its new leaves (one paid on, say): the
 		// operator runs the participation again, and the wallet follows it.

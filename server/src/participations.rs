@@ -355,6 +355,9 @@ pub enum ParticipationError {
 	#[error("claim leaf {0} is not open yet: its distribution is not released, so no preimage opens its entry; it is taken up once \
 		its payer has handed over its forfeits")]
 	ClaimNotReleased(LeafId),
+	#[error("claim leaf {0} has lapsed: its distribution's deadline {1} has passed, and what its holder did not take up by then goes \
+		back to its payer")]
+	ClaimLapsed(LeafId, u32),
 	#[error("the return script is a script the server knows as an Arca script: what no holder takes up is paid to an address of the \
 		payer's, never into the tree")]
 	ReturnScriptReused,
@@ -413,6 +416,7 @@ impl ParticipationError {
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Channel(_)) => "template",
+			Coin(CoinError::Lapsed { .. }) => "lapsed",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
 			Template(..) | HtlcInput(..) => "template",
@@ -425,6 +429,7 @@ impl ParticipationError {
 			Unknown(_) => "unknown_participation",
 			UnknownClaim(_) => "unknown_leaf",
 			ClaimNotReleased(_) => "not_live",
+			ClaimLapsed(..) => "lapsed",
 			ReturnScriptReused => "script_reused",
 			NotSynced => "not_synced",
 			Planned(_) => "planned",
@@ -891,6 +896,7 @@ impl Participations {
 					order: *order,
 					landing: *landing,
 					channel: *channel,
+					claim: None,
 				},
 				OutputRequest::Offboard { asset, value, script } => {
 					let destination = ExplicitOutput::new(*asset, *value, script.clone());
@@ -1134,6 +1140,7 @@ impl Participations {
 					order: None,
 					landing: None,
 					channel: None,
+					claim: None,
 				},
 				leaf_id: None,
 			}],

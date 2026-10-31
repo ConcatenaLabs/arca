@@ -421,10 +421,10 @@ enum Cmd {
 	/// (a file, or `-` for standard input) names a holder's key and an amount
 	/// of `asset`, `KEY AMOUNT`; a key is 64 hex digits (x-only), 66 (a
 	/// compressed public key) or a taproot address. Each holder takes its
-	/// leaf up with `arca claim`; what no holder takes up by the deadline
-	/// goes back to `--return`, by default a new on-chain address of this
-	/// wallet's, once the operator's sweep of it is final. `sync` hands over
-	/// the forfeits once the round is final.
+	/// leaf up with `arca claim` before the deadline (`--days`, 30 by
+	/// default); what no holder takes up by then lapses back to `--return`,
+	/// by default a new on-chain address of this wallet's, by its leaf's own
+	/// script. `sync` hands over the forfeits once the round is final.
 	Distribute {
 		list: String,
 		#[arg(long)]
@@ -440,6 +440,10 @@ enum Cmd {
 		/// the distribution goes ahead only on this very fee.
 		#[arg(long)]
 		shown: Option<u64>,
+		/// How many days the holders have to take their claims up; what is
+		/// left after that goes back to `--return`.
+		#[arg(long)]
+		days: Option<u32>,
 	},
 	/// Every distribution this wallet made, as the operator shows it: each
 	/// claim's state, the deadline and what went back.
@@ -1563,7 +1567,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::BtcSwap(c) => btc_swap(&mut w, &datadir, c),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
-		Cmd::Distribute { list, asset: a, return_address, quote, shown } => {
+		Cmd::Distribute { list, asset: a, return_address, quote, shown, days } => {
 			let mut claims = vec![];
 			for (key, amount) in read_claims(&list)? {
 				claims.push((w.named(&key)?, amount));
@@ -1572,7 +1576,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				w.distribute_quote(asset(&a)?, &claims)
 			} else {
 				let return_to = return_address.as_deref().map(|r| w.script_of(r)).transpose()?;
-				w.distribute(asset(&a)?, &claims, return_to, shown)
+				match days {
+					Some(d) => w.distribute_days(asset(&a)?, &claims, return_to, shown, d),
+					None => w.distribute(asset(&a)?, &claims, return_to, shown),
+				}
 			}
 		},
 		Cmd::Distributions => w.distributions(),

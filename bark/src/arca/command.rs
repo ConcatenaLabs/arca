@@ -39,7 +39,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	asset?, max_fee_ppm?, timeout?, shown?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
-	return_address?, shown?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
+	return_address?, shown?, deadline?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
@@ -433,7 +433,8 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 				Some(r) => Some(w.chain.script_of(r)?),
 				None => None,
 			};
-			w.distribute(asset, &claims, return_to, opt_u64(&a["shown"], "the fee shown")?)
+			let deadline = opt_u64(&a["deadline"], "the deadline")?.map(|t| t.min(u32::MAX as u64) as u32);
+			w.distribute_until(asset, &claims, return_to, opt_u64(&a["shown"], "the fee shown")?, deadline)
 		},
 		"distributions" => w.distributions(),
 		"claims" => w.claims(opt_u64(&a["scan"], "the keys to scan")?.map(|n| n.min(u32::MAX as u64) as u32)),

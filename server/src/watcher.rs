@@ -78,10 +78,14 @@
 //!    order then rests on the chain, its maker's to refund, and is not swept
 //!    with its batch. A coin the signer holds a spend of (a fill, a cancel,
 //!    a forfeit) is left alone.
-//! 8. **Returns.** A claim leaf of a distribution that a final sweep took
-//!    with no spend of it recorded (its holder never took it up) is paid back
-//!    to the distribution's return script, with every other such leaf of the
-//!    distribution, from the operator's own coins (`returns.rs`).
+//! 8. **Returns.** A `claim-1` leaf no holder took up by its distribution's
+//!    deadline is brought on the chain by the operator's own authorisations
+//!    and lapsed to the distribution's return script once it has waited its
+//!    exit delay, its fee from the leaf's allowance. A `vtxo-1` claim leaf of
+//!    a distribution that a final sweep took with no spend of it recorded (its
+//!    holder never took it up) is paid back to the distribution's return
+//!    script, with every other such leaf of the distribution, from the
+//!    operator's own coins (`returns.rs`).
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
@@ -369,6 +373,7 @@ impl Watcher {
 		self.answer_stale_exits().await?;
 		self.offboards().await?;
 		self.land_orders(now).await?;
+		self.lapses(now).await?;
 		self.expiries(now).await?;
 		self.reclaims(now).await?;
 		self.returns().await?;
@@ -1218,7 +1223,8 @@ impl Watcher {
 		}
 		Ok(ValidCoin {
 			id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value, sweep: record.schedule.sweep_path(true, record.burn),
-			expiry: record.schedule.expiries()[0], hops: 0, origin: ValidOrigin::Leaf { valid, preimage, auths },
+			expiry: record.schedule.expiries().first().copied().unwrap_or(arca_covenant::transfer::NEVER), hops: 0,
+			origin: ValidOrigin::Leaf { valid, preimage, auths },
 		})
 	}
 

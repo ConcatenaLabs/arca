@@ -5,7 +5,8 @@
 //! holder already has (the x coordinate of a P2WPKH address's public key, or a
 //! taproot address's output key, which is its program), or any key the holder
 //! hands it. For each holder the payer draws a fresh 32-byte nonce `n`, and the
-//! holder's leaf, an ordinary `vtxo-1` leaf, is owned by the claim key
+//! holder's leaf (`vtxo-1`, or `claim-1` for a distribution with a deadline,
+//! below) is owned by the claim key
 //!
 //! ```text
 //! A' = lift_x(A) + t·G,   t = SHA256(T ‖ T ‖ A ‖ n),   T = SHA256("Arca/claim-key")
@@ -317,9 +318,10 @@ impl Claim {
 	}
 }
 
-/// What a payer submits: the coins it gives up, all in `asset`, for one
-/// `vtxo-1` leaf per claim, each with `exit_delay`, in the asset's next round;
-/// `return_script`, where the operator pays what no holder takes up; the fee.
+/// What a payer submits: the coins it gives up, all in `asset`, for one leaf
+/// per claim (`claim-1` with a `lapse`, `vtxo-1` without), each with
+/// `exit_delay`, in the asset's next round; `return_script`, where what no
+/// holder takes up goes back; the fee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distribution {
 	pub inputs: Vec<LeafId>,

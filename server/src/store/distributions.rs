@@ -34,6 +34,11 @@ pub struct ClaimRow {
 	pub participation_state: ParticipationState,
 	/// The payment that returned it to the payer.
 	pub returned_in: Option<[u8; 32]>,
+	/// A `claim-1` leaf's lapse: its distribution's deadline, the allowance
+	/// and the return script; `None` for a `vtxo-1` claim leaf.
+	pub lapse: Option<arca_covenant::Lapse>,
+	/// The watcher's lapse that paid the leaf back to the payer.
+	pub lapsed_in: Option<[u8; 32]>,
 }
 
 /// A payment of unclaimed leaves to a distribution's payer.
@@ -57,7 +62,7 @@ pub struct DistributionRow {
 }
 
 const CLAIM_COLUMNS: &str = "c.participation_id, c.idx, c.named_key, o.owner_key, o.owner_nonce, o.asset, o.value, o.exit_delay_units,
-	o.leaf_id, l.state::text, l.spent_by, (l.record IS NOT NULL AND l.record <> ''::bytea), p.state::text, c.returned_in";
+	o.leaf_id, l.state::text, l.spent_by, (l.record IS NOT NULL AND l.record <> ''::bytea), p.state::text, c.returned_in, o.claim, c.lapsed_in";
 
 const CLAIM_FROM: &str = "distribution_claim c
 	JOIN participation_output o ON o.participation_id = c.participation_id AND o.idx = c.idx
@@ -83,6 +88,8 @@ fn claim_row(r: &tokio_postgres::Row) -> Result<ClaimRow, StoreError> {
 		authorised: r.get::<_, Option<bool>>(11).unwrap_or(false),
 		participation_state: ParticipationState::parse(&r.get::<_, String>(12))?,
 		returned_in: r.get::<_, Option<Vec<u8>>>(13).map(|v| array32(v, "return txid")).transpose()?,
+		lapse: r.get::<_, Option<Vec<u8>>>(14).map(|b| super::participations::claim_of(&b)).transpose()?,
+		lapsed_in: r.get::<_, Option<Vec<u8>>>(15).map(|v| array32(v, "lapse txid")).transpose()?,
 	})
 }
 
@@ -157,7 +164,8 @@ impl Store {
 		let rows = conn.query(
 			"SELECT d.participation_id FROM distribution d JOIN participation p USING (participation_id)
 			 WHERE p.state = 'released'
-			   AND EXISTS (SELECT 1 FROM distribution_claim c WHERE c.participation_id = d.participation_id AND c.returned_in IS NULL)
+			   AND EXISTS (SELECT 1 FROM distribution_claim c WHERE c.participation_id = d.participation_id AND c.returned_in IS NULL
+			     AND c.lapsed_in IS NULL)
 			 ORDER BY d.created_at, d.participation_id",
 			&[]).await?;
 		rows.into_iter().map(|r| array32(r.get(0), "participation id")).collect()
@@ -184,6 +192,15 @@ impl Store {
 		}
 		t.commit().await?;
 		Ok(true)
+	}
+
+	/// Records that the watcher's lapse `txid` pays claim `idx` of the
+	/// distribution `id` back to its payer.
+	pub async fn record_lapse(&self, id: &[u8; 32], idx: u16, txid: &[u8; 32]) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("UPDATE distribution_claim SET lapsed_in = $3 WHERE participation_id = $1 AND idx = $2",
+			&[&&id[..], &(idx as i16), &&txid[..]]).await?;
+		Ok(())
 	}
 
 	/// Every return recorded, oldest first: each must be in the nursery.

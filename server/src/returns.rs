@@ -1,6 +1,20 @@
 //! 8. Returns: what no holder took up of a distribution goes back to its
 //! payer ([`crate::participations::distributions`]).
 //!
+//! A `claim-1` leaf lapses by itself ([`arca_covenant::claim`]). Once its
+//! distribution's deadline has passed, a claim leaf no holder took up (its
+//! leaf live or pending, and the signer holding no spend under its salt) is
+//! brought on the chain one step a pass, its path unrolled by the operator's
+//! own authorisations (it is member 0 of every node) and its entry opened
+//! with the distribution's preimage, as a coin is brought for its landing
+//! ([`Watcher::bring_on_chain`]); once the leaf has waited its exit delay in
+//! a block, its lapse pays the return script, its fee from the allowance
+//! where the node takes the asset, else from a coin of the wallet's, the
+//! whole value going back. The lapse is recorded against the claim as it is
+//! published. A leaf that left the chain another way (its holder's exit) is
+//! its holder's, and nothing more is done.
+//!
+//! The `vtxo-1` claim leaves of a distribution without a deadline:
 //! A claim leaf is returned once a sweep of the watcher's that is final took
 //! its value (spending the batch output, a node above the leaf, or the
 //! leaf's entry) while the store records no spend of the leaf: its holder
@@ -44,7 +58,8 @@ impl Watcher {
 	async fn return_of(&self, id: &[u8; 32]) -> Result<(), WatcherError> {
 		let Some(d) = self.store.distribution(id).await? else { return Ok(()) };
 		let open: Vec<&ClaimRow> = d.claims.iter()
-			.filter(|c| c.returned_in.is_none() && matches!(c.leaf_state, Some(LeafState::Live) | Some(LeafState::Pending))
+			.filter(|c| c.returned_in.is_none() && c.lapsed_in.is_none()
+				&& matches!(c.leaf_state, Some(LeafState::Live) | Some(LeafState::Pending))
 				&& c.leaf_id.is_some())
 			.collect();
 		let mut due = vec![];
@@ -90,6 +105,72 @@ impl Watcher {
 		self.nursery.submit(&built.tx, NurseryKind::Wallet, Some(built.fee)).await.map_err(|e| WatcherError::Nursery(e.to_string()))?;
 		log::info!("watcher: distribution {}: {} claim(s) no holder took up, {} of {}, paid back to its return script in {}", hex(id),
 			due.len(), value, asset, txid);
+		Ok(())
+	}
+
+	/// Lapses every claim-1 leaf no holder took up by its distribution's
+	/// deadline: see the [module documentation](self).
+	pub(super) async fn lapses(&self, now: MedianTime) -> Result<(), WatcherError> {
+		for id in self.store.distributions_open().await? {
+			let Some(d) = self.store.distribution(&id).await? else { continue };
+			let Some(p) = self.store.participation(&id).await? else { continue };
+			for c in &d.claims {
+				let r = self.lapse_claim(&id, c, p.preimage, now).await;
+				Self::item(&format!("the lapse of claim {} of distribution {}", c.idx, hex(&id)), r)?;
+			}
+		}
+		Ok(())
+	}
+
+	/// One step of [`Watcher::lapses`] for the claim `c`: its leaf brought a
+	/// step nearer the chain or, on the chain and its exit delay waited,
+	/// lapsed.
+	async fn lapse_claim(&self, id: &[u8; 32], c: &ClaimRow, preimage: [u8; 32], now: MedianTime) -> Result<(), WatcherError> {
+		let (Some(lapse), Some(leaf)) = (&c.lapse, c.leaf_id) else { return Ok(()) };
+		if c.lapsed_in.is_some() || c.returned_in.is_some() || now.to_consensus_u32() <= lapse.deadline.to_consensus_u32()
+			|| !matches!(c.leaf_state, Some(LeafState::Live) | Some(LeafState::Pending))
+		{
+			return Ok(());
+		}
+		let coin = self.plan_leaf_coin(&leaf, preimage).await?;
+		// A take-up co-signed before the deadline is its holder's way on.
+		if !self.signer.under(&coin.leaf.salt).await?.is_empty() {
+			return Ok(());
+		}
+		let script = coin.leaf.script_pubkey();
+		let Some(at) = self.unspent_at(&script).await? else {
+			// On the chain and spent (its holder's exit): nothing more.
+			if !self.store.sightings_of(script.as_bytes()).await?.is_empty() {
+				return Ok(());
+			}
+			log::info!("distribution {}: claim {} not taken up by its deadline {}: its leaf {} brought on the chain to lapse", hex(id),
+				c.idx, lapse.deadline.to_consensus_u32(), coin.id);
+			return self.bring_on_chain(&coin, now).await;
+		};
+		if let Some(w) = self.store.watcher_spend(&at.txid.to_byte_array(), at.vout).await? {
+			if w.kind == "lapse" {
+				self.store.record_lapse(id, c.idx, &w.txid).await?;
+			}
+			return Ok(());
+		}
+		if !self.confirmed(at).await? || !self.waited(at.txid, coin.leaf.exit_delay).await? {
+			return Ok(());
+		}
+		let ret = lapse.return_script.clone();
+		let (u, fee_coin, fee) = self.margin_or_coin(coin.asset, lapse.allowance, |fee| {
+			let u = coin.leaf.lapse_tx(at, coin.value, &ret, fee).map_err(|e| e.to_string())?;
+			let t = u.tx.clone();
+			Ok((u, t))
+		}).await?;
+		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
+		let published = self.publish(Ready { tx: u.tx, wallet, fee }, "lapse", leaf.to_vec(),
+			format!("claim {} of distribution {}, not taken up by its deadline: its leaf {} at {} lapsed to the return script", c.idx, hex(id),
+				coin.id, at)).await?;
+		if let Some(txid) = published {
+			self.store.record_lapse(id, c.idx, &txid.to_byte_array()).await?;
+			log::info!("watcher: distribution {}: claim {} lapsed, {} of {} back to its return script in {}", hex(id), c.idx, coin.value,
+				coin.asset, txid);
+		}
 		Ok(())
 	}
 

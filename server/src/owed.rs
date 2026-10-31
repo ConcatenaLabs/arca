@@ -206,6 +206,7 @@ pub async fn claim(store: &Store, params: &Params, req: &ClaimRequest) -> Result
 			kind: WantedKind::Leaf {
 				template: template.to_string(), owner_key: owner.serialize(), owner_nonce: *owner_nonce,
 				exit_delay_units: exit_delay.units(), operator_nonce: [0; 32], htlc: None, order: None, landing: *landing, channel: None,
+				claim: None,
 			},
 			leaf_id: None,
 		}],

@@ -135,6 +135,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(34, include_str!("../../schema/V34__owed.sql")),
 	(35, include_str!("../../schema/V35__release_delegation.sql")),
 	(36, include_str!("../../schema/V36__paid_send_releases.sql")),
+	(37, include_str!("../../schema/V37__claim_lapse.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

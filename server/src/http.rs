@@ -1427,6 +1427,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 			order: l.order.as_ref().map(arca_covenant::record_json::order_terms_json),
 			landing: l.landing.as_ref().map(arca_covenant::record_json::landing_json),
 			channel: l.channel.as_ref().map(arca_covenant::record_json::channel_json),
+			claim: l.claim.as_ref().map(arca_covenant::record_json::claim_json),
 		}).collect(),
 		round_state: Some(t.round_state.as_str().into()),
 		nodes,

@@ -11,6 +11,14 @@
 //! Every refusal the server makes of a distribution, a claims lookup and a
 //! claim leaf's authorisations is printed verbatim.
 //!
+//! A distribution with a deadline: its three claim leaves are claim-1; one
+//! holder takes its claim up before the deadline, one hands over its
+//! authorisations and stops, one does nothing. From the deadline on, the
+//! server takes no claim's authorisations and co-signs no take-up; its
+//! watcher brings the two leaves nobody took up on the chain by its own
+//! authorisations and lapses each to the payer's return script, the fee from
+//! the allowance, before any batch expiry and with nothing of the operator's.
+//!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
 mod common;
@@ -21,7 +29,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::claim::{claim_key, claim_keypair};
 use arca_covenant::sign::sign_digest;
-use arca_covenant::{Claim, CoinRecord, Distribution, LeafId, LeafRecord, MedianTime, RelativeTime, ValidLeaf};
+use arca_covenant::{Claim, CoinRecord, Distribution, DistributionLapse, LeafId, LeafRecord, MedianTime, RelativeTime, Template, ValidLeaf};
 
 use common::client::{exit_delay, forfeit_sig, hex, new_leaf, random32, rebuild, transfer_body, unhex, Held};
 use common::flow::{drive, forfeit_for, held_by, refresh, settle, Coin};
@@ -37,12 +45,20 @@ const DAY: u32 = 86_400;
 fn distribute_body(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Claim], ret: &Script, fees: &[(AssetId, u64)],
 	delay: RelativeTime) -> (Value, [u8; 32])
 {
+	distribute_lapsing(r, coins, asset, claims, ret, fees, delay, None)
+}
+
+/// [`distribute_body`] for claims that lapse at `lapse`.
+#[allow(clippy::too_many_arguments)]
+fn distribute_lapsing(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Claim], ret: &Script, fees: &[(AssetId, u64)],
+	delay: RelativeTime, lapse: Option<DistributionLapse>) -> (Value, [u8; 32])
+{
 	let d = Distribution {
 		inputs: coins.iter().map(|h| h.id).collect(), asset, exit_delay: delay, claims: claims.to_vec(), return_script: ret.clone(),
-		fees: fees.to_vec(), not_before: None, lapse: None,
+		fees: fees.to_vec(), not_before: None, lapse,
 	};
 	let id = d.id(&r.chain, &xonly(&r.s));
-	(json!({
+	let mut body = json!({
 		"inputs": coins.iter().map(|h| json!({"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref())}))
 			.collect::<Vec<_>>(),
 		"asset": asset.to_string(),
@@ -51,7 +67,12 @@ fn distribute_body(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Claim
 			.collect::<Vec<_>>(),
 		"return_script": hex(ret.as_bytes()),
 		"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>(),
-	}), id)
+	});
+	if let Some(l) = lapse {
+		body["deadline"] = json!(l.deadline.to_consensus_u32());
+		body["lapse_allowance"] = json!(l.allowance.to_string());
+	}
+	(body, id)
 }
 
 /// A claims lookup proven by each of `keys`, under one challenge.
@@ -265,6 +286,140 @@ async fn a_distribution_pays_its_holders_and_what_nobody_takes_up_goes_back_to_i
 	settle(&r).await;
 	let ds2 = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
 	assert_eq!(ds2["returns"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_nobody_takes_up_lapse_to_the_payer_after_the_deadline() {
+	let mut r = common::rounds::start().await;
+	let x = r.x;
+	let payer = keypair("DL payer");
+	let (b1, tx1) = credited_board(&mut r, &payer, x).await;
+	let holders: Vec<Keypair> = (0..3).map(|i| keypair(&format!("DL holder {}", i))).collect();
+	let value = VALUE / 3;
+	let claims: Vec<Claim> = holders.iter().map(|h| Claim { named: xonly(h), nonce: random32(), value }).collect();
+	let fee = VALUE - 3 * value;
+	let ret = Script::from([vec![0x00, 0x14], vec![9u8; 20]].concat());
+	let deadline = MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 8 * DAY).unwrap();
+	let allowance = 20_000;
+	let lapse = DistributionLapse { deadline, allowance };
+	// Refused: a deadline sooner than a week, an allowance as large as a
+	// claim, a deadline without an allowance.
+	let soon = DistributionLapse { deadline: MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 2 * DAY).unwrap(), allowance };
+	let (body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(soon));
+	refused(r.http.post("distribute", &body), "out_of_bounds", "a deadline two days ahead");
+	let (body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(),
+		Some(DistributionLapse { deadline, allowance: value }));
+	refused(r.http.post("distribute", &body), "malformed", "an allowance as large as a claim");
+	let (mut body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(lapse));
+	body.as_object_mut().unwrap().remove("lapse_allowance");
+	refused(r.http.post("distribute", &body), "malformed", "a deadline without an allowance");
+	let (body, id) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(lapse));
+	let st = r.http.post("distribute", &body).ok();
+	assert_eq!(st["state"], "pending", "{}", st);
+
+	// The round, final; the payer forfeits its coin.
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &id);
+	let txid = st["round"]["txid"].as_str().unwrap().to_string();
+	let vout = st["outputs"][0]["batch_vout"].as_u64().unwrap();
+	let tree = rebuild(&r.http.post("tree", &json!({"txid": txid, "vout": vout})).ok());
+	let round = r.rt.client().raw_transaction(&common::client::txid(&txid)).unwrap();
+	let idx0 = st["outputs"][0]["leaf_index"].as_u64().unwrap() as usize;
+	let rec = tree.record(idx0);
+	assert_eq!(rec.template, Template::Claim1, "a lapsing distribution's claim leaves are claim-1");
+	assert_eq!(rec.claim, Some(arca_covenant::Lapse { deadline, allowance, return_script: ret.clone() }));
+	let new0 = rec.validate(&round, &accept_policy(&r), &claims[0].owner().unwrap(), &claims[0].nonce).unwrap();
+	let old = b1.record.resolve(std::slice::from_ref(&tx1), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &new0, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id), "forfeits": [
+		{"leaf_id": b1.id.to_string(), "signature": forfeit_sig(&f, &b1.key)}], "leaves": []})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+	println!("released: {}", ds);
+	assert_eq!(ds["lapse_deadline"], json!(deadline.to_consensus_u32()));
+	assert_eq!(ds["deadline"], json!(deadline.to_consensus_u32()), "the take-up deadline is the lapse's, before the exit deadline");
+	assert_eq!(ds["lapse_allowance"], json!(allowance.to_string()));
+
+	// Holder 0 takes its claim up; holder 1 hands over its authorisations.
+	let found = lookup(&r, &[&holders[0], &holders[1], &holders[2]]).ok();
+	let pick = |k: &Keypair| found["claims"].as_array().unwrap().iter().find(|c| c["key"] == json!(hex(&xonly(k).serialize()))).unwrap().clone();
+	let (f0, f1, f2) = (pick(&holders[0]), pick(&holders[1]), pick(&holders[2]));
+	assert_eq!(f0["lapse_deadline"], json!(deadline.to_consensus_u32()));
+	let pre: [u8; 32] = unhex(f0["preimage"].as_str().unwrap()).try_into().unwrap();
+	let t = MedianTime::from_consensus(mtp(&r).to_consensus_u32() - HOUR).unwrap();
+	let (v0, rec0, round0) = checked(&r, &f0, &holders[0]);
+	let n0: [u8; 32] = unhex(f0["nonce"].as_str().unwrap()).try_into().unwrap();
+	let claim0 = claim_keypair(&holders[0], &n0).unwrap();
+	let a0 = auths(&v0, &claim0, t);
+	assert_eq!(r.http.post("claim_leaf", &auths_body(&v0.leaf_id, &a0)).ok()["state"], "open");
+	let held0 = Held { key: claim0, nonce: n0, id: v0.leaf_id, record: CoinRecord::Leaf { record: rec0, preimage: pre, auths: a0 } };
+	let c0 = held0.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let (to, _) = new_leaf(&keypair("DL holder 0, its own leaf"));
+	let kept = c0.value - 2_000;
+	r.http.post("cosign_transfer", &transfer_body(&[(&held0, c0, kept)], &[(x, kept - 2_000, to)], xonly(&r.s), r.chain)).ok();
+	let (v1, rec1, _) = checked(&r, &f1, &holders[1]);
+	let n1: [u8; 32] = unhex(f1["nonce"].as_str().unwrap()).try_into().unwrap();
+	let claim1 = claim_keypair(&holders[1], &n1).unwrap();
+	let a1 = auths(&v1, &claim1, t);
+	assert_eq!(r.http.post("claim_leaf", &auths_body(&v1.leaf_id, &a1)).ok()["state"], "open");
+	let held1 = Held { key: claim1, nonce: n1, id: v1.leaf_id, record: CoinRecord::Leaf { record: rec1, preimage: pre, auths: a1 } };
+
+	// Holder 2 checks its claim and signs its authorisations, then hands them
+	// over too late: the deadline passes, and the server takes no
+	// authorisations and co-signs no take-up.
+	let (v2, _, _) = checked(&r, &f2, &holders[2]);
+	let n2: [u8; 32] = unhex(f2["nonce"].as_str().unwrap()).try_into().unwrap();
+	let claim2 = claim_keypair(&holders[2], &n2).unwrap();
+	let a2 = auths(&v2, &claim2, t);
+	advance_mtp(&r, 8 * DAY + HOUR).await;
+	r.synced().await;
+	refused(r.http.post("claim_leaf", &auths_body(&v2.leaf_id, &a2)), "lapsed", "a claim leaf's authorisations after its deadline");
+	let c1 = held1.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let (to1, _) = new_leaf(&keypair("DL holder 1, too late"));
+	refused(r.http.post("cosign_transfer", &transfer_body(&[(&held1, c1.clone(), c1.value - 2_000)], &[(x, c1.value - 4_000, to1)],
+		xonly(&r.s), r.chain)), "lapsed", "a take-up of a claim leaf after its deadline");
+	let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+	let states: Vec<&str> = ds["claims"].as_array().unwrap().iter().map(|c| c["state"].as_str().unwrap()).collect();
+	println!("past the deadline: {:?}", states);
+
+	// The watcher brings the two leaves on the chain and, once each has
+	// waited its exit delay, lapses it.
+	let mut lapsed = None;
+	for pass in 0..40 {
+		r.server.watcher.pass().await.unwrap();
+		settle(&r).await;
+		if pass % 4 == 3 {
+			advance_mtp(&r, 12 * HOUR).await;
+		}
+		let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+		let n = ds["claims"].as_array().unwrap().iter().filter(|c| c["state"] == "lapsed").count();
+		if n == 2 {
+			lapsed = Some(ds);
+			break;
+		}
+	}
+	let ds = lapsed.expect("both unclaimed leaves lapse");
+	println!("lapsed: {}", ds);
+	settle(&r).await;
+	let mut back = 0u64;
+	for c in ds["claims"].as_array().unwrap() {
+		let want = if c["key"] == json!(hex(&xonly(&holders[0]).serialize())) { "claimed" } else { "lapsed" };
+		assert_eq!(c["state"], want);
+		if let Some(t) = c["lapsed_in"].as_str() {
+			let tx = r.rt.client().raw_transaction(&common::client::txid(t)).unwrap();
+			assert!(r.rt.client().confirmations(&tx.txid()).unwrap() >= 1, "the lapse confirmed");
+			let paid: u64 = tx.output.iter().filter(|o| o.script_pubkey == ret && o.asset.explicit() == Some(x))
+				.map(|o| o.value.explicit().unwrap()).sum();
+			assert!(paid >= value - allowance && paid <= value, "the lapse pays the return script the claim less at most the allowance");
+			println!("lapse {}: {} vB, {} of X to the payer's script, {} inputs", t, tx.vsize(), paid, tx.input.len());
+			back += paid;
+		}
+	}
+	assert!(back >= 2 * (value - allowance));
+	assert!(ds["returns"].as_array().unwrap().is_empty(), "nothing is paid from the operator's coins");
 }
 
 #[tokio::test(flavor = "multi_thread")]

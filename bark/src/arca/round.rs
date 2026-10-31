@@ -190,6 +190,8 @@ pub(crate) trait LeafTerms {
 	fn burn(&self) -> bool;
 	/// A `channel-1` leaf's terms; an accumulator batch takes none.
 	fn channel(&self) -> Option<&arca_covenant::Channel>;
+	/// A `claim-1` leaf's lapse; an accumulator batch takes none.
+	fn lapse(&self) -> Option<&arca_covenant::Lapse>;
 }
 
 impl LeafTerms for LeafRecord {
@@ -199,6 +201,7 @@ impl LeafTerms for LeafRecord {
 	fn asset(&self) -> AssetId { self.asset }
 	fn burn(&self) -> bool { self.burn }
 	fn channel(&self) -> Option<&arca_covenant::Channel> { self.channel.as_ref() }
+	fn lapse(&self) -> Option<&arca_covenant::Lapse> { self.claim.as_ref() }
 }
 
 /// A new leaf as the wallet rebuilds it from a published batch: a tree's
@@ -228,6 +231,9 @@ impl LeafTerms for NewRecord {
 	}
 	fn channel(&self) -> Option<&arca_covenant::Channel> {
 		match self { NewRecord::Tree(r) => r.channel.as_ref(), NewRecord::Accumulator(_) => None }
+	}
+	fn lapse(&self) -> Option<&arca_covenant::Lapse> {
+		match self { NewRecord::Tree(r) => r.claim.as_ref(), NewRecord::Accumulator(_) => None }
 	}
 }
 
@@ -436,7 +442,12 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 				.map_err(|e| Error::Parse(format!("a published leaf's order terms: {}", e)))?),
 			None => None,
 		};
-		leaves.push(LeafSpec { claim: None,
+		leaves.push(LeafSpec {
+			claim: match l.get("claim").filter(|c| !c.is_null()) {
+				Some(c) => Some(arca_covenant::record_json::claim_from_json(c)
+					.map_err(|e| Error::Parse(format!("a published leaf's lapse: {}", e)))?),
+				None => None,
+			},
 			template: l["template"].as_str().unwrap_or("").parse().map_err(|e: arca_covenant::RecordError| Error::Parse(e.to_string()))?,
 			owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap_or(""))?)
 				.map_err(|e| Error::Parse(e.to_string()))?,
@@ -481,6 +492,21 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 	let asked_landing = w.get("landing").is_some_and(|l| !l.is_null());
 	let asked_channel = w.get("channel").filter(|c| !c.is_null());
 	let asked_v2 = w.get("template").and_then(|t| t.as_str()) == Some("vtxo-2");
+	// A claim leaf that lapses, on exactly the terms its distribution named:
+	// the deadline, the allowance and the return script.
+	let asked_lapse = w.get("lapse").filter(|l| !l.is_null());
+	let served_lapse = record.lapse().map(arca_covenant::record_json::claim_json);
+	if asked_lapse != served_lapse.as_ref() {
+		return Err(format!("its lapse is {}, and the wallet asked for {}", served_lapse.map_or("none".into(), |l| l.to_string()),
+			asked_lapse.map_or("none".into(), |l| l.to_string())));
+	}
+	if asked_lapse.is_some() {
+		return if record.template() == Template::Claim1 && record.htlc().is_none() && record.order().is_none() {
+			Ok(())
+		} else {
+			Err(format!("it is a leaf of template {}, and the wallet asked for a claim-1 leaf", record.template()))
+		};
+	}
 	let want = match (receive, asked_order, asked_landing, asked_channel) {
 		(Some(_), ..) => Template::Htlc1,
 		// The terms name their version: order-3, or order-2 for a leaf from

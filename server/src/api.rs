@@ -33,7 +33,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
 	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
-	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
+	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "on_chain", "open_reassignment",
 	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
@@ -2286,6 +2286,10 @@ pub struct TreeLeaf {
 	/// operator's side of its value and its credit window.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub channel: Option<serde_json::Value>,
+	/// A `claim-1` leaf's lapse (`{"deadline", "allowance",
+	/// "return_script"}`): when, and where, a claim nobody took up goes back.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub claim: Option<serde_json::Value>,
 }
 
 /// `POST /v1/forfeit_leaves`: the owner's signature over the forfeit of each
@@ -2389,6 +2393,15 @@ pub struct Distribute {
 	pub fees: Vec<FeeAmount>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub not_before: Option<u32>,
+	/// The deadline its claims lapse at, a median time: each claim leaf is
+	/// `claim-1`, and what its holder has not taken up by then goes back to
+	/// the return script by the leaf's own lapse. With `lapse_allowance`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deadline: Option<u32>,
+	/// What each lapse may leave out of its output for its fee, in the
+	/// asset's atoms, decimal; below every claim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lapse_allowance: Option<String>,
 }
 
 /// One claim of a distribution: the named key (x-only, hex), the payer's
@@ -2410,9 +2423,10 @@ pub struct DistributionStatusRequest {
 
 /// A distribution as its payer sees it: its participation's state, where
 /// its leaves are, the deadline by which a holder takes a claim up through
-/// the operator (the claim leaves' exit deadline, three days before their
-/// batch's first expiry), each claim, and each payment of unclaimed leaves
-/// back to the return script.
+/// the operator (for claims that lapse, the distribution's own deadline, or
+/// the claim leaves' exit deadline, three days before their batch's first
+/// expiry, when that comes first), each claim, each lapse and each payment of
+/// unclaimed leaves back to the return script.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DistributionStatus {
@@ -2426,6 +2440,12 @@ pub struct DistributionStatus {
 	pub expiry: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub deadline: Option<u32>,
+	/// The deadline the claims lapse at, for a distribution whose claims
+	/// are `claim-1` leaves.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lapse_deadline: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lapse_allowance: Option<String>,
 	pub claims: Vec<ClaimStatus>,
 	pub returns: Vec<ClaimReturn>,
 	/// What the returns pay together.
@@ -2435,7 +2455,9 @@ pub struct DistributionStatus {
 /// One claim's state: `pending` (its distribution not released), `open`
 /// (its leaf live, not taken up), `claimed` (its leaf spent, by its holder's
 /// take-up or refresh), `returned` (paid back to the payer after a final
-/// sweep took it), or the state of a distribution that never released
+/// sweep took it), `lapsing` (its deadline passed, not taken up: the watcher
+/// brings it on the chain and lapses it), `lapsed` (its lapse published, back
+/// to the payer by the leaf itself), or the state of a distribution that never released
 /// (`void`, `expired`), or of a leaf lost with its round (`lost`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2449,6 +2471,8 @@ pub struct ClaimStatus {
 	pub state: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub returned_in: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lapsed_in: Option<String>,
 }
 
 /// A payment of unclaimed leaves to the payer: its transaction, what it
@@ -2515,6 +2539,10 @@ pub struct ClaimFound {
 	pub expiry: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub deadline: Option<u32>,
+	/// The deadline the claim lapses at, for a `claim-1` leaf: the operator
+	/// takes it up only before then.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lapse_deadline: Option<u32>,
 }
 
 /// `POST /v1/claim_leaf`: a holder's unroll authorisations for a claim leaf,

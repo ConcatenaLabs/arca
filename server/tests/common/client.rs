@@ -413,7 +413,8 @@ fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 		min_leaf: num(&t["min_leaf"]),
 	};
 	let tree_asset: elements::AssetId = s("asset").parse().unwrap();
-	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec { claim: None,
+	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
+		claim: (!l["claim"].is_null()).then(|| arca_covenant::record_json::claim_from_json(&l["claim"]).unwrap()),
 		template: l["template"].as_str().unwrap().parse().unwrap(),
 		owner: XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap())).unwrap(),
 		value: num(&l["value"]),
