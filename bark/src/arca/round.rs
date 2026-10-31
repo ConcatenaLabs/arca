@@ -85,6 +85,38 @@ pub const DEFAULT_MAX_FEE_PPM: u64 = 10_000;
 /// publishes.
 pub const FREE_WINDOW: u32 = 2 * 86_400;
 
+/// A refresh quote's coins in the participations that give them up: one per
+/// asset, or one per [`MAX_GIVEN`] coins of an asset that has more, each
+/// with its coins' value and fee as quoted (`coins[k]`'s `value` and `fee`,
+/// `assets[k]` its asset); a channel leaf is one participation whatever it
+/// gives up. Each part is its asset, value, fee and the indices of its coins.
+pub(crate) fn participation_parts(per: &BTreeMap<AssetId, (u64, u64)>, assets: &[AssetId], coins: &[Value], channel: bool)
+	-> Vec<(AssetId, u64, u64, Vec<usize>)>
+{
+	let mut parts = vec![];
+	for (asset, (total, fee)) in per {
+		let mine: Vec<usize> = (0..assets.len()).filter(|k| assets[*k] == *asset).collect();
+		if channel || mine.len() <= MAX_GIVEN {
+			parts.push((*asset, *total, *fee, mine));
+			continue;
+		}
+		let of = |k: &usize, key: &str| coins[*k][key].as_str().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+		for chunk in mine.chunks(MAX_GIVEN) {
+			let t = chunk.iter().map(|k| of(k, "value")).sum::<u64>();
+			let f = chunk.iter().map(|k| of(k, "fee")).sum::<u64>();
+			parts.push((*asset, t, f, chunk.to_vec()));
+		}
+	}
+	parts
+}
+
+/// The most coins one participation, take or distribution gives up: the
+/// operator refuses more (`MAX_INPUTS` in its participations). A refresh of
+/// more coins of an asset is made in as many participations as it needs;
+/// every other selection stops at this many coins, the largest first when
+/// the wallet holds more.
+pub const MAX_GIVEN: usize = 16;
+
 /// Whether a coin whose first expiry is `expiry` is in its free window at
 /// `now`.
 pub fn in_free_window(expiry: u32, now: u32) -> bool {
@@ -721,9 +753,10 @@ impl Wallet {
 	}
 
 	/// Gives up the coins of `quote` for a new leaf in each asset, in one
-	/// participation per asset: a round carries one asset, so each asset's
-	/// coins are refreshed in that asset's rounds. Each pays the fee the quote
-	/// states in its own asset. Not before median time `not_before`, when
+	/// participation per asset, or per [`MAX_GIVEN`] coins of an asset when
+	/// it refreshes more: a round carries one asset, so each asset's coins
+	/// are refreshed in that asset's rounds. Each pays the fee the quote
+	/// states for its coins, in its own asset. Not before median time `not_before`, when
 	/// given. Answers each participation (`participations`), one the server
 	/// refused or did not take now with its `error` (one not taken stands,
 	/// and sync posts it again); it is an error only when none was taken.
@@ -731,8 +764,8 @@ impl Wallet {
 		let RefreshQuote { info, channel, keep, rows, ids, assets, per, coins } = quote;
 		let mut out = vec![];
 		let mut first_error = None;
-		for (asset, (total, fee)) in &per {
-			let mine: Vec<usize> = (0..rows.len()).filter(|k| assets[*k] == *asset).collect();
+		let parts = participation_parts(&per, &assets, &coins, channel.is_some());
+		for (asset, total, fee, mine) in &parts {
 			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
 			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
 			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel, keep) {
@@ -2247,6 +2280,35 @@ pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_refresh_of_more_coins_than_one_participation_takes_is_split() {
+		let a = AssetId::from_slice(&[1; 32]).unwrap();
+		let b = AssetId::from_slice(&[2; 32]).unwrap();
+		// 40 coins of a (value 100 + k, fee 1 each) and 3 of b.
+		let mut assets = vec![];
+		let mut coins = vec![];
+		let mut per: BTreeMap<AssetId, (u64, u64)> = BTreeMap::new();
+		for k in 0..43u64 {
+			let asset = if k < 40 { a } else { b };
+			assets.push(asset);
+			coins.push(json!({"value": (100 + k).to_string(), "fee": "1"}));
+			let e = per.entry(asset).or_default();
+			e.0 += 100 + k;
+			e.1 += 1;
+		}
+		let parts = participation_parts(&per, &assets, &coins, false);
+		let sizes: Vec<(AssetId, usize)> = parts.iter().map(|p| (p.0, p.3.len())).collect();
+		assert_eq!(sizes, vec![(a, 16), (a, 16), (a, 8), (b, 3)], "at most {} coins a participation", MAX_GIVEN);
+		for (asset, total, fee, idx) in &parts {
+			assert!(idx.iter().all(|k| assets[*k] == *asset));
+			assert_eq!(*total, idx.iter().map(|k| 100 + *k as u64).sum::<u64>());
+			assert_eq!(*fee, idx.len() as u64);
+		}
+		assert_eq!(parts.iter().filter(|p| p.0 == a).map(|p| p.1).sum::<u64>(), per[&a].0, "every coin given up once");
+		// A channel leaf is one participation, whatever it gives up.
+		assert_eq!(participation_parts(&per, &assets, &coins, true).len(), 2);
+	}
 
 	#[test]
 	fn a_batch_agrees_with_the_profile_its_operator_states() {

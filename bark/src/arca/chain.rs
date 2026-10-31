@@ -88,6 +88,10 @@ use super::Error;
 /// main chain ([`ChainSource::follow_anchor_depth`]).
 pub const ANCHOR_DEPTH: u64 = 2;
 
+/// The most transactions [`ChainSource::gone`] reads walking back through
+/// parents that are off the chain.
+pub const GONE_REACH: usize = 512;
+
 /// How far above a block the wallet looks for a committee certificate.
 const CERT_LOOKAHEAD: u64 = 200;
 
@@ -1241,23 +1245,42 @@ impl ChainSource {
 
 	/// Whether `tx` can never return to the chain: it is in no block of the
 	/// active chain and not in the mempool, and one of the coins it spends is
-	/// spent by another transaction that is final. One that is merely out of
-	/// the chain, its coins unspent or spent only in blocks not yet final,
-	/// can still return.
+	/// spent by another transaction that is final, or is made by a
+	/// transaction that can never return either (a chain of transactions left
+	/// on a branch an anchor-driven reorganisation invalidated, whose first
+	/// transaction lost its coins to another that is final). One that is
+	/// merely out of the chain, its coins unspent or spent only in blocks not
+	/// yet final, can still return. The walk back reads at most
+	/// [`GONE_REACH`] transactions; past that, it says the transaction can
+	/// return.
 	pub fn gone(&self, tx: &Transaction) -> Result<bool, Error> {
-		if self.whereabouts(&tx.txid())? != (false, false) {
-			return Ok(false);
-		}
-		for i in &tx.input {
-			let op = i.previous_output;
-			let Some((_, height)) = self.tx_block(&op.txid)? else { continue };
-			let v: Value = self.call("gettxout", &[json!(op.txid.to_string()), json!(op.vout), json!(false)]).map_err(node)?;
-			if !v.is_null() {
+		let mut seen: BTreeSet<Txid> = BTreeSet::new();
+		let mut todo: Vec<Transaction> = vec![tx.clone()];
+		while let Some(t) = todo.pop() {
+			if !seen.insert(t.txid()) || seen.len() > GONE_REACH {
 				continue;
 			}
-			if let Some((other, Some(_))) = self.spender(&op, height)? {
-				if other.txid() != tx.txid() && self.finality(&other.txid())?.is_final() {
-					return Ok(true);
+			if self.whereabouts(&t.txid())? != (false, false) {
+				continue;
+			}
+			for i in &t.input {
+				let op = i.previous_output;
+				let Some((_, height)) = self.tx_block(&op.txid)? else {
+					// Made by a transaction off the chain: this one returns
+					// only if that one does.
+					if let Some(parent) = self.transaction(&op.txid)? {
+						todo.push(parent);
+					}
+					continue;
+				};
+				let v: Value = self.call("gettxout", &[json!(op.txid.to_string()), json!(op.vout), json!(false)]).map_err(node)?;
+				if !v.is_null() {
+					continue;
+				}
+				if let Some((other, Some(_))) = self.spender(&op, height)? {
+					if other.txid() != t.txid() && self.finality(&other.txid())?.is_final() {
+						return Ok(true);
+					}
 				}
 			}
 		}
@@ -1666,6 +1689,70 @@ mod test {
 	///
 	/// Needs `SEQUENTIAD_EXEC`.
 	#[cfg(not(target_arch = "wasm32"))]
+	/// A chain of transactions left off the chain by an anchor-driven
+	/// reorganisation, and gone from the mempool: the child can return while
+	/// its parent can, and can never return once another transaction, final,
+	/// takes the parent's coin, although the child's own coin is made by a
+	/// transaction in no block.
+	#[test]
+	fn a_transaction_whose_parent_can_never_return_is_gone() {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let mut r = Regtest::pos_from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let asset = coin.asset.explicit().unwrap();
+		let value = coin.value.explicit().unwrap();
+		// Blocks anchored below the parent block the reorganisation takes,
+		// for the chain to fall back to.
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		// A parent and its child, in one block anchored to a parent block of
+		// its own.
+		let parent = spend_to(free, asset, value, op_true.clone());
+		let child = spend_to(OutPoint::new(parent.txid(), 0), asset, value - 10_000, op_true.clone());
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let anchored = r.parent.client().block_count().unwrap();
+		r.node.client().send_raw_transaction(&parent).unwrap();
+		r.node.client().send_raw_transaction(&child).unwrap();
+		r.produce_block().unwrap();
+		gap();
+		chain.new_command();
+		assert!(chain.tx_block(&child.txid()).unwrap().is_some());
+		// Bitcoin reorganises that parent block away; the node forgets its
+		// mempool.
+		r.orphan_parent_from(anchored).unwrap();
+		r.node.restart(&["-persistmempool=0"]).unwrap();
+		gap();
+		chain.new_command();
+		assert_eq!(chain.whereabouts(&child.txid()).unwrap(), (false, false), "in no block and not in the mempool");
+		assert!(chain.tx_block(&parent.txid()).unwrap().is_none(), "the child's coin is made by a transaction in no block");
+		assert!(!chain.gone(&child).unwrap(), "the parent's coin is unspent: both can return");
+		println!("the parent {} and the child {} are off the chain; both can return", parent.txid(), child.txid());
+		// Another transaction takes the parent's coin, and is final.
+		let other = spend_to(free, asset, value, Script::from(vec![0x52]));
+		r.node.client().send_raw_transaction(&other).unwrap();
+		r.produce_block().unwrap();
+		r.mine_parent(2).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		gap();
+		chain.new_command();
+		assert!(chain.finality(&other.txid()).unwrap().is_final(), "{:?}", chain.finality(&other.txid()).unwrap());
+		assert!(chain.gone(&parent).unwrap(), "its coin is spent by a final transaction");
+		assert!(chain.gone(&child).unwrap(), "its parent can never return, so neither can it");
+		println!("{} took the parent's coin and is final: the parent and the child are gone", other.txid());
+	}
+
 	#[test]
 	fn a_lineage_is_read_from_the_chain_only_once_its_root_is_spent() {
 		use sequentia_ext::regtest::Regtest;

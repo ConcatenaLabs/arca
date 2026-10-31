@@ -381,6 +381,25 @@ impl Wallet {
 		self.spendable(asset)
 	}
 
+	/// The live coins of `asset` a participation, a take or an offboard may
+	/// give up, in the order a selection takes them: as [`Self::spendable`]
+	/// orders them while the wallet holds at most [`super::round::MAX_GIVEN`],
+	/// and the largest first when it holds more, since a selection stops at
+	/// that many coins.
+	pub(crate) fn coins_to_give(&self, asset: AssetId) -> Result<Vec<In>, Error> {
+		let mut coins = self.spendable(asset)?;
+		if coins.len() > super::round::MAX_GIVEN {
+			coins.sort_by(|a, b| b.coin.value.cmp(&a.coin.value));
+		}
+		Ok(coins)
+	}
+
+	/// The refusal of a selection that reached [`super::round::MAX_GIVEN`]
+	/// coins of `asset` without holding what it needs.
+	pub(crate) fn too_many_coins(asset: AssetId, held: u64, need: u64) -> Error {
+		Error::Refused(format!("the {} largest of the wallet's coins of asset {} hold {}, short of the {} this needs, and one participation 			gives up at most that many: refresh the coins first, which merges them", super::round::MAX_GIVEN, asset, held, need))
+	}
+
 	/// The checkpoint margin of `coin` ([`Self::checkpoint_margin`]).
 	pub(crate) fn checkpoint_margin_of(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
 		self.checkpoint_margin(coin, m)
