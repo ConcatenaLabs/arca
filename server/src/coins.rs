@@ -71,8 +71,8 @@ pub enum CoinError {
 	InvalidCoin { leaf: LeafId, error: TransferError },
 	/// It rests on a board whose service ends at `expiry`, less than
 	/// `horizon` seconds ahead.
-	#[error("leaf {leaf} rests on a board whose service ends at median time {expiry}: it is taken here only until {horizon} s before \
-		that, its exit deadline, for a transfer and a refresh alike)")]
+	#[error("leaf {leaf} rests on a board, or a batch without a sweep, whose service ends at median time {expiry}: it is taken here only \
+		until {horizon} s before that, its exit deadline, for a transfer and a refresh alike)")]
 	PastBoardDate { leaf: LeafId, expiry: u32, horizon: u32 },
 	/// A `channel-1` coin, given up only in a round's participation and
 	/// paid from only by a state of its channel ([`crate::channels`]): its
@@ -165,25 +165,40 @@ pub async fn bases(store: &Store, record: &CoinRecord, out: &mut Vec<Transaction
 	Ok(())
 }
 
-/// The earliest service expiry of the boards `record` rests on, each the
-/// median time of the block of the followed chain that holds it plus
-/// [`Params::BOARD_LIFETIME`]; boards in no block are passed over (a coin on
-/// one is not live). `None` when it rests on no board in a block.
+/// The earliest service expiry of the boards and the batches without a sweep
+/// `record` rests on: a board's, the median time of the block of the
+/// followed chain that holds it plus [`Params::BOARD_LIFETIME`] (boards in
+/// no block are passed over: a coin on one is not live); a batch without a
+/// sweep's, its service horizon ([`crate::store::BatchRow::collect_mtp`]).
+/// Neither expires; from its service expiry the operator takes no off-chain
+/// spend of a coin resting on it and brings that coin on the chain under its
+/// holder's key. `None` when it rests on neither.
 pub async fn board_expiry(store: &Store, record: &CoinRecord) -> Result<Option<u32>, CoinError> {
 	let mut boards = vec![];
-	fn collect(r: &CoinRecord, out: &mut Vec<[u8; 32]>) {
+	let mut leaves = vec![];
+	fn collect(r: &CoinRecord, out: &mut Vec<[u8; 32]>, leaves: &mut Vec<[u8; 32]>) {
 		match r {
 			CoinRecord::Board(b) => out.push(b.leaf_id().0),
-			CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
-			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out)),
+			CoinRecord::Leaf { record, .. } => {
+				if !record.schedule.expires() {
+					leaves.extend(record.leaf_id().ok().map(|l| l.0));
+				}
+			},
+			CoinRecord::Accumulator { .. } => {},
+			CoinRecord::Transfer(t) => t.inputs.iter().for_each(|i| collect(&i.coin, out, leaves)),
 			CoinRecord::Fill(f) => {
-				collect(&f.fill.order, out);
-				f.fill.inputs.iter().for_each(|i| collect(&i.coin, out));
+				collect(&f.fill.order, out, leaves);
+				f.fill.inputs.iter().for_each(|i| collect(&i.coin, out, leaves));
 			},
 		}
 	}
-	collect(record, &mut boards);
+	collect(record, &mut boards, &mut leaves);
 	let mut earliest: Option<u32> = None;
+	for l in leaves {
+		if let Some(e) = store.leaf_collect_mtp(&l).await? {
+			earliest = Some(earliest.map_or(e, |x| x.min(e)));
+		}
+	}
 	for b in boards {
 		let Some(row) = store.board(&b).await? else { continue };
 		if let Some(block) = store.tx_location(&row.txid).await? {

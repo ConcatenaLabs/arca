@@ -24,7 +24,8 @@
 //! leaf leaves in one transaction. Each batch has
 //! a sweep token of its own, issued as one explicit atom with no reissuance
 //! token by one of the operator's coins, and a clock schedule of three steps
-//! (28, 56 and 84 days after the round) with a notice of 36 hours.
+//! (28, 56 and 84 days after the round) with a notice of 36 hours; with
+//! [`RoundConfig::no_sweep`], none (below).
 //!
 //! The round transaction pays, in order (after the orders' outputs in a round
 //! that fills on-chain orders, below): each batch output followed by its
@@ -145,6 +146,21 @@
 //! the board's dates, a batch leaf to its batch's expiry, either answered at
 //! once if its owner exits). Nothing goes on the chain for a re-run that an
 //! ordinary participation would not put there.
+//!
+//! # Batches without a sweep
+//!
+//! With [`RoundConfig::no_sweep`] (`[batches] no_sweep`, always on the main
+//! chain) every batch is built with [`ClockSchedule::never`]: no token, no
+//! clock, no sweep leaf anywhere, a tree always, and each batch output
+//! followed by the next with no token's atom between them. Its service
+//! horizon, [`Params::collect_after_seconds`] after the round, is recorded
+//! with it; the watcher collects it on the chain there ([`crate::watcher`]).
+//! Nothing then takes back a new leaf whose owner never hands its forfeit
+//! over, so such a round is held, built and unbroadcast, exactly as a round
+//! that fills on-chain orders is (below): it goes out only once every
+//! participation in it that gives up a coin has handed over its forfeits, and
+//! one that does not within the window is voided, the round dropped, killed
+//! on the chain and built again without it ([`Rounds::pass`]).
 //!
 //! # Rounds that fill on-chain orders
 //!
@@ -301,6 +317,12 @@ pub struct RoundConfig {
 	/// batch's leaves, so it is set only once every wallet its holders use
 	/// reads it.
 	pub delegated_reclaim: bool,
+	/// Whether every batch is built without a sweep
+	/// ([`ClockSchedule::never`]): no token issued, no clock paid, always a
+	/// tree, and the round held unbroadcast until every participation in it
+	/// has handed over its forfeits ([`Rounds::pass`]). Always on for the
+	/// main chain ([`Params::no_sweep`]).
+	pub no_sweep: bool,
 }
 
 /// The lowest nodes of the batch leaves a coin rests on: its own, or each up
@@ -347,6 +369,7 @@ impl Default for RoundConfig {
 			holder_batches: 8,
 			holder_window: 3 * 86_400,
 			delegated_reclaim: false,
+			no_sweep: false,
 		}
 	}
 }
@@ -771,8 +794,30 @@ impl Rounds {
 			}
 		}
 		let assets: BTreeSet<AssetId> = leaves.iter().map(|l| l.0).collect();
-		let room = self.config.holder_batches.min(self.wallet.issuing_coins(None).await?.saturating_sub(assets.len() + reserved));
+		// A batch without a sweep issues no token, so no coin bounds them.
+		let room = if self.config.no_sweep {
+			self.config.holder_batches
+		} else {
+			self.config.holder_batches.min(self.wallet.issuing_coins(None).await?.saturating_sub(assets.len() + reserved))
+		};
 		Ok(plan_batches(&leaves, room))
+	}
+
+	/// A batch's kind: a holder's own batch (`own`) is a tree, so that it can
+	/// be reclaimed, and so is every batch without a sweep, which an
+	/// accumulator batch cannot yet be.
+	fn kind_for(&self, own: bool, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
+		if own || self.config.no_sweep { BatchKind::Tree } else { self.kind_of(asset, specs) }
+	}
+
+	/// A batch's schedule: [`ClockSchedule::never`] without a sweep, else the
+	/// clock of `token` at `expiries`.
+	fn schedule_for(&self, token: Option<AssetId>, expiries: &[MedianTime]) -> Result<ClockSchedule, String> {
+		match (self.config.no_sweep, token) {
+			(true, _) => Ok(ClockSchedule::never(self.params.operator)),
+			(false, Some(t)) => ClockSchedule::new(t, self.params.operator, self.config.notice, expiries.to_vec()).map_err(|e| e.to_string()),
+			(false, None) => Err("a batch with a sweep needs a token".into()),
+		}
 	}
 
 	fn kind_of(&self, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
@@ -1486,13 +1531,12 @@ impl Rounds {
 				None => ReserveRule::Fixed { node: 1, entry: 1 },
 			};
 			// The token's id changes no value: any asset stands in for it.
-			let schedule = ClockSchedule::new(AssetId::from_byte_array([0xee; 32]), self.params.operator, self.config.notice, expiries.clone())
-				.map_err(|e| RoundError::Internal(e.to_string()))?;
+			let schedule = self.schedule_for(Some(AssetId::from_byte_array([0xee; 32])), &expiries).map_err(RoundError::Internal)?;
 			let params = TreeParams {
 				asset, chain: self.params.chain, schedule, burn: false, delegated_reclaim: self.config.delegated_reclaim, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
-			let kind = if plan.own { BatchKind::Tree } else { self.kind_of(&asset, &specs) };
+			let kind = self.kind_for(plan.own, &asset, &specs);
 			let batch = Batch::build(kind, params, &specs)
 				.map_err(|e| RoundError::Internal(format!("the batch of asset {}: {}", asset, e)))?;
 			*pays.entry(asset).or_default() += batch.batch_output().value;
@@ -1784,7 +1828,7 @@ impl Rounds {
 			Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
 			None => ReserveRule::Fixed { node: 1, entry: 1 },
 		})).collect();
-		let (radix, notice, chain, delegated_reclaim) = (self.config.radix, self.config.notice, p.chain, self.config.delegated_reclaim);
+		let (radix, chain, delegated_reclaim) = (self.config.radix, p.chain, self.config.delegated_reclaim);
 
 		// The transaction: the wallet issues the tokens, the trees are built
 		// on them.
@@ -1849,14 +1893,19 @@ impl Rounds {
 		// accumulator batch.
 		// A holder's own batch is a tree, so that it can be reclaimed.
 		let kinds: Vec<BatchKind> = groups.iter().zip(&plan)
-			.map(|((a, leaves), b)| if b.own { BatchKind::Tree } else { self.kind_of(a, &leaves.iter().map(|l| l.spec.clone()).collect::<Vec<_>>()) })
+			.map(|((a, leaves), b)| self.kind_for(b.own, a, &leaves.iter().map(|l| l.spec.clone()).collect::<Vec<_>>()))
 			.collect();
-		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, minted, |tokens| {
+		// A batch without a sweep issues no token: its output alone, where a
+		// batch with one is followed by its token's atom.
+		let no_sweep = self.config.no_sweep;
+		let stride: u32 = if no_sweep { 1 } else { 2 };
+		let (built, trees) = self.wallet.build_round(if no_sweep { 0 } else { groups.len() }, fee_asset, connector, &forced, &foreign, minted, |tokens| {
 			let mut outputs: Vec<ExplicitOutput> = successor.iter().cloned().collect();
 			outputs.extend(fill_outputs.iter().cloned());
 			let mut trees = vec![];
-			for (bi, ((asset, leaves), token)) in groups.iter().zip(tokens).enumerate() {
-				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
+			for (bi, (asset, leaves)) in groups.iter().enumerate() {
+				let token = tokens.get(bi).copied();
+				let schedule = self.schedule_for(token, &expiries)?;
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec.clone()).collect();
 				// An issuer-operated asset's batch is burn-only.
 				let params = TreeParams {
@@ -1865,8 +1914,10 @@ impl Rounds {
 				};
 				let tree = Batch::build(kinds[bi], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
 				outputs.push(tree.batch_output());
-				if let Some(clock0) = tree.clock0_script_pubkey() {
-					outputs.push(ExplicitOutput::new(*token, 1, clock0));
+				match (tree.clock0_script_pubkey(), token) {
+					(Some(clock0), Some(token)) => outputs.push(ExplicitOutput::new(token, 1, clock0)),
+					(None, None) => {},
+					_ => return Err(format!("the batch of asset {} and its token do not agree", asset)),
 				}
 				trees.push((tree, params));
 			}
@@ -1896,13 +1947,13 @@ impl Rounds {
 				if tree.kind() != BatchKind::Tree {
 					return release(RoundError::Internal("an issuer-operated asset's batch is a tree".into())).await;
 				}
-				match crate::issuer::WireBatch::of(base + 2 * k as u32, params, &specs) {
+				match crate::issuer::WireBatch::of(base + stride * k as u32, params, &specs) {
 					Ok(b) => batches.push(b),
 					Err(e) => return release(RoundError::Internal(e)).await,
 				}
 			}
 			let offs = offboards.iter().enumerate()
-				.map(|(k, o)| crate::issuer::WireOffboard::of(base + 2 * trees.len() as u32 + k as u32, &o.policy, o.margin)).collect();
+				.map(|(k, o)| crate::issuer::WireOffboard::of(base + stride * trees.len() as u32 + k as u32, &o.policy, o.margin)).collect();
 			let req = crate::issuer::WireReissue::new(&tx, &built.prevouts, *asset, i.entropy, room.now.state, batches, offs);
 			match self.signer.reissue(&req).await {
 				Ok(w) => tx.input[0].witness.script_witness = w,
@@ -1918,11 +1969,11 @@ impl Rounds {
 		let accept = WalletPolicy {
 			min_exit_delay: p.min_exit_delay,
 			max_exit_delay: p.max_exit_delay,
-			..WalletPolicy::new(chain, s, now)
+			..if no_sweep { WalletPolicy::no_sweep(chain, s, now) } else { WalletPolicy::new(chain, s, now) }
 		};
 		let mut new_batches = vec![];
 		for (i, ((batch, tp), (asset, leaves))) in trees.iter().zip(&groups).enumerate() {
-			let vout = base + 2 * i as u32;
+			let vout = base + stride * i as u32;
 			// Each leaf's id, script and record, as its owner's wallet checks
 			// it: a tree leaf's path, or an accumulator leaf's slot.
 			let mut checked: Vec<(LeafId, Script, Result<Vec<u8>, String>)> = Vec::with_capacity(leaves.len());
@@ -2015,9 +2066,16 @@ impl Rounds {
 					asset: asset.into_inner().to_byte_array(),
 					value: batch.batch_output().value,
 					token: tp.schedule.token.into_inner().to_byte_array(),
-					token_vout: vout + 1,
-					issuer: (tx.input[foreign.len() + i].previous_output.txid.to_byte_array(),
-						tx.input[foreign.len() + i].previous_output.vout),
+					// A batch without a sweep has no token output: its own
+					// output stands in, and no token was issued, so the
+					// round's first input of the operator's stands in for
+					// the issuer. Neither is read for such a batch.
+					token_vout: if no_sweep { vout } else { vout + 1 },
+					issuer: if no_sweep {
+						(tx.input[foreign.len()].previous_output.txid.to_byte_array(), tx.input[foreign.len()].previous_output.vout)
+					} else {
+						(tx.input[foreign.len() + i].previous_output.txid.to_byte_array(), tx.input[foreign.len() + i].previous_output.vout)
+					},
 					schedule: tp.schedule.encode(),
 					burn: tp.burn,
 					radix: if batch.kind() == BatchKind::Tree { tp.radix as u16 } else { 0 },
@@ -2028,6 +2086,7 @@ impl Rounds {
 					min_leaf: tp.min_leaf,
 					kind: batch.kind(),
 					delegated_reclaim: tp.delegated_reclaim,
+					collect_mtp: no_sweep.then(|| now.to_consensus_u32().saturating_add(p.collect_after_seconds)),
 				},
 				leaves: new_leaves,
 				scripts,
@@ -2065,7 +2124,7 @@ impl Rounds {
 		}
 		let mut new_offboards = vec![];
 		for (k, o) in offboards.iter().enumerate() {
-			let vout = base + 2 * trees.len() as u32 + k as u32;
+			let vout = base + stride * trees.len() as u32 + k as u32;
 			match o.policy.find(&tx) {
 				Ok(v) if v == vout => {},
 				Ok(v) => return release(RoundError::Check(format!("offboard {} is at output {}, not {}", k, v, vout))).await,
@@ -2121,14 +2180,18 @@ impl Rounds {
 			Ok(id) => id,
 			Err(e) => return release(e.into()).await,
 		};
-		// A round that fills orders waits, built, for its takes' forfeits
-		// ([`Self::takes_ready`]); any other goes out at once.
-		let broadcast = if fills.is_empty() {
+		// A round that fills orders, or holds a batch without a sweep, waits,
+		// built, for its participations' forfeits ([`Self::forfeits_ready`]);
+		// any other goes out at once.
+		// (A round of offboards alone holds no batch: its outputs come back to
+		// the operator by their reclaim if no preimage goes out.)
+		let waits = !fills.is_empty() || (no_sweep && !groups.is_empty() && chosen.iter().any(|r| !r.inputs.is_empty()));
+		let broadcast = if !waits {
 			self.submit(round_id, &tx, built.fee).await?
 		} else {
-			"held: it is broadcast once every take in it has handed over its forfeits".to_string()
+			"held: it is broadcast once every participation in it has handed over its forfeits".to_string()
 		};
-		let batches: Vec<(AssetId, u32, usize)> = groups.iter().enumerate().map(|(i, (a, l))| (*a, base + 2 * i as u32, l.len())).collect();
+		let batches: Vec<(AssetId, u32, usize)> = groups.iter().enumerate().map(|(i, (a, l))| (*a, base + stride * i as u32, l.len())).collect();
 		log::info!("round {} ({}): {} batch(es), {} offboard(s), {} participation(s), {} order(s) filled, {} vB, fee {} of {}: {}",
 			round_id, txid, batches.len(), offboards.len(), chosen.len(), fills.len(), tx.vsize(), built.fee.amount, fee_asset, broadcast);
 		for (k, f) in fills.iter().enumerate() {
@@ -2165,6 +2228,7 @@ impl Rounds {
 		let going_out = self.going_out.lock().await;
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let fills = !self.store.round_fills(r.round_id).await?.is_empty();
+			let held = fills || self.store.round_held(r.round_id).await?;
 			if fills {
 				// A round that fills orders goes out only with every order of
 				// it unspent: each is checked again at the node first, and
@@ -2185,16 +2249,16 @@ impl Rounds {
 						continue;
 					},
 					OrdersNow::Taken(voids) => {
-						self.drop_fill_round(&r, &voids).await?;
+						self.drop_held_round(&r, &voids).await?;
 						continue;
 					},
 				}
-				// It goes out once every take in it has handed over its
-				// forfeits, and is dropped, unbroadcast, when one has not
-				// within the window.
-				if !self.takes_ready(&r).await? {
-					continue;
-				}
+			}
+			// A held round goes out once every participation in it has
+			// handed over its forfeits, and is dropped, unbroadcast, when one
+			// has not within the window.
+			if held && !self.forfeits_ready(&r).await? {
+				continue;
 			}
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
@@ -2216,12 +2280,12 @@ impl Rounds {
 				self.restore(&r).await?;
 				continue;
 			}
-			// A fill round dropped unbroadcast (one the nursery was never
+			// A held round dropped unbroadcast (one the nursery was never
 			// handed) dies on the chain: one of its own coins spent in a
 			// transaction of the wallet's, done again at each pass until one
 			// is under way (after a restart, or when the wallet could not do
 			// it at once).
-			if !self.store.round_fills(r.round_id).await?.is_empty() && self.store.nursery_get(&r.txid).await?.is_none() {
+			if self.store.round_held(r.round_id).await? && self.store.nursery_get(&r.txid).await?.is_none() {
 				if let Err(e) = self.void_on_chain(&r).await {
 					log::warn!("round {} ({}), dropped unbroadcast: its own coin could not be spent now: {}", r.round_id,
 						Txid::from_byte_array(r.txid), e);
@@ -2255,22 +2319,26 @@ impl Rounds {
 		Ok(())
 	}
 
-	/// Whether the round `r`, built to fill on-chain orders and not yet
-	/// broadcast, may go out: every take in it has handed over its forfeits
-	/// (the owner's half of each, which is all the operator needs to complete
-	/// it). Its takes' forfeits are what the operator gets for paying their
-	/// orders' makers on the chain: a round broadcast without them would pay a
-	/// maker for a take that could then walk away with its coins. When the
-	/// window ([`Params::fill_forfeit_window_seconds`], by the chain's median
-	/// time from when the round was built) has passed without them, the round
-	/// is dropped unbroadcast: its coins are freed, each take whose forfeits
-	/// did not come is voided, saying why, and the others run again.
-	async fn takes_ready(&self, r: &RoundRow) -> Result<bool, RoundError> {
+	/// Whether the round `r`, held unbroadcast ([`Store::round_held`]), may
+	/// go out: every participation in it has handed over its forfeits (the
+	/// owner's half of each, which is all the operator needs to complete
+	/// it). A fill round's takes' forfeits are what the operator gets for
+	/// paying their orders' makers on the chain: a round broadcast without
+	/// them would pay a maker for a take that could then walk away with its
+	/// coins. A batch without a sweep has nothing that takes back a new leaf
+	/// whose owner never hands its forfeit over: broadcast without it, the
+	/// operator's value under that leaf would be stranded for good, and the
+	/// owner could take its old coin home as well. When the window
+	/// ([`Params::fill_forfeit_window_seconds`], by the chain's median time
+	/// from when the round was built) has passed without them, the round is
+	/// dropped unbroadcast: its coins are freed, each participation whose
+	/// forfeits did not come is voided, saying why, and the others run again.
+	async fn forfeits_ready(&self, r: &RoundRow) -> Result<bool, RoundError> {
 		let mut missing = vec![];
-		for f in self.store.round_fills(r.round_id).await? {
-			let (n, whole, unsigned) = self.store.forfeit_count(&f.participation_id, r.round_id).await?;
+		for id in self.store.round_participations(r.round_id).await? {
+			let (n, whole, unsigned) = self.store.forfeit_count(&id, r.round_id).await?;
 			if whole + unsigned < n {
-				missing.push(f.participation_id);
+				missing.push(id);
 			}
 		}
 		if missing.is_empty() {
@@ -2280,10 +2348,10 @@ impl Rounds {
 		if now < r.created_mtp as u64 + self.params.fill_forfeit_window_seconds as u64 {
 			return Ok(false);
 		}
-		let why = format!("its forfeits did not come within {} s of its round being built: a round that fills orders pays their makers \
-			on the chain, so it goes out only once every take in it has handed over its forfeits", self.params.fill_forfeit_window_seconds);
+		let why = format!("its forfeits did not come within {} s of its round being built: a round that fills orders, or holds a batch \
+			without a sweep, goes out only once every participation in it has handed over its forfeits", self.params.fill_forfeit_window_seconds);
 		let voids: Vec<([u8; 32], String)> = missing.into_iter().map(|id| (id, why.clone())).collect();
-		self.drop_fill_round(r, &voids).await?;
+		self.drop_held_round(r, &voids).await?;
 		Ok(false)
 	}
 
@@ -2309,26 +2377,26 @@ impl Rounds {
 		})
 	}
 
-	/// Drops `r`, a fill round built and never broadcast, whole or not at all
-	/// ([`Store::drop_unbroadcast_round`]): every forfeit recorded for it
-	/// deleted, its coins freed, each take of `voids` voided with its reason,
-	/// and every other take of it run again in the round built after it. One
-	/// of its own coins is then spent at once ([`Self::void_on_chain`]), so it
-	/// can never confirm. Returns whether it was dropped: not when it is no
-	/// longer built.
-	async fn drop_fill_round(&self, r: &RoundRow, voids: &[([u8; 32], String)]) -> Result<bool, RoundError> {
+	/// Drops `r`, a held round built and never broadcast, whole or not at
+	/// all ([`Store::drop_unbroadcast_round`]): every forfeit recorded for it
+	/// deleted, its coins freed, each participation of `voids` voided with
+	/// its reason, and every other participation of it run again in the
+	/// round built after it. One of its own coins is then spent at once
+	/// ([`Self::void_on_chain`]), so it can never confirm. Returns whether it
+	/// was dropped: not when it is no longer built.
+	async fn drop_held_round(&self, r: &RoundRow, voids: &[([u8; 32], String)]) -> Result<bool, RoundError> {
 		let txid = Txid::from_byte_array(r.txid);
 		let Some(again) = self.store.drop_unbroadcast_round(r.round_id).await? else { return Ok(false) };
 		self.wallet.release(&txid).await?;
 		let mut voided = 0;
 		for (id, why) in voids {
-			let why = format!("{}; its round {} was dropped unbroadcast, the take is void and the coins it gave up are its owner's again",
-				why, txid);
+			let why = format!("{}; its round {} was dropped unbroadcast, the participation is void and the coins it gave up are its owner's \
+				again", why, txid);
 			if self.store.void_participation(id, &why).await? {
 				voided += 1;
 			}
 		}
-		log::warn!("round {} ({}), which fills on-chain orders, dropped unbroadcast: {} take(s) void, {} run again", r.round_id, txid,
+		log::warn!("round {} ({}), held for its forfeits, dropped unbroadcast: {} participation(s) void, {} run again", r.round_id, txid,
 			voided, again.len().saturating_sub(voided));
 		let dropped = self.store.round(r.round_id).await?.unwrap_or_else(|| r.clone());
 		if let Err(e) = self.void_on_chain(&dropped).await {

@@ -75,6 +75,7 @@ pub async fn refresh(r: &mut Running, coins: &[(&Coin, &Keypair)]) -> Vec<Refres
 		ids.push((id, nonce));
 	}
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	super::rounds::send_held(r, &built.tx.txid()).await;
 	r.produce().await;
 	r.bury().await;
 	round_final(r, &built.tx.txid()).await;

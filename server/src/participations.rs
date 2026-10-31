@@ -1241,7 +1241,11 @@ impl Participations {
 						p.offboard_vout = Some(vout);
 					}
 				}
-				let unbroadcast = if r.state == crate::store::RoundState::Built && !self.store.round_fills(round_id).await?.is_empty() {
+				// A held round, before it is broadcast: the transaction a
+				// participation validates its new leaves against before it
+				// hands over its forfeits.
+				let unbroadcast = if r.state == crate::store::RoundState::Built && !row.inputs.is_empty()
+					&& self.store.round_held(round_id).await? {
 					let mut tx: elements::Transaction = elements::encode::deserialize(&r.tx).map_err(|e| ParticipationError::Internal(e.to_string()))?;
 					for i in &mut tx.input {
 						i.witness = Default::default();

@@ -315,11 +315,25 @@ forfeit_window_seconds = 600
 # current holders refresh and release it (README, "Reclaim"). A wallet that
 # does not read the leaf record's RECLAIM-D flag refuses such a batch's
 # leaves: set it only once every wallet your holders use reads it.
+#
+# no_sweep builds every batch without a sweep: no token, no clock, a tree
+# always, so nobody can take a coin from a holder who stays away. Every
+# refresh round is then held, built and unbroadcast, until each participation
+# in it has handed over its forfeits (within [fills] forfeit_window_seconds,
+# or it is voided and the round built again without it). On the main chain
+# (sequentia) it is always on. collect_after_seconds is the service horizon:
+# from that long after its round, the operator brings what is left of such a
+# batch on the chain (each holder's coin as its own leaf, each given-up coin
+# to its forfeit), and from three days before it takes no off-chain spend of
+# its coins. Set no_sweep only once every wallet your holders use reads such
+# a batch's records.
 [batches]
 # accumulator_exit_rate_ppm = 10000
 holder_batches = 8
 holder_window_seconds = 259200
 delegated_reclaim = false
+no_sweep = false
+collect_after_seconds = 2419200
 
 # The Lightning gateway beside each asset's own node.
 [lightning]

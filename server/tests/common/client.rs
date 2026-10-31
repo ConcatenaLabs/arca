@@ -298,6 +298,44 @@ pub fn output_json(o: &OutputRequest) -> Value {
 	}
 }
 
+/// What the tests' wallets hold of each participation they made: the coins
+/// given up and each leaf wanted's owner key and nonce, so that a round held
+/// for its forfeits can have them handed over as a wallet hands them over
+/// ([`super::rounds::hand_over_held`]).
+#[derive(Clone)]
+pub struct Made {
+	pub coins: Vec<Held>,
+	pub leaves: Vec<Option<(XOnlyPublicKey, [u8; 32])>>,
+}
+
+static MADE: std::sync::Mutex<Vec<([u8; 32], Made)>> = std::sync::Mutex::new(Vec::new());
+
+fn remember(id: [u8; 32], coins: &[&Held], outputs: &[OutputRequest]) {
+	let leaves = outputs.iter().map(|o| match o {
+		OutputRequest::Leaf { owner, owner_nonce, .. } => Some((*owner, *owner_nonce)),
+		_ => None,
+	}).collect();
+	let mut m = MADE.lock().unwrap();
+	m.retain(|(i, _)| *i != id);
+	m.push((id, Made { coins: coins.iter().map(|h| (*h).clone()).collect(), leaves }));
+}
+
+/// Remembers participation `id` (a distribution, say) as giving up `coins`
+/// for no leaf of the tests' own ([`made`]).
+pub fn remember_given(id: [u8; 32], coins: &[&Held]) {
+	remember(id, coins, &[]);
+}
+
+/// What the tests' wallets made participation `id` of, if they made it.
+pub fn made(id: &[u8; 32]) -> Option<Made> {
+	MADE.lock().unwrap().iter().find(|(i, _)| i == id).map(|(_, m)| m.clone())
+}
+
+/// The key the tests hold for `owner`, if any ([`hold_key`]).
+pub fn key_of(owner: &XOnlyPublicKey) -> Option<Keypair> {
+	held_key(owner)
+}
+
 /// A participation's request body and its id: `coins` given up, each
 /// attested by its owner's key, for `outputs`, each leaf's key proved when
 /// the tests hold it ([`hold_key`]), paying `fees`.
@@ -307,6 +345,7 @@ pub fn participation_body(coins: &[&Held], outputs: &[OutputRequest], fees: &[(A
 	let ids: Vec<LeafId> = coins.iter().map(|h| h.id).collect();
 	let nb = not_before.map(|t| arca_covenant::MedianTime::from_consensus(t).unwrap());
 	let id = participation_id(&chain, &operator, &ids, outputs, fees, nb);
+	remember(id, coins, outputs);
 	let inputs: Vec<Value> = coins.iter().map(|h| json!({
 		"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref()),
 	})).collect();

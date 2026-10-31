@@ -10,10 +10,14 @@
 //! key `W` (never `S`, which the signer would sign for), the notice delay `D`
 //! in 512-second units, the bond coin's `outpoint` once posted, and the
 //! notice output's (`notice`) once a notice is given. `D` is at least a
-//! batch's lifetime, plus the longest exit delay, plus a day
-//! ([`min_notice_seconds`]): after a notice every wallet brings each coin it
-//! holds out of round into a round by that coin's exit deadline, which falls
-//! within a lifetime of the notice, and the rest covers a coin taken home on
+//! coin's service life (a batch's lifetime, a board's, and the service
+//! horizon of a batch without a sweep, whichever is longest), plus the
+//! longest exit delay, plus a day ([`min_notice_seconds`]): after a notice
+//! every wallet brings each coin it holds out of round into a round by that
+//! coin's exit deadline, which falls within a service life of the notice
+//! (a coin resting on a batch without a sweep that its holder leaves is
+//! brought on the chain by the operator at the batch's horizon, so nothing
+//! paid out of round outlives it), and the rest covers a coin taken home on
 //! the chain instead and a slash's own confirmation. The server refuses to
 //! start with a shorter one.
 //!
@@ -45,7 +49,9 @@ use arca_covenant::{BondPolicy, Chain, RelativeTime};
 use crate::chain::{ChainError, ChainSource, FinalityService};
 
 /// The longest a coin the operator makes lives from its round or board to
-/// its first expiry, in seconds: a batch's and a board's lifetime.
+/// its first expiry, in seconds: a batch's and a board's lifetime, and the
+/// default service horizon of a batch without a sweep
+/// ([`crate::params::COLLECT_AFTER_SECONDS`]).
 pub const LIFETIME: u32 = 28 * 86_400;
 
 /// The time a notice leaves beyond a lifetime and the longest exit delay,

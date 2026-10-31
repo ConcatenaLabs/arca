@@ -999,6 +999,11 @@ impl Wallet {
 		} else {
 			"submit_participation"
 		};
+		// The forfeit window and whether rounds are held for forfeits, so
+		// that the wallet keeps in touch until its round is built.
+		if let Ok(info) = self.server_info() {
+			self.remember_fills(&info)?;
+		}
 		match self.server.post(call, body) {
 			Ok(a) => {
 				self.store.set_participation(pid, a["state"].as_str().unwrap_or("pending"), None, None)?;
@@ -1231,12 +1236,17 @@ impl Wallet {
 		}
 		let round_txid = Txid::from_str(st["round"]["txid"].as_str().unwrap_or("")).map_err(|e| Error::Parse(e.to_string()))?;
 		let take = Self::is_take(body);
-		// A take's round fills an on-chain order and is broadcast only once
-		// every take in it has handed over its forfeits: until then its status
-		// serves the transaction without its witnesses, its txid the round's,
-		// which the wallet checks and validates its new leaf against.
+		// A round held for its forfeits (one that fills on-chain orders, or
+		// holds a batch without a sweep) is broadcast only once every
+		// participation in it has handed over its forfeits: until then its
+		// status serves the transaction without its witnesses, its txid the
+		// round's, which the wallet checks and validates its new leaves
+		// against. A forfeit names the round's connector asset, which only
+		// that transaction issues: signed for a round that never confirms, it
+		// spends nothing, and a claim of it on the chain reveals the preimage
+		// of the new leaves it was given up for.
 		let unbroadcast = match st["round"]["tx"].as_str() {
-			Some(t) if take => {
+			Some(t) if take || !given.is_empty() => {
 				let tx: Transaction = elements::encode::deserialize(&unhex(t)?).map_err(|e| Error::Parse(format!("the round: {}", e)))?;
 				if tx.txid() != round_txid {
 					return Err(Error::Refused(format!("the server serves a transaction {} for round {}", tx.txid(), round_txid)));
@@ -1273,9 +1283,7 @@ impl Wallet {
 			self.check_take_round(body, st, &round)?;
 		}
 		let info = self.server_info()?;
-		if take {
-			self.remember_fills(&info)?;
-		}
+		self.remember_fills(&info)?;
 		// The one participation whose new leaf is `htlc-1`: a payment the
 		// wallet receives over Lightning, whose participation id its hash
 		// gives. Every other new leaf is the template the wallet asked for.
@@ -1567,7 +1575,7 @@ impl Wallet {
 		let Some(pre) = done["preimage"].as_str() else {
 			if finality.is_none() {
 				return Ok(json!({"participation": pid, "state": "forfeiting", "round": round_txid.to_string(),
-					"note": "the take's forfeits are in before its round is broadcast: the round goes out once every take in it has \
+					"note": "the forfeits are in before the round is broadcast: the round goes out once every participation in it has \
 					handed over its own, and the preimage comes once it is final"}));
 			}
 			return Ok(json!({"participation": pid, "state": "forfeiting",

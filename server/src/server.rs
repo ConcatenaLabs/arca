@@ -138,6 +138,20 @@ pub struct BatchesSection {
 	/// RECLAIM-D flag: one that does not refuses such a batch's leaves.
 	#[serde(default)]
 	pub delegated_reclaim: bool,
+	/// Whether refresh rounds build their batches without a sweep
+	/// ([`RoundConfig::no_sweep`]): no token is issued and no clock paid, so
+	/// nobody can take a coin from a holder who stays away, and every
+	/// forfeit is taken before the round is broadcast. Always on when the
+	/// node's chain is `sequentia`, where no batch with a sweep is built;
+	/// off when absent elsewhere. Set it only once every wallet the
+	/// operator's holders use reads such a batch's records.
+	#[serde(default)]
+	pub no_sweep: bool,
+	/// How long after its round a batch without a sweep is collected on the
+	/// chain ([`Params::collect_after_seconds`]): 2,419,200 (28 days) when
+	/// absent.
+	#[serde(default)]
+	pub collect_after_seconds: Option<u32>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -796,28 +810,68 @@ fn node_client(config: &Config) -> Result<Client, StartError> {
 
 /// The salts the signer's record no longer needs: each leaf whose coin rests
 /// on batches alone, every one of them past its last expiry at the tip the
-/// database followed, and its checkpoint's. A batch past its last expiry is
-/// swept, and the server serves none of its coins; a coin resting on a board
-/// is never dropped. What `arca-signer --compact-into` drops; `arcad
-/// <config> expired-salts` prints them, one hex salt a line. It needs the
-/// database alone.
+/// database followed, or collected, and its checkpoint's. A batch past its
+/// last expiry is swept, and the server serves none of its coins. A coin
+/// resting on batches without a sweep is collected once every one of them
+/// is past its service horizon (the server takes no off-chain spend of it
+/// from three days before) and its own leaf has been seen on the chain:
+/// landed as its holder's, or brought down for its forfeit. A coin resting
+/// on a board is never dropped. What `arca-signer --compact-into` drops;
+/// `arcad <config> expired-salts` prints them, one hex salt a line. It needs
+/// the database alone.
 pub async fn expired_salts(config: &Config) -> Result<Vec<[u8; 32]>, StartError> {
 	use arca_covenant::CoinRecord;
-	fn last_expiry(r: &CoinRecord) -> Option<u32> {
+	/// The latest of the dates past which no batch it rests on serves it:
+	/// a batch's last expiry, or the service horizon of one without a
+	/// sweep (`horizons`, by leaf id). `None` for a coin on a board, or on
+	/// a batch whose horizon is unknown.
+	fn last_date(r: &CoinRecord, horizons: &std::collections::HashMap<[u8; 32], u32>) -> Option<u32> {
 		match r {
 			CoinRecord::Board(_) => None,
+			CoinRecord::Leaf { record, .. } if !record.schedule.expires() =>
+				record.leaf_id().ok().and_then(|l| horizons.get(&l.0).copied()),
 			CoinRecord::Leaf { record, .. } => Some(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX)),
 			CoinRecord::Accumulator { record, .. } => Some(record.schedule.expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX)),
-			CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().map(last_expiry).try_fold(0u32, |m, e| e.map(|e| m.max(e))),
+			CoinRecord::Transfer(_) | CoinRecord::Fill(_) =>
+				r.parents().into_iter().map(|p| last_date(p, horizons)).try_fold(0u32, |m, e| e.map(|e| m.max(e))),
+		}
+	}
+	fn rests_without_sweep(r: &CoinRecord) -> bool {
+		match r {
+			CoinRecord::Leaf { record, .. } => !record.schedule.expires(),
+			CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().any(rests_without_sweep),
+			_ => false,
+		}
+	}
+	fn batch_leaves(r: &CoinRecord, out: &mut Vec<[u8; 32]>) {
+		match r {
+			CoinRecord::Leaf { record, .. } => out.extend(record.leaf_id().ok().map(|l| l.0)),
+			CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| batch_leaves(p, out)),
+			_ => {},
 		}
 	}
 	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
 	let now = store.tip_block().await.map_err(err("the database"))?
 		.ok_or_else(|| StartError("the database has followed no block yet".into()))?.median_time;
 	let mut out = vec![];
-	for (salt, record) in store.leaf_salts().await.map_err(err("the database"))? {
+	let mut horizons = std::collections::HashMap::new();
+	for (salt, record, script) in store.leaf_salts().await.map_err(err("the database"))? {
 		let Ok(record) = CoinRecord::from_bytes(&record) else { continue };
-		if last_expiry(&record).is_some_and(|e| (e as u64) < now) {
+		let no_sweep = rests_without_sweep(&record);
+		if no_sweep {
+			let mut leaves = vec![];
+			batch_leaves(&record, &mut leaves);
+			for l in leaves {
+				if let std::collections::hash_map::Entry::Vacant(e) = horizons.entry(l) {
+					if let Some(h) = store.leaf_collect_mtp(&l).await.map_err(err("the database"))? {
+						e.insert(h);
+					}
+				}
+			}
+		}
+		let past = last_date(&record, &horizons).is_some_and(|e| (e as u64) < now);
+		let collected = !no_sweep || !store.sightings_of(&script).await.map_err(err("the database"))?.is_empty();
+		if past && collected {
 			out.push(salt);
 			out.push(arca_covenant::transfer::checkpoint_salt(&salt));
 		}
@@ -860,8 +914,10 @@ async fn configured_bond(config: &Config) -> Result<(crate::bond::Bond, Client),
 		Some((_, max)) => RelativeTime::from_units(max).map_err(err("exit_delay_units"))?,
 		None => Params::new(Chain::new(genesis), operator, BTreeMap::new()).max_exit_delay,
 	};
-	let bond = crate::bond::Bond::from_section(section, Chain::new(genesis), operator,
-		RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME), max_exit).map_err(|e| StartError(format!("bond: {}", e)))?;
+	let lifetime = RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME)
+		.max(config.batches.collect_after_seconds.unwrap_or(crate::params::COLLECT_AFTER_SECONDS));
+	let bond = crate::bond::Bond::from_section(section, Chain::new(genesis), operator, lifetime, max_exit)
+		.map_err(|e| StartError(format!("bond: {}", e)))?;
 	Ok((bond, client))
 }
 
@@ -1669,6 +1725,16 @@ impl Server {
 		params.fill_forfeit_window_seconds = config.fills.forfeit_window_seconds;
 		params.round_interval_seconds = config.round_interval_seconds;
 		params.watchtowers = config.watcher.watchtowers.clone();
+		// On the main chain no batch with a sweep is built: a holder who
+		// stays away keeps its coin whatever the operator does.
+		let chain_name = finality.call(|c| c.chain_name()).await.map_err(err("the node"))?;
+		params.no_sweep = config.batches.no_sweep || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
+		if let Some(c) = config.batches.collect_after_seconds {
+			if c == 0 {
+				return Err(StartError("batches.collect_after_seconds is at least 1".into()));
+			}
+			params.collect_after_seconds = c;
+		}
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
@@ -1678,7 +1744,8 @@ impl Server {
 		// The bond binds S; its notice outlasts every coin paid out of round
 		// before it.
 		let bond = match &config.bond {
-			Some(b) => Some(crate::bond::Bond::from_section(b, params.chain, operator, RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME),
+			Some(b) => Some(crate::bond::Bond::from_section(b, params.chain, operator,
+				RoundConfig::default().lifetime.max(Params::BOARD_LIFETIME).max(params.collect_after_seconds),
 				params.max_exit_delay).map_err(|e| StartError(format!("bond: {}", e)))?),
 			None => None,
 		};
@@ -1702,6 +1769,7 @@ impl Server {
 				holder_batches: config.batches.holder_batches.unwrap_or(RoundConfig::default().holder_batches),
 				holder_window: config.batches.holder_window_seconds.unwrap_or(RoundConfig::default().holder_window),
 				delegated_reclaim: config.batches.delegated_reclaim,
+				no_sweep: params.no_sweep,
 				..RoundConfig::default()
 			});
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());

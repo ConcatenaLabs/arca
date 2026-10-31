@@ -64,7 +64,13 @@ const IN_FLIGHT_WITH: &str = "
 	   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'
 	   UNION
 	   SELECT nr.leaf_id FROM node_release nr JOIN watcher_tx w ON w.kind = 'reclaim' AND w.subject = nr.node_hash
-	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost'),
+	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost'
+	   UNION
+	   -- A leaf of a batch without a sweep, collected: brought down to its
+	   -- leaf and forfeited on the chain, the forfeit final.
+	   SELECT bl.leaf_id FROM batch_leaf bl JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
+	   JOIN watcher_tx w ON w.kind = 'forfeit' AND w.subject = bl.leaf_id JOIN nursery_tx n ON n.txid = w.txid
+	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final'),
 	 held AS MATERIALIZED (
 	   SELECT u.root, bl.leaf_id, bl.round_id, bl.vout, bl.record FROM up u
 	   JOIN batch_leaf bl ON bl.leaf_id = u.leaf_id JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout

@@ -326,6 +326,45 @@ operator serves one so that a frozen holder can neither move nor escape
   then its holder's; one a sweep took all the same is repaid as a
   `landing-1` coin to its holder's landing key, less the late-refresh fee.
 
+## Building batches without a sweep
+
+On the main chain (`sequentia`) the server builds every batch without a
+sweep, whatever the configuration says: no token, no clock, and nothing the
+operator signs can take a coin from a holder who stays away. Elsewhere it
+does so with `[batches] no_sweep = true`. Turn it on only once every wallet
+your holders use reads such a batch's records (a wallet that does not refuses
+their leaves) and signs its forfeits against the round's transaction before
+the round is broadcast.
+
+What it changes for the operator:
+
+- **Every refresh round waits for its forfeits.** A round is built, held,
+  and broadcast only once every participation in it that gives up a coin has
+  handed its forfeits over, within `[fills] forfeit_window_seconds` of the
+  round being built (600 s unless set). One that does not is voided, its
+  coins given back; the round is dropped, and a spend of one of its own
+  coins kills it on the chain, so it can never confirm; the rest run again
+  in the next round. Expect a refresh to take one round interval plus the
+  window at worst.
+- **No sweep brings capital back; RECLAIM, RECLAIM-D and collection do.** A
+  lowest node every owner of which has refreshed and released comes back by
+  RECLAIM as soon as it does (`[watcher] reclaim_early`); with
+  `[batches] delegated_reclaim`, one whose coins were paid on out of round
+  comes back by RECLAIM-D once their current holders refresh and release.
+  Whatever is left of a batch at its service horizon
+  (`[batches] collect_after_seconds`, 28 days by default) is collected on
+  the chain: each holder's coin lands as its own leaf, each given-up coin is
+  forfeited and claimed, each coin paid on out of round lands through its
+  lineage. Keep the wallet able to pay those fees (the reserves pay them where
+  the node takes the batch's asset).
+- **No plans.** The server refuses offline-refresh plans, and stops an open
+  one before its next step.
+- **No accumulator batches.** `accumulator_exit_rate_ppm` is ignored: every
+  batch is a tree.
+- **The bond's notice** must cover the horizon: `notice_units` at least the
+  longer of 28 days and `collect_after_seconds`, plus the longest exit
+  delay, plus a day.
+
 ## What holders are told
 
 Every holder receives these rules before the operator holds their coins:
@@ -378,6 +417,12 @@ Every holder receives these rules before the operator holds their coins:
   can therefore find the coin taken on the chain at its batch's release, as
   any absent holder can, and boarded back at its next sync (or, swept all the
   same, repaid less the late-refresh fee).
+- **On an operator that builds batches without a sweep, a coin never
+  expires.** Nobody can take it. Sync before its batch's service horizon
+  (`info.batches.collect_after_seconds` after its round) to keep it off the
+  chain; a wallet away past the horizon finds it on the chain, its own, and
+  boards it again. A refresh asks the wallet to stay in touch until its
+  round is built, to sign its forfeits before the round goes out.
 - **A coin left past its expiry is taken on the chain, not swept.** Once
   its batch is released, the operator brings every live coin of it on the
   chain under its holder's key (`[watcher] unroll_at_release`), and so does

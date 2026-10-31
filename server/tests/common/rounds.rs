@@ -59,9 +59,95 @@ pub async fn credited_board(r: &mut Running, owner: &Keypair, asset: AssetId) ->
 	(Held { key: *owner, nonce: record.owner_nonce, id, record: CoinRecord::Board(record) }, tx)
 }
 
-/// Waits until the server calls the round `round_txid` final.
+/// Waits until the server calls the round `round_txid` final. A round held
+/// unbroadcast for its forfeits (one holding a batch without a sweep) first
+/// has them handed over for every participation the tests made
+/// ([`hand_over_held`]), then goes out and is mined and buried.
 pub async fn round_final(r: &Running, round_txid: &Txid) {
+	if send_held(r, round_txid).await {
+		r.produce().await;
+		r.bury().await;
+	}
 	round_state(r, round_txid, RoundState::Final).await
+}
+
+/// When the round `round_txid` is held unbroadcast for its forfeits, hands
+/// them over ([`hand_over_held`]) and runs a pass over the rounds, which
+/// broadcasts it. Returns whether it was held.
+pub async fn send_held(r: &Running, round_txid: &Txid) -> bool {
+	let row = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap();
+	if !row.as_ref().is_some_and(|x| x.state == RoundState::Built) {
+		return false;
+	}
+	let n = hand_over_held(r, round_txid).await;
+	r.server.rounds.pass().await.unwrap();
+	println!("round {} held for its forfeits: {} participation(s) handed theirs over before it went out", round_txid, n);
+	true
+}
+
+/// Hands over, for every participation the tests made that is issued in
+/// the round `round_txid` (built, held unbroadcast), its forfeits as a
+/// wallet hands them over: each new leaf rebuilt from the published tree and
+/// validated against the transaction the status serves, each coin's forfeit
+/// signed against it, the new leaves' unroll authorisations. Returns how
+/// many were handed over.
+pub async fn hand_over_held(r: &Running, round_txid: &Txid) -> usize {
+	let row = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap().expect("the round");
+	let mut n = 0;
+	for id in r.server.store.round_participations(row.round_id).await.unwrap() {
+		let Some(m) = super::client::made(&id) else { continue };
+		if m.coins.is_empty() {
+			continue;
+		}
+		hand_over(r, &id, &m).await;
+		n += 1;
+	}
+	n
+}
+
+/// [`hand_over_held`] for one participation `id`, made of `m`.
+pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> Value {
+	use super::client::{auths_json, forfeit_sig, hex, unhex};
+	let st = status(r, id);
+	let round: Transaction = elements::encode::deserialize(&unhex(st["round"]["tx"].as_str().unwrap_or_else(|| panic!("the held round's transaction: {}", st)))).unwrap();
+	assert_eq!(round.txid().to_string(), st["round"]["txid"].as_str().unwrap());
+	let mut news = vec![];
+	let mut leaves = vec![];
+	for (j, l) in m.leaves.iter().enumerate() {
+		let Some((owner, nonce)) = l else { continue };
+		let o = &st["outputs"][j];
+		let published = r.http.post("tree", &json!({"txid": st["round"]["txid"], "vout": o["batch_vout"]})).ok();
+		let record = rebuild(&published).record(o["leaf_index"].as_u64().unwrap() as usize);
+		let valid = record.validate(&round, &accept_policy(r), owner, nonce).unwrap();
+		if let Some(k) = super::client::key_of(owner) {
+			leaves.push(auths_json(&valid, &k, created(&record)));
+		}
+		news.push(valid);
+	}
+	let c = st["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let delay = arca_covenant::RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap() as u16).unwrap();
+	let mut forfeits = vec![];
+	for h in &m.coins {
+		let mut bases = vec![];
+		server::coins::bases(&r.server.store, &h.record, &mut bases).await.unwrap();
+		let old = h.record.resolve(&bases, &r.policy()).unwrap();
+		let input = st["inputs"].as_array().unwrap().iter().find(|i| i["leaf_id"] == json!(h.id.to_string())).unwrap();
+		let margin: u64 = input["margin"].as_str().unwrap().parse().unwrap();
+		// A participation with no leaf of its own (a distribution's payer)
+		// signs against the unlock hash and connector its status names.
+		let f = match news.first() {
+			Some(new) => arca_covenant::Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, delay, margin).unwrap(),
+			None => {
+				let unlock: [u8; 32] = unhex(st["unlock_hash"].as_str().unwrap()).try_into().unwrap();
+				arca_covenant::Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, arca_covenant::connector_asset(round.txid(), c),
+					delay, margin).unwrap()
+			},
+		};
+		forfeits.push(json!({"leaf_id": h.id.to_string(), "signature": forfeit_sig(&f, &h.key)}));
+	}
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(id), "forfeits": forfeits, "leaves": leaves})).ok();
+	assert!(done.get("preimage").is_none(), "no preimage before the round is broadcast: {}", done);
+	done
 }
 
 /// Waits until the server has the round `round_txid` in `state`.
@@ -132,7 +218,14 @@ pub fn validate_new_leaf(r: &Running, id: &[u8; 32], output: usize, key: &Keypai
 /// final only once the tip's median time is past the authorisation's time,
 /// and right after a round the median time may not yet be past the round's
 /// own; an earlier time is usable at once.
+///
+/// A batch without a sweep carries no date: its owner signs with an hour
+/// before now, as a wallet does.
 pub fn created(record: &LeafRecord) -> MedianTime {
+	if !record.schedule.expires() {
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+		return MedianTime::from_consensus(now - 2 * 3_600).unwrap();
+	}
 	MedianTime::from_consensus(record.schedule.expiries()[0].to_consensus_u32() - 28 * 86_400 - 3_600).unwrap()
 }
 
