@@ -92,6 +92,13 @@ pub const ANCHOR_DEPTH: u64 = 2;
 /// parents that are off the chain.
 pub const GONE_REACH: usize = 512;
 
+/// What is left of one [`ChainSource::gone`] walk: the transactions it may
+/// still read, and whether it was cut short.
+struct GoneWalk {
+	left: usize,
+	cut: bool,
+}
+
 /// How far above a block the wallet looks for a committee certificate.
 const CERT_LOOKAHEAD: u64 = 200;
 
@@ -208,6 +215,11 @@ struct Memo {
 	shared: bool,
 	/// Answers fixed by the view.
 	view: HashMap<String, Kept>,
+	/// Whether each transaction asked of [`ChainSource::gone`] can never
+	/// return, in this view and its mempool: a walk back through parents
+	/// off the chain reads each transaction once, however many coins rest on
+	/// it.
+	gone: HashMap<Txid, bool>,
 	/// Answers fixed by the view's mempool as well (a mempool entry, an
 	/// output looked up with the mempool's spends, a transaction in no
 	/// block): dropped when the mempool changes, while what is fixed by the
@@ -511,10 +523,11 @@ impl ChainSource {
 			// fixes is read again. On a busy chain the mempool changes between
 			// nearly every two looks, and the headers and confirmed
 			// transactions a command reads stay as they were.
-			Some(k) if k.tip == key.tip && k.anchors == key.anchors => if k.mempool != key.mempool { m.pool.clear() },
+			Some(k) if k.tip == key.tip && k.anchors == key.anchors => if k.mempool != key.mempool { m.pool.clear(); m.gone.clear() },
 			_ => {
 				m.view.clear();
 				m.pool.clear();
+				m.gone.clear();
 			},
 		}
 		m.key = Some(key);
@@ -1254,33 +1267,56 @@ impl ChainSource {
 	/// [`GONE_REACH`] transactions; past that, it says the transaction can
 	/// return.
 	pub fn gone(&self, tx: &Transaction) -> Result<bool, Error> {
-		let mut seen: BTreeSet<Txid> = BTreeSet::new();
-		let mut todo: Vec<Transaction> = vec![tx.clone()];
-		while let Some(t) = todo.pop() {
-			if !seen.insert(t.txid()) || seen.len() > GONE_REACH {
-				continue;
-			}
-			if self.whereabouts(&t.txid())? != (false, false) {
-				continue;
-			}
-			for i in &t.input {
-				let op = i.previous_output;
-				let Some((_, height)) = self.tx_block(&op.txid)? else {
-					// Made by a transaction off the chain: this one returns
-					// only if that one does.
-					if let Some(parent) = self.transaction(&op.txid)? {
-						todo.push(parent);
-					}
-					continue;
-				};
-				let v: Value = self.call("gettxout", &[json!(op.txid.to_string()), json!(op.vout), json!(false)]).map_err(node)?;
-				if !v.is_null() {
-					continue;
-				}
-				if let Some((other, Some(_))) = self.spender(&op, height)? {
-					if other.txid() != t.txid() && self.finality(&other.txid())?.is_final() {
+		let mut walk = GoneWalk { left: GONE_REACH, cut: false };
+		self.gone_in(tx, &mut walk)
+	}
+
+	/// [`Self::gone`] of `tx`, answered from what this view already found of
+	/// it, or found now and kept: a walk cut short by [`GONE_REACH`] keeps no
+	/// "can return" it could not finish.
+	fn gone_in(&self, tx: &Transaction, walk: &mut GoneWalk) -> Result<bool, Error> {
+		let id = tx.txid();
+		if let Some(g) = self.memo.lock().expect("the chain memo").gone.get(&id) {
+			return Ok(*g);
+		}
+		if walk.left == 0 {
+			walk.cut = true;
+			return Ok(false);
+		}
+		walk.left -= 1;
+		let cut_before = walk.cut;
+		walk.cut = false;
+		let g = self.gone_found(tx, walk)?;
+		if g || !walk.cut {
+			self.memo.lock().expect("the chain memo").gone.insert(id, g);
+		}
+		walk.cut |= cut_before;
+		Ok(g)
+	}
+
+	fn gone_found(&self, tx: &Transaction, walk: &mut GoneWalk) -> Result<bool, Error> {
+		if self.whereabouts(&tx.txid())? != (false, false) {
+			return Ok(false);
+		}
+		for i in &tx.input {
+			let op = i.previous_output;
+			let Some((_, height)) = self.tx_block(&op.txid)? else {
+				// Made by a transaction off the chain: this one returns only
+				// if that one does.
+				if let Some(parent) = self.transaction(&op.txid)? {
+					if self.gone_in(&parent, walk)? {
 						return Ok(true);
 					}
+				}
+				continue;
+			};
+			let v: Value = self.call("gettxout", &[json!(op.txid.to_string()), json!(op.vout), json!(false)]).map_err(node)?;
+			if !v.is_null() {
+				continue;
+			}
+			if let Some((other, Some(_))) = self.spender(&op, height)? {
+				if other.txid() != tx.txid() && self.finality(&other.txid())?.is_final() {
+					return Ok(true);
 				}
 			}
 		}
@@ -1750,6 +1786,13 @@ mod test {
 		assert!(chain.finality(&other.txid()).unwrap().is_final(), "{:?}", chain.finality(&other.txid()).unwrap());
 		assert!(chain.gone(&parent).unwrap(), "its coin is spent by a final transaction");
 		assert!(chain.gone(&child).unwrap(), "its parent can never return, so neither can it");
+		// What the walk found is kept for the view: asked again, it reads
+		// nothing but, at most, a look at the view.
+		let (before, _) = chain.calls();
+		assert!(chain.gone(&child).unwrap() && chain.gone(&parent).unwrap());
+		let (after, _) = chain.calls();
+		println!("asked again: {} request(s) of the node", after - before);
+		assert!(after - before <= 1, "{} requests", after - before);
 		println!("{} took the parent's coin and is final: the parent and the child are gone", other.txid());
 	}
 
