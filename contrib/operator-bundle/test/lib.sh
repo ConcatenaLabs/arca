@@ -71,20 +71,38 @@ mkwallet() {
     --exit-delay-units "$EXIT_UNITS" --min-exit-delay-units 1 > /dev/null
   if [ -n "$key" ] && [ "$(arca "$name" info | jq -r .operator)" != "$key" ]; then die "wallet $name pinned another operator key"; fi
 }
-# NAME ATOMS: on-chain coins paid by FUND, boarded, credited.
+# NAME OUTPUT: waits for the payments FUND made for NAME (every txid in what
+# it printed) to confirm, a block at a time, up to FUND_BLOCKS blocks (default
+# 30); stops the run naming the payment that did not. A FUND that prints no
+# txid gets one block.
+funded() {
+  local name=$1 t i c ids
+  ids=$(grep -oE '\b[0-9a-f]{64}\b' <<<"$2" | sort -u || true)
+  if [ -z "$ids" ]; then produce; return 0; fi
+  for t in $ids; do
+    for i in $(seq "${FUND_BLOCKS:-30}"); do
+      c=$(node_rpc getrawtransaction "\"$t\", true" 2>/dev/null | jq -r '.confirmations // 0' 2>/dev/null) || c=0
+      [ "${c:-0}" -ge 1 ] 2>/dev/null && break
+      produce
+    done
+    [ "${c:-0}" -ge 1 ] 2>/dev/null || die "$name's funding $t is not confirmed after ${FUND_BLOCKS:-30} blocks' wait"
+  done
+  say "  $name's funding confirmed: $(tr '\n' ' ' <<<"$ids")"
+}
+# NAME ATOMS: on-chain coins paid by FUND, confirmed, boarded, credited.
 # With FEE_ASSET, the board's fee is paid in that asset (for an asset the
 # node does not accept for fees), from coins of it paid beside.
 board() {
-  local name=$1 atoms=$2 addr fee=()
+  local name=$1 atoms=$2 addr fee=() paid
   addr=$(must "$name" address | jq -r .address)
   if [ -n "${FEE_ASSET:-}" ] && [ "$FEE_ASSET" != "$ASSET" ]; then
-    $FUND "$addr" "$ASSET" "$atoms" > /dev/null
-    $FUND "$(must "$name" address | jq -r .address)" "$FEE_ASSET" 1000000 > /dev/null
+    paid=$($FUND "$addr" "$ASSET" "$atoms")
+    paid+=" $($FUND "$(must "$name" address | jq -r .address)" "$FEE_ASSET" 1000000)"
     fee=(--fee-asset "$FEE_ASSET")
   else
-    $FUND "$addr" "$ASSET" $((atoms + 1000000)) > /dev/null
+    paid=$($FUND "$addr" "$ASSET" $((atoms + 1000000)))
   fi
-  produce
+  funded "$name" "$paid"
   must "$name" board "$ASSET" "$atoms" "${fee[@]}" > /dev/null
   produce; bury
   for _ in $(seq 120); do
