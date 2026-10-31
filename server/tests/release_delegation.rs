@@ -21,9 +21,19 @@
 //!    whose coins was paid on is held by the cap too (arca#450).
 //! 4. A resting order filled in the tree (arca#419): the taker's coin
 //!    delegates with the fill, the maker's order coin afterwards from a coin
-//!    the fill made; once every holder refreshes, both nodes come back. A
-//!    maker whose order is filled every round keeps `transferred` at one
-//!    order; without its delegation it grows by an order a round.
+//!    the fill made. A maker whose order is filled whole every round keeps
+//!    `transferred` at one order; without its delegation it grows by an
+//!    order a round. A fill that leaves the order resting again leaves both
+//!    nodes to their batches' expiry: the order resting again carries the
+//!    order's key and delegates nothing, and the operator keeps no
+//!    delegation one sends (arca#460).
+//! 6. An operator acting alone, against the order resting again (arca#460):
+//!    with its own store changed, it finds no consent for the order's node;
+//!    a delegation by the remainder's key that a wallet signed before
+//!    wallets stopped, kept in the store, is not followed; and the reclaim
+//!    built by hand with the only delegation the order's key signs is
+//!    refused in a block, where the same reclaim with that earlier wallet's
+//!    signature would be taken.
 //! 5. The `htlc-1` leaf of a paid payment out of the tree (arca#431): its
 //!    sender releases it once the payment is paid.
 //!
@@ -188,7 +198,11 @@ fn pay_body(r: &Running, coin: &Coin, to: &[(Keypair, u64)], delegate: bool) -> 
 	if delegate {
 		let plan_outputs: Vec<ExplicitOutput> = outs.iter().map(|(a, val, l)| ExplicitOutput::new(*a, *val, l.policy(xonly(&r.s), r.chain).script_pubkey())).collect();
 		let leaves: Vec<NewLeaf> = outs.iter().map(|o| o.2).collect();
-		let d = Delegation::for_reassignment(&v, &plan_outputs, &leaves).unwrap();
+		// As a wallet signs it (`Delegation::for_reassignment`), and for an
+		// order resting again as a wallet did before arca#460, which
+		// `for_reassignment` now refuses.
+		let policies: Vec<arca_covenant::LeafPolicy> = leaves.iter().map(|l| l.policy(xonly(&r.s), r.chain)).collect();
+		let d = Delegation::for_outputs(v.leaf.owner, r.chain, &plan_outputs, &policies).unwrap();
 		body["inputs"][0]["delegation_sig"] = json!(hex(sign_digest(&coin.held.key, &d.message().digest, &random32()).as_ref()));
 	}
 	(body, nonces)
@@ -773,7 +787,7 @@ fn fill_coins(done: &Value, holders: &[(&Keypair, [u8; 32])], bases: &[Transacti
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_filled_orders_nodes_come_back_once_maker_and_taker_refresh() {
+async fn a_partly_filled_orders_nodes_wait_for_their_expiry() {
 	let mut r = Running::start_with(|c, y| {
 		c.batches.delegated_reclaim = true;
 		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
@@ -854,10 +868,17 @@ async fn a_filled_orders_nodes_come_back_once_maker_and_taker_refresh() {
 	assert_eq!(r.http.post("order_fill_delegation", &good).ok()["kept"], true);
 	assert_eq!(r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok()["delegated"], true);
 
-	// The maker cancels the order resting again into a leaf of its own,
-	// delegating; then everyone refreshes and releases.
+	// The maker cancels the order resting again into a leaf of its own. A
+	// wallet signs no delegation for it (the order's key delegated at the
+	// fill); one sent as before arca#460 is not kept. Then everyone
+	// refreshes and releases.
+	let rv = rest.valid(&r);
+	assert!(rv.is_rest() && !order.valid(&r).is_rest() && !credit.valid(&r).is_rest());
+	let e = Delegation::for_reassignment(&rv, &[], &[]).unwrap_err();
+	println!("a wallet's delegation for the order resting again: refused, {}", e);
 	let mc = keypair("M, cancelled");
 	let cancelled = pay(&r, rest, &[(mc, 0)], true).remove(0);
+	assert!(r.db.store.delegation(&rest.held.id.0).await.unwrap().is_none(), "the cancel's delegation is not kept");
 	let ids = [
 		submit(&r, &[credit], &[keypair("M, credit new")]),
 		submit(&r, &[plain], &[keypair("M, plain new")]),
@@ -879,9 +900,13 @@ async fn a_filled_orders_nodes_come_back_once_maker_and_taker_refresh() {
 		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
 		println!("reclaim {} ({:?}): {} vB; {}", common::flow::txid(w), w.state, tx.vsize(), w.detail);
 	}
-	assert!(reclaims.len() >= 2, "the order's node and the taker's come back by RECLAIM-D");
-	assert!(reclaims.iter().all(|w| w.state == server::store::NurseryState::Final), "each reclaim is final");
-	assert_eq!((n(&px, "transferred"), n(&py, "transferred")), (0, 0));
+	let (h, ht) = (order.valid(&r).release_nodes()[0].1, tcoin.valid(&r).release_nodes()[0].1);
+	let (ch, cht) = (server::delegations::can_complete(&r.db.store, &[order.held.id.0, plain.held.id.0], h).await.unwrap(),
+		server::delegations::can_complete(&r.db.store, &[tcoin.held.id.0], ht).await.unwrap());
+	println!("can complete: the order's node {}, the taker's {}", ch, cht);
+	assert!(!ch && !cht, "the order resting again moved on without a delegation: neither node can come back early");
+	assert!(reclaims.iter().all(|w| w.subject != h.to_vec() && w.subject != ht.to_vec()), "neither node comes back before its expiry");
+	assert_eq!((n(&px, "transferred"), n(&py, "transferred")), (ORDER, VALUE), "both stay counted until their expiry");
 }
 
 /// A maker resting an order every round, which a taker fills whole: the
@@ -1127,4 +1152,257 @@ async fn a_paid_sends_leaf_is_released_by_its_sender() {
 	}
 	assert!(mine.iter().any(|w| w.state == server::store::NurseryState::Final), "the node comes back with the sender's release");
 	assert_eq!(n(&pool(&r, x), "transferred"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The order resting again, against an operator acting alone (arca#460).
+// ---------------------------------------------------------------------------
+
+/// The maker's delegation of the order coin a fill spent, as a wallet
+/// signed it before arca#460: over the fill's outputs in `made`'s record,
+/// whatever its order coin, which `Delegation::for_filled_order` now
+/// refuses for an order resting again.
+fn maker_delegation_unchecked(made: &arca_covenant::ValidCoin, takers: &[NewLeaf], signer: &Keypair) -> elements::secp256k1_zkp::schnorr::Signature {
+	let ValidOrigin::Fill { order, outputs, .. } = &made.origin else { panic!("a coin a fill made") };
+	let d = Delegation::for_fill(&order.leaf, &order.leaf.order_policy().unwrap(), outputs, takers).unwrap();
+	sign_digest(signer, &d.message().digest, &random32())
+}
+
+/// The taker's leaves of fill `transfer`, as the operator names them.
+fn takers_of(r: &Running, transfer: &str) -> Vec<NewLeaf> {
+	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
+	t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
+		enclave: None, v2: false, htlc: None, landing: None,
+		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
+		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
+		creator_nonce: common::client::unhex(l["creator_nonce"].as_str().unwrap()).try_into().unwrap(),
+		exit_delay: arca_covenant::RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+	}).collect()
+}
+
+/// An atom of the connector asset of each round of `rounds`, issued from
+/// the round's connector output to a bare `OP_TRUE` and confirmed, as an
+/// operator acting alone issues them: each its outpoint and output.
+async fn atoms_by_hand(r: &Running, rounds: &[i64]) -> Vec<(elements::OutPoint, elements::TxOut)> {
+	use arca_covenant::spend::FeeSource;
+	let mut out = vec![];
+	for id in rounds {
+		let row = r.db.store.round(*id).await.unwrap().unwrap();
+		let round: Transaction = elements::encode::deserialize(&row.tx).unwrap();
+		let conn = elements::OutPoint::new(round.txid(), row.connector_vout);
+		let held = ExplicitOutput::from_txout(&round.output[row.connector_vout as usize]).unwrap();
+		let ks = arca_covenant::ConnectorPolicy { operator: xonly(&r.s) }
+			.issuance(conn, (held.asset, held.value), common::node::op_true(), &[], &FeeSource::Reserve).unwrap();
+		let sig = sign_digest(&r.s, &ks.sighash(r.chain.genesis_hash()).unwrap(), &random32());
+		let tx = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+		r.rt.client().send_raw_transaction(&tx).unwrap();
+		out.push((elements::OutPoint::new(tx.txid(), 0), tx.output[0].clone()));
+	}
+	r.produce().await;
+	out
+}
+
+/// The reclaim by RECLAIM-D of the lowest node at the top of `order`'s
+/// one-level tree (its batch output), with one tree per owner `slots` in
+/// owner order, built and signed by hand as an operator acting alone would:
+/// the node's value less 5,000 to `OP_TRUE`, its reserve the fee, the
+/// connector atoms `atoms` back to `OP_TRUE`.
+fn reclaim_by_hand(r: &Running, order: &Coin, atoms: &[(elements::OutPoint, elements::TxOut)],
+	slots: &[server::delegations::Consent]) -> Transaction
+{
+	use arca_covenant::spend::FeeSource;
+	let v = order.valid(r);
+	let ValidOrigin::Leaf { valid, .. } = &v.origin else { panic!("the order's first coin is a batch leaf") };
+	assert_eq!(valid.branch.nodes.len(), 1, "a one-level tree: its lowest node is the batch output");
+	let lowest = &valid.branch.nodes[0];
+	let at = elements::OutPoint::new(valid.round_txid, valid.batch_vout);
+	let asset = lowest.children[0].asset;
+	let outs = [ExplicitOutput::new(asset, lowest.value - 5_000, common::node::op_true())];
+	let ks = lowest.reclaim_delegated_tx(at, atoms, &outs, common::node::op_true(), &FeeSource::Reserve).unwrap();
+	let trees: Vec<_> = slots.iter().map(|c| c.tree(&ks.prevouts).unwrap()).collect();
+	let sig = sign_digest(&r.s, &ks.sighash(r.chain.genesis_hash()).unwrap(), &random32());
+	let items = lowest.reclaim_delegated_items(r.chain, &sig, &trees).unwrap();
+	ks.finish(items).tx
+}
+
+/// RV5's reproduction of arca#460, after the fix. An order O of 500,000
+/// (key K) rests on lowest node H beside the maker's plain leaf. Taker 1
+/// fills 200,000: credit 1, the order resting again R (also K), taker 1's
+/// two leaves; the maker delegates O into the fill. Then R moves on: filled
+/// whole by taker 2 (`cancel` false), or cancelled by its maker into a leaf
+/// of its own (`cancel` true). The wallets sign no delegation for R; the
+/// one a wallet signed before the fix is not kept. Only the coins of R's
+/// move and the plain leaf refresh and release; credit 1 and taker 1's
+/// coins are held. Then the operator, alone:
+/// - points O's slot at R in its own store (RV5's row): no reclaim of H;
+/// - also keeps the earlier wallet's delegation of R: not followed;
+/// - builds the reclaim of H by hand with RV5's tree, the only delegation
+///   K signs (O's into fill 1) in R's place: refused in a block, for the
+///   signature. The same reclaim with the earlier wallet's signature is
+///   taken by the node, so the refusal is that signature's and nothing
+///   else's.
+async fn rest_moves_on(cancel: bool) {
+	let tag = if cancel { "cancel" } else { "fill2" };
+	let mut r = Running::start_plain_on(&["-acceptnonstdtxn"], |c, y| {
+		c.batches.delegated_reclaim = true;
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
+	}).await;
+	let (x, y) = (r.x, r.y);
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let m = maker(&r, &format!("{} M", tag));
+	let (mk2, tk1, tk2) = (keypair(&format!("{} M plain", tag)), keypair(&format!("{} T1", tag)), keypair(&format!("{} T2", tag)));
+	let bm = boards(&mut r, &[keypair(&format!("{} M board", tag))], x).await.remove(0);
+	let bt = boards(&mut r, &[keypair(&format!("{} T1 board", tag)), keypair(&format!("{} T2 board", tag))], y).await;
+	let (wo, no) = want_order(&m, ORDER, x);
+	let (wp, np) = want_leaf(&mk2, x, VALUE - ORDER);
+	let idm = submit_wants(&r, &[&bm], &[wo, wp]);
+	let (w1, n1) = want_leaf(&tk1, y, VALUE);
+	let id1 = submit_wants(&r, &[&bt[0]], &[w1]);
+	let (w2, n2) = want_leaf(&tk2, y, VALUE);
+	let id2 = submit_wants(&r, &[&bt[1]], &[w2]);
+	all_rounds(&r).await;
+	let made = complete(&r, &idm, &[&bm], &[m.key, mk2], &[no, np], true).await;
+	let (order, plain) = (&made[0], &made[1]);
+	let t1 = complete(&r, &id1, &[&bt[0]], &[tk1], &[n1], true).await.remove(0);
+	let t2 = complete(&r, &id2, &[&bt[1]], &[tk2], &[n2], true).await.remove(0);
+	let h = order.valid(&r).release_nodes()[0].1;
+	let st = publish(&r, &m, order);
+
+	// Fill 1, by taker 1: 200,000 of the 500,000; both delegate.
+	let (gk1, ck1) = (keypair(&format!("{} T1 got", tag)), keypair(&format!("{} T1 change", tag)));
+	let ((got1, gn1), (ch1, cn1)) = (new_leaf(&gk1), new_leaf(&ck1));
+	let (body, _) = fill_body(&r, &st, order, &t1, 200_000, &got1, &ch1, true, &tk1);
+	let done = r.http.post("order_fill", &body).ok();
+	let tr1 = done["transfer_id"].as_str().unwrap().to_string();
+	let maker_nonce = match &order.held.record { CoinRecord::Leaf { record, .. } => record.owner_nonce, _ => unreachable!() };
+	let c1 = fill_coins(&done, &[(&m.credits[0], m.credit_nonces[0]), (&m.key, maker_nonce), (&gk1, gn1), (&ck1, cn1)], &joined(&[order, &t1]));
+	let (credit1, rest, tgot1, tch1) = (&c1[0], &c1[1], &c1[2], &c1[3]);
+	let d = maker_delegation(&r, &tr1, &credit1.valid(&r), &m.key);
+	assert_eq!(r.http.post("order_fill_delegation", &d).ok()["kept"], true);
+	assert!(rest.valid(&r).is_rest() && rest.valid(&r).leaf.owner == order.valid(&r).leaf.owner, "R is the order resting again, under K");
+	assert!(tgot1.valid(&r).release_nodes().iter().any(|(_, n)| *n == h), "taker 1's leaf rests on H");
+	let d1 = r.db.store.delegation(&order.held.id.0).await.unwrap().expect("O's delegation into fill 1");
+	let d1_sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&d1.signature).unwrap();
+	println!("{}: order {} (key K) on H {}; fill 1: credit {}, rest {} (K), taker 1 {} and {}", tag, order.held.id, hex(&h),
+		credit1.held.id, rest.held.id, tgot1.held.id, tch1.held.id);
+
+	// R moves on. A wallet signs no delegation for it; the one a wallet
+	// signed before the fix (`old`) is sent and not kept.
+	let mut refresh: Vec<(Coin, Keypair)> = vec![(plain.clone(), keypair(&format!("{} M plain new", tag)))];
+	let old = if cancel {
+		let e = Delegation::for_reassignment(&rest.valid(&r), &[], &[]).unwrap_err();
+		println!("{}: the wallet's delegation of R into its cancel: refused, {}", tag, e);
+		let mc = keypair(&format!("{} M cancelled", tag));
+		let (body, nonces) = pay_body(&r, rest, &[(mc, 0)], true);
+		let old = elements::secp256k1_zkp::schnorr::Signature::from_slice(&common::client::unhex(body["inputs"][0]["delegation_sig"].as_str().unwrap())).unwrap();
+		let done = r.http.post("cosign_transfer", &body).ok();
+		let id: arca_covenant::LeafId = done["outputs"][0]["leaf_id"].as_str().unwrap().parse().unwrap();
+		let cancelled = Coin { held: held_by(&r, &mc, nonces[0], id), bases: rest.bases.clone() };
+		println!("{}: the maker cancels R into {}; the delegation sent with it as before the fix: kept {}", tag, cancelled.held.id,
+			r.db.store.delegation(&rest.held.id.0).await.unwrap().is_some());
+		refresh.push((cancelled, keypair(&format!("{} M cancelled new", tag))));
+		old
+	} else {
+		let st2 = r.http.post("order_state", &json!({"orders": [st["order"]]})).ok()["orders"][0].clone();
+		assert_eq!(st2["coin"].as_str().unwrap(), rest.held.id.to_string(), "the order rests at R");
+		let (gk2, ck2) = (keypair(&format!("{} T2 got", tag)), keypair(&format!("{} T2 change", tag)));
+		let ((got2, gn2), (ch2, cn2)) = (new_leaf(&gk2), new_leaf(&ck2));
+		let (body, _) = fill_body(&r, &st2, rest, &t2, 300_000, &got2, &ch2, true, &tk2);
+		let done = r.http.post("order_fill", &body).ok();
+		let tr2 = done["transfer_id"].as_str().unwrap().to_string();
+		let c2 = fill_coins(&done, &[(&m.credits[1], m.credit_nonces[1]), (&gk2, gn2), (&ck2, cn2)], &joined(&[rest, &t2]));
+		let e = Delegation::for_filled_order(&c2[0].valid(&r), &takers_of(&r, &tr2)).unwrap_err();
+		println!("{}: the wallet's delegation of R into fill 2: refused, {}", tag, e);
+		let old = maker_delegation_unchecked(&c2[0].valid(&r), &takers_of(&r, &tr2), &m.key);
+		let a = r.http.post("order_fill_delegation", &json!({"transfer_id": tr2, "signature": hex(old.as_ref())})).ok();
+		println!("{}: taker 2 fills R whole: credit 2 {}, taker 2 {} and {}; R's delegation as before the fix: kept {}", tag,
+			c2[0].held.id, c2[1].held.id, c2[2].held.id, a["kept"]);
+		assert_eq!(a["kept"], false);
+		for (co, l) in c2.iter().zip(["credit2 new", "T2 got new", "T2 change new"]) {
+			refresh.push((co.clone(), keypair(&format!("{} {}", tag, l))));
+		}
+		old
+	};
+	assert!(r.db.store.delegation(&rest.held.id.0).await.unwrap().is_none(), "R's delegation is not kept");
+	let ids: Vec<_> = refresh.iter().map(|(c, k)| submit(&r, &[c], &[*k])).collect();
+	all_rounds(&r).await;
+	for ((id, nn), (c, k)) in ids.iter().zip(&refresh) {
+		complete(&r, id, &[c], &[*k], nn, true).await;
+	}
+	let of_h = |v: &[server::store::WatcherTxRow]| v.iter().filter(|w| w.subject == h.to_vec()).count();
+	let slots = [order.held.id.0, plain.held.id.0];
+	let honest = passes(&r).await;
+	let cc = server::delegations::can_complete(&r.db.store, &slots, h).await.unwrap();
+	println!("{}: honest operator: reclaims of H {} (of {}); can_complete(H) {}", tag, of_h(&honest), honest.len(), cc);
+	assert!(of_h(&honest) == 0 && !cc);
+
+	// The operator's store: O's slot named by R (RV5's row).
+	let (c, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move { let _ = conn.await; });
+	let n = c.execute("UPDATE batch_leaf SET leaf_id = $1 WHERE leaf_id = $2", &[&&rest.held.id.0[..], &&order.held.id.0[..]]).await.unwrap();
+	assert_eq!(n, 1);
+	let after = passes(&r).await;
+	println!("{}: O's slot named by R in the store: reclaims of H {}", tag, of_h(&after));
+	assert_eq!(of_h(&after), 0);
+
+	// And the earlier wallet's delegation of R, kept as a server before
+	// the fix kept it: not followed.
+	let server::store::SpentBy::Reassignment { transfer_id, outputs } = r.db.store.spent_by(&rest.held.id.0).await.unwrap() else {
+		panic!("R moved by a reassignment")
+	};
+	assert!(r.db.store.insert_delegation(&rest.held.id.0, &transfer_id, old.as_ref()).await.unwrap());
+	let after = passes(&r).await;
+	let cc = server::delegations::can_complete(&r.db.store, &[rest.held.id.0, plain.held.id.0], h).await.unwrap();
+	println!("{}: with the earlier wallet's delegation of R kept too: reclaims of H {}; can_complete {}", tag, of_h(&after), cc);
+	assert!(of_h(&after) == 0 && !cc);
+	for (label, co) in [("credit 1", credit1), ("taker 1 got", tgot1), ("taker 1 change", tch1)] {
+		let s: String = c.query_one("SELECT state::TEXT FROM leaf WHERE leaf_id = $1", &[&&co.held.id.0[..]]).await.unwrap().get(0);
+		println!("{}: {} {}: {} in the store, rests on H", tag, label, co.held.id, s);
+	}
+
+	// By hand, RV5's tree: O's slot by K's delegation into R's move, each
+	// of its outputs by its holder's release; the plain leaf's by its own.
+	let mut to = vec![];
+	for (out, k) in &outputs {
+		let k = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(k).unwrap();
+		to.push(server::delegations::consent(&r.db.store, *out, k, h, 30).await.unwrap().expect("a refreshed holder's release"));
+	}
+	let p = server::delegations::consent(&r.db.store, plain.held.id.0, plain.valid(&r).leaf.owner, h, 30).await.unwrap().expect("the plain leaf's release");
+	let key = order.valid(&r).leaf.owner;
+	let slot = |sig| server::delegations::Consent::Delegation { key, sig, to: to.clone() };
+	let mut rounds = vec![];
+	slot(d1_sig).rounds(&mut rounds);
+	p.rounds(&mut rounds);
+	let atoms = atoms_by_hand(&r, &rounds).await;
+	let forged = reclaim_by_hand(&r, order, &atoms, &[slot(d1_sig), p.clone()]);
+	let control = reclaim_by_hand(&r, order, &atoms, &[slot(old), p.clone()]);
+	let steps = slot(old).steps() + p.steps();
+	let t = r.rt.client().test_mempool_accept(&[&control]).unwrap().remove(0);
+	println!("{}: control, the earlier wallet's signature in R's place: {} vB, {} steps; testmempoolaccept allowed {} {:?}", tag,
+		control.vsize(), steps, t.allowed, t.reject_reason);
+	assert!(t.allowed, "the reclaim is built right: only the signature can refuse it");
+	let h0 = r.rt.client().block_count().unwrap();
+	let e = match r.rt.client().generate_block("raw(51)", &[&forged]) {
+		Ok(b) => panic!("{}: the reclaim with K's only delegation was MINED in {}", tag, b),
+		Err(e) => e.to_string(),
+	};
+	assert_eq!(r.rt.client().block_count().unwrap(), h0);
+	println!("{}: RESULT the reclaim of H with K's only delegation (O's into fill 1) in R's place, {} vB: refused in a block: {}", tag,
+		forged.vsize(), e);
+	assert!(e.contains("Invalid Schnorr signature"), "{}", e);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_order_resting_again_cannot_release_the_orders_node_by_a_second_fill() {
+	rest_moves_on(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_order_resting_again_cannot_release_the_orders_node_by_a_cancel() {
+	rest_moves_on(true).await;
 }

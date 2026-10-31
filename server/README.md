@@ -1323,10 +1323,16 @@ the fill by its transfer id or by the order coin it spent), checks them against 
 record, and posts the order key's signature (`order_fill_delegation`), which
 the server checks against the outputs it recorded (`bad_signature`;
 `unknown_fill`, 404, for a fill not recorded). The order resting again
-carries the order coin's own key, so it releases nothing: a release by that
-key would fill the order's slot alone. It consents through its own next
-delegation, a later fill or its maker's cancel; given up in a refresh, its
-node waits for its batch's expiry.
+carries the order coin's own key, and a release or a delegation names a key,
+never a coin: whatever that key signed later would fill the order coin's slot
+in place of its delegation into the fill. So only the order's first coin
+delegates. The order resting again releases nothing and delegates nothing:
+its wallet signs neither, `order_fill_delegation` for a fill that spent it
+answers `kept` false, a delegation sent with its cancel or as a taker coin
+is not kept, and the watcher follows none, a stored one included. Once it
+moves on, by a later fill, a cancel or a refresh, the nodes under the order's
+coin and under the taker coins of each fill that left a remainder wait for
+their batches' expiry.
 
 The maker cancels by spending the order's coin as any coin: a transfer into a
 leaf of its own (`cosign_transfer`), or a refresh. The signer's one spend per
@@ -2348,7 +2354,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
 | `POST order_fill_delegation_terms` | For a signed fill, by its transfer id or the order coin it spent: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
-| `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D) |
+| `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D, and for an order resting again, whose key delegated at an earlier fill) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
@@ -3466,8 +3472,15 @@ with the release it comes back. A resting order partly filled in the tree:
 the taker's delegation by another key, or over the outputs of a whole fill,
 is refused; the maker's by its credit key, or over the taker's leaves in
 another order, is refused; with both delegations, the maker's cancel of the
-order resting again and every holder's refresh, the order's node and the
-taker's come back by RECLAIM-D. A maker whose order is filled whole every
+order resting again (its delegation not kept) and every holder's refresh,
+neither the order's node nor the taker's can come back before expiry. An
+operator acting alone against the order resting again, moved on by a second
+fill or a cancel: with the order's slot named by the remainder in its own
+store, and with a delegation of the remainder a wallet signed before wallets
+stopped kept there too, the watcher reclaims nothing; the reclaim built by
+hand with the order key's only delegation in the remainder's place is
+refused in a block (`Invalid Schnorr signature`), where the same reclaim
+with that earlier wallet's signature is taken. A maker whose order is filled whole every
 round keeps `transferred` at one order; without its delegation it grows by
 an order a round. The `htlc-1` leaf of a paid payment: its sender's release
 is refused while the payment is paying and by another key, and once paid it

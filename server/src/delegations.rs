@@ -114,6 +114,9 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 		}
 		match store.spent_by(&leaf_id).await? {
 			SpentBy::Reassignment { transfer_id, outputs } => {
+				if is_rest(store, &leaf_id).await? != Some(false) {
+					return Ok(None);
+				}
 				let Some(d) = store.delegation(&leaf_id).await? else { return Ok(None) };
 				if d.transfer_id != transfer_id || outputs.is_empty() {
 					return Ok(None);
@@ -133,7 +136,10 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 				}
 				Ok(Some(Consent::Delegation { key, sig, to }))
 			},
-			SpentBy::Other => release_of(key, store.holder_releases(&leaf_id, &node_hash).await?),
+			SpentBy::Other => match is_rest(store, &leaf_id).await? {
+				Some(false) => release_of(key, store.holder_releases(&leaf_id, &node_hash).await?),
+				_ => Ok(None),
+			},
 			// The htlc-1 leaf of a payment out of the tree that was paid is
 			// the operator's, and its sender's key releases it.
 			SpentBy::Nothing => match store.send_of_leaf(&leaf_id).await? {
@@ -142,6 +148,19 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 			},
 		}
 	})
+}
+
+/// Whether the coin `leaf` is an order resting again after a fill, by its
+/// record; `None` for a coin the store does not hold. Its key is its
+/// order's, which delegated at the fill, so it consents to no reclaim: not
+/// by a release of its own, and not by a delegation into its next move,
+/// which would fit the order's first coin's slot as well as its own
+/// ([`arca_covenant::ValidCoin::is_rest`]). A delegation a wallet signed for
+/// one before wallets stopped signing them may be in the store; it is never
+/// followed.
+async fn is_rest(store: &Store, leaf: &[u8; 32]) -> Result<Option<bool>, StoreError> {
+	Ok(store.leaf(leaf).await?.map(|row| matches!(arca_covenant::CoinRecord::from_bytes(&row.record),
+		Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }))))
 }
 
 /// `key`'s consent by the latest of its releases `rows`, if any.
@@ -180,8 +199,9 @@ pub async fn node_consents(store: &Store, slots: &[([u8; 32], XOnlyPublicKey)], 
 /// sender), and once paid when its sender's release is recorded. A coin
 /// given up in a refresh or an offboard that completed with no release, a
 /// coin that moved without a delegation, the order resting again after a fill
-/// given up in a refresh, an `htlc-1` leaf of a payment into the tree, or a
-/// tree past [`RECLAIM_STEPS`] steps, keeps the node until its batch expires.
+/// once it moves on at all (its key delegated at the fill), an `htlc-1` leaf
+/// of a payment into the tree, or a tree past [`RECLAIM_STEPS`] steps, keeps
+/// the node until its batch expires.
 pub async fn can_complete(store: &Store, slots: &[[u8; 32]], node_hash: [u8; 32]) -> Result<bool, StoreError> {
 	let mut left = RECLAIM_STEPS;
 	for leaf in slots {
@@ -204,6 +224,9 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 		}
 		match store.spent_by(&leaf).await? {
 			SpentBy::Reassignment { transfer_id, outputs } => {
+				if is_rest(store, &leaf).await? != Some(false) {
+					return Ok(None);
+				}
 				match store.delegation(&leaf).await? {
 					Some(d) if d.transfer_id == transfer_id && !outputs.is_empty() => {},
 					_ => return Ok(None),
@@ -220,11 +243,7 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 			SpentBy::Other => {
 				// An order resting again releases nothing: its key delegated
 				// at the fill. Given up in a refresh, it never consents.
-				let rest = match store.leaf(&leaf).await? {
-					Some(row) => matches!(arca_covenant::CoinRecord::from_bytes(&row.record),
-						Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. })),
-					None => return Ok(None),
-				};
+				let Some(rest) = is_rest(store, &leaf).await? else { return Ok(None) };
 				let comes = !rest && (!store.holder_releases(&leaf, &node_hash).await?.is_empty() || store.refresh_open(&leaf).await?);
 				Ok(comes.then_some(1))
 			},

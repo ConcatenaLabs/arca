@@ -143,12 +143,15 @@ pub(crate) struct Theirs {
 /// a reassignment of `outputs`, each the leaf `leaves` names, signed with
 /// `key`: for a coin resting on a lowest node with RECLAIM-D, so that the
 /// node comes back once the outputs' holders refresh and release it. `None`
-/// for any other coin. Every output is named, so no co-receiver (the change,
-/// a swap's other side) can release the node alone.
+/// for any other coin, and for an order resting again after a fill (a
+/// cancel), whose key, the order's own, delegated at that fill: a second
+/// delegation by it would stand in for the first ([`ValidCoin::is_rest`]).
+/// Every output is named, so no co-receiver (the change, a swap's other
+/// side) can release the node alone.
 pub(crate) fn delegation_sig(key: &elements::secp256k1_zkp::Keypair, coin: &ValidCoin, outputs: &[ExplicitOutput], leaves: &[NewLeaf])
 	-> Result<Option<Signature>, Error>
 {
-	if coin.release_nodes().is_empty() {
+	if coin.release_nodes().is_empty() || coin.is_rest() {
 		return Ok(None);
 	}
 	let d = arca_covenant::Delegation::for_reassignment(coin, outputs, leaves).map_err(|e| Error::Refused(format!("the delegation: {}", e)))?;
