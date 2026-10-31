@@ -127,6 +127,18 @@ pub enum SendError {
 	Store(#[from] StoreError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
+	#[error("no payment for hash {0} is known")]
+	Unknown(String),
+	/// A release of a payment that is not `paid`: before its outcome is
+	/// known the release would end the sender's refund.
+	#[error("payment {0} is {1}: its sender releases its leaf's nodes once it is paid")]
+	NotPaid(String, &'static str),
+	#[error("round {0} is not a final round of this operator: a release names one")]
+	RoundNotFinal(String),
+	#[error("the payment's htlc-1 coin rests on no lowest node with RECLAIM-D whose children hash is {0}")]
+	NotOnNode(String),
+	#[error("the release of node {0} is not the payment's htlc-1 key's signature over that node's release naming the round")]
+	BadRelease(String),
 }
 
 impl SendError {
@@ -141,6 +153,11 @@ impl SendError {
 			SendError::Cosign(c) => c.code(),
 			SendError::Store(_) => "internal",
 			SendError::NotSynced => "not_synced",
+			SendError::Unknown(_) => "unknown_payment",
+			SendError::NotPaid(..) => "release_early",
+			SendError::RoundNotFinal(_) => "round_not_final",
+			SendError::NotOnNode(_) => "not_on_node",
+			SendError::BadRelease(_) => "bad_signature",
 		}
 	}
 }
@@ -520,6 +537,87 @@ impl Sends {
 			}
 		}
 		Ok(())
+	}
+}
+
+/// What the sender of a paid payment signs its releases over
+/// ([`arca_covenant::Release::for_paid_send`]).
+#[derive(Debug, Clone)]
+pub struct ReleaseTerms {
+	pub payment: SendRow,
+	/// The lowest nodes with RECLAIM-D its `htlc-1` coin rests on.
+	pub nodes: Vec<[u8; 32]>,
+	/// The latest final round, which the releases name; `None` before any.
+	pub round: Option<crate::store::RoundRow>,
+	/// The nodes whose release is recorded, naming a round that is final.
+	pub released: Vec<[u8; 32]>,
+}
+
+impl Sends {
+	/// The paid payment `hash`, and its `htlc-1` coin as the server checks
+	/// coins.
+	async fn paid(&self, hash: &[u8; 32]) -> Result<(SendRow, arca_covenant::ValidCoin), SendError> {
+		let row = self.store.send(hash).await?.ok_or_else(|| SendError::Unknown(crate::signer::hex(hash)))?;
+		if row.state != SendState::Paid {
+			return Err(SendError::NotPaid(crate::signer::hex(hash), row.state.name()));
+		}
+		let now = self.now().await?;
+		let policy = arca_covenant::WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
+		let coin = crate::coins::resolve(&self.store, &policy, &arca_covenant::LeafId(row.htlc_leaf_id)).await
+			.map_err(|e| SendError::Cosign(e.into()))?;
+		Ok((row, coin.coin))
+	}
+
+	/// What the sender of the paid payment `hash` signs: one release of each
+	/// lowest node with RECLAIM-D its `htlc-1` coin rests on, naming the
+	/// latest final round, and which of them the server holds already.
+	pub async fn release_terms(&self, hash: &[u8; 32]) -> Result<ReleaseTerms, SendError> {
+		let (payment, coin) = self.paid(hash).await?;
+		let nodes: Vec<[u8; 32]> = coin.release_nodes().into_iter().map(|(_, h)| h).collect();
+		let round = match self.store.latest_final_round().await? {
+			Some(id) => self.store.round(id).await?,
+			None => None,
+		};
+		let mut released = vec![];
+		for n in &nodes {
+			if !self.store.paid_send_releases(&payment.htlc_leaf_id, n).await?.is_empty() {
+				released.push(*n);
+			}
+		}
+		Ok(ReleaseTerms { payment, nodes, round, released })
+	}
+
+	/// Takes the sender's releases of the lowest nodes its paid payment
+	/// `hash`'s `htlc-1` coin rests on, each naming the connector asset of
+	/// round `round_txid`, which must be final. Returns the nodes whose
+	/// release is recorded.
+	pub async fn take_releases(&self, hash: &[u8; 32], round_txid: &[u8; 32], releases: &[([u8; 32], elements::secp256k1_zkp::schnorr::Signature)])
+		-> Result<Vec<[u8; 32]>, SendError>
+	{
+		let (payment, coin) = self.paid(hash).await?;
+		let round = self.store.round_by_txid(round_txid).await?
+			.filter(|r| r.state == crate::store::RoundState::Final)
+			.ok_or_else(|| SendError::RoundNotFinal(crate::signer::hex(round_txid)))?;
+		let m = crate::watcher::round_connector(&round);
+		let nodes = coin.release_nodes();
+		let mut done = vec![];
+		for (node, sig) in releases {
+			let Some((chain, _)) = nodes.iter().find(|(_, h)| h == node) else {
+				return Err(SendError::NotOnNode(crate::signer::hex(node)));
+			};
+			let release = arca_covenant::Release { chain: *chain, node_hash: *node, owner: coin.leaf.owner, connector: m };
+			if release.verify(sig).is_err() {
+				return Err(SendError::BadRelease(crate::signer::hex(node)));
+			}
+			self.store.insert_paid_send_release(&payment.htlc_leaf_id, round.round_id, node, &m.into_inner().to_byte_array(),
+				&<[u8; 64]>::try_from(sig.as_ref().as_slice()).expect("64 bytes")).await?;
+			done.push(*node);
+		}
+		if !done.is_empty() {
+			log::info!("lightning: the sender of paid payment {} released {} node(s), naming round {}", crate::signer::hex(hash),
+				done.len(), round.round_id);
+		}
+		Ok(done)
 	}
 }
 

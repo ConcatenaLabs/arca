@@ -18,7 +18,7 @@ pub struct PoolFlow {
 	/// unrolls and reclaims them on its next passes.
 	pub reclaimable: u64,
 	/// Of `locked`, the leaves paid on out of round (given up in a
-	/// transfer), not reclaimed yet: no release of their lowest node can come
+	/// transfer, or a resting order's coin a fill spent), not reclaimed yet: no release of their lowest node can come
 	/// from their owner, so they come back by RECLAIM-D once every coin they
 	/// became is refreshed and released ([`crate::delegations`]), or else at
 	/// their batch's expiry.
@@ -100,7 +100,8 @@ impl Store {
 			                  WHERE nr.leaf_id = bl.leaf_id)
 			           OR EXISTS (SELECT 1 FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid)
 			                      WHERE rl.leaf_id = bl.leaf_id AND n.state <> 'lost')) AS reclaimed,
-			          EXISTS (SELECT 1 FROM transfer_input ti WHERE ti.leaf_id = bl.leaf_id) AS transferred
+			          (EXISTS (SELECT 1 FROM transfer_input ti WHERE ti.leaf_id = bl.leaf_id)
+			           OR EXISTS (SELECT 1 FROM order_fill f WHERE f.order_leaf = bl.leaf_id AND f.signature IS NOT NULL)) AS transferred
 			   FROM batch_leaf bl JOIN live USING (round_id, vout)),
 			 per_batch AS (
 			   SELECT l.round_id, l.vout,

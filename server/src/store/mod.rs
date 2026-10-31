@@ -18,7 +18,8 @@
 //! `schema/V29__fill_requests.sql`, `schema/V30__order_landings.sql`,
 //! `schema/V31__supervised.sql`, `schema/V32__channels.sql`,
 //! `schema/V33__accumulator_batches.sql`, `schema/V34__owed.sql`,
-//! `schema/V35__release_delegation.sql`),
+//! `schema/V35__release_delegation.sql`,
+//! `schema/V36__paid_send_releases.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -133,6 +134,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(33, include_str!("../../schema/V33__accumulator_batches.sql")),
 	(34, include_str!("../../schema/V34__owed.sql")),
 	(35, include_str!("../../schema/V35__release_delegation.sql")),
+	(36, include_str!("../../schema/V36__paid_send_releases.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

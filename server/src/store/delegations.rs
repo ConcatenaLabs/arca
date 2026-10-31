@@ -100,6 +100,62 @@ impl Store {
 		})).collect()
 	}
 
+	/// Records the release by the sender of a paid Lightning payment of the
+	/// lowest node whose children hash is `node_hash`, its `htlc-1` coin
+	/// `leaf_id` resting on it, naming round `round_id` (whose connector
+	/// asset is `connector_asset`). A release already recorded for the coin,
+	/// round and node stays as it was. Returns whether this one is new.
+	pub async fn insert_paid_send_release(&self, leaf_id: &[u8; 32], round_id: i64, node_hash: &[u8; 32], connector_asset: &[u8; 32],
+		signature: &[u8; 64]) -> Result<bool, StoreError>
+	{
+		let conn = self.conn().await?;
+		let n = conn.execute(
+			"INSERT INTO node_release (leaf_id, round_id, participation_id, node_hash, connector_asset, signature)
+			 VALUES ($1, $2, NULL, $3, $4, $5) ON CONFLICT DO NOTHING",
+			&[&&leaf_id[..], &round_id, &&node_hash[..], &&connector_asset[..], &&signature[..]],
+		).await?;
+		Ok(n == 1)
+	}
+
+	/// The releases the sender of a paid Lightning payment signed of the
+	/// lowest node whose children hash is `node_hash`, its `htlc-1` coin
+	/// being `leaf_id`, naming a round that is final now. A round lost to a
+	/// rollback takes its connector asset with it, so a release naming it is
+	/// of no use until the round is final again.
+	pub async fn paid_send_releases(&self, leaf_id: &[u8; 32], node_hash: &[u8; 32]) -> Result<Vec<HolderReleaseRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT nr.round_id, nr.connector_asset, nr.signature FROM node_release nr JOIN round r USING (round_id)
+			 WHERE nr.leaf_id = $1 AND nr.node_hash = $2 AND nr.participation_id IS NULL AND r.state = 'final'
+			 ORDER BY nr.round_id",
+			&[&&leaf_id[..], &&node_hash[..]]).await?;
+		rows.iter().map(|r| Ok(HolderReleaseRow {
+			round_id: r.get(0),
+			connector_asset: array32(r.get(1), "connector asset")?,
+			signature: sig64(r.get(2))?,
+		})).collect()
+	}
+
+	/// Whether `leaf_id` is given up in a participation that has not
+	/// completed yet (pending, or in a round and waiting for its forfeits):
+	/// its holder's release can still come once it completes.
+	pub async fn refresh_open(&self, leaf_id: &[u8; 32]) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_one(
+			"SELECT EXISTS (SELECT 1 FROM participation_input pi JOIN participation p USING (participation_id)
+			 WHERE pi.leaf_id = $1 AND pi.active AND p.state IN ('pending', 'issued'))",
+			&[&&leaf_id[..]]).await?;
+		Ok(r.get(0))
+	}
+
+	/// The latest round that is final, by id: the one a paid payment's
+	/// sender is asked to name in its releases.
+	pub async fn latest_final_round(&self) -> Result<Option<i64>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT round_id FROM round WHERE state = 'final' ORDER BY round_id DESC LIMIT 1", &[]).await?;
+		Ok(r.map(|r| r.get(0)))
+	}
+
 	/// The batches with RECLAIM-D one of whose leaves moved into a
 	/// reassignment with a delegation: each may come back by its holders'
 	/// releases. By round and output.

@@ -40,7 +40,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/chain`: where the operator's finality service stands, so an
@@ -1055,6 +1055,53 @@ pub struct LightningClaimed {
 	pub receive: LightningReceived,
 }
 
+/// What the sender of a paid payment out of the tree signs, answered by
+/// `POST /v1/lightning_send_release_terms` (asked with a
+/// [`LightningSendStatus`]): a release of each lowest node with RECLAIM-D
+/// its `htlc-1` coin rests on (`nodes`, children hashes), each naming the
+/// connector asset of `round`, the latest final round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSendReleaseTerms {
+	pub payment_hash: String,
+	pub htlc_leaf_id: String,
+	pub nodes: Vec<String>,
+	/// The round to name, with its transaction; absent before any round is
+	/// final.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub round: Option<RoundRef>,
+	/// The nodes whose release is recorded, naming a round that is final.
+	pub released: Vec<String>,
+}
+
+/// `POST /v1/lightning_send_release`: the paid payment's sender's releases,
+/// each signed with the `htlc-1` coin's key over
+/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset
+/// of round `round_txid`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSendRelease {
+	pub payment_hash: String,
+	pub round_txid: String,
+	pub releases: Vec<NodeRelease>,
+}
+
+/// One node's release: its children hash `H` and the signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeRelease {
+	pub node: String,
+	pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningSendReleased {
+	pub payment_hash: String,
+	/// The nodes whose release is recorded.
+	pub released: Vec<String>,
+}
+
 /// `POST /v1/lightning_send_status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1091,6 +1138,58 @@ pub struct OrderPublish {
 	pub mailbox: String,
 	/// The order's leaf key's signature over the publication.
 	pub signature: String,
+}
+
+/// `POST /v1/order_fill_delegation_terms` and the request of
+/// `order_fill_delegation`'s terms: a fill by its transfer id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillRef {
+	pub transfer_id: String,
+}
+
+/// What the maker of a filled order signs its order coin's delegation into
+/// the fill over: the fill's order coin and the taker's leaves, in output
+/// order after the maker's credit (and the order resting again, for a
+/// partial fill). The maker checks them against the fill's outputs in a
+/// coin of the fill it holds (`Delegation::for_filled_order`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillDelegationTerms {
+	pub transfer_id: String,
+	pub order_coin: String,
+	pub takers: Vec<FillTakerLeaf>,
+	/// Whether the order coin's delegation into this fill is recorded.
+	pub delegated: bool,
+}
+
+/// A taker's leaf of a fill, as its taker named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillTakerLeaf {
+	pub owner: String,
+	pub owner_nonce: String,
+	pub creator_nonce: String,
+	pub exit_delay_units: u16,
+}
+
+/// `POST /v1/order_fill_delegation`: the order coin's key's signature over
+/// `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`, the owner keys
+/// of the fill's outputs in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillDelegation {
+	pub transfer_id: String,
+	pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillDelegated {
+	pub transfer_id: String,
+	/// Whether the delegation is kept: only for an order coin resting on a
+	/// lowest node with RECLAIM-D.
+	pub kept: bool,
 }
 
 /// `POST /v1/order_fill`: a taker fills a resting order in the tree.

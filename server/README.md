@@ -52,7 +52,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V32__channels.sql`](schema/V32__channels.sql),
 [`schema/V33__accumulator_batches.sql`](schema/V33__accumulator_batches.sql),
 [`schema/V34__owed.sql`](schema/V34__owed.sql),
-[`schema/V35__release_delegation.sql`](schema/V35__release_delegation.sql)). `Store::connect` builds it
+[`schema/V35__release_delegation.sql`](schema/V35__release_delegation.sql),
+[`schema/V36__paid_send_releases.sql`](schema/V36__paid_send_releases.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -243,7 +244,8 @@ final), and where each asset's value is besides the wallet (`pool`): what its
 live batches hold until a reclaim or their expiry brings it back (`locked`), of
 that what holders released and is not reclaimed yet (`released`), in batches
 every leaf of which is released and that the watcher reclaims on its next passes
-(`reclaimable`), and in leaves paid on out of round and not reclaimed, whose
+(`reclaimable`), and in leaves paid on out of round (a transfer's input, or a
+resting order's coin a fill spent) and not reclaimed, whose
 owners can release nothing, so that they come back by RECLAIM-D once every
 coin they became is refreshed and released, and otherwise at their batch's
 expiry (`transferred`); what the operator fronted for refreshes whose old coins
@@ -516,6 +518,19 @@ collaborative path. The leaf's refund path stays the owner's should the
 operator do neither. `lightning_send_status` answers a payment by its hash,
 with the preimage once paid or the reason once failed (`unknown_payment`, 404,
 for a hash no payment is recorded for).
+
+A paid leaf's owner key is the sender's, so on a batch with RECLAIM-D the
+sender releases the lowest nodes the leaf rests on once the payment is paid,
+and the node the leaf rests on comes back with its other coins
+(`arca_covenant::Release::for_paid_send`). `lightning_send_release_terms`
+names those nodes, the round to name (the latest final round, with its
+transaction) and which are released already; `lightning_send_release` takes
+the releases, each the leaf key's signature naming that round's connector
+asset. Both refuse a payment that is not `paid` (`release_early`): before
+then the release would end the sender's refund. A release naming a round
+that is not final is refused (`round_not_final`), one of a node the leaf does
+not rest on (`not_on_node`), and one by another key (`bad_signature`). The
+watcher uses a release only while its round is final.
 
 A request repeated byte for byte gets the answer it got, whatever has changed
 since (the invoice expired, the fees, the node): a wallet whose answer was
@@ -1297,6 +1312,22 @@ nothing from anyone, and the order's coin is not held until the taker returns.
 One the signer refuses (its record holds another spend of a coin) is dropped,
 its coins live again. While a fill is unsigned the order reads `filling`.
 
+On a batch with RECLAIM-D a fill delegates like a transfer, into all of its
+outputs in order (the credit, the order resting again, the taker's leaves;
+`arca_covenant::Delegation::for_fill`). Each taker coin's delegation comes
+with the fill (`delegation_sig`, as in `cosign_transfer`), and a wrong one is
+refused (`bad_signature`) before anything is recorded. The order's coin
+delegates later, since its maker is away: once its wallet holds a coin the
+fill made, it reads the taker's leaves (`order_fill_delegation_terms`, by the
+fill's transfer id), checks them against the fill's outputs in that coin's
+record, and posts the order key's signature (`order_fill_delegation`), which
+the server checks against the outputs it recorded (`bad_signature`;
+`unknown_fill`, 404, for a fill not recorded). The order resting again
+carries the order coin's own key, so it releases nothing: a release by that
+key would fill the order's slot alone. It consents through its own next
+delegation, a later fill or its maker's cancel; given up in a refresh, its
+node waits for its batch's expiry.
+
 The maker cancels by spending the order's coin as any coin: a transfer into a
 leaf of its own (`cosign_transfer`), or a refresh. The signer's one spend per
 salt keeps a cancel and a fill of one coin apart. A credit's key is public in
@@ -1375,11 +1406,13 @@ one with a coin within six days of its first expiry (a wallet asks for a
 refresh by itself from five days before, and takes the coin on the chain
 from four), so the cap never sends a coin home; one whose coins rest only on
 lowest nodes that already hold fronted value and can still come back (every
-coin on them still held, refreshed, or moved with a delegation, within
+coin on them still held, given up in a refresh whose release is recorded or
+whose participation has not completed, or moved with a delegation, within
 RECLAIM-D's 32 steps), which opens nothing new and without which those nodes
 never come back; and one larger than a cap above 0 while nothing of the asset
 is in flight. A refresh on a node that can come back only at its batch's
-expiry (a coin on it moved without a delegation) is held by the cap like any
+expiry (a coin on it moved without a delegation, or refreshed or offboarded
+with no release) is held by the cap like any
 other, and a coin on an accumulator batch, which has no lowest node, counts
 in flight and never completes one. A cap of `"0"` fronts nothing, for
 an asset whose pool is empty.
@@ -2065,7 +2098,8 @@ rests on (`arca_covenant::Release::for_holder`,
 `ValidCoin::release_nodes`), each release naming that node's children hash
 (`node`); one naming a node the coin does not rest on is refused
 (`not_on_node`), and so is a coin with no such node (`no_lowest_node`). A
-release for a coin a signed reassignment spent is refused (`delegated`, or
+release for a coin a signed reassignment spent, or for the order resting
+again after a fill, whose key is the order coin's, is refused (`delegated`, or
 `open_reassignment` while the reassignment is open): the chain cannot tell a
 release by a key that already delegated from its holder's, so the operator
 takes such a coin's consent only through its delegation. Each release is kept
@@ -2201,7 +2235,9 @@ meanwhile.
   consents through the leaf's delegation and, for each output it names, that
   coin's consent in turn, down to the coins' current holders: a coin a signed
   reassignment spent consents only through its delegation into it, never by a
-  release of its own key; any other through its holder's release. When every
+  release of its own key (a filled order's coin through the maker's
+  delegation into the fill); the `htlc-1` leaf of a paid payment through its
+  sender's release; any other through its holder's release. When every
   slot so consents within RECLAIM-D's 32 steps, the watcher reclaims the node
   by RECLAIM-D (by RECLAIM when every slot is its leaf owner's own release),
   with an atom of each connector asset the trees' releases name. A node one
@@ -2285,6 +2321,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins, with the signed head of the signer's record its last signature was recorded at (`signer_record`). An output that pays a receive request names when the request lapses (`until`, a median time, as the request carries it): once the chain's median time has reached it, the server records no transfer paying it and answers `request_lapsed` (422), naming that time, since its receiver no longer waits for the payment; a transfer recorded before it completes when it is asked again. An output without `until` is taken as any other. An input resting on a lowest node with RECLAIM-D carries its owner's delegation to the outputs' owner keys (`delegation_sig`; see Out-of-round transfers) |
 | `POST lightning_send` | Pays a BOLT11 invoice out of the tree (see Paying an invoice out of the tree): co-signs the transfer into the payment's `htlc-1` leaf and the change, as `cosign_transfer` answers it (`cosigned`), and answers the payment (`payment`: its hash, asset, amount, fee, `htlc_leaf_id` and state) |
 | `POST lightning_send_status` | A payment out of the tree by its payment hash: `paying`, `paid` with its preimage, or `failed` with the reason |
+| `POST lightning_send_release_terms` | For a paid payment out of the tree: the lowest nodes with RECLAIM-D its `htlc-1` leaf rests on, the round its sender's releases name (the latest final round, with its transaction) and the nodes already released |
+| `POST lightning_send_release` | Takes the paid payment's sender's release of each of those nodes, naming that round |
 | `POST lightning_receive` | An invoice paid into the tree under the wallet's own payment hash (see Receiving into the tree), and the payment (`open`) |
 | `POST lightning_receive_status` | A payment into the tree by its payment hash: `open`, `accepted` with its participation and the leaf's timeout, `claimed` and whether the node has settled it, or `cancelled` with the reason |
 | `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
@@ -2308,7 +2346,9 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cancel_plan` | Cancels the steps of a plan that have not started, on the plan's mailbox key's signature over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`; a plan with a step in a round is cancelled once that round decides it |
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
-| `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`) |
+| `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
+| `POST order_fill_delegation_terms` | For a signed fill, by its transfer id: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
+| `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
@@ -3420,7 +3460,18 @@ once it completes a node the first opened; on a node one of whose coins was
 paid on without a delegation the refreshes past the cap keep waiting; an asset
 with a cap of 0 and an empty pool waits and holds up no other asset's round.
 A transfer refused for good after it was recorded with a delegation is
-dropped whole, its coin live again.
+dropped whole, its coin live again. A refresh with no release on a node one
+of whose coins was paid on keeps waiting under the cap, and the node waits;
+with the release it comes back. A resting order partly filled in the tree:
+the taker's delegation by another key, or over the outputs of a whole fill,
+is refused; the maker's by its credit key, or over the taker's leaves in
+another order, is refused; with both delegations, the maker's cancel of the
+order resting again and every holder's refresh, the order's node and the
+taker's come back by RECLAIM-D. A maker whose order is filled whole every
+round keeps `transferred` at one order; without its delegation it grows by
+an order a round. The `htlc-1` leaf of a paid payment: its sender's release
+is refused while the payment is paying and by another key, and once paid it
+brings the node back.
 
 `tests/rates.rs` prices X by the node's own rate, Y by a file and, in a
 second server, X by a command: `info` shows each rate, its source and its
