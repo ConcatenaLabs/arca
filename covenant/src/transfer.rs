@@ -634,6 +634,17 @@ impl ValidCoin {
 		}
 	}
 
+	/// Whether the coin is an order resting again after an in-tree fill: an
+	/// order's leaf that a fill made. It carries the order's own key, which
+	/// delegated its release into that fill when the order's first coin was
+	/// spent, so it signs neither a delegation nor a release of its own. A
+	/// delegation names keys and no coin: a second one by the same key fits
+	/// the first coin's slot in RECLAIM-D's tree, in place of the fill's, and
+	/// would let the node go while the fill's coins are still held.
+	pub fn is_rest(&self) -> bool {
+		self.leaf.order.is_some() && matches!(self.origin, ValidOrigin::Fill { .. })
+	}
+
 	/// The lowest nodes with RECLAIM-D the coin rests on, each as its chain
 	/// and children hash `H`, without repeats, in the order the record nests
 	/// them: those whose release the coin's holder signs once it has a new

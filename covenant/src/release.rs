@@ -69,8 +69,14 @@
 //!
 //! What a delegation authorises: nothing alone. It makes the releases of the
 //! keys it names, all of them, stand for the signer's release, on every node
-//! the signer's coin rests on, on this chain. The signer's key is one coin's
-//! own, so it names a slot only through that coin. The chain cannot know
+//! the signer's coin rests on, on this chain. It names no coin: the chain
+//! takes it for whichever slot the signer's key holds. So a key signs at
+//! most one, and only one coin's key signs: a plain leaf's key is single-use,
+//! and an order resting again after a fill ([`ValidCoin::is_rest`]), which
+//! keeps the order's key, signs none, since the order's first coin delegated
+//! with that key into the fill, and a second delegation would fit that coin's
+//! slot in place of the fill's. A node under a partly filled order therefore
+//! comes back at its batch's expiry. The chain cannot know
 //! whether a key has delegated, so a release by a key that did is accepted
 //! by RECLAIM-D as its holder's: the operator refuses one, and refuses the
 //! release of any coin that has moved on.
@@ -275,8 +281,12 @@ impl Delegation {
 	/// (under `coin`'s operator and chain). Refuses outputs and leaves that
 	/// differ in number, and an output that is not its leaf's script, asset
 	/// and all: the keys must be the outputs' own, or the delegation would
-	/// leave the slot to keys that hold nothing.
+	/// leave the slot to keys that hold nothing; and an order resting again
+	/// ([`ValidCoin::is_rest`]), whose key has delegated already.
 	pub fn for_reassignment(coin: &ValidCoin, outputs: &[ExplicitOutput], leaves: &[NewLeaf]) -> Result<Delegation, SpendError> {
+		if coin.is_rest() {
+			return Err(SpendError::Delegation("an order resting again delegates nothing: its key delegated at the fill"));
+		}
 		let (operator, chain) = (coin.leaf.operator, coin.leaf.chain);
 		let policies: Vec<LeafPolicy> = leaves.iter().map(|l| l.policy(operator, chain)).collect();
 		Delegation::for_outputs(coin.leaf.owner, chain, outputs, &policies)
@@ -324,10 +334,15 @@ impl Delegation {
 	/// and the order's coin come from `made`'s record, so the delegation
 	/// names the keys of exactly the outputs the operator signed, or is
 	/// refused ([`Delegation::for_fill`]). Signed by the order coin's key.
+	/// Refused when the order coin is itself an order resting again: only the
+	/// order's first coin delegates.
 	pub fn for_filled_order(made: &ValidCoin, takers: &[NewLeaf]) -> Result<Delegation, SpendError> {
 		let ValidOrigin::Fill { order, outputs, .. } = &made.origin else {
 			return Err(SpendError::Delegation("the coin is not one a fill made"));
 		};
+		if order.is_rest() {
+			return Err(SpendError::Delegation("the fill's order coin is an order resting again: its key delegated at an earlier fill"));
+		}
 		let op = order.leaf.order_policy().ok_or(SpendError::Delegation("the fill's order coin is not an order"))?;
 		Delegation::for_fill(&order.leaf, &op, outputs, takers)
 	}

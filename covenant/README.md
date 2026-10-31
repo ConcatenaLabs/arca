@@ -473,10 +473,19 @@ away when it is filled and the operator's signature alone fills it. The
 maker signs once it holds a coin the fill made, from that coin's record and
 the taker's leaves the operator names (`Delegation::for_filled_order`, which
 refuses leaves that are not the fill's outputs). The order resting again
-carries the order coin's own key, so its holder's release also fills the
-order's slot directly; the operator uses it only in the remainder's place,
-and this adds no one the taker must trust, since the maker and the operator
-can already spend the order's coin by its collaborative path.
+carries the order coin's own key, and a delegation or a release names a key,
+never a coin: whatever that key signed later would fill the order coin's
+slot in place of its delegation into the fill, and the node could go while
+the first fill's credit and taker leaves still rest on it. So only the
+order's first coin signs. The order resting again (`ValidCoin::is_rest`)
+signs no release and no delegation, into a later fill or a cancel alike
+(`Delegation::for_reassignment` and `Delegation::for_filled_order` refuse
+it), and the operator neither keeps nor follows one. Every tree that runs
+through it then stays open, so the nodes under the order's coin and under
+the taker coins of a fill that left a remainder come back at their batches'
+expiry.
+A delegation that named its coin would keep that liveness, but the message
+is built by RECLAIM-D's script, so it would take a new leaf version.
 
 The `htlc-1` leaf of a Lightning payment out of the tree is the operator's
 once the payment is paid, and its owner key is the sender's. The sender

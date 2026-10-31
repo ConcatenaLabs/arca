@@ -6,7 +6,8 @@
 //! A swap delegates both sides; a paid Lightning send's htlc-1 leaf is
 //! released by its sender's sync; a payee that offboards releases as a
 //! holder; and a resting order filled in the tree delegates on both sides,
-//! the maker's sync signing for its order's coin.
+//! the maker's sync signing for its order's first coin and never for the
+//! order resting again, nor its cancel (arca#460).
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -128,6 +129,15 @@ async fn the_wallet_delegates_at_a_payment_and_releases_as_a_holder() {
 }
 
 /// The coins of `w` live in `asset`.
+/// The outputs of the reassignment that spent the coin `id` (leaf id and
+/// owner key each), or none while it is unspent by one.
+async fn moved(r: &Running, id: [u8; 32]) -> Vec<([u8; 32], [u8; 32])> {
+	match r.server.store.spent_by(&id).await.unwrap() {
+		server::store::SpentBy::Reassignment { outputs, .. } => outputs,
+		_ => vec![],
+	}
+}
+
 fn live(w: &Arca, asset: &str) -> Vec<Value> {
 	w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live" && c["asset"] == asset).cloned().collect()
 }
@@ -347,11 +357,14 @@ async fn a_payee_that_offboards_releases_as_a_holder() {
 /// order selling X for Y (giving up a board), T refreshes a board of Y into
 /// a leaf in the same rounds and fills part of the order (its wallet
 /// delegates its coin with the fill). M's `sync` takes up its credit and the
-/// order resting again and delegates the order's coin into the fill; it
-/// cancels the rest (a transfer, delegating). Every coin then refreshes, and
-/// the order's node and the taker's come back by RECLAIM-D.
+/// order resting again and delegates the order's coin into the fill. T fills
+/// part of the rest: M's `sync` takes that credit and delegates nothing, the
+/// order's key having delegated at the first fill; M cancels what rests (a
+/// transfer, with no delegation either). Every coin then refreshes; the
+/// order's node and the taker's wait for their batches' expiry, since a
+/// second delegation by the order's key would stand in for the first.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_resting_order_filled_in_the_tree_delegates_both_sides() {
+async fn a_resting_order_filled_in_the_tree_delegates_its_first_coin_only() {
 	let mut r = Running::start_with(|c, x, _| {
 		c.batches.delegated_reclaim = true;
 		c.batches.holder_batches = Some(0);
@@ -414,20 +427,33 @@ async fn a_resting_order_filled_in_the_tree_delegates_both_sides() {
 	let again = m.ok(&["sync"]);
 	assert!(again["resting"].as_array().is_none_or(|a| a.iter().all(|v| v.get("order_coin").is_none())),
 		"done once: {}", again["resting"]);
+	let rest = moved(&r, id32(&order)).await[1].0;
+
+	// T fills 300,000 of what rests; M's sync takes the credit and signs no
+	// delegation for the order resting again.
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "300000"]);
+	assert_eq!(f["filled"], "300000", "{}", f);
+	let s = m.ok(&["sync"]);
+	println!("M's sync after the second fill, resting: {}", s["resting"]);
+	assert!(r.server.store.delegation(&rest).await.unwrap().is_none(), "the order resting again delegates nothing: {}", s);
+	let rest2 = moved(&r, rest).await[1].0;
+
+	// M cancels what rests: a transfer with no delegation.
 	let cq = m.ok(&["order", "cancel-resting", &order, "--quote"]);
 	m.ok(&["order", "cancel-resting", &order, "--shown", &cq.to_string()]);
+	assert!(!moved(&r, rest2).await.is_empty(), "the cancel spent the order resting again");
+	assert!(r.server.store.delegation(&rest2).await.unwrap().is_none(), "the cancel carries no delegation");
 
-	// Every coin refreshes, and the nodes come back.
+	// Every coin refreshes; neither node comes back before its expiry.
 	refresh_all(&r, &[&m, &t]).await;
 	let ks = reclaims(&r).await;
 	for k in &ks {
 		let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
 		println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
 	}
-	assert!(ks.iter().filter(|k| k.detail.contains("RECLAIM-D") && k.state == NurseryState::Final).count() >= 2,
-		"the order's node and the taker's come back by RECLAIM-D");
+	assert!(ks.iter().all(|k| !k.detail.contains("RECLAIM-D")), "no node comes back by RECLAIM-D through the order resting again");
 	let flows = r.server.store.pool_flow().await.unwrap();
-	for a in [x_id, y_id] {
-		assert_eq!(flows[&a.into_inner().to_byte_array()].transferred, 0, "nothing of {} stays transferred", a);
-	}
+	let (fx, fy) = (flows[&x_id.into_inner().to_byte_array()].transferred, flows[&y_id.into_inner().to_byte_array()].transferred);
+	println!("after every holder refreshed: transferred X {}, Y {}", fx, fy);
+	assert!(fx > 0 && fy > 0, "both nodes stay counted until their expiry");
 }

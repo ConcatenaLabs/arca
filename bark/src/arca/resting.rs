@@ -342,7 +342,10 @@ impl Wallet {
 	/// (`order_fill_delegation_terms`) and are checked against the fill's
 	/// outputs in the coin's own record (`Delegation::for_filled_order`), so
 	/// the delegation names exactly the outputs the operator signed. Each
-	/// order coin is done once.
+	/// order coin is done once, and only the order's first coin delegates:
+	/// an order resting again carries the same key, and a second delegation
+	/// by it would stand in for the first ([`arca_covenant::ValidCoin::is_rest`]),
+	/// so a node under a partly filled order comes back at its batch's expiry.
 	fn delegate_fills(&mut self) -> Result<Vec<Value>, Error> {
 		use arca_covenant::transfer::FillLeaf;
 		let mut done: BTreeSet<String> = self.store.meta(FILLS_DELEGATED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
@@ -359,7 +362,7 @@ impl Wallet {
 			if done.contains(&order_coin) {
 				continue;
 			}
-			if order.release_nodes().is_empty() {
+			if order.release_nodes().is_empty() || order.is_rest() {
 				done.insert(order_coin);
 				continue;
 			}
@@ -622,7 +625,7 @@ impl Wallet {
 				.map_err(|e| Error::Refused(e.to_string()))?.digest);
 			let mut input = json!({"leaf_id": c.row.leaf_id, "checkpoint_value": c.checkpoint_value.to_string(),
 				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())});
-			if !c.coin.release_nodes().is_empty() {
+			if !c.coin.release_nodes().is_empty() && !c.coin.is_rest() {
 				let d = arca_covenant::Delegation::for_fill(&c.coin.leaf, &policy, &outputs, &takers)
 					.map_err(|e| Error::Refused(format!("the delegation: {}", e)))?;
 				input["delegation_sig"] = json!(hex(sign(&key, &d.message().digest).as_ref()));

@@ -728,7 +728,8 @@ impl Orders {
 		}
 		// Each taker coin's delegation, against the fill's outputs as the
 		// server builds them; one for a coin that rests on no lowest node with
-		// RECLAIM-D is of no use and is not kept.
+		// RECLAIM-D is of no use and is not kept, nor one by an order resting
+		// again, whose key delegated at its fill ([`ValidCoin::is_rest`]).
 		let takers: Vec<NewLeaf> = req.outputs.iter().map(|o| o.leaf).collect();
 		let mut delegations = vec![];
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
@@ -736,7 +737,7 @@ impl Orders {
 			if Delegation::for_fill(&c.coin.leaf, &op, &outputs, &takers).and_then(|x| x.verify(d)).is_err() {
 				return Err(OrderError::Cosign(CosignError::BadSignature { input: k, which: "delegation" }));
 			}
-			if !c.coin.release_nodes().is_empty() {
+			if !c.coin.release_nodes().is_empty() && !c.coin.is_rest() {
 				delegations.push((c.coin.id, *d));
 			}
 		}
@@ -1029,7 +1030,9 @@ impl Orders {
 	/// the order's leaf key over the owner keys of the fill's outputs in
 	/// order: the maker's credit, the order resting again for a partial
 	/// fill, then the taker's leaves ([`Delegation::for_fill`]). Kept only
-	/// when the order coin rests on a lowest node with RECLAIM-D. Returns
+	/// when the order coin rests on a lowest node with RECLAIM-D and is the
+	/// order's first coin: an order resting again carries the same key, which
+	/// delegated at the earlier fill ([`ValidCoin::is_rest`]). Returns
 	/// whether it is kept.
 	pub async fn delegate(&self, transfer: &[u8; 32], sig: &Signature) -> Result<bool, OrderError> {
 		let (f, outputs, takers) = self.signed_fill(transfer).await?;
@@ -1043,7 +1046,7 @@ impl Orders {
 		let now = self.now().await?;
 		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
 		let coin = coins::resolve(&self.store, &policy, &id).await?;
-		if coin.coin.release_nodes().is_empty() {
+		if coin.coin.release_nodes().is_empty() || coin.coin.is_rest() {
 			return Ok(false);
 		}
 		self.store.insert_delegation(&id.0, transfer, &cosign::sig_bytes(sig)).await?;

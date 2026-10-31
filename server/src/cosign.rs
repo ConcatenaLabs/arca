@@ -627,7 +627,8 @@ impl Cosigner {
 		}
 		// Each delegation, against the outputs as the server builds them;
 		// one for a coin that rests on no lowest node with RECLAIM-D is of no
-		// use and is not kept.
+		// use and is not kept, nor one by an order resting again (a cancel),
+		// whose key delegated at its fill (`ValidCoin::is_rest`).
 		let policies: Vec<arca_covenant::LeafPolicy> = req.outputs.iter().map(|o| o.leaf.policy(s, chain)).collect();
 		let mut delegations = vec![];
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
@@ -635,7 +636,7 @@ impl Cosigner {
 			if crate::delegations::check(&c.coin, chain, &outputs, &policies, d).is_err() {
 				return Err(CosignError::BadSignature { input: k, which: "delegation" });
 			}
-			if !c.coin.release_nodes().is_empty() {
+			if !c.coin.release_nodes().is_empty() && !c.coin.is_rest() {
 				delegations.push((c.coin.id, *d));
 			}
 		}
