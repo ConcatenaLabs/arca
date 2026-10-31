@@ -255,3 +255,72 @@ async fn a_lightning_send_carries_the_payers_delegation() {
 	println!("paid over Lightning from {}: delegation recorded: {}", &coin[..16], d.is_some());
 	assert!(d.is_some(), "a Lightning send delegates the coin's release to its outputs, the htlc-1 leaf and the change");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payee_that_offboards_releases_as_a_holder() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x_id = r.x;
+	let x = x_id.to_string();
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b, c) = (Arca::new("OA"), Arca::new("OB"), Arca::new("OC"));
+	for w in [&a, &b, &c] {
+		w.ok(&create);
+	}
+	for w in [&a, &b] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x_id, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	refresh_all(&r, &[&a, &b]).await;
+	let req = c.ok(&["receive"]);
+	a.ok(&["send", req["request"].as_str().unwrap(), "--amount", "600000", "--asset", &x]);
+	c.ok(&["mailbox"]);
+	// C takes the whole coin it got off the tree, to an address on the chain:
+	// no new leaf of its own, so its release is the offboard's.
+	let to = c.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let mut amount = 590_000u64;
+	let mut q = Value::Null;
+	for _ in 0..4 {
+		q = c.ok(&["offboard", "--asset", &x, "--amount", &amount.to_string(), "--address", &to, "--quote"]);
+		match q["change"].as_str().and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
+			Some(ch) => amount += ch,
+			None => break,
+		}
+	}
+	println!("C's offboard quote: {}", q);
+	c.ok(&["offboard", "--asset", &x, "--amount", &amount.to_string(), "--address", &to, "--shown", &q.to_string()]);
+	for w in [&a, &b] {
+		w.ok(&["participate"]);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty());
+	r.produce().await;
+	r.bury().await;
+	for bt in &built {
+		r.round_state(&bt.tx.txid(), RoundState::Final).await;
+	}
+	for w in [&a, &b, &c] {
+		let s = w.ok(&["sync"]);
+		println!("released: {}", s["participations"].as_array().unwrap().iter().map(|p| p["released"].to_string()).collect::<Vec<_>>().join(" "));
+	}
+	let ks = reclaims(&r).await;
+	let k = ks.iter().find(|w| w.detail.contains("RECLAIM-D")).unwrap_or_else(|| panic!("no reclaim by RECLAIM-D: {:?}",
+		ks.iter().map(|w| &w.detail).collect::<Vec<_>>()));
+	let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
+	println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
+	assert_eq!(k.state, NurseryState::Final);
+}

@@ -459,7 +459,8 @@ for each key it names, every leaf of every tree a release over the node's
 from an input as RECLAIM reads it. A holder signs its releases with
 `Release::for_holder`, one for each lowest node with RECLAIM-D its coin rests
 on (`ValidCoin::release_nodes`), once it holds its new leaf's preimage and
-that round is final. So the node is released only when every coin resting on
+that round is final (`Release::for_holder_offboard` when it takes the coin off
+the tree by an offboard instead). So the node is released only when every coin resting on
 it has a successor in a round in the chain, and returns at the next round
 after its holders refresh, however many times its coins moved.
 

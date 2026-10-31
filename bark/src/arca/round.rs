@@ -1452,12 +1452,17 @@ impl Wallet {
 					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
-			} else if let (CoinRecord::Transfer(_) | CoinRecord::Fill(_), Some(NewValid::Tree(v))) = (&record, new) {
+			} else if matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) && !old.release_nodes().is_empty() {
 				// A coin a reassignment made, resting on lowest nodes with
 				// RECLAIM-D: its holder releases each of them for this round,
-				// so that a node whose coins moved out of round comes back
-				// once every coin it became is refreshed.
-				let rels = Release::for_holder(old, v, &round, c).map_err(|e| Error::Refused(format!("the releases of {}: {}", l, e)))?;
+				// whether it refreshes the coin or offboards it, so that a node
+				// whose coins moved out of round comes back once every coin it
+				// became has left it.
+				let rels = match (new, offboard) {
+					(Some(NewValid::Tree(v)), _) => Release::for_holder(old, v, &round, c),
+					(None, Some(p)) => Release::for_holder_offboard(old, p, &round, c),
+					_ => Ok(vec![]),
+				}.map_err(|e| Error::Refused(format!("the releases of {}: {}", l, e)))?;
 				for rel in rels {
 					releases.push(json!({"leaf_id": l, "node": hex(&rel.node_hash),
 						"signature": hex(sign(&key, &rel.message().digest).as_ref())}));

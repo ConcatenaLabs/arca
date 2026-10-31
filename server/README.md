@@ -2059,8 +2059,9 @@ release over its round's own `M`, named or not. It is also refused for a coin wi
 open out-of-round reassignment, whatever else holds; for a coin not given up
 in the participation named; before the participation's preimage went out;
 while its round is not final; and for a board. A coin a reassignment made
-(a transfer's or a fill's output) is released by its holder once for each
-lowest node with RECLAIM-D it rests on (`arca_covenant::Release::for_holder`,
+(a transfer's or a fill's output) is released by its holder, whether it
+refreshes the coin or offboards it, once for each lowest node with RECLAIM-D it
+rests on (`arca_covenant::Release::for_holder`,
 `ValidCoin::release_nodes`), each release naming that node's children hash
 (`node`); one naming a node the coin does not rest on is refused
 (`not_on_node`), and so is a coin with no such node (`no_lowest_node`). A
