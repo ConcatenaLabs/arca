@@ -1180,8 +1180,13 @@ A coin the wallet does not refresh before its batch is released is brought on
 the chain under its own key before the operator could sweep it: by the
 operator, and by any watchtower the wallet deposited it with (the server's
 [Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
-At every `sync` the wallet deposits each live coin resting on a batch with
-each watchtower it names (`deposits` in the answer): the coin's record, its
+A coin paid to the wallet out of round is kept the same way from a sender
+up its lineage who takes an earlier coin home on the chain: whoever holds
+its record publishes the checkpoint and the reassignment within that earlier
+leaf's exit delay, and the watchtowers do so as soon as the leaf appears, the
+operator up or down. At every `sync` the wallet deposits each live coin
+resting on a batch, and each coin paid to it out of round, with each
+watchtower it names (`deposits` in the answer): the coin's record, its
 own batch leaf's unroll authorisations signed for an hour before its batch's
 first expiry, so nothing can unroll it sooner. A deposit only ever puts the
 coin on the chain under its owner's key. Once a coin is spent, exited or
@@ -1209,8 +1214,10 @@ against that operator's key), takes deposits over HTTP (`POST /v1/deposit`,
 `POST /v1/withdraw`, `GET /v1/info`; the segment after `/v1/` names the
 call, so it serves behind any path a proxy gives it) and passes over them
 every `--interval` seconds. It leaves a coin alone until a batch it rests on
-is released (the batch's token at `R`, in a block or the mempool), then
-broadcasts whatever is still missing of the coin's path, from the lowest
+is released (the batch's token at `R`, in a block or the mempool) or, for a
+coin paid out of round, until a leaf or checkpoint it descends from appears
+in a block or the mempool, then broadcasts whatever is still missing of the
+coin's path (for a lineage exit, the checkpoint and the reassignment), from the lowest
 output the chain holds unspent, each transaction paid from the reserve the
 output it spends holds when the node accepts the batch's asset for fees, else
 from an on-chain coin of the watchtower wallet's. Coins on one branch share

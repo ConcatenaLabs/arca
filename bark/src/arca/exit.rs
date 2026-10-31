@@ -68,7 +68,7 @@ pub(crate) struct Here {
 }
 
 impl Here {
-	fn at(&self, o: &ExplicitOutput) -> Option<OutPoint> {
+	pub(crate) fn at(&self, o: &ExplicitOutput) -> Option<OutPoint> {
 		let o = o.txout();
 		self.outputs.iter().zip(&self.at).find(|(w, _)| **w == o).and_then(|(_, a)| *a)
 	}
@@ -238,8 +238,12 @@ impl Wallet {
 			self.sign_p2wpkh(&mut u.tx, i, &coin, &key);
 			payer.used.push(op);
 			let txid = u.tx.txid();
+			// The next step's fee coin: the largest output to the change in
+			// the fee asset, the coin's own change. A margin of the same asset
+			// goes to the change too, ahead of it, and is far smaller.
 			payer.coin = u.tx.output.iter().enumerate()
-				.find(|(_, o)| o.script_pubkey == change && o.asset.explicit() == Some(asset))
+				.filter(|(_, o)| o.script_pubkey == change && o.asset.explicit() == Some(asset))
+				.max_by_key(|(_, o)| o.value.explicit().unwrap_or(0))
 				.map(|(j, o)| (OutPoint::new(txid, j as u32), o.clone(), change_key));
 			if let Some(c) = &payer.coin {
 				self.change_in_flight.borrow_mut().push(c.clone());
