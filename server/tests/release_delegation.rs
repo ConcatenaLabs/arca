@@ -628,6 +628,51 @@ async fn a_node_that_cannot_come_back_does_not_take_refreshes_past_the_cap() {
 	assert_eq!(pending.len(), 3, "the refreshes beyond the cap wait");
 }
 
+/// The cap holds refreshes back so that the pool keeps what holders moving
+/// coins out of the Ark need: an offboard (a stake moving out, say) runs
+/// whatever the cap, while a refresh beside it waits, and what the offboard
+/// gives up counts in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offboard_runs_whatever_the_cap() {
+	let cap = VALUE * 3 / 2;
+	let (r, c) = first_leaves(Some(cap), &["OB U0", "OB U1", "OB U2"]).await;
+	let x = r.x;
+	// U0 refreshes without a release: its node holds a coin in flight that
+	// cannot come back before expiry.
+	let k0 = keypair("OB U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, false).await;
+	let p = pool(&r, x);
+	println!("after U0's refresh: in flight {} of a cap of {}", n(&p, "in_flight"), cap);
+	assert_eq!(n(&p, "in_flight"), VALUE);
+
+	// U1 refreshes and U2 moves its coin out of the Ark: the refresh would
+	// take the asset past the cap and waits; the offboard runs.
+	let k1 = keypair("OB U1 2");
+	let (id1, _) = submit(&r, &[&c[1]], &[k1]);
+	let to = elements::Script::from(vec![0x00, 0x14, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22]);
+	let v2 = c[2].valid(&r);
+	let out = OutputRequest::Offboard { asset: x, value: VALUE - 100_000, script: to };
+	let (body, id2) = participation_body(&[&c[2].held], &[out], &[(x, 100_000)], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending", "{}", body);
+	let built = r.server.rounds.run_round().await.unwrap().expect("a round for the offboard");
+	let (s1, s2) = (status(&r, &id1), status(&r, &id2));
+	println!("U1's refresh: {}, waiting: {}; U2's offboard of {}: {} ({} offboard(s) in round {})", s1["state"], s1["waiting"],
+		v2.value, s2["state"], built.offboards, built.tx.txid());
+	assert_eq!(s1["state"], "pending", "the refresh waits for the cap: {}", s1);
+	assert!(s1["waiting"].as_str().unwrap().starts_with("This refresh waits for a later round"), "{}", s1);
+	assert_eq!(s2["state"], "issued", "the offboard runs whatever the cap: {}", s2);
+	assert_eq!(built.offboards, 1);
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let p = pool(&r, x);
+	println!("after the offboard: in flight {} of a cap of {}", n(&p, "in_flight"), cap);
+	assert_eq!(n(&p, "in_flight"), 2 * VALUE, "what the offboard gave up counts in flight");
+}
+
 // ---------------------------------------------------------------------------
 // Resting orders filled in the tree (arca#419).
 
