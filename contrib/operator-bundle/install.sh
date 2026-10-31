@@ -1245,7 +1245,7 @@ bond() {
   st=$(jq -r '.bond.state // "none"' <<<"$i")
   case $st in
     bonded)
-      say "bonded: $(jq -r '.bond | "\(.value) atoms of \(.asset[0:12])…, \(.outpoint), final: \(.final)"' <<<"$i")"
+      say "bonded: $(jq -r '.bond | "\((.value | tonumber) / 100000000) of \(.asset[0:12])…, \(.outpoint), final: \(.final)"' <<<"$i")"
       say "to end it, give the notice first, with the withdrawal key's file: arcad $ETC/arcad.toml bond-notice <file>"
       return 0 ;;
     unconfirmed) say "posted, in no block yet: $(jq -r .bond.outpoint <<<"$i"). Run $0 bond again once it confirms."; return 0 ;;
@@ -1281,6 +1281,8 @@ $fees")
       || seq_cli -named createwallet wallet_name="$BOND_WALLET" load_on_startup=true >/dev/null \
       || die "the node made no wallet $BOND_WALLET: is its wallet on? $0 install"
     say "made and loaded"
+  else
+    say "loaded"
   fi
   # The bond, and a thousandth over for its fee (at least 0.001 of a unit):
   # what is left stays in the wallet.
