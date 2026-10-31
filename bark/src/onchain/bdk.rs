@@ -567,23 +567,22 @@ impl OnchainWallet {
 		prev_tip: CheckPoint,
 	) -> anyhow::Result<()> {
 		debug!("Syncing with bitcoind, starting at block height {}...", prev_tip.height());
-		// Checkpoints a reorg has orphaned are replaced first, or no block below
-		// them could ever be applied (see `stale_checkpoint_repair`).
-		let repair_rpc = bitcoind_sync.clone();
-		let repair_tip = prev_tip.clone();
-		let repair = tokio::task::spawn_blocking(move || stale_checkpoint_repair(&repair_rpc, &repair_tip))
-			.await.context("checkpoint repair task panicked")??;
-		let prev_tip = match repair {
+		// Checkpoints a reorg has orphaned cannot take a block below them, so
+		// the emitter then restarts below the orphaned range, and the range
+		// is applied in one update once it is all in hand (see
+		// `ReorgRepair`): nothing of it lands, or is persisted, before.
+		let plan_rpc = bitcoind_sync.clone();
+		let plan_tip = prev_tip.clone();
+		let plan = tokio::task::spawn_blocking(move || plan_reorg_repair(&plan_rpc, &plan_tip))
+			.await.context("reorg repair task panicked")??;
+		let mut repair = plan.map(|plan| {
+			warn!("The wallet's chain left the node's above height {}: rescanning from height {}",
+				plan.agreement.height, plan.resume.height + 1);
+			ReorgRepair::new(plan)
+		});
+		let prev_tip = match &repair {
+			Some(r) => r.emitter_start(),
 			None => prev_tip,
-			Some(repair) => {
-				warn!("The wallet's chain left the node's at height {}: rescanning from height {}",
-					repair.agreement_height, repair.resume_height + 1);
-				self.inner.apply_update(Update { chain: Some(repair.chain), ..Default::default() })
-					.context("replacing the wallet's orphaned checkpoints")?;
-				self.persist().await?;
-				self.inner.latest_checkpoint().get(repair.resume_height)
-					.context("the repaired chain lacks its resume checkpoint")?
-			},
 		};
 		// `bdk_bitcoind_rpc::Emitter` is sync-only upstream. Run it on a
 		// blocking thread and stream blocks back over a channel so we can
@@ -617,6 +616,15 @@ impl OnchainWallet {
 
 		let mut count = 0;
 		while let Some(em) = block_rx.recv().await {
+			if let Some(r) = repair.as_mut() {
+				let (height, connected_to) = (em.block_height(), em.connected_to());
+				if r.push(em.block, height, connected_to)? {
+					let update = r.update(&self.inner);
+					self.inner.apply_update(update).context("applying the rescanned range")?;
+					repair = None;
+				}
+				continue;
+			}
 			self.inner.apply_block_connected_to(
 				&em.block, em.block_height(), em.connected_to(),
 			)?;
@@ -628,6 +636,11 @@ impl OnchainWallet {
 			}
 		}
 		emitter_handle.await.context("wallet sync blocking task panicked")??;
+		// The node's chain ended below the top of the range (it is shorter now).
+		if let Some(r) = repair.take() {
+			let update = r.update(&self.inner);
+			self.inner.apply_update(update).context("applying the rescanned range")?;
+		}
 
 		if let Ok(mempool) = mempool_rx.await {
 			let now = bark_runtime::timestamp_secs();
@@ -728,69 +741,164 @@ impl OnchainWallet {
 #[cfg(feature = "bitcoind-rpc")]
 const REORG_RESCAN_MARGIN: u32 = 6;
 
-/// The wallet's chain brought back onto the node's after a reorg.
+/// A wallet whose newest checkpoints a reorg orphaned: where its chain agrees
+/// with the node's, where to rescan from, and up to where.
 #[cfg(feature = "bitcoind-rpc")]
-struct StaleCheckpointRepair {
-	/// The node's blocks from `resume_height` up to the highest orphaned
-	/// checkpoint the node has a block for, on top of the point of agreement.
-	chain: CheckPoint,
+#[derive(Debug, Clone, Copy)]
+struct ReorgRepairPlan {
 	/// The highest of the wallet's checkpoints the node agrees with.
-	agreement_height: BlockHeight,
-	/// The emitter resumes after this block.
-	resume_height: BlockHeight,
+	agreement: bdk_wallet::chain::BlockId,
+	/// The node's block the rescan starts after: a few below the lowest
+	/// orphaned checkpoint, never below `agreement`.
+	resume: bdk_wallet::chain::BlockId,
+	/// The highest orphaned checkpoint the node has a block at.
+	top: BlockHeight,
 }
 
-/// When the wallet holds checkpoints that the node's chain no longer has (a
-/// reorg orphaned them), the update that replaces them, and where to rescan.
+/// The node's hash at `height`, or `None` above its tip.
+#[cfg(feature = "bitcoind-rpc")]
+fn node_block_hash<C: bitcoin_ext::rpc::RpcApi>(rpc: &C, height: BlockHeight) -> anyhow::Result<Option<bitcoin::BlockHash>> {
+	use bitcoin_ext::rpc::{Error, jsonrpc};
+	match rpc.get_block_hash(height as u64) {
+		Ok(hash) => Ok(Some(hash)),
+		// RPC_INVALID_PARAMETER: "Block height out of range"
+		Err(Error::JsonRpc(jsonrpc::Error::Rpc(e))) if e.code == -8 => Ok(None),
+		Err(e) => Err(e).context("getblockhash"),
+	}
+}
+
+/// Whether the wallet's newest checkpoints have left the node's chain, and if
+/// so the plan to bring it back. A wallet whose tip the node holds costs one
+/// `getblockhash`.
 ///
 /// BDK never applies a block below a checkpoint it cannot prove invalid, so a
-/// wallet whose newest checkpoints were orphaned, and whose next older one is
-/// far below (its birthday is often the only one above genesis), would fail
+/// wallet whose newest checkpoints were orphaned, with its next older one far
+/// below (a fresh wallet holds only its birthday's above genesis), would fail
 /// every block the emitter gave it ("cannot connect with the original
-/// chain"), for good. The update holds the node's hash at every height from
-/// the rescan point up to the highest orphaned checkpoint: it invalidates
-/// each orphaned one, and every block the emitter then applies up to there
-/// matches a checkpoint the wallet holds.
+/// chain"), for good (arca#440).
 #[cfg(feature = "bitcoind-rpc")]
-fn stale_checkpoint_repair<C: bitcoin_ext::rpc::RpcApi>(
+fn plan_reorg_repair<C: bitcoin_ext::rpc::RpcApi>(
 	rpc: &C,
 	tip: &CheckPoint,
-) -> anyhow::Result<Option<StaleCheckpointRepair>> {
-	use bdk_wallet::chain::BlockId;
-
-	let node_height = rpc.get_block_count().context("getblockcount")? as BlockHeight;
-	let mut stale = Vec::new();
+) -> anyhow::Result<Option<ReorgRepairPlan>> {
+	let mut stale_below_tip = Vec::new();
+	let mut any_stale = false;
 	let mut agreement = None;
 	for cp in tip.iter() {
-		if cp.height() <= node_height
-			&& rpc.get_block_hash(cp.height() as u64).context("getblockhash")? == cp.hash()
-		{
-			agreement = Some(cp);
-			break;
+		match node_block_hash(rpc, cp.height())? {
+			Some(hash) if hash == cp.hash() => {
+				agreement = Some(cp.block_id());
+				break;
+			},
+			Some(_) => stale_below_tip.push(cp.height()),
+			None => {},
 		}
-		stale.push(cp.height());
+		any_stale = true;
 	}
-	if stale.is_empty() {
+	if !any_stale {
 		return Ok(None);
 	}
 	let agreement = agreement.context(
 		"no checkpoint of the wallet, not even genesis, is on the node's chain: another network?")?;
-	// Orphaned checkpoints above the node's tip go once a lower one is replaced;
-	// with none at or below it, the node is behind the wallet and there is
-	// nothing to replace them with yet.
-	let highest = match stale.iter().copied().filter(|h| *h <= node_height).max() {
-		Some(h) => h,
-		None => return Ok(None),
+	// Orphaned checkpoints all above the node's tip: the node is behind the
+	// wallet, and there is nothing to replace them with yet.
+	let (Some(&top), Some(&lowest)) = (stale_below_tip.iter().max(), stale_below_tip.iter().min()) else {
+		return Ok(None);
 	};
-	let lowest = *stale.iter().min().expect("not empty");
-	let resume_height = lowest.saturating_sub(REORG_RESCAN_MARGIN + 1).max(agreement.height());
-	let mut ids = vec![agreement.block_id()];
-	for height in resume_height.max(agreement.height() + 1)..=highest {
-		ids.push(BlockId { height, hash: rpc.get_block_hash(height as u64).context("getblockhash")? });
+	let resume_height = lowest.saturating_sub(REORG_RESCAN_MARGIN + 1).max(agreement.height);
+	let resume = if resume_height == agreement.height {
+		agreement
+	} else {
+		let hash = node_block_hash(rpc, resume_height)?.context("the node's chain shrank while it was read")?;
+		bdk_wallet::chain::BlockId { height: resume_height, hash }
+	};
+	Ok(Some(ReorgRepairPlan { agreement, resume, top }))
+}
+
+/// The blocks of a repair's range, gathered from the emitter until the range
+/// is complete, then applied with the node's chain in one update.
+///
+/// Applying the replacement chain first and rescanning after would let an
+/// interrupted rescan leave a tip that agrees with the node above blocks that
+/// were never scanned, so a coin paid in them would never show (arca#451).
+/// The chain is also taken from the blocks themselves, each checked to link
+/// to the one before, so a reorg while it runs cannot leave a chain mixing
+/// two branches: the range restarts where the emitter does, or the sync stops
+/// and the next one plans again.
+#[cfg(feature = "bitcoind-rpc")]
+struct ReorgRepair {
+	plan: ReorgRepairPlan,
+	blocks: Vec<(bdk_wallet::chain::BlockId, bitcoin::Block)>,
+}
+
+#[cfg(feature = "bitcoind-rpc")]
+impl ReorgRepair {
+	fn new(plan: ReorgRepairPlan) -> Self {
+		ReorgRepair { plan, blocks: Vec::new() }
 	}
-	let chain = CheckPoint::from_block_ids(ids)
-		.map_err(|_| anyhow::anyhow!("the node's block hashes do not form a chain"))?;
-	Ok(Some(StaleCheckpointRepair { chain, agreement_height: agreement.height(), resume_height }))
+
+	/// Where the emitter starts: the agreement and the resume point only, so
+	/// it checks both against the node and emits the range after them.
+	fn emitter_start(&self) -> CheckPoint {
+		let mut ids = vec![self.plan.agreement];
+		if self.plan.resume.height > self.plan.agreement.height {
+			ids.push(self.plan.resume);
+		}
+		CheckPoint::from_block_ids(ids).expect("ascending heights")
+	}
+
+	/// Takes the emitter's next block; true once the range is complete.
+	fn push(
+		&mut self,
+		block: bitcoin::Block,
+		height: BlockHeight,
+		connected_to: bdk_wallet::chain::BlockId,
+	) -> anyhow::Result<bool> {
+		if connected_to.height < self.plan.resume.height {
+			anyhow::bail!("the node's chain moved below height {} while the wallet rescanned it: \
+				the next sync starts again", self.plan.resume.height);
+		}
+		// A reorg while it runs: the emitter goes back and offers the new
+		// branch from there.
+		self.blocks.retain(|(id, _)| id.height < height);
+		let prev = self.blocks.last().map(|(id, _)| *id).unwrap_or(self.plan.resume);
+		if prev.height + 1 != height || prev.hash != block.header.prev_blockhash {
+			anyhow::bail!("block {} does not follow block {}: the next sync starts again", height, prev.height);
+		}
+		self.blocks.push((bdk_wallet::chain::BlockId { height, hash: block.block_hash() }, block));
+		Ok(height >= self.plan.top)
+	}
+
+	/// One update: the node's chain from the agreement through every block
+	/// in hand, and the transactions in them that touch the wallet.
+	fn update(&self, wallet: &BdkWallet) -> Update {
+		let mut ids = vec![self.plan.agreement];
+		if self.plan.resume.height > self.plan.agreement.height {
+			ids.push(self.plan.resume);
+		}
+		ids.extend(self.blocks.iter().map(|(id, _)| *id));
+		let chain = CheckPoint::from_block_ids(ids).expect("linked, ascending heights");
+		let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+		// Outputs of transactions taken so far: a later one in the range that
+		// spends them touches the wallet too, though its index cannot see it.
+		let mut taken = HashSet::new();
+		for (id, block) in &self.blocks {
+			for tx in &block.txdata {
+				let spends_taken = tx.input.iter().any(|i| taken.contains(&i.previous_output));
+				if !spends_taken && !wallet.spk_index().inner().is_relevant(tx) {
+					continue;
+				}
+				let txid = tx.compute_txid();
+				taken.extend((0..tx.output.len() as u32).map(|vout| bitcoin::OutPoint::new(txid, vout)));
+				tx_update.txs.push(Arc::new(tx.clone()));
+				tx_update.anchors.insert((
+					ConfirmationBlockTime { block_id: *id, confirmation_time: block.header.time as u64 },
+					txid,
+				));
+			}
+		}
+		Update { chain: Some(chain), tx_update, ..Default::default() }
+	}
 }
 
 #[cfg(test)]
@@ -991,27 +1099,134 @@ mod test {
 		}
 	}
 
-	/// The bitcoind sync as `inner_sync_bitcoind` does it, minus persistence and
-	/// the mempool: optionally the checkpoint repair, then every block from the
-	/// emitter applied with `apply_block_connected_to`.
+	/// An RPC client that records each call, and can fail every `getblock`
+	/// after some, or run a hook just before the `getblock` of some index.
 	#[cfg(feature = "bitcoind-rpc")]
-	fn emitter_sync(
-		wallet: &mut BdkWallet,
-		rpc: &bitcoin_ext::rpc::BitcoinRpcClient,
-		repair: bool,
-	) -> anyhow::Result<()> {
-		let mut tip = wallet.latest_checkpoint();
-		if repair {
-			if let Some(r) = stale_checkpoint_repair(rpc, &tip)? {
-				wallet.apply_update(Update { chain: Some(r.chain), ..Default::default() })?;
-				tip = wallet.latest_checkpoint().get(r.resume_height).unwrap();
-			}
+	struct Counted<'a> {
+		inner: &'a bitcoin_ext::rpc::BitcoinRpcClient,
+		calls: std::sync::Mutex<Vec<String>>,
+		fail_getblock_after: Option<usize>,
+		hook: std::sync::Mutex<Option<(usize, Box<dyn FnOnce() + Send + 'a>)>>,
+	}
+
+	#[cfg(feature = "bitcoind-rpc")]
+	impl<'a> Counted<'a> {
+		fn new(inner: &'a bitcoin_ext::rpc::BitcoinRpcClient) -> Self {
+			Counted { inner, calls: Default::default(), fail_getblock_after: None, hook: Default::default() }
 		}
-		let mut emitter = bdk_bitcoind_rpc::Emitter::new(rpc, tip, 0, Vec::<Arc<Transaction>>::new());
+		fn count(&self, cmd: &str) -> usize {
+			self.calls.lock().unwrap().iter().filter(|c| *c == cmd).count()
+		}
+	}
+
+	#[cfg(feature = "bitcoind-rpc")]
+	impl<'a> bitcoin_ext::rpc::RpcApi for Counted<'a> {
+		fn call<T: for<'b> serde::de::Deserialize<'b>>(&self, cmd: &str, args: &[serde_json::Value])
+			-> Result<T, bitcoin_ext::rpc::Error>
+		{
+			let n = self.count(cmd);
+			if cmd == "getblock" {
+				let mut h = self.hook.lock().unwrap();
+				if h.as_ref().map(|(at, _)| *at == n).unwrap_or(false) {
+					let (_, f) = h.take().unwrap();
+					f();
+				}
+				if self.fail_getblock_after.map(|k| n >= k).unwrap_or(false) {
+					self.calls.lock().unwrap().push(cmd.to_string());
+					return Err(bitcoin_ext::rpc::Error::ReturnedError("the connection dropped".into()));
+				}
+			}
+			self.calls.lock().unwrap().push(cmd.to_string());
+			bitcoin_ext::rpc::RpcApi::call(self.inner, cmd, args)
+		}
+	}
+
+	/// The bitcoind sync as `inner_sync_bitcoind` does it, minus persistence
+	/// and the mempool: the repair plan (unless `repair` is false, the sync
+	/// before arca#440), the emitter, the repaired range applied in one
+	/// update once complete, every later block with `apply_block_connected_to`.
+	#[cfg(feature = "bitcoind-rpc")]
+	fn emitter_sync<C: bitcoin_ext::rpc::RpcApi>(wallet: &mut BdkWallet, rpc: &C, repair: bool) -> anyhow::Result<()> {
+		let plan = if repair { plan_reorg_repair(rpc, &wallet.latest_checkpoint())? } else { None };
+		let mut repair = plan.map(ReorgRepair::new);
+		let start = match &repair { Some(r) => r.emitter_start(), None => wallet.latest_checkpoint() };
+		let mut emitter = bdk_bitcoind_rpc::Emitter::new(rpc, start, 0, Vec::<Arc<Transaction>>::new());
 		while let Some(em) = emitter.next_block()? {
+			if let Some(r) = repair.as_mut() {
+				let (height, connected_to) = (em.block_height(), em.connected_to());
+				if r.push(em.block, height, connected_to)? {
+					let update = r.update(wallet);
+					wallet.apply_update(update)?;
+					repair = None;
+				}
+				continue;
+			}
 			wallet.apply_block_connected_to(&em.block, em.block_height(), em.connected_to())?;
 		}
+		if let Some(r) = repair.take() {
+			let update = r.update(wallet);
+			wallet.apply_update(update)?;
+		}
 		Ok(())
+	}
+
+	/// The heights whose checkpoint the node's chain does not hold.
+	#[cfg(feature = "bitcoind-rpc")]
+	fn off_chain(w: &BdkWallet, rpc: &bitcoin_ext::rpc::BitcoinRpcClient) -> Vec<u32> {
+		use bitcoin_ext::rpc::RpcApi;
+		let top = rpc.get_block_count().unwrap() as u32;
+		let mut v: Vec<u32> = w.latest_checkpoint().iter()
+			.filter(|cp| cp.height() > top || rpc.get_block_hash(cp.height() as u64).unwrap() != cp.hash())
+			.map(|cp| cp.height()).collect();
+		v.sort();
+		v
+	}
+
+	/// A regtest node with 110 blocks, its miner's wallet, and how to mine.
+	#[cfg(feature = "bitcoind-rpc")]
+	fn reorg_setup(exe: &str) -> (Regtest, bitcoin_ext::rpc::BitcoinRpcClient, bitcoin_ext::rpc::BitcoinRpcClient) {
+		use serde_json::json;
+		let node = Regtest::start(exe);
+		let rpc = node.client("");
+		let _: serde_json::Value = bitcoin_ext::rpc::RpcApi::call(&rpc, "createwallet", &[json!("miner")]).unwrap();
+		let miner = node.client("/wallet/miner");
+		mine(&miner, 110);
+		(node, rpc, miner)
+	}
+
+	#[cfg(feature = "bitcoind-rpc")]
+	fn mine(miner: &bitcoin_ext::rpc::BitcoinRpcClient, n: u64) {
+		use serde_json::json;
+		let a: String = bitcoin_ext::rpc::RpcApi::call(miner, "getnewaddress", &[]).unwrap();
+		let _: Vec<BlockHash> = bitcoin_ext::rpc::RpcApi::call(miner, "generatetoaddress", &[json!(n), json!(a)]).unwrap();
+	}
+
+	/// A wallet born at 105 (its checkpoint at 104, as `initial_wallet_scan`
+	/// sets it), synced to the tip.
+	#[cfg(feature = "bitcoind-rpc")]
+	fn born(rpc: &bitcoin_ext::rpc::BitcoinRpcClient) -> BdkWallet {
+		use bitcoin_ext::rpc::RpcApi;
+		let mut w = BdkWallet::create_single(get_test_wpkh())
+			.network(Network::Regtest).create_wallet_no_persist().unwrap();
+		w.set_checkpoint(104, rpc.get_block_hash(104).unwrap());
+		emitter_sync(&mut w, rpc, false).unwrap();
+		assert_eq!(w.latest_checkpoint().height(), rpc.get_block_count().unwrap() as u32);
+		w
+	}
+
+	/// A reorg from below the wallets' birthday: blocks 100 on are orphaned;
+	/// the new branch pays `payee` 1 BTC at 103 and grows to 112.
+	#[cfg(feature = "bitcoind-rpc")]
+	fn reorg_paying(rpc: &bitcoin_ext::rpc::BitcoinRpcClient, miner: &bitcoin_ext::rpc::BitcoinRpcClient, payee: &mut BdkWallet) {
+		use bitcoin_ext::rpc::RpcApi;
+		use serde_json::json;
+		let orphaned = rpc.get_block_hash(100).unwrap();
+		let _: serde_json::Value = rpc.call("invalidateblock", &[json!(orphaned.to_string())]).unwrap();
+		mine(miner, 3);
+		let addr = payee.reveal_next_address(KeychainKind::External).address;
+		let _: Txid = miner.call("sendtoaddress", &[json!(addr.to_string()), json!(1.0)]).unwrap();
+		mine(miner, 10);
+		assert_eq!(rpc.get_block_count().unwrap(), 112);
 	}
 
 	/// arca#440: a wallet born just before a reorg holds only genesis and the
@@ -1022,44 +1237,14 @@ mod test {
 	#[test]
 	fn bitcoind_sync_survives_a_reorg_of_its_newest_checkpoints() {
 		use bitcoin_ext::rpc::RpcApi;
-		use serde_json::json;
-
 		let Ok(exe) = std::env::var("BITCOIND_EXEC") else {
 			eprintln!("BITCOIND_EXEC is not set: skipped");
 			return;
 		};
-		let node = Regtest::start(&exe);
-		let rpc = node.client("");
-		let _: serde_json::Value = rpc.call("createwallet", &[json!("miner")]).unwrap();
-		let miner = node.client("/wallet/miner");
-		let mine = |n: u64| {
-			let a: String = miner.call("getnewaddress", &[]).unwrap();
-			let _: Vec<BlockHash> = miner.call("generatetoaddress", &[json!(n), json!(a)]).unwrap();
-		};
-		mine(110);
-
-		// Two wallets in the same state: born at 105 (checkpoint at 104, as
-		// `initial_wallet_scan` sets it), synced to the tip, 110.
-		let born = |rpc: &bitcoin_ext::rpc::BitcoinRpcClient| {
-			let mut w = BdkWallet::create_single(get_test_wpkh())
-				.network(Network::Regtest).create_wallet_no_persist().unwrap();
-			w.set_checkpoint(104, rpc.get_block_hash(104).unwrap());
-			emitter_sync(&mut w, rpc, false).unwrap();
-			assert_eq!(w.latest_checkpoint().height(), 110);
-			w
-		};
+		let (_node, rpc, miner) = reorg_setup(&exe);
 		let mut plain = born(&rpc);
 		let mut repaired = born(&rpc);
-
-		// A reorg from below the birthday: blocks 100 to 110 are orphaned, and
-		// the new branch pays the wallet at 103 and grows to 112.
-		let orphaned = rpc.get_block_hash(100).unwrap();
-		let _: serde_json::Value = rpc.call("invalidateblock", &[json!(orphaned.to_string())]).unwrap();
-		mine(3);
-		let addr = repaired.reveal_next_address(KeychainKind::External).address;
-		let _: Txid = miner.call("sendtoaddress", &[json!(addr.to_string()), json!(1.0)]).unwrap();
-		mine(10);
-		assert_eq!(rpc.get_block_count().unwrap(), 112);
+		reorg_paying(&rpc, &miner, &mut repaired);
 
 		let err = emitter_sync(&mut plain, &rpc, false).unwrap_err();
 		eprintln!("the plain sync after the reorg: {err:#}");
@@ -1068,9 +1253,88 @@ mod test {
 		emitter_sync(&mut repaired, &rpc, true).unwrap();
 		assert_eq!(repaired.latest_checkpoint().height(), 112);
 		assert_eq!(repaired.latest_checkpoint().hash(), rpc.get_block_hash(112).unwrap());
+		assert_eq!(off_chain(&repaired, &rpc), Vec::<u32>::new());
 		assert_eq!(repaired.balance().confirmed, Amount::from_sat(100_000_000));
 		// And a second sync has nothing left to repair.
-		assert!(stale_checkpoint_repair(&rpc, &repaired.latest_checkpoint()).unwrap().is_none());
+		assert!(plan_reorg_repair(&rpc, &repaired.latest_checkpoint()).unwrap().is_none());
 		emitter_sync(&mut repaired, &rpc, true).unwrap();
+	}
+
+	/// A wallet whose tip the node holds costs the repair one call, also when
+	/// the node is ahead of it.
+	#[cfg(feature = "bitcoind-rpc")]
+	#[test]
+	fn reorg_repair_costs_a_healthy_wallet_one_call() {
+		let Ok(exe) = std::env::var("BITCOIND_EXEC") else { eprintln!("BITCOIND_EXEC is not set: skipped"); return };
+		let (_node, rpc, miner) = reorg_setup(&exe);
+		let w = born(&rpc);
+		for ahead in [0, 1] {
+			mine(&miner, ahead);
+			let c = Counted::new(&rpc);
+			assert!(plan_reorg_repair(&c, &w.latest_checkpoint()).unwrap().is_none());
+			assert_eq!(*c.calls.lock().unwrap(), vec!["getblockhash".to_string()], "node {ahead} ahead");
+		}
+	}
+
+	/// arca#451 (a): the rescan of the repaired range stops two blocks in (the
+	/// connection drops). Nothing of the range was applied, so the next sync
+	/// plans the repair again and finds the coin paid in the range.
+	#[cfg(feature = "bitcoind-rpc")]
+	#[test]
+	fn an_interrupted_rescan_is_redone_by_the_next_sync() {
+		let Ok(exe) = std::env::var("BITCOIND_EXEC") else { eprintln!("BITCOIND_EXEC is not set: skipped"); return };
+		let (_node, rpc, miner) = reorg_setup(&exe);
+		let mut w = born(&rpc);
+		let tip_before = w.latest_checkpoint().block_id();
+		reorg_paying(&rpc, &miner, &mut w);
+
+		let mut flaky = Counted::new(&rpc);
+		flaky.fail_getblock_after = Some(2);
+		let err = emitter_sync(&mut w, &flaky, true).unwrap_err();
+		eprintln!("the interrupted sync: {err:#}");
+		assert_eq!(w.latest_checkpoint().block_id(), tip_before, "part of the range was applied");
+		assert!(plan_reorg_repair(&rpc, &w.latest_checkpoint()).unwrap().is_some());
+
+		emitter_sync(&mut w, &rpc, true).unwrap();
+		assert_eq!(w.latest_checkpoint().height(), 112);
+		assert_eq!(off_chain(&w, &rpc), Vec::<u32>::new());
+		assert_eq!(w.balance().confirmed, Amount::from_sat(100_000_000));
+	}
+
+	/// arca#451 (b): a second reorg, from 102, lands while the range is being
+	/// rescanned. The range follows the emitter onto the new branch, and the
+	/// wallet ends on the node's chain with nothing off it.
+	#[cfg(feature = "bitcoind-rpc")]
+	#[test]
+	fn a_reorg_during_the_rescan_leaves_one_chain() {
+		use bitcoin_ext::rpc::RpcApi;
+		use serde_json::json;
+		let Ok(exe) = std::env::var("BITCOIND_EXEC") else { eprintln!("BITCOIND_EXEC is not set: skipped"); return };
+		let (_node, rpc, miner) = reorg_setup(&exe);
+		let mut w = born(&rpc);
+		reorg_paying(&rpc, &miner, &mut w);
+
+		let c = Counted::new(&rpc);
+		let (rpc2, miner2) = (rpc.clone(), miner.clone());
+		*c.hook.lock().unwrap() = Some((5, Box::new(move || {
+			let h = rpc2.get_block_hash(102).unwrap();
+			let _: serde_json::Value = rpc2.call("invalidateblock", &[json!(h.to_string())]).unwrap();
+			mine(&miner2, 13);
+		})));
+		let first = emitter_sync(&mut w, &c, true);
+		assert!(c.hook.lock().unwrap().is_none(), "the second reorg never happened during the rescan");
+		match first {
+			Ok(()) => {},
+			// Stopped by the move: the next sync starts again.
+			Err(e) => {
+				eprintln!("the sync during the second reorg: {e:#}");
+				emitter_sync(&mut w, &rpc, true).unwrap();
+			},
+		}
+		assert_eq!(w.latest_checkpoint().height(), rpc.get_block_count().unwrap() as u32);
+		assert_eq!(off_chain(&w, &rpc), Vec::<u32>::new());
+		// The coin was in 103 of the first new branch; the second reorg
+		// orphaned that block, so the payment is back in the mempool at most.
+		eprintln!("after both reorgs: confirmed {}", w.balance().confirmed);
 	}
 }
