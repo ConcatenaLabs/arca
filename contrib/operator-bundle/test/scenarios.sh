@@ -137,7 +137,9 @@ scenario_down_transfer() {
   for i in 1 2 3; do arca dt5 sync > /dev/null 2>&1 || true; arca dt6 sync > /dev/null 2>&1 || true; arca dt2 sync > /dev/null 2>&1 || true; done
   result "recovery" "after the restart: dt6 holds $(total dt6) (paid in flight), dt5 $(total dt5); dt2 $(total dt2) (its sender went home first)"
   verbatim "dt2 refusals" "$(arca dt2 refusals | jq -c '[.[]|.reason]')"
-  [ "$(total dt2)" = 0 ] && result "FINDING" "dt2's $a2 is on the chain under dt2's key (the reassignment dt1's exit broadcast), and dt2's wallet refuses it: $(arca dt2 refusals | jq -r '.[-1].reason')"
+  if [ "$(total dt2)" = 0 ]; then
+    result "FINDING" "dt2's $a2 is on the chain under dt2's key (the reassignment dt1's exit broadcast), and dt2's wallet refuses it: $(arca dt2 refusals | jq -r '.[-1].reason')"
+  fi
 }
 
 scenario_down_round() {
