@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 svc=${1:-}
 case $svc in
-  init|net|postgres|bitcoind|feeproxy|sequentiad|seqln|cln|arca-signer|captaind|watchmand|arcad|caddy) ;;
+  init|net|postgres|bitcoind|feeproxy|sequentiad|priceserver|seqln|cln|arca-signer|captaind|watchmand|arcad|caddy) ;;
   *) exec /opt/arca-src/contrib/operator-bundle/install.sh "$@" ;;
 esac
 BUNDLE_LIB=1 . /opt/arca-src/contrib/operator-bundle/install.sh
@@ -86,6 +86,11 @@ feeproxy)
 sequentiad)
   until_up "the Bitcoin node (the anchors are checked against it)" btc_cli getblockchaininfo
   run_as "$OPT/sequentia/bin/sequentiad" -conf="$ETC/sequentia.conf" -datadir="$LIB/sequentia" -daemon=0 -printtoconsole=1
+  ;;
+priceserver)
+  [ -n "$PRICE_FEED_URL" ] || { echo "priceserver: no PRICE_FEED_URL, so the node's fee rates are the operator's own (setfeeexchangerates)"; exec sleep infinity; }
+  until_up "the Sequentia node" seq_cli getblockchaininfo
+  run_as /usr/bin/python3 -I "$OPT/sequentia/price-server/price_server.py" --config "$LIB/price-server.json"
   ;;
 seqln)
   until_up "the Sequentia node" seq_cli getblockchaininfo

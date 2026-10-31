@@ -88,7 +88,14 @@ export CARGO_HOME=$CACHE/toolchain/cargo RUSTUP_HOME=$CACHE/toolchain/rustup
 export PATH=$CARGO_HOME/bin:$PATH
 export CARGO_BUILD_JOBS=$BUILD_JOBS CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=symbols
 U() { printf '%s-%s.service' "$NAME" "$1"; }
-UNITS="bitcoind feeproxy sequentiad arca-signer arcad seqln cln captaind watchmand"
+# Where the node's fee rates come from: the node's own price server, reading a
+# public price feed and the asset registry. The public testnet's by default
+# there; on another chain none, and the operator sets the rates himself
+# (sequentia-cli setfeeexchangerates).
+[ "$SEQ_CHAIN" = test ] && : "${PRICE_FEED_URL:=http://sequentiatestnet.com/prices}"
+[ "${PRICE_FEED_URL:-}" = none ] && PRICE_FEED_URL=""
+: "${PRICE_FEED_URL:=}" "${ASSET_REGISTRY_INDEX:=http://sequentiatestnet.com/registry/index.minimal.json}"
+UNITS="bitcoind feeproxy sequentiad $( [ -n "$PRICE_FEED_URL" ] && echo priceserver ) arca-signer arcad seqln cln captaind watchmand"
 # PostgreSQL names a cluster's unit postgresql@<version>-<cluster>, where a dash
 # in the cluster name would read as a path: the cluster takes underscores.
 PG_CLUSTER=${NAME//-/_}
@@ -302,7 +309,17 @@ log-file=$LOG/seqln.log
 log-level=info
 rpc-file-mode=0660
 EOF
-
+if [ -n "$PRICE_FEED_URL" ]; then
+  # The node's own price server (it comes with Sequentia Core): its example
+  # configuration, pointed at this node, the feed and the registry.
+  write_conf priceserver 640 "$LIB/price-server.json" < <(python3 -I -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+c["node_rpc"] = {"host": "127.0.0.1", "port": int(sys.argv[2]), "cookie": sys.argv[3]}
+c["source"]["url"] = sys.argv[4]
+c["registry_url"] = sys.argv[5]
+print(json.dumps(c, indent=2))' "$OPT/sequentia/price-server/config.example.json" "$SEQ_RPC_PORT" "$LIB/sequentia/$SEQ_SUB/.cookie" "$PRICE_FEED_URL" "$ASSET_REGISTRY_INDEX")
+fi
 }
 
 captaind_toml() {   # the server's (no argument) or the watchman's (watchman) configuration
@@ -878,6 +895,10 @@ unit feeproxy "the Bitcoin node's RPC with fee estimates from the live mempool" 
 unit sequentiad "Sequentia Core" "$(U bitcoind)" "$OPT/sequentia/bin/sequentiad -conf=$ETC/sequentia.conf -datadir=$LIB/sequentia -daemon=0 -printtoconsole=0" \
   "TimeoutStopSec=600
 $RUNDIR"
+if [ -n "$PRICE_FEED_URL" ]; then
+  unit priceserver "the node's price server: its fee rates from the price feed" "$(U sequentiad)" \
+    "/usr/bin/python3 -I $OPT/sequentia/price-server/price_server.py --config $LIB/price-server.json" "$RUNDIR"
+fi
 unit arca-signer "the Arca signer: holds the operator key" "" \
   "$BIN/arca-signer --key-file $ETC/operator.key --genesis \${ARCA_GENESIS} --socket /run/$NAME/signer.sock --record $LIB/arca/signer.record" \
   "EnvironmentFile=$ETC/signer.env
@@ -938,6 +959,18 @@ WAIT_UNIT=$(U sequentiad) wait_for 300 "the Sequentia node answering" seq_cli ge
 GENESIS=$(seq_cli getblockhash 0)
 say "$(seq_cli getblockchaininfo | jq -r '"\(.chain): \(.blocks) of \(.headers) blocks"'), genesis $GENESIS"
 write_conf arca-signer 640 "$ETC/signer.env" < <(printf 'ARCA_GENESIS=%s\n' "$GENESIS")
+if [ -n "$PRICE_FEED_URL" ]; then
+  restart_if priceserver sequentiad
+  # The rates the gateway opens its channels with and arcad values each asset
+  # at: the price server's first poll, a minute at most.
+  for ((i = 0; i < 120; i++)); do
+    r=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}'); missing=""
+    for id in "${ASSET_IDS[@]}"; do jq -e --arg a "$id" 'has($a)' <<<"$r" >/dev/null || missing+=" ${id:0:12}…"; done
+    [ -z "$missing" ] && break; sleep 1
+  done
+  if [ -n "$missing" ]; then say "the price feed gives no rate for:$missing so the node takes no fee in it: no channel opens in it, and its rate source must be none; set its rate yourself (sequentia-cli setfeeexchangerates) or serve another asset"
+  else say "a fee rate for every served asset, from $PRICE_FEED_URL"; fi
+fi
 
 step "the signer and its record"
 if [ ! -f "$LIB/arca/signer.record" ]; then
@@ -1130,6 +1163,8 @@ connect() {
     have=$(seqln listpeerchannels "$pid" | jq --arg a "$id" '[.channels[] | select((.channel_asset // .asset) == $a and (.state | test("CLOSING|ONCHAIN|CLOSED") | not))] | length')
     if [ "$have" -gt 0 ]; then say "${id:0:12}…: a channel is open already"; continue; fi
     amt=$(channel_atoms "$id"); [ "$amt" -gt 0 ] || { say "${id:0:12}…: no channel size set"; continue; }
+    jq -e --arg a "$id" 'has($a)' <<<"$(seq_cli getfeeexchangerates)" >/dev/null \
+      || die "${id:0:12}…: this node takes no fee in it, and a channel in an asset is opened with a fee in that asset: run the price server (PRICE_FEED_URL) or set its rate (sequentia-cli setfeeexchangerates)"
     r=$(seqln -k fundchannel id="$pid" amount="$amt" asset="$id" push_msat="$((amt / 2 * 1000))" announce=false 2>&1) \
       || die "${id:0:12}…: SeqLN did not open the channel: $(jq -r '.message // empty' <<<"$r" 2>/dev/null || true) ${r:0:300}"
     say "${id:0:12}…: opened $amt atoms, half pushed: $(jq -r .txid <<<"$r")"
