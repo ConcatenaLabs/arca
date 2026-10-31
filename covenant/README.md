@@ -301,8 +301,10 @@ chain during the notice, which anyone holding its coin record can do: the
 record carries its owner's unroll authorisations and its entry's preimage
 (and, for a coin paid out of round, the pairs of every step), each of which
 spends only into the outputs it pins. A wallet hands its record to
-watchtowers, its own batch leaf's authorisations signed for a time an hour
-before the batch's first expiry so that they unroll nothing sooner; the
+watchtowers, sealed so that each reads it only once its batch is released or
+a leaf of its lineage is on the chain, its own batch leaf's authorisations
+signed for a time an hour before the batch's first expiry so that they unroll
+nothing sooner; the
 operator, a member of every node, does the same from its own records
 ([Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
 The holder then relies on any one of them acting within the notice, paid

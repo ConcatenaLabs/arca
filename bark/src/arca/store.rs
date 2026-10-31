@@ -171,21 +171,25 @@ CREATE TABLE IF NOT EXISTS tower_deposit (
 	updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
+CREATE TABLE IF NOT EXISTS tower_sealed (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tower_hint (hint TEXT NOT NULL, id TEXT NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (hint, id));
 ";
 
 /// A deposit a watchtower holds ([`super::tower`]).
 #[derive(Debug, Clone)]
 pub struct TowerRow {
-	/// The deposit's id, hex: the SHA256 of its record.
+	/// The deposit's id, hex: the SHA256 of its record, or for a sealed
+	/// deposit of its withdrawal key, salt and blob.
 	pub id: String,
-	/// The coin's owner key, hex.
+	/// The key that withdraws it, hex: the coin's owner key, or for a sealed
+	/// deposit the key derived for it.
 	pub owner: String,
 	pub leaf_id: String,
 	/// The coin record, binary form.
 	pub record: Vec<u8>,
 	/// The transactions it rests on, a JSON array of hex.
 	pub bases: String,
-	/// `held`, `brought`, `on_chain` or `gone`.
+	/// `sealed`, `held`, `brought`, `on_chain`, `gone` or `invalid`.
 	pub state: String,
 	pub note: String,
 	/// What the watchtower broadcast for it, a JSON array.
@@ -438,8 +442,52 @@ impl Store {
 	}
 
 	pub fn tower_delete(&self, id: &str) -> Result<(), Error> {
-		self.conn.execute("DELETE FROM tower_deposit WHERE id = ?1", params![id]).map_err(db)?;
-		Ok(())
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		tx.execute("DELETE FROM tower_deposit WHERE id = ?1", params![id]).map_err(db)?;
+		tx.execute("DELETE FROM tower_sealed WHERE id = ?1", params![id]).map_err(db)?;
+		tx.execute("DELETE FROM tower_hint WHERE id = ?1", params![id]).map_err(db)?;
+		tx.commit().map_err(db)
+	}
+
+	/// Takes a sealed deposit: its row (`sealed`, no record yet, its owner
+	/// the withdrawal key), its body, and one hint row per hint it carries.
+	pub fn tower_put_sealed(&self, id: &str, withdraw: &str, body: &str, hints: &[String]) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		let fresh = tx.execute("INSERT INTO tower_deposit (id, owner, leaf_id, record, bases, state, note, txs, created_at, updated_at) \
+			VALUES (?1, ?2, '', x'', '[]', 'sealed', '', '[]', ?3, ?3) ON CONFLICT(id) DO NOTHING", params![id, withdraw, now()]).map_err(db)?;
+		if fresh > 0 {
+			tx.execute("INSERT OR REPLACE INTO tower_sealed (id, body) VALUES (?1, ?2)", params![id, body]).map_err(db)?;
+			for (k, h) in hints.iter().enumerate() {
+				tx.execute("INSERT OR IGNORE INTO tower_hint (hint, id, k) VALUES (?1, ?2, ?3)", params![h, id, k as i64]).map_err(db)?;
+			}
+		}
+		tx.commit().map_err(db)
+	}
+
+	/// The sealed deposits a hint names, each with the index of its hint.
+	pub fn tower_hinted(&self, hint: &str) -> Result<Vec<(String, usize)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, k FROM tower_hint WHERE hint = ?1 ORDER BY id").map_err(db)?;
+		let rows = st.query_map(params![hint], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
+	pub fn tower_sealed_body(&self, id: &str) -> Result<Option<String>, Error> {
+		self.conn.query_row("SELECT body FROM tower_sealed WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(db)
+	}
+
+	pub fn tower_sealed_count(&self) -> Result<u64, Error> {
+		self.conn.query_row("SELECT COUNT(*) FROM tower_sealed", [], |r| r.get::<_, i64>(0)).map(|n| n as u64).map_err(db)
+	}
+
+	/// A sealed deposit opened: its record and bases in its row, held from
+	/// now on as any deposit is, and its body and hints dropped.
+	pub fn tower_opened(&self, id: &str, leaf_id: &str, record: &[u8], bases: &str, note: &str) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		tx.execute("UPDATE tower_deposit SET leaf_id = ?2, record = ?3, bases = ?4, state = 'held', note = ?5, updated_at = ?6 WHERE id = ?1",
+			params![id, leaf_id, record, bases, note, now()]).map_err(db)?;
+		tx.execute("DELETE FROM tower_sealed WHERE id = ?1", params![id]).map_err(db)?;
+		tx.execute("DELETE FROM tower_hint WHERE id = ?1", params![id]).map_err(db)?;
+		tx.commit().map_err(db)
 	}
 
 	/// Sets a deposit's state and note, and what was broadcast for it when
