@@ -172,7 +172,8 @@ impl Store {
 
 	/// Drops the record of transfer `transfer_id`, recorded and never signed:
 	/// its new coins (pending, never posted but as pending), its
-	/// reassignment, its inputs' checkpoint scripts and the transfer itself,
+	/// reassignment, its inputs' checkpoint scripts and delegations, and the
+	/// transfer itself,
 	/// and gives each of its inputs back to its owner, live again, all or
 	/// nothing. Each output's pending notice is withdrawn in its mailbox,
 	/// naming `reason`. For a transfer the signer refused before signing
@@ -207,6 +208,9 @@ impl Store {
 			&[&inputs, &outputs],
 		).await?;
 		t.execute("DELETE FROM transfer_input WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		// The inputs' delegations into it go with it: they name outputs that
+		// will never exist, and each coin given back may delegate again.
+		t.execute("DELETE FROM delegation WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
 		t.execute("DELETE FROM transfer WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
 		let back = t.query(
 			"UPDATE leaf SET state = 'live', spent_by = NULL, updated_at = now()

@@ -5,9 +5,10 @@
 //! resting on such a node moves into a reassignment (a payment, a swap, a
 //! Lightning send, a fill), its key signs a delegation of its release to the
 //! owner keys of every output of that reassignment, in output order. The
-//! server takes it with the transfer ([`crate::cosign`]), or afterwards for a
-//! coin a fill spent ([`Delegations::take`]), checks it against the outputs it
-//! recorded, and keeps it. Each holder that refreshes a coin resting on such
+//! server takes it with the transfer ([`crate::cosign`]), checks it against
+//! the outputs it builds, and keeps it. A fill takes none yet (its order coin's
+//! maker is away when it is filled), so a node a filled order rests on comes
+//! back only at its batch's expiry. Each holder that refreshes a coin resting on such
 //! a node signs a release of every one of them it rests on, naming its new
 //! round ([`crate::forfeits`]).
 //!
@@ -156,4 +157,61 @@ pub async fn node_consents(store: &Store, slots: &[([u8; 32], XOnlyPublicKey)], 
 		}
 	}
 	Ok(Some(out))
+}
+
+/// Whether the lowest node whose children hash is `node_hash`, its slots
+/// `slots` in owner order, can still come back by its holders' releases
+/// within RECLAIM-D's steps: every coin it became either still held or given
+/// up in a refresh (whose release comes, or came, from its holder), or moved
+/// into a signed reassignment with a delegation into it, the same down each
+/// of its outputs. A coin that moved without a delegation, or an `htlc-1`
+/// leaf (whose sender holds nothing once the payment is decided), or a tree
+/// past [`RECLAIM_STEPS`] steps, keeps the node until its batch expires.
+pub async fn can_complete(store: &Store, slots: &[[u8; 32]], node_hash: [u8; 32]) -> Result<bool, StoreError> {
+	let mut left = RECLAIM_STEPS;
+	for leaf in slots {
+		match reach(store, *leaf, node_hash, left).await? {
+			Some(n) if n <= left => left -= n,
+			_ => return Ok(false),
+		}
+	}
+	Ok(true)
+}
+
+/// The steps `leaf`'s consent would take once every holder under it
+/// releases ([`can_complete`]), or `None` when it never can within `budget`.
+fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usize)
+	-> Pin<Box<dyn Future<Output = Result<Option<usize>, StoreError>> + Send + 'a>>
+{
+	Box::pin(async move {
+		if budget == 0 {
+			return Ok(None);
+		}
+		match store.spent_by(&leaf).await? {
+			SpentBy::Reassignment { transfer_id, outputs } => {
+				match store.delegation(&leaf).await? {
+					Some(d) if d.transfer_id == transfer_id && !outputs.is_empty() => {},
+					_ => return Ok(None),
+				}
+				let mut used = 1;
+				for (out, _) in outputs {
+					match reach(store, out, node_hash, budget.saturating_sub(used)).await? {
+						Some(n) => used += n,
+						None => return Ok(None),
+					}
+				}
+				Ok((used <= budget).then_some(used))
+			},
+			SpentBy::Other | SpentBy::Nothing => {
+				let htlc = match store.leaf(&leaf).await? {
+					Some(row) => match arca_covenant::CoinRecord::from_bytes(&row.record) {
+						Ok(arca_covenant::CoinRecord::Transfer(t)) => t.leaf.htlc.is_some(),
+						_ => false,
+					},
+					None => true,
+				};
+				Ok((!htlc).then_some(1))
+			},
+		}
+	})
 }

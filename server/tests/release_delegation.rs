@@ -154,6 +154,15 @@ async fn complete(r: &Running, id: &[u8; 32], coins: &[&Coin], keys: &[Keypair],
 /// the rest less two margins of 2,000 to the last key, delegating its
 /// release to every output when `delegate`. The new coins, in order.
 fn pay(r: &Running, coin: &Coin, to: &[(Keypair, u64)], delegate: bool) -> Vec<Coin> {
+	let (body, nonces) = pay_body(r, coin, to, delegate);
+	let done = r.http.post("cosign_transfer", &body).ok();
+	let ids: Vec<arca_covenant::LeafId> = done["outputs"].as_array().unwrap().iter()
+		.map(|o| o["leaf_id"].as_str().unwrap().parse().unwrap()).collect();
+	to.iter().zip(nonces).zip(ids).map(|(((k, _), nonce), id)| Coin { held: held_by(r, k, nonce, id), bases: coin.bases.clone() }).collect()
+}
+
+/// [`pay`]'s request body, and the outputs' owner nonces.
+fn pay_body(r: &Running, coin: &Coin, to: &[(Keypair, u64)], delegate: bool) -> (Value, Vec<[u8; 32]>) {
 	let v = coin.valid(r);
 	let kept = v.value - 2_000;
 	let x = v.asset;
@@ -174,10 +183,7 @@ fn pay(r: &Running, coin: &Coin, to: &[(Keypair, u64)], delegate: bool) -> Vec<C
 		let d = Delegation::for_reassignment(&v, &plan_outputs, &leaves).unwrap();
 		body["inputs"][0]["delegation_sig"] = json!(hex(sign_digest(&coin.held.key, &d.message().digest, &random32()).as_ref()));
 	}
-	let done = r.http.post("cosign_transfer", &body).ok();
-	let ids: Vec<arca_covenant::LeafId> = done["outputs"].as_array().unwrap().iter()
-		.map(|o| o["leaf_id"].as_str().unwrap().parse().unwrap()).collect();
-	to.iter().zip(nonces).zip(ids).map(|(((k, _), nonce), id)| Coin { held: held_by(r, k, nonce, id), bases: coin.bases.clone() }).collect()
+	(body, nonces)
 }
 
 /// The watcher's passes, a block between them, then buried and synced. How
@@ -277,7 +283,7 @@ async fn a_coin_paid_twice_then_refreshed_comes_back_at_the_next_round() {
 	let e = r.http.post("release_leaves", &json!({"participation_id": hex(&parts[1].0), "releases": [
 		{"leaf_id": bv.id.to_string(), "node": hex(&node), "signature": hex(stale_sig.as_ref())}]})).json;
 	println!("B's release of the coin it paid on, from a wallet: {}", e);
-	assert!(["delegated", "open_reassignment", "not_participating"].contains(&e["error"]["code"].as_str().unwrap_or("")), "{}", e);
+	assert_eq!(e["error"]["code"], "open_reassignment", "{}", e);
 	let round2_id = r.db.store.round_by_txid(&st["round"]["txid"].as_str().unwrap().parse::<elements::Txid>().unwrap().to_byte_array())
 		.await.unwrap().unwrap().round_id;
 	r.db.store.insert_release(&bv.id.0, &parts[1].0, round2_id, &node, &m.into_inner().to_byte_array(), stale_sig.as_ref()).await.unwrap();
@@ -489,4 +495,113 @@ async fn the_in_flight_cap_holds_new_refreshes_and_no_other_asset() {
 	println!("after round 3: reclaims {}; in flight {}", reclaims.len(), n(&p, "in_flight"));
 	assert!(!reclaims.is_empty());
 	assert_eq!(n(&p, "in_flight"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_transfer_that_carried_a_delegation_gives_its_coin_back() {
+	let mut r = Running::start_with(|c, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_wallet_in(x, 300_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let bs = boards(&mut r, &[keypair("F1 A board"), keypair("F1 D board")], x).await;
+	let (ka, kd) = (keypair("F1 A"), keypair("F1 D"));
+	let (ida, na) = submit(&r, &[&bs[0]], &[ka]);
+	let (idd, nd) = submit(&r, &[&bs[1]], &[kd]);
+	round(&r).await;
+	let a = complete(&r, &ida, &[&bs[0]], &[ka], &na, false).await.remove(0);
+	let d = complete(&r, &idd, &[&bs[1]], &[kd], &nd, false).await.remove(0);
+	let (with, _) = pay_body(&r, &a, &[(keypair("F1 B"), VALUE / 2), (keypair("F1 A2"), 0)], true);
+	let (without, _) = pay_body(&r, &d, &[(keypair("F1 E"), VALUE / 2), (keypair("F1 D2"), 0)], false);
+	// The signer away: each transfer is recorded, and nothing of it signed.
+	r.signer.kill();
+	for (what, body, coin) in [("with a delegation", &with, &a), ("without one", &without, &d)] {
+		let ans = r.http.post("cosign_transfer", body);
+		assert_eq!(ans.status, 503, "{}", ans.json);
+		let t = r.server.store.spent_by_transfer(&coin.held.id.0).await.unwrap().expect("recorded");
+		let delegated = r.server.store.delegation(&coin.held.id.0).await.unwrap().is_some();
+		// Refused for good: its record is dropped and its coin given back.
+		let back = r.server.store.drop_transfer(&t, "refused for good").await;
+		let leaf = r.server.store.leaf(&coin.held.id.0).await.unwrap().unwrap();
+		println!("a transfer {} (delegation kept: {}): dropped {:?}; the coin is {:?}", what, delegated, back.as_ref().map(|b| b.len()), leaf.state);
+		assert_eq!(back.unwrap().len(), 1, "the coin is given back");
+		assert_eq!(leaf.state, server::store::LeafState::Live);
+		assert!(r.server.store.delegation(&coin.held.id.0).await.unwrap().is_none(), "the delegation goes with the transfer");
+	}
+	tokio::task::block_in_place(|| r.signer.restart(&r.s, genesis));
+}
+
+/// Round 1: one leaf for each of `names` (at most four), all under one lowest
+/// node with RECLAIM-D, on a server whose X is capped at `cap` when given.
+async fn first_leaves(cap: Option<u64>, names: &[&str]) -> (Running, Vec<Coin>) {
+	let mut r = Running::start_with(|c, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+		if let Some(cap) = cap {
+			c.assets[0].in_flight_cap = Some(cap.to_string());
+		}
+	}).await;
+	let x = r.x;
+	r.fund_wallet_in(x, 300_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let bk: Vec<Keypair> = names.iter().map(|s| keypair(&format!("{} board", s))).collect();
+	let bs = boards(&mut r, &bk, x).await;
+	let nk: Vec<Keypair> = names.iter().map(|s| keypair(&format!("{} 1", s))).collect();
+	let mut parts = vec![];
+	for (b, k) in bs.iter().zip(&nk) {
+		parts.push(submit(&r, &[b], &[*k]));
+	}
+	round(&r).await;
+	let mut out = vec![];
+	for ((b, k), (id, nn)) in bs.iter().zip(&nk).zip(&parts) {
+		out.push(complete(&r, id, &[b], &[*k], nn, false).await.remove(0));
+	}
+	(r, out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_cannot_come_back_does_not_take_refreshes_past_the_cap() {
+	let cap = VALUE * 3 / 2;
+	let (r, c) = first_leaves(Some(cap), &["F5 U0", "F5 U1", "F5 U2", "F5 U3"]).await;
+	let x = r.x;
+	// One leaf paid on without a delegation: its node can come back only at
+	// its batch's expiry, however its other coins are refreshed.
+	let paid = pay(&r, &c[0], &[(keypair("F5 P"), 100_000), (keypair("F5 U0 change"), 0)], false);
+	let held: Vec<Coin> = vec![paid[1].clone(), c[1].clone(), c[2].clone(), c[3].clone()];
+	let mut pending = vec![];
+	for (j, h) in held.iter().enumerate() {
+		let k = keypair(&format!("F5 r2 {}", j));
+		let (id, nn) = submit(&r, &[h], &[k]);
+		pending.push((j, id, nn, k));
+	}
+	let mut most = 0;
+	for rn in 2..=3 {
+		if let Some(built) = r.server.rounds.run_round().await.unwrap() {
+			r.produce().await;
+			r.bury().await;
+			round_final(&r, &built.tx.txid()).await;
+		}
+		let mut left = vec![];
+		for (j, id, nn, k) in pending.drain(..) {
+			let s = status(&r, &id);
+			if s["state"] == "pending" {
+				left.push((j, id, nn, k));
+			} else {
+				complete(&r, &id, &[&held[j]], &[k], &nn, true).await;
+			}
+		}
+		let p = pool(&r, x);
+		most = most.max(n(&p, "in_flight"));
+		println!("round {}: {} refresh(es) wait; in flight {} of a cap of {}", rn, left.len(), n(&p, "in_flight"), cap);
+		pending = left;
+	}
+	assert!(most <= cap, "nothing runs past the cap on a node that cannot come back: {} in flight", most);
+	assert_eq!(pending.len(), 3, "the refreshes beyond the cap wait");
 }

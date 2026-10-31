@@ -24,22 +24,27 @@ fn script(v: &Value) -> Script {
 	Script::from((0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<u8>>())
 }
 
-/// Every wallet of `ws` asks for its refresh; one round is built and made
-/// final, and every wallet completes it.
+/// Every wallet of `ws` asks for its refresh; the rounds of every asset are
+/// built and made final, and every wallet completes them.
 async fn refresh_all(r: &Running, ws: &[&Arca]) {
 	for w in ws {
 		let p = w.ok(&["participate"]);
-		assert_eq!(p["participations"][0]["state"], "pending", "{}", p);
+		assert!(p["participations"].as_array().unwrap().iter().all(|x| x["state"] == "pending"), "{}", p);
 	}
-	let built = r.server.rounds.run_round().await.unwrap().expect("a round");
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
 	r.produce().await;
 	r.bury().await;
-	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
 	for (i, w) in ws.iter().enumerate() {
 		let s = w.ok(&["sync"]);
-		let done = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released").cloned();
-		assert!(done.is_some(), "{}", s);
-		println!("wallet {}: released {}", i, done.unwrap()["released"]);
+		let ps = s["participations"].as_array().unwrap();
+		assert!(!ps.is_empty() && ps.iter().all(|p| p["state"] == "released"), "{}", s);
+		for p in ps {
+			println!("wallet {}: released {}", i, p["released"]);
+		}
 	}
 }
 
@@ -116,4 +121,137 @@ async fn the_wallet_delegates_at_a_payment_and_releases_as_a_holder() {
 	println!("after the reclaim: transferred {}, in flight {}, reclaimed in the last hour {}", pool.transferred, pool.in_flight,
 		pool.reclaimed_last_hour);
 	assert_eq!(pool.transferred, 0);
+}
+
+/// The coins of `w` live in `asset`.
+fn live(w: &Arca, asset: &str) -> Vec<Value> {
+	w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live" && c["asset"] == asset).cloned().collect()
+}
+
+fn id32(s: &str) -> [u8; 32] {
+	let b: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+	b.try_into().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_delegates_both_sides_and_a_restored_wallet_releases() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let (x_id, y_id) = (r.x, r.y);
+	let (x, y) = (x_id.to_string(), y_id.to_string());
+	common::node::list_fee_asset(&r.rt, y_id, 100_000_000);
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(y_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b) = (Arca::new("SA"), Arca::new("SB"));
+	a.ok(&create);
+	b.ok(&create);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x_id, 5_000_000);
+	let s = script(&b.ok(&["address"]));
+	r.pay_to(s, y_id, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	// A's X and B's Y each into a batch with RECLAIM-D.
+	refresh_all(&r, &[&a, &b]).await;
+	let (ax, by) = (live(&a, &x)[0]["leaf_id"].as_str().unwrap().to_string(), live(&b, &y)[0]["leaf_id"].as_str().unwrap().to_string());
+
+	// A gives X for B's Y in one reassignment: both inputs delegate, A's
+	// signed at completion, B's carried in its acceptance.
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x, "--give", "600000", "--want-asset", &y, "--want", "700000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	b.ok(&["mailbox"]);
+	for (who, leaf) in [("A's X", &ax), ("B's Y", &by)] {
+		let d = r.server.store.delegation(&id32(leaf)).await.unwrap();
+		println!("{} leaf {}: delegation recorded: {}", who, &leaf[..16], d.is_some());
+		assert!(d.is_some(), "{}'s input carries a delegation", who);
+	}
+
+	// B is lost and restored from its mnemonic alone.
+	let mnemonic = std::fs::read_to_string(b.dir.join("mnemonic")).unwrap();
+	let b2 = Arca::new("SB2");
+	let mut args: Vec<&str> = create.to_vec();
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	let made = b2.ok(&args);
+	println!("B restored: {}", made["restore"]);
+	b2.ok(&["sync"]);
+
+	// Every coin the swap made refreshes and releases: both nodes come back.
+	refresh_all(&r, &[&a, &b2]).await;
+	let ks = reclaims(&r).await;
+	let by_d: Vec<_> = ks.iter().filter(|w| w.detail.contains("RECLAIM-D")).collect();
+	for k in &by_d {
+		let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
+		println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
+		assert_eq!(k.state, NurseryState::Final);
+	}
+	assert_eq!(by_d.len(), 2, "the X node and the Y node, each released by both sides of the swap");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lightning_send_carries_the_payers_delegation() {
+	let Some(lnd) = common::lightning::lightningd("a_lightning_send_carries_the_payers_delegation") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+	}).await;
+	let x_id = r.x;
+	let x = x_id.to_string();
+	r.fund_server(x_id, 100_000_000).await;
+	let (ox, px) = tokio::task::block_in_place(|| {
+		let ox = common::lightning::node(&r.rt, &mut r.purse, &lnd, "dox", true, x_id, 2_000_000_000);
+		let px = common::lightning::node(&r.rt, &mut r.purse, &lnd, "dpx", true, x_id, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x_id, 1_000_000_000, 300_000_000);
+		(ox, px)
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut().filter(|a| a.asset == x) {
+		a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("the leg up", || g.leg(&x_id, true).is_ok()).await;
+	let (url, nurl) = (r.url(), r.node_url());
+	let a = Arca::new("LD");
+	a.ok(&["create", "--server", &url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1"]);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x_id, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	// Its coin into a batch with RECLAIM-D, then paid out over Lightning.
+	refresh_all(&r, &[&a]).await;
+	let coin = live(&a, &x)[0]["leaf_id"].as_str().unwrap().to_string();
+	let (inv, _) = common::lightning::invoice(&px, x_id, 100_000, "delegated-send");
+	let p = a.ok(&["lightning", "pay", &inv, "--asset", &x]);
+	assert_eq!(p["payment"]["state"], "paid", "{}", p);
+	let d = r.server.store.delegation(&id32(&coin)).await.unwrap();
+	println!("paid over Lightning from {}: delegation recorded: {}", &coin[..16], d.is_some());
+	assert!(d.is_some(), "a Lightning send delegates the coin's release to its outputs, the htlc-1 leaf and the change");
 }

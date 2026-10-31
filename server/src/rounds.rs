@@ -304,12 +304,27 @@ pub struct RoundConfig {
 }
 
 /// The lowest nodes of the batch leaves a coin rests on: its own, or each up
-/// its lineage of reassignments.
-fn lowest_nodes(record: &CoinRecord) -> Vec<[u8; 32]> {
+/// its lineage of reassignments; `None` when it rests on an accumulator
+/// batch, which has none (so no refresh of it completes a node).
+fn lowest_nodes(record: &CoinRecord) -> Option<Vec<[u8; 32]>> {
 	match record {
-		CoinRecord::Leaf { record, .. } => record.branch().ok().and_then(|b| b.nodes.last().map(|n| n.children_hash())).into_iter().collect(),
-		_ => record.parents().into_iter().flat_map(lowest_nodes).collect(),
+		CoinRecord::Leaf { record, .. } => Some(record.branch().ok().and_then(|b| b.nodes.last().map(|n| n.children_hash())).into_iter().collect()),
+		CoinRecord::Accumulator { .. } => None,
+		CoinRecord::Board(_) => Some(vec![]),
+		_ => {
+			let mut out = vec![];
+			for p in record.parents() {
+				out.extend(lowest_nodes(p)?);
+			}
+			Some(out)
+		},
 	}
+}
+
+/// The children hash of the lowest node above a batch leaf, from its leaf
+/// record; `None` for an accumulator batch's leaf.
+fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
+	arca_covenant::LeafRecord::from_bytes(record).ok().and_then(|r| r.branch().ok()).and_then(|b| b.nodes.last().map(|n| n.children_hash()))
 }
 
 /// How close to its first expiry a coin given up must be for its refresh to
@@ -1550,10 +1565,12 @@ impl Rounds {
 	/// operator's forfeit of them pays it back at once. A participation with a
 	/// coin within [`CAP_EXEMPT`] of its first expiry is never held by the
 	/// cap: its holder would otherwise take it on the chain. Nor is one whose
-	/// coins rest only on lowest nodes that already hold fronted value: it
-	/// opens nothing new, and those nodes come back only once it runs, so
-	/// holding it would keep the cap full for ever. One larger than a cap
-	/// above 0 runs once nothing of the asset is in flight.
+	/// coins rest only on lowest nodes that already hold fronted value and
+	/// can still come back ([`crate::delegations::can_complete`]): it opens
+	/// nothing new, and those nodes come back only once it runs, so holding it
+	/// would keep the cap full for ever. One larger than a cap above 0 runs
+	/// once nothing of the asset is in flight. Coins on accumulator batches
+	/// count like any others, and never complete a node.
 	async fn within_cap(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
 		let caps: BTreeMap<AssetId, u64> = self.params.assets.ids().into_iter()
 			.filter_map(|a| self.params.in_flight_cap(&a).map(|c| (a, c))).collect();
@@ -1562,15 +1579,34 @@ impl Rounds {
 		}
 		let mut flight: BTreeMap<AssetId, u64> = self.store.in_flight().await?.into_iter()
 			.map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
-		// The lowest nodes already holding fronted value: a refresh of a coin
-		// resting on them alone opens nothing new, and the node comes back
-		// only once it runs.
+		// The lowest nodes already holding fronted value that can still come
+		// back by their holders' releases: a refresh of a coin resting on them
+		// alone opens nothing new, and the node comes back only once it runs.
+		// A node that cannot come back (a coin on it moved without a
+		// delegation, say) holds its value until expiry whatever runs, so a
+		// refresh on it is held by the cap like any other.
 		let mut open: HashSet<[u8; 32]> = HashSet::new();
-		for rec in self.store.in_flight_slots().await? {
-			if let Some(h) = arca_covenant::LeafRecord::from_bytes(&rec).ok().and_then(|r| r.branch().ok())
-				.and_then(|b| b.nodes.last().map(|n| n.children_hash()))
-			{
+		let mut batches: BTreeSet<(i64, u32)> = BTreeSet::new();
+		for (_, round_id, vout, rec) in self.store.in_flight_slots().await? {
+			if let Some(h) = lowest_of(&rec) {
 				open.insert(h);
+				batches.insert((round_id, vout));
+			}
+		}
+		let mut slots: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+		for (round_id, vout) in batches {
+			let Some(round) = self.store.round(round_id).await? else { continue };
+			let Some((_, leaves)) = self.store.batch(&round.txid, vout).await? else { continue };
+			for l in leaves {
+				if let Some(h) = lowest_of(&l.record).filter(|h| open.contains(h)) {
+					slots.entry(h).or_default().push(l.leaf_id);
+				}
+			}
+		}
+		let mut completable: HashSet<[u8; 32]> = HashSet::new();
+		for (h, ids) in &slots {
+			if crate::delegations::can_complete(&self.store, ids, *h).await? {
+				completable.insert(*h);
 			}
 		}
 		let mut out = Vec::with_capacity(chosen.len());
@@ -1587,7 +1623,7 @@ impl Rounds {
 				let Ok(record) = CoinRecord::from_bytes(&l.record) else { continue };
 				let Some(expiry) = crate::cosign::first_expiry(&record) else { continue };
 				near |= expiry < now.to_consensus_u32().saturating_add(CAP_EXEMPT);
-				completes &= lowest_nodes(&record).iter().all(|h| open.contains(h));
+				completes &= lowest_nodes(&record).is_some_and(|ns| !ns.is_empty() && ns.iter().all(|h| completable.contains(h)));
 				*adds.entry(asset).or_default() += i.value;
 			}
 			let completes = completes && !adds.is_empty();
