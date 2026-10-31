@@ -635,3 +635,70 @@ async fn a_wallet_deposits_with_the_default_watchtowers_that_watch_for_its_opera
 	assert_eq!(t.deposits().len(), 1);
 	assert_eq!(t.deposits()[0]["state"], "sealed");
 }
+
+/// The same answer when the earlier coin is a board: a sender pays out of
+/// round from the board it made, then converts that board into its leaf
+/// from a copy of its wallet made before it paid, while the receiver is
+/// away and the operator is down. The watchtower opens the receiver's
+/// deposit by the converted leaf's script and publishes the checkpoint
+/// from that leaf and the reassignment; the receiver's coin is on the chain
+/// under its own key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchtower_answers_a_sender_who_converts_the_board_it_paid_from() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.watcher.unroll_at_release = false;
+		c.watcher.enabled = false;
+	}).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x.to_string();
+	let s = Arca::new("wt board S");
+	let s_old = Arca::new("wt board S old");
+	let rc = Arca::new("wt board R");
+	for w in [&s, &rc] {
+		w.ok(&create_args(&url, &node));
+	}
+	let board_s = board(&mut r, &s, "2000000").await;
+	copy_wallet(&s, &s_old);
+	let t = Tower::new("wt board T", &url, &node);
+	r.pay_to(script(&t.wallet.ok(&["address"])), r.x, 1_000_000);
+	r.produce().await;
+	r.bury().await;
+	rc.ok(&["watchtowers", &t.url]);
+	let req = rc.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "600000", "--asset", &x]);
+	let m = rc.ok(&["mailbox"]);
+	let coin = m["accepted"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("R accepts the payment: {}", m)).to_string();
+	let sync = rc.ok(&["sync"]);
+	println!("R's coin {} rests on S's board {}; its sync's deposits: {}", coin, board_s, sync["deposits"]);
+	t.learn(&sync);
+	t.holds_sealed(&coin);
+
+	r.server.stop();
+	let e = s_old.ok(&["exit", &board_s]);
+	println!("S converts the board it paid from: {}", e);
+	let start = Instant::now();
+	let mut brought = Value::Null;
+	loop {
+		let d = t.deposit_of(&coin).unwrap();
+		if d["state"] == "brought" {
+			brought = d.clone();
+		}
+		if d["state"] == "on_chain" {
+			break;
+		}
+		assert!(start.elapsed() < Duration::from_secs(90), "the watchtower did not answer: {}", d);
+		r.produce().await;
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+	let d = t.deposit_of(&coin).unwrap();
+	println!("T answered: {} | then {}", brought["note"], d["note"]);
+	for st in d["broadcast"].as_array().unwrap() {
+		println!("T's step {}: {} vB, fee {}, paid by {}", st["txid"], st["vsize"], st["fee"], st["paid_by"]);
+	}
+	assert!(brought["note"].as_str().unwrap_or("").contains("a sender up its lineage took an earlier coin on the chain"), "{}", brought);
+	let leaf_at = e["leaf"].as_str().unwrap().trim_start_matches("[elements]").to_string();
+	let (lt, lv) = leaf_at.split_once(':').unwrap();
+	let cp = r.rt.client().raw_transaction(&elements::Txid::from_str(d["broadcast"][0]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert!(cp.input.iter().any(|i| i.previous_output.txid.to_string() == lt && i.previous_output.vout.to_string() == lv),
+		"the checkpoint spends S's converted leaf {}", leaf_at);
+}
