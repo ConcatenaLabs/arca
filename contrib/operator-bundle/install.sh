@@ -990,8 +990,10 @@ write_conf arca-signer 640 "$ETC/signer.env" < <(printf 'ARCA_GENESIS=%s\n' "$GE
 if [ -n "$PRICE_FEED_URL" ]; then
   restart_if priceserver sequentiad
   # The rates the gateway opens its channels with and arcad values each asset
-  # at: the price server's first poll, a minute at most.
-  for ((i = 0; i < 120; i++)); do
+  # at. A price server that stops clears the node's whole list, so after its
+  # restart the node takes no fee at all until its first publish (the feed and
+  # the registry read first): up to a few minutes.
+  for ((i = 0; i < 360; i++)); do
     r=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}'); missing=""
     for id in "${ASSET_IDS[@]}"; do jq -e --arg a "$id" 'has($a)' <<<"$r" >/dev/null || missing+=" ${id:0:12}…"; done
     [ -z "$missing" ] && break; sleep 1
