@@ -55,10 +55,16 @@ fn the_builder_rebuilds_every_record_vector() {
 	for b in v["batches"].as_array().unwrap() {
 		let name = b["name"].as_str().unwrap();
 		let inp = &b["inputs"];
-		let expiries = inp["expiries"].as_array().unwrap().iter()
-			.map(|e| MedianTime::from_consensus(e.as_u64().unwrap() as u32).unwrap()).collect();
-		let schedule = ClockSchedule::new(AssetId::from_str(inp["token"].as_str().unwrap()).unwrap(), operator,
-			RelativeTime::from_units(inp["notice_units"].as_u64().unwrap() as u16).unwrap(), expiries).unwrap();
+		// A batch without a sweep has no token, notice or expiries.
+		let no_sweep = inp.get("no_sweep").is_some_and(|d| d == true);
+		let schedule = if no_sweep {
+			ClockSchedule::never(operator)
+		} else {
+			let expiries = inp["expiries"].as_array().unwrap().iter()
+				.map(|e| MedianTime::from_consensus(e.as_u64().unwrap() as u32).unwrap()).collect();
+			ClockSchedule::new(AssetId::from_str(inp["token"].as_str().unwrap()).unwrap(), operator,
+				RelativeTime::from_units(inp["notice_units"].as_u64().unwrap() as u16).unwrap(), expiries).unwrap()
+		};
 		let params = TreeParams {
 			asset, chain: Chain::new(genesis), schedule, burn: inp["burn"].as_bool().unwrap(),
 			delegated_reclaim: inp.get("delegated_reclaim").is_some_and(|d| d == true),
@@ -112,8 +118,10 @@ fn the_builder_rebuilds_every_record_vector() {
 		let expected: Vec<Vec<u64>> = b["children"].as_array().unwrap().iter()
 			.map(|l| l.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()).collect();
 		assert_eq!(counts, expected, "{}: the children of every node", name);
-		assert_eq!(tree.clock0_script_pubkey().unwrap().as_bytes().to_vec(),
-			Vec::<u8>::from_hex(b["clock0_script_pubkey"].as_str().unwrap()).unwrap());
+		match tree.clock0_script_pubkey() {
+			None => assert!(no_sweep && b.get("clock0_script_pubkey").is_none(), "{}: a token only with a sweep", name),
+			Some(c) => assert_eq!(c.as_bytes().to_vec(), Vec::<u8>::from_hex(b["clock0_script_pubkey"].as_str().unwrap()).unwrap()),
+		}
 		for r in b["records"].as_array().unwrap() {
 			let i = r["leaf"].as_u64().unwrap() as usize;
 			let rec = tree.record(i);
