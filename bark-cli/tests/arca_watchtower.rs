@@ -51,6 +51,9 @@ struct Tower {
 	url: String,
 	listen: String,
 	child: Option<Child>,
+	/// The deposit id of each coin, as its wallet's `sync` named it: a
+	/// sealed deposit names no coin until it is opened.
+	ids: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 impl Tower {
@@ -59,7 +62,7 @@ impl Tower {
 		wallet.ok(&create_args(server, node));
 		let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
 		let listen = format!("127.0.0.1:{}", port);
-		let mut t = Tower { wallet, url: format!("http://{}", listen), listen, child: None };
+		let mut t = Tower { wallet, url: format!("http://{}", listen), listen, child: None, ids: Default::default() };
 		t.start();
 		t
 	}
@@ -88,8 +91,31 @@ impl Tower {
 		self.wallet.ok(&["watchtower", "deposits"]).as_array().unwrap().clone()
 	}
 
+	/// The deposit of coin `leaf`: by the coin once it is opened, else by the
+	/// id its wallet's sync named.
 	fn deposit_of(&self, leaf: &str) -> Option<Value> {
-		self.deposits().into_iter().find(|d| d["leaf_id"] == leaf)
+		let all = self.deposits();
+		let id = self.ids.borrow().get(leaf).cloned();
+		all.iter().find(|d| d["leaf_id"] == leaf).or_else(|| all.iter().find(|d| id.as_deref().is_some_and(|i| d["deposit"] == i))).cloned()
+	}
+
+	/// Notes the deposit ids a wallet's `sync` answer `s` names for this
+	/// watchtower.
+	fn learn(&self, s: &Value) {
+		for d in s["deposits"].as_array().cloned().unwrap_or_default() {
+			if d["watchtower"] == self.url.as_str() && d["deposited"].is_string() {
+				self.ids.borrow_mut().insert(d["leaf_id"].as_str().unwrap().to_string(), d["deposited"].as_str().unwrap().to_string());
+			}
+		}
+	}
+
+	/// Asserts the watchtower holds `leaf`'s deposit sealed, and that
+	/// nothing it lists names the coin.
+	fn holds_sealed(&self, leaf: &str) {
+		let d = self.deposit_of(leaf).unwrap_or_else(|| panic!("{} holds no deposit of {}", self.wallet.name, leaf));
+		assert_eq!(d["state"], "sealed", "{}", d);
+		assert_eq!(d["leaf_id"], "", "{}", d);
+		assert!(!self.wallet.ok(&["watchtower", "deposits"]).to_string().contains(leaf), "the watchtower lists nothing of the coin");
 	}
 }
 
@@ -183,11 +209,14 @@ async fn watchtowers_take_absent_holders_coins_on_chain_before_the_sweep() {
 	for w in [&a, &b, &d, &e] {
 		let s = w.ok(&["sync"]);
 		println!("{}'s sync deposits: {}", w.name, s["deposits"]);
+		t.learn(&s);
+		t2.learn(&s);
 	}
+	println!("T's deposits, sealed: {}", serde_json::to_string(&t.deposits()).unwrap());
 	for l in [&la, &lb, &ld, &le] {
-		assert_eq!(t.deposit_of(l).expect("T holds the deposit")["state"], "held");
+		t.holds_sealed(l);
 	}
-	assert_eq!(t2.deposit_of(&ld).expect("T2 holds D's deposit")["state"], "held");
+	t2.holds_sealed(&ld);
 	// A second sync deposits nothing again.
 	assert!(a.ok(&["sync"]).get("deposits").is_none(), "nothing deposited twice");
 
@@ -204,21 +233,23 @@ async fn watchtowers_take_absent_holders_coins_on_chain_before_the_sweep() {
 	r.round_state(&built2.tx.txid(), RoundState::Final).await;
 	let s = d.ok(&["sync"]);
 	let (ld2, vd2, _) = new_leaf(&s);
+	t.learn(&s);
 	let s = d.ok(&["sync"]);
+	t.learn(&s);
 	println!("D refreshed {} into {} = {}; its sync's deposits: {}", ld, ld2, vd2, s["deposits"]);
-	e.ok(&["sync"]);
+	t.learn(&e.ok(&["sync"]));
 	let s = e.ok(&["sync"]);
 	println!("E refreshed {}; its sync's deposits: {}", le, s["deposits"]);
 	assert!(t.deposit_of(&le).is_none(), "E withdrew its old coin's deposit");
 	assert!(t.deposit_of(&ld).is_none(), "D withdrew its old coin's deposit from T");
 	assert!(t.deposit_of(&ld2).is_some(), "and deposited its new coin with T");
 	t2.start();
-	assert_eq!(t2.deposit_of(&ld).expect("T2 still holds D's old coin")["state"], "held");
+	t2.holds_sealed(&ld);
 
 	// Before the release, the watchtowers do nothing.
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	for l in [&la, &lb] {
-		assert_eq!(t.deposit_of(l).unwrap()["state"], "held", "nothing before the release");
+		t.holds_sealed(l);
 	}
 
 	// A, B and D are away. The batch expires and is released.
@@ -458,9 +489,10 @@ async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
 	let coin = m["accepted"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("R accepts the payment: {}", m)).to_string();
 	let sync = rc.ok(&["sync"]);
 	println!("R's coin {}; its sync's deposits: {}", coin, sync["deposits"]);
-	assert_eq!(t.deposit_of(&coin).expect("T holds R's deposit")["state"], "held");
+	t.learn(&sync);
+	t.holds_sealed(&coin);
 	tokio::time::sleep(Duration::from_secs(3)).await;
-	assert_eq!(t.deposit_of(&coin).unwrap()["state"], "held", "nothing while the lineage is off the chain");
+	t.holds_sealed(&coin);
 
 	// R is away and the operator stops. S takes its old coin home from the copy.
 	r.server.stop();

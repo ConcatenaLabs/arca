@@ -1160,7 +1160,8 @@ signed for an hour before its batch's first expiry, so it unrolls nothing
 before the batch can be released. Nothing in it lets anyone take the coin:
 the unroll pins every child, the entry's unlock pins the leaf, and a coin
 paid out of round carries only pairs that spend into the outputs they commit
-to. A wallet deposits each coin with every watchtower it names, renews the
+to. The deposit is sealed: a watchtower reads it only once one of the
+events it answers is on the chain, and learns nothing of the coin before. A wallet deposits each coin with every watchtower it names, renews the
 deposit when the coin changes, and withdraws it, signed by the coin's key,
 once the coin is no longer its own. A deposit a watchtower kept for a coin
 its holder has given up brings only that old coin on the chain, where the

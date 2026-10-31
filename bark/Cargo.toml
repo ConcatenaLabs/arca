@@ -48,6 +48,7 @@ arca-core = [
 	"dep:elements",
 	"dep:lwk_signer",
 	"dep:web-time",
+	"dep:chacha20poly1305",
 ]
 
 # TLS implementations
@@ -91,6 +92,8 @@ arca-covenant = { path = "../covenant", optional = true }
 arca-sequentia-ext = { path = "../sequentia-ext", optional = true, default-features = false }
 # The clock of the Arca wallet: `std::time` on a native target, the browser's on `wasm32`.
 web-time = { version = "1.1", optional = true }
+# The cipher of a sealed watchtower deposit, as Lightning's watchtower blobs use.
+chacha20poly1305 = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
 elements = { workspace = true, optional = true }
 lwk_signer = { workspace = true, optional = true }
 minreq = { version = "3", optional = true, features = ["https-rustls"] }
