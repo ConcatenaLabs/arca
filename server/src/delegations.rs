@@ -6,11 +6,14 @@
 //! Lightning send, a fill), its key signs a delegation of its release to the
 //! owner keys of every output of that reassignment, in output order. The
 //! server takes it with the transfer ([`crate::cosign`]), checks it against
-//! the outputs it builds, and keeps it. A fill takes none yet (its order coin's
-//! maker is away when it is filled), so a node a filled order rests on comes
-//! back only at its batch's expiry. Each holder that refreshes a coin resting on such
-//! a node signs a release of every one of them it rests on, naming its new
-//! round ([`crate::forfeits`]).
+//! the outputs it builds, and keeps it. A fill takes each taker coin's with
+//! the fill ([`crate::orders`]), and its order coin's afterwards: the maker is
+//! away when its order is filled, and delegates once its wallet holds a coin
+//! the fill made ([`crate::orders::Orders::delegate`]). Each holder that
+//! refreshes a coin resting on such a node signs a release of every one of
+//! them it rests on, naming its new round ([`crate::forfeits`]); the sender
+//! of a paid Lightning payment out of the tree releases its `htlc-1` leaf's
+//! nodes, naming the latest final round ([`crate::lightning::send`]).
 //!
 //! The watcher reclaims a lowest node once every one of its slots has its
 //! consent ([`consent`]): the slot's batch leaf released by its owner, or its
@@ -33,7 +36,7 @@ use arca_covenant::message::Chain;
 use arca_covenant::node::{connector_index, ReleaseTree, RECLAIM_STEPS};
 use arca_covenant::{Delegation, ExplicitOutput, LeafPolicy, ValidCoin};
 
-use crate::store::{SpentBy, Store, StoreError};
+use crate::store::{HolderReleaseRow, SendState, SpentBy, Store, StoreError};
 
 /// Checks `sig`, `coin`'s key's delegation into a reassignment of `outputs`,
 /// each the leaf `leaves` names at its index.
@@ -130,16 +133,23 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 				}
 				Ok(Some(Consent::Delegation { key, sig, to }))
 			},
-			SpentBy::Other => {
-				let rows = store.holder_releases(&leaf_id, &node_hash).await?;
-				let Some(r) = rows.last() else { return Ok(None) };
-				let Ok(sig) = Signature::from_slice(&r.signature) else { return Ok(None) };
-				Ok(Some(Consent::Release { key, sig, round_id: r.round_id, connector: AssetId::from_slice(&r.connector_asset)
-					.map_err(|e| StoreError::Corrupt(e.to_string()))? }))
+			SpentBy::Other => release_of(key, store.holder_releases(&leaf_id, &node_hash).await?),
+			// The htlc-1 leaf of a payment out of the tree that was paid is
+			// the operator's, and its sender's key releases it.
+			SpentBy::Nothing => match store.send_of_leaf(&leaf_id).await? {
+				Some(s) if s.state == SendState::Paid => release_of(key, store.paid_send_releases(&leaf_id, &node_hash).await?),
+				_ => Ok(None),
 			},
-			SpentBy::Nothing => Ok(None),
 		}
 	})
+}
+
+/// `key`'s consent by the latest of its releases `rows`, if any.
+fn release_of(key: XOnlyPublicKey, rows: Vec<HolderReleaseRow>) -> Result<Option<Consent>, StoreError> {
+	let Some(r) = rows.last() else { return Ok(None) };
+	let Ok(sig) = Signature::from_slice(&r.signature) else { return Ok(None) };
+	Ok(Some(Consent::Release { key, sig, round_id: r.round_id, connector: AssetId::from_slice(&r.connector_asset)
+		.map_err(|e| StoreError::Corrupt(e.to_string()))? }))
 }
 
 /// The consents of every slot of a lowest node, in owner order, when all
@@ -161,12 +171,17 @@ pub async fn node_consents(store: &Store, slots: &[([u8; 32], XOnlyPublicKey)], 
 
 /// Whether the lowest node whose children hash is `node_hash`, its slots
 /// `slots` in owner order, can still come back by its holders' releases
-/// within RECLAIM-D's steps: every coin it became either still held or given
-/// up in a refresh (whose release comes, or came, from its holder), or moved
-/// into a signed reassignment with a delegation into it, the same down each
-/// of its outputs. A coin that moved without a delegation, or an `htlc-1`
-/// leaf (whose sender holds nothing once the payment is decided), or a tree
-/// past [`RECLAIM_STEPS`] steps, keeps the node until its batch expires.
+/// within RECLAIM-D's steps, by the same tree [`consent`] builds: every coin
+/// it became either still held, or given up in a refresh whose release is
+/// recorded or can still come (its participation not completed yet), or
+/// moved into a signed reassignment with a delegation into it, the same down
+/// each of its outputs. The `htlc-1` leaf of a payment out of the tree counts
+/// as held while the payment is undecided or failed (it goes back to its
+/// sender), and once paid when its sender's release is recorded. A coin
+/// given up in a refresh or an offboard that completed with no release, a
+/// coin that moved without a delegation, the order resting again after a fill
+/// given up in a refresh, an `htlc-1` leaf of a payment into the tree, or a
+/// tree past [`RECLAIM_STEPS`] steps, keeps the node until its batch expires.
 pub async fn can_complete(store: &Store, slots: &[[u8; 32]], node_hash: [u8; 32]) -> Result<bool, StoreError> {
 	let mut left = RECLAIM_STEPS;
 	for leaf in slots {
@@ -202,15 +217,31 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 				}
 				Ok((used <= budget).then_some(used))
 			},
-			SpentBy::Other | SpentBy::Nothing => {
-				let htlc = match store.leaf(&leaf).await? {
-					Some(row) => match arca_covenant::CoinRecord::from_bytes(&row.record) {
-						Ok(arca_covenant::CoinRecord::Transfer(t)) => t.leaf.htlc.is_some(),
-						_ => false,
-					},
-					None => true,
+			SpentBy::Other => {
+				// An order resting again releases nothing: its key delegated
+				// at the fill. Given up in a refresh, it never consents.
+				let rest = match store.leaf(&leaf).await? {
+					Some(row) => matches!(arca_covenant::CoinRecord::from_bytes(&row.record),
+						Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. })),
+					None => return Ok(None),
 				};
-				Ok((!htlc).then_some(1))
+				let comes = !rest && (!store.holder_releases(&leaf, &node_hash).await?.is_empty() || store.refresh_open(&leaf).await?);
+				Ok(comes.then_some(1))
+			},
+			SpentBy::Nothing => {
+				let Some(row) = store.leaf(&leaf).await? else { return Ok(None) };
+				let held = match arca_covenant::CoinRecord::from_bytes(&row.record) {
+					Ok(arca_covenant::CoinRecord::Transfer(t)) => match t.leaf.htlc {
+						None => true,
+						Some(h) if h.direction == arca_covenant::HtlcDirection::Send => match store.send_of_leaf(&leaf).await? {
+							Some(s) if s.state == SendState::Paid => !store.paid_send_releases(&leaf, &node_hash).await?.is_empty(),
+							_ => true,
+						},
+						Some(_) => false,
+					},
+					_ => true,
+				};
+				Ok(held.then_some(1))
 			},
 		}
 	})

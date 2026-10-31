@@ -17,7 +17,15 @@
 //!    waits for its expiry.
 //! 3. The in-flight cap: a refresh beyond an asset's cap waits, in plain
 //!    words, and an asset with a cap of 0 and an empty pool holds up none of
-//!    the round's other assets.
+//!    the round's other assets. A refresh with no release on a node one of
+//!    whose coins was paid on is held by the cap too (arca#450).
+//! 4. A resting order filled in the tree (arca#419): the taker's coin
+//!    delegates with the fill, the maker's order coin afterwards from a coin
+//!    the fill made; once every holder refreshes, both nodes come back. A
+//!    maker whose order is filled every round keeps `transferred` at one
+//!    order; without its delegation it grows by an order a round.
+//! 5. The `htlc-1` leaf of a paid payment out of the tree (arca#431): its
+//!    sender releases it once the payment is paid.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -29,7 +37,7 @@ use elements::{AssetId, Transaction};
 use serde_json::{json, Value};
 
 use arca_covenant::sign::sign_digest;
-use arca_covenant::{CoinRecord, Delegation, ExplicitOutput, NewLeaf, Release, ValidOrigin};
+use arca_covenant::{CoinRecord, Delegation, ExplicitOutput, NewLeaf, Rebindable, Release, ValidOrigin};
 use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, transfer_body, want_leaf, Held};
 use common::flow::{forfeit_for, held_by, Coin};
 use common::keys::{keypair, xonly};
@@ -604,4 +612,517 @@ async fn a_node_that_cannot_come_back_does_not_take_refreshes_past_the_cap() {
 	}
 	assert!(most <= cap, "nothing runs past the cap on a node that cannot come back: {} in flight", most);
 	assert_eq!(pending.len(), 3, "the refreshes beyond the cap wait");
+}
+
+// ---------------------------------------------------------------------------
+// Resting orders filled in the tree (arca#419).
+
+const LOT: u64 = 10_000;
+const ORDER: u64 = 500_000;
+
+/// A maker's order: its leaf key, its four credit keys and their nonces, and
+/// its terms (X for Y, one for one).
+struct Maker {
+	key: Keypair,
+	credits: Vec<Keypair>,
+	credit_nonces: [[u8; 32]; 4],
+	terms: arca_covenant::order::OrderLeafTerms,
+}
+
+fn maker(r: &Running, label: &str) -> Maker {
+	use arca_covenant::order::{OrderLeafTerms, OrderTerms, SeqdexOrder, SeqdexVersion};
+	let credits: Vec<Keypair> = (0..4).map(|i| keypair(&format!("{}, credit {}", label, i))).collect();
+	let mut keys = [[0u8; 32]; 4];
+	for (i, c) in credits.iter().enumerate() {
+		keys[i] = xonly(c).serialize();
+		common::client::hold_key(c);
+	}
+	let landed = SeqdexOrder {
+		terms: OrderTerms { asset_a: r.x, asset_b: r.y, rate_num: 1, rate_den: 1, min_lot: LOT },
+		maker: arca_covenant::script::sha256(common::node::op_true().as_bytes()),
+		expiry: common::rounds::mtp(r).to_consensus_u32() + 60 * 86_400,
+		refund_key: xonly(&keypair(&format!("{}, refund", label))),
+		version: SeqdexVersion::V2,
+	};
+	Maker { key: keypair(label), credits, credit_nonces: [random32(), random32(), random32(), random32()],
+		terms: OrderLeafTerms { landed, credits: keys } }
+}
+
+/// The wanted `order-3` leaf of `value` of X.
+fn want_order(m: &Maker, value: u64, asset: AssetId) -> (OutputRequest, [u8; 32]) {
+	common::client::hold_key(&m.key);
+	let nonce = random32();
+	(OutputRequest::Leaf {
+		asset, value, template: arca_covenant::Template::Order3, owner: xonly(&m.key), owner_nonce: nonce,
+		exit_delay: common::client::exit_delay(), order: Some(m.terms), landing: None, channel: None,
+	}, nonce)
+}
+
+/// A participation giving up `coins` for the leaves `wants`; its id.
+fn submit_wants(r: &Running, coins: &[&Coin], wants: &[OutputRequest]) -> [u8; 32] {
+	let held: Vec<&Held> = coins.iter().map(|c| &c.held).collect();
+	let (body, id) = participation_body(&held, wants, &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending", "{}", body);
+	id
+}
+
+/// Runs every round there is to run (X's first), each made final.
+async fn all_rounds(r: &Running) -> usize {
+	let mut built = vec![];
+	while let Some(b) = r.server.rounds.run_round().await.unwrap() {
+		r.produce().await;
+		built.push(b.tx.txid());
+	}
+	r.bury().await;
+	for t in &built {
+		round_final(r, t).await;
+	}
+	built.len()
+}
+
+/// `m` publishes its order resting at `coin`; the state view of it.
+fn publish(r: &Running, m: &Maker, coin: &Coin) -> Value {
+	let mailbox = xonly(&keypair("makers' mailbox"));
+	let digest = server::orders::publish_digest(&r.chain, &xonly(&r.s), &coin.held.id, &m.credit_nonces, &mailbox);
+	let st = r.http.post("order_publish", &json!({
+		"record": hex(&coin.held.record.to_bytes().unwrap()),
+		"credit_nonces": m.credit_nonces.iter().map(|n| hex(n)).collect::<Vec<_>>(),
+		"mailbox": hex(&mailbox.serialize()),
+		"signature": hex(sign_digest(&m.key, &digest, &random32()).as_ref()),
+	})).ok();
+	assert_eq!(st["state"], "resting", "{}", st);
+	st
+}
+
+/// A taker's fill of `filled` of the order whose state view is `st`, paid
+/// with `paid` (its checkpoint keeping all but one atom) into the leaves
+/// `got` and `change`, the fill keeping one atom (`order` is the coin the
+/// order rests at); its coin's delegation
+/// into the fill when `delegate`, signed by `signer`.
+#[allow(clippy::too_many_arguments)]
+fn fill_body(r: &Running, st: &Value, order: &Coin, paid: &Coin, filled: u64, got: &NewLeaf, change: &NewLeaf, delegate: bool,
+	signer: &Keypair) -> (Value, Vec<ExplicitOutput>)
+{
+	let bases = joined(&[order, paid]);
+	let s = xonly(&r.s);
+	let record = CoinRecord::from_bytes(&common::client::unhex(st["record"].as_str().unwrap())).unwrap();
+	let oc = record.resolve(&bases, &r.policy()).unwrap();
+	let p = oc.leaf.order_policy().unwrap();
+	let v = paid.valid(r);
+	let kept = v.value - 1;
+	let plan = p.plan(oc.value, filled).unwrap();
+	let change_value = kept - plan.credit.value - 1;
+	let mut outputs = vec![plan.credit.clone()];
+	outputs.extend(plan.rest.clone());
+	outputs.push(ExplicitOutput::new(r.x, filled, got.policy(s, r.chain).script_pubkey()));
+	outputs.push(ExplicitOutput::new(v.asset, change_value, change.policy(s, r.chain).script_pubkey()));
+	let tplan = arca_covenant::TransferPlan { inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let mut named = vec![oc.output().txout()];
+	named.push(tplan.checkpoint_output(0).txout());
+	let cp = sign_digest(&paid.held.key, &tplan.checkpoint_message(0).unwrap().digest, &random32());
+	let re = sign_digest(&paid.held.key, &tplan.checkpoint(0).message_in(1, &named, &outputs).unwrap().digest, &random32());
+	let leaf_json = |asset: AssetId, value: u64, l: &NewLeaf| json!({
+		"asset": asset.to_string(), "value": value.to_string(), "owner": hex(&l.owner.serialize()), "owner_nonce": hex(&l.owner_nonce),
+		"creator_nonce": hex(&l.creator_nonce), "exit_delay_units": l.exit_delay.units(),
+	});
+	let mut input = json!({"leaf_id": paid.held.id.to_string(), "checkpoint_value": kept.to_string(), "checkpoint_sig": hex(cp.as_ref()),
+		"reassignment_sig": hex(re.as_ref())});
+	if delegate {
+		let d = Delegation::for_fill(&v.leaf, &p, &outputs, &[*got, *change]).unwrap();
+		input["delegation_sig"] = json!(hex(sign_digest(signer, &d.message().digest, &random32()).as_ref()));
+	}
+	(json!({"order": st["order"], "coin": st["coin"], "filled": filled.to_string(), "inputs": [input],
+		"outputs": [leaf_json(r.x, filled, got), leaf_json(v.asset, change_value, change)]}), outputs)
+}
+
+/// The transactions the coins' records rest on, each once.
+fn joined(coins: &[&Coin]) -> Vec<Transaction> {
+	let mut out: Vec<Transaction> = vec![];
+	for c in coins {
+		for t in &c.bases {
+			if !out.iter().any(|o| o.txid() == t.txid()) {
+				out.push(t.clone());
+			}
+		}
+	}
+	out
+}
+
+/// The maker's delegation of its order coin into fill `transfer`, checked
+/// against `made` (a coin the fill made the maker) and signed by `signer`.
+fn maker_delegation(r: &Running, transfer: &str, made: &arca_covenant::ValidCoin, signer: &Keypair) -> Value {
+	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
+	let takers: Vec<NewLeaf> = t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
+		enclave: None, v2: false, htlc: None, landing: None,
+		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
+		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
+		creator_nonce: common::client::unhex(l["creator_nonce"].as_str().unwrap()).try_into().unwrap(),
+		exit_delay: arca_covenant::RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),
+	}).collect();
+	let d = Delegation::for_filled_order(made, &takers).unwrap();
+	json!({"transfer_id": transfer, "signature": hex(sign_digest(signer, &d.message().digest, &random32()).as_ref())})
+}
+
+/// The coins of a fill's answer, each held by its key and nonce.
+fn fill_coins(done: &Value, holders: &[(&Keypair, [u8; 32])], bases: &[Transaction]) -> Vec<Coin> {
+	done["outputs"].as_array().unwrap().iter().zip(holders).map(|(o, (k, n))| {
+		let record = CoinRecord::from_bytes(&common::client::unhex(o["record"].as_str().unwrap())).unwrap();
+		let id: arca_covenant::LeafId = o["leaf_id"].as_str().unwrap().parse().unwrap();
+		Coin { held: Held { key: **k, nonce: *n, id, record }, bases: bases.to_vec() }
+	}).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_orders_nodes_come_back_once_maker_and_taker_refresh() {
+	let mut r = Running::start_with(|c, y| {
+		c.batches.delegated_reclaim = true;
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
+	}).await;
+	let (x, y) = (r.x, r.y);
+	// Two coins of X: a round of Y pays its fee in X beside the round of X.
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let m = maker(&r, "M");
+	let (mk2, tk) = (keypair("M, plain"), keypair("T"));
+	let bm = boards(&mut r, &[keypair("M, board")], x).await.remove(0);
+	let bt = boards(&mut r, &[keypair("T, board")], y).await.remove(0);
+
+	// The order and the maker's plain leaf in one batch of X; the taker's
+	// leaf of Y in another.
+	let (wo, no) = want_order(&m, ORDER, x);
+	let (wp, np) = want_leaf(&mk2, x, VALUE - ORDER);
+	let idm = submit_wants(&r, &[&bm], &[wo, wp]);
+	let (wt, nt) = want_leaf(&tk, y, VALUE);
+	let idt = submit_wants(&r, &[&bt], &[wt]);
+	let built = all_rounds(&r).await;
+	assert_eq!(built, 2, "a round of X and one of Y");
+	let made = complete(&r, &idm, &[&bm], &[m.key, mk2], &[no, np], true).await;
+	let (order, plain) = (&made[0], &made[1]);
+	let tcoin = complete(&r, &idt, &[&bt], &[tk], &[nt], true).await.remove(0);
+	let st = publish(&r, &m, order);
+	println!("order {} rests with {} of X; the taker's coin {} holds {} of Y", order.held.id, ORDER, tcoin.held.id, VALUE);
+
+	// The taker fills 200,000: refused first with a delegation by another
+	// key, and with one over the outputs of a whole fill.
+	let (gk, ck) = (keypair("T, got"), keypair("T, change"));
+	let ((got, gn), (change, cn)) = (new_leaf(&gk), new_leaf(&ck));
+	let (body, outputs) = fill_body(&r, &st, order, &tcoin, 200_000, &got, &change, true, &mk2);
+	let a = r.http.post("order_fill", &body);
+	println!("refused, a taker's delegation by another key: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "bad_signature");
+	let (mut whole, _) = fill_body(&r, &st, order, &tcoin, 200_000, &got, &change, false, &tk);
+	let p = order.valid(&r).leaf.order_policy().unwrap();
+	let w = Delegation::new(r.chain, xonly(&tk), vec![p.credit_leaf().unwrap().owner, got.owner, change.owner]).unwrap();
+	whole["inputs"][0]["delegation_sig"] = json!(hex(sign_digest(&tk, &w.message().digest, &random32()).as_ref()));
+	let a = r.http.post("order_fill", &whole);
+	println!("refused, a taker's delegation that leaves out the order resting again: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "bad_signature");
+	assert_eq!(outputs.len(), 4);
+	let (body, _) = fill_body(&r, &st, order, &tcoin, 200_000, &got, &change, true, &tk);
+	let done = r.http.post("order_fill", &body).ok();
+	let transfer = done["transfer_id"].as_str().unwrap().to_string();
+	let maker_nonce = match &order.held.record { CoinRecord::Leaf { record, .. } => record.owner_nonce, _ => unreachable!() };
+	let coins = fill_coins(&done, &[(&m.credits[0], m.credit_nonces[0]), (&m.key, maker_nonce), (&gk, gn), (&ck, cn)], &joined(&[order, &tcoin]));
+	let (credit, rest, tgot, tchange) = (&coins[0], &coins[1], &coins[2], &coins[3]);
+	println!("filled 200,000: credit {}, rest {}, taker {} and {}; the taker's delegation recorded", credit.held.id, rest.held.id,
+		tgot.held.id, tchange.held.id);
+	let p = pool(&r, x);
+	assert_eq!(n(&p, "transferred"), ORDER, "the order's coin counts as paid on out of round");
+
+	// The maker delegates its order's coin: refused signed by its credit
+	// key, and over the taker's leaves in another order; an unknown fill.
+	let cv = credit.valid(&r);
+	let bad = maker_delegation(&r, &transfer, &cv, &m.credits[0]);
+	let a = r.http.post("order_fill_delegation", &bad);
+	println!("refused, the maker's delegation by its credit key: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "bad_signature");
+	let swapped = Delegation::new(r.chain, xonly(&m.key), vec![xonly(&m.credits[0]), xonly(&m.key), change.owner, got.owner]).unwrap();
+	let a = r.http.post("order_fill_delegation", &json!({"transfer_id": transfer,
+		"signature": hex(sign_digest(&m.key, &swapped.message().digest, &random32()).as_ref())}));
+	println!("refused, the maker's delegation over the taker's leaves swapped: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "bad_signature");
+	let a = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": hex(&random32())}));
+	println!("refused, the terms of an unknown fill: {} {:?}", a.status, a.refusal());
+	assert_eq!((a.status, a.refusal().0.as_str()), (404, "unknown_fill"));
+	let good = maker_delegation(&r, &transfer, &cv, &m.key);
+	assert_eq!(r.http.post("order_fill_delegation", &good).ok()["kept"], true);
+	assert_eq!(r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok()["delegated"], true);
+
+	// The maker cancels the order resting again into a leaf of its own,
+	// delegating; then everyone refreshes and releases.
+	let mc = keypair("M, cancelled");
+	let cancelled = pay(&r, rest, &[(mc, 0)], true).remove(0);
+	let ids = [
+		submit(&r, &[credit], &[keypair("M, credit new")]),
+		submit(&r, &[plain], &[keypair("M, plain new")]),
+		submit(&r, &[&cancelled], &[keypair("M, cancelled new")]),
+		submit(&r, &[tgot], &[keypair("T, got new")]),
+		submit(&r, &[tchange], &[keypair("T, change new")]),
+	];
+	let keys = ["M, credit new", "M, plain new", "M, cancelled new", "T, got new", "T, change new"];
+	let given = [credit, plain, &cancelled, tgot, tchange];
+	all_rounds(&r).await;
+	for ((id, nn), (c, k)) in ids.iter().zip(given.iter().zip(keys)) {
+		complete(&r, id, &[c], &[keypair(k)], nn, true).await;
+	}
+	let reclaims = passes(&r).await;
+	let (px, py) = (pool(&r, x), pool(&r, y));
+	println!("after every holder refreshed: reclaims {}; X locked {}, transferred {}; Y locked {}, transferred {}", reclaims.len(),
+		n(&px, "locked"), n(&px, "transferred"), n(&py, "locked"), n(&py, "transferred"));
+	for w in &reclaims {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		println!("reclaim {} ({:?}): {} vB; {}", common::flow::txid(w), w.state, tx.vsize(), w.detail);
+	}
+	assert!(reclaims.len() >= 2, "the order's node and the taker's come back by RECLAIM-D");
+	assert!(reclaims.iter().all(|w| w.state == server::store::NurseryState::Final), "each reclaim is final");
+	assert_eq!((n(&px, "transferred"), n(&py, "transferred")), (0, 0));
+}
+
+/// A maker resting an order every round, which a taker fills whole: the
+/// maker refreshes its credit and its other leaf of X each round, the taker
+/// what it got once. The maker delegates its order's coin into each fill
+/// when `delegated`. The pool of X after each round: locked, transferred,
+/// reclaims so far.
+async fn filled_every_round(delegated: bool, rounds: usize) -> Vec<(u64, u64, usize)> {
+	let mut r = Running::start_with(|c, y| {
+		c.batches.delegated_reclaim = true;
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
+	}).await;
+	let (x, y) = (r.x, r.y);
+	r.fund_wallet_in(x, 300_000_000).await;
+	r.fund_wallet_in(x, 300_000_000).await;
+	r.fund_wallet_in(y, 300_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let tag = if delegated { "d" } else { "c" };
+	let mb: Vec<Keypair> = (0..rounds).map(|k| keypair(&format!("maker board {} {}", k, tag))).collect();
+	let tb: Vec<Keypair> = (0..rounds).map(|k| keypair(&format!("taker board {} {}", k, tag))).collect();
+	let mboards = boards(&mut r, &mb, x).await;
+	let mut held_x: Option<Coin> = None;
+	let mut held_y: Option<Coin> = None;
+	let mut last: Option<(Coin, Coin, Coin)> = None; // the credit, the taker's leaf and change
+	let mut out = vec![];
+	for k in 0..rounds {
+		// The maker: its board and its leaf of X for this round's order and
+		// a leaf of X; its credit and its leaf of Y for a leaf of Y. The
+		// taker refreshes what the last fill gave it.
+		let m = maker(&r, &format!("maker {} {}", k, tag));
+		let px = keypair(&format!("maker x {} {}", k, tag));
+		let mut give_x: Vec<&Coin> = vec![&mboards[k]];
+		give_x.extend(held_x.iter());
+		let total_x: u64 = give_x.iter().map(|c| c.valid(&r).value).sum();
+		let (wo, no) = want_order(&m, ORDER, x);
+		let (wp, np) = want_leaf(&px, x, total_x - ORDER);
+		let idx = submit_wants(&r, &give_x, &[wo, wp]);
+		let mut idy = None;
+		let mut taker_ids = vec![];
+		if let Some((credit, got, change)) = &last {
+			let py = keypair(&format!("maker y {} {}", k, tag));
+			let mut give_y: Vec<&Coin> = vec![credit];
+			give_y.extend(held_y.iter());
+			let total_y: u64 = give_y.iter().map(|c| c.valid(&r).value).sum();
+			let (wy, ny) = want_leaf(&py, y, total_y);
+			idy = Some((submit_wants(&r, &give_y, &[wy]), py, ny));
+			for (c, label) in [(got, "got"), (change, "change")] {
+				let nk = keypair(&format!("taker refreshed {} {} {}", label, k, tag));
+				taker_ids.push((submit(&r, &[c], &[nk]), c.clone(), nk));
+			}
+		}
+		all_rounds(&r).await;
+		let made = complete(&r, &idx, &give_x, &[m.key, px], &[no, np], true).await;
+		if let (Some((id, py, ny)), Some((credit, _, _))) = (&idy, &last) {
+			let mut give_y: Vec<&Coin> = vec![credit];
+			give_y.extend(held_y.iter());
+			held_y = Some(complete(&r, id, &give_y, &[*py], &[*ny], true).await.remove(0));
+		}
+		for ((id, nn), c, nk) in &taker_ids {
+			complete(&r, id, &[c], &[*nk], nn, true).await;
+		}
+		let (order, plain) = (made[0].clone(), made[1].clone());
+		held_x = Some(plain);
+
+		// The order rests; the taker fills it whole from a board of Y made
+		// now (a board's service expiry must not come before the order's).
+		let tboard = boards(&mut r, &tb[k..k + 1], y).await.remove(0);
+		let st = publish(&r, &m, &order);
+		let (gk, ck) = (keypair(&format!("taker got {} {}", k, tag)), keypair(&format!("taker change {} {}", k, tag)));
+		let ((got, gn), (change, cn)) = (new_leaf(&gk), new_leaf(&ck));
+		let (body, _) = fill_body(&r, &st, &order, &tboard, ORDER, &got, &change, true, &tb[k]);
+		let done = r.http.post("order_fill", &body).ok();
+		let transfer = done["transfer_id"].as_str().unwrap().to_string();
+		let coins = fill_coins(&done, &[(&m.credits[0], m.credit_nonces[0]), (&gk, gn), (&ck, cn)], &joined(&[&order, &tboard]));
+		if delegated {
+			let d = maker_delegation(&r, &transfer, &coins[0].valid(&r), &m.key);
+			assert_eq!(r.http.post("order_fill_delegation", &d).ok()["kept"], true);
+		}
+		last = Some((coins[0].clone(), coins[1].clone(), coins[2].clone()));
+		let reclaims = passes(&r).await;
+		let p = pool(&r, x);
+		println!("{} round {}: reclaims {}; X locked {}, transferred {}, in flight {}", if delegated { "maker delegates" } else { "control" },
+			k, reclaims.len(), n(&p, "locked"), n(&p, "transferred"), n(&p, "in_flight"));
+		out.push((n(&p, "locked"), n(&p, "transferred"), reclaims.len()));
+	}
+	out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maker_filled_every_round_keeps_transferred_bounded() {
+	const ROUNDS: usize = 5;
+	let with = filled_every_round(true, ROUNDS).await;
+	println!("maker delegates: transferred by round {:?}; reclaims {}", with.iter().map(|w| w.1).collect::<Vec<_>>(), with[ROUNDS - 1].2);
+	assert!(with[ROUNDS - 1].2 >= ROUNDS - 1, "the batch of every round's order comes back at the next");
+	assert!(with.iter().all(|w| w.1 <= ORDER), "transferred holds at most the last round's order: {:?}", with);
+	let without = filled_every_round(false, ROUNDS).await;
+	println!("control: transferred by round {:?}; reclaims {}", without.iter().map(|w| w.1).collect::<Vec<_>>(), without[ROUNDS - 1].2);
+	assert_eq!(without[ROUNDS - 1].1, ROUNDS as u64 * ORDER, "without the maker's delegation every filled order waits for its expiry");
+}
+
+/// One of four leaves on a node is paid on with its delegation, to P and
+/// change; P refreshes, releasing when `release`. Then the change and the
+/// other three leaves refresh under a cap of 1,500,000. The most in flight
+/// after any round, and whether the node came back (arca#450).
+async fn payee_refreshes(tag: &str, release: bool) -> (u64, bool) {
+	let cap = VALUE * 3 / 2;
+	let names: Vec<String> = (0..4).map(|i| format!("{} U{}", tag, i)).collect();
+	let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+	let (r, c) = first_leaves(Some(cap), &refs).await;
+	let node = c[0].valid(&r).release_nodes()[0].1;
+	assert!(c.iter().all(|co| co.valid(&r).release_nodes()[0].1 == node), "one lowest node for all four");
+	let paid = pay(&r, &c[0], &[(keypair(&format!("{} P", tag)), 500_000), (keypair(&format!("{} U0 change", tag)), 0)], true);
+	let k = keypair(&format!("{} P new", tag));
+	let (pid, nn) = submit(&r, &[&paid[0]], &[k]);
+	round(&r).await;
+	complete(&r, &pid, &[&paid[0]], &[k], &nn, release).await;
+	let held: Vec<Coin> = vec![paid[1].clone(), c[1].clone(), c[2].clone(), c[3].clone()];
+	let mut pending = vec![];
+	for (j, h) in held.iter().enumerate() {
+		let k = keypair(&format!("{} r {}", tag, j));
+		let (id, nn) = submit(&r, &[h], &[k]);
+		pending.push((j, id, nn, k));
+	}
+	let (mut most, mut back) = (0, false);
+	for rn in 0..4 {
+		let Some(built) = r.server.rounds.run_round().await.unwrap() else { break };
+		r.produce().await;
+		r.bury().await;
+		round_final(&r, &built.tx.txid()).await;
+		let mut left = vec![];
+		for (j, id, nn, k) in pending.drain(..) {
+			if status(&r, &id)["state"] == "pending" {
+				left.push((j, id, nn, k));
+			} else {
+				complete(&r, &id, &[&held[j]], &[k], &nn, true).await;
+			}
+		}
+		pending = left;
+		let reclaims = passes(&r).await;
+		back |= reclaims.iter().any(|w| w.subject == node.to_vec());
+		let p = pool(&r, r.x);
+		most = most.max(n(&p, "in_flight"));
+		println!("{} round {}: {} refreshes wait; in flight {} of a cap of {}; node back {}", tag, rn, pending.len(), n(&p, "in_flight"), cap, back);
+		if pending.is_empty() {
+			break;
+		}
+	}
+	(most, back)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payee_that_refreshes_without_a_release_holds_the_cap() {
+	let (most, back) = payee_refreshes("norel", false).await;
+	assert!(!back, "the node cannot come back: P's release never came");
+	assert!(most <= VALUE * 3 / 2, "nothing runs past the cap as completing a node that cannot complete: {}", most);
+	let (_, back) = payee_refreshes("control", true).await;
+	assert!(back, "with P's release the node comes back");
+}
+
+/// The `htlc-1` send leaf of a payment out of the tree (arca#431): a batch
+/// leaf pays one, with change, delegating; the payment is then decided as
+/// A's node decides it (here written to the store: no Lightning node runs,
+/// and `lightning_pay` covers the payment itself). The sender's release is
+/// refused while the payment is paying and with another key; once it is
+/// paid the sender releases, the change and the other leaf refresh, and the
+/// node comes back by RECLAIM-D.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paid_sends_leaf_is_released_by_its_sender() {
+	use arca_covenant::{HtlcDirection, HtlcTerms, RelativeTime, TransferPlan};
+	use server::cosign::{InputRequest, OutputRequest, TransferRequest};
+	let (r, c) = first_leaves(None, &["S", "D"]).await;
+	let x = r.x;
+	let node = c[0].valid(&r).release_nodes()[0].1;
+	assert_eq!(c[1].valid(&r).release_nodes()[0].1, node, "one lowest node");
+	let v = c[0].valid(&r);
+	let (hk, ck) = (keypair("S, htlc"), keypair("S, change"));
+	let preimage = random32();
+	let hash = arca_covenant::script::sha256(&preimage);
+	let (mut hl, _) = new_leaf(&hk);
+	hl.htlc = Some(HtlcTerms { direction: HtlcDirection::Send, payment_hash: hash,
+		timeout: arca_covenant::MedianTime::from_consensus(common::rounds::mtp(&r).to_consensus_u32() + 7 * 86_400).unwrap(),
+		operator_delay: RelativeTime::from_units(hl.exit_delay.units() - 1).unwrap() });
+	let (cl, cn) = new_leaf(&ck);
+	let kept = v.value - 2_000;
+	let outs = [(x, 400_000, hl), (x, kept - 2_000 - 400_000, cl)];
+	let outputs: Vec<ExplicitOutput> = outs.iter().map(|(a, val, l)| ExplicitOutput::new(*a, *val, l.policy(xonly(&r.s), r.chain).script_pubkey())).collect();
+	let plan = TransferPlan { inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let sk = &c[0].held.key;
+	let d = Delegation::for_reassignment(&v, &outputs, &[hl, cl]).unwrap();
+	let req = TransferRequest {
+		inputs: vec![InputRequest { leaf_id: v.id, checkpoint_value: kept,
+			checkpoint_sig: sign_digest(sk, &plan.checkpoint_message(0).unwrap().digest, &random32()),
+			reassignment_sig: sign_digest(sk, &plan.reassignment_message(0).unwrap().digest, &random32()),
+			delegation_sig: Some(sign_digest(sk, &d.message().digest, &random32())) }],
+		outputs: outs.iter().map(|(a, val, l)| OutputRequest { asset: *a, value: *val, leaf: *l, mailbox: None, until: None }).collect(),
+	};
+	let done = r.server.cosigner.cosign_htlc(&req).await.unwrap();
+	let (htlc_id, htlc_record) = done.outputs[0].clone();
+	let change = Coin { held: Held { key: ck, nonce: cn, id: done.outputs[1].0, record: done.outputs[1].1.clone() }, bases: c[0].bases.clone() };
+	let row = server::store::SendRow { payment_hash: hash, asset: { use elements::hashes::Hash; x.into_inner().to_byte_array() },
+		invoice: "lnsq1test".into(), amount: 399_000, fee: 1_000, transfer_id: done.transfer_id, htlc_leaf_id: htlc_id.0,
+		state: server::store::SendState::Paying, preimage: None, reason: None };
+	r.db.store.record_send(&row).await.unwrap();
+
+	// The terms and a release while the payment is paying: refused.
+	let terms_of = || r.http.post("lightning_send_release_terms", &json!({"payment_hash": hex(&hash)}));
+	let a = terms_of();
+	println!("refused, the release terms of a payment still paying: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "release_early");
+	r.db.store.decide_send(&hash, Some(&preimage), None).await.unwrap();
+	let t = terms_of().ok();
+	assert_eq!(t["nodes"], json!([hex(&node)]), "{}", t);
+	assert_eq!(t["released"], json!([]));
+	let round_tx: Transaction = elements::encode::deserialize(&common::client::unhex(t["round"]["tx"].as_str().unwrap())).unwrap();
+	let cv = t["round"]["connector_vout"].as_u64().unwrap() as u32;
+	let hv = htlc_record.resolve(&c[0].bases, &r.policy()).unwrap();
+	assert!(Release::for_paid_send(&hv, &random32(), &round_tx, cv).is_err(), "a preimage of another hash");
+	let rel = Release::for_paid_send(&hv, &preimage, &round_tx, cv).unwrap();
+	assert_eq!(rel.len(), 1);
+	let body = |key: &Keypair| json!({"payment_hash": hex(&hash), "round_txid": round_tx.txid().to_string(),
+		"releases": [{"node": hex(&rel[0].node_hash), "signature": hex(sign_digest(key, &rel[0].message().digest, &random32()).as_ref())}]});
+	let a = r.http.post("lightning_send_release", &body(sk));
+	println!("refused, a paid send's release by the coin's sender's old key: {:?}", a.refusal());
+	assert_eq!(a.refusal().0, "bad_signature");
+	let a = r.http.post("lightning_send_release", &body(&hk)).ok();
+	assert_eq!(a["released"], json!([hex(&node)]));
+	assert_eq!(terms_of().ok()["released"], json!([hex(&node)]));
+
+	// The change and D refresh and release: the node comes back.
+	let (k1, k2) = (keypair("S, change new"), keypair("D new"));
+	let (i1, n1) = submit(&r, &[&change], &[k1]);
+	let (i2, n2) = submit(&r, &[&c[1]], &[k2]);
+	round(&r).await;
+	complete(&r, &i1, &[&change], &[k1], &n1, true).await;
+	complete(&r, &i2, &[&c[1]], &[k2], &n2, true).await;
+	let reclaims = passes(&r).await;
+	let mine: Vec<_> = reclaims.iter().filter(|w| w.subject == node.to_vec()).collect();
+	for w in &mine {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		println!("reclaim {} ({:?}): {} vB; {}", common::flow::txid(w), w.state, tx.vsize(), w.detail);
+	}
+	assert!(mine.iter().any(|w| w.state == server::store::NurseryState::Final), "the node comes back with the sender's release");
+	assert_eq!(n(&pool(&r, x), "transferred"), 0);
 }

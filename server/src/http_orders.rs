@@ -95,6 +95,36 @@ pub(super) async fn order_fill(State(app): State<Arc<App>>, body: Result<Bytes, 
 	}))
 }
 
+/// What the maker of a filled order signs its order coin's delegation into
+/// the fill over ([`crate::orders::Orders::delegation_terms`]).
+pub(super) async fn order_fill_delegation_terms(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::FillDelegationTerms>, Refusal>
+{
+	let req: api::FillRef = parse(body, app.max_request)?;
+	let transfer = unhex32(&req.transfer_id).map_err(Refusal::malformed)?;
+	let t = app.orders.delegation_terms(&transfer).await?;
+	Ok(Json(api::FillDelegationTerms {
+		transfer_id: hex(&t.transfer_id),
+		order_coin: t.order_coin.to_string(),
+		takers: t.takers.iter().map(|l| api::FillTakerLeaf {
+			owner: hex(&l.owner.serialize()), owner_nonce: hex(&l.owner_nonce), creator_nonce: hex(&l.creator_nonce),
+			exit_delay_units: l.exit_delay.units(),
+		}).collect(),
+		delegated: t.delegated,
+	}))
+}
+
+/// Takes a maker's delegation of its order coin into a fill
+/// ([`crate::orders::Orders::delegate`]).
+pub(super) async fn order_fill_delegation(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::FillDelegated>, Refusal>
+{
+	let req: api::FillDelegation = parse(body, app.max_request)?;
+	let transfer = unhex32(&req.transfer_id).map_err(Refusal::malformed)?;
+	let kept = app.orders.delegate(&transfer, &sig(&req.signature)?).await?;
+	Ok(Json(api::FillDelegated { transfer_id: hex(&transfer), kept }))
+}
+
 /// How resting orders stand: anyone may read it, a relay included.
 pub(super) async fn order_state(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
 	body: Result<Bytes, BytesRejection>) -> Result<Json<api::OrderStates>, Refusal>

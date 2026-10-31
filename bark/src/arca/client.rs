@@ -336,7 +336,7 @@ pub const REFUSALS: &[&str] = &[
 	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",
-	"unknown_batch", "unknown_board", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator",
+	"unknown_batch", "unknown_board", "unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator",
 	"wrong_round",
 ];
 

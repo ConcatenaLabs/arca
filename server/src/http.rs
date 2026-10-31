@@ -385,7 +385,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"owed_claimed" | "owed_withdrawn" => StatusCode::CONFLICT,
-		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
 			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" =>
 			StatusCode::CONFLICT,
@@ -1038,6 +1038,41 @@ async fn lightning_send_status(State(app): State<Arc<App>>, body: Result<Bytes, 
 		Some(r) => Ok(Json(payment(&r))),
 		None => Err(Refusal::new(StatusCode::NOT_FOUND, "unknown_payment", format!("no payment for hash {} is known", req.payment_hash))),
 	}
+}
+
+/// What the sender of a paid payment out of the tree signs to release its
+/// `htlc-1` leaf's nodes ([`crate::lightning::send::Sends::release_terms`]).
+async fn lightning_send_release_terms(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningSendReleaseTerms>, Refusal>
+{
+	let req: api::LightningSendStatus = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	let t = app.sends.release_terms(&hash).await?;
+	Ok(Json(api::LightningSendReleaseTerms {
+		payment_hash: hex(&hash),
+		htlc_leaf_id: LeafId(t.payment.htlc_leaf_id).to_string(),
+		nodes: t.nodes.iter().map(|n| hex(n)).collect(),
+		round: t.round.map(|r| api::RoundRef {
+			txid: { use elements::hashes::Hash; elements::Txid::from_byte_array(r.txid).to_string() }, connector_vout: r.connector_vout, tx: Some(hex(&r.tx)),
+		}),
+		released: t.released.iter().map(|n| hex(n)).collect(),
+	}))
+}
+
+/// Takes the releases of a paid payment's sender
+/// ([`crate::lightning::send::Sends::take_releases`]).
+async fn lightning_send_release(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::LightningSendReleased>, Refusal>
+{
+	let req: api::LightningSendRelease = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	let round = elements::Txid::from_str(&req.round_txid).map_err(|e| Refusal::malformed(format!("round_txid: {}", e)))?;
+	let mut releases = Vec::with_capacity(req.releases.len());
+	for r in &req.releases {
+		releases.push((unhex32(&r.node).map_err(Refusal::malformed)?, sig(&r.signature)?));
+	}
+	let done = { use elements::hashes::Hash; app.sends.take_releases(&hash, &round.to_byte_array(), &releases).await? };
+	Ok(Json(api::LightningSendReleased { payment_hash: hex(&hash), released: done.iter().map(|n| hex(n)).collect() }))
 }
 
 fn participation_status(s: &Status) -> api::ParticipationStatus {
@@ -1875,6 +1910,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/cosign_transfer", post(cosign_transfer))
 		.route("/v1/lightning_send", post(lightning_send))
 		.route("/v1/lightning_send_status", post(lightning_send_status))
+		.route("/v1/lightning_send_release_terms", post(lightning_send_release_terms))
+		.route("/v1/lightning_send_release", post(lightning_send_release))
 		.route("/v1/lightning_receive", post(lightning_receive))
 		.route("/v1/lightning_receive_status", post(lightning_receive_status))
 		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
@@ -1898,6 +1935,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/plan_leaf", post(plans::plan_leaf))
 		.route("/v1/order_publish", post(orders::order_publish))
 		.route("/v1/order_fill", post(orders::order_fill))
+		.route("/v1/order_fill_delegation_terms", post(orders::order_fill_delegation_terms))
+		.route("/v1/order_fill_delegation", post(orders::order_fill_delegation))
 		.route("/v1/order_state", post(orders::order_state))
 		.route("/v1/tree", post(tree))
 		.route("/v1/rounds", post(rounds))

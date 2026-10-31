@@ -74,7 +74,7 @@ use arca_covenant::order::OrderPolicy;
 use arca_covenant::sign::verify_digest;
 use arca_covenant::spend::{margin_for, Rebindable};
 use arca_covenant::transfer::{fill_hash, FillCoin, FillLeaf, OrderFill, SeenReassignments, TransferInput, MAX_INPUTS};
-use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, MedianTime, Pair, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
+use arca_covenant::{CoinRecord, Delegation, ExplicitOutput, LeafId, MedianTime, NewLeaf, Pair, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
 use crate::chain::FinalityService;
 use crate::coins::{self, BoardDates, Checked, CoinError};
@@ -312,6 +312,8 @@ pub enum OrderError {
 	Malformed(String),
 	#[error("no resting order {0} is published here")]
 	UnknownOrder(String),
+	#[error("no fill {0} of a resting order is recorded here")]
+	UnknownFill(String),
 	#[error("{0}")]
 	NotAnOrder(String),
 	#[error("{0}")]
@@ -331,6 +333,7 @@ impl OrderError {
 		match self {
 			OrderError::Malformed(_) => "malformed",
 			OrderError::UnknownOrder(_) => "unknown_order",
+			OrderError::UnknownFill(_) => "unknown_fill",
 			OrderError::NotAnOrder(_) => "not_an_order",
 			OrderError::Moved(_) => "order_moved",
 			OrderError::Terms(_) => "order",
@@ -723,6 +726,20 @@ impl Orders {
 			}
 			messages.push((cp, re));
 		}
+		// Each taker coin's delegation, against the fill's outputs as the
+		// server builds them; one for a coin that rests on no lowest node with
+		// RECLAIM-D is of no use and is not kept.
+		let takers: Vec<NewLeaf> = req.outputs.iter().map(|o| o.leaf).collect();
+		let mut delegations = vec![];
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+			let Some(d) = &i.delegation_sig else { continue };
+			if Delegation::for_fill(&c.coin.leaf, &op, &outputs, &takers).and_then(|x| x.verify(d)).is_err() {
+				return Err(OrderError::Cosign(CosignError::BadSignature { input: k, which: "delegation" }));
+			}
+			if !c.coin.release_nodes().is_empty() {
+				delegations.push((c.coin.id, *d));
+			}
+		}
 		let txouts: Vec<_> = outputs.iter().map(|o| o.txout()).collect();
 		let fill_digest = op.fill_digest(oc.coin.value, &txouts).map_err(internal)?;
 
@@ -827,6 +844,12 @@ impl Orders {
 					StoreError::LeafSpent(id) => OrderError::Cosign(CosignError::DoubleSpend(id.parse().unwrap_or(req.coin))),
 					other => other.into(),
 				})?;
+		}
+
+		// The taker's delegations, kept with the fill recorded; one given
+		// again with a repeated request stays as it was.
+		for (id, d) in &delegations {
+			self.store.insert_delegation(&id.0, &transfer, &cosign::sig_bytes(d)).await?;
 		}
 
 		// Nothing is signed while the signer holds anything else under the
@@ -960,6 +983,72 @@ impl Orders {
 			t.asset_b, if plan.rest.is_some() { format!(", {} resting at {}", plan.remainder, new_ids[1]) } else { String::new() });
 		let row = self.store.order_fill_by_transfer(&transfer).await?.ok_or_else(|| internal("a fill just signed is gone"))?;
 		self.answer(&transfer, &row).await
+	}
+}
+
+/// What a maker's wallet signs its order coin's delegation into a fill
+/// over: the order coin the fill spent, and the taker's leaves, in output
+/// order after the maker's.
+#[derive(Debug, Clone)]
+pub struct DelegationTerms {
+	pub transfer_id: [u8; 32],
+	pub order_coin: LeafId,
+	pub takers: Vec<NewLeaf>,
+	/// Whether the order coin's delegation into the fill is recorded.
+	pub delegated: bool,
+}
+
+impl Orders {
+	/// The fill `transfer`, signed, with its order coin, the outputs it
+	/// commits to and the taker's leaves from the request kept with it.
+	async fn signed_fill(&self, transfer: &[u8; 32]) -> Result<(OrderFillRow, Vec<ExplicitOutput>, Vec<NewLeaf>), OrderError> {
+		let f = self.store.order_fill_by_transfer(transfer).await?
+			.ok_or_else(|| OrderError::UnknownFill(hex(transfer)))?;
+		if f.signature.is_none() {
+			return Err(OrderError::Terms(format!("fill {} is not signed: its order coin delegates once it is", hex(transfer))));
+		}
+		let (request, outputs) = self.store.order_fill_terms(transfer).await?
+			.ok_or_else(|| internal("a signed fill without its reassignment"))?;
+		let request = request.ok_or_else(|| OrderError::Terms(format!("fill {} was recorded with no request kept: its taker's \
+			leaves are not known, and its order coin cannot delegate into it", hex(transfer))))?;
+		let req = FillRequest::from_bytes(&request).map_err(internal)?;
+		let outputs = cosign::decode_outputs(&outputs).map_err(internal)?;
+		Ok((f, outputs, req.outputs.iter().map(|o| o.leaf).collect()))
+	}
+
+	/// What the maker of the order a fill spent signs its delegation over
+	/// ([`Delegation::for_filled_order`]). Anyone may read it: the taker's
+	/// leaves name keys and nonces, no secret.
+	pub async fn delegation_terms(&self, transfer: &[u8; 32]) -> Result<DelegationTerms, OrderError> {
+		let (f, _, takers) = self.signed_fill(transfer).await?;
+		let delegated = self.store.delegation(&f.order_leaf).await?.is_some_and(|d| d.transfer_id == *transfer);
+		Ok(DelegationTerms { transfer_id: *transfer, order_coin: LeafId(f.order_leaf), takers, delegated })
+	}
+
+	/// Takes the order coin's delegation into the fill `transfer`, signed by
+	/// the order's leaf key over the owner keys of the fill's outputs in
+	/// order: the maker's credit, the order resting again for a partial
+	/// fill, then the taker's leaves ([`Delegation::for_fill`]). Kept only
+	/// when the order coin rests on a lowest node with RECLAIM-D. Returns
+	/// whether it is kept.
+	pub async fn delegate(&self, transfer: &[u8; 32], sig: &Signature) -> Result<bool, OrderError> {
+		let (f, outputs, takers) = self.signed_fill(transfer).await?;
+		let id = LeafId(f.order_leaf);
+		let row = self.store.leaf(&id.0).await?.ok_or_else(|| internal("a fill's order coin is gone"))?;
+		let record = CoinRecord::from_bytes(&row.record).map_err(internal)?;
+		let op = record.order_policy().ok_or_else(|| internal("a fill's order coin is not an order"))?;
+		if Delegation::for_fill(&op.leaf(), &op, &outputs, &takers).and_then(|d| d.verify(sig)).is_err() {
+			return Err(OrderError::Cosign(CosignError::BadSignature { input: 0, which: "delegation" }));
+		}
+		let now = self.now().await?;
+		let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
+		let coin = coins::resolve(&self.store, &policy, &id).await?;
+		if coin.coin.release_nodes().is_empty() {
+			return Ok(false);
+		}
+		self.store.insert_delegation(&id.0, transfer, &cosign::sig_bytes(sig)).await?;
+		log::info!("order coin {} delegated its release into fill {}", id, hex(transfer));
+		Ok(true)
 	}
 }
 

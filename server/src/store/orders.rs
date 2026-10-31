@@ -231,6 +231,17 @@ impl Store {
 	/// Drops a fill recorded and never signed: its transfer (and so its
 	/// taker's coins back) as [`Store::drop_transfer`] drops one, the order
 	/// coin given back, and its row.
+	/// What a maker's delegation of its order coin into fill `transfer_id`
+	/// is checked against: the request kept with the fill, when it was kept,
+	/// and the outputs its reassignment commits to, as `cosign` encodes them.
+	pub async fn order_fill_terms(&self, transfer_id: &[u8; 32]) -> Result<Option<(Option<Vec<u8>>, Vec<u8>)>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT f.request, r.outputs FROM order_fill f JOIN reassignment r USING (transfer_id) WHERE f.transfer_id = $1",
+			&[&&transfer_id[..]]).await?;
+		Ok(r.map(|r| (r.get(0), r.get(1))))
+	}
+
 	pub async fn drop_order_fill(&self, transfer_id: &[u8; 32], reason: &str) -> Result<(), StoreError> {
 		let Some(f) = self.order_fill_by_transfer(transfer_id).await? else { return Ok(()) };
 		if f.signature.is_some() {

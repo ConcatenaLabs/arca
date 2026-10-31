@@ -180,7 +180,7 @@ pub enum ForfeitError {
 	BadRelease(LeafId),
 	#[error("coin {leaf}'s release names the connector asset {named}; the participation's round's is {round}")]
 	WrongRound { leaf: LeafId, named: AssetId, round: AssetId },
-	#[error("coin {0} moved into a reassignment: its release is its delegation's, and the operator takes no release by its key")]
+	#[error("coin {0} moved into a reassignment, or its key delegated at a fill: its release is its delegation's, and the operator takes no release by its key")]
 	Delegated(LeafId),
 	#[error("coin {0} rests on no lowest node with RECLAIM-D whose children hash is the one named")]
 	NotOnNode(LeafId),
@@ -568,6 +568,14 @@ impl Forfeits {
 				Ok(CoinRecord::Leaf { record, .. }) => record,
 				// A coin a reassignment made: its holder releases each lowest
 				// node with RECLAIM-D it rests on, one at a time.
+				// The order resting again after a fill carries the order
+				// coin's own key, which delegated at that fill: a release by
+				// it would fill the order's slot directly, standing for the
+				// fill's other coins. It consents only through its own next
+				// delegation (a fill, or its maker's cancel).
+				Ok(CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }) => {
+					return Err(ForfeitError::Delegated(r.leaf_id));
+				},
 				Ok(CoinRecord::Transfer(_)) | Ok(CoinRecord::Fill(_)) => {
 					let node = r.node.ok_or(ForfeitError::NoLowestNode(r.leaf_id))?;
 					if let Some(named) = r.connector.filter(|n| *n != m) {
