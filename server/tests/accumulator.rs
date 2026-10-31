@@ -52,6 +52,9 @@ fn send(r: &Running, what: &str, tx: &Transaction) -> Txid {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_accumulator_batch_is_built_held_left_and_swept() {
 	let mut r = Running::start_with(|c, y| {
+		// What follows is the sweep of a live coin: the operator does not take
+		// it on the chain at its batch's release first.
+		c.watcher.unroll_at_release = false;
 		c.assets.push(server::server::AssetSection::new(y, MIN_LEAF));
 		c.batches.accumulator_exit_rate_ppm = Some(10_000);
 	}).await;

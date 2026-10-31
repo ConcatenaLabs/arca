@@ -4614,7 +4614,7 @@ async fn d57_a_coin_in_a_delisted_asset_comes_home_with_a_fee_coin_the_wallet_ch
 /// shows the coin lost, with the sweep that took it, once that is final.
 #[tokio::test(flavor = "multi_thread")]
 async fn d57_past_its_expiry_a_coin_goes_on_until_the_chain_says_it_is_gone() {
-	let mut r = Running::start().await;
+	let mut r = Running::start_sweeping().await;
 	let url = r.url();
 	let x = r.x;
 	let (a, b) = (Arca::new("D57XA"), Arca::new("D57XB"));
@@ -6010,7 +6010,7 @@ async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_
 	for final_first in [true, false] {
 		let tag = if final_first { "D58W the sweep final" } else { "D58W the sweep not yet final" };
 		let n = if final_first { 1 } else { 2 };
-		let mut r = Running::start().await;
+		let mut r = Running::start_sweeping().await;
 		let url = r.url();
 		let x = r.x;
 		let (a, b) = (Arca::new(&format!("D58WA{}", n)), Arca::new(&format!("D58WB{}", n)));

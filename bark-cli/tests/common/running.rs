@@ -52,6 +52,13 @@ impl Running {
 		Self::start_kept(0, None).await
 	}
 
+	/// [`Running::start`] with the operator's unroll at release off: for a
+	/// test that follows the sweep of a live coin, which the operator would
+	/// otherwise take on the chain under its holder's key first.
+	pub async fn start_sweeping() -> Running {
+		Self::start_with(|c, _, _| c.watcher.unroll_at_release = false).await
+	}
+
 	/// [`Running::start`], with the server's configuration changed by `tune`
 	/// first; `tune` is given the configuration and assets X and Y.
 	pub async fn start_with<F: FnOnce(&mut Config, AssetId, AssetId)>(tune: F) -> Running {

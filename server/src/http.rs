@@ -805,6 +805,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		},
 		bond,
 		swept: api::SweptInfo { policy: "repaid".into(), late_fee: "refresh".into() },
+		watchtowers: app.params.watchtowers.clone(),
 	})
 }
 

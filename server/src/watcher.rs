@@ -52,6 +52,12 @@
 //!    there, each sweep takes every unspent output of the batch whose own
 //!    notice has passed (the batch output, a node or entry someone unrolled, a
 //!    checkpoint of a coin from the batch) and returns the token to `R`.
+//!    Once the token is at `R`, before any sweep, every live coin of the
+//!    batch (a leaf of it, or a coin resting on one through transfers) that
+//!    no participation is giving up is brought on the chain under its
+//!    holder's key, one step a pass, paid from its path's reserves, as a
+//!    watchtower brings a deposited coin (`unroll_at_release`); so a sweep
+//!    takes only what no one could unroll.
 //! 6. **Reclaim.** A lowest node every owner of which has released it is
 //!    reclaimed with an atom of each `M` the releases name. With
 //!    `reclaim_early`, a node all of whose lowest nodes are released is
@@ -155,13 +161,16 @@ pub struct WatcherConfig {
 	/// The chain's block interval, to tell whether a forfeit published now
 	/// can be claimed within its refund delay.
 	pub block_interval: Duration,
+	/// Whether every live coin of a released batch is brought on the chain
+	/// under its holder's key before the sweep.
+	pub unroll_at_release: bool,
 }
 
 impl Default for WatcherConfig {
 	fn default() -> WatcherConfig {
 		WatcherConfig {
 			reclaim_early: true, max_sweep_inputs: 50, recovery_interval: Duration::from_secs(30),
-			max_claim_inputs: 200, block_share_vbytes: 45_000, block_interval: Duration::from_secs(60),
+			max_claim_inputs: 200, block_share_vbytes: 45_000, block_interval: Duration::from_secs(60), unroll_at_release: true,
 		}
 	}
 }
@@ -2178,6 +2187,9 @@ impl Watcher {
 						e.to_consensus_u32())).await?;
 			},
 			TokenPlace::Released => {
+				if self.config.unroll_at_release {
+					self.unroll_live(round, b, now).await?;
+				}
 				if !self.confirmed(at).await? || self.spending(&at).await?
 					|| !self.waited(at.txid, schedule.notice).await?
 				{
@@ -2225,6 +2237,60 @@ impl Watcher {
 				self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "sweep", subject,
 					format!("{} output(s) of the batch at output {} of round {}, {} of {}", swept.len(), b.vout, round.round_id, total, asset)).await?;
 			},
+		}
+		Ok(())
+	}
+
+	/// Brings every live coin of the released batch on the chain under its
+	/// holder's key, one step a coin a pass: each leaf of the batch, and each
+	/// coin resting on one through transfers, that is live, not on the chain,
+	/// not given up to a participation (its forfeit stored), not an `htlc-1`
+	/// leaf (its payment's own paths settle it) and not a claim leaf of a
+	/// distribution (which goes back to its payer). Paid from each output's
+	/// reserve where the node accepts the batch's asset, else from a wallet
+	/// coin.
+	async fn unroll_live(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
+		let Some((_, leaves)) = self.store.batch(&round.txid, b.vout).await? else { return Ok(()) };
+		let mut stack = vec![];
+		for bl in leaves {
+			if !self.store.is_distribution(&bl.participation_id).await? {
+				stack.push(bl.leaf_id);
+			}
+		}
+		let mut visited = HashSet::new();
+		let mut brought = 0usize;
+		while let Some(leaf) = stack.pop() {
+			if !visited.insert(leaf) {
+				continue;
+			}
+			let Some(row) = self.store.leaf(&leaf).await? else { continue };
+			match row.state {
+				LeafState::Live => {},
+				LeafState::Spent => {
+					stack.extend(self.store.transfer_outputs_of(&leaf).await?);
+					continue;
+				},
+				_ => continue,
+			}
+			if !self.store.sightings_of(&row.script_pubkey).await?.is_empty() || self.live_forfeit(&leaf).await?.is_some() {
+				continue;
+			}
+			let r = async {
+				let coin = self.coin(&leaf).await?;
+				if coin.leaf.htlc.is_some() {
+					return Ok(false);
+				}
+				self.bring_on_chain(&coin, now).await.map(|_| true)
+			}.await;
+			if Self::item(&format!("the unroll of coin {} of the released batch at output {} of round {}", hex(&leaf), b.vout,
+				round.round_id), r)? == Some(true)
+			{
+				brought += 1;
+			}
+		}
+		if brought > 0 {
+			log::info!("watcher: the batch at output {} of round {} is released: {} live coin(s) brought a step nearer the chain, \
+				each under its holder's key", b.vout, round.round_id, brought);
 		}
 		Ok(())
 	}

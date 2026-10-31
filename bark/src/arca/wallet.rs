@@ -3030,6 +3030,12 @@ impl Wallet {
 		let mut out = vec![];
 		for c in self.store.coins()? {
 			let mut v = Self::coin_json(&c);
+			let (kept, reboarded) = self.kept_safe(&c.leaf_id)?;
+			if kept {
+				v[super::tower::KEPT_SAFE] = json!(true);
+				v["kept_safe_note"] = json!(super::tower::KEPT_SAFE_NOTE);
+				v["reboarded"] = json!(reboarded);
+			}
 			if let Some(t) = CoinRecord::from_bytes(&c.record).ok().as_ref().and_then(template_of) {
 				v["template"] = json!(t.to_string());
 			}
@@ -3179,6 +3185,11 @@ impl Wallet {
 			// A channel coin counts the wallet's side of it alone.
 			let worth = self.channel_worth(&c)?.unwrap_or(c.value);
 			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += worth;
+			// Of what is exiting, a coin kept safe on the chain while the
+			// wallet was away, to be boarded back ([`super::tower`]).
+			if c.state == "exiting" && self.kept_safe(&c.leaf_id)?.0 {
+				*per.entry(c.asset.clone()).or_default().entry(super::tower::KEPT_SAFE.to_string()).or_default() += worth;
+			}
 		}
 		let mut onchain: BTreeMap<String, u64> = BTreeMap::new();
 		let mut frozen_onchain: BTreeMap<String, u64> = BTreeMap::new();

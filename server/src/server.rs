@@ -474,6 +474,14 @@ pub struct WatcherSection {
 	/// The chain's block interval, in seconds.
 	#[serde(default = "default_block_interval")]
 	pub block_interval_seconds: u64,
+	/// Bring every live coin of a released batch on the chain under its
+	/// holder's key before the sweep.
+	#[serde(default = "default_true")]
+	pub unroll_at_release: bool,
+	/// The watchtowers `info` lists for holders who name none of their own:
+	/// base URLs, each `https://`.
+	#[serde(default)]
+	pub watchtowers: Vec<String>,
 }
 
 impl Default for WatcherSection {
@@ -481,7 +489,8 @@ impl Default for WatcherSection {
 		WatcherSection {
 			enabled: true, reclaim_early: default_true(), max_sweep_inputs: default_sweep_inputs(),
 			recovery_interval_seconds: default_recovery_interval(), max_claim_inputs: default_claim_inputs(),
-			block_share_vbytes: default_block_share(), block_interval_seconds: default_block_interval(),
+			block_share_vbytes: default_block_share(), block_interval_seconds: default_block_interval(), unroll_at_release: true,
+			watchtowers: vec![],
 		}
 	}
 }
@@ -1639,6 +1648,7 @@ impl Server {
 		params.order_block_seconds = config.fills.block_seconds;
 		params.fill_forfeit_window_seconds = config.fills.forfeit_window_seconds;
 		params.round_interval_seconds = config.round_interval_seconds;
+		params.watchtowers = config.watcher.watchtowers.clone();
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
@@ -1682,6 +1692,7 @@ impl Server {
 				max_claim_inputs: config.watcher.max_claim_inputs.max(1),
 				block_share_vbytes: config.watcher.block_share_vbytes.max(1),
 				block_interval: Duration::from_secs(config.watcher.block_interval_seconds.max(1)),
+				unroll_at_release: config.watcher.unroll_at_release,
 			});
 
 		// The first pass before anything is answered, so the chain is known,

@@ -929,8 +929,15 @@ impl Wallet {
 		// What the claim's bid counts from (D76), kept across runs: when the
 		// claim opens, when it was first broadcast, and the leaf's rate when
 		// the node last accepted its asset.
-		let kept: Vec<(&str, Value)> = ["claim_from", "claimed_at", "leaf_rate"].iter()
+		let mut kept: Vec<(&str, Value)> = ["claim_from", "claimed_at", "leaf_rate", super::tower::KEPT_SAFE].iter()
 			.filter(|k| !prior[**k].is_null()).map(|k| (*k, prior[*k].clone())).collect();
+		// A coin whose leaf someone else brought on the chain before the
+		// wallet started any exit of it (a watchtower, or the operator, once
+		// its batch was released while the wallet was away): kept safe, and
+		// boarded back once its claim is final ([`Wallet::progress_reboards`]).
+		if prior.as_object().is_none_or(|o| o.is_empty()) && plan.is_empty() && coin.board().is_none() {
+			kept.push((super::tower::KEPT_SAFE, json!(true)));
+		}
 		let received = coin.leaf.htlc.is_some_and(|t| t.direction == HtlcDirection::Receive);
 		let record_exit = |state: &str, fee_asset: Option<AssetId>, s: &Wallet| -> Result<(), Error> {
 			let mut v = json!({"txs": plan.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(), "leaf": leaf_at.to_string(),
@@ -1569,6 +1576,12 @@ impl Wallet {
 		self.exits_meanwhile();
 		let forfeits = self.watch_forfeits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		steps.lap(self, "forfeits");
+		// Every live coin resting on a batch deposited with the watchtowers,
+		// every deposit of a coin no longer the wallet's withdrawn: none of
+		// it needs the operator.
+		self.exits_meanwhile();
+		let deposits = self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "deposits");
 		// D57: a coin the wallet cannot have refreshed goes home before its
 		// date, whatever the reason: every coin whose refresh has not
 		// completed a day before its exit date, and after a stop every coin
@@ -1602,6 +1615,10 @@ impl Wallet {
 		};
 		let home = self.home(true, &why).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		// A coin kept safe on the chain while the wallet was away, its claim
+		// final: boarded back.
+		let reboards = if talk { self.progress_reboards().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
 		if let Ok(now) = self.now() {
 			self.store.set_meta(super::wallet::LAST_EXITS, &now.to_consensus_u32().to_string())?;
 		}
@@ -1621,6 +1638,12 @@ impl Wallet {
 		}
 		if owed.as_array().is_none_or(|o| !o.is_empty()) {
 			out["owed"] = owed;
+		}
+		if deposits.as_array().is_none_or(|d| !d.is_empty()) {
+			out["deposits"] = deposits;
+		}
+		if reboards.as_array().is_none_or(|d| !d.is_empty()) {
+			out["reboards"] = reboards;
 		}
 		if orders.as_array().is_none_or(|o| !o.is_empty()) {
 			out["orders"] = orders;

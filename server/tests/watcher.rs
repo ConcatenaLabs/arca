@@ -55,7 +55,7 @@ use common::client::{new_leaf, random32, transfer_body, unhex};
 use common::flow::{claim_of, claimed, drive, exit_tx, final_of, has, log, of_kind, refresh, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{advance_mtp, credited_board, start, VALUE};
+use common::rounds::{advance_mtp, credited_board, start, start_sweeping, VALUE};
 use common::running::Running;
 
 const HOUR: u32 = 3_600;
@@ -274,7 +274,7 @@ fn unroll_level(r: &Running, coin: &Coin, level: usize, at: OutPoint, label: &st
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_batch_is_released_then_swept() {
-	let mut r = start().await;
+	let mut r = start_sweeping().await;
 	let x = r.x;
 	let mut boards = vec![];
 	let mut keys = vec![];

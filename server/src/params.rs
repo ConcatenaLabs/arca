@@ -307,6 +307,8 @@ pub struct Params {
 	/// credit not yet folded before the operator may take its own side
 	/// ([`crate::channels`]). Twice the longest exit delay.
 	pub channel_window: RelativeTime,
+	/// The watchtowers `info` lists for holders who name none of their own.
+	pub watchtowers: Vec<String>,
 }
 
 /// The default [`Params::fill_forfeit_window_seconds`]: ten minutes.
@@ -343,6 +345,7 @@ impl Params {
 			order_block_seconds: ORDER_BLOCK_SECONDS,
 			fill_forfeit_window_seconds: FILL_FORFEIT_WINDOW_SECONDS,
 			round_interval_seconds: 0,
+			watchtowers: vec![],
 			channel_window: spec.max_exit_delay,
 		};
 		p.set_delays();
