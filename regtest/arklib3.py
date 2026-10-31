@@ -13,6 +13,7 @@ from arklib import _csfs_2of2
 import os as _os
 from test_framework.messages import CAssetIssuance, CTxOutValue as _Val
 from test_framework.script import OP_INSPECTINPUTISSUANCE, OP_INSPECTINPUTSCRIPTPUBKEY, OP_GREATERTHANOREQUAL64
+from test_framework.script import OP_DEPTH, OP_PICK, OP_SIZE, OP_ROT, OP_OVER, OP_SUB, OP_2, OP_3
 
 TAG = b"ArcaRbd1"
 UTAG = b"Arca/unroll"
@@ -353,6 +354,105 @@ def reclaim_items(s_sig, owner_sigs, ks):
 
 
 # --------------------------------------------------------------------------
+# T25: reclaim with delegation
+# --------------------------------------------------------------------------
+
+DTAG = b"Arca/delegate"
+RECLAIM_STEPS = 32
+MAX_DELEGATES = 4
+
+
+def delegate_prefix(genesis_internal):
+    """The fixed part of a delegation: "Arca/delegate" || genesis_hash (45
+    bytes), the genesis hash in internal byte order."""
+    assert len(genesis_internal) == 32
+    return DTAG + genesis_internal
+
+
+def delegate_msg(genesis_internal, to_keys):
+    """The delegation a coin's key signs when the coin moves out of round:
+    SHA256("Arca/delegate" || genesis_hash || K_1 || ... || K_m), K_j the
+    owner keys of the reassignment's outputs in output order, 1 <= m <= 4."""
+    assert 1 <= len(to_keys) <= MAX_DELEGATES and all(len(k) == 32 for k in to_keys)
+    return sha256(delegate_prefix(genesis_internal) + b"".join(to_keys))
+
+
+def reclaim_step():
+    """One step of RECLAIM-D. Items, top first: `a` (empty: the step does
+    nothing), then `d` (empty: a release, 0x01: a delegation).
+      release:    K, sig, k          K signed SHA256(P || M), M the explicit asset of input k
+      delegation: e1, e2, e3, K, sig K signed SHA256(Q || K_1 || ... || K_m), the K_j the
+                                     last m keys earlier steps left on the alt stack,
+                                     m = 1 + the number of e set
+    Either way K must be 32 bytes and goes on the alt stack. P and Q are the
+    second and third items from the bottom of the stack."""
+    take = [OP_SWAP, OP_IF, OP_FROMALTSTACK, OP_SWAP, OP_CAT, OP_ENDIF]
+    return ([OP_IF,
+             OP_IF,
+             OP_FROMALTSTACK] + take * 3 + [OP_DEPTH, OP_3, OP_SUB, OP_PICK, OP_SWAP, OP_CAT,
+             OP_ELSE,
+             OP_ROT, OP_INSPECTINPUTASSET, OP_1, OP_EQUALVERIFY, OP_DEPTH, OP_2, OP_SUB, OP_PICK, OP_SWAP, OP_CAT,
+             OP_ENDIF,
+             OP_SHA256, OP_OVER, OP_SIZE, 32, OP_EQUALVERIFY, OP_TOALTSTACK, OP_SWAP, OP_CHECKSIGFROMSTACKVERIFY,
+             OP_ENDIF])
+
+
+def reclaim_delegated_leaf(prefix, dprefix, owners, s_x, steps=RECLAIM_STEPS):
+    """RECLAIM-D: `steps` steps; then the keys the steps left on the alt stack
+    must end with the owners', owner n-1 on top; then the stack must be exactly
+    S's signature, P (the release prefix) and Q (the delegation prefix).
+    Witness (bottom -> top): <sig_S> <P> <Q> <step_{N-1}> ... <step_0>."""
+    s = reclaim_step() * steps
+    for a in reversed(owners):
+        s += [OP_FROMALTSTACK, a, OP_EQUALVERIFY]
+    s += [dprefix, OP_EQUALVERIFY, prefix, OP_EQUALVERIFY, s_x, OP_CHECKSIG]
+    return CScript(s)
+
+
+def rel_node(key, sig, k):
+    """A key's release: it signed SHA256(P || M), M at input k."""
+    return ("rel", key, sig, k)
+
+
+def del_node(key, sig, kids):
+    """A key's delegation to the keys of `kids` (in order), each a release or a delegation."""
+    return ("del", key, sig, kids)
+
+
+def reclaim_delegated_steps(trees):
+    """The steps for one tree per owner, in owner order, each tree in post
+    order (children before the delegation naming them); each step's items top
+    first."""
+    seq = []
+
+    def walk(t):
+        if t[0] == "rel":
+            _, key, sig, k = t
+            seq.append([b"\x01", b"", key, sig, sn(k)])
+        else:
+            _, key, sig, kids = t
+            assert 1 <= len(kids) <= MAX_DELEGATES
+            for c in kids:
+                walk(c)
+            flags = [b"\x01" if i < len(kids) - 1 else b"" for i in range(3)]
+            seq.append([b"\x01", b"\x01"] + flags + [key, sig])
+    for t in trees:
+        walk(t)
+    return seq
+
+
+def reclaim_delegated_items(s_sig, prefix, dprefix, trees, steps=RECLAIM_STEPS, seq=None):
+    """The items below RECLAIM-D (bottom first). `seq` overrides the steps."""
+    seq = list(seq if seq is not None else reclaim_delegated_steps(trees))
+    assert len(seq) <= steps, "%d steps, the leaf has %d" % (len(seq), steps)
+    seq += [[b""]] * (steps - len(seq))
+    below = [s_sig, prefix, dprefix]
+    for st in reversed(seq):
+        below += list(reversed(st))
+    return below
+
+
+# --------------------------------------------------------------------------
 # T20: notice
 # --------------------------------------------------------------------------
 
@@ -674,6 +774,15 @@ def node_taptree3(unroll, sweep, reclaim=None):
         return tap, {"unroll": unroll, "sweep": sweep}
     tap = taproot_construct(NUMS, [("unroll", unroll), [("sweep", sweep), ("reclaim", reclaim)]])
     return tap, {"unroll": unroll, "sweep": sweep, "reclaim": reclaim}
+
+
+def node_taptree_delegated(unroll, sweep, reclaim, reclaim_d):
+    """A lowest node with RECLAIM-D: [UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]].
+    UNROLL keeps its 65-byte control block; SWEEP's is 97 bytes, RECLAIM's and
+    RECLAIM-D's 129."""
+    tap = taproot_construct(NUMS, [("unroll", unroll), [("sweep", sweep),
+                                                       [("reclaim", reclaim), ("reclaim_d", reclaim_d)]]])
+    return tap, {"unroll": unroll, "sweep": sweep, "reclaim": reclaim, "reclaim_d": reclaim_d}
 
 
 # --------------------------------------------------------------------------
