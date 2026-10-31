@@ -1452,7 +1452,12 @@ impl Wallet {
 					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
-			} else if matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) && !old.release_nodes().is_empty() {
+			} else if matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) && !old.release_nodes().is_empty()
+				// The order resting again after a fill carries the order
+				// coin's own key, which delegated into the fill: a release by
+				// it would release the order's slot alone, for every coin the
+				// fill made. It is never signed.
+				&& !matches!(&record, CoinRecord::Fill(f) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. })) {
 				// A coin a reassignment made, resting on lowest nodes with
 				// RECLAIM-D: its holder releases each of them for this round,
 				// whether it refreshes the coin or offboards it, so that a node

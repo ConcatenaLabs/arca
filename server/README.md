@@ -1318,8 +1318,8 @@ outputs in order (the credit, the order resting again, the taker's leaves;
 with the fill (`delegation_sig`, as in `cosign_transfer`), and a wrong one is
 refused (`bad_signature`) before anything is recorded. The order's coin
 delegates later, since its maker is away: once its wallet holds a coin the
-fill made, it reads the taker's leaves (`order_fill_delegation_terms`, by the
-fill's transfer id), checks them against the fill's outputs in that coin's
+fill made, it reads the taker's leaves (`order_fill_delegation_terms`, naming
+the fill by its transfer id or by the order coin it spent), checks them against the fill's outputs in that coin's
 record, and posts the order key's signature (`order_fill_delegation`), which
 the server checks against the outputs it recorded (`bad_signature`;
 `unknown_fill`, 404, for a fill not recorded). The order resting again
@@ -2347,7 +2347,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
-| `POST order_fill_delegation_terms` | For a signed fill, by its transfer id: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
+| `POST order_fill_delegation_terms` | For a signed fill, by its transfer id or the order coin it spent: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
 | `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |

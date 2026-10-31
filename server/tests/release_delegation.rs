@@ -848,6 +848,8 @@ async fn a_filled_orders_nodes_come_back_once_maker_and_taker_refresh() {
 	let a = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": hex(&random32())}));
 	println!("refused, the terms of an unknown fill: {} {:?}", a.status, a.refusal());
 	assert_eq!((a.status, a.refusal().0.as_str()), (404, "unknown_fill"));
+	let by_coin = r.http.post("order_fill_delegation_terms", &json!({"order_coin": order.held.id.to_string()})).ok();
+	assert_eq!(by_coin["transfer_id"].as_str(), Some(transfer.as_str()), "a fill named by the order coin it spent");
 	let good = maker_delegation(&r, &transfer, &cv, &m.key);
 	assert_eq!(r.http.post("order_fill_delegation", &good).ok()["kept"], true);
 	assert_eq!(r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok()["delegated"], true);
