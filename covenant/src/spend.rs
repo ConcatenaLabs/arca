@@ -80,6 +80,8 @@ pub enum SpendError {
 	OtherOperator,
 	#[error("the delegation does not fit the reassignment: {0}")]
 	Delegation(&'static str),
+	#[error("the release does not fit the coin: {0}")]
+	Release(&'static str),
 	#[error(transparent)]
 	Offboard(#[from] crate::offboard::OffboardError),
 	#[error("the board is not the coin the forfeit gives up")]

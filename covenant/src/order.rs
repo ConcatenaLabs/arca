@@ -686,6 +686,19 @@ impl OrderPolicy {
 			htlc: None, order: None, landing: None, channel: None , v2: false})
 	}
 
+	/// The leaves a fill of this coin pays the maker, in output order: its
+	/// credit ([`OrderPolicy::credit_leaf`]) and, for a `partial` fill, the
+	/// order resting again ([`OrderPolicy::next`]), whose owner key is this
+	/// coin's own. `None` once the credit keys are used up. A delegation of a
+	/// coin the fill spends names these keys first, then the taker's.
+	pub fn fill_leaves(&self, partial: bool) -> Option<Vec<LeafPolicy>> {
+		let mut leaves = vec![self.credit_leaf()?];
+		if partial {
+			leaves.push(self.next().leaf());
+		}
+		Some(leaves)
+	}
+
 	/// The message maker and operator sign to spend the coin by the
 	/// collaborative path, holding `value_in` of `asset_a`, into `outputs`.
 	pub fn collab_message(&self, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
@@ -920,6 +933,20 @@ mod test {
 		assert_eq!(o.next().next().next().next().fills_left(), 0);
 		assert!(o.next().next().next().next().credit_leaf().is_none());
 		assert_ne!(o.credit_leaf().unwrap().script_pubkey(), n.credit_leaf().unwrap().script_pubkey());
+	}
+
+	#[test]
+	fn a_fill_pays_the_credit_then_the_order_resting_again() {
+		let o = order();
+		let whole = o.fill_leaves(false).unwrap();
+		assert_eq!(whole, vec![o.credit_leaf().unwrap()]);
+		let part = o.fill_leaves(true).unwrap();
+		assert_eq!(part, vec![o.credit_leaf().unwrap(), o.next().leaf()]);
+		assert_eq!(part[1].owner, o.owner, "the order rests again under its own key");
+		let plan = o.plan(50_000, 10_000).unwrap();
+		assert_eq!(plan.credit.script_pubkey, part[0].script_pubkey());
+		assert_eq!(plan.rest.unwrap().script_pubkey, part[1].script_pubkey());
+		assert!(o.next().next().next().next().fill_leaves(false).is_none());
 	}
 
 	/// The same order landing as `seqdex/order` version 1: an `order-2` leaf.

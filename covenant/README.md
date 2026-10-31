@@ -464,6 +464,27 @@ the tree by an offboard instead). So the node is released only when every coin r
 it has a successor in a round in the chain, and returns at the next round
 after its holders refresh, however many times its coins moved.
 
+An in-tree fill of a resting order is a reassignment too. Its outputs are the
+maker's credit, for a partial fill the order resting again, then the taker's
+leaves (`OrderPolicy::fill_leaves` gives the maker's two), and every coin it
+spends delegates to all of them (`Delegation::for_fill`): each taker coin
+when the taker signs the fill, and the order's coin later, since its maker is
+away when it is filled and the operator's signature alone fills it. The
+maker signs once it holds a coin the fill made, from that coin's record and
+the taker's leaves the operator names (`Delegation::for_filled_order`, which
+refuses leaves that are not the fill's outputs). The order resting again
+carries the order coin's own key, so its holder's release also fills the
+order's slot directly; the operator uses it only in the remainder's place,
+and this adds no one the taker must trust, since the maker and the operator
+can already spend the order's coin by its collaborative path.
+
+The `htlc-1` leaf of a Lightning payment out of the tree is the operator's
+once the payment is paid, and its owner key is the sender's. The sender
+releases each lowest node with RECLAIM-D it rests on once it holds the
+payment's preimage, naming a round the operator names
+(`Release::for_paid_send`, which refuses a leaf of a receive and a preimage
+of another hash), and never before: the release ends its refund.
+
 A delegation names every output, so no co-receiver (a payer's change, a
 swap's other side) can release a slot without the others; and it adds no one
 a coin must trust, since the coin's senders, with the operator, could already
@@ -487,7 +508,10 @@ steps 1,691 vB.
 let d = Delegation::for_reassignment(&my_coin, &plan.outputs, &leaves)?;  // the sender, at the transfer
 let sig = sign_digest(&my_key, &d.message().digest, &aux);
 d.verify(&sig)?;                                                       // the operator's check
+let df = Delegation::for_fill(&taker_coin.leaf, &order_policy, &fill_outputs, &taker_leaves)?;  // a taker, at a fill
+let dm = Delegation::for_filled_order(&credit_coin, &taker_leaves)?;   // the maker, later, from its credit
 let rs = Release::for_holder(&coin, &new_valid, &round, c)?;           // the holder, after its refresh
+let rp = Release::for_paid_send(&htlc_coin, &preimage, &round, c)?;    // a sender, once its payment is paid
 let trees = vec![ReleaseTree::Delegation { key: a0, sig: d0, to: vec![
 	ReleaseTree::Release { key: b, sig: rb, connector_input: 1 },
 	ReleaseTree::Release { key: a0_change, sig: rc, connector_input: 1 },
