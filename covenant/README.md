@@ -55,7 +55,7 @@ sequentia-contracts (`accumulator_programs`).
 | `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `bond` | The operator's equivocation bond (`BondPolicy`: the chain, `S`, the withdrawal key `W`, the notice delay `D`), and the notice output a withdrawal waits in | SLASH, in both outputs: the salt, two messages `S` signed under it (each a form, `Rebind` for a collaborative path's message `SHA256(K ‖ rest)` or `Fill` for an `order-2` fill's `SHA256(F ‖ salt ‖ rest)`, its rest in three chunks of at most 80 bytes, and `S`'s signature), the digests computed in the script and required to differ, and the output at the input's own index a bare `OP_RETURN` of its whole amount, so a slash pays no one; NOTICE, `W`'s signature, the bond whole to the notice output; WITHDRAW, on the notice output, `W`'s signature `D` after the notice confirmed. `slash_tx`, `notice_tx` and `withdraw_tx` build the three spends, a fee coin paying; `check` judges evidence as SLASH will; `rebind_signed_in` reads `S`'s signature and its message from a collaborative spend found on the chain, and `collab2_signed_in` from a `vtxo-2` spend given the outputs its named inputs spend; `cosigned_by` lists every message `S` signed that a coin's lineage rests on, each under its salt, which a holder hands a watcher |
 | `channel` | `channel-1`'s outputs: the channel output of each state (`ChannelPolicy`, `State`: the number, the owner's and the operator's balances, the credit already folded into the owner's), the leaf in the tree being the output of state 0, and the credit output the operator's balance settles into | The leaf's collaborative path under the salt's `K`, the same in every state, so a pair made for the coin spends it in any state; UPDATE(n), a state `m > n` signed by owner and operator over `SHA256(Q ‖ le8(m) ‖ P)` (`state_message`), `Q` the salt's state constant and `P` the program of the output at the input's own index, which keeps the input's asset and value; SETTLE(n), after the exit delay, exactly the owner's balance to `OP_1 <A>` and the operator's to the state's credit output, a zero balance's half left out. The credit output's CLAIM pays the owner, at the input's own index, what the operator's cumulative note (`note_message`, `SHA256(N ‖ le8(c))`) credits beyond what was paid, capped at the state's `s + F`, the rest returning to the same script; PROVIDER, `S`'s after the window. A `channel-1` leaf's `LeafPolicy` carries its terms (`ChannelTerms`: the value, the operator's opening balance, the credit window) and `channel_policy` gives its channel. `collab_tx` (the coin's pair at any state), `update_tx`, `settle_tx`, `claim_tx` and `provider_tx` build the spends, a fee coin paying; `claim_amounts` computes a claim as the script does. `read_spend` reads how a spend found on the chain left a state's output (`ChannelSpend`: an update and the number it moved to, a settle, or the collaborative path) by the leaf script it ran, through `witness::without_annex`: nothing a channel signs covers an annex, so whoever relays or mines an update, a settle or a claim can add one, the same spend with the same outputs; a witness that is no spend of that output's leaves is refused |
-| `claim` | No output of its own: the claim key a holder's `vtxo-1` leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair), and the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up) | None of its own: the leaf is `vtxo-1`, its owner key the claim key |
+| `claim` | The claim key a holder's leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair); the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up, with a deadline and a fee allowance when its claims lapse, `DistributionLapse`); and `claim-1`, the claim leaf that lapses ([Claim leaves that lapse](#claim-leaves-that-lapse)) | A distribution without a deadline pays `vtxo-1` leaves under claim keys. `claim-1`: `[collab, [exit, lapse]]`, `vtxo-1`'s collaborative path and exit under the claim key, and LAPSE, which once the median time has passed the deadline `D` (`OP_CHECKLOCKTIMEVERIFY`) and the leaf has waited its exit delay (`OP_CHECKSEQUENCEVERIFY`) pays the output at its own input's index to the distribution's return script (`script_pin`: `SHA256(program ‖ version + 2)`), explicitly in the leaf's asset, holding at least the value less the allowance, with no signature (`LapseTerms`; 105 bytes with a 36-hour delay; `lapse_tx` builds it, the allowance or a fee coin paying) |
 
 `batch` holds a batch of either kind (`Batch`: a tree or an accumulator
 batch, built from the same parameters and leaves) and the operator's rule for
@@ -109,7 +109,9 @@ maker script hash, REFUND time and key, and the four credit keys;
 `landing-1` with its landing program and fee allowance; `enclave-1` with its
 holder's key, the asset's policy key and its clawback key, though no batch holds
 an `enclave-1` leaf: it rests on a board or comes from a reassignment; or
-`channel-1` with the operator's opening balance and the credit window; or
+`channel-1` with the operator's opening balance and the credit window;
+`claim-1` with its distribution's deadline, the lapse's fee allowance and the
+return script; or
 `vtxo-2`, a `vtxo-1` leaf whose collaborative path is `arca/collab-2`), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
@@ -373,6 +375,70 @@ validates its new leaf against the built transaction and signs
 
 An accumulator batch keeps its expiry: `Accumulator::build` refuses the never
 schedule, and an accumulator record without a sweep is refused.
+
+## Claim leaves that lapse
+
+A distribution pays many holders in one round, each a leaf owned by the claim
+key of a key the payer names (`claim`). A distribution that names a deadline
+`D` (`DistributionLapse`, in its id) pays `claim-1` leaves, whose LAPSE pays
+back to the payer's return script what a holder did not take up by `D`, a term
+between payer and payee on the payer's own money, as a cheque lapses. In a
+batch without a sweep nothing else would ever bring an unclaimed leaf back: it
+would stay its absent holder's for good.
+
+```text
+collab:  vtxo-1's collaborative path under the leaf's salt
+exit:    <delay> OP_CHECKSEQUENCEVERIFY OP_DROP <A'> OP_CHECKSIG
+lapse:   <D> OP_CHECKLOCKTIMEVERIFY OP_DROP <delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+         output[k].script: SHA256(program ‖ version + 2) == pin        k = this input's index
+         output[k].asset == the leaf's asset, explicit
+         output[k].value >= the leaf's value less the allowance
+```
+
+- **Nobody signs a lapse.** Once the leaf is on the chain, `D` has passed and
+  the exit delay has run, the payer, the operator's watcher or anyone else can
+  lapse it, and it pays only the return script, in the leaf's asset. An annex
+  or a fee coin added to it changes nothing it pins, and whatever of the
+  allowance the fee leaves goes where the lapser puts it.
+- **Its own index.** Each lapse pins the output at its input's index, so the
+  claim leaves of one distribution, with one return script and one minimum,
+  lapse together in one transaction, each to its own output, and one output
+  never stands for two.
+- **The exit delay protects a holder who took the claim up.** A holder takes
+  its claim up out of round, by the collaborative path, before `D`, and holds
+  a coin resting on the claim leaf. If the leaf reaches the chain after `D`,
+  the lapse still waits the exit delay from the leaf's confirmation, and the
+  holder (or a watchtower, or the operator holding the coin's forfeit)
+  publishes its pair in that time, as it answers an exit.
+- **The holder's exit and the lapse.** Both wait the exit delay from the
+  leaf's confirmation, and the lapse also waits for `D`. A holder whose leaf
+  confirms at least an exit delay before `D` exits before the lapse opens; one
+  whose leaf confirms later meets the lapse at the same moment, and the first
+  spend to confirm takes the coin. So a wallet takes a claim up well before
+  `D`, which needs no chain, or starts its exit an exit delay and a margin
+  before `D`.
+- **Fees.** The allowance pays the fee in the leaf's asset where the node
+  takes it (`FeeSource::Split`); where it does not, as for an asset that is
+  delisted, a coin of any accepted asset pays the fee and the return script
+  gets the whole value (`FeeSource::Coin`). `FeeSource::Reserve` makes the
+  whole allowance the fee. `lapse_allowance(floor, multiple)` prices an
+  allowance at a multiple of a relay floor for a lapse of `LAPSE_VSIZE`
+  (220) vbytes; a lapse into the return script and the fee output measures
+  215.
+- **Assets.** A `claim-1` leaf's exit pays the claim key by a script path, and
+  its lapse any return script, so neither lands where a freeze binds: a
+  server takes no distribution of a supervised or a restricted asset, as for
+  `vtxo-1` claim leaves. No accumulator batch holds a `claim-1` leaf.
+
+The record keeps the lapse (`Lapse`: the deadline, the allowance, the return
+script), template `claim-1` (id 8, version 1); `CoinRecord::lapse` gives it for
+the claim leaf itself, and nothing for a coin paid on from one. `Tree::build`
+takes it in `LeafSpec::claim`.
+
+```rust
+let lapse = distribution.claim_lapse().unwrap();     // what every claim leaf's record keeps
+let tx = valid.branch.leaf.lapse_tx(at, value, &lapse.return_script, &FeeSource::Split { fee, change })?.tx;
+```
 
 ## Off-chain transactions
 
@@ -1205,7 +1271,18 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   named key and by the payer's key; and the collaborative path signed by the
   named key and by the payer's key, each with the operator's signature: every
   one refused by the mempool and in a block, for its reason. The same
-  transactions signed by the claim key confirm.
+  transactions signed by the claim key confirm. Then a batch without a sweep
+  of three `claim-1` leaves: each record is format 3 and reads back from both
+  forms, validates for its claim key under the no-sweep policy, and its coin
+  record names its lapse. Before the deadline the lapse is refused
+  (`non-final`) and the holder's exit confirms; after it the lapse to another
+  script (`Script failed an OP_EQUALVERIFY operation`) and one atom short of
+  the value less the allowance (`Script evaluated without error but finished
+  with a false/empty top stack element`) are refused, and the lapse
+  `lapse_tx` builds, its fee from the allowance, confirms; a leaf brought on
+  the chain after the deadline is refused its lapse at once
+  (`non-BIP68-final`), and lapses with a fee coin once its exit delay has
+  run, the whole value to the return script.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and

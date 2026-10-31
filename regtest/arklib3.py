@@ -138,6 +138,42 @@ def landing_taptree(a_x, s_x, salt, ctag, delay, program, asset_id, value, allow
     return tap, {"collab": collab, "landing": land}
 
 
+def script_pin(spk):
+    """SHA256(program || version + 2): the script part of the injective
+    output record (record()), the program being SHA256(scriptPubKey) and the
+    version -1 for a script that is no witness program."""
+    return sha256(record(b"\x00" * 32, 0, spk)[42:])
+
+
+def lapse_leaf(deadline, delay, return_spk, asset_id, min_value):
+    """claim-1's LAPSE: once the median time has passed the distribution's
+    deadline (CLTV) and the exit delay has run since the leaf confirmed (CSV),
+    the output at this input's own index must pay the distribution's return
+    script (pinned by script_pin), explicitly in `asset_id`, holding at least
+    `min_value` (the leaf's value less the fee allowance). No signature: the
+    witness is empty, so whoever brings the leaf on the chain lapses it."""
+    assert len(asset_id) == 32 and deadline >= 500_000_000
+    return CScript([deadline, OP_CHECKLOCKTIMEVERIFY, OP_DROP, delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY, 2, OP_ADD, OP_CAT, OP_SHA256,
+                    script_pin(return_spk), OP_EQUALVERIFY,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTASSET, OP_1, OP_EQUALVERIFY, asset_id, OP_EQUALVERIFY,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTVALUE, OP_1, OP_EQUALVERIFY, le8(min_value),
+                    OP_GREATERTHANOREQUAL64])
+
+
+def claim_taptree(a_x, s_x, salt, ctag, delay, deadline, return_spk, asset_id, value, allowance):
+    """claim-1, a distribution's claim leaf: [collab, [exit, lapse]]. collab
+    and exit are vtxo-1's under the leaf's salt, the owner being the claim
+    key; lapse (lapse_leaf) pays the distribution's return script what nobody
+    took up by the deadline."""
+    assert 0 <= allowance < value
+    collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
+    ex = exit_leaf(a_x, delay)
+    lapse = lapse_leaf(deadline, delay, return_spk, asset_id, value - allowance)
+    tap = taproot_construct(NUMS, [("collab", collab), [("exit", ex), ("lapse", lapse)]])
+    return tap, {"collab": collab, "exit": ex, "lapse": lapse}
+
+
 def leaf3_taptree(a_x, s_x, salt, ctag, delay, sweep=None, fold=False):
     """sweep=None: the noticed leaf of T20, [collab, exit]. With a sweep script:
     the T10 shape [collab, [exit, sweep]] (used by T16 for a like-for-like size)."""

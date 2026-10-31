@@ -157,7 +157,7 @@ fn pair(f: &Forfeit, owner: &Keypair, operator: &Keypair) -> Pair {
 
 /// A leaf funded directly (as a board pays it), its id the board form's.
 fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy { enclave: None,
+	let leaf = LeafPolicy { enclave: None, claim: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),
@@ -233,7 +233,7 @@ fn board_and_refresh(c: &mut Ctx) {
 	// fresh nonce, behind an entry locked to h; the connector output.
 	let (issuer, sched) = c.schedule(&s);
 	let preimage = label32("board refresh preimage");
-	let spec = LeafSpec {
+	let spec = LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(&a2), value: 19_990_000, owner_nonce: label32("board new leaf nonce"),
 		operator_nonce: label32("board new leaf operator nonce"), exit_delay: delay(), unlock_hash: sha256(&preimage),
 		htlc: None,
@@ -243,7 +243,7 @@ fn board_and_refresh(c: &mut Ctx) {
 	};
 	let second_owner = keypair("refresh second owner, new leaf");
 	let preimage_b = label32("second owner refresh preimage");
-	let spec_b = LeafSpec {
+	let spec_b = LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(&second_owner), value: LEAF - 2_000,
 		owner_nonce: label32("second owner new nonce"), operator_nonce: label32("second owner operator nonce"),
 		exit_delay: delay(), unlock_hash: sha256(&preimage_b),
@@ -252,7 +252,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		landing: None,
 		channel: None,
 	};
-	let tree = c.tree(&sched, &[spec, spec_b]);
+	let tree = c.tree(&sched, &[spec.clone(), spec_b.clone()]);
 	let (round, cv) = round_tx(&c.net, &issuer, Some(&tree), vec![], &s);
 	let rt = c.pass("board/refresh: the round", &round);
 	c.net.purse.push(coin_of(rt, cv + 1, &round));
@@ -392,7 +392,7 @@ fn board_and_refresh(c: &mut Ctx) {
 	c.net.wait_csv(&bt3, delay());
 	let (issuer, sched) = c.schedule(&s);
 	let preimage3 = label32("second board preimage");
-	let spec3 = LeafSpec {
+	let spec3 = LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(&keypair("second board, new leaf")), value: 14_990_000,
 		owner_nonce: label32("second board new nonce"), operator_nonce: label32("second board new operator nonce"),
 		exit_delay: delay(), unlock_hash: sha256(&preimage3),
@@ -401,7 +401,7 @@ fn board_and_refresh(c: &mut Ctx) {
 		landing: None,
 		channel: None,
 	};
-	let tree3 = c.tree(&sched, &[spec3]);
+	let tree3 = c.tree(&sched, &[spec3.clone()]);
 	let (round3, cv3) = round_tx(&c.net, &issuer, Some(&tree3), vec![], &s);
 	let rt3 = c.pass("board/a second board's refresh: the round", &round3);
 	let round3 = c.net.rt.client().raw_transaction(&rt3).unwrap();

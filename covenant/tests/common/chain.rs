@@ -71,7 +71,7 @@ pub fn batches(chain: Chain, x: AssetId, y: AssetId, s: Keypair, sched1: ClockSc
 	let c = keypair("chain C key");
 	let build = |label: &str, asset: AssetId, sched: ClockSchedule, n: usize, at: usize, owner: &Keypair, value: u64| {
 		let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("chain {} preimage {}", label, i))).collect();
-		let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
+		let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec { claim: None,
 			template: Template::Vtxo1,
 			owner: if i == at { xonly(owner) } else { xonly(&keypair(&format!("chain {} bystander {}", label, i))) },
 			value,

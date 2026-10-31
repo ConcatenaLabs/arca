@@ -1670,7 +1670,7 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel } => Ok(LeafSpec {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel } => Ok(LeafSpec { claim: None,
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -1840,7 +1840,7 @@ impl Rounds {
 		// accumulator batch.
 		// A holder's own batch is a tree, so that it can be reclaimed.
 		let kinds: Vec<BatchKind> = groups.iter().zip(&plan)
-			.map(|((a, leaves), b)| if b.own { BatchKind::Tree } else { self.kind_of(a, &leaves.iter().map(|l| l.spec).collect::<Vec<_>>()) })
+			.map(|((a, leaves), b)| if b.own { BatchKind::Tree } else { self.kind_of(a, &leaves.iter().map(|l| l.spec.clone()).collect::<Vec<_>>()) })
 			.collect();
 		let (built, trees) = self.wallet.build_round(groups.len(), fee_asset, connector, &forced, &foreign, minted, |tokens| {
 			let mut outputs: Vec<ExplicitOutput> = successor.iter().cloned().collect();
@@ -1848,7 +1848,7 @@ impl Rounds {
 			let mut trees = vec![];
 			for (bi, ((asset, leaves), token)) in groups.iter().zip(tokens).enumerate() {
 				let schedule = ClockSchedule::new(*token, s, notice, expiries.clone()).map_err(|e| e.to_string())?;
-				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
+				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec.clone()).collect();
 				// An issuer-operated asset's batch is burn-only.
 				let params = TreeParams {
 					asset: *asset, chain, schedule, burn: Some(*asset) == minted, delegated_reclaim, radix, reserve: reserves[asset],
@@ -1883,7 +1883,7 @@ impl Rounds {
 		if let Some((asset, i, room, amount, _)) = &mint {
 			let mut batches = vec![];
 			for (k, ((tree, params), (_, leaves))) in trees.iter().zip(&groups).enumerate() {
-				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
+				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec.clone()).collect();
 				if tree.kind() != BatchKind::Tree {
 					return release(RoundError::Internal("an issuer-operated asset's batch is a tree".into())).await;
 				}
@@ -3113,7 +3113,7 @@ impl Rounds {
 					(r.htlc, r.order, r.landing, None)
 				},
 			};
-			specs.push(LeafSpec {
+			specs.push(LeafSpec { claim: None,
 				template: l.template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&l.owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: l.value,

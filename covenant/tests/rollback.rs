@@ -77,7 +77,7 @@ fn refresh(c: &mut Arca, label: &str) -> Refresh {
 	let preimage = label32(&format!("{} preimage", label));
 	let (issuer, sched) = c.schedule(&s);
 	let sp = spec(&owner_new, &format!("{} new leaf", label), LEAF - 2_000, sha256(&preimage));
-	let tree = c.tree(&sched, &[sp]);
+	let tree = c.tree(&sched, &[sp.clone()]);
 	let (round, cv) = round_tx(&c.net, &issuer, &[], &tree.batch_output(), &sched);
 	c.net.pass(&format!("{}/round X", label), &round);
 	let record = tree.record(0);
@@ -199,7 +199,7 @@ fn a_round_that_cannot_return_is_followed_by_a_new_round() {
 	let (issuer, sched) = c.schedule(&s);
 	let (pre_px, pre_qx) = (label32("lost P preimage X"), label32("lost Q preimage X"));
 	let (sp, sq) = (spec(&p_new_key, "lost P new X", LEAF - 2_000, sha256(&pre_px)), spec(&q_new_key, "lost Q new X", LEAF - 2_000, sha256(&pre_qx)));
-	let tree_x = c.tree(&sched, &[sp, sq]);
+	let tree_x = c.tree(&sched, &[sp.clone(), sq.clone()]);
 	let fill = c.net.fund(vec![explicit(x, 50_000, op_true_spk())]).remove(0);
 	let (round_x, cx) = round_tx(&c.net, &issuer, std::slice::from_ref(&fill), &tree_x.batch_output(), &sched);
 	let rt = c.net.pass("lost/round X, with a third party's input", &round_x);
@@ -222,7 +222,7 @@ fn a_round_that_cannot_return_is_followed_by_a_new_round() {
 	let (issuer, sched) = c.schedule(&s);
 	let (pre_py, pre_qy) = (label32("lost P preimage Y"), label32("lost Q preimage Y"));
 	let (spy, sqy) = (spec(&p_new_key, "lost P new Y", LEAF - 2_000, sha256(&pre_py)), spec(&q_new_key, "lost Q new Y", LEAF - 2_000, sha256(&pre_qy)));
-	let tree_y = c.tree(&sched, &[spy, sqy]);
+	let tree_y = c.tree(&sched, &[spy.clone(), sqy.clone()]);
 	let (round_y, cy) = round_tx(&c.net, &issuer, &[], &tree_y.batch_output(), &sched);
 	c.net.pass("lost/round Y, a new round", &round_y);
 	assert_eq!(tree_x.record(0).validate_round(&round_y, &policy).unwrap_err(), RecordError::BatchOutputMissing);

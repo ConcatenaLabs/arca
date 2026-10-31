@@ -241,7 +241,7 @@ impl Plan {
 			return Some(self.first);
 		}
 		let s = self.steps.get(i - 1)?;
-		Some(LeafPolicy { enclave: None,
+		Some(LeafPolicy { enclave: None, claim: None,
 			owner: s.owner,
 			operator: self.operator,
 			salt: leaf_salt(&s.owner_nonce, &s.operator_nonce),
@@ -355,7 +355,7 @@ mod tests {
 	fn plan(steps: usize) -> Plan {
 		let chain = Chain::new(BlockHash::from_raw_hash(sha256d::Hash::hash(b"genesis")));
 		let operator = key("S");
-		let first = LeafPolicy { enclave: None, owner: key("A0"), operator, salt: n("salt 0"), chain, exit_delay: RelativeTime::from_units(254).unwrap(),
+		let first = LeafPolicy { enclave: None, claim: None, owner: key("A0"), operator, salt: n("salt 0"), chain, exit_delay: RelativeTime::from_units(254).unwrap(),
 			htlc: None, order: None, landing: None, channel: None , v2: false};
 		Plan {
 			chain, operator, coin: LeafId(n("coin")), first, asset: AssetId::from_slice(&n("asset")).unwrap(), value: 1_000_000,

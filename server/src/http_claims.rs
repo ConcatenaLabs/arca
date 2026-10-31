@@ -81,6 +81,7 @@ pub(super) async fn distribute(State(app): State<Arc<App>>, body: Result<Bytes, 
 		fees,
 		not_before: req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 			.transpose()?,
+		lapse: None,
 	};
 	let status = app.participations.distribute(&DistributionRequest { distribution, attestations }).await?;
 	Ok(Json(participation_status(&status)))

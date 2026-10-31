@@ -56,8 +56,10 @@
 //!   policy ([`encode`]) and the reading of witnesses found on-chain
 //!   ([`witness`]);
 //! - claim trees ([`claim`]): the claim key a holder's leaf is owned by,
-//!   derived from the key a payer names and a nonce, and the distribution a
-//!   payer submits to pay many holders in one round;
+//!   derived from the key a payer names and a nonce, the distribution a
+//!   payer submits to pay many holders in one round, and `claim-1`, the
+//!   claim leaf whose LAPSE pays the payer back what nobody took up by the
+//!   distribution's deadline;
 //! - a resting order in the tree ([`order`]): the `order-2` leaf, which the
 //!   operator fills with the maker offline under a Simplicity program, which
 //!   pays each credit to a leaf of its own, and which lands, one exit delay
@@ -152,7 +154,7 @@ pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signe
 pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTerms, State};
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
-pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};
+pub use claim::{claim_key, claim_keypair, script_pin, Claim, ClaimError, Distribution, DistributionLapse, Lapse, LapseError, LapseTerms};
 pub use clock::{no_sweep_token, Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
 pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLeaf};

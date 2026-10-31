@@ -172,7 +172,7 @@ fn a_degenerate_layout_is_refused() {
 	let (issuer, sched) = c.schedule(&s);
 	let proof = Members::new(xonly(&s), &[xonly(&a)]).proof(1);
 	let owner_nonce = label32("lineage e4 owner nonce");
-	let record = LeafRecord {
+	let record = LeafRecord { claim: None,
 		template: Template::Vtxo1, owner: xonly(&a), owner_nonce, operator_nonce: label32("lineage e4 operator nonce"),
 		exit_delay: delay(), asset: c.net.x, value: LEAF, unlock_hash: sha256(&preimage), entry_reserve: 0,
 		chain: c.net.chain, schedule: sched.clone(), burn: false, delegated: false,

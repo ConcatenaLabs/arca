@@ -93,6 +93,7 @@ fn vtxo_2_matches_the_regtest_suites_vectors() {
 	let delay = RelativeTime::from_sequence(v["exit_delay_sequence"].as_u64().unwrap() as u32).unwrap();
 	let l = &v["leaf"];
 	let leaf = LeafPolicy {
+		claim: None,
 		owner: key(&keys["A"]), operator: key(&keys["S"]), salt: h32(&l["salt"]), chain, exit_delay: delay,
 		htlc: None, order: None, landing: None, channel: None, enclave: None, v2: true,
 	};

@@ -51,6 +51,10 @@
 //! and operator: it is the output of the channel's state 0,
 //! `[collab, [update(0), settle(0)]]`, its collaborative path this very one.
 //!
+//! A `claim-1` leaf ([`crate::claim`]), a distribution's claim leaf, keeps
+//! the collaborative path and the exit and adds the lapse, which after the
+//! distribution's deadline pays its return script: `[collab, [exit, lapse]]`.
+//!
 //! A `vtxo-2` leaf ([`crate::collab`]) keeps the exit and replaces the
 //! collaborative script with the Simplicity program `arca/collab-2` and its
 //! data leaf, `[[program, data], exit]`: owner and operator sign the coin's
@@ -64,6 +68,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::channel::{ChannelPolicy, ChannelTerms};
+use crate::claim::LapseTerms;
 use crate::collab::Collab2;
 use crate::htlc::{HtlcPath, HtlcTerms};
 use crate::enclave::EnclaveTerms;
@@ -173,6 +178,9 @@ pub struct LeafPolicy {
 	/// `arca/collab-2` ([`crate::collab`]) in place of the tapscript path. Only
 	/// a leaf with no `htlc`, `order` or `landing` terms is `vtxo-2`.
 	pub v2: bool,
+	/// `claim-1`'s lapse: after the distribution's deadline, the leaf pays its
+	/// return script ([`crate::claim`]); `None` otherwise.
+	pub claim: Option<LapseTerms>,
 }
 
 impl LeafPolicy {
@@ -219,6 +227,17 @@ impl LeafPolicy {
 		self.enclave.and_then(|e| e.enclave.claw_script()).ok_or(crate::EnclaveError::NoClawback)
 	}
 
+	/// The lapse of a `claim-1` leaf.
+	pub fn lapse_script(&self) -> Option<Script> {
+		self.claim.map(|t| t.script(self.exit_delay))
+	}
+
+	/// The full lapse witness of a `claim-1` leaf: the script and its control
+	/// block, nothing below them.
+	pub fn lapse_witness(&self) -> Option<Vec<Vec<u8>>> {
+		self.lapse_script().map(|l| self.taproot().witness(&l, vec![]))
+	}
+
 	/// The claim of an `htlc-1` leaf.
 	pub fn claim_script(&self) -> Result<Script, Error> {
 		let t = self.htlc.ok_or(Error::NotAnHtlc("claim"))?;
@@ -247,6 +266,7 @@ impl LeafPolicy {
 	/// ([`crate::order`]), the fill the template's program.
 	/// `channel-1`: `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
 	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
+	/// `claim-1`: `[collab, [exit, lapse]]` ([`crate::claim`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
@@ -262,6 +282,9 @@ impl LeafPolicy {
 				(2, TapNode::Hidden(o.data_leaf())),
 			]);
 		}
+		if let Some(lapse) = self.lapse_script() {
+			return TapOutput::new(vec![(1, self.collab_script()), (2, self.exit_script()), (2, lapse)]);
+		}
 		if let Some(claw) = self.enclave.and_then(|e| e.enclave.claw_script()) {
 			return TapOutput::new(vec![(1, self.collab_script()), (2, self.exit_script()), (2, claw)]);
 		}
@@ -276,9 +299,11 @@ impl LeafPolicy {
 	}
 
 	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
-	/// `order-2`), `landing-1`, `enclave-1` or `channel-1`.
+	/// `order-2`), `landing-1`, `enclave-1`, `channel-1` or `claim-1`.
 	pub fn template(&self) -> crate::Template {
-		if self.channel.is_some() {
+		if self.claim.is_some() {
+			crate::Template::Claim1
+		} else if self.channel.is_some() {
 			crate::Template::Channel1
 		} else if self.v2 {
 			crate::Template::Vtxo2

@@ -413,7 +413,7 @@ fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 		min_leaf: num(&t["min_leaf"]),
 	};
 	let tree_asset: elements::AssetId = s("asset").parse().unwrap();
-	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
+	let leaves: Vec<LeafSpec> = t["leaves"].as_array().unwrap().iter().map(|l| LeafSpec { claim: None,
 		template: l["template"].as_str().unwrap().parse().unwrap(),
 		owner: XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap())).unwrap(),
 		value: num(&l["value"]),

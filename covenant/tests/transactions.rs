@@ -218,7 +218,7 @@ fn the_forfeit_its_claim_and_its_refund() {
 	let f = &v["forfeit"];
 	let inp = &f["inputs"];
 	let chain = Chain::new(fx.genesis);
-	let leaf = LeafPolicy { enclave: None,
+	let leaf = LeafPolicy { enclave: None, claim: None,
 		owner: key(&inp["owner"]), operator: key(&inp["operator"]),
 		salt: arca_covenant::leaf::leaf_salt(&h32(&inp["owner_nonce"]), &h32(&inp["operator_nonce"])),
 		chain, exit_delay: RelativeTime::from_units(inp["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),

@@ -333,7 +333,7 @@ impl Net {
 	}
 
 	pub fn leaf(&self, owner: &Keypair, operator: &Keypair, salt: &str) -> LeafPolicy {
-		LeafPolicy { enclave: None, owner: xonly(owner), operator: xonly(operator), salt: label32(salt), chain: self.chain,
+		LeafPolicy { enclave: None, claim: None, owner: xonly(owner), operator: xonly(operator), salt: label32(salt), chain: self.chain,
 			exit_delay: delay(), htlc: None, order: None, landing: None, channel: None , v2: false}
 	}
 

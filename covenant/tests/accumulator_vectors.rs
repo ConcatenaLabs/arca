@@ -46,7 +46,7 @@ fn accumulator_matches_the_regtest_suites_vectors() {
 		.map(|e| MedianTime::from_consensus(e.as_u64().unwrap() as u32).unwrap()).collect();
 	let schedule = ClockSchedule::new(AssetId::from_byte_array(h32(&v["token"])), operator,
 		RelativeTime::from_units(v["notice_units"].as_u64().unwrap() as u16).unwrap(), expiries).unwrap();
-	let leaves: Vec<LeafSpec> = v["leaves"].as_array().unwrap().iter().map(|l| LeafSpec {
+	let leaves: Vec<LeafSpec> = v["leaves"].as_array().unwrap().iter().map(|l| LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: key(&l["owner"]), value: l["value"].as_u64().unwrap(),
 		owner_nonce: h32(&l["owner_nonce"]), operator_nonce: h32(&l["operator_nonce"]),
 		exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap() as u16).unwrap(),

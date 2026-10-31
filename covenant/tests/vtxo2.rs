@@ -58,6 +58,7 @@ const FEE: u64 = 2_000;
 
 fn leaf(net: &Net, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp256k1_zkp::Keypair, salt: &str, v2: bool) -> LeafPolicy {
 	LeafPolicy {
+		claim: None,
 		owner: xonly(owner), operator: xonly(s), salt: label32(salt), chain: net.chain, exit_delay: delay(), htlc: None, order: None,
 		landing: None, channel: None, enclave: None, v2,
 	}

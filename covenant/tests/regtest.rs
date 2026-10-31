@@ -504,7 +504,7 @@ fn htlc(net: &mut Net) {
 	let preimage = label32("htlc payment");
 	let timeout = net.now() + 6 * H as u64;
 	let operator_delay = RelativeTime::from_units(delay().units() / 3).unwrap();
-	let mk = |direction, salt: &str| LeafPolicy { enclave: None,
+	let mk = |direction, salt: &str| LeafPolicy { enclave: None, claim: None,
 		owner: xonly(&a), operator: xonly(&s_key), salt: label32(salt), chain: net.chain, exit_delay: delay(),
 		htlc: Some(HtlcTerms { direction, payment_hash: sha256(&preimage), timeout: mt(timeout), operator_delay }),
 		order: None,
@@ -911,7 +911,7 @@ fn issuer_operated(net: &mut Net) {
 	let e0 = net.now() + 24 * H as u64;
 	let tree_of = |net: &Net, label: &str, issuer: &Coin, burn: bool| -> Tree {
 		let sched = ClockSchedule::new(token_of(issuer), xonly(&s_key), delay(), vec![mt(e0)]).unwrap();
-		let leaves: Vec<LeafSpec> = (0..4).map(|i| LeafSpec {
+		let leaves: Vec<LeafSpec> = (0..4).map(|i| LeafSpec { claim: None,
 			template: Template::Vtxo1, owner: xonly(&keypair(&format!("{} owner {}", label, i))), value: 25_000_000,
 			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
@@ -1050,7 +1050,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 	let floor_per_kvb = (info["minrelaytxfee"].as_f64().unwrap() * 1e8).round() as u64;
 	let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();
 	let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
-	let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
+	let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(&owners[i]), value: LEAF,
 		owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 		operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
@@ -1258,7 +1258,7 @@ fn probes_turned_around(net: &mut Net) {
 	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
 	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s_key), delay(),
 		vec![mt(net.now() + 28 * day), mt(net.now() + 56 * day)]).unwrap();
-	let specs: Vec<LeafSpec> = (0..4).map(|i| LeafSpec {
+	let specs: Vec<LeafSpec> = (0..4).map(|i| LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(keys[i]), value: LEAF,
 		owner_nonce: label32(&format!("probe B owner nonce {}", i)),
 		operator_nonce: label32(&format!("probe B operator nonce {}", i)),
@@ -1276,7 +1276,7 @@ fn probes_turned_around(net: &mut Net) {
 	// By hand: the four entries under one node, gated to [S, A, A, B, C],
 	// whose RECLAIM names A twice.
 	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
-		let leaf = LeafPolicy { enclave: None, owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None, channel: None , v2: false};
+		let leaf = LeafPolicy { enclave: None, claim: None, owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None, channel: None , v2: false};
 		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
 			sweep: Some(sched.sweep(true, false)) };
 		(leaf, entry)
@@ -1289,7 +1289,7 @@ fn probes_turned_around(net: &mut Net) {
 	let policy = WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp()));
 	for i in 0..4 {
 		let others: Vec<usize> = (0..4).filter(|j| *j != i).collect();
-		let rec = LeafRecord {
+		let rec = LeafRecord { claim: None,
 			template: Template::Vtxo1, owner: specs[i].owner, owner_nonce: specs[i].owner_nonce,
 			operator_nonce: specs[i].operator_nonce, exit_delay: delay(), asset: net.x, value: LEAF,
 			unlock_hash: specs[i].unlock_hash, entry_reserve: ENTRY_RESERVE, chain: net.chain, schedule: sched.clone(),
@@ -1327,7 +1327,7 @@ fn probes_turned_around(net: &mut Net) {
 	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
 	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s_key), delay(),
 		vec![mt(net.now() + 28 * day), mt(net.now() + 56 * day)]).unwrap();
-	let replayed = LeafSpec {
+	let replayed = LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(&owner), value: LEAF, owner_nonce: old_nonce, operator_nonce: old_op,
 		exit_delay: delay(), unlock_hash: sha256(&label32("probe F new entry preimage")),
 		htlc: None,

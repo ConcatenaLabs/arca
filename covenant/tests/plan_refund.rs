@@ -110,7 +110,7 @@ fn pairs(p: &P, i: usize) -> (Pair, Pair) {
 fn step_round(c: &mut Arca, p: &P, i: usize, label: &str) -> (Tree, Transaction, Coin) {
 	let st = &p.plan.steps[i - 1];
 	let (issuer, sched) = c.schedule(&p.s);
-	let mine = LeafSpec {
+	let mine = LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: st.owner, value: st.value, owner_nonce: st.owner_nonce,
 		operator_nonce: st.operator_nonce, exit_delay: st.exit_delay, unlock_hash: st.unlock_hash, htlc: None,
 		order: None,

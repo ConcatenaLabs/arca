@@ -213,7 +213,7 @@ impl Wallet {
 		let d = Distribution {
 			inputs: plan.coins.iter().map(|c| LeafId::from_str(&c.leaf_id).map_err(|e| Error::Store(e.to_string()))).collect::<Result<_, _>>()?,
 			asset, exit_delay: self.exit_delay(), claims: claims.clone(), return_script: return_script.clone(), fees: fees.clone(),
-			not_before: None,
+			not_before: None, lapse: None,
 		};
 		d.check().map_err(|e| Error::Refused(e.to_string()))?;
 		let id = d.id(&self.genesis, &self.operator);

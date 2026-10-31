@@ -436,7 +436,7 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 				.map_err(|e| Error::Parse(format!("a published leaf's order terms: {}", e)))?),
 			None => None,
 		};
-		leaves.push(LeafSpec {
+		leaves.push(LeafSpec { claim: None,
 			template: l["template"].as_str().unwrap_or("").parse().map_err(|e: arca_covenant::RecordError| Error::Parse(e.to_string()))?,
 			owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&unhex(l["owner"].as_str().unwrap_or(""))?)
 				.map_err(|e| Error::Parse(e.to_string()))?,
