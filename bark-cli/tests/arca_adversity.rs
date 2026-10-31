@@ -3153,6 +3153,21 @@ async fn a_rewritten_witness_is_an_unreachable_server_and_takes_nothing() {
 	let shown = b.ok(&["info"]);
 	println!("D54 an older signed head in info: {}", shown["server_info"]);
 	assert!(shown["server_info"]["unreachable"].as_str().unwrap_or("").contains("proves no rollback"), "{}", shown);
+	// One older head, then the latest: what an `info` a long-running wallet kept a few seconds
+	// shows once a transfer has handed it a later head. It is read again, and passes.
+	let old = old_head.clone();
+	let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let seen = reads.clone();
+	pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, _: u16, v: &mut Value| {
+		if path == "/v1/info" && seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+			v["signer_record"] = old.clone();
+		}
+		None
+	})));
+	let shown = b.ok(&["info"]);
+	println!("D54 one older head in info, then the latest ({} reads): {}", reads.load(std::sync::atomic::Ordering::SeqCst), shown["server_info"]);
+	assert!(shown["server_info"]["unreachable"].is_null(), "an info older than a held head is read again: {}", shown);
+	assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2, "read again");
 	pb.rewrite(None);
 
 	// Honest again: nothing was refused for good.
