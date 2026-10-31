@@ -8,7 +8,7 @@
 # that hold the keys, the chains and the sockets.
 #
 # Any other argument runs install.sh with it: bundle-run status, addresses,
-# connect, register, credentials.
+# connect, bond, register, credentials.
 set -Eeuo pipefail
 svc=${1:-}
 case $svc in

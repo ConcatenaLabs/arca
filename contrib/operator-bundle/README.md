@@ -10,7 +10,7 @@ and run it.
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | The installer for an Ubuntu 24.04 machine with systemd (a server, or a WSL2 distro on Windows), and the commands every path uses (`status`, `addresses`, `connect`, `register`, `credentials`) |
+| `install.sh` | The installer for an Ubuntu 24.04 machine with systemd (a server, or a WSL2 distro on Windows), and the commands every path uses (`status`, `addresses`, `connect`, `bond`, `register`, `credentials`) |
 | `docker/Dockerfile`, `docker/docker-compose.yml` | The bundle in containers, one per daemon, for any system with Docker; `docker/bundle-run` is each container's entrypoint, and `docker/docker-compose.host.yml` puts the bundle on a Linux host's own network |
 | `bundle.env.example` | Every setting, with what it does |
 | `pins.env` | The version and checksum of every download and the commit of every build |

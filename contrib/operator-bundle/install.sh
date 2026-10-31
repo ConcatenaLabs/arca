@@ -76,6 +76,15 @@ fi
 # host's loopback alone.
 : "${LISTEN_HOST:=127.0.0.1}"
 : "${BUNDLE_MEMORY_MAX:=}" "${BUNDLE_CPU_QUOTA:=}" "${ARK_VTXO_POOL:=10000sat:10 50000sat:2}"
+# The equivocation bond ($0 bond): its withdrawal key, drawn on another
+# machine; its asset and size; the notice before a withdrawal; and the node
+# wallet it is paid from. With a withdrawal key set, the node's wallet is on.
+: "${BOND_WITHDRAW_KEY:=}" "${BOND_ASSET:=}" "${BOND_ATOMS:=}" "${BOND_NOTICE_UNITS:=5232}" "${BOND_WALLET:=operating}"
+[ -z "$BOND_WITHDRAW_KEY" ] || [[ $BOND_WITHDRAW_KEY =~ ^[0-9a-f]{64}$ ]] || die "BOND_WITHDRAW_KEY is the withdraw_key arcad bond-key prints (64 hex characters)"
+[ -z "$BOND_ASSET" ] || [[ $BOND_ASSET =~ ^[0-9a-f]{64}$ ]] || die "BOND_ASSET is an asset id (64 hex characters)"
+[ -z "$BOND_ATOMS" ] || [[ $BOND_ATOMS =~ ^[1-9][0-9]*$ ]] || die "BOND_ATOMS is a whole number of atoms"
+[[ $BOND_NOTICE_UNITS =~ ^[0-9]+$ ]] || die "BOND_NOTICE_UNITS is a number of 512-second units"
+[[ $BOND_WALLET =~ ^[A-Za-z0-9_-]+$ ]] || die "BOND_WALLET is a node wallet's name: letters, digits, _ and -"
 
 case "$NAME" in *[!a-z0-9-]*|"") die "NAME is lower-case letters, digits and dashes: $NAME";; esac
 USER_=$NAME
@@ -244,6 +253,11 @@ fi
 testnet_rules=""; [ "$SEQ_CHAIN" = test ] && testnet_rules="# The public testnet's network-wide rules.
 pospubliccommittee=1
 poscommitteesize=250"
+# The wallet stays off but for the bond: the operating wallet it is paid
+# from ($BOND_WALLET), made and loaded by "$0 bond".
+wallet_conf="disablewallet=1"
+[ -n "$BOND_WITHDRAW_KEY" ] && wallet_conf="# The operating wallet the bond is paid from (BOND_WALLET), and nothing else.
+disablewallet=0"
 write_conf sequentiad 640 "$ETC/sequentia.conf" <<EOF
 # The Sequentia node: the chain arcad and the SeqLN gateway read. Written by
 # install.sh from $BUNDLE_ENV.
@@ -254,7 +268,7 @@ $testnet_rules
 ${SEQ_CHAIN_CONF//;/$'\n'}
 server=1
 txindex=1
-disablewallet=1
+$wallet_conf
 # Every anchor is checked against this machine's Bitcoin node: the chain
 # follows Bitcoin's reorganisations, and arcad's finality waits on them.
 validateanchor=1
@@ -511,6 +525,19 @@ done
 for id in $ARCA_FEE_ASSETS; do fee_assets+="\"$id\", "; done
 [ -n "$fee_assets" ] || die "no served asset is accepted for fees by the node, so no round could pay its fee: name one in ARCA_FEE_ASSETS"
 read -r dmin dmax <<<"$ARCA_EXIT_DELAY_UNITS"
+# The bond's terms once a withdrawal key is chosen, and its coin once
+# "$0 bond" has posted it ($ETC/bond.outpoint).
+bond_toml=""
+if [ -n "$BOND_WITHDRAW_KEY" ]; then
+  bond_toml="
+[bond]
+withdraw_key = \"$BOND_WITHDRAW_KEY\"
+notice_units = $BOND_NOTICE_UNITS"
+  [ -s "$ETC/bond.outpoint" ] && bond_toml+="
+outpoint = \"$(cat "$ETC/bond.outpoint")\""
+  [ -s "$ETC/bond.notice" ] && bond_toml+="
+notice = \"$(cat "$ETC/bond.notice")\""
+fi
 write_conf arcad 600 "$ETC/arcad.toml" <<EOF
 # arcad's configuration, written by install.sh from $BUNDLE_ENV. Every
 # setting is described in arca's server/arcad.example.toml.
@@ -557,6 +584,7 @@ receive_cap_ppm = 100000
 [lightning.bitcoin]
 rpc = "$LIB/cln/$BTC_SUB/lightning-rpc"
 ark = "$ark_url"
+$bond_toml
 $assets_toml
 EOF
 }
@@ -1100,7 +1128,8 @@ The bundle runs. Next:
   1. Wait for both nodes to sync: $0 status
   2. Pay the pools and the gateways: $0 addresses
   3. Open the gateways' channels to the peer's: $0 connect
-  4. With DOMAIN set, list the operator: $0 register
+  4. Holding other people's coins, post the equivocation bond: $0 bond
+  5. With DOMAIN set, list the operator: $0 register
 EOF
 }
 
@@ -1125,6 +1154,7 @@ status() {
     say "key $(jq -r .operator <<<"$i"), exit delays $(jq -c .exit_delay_units <<<"$i")"
     jq -r '.assets[] | "  \(.asset[0:16])… min leaf \(.min_leaf), lightning \(.lightning.state // "none"), \(.lightning.channels // 0) channels"' <<<"$i" | cut -c1-200
     say "Bitcoin leg: $(jq -r '.lightning.bitcoin // {} | "\(.node.state // "none"), \(.node.channels // 0) channels, ark \(.ark // "none")"' <<<"$i")"
+    say "bond: $(jq -r '.bond // {} | .state // "none"' <<<"$i") ($0 bond)"
   else say "arcad is not answering"; fi
   step "the Bitcoin ark"
   say "$(captaind_rpc wallet 2>/dev/null | jq -c '.rounds | {address, total_balance, trusted_balance}' || echo 'captaind is not answering')"
@@ -1202,6 +1232,93 @@ register() {
   case $code in 2*) say "listed";; *) die "the registry answered $code";; esac
 }
 
+# The equivocation bond, one step at a time: it says what is still to choose
+# or to pay, and where, and posts the bond once everything is there. Run it
+# again after each step; once the bond stands it only reports it.
+bond() {
+  step "the equivocation bond"
+  say "A coin the operator loses if it ever co-signs two spends of one coin: wallets weigh it"
+  say "before trusting payments made out of round. An operator holding only its own coins can"
+  say "go without; one holding other people's posts it (doc/operator-procedure.md)."
+  local i st todo=() fees
+  i=$(info) || die "arcad is not answering: $0 status"
+  st=$(jq -r '.bond.state // "none"' <<<"$i")
+  case $st in
+    bonded)
+      say "bonded: $(jq -r '.bond | "\(.value) atoms of \(.asset[0:12])…, \(.outpoint), final: \(.final)"' <<<"$i")"
+      say "to end it, give the notice first, with the withdrawal key's file: arcad $ETC/arcad.toml bond-notice <file>"
+      return 0 ;;
+    unconfirmed) say "posted, in no block yet: $(jq -r .bond.outpoint <<<"$i"). Run $0 bond again once it confirms."; return 0 ;;
+    missing|spent|noticed) die "the bond reads $st: $(jq -r '.bond.why // empty' <<<"$i")" ;;
+  esac
+
+  fees=$(sed -n 's/^fee_assets = \[\(.*\)\]$/\1/p' "$ETC/arcad.toml" | tr -d '" ' | tr ',' '\n' | sed 's/^/      /')
+  [ -n "$BOND_WITHDRAW_KEY" ] || todo+=("BOND_WITHDRAW_KEY, the withdrawal key: the only key that can ever end the bond.
+    Draw it on a machine other than this one, never here: copy $BIN/arcad (Linux x86_64)
+    there and run   arcad bond-key bond-withdraw.key
+    It prints {\"withdraw_key\": ...}: put that key here. Keep the file, and a backup of it, off
+    this server: whoever holds it can end the bond, and without it nobody can.")
+  [ -n "$BOND_ASSET" ] || todo+=("BOND_ASSET, the asset the bond is posted in, its fee paid in it too: one this node
+    takes fees in. The operator's fee assets:
+$fees")
+  [ -n "$BOND_ATOMS" ] || todo+=("BOND_ATOMS, its size in atoms. Size it above what holders keep out of round together,
+    not one holder's most: a double spend must cost the operator more than it could take,
+    and one slash burns the bond once.")
+  if [ ${#todo[@]} -gt 0 ]; then
+    step "still to choose, in $BUNDLE_ENV"
+    for t in "${todo[@]}"; do printf '  - %s\n' "$t"; done
+    say "BOND_NOTICE_UNITS ($BOND_NOTICE_UNITS) is the notice before a withdrawal, at least a coin's lifetime,"
+    say "the longest exit delay and a day; BOND_WALLET ($BOND_WALLET) the node wallet it is paid from."
+    say "Then: $0 install (it writes the bond's terms and turns the node's wallet on), and $0 bond again."
+    exit 1
+  fi
+  grep -q "^withdraw_key = \"$BOND_WITHDRAW_KEY\"" "$ETC/arcad.toml" && [ "$st" = unposted ] \
+    || die "arcad does not run with these terms yet: $0 install, then $0 bond again"
+
+  step "the operating wallet: $BOND_WALLET"
+  if ! seq_cli -rpcwallet="$BOND_WALLET" getwalletinfo >/dev/null 2>&1; then
+    seq_cli loadwallet "$BOND_WALLET" >/dev/null 2>&1 \
+      || seq_cli -named createwallet wallet_name="$BOND_WALLET" load_on_startup=true >/dev/null \
+      || die "the node made no wallet $BOND_WALLET: is its wallet on? $0 install"
+    say "made and loaded"
+  fi
+  # The bond, and a thousandth over for its fee (at least 0.001 of a unit):
+  # what is left stays in the wallet.
+  local need have pend addr
+  need=$((BOND_ATOMS + (BOND_ATOMS / 1000 > 100000 ? BOND_ATOMS / 1000 : 100000)))
+  units() { python3 -I -c 'import sys; from decimal import Decimal as D; print(D(sys.argv[1]) / D(100000000))' "$1"; }
+  atoms() { python3 -I -c 'import sys; from decimal import Decimal as D; print(int(D(sys.argv[1]) * 100000000))' "$1"; }
+  have=$(atoms "$(seq_cli -rpcwallet="$BOND_WALLET" -named getbalance minconf=1 assetlabel="$BOND_ASSET")")
+  if [ "$have" -lt "$need" ]; then
+    pend=$(atoms "$(seq_cli -rpcwallet="$BOND_WALLET" -named getbalance minconf=0 assetlabel="$BOND_ASSET")")
+    addr=$(seq_cli -rpcwallet="$BOND_WALLET" getnewaddress "bond" bech32)
+    addr=$(seq_cli -rpcwallet="$BOND_WALLET" getaddressinfo "$addr" | jq -r '.unconfidential // .address')
+    step "to pay"
+    say "$(units "$need") of ${BOND_ASSET:0:12}… (the bond, $(units "$BOND_ATOMS"), and its fee) to"
+    say "  $addr"
+    say "the wallet holds $(units "$have") confirmed$( [ "$pend" -gt "$have" ] && printf ', %s with what is still unconfirmed' "$(units "$pend")")."
+    say "Once it confirms: $0 bond"
+    return 0
+  fi
+
+  step "posting $(units "$BOND_ATOMS") of ${BOND_ASSET:0:12}… from $BOND_WALLET"
+  local r err; err=$(mktemp)
+  r=$(arcad_cmd bond-post "$BOND_WALLET" "$BOND_ASSET" "$BOND_ATOMS" 2>"$err") \
+    || { r=$(tail -c 400 "$err"); rm -f "$err"; die "arcad did not post the bond: $r"; }
+  rm -f "$err"
+  jq -r .outpoint <<<"$r" > "$ETC/bond.outpoint"
+  chown root:"$USER_" "$ETC/bond.outpoint"; chmod 640 "$ETC/bond.outpoint"
+  say "paid: $(jq -r .outpoint <<<"$r")"
+  write_arcad_toml
+  if [ -d /run/systemd/system ]; then
+    systemctl restart "$(U arcad)"
+    WAIT_UNIT=$(U arcad) wait_for 300 "arcad answering" info
+    say "the bond reads $(info | jq -r .bond.state); $0 bond again shows it once final"
+  else
+    say "restart arcad to name it (docker compose restart arcad), then $0 bond"
+  fi
+}
+
 credentials() {
   step "RPC logins for a Lightning wallet beside the bundle (Fulmen)"
   say "Sequentia node: 127.0.0.1:$SEQ_RPC_PORT, user $NAME, password $(cat "$ETC/seq-rpc.password")"
@@ -1218,6 +1335,7 @@ case $CMD in
   addresses) addresses ;;
   connect) connect ;;
   register) register ;;
+  bond) bond ;;
   credentials) credentials ;;
-  *) die "unknown command $CMD (install, status, addresses, connect, register, credentials)" ;;
+  *) die "unknown command $CMD (install, status, addresses, connect, bond, register, credentials)" ;;
 esac
