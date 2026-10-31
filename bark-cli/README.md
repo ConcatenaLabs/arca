@@ -629,6 +629,46 @@ refresh, and a schedule that changed since it was shown is not taken: the
 server refuses a fee short of the asset's schedule (`fee`), and the browser
 wallet submits only the fees it showed.
 
+### Speeding up what waits on the chain
+
+A transaction the wallet needs can wait in the mempool for good: its fee was
+the node's floor when it was broadcast, and the producers take only more, or
+its fee asset's price fell since. An exit's steps cannot be replaced (their
+inputs signal no replacement, and the operator, a watchtower or the wallet
+may each have broadcast them), so the wallet speeds one up by a child: a
+transaction spending an output of the wallet's in the waiting transaction or
+in what spends it, which pays for itself and every ancestor still waiting.
+The producer values the two together in the reference unit, whatever asset
+each pays in. The child pays in the asset of the output it spends where the
+node accepts it, takes the package's other outputs of the wallet's next, and
+then a coin of the wallet's on the chain in an accepted asset as a second
+input; a raise replaces the child.
+
+Each exit step the wallet builds from its own reserve pays the floor of it
+and leaves the rest to the wallet's change, which is that output (an anchor),
+when the rest pays more than a child's input costs. A coin of a supervised
+asset at an address its issuer froze cannot be spent and speeds nothing up;
+a transaction in which nothing is the wallet's cannot be sped up by it.
+
+`sync` does it by itself for every exit under way: a step or claim that has
+waited two blocks in the mempool is sped up to twice the node's relay floor,
+the rate doubling at each further wait of two blocks, at most eight times,
+and the coin's note says so. `arca speed-up TXID [--fee-asset A] [--rate R]
+[--max-fee N]` speeds up any transaction of the wallet's that waits, `R` in
+atoms of the reference unit per 1,000 vbytes for the package.
+
+### Refreshing what it receives
+
+A coin received out of round can be spent again by a sender up its lineage
+together with the operator, or taken by a sender's exit of an earlier coin
+of its lineage, until it is refreshed in a round. `arca refresh-received
+[--max-fee-ppm N]` gives up every such coin it holds live (one a sender other
+than the wallet signed into since its last round or board; the change of its
+own payment from a coin of a round is not one) in the next round for a leaf
+of its own, at the operator's refresh fee within the wallet's bound, and says
+which coins it left as they are, and why. The browser wallets run it by
+themselves in their default mode.
+
 ### Paying and receiving over Lightning
 
 `lightning pay INVOICE` pays a BOLT11 invoice out of the wallet's coins in the
@@ -1626,6 +1666,8 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `channel pay LEAF TO AMOUNT` | Pays `AMOUNT` from the channel `LEAF` into the operator's channel `TO`, in the same asset: the next state signed, every credit not folded folded in it, and the answer the operator's signature and the receiver's note (`receipt`). Refused beyond the wallet's side, beyond what the receiver's operator side can take, or into the channel itself |
 | `channel fold LEAF` | Folds every credit the channel was paid into its balance |
 | `channel exit LEAF [--fee-asset A]` | Closes the channel on the chain, one step a run (see Channel leaves); `exited` once the wallet's side is swept home |
+| `speed-up TXID [--fee-asset A] [--rate R] [--max-fee N]` | Speeds up a transaction of the wallet's waiting in the mempool by a child that pays for it (see Speeding up what waits on the chain): what it spends, its fee, a second input if one paid, the child it replaced |
+| `refresh-received [--max-fee-ppm N]` | Gives up every coin received out of round in the next round for a leaf of its own (see Refreshing what it receives): the participations, and each coin left as it is with why |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit left it, followed from the round through each exit's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
@@ -1706,6 +1748,16 @@ each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
 refusal is asserted by its reason.
+
+`tests/arca_speed_up.rs` runs the same way, a transaction made to wait by
+halving its fee asset's rate after it is broadcast: a stuck exit rescued by
+`sync`'s child, which takes both steps into the next block; two holders
+exiting during a released batch's notice, one whose wallet syncs and is home
+long before the notice runs out, the other, which only runs `exit`, losing its
+coin to the operator's sweep; a coin of an asset the node does not take for
+fees sped up by a child with a second input in an accepted one (the coin's
+own asset for the fee refused); and a coin received out of round refreshed
+in the next round, while the sender's change is left as it is.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
 accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets

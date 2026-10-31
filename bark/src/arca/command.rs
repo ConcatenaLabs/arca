@@ -27,7 +27,8 @@ use super::{Config, Error, Wallet};
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
-	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, refusals, \
+	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
+	refresh_received {max_fee_ppm?}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
@@ -162,7 +163,7 @@ fn reads_only(command: &str) -> bool {
 /// on this machine and the node), then the re-check (unless the command is
 /// itself `recheck`, `sync` or `schedule`).
 fn start(w: &mut Wallet, command: &str) -> Value {
-	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "schedule"
+	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "speed_up" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	// A command that reads only, of the operator or an offer, skips the
 	// witness: it guards the coins the wallet takes and the spends it signs
@@ -287,6 +288,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.exit_shown(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?, shown)
 		},
 		"exit_quote" => w.exit_quote(req_str(&a["leaf_id"], "the coin")?, opt_asset(&a["fee_asset"])?),
+		// A transaction of the wallet's waiting in the mempool, sped up by a
+		// child (CPFP); `rate` in atoms of the reference unit a kvB.
+		"speed_up" => {
+			let txid = elements::Txid::from_str(req_str(&a["txid"], "the transaction")?)
+				.map_err(|e| Error::Parse(format!("the transaction: {}", e)))?;
+			w.speed_up(txid, opt_asset(&a["fee_asset"])?, opt_u64(&a["rate"], "the rate")?, opt_u64(&a["max_fee"], "the most it may pay")?)
+		},
+		"refresh_received" => w.refresh_received(opt_u64(&a["max_fee_ppm"], "the fee bound")?),
 		"refusals" => w.refusals(),
 		// The order as the relay serves it: its JSON, as text or as an
 		// object.
