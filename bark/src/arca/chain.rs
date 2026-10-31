@@ -99,6 +99,10 @@ struct GoneWalk {
 	cut: bool,
 }
 
+/// The most transactions [`ChainSource::rebroadcast_with_parents`] sends
+/// for one.
+pub const REDO_REACH: usize = 64;
+
 /// How far above a block the wallet looks for a committee certificate.
 const CERT_LOOKAHEAD: u64 = 200;
 
@@ -918,6 +922,49 @@ impl ChainSource {
 		Ok(v["validateanchor"].as_bool().unwrap_or(false))
 	}
 
+	/// Broadcasts `tx` again, with every transaction it rests on that is in
+	/// no block of the active chain and not in the mempool, parents first: a
+	/// chain an anchor-driven reorganisation took out of the chain, which the
+	/// node did not keep. Each parent comes from the node's own index; at most
+	/// [`REDO_REACH`] of them. Answers each transaction sent, with the node's
+	/// refusal when it refused one (the rest are sent all the same).
+	pub fn rebroadcast_with_parents(&self, tx: &Transaction) -> Result<Vec<Value>, Error> {
+		let mut order: Vec<Transaction> = vec![];
+		let mut seen: BTreeSet<Txid> = BTreeSet::new();
+		let mut stack: Vec<(Transaction, bool)> = vec![(tx.clone(), false)];
+		while let Some((t, expanded)) = stack.pop() {
+			if expanded {
+				order.push(t);
+				continue;
+			}
+			if !seen.insert(t.txid()) || seen.len() > REDO_REACH {
+				continue;
+			}
+			if self.whereabouts(&t.txid())? != (false, false) {
+				continue;
+			}
+			let parents: Vec<Txid> = t.input.iter().map(|i| i.previous_output.txid).collect();
+			stack.push((t, true));
+			for p in parents {
+				if seen.contains(&p) || self.tx_block(&p)?.is_some() {
+					continue;
+				}
+				if let Some(parent) = self.transaction(&p)? {
+					stack.push((parent, false));
+				}
+			}
+		}
+		let mut out = vec![];
+		for t in order {
+			out.push(match self.broadcast(&t) {
+				Ok(id) => json!({"txid": id.to_string()}),
+				Err(e) => json!({"txid": t.txid().to_string(), "refused": e.to_string()}),
+			});
+		}
+		gap();
+		Ok(out)
+	}
+
 	/// Broadcasts `tx`. One the node already holds is not an error.
 	pub fn broadcast(&self, tx: &Transaction) -> Result<Txid, Error> {
 		match self.call::<Txid>("sendrawtransaction", &[json!(hex(&elements::encode::serialize(tx)))]) {
@@ -1725,6 +1772,58 @@ mod test {
 	///
 	/// Needs `SEQUENTIAD_EXEC`.
 	#[cfg(not(target_arch = "wasm32"))]
+	/// A parent and its child left in no block and out of the mempool by an
+	/// anchor-driven reorganisation, their coin unspent: broadcast again from
+	/// the child, the parent goes first, and both are mined.
+	#[test]
+	fn a_chain_a_reorganisation_dropped_is_broadcast_again_parents_first() {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let mut r = Regtest::pos_from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let asset = coin.asset.explicit().unwrap();
+		let value = coin.value.explicit().unwrap();
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let parent = spend_to(free, asset, value, op_true.clone());
+		let child = spend_to(OutPoint::new(parent.txid(), 0), asset, value - 10_000, op_true.clone());
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let anchored = r.parent.client().block_count().unwrap();
+		r.node.client().send_raw_transaction(&parent).unwrap();
+		r.node.client().send_raw_transaction(&child).unwrap();
+		r.produce_block().unwrap();
+		r.orphan_parent_from(anchored).unwrap();
+		r.node.restart(&["-persistmempool=0"]).unwrap();
+		gap();
+		chain.new_command();
+		assert_eq!(chain.whereabouts(&child.txid()).unwrap(), (false, false));
+		assert!(!chain.gone(&child).unwrap(), "its coin is unspent: it can return");
+		let sent = chain.rebroadcast_with_parents(&child).unwrap();
+		println!("broadcast again: {}", serde_json::to_string(&sent).unwrap());
+		assert_eq!(sent.iter().map(|v| v["txid"].as_str().unwrap().to_string()).collect::<Vec<_>>(),
+			vec![parent.txid().to_string(), child.txid().to_string()], "the parent first");
+		assert!(sent.iter().all(|v| v.get("refused").is_none()), "{:?}", sent);
+		chain.new_command();
+		assert_eq!(chain.whereabouts(&child.txid()).unwrap(), (false, true), "in the mempool again");
+		r.produce_block().unwrap();
+		gap();
+		chain.new_command();
+		assert!(chain.tx_block(&child.txid()).unwrap().is_some() && chain.tx_block(&parent.txid()).unwrap().is_some(), "both mined");
+		// Asked again, nothing is sent: both are in the chain.
+		assert!(chain.rebroadcast_with_parents(&child).unwrap().is_empty());
+	}
+
 	/// A chain of transactions left off the chain by an anchor-driven
 	/// reorganisation, and gone from the mempool: the child can return while
 	/// its parent can, and can never return once another transaction, final,

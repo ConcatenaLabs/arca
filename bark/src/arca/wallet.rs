@@ -3776,7 +3776,9 @@ impl Wallet {
 		}
 	}
 
-	/// Posts again every board registration the server has not answered.
+	/// Posts again every board registration the server has not answered,
+	/// and broadcasts again every waiting board a reorganisation left in no
+	/// block and out of the mempool, or gives up one the server holds lost.
 	pub(crate) fn retry_boards(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for (leaf_id, body) in self.store.board_requests_in("requested")? {
@@ -3787,6 +3789,40 @@ impl Wallet {
 				Ok(state) => json!({"board": leaf_id, "registered": true, "state": state}),
 				Err(e) => json!({"board": leaf_id, "error": e.to_string()}),
 			});
+		}
+		// A board registered and waiting whose transaction is in no block and
+		// not in the mempool (an anchor-driven reorganisation took it out,
+		// and the node did not keep it): broadcast again, its parents off the
+		// chain first, so it is mined and credited as it would have been.
+		// One the operator holds as lost is given up: the coins it spent are
+		// the wallet's on the chain again, and it is followed should it ever
+		// be credited ([`Self::lost_boards_credited`]).
+		for c in self.store.coins_in("pending")?.into_iter().filter(|c| c.kind == "board") {
+			let Some(Ok(txid)) = c.bases.first().map(|t| Txid::from_str(t)) else { continue };
+			if self.chain.whereabouts(&txid)? != (false, false) {
+				continue;
+			}
+			match self.server.post("board_status", &json!({"leaf_id": c.leaf_id})) {
+				Ok(st) if st["state"].as_str() == Some("lost") => {
+					let why = "the server holds the board as lost: its transaction stayed out of every block";
+					self.store.set_coin_state(&c.leaf_id, "lost", why)?;
+					out.push(json!({"board": c.leaf_id, "state": "lost", "why": why}));
+					continue;
+				},
+				Ok(_) => {},
+				Err(e) => {
+					out.push(json!({"board": c.leaf_id, "error": e.to_string()}));
+					continue;
+				},
+			}
+			let tx = match self.store.tx(&txid.to_string())? {
+				Some(raw) => elements::encode::deserialize::<Transaction>(&raw).map_err(|e| Error::Store(e.to_string()))?,
+				None => match self.chain.transaction(&txid)? {
+					Some(t) => t,
+					None => continue,
+				},
+			};
+			out.push(json!({"board": c.leaf_id, "rebroadcast": self.chain.rebroadcast_with_parents(&tx)?}));
 		}
 		Ok(out)
 	}
