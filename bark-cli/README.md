@@ -1750,7 +1750,8 @@ sides (the taker's delegation carried in its acceptance); the taker is then
 restored from its mnemonic alone, and once both refresh, the X node and the Y
 node each come back by RECLAIM-D. A payment over Lightning from such a coin
 carries its delegation too (run where `LIGHTNINGD_EXEC` names SeqLN's
-`lightningd`).
+`lightningd`). A payee that takes its whole coin off the tree by an offboard
+releases the node through the offboard, and the node comes back the same way.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when

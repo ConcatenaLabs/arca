@@ -194,6 +194,26 @@ impl Release {
 	}
 }
 
+impl Release {
+	/// [`Release::for_holder`] for a coin given up for `offboard`, an
+	/// offboard output `round` pays, whose connector output is `c`: one
+	/// release for each lowest node with RECLAIM-D the coin rests on, naming
+	/// the round's connector asset. Refuses a round that does not pay the
+	/// offboard, an output `c` that is not the operator's connector, and an
+	/// offboard of another operator.
+	pub fn for_holder_offboard(coin: &ValidCoin, offboard: &OffboardPolicy, round: &Transaction, c: u32) -> Result<Vec<Release>, SpendError> {
+		if coin.leaf.operator != offboard.operator {
+			return Err(SpendError::OtherOperator);
+		}
+		offboard.find(round)?;
+		ConnectorPolicy { operator: coin.leaf.operator }.check(round, c)?;
+		let connector = connector_asset(round.txid(), c);
+		Ok(coin.release_nodes().into_iter().map(|(chain, node_hash)| Release {
+			chain, node_hash, owner: coin.leaf.owner, connector,
+		}).collect())
+	}
+}
+
 /// A coin's key's delegation of its release to the owner keys of a
 /// reassignment's outputs: see the [module documentation](self).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
