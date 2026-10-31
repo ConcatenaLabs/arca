@@ -460,8 +460,8 @@ pub struct WatcherSection {
 	/// only when `Watcher::pass` is called.
 	#[serde(default = "default_true")]
 	pub enabled: bool,
-	/// Unroll a node all of whose owners have released their lowest nodes,
-	/// and reclaim those, before the batch expires.
+	/// Unroll the nodes above each lowest node all of whose owners have
+	/// released it, and reclaim it, before the batch expires.
 	#[serde(default = "default_true")]
 	pub reclaim_early: bool,
 	/// The most outputs one sweep takes.

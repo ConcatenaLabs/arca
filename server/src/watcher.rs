@@ -60,11 +60,13 @@
 //!    takes only what no one could unroll.
 //! 6. **Reclaim.** A lowest node every owner of which has released it is
 //!    reclaimed with an atom of each `M` the releases name. With
-//!    `reclaim_early`, a node all of whose lowest nodes are released is
-//!    unrolled first, by a released owner's authorisation from the server's
-//!    records, so a fully refreshed batch comes back before it expires; a
-//!    node with an owner who has not released is never unrolled by the
-//!    watcher.
+//!    `reclaim_early`, the nodes above a released lowest node are unrolled
+//!    first, by the authorisation of one of its owners from the server's
+//!    records, so each released lowest node comes back before its batch
+//!    expires, whoever else rests on the batch: an upper node on the chain
+//!    shows no wallet a leaf or checkpoint of its coin. A lowest node with an
+//!    owner who has not released is never unrolled by the watcher, since
+//!    that would put the owner's leaf on the chain.
 //! 7. **Absent makers' orders.** A resting order whose coin is live at its
 //!    exit deadline (three days before the earliest expiry in its lineage),
 //!    its maker not back to refresh or take it home, is landed by the
@@ -142,8 +144,8 @@ mod swept;
 /// How the watcher works.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
-	/// Unroll a subtree whose every owner has released it and reclaim its
-	/// lowest nodes before the batch expires.
+	/// Unroll the nodes above each released lowest node and reclaim it
+	/// before the batch expires.
 	pub reclaim_early: bool,
 	/// The most outputs one sweep takes.
 	pub max_sweep_inputs: usize,
@@ -2459,9 +2461,22 @@ impl Watcher {
 		let leaf_ids: Vec<[u8; 32]> = leaves.iter().map(|l| l.leaf_id).collect();
 		let seen = self.store.tree_sightings(round.round_id, b.vout).await?;
 		let depth = tree.levels().len();
+		// The lowest nodes every slot of which consents (its owner's release,
+		// or its holders' through RECLAIM-D), by their leaf ranges: those the
+		// watcher reclaims, and toward which it unrolls.
+		let done = |n: &arca_covenant::tree::TreeNode| n.leaves.clone().all(|i| released.contains_key(&i) || consents.contains_key(&i));
+		let complete: Vec<std::ops::Range<usize>> = tree.levels()[0].iter().filter(|n| done(n)).map(|n| n.leaves.clone()).collect();
 		for level in (0..depth).rev() {
 			for (k, node) in tree.levels()[level].iter().enumerate() {
-				if !node.leaves.clone().all(|i| released.contains_key(&i) || consents.contains_key(&i)) {
+				// A lowest node is reclaimed only once all of its slots
+				// consent. A node above is unrolled toward any such lowest
+				// node under it, whoever else rests on it: an upper node on
+				// the chain puts no leaf or checkpoint of anyone's coin
+				// there, so no wallet under it takes its coin home for it,
+				// and each one's own exit is a step shorter.
+				let toward = complete.iter().find(|c| node.leaves.start <= c.start && c.end <= node.leaves.end).map(|c| c.start);
+				let wanted = if level == 0 { done(node) } else { toward.is_some() };
+				if !wanted {
 					continue;
 				}
 				let mut candidates: Vec<OutPoint> = seen.iter().filter(|s| s.kind == TreeScriptKind::Node && s.level as usize == level && s.idx as usize == k)
@@ -2481,8 +2496,8 @@ impl Watcher {
 							let cs: Vec<&crate::delegations::Consent> = node.leaves.clone().map(|i| &consents[&i]).collect();
 							self.reclaim_node_delegated(node, op, &cs, ids).await?;
 						}
-					} else if self.config.reclaim_early && !expired {
-						self.unroll_released(node, level, depth, op, &leaves, &released).await?;
+					} else if let Some(by) = toward.filter(|_| self.config.reclaim_early && !expired) {
+						self.unroll_released(node, level, depth, op, &leaves, by).await?;
 					}
 					break;
 				}
@@ -2491,15 +2506,16 @@ impl Watcher {
 		Ok(())
 	}
 
-	/// Unrolls `node`, on the chain at `op`, all of whose owners have
-	/// released their lowest nodes, by the first such owner's authorisation.
+	/// Unrolls `node`, on the chain at `op`, toward a lowest node under it
+	/// every slot of which consents, by the authorisation of that lowest
+	/// node's first leaf (`by`), an owner who released it or a slot whose
+	/// holders did.
 	#[allow(clippy::too_many_arguments)]
 	async fn unroll_released(&self, node: &arca_covenant::tree::TreeNode, level: usize, depth: usize, op: OutPoint,
-		leaves: &[crate::store::BatchLeafRow], released: &HashMap<usize, crate::store::ReleaseRow>) -> Result<(), WatcherError>
+		leaves: &[crate::store::BatchLeafRow], by: usize) -> Result<(), WatcherError>
 	{
-		let i = node.leaves.start;
+		let i = by;
 		let leaf = leaves.get(i).ok_or_else(|| WatcherError::Build("a leaf the tree has and the store does not".into()))?;
-		let _ = released;
 		let coin = self.coin(&leaf.leaf_id).await?;
 		let (branch, auths) = match &coin.origin {
 			ValidOrigin::Leaf { valid, auths, .. } => (&valid.branch, auths),
@@ -2518,7 +2534,8 @@ impl Watcher {
 		}).await?;
 		let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
 		self.publish(Ready { tx: u.tx, wallet, fee }, "unroll", node.policy.children_hash().to_vec(),
-			format!("a node at level {} all of whose owners released it, by coin {}'s authorisation", level, hex(&leaf.leaf_id))).await?;
+			format!("a node at level {} toward a lowest node every slot of which consents, by coin {}'s authorisation", level,
+				hex(&leaf.leaf_id))).await?;
 		Ok(())
 	}
 
