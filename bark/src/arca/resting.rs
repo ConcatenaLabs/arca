@@ -154,7 +154,10 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut fee) = (0u64, 0u64);
 		let mut done = None;
-		for c in self.spendable_coins(a)? {
+		for c in self.coins_to_give(a)? {
+			if chosen.len() == super::round::MAX_GIVEN {
+				return Err(Self::too_many_coins(a, total, ask.amount.saturating_add(fee)));
+			}
 			let (record, held) = self.held(&c.row)?;
 			let expiry = self.service_expiry(&record, &held)?;
 			fee = fee.saturating_add(refresh_fee(&schedule, c.coin.value, expiry, now));
@@ -446,9 +449,12 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;
-		for mut c in self.spendable_coins(asset_b)? {
+		for mut c in self.coins_to_give(asset_b)? {
 			if c.row.expiry < order_expiry {
 				continue;
+			}
+			if chosen.len() == super::round::MAX_GIVEN {
+				return Err(Self::too_many_coins(asset_b, kept, price));
 			}
 			let cp = self.checkpoint_margin_of(&c.coin, &m)?;
 			let Some(v) = c.coin.value.checked_sub(cp).filter(|v| *v > 0) else { continue };

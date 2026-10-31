@@ -109,7 +109,10 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut refresh) = (0u64, 0u64);
 		let mut done = None;
-		for c in self.spendable_coins(asset)? {
+		for c in self.coins_to_give(asset)? {
+			if chosen.len() == super::round::MAX_GIVEN {
+				return Err(Self::too_many_coins(asset, total, amount.saturating_add(refresh).saturating_add(offboard)));
+			}
 			let (record, held) = self.held(&c.row)?;
 			let expiry = self.service_expiry(&record, &held)?;
 			refresh = refresh.saturating_add(refresh_fee(&schedule, c.coin.value, expiry, now));
