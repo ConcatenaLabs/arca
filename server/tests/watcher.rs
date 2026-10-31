@@ -546,7 +546,7 @@ async fn a_refreshed_coin_paid_from_a_board_waits_for_the_change_and_then_comes_
 	let refused = r.http.post("submit_participation", &body);
 	println!("A's refresh of its change past the board's exit deadline: {} {:?}", refused.status, refused.refusal());
 	assert_eq!(refused.status, 422, "{}", refused.json);
-	assert!(refused.refusal().1.contains("rests on a board whose service ends"), "{:?}", refused.refusal());
+	assert!(refused.refusal().1.contains("whose service ends at median time"), "{:?}", refused.refusal());
 
 	// A's change rests live on the lineage: the watcher publishes nothing of
 	// it before the board's expiry.

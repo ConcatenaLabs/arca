@@ -329,7 +329,7 @@ async fn a_take_completes_on_the_schedule_alone() {
 	let sch = t.ok(&["schedule"]);
 	println!("take {} {} | schedule: due {} next_sync_at {} (now {}) why {}", pid, k["state"], sch["due"], sch["next_sync_at"], sch["now"],
 		sch["why"]);
-	assert!(sch["why"].as_str().unwrap_or("").contains("a take of an on-chain order waits on its round"), "{}", sch);
+	assert!(sch["why"].as_str().unwrap_or("").contains("a participation waits on its round"), "{}", sch);
 	let wake = sch["next_sync_at"].as_u64().unwrap();
 	assert!(wake <= sch["now"].as_u64().unwrap() + 300, "a wake within half the forfeit window: {}", sch);
 	let (built, _) = r.server.rounds.run_rounds().await.unwrap();

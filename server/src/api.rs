@@ -186,6 +186,28 @@ pub struct Info {
 	/// with: base URLs.
 	#[serde(default)]
 	pub watchtowers: Vec<String>,
+	/// How the operator builds its batches.
+	#[serde(default)]
+	pub batches: BatchesInfo,
+}
+
+/// How the operator builds its batches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchesInfo {
+	/// Whether its refresh rounds build batches without a sweep, whose coins
+	/// never expire: such a round is held, built and unbroadcast, until every
+	/// participation in it has handed over its forfeits (within
+	/// `fills.forfeit_window_seconds` of the round being built, or it is
+	/// voided), so a wallet stays in touch until its round is built and signs
+	/// against the transaction its status serves. Always true on the main
+	/// chain.
+	pub no_sweep: bool,
+	/// The service horizon: the seconds after its round's median time from
+	/// which the operator collects a batch without a sweep on the chain and
+	/// co-signs no off-chain spend of a coin resting on it. A holder
+	/// refreshes such a coin before then, or finds it on the chain, its own.
+	pub collect_after_seconds: u32,
 }
 
 /// The operator's equivocation bond ([`crate::bond`]).
@@ -582,6 +604,25 @@ pub struct IssuerSupply {
 	/// chain and against its batch's published tree (`tree`).
 	#[serde(default)]
 	pub in_batches_outputs: Vec<BatchOutputEntry>,
+	/// Of `in_batches`, the units of coins their owners gave up in batches
+	/// without a sweep that the operator has not collected yet: each such
+	/// coin's new units are live beside them until its forfeit's claim, or
+	/// its node's reclaim, burns them. The operator collects them at the
+	/// batch's service horizon at the latest.
+	#[serde(default)]
+	pub forfeited_uncollected: String,
+	/// Each coin `forfeited_uncollected` counts.
+	#[serde(default)]
+	pub forfeited_uncollected_coins: Vec<ForfeitedCoin>,
+}
+
+/// A coin given up and not yet collected ([`IssuerSupply::forfeited_uncollected`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForfeitedCoin {
+	pub leaf_id: String,
+	pub value: String,
+	pub round_txid: String,
 }
 
 /// An unspent output under a burn-only sweep: where it is, what it holds,
@@ -1993,10 +2034,12 @@ pub struct RoundRef {
 	pub txid: String,
 	/// The round's connector output, whose asset every forfeit of the round names.
 	pub connector_vout: u32,
-	/// For a round that fills on-chain orders and is not broadcast yet: the
-	/// transaction without its witnesses (its txid the round's), which a
-	/// take validates its new leaf against before it hands over its forfeits;
-	/// nobody but the operator can broadcast it.
+	/// For a round held for its forfeits and not broadcast yet (one that
+	/// fills on-chain orders, or holds a batch without a sweep), to a
+	/// participation that gives up coins: the transaction without its
+	/// witnesses (its txid the round's), which the participation validates
+	/// its new leaves against before it hands over its forfeits; nobody but
+	/// the operator can broadcast it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub tx: Option<String>,
 }

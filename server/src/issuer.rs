@@ -617,6 +617,7 @@ pub async fn supply(store: &Store, finality: &FinalityService, asset: AssetId, i
 		asset: asset.to_string(), limiter_coin: None, limiter_minted: None, limiter_elapsed: None, limiter_armed: None,
 		limiter_unavailable: None, mints: vec![], burns: vec![], minted: String::new(), minted_final: String::new(),
 		burned: String::new(), burned_final: String::new(), in_batches: String::new(), in_batches_outputs: vec![],
+		forfeited_uncollected: String::new(), forfeited_uncollected_coins: vec![],
 	};
 	match limiter_now(store, finality, asset, i).await? {
 		LimiterAt::Ready(n) => {
@@ -688,5 +689,13 @@ pub async fn supply(store: &Store, finality: &FinalityService, asset: AssetId, i
 	out.burned = burned.to_string();
 	out.burned_final = burned_final.to_string();
 	out.in_batches = live.to_string();
+	let mut forfeited = 0u64;
+	for (leaf, value, round) in store.forfeited_uncollected(&a).await? {
+		forfeited = forfeited.saturating_add(value);
+		out.forfeited_uncollected_coins.push(crate::api::ForfeitedCoin {
+			leaf_id: arca_covenant::LeafId(leaf).to_string(), value: value.to_string(), round_txid: Txid::from_byte_array(round).to_string(),
+		});
+	}
+	out.forfeited_uncollected = forfeited.to_string();
 	Ok(out)
 }

@@ -3,13 +3,16 @@
 //! lowest nodes of the coins it gave up.
 //!
 //! `forfeit_leaves` is accepted only for a participation in a round the
-//! finality service calls final, or for a take in a round that fills
-//! on-chain orders and is not broadcast yet: such a round pays its makers on
-//! the chain from the operator's coins, so it goes out only once every take
-//! in it has handed over its forfeits (the owner's halves, which are all the
-//! operator needs to complete them; the signer is asked for its half once
-//! the node holds the round, in its mempool or a block), and the preimage
-//! goes out once it is final, as for any participation. The forfeits must
+//! finality service calls final, or for one that gives up coins in a round
+//! held for its forfeits and not broadcast yet ([`Store::round_held`]): a
+//! round that fills on-chain orders pays its makers on the chain from the
+//! operator's coins, and a batch without a sweep has nothing to take back a
+//! new leaf whose owner never hands its forfeit over, so such a round goes
+//! out only once every participation in it has handed over its forfeits (the
+//! owner's halves, which are all the operator needs to complete them; the
+//! signer is asked for its half once the node holds the round, in its
+//! mempool or a block), and the preimage goes out once it is final, as for
+//! any participation. The forfeits must
 //! be exactly the coins the
 //! participation gave up, one each, and the server verifies every one against
 //! the forfeit it builds itself ([`Forfeit::new`]) from what it chose: the
@@ -300,12 +303,13 @@ impl Forfeits {
 		}
 		let round = self.store.round(round_id).await?.ok_or_else(|| ForfeitError::Internal(format!("round {} is not recorded", round_id)))?;
 		let round_txid = Txid::from_byte_array(round.txid);
-		// A take hands its forfeits over before its round is broadcast: the
-		// round fills an on-chain order and pays its maker on the chain, so
-		// it goes out only once the operator holds the owner's half of every
-		// coin each of its takes gives up.
-		let before_broadcast = round.state == RoundState::Built && p.fill.is_some()
-			&& !self.store.round_fills(round_id).await?.is_empty();
+		// A participation in a held round hands its forfeits over before the
+		// round is broadcast: a round that fills an on-chain order pays its
+		// maker on the chain, and a batch without a sweep has nothing to take
+		// back a new leaf whose owner never hands its forfeit over, so such a
+		// round goes out only once the operator holds the owner's half of
+		// every coin each of its participations gives up.
+		let before_broadcast = round.state == RoundState::Built && !p.inputs.is_empty() && self.store.round_held(round_id).await?;
 		if round.state != RoundState::Final && !before_broadcast {
 			return Err(ForfeitError::RoundNotFinal(round_txid));
 		}
@@ -427,7 +431,7 @@ impl Forfeits {
 			Err(e) => return Err(e.into()),
 		}
 		if before_broadcast {
-			log::info!("take {}: {} forfeit(s) in before its round {} is broadcast; its preimage goes out once the round is final",
+			log::info!("participation {}: {} forfeit(s) in before its round {} is broadcast; its preimage goes out once the round is final",
 				hex(&id), forfeits.len(), round_txid);
 			return Ok(Forfeited { participation_id: id, state: p.state, preimage: None });
 		}
@@ -479,7 +483,7 @@ impl Forfeits {
 			// it: the signer is asked for its half only once the node does,
 			// so a forfeit for a round that never reached the chain is never
 			// whole.
-			if !self.store.round_fills(row.round_id).await?.is_empty() {
+			if self.store.round_held(row.round_id).await? {
 				let holds = match held.get(&row.round_id) {
 					Some(h) => *h,
 					None => {
@@ -490,7 +494,7 @@ impl Forfeits {
 				};
 				if !holds {
 					log::info!("the forfeit of coin {} for round {} waits for the operator's half: the node does not hold that round, \
-						which fills on-chain orders", leaf, row.round_id);
+						which was held for its forfeits", leaf, row.round_id);
 					continue;
 				}
 			}

@@ -86,6 +86,16 @@
 //!    holder never took it up) is paid back to the distribution's return
 //!    script, with every other such leaf of the distribution, from the
 //!    operator's own coins (`returns.rs`).
+//! 9. **Collection.** A batch without a sweep never expires, and the sweep
+//!    above never acts on it. At its service horizon
+//!    ([`Params::collect_after_seconds`] after its round) the watcher brings
+//!    what is left of it on the chain, one step a coin a pass
+//!    ([`Watcher::collect_batch`]): a lowest node every owner of which
+//!    released or consented is left to its reclaim (6); every other live
+//!    coin lands as its holder's own leaf, every given-up coin is brought down
+//!    to its leaf for its forfeit (1, 3), and every coin paid on out of round
+//!    lands through its lineage's checkpoints and reassignments (1). A
+//!    claim leaf of a distribution is left to its lapse (8).
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
@@ -376,6 +386,7 @@ impl Watcher {
 		self.lapses(now).await?;
 		self.expiries(now).await?;
 		self.reclaims(now).await?;
+		self.collections(now).await?;
 		self.returns().await?;
 		self.owed().await?;
 		Ok(())
@@ -2427,40 +2438,20 @@ impl Watcher {
 
 	async fn reclaim_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
 		let schedule = ClockSchedule::decode(&b.schedule).map_err(build("the schedule"))?;
-		let (_, spk) = self.token(round, b, schedule.token).await?;
-		let expired = match schedule.place(&spk) {
-			Some(TokenPlace::Clock(j)) => now.to_consensus_u32() >= schedule.expiries()[j].to_consensus_u32(),
-			_ => true,
+		// A batch without a sweep never expires: its token is no output.
+		let expired = schedule.expires() && {
+			let (_, spk) = self.token(round, b, schedule.token).await?;
+			match schedule.place(&spk) {
+				Some(TokenPlace::Clock(j)) => now.to_consensus_u32() >= schedule.expiries()[j].to_consensus_u32(),
+				_ => true,
+			}
 		};
 		let tree = self.tree(round, b.vout).await?;
 		let leaves = match self.store.batch(&round.txid, b.vout).await? {
 			Some((_, l)) => l,
 			None => return Ok(()),
 		};
-		// Each leaf's release of its lowest node, by leaf index.
-		let mut released: HashMap<usize, crate::store::ReleaseRow> = HashMap::new();
-		// On a node with RECLAIM-D one of whose leaves moved out of round:
-		// every slot's consent, by leaf index, once each has one.
-		let mut consents: HashMap<usize, crate::delegations::Consent> = HashMap::new();
-		for node in &tree.levels()[0] {
-			let rows = self.store.releases(&node.policy.children_hash()).await?;
-			for i in node.leaves.clone() {
-				if let Some(r) = rows.iter().find(|r| leaves.get(i).is_some_and(|l| l.leaf_id == r.leaf_id)) {
-					released.insert(i, r.clone());
-				}
-			}
-			if b.delegated_reclaim && node.policy.delegated() && !node.leaves.clone().all(|i| released.contains_key(&i)) {
-				let start = node.leaves.start;
-				let slots: Option<Vec<([u8; 32], elements::secp256k1_zkp::XOnlyPublicKey)>> = node.leaves.clone()
-					.map(|i| Some((leaves.get(i)?.leaf_id, *node.policy.owners().get(i - start)?))).collect();
-				let Some(slots) = slots else { continue };
-				if let Some(cs) = crate::delegations::node_consents(&self.store, &slots, node.policy.children_hash()).await? {
-					for (i, c) in node.leaves.clone().zip(cs) {
-						consents.insert(i, c);
-					}
-				}
-			}
-		}
+		let (released, consents) = self.slots(b, &tree, &leaves).await?;
 		if released.is_empty() && consents.is_empty() {
 			return Ok(());
 		}
@@ -2508,6 +2499,127 @@ impl Watcher {
 					break;
 				}
 			}
+		}
+		Ok(())
+	}
+
+	/// Each leaf's release of its lowest node, by leaf index, and, on a node
+	/// with RECLAIM-D one of whose leaves moved out of round, every slot's
+	/// consent, by leaf index, once each has one.
+	async fn slots(&self, b: &crate::store::BatchRow, tree: &Tree, leaves: &[crate::store::BatchLeafRow])
+		-> Result<(HashMap<usize, crate::store::ReleaseRow>, HashMap<usize, crate::delegations::Consent>), WatcherError>
+	{
+		let mut released: HashMap<usize, crate::store::ReleaseRow> = HashMap::new();
+		let mut consents: HashMap<usize, crate::delegations::Consent> = HashMap::new();
+		for node in &tree.levels()[0] {
+			let rows = self.store.releases(&node.policy.children_hash()).await?;
+			for i in node.leaves.clone() {
+				if let Some(r) = rows.iter().find(|r| leaves.get(i).is_some_and(|l| l.leaf_id == r.leaf_id)) {
+					released.insert(i, r.clone());
+				}
+			}
+			if b.delegated_reclaim && node.policy.delegated() && !node.leaves.clone().all(|i| released.contains_key(&i)) {
+				let start = node.leaves.start;
+				let slots: Option<Vec<([u8; 32], elements::secp256k1_zkp::XOnlyPublicKey)>> = node.leaves.clone()
+					.map(|i| Some((leaves.get(i)?.leaf_id, *node.policy.owners().get(i - start)?))).collect();
+				let Some(slots) = slots else { continue };
+				if let Some(cs) = crate::delegations::node_consents(&self.store, &slots, node.policy.children_hash()).await? {
+					for (i, c) in node.leaves.clone().zip(cs) {
+						consents.insert(i, c);
+					}
+				}
+			}
+		}
+		Ok((released, consents))
+	}
+
+	// -----------------------------------------------------------------------
+	// Collection of batches without a sweep
+	// -----------------------------------------------------------------------
+
+	/// Collects every batch without a sweep past its service horizon
+	/// ([`Params::collect_after_seconds`] after its round): see
+	/// [`Self::collect_batch`].
+	async fn collections(&self, now: MedianTime) -> Result<(), WatcherError> {
+		for round in self.store.rounds_in(RoundState::Final).await? {
+			for b in self.store.batches(round.round_id).await? {
+				let Some(at) = b.collect_mtp else { continue };
+				if now.to_consensus_u32() < at {
+					continue;
+				}
+				let r = self.collect_batch(&round, &b, now).await;
+				Self::item(&format!("the collection of the batch at output {} of round {}", b.vout, round.round_id), r)?;
+			}
+		}
+		Ok(())
+	}
+
+	/// Collects the batch `b` without a sweep, past its service horizon, one
+	/// step a coin a pass: what the operator fronted comes back on the chain,
+	/// and every holder's coin lands there as its holder's own. A lowest node
+	/// every owner of which has released it, or consented through a
+	/// delegation, is left to its RECLAIM or RECLAIM-D ([`Self::reclaims`]).
+	/// Every other leaf is brought on the chain by the operator's own
+	/// authorisations and the entry's preimage: a live coin under its
+	/// holder's key, as a coin of a released batch is brought
+	/// ([`Self::unroll_live`]); a coin its owner gave up, its forfeit stored,
+	/// down to its leaf, which the answer to stale exits then forfeits and the
+	/// claim takes; and a coin paid on out of round, through its lineage, its
+	/// checkpoints and reassignments published by the answers to stale exits,
+	/// so its current holder's coin is an on-chain leaf of its own. A claim
+	/// leaf of a distribution, and an `htlc-1` leaf, are left to their own
+	/// paths.
+	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
+		if b.kind != arca_covenant::BatchKind::Tree {
+			return Ok(());
+		}
+		let tree = self.tree(round, b.vout).await?;
+		let Some((_, leaves)) = self.store.batch(&round.txid, b.vout).await? else { return Ok(()) };
+		let (released, consents) = self.slots(b, &tree, &leaves).await?;
+		let reclaimed = |i: usize| tree.levels()[0].iter().any(|n| n.leaves.contains(&i)
+			&& n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)));
+		let mut stack = vec![];
+		for (i, bl) in leaves.iter().enumerate() {
+			if !reclaimed(i) && !self.store.is_distribution(&bl.participation_id).await? {
+				stack.push(bl.leaf_id);
+			}
+		}
+		let mut visited = HashSet::new();
+		let (mut live, mut given) = (0usize, 0usize);
+		while let Some(leaf) = stack.pop() {
+			if !visited.insert(leaf) {
+				continue;
+			}
+			let Some(row) = self.store.leaf(&leaf).await? else { continue };
+			let forfeited = match row.state {
+				LeafState::Live => false,
+				LeafState::Spent if self.live_forfeit(&leaf).await?.is_some() => true,
+				LeafState::Spent => {
+					stack.extend(self.store.transfer_outputs_of(&leaf).await?);
+					continue;
+				},
+				_ => continue,
+			};
+			if !self.store.sightings_of(&row.script_pubkey).await?.is_empty() {
+				continue;
+			}
+			let r = async {
+				let coin = self.coin(&leaf).await?;
+				if coin.leaf.htlc.is_some() {
+					return Ok(false);
+				}
+				self.bring_on_chain(&coin, now).await.map(|_| true)
+			}.await;
+			if Self::item(&format!("the collection of coin {} of the batch at output {} of round {}", hex(&leaf), b.vout, round.round_id),
+				r)? == Some(true)
+			{
+				if forfeited { given += 1 } else { live += 1 }
+			}
+		}
+		if live + given > 0 {
+			log::info!("watcher: the batch at output {} of round {}, past its service horizon, is collected: {} live coin(s) brought a step \
+				nearer the chain under their holders' keys, {} given-up coin(s) a step nearer their forfeits", b.vout, round.round_id, live,
+				given);
 		}
 		Ok(())
 	}

@@ -99,6 +99,11 @@ pub struct BatchRow {
 	pub kind: arca_covenant::BatchKind,
 	/// Whether its lowest nodes carry RECLAIM-D beside RECLAIM.
 	pub delegated_reclaim: bool,
+	/// For a batch without a sweep, its service horizon: the median time
+	/// from which the operator collects it on the chain and co-signs no
+	/// off-chain spend of a coin resting on it. `None` for a batch with a
+	/// sweep.
+	pub collect_mtp: Option<u32>,
 }
 
 /// A batch to record, with its leaves in tree order and the scripts of its
@@ -254,7 +259,7 @@ fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 }
 
 const BATCH_COLUMNS: &str = "round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn, radix,
-	reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim";
+	reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim, collect_mtp";
 
 fn batch_kind(s: &str) -> Result<arca_covenant::BatchKind, StoreError> {
 	arca_covenant::BatchKind::parse(s).ok_or_else(|| StoreError::Corrupt(format!("batch kind {}", s)))
@@ -298,6 +303,7 @@ fn batch_row(r: &tokio_postgres::Row) -> Result<BatchRow, StoreError> {
 		},
 		min_leaf: u64_of(r.get(14), "min leaf")?,
 		kind: batch_kind(r.get(15))?,
+		collect_mtp: r.get::<_, Option<i64>>(17).map(|t| t as u32),
 		delegated_reclaim: r.get(16),
 	})
 }
@@ -381,11 +387,11 @@ impl Store {
 			};
 			t.execute(
 				"INSERT INTO batch (round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn,
-				 radix, reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+				 radix, reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim, collect_mtp)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
 				&[&round_id, &(x.vout as i32), &&x.asset[..], &i64_of(x.value)?, &&x.token[..], &(x.token_vout as i32),
 					&&x.issuer.0[..], &(x.issuer.1 as i32), &x.schedule, &x.burn, &(x.radix as i16), &kind, &i64_of(a)?,
-					&i64_of(bb)?, &i64_of(x.min_leaf)?, &x.kind.as_str(), &x.delegated_reclaim],
+					&i64_of(bb)?, &i64_of(x.min_leaf)?, &x.kind.as_str(), &x.delegated_reclaim, &x.collect_mtp.map(|t| t as i64)],
 			).await?;
 			for sc in &b.scripts {
 				t.execute(
@@ -484,6 +490,26 @@ impl Store {
 		rows.iter().map(batch_row).collect()
 	}
 
+	/// The leaves of burn-only batches without a sweep of `asset` whose
+	/// owners gave them up (a forfeit of each whole in the operator's hands)
+	/// and that are not yet collected: no forfeit of theirs published, no
+	/// reclaim of their node recorded. Each leaf id, value and round txid.
+	pub async fn forfeited_uncollected(&self, asset: &[u8; 32]) -> Result<Vec<([u8; 32], u64, [u8; 32])>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT l.leaf_id, l.value, r.txid FROM batch_leaf l
+			 JOIN batch b ON b.round_id = l.round_id AND b.vout = l.vout
+			 JOIN round r ON r.round_id = l.round_id
+			 WHERE b.asset = $1 AND b.burn AND b.collect_mtp IS NOT NULL
+			   AND EXISTS (SELECT 1 FROM forfeit f JOIN round fr ON fr.round_id = f.round_id
+			               WHERE f.leaf_id = l.leaf_id AND fr.state <> 'lost' AND f.operator_sig IS NOT NULL)
+			   AND NOT EXISTS (SELECT 1 FROM watcher_tx w WHERE w.kind = 'forfeit' AND w.subject = l.leaf_id)
+			   AND NOT EXISTS (SELECT 1 FROM reclaimed_leaf x WHERE x.leaf_id = l.leaf_id)
+			 ORDER BY l.round_id, l.vout, l.idx",
+			&[&&asset[..]]).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, u64_of(r.get(1), "value")?, array32(r.get(2), "txid")?))).collect()
+	}
+
 	/// Where the take `id` fills its order in a round, at `attempt`: the
 	/// round and the covenant's input `k`.
 	pub async fn fill_in_round(&self, id: &[u8; 32], attempt: u32) -> Result<Option<(i64, u32)>, StoreError> {
@@ -505,6 +531,39 @@ impl Store {
 			participation_id: array32(r.get(1), "participation id")?,
 			attempt: r.get::<_, i32>(2) as u32,
 		})).collect()
+	}
+
+	/// Whether the round `round_id` is held, built and unbroadcast, until
+	/// every participation in it has handed over its forfeits: one that
+	/// fills on-chain orders, which pays their makers from the operator's
+	/// coins, and one holding a batch without a sweep, whose new leaves
+	/// nothing would take back from an owner that never hands its forfeits
+	/// over.
+	pub async fn round_held(&self, round_id: i64) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let token = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let r = conn.query_one(
+			"SELECT EXISTS (SELECT 1 FROM round_fill WHERE round_id = $1) OR EXISTS (SELECT 1 FROM batch WHERE round_id = $1 AND token = $2)",
+			&[&round_id, &&token[..]]).await?;
+		Ok(r.get(0))
+	}
+
+	/// The service horizon of the batch leaf `leaf_id` rests on, if that
+	/// batch has no sweep ([`BatchRow::collect_mtp`]).
+	pub async fn leaf_collect_mtp(&self, leaf_id: &[u8; 32]) -> Result<Option<u32>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT b.collect_mtp FROM batch_leaf l JOIN batch b ON b.round_id = l.round_id AND b.vout = l.vout WHERE l.leaf_id = $1",
+			&[&&leaf_id[..]]).await?;
+		Ok(r.and_then(|r| r.get::<_, Option<i64>>(0)).map(|t| t as u32))
+	}
+
+	/// The participations issued in the round `round_id`, in id order.
+	pub async fn round_participations(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query("SELECT participation_id FROM participation WHERE round_id = $1 AND state = 'issued' ORDER BY participation_id",
+			&[&round_id]).await?;
+		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
 	}
 
 	/// How many orders the round `round_id` fills: its covenant inputs,

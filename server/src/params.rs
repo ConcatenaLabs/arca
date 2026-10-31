@@ -314,7 +314,25 @@ pub struct Params {
 	pub channel_window: RelativeTime,
 	/// The watchtowers `info` lists for holders who name none of their own.
 	pub watchtowers: Vec<String>,
+	/// Whether the operator's refresh rounds build batches without a sweep
+	/// (`[batches] no_sweep`, always on the main chain): no token, no clock,
+	/// and every forfeit taken before the round is broadcast
+	/// ([`crate::rounds`]).
+	pub no_sweep: bool,
+	/// How long after its round's median time the operator collects a batch
+	/// without a sweep on the chain, and from when it co-signs no off-chain
+	/// spend of a coin resting on it (`[batches] collect_after_seconds`):
+	/// the service horizon ([`crate::watcher`]).
+	pub collect_after_seconds: u32,
 }
+
+/// The name the node gives the main chain (`getblockchaininfo`'s `chain`),
+/// on which the operator builds no batch with a sweep.
+pub const MAIN_CHAIN: &str = "sequentia";
+
+/// The default [`Params::collect_after_seconds`]: 28 days, a batch's
+/// lifetime where it has a sweep.
+pub const COLLECT_AFTER_SECONDS: u32 = 28 * 86_400;
 
 /// The default [`Params::fill_forfeit_window_seconds`]: ten minutes.
 pub const FILL_FORFEIT_WINDOW_SECONDS: u32 = 600;
@@ -352,6 +370,8 @@ impl Params {
 			round_interval_seconds: 0,
 			watchtowers: vec![],
 			channel_window: spec.max_exit_delay,
+			no_sweep: false,
+			collect_after_seconds: COLLECT_AFTER_SECONDS,
 		};
 		p.set_delays();
 		p

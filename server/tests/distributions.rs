@@ -58,6 +58,7 @@ fn distribute_lapsing(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Cl
 		fees: fees.to_vec(), not_before: None, lapse,
 	};
 	let id = d.id(&r.chain, &xonly(&r.s));
+	common::client::remember_given(id, coins);
 	let mut body = json!({
 		"inputs": coins.iter().map(|h| json!({"leaf_id": h.id.to_string(), "attestation": hex(sign_digest(&h.key, &id, &random32()).as_ref())}))
 			.collect::<Vec<_>>(),

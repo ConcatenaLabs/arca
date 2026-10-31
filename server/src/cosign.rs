@@ -191,7 +191,7 @@ pub enum CosignError {
 	Mergeable(String),
 	/// A coin resting on a board past its exit deadline: its owner takes it
 	/// on the chain.
-	#[error("leaf {leaf} rests on a board whose exit deadline has passed (its service ends at median time {expiry}): the operator \
+	#[error("leaf {leaf} rests on a board, or a batch without a sweep, whose exit deadline has passed (its service ends at median time {expiry}): the operator \
 		co-signs no spend of it and takes it into no refresh; its owner takes it on the chain")]
 	PastBoardDate { leaf: LeafId, expiry: u32 },
 	/// A payment to a receive request past its lapse: its receiver no longer

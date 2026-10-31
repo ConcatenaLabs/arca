@@ -1978,8 +1978,8 @@ impl Wallet {
 		if !stopped {
 			if let Some((t, window, period)) = self.take_wakes(base)? {
 				next = Some(next.map_or(t, |n| n.min(t)));
-				out["why"] = json!(format!("a take of an on-chain order waits on its round: its forfeits must reach the operator within \
-					{} s of the round being built, or the take is void, so sync runs every {} s until the take is released", window, period));
+				out["why"] = json!(format!("a participation waits on its round: its forfeits must reach the operator within {} s of the \
+					round being built, or it is void, so sync runs every {} s until it is released", window, period));
 			}
 		}
 		// A wallet that has never synced is due at once: what is waiting for
@@ -2001,12 +2001,17 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// Keeps the operator's terms for a take's forfeits from `info`
-	/// (`info.fills`), for the schedule.
+	/// Keeps the operator's terms for a held round's forfeits from `info`
+	/// (`info.fills`), and how it builds its batches (`info.batches`:
+	/// whether every refresh round is held for its forfeits, and the service
+	/// horizon of a batch without a sweep), for the schedule and the coins'
+	/// dates.
 	pub(crate) fn remember_fills(&self, info: &Value) -> Result<(), Error> {
 		let f = &info["fills"];
 		let Some(window) = f["forfeit_window_seconds"].as_u64() else { return Ok(()) };
-		let terms = json!({"forfeit_window_seconds": window, "round_interval_seconds": f["round_interval_seconds"].as_u64().unwrap_or(0)});
+		let terms = json!({"forfeit_window_seconds": window, "round_interval_seconds": f["round_interval_seconds"].as_u64().unwrap_or(0),
+			"no_sweep": info["batches"]["no_sweep"].as_bool().unwrap_or(false),
+			"collect_after_seconds": info["batches"]["collect_after_seconds"].as_u64()});
 		if self.store.meta(FILLS_TERMS)?.as_deref() != Some(terms.to_string().as_str()) {
 			self.store.set_meta(FILLS_TERMS, &terms.to_string())?;
 		}
@@ -2023,12 +2028,17 @@ impl Wallet {
 	/// a round dropped then runs the take again in another, whose forfeits
 	/// are due the same way. `(when, the window, the period)`, or `None`.
 	pub(crate) fn take_wakes(&self, base: u32) -> Result<Option<(u32, u32, u32)>, Error> {
+		let terms = self.store.meta(FILLS_TERMS)?.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
+		// An operator that builds batches without a sweep holds every round
+		// for its forfeits: a refresh giving up coins wakes the wallet too.
+		let held = terms["no_sweep"].as_bool().unwrap_or(false);
 		let mut waiting = false;
-		for (_, body, _, _, state, _, _) in self.store.participations()? {
+		for (_, body, given, _, state, _, _) in self.store.participations()? {
 			if !matches!(state.as_str(), "submitting" | "pending" | "issued" | "forfeiting") {
 				continue;
 			}
-			if Self::is_take(&serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)) {
+			let gives = serde_json::from_str::<Vec<String>>(&given).is_ok_and(|g| !g.is_empty());
+			if Self::is_take(&serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)) || (held && gives) {
 				waiting = true;
 				break;
 			}
@@ -2036,7 +2046,6 @@ impl Wallet {
 		if !waiting {
 			return Ok(None);
 		}
-		let terms = self.store.meta(FILLS_TERMS)?.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
 		let window = terms["forfeit_window_seconds"].as_u64().map_or(DEFAULT_FORFEIT_WINDOW, |w| w.min(u32::MAX as u64) as u32).max(2);
 		let interval = terms["round_interval_seconds"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
 		let period = if interval > 0 { (window / 2).min(interval) } else { window / 2 }.max(1);
@@ -2427,23 +2436,31 @@ impl Wallet {
 
 	/// The earliest service expiry of the boards `record` rests on, each
 	/// [`BOARD_LIFETIME`] after the median time of the block of the active
-	/// chain that holds it (`bases`, as [`Self::assess`] finds them); `None`
-	/// when no board it rests on is in a block.
+	/// chain that holds it (`bases`, as [`Self::assess`] finds them), and of
+	/// the batches without a sweep it rests on, each the operator's service
+	/// horizon (`info.batches.collect_after_seconds`, 28 days unless it said
+	/// otherwise) after its round's block: neither expires, but the operator
+	/// serves a coin on it only until then, and collects it on the chain
+	/// after. `None` when it rests on neither in a block.
 	pub(crate) fn board_expiry(&self, record: &CoinRecord, bases: &[(Transaction, Finality)]) -> Result<Option<u32>, Error> {
-		fn boards(r: &CoinRecord, out: &mut Vec<TxOut>) {
+		fn boards(r: &CoinRecord, out: &mut Vec<(TxOut, bool)>) {
 			match r {
-				CoinRecord::Board(b) => out.push(b.output().txout()),
+				CoinRecord::Board(b) => out.push((b.output().txout(), true)),
+				CoinRecord::Leaf { record, .. } if !record.schedule.expires() =>
+					out.extend(record.branch().ok().map(|b| (b.batch_output().txout(), false))),
 				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
 			}
 		}
 		let mut outs = vec![];
 		boards(record, &mut outs);
+		let horizon = self.store.meta(FILLS_TERMS)?.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+			.and_then(|t| t["collect_after_seconds"].as_u64()).map_or(BOARD_LIFETIME, |h| h.min(u32::MAX as u64) as u32);
 		let mut earliest: Option<u32> = None;
-		for o in outs {
+		for (o, board) in outs {
 			let Some(h) = bases.iter().find(|(t, _)| t.output.contains(&o)).and_then(|(_, f)| f.height()) else { continue };
 			if let Some(m) = self.chain.median_time_at(h)? {
-				let e = m.saturating_add(BOARD_LIFETIME);
+				let e = m.saturating_add(if board { BOARD_LIFETIME } else { horizon });
 				earliest = Some(earliest.map_or(e, |x| x.min(e)));
 			}
 		}

@@ -128,6 +128,11 @@ pub trait ChainSource: Send + Sync + 'static {
 	fn broadcast(&self, tx: &Transaction) -> Result<Txid, ChainError>;
 	/// The chain's genesis block hash.
 	fn genesis(&self) -> Result<BlockHash, ChainError>;
+	/// The chain's name as the node gives it (`getblockchaininfo`'s
+	/// `chain`), where the source knows it.
+	fn chain_name(&self) -> Result<Option<String>, ChainError> {
+		Ok(None)
+	}
 	/// The node's fee whitelist, now: each accepted fee asset and its rate, in
 	/// reference units per 10^8 atoms of the asset. An asset not listed is not
 	/// accepted for fees by this node.
@@ -254,6 +259,10 @@ impl ChainSource for NodeSource {
 
 	fn genesis(&self) -> Result<BlockHash, ChainError> {
 		Ok(self.client.genesis_hash()?)
+	}
+
+	fn chain_name(&self) -> Result<Option<String>, ChainError> {
+		Ok(Some(self.client.blockchain_info()?.chain))
 	}
 
 	fn fee_rates(&self) -> Result<BTreeMap<AssetId, u64>, ChainError> {

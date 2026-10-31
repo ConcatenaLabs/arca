@@ -126,6 +126,10 @@ impl Running {
 			lightning: Default::default(),
 			batches: Default::default(),
 		};
+		// `ARCA_TEST_NO_SWEEP=1` runs a suite with batches without a sweep,
+		// every round held for its forfeits ([`super::rounds::round_final`]
+		// hands them over for the tests' own participations).
+		config.batches.no_sweep = std::env::var("ARCA_TEST_NO_SWEEP").is_ok_and(|v| v == "1");
 		tune(&mut config, y);
 		let server = Server::start(&config).await.unwrap();
 		let http = Http { base: format!("http://{}", server.addr) };

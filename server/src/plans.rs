@@ -379,12 +379,28 @@ impl Plans {
 		Ok(None)
 	}
 
+	/// Refuses a plan where there is nothing for it to outlive: an operator
+	/// that builds batches without a sweep ([`Params::no_sweep`]), whose
+	/// steps would land in them, and a coin resting on such a batch, which
+	/// never expires.
+	async fn retired(&self, coin: &LeafId) -> Result<(), PlanError> {
+		if self.params.no_sweep {
+			return Err(PlanError::OutOfBounds(NO_SWEEP_PLANS.into()));
+		}
+		if coin_expiry(&self.store, &coin.0).await.map_err(PlanError::Store)?.is_some_and(|e| e == arca_covenant::transfer::NEVER.to_consensus_u32()) {
+			return Err(PlanError::OutOfBounds(format!("coin {} rests on a batch without a sweep, which never expires: a plan has nothing to \
+				outlive", coin)));
+		}
+		Ok(())
+	}
+
 	/// Quotes a plan of one step per owner nonce, 1 to [`MAX_STEPS`], from
 	/// the coin `req.coin`: for each step an operator nonce drawn now, the
 	/// step's fee by the asset's schedule at its earliest time, and the
 	/// refund's margin; and the script the operator's share of every refund
 	/// pays to.
 	pub async fn quote(&self, req: &QuoteRequest) -> Result<Quote, PlanError> {
+		self.retired(&req.coin).await?;
 		self.supervised_coin(&req.coin).await?;
 		let n = req.owner_nonces.len();
 		if n == 0 || n > MAX_STEPS {
@@ -456,6 +472,7 @@ impl Plans {
 	/// Takes a plan: see the [module documentation](self). A plan taken
 	/// before is answered with its status.
 	pub async fn submit(&self, req: &SubmitRequest) -> Result<PlanStatus, PlanError> {
+		self.retired(&req.coin).await?;
 		self.supervised_coin(&req.coin).await?;
 		let n = req.steps.len();
 		if n == 0 || n > MAX_STEPS {
@@ -691,6 +708,11 @@ pub async fn coin_expiry(store: &Store, leaf: &[u8; 32]) -> Result<Option<u32>, 
 	Ok(crate::coins::batch_leaf_expiry(&b))
 }
 
+/// Why no plan is taken or run by an operator that builds batches without a
+/// sweep.
+pub const NO_SWEEP_PLANS: &str = "the operator builds batches without a sweep, whose coins never expire: a plan has nothing to outlive, \
+	and its holder refreshes the coin when it is back";
+
 /// Starts every step whose turn it is and whose time has come (`now` at or
 /// past the start of its coin's free window): its participation, recorded
 /// pending, runs in the asset's next round. A step whose coin is spent
@@ -702,6 +724,16 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 		let Some(plan) = store.plan(&id).await? else { continue };
 		let Some(next) = plan.next().cloned() else { continue };
 		if next.state != StepState::Waiting {
+			continue;
+		}
+		// No step is placed in a batch without a sweep: its new coin would
+		// wait for its old coin's sweep, and nothing it could outlive is
+		// left. The coin is its holder's again, brought on the chain under
+		// its key at its batch's release ([`crate::watcher`]).
+		if params.no_sweep {
+			if store.void_step(&id, next.step.idx, NO_SWEEP_PLANS).await? {
+				log::warn!("plan {}: step {} is void and the plan stopped: {}", hex(&id), next.step.idx, NO_SWEEP_PLANS);
+			}
 			continue;
 		}
 		let Some(coin) = plan.current_coin() else { continue };
