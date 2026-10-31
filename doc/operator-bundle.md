@@ -395,7 +395,14 @@ Fund `mine` (`$A --datadir $W/mine address`), board it
     $A --datadir $W/mine lightning pay <invoice> --wait 120       # through this gateway to theirs
     $A --datadir $W/theirs sync                                   # the leaf, claimed
 
-and back, the other way round. On Bitcoin, each wallet joins its operator's
+and back, the other way round. The receiving operator holds the payment
+until its next round makes the receiver's leaf, and the receiver's wallet
+claims it when it syncs, so until then the payer's wallet reads `paying` and
+the receiver's `issuing`: a round and its block, about a minute on the public
+testnet, longer while the receiving operator restarts. A receiver that stays
+offline lets the payment fail back to the payer before its lock ends.
+
+On Bitcoin, each wallet joins its operator's
 Bitcoin ark, and the receiver claims while the payer pays:
 
     BCOOKIE=/var/lib/arca-bundle/bitcoin/testnet4/.cookie
@@ -416,7 +423,7 @@ payment into its tree carries a final lock of about 5,790 blocks (four days at
 a minute a block) at the specification's exit delays, so the paying operator
 must let a payment out of its tree stay unresolved that long: the bundle sets
 `ARCA_SEND_TIMEOUT` to nine days. That costs nothing while payments settle,
-as they do in seconds. A payment that gets stuck on its way (a gateway that
+as they do within a round. A payment that gets stuck on its way (a gateway that
 holds the HTLC and never answers) keeps the payer's coins until its timeout,
 up to eighteen days, and then they come back to the payer; meanwhile the
 payer's wallet shows the payment `paying`, never `failed`, since it follows

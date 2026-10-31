@@ -310,8 +310,10 @@ chain during the notice, which anyone holding its coin record can do: the
 record carries its owner's unroll authorisations and its entry's preimage
 (and, for a coin paid out of round, the pairs of every step), each of which
 spends only into the outputs it pins. A wallet hands its record to
-watchtowers, its own batch leaf's authorisations signed for a time an hour
-before the batch's first expiry so that they unroll nothing sooner; the
+watchtowers, sealed so that each reads it only once its batch is released or
+a leaf of its lineage is on the chain, its own batch leaf's authorisations
+signed for a time an hour before the batch's first expiry so that they unroll
+nothing sooner; the
 operator, a member of every node, does the same from its own records
 ([Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
 The holder then relies on any one of them acting within the notice, paid
@@ -715,7 +717,8 @@ board's leaf carries the frozen sweep for a token no issuance creates
 Against the sender alone the receiver is then safe: every leaf of the lineage is
 off-chain and has an exit delay of at least the policy's minimum, so when the
 sender's leaf reaches the chain, the receiver publishes the checkpoint and the
-reassignment within that delay. It answers at once: a rollback that disconnects
+reassignment within that delay, or a watchtower holding the receiver's record
+does while the receiver is away. It answers at once: a rollback that disconnects
 its answer does not restart the delay of the leaf it answered. Against the sender
 and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.

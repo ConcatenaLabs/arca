@@ -24,6 +24,7 @@
 mod common;
 
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use elements::Script;
@@ -50,6 +51,9 @@ struct Tower {
 	url: String,
 	listen: String,
 	child: Option<Child>,
+	/// The deposit id of each coin, as its wallet's `sync` named it: a
+	/// sealed deposit names no coin until it is opened.
+	ids: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 impl Tower {
@@ -58,7 +62,7 @@ impl Tower {
 		wallet.ok(&create_args(server, node));
 		let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
 		let listen = format!("127.0.0.1:{}", port);
-		let mut t = Tower { wallet, url: format!("http://{}", listen), listen, child: None };
+		let mut t = Tower { wallet, url: format!("http://{}", listen), listen, child: None, ids: Default::default() };
 		t.start();
 		t
 	}
@@ -87,8 +91,31 @@ impl Tower {
 		self.wallet.ok(&["watchtower", "deposits"]).as_array().unwrap().clone()
 	}
 
+	/// The deposit of coin `leaf`: by the coin once it is opened, else by the
+	/// id its wallet's sync named.
 	fn deposit_of(&self, leaf: &str) -> Option<Value> {
-		self.deposits().into_iter().find(|d| d["leaf_id"] == leaf)
+		let all = self.deposits();
+		let id = self.ids.borrow().get(leaf).cloned();
+		all.iter().find(|d| d["leaf_id"] == leaf).or_else(|| all.iter().find(|d| id.as_deref().is_some_and(|i| d["deposit"] == i))).cloned()
+	}
+
+	/// Notes the deposit ids a wallet's `sync` answer `s` names for this
+	/// watchtower.
+	fn learn(&self, s: &Value) {
+		for d in s["deposits"].as_array().cloned().unwrap_or_default() {
+			if d["watchtower"] == self.url.as_str() && d["deposited"].is_string() {
+				self.ids.borrow_mut().insert(d["leaf_id"].as_str().unwrap().to_string(), d["deposited"].as_str().unwrap().to_string());
+			}
+		}
+	}
+
+	/// Asserts the watchtower holds `leaf`'s deposit sealed, and that
+	/// nothing it lists names the coin.
+	fn holds_sealed(&self, leaf: &str) {
+		let d = self.deposit_of(leaf).unwrap_or_else(|| panic!("{} holds no deposit of {}", self.wallet.name, leaf));
+		assert_eq!(d["state"], "sealed", "{}", d);
+		assert_eq!(d["leaf_id"], "", "{}", d);
+		assert!(!self.wallet.ok(&["watchtower", "deposits"]).to_string().contains(leaf), "the watchtower lists nothing of the coin");
 	}
 }
 
@@ -182,11 +209,14 @@ async fn watchtowers_take_absent_holders_coins_on_chain_before_the_sweep() {
 	for w in [&a, &b, &d, &e] {
 		let s = w.ok(&["sync"]);
 		println!("{}'s sync deposits: {}", w.name, s["deposits"]);
+		t.learn(&s);
+		t2.learn(&s);
 	}
+	println!("T's deposits, sealed: {}", serde_json::to_string(&t.deposits()).unwrap());
 	for l in [&la, &lb, &ld, &le] {
-		assert_eq!(t.deposit_of(l).expect("T holds the deposit")["state"], "held");
+		t.holds_sealed(l);
 	}
-	assert_eq!(t2.deposit_of(&ld).expect("T2 holds D's deposit")["state"], "held");
+	t2.holds_sealed(&ld);
 	// A second sync deposits nothing again.
 	assert!(a.ok(&["sync"]).get("deposits").is_none(), "nothing deposited twice");
 
@@ -203,21 +233,23 @@ async fn watchtowers_take_absent_holders_coins_on_chain_before_the_sweep() {
 	r.round_state(&built2.tx.txid(), RoundState::Final).await;
 	let s = d.ok(&["sync"]);
 	let (ld2, vd2, _) = new_leaf(&s);
+	t.learn(&s);
 	let s = d.ok(&["sync"]);
+	t.learn(&s);
 	println!("D refreshed {} into {} = {}; its sync's deposits: {}", ld, ld2, vd2, s["deposits"]);
-	e.ok(&["sync"]);
+	t.learn(&e.ok(&["sync"]));
 	let s = e.ok(&["sync"]);
 	println!("E refreshed {}; its sync's deposits: {}", le, s["deposits"]);
 	assert!(t.deposit_of(&le).is_none(), "E withdrew its old coin's deposit");
 	assert!(t.deposit_of(&ld).is_none(), "D withdrew its old coin's deposit from T");
 	assert!(t.deposit_of(&ld2).is_some(), "and deposited its new coin with T");
 	t2.start();
-	assert_eq!(t2.deposit_of(&ld).expect("T2 still holds D's old coin")["state"], "held");
+	t2.holds_sealed(&ld);
 
 	// Before the release, the watchtowers do nothing.
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	for l in [&la, &lb] {
-		assert_eq!(t.deposit_of(l).unwrap()["state"], "held", "nothing before the release");
+		t.holds_sealed(l);
 	}
 
 	// A, B and D are away. The batch expires and is released.
@@ -392,4 +424,214 @@ async fn the_operator_brings_live_coins_on_chain_at_release() {
 	println!("A's coin on return: {} {} | {}", coin["state"], coin["kept_safe_note"], coin["note"]);
 	assert_eq!(coin["kept_safe"], true);
 	assert_eq!(a.ok(&["balance"])["arca"][&x]["kept_safe"], va.to_string());
+}
+
+/// A copy of `from`'s wallet directory as `to`: the wallet as a backup
+/// taken now would restore it.
+fn copy_wallet(from: &Arca, to: &Arca) {
+	fn copy(a: &std::path::Path, b: &std::path::Path) {
+		std::fs::create_dir_all(b).unwrap();
+		for e in std::fs::read_dir(a).unwrap() {
+			let e = e.unwrap();
+			let p = b.join(e.file_name());
+			if e.file_type().unwrap().is_dir() {
+				copy(&e.path(), &p);
+			} else {
+				std::fs::copy(e.path(), p).unwrap();
+			}
+		}
+	}
+	copy(&from.dir, &to.dir);
+}
+
+/// A sender takes home, on the chain, a coin it has already paid on (from a
+/// copy of its wallet made before it paid), while the receiver is away and
+/// the operator is down. The receiver's watchtower sees the earlier coin's
+/// leaf reach the chain, its batch not released, and answers within that
+/// leaf's exit delay: it publishes the checkpoint and the reassignment the
+/// receiver deposited, paying what the reserves cannot from a coin of its
+/// own. The sender's claim then fails, and the receiver, back, finds its
+/// coin on the chain under its own key and takes it home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.watcher.unroll_at_release = false;
+		c.watcher.enabled = false;
+	}).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x.to_string();
+	let s = Arca::new("wt lineage S");
+	let s_old = Arca::new("wt lineage S old");
+	let rc = Arca::new("wt lineage R");
+	for w in [&s, &rc] {
+		w.ok(&create_args(&url, &node));
+	}
+	let board_s = board(&mut r, &s, "2000000").await;
+	s.ok(&["participate", "--leaf", &board_s, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let (ls, vs, _) = new_leaf(&s.ok(&["sync"]));
+	println!("S's batch leaf {} = {}", ls, vs);
+	// The copy S keeps of its wallet before it pays: it still holds `ls`.
+	copy_wallet(&s, &s_old);
+
+	// R names the watchtower, which holds a coin of its own for fees.
+	let mut t = Tower::new("wt lineage T", &url, &node);
+	r.pay_to(script(&t.wallet.ok(&["address"])), r.x, 1_000_000);
+	r.produce().await;
+	r.bury().await;
+	rc.ok(&["watchtowers", &t.url]);
+	let req = rc.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "600000", "--asset", &x]);
+	let m = rc.ok(&["mailbox"]);
+	let coin = m["accepted"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("R accepts the payment: {}", m)).to_string();
+	let sync = rc.ok(&["sync"]);
+	println!("R's coin {}; its sync's deposits: {}", coin, sync["deposits"]);
+	t.learn(&sync);
+	t.holds_sealed(&coin);
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	t.holds_sealed(&coin);
+
+	// R is away and the operator stops. S takes its old coin home from the copy.
+	r.server.stop();
+	// The watchtower is down a while, and returns once S's exit is out.
+	t.stop();
+	let e = s_old.ok(&["exit", &ls]);
+	println!("S takes its old coin home: {}", e);
+	assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+	r.produce().await;
+	// Meanwhile the node comes to value X at a tenth of what it did: the
+	// reserves the transfer left for its checkpoint and reassignment no
+	// longer pay the floor, and the watchtower adds a coin of its own to each.
+	let before: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	let mut rates: serde_json::Map<String, Value> = serde_json::from_value(r.rt.client().call::<Value>("getfeeexchangerates", &[]).unwrap()).unwrap();
+	rates.insert(x.clone(), serde_json::json!(10_000_000));
+	r.rt.client().call::<Value>("setfeeexchangerates", &[Value::Object(rates)]).unwrap();
+	t.start();
+	let start = Instant::now();
+	let mut brought = Value::Null;
+	loop {
+		let d = t.deposit_of(&coin).unwrap();
+		if d["state"] == "brought" {
+			brought = d.clone();
+		}
+		if d["state"] == "on_chain" {
+			break;
+		}
+		assert!(start.elapsed() < Duration::from_secs(90), "the watchtower did not answer: {}", d);
+		r.produce().await;
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+	let d = t.deposit_of(&coin).unwrap();
+	println!("T answered: {} | then {}", brought["note"], d["note"]);
+	assert!(brought["note"].as_str().unwrap_or("").contains("a sender up its lineage took an earlier coin on the chain"), "{}", brought);
+	let steps = d["broadcast"].as_array().unwrap();
+	assert_eq!(steps.len(), 2, "the checkpoint and the reassignment: {}", d["broadcast"]);
+	for st in steps {
+		println!("T's step {}: {} vB, fee {}, paid by {}", st["txid"], st["vsize"], st["fee"], st["paid_by"]);
+		assert_eq!(st["paid_by"], "a coin of the watchtower's", "{}", st);
+	}
+
+	// S's leaf is spent by the watchtower's checkpoint: once its exit delay
+	// runs out there is nothing left for S to claim.
+	let leaf_at = e["leaf"].as_str().unwrap().trim_start_matches("[elements]").to_string();
+	let (lt, lv) = leaf_at.split_once(':').unwrap();
+	let cp = r.rt.client().raw_transaction(&elements::Txid::from_str(steps[0]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert!(cp.input.iter().any(|i| i.previous_output.txid.to_string() == lt && i.previous_output.vout.to_string() == lv),
+		"the checkpoint spends S's leaf {}", leaf_at);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 2 * 512));
+	r.produce().await;
+	let unspent: Value = r.rt.client().call("gettxout", &[serde_json::json!(lt), serde_json::json!(lv.parse::<u32>().unwrap())]).unwrap();
+	assert!(unspent.is_null(), "S's leaf is spent: {}", unspent);
+	let (ok, v) = s_old.run(&["exit", &ls]);
+	println!("S's claim after the delay: ok {} | {}", ok, v);
+	assert!(!(ok && v["state"] == "claimed"), "S cannot claim the coin it paid on: {}", v);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[before]).unwrap();
+
+	// R returns: its coin is on the chain under its key; it takes it home.
+	r.restart_server().await;
+	r.synced().await;
+	let s1 = rc.ok(&["sync"]);
+	println!("R's sync on return: {}", s1["recheck"]["changes"]);
+	let c = rc.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned().unwrap();
+	println!("R's coin on return: {} {} | {}", c["state"], c["kept_safe_note"], c["note"]);
+	assert_eq!(c["kept_safe"], true, "{}", c);
+	let mut claimed = Value::Null;
+	for _ in 0..6 {
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		let e = rc.ok(&["exit", &coin]);
+		if e["state"] == "claimed" {
+			claimed = e;
+			break;
+		}
+	}
+	println!("R's claim: {}", claimed);
+	assert_eq!(claimed["state"], "claimed", "R takes its coin home");
+	r.produce().await;
+	let claim = elements::Txid::from_str(claimed["claim"]["txid"].as_str().unwrap()).unwrap();
+	let tx = r.rt.client().raw_transaction(&claim).unwrap();
+	let paid = tx.output[0].value.explicit().unwrap();
+	println!("R's claim {} pays {} of X", claim, paid);
+	assert!(paid > 590_000, "R keeps the coin, less its claim's fee: {}", paid);
+}
+
+/// A stand-in watchtower that answers `GET /v1/info` with `info`, and
+/// nothing else: what a watchtower of another operator says of itself.
+fn info_only(info: Value) -> String {
+	let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let url = format!("http://{}", l.local_addr().unwrap());
+	std::thread::spawn(move || {
+		for s in l.incoming() {
+			let Ok(mut s) = s else { continue };
+			use std::io::{Read, Write};
+			let mut buf = [0u8; 4096];
+			let n = s.read(&mut buf).unwrap_or(0);
+			let req = String::from_utf8_lossy(&buf[..n]).to_string();
+			let (code, body) = if req.starts_with("GET") && req.contains("/v1/info") { ("200 OK", info.to_string()) }
+				else { ("404 Not Found", "{\"error\":\"not_found\"}".to_string()) };
+			let _ = write!(s, "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", code, body.len(), body);
+		}
+	});
+	url
+}
+
+/// A wallet program names watchtowers beside the operator's. The wallet
+/// deposits only with one that watches its chain for its own operator and
+/// takes sealed deposits: one of another operator, and one that does not
+/// answer, are passed over, saying why, and the deposit goes to the one
+/// that can hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_deposits_with_the_default_watchtowers_that_watch_for_its_operator() {
+	let mut r = Running::start().await;
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("wt defaults A");
+	a.ok(&create_args(&url, &node));
+	let t = Tower::new("wt defaults T", &url, &node);
+	let info: Value = minreq::get(format!("{}/v1/info", t.url)).send().unwrap().json().unwrap();
+	let mut other = info.clone();
+	other["operator"] = serde_json::json!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+	let foreign = info_only(other);
+	let gone = "http://127.0.0.1:1".to_string();
+	let w = a.ok(&["watchtowers", "--default", &foreign, "--default", &t.url, "--default", &gone]);
+	println!("A's watchtowers: {}", w);
+	assert_eq!(w["from"], "operator and defaults");
+	let l = board(&mut r, &a, "2000000").await;
+	a.ok(&["participate", "--leaf", &l, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let s = a.ok(&["sync"]);
+	let s = if s["deposits"].is_null() { a.ok(&["sync"]) } else { s };
+	println!("A's sync deposits: {}", s["deposits"]);
+	let deps = s["deposits"].as_array().unwrap();
+	let over = |u: &str| deps.iter().find(|d| d["watchtower"] == u).and_then(|d| d["passed_over"].as_str()).unwrap_or("").to_string();
+	assert!(over(&foreign).contains("another operator"), "{}", s["deposits"]);
+	assert!(over(&gone).contains("does not answer"), "{}", s["deposits"]);
+	assert!(deps.iter().any(|d| d["watchtower"] == t.url.as_str() && d["deposited"].is_string()), "{}", s["deposits"]);
+	assert_eq!(t.deposits().len(), 1);
+	assert_eq!(t.deposits()[0]["state"], "sealed");
 }

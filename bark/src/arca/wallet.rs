@@ -546,7 +546,7 @@ pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirectio
 
 /// Every output a coin rests on: the batch output of each batch leaf and each
 /// board output in its record, from the coin up.
-fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> {
+pub(crate) fn base_outputs(record: &CoinRecord, out: &mut Vec<TxOut>) -> Result<(), Error> {
 	match record {
 		CoinRecord::Leaf { record, .. } => {
 			out.push(record.branch().map_err(|e| Error::Refused(e.to_string()))?.batch_output().txout());

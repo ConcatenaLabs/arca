@@ -629,6 +629,46 @@ refresh, and a schedule that changed since it was shown is not taken: the
 server refuses a fee short of the asset's schedule (`fee`), and the browser
 wallet submits only the fees it showed.
 
+### Speeding up what waits on the chain
+
+A transaction the wallet needs can wait in the mempool for good: its fee was
+the node's floor when it was broadcast, and the producers take only more, or
+its fee asset's price fell since. An exit's steps cannot be replaced (their
+inputs signal no replacement, and the operator, a watchtower or the wallet
+may each have broadcast them), so the wallet speeds one up by a child: a
+transaction spending an output of the wallet's in the waiting transaction or
+in what spends it, which pays for itself and every ancestor still waiting.
+The producer values the two together in the reference unit, whatever asset
+each pays in. The child pays in the asset of the output it spends where the
+node accepts it, takes the package's other outputs of the wallet's next, and
+then a coin of the wallet's on the chain in an accepted asset as a second
+input; a raise replaces the child.
+
+Each exit step the wallet builds from its own reserve pays the floor of it
+and leaves the rest to the wallet's change, which is that output (an anchor),
+when the rest pays more than a child's input costs. A coin of a supervised
+asset at an address its issuer froze cannot be spent and speeds nothing up;
+a transaction in which nothing is the wallet's cannot be sped up by it.
+
+`sync` does it by itself for every exit under way: a step or claim that has
+waited two blocks in the mempool is sped up to twice the node's relay floor,
+the rate doubling at each further wait of two blocks, at most eight times,
+and the coin's note says so. `arca speed-up TXID [--fee-asset A] [--rate R]
+[--max-fee N]` speeds up any transaction of the wallet's that waits, `R` in
+atoms of the reference unit per 1,000 vbytes for the package.
+
+### Refreshing what it receives
+
+A coin received out of round can be spent again by a sender up its lineage
+together with the operator, or taken by a sender's exit of an earlier coin
+of its lineage, until it is refreshed in a round. `arca refresh-received
+[--max-fee-ppm N]` gives up every such coin it holds live (one a sender other
+than the wallet signed into since its last round or board; the change of its
+own payment from a coin of a round is not one) in the next round for a leaf
+of its own, at the operator's refresh fee within the wallet's bound, and says
+which coins it left as they are, and why. The browser wallets run it by
+themselves in their default mode.
+
 ### Paying and receiving over Lightning
 
 `lightning pay INVOICE` pays a BOLT11 invoice out of the wallet's coins in the
@@ -1180,18 +1220,38 @@ A coin the wallet does not refresh before its batch is released is brought on
 the chain under its own key before the operator could sweep it: by the
 operator, and by any watchtower the wallet deposited it with (the server's
 [Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
-At every `sync` the wallet deposits each live coin resting on a batch with
-each watchtower it names (`deposits` in the answer): the coin's record, its
+A coin paid to the wallet out of round is kept the same way from a sender
+up its lineage who takes an earlier coin home on the chain: whoever holds
+its record publishes the checkpoint and the reassignment within that earlier
+leaf's exit delay, and the watchtowers do so as soon as the leaf appears, the
+operator up or down. At every `sync` the wallet deposits each live coin
+resting on a batch, and each coin paid to it out of round, with each
+watchtower it names (`deposits` in the answer): the coin's record, its
 own batch leaf's unroll authorisations signed for an hour before its batch's
 first expiry, so nothing can unroll it sooner. A deposit only ever puts the
-coin on the chain under its owner's key. Once a coin is spent, exited or
+coin on the chain under its owner's key. It is sealed: the watchtower can
+read it only once an event it answers is on the chain (a release of a batch
+the coin rests on, or a leaf or checkpoint of its lineage), and until then
+learns nothing of the coin, its value or its keys. Once a coin is spent, exited or
 lost, `sync` withdraws its deposit, signed by the coin's key; a watchtower
 that cannot be reached is tried again at the next `sync`.
 
     arca watchtowers                          # the watchtowers deposited with, and whether the operator's list or the wallet's
     arca watchtowers https://a.example https://b.example   # name them instead
     arca watchtowers --none                   # deposit with none
-    arca watchtowers --operator               # back to the ones the operator's info lists
+    arca watchtowers --operator               # back to the ones the operator's info lists, and the defaults
+    arca watchtowers --default https://c.example --default https://d.example   # the defaults, added to the operator's
+
+While the user names none, the wallet deposits with the watchtowers the
+operator's `info` lists and with the defaults the program running it names
+(`set_default_watchtowers` in the command interface). A wallet program lists
+there watchtowers run by others than the operator, so that a coin does not
+depend on its operator alone to name who watches it. Before it deposits, the
+wallet reads each watchtower's `info` once a `sync`, and passes over one
+that does not answer, watches another chain or another operator's coins, or
+takes no sealed deposit (`passed_over` in `deposits`, with why): a sealed
+deposit cannot be checked when it is taken, so one sent to a watchtower of
+another operator would only be refused when it had to act.
 
 Back from an absence, the wallet finds such a coin on the chain: `coins`
 marks it `kept_safe`, with the sentence a program shows its user
@@ -1209,14 +1269,18 @@ against that operator's key), takes deposits over HTTP (`POST /v1/deposit`,
 `POST /v1/withdraw`, `GET /v1/info`; the segment after `/v1/` names the
 call, so it serves behind any path a proxy gives it) and passes over them
 every `--interval` seconds. It leaves a coin alone until a batch it rests on
-is released (the batch's token at `R`, in a block or the mempool), then
-broadcasts whatever is still missing of the coin's path, from the lowest
+is released (the batch's token at `R`, in a block or the mempool) or, for a
+coin paid out of round, until a leaf or checkpoint it descends from appears
+in a block or the mempool, then broadcasts whatever is still missing of the
+coin's path (for a lineage exit, the checkpoint and the reassignment), from the lowest
 output the chain holds unspent, each transaction paid from the reserve the
 output it spends holds when the node accepts the batch's asset for fees, else
 from an on-chain coin of the watchtower wallet's. Coins on one branch share
 its nodes, whoever built them. It needs only its node, never the operator.
-`arca watchtower deposits` lists what it holds (`held`, `brought`,
-`on_chain`, `gone`) and what it broadcast for each; `arca watchtower pass`
+`arca watchtower deposits` lists what it holds (`sealed`, naming no coin
+until a block or the mempool shows its trigger; `held`, `brought`,
+`on_chain`, `gone`, or `invalid` when what opened does not check) and what
+it broadcast for each; `arca watchtower pass`
 runs one pass.
 
 ### Swept coins
@@ -1595,7 +1659,7 @@ registry for both commands.
 | `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); for a coin someone else brought on the chain while the wallet was away, `kept_safe`, the sentence to show (`kept_safe_note`) and whether it is boarded back (`reboarded`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
-| `watchtowers [URL…] [--none \| --operator]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`, or `operator`: those `info` lists), after naming them when given (see Watchtowers) |
+| `watchtowers [URL…] [--none \| --operator \| --default URL…]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`; `operator`, those `info` lists; or `operator and defaults`, with the program's defaults), after naming them, or the defaults, when given (see Watchtowers) |
 | `watchtower serve [--listen ADDR] [--interval S]` | Runs this wallet as a watchtower for other wallets' coins until stopped: deposits over HTTP, and a pass every `S` seconds (see Watchtowers). `watchtower pass` runs one pass; `watchtower deposits` lists the deposits held, each with its state and what was broadcast for it |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
@@ -1626,6 +1690,8 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `channel pay LEAF TO AMOUNT` | Pays `AMOUNT` from the channel `LEAF` into the operator's channel `TO`, in the same asset: the next state signed, every credit not folded folded in it, and the answer the operator's signature and the receiver's note (`receipt`). Refused beyond the wallet's side, beyond what the receiver's operator side can take, or into the channel itself |
 | `channel fold LEAF` | Folds every credit the channel was paid into its balance |
 | `channel exit LEAF [--fee-asset A]` | Closes the channel on the chain, one step a run (see Channel leaves); `exited` once the wallet's side is swept home |
+| `speed-up TXID [--fee-asset A] [--rate R] [--max-fee N]` | Speeds up a transaction of the wallet's waiting in the mempool by a child that pays for it (see Speeding up what waits on the chain): what it spends, its fee, a second input if one paid, the child it replaced |
+| `refresh-received [--max-fee-ppm N]` | Gives up every coin received out of round in the next round for a leaf of its own (see Refreshing what it receives): the participations, and each coin left as it is with why |
 | `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit left it, followed from the round through each exit's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
@@ -1706,6 +1772,16 @@ each before it signs anything, and completes once the tree is honest; a
 second refresh then gives up that batch leaf and releases its lowest node for
 the new round. Every
 refusal is asserted by its reason.
+
+`tests/arca_speed_up.rs` runs the same way, a transaction made to wait by
+halving its fee asset's rate after it is broadcast: a stuck exit rescued by
+`sync`'s child, which takes both steps into the next block; two holders
+exiting during a released batch's notice, one whose wallet syncs and is home
+long before the notice runs out, the other, which only runs `exit`, losing its
+coin to the operator's sweep; a coin of an asset the node does not take for
+fees sped up by a child with a second input in an accepted one (the coin's
+own asset for the fee refused); and a coin received out of round refreshed
+in the next round, while the sender's change is left as it is.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
 accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets
