@@ -213,7 +213,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let landing = Landing { program, allowance: ALLOWANCE };
 	let land_spk = landing.script_pubkey();
 	let (chain, genesis) = (net.chain, net.genesis);
-	let leaf = |salt: &str| LeafPolicy { enclave: None,
+	let leaf = |salt: &str| LeafPolicy { enclave: None, claim: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
 		landing: Some(landing.terms(sup.z, V).unwrap()),
 		channel: None, v2: false,
@@ -328,7 +328,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	// ---- a round of Z keeps every output explicit ---------------------------
 	let leaves: Vec<LeafSpec> = (0..4).map(|i| {
 		let owner = keypair(&format!("batch owner {}", i));
-		LeafSpec {
+		LeafSpec { claim: None,
 			template: Template::Landing1, owner: xonly(&owner), value: 10_000_000,
 			owner_nonce: label32(&format!("batch {} owner nonce", i)), operator_nonce: label32(&format!("batch {} operator nonce", i)),
 			exit_delay: delay(), unlock_hash: label32(&format!("batch {} unlock", i)), htlc: None, order: None,

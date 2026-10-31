@@ -27,17 +27,75 @@
 //!
 //! A distribution ([`Distribution`]) is what the payer submits: the coins it
 //! gives up, the asset, the claims, the script the unclaimed sum goes back to,
-//! and the fee. Its id ([`Distribution::id`]) is what each coin's owner
-//! attests.
+//! the fee and, for claims that lapse, the deadline. Its id
+//! ([`Distribution::id`]) is what each coin's owner attests.
+//!
+//! # The claim leaf that lapses: `claim-1`
+//!
+//! A distribution with a deadline `D` ([`DistributionLapse`]) pays each holder
+//! a `claim-1` leaf: `vtxo-1`'s collaborative path and exit under the claim
+//! key, and a third path, LAPSE, which pays the payer back what its holder did
+//! not take up by `D`, as a cheque lapses. The leaf never expires, so without
+//! it a claim nobody takes up would stay its absent holder's for good:
+//!
+//! ```text
+//! collab:  the leaf's collaborative path, vtxo-1's under the leaf's salt
+//! exit:    <delay> OP_CHECKSEQUENCEVERIFY OP_DROP <A'> OP_CHECKSIG
+//! lapse:   <D> OP_CHECKLOCKTIMEVERIFY OP_DROP <delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+//!          OP_PUSHCURRENTINPUTINDEX OP_INSPECTOUTPUTSCRIPTPUBKEY OP_2 OP_ADD OP_CAT OP_SHA256 <pin> OP_EQUALVERIFY
+//!          OP_PUSHCURRENTINPUTINDEX OP_INSPECTOUTPUTASSET OP_1 OP_EQUALVERIFY <asset> OP_EQUALVERIFY
+//!          OP_PUSHCURRENTINPUTINDEX OP_INSPECTOUTPUTVALUE OP_1 OP_EQUALVERIFY <min, u64 LE> OP_GREATERTHANOREQUAL64
+//! ```
+//!
+//! as `[collab, [exit, lapse]]`. `pin` is `SHA256(program ‖ version + 2)` of
+//! the return script, the script part of the injective output record
+//! ([`script_pin`]), so any script can be the return; `min` is the leaf's value
+//! less the fee allowance. The lapse needs no signature: once the median time
+//! has passed `D` and the leaf has waited its exit delay on the chain, anyone
+//! may spend it, and it can only pay the return script, at the input's own
+//! index, explicitly in the leaf's asset. The payer, the operator's watcher or
+//! a stranger who brings an unclaimed leaf on the chain lapses it alike, and
+//! whatever of the allowance the fee leaves goes where the lapser says.
+//!
+//! - **Its own index.** Each lapse pins the output at its own input's index,
+//!   so two claim leaves of one distribution, with one return script and one
+//!   minimum, lapse in one transaction to two outputs, and one output never
+//!   stands for both.
+//! - **The exit delay, again.** The lapse waits the exit delay after the leaf
+//!   confirms, as the exit does. A holder who took its claim up holds a coin
+//!   resting on the leaf (its pair co-signed before `D`); if the leaf reaches
+//!   the chain after `D`, that holder has the exit delay to answer with its
+//!   pair, as it answers an exit, and nothing a holder holds is lapsed at once.
+//! - **The holder's race.** A holder's exit and the lapse both wait the exit
+//!   delay from the leaf's confirmation, and the lapse also waits for `D`. A
+//!   holder who brings its leaf on the chain at least an exit delay before `D`
+//!   exits before the lapse opens; later than that, both open together and the
+//!   first to confirm takes the coin. A wallet takes its claims up well before
+//!   `D` instead, which needs no chain at all.
+//! - **What it authorises.** Nothing signs the lapse, so an annex or a fee coin
+//!   anyone attaches changes nothing it pins. Its output is the return script
+//!   only, in the leaf's asset only, so no lapse moves another coin, another
+//!   leaf's value or another asset; a leaf exists on one chain, so no lapse
+//!   runs on another. The collaborative path is `vtxo-1`'s under the leaf's
+//!   own salt, so a pair for this leaf is valid for no other.
+//! - **Fees.** The allowance pays the fee in the leaf's asset where the node
+//!   takes it. Where it does not (the asset delisted), a coin of any accepted
+//!   asset pays the fee and the return gets the whole value ([`LeafPolicy::lapse_tx`]).
 
 use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::{Keypair, Scalar, XOnlyPublicKey};
 use elements::{AssetId, Script};
 
+use elements::opcodes::all::*;
+use elements::script::Builder;
+
 use crate::message::Chain;
 use crate::record::LeafId;
+use crate::script::{asset_bytes as script_asset_bytes, BuilderExt, ExplicitOutput};
 use crate::taptree::secp;
 use crate::time::{MedianTime, RelativeTime};
+#[allow(unused_imports)]
+use crate::LeafPolicy;
 
 /// The tag of a claim key's tweak.
 pub const CLAIM_KEY_TAG: &[u8] = b"Arca/claim-key";
@@ -74,6 +132,123 @@ pub enum ClaimError {
 	ReturnScript(usize),
 	#[error("the fees name {0} assets, or one twice")]
 	Fees(usize),
+	#[error("claim {index} holds {value}, not above the lapse's fee allowance of {allowance}")]
+	LapseAllowance { index: usize, value: u64, allowance: u64 },
+}
+
+/// Why a claim leaf's lapse cannot be built or does not fit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LapseError {
+	#[error("a claim-1 leaf's allowance of {allowance} is not below its value of {value}: its lapse would hold nothing")]
+	Allowance { allowance: u64, value: u64 },
+	#[error("a claim-1 leaf's return script has {0} bytes; it has 1 to {max}", max = MAX_RETURN_SCRIPT)]
+	ReturnScript(usize),
+	#[error("the lapse's output at its input's index is not the return script, explicitly in the leaf's asset, holding at least {min}")]
+	Output { min: u64 },
+}
+
+/// `SHA256(program ‖ version + 2)` of `script_pubkey`: the script part of the
+/// injective output record ([`crate::script::record`]), the program being
+/// `SHA256(script_pubkey)` and the version -1 for a script that is no witness
+/// program. What a lapse pins of its return script.
+pub fn script_pin(script_pubkey: &Script) -> [u8; 32] {
+	let record = crate::script::record(AssetId::from_slice(&[0; 32]).expect("32 bytes"), 0, script_pubkey);
+	crate::script::sha256(&record[42..])
+}
+
+/// A `claim-1` leaf's lapse, as its record keeps it: the deadline, the fee
+/// allowance and the return script.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Lapse {
+	/// `D`: the lapse waits for the chain's median time to pass it.
+	pub deadline: MedianTime,
+	/// How much of the leaf's value the lapse may leave out of its output:
+	/// below the value.
+	pub allowance: u64,
+	/// The distribution's return script, the payer's.
+	pub return_script: Script,
+}
+
+impl Lapse {
+	/// The terms a leaf of `value` of `asset` lapses by.
+	pub fn terms(&self, asset: AssetId, value: u64) -> Result<LapseTerms, LapseError> {
+		if self.return_script.is_empty() || self.return_script.len() > MAX_RETURN_SCRIPT {
+			return Err(LapseError::ReturnScript(self.return_script.len()));
+		}
+		if self.allowance >= value {
+			return Err(LapseError::Allowance { allowance: self.allowance, value });
+		}
+		Ok(LapseTerms { deadline: self.deadline, pin: script_pin(&self.return_script), asset, min_value: value - self.allowance })
+	}
+}
+
+/// What a `claim-1` leaf's lapse script checks: the deadline, and where the
+/// output at its own index pays, in what, and at least how much.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LapseTerms {
+	/// `D`, a median time.
+	pub deadline: MedianTime,
+	/// [`script_pin`] of the return script.
+	pub pin: [u8; 32],
+	/// The leaf's asset.
+	pub asset: AssetId,
+	/// The least the lapse's output holds: the leaf's value less the
+	/// allowance.
+	pub min_value: u64,
+}
+
+impl LapseTerms {
+	/// The lapse script, its relative lock the leaf's exit delay.
+	pub fn script(&self, delay: RelativeTime) -> Script {
+		Builder::new()
+			.push_int(self.deadline.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP])
+			.push_int(delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP])
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY]).push_int(2).ops(&[OP_ADD, OP_CAT, OP_SHA256])
+			.push_slice(&self.pin).push_opcode(OP_EQUALVERIFY)
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTASSET]).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&script_asset_bytes(self.asset)).push_opcode(OP_EQUALVERIFY)
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTVALUE]).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&self.min_value.to_le_bytes()).push_opcode(OP_GREATERTHANOREQUAL64)
+			.into_script()
+	}
+
+	/// Checks `output` as the lapse script will check the output at its
+	/// input's index.
+	pub fn check_output(&self, output: &ExplicitOutput) -> Result<(), LapseError> {
+		if script_pin(&output.script_pubkey) != self.pin || output.asset != self.asset || output.value < self.min_value {
+			return Err(LapseError::Output { min: self.min_value });
+		}
+		Ok(())
+	}
+
+	/// Whether a lapse can confirm at the chain's median time `now`: once
+	/// `now` has passed `D` (a lock time of `D` is final then).
+	pub fn open_at(&self, now: MedianTime) -> bool {
+		now.to_consensus_u32() > self.deadline.to_consensus_u32()
+	}
+}
+
+/// The virtual size a lapse is priced at: one claim leaf spent by its lapse
+/// into the return script and the fee output, 215 vbytes as measured on a
+/// regtest node (`regtest/t27_claim_lapse.py`), and a little over.
+pub const LAPSE_VSIZE: usize = 220;
+
+/// The allowance that pays a lapse's fee at `multiple` times the relay floor
+/// `floor_per_kvb` (the asset's atoms per 1,000 vbytes); nothing where the
+/// node takes no fee in the asset (`None`), whose lapse a coin attached
+/// pays. A payer's wallet names four times its node's floor; a server takes
+/// no allowance below one time its own.
+pub fn lapse_allowance(floor_per_kvb: Option<u64>, multiple: u64) -> u64 {
+	floor_per_kvb.map_or(0, |f| crate::spend::margin_for(LAPSE_VSIZE, f, multiple))
+}
+
+/// A distribution's lapse: the deadline after which what nobody took up of
+/// it goes back to its return script, and the allowance each lapse may leave
+/// out for its fee. Every claim leaf of such a distribution is `claim-1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DistributionLapse {
+	pub deadline: MedianTime,
+	pub allowance: u64,
 }
 
 /// `t = SHA256(T ‖ T ‖ A ‖ n)`, `T = SHA256("Arca/claim-key")`, as 32 bytes.
@@ -155,6 +330,9 @@ pub struct Distribution {
 	pub fees: Vec<(AssetId, u64)>,
 	/// The earliest median time of a round it may run in.
 	pub not_before: Option<MedianTime>,
+	/// The deadline its claims lapse at; `None` for claims that are plain
+	/// `vtxo-1` leaves, which a batch's sweep returns.
+	pub lapse: Option<DistributionLapse>,
 }
 
 fn asset_bytes(a: AssetId) -> [u8; 32] {
@@ -189,7 +367,18 @@ impl Distribution {
 		if self.fees.len() > u8::MAX as usize || fee_assets.len() != self.fees.len() {
 			return Err(ClaimError::Fees(self.fees.len()));
 		}
+		if let Some(l) = &self.lapse {
+			if let Some((index, c)) = self.claims.iter().enumerate().find(|(_, c)| c.value <= l.allowance) {
+				return Err(ClaimError::LapseAllowance { index, value: c.value, allowance: l.allowance });
+			}
+		}
 		Ok(())
+	}
+
+	/// The lapse every claim leaf's record keeps; `None` for a distribution
+	/// without a deadline, whose claims are `vtxo-1` leaves.
+	pub fn claim_lapse(&self) -> Option<Lapse> {
+		self.lapse.map(|l| Lapse { deadline: l.deadline, allowance: l.allowance, return_script: self.return_script.clone() })
 	}
 
 	/// What the claims hold together.
@@ -207,6 +396,8 @@ impl Distribution {
 	///      ‖ return script length (u16) ‖ return script
 	///      ‖ n_fees (u8), each fee: asset ‖ amount (u64)
 	///      ‖ 0, or 1 and the earliest round time (u32)
+	///      ‖ for a distribution with a deadline only: 1, the deadline (u32)
+	///        and the lapse's fee allowance (u64)
 	/// ```
 	///
 	/// Integers little-endian, asset ids in internal byte order. Its tag is its
@@ -246,6 +437,11 @@ impl Distribution {
 				e.input(&t.to_consensus_u32().to_le_bytes());
 			},
 			None => e.input(&[0]),
+		}
+		if let Some(l) = &self.lapse {
+			e.input(&[1]);
+			e.input(&l.deadline.to_consensus_u32().to_le_bytes());
+			e.input(&l.allowance.to_le_bytes());
 		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
@@ -351,6 +547,7 @@ mod tests {
 			return_script: Script::from(vec![0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]),
 			fees: vec![(AssetId::from_slice(&[5; 32]).unwrap(), 30)],
 			not_before: None,
+			lapse: None,
 		}
 	}
 
@@ -380,6 +577,10 @@ mod tests {
 		changed(&|x| x.fees[0].1 = 31);
 		changed(&|x| x.fees.clear());
 		changed(&|x| x.not_before = Some(MedianTime::from_consensus(1_800_000_000).unwrap()));
+		let lapse = |t: u32, a: u64| Some(DistributionLapse { deadline: MedianTime::from_consensus(t).unwrap(), allowance: a });
+		changed(&|x| x.lapse = lapse(1_800_000_000, 0));
+		changed(&|x| x.lapse = lapse(1_800_000_001, 0));
+		changed(&|x| x.lapse = lapse(1_800_000_000, 1));
 		assert_ne!(d.id(&Chain::new(elements::BlockHash::from_byte_array([0x12; 32])), &s), id, "another chain");
 		assert_ne!(d.id(&chain, &pair("another operator").x_only_public_key().0), id, "another operator");
 	}
@@ -404,5 +605,10 @@ mod tests {
 		let mut d = distribution();
 		d.fees.push(d.fees[0]);
 		assert_eq!(d.check(), Err(ClaimError::Fees(2)));
+		let mut d = distribution();
+		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 1_000 });
+		assert_eq!(d.check(), Err(ClaimError::LapseAllowance { index: 0, value: 1_000, allowance: 1_000 }));
+		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 999 });
+		assert!(d.check().is_ok());
 	}
 }

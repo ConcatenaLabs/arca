@@ -140,7 +140,7 @@ impl Ctx {
 
 	fn leaf(&self) -> LeafPolicy {
 		let p = &self.output("leaf")["params"];
-		let leaf = LeafPolicy { enclave: None,
+		let leaf = LeafPolicy { enclave: None, claim: None,
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
@@ -157,7 +157,7 @@ impl Ctx {
 
 	fn board(&self) -> BoardPolicy {
 		let p = &self.output("board")["params"];
-		let leaf = LeafPolicy { enclave: None,
+		let leaf = LeafPolicy { enclave: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
@@ -220,7 +220,7 @@ impl Ctx {
 			timeout: time(&p["timeout"]),
 			operator_delay: rel(&p["operator_delay"]),
 		};
-		let h = LeafPolicy { enclave: None,
+		let h = LeafPolicy { enclave: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
 			order: None,
@@ -243,7 +243,7 @@ impl Ctx {
 		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap() };
 		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy { enclave: None,
+		let l = LeafPolicy { enclave: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: Some(terms),
 			channel: None, v2: false,
@@ -254,6 +254,26 @@ impl Ctx {
 		assert_eq!(l.collab_prefix(), [&h32(&p["K"])[..], &program[..]].concat());
 		assert_eq!(l.template(), arca_covenant::Template::Landing1);
 		l
+	}
+
+	fn claim(&self) -> (LeafPolicy, Script) {
+		let p = &self.output("claim")["params"];
+		let ret = Script::from(hex(&p["return_script"]));
+		assert_eq!(arca_covenant::script_pin(&ret), h32(&p["return_pin"]));
+		let lapse = arca_covenant::Lapse {
+			deadline: time(&p["deadline"]), allowance: p["allowance"].as_u64().unwrap(), return_script: ret.clone(),
+		};
+		let terms = lapse.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
+		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
+		let l = LeafPolicy { enclave: None, claim: Some(terms),
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
+			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: None,
+			channel: None, v2: false,
+		};
+		assert_eq!(l.leaf_constant(), h32(&p["K"]), "claim-1's K is the salt's own");
+		assert_eq!(l.collab_prefix(), h32(&p["K"]).to_vec(), "its collaborative script is vtxo-1's");
+		assert_eq!(l.template(), arca_covenant::Template::Claim1);
+		(l, ret)
 	}
 
 	/// The Rust output for a vector output, with its leaves by name.
@@ -314,6 +334,11 @@ impl Ctx {
 				let l = self.landing();
 				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("landing", l.exit_script())]))
 			},
+			"claim" => {
+				let (l, _) = self.claim();
+				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("exit", l.exit_script()),
+					("lapse", l.lapse_script().unwrap())]))
+			},
 			other => panic!("no builder for vector output {}", other),
 		}
 	}
@@ -323,7 +348,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 19);
+	assert_eq!(outputs.len(), 20);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -363,7 +388,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 34);
+	assert_eq!(spends.len(), 37);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -515,6 +540,29 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			("landing", "collab") => {
 				let l = ctx.landing();
+				let owner = ctx.label_of(&l.owner).to_string();
+				let outs = committed(s["m"].as_u64().unwrap() as usize);
+				let msg = l.collab_message(asset_in, value_in, &outs).unwrap();
+				l.collab_witness(&csfs(&msg, "S"), &csfs(&msg, &owner), outs.len() as u8)
+			},
+			("claim", "lapse") => {
+				let (l, ret) = ctx.claim();
+				l.claim.unwrap().check_output(&ExplicitOutput::from_txout(&tx.output[0]).unwrap()).unwrap();
+				// The lapse as the policy builds it: the same transaction,
+				// the coin's split paying the fee, nothing signed.
+				let fee = value_in - tx.output[0].value.explicit().unwrap();
+				let built = l.lapse_tx(tx.input[0].previous_output, value_in, &ret,
+					&FeeSource::Split { fee, change: Script::new() }).unwrap();
+				assert_eq!(built.tx.txid(), tx.txid(), "{}: the policy's lapse transaction", name);
+				assert_eq!(built.tx.input[0].witness.script_witness, l.lapse_witness().unwrap());
+				l.lapse_witness().unwrap()
+			},
+			("claim", "exit") => {
+				let (l, _) = ctx.claim();
+				l.exit_witness(&checksig(ctx.label_of(&l.owner)))
+			},
+			("claim", "collab") => {
+				let (l, _) = ctx.claim();
 				let owner = ctx.label_of(&l.owner).to_string();
 				let outs = committed(s["m"].as_u64().unwrap() as usize);
 				let msg = l.collab_message(asset_in, value_in, &outs).unwrap();

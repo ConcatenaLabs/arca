@@ -4040,7 +4040,7 @@ mod tests {
 		let w = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
 		let e: Vec<MedianTime> = (1..=3u32).map(|k| MedianTime::from_consensus(1_800_000_000 + k * 28 * 86_400).unwrap()).collect();
 		let schedule = ClockSchedule::new(AssetId::from_slice(&[9; 32]).unwrap(), s, w, e).unwrap();
-		let leaves: Vec<LeafSpec> = (0..16u8).map(|i| LeafSpec {
+		let leaves: Vec<LeafSpec> = (0..16u8).map(|i| LeafSpec { claim: None,
 			template: Template::Vtxo1, owner: key(i + 1).x_only_public_key().0, value: 1_000_000,
 			owner_nonce: [i; 32], operator_nonce: [i + 100; 32], exit_delay: w, unlock_hash: [i + 50; 32],
 			htlc: None,

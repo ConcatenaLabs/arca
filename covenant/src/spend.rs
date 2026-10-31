@@ -98,6 +98,12 @@ pub enum SpendError {
 	LandingFee,
 	#[error("the enclave-1 terms: {0}")]
 	Enclave(crate::EnclaveError),
+	#[error(transparent)]
+	Lapse(crate::LapseError),
+	#[error("the leaf is no claim-1 leaf: it has no lapse")]
+	NoLapse,
+	#[error("a lapse pays its fee from its allowance, or from a coin attached that pays it; it burns nothing")]
+	LapseFee,
 	#[error("an enclave-1 exit pays its fee from a coin attached in another asset: the leaf's whole value goes to the enclave")]
 	EnclaveFee,
 	#[error("the schedule has no clock {step}; it has {steps}")]
@@ -535,6 +541,35 @@ impl LeafPolicy {
 			FeeSource::Reserve | FeeSource::Burning { .. } => return Err(SpendError::LandingFee),
 		};
 		self.exit_tx(coin, asset, value, &[l.output(paid)], &fee)
+	}
+
+	/// The lapse of `coin`, this `claim-1` leaf on-chain holding `value` of
+	/// `asset`, back to the distribution's `return_script`: its lock time is
+	/// the deadline and input 0's sequence the exit delay, so it confirms
+	/// once the median time has passed the deadline and the leaf has waited
+	/// its exit delay. With [`FeeSource::Split`] the coin pays its own `fee`,
+	/// which must be within the allowance, and output 0 holds the rest; with
+	/// [`FeeSource::Reserve`] the whole allowance is the fee and output 0
+	/// holds the least the lapse pays; with a coin of the broadcaster's
+	/// ([`FeeSource::Coin`]), in any accepted asset, output 0 holds the whole
+	/// value. Nothing signs it: its witness is the script and its control
+	/// block ([`Self::lapse_witness`]), and it is complete as returned.
+	pub fn lapse_tx(&self, coin: OutPoint, value: u64, return_script: &Script, fee: &FeeSource) -> Result<UnrollTx, SpendError> {
+		let t = self.claim.ok_or(SpendError::NoLapse)?;
+		let (paid, fee) = match fee {
+			FeeSource::Split { fee, .. } => (value.checked_sub(*fee).ok_or(SpendError::Margin { margin: *fee, value })?, FeeSource::Reserve),
+			FeeSource::Reserve => (t.min_value, FeeSource::Reserve),
+			FeeSource::Coin { .. } => (value, fee.clone()),
+			FeeSource::Burning { .. } => return Err(SpendError::LapseFee),
+		};
+		let out = ExplicitOutput::new(t.asset, paid, return_script.clone());
+		t.check_output(&out).map_err(SpendError::Lapse)?;
+		let spent = explicit_txout(t.asset, value, self.script_pubkey());
+		let lock = LockTime::from_consensus(t.deadline.to_consensus_u32());
+		let lapse = self.lapse_script().ok_or(SpendError::NoLapse)?;
+		let k = KeySpend::build_at(lock, self.taproot(), lapse, vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))],
+			&[out], &fee)?;
+		Ok(k.finish(vec![]))
 	}
 
 	/// The exit of `coin`, this `enclave-1` leaf on-chain: output 0 pays the

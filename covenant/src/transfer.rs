@@ -268,6 +268,7 @@ impl NewLeaf {
 	/// The leaf, for `operator` on `chain`.
 	pub fn policy(&self, operator: XOnlyPublicKey, chain: Chain) -> LeafPolicy {
 		LeafPolicy {
+			claim: None,
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
 			order: None, landing: self.landing, enclave: self.enclave,
 			channel: None, v2: self.v2,
@@ -1131,6 +1132,18 @@ impl CoinRecord {
 			CoinRecord::Leaf { record, .. } => record.leaf().order_policy(),
 			CoinRecord::Accumulator { record, .. } => record.leaf().order_policy(),
 			CoinRecord::Fill(f) if matches!(f.leaf, FillLeaf::Rest { .. }) => f.fill.order.order_policy().map(|o| o.next()),
+			_ => None,
+		}
+	}
+
+	/// The lapse of a `claim-1` coin, from its record alone: the claim leaf
+	/// of a distribution itself, which after the distribution's deadline pays
+	/// its return script ([`crate::claim`]); `None` for any other coin,
+	/// including one paid on from a claim leaf, which no lapse reaches once its
+	/// pair is published.
+	pub fn lapse(&self) -> Option<&crate::claim::Lapse> {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.claim.as_ref(),
 			_ => None,
 		}
 	}

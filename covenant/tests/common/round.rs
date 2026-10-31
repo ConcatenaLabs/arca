@@ -125,7 +125,7 @@ impl Arca {
 
 /// A leaf of `value` for `owner`, behind `h`, with nonces from `label`.
 pub fn spec(owner: &Keypair, label: &str, value: u64, h: [u8; 32]) -> LeafSpec {
-	LeafSpec {
+	LeafSpec { claim: None,
 		template: Template::Vtxo1, owner: xonly(owner), value,
 		owner_nonce: label32(&format!("{} owner nonce", label)),
 		operator_nonce: label32(&format!("{} operator nonce", label)),
@@ -233,7 +233,7 @@ pub fn inputs(coin: &ValidCoin) -> Vec<ValidInput> {
 /// A leaf funded straight on-chain, standing for an old leaf being given
 /// up, and its id in the board form.
 pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, value: u64) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy { enclave: None,
+	let leaf = LeafPolicy { enclave: None, claim: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),

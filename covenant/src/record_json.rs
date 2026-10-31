@@ -17,6 +17,8 @@
 //!                    for order-3 "version": 3 (absent for order-2)
 //! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
 //! channel            channel-1 only: {"capacity": decimal string, "window_units": 512-second units}
+//! claim              claim-1 only: {"deadline": median time, "allowance": decimal string,
+//!                    "return_script": hex}
 //! asset              hex, display order
 //! value              decimal string
 //! unlock_hash        hex
@@ -58,6 +60,7 @@ use serde_json::{Map, Value};
 use crate::clock::{ClockSchedule, MAX_STEPS};
 use crate::gate::{MemberProof, MAX_DEPTH};
 use crate::htlc::{HtlcDirection, HtlcTerms};
+use crate::claim::Lapse;
 use crate::channel::Channel;
 use crate::landing::{Landing, PROGRAM_BYTES};
 use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder, SeqdexVersion};
@@ -139,6 +142,9 @@ impl LeafRecord {
 		if let Some(c) = &self.channel {
 			m.insert("channel".into(), channel_json(c));
 		}
+		if let Some(l) = &self.claim {
+			m.insert("claim".into(), claim_json(l));
+		}
 		m.insert("asset".into(), Value::String(display(asset_bytes(self.asset))));
 		m.insert("value".into(), Value::String(self.value.to_string()));
 		m.insert("unlock_hash".into(), Value::String(hex(&self.unlock_hash)));
@@ -200,6 +206,9 @@ impl LeafRecord {
 		if named == Some(Template::Channel1) {
 			fields.push("channel");
 		}
+		if named == Some(Template::Claim1) {
+			fields.push("claim");
+		}
 		let m = object(v, "record", &fields)?;
 		let version = int(m, "version", u64::MAX)?;
 		if version != RECORD_VERSION as u64 && version != RECORD_VERSION_NO_SWEEP as u64 {
@@ -232,6 +241,7 @@ impl LeafRecord {
 		};
 		let landing = m.get("landing").map(landing_from_json).transpose()?;
 		let channel = m.get("channel").map(channel_from_json).transpose()?;
+		let claim = m.get("claim").map(claim_from_json).transpose()?;
 		let value = amount(m, "value")?;
 		let unlock_hash = bytes32(m, "unlock_hash")?;
 		let entry_reserve = amount(m, "entry_reserve")?;
@@ -291,10 +301,36 @@ impl LeafRecord {
 			order,
 			landing,
 			channel,
+			claim,
 		};
 		record.check()?;
 		Ok(record)
 	}
+}
+
+/// `claim-1`'s lapse as the record's JSON form and the server's interface
+/// write it: `{"deadline": median time, "allowance": decimal string,
+/// "return_script": hex}`.
+pub fn claim_json(l: &Lapse) -> Value {
+	let mut m = Map::new();
+	m.insert("deadline".into(), l.deadline.to_consensus_u32().into());
+	m.insert("allowance".into(), Value::String(l.allowance.to_string()));
+	m.insert("return_script".into(), Value::String(hex(l.return_script.as_bytes())));
+	Value::Object(m)
+}
+
+/// Reads [`claim_json`].
+pub fn claim_from_json(v: &Value) -> Result<Lapse, RecordError> {
+	let o = object(v, "claim", &["deadline", "allowance", "return_script"])?;
+	let t = int(o, "deadline", u32::MAX as u64)?;
+	let deadline = MedianTime::from_consensus(t as u32).map_err(crate::encode::DecodeError::from)?;
+	let allowance = match &o["allowance"] {
+		Value::String(_) => amount(o, "allowance").map_err(|_| RecordError::Amount("claim.allowance".into()))?,
+		_ => return Err(RecordError::Type("claim.allowance".into())),
+	};
+	let script = string(o, "return_script").map_err(|_| RecordError::Type("claim.return_script".into()))?;
+	let bytes = crate::record::hex_lower(script).ok_or_else(|| RecordError::Hex("claim.return_script".into()))?;
+	Ok(Lapse { deadline, allowance, return_script: elements::Script::from(bytes) })
 }
 
 /// `landing-1`'s landing as the record's JSON form and the server's interface

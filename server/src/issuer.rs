@@ -421,7 +421,7 @@ impl WireBatch {
 		};
 		let mut leaves = vec![];
 		for l in &self.leaves {
-			leaves.push(LeafSpec {
+			leaves.push(LeafSpec { claim: None,
 				template: Template::Vtxo1,
 				owner: XOnlyPublicKey::from_slice(&unhex(&l.owner)?).map_err(|e| format!("owner: {}", e))?,
 				value: amount(&l.value, "value")?,

@@ -688,9 +688,10 @@ impl Accumulator {
 		if !params.schedule.expires() {
 			return Err(TreeError::Policy(crate::Error::NoSweep));
 		}
-		// A channel-1 leaf's terms are not in an accumulator record: a
-		// channel goes in a tree.
-		if let Some(i) = leaves.iter().position(|l| l.template == Template::Channel1 || l.channel.is_some()) {
+		// A channel-1 leaf's terms, and a claim-1 leaf's, are not in an
+		// accumulator record: a channel and a claim go in a tree.
+		if let Some(i) = leaves.iter().position(|l| matches!(l.template, Template::Channel1 | Template::Claim1) || l.channel.is_some()
+			|| l.claim.is_some()) {
 			return Err(TreeError::Template { leaf: i });
 		}
 		let tree_leaves = build_leaves(&params.as_tree(), leaves)?;
@@ -912,7 +913,7 @@ impl AccumulatorRecord {
 	/// Checks the record's shape: the template and its terms, the value
 	/// bounds, the slot and the path's length.
 	pub fn check(&self) -> Result<(), AccumulatorError> {
-		check_template(self.template, &self.htlc, &self.order, &self.landing, self.asset, self.value, &self.owner,
+		check_template(self.template, &self.htlc, &self.order, &self.landing, &None, self.asset, self.value, &self.owner,
 			&self.schedule.operator, self.exit_delay)?;
 		if self.value == 0 || self.value > MAX_VALUE {
 			return Err(RecordError::Value(self.value).into());
@@ -933,7 +934,7 @@ impl AccumulatorRecord {
 
 	/// The leaf's policy.
 	pub fn leaf(&self) -> LeafPolicy {
-		leaf_policy(self.template, (&self.htlc, &self.order, &self.landing), self.owner, self.schedule.operator, self.salt(), self.chain,
+		leaf_policy(self.template, (&self.htlc, &self.order, &self.landing, &None), self.owner, self.schedule.operator, self.salt(), self.chain,
 			self.exit_delay, self.asset, self.value)
 	}
 

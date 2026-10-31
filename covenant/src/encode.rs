@@ -12,9 +12,9 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64) |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
@@ -323,10 +323,16 @@ impl Encoding for LeafPolicy {
 			w.extend(asset_bytes(e.asset));
 			w.extend(e.value.to_le_bytes());
 		}
+		if let Some(c) = &self.claim {
+			w.extend(c.deadline.to_consensus_u32().to_le_bytes());
+			w.extend(c.pin);
+			w.extend(asset_bytes(c.asset));
+			w.extend(c.min_value.to_le_bytes());
+		}
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<LeafPolicy, DecodeError> {
-		Ok(LeafPolicy { enclave: None,
+		Ok(LeafPolicy { enclave: None, claim: None,
 			owner: r.key()?,
 			operator: r.key()?,
 			salt: r.array32()?,
@@ -504,7 +510,7 @@ impl Encoding for OffboardPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
 	/// A leaf, `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3`, `order-2`,
-	/// `landing-1`, `enclave-1` or `channel-1`.
+	/// `landing-1`, `enclave-1`, `channel-1` or `claim-1`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -541,6 +547,7 @@ impl Encoding for Policy {
 					crate::Template::Enclave1 => 11,
 					crate::Template::Htlc1 => 6,
 					crate::Template::Vtxo2 => 12,
+					crate::Template::Claim1 => 15,
 					crate::Template::Vtxo1 | crate::Template::Board1 => 1,
 				});
 				p.encode_to(w)
@@ -615,6 +622,18 @@ impl Encoding for Policy {
 			},
 			12 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
 			14 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
+			15 => {
+				let mut p = LeafPolicy::decode_from(r)?;
+				let deadline = r.median_time()?;
+				let pin = r.array32()?;
+				let asset = r.asset()?;
+				let min_value = r.u64()?;
+				if min_value == 0 {
+					return Err(DecodeError::Count(0));
+				}
+				p.claim = Some(crate::claim::LapseTerms { deadline, pin, asset, min_value });
+				Policy::Leaf(p)
+			},
 			t => return Err(DecodeError::PolicyType(t)),
 		})
 	}

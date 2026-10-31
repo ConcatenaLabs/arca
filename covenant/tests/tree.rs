@@ -89,9 +89,15 @@ fn the_builder_rebuilds_every_record_vector() {
 				capacity: c["capacity"].as_u64().unwrap(),
 				window: RelativeTime::from_units(c["window_units"].as_u64().unwrap() as u16).unwrap(),
 			});
+			let claim = l.get("claim").map(|q| arca_covenant::Lapse {
+				deadline: MedianTime::from_consensus(q["deadline"].as_u64().unwrap() as u32).unwrap(),
+				allowance: q["allowance"].as_u64().unwrap(),
+				return_script: elements::Script::from(Vec::<u8>::from_hex(q["return_script"].as_str().unwrap()).unwrap()),
+			});
 			LeafSpec {
 				template: if let Some(o) = &order { o.template() } else if htlc.is_some() { Template::Htlc1 }
 					else if landing.is_some() { Template::Landing1 } else if channel.is_some() { Template::Channel1 }
+					else if claim.is_some() { Template::Claim1 }
 					else if l.get("template") == Some(&serde_json::json!("vtxo-2")) { Template::Vtxo2 } else { Template::Vtxo1 },
 				owner: key_of(&l["owner"]),
 				value: l["value"].as_u64().unwrap(),
@@ -103,6 +109,7 @@ fn the_builder_rebuilds_every_record_vector() {
 				order,
 				landing,
 				channel,
+				claim,
 			}
 		}).collect();
 		let tree = Tree::build(params, &leaves).unwrap();
@@ -190,7 +197,7 @@ impl Fx {
 		};
 		let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();
 		let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
-		let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec {
+		let leaves: Vec<LeafSpec> = (0..n).map(|i| LeafSpec { claim: None,
 			template: Template::Vtxo1, owner: xonly(&owners[i]), value: 1_000_000 + 7 * i as u64,
 			owner_nonce: label32(&format!("{} owner nonce {}", label, i)),
 			operator_nonce: label32(&format!("{} operator nonce {}", label, i)),
@@ -416,7 +423,7 @@ fn the_builder_refuses() {
 	let fx = Fx::new();
 	let b = fx.batch(3, 4, "refusals");
 	let params = b.tree.params().clone();
-	let leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec).collect();
+	let leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec.clone()).collect();
 	assert_eq!(Tree::build(params.clone(), &[]).unwrap_err(), TreeError::NoLeaves);
 	for radix in [0, 1, 2, 7] {
 		assert_eq!(Tree::build(TreeParams { radix, ..params.clone() }, &leaves).unwrap_err(), TreeError::Radix(radix));
@@ -431,7 +438,7 @@ fn the_builder_refuses() {
 	// before it looks at the script (the same script from different nonces
 	// would need a SHA256 collision).
 	let mut twice = leaves.clone();
-	twice[2] = twice[0];
+	twice[2] = twice[0].clone();
 	assert_eq!(Tree::build(params.clone(), &twice).unwrap_err(), TreeError::DuplicateOperatorNonce { first: 0, second: 2 });
 	let mut nonce_twice = leaves.clone();
 	nonce_twice[1].operator_nonce = nonce_twice[0].operator_nonce;
@@ -452,7 +459,7 @@ fn the_builder_refuses() {
 	let backwards = ClockSchedule::new_unchecked(params.schedule.token, params.schedule.operator, params.schedule.notice,
 		vec![params.schedule.expiries()[1], params.schedule.expiries()[0]]).unwrap();
 	assert_eq!(Tree::build(TreeParams { schedule: backwards, ..params.clone() }, &leaves).unwrap_err(), TreeError::ScheduleBackwards(1));
-	let many = vec![leaves[0]; arca_covenant::gate::MAX_OWNERS + 1];
+	let many = vec![leaves[0].clone(); arca_covenant::gate::MAX_OWNERS + 1];
 	assert_eq!(Tree::build(params, &many).unwrap_err(), TreeError::TooManyLeaves(arca_covenant::gate::MAX_OWNERS + 1));
 	let _ = TxOut::default();
 }
@@ -512,7 +519,7 @@ fn a_record_whose_salt_lacks_the_owner_nonce_is_refused() {
 	// of the wallet's (say one the wallet signed under before). If its record
 	// says so, the round matches it and the wallet refuses the nonce; if the
 	// record names the wallet's nonce, the round refuses it.
-	let mut leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec).collect();
+	let mut leaves: Vec<LeafSpec> = b.tree.leaves().iter().map(|l| l.spec.clone()).collect();
 	leaves[i].owner_nonce = label32("the operator's substitute");
 	let swapped = Tree::build(b.tree.params().clone(), &leaves).unwrap();
 	let round = fx.round(&swapped, issuer_of(label));

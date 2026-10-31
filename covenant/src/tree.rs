@@ -129,7 +129,7 @@ pub struct TreeParams {
 }
 
 /// A leaf a batch is to hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LeafSpec {
 	pub template: Template,
 	/// The owner's key `A`.
@@ -153,6 +153,9 @@ pub struct LeafSpec {
 	/// `channel-1`: the operator's opening balance, part of the leaf's value,
 	/// and the credit window.
 	pub channel: Option<crate::channel::Channel>,
+	/// `claim-1`'s lapse, present exactly when the template is `claim-1`: a
+	/// distribution's claim leaf ([`crate::claim`]).
+	pub claim: Option<crate::claim::Lapse>,
 }
 
 impl LeafSpec {
@@ -306,8 +309,17 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			(Template::Channel1, _) | (_, Some(_)) => return Err(TreeError::Template { leaf: i }),
 			_ => None,
 		};
+		let claim = match (spec.template, &spec.claim) {
+			(Template::Claim1, Some(l)) if spec.htlc.is_none() && spec.order.is_none() && spec.landing.is_none()
+				&& spec.channel.is_none() => match l.terms(params.asset, spec.value) {
+				Ok(t) => Some(t),
+				Err(_) => return Err(TreeError::Template { leaf: i }),
+			},
+			(Template::Claim1, _) | (_, Some(_)) => return Err(TreeError::Template { leaf: i }),
+			_ => None,
+		};
 		let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
-			(Template::Channel1, None, None, None) => None,
+			(Template::Channel1 | Template::Claim1, None, None, None) => None,
 			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
 			(Template::Order2 | Template::Order3, None, Some(o), None)
@@ -321,7 +333,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		if spec.value < min || spec.value > MAX_VALUE {
 			return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 		}
-		let leaf = LeafPolicy { enclave: None,
+		let leaf = LeafPolicy { enclave: None, claim,
 			owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 			htlc: spec.htlc,
 			order: spec.order,
@@ -348,7 +360,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		};
 		let entry_value = sum(spec.value, entry_reserve)?;
 		tree_leaves.push(TreeLeaf {
-			spec: *spec, leaf, entry, entry_value, entry_reserve, entry_program: entry_tap.program(),
+			spec: spec.clone(), leaf, entry, entry_value, entry_reserve, entry_program: entry_tap.program(),
 		});
 	}
 	Ok(tree_leaves)
@@ -530,6 +542,7 @@ impl Tree {
 			order: l.spec.order,
 			landing: l.spec.landing,
 			channel: l.spec.channel,
+			claim: l.spec.claim.clone(),
 		}
 	}
 

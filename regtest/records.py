@@ -39,8 +39,8 @@ All integers are little-endian. Asset ids and the genesis hash are in internal
 byte order.
 
     u8    format version, 2
-    u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing) or 7 (channel)
-    u8    template version, 1 (vtxo, htlc, landing, channel), 2 or 3 (order), or 2
+    u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel) or 8 (claim)
+    u8    template version, 1 (vtxo, htlc, landing, channel, claim), 2 or 3 (order), or 2
           (vtxo-2, a vtxo leaf whose collaborative path is arca/collab-2, collab2.py)
     [32]  owner key A                 the vtxo-1 parameters
     [32]  owner nonce
@@ -66,6 +66,11 @@ byte order.
           channel-1 only (a leaf with a balance for each side, channel.py):
     u64   the operator's opening balance, below the value
     u16   the credit window, 512-second units, no shorter than the exit delay
+          claim-1 only (a distribution's claim leaf, arklib3.claim_taptree):
+    u32   the deadline D, a median time: the lapse waits for it
+    u64   the fee allowance: the lapse's output holds at least the value less
+          this; below the value
+    u16   the return script's length, 1 to 10,000, then the return script
     [32]  asset                       the leaf and its entry
     u64   value
     [32]  unlock hash h
@@ -111,7 +116,8 @@ The JSON form has the same fields; an htlc-1 record's terms are one object,
 "operator_delay_units"}, and an order-2 or order-3 record's `order`:
 {"asset_b", "rate_num", "rate_den", "min_lot", "maker", "expiry",
 "refund_key", "credits"}, with "version": 3 for order-3, and a landing-1 record's `landing`: {"program", "allowance"},
-and a channel-1 record's `channel`: {"capacity", "window_units"}.
+and a channel-1 record's `channel`: {"capacity", "window_units"},
+and a claim-1 record's `claim`: {"deadline", "allowance", "return_script"}.
 Its canonical text has its keys sorted and
 no whitespace. Asset ids, the token and the genesis hash are hex in display
 order (the order the node's RPCs print), every other byte string hex in its
@@ -128,13 +134,14 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
 FORMAT_VERSION = 2
 FORMAT_VERSION_NO_SWEEP = 3
 NO_SWEEP_TOKEN = sha256(b"Arca/no-sweep")
-TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4, "landing": 5, "channel": 7}   # name -> template id; a board record names board
+TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4, "landing": 5, "channel": 7, "claim": 8}   # name -> template id; a board record names board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
 TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
 TEMPLATE_ORDER, TEMPLATE_ORDER_VERSION = 4, 2
 TEMPLATE_LANDING, TEMPLATE_LANDING_VERSION = 5, 1
 TEMPLATE_CHANNEL, TEMPLATE_CHANNEL_VERSION = 7, 1
+TEMPLATE_CLAIM, TEMPLATE_CLAIM_VERSION = 8, 1
 TEMPLATE_VTXO2_VERSION = 2
 
 
@@ -298,6 +305,10 @@ class Batch:
                 ch = channel_py.Channel(p["genesis"], salt, lf["owner"], S, SEQ_TIME | lf["exit_delay"], lf["value"],
                                         c["capacity"], SEQ_TIME | c["window"])
                 tap, _ = ch.tap(ch.opening())
+            elif lf.get("claim") is not None:
+                q = lf["claim"]
+                tap, _ = claim_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], q["deadline"],
+                                       q["return_script"], p["asset"], lf["value"], q["allowance"])
             elif lf.get("landing") is not None:
                 g = lf["landing"]
                 tap, _ = landing_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], g["program"], p["asset"],
@@ -377,14 +388,17 @@ class Batch:
         o = lf.get("order")
         g = lf.get("landing")
         c = lf.get("channel")
+        q = lf.get("claim")
         return {
             "template": ("order", o.get("version", TEMPLATE_ORDER_VERSION)) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
             else ("landing", TEMPLATE_LANDING_VERSION) if g else ("channel", TEMPLATE_CHANNEL_VERSION) if c
+            else ("claim", TEMPLATE_CLAIM_VERSION) if q
             else ("vtxo", TEMPLATE_VTXO2_VERSION) if lf.get("v2") else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
             "order": o,
             "landing": g,
             "channel": c,
+            "claim": q,
             "owner": lf["owner"], "owner_nonce": lf["owner_nonce"], "operator_nonce": lf["operator_nonce"],
             "exit_delay": lf["exit_delay"],
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
@@ -418,6 +432,9 @@ def encode(rec):
     if name == "channel":
         c = rec["channel"]
         b += le64(c["capacity"]) + le16(c["window"])
+    if name == "claim":
+        q = rec["claim"]
+        b += le32(q["deadline"]) + le64(q["allowance"]) + le16(len(q["return_script"])) + q["return_script"]
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     if no_sweep:
         b += rec["genesis"] + rec["operator"] + bytes([2 if rec.get("delegated") else 0])
@@ -478,6 +495,9 @@ def to_json(rec):
     if name == "channel":
         c = rec["channel"]
         o["channel"] = {"capacity": str(c["capacity"]), "window_units": c["window"]}
+    if name == "claim":
+        q = rec["claim"]
+        o["claim"] = {"deadline": q["deadline"], "allowance": str(q["allowance"]), "return_script": q["return_script"].hex()}
     return o
 
 
@@ -533,7 +553,7 @@ def txout(asset, value, spk):
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
                  expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
-                 v2=None, delegated=False, no_sweep=False):
+                 v2=None, delegated=False, no_sweep=False, claim=None):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -569,6 +589,12 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     # operator's opening balance that part of its value.
     for i, capacity in (channel or {}).items():
         leaves[i]["channel"] = {"capacity": capacity, "window": 2 * EXIT_DELAY}
+    # claim: [leaf index]; each such leaf is a claim-1 leaf of one distribution,
+    # lapsing to its return script after its deadline.
+    for i in (claim or []):
+        leaves[i]["claim"] = {"deadline": CREATED + 14 * DAY,
+                              "return_script": b"\x00\x14" + label_hash("claim", "%s return" % name)[:20],
+                              "allowance": 1_500 + i}
     # v2: [leaf index]; each such leaf is a vtxo-2 leaf.
     for i in (v2 or []):
         leaves[i]["v2"] = True
@@ -629,6 +655,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                                             "allowance": lf["landing"]["allowance"]}} if "landing" in lf else {}),
                             **({"channel": {"capacity": lf["channel"]["capacity"],
                                             "window_units": lf["channel"]["window"]}} if "channel" in lf else {}),
+                            **({"claim": {"deadline": lf["claim"]["deadline"], "allowance": lf["claim"]["allowance"],
+                                          "return_script": lf["claim"]["return_script"].hex()}} if "claim" in lf else {}),
                             **({"template": "vtxo-2"} if lf.get("v2") else {}))
                        for lf in leaves],
         },
@@ -779,6 +807,45 @@ def invalid_landing_vectors(valid_binary, valid_json):
             [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
 
 
+def invalid_claim_vectors(valid_binary, valid_json):
+    """claim-1 records a decoder must refuse."""
+    v = bytes.fromhex(valid_binary)
+    DEADLINE = 3 + 32 + 32 + 32 + 2
+    ALLOW = DEADLINE + 4
+    LEN = ALLOW + 8
+    n = struct.unpack("<H", v[LEN:LEN + 2])[0]
+    VALUE = LEN + 2 + n + 32
+    value = struct.unpack("<Q", v[VALUE:VALUE + 8])[0]
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [
+        ("claim-1: an allowance as large as the value", put(ALLOW, le64(value)), "claim"),
+        ("claim-1: a deadline that is a height", put(DEADLINE, le32(499_999_999)), "time"),
+        ("claim-1: an empty return script", v[:LEN] + le16(0) + v[LEN + 2 + n:], "claim"),
+        ("claim-1, version 2", put(2, b"\x02"), "template_version"),
+    ]
+
+    def edit(f):
+        o = json.loads(valid_json)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("claim-1 without its terms", edit(lambda o: o.pop("claim")), "field"),
+        ("claim-1 terms on a vtxo-1 record", edit(lambda o: o.update({"template": "vtxo-1"})), "field"),
+        ("claim-1: an allowance as a number", edit(lambda o: o["claim"].update({"allowance": 1500})), "type"),
+        ("claim-1: an allowance above the value", edit(lambda o: o["claim"].update({"allowance": str(int(o["value"]) + 1)})),
+         "claim"),
+        ("claim-1: a return script of odd hex", edit(lambda o: o["claim"].update({"return_script": o["claim"]["return_script"][:-1]})),
+         "hex"),
+        ("claim-1: an unknown field in its terms", edit(lambda o: o["claim"].update({"extra": 1})), "field"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
 def invalid_channel_vectors(valid_binary, valid_json):
     """channel-1 records a decoder must refuse."""
     v = bytes.fromhex(valid_binary)
@@ -887,6 +954,8 @@ def generate():
         batch_vector("seventeen leaves without a sweep, RECLAIM-D on every lowest node", 17, 4, delegated=True,
                      no_sweep=True),
         batch_vector("five leaves without a sweep, two of them vtxo-2", 5, 4, v2=[1, 2], no_sweep=True),
+        batch_vector("five leaves without a sweep, two of them claim-1", 5, 4, claim=[1, 3], no_sweep=True),
+        batch_vector("five leaves, two of them claim-1", 5, 4, claim=[0, 4]),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
@@ -910,6 +979,10 @@ def generate():
     ni, nj = invalid_no_sweep_vectors(ns["binary"], ns["json"], first["json"])
     invalid += ni
     invalid_json += nj
+    q = batches[16]["records"][1]
+    qi, qj = invalid_claim_vectors(q["binary"], q["json"])
+    invalid += qi
+    invalid_json += qj
     return {
         "about": "Golden vectors for Arca's leaf record, its id and its encodings. Generated by "
                  "regtest/vectors.py from regtest/records.py; do not edit.",

@@ -39,7 +39,7 @@ fn distribute_body(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Claim
 {
 	let d = Distribution {
 		inputs: coins.iter().map(|h| h.id).collect(), asset, exit_delay: delay, claims: claims.to_vec(), return_script: ret.clone(),
-		fees: fees.to_vec(), not_before: None,
+		fees: fees.to_vec(), not_before: None, lapse: None,
 	};
 	let id = d.id(&r.chain, &xonly(&r.s));
 	(json!({
