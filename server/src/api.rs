@@ -102,8 +102,8 @@ pub struct PoolFlowInfo {
 	pub locked: String,
 	/// Of `locked`, the leaves whose holders released them, not reclaimed yet.
 	pub released: String,
-	/// Of `released`, the batches every leaf of which is released: the watcher reclaims them
-	/// on its next passes.
+	/// Of `released`, the lowest nodes every leaf of which is released: the watcher unrolls
+	/// toward them and reclaims them on its next passes, whoever else rests on their batch.
 	pub reclaimable: String,
 	/// Of `locked`, the leaves paid on out of round, not reclaimed yet: their owner has moved on
 	/// to another coin, so on a batch with RECLAIM-D they come back once every coin they became is

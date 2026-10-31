@@ -74,9 +74,11 @@ poll_interval_ms = 1000
 # Whether the watcher acts on its own as it follows the chain. An operator
 # runs it: without it nothing answers a stale exit, and no batch is swept.
 enabled = true
-# Unroll a node all of whose owners have released their lowest nodes, and
-# reclaim those lowest nodes, so a fully refreshed batch comes back before it
-# expires. A node with an owner who has not released is never unrolled.
+# Unroll the nodes above each lowest node all of whose owners have released
+# it, and reclaim it, so a refreshed lowest node comes back before its batch
+# expires, whoever else rests on the batch. A lowest node with an owner who
+# has not released is never unrolled: that would put the owner's leaf on the
+# chain.
 reclaim_early = true
 # Bring every live coin of a released batch on the chain under its holder's
 # key before the sweep, paid from the path's reserves: the sweep then takes
