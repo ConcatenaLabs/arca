@@ -4,11 +4,23 @@
 //! a board) is **final** when its block is in the node's active chain,
 //! certified by the committee (the node reports the certificate for that block
 //! or for one above it), and its Bitcoin anchor is buried: the anchor height of
-//! the tip less the block's is at least the anchor depth (2), while the node
+//! the tip less the block's is at least the anchor depth, while the node
 //! reports its tip's anchor as validated and `ok`. That is the server's rule
 //! and SeqLN's. Sequentia reorganises whenever its anchor does, with no depth
 //! limit, so finality is read from the node in every view it is asked in
 //! (below), and never remembered past it.
+//!
+//! **The anchor depth** is the operator's: the wallet judges finality as the
+//! operator it uses does, from the `finality.anchor_depth` its `info`
+//! publishes ([`ChainSource::follow_anchor_depth`]), so that a coin the
+//! operator takes into a round is one the wallet calls final, and the other
+//! way round. An operator that publishes none is held to [`ANCHOR_DEPTH`].
+//! On the main chain (`sequentia`) the wallet never goes below
+//! [`ANCHOR_DEPTH`], whatever the operator publishes. At depth 0 a coin is
+//! final once its block is certified while the node's anchor status is `ok`:
+//! a Bitcoin reorganisation of the anchored block still takes the block, and
+//! everything built on it, out of the chain, and the wallet follows that as
+//! it follows any other.
 //!
 //! The node must run with `-txindex`, so the wallet can fetch any transaction
 //! by its id, and with `-validateanchor`, without which it has no notion of
@@ -71,7 +83,9 @@ use sequentia_ext::{Block, BlockHeader, BlockHeaderExt};
 
 use super::Error;
 
-/// The Bitcoin blocks that bury a final block's anchor.
+/// The Bitcoin blocks that bury a final block's anchor, when the operator
+/// publishes no depth of its own, and the least the wallet accepts on the
+/// main chain ([`ChainSource::follow_anchor_depth`]).
 pub const ANCHOR_DEPTH: u64 = 2;
 
 /// How far above a block the wallet looks for a committee certificate.
@@ -84,8 +98,8 @@ pub enum Finality {
 	NotInChain { in_mempool: bool },
 	/// In a block the committee has not certified.
 	Unsettled { height: u64 },
-	/// In a certified block, its anchor buried fewer than [`ANCHOR_DEPTH`]
-	/// Bitcoin blocks.
+	/// In a certified block, its anchor buried fewer than the anchor depth's
+	/// Bitcoin blocks ([`ChainSource::anchor_depth`]).
 	Settled { height: u64, depth: u64 },
 	/// Certified, and its anchor buried.
 	Final { height: u64, depth: u64 },
@@ -132,6 +146,8 @@ pub struct Tip {
 pub struct ChainSource {
 	client: Client,
 	memo: Arc<Mutex<Memo>>,
+	/// The anchor depth finality counts ([`ChainSource::anchor_depth`]).
+	anchor_depth: Arc<AtomicU64>,
 }
 
 /// How long a view stands, at most, before the source looks at the node again.
@@ -322,6 +338,16 @@ fn not_found(e: &RpcError) -> bool {
 	matches!(e, RpcError::Rpc { code: -5, .. } | RpcError::Rpc { code: -8, .. })
 }
 
+/// The anchor depth the wallet counts for an operator that publishes
+/// `published` on the chain named `chain_name` ([`ChainSource::follow_anchor_depth`]).
+pub fn anchor_depth_of(published: Option<u64>, chain_name: &str) -> u64 {
+	match published {
+		None => ANCHOR_DEPTH,
+		Some(d) if chain_name == "sequentia" => d.max(ANCHOR_DEPTH),
+		Some(d) => d,
+	}
+}
+
 impl ChainSource {
 	/// The node at `url`, authenticated with `user` and `password`, or with
 	/// its cookie file when `cookie` is given.
@@ -332,7 +358,30 @@ impl ChainSource {
 			(None, Some(u), None) => Auth::UserPass(u.into(), String::new()),
 			(None, None, _) => Auth::UserPass(String::new(), String::new()),
 		};
-		ChainSource { client: Client::new(url, auth).with_timeout(60), memo: Arc::new(Mutex::new(Memo::default())) }
+		ChainSource {
+			client: Client::new(url, auth).with_timeout(60), memo: Arc::new(Mutex::new(Memo::default())),
+			anchor_depth: Arc::new(AtomicU64::new(ANCHOR_DEPTH)),
+		}
+	}
+
+	/// The Bitcoin blocks that must bury a certified block's anchor for the
+	/// wallet to call it final: the operator's, once
+	/// [`ChainSource::follow_anchor_depth`] has read it, and [`ANCHOR_DEPTH`]
+	/// until then.
+	pub fn anchor_depth(&self) -> u64 {
+		self.anchor_depth.load(Ordering::SeqCst)
+	}
+
+	/// Follows the anchor depth an operator publishes (`published`, its
+	/// `info`'s `finality.anchor_depth`) on the chain named `chain_name`, and
+	/// returns the depth finality counts from now on: the operator's;
+	/// [`ANCHOR_DEPTH`] when it publishes none; and never less than
+	/// [`ANCHOR_DEPTH`] on the main chain. Every clone of the source follows
+	/// it.
+	pub fn follow_anchor_depth(&self, published: Option<u64>, chain_name: &str) -> u64 {
+		let d = anchor_depth_of(published, chain_name);
+		self.anchor_depth.store(d, Ordering::SeqCst);
+		d
 	}
 
 	pub fn client(&self) -> &Client {
@@ -830,7 +879,7 @@ impl ChainSource {
 			let v: Value = self.call("getanchorstatus", &[]).map_err(node)?;
 			v["validateanchor"].as_bool().unwrap_or(false) && v["anchorstatus"].as_str() == Some("ok")
 		};
-		if depth >= ANCHOR_DEPTH && anchor_ok {
+		if depth >= self.anchor_depth() && anchor_ok {
 			Ok(Finality::Final { height, depth })
 		} else {
 			Ok(Finality::Settled { height, depth })
@@ -838,11 +887,12 @@ impl ChainSource {
 	}
 
 	/// The node's anchor status in a word (whether it validates anchors and
-	/// how it finds them): a block's finality counts on it, so a change of it
-	/// is a change of what the wallet read as final.
+	/// how it finds them), with the anchor depth finality counts: a block's
+	/// finality counts on both, so a change of either is a change of what the
+	/// wallet read as final.
 	pub fn anchor_word(&self) -> Result<String, Error> {
 		let v: Value = self.call("getanchorstatus", &[]).map_err(node)?;
-		Ok(format!("{} {}", v["validateanchor"], v["anchorstatus"]))
+		Ok(format!("{} {} depth {}", v["validateanchor"], v["anchorstatus"], self.anchor_depth()))
 	}
 
 	/// Whether the node validates its anchors against the parent chain.
@@ -1264,6 +1314,21 @@ mod test {
 	/// A command that shares the view answers from another's look made within
 	/// BURST_VIEW_FOR; one that does not looks when it starts; one started
 	/// later looks again, and a gap calls for a look at once.
+	#[test]
+	fn the_anchor_depth_is_the_operators_and_never_below_two_on_the_main_chain() {
+		assert_eq!(anchor_depth_of(None, "test"), ANCHOR_DEPTH, "an operator that publishes none is held to the constant");
+		assert_eq!(anchor_depth_of(Some(0), "test"), 0, "the testnet operator's 0 is followed");
+		assert_eq!(anchor_depth_of(Some(5), "elementsregtest"), 5);
+		assert_eq!(anchor_depth_of(Some(0), "sequentia"), ANCHOR_DEPTH, "the main chain keeps its depth");
+		assert_eq!(anchor_depth_of(Some(3), "sequentia"), 3);
+		let chain = ChainSource::new("http://127.0.0.1:1/", None, None, None);
+		let other = chain.clone();
+		assert_eq!(chain.anchor_depth(), ANCHOR_DEPTH, "the constant until the operator's is read");
+		assert_eq!(chain.follow_anchor_depth(Some(0), "test"), 0);
+		assert_eq!(other.anchor_depth(), 0, "every clone follows it");
+		assert_eq!(chain.follow_anchor_depth(None, "test"), ANCHOR_DEPTH);
+	}
+
 	#[test]
 	fn a_burst_of_commands_shares_one_look() {
 		let mut m = Memo { looked: Some(web_time::Instant::now()), gaps: GAPS.load(Ordering::SeqCst), ..Default::default() };

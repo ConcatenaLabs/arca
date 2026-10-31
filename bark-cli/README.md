@@ -298,11 +298,17 @@ and a board whose registration never reached the server, are not recovered.
   (the checkpoint from a converted board's leaf, then the reassignment)
   before any exit delay runs out.
 - **Finality** is the node's: a round or board is final when its block is
-  certified by the committee and its Bitcoin anchor buried two blocks. A coin
+  certified by the committee and its Bitcoin anchor buried as many blocks as
+  the operator's `info` publishes (`finality.anchor_depth`; 2 for an operator
+  that publishes none, and never fewer on the main chain; 0 on the public
+  testnet, where a coin is final once its block is certified). A coin
   is spendable only while everything it rests on is final. The wallet asks again
   every time, never remembers: on every start it re-checks every coin against
   the chain, so a rollback un-credits the coins it took out, and credits them
-  again when their round or board returns. It reads each round and board from
+  again when their round or board returns. A live coin a rollback takes out
+  of finality stays in the balance: `coins` marks it `redoing`, its note
+  saying it is being redone after a Bitcoin reorganisation, until it is live
+  again. It reads each round and board from
   the chain, not from what it stored: when another transaction now pays a
   batch output a coin rests on, the checks run again on that one, and a coin
   that fails them on a transaction the chain holds goes into its exit at once.

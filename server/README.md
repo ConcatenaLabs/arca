@@ -194,7 +194,15 @@ something in the server relies on:
 | not in the chain | not in a block of the active chain (perhaps in the mempool) |
 | unsettled | in a block the committee has not certified |
 | settled | in a certified block, its anchor buried fewer Bitcoin blocks than the rule |
-| final | certified, and its anchor buried `anchor_depth` Bitcoin blocks (2) |
+| final | certified, and its anchor buried `anchor_depth` Bitcoin blocks |
+
+`anchor_depth` is the `[finality]` setting, 2 by default; the public testnet's
+operator runs at 0, where a block is final once it is certified while the node
+reports its tip's anchor as `ok`. `info` publishes it (`finality`), and the
+wallet judges finality by the depth its operator publishes, never below 2 on
+the main chain. At any depth a Bitcoin reorganisation of the anchored block
+takes the block, and every round built on it, out of the chain: the service
+disconnects it as below, and the rounds return or are run again.
 
 A block counts as certified when the node reports the committee's certificate
 for it or for any block above it. The anchor's burial is the anchor height of
