@@ -634,6 +634,37 @@ impl ValidCoin {
 		}
 	}
 
+	/// The lowest nodes with RECLAIM-D the coin rests on, each as its chain
+	/// and children hash `H`, without repeats, in the order the record nests
+	/// them: those whose release the coin's holder signs once it has a new
+	/// coin ([`crate::Release::for_holder`]). A board and an accumulator
+	/// batch have none, and a node without RECLAIM-D takes only its original
+	/// owners' releases.
+	pub fn release_nodes(&self) -> Vec<(Chain, [u8; 32])> {
+		let mut out: Vec<(Chain, [u8; 32])> = vec![];
+		self.release_nodes_into(&mut out);
+		out
+	}
+
+	fn release_nodes_into(&self, out: &mut Vec<(Chain, [u8; 32])>) {
+		let mut add = |n: (Chain, [u8; 32])| if !out.contains(&n) { out.push(n) };
+		match &self.origin {
+			ValidOrigin::Leaf { valid, .. } => {
+				if let Some(lowest) = valid.branch.nodes.last() {
+					if lowest.reclaim.as_ref().is_some_and(|r| r.delegated.is_some()) {
+						add((valid.branch.leaf.chain, lowest.children_hash()));
+					}
+				}
+			},
+			ValidOrigin::Transfer { inputs, .. } => inputs.iter().for_each(|i| i.coin.release_nodes_into(out)),
+			ValidOrigin::Fill { order, inputs, .. } => {
+				order.release_nodes_into(out);
+				inputs.iter().for_each(|i| i.coin.release_nodes_into(out));
+			},
+			ValidOrigin::Board { .. } | ValidOrigin::Accumulator { .. } => {},
+		}
+	}
+
 	/// Every board the coin descends from, its own included: each must still
 	/// be unspent when the coin is received, since a board spent by its
 	/// conversion or by a forfeit no longer backs the coin.

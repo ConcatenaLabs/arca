@@ -26,6 +26,7 @@
 //! token              hex, display order
 //! notice_units       512-second units
 //! burn               true or false
+//! reclaim_delegated  true, only when the lowest node carries RECLAIM-D
 //! expiries           [median times]
 //! path               [levels, from the batch output down]
 //!   index            the index on the leaf's path
@@ -146,6 +147,9 @@ impl LeafRecord {
 		m.insert("token".into(), Value::String(display(asset_bytes(self.schedule.token))));
 		m.insert("notice_units".into(), self.schedule.notice.units().into());
 		m.insert("burn".into(), Value::Bool(self.burn));
+		if self.delegated {
+			m.insert("reclaim_delegated".into(), Value::Bool(true));
+		}
 		m.insert("expiries".into(), Value::Array(self.schedule.expiries().iter().map(|e| e.to_consensus_u32().into()).collect()));
 		m.insert("path".into(), Value::Array(path));
 		Ok(Value::Object(m))
@@ -173,6 +177,10 @@ impl LeafRecord {
 		];
 		if named == Some(Template::Htlc1) {
 			fields.push("htlc");
+		}
+		let delegated = v.as_object().is_some_and(|o| o.contains_key("reclaim_delegated"));
+		if delegated {
+			fields.push("reclaim_delegated");
 		}
 		if matches!(named, Some(Template::Order2 | Template::Order3)) {
 			fields.push("order");
@@ -223,6 +231,10 @@ impl LeafRecord {
 		let token = AssetId::from_byte_array(display32(m, "token")?);
 		let notice = units(m, "notice_units")?;
 		let burn = m["burn"].as_bool().ok_or_else(|| RecordError::Type("burn".into()))?;
+		// Written only when set, so `false` is not its canonical form.
+		if delegated && m["reclaim_delegated"] != Value::Bool(true) {
+			return Err(RecordError::Type("reclaim_delegated".into()));
+		}
 		let expiries = array(m, "expiries", MAX_STEPS)?;
 		let mut times = Vec::with_capacity(expiries.len());
 		for e in expiries {
@@ -258,7 +270,7 @@ impl LeafRecord {
 		}
 		let record = LeafRecord {
 			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, asset, value, unlock_hash, entry_reserve, chain,
-			schedule, burn,
+			schedule, burn, delegated,
 			upper, lowest: LowestLevel { index, reserve, siblings, owners },
 			order,
 			landing,

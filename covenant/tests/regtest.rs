@@ -920,7 +920,7 @@ fn issuer_operated(net: &mut Net) {
 			channel: None,
 		}).collect();
 		Tree::build(TreeParams {
-			asset: z, chain: net.chain, schedule: sched, burn, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1,
+			asset: z, chain: net.chain, schedule: sched, burn, delegated_reclaim: false, radix: 4, reserve: ReserveRule::Fixed { node: 1, entry: 1 }, min_leaf: 1,
 		}, &leaves).unwrap()
 	};
 	let issuer = net.fund(vec![explicit(net.x, 100_000, op_true_spk())]).remove(0);
@@ -1061,7 +1061,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 		channel: None,
 	}).collect();
 	let params = TreeParams {
-		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
+		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
 		reserve: ReserveRule::FeeRate { floor_per_kvb, multiple: 4 }, min_leaf: 1_000 * floor_per_kvb / 1_000,
 	};
 	let tree = Tree::build(params, &leaves).unwrap();
@@ -1269,7 +1269,7 @@ fn probes_turned_around(net: &mut Net) {
 		channel: None,
 	}).collect();
 	let params = TreeParams {
-		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
+		asset: net.x, chain: net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
 		reserve: ReserveRule::Fixed { node: NODE_RESERVE, entry: ENTRY_RESERVE }, min_leaf: 1,
 	};
 	assert_eq!(Tree::build(params.clone(), &specs).unwrap_err(), TreeError::DuplicateOwner { first: 0, second: 1 });
@@ -1293,7 +1293,7 @@ fn probes_turned_around(net: &mut Net) {
 			template: Template::Vtxo1, owner: specs[i].owner, owner_nonce: specs[i].owner_nonce,
 			operator_nonce: specs[i].operator_nonce, exit_delay: delay(), asset: net.x, value: LEAF,
 			unlock_hash: specs[i].unlock_hash, entry_reserve: ENTRY_RESERVE, chain: net.chain, schedule: sched.clone(),
-			burn: false, upper: vec![],
+			burn: false, delegated: false, upper: vec![],
 			lowest: arca_covenant::record::LowestLevel {
 				index: i as u8, reserve: NODE_RESERVE,
 				siblings: others.iter().map(|j| arca_covenant::record::Sibling { value: children[*j].value, program: children[*j].program }).collect(),

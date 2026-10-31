@@ -27,9 +27,11 @@ and the block is refused for the mempool's reason. Relay policy can hide a
 consensus flaw, so no negative case rests on the mempool alone, and a negative
 case refused for an unrelated reason would be a test that cannot fail. The node
 runs with `-par=1`, checking scripts inline, so a block refused for a script
-names the failure, as the mempool does, under the consensus label
-(`mandatory-script-verify-flag-failed` where the mempool's reads
-`mempool-script-verify-flag-failed`); a lock not yet reached reads
+names the failure, as the mempool does; the harness compares the failure and
+not the label before it, which a node prints as
+`mandatory-script-verify-flag-failed` or, where its block flags include one
+that relay policy also sets, `mempool-script-verify-flag-failed`, as the
+mempool's reads. A lock not yet reached reads
 `bad-txns-nonfinal` in a block. A few spends that relay policy refuses but consensus accepts are mined on
 purpose with `generateblock`, to show what a block producer could do.
 
@@ -106,7 +108,8 @@ batches (one leaf; five; sixteen; seventeen with burn-only sweeps; ten at radix
 second and fourth leaves are `htlc-1`, one whose first and fourth are
 `order-2`, one whose second and fifth are `order-3`, one of a supervised asset whose five leaves are all
 `landing-1`, one whose second and fifth leaves are `channel-1` (the
-fifth with no opening balance for the operator), and one whose second and third are `vtxo-2`, it holds the inputs, the
+fifth with no opening balance for the operator), one whose second and third are `vtxo-2`, and one of seventeen with
+RECLAIM-D on every lowest node, it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds
@@ -180,6 +183,12 @@ owner and then by the operator, each with its path, digest, signature, witness
 value and the state it leaves; and every leaf's record and coin record in
 binary form, with its leaf id, and records a reader must refuse. The
 Simplicity commitment root is sequentia-contracts' (`arca/accumulator-1`).
+
+`vectors/reclaim_d.json` holds RECLAIM-D's vectors, written by `reclaim_d.py`
+from T25's constructions: a lowest node of four owners with RECLAIM and
+RECLAIM-D (its scripts, scriptPubKey and control blocks), the release and
+delegation prefixes and messages, and the items below RECLAIM-D for a coin
+paid twice, a swap and a direct release, with every signature.
 
 `vectors.py` writes every file from the suite's builders and the node framework's
 taproot code; no node runs. Every input comes from a fixed label and every

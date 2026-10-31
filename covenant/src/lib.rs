@@ -164,12 +164,12 @@ pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
 pub use message::{Chain, CsfsMessage};
-pub use node::NodePolicy;
+pub use node::{NodePolicy, ReleaseTree};
 pub use offboard::OffboardPolicy;
 pub use order::{OrderError, OrderFillPlan, OrderFilled, OrderLeafTerms, OrderPath, OrderPolicy, OrderTerms, SeqdexOrder};
 pub use plan::{Plan, PlanError, PlanStep, Refund};
 pub use record::{Branch, BranchNode, LeafId, LeafRecord, Recheck, RecordError, ReserveFloor, Template, ValidLeaf, WalletPolicy};
-pub use release::Release;
+pub use release::{Delegation, Release};
 pub use script::{Child, ExplicitOutput};
 pub use spend::{collab_tx, KeySpend, Pair, Rebindable, SpendError};
 pub use sweep::{sweep_tx, Sweep, SweepTx, Sweepable};
@@ -199,6 +199,8 @@ pub enum Error {
 	NotAMember,
 	#[error("{given} owner signatures given for a reclaim that needs {needed}")]
 	ReclaimSignatures { given: usize, needed: usize },
+	#[error("the releases need {0} steps of RECLAIM-D, which has 32")]
+	ReclaimSteps(usize),
 	#[error("the clock schedule is empty")]
 	EmptySchedule,
 	#[error("the clock schedule runs backwards: expiry {index} is earlier than the one before it")]

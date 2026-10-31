@@ -99,7 +99,8 @@
 //! [32]  operator key S
 //! [32]  token T
 //! u16   notice W, 512-second units
-//! u8    flags: bit 0, the sweeps are burn-only; other bits zero
+//! u8    flags: bit 0, the sweeps are burn-only; bit 1, the lowest node
+//!       carries RECLAIM-D ([`crate::node`]); other bits zero
 //! u8    expiry count, 1 to 64, then each expiry E_k as u32
 //! u8    level count, 1 to 16, then each level from the batch output down:
 //!         u8    child count k, 1 to 6
@@ -151,7 +152,10 @@ use crate::order::OrderLeafTerms;
 use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
 use crate::leaf::leaf_salt;
 use crate::message::{release_message, unroll_authorisation, Chain, CsfsMessage};
-use crate::node::{node_taproot, reclaim_script, reclaim_tx, unroll_script, MAX_CHILDREN};
+use crate::node::{
+	node_taproot_delegated, reclaim_delegated_items, reclaim_delegated_script, reclaim_script, reclaim_tx, unroll_script,
+	ReleaseTree, MAX_CHILDREN,
+};
 use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
@@ -410,6 +414,9 @@ pub struct LeafRecord {
 	pub schedule: ClockSchedule,
 	/// The sweeps are burn-only (an issuer-operated batch).
 	pub burn: bool,
+	/// The lowest node carries RECLAIM-D beside RECLAIM, so that the holders
+	/// of coins paid out of round from its leaves can release it.
+	pub delegated: bool,
 	/// The levels above the lowest node, from the batch output down.
 	pub upper: Vec<UpperLevel>,
 	pub lowest: LowestLevel,
@@ -798,10 +805,12 @@ impl LeafRecord {
 		let members = Members::new(operator, &owners);
 		let prefix = self.chain.release_prefix(&children_hash(&children));
 		let reclaim = reclaim_script(&prefix, &owners, &operator);
+		let delegated = self.delegated
+			.then(|| reclaim_delegated_script(&prefix, &self.chain.delegation_prefix(), &owners, &operator));
 		let node = BranchNode::new(
 			children, l.index as usize, l.reserve, operator, members.commitment(),
 			members.proof(1 + l.index as usize), self.schedule.sweep(level != 0, self.burn),
-			Some(Reclaim { owners, prefix, script: reclaim }),
+			Some(Reclaim { owners, prefix, script: reclaim, delegated }),
 		)?;
 		child = Child::new(self.asset, node.value, node.program());
 		nodes.push(node);
@@ -943,7 +952,7 @@ impl LeafRecord {
 		w.extend(self.schedule.operator.serialize());
 		w.extend(asset_bytes(self.schedule.token));
 		w.extend(self.schedule.notice.units().to_le_bytes());
-		w.push(self.burn as u8);
+		w.push(self.burn as u8 | (self.delegated as u8) << 1);
 		w.push(self.schedule.expiries().len() as u8);
 		for e in self.schedule.expiries() {
 			w.extend(e.to_consensus_u32().to_le_bytes());
@@ -1024,7 +1033,7 @@ impl LeafRecord {
 		let token = r.asset()?;
 		let notice = r.relative_time()?;
 		let flags = r.u8()?;
-		if flags & !1 != 0 {
+		if flags & !3 != 0 {
 			return Err(DecodeError::Flag(flags).into());
 		}
 		let steps = r.u8()? as usize;
@@ -1081,7 +1090,7 @@ impl LeafRecord {
 		let record = LeafRecord {
 			template, owner, owner_nonce, operator_nonce, exit_delay, htlc, order, landing, channel, asset, value, unlock_hash,
 			entry_reserve, chain,
-			schedule, burn: flags & 1 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
+			schedule, burn: flags & 1 != 0, delegated: flags & 2 != 0, upper, lowest: LowestLevel { index, reserve, siblings, owners },
 		};
 		record.check()?;
 		Ok(record)
@@ -1293,6 +1302,8 @@ pub struct Reclaim {
 	pub owners: Vec<XOnlyPublicKey>,
 	pub prefix: Vec<u8>,
 	pub script: Script,
+	/// RECLAIM-D, when the batch was built with it.
+	pub delegated: Option<Script>,
 }
 
 impl Reclaim {
@@ -1339,7 +1350,8 @@ impl BranchNode {
 	) -> Result<BranchNode, RecordError> {
 		let value = children.iter().try_fold(reserve, |acc, c| sum(acc, c.value))?;
 		let unroll = unroll_script(&gate, &children);
-		let taproot = node_taproot(unroll.clone(), sweep.script(), reclaim.as_ref().map(|r| r.script.clone()));
+		let taproot = node_taproot_delegated(unroll.clone(), sweep.script(), reclaim.as_ref().map(|r| r.script.clone()),
+			reclaim.as_ref().and_then(|r| r.delegated.clone()));
 		Ok(BranchNode { children, index, reserve, value, operator, gate, proof, sweep, reclaim, unroll, taproot })
 	}
 
@@ -1400,6 +1412,36 @@ impl BranchNode {
 		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
 		let spent = self.output().txout();
 		reclaim_tx(self.taproot.clone(), r.script.clone(), (node, spent), connectors, outputs, connector_to, fee)
+	}
+
+	/// The operator's reclaim of this node by RECLAIM-D, for a node that
+	/// carries it: as [`BranchNode::reclaim_tx`], finished with
+	/// [`BranchNode::reclaim_delegated_items`].
+	pub fn reclaim_delegated_tx(
+		&self,
+		node: elements::OutPoint,
+		connectors: &[(elements::OutPoint, TxOut)],
+		outputs: &[ExplicitOutput],
+		connector_to: Script,
+		fee: &crate::spend::FeeSource,
+	) -> Result<crate::spend::KeySpend, crate::spend::SpendError> {
+		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
+		let script = r.delegated.clone().ok_or(crate::Error::NoOwners)?;
+		let spent = self.output().txout();
+		reclaim_tx(self.taproot.clone(), script, (node, spent), connectors, outputs, connector_to, fee)
+	}
+
+	/// The items below RECLAIM-D: the operator's signature and one tree per
+	/// owner of the node, in owner order ([`crate::node::reclaim_delegated_items`]).
+	pub fn reclaim_delegated_items(&self, chain: Chain, operator_sig: &Signature, trees: &[ReleaseTree]) -> Result<Vec<Vec<u8>>, crate::Error> {
+		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
+		if r.delegated.is_none() {
+			return Err(crate::Error::NoOwners);
+		}
+		if trees.len() != r.owners.len() {
+			return Err(crate::Error::ReclaimSignatures { given: trees.len(), needed: r.owners.len() });
+		}
+		reclaim_delegated_items(operator_sig, &r.prefix, &chain.delegation_prefix(), trees)
 	}
 
 	/// The full UNROLL witness for the owner's authorisation `sig` at `t`.

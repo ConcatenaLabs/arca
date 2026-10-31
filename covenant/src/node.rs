@@ -46,6 +46,42 @@
 //! OP_CHECKSIG`. Each owner names its own round, so a node whose owners
 //! refreshed in different rounds is reclaimed with one atom of each round's
 //! connector asset among the inputs; owners of one round share an input.
+//!
+//! RECLAIM-D, on a lowest node built with it ([`NodePolicy::with_delegation`]),
+//! takes the release of a coin's current holders: for each owner, a tree
+//! ([`ReleaseTree`]) whose leaves are releases and whose inner nodes are
+//! delegations ([`crate::release::Delegation`]), checked in [`RECLAIM_STEPS`]
+//! steps. Each step reads, top first, `a` (empty: nothing to do) and `d`
+//! (empty: a release, `0x01`: a delegation):
+//!
+//! ```text
+//! # witness, bottom to top: <sig_S> <P> <Q> <step_31> … <step_0>
+//! # release:    <k> <sig> <K> <> <0x01>                K signed SHA256(P ‖ M), M at input k
+//! # delegation: <sig> <K> <e3> <e2> <e1> <0x01> <0x01>  K signed SHA256(Q ‖ K_1 ‖ … ‖ K_m)
+//! OP_IF
+//!   OP_IF                                             a delegation: the last m keys the steps
+//!     OP_FROMALTSTACK                                 before it left, m = 1 + the e set
+//!     (OP_SWAP OP_IF OP_FROMALTSTACK OP_SWAP OP_CAT OP_ENDIF) × 3
+//!     OP_DEPTH OP_3 OP_SUB OP_PICK OP_SWAP OP_CAT     Q, third from the bottom
+//!   OP_ELSE
+//!     OP_ROT OP_INSPECTINPUTASSET OP_1 OP_EQUALVERIFY
+//!     OP_DEPTH OP_2 OP_SUB OP_PICK OP_SWAP OP_CAT     P, second from the bottom
+//!   OP_ENDIF
+//!   OP_SHA256 OP_OVER OP_SIZE <32> OP_EQUALVERIFY OP_TOALTSTACK OP_SWAP OP_CHECKSIGFROMSTACKVERIFY
+//! OP_ENDIF                                            … 32 steps
+//! (OP_FROMALTSTACK <A_i> OP_EQUALVERIFY) for i = n-1 … 0
+//! <Q> OP_EQUALVERIFY <P> OP_EQUALVERIFY <S> OP_CHECKSIG
+//! ```
+//!
+//! `P = "Arca/release" ‖ genesis_hash ‖ H` and `Q = "Arca/delegate" ‖
+//! genesis_hash`. Every key is checked to be 32 bytes: `OP_CHECKSIGFROMSTACK`
+//! passes any non-empty signature for a key of another length (an upgradable
+//! key type), so two keys of 33 and 31 bytes over the 64 a delegation signed
+//! would release a node nobody under it released. The chain cannot know that
+//! a key has delegated, so a release by a key that already did confirms as
+//! its holder's would: the operator, whose signature every reclaim needs,
+//! refuses it, as it refuses to co-sign any spend that would void a coin it
+//! confirmed.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -66,6 +102,13 @@ use crate::Error;
 /// 520-byte limit on an `OP_CAT` result.
 pub const MAX_CHILDREN: usize = 6;
 
+/// The steps RECLAIM-D runs: the most releases and delegations, summed over
+/// every owner's tree, one reclaim can carry.
+pub const RECLAIM_STEPS: usize = 32;
+
+/// The most keys one delegation names: a reassignment's outputs.
+pub const MAX_DELEGATES: usize = 4;
+
 /// A tree node's policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePolicy {
@@ -74,6 +117,7 @@ pub struct NodePolicy {
 	owners: Vec<XOnlyPublicKey>,
 	sweep: Sweep,
 	reclaim: Option<Chain>,
+	delegated: bool,
 }
 
 impl NodePolicy {
@@ -97,7 +141,23 @@ impl NodePolicy {
 		if reclaim.is_some() && owners.is_empty() {
 			return Err(Error::NoOwners);
 		}
-		Ok(NodePolicy { children, operator, owners, sweep, reclaim })
+		Ok(NodePolicy { children, operator, owners, sweep, reclaim, delegated: false })
+	}
+
+	/// The same lowest node with RECLAIM-D beside RECLAIM, so that the
+	/// holders of coins moved out of round can release it. Refuses a node
+	/// without RECLAIM.
+	pub fn with_delegation(mut self) -> Result<NodePolicy, Error> {
+		if self.reclaim.is_none() {
+			return Err(Error::NoOwners);
+		}
+		self.delegated = true;
+		Ok(self)
+	}
+
+	/// Whether the node carries RECLAIM-D.
+	pub fn delegated(&self) -> bool {
+		self.delegated
 	}
 
 	pub fn children(&self) -> &[Child] {
@@ -155,10 +215,20 @@ impl NodePolicy {
 		Some(reclaim_script(&self.release_prefix()?, &self.owners, &self.operator))
 	}
 
-	/// The node's output: `[UNROLL, SWEEP]`, or `[UNROLL, [SWEEP, RECLAIM]]`
-	/// for a lowest node.
+	/// The RECLAIM-D leaf, for a lowest node built with it.
+	pub fn reclaim_delegated_script(&self) -> Option<Script> {
+		if !self.delegated {
+			return None;
+		}
+		let chain = self.reclaim?;
+		Some(reclaim_delegated_script(&self.release_prefix()?, &chain.delegation_prefix(), &self.owners, &self.operator))
+	}
+
+	/// The node's output: `[UNROLL, SWEEP]`, `[UNROLL, [SWEEP, RECLAIM]]` for
+	/// a lowest node, `[UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]]` for one with
+	/// RECLAIM-D.
 	pub fn taproot(&self) -> TapOutput {
-		node_taproot(self.unroll_script(), self.sweep_script(), self.reclaim_script())
+		node_taproot_delegated(self.unroll_script(), self.sweep_script(), self.reclaim_script(), self.reclaim_delegated_script())
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -201,6 +271,36 @@ impl NodePolicy {
 		Ok(self.taproot().witness(&script, below))
 	}
 
+	/// The full RECLAIM-D witness: the operator's signature over the reclaim
+	/// and one tree per owner, in owner order ([`reclaim_delegated_items`]).
+	pub fn reclaim_delegated_witness(&self, operator_sig: &Signature, trees: &[ReleaseTree]) -> Result<Vec<Vec<u8>>, Error> {
+		let script = self.reclaim_delegated_script().ok_or(Error::NoOwners)?;
+		if trees.len() != self.owners.len() {
+			return Err(Error::ReclaimSignatures { given: trees.len(), needed: self.owners.len() });
+		}
+		let chain = self.reclaim.ok_or(Error::NoOwners)?;
+		let below = reclaim_delegated_items(operator_sig, &self.release_prefix().ok_or(Error::NoOwners)?,
+			&chain.delegation_prefix(), trees)?;
+		Ok(self.taproot().witness(&script, below))
+	}
+
+	/// The operator's reclaim of this lowest node by RECLAIM-D: as
+	/// [`NodePolicy::reclaim_tx`], finished with
+	/// [`NodePolicy::reclaim_delegated_witness`]'s items.
+	pub fn reclaim_delegated_tx(
+		&self,
+		node: OutPoint,
+		value: u64,
+		connectors: &[(OutPoint, TxOut)],
+		outputs: &[ExplicitOutput],
+		connector_to: Script,
+		fee: &FeeSource,
+	) -> Result<KeySpend, SpendError> {
+		let script = self.reclaim_delegated_script().ok_or(Error::NoOwners)?;
+		let spent = explicit_txout(self.children[0].asset, value, self.script_pubkey());
+		reclaim_tx(self.taproot(), script, (node, spent), connectors, outputs, connector_to, fee)
+	}
+
 	/// The operator's reclaim of this lowest node at `node`, holding `value`
 	/// of its asset: see [`reclaim_tx`].
 	pub fn reclaim_tx(
@@ -231,6 +331,80 @@ pub fn reclaim_items(operator_sig: &Signature, releases: &[(Signature, u32)], ow
 	for (sig, k) in releases.iter().rev() {
 		below.push(sig.as_ref().to_vec());
 		below.push(scriptnum(*k as i64));
+	}
+	Ok(below)
+}
+
+/// One owner's consent to a reclaim by RECLAIM-D: its own release, or its
+/// delegation to the keys of a reassignment's outputs and, for each of them in
+/// order, a tree in turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseTree {
+	/// `key` signed the node's release naming the connector asset held by
+	/// input `connector_input`.
+	Release { key: XOnlyPublicKey, sig: Signature, connector_input: u32 },
+	/// `key` signed a delegation to the keys of `to`, in order (1 to 4).
+	Delegation { key: XOnlyPublicKey, sig: Signature, to: Vec<ReleaseTree> },
+}
+
+impl ReleaseTree {
+	/// The key whose consent this is.
+	pub fn key(&self) -> XOnlyPublicKey {
+		match self {
+			ReleaseTree::Release { key, .. } | ReleaseTree::Delegation { key, .. } => *key,
+		}
+	}
+
+	/// The steps of RECLAIM-D the tree takes: one per release and delegation.
+	pub fn steps(&self) -> usize {
+		match self {
+			ReleaseTree::Release { .. } => 1,
+			ReleaseTree::Delegation { to, .. } => 1 + to.iter().map(ReleaseTree::steps).sum::<usize>(),
+		}
+	}
+
+	/// Each step's items, top first, in the order RECLAIM-D runs them:
+	/// children before the delegation that names them.
+	fn push_steps(&self, out: &mut Vec<Vec<Vec<u8>>>) -> Result<(), Error> {
+		match self {
+			ReleaseTree::Release { key, sig, connector_input } => {
+				out.push(vec![vec![1], vec![], key.serialize().to_vec(), sig.as_ref().to_vec(), scriptnum(*connector_input as i64)]);
+			},
+			ReleaseTree::Delegation { key, sig, to } => {
+				if to.is_empty() || to.len() > MAX_DELEGATES {
+					return Err(Error::OutputCount(to.len()));
+				}
+				for t in to {
+					t.push_steps(out)?;
+				}
+				let mut step = vec![vec![1], vec![1]];
+				step.extend((0..3).map(|i| if i < to.len() - 1 { vec![1] } else { vec![] }));
+				step.push(key.serialize().to_vec());
+				step.push(sig.as_ref().to_vec());
+				out.push(step);
+			},
+		}
+		Ok(())
+	}
+}
+
+/// The items below RECLAIM-D, bottom to top: the operator's signature, `P`
+/// (`prefix`, [`Chain::release_prefix`]), `Q` (`dprefix`,
+/// [`Chain::delegation_prefix`]), then the steps of every owner's tree, in
+/// owner order, the first step on top, and an empty item for each step left.
+/// Refuses trees that need more than [`RECLAIM_STEPS`] steps.
+pub fn reclaim_delegated_items(operator_sig: &Signature, prefix: &[u8], dprefix: &[u8], trees: &[ReleaseTree]) -> Result<Vec<Vec<u8>>, Error> {
+	let mut steps = Vec::new();
+	for t in trees {
+		t.push_steps(&mut steps)?;
+	}
+	if steps.len() > RECLAIM_STEPS {
+		return Err(Error::ReclaimSteps(steps.len()));
+	}
+	let mut below = vec![operator_sig.as_ref().to_vec(), prefix.to_vec(), dprefix.to_vec()];
+	below.extend((steps.len()..RECLAIM_STEPS).map(|_| Vec::new()));
+	for step in steps.into_iter().rev() {
+		below.extend(step.into_iter().rev());
 	}
 	Ok(below)
 }
@@ -310,6 +484,40 @@ pub fn reclaim_script(prefix: &[u8], owners: &[XOnlyPublicKey], operator: &XOnly
 		b = check(read_m(b).push_opcode(OP_FROMALTSTACK), &owners[n - 1]);
 	}
 	b.push_slice(&operator.serialize()).push_opcode(OP_CHECKSIG).into_script()
+}
+
+/// The RECLAIM-D leaf over the release prefix `prefix` and the delegation
+/// prefix `dprefix` ([`Chain::delegation_prefix`]): see the
+/// [module documentation](self). Panics if `owners` is empty.
+pub fn reclaim_delegated_script(prefix: &[u8], dprefix: &[u8], owners: &[XOnlyPublicKey], operator: &XOnlyPublicKey) -> Script {
+	assert!(!owners.is_empty(), "a reclaim needs an owner");
+	let take = [OP_SWAP, OP_IF, OP_FROMALTSTACK, OP_SWAP, OP_CAT, OP_ENDIF];
+	let mut b = Builder::new();
+	for _ in 0..RECLAIM_STEPS {
+		b = b.ops(&[OP_IF, OP_IF, OP_FROMALTSTACK]).ops(&take).ops(&take).ops(&take)
+			.ops(&[OP_DEPTH, OP_PUSHNUM_3, OP_SUB, OP_PICK, OP_SWAP, OP_CAT])
+			.push_opcode(OP_ELSE)
+			.ops(&[OP_ROT, OP_INSPECTINPUTASSET, OP_PUSHNUM_1, OP_EQUALVERIFY])
+			.ops(&[OP_DEPTH, OP_PUSHNUM_2, OP_SUB, OP_PICK, OP_SWAP, OP_CAT])
+			.push_opcode(OP_ENDIF)
+			.ops(&[OP_SHA256, OP_OVER, OP_SIZE]).push_int(32).ops(&[OP_EQUALVERIFY, OP_TOALTSTACK, OP_SWAP, OP_CHECKSIGFROMSTACKVERIFY])
+			.push_opcode(OP_ENDIF);
+	}
+	for a in owners.iter().rev() {
+		b = b.push_opcode(OP_FROMALTSTACK).push_slice(&a.serialize()).push_opcode(OP_EQUALVERIFY);
+	}
+	b.push_slice(dprefix).push_opcode(OP_EQUALVERIFY).push_slice(prefix).push_opcode(OP_EQUALVERIFY)
+		.push_slice(&operator.serialize()).push_opcode(OP_CHECKSIG).into_script()
+}
+
+/// A node's output: `[UNROLL, SWEEP]`, `[UNROLL, [SWEEP, RECLAIM]]` for a
+/// lowest node, and `[UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]]` for one with
+/// RECLAIM-D.
+pub fn node_taproot_delegated(unroll: Script, sweep: Script, reclaim: Option<Script>, reclaim_d: Option<Script>) -> TapOutput {
+	match (reclaim, reclaim_d) {
+		(Some(rc), Some(rd)) => TapOutput::new(vec![(1, unroll), (2, sweep), (3, rc), (3, rd)]),
+		(reclaim, _) => node_taproot(unroll, sweep, reclaim),
+	}
 }
 
 /// A node's output: `[UNROLL, SWEEP]`, or `[UNROLL, [SWEEP, RECLAIM]]` for a

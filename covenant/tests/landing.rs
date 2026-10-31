@@ -343,7 +343,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 		let now = net.now();
 		let sched = ClockSchedule::new(token_of(&issuer), xonly(&s), delay(), vec![mt(now + 28 * DAY), mt(now + 56 * DAY)]).unwrap();
 		let tree = Tree::build(TreeParams {
-			asset, chain: net.chain, schedule: sched.clone(), burn: false, radix: 4,
+			asset, chain: net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
 			reserve: ReserveRule::FeeRate { floor_per_kvb: floor, multiple: 4 }, min_leaf: 1,
 		}, specs).unwrap();
 		let coin = net.fund(vec![explicit(asset, tree.batch_output().value + 5_000_000, op_true_spk())]).remove(0);

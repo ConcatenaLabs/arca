@@ -58,6 +58,12 @@ generates: one channel's outputs at three states (each one's update, settle
 and collaborative leaves, its credit output's claim and provider leaves,
 their control blocks), each state's message with both signatures, and two
 credit notes with the operator's signatures.
+
+vectors/reclaim_d.json holds RECLAIM-D's vectors, which reclaim_d.py
+generates: a lowest node of four owners with RECLAIM and RECLAIM-D (its
+scripts, scriptPubKey and control blocks), the release and delegation
+prefixes and messages, and the items below RECLAIM-D for a coin paid twice, a
+swap and a direct release, with every signature.
 """
 import json
 import os
@@ -79,6 +85,7 @@ COLLAB2_OUT = os.path.join(HERE, "vectors", "collab2.json")
 BOND_OUT = os.path.join(HERE, "vectors", "bond.json")
 CHANNEL_OUT = os.path.join(HERE, "vectors", "channel.json")
 ACCUMULATOR_OUT = os.path.join(HERE, "vectors", "accumulator.json")
+RECLAIM_D_OUT = os.path.join(HERE, "vectors", "reclaim_d.json")
 
 # --------------------------------------------------------------------------
 # Inputs
@@ -751,6 +758,9 @@ def main():
     import offchain
     import order
     import records
+    import reclaim_d
+    reclaim_d_keys = dict([("S", S)] + [(n, Key("reclaim_d " + n)) for n in
+                                        ["A0", "A1", "A2", "A3", "B", "A0c", "C", "Bc", "X2", "X3"]])
     order_keys = {k: Key("order " + k) for k in ["maker", "credit0", "credit1", "credit2", "credit3", "refund", "taker"]}
     order_keys["S"] = S
     accumulator_keys = dict([("S", S)] + [("owner%d" % i, Key("accumulator owner %d" % i)) for i in range(6)])
@@ -764,7 +774,9 @@ def main():
                                                  rel_time(32 * DAY)), indent=1) + "\n"),
              (CHANNEL_OUT, json.dumps(channel.generate(GENESIS, {"A": A, "S": S}, label_hash, DELAY, rel_time(48 * H)),
                                       indent=1) + "\n"),
-             (ACCUMULATOR_OUT, json.dumps(accumulator.generate(GENESIS, accumulator_keys), indent=1) + "\n")]
+             (ACCUMULATOR_OUT, json.dumps(accumulator.generate(GENESIS, accumulator_keys), indent=1) + "\n"),
+             (RECLAIM_D_OUT, json.dumps(reclaim_d.generate(GENESIS, reclaim_d_keys, label_hash, EXPIRIES[0]),
+                                        indent=1) + "\n")]
     if "--check" in sys.argv[1:]:
         stale = []
         for path, text in files:

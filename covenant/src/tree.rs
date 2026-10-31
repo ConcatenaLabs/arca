@@ -111,6 +111,11 @@ pub struct TreeParams {
 	pub schedule: ClockSchedule,
 	/// Burn-only sweeps, for a batch its asset's issuer runs.
 	pub burn: bool,
+	/// RECLAIM-D on every lowest node beside RECLAIM, so that the holders of
+	/// coins paid out of round from its leaves can release it
+	/// ([`crate::node`]). A wallet that reads records without it refuses
+	/// such a batch's leaves.
+	pub delegated_reclaim: bool,
 	/// The most children a node has: [`MIN_RADIX`] to 6.
 	pub radix: usize,
 	pub reserve: ReserveRule,
@@ -393,7 +398,10 @@ impl Tree {
 				let children: Vec<Child> = group.iter().map(|(c, _)| *c).collect();
 				let leaf_range = group[0].1.start..group[group.len() - 1].1.end;
 				let owners: Vec<XOnlyPublicKey> = tree_leaves[leaf_range.clone()].iter().map(|l| l.spec.owner).collect();
-				let policy = NodePolicy::new(children, operator, owners, sweep, lowest.then_some(params.chain))?;
+				let mut policy = NodePolicy::new(children, operator, owners, sweep, lowest.then_some(params.chain))?;
+				if lowest && params.delegated_reclaim {
+					policy = policy.with_delegation()?;
+				}
 				let taproot = policy.taproot();
 				let members = policy.members();
 				let reserve = match params.reserve {
@@ -506,6 +514,7 @@ impl Tree {
 			chain: self.params.chain,
 			schedule: self.params.schedule.clone(),
 			burn: self.params.burn,
+			delegated: self.params.delegated_reclaim,
 			upper,
 			lowest: LowestLevel {
 				index: lowest_index as u8,

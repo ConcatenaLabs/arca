@@ -1448,7 +1448,7 @@ impl Rounds {
 			let schedule = ClockSchedule::new(AssetId::from_byte_array([0xee; 32]), self.params.operator, self.config.notice, expiries.clone())
 				.map_err(|e| RoundError::Internal(e.to_string()))?;
 			let params = TreeParams {
-				asset, chain: self.params.chain, schedule, burn: false, radix: self.config.radix, reserve,
+				asset, chain: self.params.chain, schedule, burn: false, delegated_reclaim: false, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
 			let kind = if plan.own { BatchKind::Tree } else { self.kind_of(&asset, &specs) };
@@ -1715,7 +1715,7 @@ impl Rounds {
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
 				// An issuer-operated asset's batch is burn-only.
 				let params = TreeParams {
-					asset: *asset, chain, schedule, burn: Some(*asset) == minted, radix, reserve: reserves[asset],
+					asset: *asset, chain, schedule, burn: Some(*asset) == minted, delegated_reclaim: false, radix, reserve: reserves[asset],
 					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
 				let tree = Batch::build(kinds[bi], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
@@ -2951,7 +2951,7 @@ impl Rounds {
 			asset: AssetId::from_byte_array(b.asset),
 			chain: self.params.chain,
 			schedule,
-			burn: b.burn,
+			burn: b.burn, delegated_reclaim: false,
 			radix: b.radix as usize,
 			reserve: match b.reserve {
 				StoredReserve::FeeRate { floor_per_kvb, multiple } => ReserveRule::FeeRate { floor_per_kvb, multiple },

@@ -12,7 +12,10 @@
 //! - the unroll authorisation, `SHA256("Arca/unroll" ‖ H ‖ t)`;
 //! - the release each owner under a lowest node signs,
 //!   `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`, `M` the connector asset
-//!   of the round that made the owner's new leaf ([`crate::release`]).
+//!   of the round that made the owner's new leaf ([`crate::release`]);
+//! - the delegation a coin's key signs when the coin moves out of round,
+//!   `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`, the `K_j` the
+//!   owner keys of the reassignment's outputs ([`crate::release::Delegation`]).
 //!
 //! The genesis hash and asset ids are in internal byte order, the reverse of
 //! what the node's RPCs print.
@@ -30,6 +33,8 @@ pub const REBIND_TAG: &[u8; 8] = b"ArcaRbd1";
 pub const UNROLL_TAG: &[u8; 11] = b"Arca/unroll";
 /// The release message's domain tag.
 pub const RELEASE_TAG: &[u8; 12] = b"Arca/release";
+/// The delegation message's domain tag.
+pub const DELEGATE_TAG: &[u8; 13] = b"Arca/delegate";
 
 /// A message an `OP_CHECKSIGFROMSTACK` path verifies: the bytes the script
 /// assembles, and their SHA256, which is what is signed.
@@ -129,6 +134,29 @@ impl Chain {
 	/// `SHA256("Arca/release" ‖ genesis_hash ‖ H ‖ M)`.
 	pub fn release_message(&self, children_hash: &[u8; 32], connector: AssetId) -> CsfsMessage {
 		release_message(&self.release_prefix(children_hash), connector)
+	}
+
+	/// The fixed part of every delegation on this chain:
+	/// `"Arca/delegate" ‖ genesis_hash`, 45 bytes. RECLAIM-D appends the keys
+	/// a delegation names.
+	pub fn delegation_prefix(&self) -> Vec<u8> {
+		let mut b = DELEGATE_TAG.to_vec();
+		b.extend(self.genesis_bytes());
+		b
+	}
+
+	/// The delegation a coin's key signs when the coin moves into a
+	/// reassignment whose outputs are owned by `to`, in output order:
+	/// `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`, 1 to 4 keys.
+	pub fn delegation_message(&self, to: &[elements::secp256k1_zkp::XOnlyPublicKey]) -> Result<CsfsMessage, Error> {
+		if to.is_empty() || to.len() > crate::node::MAX_DELEGATES {
+			return Err(Error::OutputCount(to.len()));
+		}
+		let mut b = self.delegation_prefix();
+		for k in to {
+			b.extend(k.serialize());
+		}
+		Ok(CsfsMessage::new(b))
 	}
 }
 
