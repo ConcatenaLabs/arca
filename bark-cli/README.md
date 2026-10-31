@@ -1189,7 +1189,10 @@ resting on a batch, and each coin paid to it out of round, with each
 watchtower it names (`deposits` in the answer): the coin's record, its
 own batch leaf's unroll authorisations signed for an hour before its batch's
 first expiry, so nothing can unroll it sooner. A deposit only ever puts the
-coin on the chain under its owner's key. Once a coin is spent, exited or
+coin on the chain under its owner's key. It is sealed: the watchtower can
+read it only once an event it answers is on the chain (a release of a batch
+the coin rests on, or a leaf or checkpoint of its lineage), and until then
+learns nothing of the coin, its value or its keys. Once a coin is spent, exited or
 lost, `sync` withdraws its deposit, signed by the coin's key; a watchtower
 that cannot be reached is tried again at the next `sync`.
 
@@ -1222,8 +1225,10 @@ output the chain holds unspent, each transaction paid from the reserve the
 output it spends holds when the node accepts the batch's asset for fees, else
 from an on-chain coin of the watchtower wallet's. Coins on one branch share
 its nodes, whoever built them. It needs only its node, never the operator.
-`arca watchtower deposits` lists what it holds (`held`, `brought`,
-`on_chain`, `gone`) and what it broadcast for each; `arca watchtower pass`
+`arca watchtower deposits` lists what it holds (`sealed`, naming no coin
+until a block or the mempool shows its trigger; `held`, `brought`,
+`on_chain`, `gone`, or `invalid` when what opened does not check) and what
+it broadcast for each; `arca watchtower pass`
 runs one pass.
 
 ### Swept coins
