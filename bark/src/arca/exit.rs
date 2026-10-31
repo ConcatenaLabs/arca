@@ -27,7 +27,10 @@
 //! where the node takes it, and otherwise none preferred
 //! ([`Wallet::choose_fee_asset`]); the reserve goes to the wallet's change.
 //! An exit that needs a fee coin the wallet does not hold stops and says so:
-//! that coin cannot come home until the wallet holds one.
+//! that coin cannot come home until the wallet holds one. A step paid from
+//! its own reserve pays the floor of it and leaves the rest to the wallet's
+//! change, when the rest is worth spending: the output the wallet speeds
+//! the step up from, by a child, should it wait in the mempool (`speed.rs`).
 //!
 //! The claim of a leaf received over Lightning races the operator's refund,
 //! valid beside it from the leaf's timeout (D76). From its broadcast its fee
@@ -112,12 +115,18 @@ pub(crate) struct Payer {
 	/// The least fee the next transaction pays, in the asset it pays in: a
 	/// replacement's, which outbids the transaction it replaces.
 	min_fee: u64,
+	/// Whether a step paid from its own reserve leaves the part of the
+	/// reserve its fee does not take to the wallet's change, so that the
+	/// wallet can speed the step up from that output should it wait in the
+	/// mempool ([`Wallet::speed_up`]). The wallet's own exits do; a
+	/// watchtower's and the operator's steps keep the reserve whole.
+	pub(crate) anchor: bool,
 }
 
 impl Payer {
 	/// A payer of fees in `asset`, when named.
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
-		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0 }
+		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false }
 	}
 }
 
@@ -130,6 +139,14 @@ fn txs_fee(tx: &Transaction) -> Vec<(AssetId, u64)> {
 /// default dust rate of 3,000 a kvB. A claim that pays its fee from the leaf
 /// keeps twice this in the leaf's asset, whatever its fee.
 const CLAIM_DUST_REFERENCE: u64 = 294;
+
+/// The vbytes a child adds to spend a P2WPKH output: an anchor whose value
+/// pays less than this input's fee is not worth leaving.
+pub(crate) const ANCHOR_INPUT_VSIZE: u64 = 68;
+
+/// Change of the fee asset below this many atoms is not worth an output of a
+/// child that speeds a transaction up: it goes to the child's fee.
+pub(crate) const CHILD_DUST: u64 = 300;
 
 /// D76: the share of a received leaf's value its claim pays in fees at
 /// `now`, in millionths: from the claim's opening (`from`) to the leaf's
@@ -167,7 +184,7 @@ impl Wallet {
 		}
 	}
 
-	fn change_key(&self) -> Result<(Script, Keypair), Error> {
+	pub(crate) fn change_key(&self) -> Result<(Script, Keypair), Error> {
 		let i = self.store.take_index(CHANGE)?;
 		let k = self.keys.onchain(CHANGE, i)?;
 		Ok((super::keys::p2wpkh(&k), k))
@@ -216,6 +233,11 @@ impl Wallet {
 		let u = build(&FeeSource::Reserve);
 		if let Ok(u) = &u {
 			if self.pays_floor(&u.tx)? {
+				if payer.anchor {
+					if let Some(a) = self.anchored(payer, u, build)? {
+						return Ok(a);
+					}
+				}
 				return Ok(u.clone());
 			}
 		}
@@ -249,6 +271,29 @@ impl Wallet {
 				self.change_in_flight.borrow_mut().push(c.clone());
 			}
 			return Ok(u);
+		}
+	}
+
+	/// `u`, a step paid from its own reserve, built again to pay the node's
+	/// floor (with the wallet's margin) of that reserve and leave the rest to
+	/// the wallet's change: the output the wallet speeds the step up from
+	/// should it wait in the mempool. `None` when the reserve leaves too
+	/// little beside the fee to be worth spending (less than the fee of a
+	/// child's input), or the step takes no split.
+	fn anchored(&self, payer: &mut Payer, u: &UnrollTx, build: &dyn Fn(&FeeSource) -> Result<UnrollTx, Error>) -> Result<Option<UnrollTx>, Error> {
+		let [(asset, margin)] = txs_fee(&u.tx)[..] else { return Ok(None) };
+		// The change output adds about 45 vbytes.
+		let fee = self.fee_for(asset, u.tx.vsize() as u64 + 45)?.max(payer.min_fee);
+		if margin < fee.saturating_add(self.fee_for(asset, ANCHOR_INPUT_VSIZE)?) {
+			return Ok(None);
+		}
+		if payer.change.is_none() {
+			payer.change = Some(self.change_key()?);
+		}
+		let (change, _) = payer.change.clone().expect("set");
+		match build(&FeeSource::Split { fee, change }) {
+			Ok(a) if self.pays_floor(&a.tx)? => Ok(Some(a)),
+			_ => Ok(None),
 		}
 	}
 
@@ -409,7 +454,7 @@ impl Wallet {
 		let key = self.keys.leaf(&row.owner_nonce)?;
 		let to = self.claim_script(coin, claim_index as u32)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
 		let new = self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after)?;
 		let txid = self.chain.broadcast_any_fee(&new.tx).map_err(|e| Error::Refused(format!("coin {}'s output is spent in the mempool \
 			by {}, which is not the wallet's; the node refused the claim that outbids it: {}", leaf_id, other.txid(), e)))?;
@@ -475,7 +520,7 @@ impl Wallet {
 			}
 			need = need.max(b);
 		}
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
 		let new = match self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after) {
 			Ok(c) => c,
 			Err(e) => {
@@ -773,7 +818,7 @@ impl Wallet {
 		// that of every P2WPKH change.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None,
-			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0 };
+			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0, anchor: true };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -801,6 +846,8 @@ impl Wallet {
 			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
 			_ => vec![],
 		};
+		// The claim pays to the wallet already: it needs no anchor.
+		payer.anchor = false;
 		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		self.change_in_flight.borrow_mut().truncate(in_flight);
 		let claim = match claim {
@@ -873,7 +920,7 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0 };
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -933,7 +980,8 @@ impl Wallet {
 		// What the claim's bid counts from (D76), kept across runs: when the
 		// claim opens, when it was first broadcast, and the leaf's rate when
 		// the node last accepted its asset.
-		let mut kept: Vec<(&str, Value)> = ["claim_from", "claimed_at", "leaf_rate", super::tower::KEPT_SAFE].iter()
+		let mut kept: Vec<(&str, Value)> = ["claim_from", "claimed_at", "leaf_rate", super::tower::KEPT_SAFE, super::speed::SEEN,
+			super::speed::RAISES, super::speed::RAISED_AT, super::speed::STEPS].iter()
 			.filter(|k| !prior[**k].is_null()).map(|k| (*k, prior[*k].clone())).collect();
 		// A coin whose leaf someone else brought on the chain before the
 		// wallet started any exit of it (a watchtower, or the operator, once
@@ -949,6 +997,15 @@ impl Wallet {
 			for (k, x) in &kept {
 				v[*k] = x.clone();
 			}
+			// Every step the exit has broadcast, across its runs: what a speed-up watches.
+			let mut steps = v[super::speed::STEPS].as_array().cloned().unwrap_or_default();
+			for t in &plan {
+				let id = json!(t.txid().to_string());
+				if !steps.contains(&id) {
+					steps.push(id);
+				}
+			}
+			v[super::speed::STEPS] = Value::Array(steps);
 			if received {
 				if let Some(r) = s.chain.fee_rates()?.get(&coin.asset).copied().filter(|r| *r > 0) {
 					v["leaf_rate"] = json!(r);
@@ -997,6 +1054,7 @@ impl Wallet {
 				}
 			}
 		}
+		payer.anchor = false;
 		let claim = self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after);
 		let claim = match claim {
 			Ok(c) => c,
@@ -1314,7 +1372,14 @@ impl Wallet {
 	pub(crate) fn progress_exits(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for c in self.store.coins_in("exiting")? {
-			out.push(self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"leaf_id": c.leaf_id, "error": e.to_string()})));
+			let mut v = self.exit(&c.leaf_id, None).unwrap_or_else(|e| json!({"leaf_id": c.leaf_id, "error": e.to_string()}));
+			// A step that waits in the mempool is sped up, by itself.
+			match self.speed_up_exit(&c.leaf_id) {
+				Ok(Some(s)) => v["sped_up"] = s,
+				Ok(None) => {},
+				Err(e) => v["sped_up"] = json!({"error": e.to_string()}),
+			}
+			out.push(v);
 		}
 		Ok(out)
 	}

@@ -126,6 +126,7 @@ pub mod plan;
 mod restore;
 pub mod resting;
 mod round;
+mod speed;
 mod take;
 pub mod tower;
 mod wallet;

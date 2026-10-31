@@ -316,6 +316,31 @@ enum Cmd {
 		#[arg(long)]
 		shown: Option<String>,
 	},
+	/// Speeds up a transaction of the wallet's waiting in the mempool (child
+	/// pays for parent): a child spending an output of the wallet's in it, or
+	/// in what spends it, pays for itself and every ancestor still waiting.
+	SpeedUp {
+		txid: String,
+		/// The asset the child pays its fee in; by default the asset of the
+		/// output it spends where the node accepts it, else one the wallet
+		/// holds on the chain.
+		#[arg(long)]
+		fee_asset: Option<String>,
+		/// The rate the child lifts the package to, in atoms of the reference
+		/// unit per 1,000 vbytes; by default twice the node's relay floor.
+		#[arg(long)]
+		rate: Option<u64>,
+		/// The most the child may pay, in atoms of the fee asset.
+		#[arg(long)]
+		max_fee: Option<u64>,
+	},
+	/// Gives up in the next round every coin the wallet received out of round
+	/// and has not refreshed, for a leaf of its own, at the operator's fee.
+	RefreshReceived {
+		/// The most the refresh may cost, in millionths of each coin.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
 	/// Takes an on-chain order in the operator's round: a fill of an order
 	/// resting on the chain under SeqDEX's fill covenant, paid with the
 	/// wallet's coins of the asset it is paid in, for a leaf of what it fills.
@@ -1315,7 +1340,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
 	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
-		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Offboards | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
+		| Cmd::Exit { .. } | Cmd::SpeedUp { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Offboards | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
 		| Cmd::Channel(ChannelCmd::List) | Cmd::Channel(ChannelCmd::Exit { .. })
 		| Cmd::Distributions | Cmd::Plans | Cmd::Watchtower(_))
 	{
@@ -1445,6 +1470,11 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Channel(ChannelCmd::Pay { leaf_id, to, amount }) => w.channel_pay(&leaf_id, &to, amount),
 		Cmd::Channel(ChannelCmd::Fold { leaf_id }) => w.channel_fold(&leaf_id),
 		Cmd::Channel(ChannelCmd::Exit { leaf_id, fee_asset }) => w.channel_exit(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
+		Cmd::SpeedUp { txid, fee_asset, rate, max_fee } => {
+			let txid = bark::arca::elements::Txid::from_str(&txid).map_err(|e| bark::arca::Error::Parse(format!("the transaction: {}", e)))?;
+			w.speed_up(txid, fee_asset.as_deref().map(asset).transpose()?, rate, max_fee)
+		},
+		Cmd::RefreshReceived { max_fee_ppm } => w.refresh_received(max_fee_ppm),
 		Cmd::Exit { leaf_id, fee_asset, quote: true, .. } => w.exit_quote(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Exit { leaf_id, fee_asset, quote: false, shown } => {
 			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)

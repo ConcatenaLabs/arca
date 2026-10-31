@@ -1049,16 +1049,54 @@ impl ChainSource {
 		Ok(Some((floor * 100_000_000).div_ceil(rate).max(1).min(u64::MAX as u128) as u64))
 	}
 
-	/// The fee `txid` pays as the node valued it when its mempool took it, in
-	/// atoms of the node's reference unit (`getmempoolentry`'s `fees.base`);
-	/// `None` when it is not in the mempool. A replacement outbids it on
-	/// that value, whatever the fee asset's rate is now.
+	/// The fee `txid` pays as the node values it, in atoms of the node's
+	/// reference unit (`getmempoolentry`'s `fees.value`; `fees.base` is the
+	/// amount in the fee asset's own atoms, and is the value only on a node
+	/// without fees in any asset); `None` when it is not in the mempool. A
+	/// replacement outbids it on that value, whatever the fee asset's rate.
 	pub fn mempool_fee_value(&self, txid: &Txid) -> Result<Option<u64>, Error> {
 		match self.call::<Value>("getmempoolentry", &[json!(txid.to_string())]) {
-			Ok(v) => Ok(v["fees"]["base"].as_f64().map(|f| (f * 100_000_000.0).round().max(0.0) as u64)),
+			Ok(v) => Ok(v["fees"]["value"].as_f64().or_else(|| v["fees"]["base"].as_f64())
+				.map(|f| (f * 100_000_000.0).round().max(0.0) as u64)),
 			Err(e) if not_found(&e) => Ok(None),
 			Err(e) => Err(node(e)),
 		}
+	}
+
+	/// What the node's mempool holds of `txid` for ranking it in a block
+	/// ([`MempoolEntry`]); `None` when it is not in the mempool.
+	pub fn mempool_entry(&self, txid: &Txid) -> Result<Option<MempoolEntry>, Error> {
+		let rfa = |v: &Value| v.as_f64().map(|f| (f * 100_000_000.0).round().max(0.0) as u64).unwrap_or(0);
+		match self.call::<Value>("getmempoolentry", &[json!(txid.to_string())]) {
+			Ok(v) => Ok(Some(MempoolEntry {
+				vsize: v["vsize"].as_u64().unwrap_or(0),
+				fee_value: rfa(&v["fees"]["value"]).max(rfa(&v["fees"]["modified"])),
+				ancestor_vsize: v["ancestorsize"].as_u64().unwrap_or(0),
+				ancestor_fee_value: rfa(&v["fees"]["ancestor"]),
+				height: v["height"].as_u64().unwrap_or(0),
+			})),
+			Err(e) if not_found(&e) => Ok(None),
+			Err(e) => Err(node(e)),
+		}
+	}
+
+	/// The transactions in the mempool that descend from `txid`, which is in
+	/// it; none when it is not.
+	pub fn mempool_descendants(&self, txid: &Txid) -> Result<Vec<Txid>, Error> {
+		match self.call::<Vec<String>>("getmempooldescendants", &[json!(txid.to_string())]) {
+			Ok(ids) => ids.iter().map(|t| Txid::from_str(t).map_err(|e| Error::Node(e.to_string()))).collect(),
+			Err(e) if not_found(&e) => Ok(vec![]),
+			Err(e) => Err(node(e)),
+		}
+	}
+
+	/// The least fee rate the node relays now, in atoms of the reference unit
+	/// per 1,000 vbytes: the larger of its relay floor and its mempool's own
+	/// minimum.
+	pub fn relay_floor_value(&self) -> Result<u64, Error> {
+		let v: Value = self.call("getmempoolinfo", &[]).map_err(node)?;
+		let rfa = |k: &str| v[k].as_f64().map(|f| (f * 100_000_000.0).round().max(0.0) as u64).unwrap_or(0);
+		Ok(rfa("minrelaytxfee").max(rfa("mempoolminfee")).max(1))
 	}
 
 	/// The active chain's block at `height`, if the chain is that long.
@@ -1396,6 +1434,18 @@ impl ChainSource {
 }
 
 /// Lower-case hex.
+/// A transaction in the node's mempool, as the node ranks it for a block:
+/// its size, its fee's value in atoms of the reference unit, the same for it
+/// with every ancestor still in the mempool, and the height it entered at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MempoolEntry {
+	pub vsize: u64,
+	pub fee_value: u64,
+	pub ancestor_vsize: u64,
+	pub ancestor_fee_value: u64,
+	pub height: u64,
+}
+
 pub fn hex(b: &[u8]) -> String {
 	b.iter().map(|x| format!("{:02x}", x)).collect()
 }
