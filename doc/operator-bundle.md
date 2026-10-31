@@ -38,7 +38,7 @@ start; the Linux paths are the ones tested.
 | | SeqLN (`lightningd`) | The Sequentia gateway: one channel per served asset, with the hold-invoice plugin |
 | | price server | The node's fee rates, from a price feed: an asset is accepted for fees only with a rate |
 | Bitcoin | `bitcoind` (Bitcoin Core) | testnet4, with a transaction index |
-| | fee proxy | The node's RPC with fee estimates from the live mempool (testnet4's own estimates often say a sat or two while its mempool queues at tens) |
+| | fee proxy | The node's RPC with fee estimates from the live mempool, for Bark's server and the Bitcoin gateway (testnet4's own estimates often say a sat or two while its mempool queues at tens, or nothing at all, and a gateway with no estimate refuses every channel opened to it) |
 | | `captaind`, `watchmand` | Bark's server and watchman: the Bitcoin ark |
 | | Core Lightning | The Bitcoin gateway, with Boltz's hold-invoice plugin |
 | Both | Caddy | The public route over TLS: the operator at `https://<your domain>/arca`, the Bitcoin ark at `https://<your domain>` |

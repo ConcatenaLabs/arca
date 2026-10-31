@@ -14,7 +14,7 @@ and run it.
 | `docker/Dockerfile`, `docker/docker-compose.yml` | The bundle in containers, one per daemon, for any system with Docker; `docker/bundle-run` is each container's entrypoint, and `docker/docker-compose.host.yml` puts the bundle on a Linux host's own network |
 | `bundle.env.example` | Every setting, with what it does |
 | `pins.env` | The version and checksum of every download and the commit of every build |
-| `fee-proxy.py` | The Bitcoin node's RPC with fee estimates from the live mempool, for `captaind` and `watchmand` |
+| `fee-proxy.py` | The Bitcoin node's RPC with fee estimates from the live mempool, for `captaind`, `watchmand` and the Bitcoin gateway |
 | `patches/bark-testnet4.patch` | Adds testnet4 to the networks Bark's client lists, and lets a testnet4 wallet pay its network's invoices |
 | `patches/hold-testnet4.patch` | Lets Boltz's [hold-invoice plugin](https://github.com/BoltzExchange/hold) run on testnet4 |
 | `windows/setup-wsl.ps1` | The Windows side: WSL2, the distro, the ports, start at boot |

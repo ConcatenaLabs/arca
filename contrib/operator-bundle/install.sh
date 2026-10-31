@@ -300,7 +300,11 @@ network=$BTC_CHAIN
 alias=$NAME-btc
 bitcoin-cli=$OPT/core/bin/bitcoin-cli
 bitcoin-datadir=$LIB/bitcoin
-bitcoin-rpcport=$BTC_RPC_PORT
+# The node through the fee proxy, as Bark's server reads it: Core often has no
+# estimate on testnet4, and Core Lightning then refuses every channel a peer
+# opens to it ("Cannot accept channel: feerates unknown"), whatever
+# force-feerates says. The proxy always answers, at the going rate.
+bitcoin-rpcport=$FEE_PROXY_PORT
 bitcoin-rpcconnect=127.0.0.1
 # Peers reach it from anywhere: its channels are its route to other
 # operators' gateways and to wallets.
@@ -315,7 +319,12 @@ rpc-file-mode=0660
 $( [ "$BTC_CHAIN" = testnet4 ] && echo "# testnet4's own fee estimates often say nothing; these fixed rates (sat per
 # 1,000 weight) let it open and close channels. The option exists on test
 # networks only.
-force-feerates=7500/7500/500/7500/7500/7500" )
+force-feerates=7500/7500/500/7500/7500/7500
+# A peer's commitment rate is taken as it is. Core Lightning's floor is half
+# its slowest estimate, which the proxy puts at the going rate (15 sat/vB and
+# up): every opener proposing an anchor channel's usual 1 to 2 sat/vB would be
+# refused. The anchor lifts a commitment when it is needed.
+ignore-fee-limits=true" )
 EOF
 write_conf seqln 640 "$LIB/seqln/config" <<EOF
 # The Sequentia gateway: SeqLN with the hold-invoice plugin, one channel in
@@ -950,7 +959,7 @@ unit seqln "SeqLN, the Sequentia gateway" "$(U sequentiad)" "$OPT/seqln/lightnin
   "ExecStartPre=-/bin/sh -c 'for d in $LIB/seqln/*/; do chmod 0750 \"\$\$d\"; done'
 TimeoutStopSec=120
 $RUNDIR"
-unit cln "Core Lightning, the Bitcoin gateway" "$(U bitcoind)" "$OPT/cln/usr/bin/lightningd --lightning-dir=$LIB/cln" \
+unit cln "Core Lightning, the Bitcoin gateway" "$(U bitcoind) $(U feeproxy)" "$OPT/cln/usr/bin/lightningd --lightning-dir=$LIB/cln" \
   "ExecStartPre=-/bin/sh -c 'for d in $LIB/cln/*/; do chmod 0750 \"\$\$d\"; done'
 TimeoutStopSec=120
 $RUNDIR"
