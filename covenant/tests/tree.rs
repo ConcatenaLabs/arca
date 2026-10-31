@@ -112,7 +112,7 @@ fn the_builder_rebuilds_every_record_vector() {
 		let expected: Vec<Vec<u64>> = b["children"].as_array().unwrap().iter()
 			.map(|l| l.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()).collect();
 		assert_eq!(counts, expected, "{}: the children of every node", name);
-		assert_eq!(tree.clock0_script_pubkey().as_bytes().to_vec(),
+		assert_eq!(tree.clock0_script_pubkey().unwrap().as_bytes().to_vec(),
 			Vec::<u8>::from_hex(b["clock0_script_pubkey"].as_str().unwrap()).unwrap());
 		for r in b["records"].as_array().unwrap() {
 			let i = r["leaf"].as_u64().unwrap() as usize;
@@ -201,7 +201,7 @@ impl Fx {
 	fn round(&self, tree: &Tree, issuer: OutPoint) -> Transaction {
 		let token = tree.params().schedule.token;
 		let mut round = Spend::new(0).input(issuer, explicit(self.x, 10_000_000_000, op_true().script_pubkey()), 0xffff_ffff)
-			.outputs(vec![tree.batch_output().txout(), explicit(token, 1, tree.clock0_script_pubkey()), fee(self.x, 2_000)]).tx;
+			.outputs(vec![tree.batch_output().txout(), explicit(token, 1, tree.clock0_script_pubkey().unwrap()), fee(self.x, 2_000)]).tx;
 		round.input[0].asset_issuance = AssetIssuance {
 			asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
 			amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null,

@@ -122,7 +122,7 @@ fn round_tx(net: &Net, issuer: &Coin, tree: Option<&Tree>, extra: Vec<TxOut>, s:
 	let mut outs = vec![];
 	if let Some(t) = tree {
 		outs.push(t.batch_output().txout());
-		outs.push(explicit(t.params().schedule.token, 1, t.clock0_script_pubkey()));
+		outs.push(explicit(t.params().schedule.token, 1, t.clock0_script_pubkey().unwrap()));
 	}
 	let c = outs.len() as u32;
 	outs.push(ConnectorPolicy { operator: xonly(s) }.output(net.x, 5_000).txout());
@@ -604,7 +604,7 @@ fn asset_round(c: &mut Ctx, name: &str, issuer: &Coin, tree: &Tree) -> Transacti
 	let fund = c.net.fund(vec![explicit(a, batch.value + 1_000, op_true_spk())]).remove(0);
 	let total = issuer.txout.value.explicit().unwrap();
 	let mut s = spend(0).coin(issuer, 0xffff_ffff).coin(&fund, 0xffff_ffff).outputs(vec![
-		batch.txout(), explicit(tree.params().schedule.token, 1, tree.clock0_script_pubkey()),
+		batch.txout(), explicit(tree.params().schedule.token, 1, tree.clock0_script_pubkey().unwrap()),
 		explicit(x, 5_000, op_true_spk()), explicit(a, 1_000, op_true_spk()),
 		explicit(x, total - 5_000 - 2_000, op_true_spk()), fee(x, 2_000),
 	]);

@@ -131,7 +131,7 @@ async fn cosign(State(s): State<Arc<Stub>>, headers: HeaderMap, Json(body): Json
 		let coin = CoinRecord::from_bytes(&unhex(i["coin"].as_str().unwrap())).unwrap();
 		let v: u64 = i["checkpoint_value"].as_str().unwrap().parse().unwrap();
 		let (leaf, sweep, asset, value) = coin_leaf(&coin);
-		let cp = CheckpointPolicy { owner: leaf.owner, operator: s.operator, salt: checkpoint_salt(&leaf.salt), chain, sweep, v2: false };
+		let cp = CheckpointPolicy { owner: leaf.owner, operator: s.operator, salt: checkpoint_salt(&leaf.salt), chain, sweep: Some(sweep), v2: false };
 		let cm = leaf.message(asset, value, &[ExplicitOutput::new(asset, v, cp.script_pubkey())]).unwrap().digest;
 		let rm = cp.message(asset, v, &outs).unwrap().digest;
 		for d in [cm, rm] {

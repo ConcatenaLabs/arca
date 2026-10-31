@@ -153,16 +153,16 @@ fn tree(asset: elements::AssetId, net: &Net, s: &Keypair, sched: &ClockSchedule,
 {
 	let preimages: Vec<[u8; 32]> = (0..LEAVES).map(|i| label32(&format!("{} batch preimage {}", tag, i))).collect();
 	let entries: Vec<EntryPolicy> = (0..LEAVES).map(|i| EntryPolicy {
-		unlock_hash: sha256(&preimages[i]), asset, value: values[i], leaf_program: programs[i], sweep: sched.sweep(true, false),
+		unlock_hash: sha256(&preimages[i]), asset, value: values[i], leaf_program: programs[i], sweep: Some(sched.sweep(true, false)),
 	}).collect();
 	let lowest: Vec<NodePolicy> = (0..4).map(|j| {
 		let children = (0..4).map(|i| Child::new(asset, values[4 * j + i] + ENTRY_RESERVE, entries[4 * j + i].taproot().program())).collect();
-		NodePolicy::new(children, xonly(s), (0..4).map(|i| xonly(&owners[4 * j + i])).collect(), sched.sweep(true, false),
+		NodePolicy::new(children, xonly(s), (0..4).map(|i| xonly(&owners[4 * j + i])).collect(), Some(sched.sweep(true, false)),
 			Some(net.chain)).unwrap()
 	}).collect();
 	let low_values: Vec<u64> = (0..4).map(|j| (0..4).map(|i| values[4 * j + i] + ENTRY_RESERVE).sum::<u64>() + NODE_RESERVE).collect();
 	let children = lowest.iter().zip(&low_values).map(|(n, v)| Child::new(asset, *v, n.taproot().program())).collect();
-	let root = NodePolicy::new(children, xonly(s), owners.iter().map(xonly).collect(), sched.sweep(false, false), None).unwrap();
+	let root = NodePolicy::new(children, xonly(s), owners.iter().map(xonly).collect(), Some(sched.sweep(false, false)), None).unwrap();
 	let value = low_values.iter().sum::<u64>() + NODE_RESERVE;
 	Tree { entries, preimages, lowest, root, value }
 }
@@ -630,7 +630,7 @@ fn order_3_on_regtest() {
 			return InTree { fill: sx.tx, checkpoint: None, taker_leaf_tx: unl };
 		}
 		let cp = CheckpointPolicy { owner: xonly(tk), operator: xonly(&s), salt: label32(&format!("order-2 taker {} checkpoint", i)),
-			chain: net.chain, sweep: sched_y.sweep(true, false), v2: false };
+			chain: net.chain, sweep: Some(sched_y.sweep(true, false)), v2: false };
 		let cp_out = ExplicitOutput::new(net.y, ty_value, cp.script_pubkey());
 		let m_cp = tl.collab_message(net.y, ty_value, std::slice::from_ref(&cp_out)).unwrap();
 		let fcc = net.fee_coin();
@@ -813,7 +813,7 @@ fn order_3_on_regtest() {
 	let ug = unlock(&tx_, 6, &entry[6], g.order.script_pubkey());
 	let og = coin_of(ug.txid(), 0, &ug);
 	let cpg = CheckpointPolicy { owner: xonly(&g.leaf_key), operator: xonly(&s), salt: label32("order-2 G cancel checkpoint"),
-		chain: net.chain, sweep: sched_x.sweep(true, false), v2: false };
+		chain: net.chain, sweep: Some(sched_x.sweep(true, false)), v2: false };
 	let cpo = ExplicitOutput::new(net.x, N, cpg.script_pubkey());
 	let cancel = collab(&mut net, &g.order, &og, std::slice::from_ref(&cpo), &s, &g.leaf_key);
 	net.pass("G/the maker brings the order it cancelled to the chain", &ug);

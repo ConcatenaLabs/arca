@@ -370,7 +370,7 @@ fn gate_cases(f: &F, book: &mut Book) {
 	let os = owners(4);
 	let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
 	let children = children_of(f, &os, LEAF);
-	let node = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, false), Some(f.chain)).unwrap();
+	let node = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, false)), Some(f.chain)).unwrap();
 	assert_eq!(node.members().depth(), 3, "four owners and the operator pad to eight");
 	let value = 4 * LEAF + RESERVE;
 	let coin = explicit(f.x, value, node.script_pubkey());
@@ -487,7 +487,7 @@ fn gate_cases(f: &F, book: &mut Book) {
 	let at = bytes.windows(32).position(|w| w == good_root).unwrap();
 	bytes[at..at + 32].copy_from_slice(&bad_root);
 	let bad_script = Script::from(bytes);
-	let bad_tap = TapOutput::new(vec![(1, bad_script.clone()), (2, node.sweep_script()), (2, node.reclaim_script().unwrap())]);
+	let bad_tap = TapOutput::new(vec![(1, bad_script.clone()), (2, node.sweep_script().unwrap()), (2, node.reclaim_script().unwrap())]);
 	let bad_coin = explicit(f.x, value, bad_tap.script_pubkey());
 	for (i, what) in [(3usize, "33"), (4, "64"), (5, "31")] {
 		for (sig_bytes, sig_name) in [(vec![1u8; 64], "random 64-byte"), (vec![1u8], "one-byte")] {
@@ -510,8 +510,8 @@ fn sweep_cases(f: &F, book: &mut Book) {
 	let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
 	let children = children_of(f, &os, LEAF);
 	let value = 4 * LEAF + RESERVE;
-	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, false), None).unwrap();
-	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, false), Some(f.chain)).unwrap();
+	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(false, false)), None).unwrap();
+	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, false)), Some(f.chain)).unwrap();
 	let r_spk = f.schedule.r().script_pubkey();
 	let w = f.w.to_sequence();
 
@@ -520,8 +520,8 @@ fn sweep_cases(f: &F, book: &mut Book) {
 		let coin = explicit(f.x, value, node.script_pubkey());
 		let mut s = Spend::new(0).fake_input("node", coin, node_seq).fake_input("token", t_in.clone(), t_seq)
 			.outputs(vec![explicit(f.x, value - 3_000, f.operator_spk()), t_out, fee(f.x, 3_000)]);
-		let sg = s.sign(key, 0, &node.sweep_script(), f.genesis);
-		s.witness(0, node.sweep_witness(&sg, k));
+		let sg = s.sign(key, 0, &node.sweep_script().unwrap(), f.genesis);
+		s.witness(0, node.sweep_witness(&sg, k).unwrap());
 		if sign_r {
 			let rw = f.r_witness(&s, 1);
 			s.witness(1, rw);
@@ -562,8 +562,8 @@ fn sweep_cases(f: &F, book: &mut Book) {
 		let mut s = Spend::new(0).fake_input("node", coin, 0xffff_fffe).fake_input("clock0", t0, 0xffff_fffe)
 			.outputs(vec![explicit(f.x, value - 3_000, f.operator_spk()),
 				explicit(f.schedule.token, 1, clocks[1].output.script_pubkey()), fee(f.x, 3_000)]);
-		let sg = s.sign(&f.s, 0, &batch.sweep_script(), f.genesis);
-		s.witness(0, batch.sweep_witness(&sg, 1));
+		let sg = s.sign(&f.s, 0, &batch.sweep_script().unwrap(), f.genesis);
+		s.witness(0, batch.sweep_witness(&sg, 1).unwrap());
 		let roll = c0.roll.clone().unwrap();
 		let rs = s.sign(&f.s, 1, &roll, f.genesis);
 		s.witness(1, c0.output.witness(&roll, Clock::witness_items(&rs)));
@@ -576,8 +576,8 @@ fn sweep_cases(f: &F, book: &mut Book) {
 		let t0 = explicit(f.schedule.token, 1, c0.output.script_pubkey());
 		let mut s = Spend::new(e0).fake_input("node", coin, 0xffff_fffe).fake_input("clock0", t0, 0xffff_fffe)
 			.outputs(vec![explicit(f.x, value - 3_000, f.operator_spk()), t_back.clone(), fee(f.x, 3_000)]);
-		let sg = s.sign(&f.s, 0, &batch.sweep_script(), f.genesis);
-		s.witness(0, batch.sweep_witness(&sg, 1));
+		let sg = s.sign(&f.s, 0, &batch.sweep_script().unwrap(), f.genesis);
+		s.witness(0, batch.sweep_witness(&sg, 1).unwrap());
 		let rs = s.sign(&f.s, 1, &c0.release, f.genesis);
 		s.witness(1, c0.output.witness(&c0.release, Clock::witness_items(&rs)));
 		s
@@ -646,7 +646,7 @@ fn reclaim_cases(f: &F, book: &mut Book) {
 		let os: Vec<Keypair> = (0..n_owners).map(|i| keypair(&format!("{} owner{}", label, i))).collect();
 		let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
 		let children = children_of(f, &os[..n_children], LEAF);
-		let node = NodePolicy::new(children, xonly(&f.s), keys, f.schedule.sweep(true, false), Some(f.chain)).unwrap();
+		let node = NodePolicy::new(children, xonly(&f.s), keys, Some(f.schedule.sweep(true, false)), Some(f.chain)).unwrap();
 		(os, node)
 	};
 	// The reclaim of `node`, built by the policy: the atoms `ms` at inputs
@@ -786,7 +786,7 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 	let leaf = f.leaf(&f.a, "new leaf");
 	let entry = EntryPolicy {
 		unlock_hash: sha256(&preimage), asset: f.x, value: LEAF, leaf_program: leaf.program(),
-		sweep: f.schedule.sweep(true, false),
+		sweep: Some(f.schedule.sweep(true, false)),
 	};
 	let coin = explicit(f.x, LEAF + 1_000, entry.script_pubkey());
 	let unlock = |outs: Vec<TxOut>, item: Vec<u8>| {
@@ -812,8 +812,8 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 		let t_in = if with_token { f.r_coin() } else { f.fee_coin(f.x, 1) };
 		let mut s = Spend::new(0).fake_input("entry", coin.clone(), seq).fake_input("token", t_in, w)
 			.outputs(vec![explicit(f.x, LEAF - 2_000, f.operator_spk()), f.r_coin(), fee(f.x, 3_000)]);
-		let sg = s.sign(&f.s, 0, &entry.sweep_script(), f.genesis);
-		s.witness(0, entry.sweep_witness(&sg, 1));
+		let sg = s.sign(&f.s, 0, &entry.sweep_script().unwrap(), f.genesis);
+		s.witness(0, entry.sweep_witness(&sg, 1).unwrap());
 		if with_token { let rw = f.r_witness(&s, 1); s.witness(1, rw); } else { s.witness(1, op_true_witness()); }
 		s
 	};
@@ -875,7 +875,7 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 fn checkpoint_swap_cases(f: &F, book: &mut Book) {
 	// The checkpoint and the reassignment, both signed before anything exists.
 	let leaf = f.leaf(&f.a, "cp leaf");
-	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: f.schedule.sweep(true, false), v2: false };
+	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: Some(f.schedule.sweep(true, false)), v2: false };
 	let cp_out = ExplicitOutput::new(f.x, LEAF - FEE, cp.script_pubkey());
 	let m1 = leaf.collab_message(f.x, LEAF, std::slice::from_ref(&cp_out)).unwrap();
 	let recv = ExplicitOutput::new(f.x, 7_000_000, f.leaf(&f.b, "cp recv").script_pubkey());
@@ -902,8 +902,8 @@ fn checkpoint_swap_cases(f: &F, book: &mut Book) {
 	let w = f.w.to_sequence();
 	let mut s = Spend::new(0).fake_input("checkpoint", cp_coin, w).fake_input("token", f.r_coin(), w)
 		.outputs(vec![explicit(f.x, LEAF - FEE - 3_000, f.operator_spk()), f.r_coin(), fee(f.x, 3_000)]);
-	let sg = s.sign(&f.s, 0, &cp.sweep_script(), f.genesis);
-	s.witness(0, cp.sweep_witness(&sg, 1));
+	let sg = s.sign(&f.s, 0, &cp.sweep_script().unwrap(), f.genesis);
+	s.witness(0, cp.sweep_witness(&sg, 1).unwrap());
 	let rw = f.r_witness(&s, 1);
 	s.witness(1, rw);
 	book.pass("checkpoint/sweep after the notice, behind the token", &s);
@@ -960,8 +960,8 @@ fn burn_cases(f: &F, book: &mut Book) {
 	let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
 	let children = children_of(f, &os, LEAF);
 	let value = 4 * LEAF + RESERVE;
-	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, true), Some(f.chain)).unwrap();
-	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, true), None).unwrap();
+	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, true)), Some(f.chain)).unwrap();
+	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(false, true)), None).unwrap();
 	let burn_spk = Script::from(vec![0x6a]);
 	let w = f.w.to_sequence();
 	// inputs: nodes, then the token, then a fee coin; outputs as given.
@@ -974,8 +974,8 @@ fn burn_cases(f: &F, book: &mut Book) {
 		s = s.fake_input("token", f.r_coin(), w).fake_input("fee coin", f.fee_coin(f.y, 10_000), 0xffff_fffe);
 		s = s.outputs(outs);
 		for (i, n) in nodes.iter().enumerate() {
-			let sg = s.sign(key, i, &n.sweep_script(), f.genesis);
-			s.witness(i, n.sweep_witness(&sg, k.unwrap_or(k_idx as u32)));
+			let sg = s.sign(key, i, &n.sweep_script().unwrap(), f.genesis);
+			s.witness(i, n.sweep_witness(&sg, k.unwrap_or(k_idx as u32)).unwrap());
 		}
 		let rw = f.r_witness(&s, k_idx);
 		s.witness(k_idx, rw);
@@ -992,7 +992,7 @@ fn burn_cases(f: &F, book: &mut Book) {
 	book.fail("burn/neg the same amount of another asset", &burn(&[&lowest], w, tail(vec![explicit(f.y, value, burn_spk.clone()), f.r_coin(), explicit(f.x, value, f.operator_spk())]), &f.s, None), 0, EQUALVERIFY);
 	book.fail("burn/neg OP_RETURN at another index", &burn(&[&lowest], w, tail(vec![f.r_coin(), burn_out.clone()]), &f.s, None), 0, EQUALVERIFY);
 	book.fail("burn/neg OP_TRUE in place of OP_RETURN", &burn(&[&lowest], w, tail(vec![explicit(f.x, value, Script::from(vec![0x51])), f.r_coin()]), &f.s, None), 0, EQUALVERIFY);
-	let lowest_b = NodePolicy::new(children_of(f, &owners(4)[..], LEAF), xonly(&f.s), keys, f.schedule.sweep(true, true), Some(Chain::new(BlockHash::from_byte_array(label32("b"))))).unwrap();
+	let lowest_b = NodePolicy::new(children_of(f, &owners(4)[..], LEAF), xonly(&f.s), keys, Some(f.schedule.sweep(true, true)), Some(Chain::new(BlockHash::from_byte_array(label32("b"))))).unwrap();
 	book.fail("burn/neg two nodes sharing one burn output", &burn(&[&lowest, &lowest_b], w, tail(vec![burn_out.clone(), f.r_coin()]), &f.s, None), 1, EQUALVERIFY);
 	book.fail("burn/neg signed by a stranger", &burn(&[&lowest], w, tail(vec![burn_out.clone(), f.r_coin()]), &f.stranger, None), 0, BAD_SIG);
 	book.fail("burn/neg k names the fee coin", &burn(&[&lowest], w, tail(vec![burn_out, f.r_coin()]), &f.s, Some(2)), 0, EQUALVERIFY);
@@ -1060,17 +1060,17 @@ fn builder_cases(f: &F, book: &mut Book) {
 	let keys: Vec<XOnlyPublicKey> = os.iter().map(xonly).collect();
 	let children = children_of(f, &os, LEAF);
 	let value = 4 * LEAF + RESERVE;
-	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, false), None).unwrap();
-	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, false), Some(f.chain)).unwrap();
+	let batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(false, false)), None).unwrap();
+	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, false)), Some(f.chain)).unwrap();
 	let entry = EntryPolicy { unlock_hash: label32("h"), asset: f.x, value: LEAF, leaf_program: f.leaf(&f.a, "salt").program(),
-		sweep: f.schedule.sweep(true, false) };
+		sweep: Some(f.schedule.sweep(true, false)) };
 	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp salt"), chain: f.chain,
-		sweep: f.schedule.sweep(true, false), v2: false };
+		sweep: Some(f.schedule.sweep(true, false)), v2: false };
 	let swept = vec![
-		batch.sweepable(fake_outpoint("batch"), value),
-		lowest.sweepable(fake_outpoint("lowest"), value),
-		entry.sweepable(fake_outpoint("entry"), LEAF + RESERVE),
-		cp.sweepable(fake_outpoint("checkpoint"), f.x, LEAF),
+		batch.sweepable(fake_outpoint("batch"), value).unwrap(),
+		lowest.sweepable(fake_outpoint("lowest"), value).unwrap(),
+		entry.sweepable(fake_outpoint("entry"), LEAF + RESERVE).unwrap(),
+		cp.sweepable(fake_outpoint("checkpoint"), f.x, LEAF).unwrap(),
 	];
 	let total = 2 * value + LEAF + RESERVE + LEAF;
 	let at_r = fake_outpoint("token at R");
@@ -1101,9 +1101,9 @@ fn builder_cases(f: &F, book: &mut Book) {
 	book.pass("builder/sweep of the batch output, a fee coin of another asset paying", &spend_of(sw.finish(&sigs).unwrap(), Some(2)));
 
 	// Burn-only: the builder pays each input whole to an OP_RETURN at its index.
-	let burn_lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(true, true), Some(f.chain)).unwrap();
-	let burn_batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), f.schedule.sweep(false, true), None).unwrap();
-	let burnt = vec![burn_batch.sweepable(fake_outpoint("burn batch"), value), burn_lowest.sweepable(fake_outpoint("burn lowest"), value)];
+	let burn_lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, true)), Some(f.chain)).unwrap();
+	let burn_batch = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(false, true)), None).unwrap();
+	let burnt = vec![burn_batch.sweepable(fake_outpoint("burn batch"), value).unwrap(), burn_lowest.sweepable(fake_outpoint("burn lowest"), value).unwrap()];
 	let sw = sweep_tx(&f.schedule, at_r, &burnt, &[], &fee_coin_source(f, "fee coin", 9_000, 900)).unwrap();
 	assert_eq!(sw.tx.output[0], explicit(f.x, value, Script::from(vec![0x6a])));
 	assert_eq!(sw.tx.output[1], explicit(f.x, value, Script::from(vec![0x6a])));

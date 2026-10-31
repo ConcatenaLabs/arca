@@ -525,8 +525,10 @@ pub struct ValidCoin {
 	pub leaf: LeafPolicy,
 	pub asset: AssetId,
 	pub value: u64,
-	/// The sweep its checkpoint takes: that of the batch it descends from.
-	pub sweep: Sweep,
+	/// The sweep its checkpoint takes: that of the batch it descends from;
+	/// `None` for a coin of a batch without a sweep, whose checkpoint has
+	/// the collaborative path alone.
+	pub sweep: Option<Sweep>,
 	/// The earliest first expiry among the batches it descends from.
 	pub expiry: MedianTime,
 	/// Reassignments since a round, along the longest path.
@@ -1270,7 +1272,7 @@ impl CoinRecord {
 				let leaf = record.leaf();
 				let id = valid.leaf_id;
 				Ok(ValidCoin {
-					id, leaf, asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
+					id, leaf, asset: record.asset, value: record.value, sweep: record.schedule.sweep_path(true, record.burn),
 					expiry: record.schedule.expiries()[0], hops: 0,
 					origin: ValidOrigin::Leaf { valid, preimage: *preimage, auths: unroll },
 				})
@@ -1293,7 +1295,7 @@ impl CoinRecord {
 				}
 				Ok(ValidCoin {
 					id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
-					sweep: record.schedule.sweep(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
+					sweep: record.schedule.sweep_path(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
 					origin: ValidOrigin::Accumulator { valid, preimage: *preimage, auth: ExitAuth { by_operator: false, time, signature } },
 				})
 			},
@@ -1305,7 +1307,7 @@ impl CoinRecord {
 				let valid = record.validate(tx, policy)?;
 				Ok(ValidCoin {
 					id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
-					sweep: board_sweep(record.operator, record.exit_delay), expiry: NEVER, hops: 0,
+					sweep: Some(board_sweep(record.operator, record.exit_delay)), expiry: NEVER, hops: 0,
 					origin: ValidOrigin::Board { valid, record: *record },
 				})
 			},

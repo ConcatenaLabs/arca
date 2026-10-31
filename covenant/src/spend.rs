@@ -406,7 +406,7 @@ impl Rebindable for CheckpointPolicy {
 		if !self.v2 {
 			return self.collab_witness(&pair.operator, &pair.owner, m);
 		}
-		self.collab2().witness(self.sweep_script(), pair, n, m)
+		self.collab2().witness_of(self.sweep_script(), pair, n, m)
 	}
 }
 

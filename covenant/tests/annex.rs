@@ -70,7 +70,7 @@ fn preimages_are_read_from_annexed_claims() {
 	let new = net.leaf(&a, &s_key, "annex new leaf");
 	let preimage = label32("annex forfeit preimage");
 	let entry = EntryPolicy { unlock_hash: sha256(&preimage), asset: x, value: LEAF, leaf_program: new.program(),
-		sweep: sched.sweep(true, false) };
+		sweep: Some(sched.sweep(true, false)) };
 	let f = ForfeitPolicy {
 		unlock_hash: sha256(&preimage), owner: xonly(&a), operator: xonly(&s_key), refund_delay: delay(),
 		leaf_id: LeafId(label32("annex old leaf id")), connector: m,
@@ -99,7 +99,7 @@ fn preimages_are_read_from_annexed_claims() {
 
 	// --- An entry's unlock, an annex added by whoever mines it ---------------
 	let p2 = label32("annex entry preimage");
-	let entry2 = EntryPolicy { unlock_hash: sha256(&p2), asset: x, value: LEAF, leaf_program: new.program(), sweep: sched.sweep(true, false) };
+	let entry2 = EntryPolicy { unlock_hash: sha256(&p2), asset: x, value: LEAF, leaf_program: new.program(), sweep: Some(sched.sweep(true, false)) };
 	let e2 = net.fund(vec![explicit(x, LEAF + 1_000, entry2.script_pubkey())]).remove(0);
 	let mut u = spend(0).coin(&e2, 0xffff_ffff).outputs(vec![explicit(x, LEAF, new.script_pubkey()), fee(x, 1_000)]);
 	let mut w = entry2.unlock_witness(&p2);

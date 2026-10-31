@@ -1195,7 +1195,7 @@ impl Watcher {
 			}
 			return Ok(ValidCoin {
 				id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value,
-				sweep: record.schedule.sweep(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
+				sweep: record.schedule.sweep_path(true, record.burn), expiry: record.schedule.expiries()[0], hops: 0,
 				origin: ValidOrigin::Accumulator { valid, preimage, auth: ExitAuth { by_operator: true, time: t, signature } },
 			});
 		}
@@ -1215,7 +1215,7 @@ impl Watcher {
 			auths.push(arca_covenant::UnrollAuth { signature, time: t, key: self.params.operator, proof: node.members().proof(0) });
 		}
 		Ok(ValidCoin {
-			id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value, sweep: record.schedule.sweep(true, record.burn),
+			id: valid.leaf_id, leaf: record.leaf(), asset: record.asset, value: record.value, sweep: record.schedule.sweep_path(true, record.burn),
 			expiry: record.schedule.expiries()[0], hops: 0, origin: ValidOrigin::Leaf { valid, preimage, auths },
 		})
 	}
@@ -2308,7 +2308,7 @@ impl Watcher {
 		let root = tree.root();
 		let batch = OutPoint::new(txid_of(&round.txid), b.vout);
 		if self.confirmed(batch).await? && !self.spending(&batch).await? {
-			out.push(root.policy.sweepable(batch, root.value));
+			out.extend(root.policy.sweepable(batch, root.value));
 		}
 		seen.insert(batch);
 		for s in self.store.tree_sightings(round.round_id, b.vout).await? {
@@ -2321,8 +2321,8 @@ impl Watcher {
 			}
 			let item = match s.kind {
 				TreeScriptKind::Node => tree.levels().get(s.level as usize).and_then(|l| l.get(s.idx as usize))
-					.map(|n| n.policy.sweepable(op, n.value)),
-				TreeScriptKind::Entry => tree.leaves().get(s.idx as usize).map(|l| l.entry.sweepable(op, l.entry_value)),
+					.and_then(|n| n.policy.sweepable(op, n.value)),
+				TreeScriptKind::Entry => tree.leaves().get(s.idx as usize).and_then(|l| l.entry.sweepable(op, l.entry_value)),
 			};
 			out.extend(item);
 		}
@@ -2354,7 +2354,7 @@ impl Watcher {
 			if !self.confirmed(op).await? || self.spending(&op).await? || !self.waited(op.txid, schedule.notice).await? {
 				continue;
 			}
-			out.extend(acc.leaves().get(s.idx as usize).map(|l| l.entry.sweepable(op, l.entry_value)));
+			out.extend(acc.leaves().get(s.idx as usize).and_then(|l| l.entry.sweepable(op, l.entry_value)));
 		}
 		self.checkpoints_sweepable(schedule, &mut out, &mut seen).await?;
 		Ok(out)
@@ -2379,12 +2379,12 @@ impl Watcher {
 				Err(_) => continue,
 			};
 			let cp = coin.checkpoint();
-			if cp.sweep.token != schedule.token || !self.waited(op.txid, schedule.notice).await? {
+			if cp.sweep.map(|s| s.token) != Some(schedule.token) || !self.waited(op.txid, schedule.notice).await? {
 				continue;
 			}
 			let t = self.finality.call(move |c| c.transaction(&op.txid)).await.map_err(|e| WatcherError::Chain(e.to_string()))?;
 			if let Some(v) = t.and_then(|t| t.output.get(op.vout as usize).and_then(|o| o.value.explicit())) {
-				out.push(cp.sweepable(op, coin.asset, v));
+				out.extend(cp.sweepable(op, coin.asset, v));
 			}
 		}
 		Ok(())

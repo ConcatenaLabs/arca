@@ -682,6 +682,12 @@ impl Accumulator {
 		if let Some(i) = params.schedule.backwards_at() {
 			return Err(TreeError::ScheduleBackwards(i));
 		}
+		// An accumulator batch keeps its expiry: without a sweep a slot whose
+		// owner gave it up comes back only by its own exit, until a release
+		// of slots is written into the program.
+		if !params.schedule.expires() {
+			return Err(TreeError::Policy(crate::Error::NoSweep));
+		}
 		// A channel-1 leaf's terms are not in an accumulator record: a
 		// channel goes in a tree.
 		if let Some(i) = leaves.iter().position(|l| l.template == Template::Channel1 || l.channel.is_some()) {
@@ -935,7 +941,7 @@ impl AccumulatorRecord {
 	pub fn entry(&self) -> EntryPolicy {
 		EntryPolicy {
 			unlock_hash: self.unlock_hash, asset: self.asset, value: self.value, leaf_program: self.leaf().program(),
-			sweep: self.schedule.sweep(true, self.burn),
+			sweep: Some(self.schedule.sweep(true, self.burn)),
 		}
 	}
 
@@ -1042,9 +1048,13 @@ impl AccumulatorRecord {
 			[i] => i as u32,
 			_ => return Err(RecordError::BatchOutputRepeated(found.len()).into()),
 		};
+		if !self.schedule.expires() {
+			return Err(RecordError::NoSweepAccumulator.into());
+		}
 		let entry = self.entry();
-		check_round(round, &self.schedule, &state.sweep, &[entry.sweep]).map_err(RecordError::from)?;
-		check_reissue(round, self.asset, &state.sweep, &[entry.sweep]).map_err(RecordError::from)?;
+		let entry_sweep = self.schedule.sweep(true, self.burn);
+		check_round(round, &self.schedule, &state.sweep, &[entry_sweep]).map_err(RecordError::from)?;
+		check_reissue(round, self.asset, &state.sweep, &[entry_sweep]).map_err(RecordError::from)?;
 		Ok(ValidAccumulatorLeaf {
 			leaf_id: self.leaf_id()?, round_txid: round.txid(), batch_vout, policy: state, total, exit,
 			leaf: self.leaf(), entry, entry_value: self.entry_value()?,

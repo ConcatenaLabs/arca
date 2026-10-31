@@ -21,6 +21,7 @@
 //! | [`CheckpointPolicy`] | `A`, `S`, salt, genesis hash (32 each), sweep |
 //! | [`OffboardPolicy`] | unlock hash (32), destination asset (32), value (u64), script length (compact size, at most 10,000), script, `S` (32), reclaim delay units (u16) |
 //! | [`Sweep`] | `T`, `R` program, `S` (32 each), flags (u8: bit 0 notice, bit 1 burn), and the notice units (u16) when bit 0 is set |
+//! | No sweep, where a policy above holds its sweep | the no-sweep token ([`crate::clock::no_sweep_token`], 32), alone: no sweep names it |
 //!
 //! Asset ids and the genesis hash are in internal byte order.
 
@@ -57,6 +58,8 @@ pub enum DecodeError {
 	PolicyType(u8),
 	#[error("not a valid x-only public key")]
 	Key,
+	#[error("a sweep names the no-sweep token, which only marks an output without a sweep")]
+	NoSweepToken,
 	#[error("invalid flag byte {0:#x}")]
 	Flag(u8),
 	#[error("a count of {0} is out of range")]
@@ -204,6 +207,36 @@ pub trait Encoding: Sized {
 	}
 }
 
+/// The sweep path of a node, an entry or a checkpoint: a [`Sweep`], or for an
+/// output of a batch without a sweep the no-sweep token alone.
+fn encode_sweep_path(w: &mut Vec<u8>, sweep: Option<&Sweep>) {
+	match sweep {
+		Some(s) => s.encode_to(w),
+		None => w.extend(asset_bytes(crate::clock::no_sweep_token())),
+	}
+}
+
+fn decode_sweep_path(r: &mut Reader) -> Result<Option<Sweep>, DecodeError> {
+	let token = r.asset()?;
+	if token == crate::clock::no_sweep_token() {
+		return Ok(None);
+	}
+	Sweep::decode_rest(token, r).map(Some)
+}
+
+impl Sweep {
+	fn decode_rest(token: AssetId, r: &mut Reader) -> Result<Sweep, DecodeError> {
+		let r_program = r.array32()?;
+		let operator = r.key()?;
+		let flags = r.u8()?;
+		if flags & !0b11 != 0 {
+			return Err(DecodeError::Flag(flags));
+		}
+		let notice = if flags & 1 != 0 { Some(r.relative_time()?) } else { None };
+		Ok(Sweep { token, r_program, operator, notice, burn: flags & 2 != 0 })
+	}
+}
+
 impl Encoding for Sweep {
 	fn encode_to(&self, w: &mut Vec<u8>) {
 		w.extend(asset_bytes(self.token));
@@ -217,14 +250,10 @@ impl Encoding for Sweep {
 
 	fn decode_from(r: &mut Reader) -> Result<Sweep, DecodeError> {
 		let token = r.asset()?;
-		let r_program = r.array32()?;
-		let operator = r.key()?;
-		let flags = r.u8()?;
-		if flags & !0b11 != 0 {
-			return Err(DecodeError::Flag(flags));
+		if token == crate::clock::no_sweep_token() {
+			return Err(DecodeError::NoSweepToken);
 		}
-		let notice = if flags & 1 != 0 { Some(r.relative_time()?) } else { None };
-		Ok(Sweep { token, r_program, operator, notice, burn: flags & 2 != 0 })
+		Sweep::decode_rest(token, r)
 	}
 }
 
@@ -346,7 +375,7 @@ impl Encoding for NodePolicy {
 		for o in self.owners() {
 			w.extend(o.serialize());
 		}
-		self.sweep().encode_to(w);
+		encode_sweep_path(w, self.sweep());
 		match self.reclaim_chain() {
 			None => w.push(0),
 			Some(c) => { w.push(1); w.extend(c.genesis_bytes()); },
@@ -373,7 +402,7 @@ impl Encoding for NodePolicy {
 		for _ in 0..owners_n {
 			owners.push(r.key()?);
 		}
-		let sweep = Sweep::decode_from(r)?;
+		let sweep = decode_sweep_path(r)?;
 		let reclaim = if r.flag()? { Some(r.chain()?) } else { None };
 		Ok(NodePolicy::new(children, operator, owners, sweep, reclaim)?)
 	}
@@ -385,7 +414,7 @@ impl Encoding for EntryPolicy {
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
 		w.extend(self.leaf_program);
-		self.sweep.encode_to(w);
+		encode_sweep_path(w, self.sweep.as_ref());
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<EntryPolicy, DecodeError> {
@@ -394,7 +423,7 @@ impl Encoding for EntryPolicy {
 			asset: r.asset()?,
 			value: r.u64()?,
 			leaf_program: r.array32()?,
-			sweep: Sweep::decode_from(r)?,
+			sweep: decode_sweep_path(r)?,
 		})
 	}
 }
@@ -427,7 +456,7 @@ impl Encoding for CheckpointPolicy {
 		w.extend(self.operator.serialize());
 		w.extend(self.salt);
 		w.extend(self.chain.genesis_bytes());
-		self.sweep.encode_to(w);
+		encode_sweep_path(w, self.sweep.as_ref());
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<CheckpointPolicy, DecodeError> {
@@ -436,7 +465,7 @@ impl Encoding for CheckpointPolicy {
 			operator: r.key()?,
 			salt: r.array32()?,
 			chain: r.chain()?,
-			sweep: Sweep::decode_from(r)?, v2: false,
+			sweep: decode_sweep_path(r)?, v2: false,
 		})
 	}
 }

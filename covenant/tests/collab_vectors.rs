@@ -108,11 +108,11 @@ fn vtxo_2_matches_the_regtest_suites_vectors() {
 	};
 	let c = &v["checkpoint"];
 	let cp = CheckpointPolicy {
-		owner: leaf.owner, operator: leaf.operator, salt: arca_covenant::transfer::checkpoint_salt(&leaf.salt), chain, sweep, v2: true,
+		owner: leaf.owner, operator: leaf.operator, salt: arca_covenant::transfer::checkpoint_salt(&leaf.salt), chain, sweep: Some(sweep), v2: true,
 	};
 	same("checkpoint salt", &cp.salt, &c["salt"]);
 	same("checkpoint params", &cp.collab2().data_bytes(), &c["params"]);
-	check_output("checkpoint", &cp, &cp.sweep_script(), c);
+	check_output("checkpoint", &cp, &cp.sweep_script().unwrap(), c);
 	check_spend("the leaf into its checkpoint", &leaf, &hex(&l["params"]), &v["spends"]["leaf_into_checkpoint"]);
 	check_spend("the checkpoint at index 1 of a swap", &cp, &hex(&c["params"]), &v["spends"]["checkpoint_in_a_swap"]);
 }

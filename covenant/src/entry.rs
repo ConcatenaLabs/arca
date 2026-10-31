@@ -15,7 +15,8 @@
 //!
 //! The unlock needs no signature, because its destination is pinned. An entry
 //! the owner never unlocks is the operator's to sweep with the rest of the
-//! batch.
+//! batch. In a batch without a sweep the unlock is the entry's one leaf: the
+//! entry can only ever become its owner's leaf.
 
 use elements::opcodes::all::*;
 use elements::script::Builder;
@@ -42,8 +43,8 @@ pub struct EntryPolicy {
 	pub value: u64,
 	/// The leaf's witness v1 program, which output 0 must pay.
 	pub leaf_program: [u8; 32],
-	/// The batch's sweep with notice.
-	pub sweep: Sweep,
+	/// The batch's sweep with notice; `None` in a batch without a sweep.
+	pub sweep: Option<Sweep>,
 }
 
 impl EntryPolicy {
@@ -58,13 +59,17 @@ impl EntryPolicy {
 			.into_script()
 	}
 
-	pub fn sweep_script(&self) -> Script {
-		self.sweep.script()
+	/// The sweep leaf, when the batch has one.
+	pub fn sweep_script(&self) -> Option<Script> {
+		self.sweep.map(|s| s.script())
 	}
 
-	/// `[unlock, sweep]`, both at depth 1.
+	/// `[unlock, sweep]`, both at depth 1; `[unlock]` without a sweep.
 	pub fn taproot(&self) -> TapOutput {
-		TapOutput::new(vec![(1, self.unlock_script()), (1, self.sweep_script())])
+		match self.sweep_script() {
+			Some(sweep) => TapOutput::new(vec![(1, self.unlock_script()), (1, sweep)]),
+			None => TapOutput::new(vec![(0, self.unlock_script())]),
+		}
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -77,7 +82,8 @@ impl EntryPolicy {
 	}
 
 	/// The full sweep witness.
-	pub fn sweep_witness(&self, sig: &elements::secp256k1_zkp::schnorr::Signature, k: u32) -> Vec<Vec<u8>> {
-		self.taproot().witness(&self.sweep_script(), Sweep::witness_items(sig, k))
+	/// The full sweep witness, when the entry has a sweep.
+	pub fn sweep_witness(&self, sig: &elements::secp256k1_zkp::schnorr::Signature, k: u32) -> Option<Vec<Vec<u8>>> {
+		Some(self.taproot().witness(&self.sweep_script()?, Sweep::witness_items(sig, k)))
 	}
 }

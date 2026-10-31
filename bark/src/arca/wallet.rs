@@ -954,13 +954,28 @@ impl Wallet {
 		Self::delay(self.cfg.exit_delay_units)
 	}
 
-	/// The policy for accepting a leaf from a round, at `now`.
+	/// The policy for accepting a leaf from a round, at `now`. On the main
+	/// chain (`sequentia`) it accepts only batches without a sweep, whose
+	/// coins nobody can take from a holder who stays away
+	/// ([`WalletPolicy::no_sweep`]); elsewhere it accepts both kinds.
 	pub(crate) fn accept_policy(&self, now: MedianTime) -> WalletPolicy {
+		let base = if self.refuses_sweep() {
+			WalletPolicy::no_sweep(self.genesis, self.operator, now)
+		} else {
+			WalletPolicy::new(self.genesis, self.operator, now)
+		};
 		WalletPolicy {
 			min_exit_delay: Self::delay(self.cfg.min_exit_delay_units),
 			max_exit_delay: Self::delay(self.cfg.max_exit_delay_units),
-			..WalletPolicy::new(self.genesis, self.operator, now)
+			..base
 		}
+	}
+
+	/// Whether the wallet refuses a batch with a sweep: on the main chain,
+	/// and wherever the chain's name cannot be read, so a store it cannot
+	/// read never lets a sweep in.
+	pub(crate) fn refuses_sweep(&self) -> bool {
+		!matches!(self.store.meta("chain_name"), Ok(Some(n)) if n != "sequentia")
 	}
 
 	/// The policy for accepting a leaf of `asset` from a round, at `now`,
@@ -3952,6 +3967,30 @@ mod tests {
 		assert_eq!(refused(Wallet::open_in(s, B, None)), "this store holds the wallet of another mnemonic");
 
 		assert!(refused(Wallet::open_in(made(), A, None)).contains("names no mailbox key"));
+	}
+
+	/// On the main chain the wallet takes only batches without a sweep; on
+	/// any other chain both kinds.
+	#[test]
+	fn the_main_chain_refuses_a_batch_with_a_sweep() {
+		const A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+		let open = |name: &str, coin_type: u32| {
+			let s = Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+			let cfg = Config::spec_delays("https://example.org/arca", "http://127.0.0.1:1/");
+			let pins = Pins { genesis: "00".repeat(32), chain_name: name.into(), operator: key(7).x_only_public_key().0.to_string(),
+				keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32), anchor_depth: String::new() };
+			Wallet::write_pins(&s, &cfg, pins).unwrap();
+			s.set_meta("mailbox_key", &Keys::new(A, 0, coin_type).unwrap().mailbox().unwrap().x_only_public_key().0.to_string()).unwrap();
+			Wallet::open_in(s, A, None).unwrap()
+		};
+		let now = MedianTime::from_consensus(1_800_000_000).unwrap();
+		let main = open("sequentia", 0);
+		assert!(main.refuses_sweep() && main.accept_policy(now).refuse_sweep && main.receipt_policy(now).refuse_sweep);
+		assert!(main.followed_policy(u32::MAX, now).refuse_sweep);
+		for name in ["test", "elementsregtest"] {
+			let w = open(name, 1);
+			assert!(!w.refuses_sweep() && !w.accept_policy(now).refuse_sweep, "{} accepts both kinds", name);
+		}
 	}
 
 	/// The pins are written all or none: a join that fails part way leaves a

@@ -9,6 +9,9 @@
 //! sweep:   the sweep with notice of the input's batch
 //! ```
 //!
+//! The checkpoint of a coin of a batch without a sweep has the
+//! collaborative path alone (`sweep` is `None`).
+//!
 //! A `vtxo-2` coin's checkpoint has `arca/collab-2` and its data leaf in place
 //! of the tapscript collaborative path ([`crate::collab`]).
 //!
@@ -36,8 +39,9 @@ pub struct CheckpointPolicy {
 	/// The checkpoint's own salt, unique to this checkpoint.
 	pub salt: [u8; 32],
 	pub chain: Chain,
-	/// The input batch's sweep with notice.
-	pub sweep: Sweep,
+	/// The input batch's sweep with notice; `None` for a coin of a batch
+	/// without a sweep.
+	pub sweep: Option<Sweep>,
 	/// The checkpoint of a `vtxo-2` coin: its collaborative path is
 	/// `arca/collab-2` ([`crate::collab`]), `[[program, data], sweep]`.
 	pub v2: bool,
@@ -52,8 +56,9 @@ impl CheckpointPolicy {
 		rebindable_two_party(&self.owner, &self.operator, &self.leaf_constant())
 	}
 
-	pub fn sweep_script(&self) -> Script {
-		self.sweep.script()
+	/// The sweep leaf, when the coin's batch has one.
+	pub fn sweep_script(&self) -> Option<Script> {
+		self.sweep.map(|s| s.script())
 	}
 
 	/// The parameters of `arca/collab-2` for this checkpoint.
@@ -62,12 +67,16 @@ impl CheckpointPolicy {
 	}
 
 	/// `[collab, sweep]`, both at depth 1; a `vtxo-2` coin's checkpoint
-	/// `[[arca/collab-2, data], sweep]`.
+	/// `[[arca/collab-2, data], sweep]`. Without a sweep: `[collab]`, or
+	/// `[arca/collab-2, data]`.
 	pub fn taproot(&self) -> TapOutput {
 		if self.v2 {
-			return self.collab2().taproot(self.sweep_script());
+			return self.collab2().taproot_of(self.sweep_script());
 		}
-		TapOutput::new(vec![(1, self.collab_script()), (1, self.sweep_script())])
+		match self.sweep_script() {
+			Some(sweep) => TapOutput::new(vec![(1, self.collab_script()), (1, sweep)]),
+			None => TapOutput::new(vec![(0, self.collab_script())]),
+		}
 	}
 
 	pub fn script_pubkey(&self) -> Script {
@@ -90,12 +99,13 @@ impl CheckpointPolicy {
 	/// coin's checkpoint, spent alone at input 0.
 	pub fn collab_witness(&self, operator_sig: &Signature, owner_sig: &Signature, m: u8) -> Vec<Vec<u8>> {
 		if self.v2 {
-			return self.collab2().witness(self.sweep_script(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
+			return self.collab2().witness_of(self.sweep_script(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
 		}
 		self.taproot().witness(&self.collab_script(), two_party_items(operator_sig, owner_sig, m))
 	}
 
-	pub fn sweep_witness(&self, sig: &Signature, k: u32) -> Vec<Vec<u8>> {
-		self.taproot().witness(&self.sweep_script(), Sweep::witness_items(sig, k))
+	/// The full sweep witness, when the checkpoint has a sweep.
+	pub fn sweep_witness(&self, sig: &Signature, k: u32) -> Option<Vec<Vec<u8>>> {
+		Some(self.taproot().witness(&self.sweep_script()?, Sweep::witness_items(sig, k)))
 	}
 }

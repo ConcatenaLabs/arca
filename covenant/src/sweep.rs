@@ -135,32 +135,35 @@ impl Sweepable {
 }
 
 impl NodePolicy {
-	/// This node, held at `outpoint` with `value`, as a sweep takes it.
-	pub fn sweepable(&self, outpoint: OutPoint, value: u64) -> Sweepable {
-		Sweepable::new(outpoint, (self.children()[0].asset, value), self.taproot(), *self.sweep())
+	/// This node, held at `outpoint` with `value`, as a sweep takes it;
+	/// `None` for a node without a sweep.
+	pub fn sweepable(&self, outpoint: OutPoint, value: u64) -> Option<Sweepable> {
+		Some(Sweepable::new(outpoint, (self.children()[0].asset, value), self.taproot(), *self.sweep()?))
 	}
 }
 
 impl BranchNode {
-	/// This node, held at `outpoint`, as a sweep takes it.
-	pub fn sweepable(&self, outpoint: OutPoint) -> Sweepable {
-		Sweepable::new(outpoint, (self.children[0].asset, self.value), self.taproot().clone(), self.sweep)
+	/// This node, held at `outpoint`, as a sweep takes it; `None` for a
+	/// node without a sweep.
+	pub fn sweepable(&self, outpoint: OutPoint) -> Option<Sweepable> {
+		Some(Sweepable::new(outpoint, (self.children[0].asset, self.value), self.taproot().clone(), self.sweep?))
 	}
 }
 
 impl EntryPolicy {
 	/// This entry, held at `outpoint` with `value` (the leaf's value and the
-	/// entry's reserve), as a sweep takes it.
-	pub fn sweepable(&self, outpoint: OutPoint, value: u64) -> Sweepable {
-		Sweepable::new(outpoint, (self.asset, value), self.taproot(), self.sweep)
+	/// entry's reserve), as a sweep takes it; `None` for an entry without a
+	/// sweep.
+	pub fn sweepable(&self, outpoint: OutPoint, value: u64) -> Option<Sweepable> {
+		Some(Sweepable::new(outpoint, (self.asset, value), self.taproot(), self.sweep?))
 	}
 }
 
 impl CheckpointPolicy {
 	/// This checkpoint, held at `outpoint` with `value` of `asset`, as a
-	/// sweep takes it.
-	pub fn sweepable(&self, outpoint: OutPoint, asset: AssetId, value: u64) -> Sweepable {
-		Sweepable::new(outpoint, (asset, value), self.taproot(), self.sweep)
+	/// sweep takes it; `None` for a checkpoint without a sweep.
+	pub fn sweepable(&self, outpoint: OutPoint, asset: AssetId, value: u64) -> Option<Sweepable> {
+		Some(Sweepable::new(outpoint, (asset, value), self.taproot(), self.sweep?))
 	}
 }
 

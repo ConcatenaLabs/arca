@@ -89,6 +89,17 @@ byte order.
           at the lowest level (the last):
             k-1 × [32]                         the other owners, in order
 
+A record of a batch without a sweep is format version 3: the same fields,
+with the token, the notice and the expiries left out, since such a batch has
+no token and no clock and no output above its leaves carries a sweep leaf.
+In their place, after the operator key:
+
+    u8    flags: bit 1, the lowest node carries RECLAIM-D; other bits zero
+
+and its JSON form has "version": 3 and no "token", "notice_units", "burn" or
+"expiries". A version 2 record never names the no-sweep token
+SHA256("Arca/no-sweep").
+
 The leaf id is the BIP340 tagged hash, tag "Arca/leaf-id", of
 
     batch output's witness program (32) ‖ level count (u8)
@@ -115,6 +126,8 @@ from test_framework.messages import (COutPoint, CTxIn, CTxOut, CTxOutAsset, CTxO
                                      CAssetIssuance, uint256_from_str)
 
 FORMAT_VERSION = 2
+FORMAT_VERSION_NO_SWEEP = 3
+NO_SWEEP_TOKEN = sha256(b"Arca/no-sweep")
 TEMPLATES = {"vtxo": 1, "board": 2, "htlc": 3, "order": 4, "landing": 5, "channel": 7}   # name -> template id; a board record names board
 TEMPLATE_VTXO, TEMPLATE_VTXO_VERSION = 1, 1
 TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
@@ -266,6 +279,8 @@ class Batch:
         r_prog = self.r_spk[2:]
 
         def sweep(root):
+            if p.get("no_sweep"):
+                return None
             w = None if root else notice
             return burn_sweep(p["token"], r_prog, S, w) if p["burn"] else sweep_token(p["token"], r_prog, S, w)
 
@@ -333,7 +348,7 @@ class Batch:
             if is_root:
                 break
         self.root = self.levels[-1][0]
-        self.clocks = clock_chain(p["token"], self.r_spk, S, p["expiries"])
+        self.clocks = None if p.get("no_sweep") else clock_chain(p["token"], self.r_spk, S, p["expiries"])
 
     def batch_spk(self):
         return bytes(self.root["tap"].scriptPubKey)
@@ -376,6 +391,7 @@ class Batch:
             "entry_reserve": p["entry_reserve"],
             "genesis": p["genesis"], "operator": p["operator"], "token": p["token"], "notice": p["notice"],
             "burn": p["burn"], "delegated": bool(p.get("delegated")), "expiries": list(p["expiries"]),
+            "no_sweep": bool(p.get("no_sweep")),
             "path": levels,
         }
 
@@ -386,7 +402,8 @@ class Batch:
 
 def encode(rec):
     name, ver = rec["template"]
-    b = bytes([FORMAT_VERSION, TEMPLATES[name], ver])
+    no_sweep = rec.get("no_sweep")
+    b = bytes([FORMAT_VERSION_NO_SWEEP if no_sweep else FORMAT_VERSION, TEMPLATES[name], ver])
     b += rec["owner"] + rec["owner_nonce"] + rec["operator_nonce"] + le16(rec["exit_delay"])
     if name == "htlc":
         h = rec["htlc"]
@@ -402,9 +419,12 @@ def encode(rec):
         c = rec["channel"]
         b += le64(c["capacity"]) + le16(c["window"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
-    b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
-    b += bytes([(1 if rec["burn"] else 0) | (2 if rec.get("delegated") else 0)])
-    b += bytes([len(rec["expiries"])]) + b"".join(le32(e) for e in rec["expiries"])
+    if no_sweep:
+        b += rec["genesis"] + rec["operator"] + bytes([2 if rec.get("delegated") else 0])
+    else:
+        b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
+        b += bytes([(1 if rec["burn"] else 0) | (2 if rec.get("delegated") else 0)])
+        b += bytes([len(rec["expiries"])]) + b"".join(le32(e) for e in rec["expiries"])
     b += bytes([len(rec["path"])])
     for n, lv in enumerate(rec["path"]):
         b += bytes([lv["children"], lv["index"]]) + le64(lv["reserve"])
@@ -439,6 +459,10 @@ def to_json(rec):
         "notice_units": rec["notice"], "burn": rec["burn"], "expiries": rec["expiries"],
         "path": path,
     }
+    if rec.get("no_sweep"):
+        o["version"] = FORMAT_VERSION_NO_SWEEP
+        for k in ("token", "notice_units", "burn", "expiries"):
+            del o[k]
     if rec.get("delegated"):
         o["reclaim_delegated"] = True
     if name == "htlc":
@@ -509,14 +533,14 @@ def txout(asset, value, spk):
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
                  expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
-                 v2=None, delegated=False):
+                 v2=None, delegated=False, no_sweep=False):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
     token = issued_asset(issuer_txid, 0)
     p = {"genesis": GENESIS, "asset": ASSET, "operator": OPERATOR, "token": token, "notice": NOTICE,
          "expiries": [CREATED + d * DAY for d in expiries], "burn": burn, "radix": radix,
-         "node_reserve": node_reserve, "entry_reserve": entry_reserve, "delegated": delegated}
+         "node_reserve": node_reserve, "entry_reserve": entry_reserve, "delegated": delegated, "no_sweep": no_sweep}
     leaves = []
     for i in range(n):
         leaves.append({
@@ -560,8 +584,13 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
     iss.nAmount, iss.nInflationKeys, iss.denomination = CTxOutValue(1), CTxOutValue(), 0
     vin.assetIssuance = iss
     tx.vin = [vin]
-    tx.vout = [txout(ASSET, b.root["value"], b.batch_spk()), txout(token, 1, b.clocks[0]["spk"]),
-               txout(ASSET, 5_000, b"")]
+    if no_sweep:
+        # A batch without a sweep: the round issues nothing and pays no token.
+        vin.assetIssuance = CAssetIssuance()
+        tx.vout = [txout(ASSET, b.root["value"], b.batch_spk()), txout(ASSET, 5_000, b"")]
+    else:
+        tx.vout = [txout(ASSET, b.root["value"], b.batch_spk()), txout(token, 1, b.clocks[0]["spk"]),
+                   txout(ASSET, 5_000, b"")]
     ArkBase.pad(tx)
 
     batch_prog = b.batch_spk()[2:]
@@ -585,8 +614,9 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
         "inputs": {
             "radix": radix, "burn": burn, "node_reserve": node_reserve, "entry_reserve": entry_reserve,
             **({"delegated_reclaim": True} if delegated else {}),
-            "token_issuer": {"txid": display(issuer_txid), "vout": 0, "contract_hash": bytes(32).hex()},
-            "token": display(token), "notice_units": NOTICE, "expiries": p["expiries"],
+            **({"no_sweep": True} if no_sweep else {
+                "token_issuer": {"txid": display(issuer_txid), "vout": 0, "contract_hash": bytes(32).hex()},
+                "token": display(token), "notice_units": NOTICE, "expiries": p["expiries"]}),
             "leaves": [dict({"owner": lf["owner"].hex(), "owner_nonce": lf["owner_nonce"].hex(),
                              "operator_nonce": lf["operator_nonce"].hex(), "value": lf["value"],
                              "exit_delay_units": lf["exit_delay"], "unlock_hash": lf["unlock_hash"].hex()},
@@ -606,7 +636,7 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
         "children": [[nd["hi"] - nd["lo"] for nd in lv] for lv in b.levels],
         "batch_output": {"asset": display(ASSET), "value": b.root["value"],
                          "script_pubkey": b.batch_spk().hex()},
-        "clock0_script_pubkey": b.clocks[0]["spk"].hex(),
+        **({} if no_sweep else {"clock0_script_pubkey": b.clocks[0]["spk"].hex()}),
         "round": {"tx": tx.serialize().hex(), "batch_vout": 0},
         "records": records,
     }
@@ -630,7 +660,8 @@ def invalid_vectors(valid_binary, valid_json):
 
     out = [
         ("format version 1", v[:0] + b"\x01" + v[1:], "version"),
-        ("format version 3", v[:0] + b"\x03" + v[1:], "version"),
+        ("format version 4", v[:0] + b"\x04" + v[1:], "version"),
+        ("the no-sweep token in a version 2 record", put(GEN + 64, NO_SWEEP_TOKEN), "sweep"),
         ("template 2", put(1, b"\x02"), "template"),
         ("template vtxo, version 3", put(2, b"\x03"), "template_version"),
         ("a trailing byte", v + b"\x00", "trailing"),
@@ -782,6 +813,37 @@ def invalid_channel_vectors(valid_binary, valid_json):
             [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
 
 
+def invalid_no_sweep_vectors(valid_binary, valid_json, swept_json):
+    """Records of a batch without a sweep a decoder must refuse, and a version
+    2 record naming the no-sweep token."""
+    v = bytes.fromhex(valid_binary)
+    FLAGS = 3 + 32 + 32 + 32 + 2 + 32 + 8 + 32 + 8 + 64
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [
+        ("without a sweep, the burn-only flag set", put(FLAGS, bytes([v[FLAGS] | 1])), "flag"),
+        ("without a sweep, flag bit 2 set", put(FLAGS, bytes([v[FLAGS] | 4])), "flag"),
+        ("without a sweep, read as version 2", put(0, b"\x02"), "flag"),
+    ]
+
+    def edit(f, text=valid_json):
+        o = json.loads(text)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("without a sweep, with a token", edit(lambda o: o.update({"token": display(NO_SWEEP_TOKEN)})), "field"),
+        ("without a sweep, with expiries", edit(lambda o: o.update({"expiries": [CREATED]})), "field"),
+        ("without a sweep, burn-only", edit(lambda o: o.update({"burn": False})), "field"),
+        ("the no-sweep token in a version 2 record", edit(lambda o: o.update({"token": display(NO_SWEEP_TOKEN)}), swept_json),
+         "sweep"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
 def invalid_order_vectors(valid_binary, valid_json, order_2_json):
     """order-3 records a decoder must refuse, and an order-2 record claiming order-3's terms."""
     v = bytes.fromhex(valid_binary)
@@ -822,6 +884,9 @@ def generate():
         batch_vector("five leaves, two of them channel-1", 5, 4, channel={1: 4_000_000, 4: 0}),
         batch_vector("five leaves, two of them vtxo-2", 5, 4, v2=[1, 2]),
         batch_vector("seventeen leaves, RECLAIM-D on every lowest node", 17, 4, delegated=True),
+        batch_vector("seventeen leaves without a sweep, RECLAIM-D on every lowest node", 17, 4, delegated=True,
+                     no_sweep=True),
+        batch_vector("five leaves without a sweep, two of them vtxo-2", 5, 4, v2=[1, 2], no_sweep=True),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
@@ -841,6 +906,10 @@ def generate():
     ci, cj = invalid_channel_vectors(c["binary"], c["json"])
     invalid += ci
     invalid_json += cj
+    ns = batches[14]["records"][3]
+    ni, nj = invalid_no_sweep_vectors(ns["binary"], ns["json"], first["json"])
+    invalid += ni
+    invalid_json += nj
     return {
         "about": "Golden vectors for Arca's leaf record, its id and its encodings. Generated by "
                  "regtest/vectors.py from regtest/records.py; do not edit.",

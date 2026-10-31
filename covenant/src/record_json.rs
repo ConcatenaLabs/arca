@@ -3,7 +3,7 @@
 //! The fields are the binary form's ([`crate::record`]), named:
 //!
 //! ```text
-//! version            2
+//! version            2, or 3 for a batch without a sweep
 //! template           "vtxo-1"
 //! owner              hex
 //! owner_nonce        hex
@@ -23,11 +23,11 @@
 //! entry_reserve      decimal string
 //! genesis_hash       hex, display order
 //! operator           hex
-//! token              hex, display order
-//! notice_units       512-second units
-//! burn               true or false
+//! token              version 2 only: hex, display order
+//! notice_units       version 2 only: 512-second units
+//! burn               version 2 only: true or false
 //! reclaim_delegated  true, only when the lowest node carries RECLAIM-D
-//! expiries           [median times]
+//! expiries           version 2 only: [median times]
 //! path               [levels, from the batch output down]
 //!   index            the index on the leaf's path
 //!   reserve          decimal string
@@ -64,7 +64,7 @@ use crate::order::{OrderLeafTerms, OrderTerms, SeqdexOrder, SeqdexVersion};
 use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
 use crate::record::{
-	hex32, LeafRecord, LowestLevel, RecordError, Sibling, Template, UpperLevel, MAX_LEVELS, RECORD_VERSION,
+	hex32, LeafRecord, LowestLevel, RecordError, Sibling, Template, UpperLevel, MAX_LEVELS, RECORD_VERSION, RECORD_VERSION_NO_SWEEP,
 };
 use crate::script::asset_bytes;
 use crate::time::{MedianTime, RelativeTime};
@@ -115,7 +115,8 @@ impl LeafRecord {
 		path.push(Value::Object(o));
 
 		let mut m = Map::new();
-		m.insert("version".into(), RECORD_VERSION.into());
+		let expires = self.schedule.expires();
+		m.insert("version".into(), if expires { RECORD_VERSION } else { RECORD_VERSION_NO_SWEEP }.into());
 		m.insert("template".into(), Value::String(self.template.to_string()));
 		m.insert("owner".into(), Value::String(hex(&self.owner.serialize())));
 		m.insert("owner_nonce".into(), Value::String(hex(&self.owner_nonce)));
@@ -144,13 +145,15 @@ impl LeafRecord {
 		m.insert("entry_reserve".into(), Value::String(self.entry_reserve.to_string()));
 		m.insert("genesis_hash".into(), Value::String(display(self.chain.genesis_bytes())));
 		m.insert("operator".into(), Value::String(hex(&self.schedule.operator.serialize())));
-		m.insert("token".into(), Value::String(display(asset_bytes(self.schedule.token))));
-		m.insert("notice_units".into(), self.schedule.notice.units().into());
-		m.insert("burn".into(), Value::Bool(self.burn));
+		if expires {
+			m.insert("token".into(), Value::String(display(asset_bytes(self.schedule.token))));
+			m.insert("notice_units".into(), self.schedule.notice.units().into());
+			m.insert("burn".into(), Value::Bool(self.burn));
+			m.insert("expiries".into(), Value::Array(self.schedule.expiries().iter().map(|e| e.to_consensus_u32().into()).collect()));
+		}
 		if self.delegated {
 			m.insert("reclaim_delegated".into(), Value::Bool(true));
 		}
-		m.insert("expiries".into(), Value::Array(self.schedule.expiries().iter().map(|e| e.to_consensus_u32().into()).collect()));
 		m.insert("path".into(), Value::Array(path));
 		Ok(Value::Object(m))
 	}
@@ -171,10 +174,16 @@ impl LeafRecord {
 		// An htlc-1 record has one field more; the template says which.
 		let named = v.as_object().and_then(|o| o.get("template")).and_then(|t| t.as_str())
 			.map(|t| t.parse::<Template>()).transpose()?;
+		// A record of a batch without a sweep (version 3) has no token,
+		// notice, burn flag or expiries.
+		let no_sweep = v.as_object().and_then(|o| o.get("version")) == Some(&Value::from(RECORD_VERSION_NO_SWEEP));
 		let mut fields = vec![
 			"version", "template", "owner", "owner_nonce", "operator_nonce", "exit_delay_units", "asset", "value",
-			"unlock_hash", "entry_reserve", "genesis_hash", "operator", "token", "notice_units", "burn", "expiries", "path",
+			"unlock_hash", "entry_reserve", "genesis_hash", "operator", "path",
 		];
+		if !no_sweep {
+			fields.extend(["token", "notice_units", "burn", "expiries"]);
+		}
 		if named == Some(Template::Htlc1) {
 			fields.push("htlc");
 		}
@@ -193,7 +202,7 @@ impl LeafRecord {
 		}
 		let m = object(v, "record", &fields)?;
 		let version = int(m, "version", u64::MAX)?;
-		if version != RECORD_VERSION as u64 {
+		if version != RECORD_VERSION as u64 && version != RECORD_VERSION_NO_SWEEP as u64 {
 			return Err(RecordError::Version(version));
 		}
 		let template: Template = string(m, "template")?.parse()?;
@@ -228,20 +237,27 @@ impl LeafRecord {
 		let entry_reserve = amount(m, "entry_reserve")?;
 		let chain = Chain::new(BlockHash::from_byte_array(display32(m, "genesis_hash")?));
 		let operator = key(m, "operator")?;
-		let token = AssetId::from_byte_array(display32(m, "token")?);
-		let notice = units(m, "notice_units")?;
-		let burn = m["burn"].as_bool().ok_or_else(|| RecordError::Type("burn".into()))?;
 		// Written only when set, so `false` is not its canonical form.
 		if delegated && m["reclaim_delegated"] != Value::Bool(true) {
 			return Err(RecordError::Type("reclaim_delegated".into()));
 		}
-		let expiries = array(m, "expiries", MAX_STEPS)?;
-		let mut times = Vec::with_capacity(expiries.len());
-		for e in expiries {
-			let t = e.as_u64().filter(|t| *t <= u32::MAX as u64).ok_or_else(|| RecordError::Type("expiries".into()))?;
-			times.push(MedianTime::from_consensus(t as u32).map_err(crate::encode::DecodeError::from)?);
-		}
-		let schedule = ClockSchedule::new_unchecked(token, operator, notice, times).map_err(RecordError::Schedule)?;
+		let (schedule, burn) = if no_sweep {
+			(ClockSchedule::never(operator), false)
+		} else {
+			let token = AssetId::from_byte_array(display32(m, "token")?);
+			if token == crate::clock::no_sweep_token() {
+				return Err(RecordError::Decode(crate::encode::DecodeError::NoSweepToken));
+			}
+			let notice = units(m, "notice_units")?;
+			let burn = m["burn"].as_bool().ok_or_else(|| RecordError::Type("burn".into()))?;
+			let expiries = array(m, "expiries", MAX_STEPS)?;
+			let mut times = Vec::with_capacity(expiries.len());
+			for e in expiries {
+				let t = e.as_u64().filter(|t| *t <= u32::MAX as u64).ok_or_else(|| RecordError::Type("expiries".into()))?;
+				times.push(MedianTime::from_consensus(t as u32).map_err(crate::encode::DecodeError::from)?);
+			}
+			(ClockSchedule::new_unchecked(token, operator, notice, times).map_err(RecordError::Schedule)?, burn)
+		};
 
 		let path = array(m, "path", MAX_LEVELS)?;
 		if path.is_empty() {

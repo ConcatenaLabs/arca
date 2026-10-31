@@ -285,7 +285,7 @@ async fn an_expired_batch_is_released_then_swept() {
 	let pairs: Vec<(&Coin, &Keypair)> = boards.iter().zip(&keys).collect();
 	let got = refresh(&mut r, &pairs).await;
 	let round = got[0].round.clone();
-	let schedule = got[0].new_valid.branch.nodes[0].sweep;
+	let schedule = got[0].new_valid.branch.nodes[0].sweep.unwrap();
 	let e0 = match &got[0].new.held.record {
 		arca_covenant::CoinRecord::Leaf { record, .. } => record.schedule.expiries()[0].to_consensus_u32(),
 		_ => unreachable!(),
