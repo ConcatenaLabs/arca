@@ -55,7 +55,8 @@ fn the_builder_rebuilds_every_record_vector() {
 	for b in v["batches"].as_array().unwrap() {
 		let name = b["name"].as_str().unwrap();
 		let inp = &b["inputs"];
-		let no_sweep = inp.get("no_sweep").is_some_and(|n| n == true);
+		// A batch without a sweep has no token, notice or expiries.
+		let no_sweep = inp.get("no_sweep").is_some_and(|d| d == true);
 		let schedule = if no_sweep {
 			ClockSchedule::never(operator)
 		} else {
@@ -124,9 +125,9 @@ fn the_builder_rebuilds_every_record_vector() {
 		let expected: Vec<Vec<u64>> = b["children"].as_array().unwrap().iter()
 			.map(|l| l.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()).collect();
 		assert_eq!(counts, expected, "{}: the children of every node", name);
-		match b.get("clock0_script_pubkey") {
-			Some(c) => assert_eq!(tree.clock0_script_pubkey().unwrap().as_bytes().to_vec(), Vec::<u8>::from_hex(c.as_str().unwrap()).unwrap()),
-			None => assert!(no_sweep && tree.clock0_script_pubkey().is_none(), "{}: a batch without a sweep pays no token", name),
+		match tree.clock0_script_pubkey() {
+			None => assert!(no_sweep && b.get("clock0_script_pubkey").is_none(), "{}: a token only with a sweep", name),
+			Some(c) => assert_eq!(c.as_bytes().to_vec(), Vec::<u8>::from_hex(b["clock0_script_pubkey"].as_str().unwrap()).unwrap()),
 		}
 		for r in b["records"].as_array().unwrap() {
 			let i = r["leaf"].as_u64().unwrap() as usize;

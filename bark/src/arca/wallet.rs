@@ -1028,7 +1028,17 @@ impl Wallet {
 				goes no further with this operator, and takes on the chain every coin resting on what it signed after", at, why)));
 		}
 		self.witnessed_now()?;
-		let info = self.server.info()?;
+		let mut info = self.server.info()?;
+		// The client keeps an `info` for a few seconds; a transfer or a mailbox message since may
+		// have handed the wallet a newer head of the signer's record than the one it shows. Such
+		// an `info` is read again before its head is judged, so a head the operator moved past is
+		// never taken for an older one replayed.
+		if let (Some(shown), Some((top, _))) = (info["signer_record"]["entry"].as_u64(), self.store.seen_latest()?) {
+			if shown < top {
+				self.server.forget_info();
+				info = self.server.info()?;
+			}
+		}
 		if let Some(l) = info["boards"]["lifetime_seconds"].as_u64() {
 			if l < BOARD_LIFETIME as u64 {
 				return Err(Error::Refused(format!("the server serves a board for {} s from its confirmation; this wallet counts on {} s, \

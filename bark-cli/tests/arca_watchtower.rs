@@ -610,6 +610,23 @@ async fn a_wallet_deposits_with_the_default_watchtowers_that_watch_for_its_opera
 	let a = Arca::new("wt defaults A");
 	a.ok(&create_args(&url, &node));
 	let t = Tower::new("wt defaults T", &url, &node);
+	// A page on another origin may call it: its answers allow any origin, and
+	// a preflight of a deposit is answered at once.
+	let raw = |req: &str| -> String {
+		use std::io::{Read, Write};
+		let mut s = std::net::TcpStream::connect(&t.listen).unwrap();
+		s.write_all(req.as_bytes()).unwrap();
+		let mut out = String::new();
+		s.read_to_string(&mut out).unwrap();
+		out
+	};
+	let pre = raw("OPTIONS /v1/deposit HTTP/1.1\r\nHost: x\r\nOrigin: https://wallet.example\r\nAccess-Control-Request-Method: POST\r\n\
+		Access-Control-Request-Headers: content-type\r\n\r\n");
+	println!("preflight: {:?}", pre);
+	assert!(pre.starts_with("HTTP/1.1 204") && pre.contains("Access-Control-Allow-Origin: *") && pre.contains("Access-Control-Allow-Methods: GET, POST")
+		&& pre.contains("Access-Control-Allow-Headers: Content-Type"), "{}", pre);
+	let got = raw("GET /v1/info HTTP/1.1\r\nHost: x\r\nOrigin: https://wallet.example\r\n\r\n");
+	assert!(got.starts_with("HTTP/1.1 200") && got.contains("Access-Control-Allow-Origin: *"), "{}", got);
 	let info: Value = minreq::get(format!("{}/v1/info", t.url)).send().unwrap().json().unwrap();
 	let mut other = info.clone();
 	other["operator"] = serde_json::json!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");

@@ -1564,7 +1564,9 @@ impl Rounds {
 	/// assets. Coins resting on boards alone count for nothing, as the
 	/// operator's forfeit of them pays it back at once. A participation with a
 	/// coin within [`CAP_EXEMPT`] of its first expiry is never held by the
-	/// cap: its holder would otherwise take it on the chain. Nor is one whose
+	/// cap: its holder would otherwise take it on the chain. Nor is an
+	/// offboard (a holder moving coins out of the Ark), which the float the
+	/// cap keeps is for, though what it gives up counts in flight. Nor is one whose
 	/// coins rest only on lowest nodes that already hold fronted value and
 	/// can still come back ([`crate::delegations::can_complete`]): it opens
 	/// nothing new, and those nodes come back only once it runs, so holding it
@@ -1627,13 +1629,19 @@ impl Rounds {
 				*adds.entry(asset).or_default() += i.value;
 			}
 			let completes = completes && !adds.is_empty();
+			// A holder moving coins out of the Ark (an offboard: a stake, a
+			// withdrawal) is never held by the cap: the cap holds refreshes
+			// back so that the pool keeps what such moves need, and holding
+			// them too would leave that float unused. What it gives up still
+			// counts in flight.
+			let leaves_the_ark = row.outputs.iter().any(|o| matches!(o.kind, WantedKind::Offboard { .. }));
 			// One refresh larger than a cap above 0 runs when nothing else is
 			// in flight, or it would wait for ever.
 			let over = adds.iter().find(|(a, v)| {
 				let f = flight.get(*a).copied().unwrap_or(0);
 				f.saturating_add(**v) > caps[*a] && !(f == 0 && caps[*a] > 0)
 			}).map(|(a, _)| *a);
-			if let Some(a) = over.filter(|_| !near && !completes) {
+			if let Some(a) = over.filter(|_| !near && !completes && !leaves_the_ark) {
 				let why = format!("This refresh waits for a later round: the operator is refreshing as much of this asset as it takes on \
 					at once, and takes more as earlier refreshes come back. Nothing is lost meanwhile. (Asset {}: {} of a cap of {} \
 					in flight.)", a, flight.get(&a).copied().unwrap_or(0), caps[&a]);
