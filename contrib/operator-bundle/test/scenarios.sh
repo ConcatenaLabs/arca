@@ -69,17 +69,17 @@ scenario_down_idle() {
   SCENARIO=down-idle
   say "== $SCENARIO: the operator stops while its holders do nothing"
   mkwallet di1; mkwallet di2; mkwallet di3
-  round_holder di1 3000000
+  round_holder di1 "$(atoms 3000000 3)"
   local req; req=$(must di2 receive --asset "$ASSET" | jq -r .request)
-  must di1 send "$req" --amount 500000 > /dev/null
+  must di1 send "$req" --amount "$(atoms 500000)" > /dev/null
   must di2 sync > /dev/null
-  board di3 1000000
+  board di3 "$(atoms 1000000 2)"
   local req3; req3=$(request di3)
   local h1 h2 h3; h1=$(total di1); h2=$(total di2); h3=$(total di3)
   stop_op stop
   down_words di1
   # A request di3 made before the stop, paid while the operator is down.
-  try di2 send "$req3" --amount 1000
+  try di2 send "$req3" --amount "$(atoms 1000)"
   verbatim "di2 send" "$(msg)"
   [ "$(total di1)" = "$h1" ] && [ "$(total di2)" = "$h2" ] && [ "$(total di3)" = "$h3" ] && \
     result "loss" "none: every holder's total unchanged with the operator down ($h1, $h2, $h3)" || \
@@ -94,7 +94,7 @@ scenario_down_idle() {
   start_op
   try di3 sync
   req=$(request di1)
-  try di3 send "$req" --amount 1000
+  try di3 send "$req" --amount "$(atoms 1000)"
   [ "$OK" = 0 ] && result "recovery" "di3 (waited) paid di1 at once after the restart; nothing done by hand" || \
     result "recovery" "di3 could not pay di1 after the restart: $(msg)"
 }
@@ -103,31 +103,32 @@ scenario_down_transfer() {
   SCENARIO=down-transfer
   say "== $SCENARIO: the operator stops in the middle of an out-of-round transfer"
   local n; for n in dt1 dt2 dt3 dt5 dt6; do mkwallet $n; done
-  board dt1 3000000; board dt5 3000000
-  local req req3 req6 h5 pid
+  board dt1 "$(atoms 3000000 4)"; board dt5 "$(atoms 3000000 4)"
+  local req req3 req6 h5 pid a2 a6
+  a2=$(atoms 400000); a6=$(atoms 250000)
   req=$(request dt2); req3=$(request dt3); req6=$(request dt6)
   # (a) Paid and co-signed, not yet read by its receiver: the coin's record
   # is in dt2's mailbox at the operator, and nowhere else.
-  must dt1 send "$req" --amount 400000 > /dev/null
+  must dt1 send "$req" --amount "$a2" > /dev/null
   # (b) The signer gone: the wallet asks for its witness first, so nothing
   # is sent or recorded.
   $KILL_SIGNER > /dev/null 2>&1 || true
   sleep 1
-  try dt1 send "$req3" --amount 300000
+  try dt1 send "$req3" --amount "$(atoms 300000)"
   verbatim "dt1 send, the signer gone" "$(msg)"
   result "signer gone" "send exit $OK; dt1's coins $(coins dt1)"
   $START_OPERATOR > /dev/null 2>&1 || true
   for _ in $(seq 30); do op_up && break; sleep 1; done
   # (c) The operator killed while a transfer is in flight.
   h5=$(total dt5)
-  ( arca dt5 send "$req6" --amount 250000 > "$RUN/dt5.send.json" 2>&1; echo "exit $?" >> "$RUN/dt5.send.json" ) &
+  ( arca dt5 send "$req6" --amount "$a6" > "$RUN/dt5.send.json" 2>&1; echo "exit $?" >> "$RUN/dt5.send.json" ) &
   pid=$!
   sleep "${KILL_AFTER:-0.05}"
   stop_op kill
   wait "$pid" || true
   verbatim "dt5 send, operator killed in flight" "$(jq -r '.error.message // ("sent: " + (.sent|tostring))' "$RUN/dt5.send.json" 2>/dev/null | head -1)"
   down_words dt6
-  result "loss while down" "dt2 holds $(total dt2) of 400000 sent (unread at the stop); dt6 $(total dt6) of 250000; dt5 $h5 -> $(total dt5), coins $(coins dt5)"
+  result "loss while down" "dt2 holds $(total dt2) of $a2 sent (unread at the stop); dt6 $(total dt6) of $a6; dt5 $h5 -> $(total dt5), coins $(coins dt5)"
   # dt1 goes home alone with its change: the reassignment that made it also
   # made dt2's coin, which reaches the chain with it.
   exit_home dt1 "$(first_held dt1)"
@@ -136,7 +137,7 @@ scenario_down_transfer() {
   for i in 1 2 3; do arca dt5 sync > /dev/null 2>&1 || true; arca dt6 sync > /dev/null 2>&1 || true; arca dt2 sync > /dev/null 2>&1 || true; done
   result "recovery" "after the restart: dt6 holds $(total dt6) (paid in flight), dt5 $(total dt5); dt2 $(total dt2) (its sender went home first)"
   verbatim "dt2 refusals" "$(arca dt2 refusals | jq -c '[.[]|.reason]')"
-  [ "$(total dt2)" = 0 ] && result "FINDING" "dt2's 400000 is on the chain under dt2's key (the reassignment dt1's exit broadcast), and dt2's wallet refuses it: $(arca dt2 refusals | jq -r '.[-1].reason')"
+  [ "$(total dt2)" = 0 ] && result "FINDING" "dt2's $a2 is on the chain under dt2's key (the reassignment dt1's exit broadcast), and dt2's wallet refuses it: $(arca dt2 refusals | jq -r '.[-1].reason')"
 }
 
 scenario_down_round() {
@@ -211,9 +212,9 @@ scenario_down_lightning() {
   : "${PEER_OPERATOR_URL:?}" "${PEER_ROUND:-}"
   mkwallet dl1
   PEER=1 mkwallet dl2
-  board dl1 3000000
+  board dl1 "$(atoms 3000000 3)"
   local inv hash
-  inv=$(must dl2 lightning receive "$ASSET" 200000)
+  inv=$(must dl2 lightning receive "$ASSET" "$(atoms 200000)")
   hash=$(jq -r .payment_hash <<<"$inv"); inv=$(jq -r .invoice <<<"$inv")
   try dl1 lightning pay "$inv" --wait 2
   verbatim "dl1 lightning pay" "$(jq -c '{payment, error}' <<<"$OUT" | head -c 600)"

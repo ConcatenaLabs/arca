@@ -25,6 +25,12 @@ stopping if it does not. Stopping someone else's operator is never its to do.
     ./operator-tests.sh down-idle down-transfer down-round down-swap
     ./operator-tests.sh load
 
+Every amount a scenario moves is at least the operator's smallest leaf in
+`ASSET` (and the other operator's, for a payment into it), read from each
+operator's `/v1/info` at the start: an out-of-round payment or a receive below
+it is refused. On an operator with larger leaves the scenarios move leaf-sized
+amounts, and `FUND` pays a little more.
+
 Each run keeps everything in a directory of its own (`RUN`, by default
 `./operator-tests.<time>` under the current directory): every wallet, its
 standard error, `log`, `results` (one line per finding, the table the run
