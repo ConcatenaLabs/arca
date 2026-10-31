@@ -727,7 +727,7 @@ impl Wallet {
 	/// transaction of the path still missing, its size and its fee (from its
 	/// own reserve or from a fee coin of the wallet's, in `fee_asset` or the
 	/// asset the wallet would choose), their fees by asset (`unroll`), and the
-	/// claim's fee at the node's floor now, which the claim pays once the
+	/// claim's fee now (a quarter above the node's relay floor, as `fee_for` sets it), which the claim pays once the
 	/// leaf is in a block and its exit delay has run. A program shows it,
 	/// then runs the exit with the `unroll` it showed ([`Self::exit_shown`]).
 	/// Refuses what the exit would refuse for the same reason.
@@ -808,8 +808,8 @@ impl Wallet {
 			"leaf_id": leaf_id, "asset": asset.to_string(), "value": value.to_string(),
 			"fee_asset": payer.asset.map(|a| a.to_string()), "steps": steps, "unroll": unroll, "claim": claim,
 			"exit_delay_seconds": leaf.exit_delay.seconds(),
-			"note": "the fees at the node's floor now, each in its asset's own atoms; the unroll is broadcast only on the fees shown, \
-				and the claim pays the floor when it is made, once the leaf is in a block and its exit delay has run",
+			"note": "the fees now, a quarter above the node's relay floor, each in its asset's own atoms; the unroll is broadcast only on the fees shown, \
+				and the claim pays the fee of that moment when it is made, once the leaf is in a block and its exit delay has run",
 		}))
 	}
 

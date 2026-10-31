@@ -3493,7 +3493,20 @@ impl Wallet {
 	/// and rate now; a refusal when the node does not accept `asset` for fees.
 	pub(crate) fn fee_for(&self, asset: AssetId, vsize: u64) -> Result<u64, Error> {
 		let floor = self.chain.floor_per_kvb(asset)?.ok_or_else(|| Self::not_accepted(asset))?;
-		Ok(vsize.saturating_mul(floor).div_ceil(1000).max(1))
+		Ok(Self::above_floor(vsize.saturating_mul(floor).div_ceil(1000)))
+	}
+
+	/// How far above the node's relay floor a fee the wallet pays is set, in percent. The floor
+	/// in an asset's own atoms moves with every update of the asset's exchange rate: a fee
+	/// exactly at it is refused ("min relay fee not met") when the rate drops between the
+	/// wallet building a transaction and a node taking it, or when the node that takes it
+	/// updated its rates a moment apart from the wallet's.
+	pub(crate) const FEE_MARGIN_PERCENT: u64 = 25;
+
+	/// `at_floor`, a fee at the node's relay floor, with [`Self::FEE_MARGIN_PERCENT`] and one atom
+	/// over it.
+	pub(crate) fn above_floor(at_floor: u64) -> u64 {
+		at_floor.saturating_add(at_floor.saturating_mul(Self::FEE_MARGIN_PERCENT).div_ceil(100)).saturating_add(1)
 	}
 
 	pub(crate) fn not_accepted(asset: AssetId) -> Error {
@@ -3569,7 +3582,7 @@ impl Wallet {
 			"asset": asset.to_string(), "value": value.to_string(),
 			"fee": {"asset": fee_asset.to_string(), "amount": fee.to_string()},
 			"vsize": tx.vsize(), "inputs": inputs,
-			"note": "the fee at the node's floor now, in the fee asset's own atoms; the board goes ahead only on this fee",
+			"note": "the fee a quarter above the node's relay floor now (the floor moves with the exchange rate), in the fee asset's own atoms; the board goes ahead only on this fee",
 		}))
 	}
 
@@ -3812,6 +3825,23 @@ use elements::hashes::Hash as _;
 
 #[cfg(test)]
 mod tests {
+
+	/// A fee the wallet pays is a quarter above the relay floor and one atom more: a floor that
+	/// rises a little between building and relay (an exchange-rate update) still clears.
+	#[test]
+	fn fees_sit_above_the_floor() {
+		assert_eq!(Wallet::above_floor(0), 1);
+		assert_eq!(Wallet::above_floor(1), 3);
+		assert_eq!(Wallet::above_floor(400), 501);
+		assert_eq!(Wallet::above_floor(1001), 1253);
+		// the live case: a floor that rose 10% after the fee was set is still met
+		for floor in [1u64, 7, 230, 9_999, 1_000_000] {
+			let rose = floor + floor.div_ceil(10);
+			assert!(Wallet::above_floor(floor) >= rose, "floor {} -> {}, the fee {}", floor, rose, Wallet::above_floor(floor));
+		}
+		assert_eq!(Wallet::above_floor(u64::MAX), u64::MAX);
+	}
+
 	use super::*;
 	use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
 	use arca_covenant::{ClockSchedule, RecordError};
