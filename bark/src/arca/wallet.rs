@@ -2866,6 +2866,20 @@ impl Wallet {
 		}
 		let waiting = bases.iter().filter(|(_, f)| !f.is_final())
 			.map(|(t, f)| format!("{} is {}", t.txid(), f.word())).collect::<Vec<_>>().join("; ");
+		// None of what the coin rests on is in a block: nothing of it can be
+		// checked against the chain, or spent, until one is mined. It waits,
+		// or is lost if one of them can never return; the checks of its
+		// record run once a base is in a block. A wallet holding many coins
+		// waiting so (boards a reorganisation dropped, whose fees no block
+		// producer takes) reads each with a few calls, not a validation.
+		if bases.iter().all(|(_, f)| !f.in_chain()) {
+			for (t, f) in &bases {
+				if matches!(f, Finality::NotInChain { in_mempool: false }) && self.chain.gone(t)? {
+					return Ok(Checked::Lost(t.txid()));
+				}
+			}
+			return Ok(Checked::Holds("pending", format!("waiting: {}", waiting)));
+		}
 		// The bases that are not the ones the wallet stored for the coin.
 		let replaced: Vec<String> = txs.iter().map(|t| t.txid().to_string()).filter(|t| !c.bases.contains(t)).collect();
 		let valid = match self.resolve(record, &txs, policy) {
@@ -3794,17 +3808,21 @@ impl Wallet {
 		// not in the mempool (an anchor-driven reorganisation took it out,
 		// and the node did not keep it): broadcast again, its parents off the
 		// chain first, so it is mined and credited as it would have been.
-		// One the operator holds as lost is given up: the coins it spent are
-		// the wallet's on the chain again, and it is followed should it ever
-		// be credited ([`Self::lost_boards_credited`]).
+		// One the operator holds as lost is given up, in the mempool or not
+		// (a fee no block producer takes keeps it there): the operator credits
+		// it no more, the coins it spent are the wallet's on the chain again,
+		// and it is followed should it ever be credited
+		// ([`Self::lost_boards_credited`]).
 		for c in self.store.coins_in("pending")?.into_iter().filter(|c| c.kind == "board") {
 			let Some(Ok(txid)) = c.bases.first().map(|t| Txid::from_str(t)) else { continue };
-			if self.chain.whereabouts(&txid)? != (false, false) {
+			let (in_chain, in_mempool) = self.chain.whereabouts(&txid)?;
+			if in_chain {
 				continue;
 			}
 			match self.server.post("board_status", &json!({"leaf_id": c.leaf_id})) {
 				Ok(st) if st["state"].as_str() == Some("lost") => {
-					let why = "the server holds the board as lost: its transaction stayed out of every block";
+					let why = "the server holds the board as lost: its transaction stayed out of every block, and the operator \
+						credits it no more";
 					self.store.set_coin_state(&c.leaf_id, "lost", why)?;
 					out.push(json!({"board": c.leaf_id, "state": "lost", "why": why}));
 					continue;
@@ -3814,6 +3832,9 @@ impl Wallet {
 					out.push(json!({"board": c.leaf_id, "error": e.to_string()}));
 					continue;
 				},
+			}
+			if in_mempool {
+				continue;
 			}
 			let tx = match self.store.tx(&txid.to_string())? {
 				Some(raw) => elements::encode::deserialize::<Transaction>(&raw).map_err(|e| Error::Store(e.to_string()))?,
