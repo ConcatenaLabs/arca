@@ -79,7 +79,7 @@
 //! the forfeit the holder signed (see the server's watcher), and the holder's
 //! new coin is untouched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use elements::hashes::{sha256, Hash, HashEngine};
@@ -99,8 +99,16 @@ use super::wallet::{sign, Wallet};
 use super::Error;
 
 /// Where the wallet keeps the watchtowers it names: a JSON array of base
-/// URLs. Absent, the wallet uses those the operator's `info` lists.
+/// URLs. Absent, the wallet uses those the operator's `info` lists and the
+/// program's defaults.
 pub const WATCHTOWERS_META: &str = "watchtowers";
+
+/// Where the wallet keeps the watchtowers the program that runs it names by
+/// default ([`Wallet::set_default_watchtowers`]): a JSON array of base URLs,
+/// used beside the operator's while the user names none. A wallet program
+/// lists here watchtowers run by others than the operator, so its users do
+/// not rely on the operator alone to name who watches for them.
+pub const DEFAULT_WATCHTOWERS_META: &str = "watchtowers_default";
 
 /// The tag of the digest a coin's owner key signs to withdraw its deposit.
 pub const WITHDRAW_TAG: &[u8] = b"Arca/watchtower-withdraw";
@@ -321,10 +329,34 @@ impl Wallet {
 	// -----------------------------------------------------------------------
 
 	/// The watchtowers the wallet deposits with, and where the list comes
-	/// from: the wallet's own setting, or the operator's `info`.
+	/// from: the wallet's own setting, or the operator's `info` and the
+	/// program's defaults.
 	pub fn watchtowers(&self) -> Result<Value, Error> {
 		let (list, from) = self.tower_list()?;
-		Ok(json!({"watchtowers": list, "from": from}))
+		Ok(json!({"watchtowers": list, "from": from, "defaults": self.default_towers()?}))
+	}
+
+	/// Names the watchtowers the program running the wallet adds to the
+	/// operator's by default (each a base URL, as for
+	/// [`Self::set_watchtowers`]); an empty list adds none. A user's own
+	/// setting still replaces both.
+	pub fn set_default_watchtowers(&mut self, urls: &[String]) -> Result<Value, Error> {
+		for u in urls {
+			ServerClient::new(u)?;
+		}
+		if urls.is_empty() {
+			self.store.delete_meta(DEFAULT_WATCHTOWERS_META)?;
+		} else {
+			self.store.set_meta(DEFAULT_WATCHTOWERS_META, &json!(urls).to_string())?;
+		}
+		self.watchtowers()
+	}
+
+	fn default_towers(&self) -> Result<Vec<String>, Error> {
+		Ok(match self.store.meta(DEFAULT_WATCHTOWERS_META)? {
+			Some(v) => serde_json::from_str(&v).map_err(|e| Error::Store(format!("the default watchtowers: {}", e)))?,
+			None => vec![],
+		})
 	}
 
 	/// Names the watchtowers the wallet deposits with (each a base URL,
@@ -350,9 +382,38 @@ impl Wallet {
 			return Ok((list, "setting"));
 		}
 		let info = self.server.info().unwrap_or(Value::Null);
-		let list = info["watchtowers"].as_array().cloned().unwrap_or_default().iter()
+		let mut list: Vec<String> = info["watchtowers"].as_array().cloned().unwrap_or_default().iter()
 			.filter_map(|u| u.as_str().map(str::to_string)).filter(|u| ServerClient::new(u).is_ok()).collect();
-		Ok((list, "operator"))
+		let defaults = self.default_towers()?;
+		let from = if defaults.is_empty() { "operator" } else { "operator and defaults" };
+		for d in defaults {
+			if !list.iter().any(|u| u.trim_end_matches('/') == d.trim_end_matches('/')) {
+				list.push(d);
+			}
+		}
+		Ok((list, from))
+	}
+
+	/// Whether watchtower `url` can hold this wallet's deposits, from its
+	/// `info`: it watches this chain, for this wallet's operator (a sealed
+	/// deposit cannot be checked when it is taken, so one sent to a
+	/// watchtower of another operator would be refused only once it must
+	/// act), and takes sealed deposits. `Err` says why not.
+	fn tower_usable(&self, url: &str) -> Result<(), String> {
+		let info = ServerClient::new(url).and_then(|c| c.get("info")).map_err(|e| format!("its info does not answer: {}", e))?;
+		if info["watchtower"] != json!(true) {
+			return Err("it is not a watchtower".into());
+		}
+		if info["genesis_hash"].as_str() != Some(self.genesis.genesis_hash().to_string().as_str()) {
+			return Err("it watches another chain".into());
+		}
+		if info["operator"].as_str() != Some(self.operator.to_string().as_str()) {
+			return Err(format!("it watches for another operator ({})", info["operator"].as_str().unwrap_or("none named")));
+		}
+		if info["sealed"].as_u64().unwrap_or(0) < 1 {
+			return Err("it takes no sealed deposit".into());
+		}
+		Ok(())
 	}
 
 	/// The deposit of the coin `row`: its record, with the authorisations of
@@ -395,8 +456,25 @@ impl Wallet {
 	/// withdrawn. What it did, a line a coin and watchtower; a watchtower
 	/// that cannot be reached is tried again at the next `sync`.
 	pub(crate) fn progress_deposits(&mut self) -> Result<Vec<Value>, Error> {
-		let (towers, _) = self.tower_list()?;
+		let (named, _) = self.tower_list()?;
 		let mut out = vec![];
+		// Each watchtower's info is read once a sync, and only when a coin
+		// has a deposit still to send it; one that cannot hold the wallet's
+		// deposits is passed over, saying why.
+		let mut towers = vec![];
+		if !named.is_empty() {
+			let mut wanted = BTreeSet::new();
+			for row in self.store.coins_in_states(&["live"])? {
+				let sent = self.store.deposit_sent_to(&row.leaf_id)?;
+				wanted.extend(named.iter().filter(|t| !sent.contains(t)).cloned());
+			}
+			for t in named.iter().filter(|t| wanted.contains(*t)) {
+				match self.tower_usable(t) {
+					Ok(()) => towers.push(t.clone()),
+					Err(why) => out.push(json!({"watchtower": t, "passed_over": why})),
+				}
+			}
+		}
 		if !towers.is_empty() {
 			for row in self.store.coins_in_states(&["live"])? {
 				let sent = self.store.deposit_sent_to(&row.leaf_id)?;

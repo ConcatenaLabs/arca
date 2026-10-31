@@ -577,3 +577,61 @@ async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
 	println!("R's claim {} pays {} of X", claim, paid);
 	assert!(paid > 590_000, "R keeps the coin, less its claim's fee: {}", paid);
 }
+
+/// A stand-in watchtower that answers `GET /v1/info` with `info`, and
+/// nothing else: what a watchtower of another operator says of itself.
+fn info_only(info: Value) -> String {
+	let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let url = format!("http://{}", l.local_addr().unwrap());
+	std::thread::spawn(move || {
+		for s in l.incoming() {
+			let Ok(mut s) = s else { continue };
+			use std::io::{Read, Write};
+			let mut buf = [0u8; 4096];
+			let n = s.read(&mut buf).unwrap_or(0);
+			let req = String::from_utf8_lossy(&buf[..n]).to_string();
+			let (code, body) = if req.starts_with("GET") && req.contains("/v1/info") { ("200 OK", info.to_string()) }
+				else { ("404 Not Found", "{\"error\":\"not_found\"}".to_string()) };
+			let _ = write!(s, "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", code, body.len(), body);
+		}
+	});
+	url
+}
+
+/// A wallet program names watchtowers beside the operator's. The wallet
+/// deposits only with one that watches its chain for its own operator and
+/// takes sealed deposits: one of another operator, and one that does not
+/// answer, are passed over, saying why, and the deposit goes to the one
+/// that can hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_deposits_with_the_default_watchtowers_that_watch_for_its_operator() {
+	let mut r = Running::start().await;
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("wt defaults A");
+	a.ok(&create_args(&url, &node));
+	let t = Tower::new("wt defaults T", &url, &node);
+	let info: Value = minreq::get(format!("{}/v1/info", t.url)).send().unwrap().json().unwrap();
+	let mut other = info.clone();
+	other["operator"] = serde_json::json!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+	let foreign = info_only(other);
+	let gone = "http://127.0.0.1:1".to_string();
+	let w = a.ok(&["watchtowers", "--default", &foreign, "--default", &t.url, "--default", &gone]);
+	println!("A's watchtowers: {}", w);
+	assert_eq!(w["from"], "operator and defaults");
+	let l = board(&mut r, &a, "2000000").await;
+	a.ok(&["participate", "--leaf", &l, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let s = a.ok(&["sync"]);
+	let s = if s["deposits"].is_null() { a.ok(&["sync"]) } else { s };
+	println!("A's sync deposits: {}", s["deposits"]);
+	let deps = s["deposits"].as_array().unwrap();
+	let over = |u: &str| deps.iter().find(|d| d["watchtower"] == u).and_then(|d| d["passed_over"].as_str()).unwrap_or("").to_string();
+	assert!(over(&foreign).contains("another operator"), "{}", s["deposits"]);
+	assert!(over(&gone).contains("does not answer"), "{}", s["deposits"]);
+	assert!(deps.iter().any(|d| d["watchtower"] == t.url.as_str() && d["deposited"].is_string()), "{}", s["deposits"]);
+	assert_eq!(t.deposits().len(), 1);
+	assert_eq!(t.deposits()[0]["state"], "sealed");
+}

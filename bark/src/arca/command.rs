@@ -444,6 +444,9 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			Value::Null => w.set_watchtowers(None),
 			v => w.set_watchtowers(Some(&texts(v, "the watchtowers")?)),
 		},
+		// `urls`: the watchtowers the program adds to the operator's by
+		// default, while the user names none (an empty list: none).
+		"set_default_watchtowers" => w.set_default_watchtowers(&texts(&a["urls"], "the watchtowers")?),
 		"care" => {
 			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
 			// Channels first: a coin a plan names is not put into a channel.
