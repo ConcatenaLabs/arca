@@ -14,8 +14,10 @@ pub struct PoolFlow {
 	/// Of that, the leaves whose holders released their lowest node, not
 	/// reclaimed yet: back once every leaf of their batch is released.
 	pub released: u64,
-	/// Of that, the batches every leaf of which is released: the watcher
-	/// unrolls and reclaims them on its next passes.
+	/// Of that, the lowest nodes of tree batches every leaf of which is
+	/// released: the watcher unrolls toward them and reclaims them on its
+	/// next passes, whoever else rests on their batch. Leaves are laid into
+	/// lowest nodes as the builder lays them ([`arca_covenant::tree::spread`]).
 	pub reclaimable: u64,
 	/// Of `locked`, the leaves paid on out of round (given up in a
 	/// transfer, or a resting order's coin a fill spent), not reclaimed yet: no release of their lowest node can come
@@ -86,7 +88,7 @@ impl Store {
 		let conn = self.conn().await?;
 		let rows = conn.query(
 			"WITH live AS (
-			   SELECT b.round_id, b.vout, b.asset, b.value FROM batch b JOIN round r USING (round_id)
+			   SELECT b.round_id, b.vout, b.asset, b.value, b.radix, b.kind FROM batch b JOIN round r USING (round_id)
 			   WHERE r.state IN ('broadcast', 'final')
 			     AND NOT EXISTS (SELECT 1 FROM watcher_tx w JOIN nursery_tx n USING (txid)
 			                     WHERE w.kind = 'sweep' AND w.subject = b.token AND n.state = 'final')),
@@ -94,7 +96,7 @@ impl Store {
 			   SELECT DISTINCT w.subject AS node_hash, w.txid FROM watcher_tx w JOIN nursery_tx n USING (txid)
 			   WHERE w.kind = 'reclaim' AND n.state <> 'lost'),
 			 leaves AS (
-			   SELECT bl.round_id, bl.vout, bl.value,
+			   SELECT bl.round_id, bl.vout, bl.idx, bl.value, live.radix, live.kind,
 			          EXISTS (SELECT 1 FROM node_release nr WHERE nr.leaf_id = bl.leaf_id AND NOT nr.retired) AS released,
 			          (EXISTS (SELECT 1 FROM node_release nr JOIN reclaimed_node k USING (node_hash)
 			                  WHERE nr.leaf_id = bl.leaf_id)
@@ -109,6 +111,20 @@ impl Store {
 			          coalesce(sum(l.value) FILTER (WHERE l.transferred AND NOT l.reclaimed), 0) AS transferred,
 			          bool_and(l.released) AS all_released
 			   FROM leaves l GROUP BY 1, 2),
+			 sized AS (
+			   SELECT l.*, count(*) OVER (PARTITION BY l.round_id, l.vout) AS n FROM leaves l WHERE l.kind = 'tree'),
+			 spread AS (
+			   SELECT s.*, (s.n + s.radix - 1) / s.radix AS k FROM sized s),
+			 placed AS (
+			   SELECT p.*, p.n / p.k AS q, p.n % p.k AS rem FROM spread p),
+			 per_node AS (
+			   SELECT p.round_id, p.vout,
+			          CASE WHEN p.idx < p.rem * (p.q + 1) THEN p.idx / (p.q + 1) ELSE p.rem + (p.idx - p.rem * (p.q + 1)) / p.q END AS node,
+			          coalesce(sum(p.value) FILTER (WHERE p.released AND NOT p.reclaimed), 0) AS released,
+			          bool_and(p.released) AS all_released
+			   FROM placed p GROUP BY 1, 2, 3),
+			 node_back AS (
+			   SELECT round_id, vout, sum(released) AS reclaimable FROM per_node WHERE all_released GROUP BY 1, 2),
 			 back AS (
 			   SELECT x.round_id, x.vout, sum(c.value) AS v
 			   FROM (SELECT b.round_id, b.vout, b.asset, k.txid FROM live b
@@ -123,9 +139,10 @@ impl Store {
 			   GROUP BY 1, 2),
 			 locked AS (
 			   SELECT b.asset, sum(b.value - coalesce(bk.v, 0)) AS locked, sum(coalesce(p.released, 0)) AS released,
-			          sum(CASE WHEN p.all_released THEN coalesce(p.released, 0) ELSE 0 END) AS reclaimable,
+			          sum(coalesce(nb.reclaimable, 0)) AS reclaimable,
 			          sum(coalesce(p.transferred, 0)) AS transferred
 			   FROM live b LEFT JOIN per_batch p USING (round_id, vout) LEFT JOIN back bk USING (round_id, vout)
+			   LEFT JOIN node_back nb USING (round_id, vout)
 			   GROUP BY 1),
 			 drawn AS (
 			   SELECT asset, sum(v) AS drawn FROM (

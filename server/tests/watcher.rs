@@ -19,8 +19,9 @@
 //!    the owner's own leaf, which it put on-chain, exits untouched.
 //! 4. A batch every owner has refreshed and released, in two rounds, comes
 //!    back before it expires: the batch output unrolled by an owner's
-//!    authorisation, each lowest node reclaimed with an atom of each round's
-//!    connector asset.
+//!    authorisation as soon as the first lowest node is whole released,
+//!    though the other's owners have not released yet, and each lowest node
+//!    reclaimed with an atom of each round's connector asset.
 //! 6. A coin paid out of round from a board and then refreshed by its
 //!    receiver rests on that board alone, which no batch sweeps: the board
 //!    carries the dates of a batch made when it confirmed (`board_status`).
@@ -365,9 +366,10 @@ async fn a_batch_every_owner_released_comes_back_before_it_expires() {
 		common::flow::release(&r, x);
 	}
 	r.server.watcher.pass().await.unwrap();
-	assert!(of_kind(&r, "unroll").await.is_empty() && of_kind(&r, "reclaim").await.is_empty(),
-		"owners 3 and 4 have not released: nothing is unrolled");
-	println!("three of five owners released: the watcher waits");
+	assert_eq!(of_kind(&r, "unroll").await.len(), 1,
+		"owners 0, 1 and 2 are lowest node 0: the batch output is unrolled toward it, though owners 3 and 4 have not released");
+	assert!(of_kind(&r, "reclaim").await.is_empty(), "lowest node 0 is reclaimed once the unroll is on the chain");
+	println!("three of five owners released, the whole of lowest node 0: the batch output is unrolled toward it");
 	let third = refresh(&mut r, &[(&first[3].new, &k2[3]), (&first[4].new, &k2[4])]).await;
 	for x in &third {
 		common::flow::release(&r, x);

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::sign::sign_digest;
 use arca_covenant::{CoinRecord, Release, ValidOrigin};
-use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, transfer_body, want_leaf, Held};
+use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, rebuild, transfer_body, want_leaf, Held};
 use common::flow::{forfeit_for, held_by, Coin};
 use common::keys::{keypair, xonly};
 use common::rounds::{created, round_final, status, validate_new_leaf, VALUE};
@@ -283,13 +283,136 @@ async fn a_maker_refreshing_every_round_keeps_the_locked_value_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_holder_batches_the_maker_strands_its_value() {
+async fn without_holder_batches_the_maker_strands_a_leaf_a_round() {
 	const ROUNDS: usize = 6;
 	let without = maker_rounds(0, ROUNDS).await;
 	let grew = without[ROUNDS - 1].0 as i64 - without[2].0 as i64;
 	let per_round = grew / (ROUNDS as i64 - 3);
 	println!("no holder batches: locked grew {} over {} rounds, {} a round; reclaims {}", grew, ROUNDS - 3, per_round,
 		without[ROUNDS - 1].4);
-	assert_eq!(without[ROUNDS - 1].4, 0, "every batch has a user who never releases: nothing comes back early");
-	assert!(per_round >= 5 * VALUE as i64, "the maker's four leaves are stranded every round: {} a round", per_round);
+	// Each round's batch is the maker's four leaves and the user's, laid
+	// into lowest nodes of three and two: the maker's first three come back
+	// once it refreshes, its fourth shares a lowest node with the user, who
+	// never releases.
+	assert!(without[ROUNDS - 1].4 >= ROUNDS - 2, "the maker's lowest node of every round from the second on is reclaimed");
+	assert!(per_round >= 2 * VALUE as i64 && per_round < 3 * VALUE as i64,
+		"the user's leaf and the maker's leaf beside it are held every round, the other three come back: {} a round", per_round);
+}
+
+/// A batch of six leaves, laid into lowest nodes of three and three: a
+/// maker's first three in one, its fourth beside two users in the other.
+/// Once the maker refreshes and releases, the watcher unrolls the batch
+/// output and reclaims the maker's lowest node, though the users have not
+/// released: the users' coins stay theirs and work as before, one paid on
+/// out of round and the other refreshed, and once the second user and the
+/// maker's payee have released, the other lowest node comes back too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_lowest_node_comes_back_beside_owners_who_have_not_released() {
+	let mut r = Running::start_with(|c, _| {
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_wallet_in(x, 300_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mk0: Vec<Keypair> = (0..4).map(|i| keypair(&format!("shared maker board {}", i))).collect();
+	let uk0 = [keypair("shared user A board"), keypair("shared user B board")];
+	let mut all = mk0.clone();
+	all.extend(uk0);
+	let mut held = boards(&mut r, &all).await;
+	let users_boards = held.split_off(4);
+	let maker_boards = held;
+
+	// Round 1: the maker's four boards and the two users' into one batch.
+	let mk1: Vec<Keypair> = (0..4).map(|i| keypair(&format!("shared maker leaf {}", i))).collect();
+	let (mid, mn) = submit(&r, &maker_boards.iter().collect::<Vec<_>>(), &mk1, None);
+	let ua = [keypair("shared user A leaf")];
+	let ub = [keypair("shared user B leaf")];
+	let (aid, an) = submit(&r, &[&users_boards[0]], &ua, None);
+	let (bid, bn) = submit(&r, &[&users_boards[1]], &ub, None);
+	let b1 = r.server.rounds.run_round().await.unwrap().expect("round 1");
+	assert_eq!(b1.batches.len(), 1, "one shared batch");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &b1.tx.txid()).await;
+	let maker1 = complete(&r, &mid, &maker_boards.iter().collect::<Vec<_>>(), &mk1, &mn, true).await;
+	let user_a = complete(&r, &aid, &[&users_boards[0]], &ua, &an, false).await.remove(0);
+	let user_b = complete(&r, &bid, &[&users_boards[1]], &ub, &bn, false).await.remove(0);
+	let tree = rebuild(&r.http.post("tree", &json!({"txid": b1.tx.txid().to_string(), "vout": b1.batches[0].1})).ok());
+	let lowest: Vec<std::ops::Range<usize>> = tree.levels()[0].iter().map(|n| n.leaves.clone()).collect();
+	println!("round 1 {}: one batch of {} leaves, lowest nodes {:?}", b1.tx.txid(), tree.len(), lowest);
+	assert_eq!(lowest, vec![0..3, 3..6], "six leaves at radix 4 make two lowest nodes of three");
+
+	// Round 2: the maker refreshes its four leaves and releases their lowest
+	// nodes; the users do nothing.
+	let mk2: Vec<Keypair> = (0..4).map(|i| keypair(&format!("shared maker leaf {} again", i))).collect();
+	let mrefs: Vec<&Coin> = maker1.iter().collect();
+	let (mid2, mn2) = submit(&r, &mrefs, &mk2, None);
+	let b2 = r.server.rounds.run_round().await.unwrap().expect("round 2");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &b2.tx.txid()).await;
+	let maker2 = complete(&r, &mid2, &mrefs, &mk2, &mn2, true).await;
+	let (_, released, _, _) = pool(&r, x);
+	let reclaimable = r.http.get("chain").json["pool"][x.to_string()]["reclaimable"].as_str().unwrap().parse::<u64>().unwrap();
+	println!("after the maker's refresh: released {}, reclaimable {}", released, reclaimable);
+	assert_eq!(released, 4 * VALUE, "the maker's four leaves are released");
+	assert_eq!(reclaimable, 3 * VALUE, "the lowest node of the maker's first three leaves is whole released");
+
+	// The watcher's passes: the batch output unrolled, the maker's lowest
+	// node reclaimed; the other lowest node, with the users' leaves, stays.
+	for _ in 0..4 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		common::flow::broadcast_all(&r).await;
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	r.server.nursery.pass().await.unwrap();
+	let unrolls = common::flow::of_kind(&r, "unroll").await;
+	let reclaims = common::flow::of_kind(&r, "reclaim").await;
+	for w in unrolls.iter().chain(&reclaims) {
+		let tx: Transaction = elements::encode::deserialize(&w.tx).unwrap();
+		println!("  {} {} ({:?}): {} vB, {}", w.kind, tx.txid(), w.state, tx.vsize(), w.detail);
+	}
+	assert_eq!(unrolls.len(), 1, "the batch output alone is unrolled, toward the maker's lowest node");
+	assert_eq!(reclaims.len(), 1, "the maker's lowest node is reclaimed");
+	for w in unrolls.iter().chain(&reclaims) {
+		assert_eq!(w.state, server::store::NurseryState::Final, "{} final", w.kind);
+	}
+	let (locked, released, _, _) = pool(&r, x);
+	let reclaimable = r.http.get("chain").json["pool"][x.to_string()]["reclaimable"].as_str().unwrap().parse::<u64>().unwrap();
+	println!("after the passes: locked {}, released {}, reclaimable {}", locked, released, reclaimable);
+	assert_eq!(released, VALUE, "the maker's fourth leaf, beside the users, stays released and held");
+	assert_eq!(reclaimable, 0);
+
+	// User A's coin is unchanged by the unroll: it pays on out of round.
+	let va = user_a.valid(&r);
+	let (to, _) = new_leaf(&keypair("user A's payee"));
+	let paid = va.value - 2_000;
+	let done = r.http.post("cosign_transfer", &transfer_body(&[(&user_a.held, va.clone(), paid)], &[(x, paid - 2_000, to)], xonly(&r.s), r.chain)).ok();
+	println!("user A pays on out of round after the unroll: {}", done["outputs"][0]["leaf_id"]);
+	assert!(done["outputs"][0]["leaf_id"].is_string(), "{}", done);
+
+	// User B's coin refreshes in a round as before, and releases.
+	let ub2 = [keypair("shared user B leaf again")];
+	let (bid2, bn2) = submit(&r, &[&user_b], &ub2, None);
+	let b3 = r.server.rounds.run_round().await.unwrap().expect("round 3");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &b3.tx.txid()).await;
+	complete(&r, &bid2, &[&user_b], &ub2, &bn2, true).await;
+	println!("user B refreshes after the unroll: round {} final", b3.tx.txid());
+	// The other lowest node still waits for user A's payee, which can
+	// release nothing (no RECLAIM-D on this batch): it comes back at expiry.
+	for _ in 0..3 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		common::flow::broadcast_all(&r).await;
+		r.produce().await;
+	}
+	assert_eq!(common::flow::of_kind(&r, "reclaim").await.len(), 1, "a lowest node with a coin paid on out of round waits");
+	let _ = maker2;
 }

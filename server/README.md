@@ -242,9 +242,9 @@ block and its anchor's burial, what the wallet holds of each asset, final or
 not (`holdings`; `fundable` in `info` leaves out the change of rounds not yet
 final), and where each asset's value is besides the wallet (`pool`): what its
 live batches hold until a reclaim or their expiry brings it back (`locked`), of
-that what holders released and is not reclaimed yet (`released`), in batches
-every leaf of which is released and that the watcher reclaims on its next passes
-(`reclaimable`), and in leaves paid on out of round (a transfer's input, or a
+that what holders released and is not reclaimed yet (`released`), in lowest
+nodes every leaf of which is released, which the watcher unrolls toward and
+reclaims on its next passes (`reclaimable`), and in leaves paid on out of round (a transfer's input, or a
 resting order's coin a fill spent) and not reclaimed, whose
 owners can release nothing, so that they come back by RECLAIM-D once every
 coin they became is refreshed and released, and otherwise at their batch's
@@ -2253,13 +2253,18 @@ meanwhile.
   by RECLAIM-D (by RECLAIM when every slot is its leaf owner's own release),
   with an atom of each connector asset the trees' releases name. A node one
   of whose coins is still held, or moved without a delegation, waits. With
-  `reclaim_early`, a node all of whose lowest nodes are released is unrolled
-  first, by a released owner's authorisation, until the lowest nodes are on
-  the chain, so a fully refreshed batch comes back before it expires; the
-  watcher never unrolls a node with an owner who has not released, since a
-  wallet whose lineage appears on the chain takes its coin home at once. A
-  batch so comes back early only when all its leaves are refreshed, which is
-  why a holder that moves its coins soon has a batch of its own (see Rounds).
+  `reclaim_early`, the nodes above each lowest node that so consents are
+  unrolled first, by the authorisation of one of its owners, until that
+  lowest node is on the chain, so it comes back before its batch expires,
+  whoever else rests on the batch: an upper node on the chain puts no leaf
+  or checkpoint of anyone's coin there, so no wallet under it takes its coin
+  home for it (a wallet does so once a leaf or checkpoint of its coin's
+  lineage appears), and each one's own exit is a step shorter. The watcher
+  never unrolls a lowest node with an owner who has not released, which
+  would put that owner's leaf on the chain. A lowest node so comes back
+  early only when all its leaves are refreshed, which is why a holder that
+  moves its coins soon has a batch of its own (see Rounds), and why a
+  shared batch keeps each holder's leaves side by side.
   A leaf paid on out of round is never released (a release is its owner's,
   over the round of its own new leaf), so its batch comes back at its
   expiry.
