@@ -10,6 +10,7 @@
 //! with its reason and exits with status 1.
 
 mod bitcoin;
+mod tower;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,6 +40,24 @@ struct Cli {
 
 	#[command(subcommand)]
 	command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum TowerCmd {
+	/// Serves deposits over HTTP (`GET /v1/info`, `POST /v1/deposit`,
+	/// `POST /v1/withdraw`) and passes over them every `interval` seconds,
+	/// until stopped. Needs the node only, never the operator.
+	Serve {
+		/// The address to listen on.
+		#[arg(long, default_value = "127.0.0.1:3536")]
+		listen: String,
+		#[arg(long, default_value_t = 30)]
+		interval: u64,
+	},
+	/// One pass over the deposits, then stops.
+	Pass,
+	/// The deposits held, each with its state and what it cost.
+	Deposits,
 }
 
 #[derive(Subcommand)]
@@ -429,6 +448,27 @@ enum Cmd {
 	/// their expiry: each coin, its value, the late-refresh fee, what is owed
 	/// and how it stands. `sync` claims each and takes the new coin home.
 	Owed,
+	/// The watchtowers the wallet deposits its coins with, after naming them
+	/// when given: each live coin resting on a batch is deposited with each
+	/// at `sync`, so any one of them takes it on the chain under its owner's
+	/// key, should the wallet be away when its batch is released. While none
+	/// is named, the wallet uses those the operator lists.
+	Watchtowers {
+		/// Base URLs of watchtowers, in place of those named before.
+		urls: Vec<String>,
+		/// Go back to the watchtowers the operator lists.
+		#[arg(long, conflicts_with_all = ["urls", "none"])]
+		operator: bool,
+		/// Deposit with no watchtower.
+		#[arg(long, conflicts_with = "urls")]
+		none: bool,
+	},
+	/// This wallet as a watchtower for other wallets' coins: it takes their
+	/// deposits and, once a batch a deposited coin rests on is released,
+	/// brings the coin on the chain under its owner's key, paying what the
+	/// path's reserves cannot from this wallet's own on-chain coins.
+	#[command(subcommand)]
+	Watchtower(TowerCmd),
 	/// Cancels the steps of an offline-refresh plan that have not started.
 	PlanCancel {
 		plan: String,
@@ -1270,7 +1310,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Offboards | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
 		| Cmd::Channel(ChannelCmd::List) | Cmd::Channel(ChannelCmd::Exit { .. })
-		| Cmd::Distributions | Cmd::Plans)
+		| Cmd::Distributions | Cmd::Plans | Cmd::Watchtower(_))
 	{
 		match w.witness() {
 			Ok(v) if !v["rolled_back"].is_null() => eprintln!("arca: the witness on start: {}", v),
@@ -1282,7 +1322,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// The re-check runs on every start: a rollback since the last command
 	// un-credits what it took out before anything is spent or shown.
 	let startup = match &cli.command {
-		Cmd::Recheck | Cmd::Sync { .. } | Cmd::Schedule => None,
+		Cmd::Recheck | Cmd::Sync { .. } | Cmd::Schedule | Cmd::Watchtower(_) => None,
 		_ => match w.recheck() {
 			Ok(v) => Some(v),
 			Err(e) => {
@@ -1506,6 +1546,20 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Plans => w.plans(),
 		Cmd::Owed => w.owed(),
+		Cmd::Watchtowers { urls, operator, none } => {
+			if operator {
+				w.set_watchtowers(None)
+			} else if none {
+				w.set_watchtowers(Some(&[]))
+			} else if !urls.is_empty() {
+				w.set_watchtowers(Some(&urls))
+			} else {
+				w.watchtowers()
+			}
+		},
+		Cmd::Watchtower(TowerCmd::Serve { listen, interval }) => tower::serve(&mut w, &listen, interval),
+		Cmd::Watchtower(TowerCmd::Pass) => w.tower_pass(),
+		Cmd::Watchtower(TowerCmd::Deposits) => w.tower_deposits(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
 		Cmd::Care { scan, expiries, max_fee_ppm, plan_within, channels } => {

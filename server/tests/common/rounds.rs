@@ -23,8 +23,19 @@ pub const VALUE: u64 = 1_000_000;
 /// A server serving X and Y, its wallet paid two coins of X and one of Y,
 /// all final.
 pub async fn start() -> Running {
+	start_tuned(true).await
+}
+
+/// [`start`] with the operator's unroll at release off, for a test that
+/// follows the sweep of a live coin.
+pub async fn start_sweeping() -> Running {
+	start_tuned(false).await
+}
+
+async fn start_tuned(unroll_at_release: bool) -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
+		c.watcher.unroll_at_release = unroll_at_release;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;

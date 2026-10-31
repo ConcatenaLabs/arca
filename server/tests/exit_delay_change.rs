@@ -31,7 +31,7 @@ use arca_covenant::ValidOrigin;
 use common::client::{auths_json, forfeit_sig, hex, participation_body, want_leaf};
 use common::flow::{claim_of, claimed, drive, final_of, forfeit_for, has, held_by, log, of_kind, refresh, settle, Coin};
 use common::keys::{keypair, xonly};
-use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, status, validate_new_leaf};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, start_sweeping, status, validate_new_leaf};
 use common::running::Running;
 
 fn send(r: &Running, what: &str, tx: &Transaction) -> Txid {
@@ -179,7 +179,7 @@ async fn a_board_registered_before_the_change_is_credited_after_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_made_before_the_change_is_swept_at_its_expiry() {
-	let mut r = start().await;
+	let mut r = start_sweeping().await;
 	let mut coins = vec![];
 	let mut keys = vec![];
 	for i in 0..2 {

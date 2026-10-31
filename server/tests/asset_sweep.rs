@@ -27,6 +27,9 @@ fn fee_asset(tx: &Transaction) -> AssetId {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_is_released_and_swept_in_its_own_asset() {
 	let mut r = Running::start_with(|c, y| {
+		// What follows is the sweep of a live coin: the operator does not take
+		// it on the chain at its batch's release first.
+		c.watcher.unroll_at_release = false;
 		c.assets.push(toml::from_str(&format!("asset = \"{}\"\nmin_leaf = \"1000\"\n", y)).unwrap());
 	}).await;
 	let (x, y) = (r.x, r.y);

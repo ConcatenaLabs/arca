@@ -134,6 +134,7 @@ async fn exited(r: &Running, w: &Arca, leaf: &str) {
 async fn accumulator_leaves_are_held_paid_left_and_swept() {
 	let mut r = Running::start_with(|c, _, _| {
 		c.batches.accumulator_exit_rate_ppm = Some(10_000);
+		c.watcher.unroll_at_release = false;
 	}).await;
 	let (url, node) = (r.url(), r.node_url());
 	let x = r.x.to_string();

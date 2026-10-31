@@ -292,15 +292,22 @@ sweep pays every input whole to an `OP_RETURN` at its own index, and takes a
 fee coin. The operator signs each input's signature hash.
 
 The sweep takes whatever is left in the batch, and the scripts do not say
-whose it was. What the operator does with it is its policy: Arca's server
-repays every coin a final sweep took from its holder as a new leaf in the
-asset's next round, less the late-refresh fee, once the holder's wallet
-claims it, and publishes that it does
-([Swept coins are repaid](../server/README.md#swept-coins-are-repaid)). A
-script guarantee would need every abandoned leaf brought on the chain, which
-is the cost expiry exists to avoid, so expiry delays a holder's coin and
-costs it that fee, and a holder who wants no reliance on the operator for it
-refreshes or exits before the exit deadline.
+whose it was. A leaf on the chain is no longer in it: its exit pays its owner
+and nothing sweeps it. So a coin is kept from the sweep by bringing it on the
+chain during the notice, which anyone holding its coin record can do: the
+record carries its owner's unroll authorisations and its entry's preimage
+(and, for a coin paid out of round, the pairs of every step), each of which
+spends only into the outputs it pins. A wallet hands its record to
+watchtowers, its own batch leaf's authorisations signed for a time an hour
+before the batch's first expiry so that they unroll nothing sooner; the
+operator, a member of every node, does the same from its own records
+([Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
+The holder then relies on any one of them acting within the notice, paid
+from the path's reserves. What a sweep takes from a holder all the same is
+the operator's to repay by its policy: Arca's server repays it as a new leaf
+in the asset's next round, less the late-refresh fee, once the holder's
+wallet claims it, and publishes that it does
+([Swept coins are repaid](../server/README.md#swept-coins-are-repaid)).
 
 A batch run by its asset's issuer is burn-only: the round that makes it
 reissues its value through the asset's mint limiter (`limiter`), and its sweep

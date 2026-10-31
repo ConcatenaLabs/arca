@@ -635,7 +635,7 @@ fn spender_of(r: &Running, op: &elements::OutPoint) -> Option<Transaction> {
 /// nowhere; the board B gave up for it is spent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_coin_restored_past_its_expiry_goes_home_while_its_path_stands() {
-	let mut r = Running::start().await;
+	let mut r = Running::start_sweeping().await;
 	let (url, node) = (r.url(), r.node_url());
 	let x = r.x;
 	let (a, b, a2, b2) = (Arca::new("RXPA"), Arca::new("RXPB"), Arca::new("RXPA2"), Arca::new("RXPB2"));

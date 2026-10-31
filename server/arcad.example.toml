@@ -78,6 +78,13 @@ enabled = true
 # reclaim those lowest nodes, so a fully refreshed batch comes back before it
 # expires. A node with an owner who has not released is never unrolled.
 reclaim_early = true
+# Bring every live coin of a released batch on the chain under its holder's
+# key before the sweep, paid from the path's reserves: the sweep then takes
+# only what no one could bring on the chain.
+unroll_at_release = true
+# The watchtowers `info` lists for holders who name none of their own: base
+# URLs of `arca watchtower serve` instances, each https://.
+watchtowers = []
 # The most outputs one sweep takes.
 max_sweep_inputs = 50
 # How often the watcher's recovery work (claims, offboards, expiry, reclaims)

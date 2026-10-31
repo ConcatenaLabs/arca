@@ -11,7 +11,10 @@ one asset, and every asset issued on Sequentia can have batches of its own.
 
 A batch expires 28 days after its round, and after a public notice the operator
 may then sweep what is left in it, so a holder moves each leaf into a new batch
-before then: a refresh. A coin the operator sweeps from a holder who stayed away
+before then: a refresh. A holder who stays away does not lose the coin to the
+sweep: once its batch is released, the operator, and every watchtower the holder's
+wallet deposited the coin with, bring it on the chain under the holder's own key,
+and the wallet boards it back when it returns. A coin a sweep takes all the same
 is not the operator's to keep: its server owes it back, less the late-refresh fee,
 and repays it as a new leaf once the holder's wallet claims it. The holder submits a participation once, naming the leaves
 it gives up and the leaves it wants, and the operator runs it in the next round
@@ -33,7 +36,8 @@ The operator's server watches the chain for what follows. A holder who brings a
 leaf it gave up back on-chain is answered, before the leaf's exit delay runs out,
 by that leaf's forfeit or by the checkpoint and reassignment it signed. A board
 given up in a round comes back to the operator by its forfeit; an expired batch
-is released and, after the notice, swept; a node every owner has released is
+is released, every live coin of it brought on the chain under its holder's key,
+and, after the notice, what is left swept; a node every owner has released is
 reclaimed before the batch expires. An offboard is paid to its destination once
 its owner hands over its forfeit, and reclaimed by the operator after a delay if
 the owner never does. Everything it publishes is broadcast again unchanged after

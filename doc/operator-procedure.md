@@ -321,9 +321,10 @@ operator serves one so that a frozen holder can neither move nor escape
   a refresh, an offboard, a take, a fill, a distribution, a plan, a Lightning
   payment. It never stops the holder taking the coin home by its landing,
   into its own key, where the freeze binds on the chain; and a coin not taken
-  home before its batch's exit deadline is swept with the batch, as any coin
-  neither refreshed nor taken home, and repaid as a `landing-1` coin to its
-  holder's landing key, less the late-refresh fee.
+  home before its batch's exit deadline is brought on the chain at its
+  batch's release, as any coin neither refreshed nor taken home, its landing
+  then its holder's; one a sweep took all the same is repaid as a
+  `landing-1` coin to its holder's landing key, less the late-refresh fee.
 
 ## What holders are told
 
@@ -374,11 +375,22 @@ Every holder receives these rules before the operator holds their coins:
   coin once its first step could run within ten days; a younger coin stays
   unplanned so it can still be paid out of round. A wallet closed within a
   coin's first two weeks or so and kept closed through that coin's step window
-  can therefore find the coin swept, as any absent holder can, and repaid
-  at its next sync, less the late-refresh fee.
-- **A coin left past its expiry is repaid, not lost.** A coin whose holder
-  neither refreshed it nor took it home before its batch was swept is owed
-  back by the operator, less the late-refresh fee (the asset's refresh fee at
+  can therefore find the coin taken on the chain at its batch's release, as
+  any absent holder can, and boarded back at its next sync (or, swept all the
+  same, repaid less the late-refresh fee).
+- **A coin left past its expiry is taken on the chain, not swept.** Once
+  its batch is released, the operator brings every live coin of it on the
+  chain under its holder's key (`[watcher] unroll_at_release`), and so does
+  every watchtower the holder's wallet deposited it with (`arca
+  watchtowers`; the operator's `info` lists the ones a wallet uses when it
+  names none, `[watcher] watchtowers`). Each needs only the chain and the
+  coin's record, so the coin is safe while any one of them acts within the
+  notice. The wallet, back, finds the coin on the chain ("moved out of the
+  Ark to keep it safe while you were away"), takes it home and boards it
+  again by itself.
+- **A coin a sweep took all the same is repaid, not lost.** A coin whose
+  holder neither refreshed it nor took it home, and that nobody brought on
+  the chain before its batch was swept, is owed back by the operator, less the late-refresh fee (the asset's refresh fee at
   its full charge: `refresh_ppm` of the coin and `refresh_base`). The next
   `arca sync`, from the wallet or one restored from its mnemonic, finds it,
   claims it, and holds the new coin once its round is final; until then
@@ -387,7 +399,8 @@ Every holder receives these rules before the operator holds their coins:
   again, the coin back in its batch meanwhile. This is the operator's
   policy, published in `info` (`swept`), kept by its server, and owed for as
   long as the operator runs: a holder who wants to rely on no operator for
-  it refreshes or takes the coin home before its exit date.
+  it names watchtowers of its own, or refreshes or takes the coin home
+  before its exit date.
 - **When a payment answers `unreachable`, run `arca sync` again that
   day.** The next `sync` posts the payment again, and its receiver reads it
   once it completes.

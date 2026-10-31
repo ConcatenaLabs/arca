@@ -96,6 +96,9 @@ async fn settle(r: &Running) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 	let mut r = Running::start_with(|c, y| {
+		// What follows is the sweep of a live coin: the operator does not take
+		// it on the chain at its batch's release first.
+		c.watcher.unroll_at_release = false;
 		let x = c.assets[0].asset.clone();
 		c.assets = vec![
 			toml::from_str(&format!("asset = \"{}\"\nmin_leaf = \"{}\"\nrefresh_ppm = {}\nrefresh_base = \"{}\"\n", x, MIN_LEAF, PPM, BASE))

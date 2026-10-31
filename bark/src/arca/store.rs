@@ -156,7 +156,41 @@ CREATE TABLE IF NOT EXISTS resting_order (
 	state TEXT NOT NULL,
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deposit (leaf_id TEXT PRIMARY KEY, id TEXT NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS deposit_sent (leaf_id TEXT NOT NULL, tower TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (leaf_id, tower));
+CREATE TABLE IF NOT EXISTS tower_deposit (
+	id TEXT PRIMARY KEY,
+	owner TEXT NOT NULL,
+	leaf_id TEXT NOT NULL,
+	record BLOB NOT NULL,
+	bases TEXT NOT NULL,
+	state TEXT NOT NULL,
+	note TEXT NOT NULL DEFAULT '',
+	txs TEXT NOT NULL DEFAULT '[]',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
 ";
+
+/// A deposit a watchtower holds ([`super::tower`]).
+#[derive(Debug, Clone)]
+pub struct TowerRow {
+	/// The deposit's id, hex: the SHA256 of its record.
+	pub id: String,
+	/// The coin's owner key, hex.
+	pub owner: String,
+	pub leaf_id: String,
+	/// The coin record, binary form.
+	pub record: Vec<u8>,
+	/// The transactions it rests on, a JSON array of hex.
+	pub bases: String,
+	/// `held`, `brought`, `on_chain` or `gone`.
+	pub state: String,
+	pub note: String,
+	/// What the watchtower broadcast for it, a JSON array.
+	pub txs: String,
+}
 
 /// A resting order the wallet made ([`super::resting`]), as the store holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +358,99 @@ impl Store {
 		if !has {
 			self.conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, kind)).map_err(db)?;
 		}
+		Ok(())
+	}
+
+	// --- watchtower deposits: the holder's ---
+
+	/// The deposit built for `leaf_id`: its id and its body.
+	pub fn deposit(&self, leaf_id: &str) -> Result<Option<(String, String)>, Error> {
+		self.conn.query_row("SELECT id, body FROM deposit WHERE leaf_id = ?1", params![leaf_id], |r| Ok((r.get(0)?, r.get(1)?)))
+			.optional().map_err(db)
+	}
+
+	pub fn put_deposit(&self, leaf_id: &str, id: &str, body: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT OR REPLACE INTO deposit (leaf_id, id, body) VALUES (?1, ?2, ?3)", params![leaf_id, id, body]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Every deposit built: leaf id and deposit id.
+	pub fn deposits(&self) -> Result<Vec<(String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, id FROM deposit ORDER BY leaf_id").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
+	pub fn delete_deposit(&self, leaf_id: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM deposit WHERE leaf_id = ?1", params![leaf_id]).map_err(db)?;
+		Ok(())
+	}
+
+	/// The watchtowers `leaf_id`'s deposit went to.
+	pub fn deposit_sent_to(&self, leaf_id: &str) -> Result<Vec<String>, Error> {
+		let mut st = self.conn.prepare("SELECT tower FROM deposit_sent WHERE leaf_id = ?1 ORDER BY tower").map_err(db)?;
+		let rows = st.query_map(params![leaf_id], |r| r.get(0)).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
+	pub fn put_deposit_sent(&self, leaf_id: &str, tower: &str) -> Result<(), Error> {
+		self.conn.execute("INSERT OR REPLACE INTO deposit_sent (leaf_id, tower, at) VALUES (?1, ?2, ?3)", params![leaf_id, tower, now()])
+			.map_err(db)?;
+		Ok(())
+	}
+
+	pub fn delete_deposit_sent(&self, leaf_id: &str, tower: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM deposit_sent WHERE leaf_id = ?1 AND tower = ?2", params![leaf_id, tower]).map_err(db)?;
+		Ok(())
+	}
+
+	// --- watchtower deposits: the watchtower's ---
+
+	pub fn tower_count(&self) -> Result<u64, Error> {
+		self.conn.query_row("SELECT COUNT(*) FROM tower_deposit", [], |r| r.get::<_, i64>(0)).map(|n| n as u64).map_err(db)
+	}
+
+	/// Takes a deposit; one held before for the same owner key is replaced.
+	pub fn tower_put(&self, id: &str, owner: &str, leaf_id: &str, record: &[u8], bases: &str) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		tx.execute("DELETE FROM tower_deposit WHERE owner = ?1 AND id != ?2", params![owner, id]).map_err(db)?;
+		tx.execute("INSERT INTO tower_deposit (id, owner, leaf_id, record, bases, state, note, txs, created_at, updated_at) \
+			VALUES (?1, ?2, ?3, ?4, ?5, 'held', '', '[]', ?6, ?6) ON CONFLICT(id) DO NOTHING", params![id, owner, leaf_id, record, bases, now()])
+			.map_err(db)?;
+		tx.commit().map_err(db)
+	}
+
+	fn tower_row(r: &rusqlite::Row) -> rusqlite::Result<TowerRow> {
+		Ok(TowerRow { id: r.get(0)?, owner: r.get(1)?, leaf_id: r.get(2)?, record: r.get(3)?, bases: r.get(4)?, state: r.get(5)?,
+			note: r.get(6)?, txs: r.get(7)? })
+	}
+
+	pub fn tower_get(&self, id: &str) -> Result<Option<TowerRow>, Error> {
+		self.conn.query_row("SELECT id, owner, leaf_id, record, bases, state, note, txs FROM tower_deposit WHERE id = ?1", params![id],
+			Self::tower_row).optional().map_err(db)
+	}
+
+	pub fn tower_all(&self) -> Result<Vec<TowerRow>, Error> {
+		let mut st = self.conn.prepare("SELECT id, owner, leaf_id, record, bases, state, note, txs FROM tower_deposit ORDER BY created_at, id")
+			.map_err(db)?;
+		let rows = st.query_map([], Self::tower_row).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
+	pub fn tower_delete(&self, id: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM tower_deposit WHERE id = ?1", params![id]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Sets a deposit's state and note, and what was broadcast for it when
+	/// given.
+	pub fn tower_set(&self, id: &str, state: &str, note: &str, txs: Option<&str>) -> Result<(), Error> {
+		match txs {
+			Some(t) => self.conn.execute("UPDATE tower_deposit SET state = ?2, note = ?3, txs = ?4, updated_at = ?5 WHERE id = ?1",
+				params![id, state, note, t, now()]),
+			None => self.conn.execute("UPDATE tower_deposit SET state = ?2, note = ?3, updated_at = ?4 WHERE id = ?1",
+				params![id, state, note, now()]),
+		}.map_err(db)?;
 		Ok(())
 	}
 

@@ -31,6 +31,12 @@
 //!   node before every payment out of round, the operator's signatures the
 //!   wallet's coins carry as evidence, and `watch-bond`, which burns the bond
 //!   on two different messages the operator key signed under one salt.
+//! - [`tower`]: watchtowers: every live coin resting on a batch deposited,
+//!   at `sync`, with the watchtowers the wallet names, so any one of them can
+//!   take it on the chain under its owner's key once its batch is released;
+//!   the watchtower's own side (taking deposits, bringing them on the
+//!   chain); and a coin kept safe that way boarded back on the wallet's
+//!   return.
 //! - [`btc_swap`]: a swap of native BTC in a Bitcoin ark for an asset in the
 //!   operator's tree, with another wallet of the operator, under one payment
 //!   hash; the Bitcoin side, Bark, is run by the program, which hands in what
@@ -121,6 +127,7 @@ mod restore;
 pub mod resting;
 mod round;
 mod take;
+pub mod tower;
 mod wallet;
 
 pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};

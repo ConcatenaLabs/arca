@@ -437,6 +437,13 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"plans" => w.plans(),
 		"owed" => w.owed(),
+		"watchtowers" => w.watchtowers(),
+		// `urls`: the watchtowers to deposit with (an empty list: none);
+		// absent or null, the operator's list again.
+		"set_watchtowers" => match &a["urls"] {
+			Value::Null => w.set_watchtowers(None),
+			v => w.set_watchtowers(Some(&texts(v, "the watchtowers")?)),
+		},
 		"care" => {
 			let steps = opt_u64(&a["expiries"], "the expiries")?.map_or(super::plan::DEFAULT_STEPS, |n| n.min(64) as usize);
 			// Channels first: a coin a plan names is not put into a channel.

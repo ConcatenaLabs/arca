@@ -48,7 +48,12 @@ async fn settle(r: &Running) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_coin_swept_while_its_holder_was_away_is_claimed_after_a_restore_and_repaid() {
-	let mut r = Running::start_with(|c, _, _| c.fees.refresh_ppm = PPM).await;
+	// What follows is the sweep of A's live coin and its repayment: the
+	// operator does not take it on the chain at its batch's release first.
+	let mut r = Running::start_with(|c, _, _| {
+		c.fees.refresh_ppm = PPM;
+		c.watcher.unroll_at_release = false;
+	}).await;
 	let (url, node) = (r.url(), r.node_url());
 	let x = r.x.to_string();
 

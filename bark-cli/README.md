@@ -1171,9 +1171,54 @@ as any.
     arca claims                                         # on a holder's wallet
     arca claim                                          # taken up
 
+### Watchtowers: a coin kept safe while the wallet is away
+
+A coin the wallet does not refresh before its batch is released is brought on
+the chain under its own key before the operator could sweep it: by the
+operator, and by any watchtower the wallet deposited it with (the server's
+[Coins are taken on the chain before the sweep](../server/README.md#coins-are-taken-on-the-chain-before-the-sweep)).
+At every `sync` the wallet deposits each live coin resting on a batch with
+each watchtower it names (`deposits` in the answer): the coin's record, its
+own batch leaf's unroll authorisations signed for an hour before its batch's
+first expiry, so nothing can unroll it sooner. A deposit only ever puts the
+coin on the chain under its owner's key. Once a coin is spent, exited or
+lost, `sync` withdraws its deposit, signed by the coin's key; a watchtower
+that cannot be reached is tried again at the next `sync`.
+
+    arca watchtowers                          # the watchtowers deposited with, and whether the operator's list or the wallet's
+    arca watchtowers https://a.example https://b.example   # name them instead
+    arca watchtowers --none                   # deposit with none
+    arca watchtowers --operator               # back to the ones the operator's info lists
+
+Back from an absence, the wallet finds such a coin on the chain: `coins`
+marks it `kept_safe`, with the sentence a program shows its user
+(`kept_safe_note`: "moved out of the Ark to keep it safe while you were
+away"), and `balance` counts it under `kept_safe` as well as `exiting`.
+`sync` takes it home (its exit's claim, the leaf already on the chain) and,
+once the claim is final, boards it back (`reboards` in the answer): a board
+of what the claim paid less the board's fee. The new board is a coin like any
+other; the kept-safe coin then shows `reboarded`.
+
+Any wallet can be a watchtower for other wallets' coins:
+`arca --datadir DIR watchtower serve --listen ADDR`, run on a wallet created
+against the operator (it checks every deposit as a receiver checks a coin,
+against that operator's key), takes deposits over HTTP (`POST /v1/deposit`,
+`POST /v1/withdraw`, `GET /v1/info`; the segment after `/v1/` names the
+call, so it serves behind any path a proxy gives it) and passes over them
+every `--interval` seconds. It leaves a coin alone until a batch it rests on
+is released (the batch's token at `R`, in a block or the mempool), then
+broadcasts whatever is still missing of the coin's path, from the lowest
+output the chain holds unspent, each transaction paid from the reserve the
+output it spends holds when the node accepts the batch's asset for fees, else
+from an on-chain coin of the watchtower wallet's. Coins on one branch share
+its nodes, whoever built them. It needs only its node, never the operator.
+`arca watchtower deposits` lists what it holds (`held`, `brought`,
+`on_chain`, `gone`) and what it broadcast for each; `arca watchtower pass`
+runs one pass.
+
 ### Swept coins
 
-A coin the wallet neither refreshed nor took home before its batch was swept
+A coin a sweep took all the same (nobody brought it on the chain in time)
 is owed back by the operator, less the late-refresh fee (the asset's refresh
 fee at its full charge), as the operator publishes (`info`'s `swept`; the
 server's [Swept coins are repaid](../server/README.md#swept-coins-are-repaid)).
@@ -1543,10 +1588,12 @@ registry for both commands.
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`) |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
 | `openamp-key` | The wallet's OpenAMP account key (`m/5/0`, as every wallet on the kit derives it): the key an OpenAMP account and a SeqPal ID are, which a payer may name to pay the wallet a claim |
-| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total; what the operator owes for a coin its sweep took, until the coin that repays it is held, as `returning`, counted in the row and the total), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
-| `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); one coin's record |
+| `balance [--without-bitcoin]` | The headline, `total`: what the wallet holds of every Sequentia asset together, Arca coins and on-chain coins, in atoms of the reference unit at the rates of the wallet's own node (the only rates it can check), each asset's value beside it, and the assets the node has no rate for set apart (`unvalued`) and left out; no asset comes first. Then one row per holding, BTC first and always, 0 included (it is on its own chain, and counted apart), then each Sequentia asset the wallet holds anything of, with its value where the node has a rate, each counted as the total counts it (`held`: a coin whose exit's claim is out once, as the claim's output on the chain); and per asset: Arca coins by state (a coin received out of round and not yet refreshed as `operator-confirmed`; a leaf received under a hash the wallet did not make, its preimage not in hand, as `awaiting_preimage`, counted in no row and no total; what the operator owes for a coin its sweep took, until the coin that repays it is held, as `returning`, counted in the row and the total; of what is `exiting`, a coin kept safe on the chain while the wallet was away, to be boarded back, as `kept_safe` too), on-chain coins (the credits of its orders at their keys among them), and the Bitcoin side (Bark's ark balance and its on-chain wallet, `bitcoin`; BTC's row counts both, and has no total when Bark could not be read). `--without-bitcoin` leaves the Bitcoin side out and runs no Bark, for a program that reads it on its own one Bark run at a time (Bark lets one process at a time open its wallet); BTC's row is still first, with no total |
+| `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); for a coin someone else brought on the chain while the wallet was away, `kept_safe`, the sentence to show (`kept_safe_note`) and whether it is boarded back (`reboarded`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
+| `watchtowers [URL…] [--none \| --operator]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`, or `operator`: those `info` lists), after naming them when given (see Watchtowers) |
+| `watchtower serve [--listen ADDR] [--interval S]` | Runs this wallet as a watchtower for other wallets' coins until stopped: deposits over HTTP, and a pass every `S` seconds (see Watchtowers). `watchtower pass` runs one pass; `watchtower deposits` lists the deposits held, each with its state and what was broadcast for it |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
 | `send REQUEST [--amount N] [--asset A] [--route any\|channel\|leaf]` | Pays a receive request or a channel code: over the wallet's channel into the receiver's when the text names one in the asset and the wallet's can pay it (see Channel leaves); otherwise a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. The server co-signs and posts the coins to the mailboxes. `route` in the answer says which |

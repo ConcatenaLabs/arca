@@ -1092,11 +1092,55 @@ What the server does with a plan once it holds it:
 - A coin a step gave up that comes on the chain is answered by the step's
   refund (see the watcher).
 
+### Coins are taken on the chain before the sweep
+
+A leaf nobody refreshes is not left for the sweep. Once a batch is released
+(its token at `R`), and before the notice `W` has run, every live coin of the
+batch is brought on the chain under its holder's own key: by the operator
+itself, and by every watchtower the holder deposited the coin with. On the
+chain the leaf is its owner's alone (its exit pays the owner's key; its
+collaborative path needs owner and operator together) and no sweep can take
+it; the holder's wallet takes it home when it is back and boards it again.
+
+**The operator.** At each pass after a batch's release, the watcher takes the
+next step of every live coin of the batch, one a coin (see The watcher,
+Expiry): a leaf of it, or a coin resting on one through out-of-round
+transfers, that is not on the chain already, not given up to a participation
+(its forfeit stored), not an `htlc-1` leaf (its payment's own paths settle
+it) and not a claim leaf of a distribution (which goes back to its payer).
+Every step is paid from the reserve of the output it spends where the node
+accepts the batch's asset for fees, else from a wallet coin. The operator
+needs no deposit for this: it holds every coin's record, and as a member of
+every node and the maker of every entry it holds the authorisations and the
+preimages. `[watcher] unroll_at_release` (on by default) turns it on.
+
+**Watchtowers.** A watchtower is a wallet run as `arca watchtower serve`
+(the CLI's README): it holds deposits of other wallets' coins and brings each
+on the chain once a batch it rests on is released, as the operator does, from
+the deposit alone, needing only a node. A deposit is the coin's record with
+its owner's unroll authorisations, those of the holder's own batch leaf
+signed for an hour before its batch's first expiry, so it unrolls nothing
+before the batch can be released. Nothing in it lets anyone take the coin:
+the unroll pins every child, the entry's unlock pins the leaf, and a coin
+paid out of round carries only pairs that spend into the outputs they commit
+to. A wallet deposits each coin with every watchtower it names, renews the
+deposit when the coin changes, and withdraws it, signed by the coin's key,
+once the coin is no longer its own. A deposit a watchtower kept for a coin
+its holder has given up brings only that old coin on the chain, where the
+watcher answers it with the forfeit the holder signed (Stale exits). `info`
+lists, under `watchtowers`, the watchtowers a wallet that names none of its
+own deposits with (`[watcher] watchtowers`, base URLs).
+
+So the sweep takes only what no one could bring on the chain: the outputs of
+coins given up, and a coin whose path could not be paid for. What a sweep
+does take from a holder is repaid (next).
+
 ### Swept coins are repaid
 
-A coin whose holder neither refreshed it nor took it home before its batch
-was swept is never the operator's to keep: the operator owes it back, less
-the late-refresh fee, and repays it as a new leaf in the asset's next round.
+A coin that a sweep took from its holder all the same (nobody brought it on
+the chain in time) is never the operator's to keep: the operator owes it
+back, less the late-refresh fee, and repays it as a new leaf in the asset's
+next round.
 Expiry can delay a holder's coin and costs it that fee, nothing more. This
 is the operator's policy, kept by the server and published (`info.swept`:
 `{"policy": "repaid", "late_fee": "refresh"}`), not a script: a guarantee in
@@ -1706,7 +1750,9 @@ pass, or while the server is stopped, goes unseen. Paying a frozen landing is co
 the chain. A frozen holder's coin leaves the tree only by its landing,
 unroll and exit by script paths that confirm under any freeze, into its own
 key, where the freeze binds; a frozen coin not landed by its batch's exit
-deadline is swept with the batch.
+deadline is brought on the chain at its batch's release, as every live coin
+is (Coins are taken on the chain before the sweep), its landing then its
+holder's under the freeze.
 
 **The signer checks on its own.** `arca-signer --supervision-node <url>
 --supervision-cookie <file>` reads freezes from a node of its own. A
@@ -2075,7 +2121,10 @@ meanwhile.
   sweep takes every output of the batch still unspent whose own notice has
   passed (the batch output, a node or an entry someone unrolled, a checkpoint
   of a coin from the batch), at most `max_sweep_inputs` at a time, and returns
-  the token to `R`. An accumulator batch's output moves with every exit: the
+  the token to `R`. Between the release and the sweep, with
+  `unroll_at_release`, every live coin of the batch is brought on the chain
+  under its holder's key, a step a coin each pass (see Coins are taken on the
+  chain before the sweep). An accumulator batch's output moves with every exit: the
   watcher follows it from the round through each exit the chain holds (every
   exit pays an entry, whose script it watches, and publishes the whole state
   it spends) and sweeps it where the last exit left it, with every entry an
@@ -2162,7 +2211,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |

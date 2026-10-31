@@ -173,6 +173,10 @@ pub struct Info {
 	pub bond: Option<BondInfo>,
 	/// What becomes of a coin the operator's sweep takes from its holder.
 	pub swept: SweptInfo,
+	/// The watchtowers a holder who names none of its own deposits its coins
+	/// with: base URLs.
+	#[serde(default)]
+	pub watchtowers: Vec<String>,
 }
 
 /// The operator's equivocation bond ([`crate::bond`]).
