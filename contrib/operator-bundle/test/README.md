@@ -61,7 +61,7 @@ prints at its end) and `verbatim` (what each wallet said, word for word).
 | `FUND` | A command run as `$FUND ADDRESS ASSET ATOMS` that pays test coins to the address on the chain and prints the payment's txid (`sendtoaddress` does), which a board then waits on to confirm (`FUND_BLOCKS`, default 30 blocks). Write it to name the node wallet it pays from, and never a treasury's, a reserve's or a service's | required |
 | `NAME` | The bundle's name, which its service units carry | `arca-bundle` |
 | `STOP_OPERATOR`, `START_OPERATOR` | Stopping and starting the operator as its service manager does | `systemctl stop\|start $NAME-arcad.service $NAME-arca-signer.service` |
-| `KILL_OPERATOR`, `KILL_SIGNER` | The failure no service manager announces | `systemctl kill -s KILL …` on both units, on the signer's |
+| `KILL_OPERATOR`, `KILL_SIGNER` | The failure no service manager announces | each unit's main process killed with SIGKILL, then the unit stopped so its `Restart=` does not bring it back mid-scenario: both units, the signer's |
 | `PEER_OPERATOR_URL`, `PEER_OPERATOR_KEY` | The other operator, for the Lightning scenario and the cross-operator refusal; never stopped | none |
 | `PEER_ROUND` | A command that makes the other operator build a round (regtest only) | none |
 | `CHAIN_PRODUCE`, `CHAIN_BURY`, `CHAIN_ADVANCE SECONDS` | Regtest hooks: a block, a block buried until final, the median time moved on | none: on a live chain the script waits for blocks, and an exit that must wait its delay is left for a later `arca sync` |

@@ -73,7 +73,7 @@ scenario_down_idle() {
   local req; req=$(must di2 receive --asset "$ASSET" | jq -r .request)
   must di1 send "$req" --amount "$(atoms 500000)" > /dev/null
   must di2 sync > /dev/null
-  board di3 "$(atoms 1000000 2)"
+  board di3 "$(atoms 1000000 3)"   # paying a leaf leaves change of at least a leaf
   local req3; req3=$(request di3)
   local h1 h2 h3; h1=$(total di1); h2=$(total di2); h3=$(total di3)
   stop_op stop

@@ -29,8 +29,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 NAME=${NAME:-arca-bundle}
 STOP_OPERATOR=${STOP_OPERATOR:-systemctl stop $NAME-arcad.service $NAME-arca-signer.service}
 START_OPERATOR=${START_OPERATOR:-systemctl start $NAME-arca-signer.service $NAME-arcad.service}
-KILL_OPERATOR=${KILL_OPERATOR:-systemctl kill -s KILL $NAME-arcad.service $NAME-arca-signer.service}
-KILL_SIGNER=${KILL_SIGNER:-systemctl kill -s KILL $NAME-arca-signer.service}
+# The failure no service manager announces: each unit's main process killed
+# outright, then the unit stopped, since the bundle's units restart on their
+# own (Restart=always) and the scenario starts them again itself.
+kill_units() {
+  local u p
+  for u in "$@"; do
+    p=$(systemctl show -p MainPID --value "$u")
+    [ "${p:-0}" -gt 0 ] && kill -9 "$p" 2>/dev/null || true
+  done
+  sleep 1; systemctl stop "$@"
+}
+KILL_OPERATOR=${KILL_OPERATOR:-kill_units $NAME-arcad.service $NAME-arca-signer.service}
+KILL_SIGNER=${KILL_SIGNER:-kill_units $NAME-arca-signer.service}
 OPERATOR_PIDS_CMD=${OPERATOR_PIDS_CMD:-}
 RUN=${RUN:-$PWD/operator-tests.$(date -u +%Y%m%dT%H%M%SZ)}
 mkdir -p "$RUN/w"
