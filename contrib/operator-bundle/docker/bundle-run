@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 svc=${1:-}
 case $svc in
-  init|net|postgres|bitcoind|feeproxy|sequentiad|priceserver|seqln|cln|arca-signer|captaind|watchmand|arcad|caddy) ;;
+  init|net|postgres|bitcoind|feeproxy|sequentiad|priceserver|seqln|cln|arca-signer|captaind|watchmand|arcad|watchtower|caddy) ;;
   *) exec /opt/arca-src/contrib/operator-bundle/install.sh "$@" ;;
 esac
 BUNDLE_LIB=1 . /opt/arca-src/contrib/operator-bundle/install.sh
@@ -142,6 +142,12 @@ arcad)
   write_arcad_toml
   export RUST_LOG=info
   run_as "$BIN/arcad" "$ETC/arcad.toml"
+  ;;
+watchtower)
+  [ -n "$PEER_ARCA_URL" ] || { echo "watchtower: no PEER_ARCA_URL, so no peer whose users to watch for"; exec sleep infinity; }
+  until_up "the Sequentia node" seq_cli getblockchaininfo
+  until tower_wallet; do echo "watchtower: its wallet could not be made against $PEER_ARCA_URL; trying again in a minute"; sleep 60; done
+  run_as "$BIN/arca" --datadir "$LIB/watchtower" watchtower serve --listen "127.0.0.1:$WATCHTOWER_PORT" --interval 10
   ;;
 caddy)
   [ -n "$DOMAIN" ] || { echo "caddy: no DOMAIN set, so no public route: nothing to serve"; exec sleep infinity; }

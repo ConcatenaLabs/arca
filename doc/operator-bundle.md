@@ -37,6 +37,7 @@ start; the Linux paths are the ones tested.
 | | `arcad` | The Arca operator's server: boards, transfers, rounds, the watcher |
 | | SeqLN (`lightningd`) | The Sequentia gateway: one channel per served asset, with the hold-invoice plugin |
 | | price server | The node's fee rates, from a price feed: an asset is accepted for fees only with a rate |
+| | watchtower (`arca watchtower serve`) | Watches the coins of the peer operator's users (`PEER_ARCA_URL`): takes their sealed deposits and, should a batch be released or a sender take an earlier coin home, brings each coin on the chain under its owner's key |
 | Bitcoin | `bitcoind` (Bitcoin Core) | testnet4, with a transaction index |
 | | fee proxy | The node's RPC with fee estimates from the live mempool, for Bark's server and the Bitcoin gateway (testnet4's own estimates often say a sat or two while its mempool queues at tens, or nothing at all, and a gateway with no estimate refuses every channel opened to it) |
 | | `captaind`, `watchmand` | Bark's server and watchman: the Bitcoin ark |
@@ -59,6 +60,7 @@ gateways and Caddy:
 | 9935 | Core Lightning | anywhere: the same, on Bitcoin |
 | 80, 443 | Caddy | anywhere: the certificate's challenge, and wallets |
 | 3535, 3545 | arcad, captaind | this machine; others through Caddy, over TLS |
+| 3537 | the watchtower | this machine; others through Caddy, at `/watchtower` |
 | 18884, 48332 | the Sequentia and Bitcoin nodes' RPC | this machine |
 | the rest (`bundle.env.example`) | the fee proxy, PostgreSQL, metrics, the gateways' gRPC | this machine |
 
@@ -106,6 +108,10 @@ Every path reads the same settings, described line by line in
   archived. Put it on other storage than the machine's disk.
 - `PEER_*`, `CHANNEL_ATOMS`, `CHANNEL_SAT`: the peer bundle the gateways open
   channels to, and their sizes. The defaults name sequentiatestnet.com.
+  `PEER_ARCA_URL` is also the operator whose users the bundle's watchtower
+  watches for, and `PEER_WATCHTOWER` the watchtower that operator runs for
+  this bundle's users, which arcad's `info` names to them (see
+  [Watching each other's users](#watching-each-others-users)).
 - `BUILD_JOBS`: 2 unless the machine has more than 8 GB of memory to spare.
 
 ## Path 1: Docker Compose
@@ -375,6 +381,43 @@ change to what the operator serves, charges or names takes a new record: run
 
 **Check:** `$A operators --registry https://sequentiatestnet.com/registry`
 lists the operator `ok`.
+
+## Watching each other's users
+
+The two operators watch for each other's users. A wallet deposits each coin
+it holds, sealed, with the watchtowers its operator's `info` names and with
+those its wallet program adds by default; a watchtower reads a deposit only
+once its batch is released or a sender up the coin's lineage takes an
+earlier coin home on the chain, and then brings the coin on the chain under
+its owner's key. A coin is safe while any one of them acts, so each operator
+runs one for the other's users, where neither depends on the other being up.
+
+The bundle's watchtower is made at install against `PEER_ARCA_URL`, whose
+users it watches for, and served at `https://<DOMAIN>/watchtower`. Its
+wallet's on-chain coins pay what a coin's own reserves cannot when it acts:
+fund it with an asset the node accepts for fees (`$B addresses`, the line
+`watchtower`). arcad's `info` names `PEER_WATCHTOWER` to this bundle's own
+users.
+
+**An installed bundle takes it on with an update** (`git pull` in the clone,
+then `$B install`, or `docker compose up -d --build`): the installer makes
+the watchtower's wallet, starts it, adds the route, and names the peer's
+watchtower in arcad's configuration, from the defaults in
+`bundle.env.example`. A `bundle.env` written before has neither setting:
+add the two lines the example holds under the peer's settings
+(`PEER_WATCHTOWER`, and `WATCHTOWER_PORT` with the ports) before the update,
+or the bundle runs its watchtower but names none to its users.
+
+**Check:** `$B status` shows, under "the watchtower for the users of
+https://sequentiatestnet.com/arca", its deposits and the operator it watches
+for, and under the Arca operator "watchtowers it names for its users" the
+peer's. From anywhere,
+
+    curl -s https://<DOMAIN>/watchtower/v1/info
+
+answers `"watchtower": true`, the operator key of sequentiatestnet.com and
+`"sealed": 1`. Tell the sequentiatestnet.com operator that URL: its wallets
+add it to the watchtowers they deposit with, and its info names it.
 
 ## Paying between the two operators
 
