@@ -221,25 +221,30 @@ scenario_down_lightning() {
   try dl1 lightning pay "$inv" --wait 2
   verbatim "dl1 lightning pay" "$(jq -c '{payment, error}' <<<"$OUT" | head -c 600)"
   stop_op stop
-  # The other operator makes dl2's leaf and dl2 claims it: the preimage
-  # goes back along the channels to this operator's node.
-  local i
-  for i in $(seq 20); do
+  # The other operator makes dl2's leaf in its next round and dl2 claims it:
+  # the preimage goes back along the channels to this operator's node. On a
+  # live operator that waits for its round and the round's block (LN_WAIT
+  # seconds, default 900); on regtest PEER_ROUND builds the round at once.
+  local i t0 wait=${LN_WAIT:-$([ -n "${PEER_ROUND:-}" ] && echo 40 || echo 900)}
+  t0=$(date +%s)
+  while [ $(( $(date +%s) - t0 )) -lt "$wait" ]; do
     [ -n "${PEER_ROUND:-}" ] && $PEER_ROUND > /dev/null 2>&1 || true
     arca dl2 sync > /dev/null 2>&1 || true
     [ "$(arca dl2 lightning receives | jq -r --arg h "$hash" '.[$h].state')" = received ] && break
-    sleep 2
+    sleep 5
   done
-  result "while down" "dl2's receive at the other operator: $(arca dl2 lightning receives | jq -r --arg h "$hash" '.[$h].state'); dl2 holds $(total dl2)"
+  result "while down" "dl2's receive at the other operator after $(( $(date +%s) - t0 )) s: $(arca dl2 lightning receives | jq -r --arg h "$hash" '.[$h].state'); dl2 holds $(total dl2)"
   down_words dl1
   try dl1 lightning payments; verbatim "dl1 payments" "$(jq -c --arg h "$hash" '.[$h]|{state,reason}' <<<"$OUT")"
   start_op
-  for i in $(seq 20); do
+  t0=$(date +%s)
+  while [ $(( $(date +%s) - t0 )) -lt "$wait" ]; do
+    arca dl2 sync > /dev/null 2>&1 || true
     arca dl1 sync > /dev/null 2>&1 || true
     [ "$(arca dl1 lightning payments | jq -r --arg h "$hash" '.[$h].state')" = paid ] && break
-    sleep 2
+    sleep 5
   done
-  result "recovery" "dl1's payment after the restart: $(arca dl1 lightning payments | jq -c --arg h "$hash" '.[$h]|{state,preimage}')"
+  result "recovery" "dl1's payment $(( $(date +%s) - t0 )) s after the restart: $(arca dl1 lightning payments | jq -c --arg h "$hash" '.[$h]|{state,preimage}'); dl2's receive $(arca dl2 lightning receives | jq -r --arg h "$hash" '.[$h].state'), dl2 holds $(total dl2)"
 }
 
 # ---------------------------------------------------------------------------

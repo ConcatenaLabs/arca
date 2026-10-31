@@ -64,6 +64,7 @@ prints at its end) and `verbatim` (what each wallet said, word for word).
 | `KILL_OPERATOR`, `KILL_SIGNER` | The failure no service manager announces | each unit's main process killed with SIGKILL, then the unit stopped so its `Restart=` does not bring it back mid-scenario: both units, the signer's |
 | `PEER_OPERATOR_URL`, `PEER_OPERATOR_KEY` | The other operator, for the Lightning scenario and the cross-operator refusal; never stopped | none |
 | `PEER_ROUND` | A command that makes the other operator build a round (regtest only) | none |
+| `LN_WAIT` | How long `down-lightning` waits for the receive, then for the payment, in seconds: the other operator makes the receiver's leaf in its next round | 40 with `PEER_ROUND`, 900 without |
 | `CHAIN_PRODUCE`, `CHAIN_BURY`, `CHAIN_ADVANCE SECONDS` | Regtest hooks: a block, a block buried until final, the median time moved on | none: on a live chain the script waits for blocks, and an exit that must wait its delay is left for a later `arca sync` |
 | `BITCOIN_ARK_URL`, `BITCOIND_URL`, `BITCOIND_COOKIE` (or `ESPLORA_URL`), `BITCOIN_NETWORK` | The Bitcoin ark and its chain, for the BTC scenarios | `regtest` |
 | `BTC_FUND`, `BTC_MINE` | `$BTC_FUND ADDRESS BTC` pays a Bark wallet on Bitcoin; `$BTC_MINE N` mines (regtest) | required for the BTC scenarios |
