@@ -449,19 +449,26 @@ enum Cmd {
 	/// and how it stands. `sync` claims each and takes the new coin home.
 	Owed,
 	/// The watchtowers the wallet deposits its coins with, after naming them
-	/// when given: each live coin resting on a batch is deposited with each
-	/// at `sync`, so any one of them takes it on the chain under its owner's
-	/// key, should the wallet be away when its batch is released. While none
-	/// is named, the wallet uses those the operator lists.
+	/// when given: each live coin resting on a batch, and each coin paid to
+	/// it out of round, is deposited with each at `sync`, sealed, so any one
+	/// of them takes it on the chain under its owner's key should the wallet
+	/// be away when its batch is released or a sender takes an earlier coin
+	/// of its lineage home. While none is named, the wallet uses those the
+	/// operator lists and the defaults.
 	Watchtowers {
 		/// Base URLs of watchtowers, in place of those named before.
 		urls: Vec<String>,
-		/// Go back to the watchtowers the operator lists.
+		/// Go back to the watchtowers the operator lists, and the defaults.
 		#[arg(long, conflicts_with_all = ["urls", "none"])]
 		operator: bool,
 		/// Deposit with no watchtower.
 		#[arg(long, conflicts_with = "urls")]
 		none: bool,
+		/// A watchtower to add to the operator's by default (repeat it for
+		/// more), in place of the defaults named before; `--default ""`
+		/// names none.
+		#[arg(long = "default", conflicts_with_all = ["urls", "none", "operator"])]
+		defaults: Vec<String>,
 	},
 	/// This wallet as a watchtower for other wallets' coins: it takes their
 	/// deposits and, once a batch a deposited coin rests on is released,
@@ -1546,8 +1553,11 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Plans => w.plans(),
 		Cmd::Owed => w.owed(),
-		Cmd::Watchtowers { urls, operator, none } => {
-			if operator {
+		Cmd::Watchtowers { urls, operator, none, defaults } => {
+			if !defaults.is_empty() {
+				let d: Vec<String> = defaults.into_iter().filter(|u| !u.is_empty()).collect();
+				w.set_default_watchtowers(&d)
+			} else if operator {
 				w.set_watchtowers(None)
 			} else if none {
 				w.set_watchtowers(Some(&[]))

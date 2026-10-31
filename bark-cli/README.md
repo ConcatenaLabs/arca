@@ -1199,7 +1199,19 @@ that cannot be reached is tried again at the next `sync`.
     arca watchtowers                          # the watchtowers deposited with, and whether the operator's list or the wallet's
     arca watchtowers https://a.example https://b.example   # name them instead
     arca watchtowers --none                   # deposit with none
-    arca watchtowers --operator               # back to the ones the operator's info lists
+    arca watchtowers --operator               # back to the ones the operator's info lists, and the defaults
+    arca watchtowers --default https://c.example --default https://d.example   # the defaults, added to the operator's
+
+While the user names none, the wallet deposits with the watchtowers the
+operator's `info` lists and with the defaults the program running it names
+(`set_default_watchtowers` in the command interface). A wallet program lists
+there watchtowers run by others than the operator, so that a coin does not
+depend on its operator alone to name who watches it. Before it deposits, the
+wallet reads each watchtower's `info` once a `sync`, and passes over one
+that does not answer, watches another chain or another operator's coins, or
+takes no sealed deposit (`passed_over` in `deposits`, with why): a sealed
+deposit cannot be checked when it is taken, so one sent to a watchtower of
+another operator would only be refused when it had to act.
 
 Back from an absence, the wallet finds such a coin on the chain: `coins`
 marks it `kept_safe`, with the sentence a program shows its user
@@ -1607,7 +1619,7 @@ registry for both commands.
 | `coins`, `record LEAF` | Every coin held or once held, with its leaf's template (`template`: `vtxo-1`, `vtxo-2`, `board-1`, …), its dates (`expiry`, `exit_deadline`), whether it rests on a board, the profile of the batches it rests on (`batch_profile`: `issuer-operated` when a sweep above it can only burn, `open` when its batch's sweep pays the operator, none for a coin of boards alone), and, for every coin held off the chain, the dates `sync` keeps (`sync_daily_from`, `refresh_from`, `home_from`, `exit_by`) and the fee coin its exit needs, if any (`exit_fee`); for a coin of a supervised asset, where it lands (`landing`) and whether its holder is frozen (`frozen`); for a coin someone else brought on the chain while the wallet was away, `kept_safe`, the sentence to show (`kept_safe_note`) and whether it is boarded back (`reboarded`); one coin's record |
 | `board ASSET AMOUNT [--fee-asset A] [--quote \| --shown FEE]` | With `--quote`, only says what the board would pay now (its fee in the fee asset's own atoms, its size, the coins it spends), signing, asking and broadcasting nothing; with `--shown` (that answer's `fee`, as JSON) it goes ahead only on that very fee, refused before anything is registered or signed when it changed. Otherwise: brings on-chain coins into Arca, the credits of its orders at their keys among them. The server registers the board before it is broadcast, so a refused board spends nothing; the coin is spendable once the board transaction is final. Only a refusal marks the board `lost`: when the server's answer is not seen (no answer, a timeout, a 5xx), the server may hold the board and broadcast it itself, so the coin stays `pending` with its transaction and `sync` posts the same registration again |
 | `boards` | Where each board stands, by the server and by the chain |
-| `watchtowers [URL…] [--none \| --operator]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`, or `operator`: those `info` lists), after naming them when given (see Watchtowers) |
+| `watchtowers [URL…] [--none \| --operator \| --default URL…]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`; `operator`, those `info` lists; or `operator and defaults`, with the program's defaults), after naming them, or the defaults, when given (see Watchtowers) |
 | `watchtower serve [--listen ADDR] [--interval S]` | Runs this wallet as a watchtower for other wallets' coins until stopped: deposits over HTTP, and a pass every `S` seconds (see Watchtowers). `watchtower pass` runs one pass; `watchtower deposits` lists the deposits held, each with its state and what was broadcast for it |
 | `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
