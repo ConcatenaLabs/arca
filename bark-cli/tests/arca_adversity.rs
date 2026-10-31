@@ -6878,7 +6878,11 @@ async fn d67_a_claim_not_mined_is_raised_when_the_floor_rises() {
 	let floor: Value = r.rt.client().call("getmempoolinfo", &[]).unwrap();
 	println!("D67F the replacement {} pays {} of X for {} vB (the old one {}); the node's mempool {}", new, fee_of(&new_tx), new_tx.vsize(),
 		fee_of(&old_tx), floor);
-	assert!(fee_of(&new_tx) >= fee_of(&old_tx) * 10, "the replacement pays the new floor");
+	// The node's floor in X's atoms now: its relay floor in the reference unit at X's new rate.
+	let floor_kvb = (floor["minrelaytxfee"].as_f64().unwrap() * 1e8).round() as u64 * 100_000_000 / 10_000_000;
+	let new_floor = (new_tx.vsize() as u64 * floor_kvb).div_ceil(1000);
+	println!("D67F the new floor for {} vB: {} of X", new_tx.vsize(), new_floor);
+	assert!(fee_of(&new_tx) >= new_floor && fee_of(&new_tx) > fee_of(&old_tx), "the replacement pays the new floor");
 	let in_mempool: Result<Value, _> = r.rt.client().call("getmempoolentry", &[json!(old.to_string())]);
 	assert!(in_mempool.is_err(), "the old claim left the mempool");
 	r.produce().await;
