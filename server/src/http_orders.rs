@@ -95,13 +95,29 @@ pub(super) async fn order_fill(State(app): State<Arc<App>>, body: Result<Bytes, 
 	}))
 }
 
+/// The transfer id of the fill a request names, by its transfer id or by the
+/// order coin it spent.
+async fn fill_named(app: &App, transfer_id: &Option<String>, order_coin: &Option<String>) -> Result<[u8; 32], Refusal> {
+	match (transfer_id, order_coin) {
+		(Some(t), None) => unhex32(t).map_err(Refusal::malformed),
+		(None, Some(o)) => {
+			let id = leaf_id(o)?;
+			match app.store.order_fill_of(&id.0).await.map_err(internal)? {
+				Some(f) => Ok(f.transfer_id),
+				None => Err(OrderError::UnknownFill(format!("of order coin {}", id)).into()),
+			}
+		},
+		_ => Err(Refusal::malformed("a fill is named by its transfer_id or its order_coin, one of the two")),
+	}
+}
+
 /// What the maker of a filled order signs its order coin's delegation into
 /// the fill over ([`crate::orders::Orders::delegation_terms`]).
 pub(super) async fn order_fill_delegation_terms(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
 	-> Result<Json<api::FillDelegationTerms>, Refusal>
 {
 	let req: api::FillRef = parse(body, app.max_request)?;
-	let transfer = unhex32(&req.transfer_id).map_err(Refusal::malformed)?;
+	let transfer = fill_named(&app, &req.transfer_id, &req.order_coin).await?;
 	let t = app.orders.delegation_terms(&transfer).await?;
 	Ok(Json(api::FillDelegationTerms {
 		transfer_id: hex(&t.transfer_id),
@@ -120,7 +136,7 @@ pub(super) async fn order_fill_delegation(State(app): State<Arc<App>>, body: Res
 	-> Result<Json<api::FillDelegated>, Refusal>
 {
 	let req: api::FillDelegation = parse(body, app.max_request)?;
-	let transfer = unhex32(&req.transfer_id).map_err(Refusal::malformed)?;
+	let transfer = fill_named(&app, &req.transfer_id, &req.order_coin).await?;
 	let kept = app.orders.delegate(&transfer, &sig(&req.signature)?).await?;
 	Ok(Json(api::FillDelegated { transfer_id: hex(&transfer), kept }))
 }

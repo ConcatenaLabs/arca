@@ -29,7 +29,7 @@ use arca_covenant::{HtlcDirection, HtlcTerms, LeafId, MedianTime, NewLeaf, Relat
 
 use super::chain::hex;
 use super::pay::{In, Out};
-use super::wallet::{amount, Wallet};
+use super::wallet::{amount, sign, Wallet};
 use super::{random32, Error};
 
 /// Where the wallet keeps its payments over Lightning: a map from the
@@ -440,6 +440,10 @@ impl Wallet {
 		let mut out = vec![];
 		for (hash, rec) in self.sends()? {
 			let state = rec["state"].as_str().unwrap_or("").to_string();
+			if state == "paid" && rec["released"] != true {
+				out.push(self.release_paid(&hash).unwrap_or_else(|e| json!({"payment_hash": hash, "state": "paid", "error": e.to_string()})));
+				continue;
+			}
 			if !matches!(state.as_str(), "paying" | "failed") {
 				continue;
 			}
@@ -458,11 +462,55 @@ impl Wallet {
 					Ok(v) => v,
 					Err(e) => json!({"payment_hash": hash, "state": "failed", "error": e.to_string()}),
 				});
+			} else if rec["state"] == "paid" {
+				out.push(self.release_paid(&hash).unwrap_or_else(|e| json!({"payment_hash": hash, "state": "paid", "error": e.to_string()})));
 			} else {
 				out.push(json!({"payment_hash": hash, "state": rec["state"], "preimage": rec["preimage"]}));
 			}
 		}
 		Ok(out)
+	}
+
+	/// Releases the lowest nodes with RECLAIM-D the `htlc-1` leaf of the paid
+	/// payment `hash` rests on: the leaf is the operator's, and its key the
+	/// wallet's, so the nodes come back with their other coins only by this
+	/// release. Signed only for a payment the wallet holds the preimage of,
+	/// since before that the release would end the leaf's refund; each
+	/// release names the round the operator names. Done once.
+	fn release_paid(&mut self, hash: &str) -> Result<Value, Error> {
+		let mut rec = self.sends()?.get(hash).cloned().unwrap_or_default();
+		let leaf = rec["htlc_leaf_id"].as_str().unwrap_or("").to_string();
+		let preimage = super::chain::unhex32(rec["preimage"].as_str().unwrap_or(""))?;
+		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Refused(format!("the wallet holds no htlc-1 coin {}", leaf)))?;
+		let record = Self::record_of(&row)?;
+		let txs = self.base_txs(&record)?;
+		let coin = self.resolve(&record, &txs, &arca_covenant::WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) })
+			.map_err(|e| Error::Refused(format!("the htlc-1 coin {}: {}", leaf, e)))?;
+		let done = |w: &mut Self, r: &mut Value| { r["released"] = json!(true); w.set_send(hash, r.clone()) };
+		if coin.release_nodes().is_empty() {
+			done(self, &mut rec)?;
+			return Ok(json!({"payment_hash": hash, "state": "paid", "preimage": rec["preimage"]}));
+		}
+		let t = self.server.post("lightning_send_release_terms", &json!({"payment_hash": hash}))?;
+		let nodes: Vec<&str> = t["nodes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+		let released: Vec<&str> = t["released"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+		if !nodes.is_empty() && nodes.iter().all(|n| released.contains(n)) {
+			done(self, &mut rec)?;
+			return Ok(json!({"payment_hash": hash, "state": "paid", "released": released}));
+		}
+		let round: elements::Transaction = elements::encode::deserialize(&super::chain::unhex(t["round"]["tx"].as_str()
+			.ok_or_else(|| Error::Refused("the operator names no final round to release for yet".into()))?)?)
+			.map_err(|e| Error::Parse(e.to_string()))?;
+		let c = t["round"]["connector_vout"].as_u64().unwrap_or(u64::MAX) as u32;
+		let rels = arca_covenant::Release::for_paid_send(&coin, &preimage, &round, c)
+			.map_err(|e| Error::Refused(format!("the release of payment {}: {}", hash, e)))?;
+		let key = self.coin_key(&row.owner_nonce)?;
+		let releases: Vec<Value> = rels.iter().map(|r| json!({"node": hex(&r.node_hash),
+			"signature": hex(sign(&key, &r.message().digest).as_ref())})).collect();
+		let a = self.server.post("lightning_send_release", &json!({"payment_hash": hash, "round_txid": round.txid().to_string(),
+			"releases": releases}))?;
+		done(self, &mut rec)?;
+		Ok(json!({"payment_hash": hash, "state": "paid", "released": a["released"]}))
 	}
 
 	/// Takes back the `htlc-1` leaf of the failed payment `hash`: through its

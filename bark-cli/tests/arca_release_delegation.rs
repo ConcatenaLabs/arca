@@ -3,6 +3,10 @@
 //! C out of round (the wallet signs the delegation with the transfer), then A,
 //! B and C refresh (each wallet signs its releases, A's and C's as holders of
 //! a coin a reassignment made) and the watcher reclaims the node by RECLAIM-D.
+//! A swap delegates both sides; a paid Lightning send's htlc-1 leaf is
+//! released by its sender's sync; a payee that offboards releases as a
+//! holder; and a resting order filled in the tree delegates on both sides,
+//! the maker's sync signing for its order's coin.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -254,6 +258,20 @@ async fn a_lightning_send_carries_the_payers_delegation() {
 	let d = r.server.store.delegation(&id32(&coin)).await.unwrap();
 	println!("paid over Lightning from {}: delegation recorded: {}", &coin[..16], d.is_some());
 	assert!(d.is_some(), "a Lightning send delegates the coin's release to its outputs, the htlc-1 leaf and the change");
+
+	// The paid payment's htlc-1 leaf: the wallet's sync releases its node,
+	// the change refreshes, and the node comes back by RECLAIM-D.
+	let hash = p["paying"]["payment_hash"].as_str().unwrap().to_string();
+	refresh_all(&r, &[&a]).await;
+	let terms = r.server.sends.release_terms(&id32(&hash)).await.unwrap();
+	println!("the paid payment's htlc-1 leaf rests on {} node(s), {} released by the sender's sync", terms.nodes.len(), terms.released.len());
+	assert!(!terms.nodes.is_empty() && terms.released == terms.nodes, "the sender's sync released every node");
+	let ks = reclaims(&r).await;
+	let k = ks.iter().find(|w| w.detail.contains("RECLAIM-D")).unwrap_or_else(|| panic!("no reclaim by RECLAIM-D: {:?}",
+		ks.iter().map(|w| &w.detail).collect::<Vec<_>>()));
+	let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
+	println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
+	assert_eq!(k.state, NurseryState::Final);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -323,4 +341,93 @@ async fn a_payee_that_offboards_releases_as_a_holder() {
 	let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
 	println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
 	assert_eq!(k.state, NurseryState::Final);
+}
+
+/// A resting order filled in the tree on batches with RECLAIM-D: M rests an
+/// order selling X for Y (giving up a board), T refreshes a board of Y into
+/// a leaf in the same rounds and fills part of the order (its wallet
+/// delegates its coin with the fill). M's `sync` takes up its credit and the
+/// order resting again and delegates the order's coin into the fill; it
+/// cancels the rest (a transfer, delegating). Every coin then refreshes, and
+/// the order's node and the taker's come back by RECLAIM-D.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resting_order_filled_in_the_tree_delegates_both_sides() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+		c.assets[0] = server::server::AssetSection::new(x, 1_000);
+	}).await;
+	let (x_id, y_id) = (r.x, r.y);
+	let (x, y) = (x_id.to_string(), y_id.to_string());
+	common::node::list_fee_asset(&r.rt, y_id, 100_000_000);
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(y_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (m, t) = (Arca::new("DM"), Arca::new("DT"));
+	for (w, asset) in [(&m, x_id), (&t, y_id)] {
+		w.ok(&create);
+		r.pay_to(script(&w.ok(&["address"])), asset, 1_600_000);
+		r.pay_to(script(&w.ok(&["address"])), x_id, 1_000_000);
+	}
+	r.produce().await;
+	m.ok(&["board", &x, "1500000"]);
+	t.ok(&["board", &y, "1500000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		m.ok(&["boards"])[0]["server"]["state"] == "credited" && t.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+
+	// M rests 1,000,000 X for Y at 1/1, lots of 100,000; T refreshes its
+	// board into a leaf of Y in the same rounds.
+	let rested = m.ok(&["order", "rest", "--sell", &x, "--amount", "1000000", "--for", &y, "--rate-num", "1", "--rate-den", "1",
+		"--min-lot", "100000", "--expires-in-hours", "720"]);
+	assert_eq!(rested["state"], "pending", "{}", rested);
+	t.ok(&["participate"]);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && built.len() == 2, "{} built, {:?}", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+	m.ok(&["sync"]);
+	t.ok(&["sync"]);
+	let view = m.ok(&["order", "resting"]);
+	let order = view["orders"].as_array().unwrap().iter().find(|o| o["rested_by"] == rested["order"]).unwrap()["order"]
+		.as_str().unwrap().to_string();
+	let tcoin = live(&t, &y)[0]["leaf_id"].as_str().unwrap().to_string();
+
+	// T fills 300,000: its wallet delegates its coin with the fill.
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "300000"]);
+	assert_eq!(f["filled"], "300000", "{}", f);
+	assert!(r.server.store.delegation(&id32(&tcoin)).await.unwrap().is_some(), "the taker's coin delegates into the fill");
+	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_none(), "the order's coin has not delegated yet");
+
+	// M comes back: its sync takes the credit and the rest, and delegates.
+	let s = m.ok(&["sync"]);
+	println!("M's sync, resting: {}", s["resting"]);
+	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_some(), "the maker's sync delegates the order's coin: {}", s);
+	let again = m.ok(&["sync"]);
+	assert!(again["resting"].as_array().is_none_or(|a| a.iter().all(|v| v.get("order_coin").is_none())),
+		"done once: {}", again["resting"]);
+	let cq = m.ok(&["order", "cancel-resting", &order, "--quote"]);
+	m.ok(&["order", "cancel-resting", &order, "--shown", &cq.to_string()]);
+
+	// Every coin refreshes, and the nodes come back.
+	refresh_all(&r, &[&m, &t]).await;
+	let ks = reclaims(&r).await;
+	for k in &ks {
+		let tx: elements::Transaction = elements::encode::deserialize(&k.tx).unwrap();
+		println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
+	}
+	assert!(ks.iter().filter(|k| k.detail.contains("RECLAIM-D") && k.state == NurseryState::Final).count() >= 2,
+		"the order's node and the taker's come back by RECLAIM-D");
+	let flows = r.server.store.pool_flow().await.unwrap();
+	for a in [x_id, y_id] {
+		assert_eq!(flows[&a.into_inner().to_byte_array()].transferred, 0, "nothing of {} stays transferred", a);
+	}
 }

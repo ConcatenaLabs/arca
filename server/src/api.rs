@@ -1140,12 +1140,16 @@ pub struct OrderPublish {
 	pub signature: String,
 }
 
-/// `POST /v1/order_fill_delegation_terms` and the request of
-/// `order_fill_delegation`'s terms: a fill by its transfer id.
+/// `POST /v1/order_fill_delegation_terms`: a signed fill, by its transfer
+/// id or by the order coin it spent (one fill spends an order coin), one of
+/// the two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FillRef {
-	pub transfer_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub transfer_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub order_coin: Option<String>,
 }
 
 /// What the maker of a filled order signs its order coin's delegation into
@@ -1179,7 +1183,11 @@ pub struct FillTakerLeaf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FillDelegation {
-	pub transfer_id: String,
+	/// The fill, by its transfer id or by the order coin it spent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub transfer_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub order_coin: Option<String>,
 	pub signature: String,
 }
 

@@ -21,7 +21,12 @@
 //! paying at least the price) and, for a part fill, the order resting again
 //! under a new salt and the same leaf key. Both come to the wallet's mailbox,
 //! and `sync` takes them up: the credit under its credit key's nonce, the
-//! remainder under the order's own, the coin it spent marked filled.
+//! remainder under the order's own, the coin it spent marked filled. Where
+//! the order's coin rests on a lowest node with RECLAIM-D, `sync` then signs
+//! its delegation into the fill, from the coin it took and the taker's leaves
+//! the operator names, so that the node comes back once the fill's coins are
+//! refreshed. The order resting again carries the order's key, which has
+//! delegated, so the wallet never signs a release by it.
 //!
 //! **Taking.** [`Wallet::order_fill_resting`] fills another maker's order:
 //! it reads the order (`order_state`), checks the coin it rests at against
@@ -81,6 +86,10 @@ const TIME_LOCKS_FROM: u32 = 500_000_000;
 
 /// The meta key of the fills the wallet sent and has no answer to yet.
 const PENDING_FILLS: &str = "resting_fills_pending";
+
+/// The meta key of the wallet's order coins whose delegation into the fill
+/// that spent them is done.
+const FILLS_DELEGATED: &str = "resting_fills_delegated";
 
 /// What a maker asks: rest `amount` of `sell` for `want`, `rate_num` atoms of
 /// `want` for every `rate_den` atoms of `sell` (each fill's price rounded
@@ -321,7 +330,87 @@ impl Wallet {
 			}
 		}
 		out.extend(self.retry_fills()?);
+		out.extend(self.delegate_fills()?);
 		Ok(out)
+	}
+
+	/// For each order coin of the wallet's that a fill spent, once the
+	/// wallet holds a coin that fill made (its credit, or the order resting
+	/// again): the order coin's delegation of its release into the fill, so
+	/// that the lowest nodes it rests on come back once the fill's coins are
+	/// refreshed. The taker's leaves come from the operator
+	/// (`order_fill_delegation_terms`) and are checked against the fill's
+	/// outputs in the coin's own record (`Delegation::for_filled_order`), so
+	/// the delegation names exactly the outputs the operator signed. Each
+	/// order coin is done once.
+	fn delegate_fills(&mut self) -> Result<Vec<Value>, Error> {
+		use arca_covenant::transfer::FillLeaf;
+		let mut done: BTreeSet<String> = self.store.meta(FILLS_DELEGATED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let mut out = vec![];
+		for row in self.store.coins()? {
+			let Ok(CoinRecord::Fill(f)) = CoinRecord::from_bytes(&row.record) else { continue };
+			if !matches!(f.leaf, FillLeaf::Credit { .. } | FillLeaf::Rest { .. }) {
+				continue;
+			}
+			let Ok((_, a)) = self.held(&row) else { continue };
+			let made = a.valid;
+			let arca_covenant::ValidOrigin::Fill { order, .. } = &made.origin else { continue };
+			let order_coin = order.id.to_string();
+			if done.contains(&order_coin) {
+				continue;
+			}
+			if order.release_nodes().is_empty() {
+				done.insert(order_coin);
+				continue;
+			}
+			match self.delegate_fill(&f.fill.order, &made, &order_coin) {
+				Ok(v) => {
+					done.insert(order_coin);
+					out.push(v);
+				},
+				Err(e) => out.push(json!({"order_coin": order_coin, "delegated": false, "error": e.to_string()})),
+			}
+		}
+		self.store.set_meta(FILLS_DELEGATED, &serde_json::to_string(&done).map_err(|e| Error::Store(e.to_string()))?)?;
+		Ok(out)
+	}
+
+	/// The delegation of the order coin `order_coin` (whose record is
+	/// `order_record`) into the fill that made `made`.
+	fn delegate_fill(&self, order_record: &CoinRecord, made: &arca_covenant::ValidCoin, order_coin: &str) -> Result<Value, Error> {
+		use arca_covenant::transfer::FillLeaf;
+		let t = self.server.post("order_fill_delegation_terms", &json!({"order_coin": order_coin}))?;
+		if t["delegated"] == true {
+			return Ok(json!({"order_coin": order_coin, "delegated": true}));
+		}
+		let mut takers = vec![];
+		for l in t["takers"].as_array().into_iter().flatten() {
+			takers.push(NewLeaf {
+				enclave: None, v2: false, htlc: None, landing: None,
+				owner: parse_key(&l["owner"], "a taker's leaf")?,
+				owner_nonce: unhex32(l["owner_nonce"].as_str().unwrap_or(""))?,
+				creator_nonce: unhex32(l["creator_nonce"].as_str().unwrap_or(""))?,
+				exit_delay: RelativeTime::from_units(l["exit_delay_units"].as_u64().unwrap_or(0) as u16).map_err(|e| Error::Parse(e.to_string()))?,
+			});
+		}
+		let d = arca_covenant::Delegation::for_filled_order(made, &takers)
+			.map_err(|e| Error::Refused(format!("the operator's terms for the fill of order coin {}: {}", order_coin, e)))?;
+		// The order coin's key: the order's own, under its first coin's nonce.
+		let nonce = match order_record {
+			CoinRecord::Leaf { record, .. } => record.owner_nonce,
+			CoinRecord::Fill(g) => match g.leaf {
+				FillLeaf::Rest { owner_nonce } => owner_nonce,
+				_ => return Err(Error::Refused(format!("order coin {} is no order's", order_coin))),
+			},
+			_ => return Err(Error::Refused(format!("order coin {} is no order's", order_coin))),
+		};
+		let key = self.coin_key(&nonce)?;
+		if key.x_only_public_key().0 != d.from {
+			return Err(Error::Keys(format!("the wallet's key for order coin {} is not the coin's", order_coin)));
+		}
+		let a = self.server.post("order_fill_delegation", &json!({"order_coin": order_coin,
+			"signature": hex(sign(&key, &d.message().digest).as_ref())}))?;
+		Ok(json!({"order_coin": order_coin, "delegated": true, "kept": a["kept"]}))
 	}
 
 	/// Publishes the resting order whose round made the coin `leaf`.
@@ -518,14 +607,27 @@ impl Wallet {
 		// one past its place among the checkpoints (`fill_tx`).
 		let mut named = vec![oc.output().txout()];
 		named.extend((0..chosen.len()).map(|j| tplan.checkpoint_output(j).txout()));
+		// Each coin resting on a lowest node with RECLAIM-D delegates its
+		// release into every output of the fill: the credit, the order resting
+		// again, the taker's leaves.
+		let mut takers = vec![got];
+		if change > 0 {
+			takers.push(change_leaf);
+		}
 		let mut inputs = vec![];
 		for (k, c) in chosen.iter().enumerate() {
 			let key = self.coin_key(&c.row.owner_nonce)?;
 			let cp = sign(&key, &tplan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 			let re = sign(&key, &tplan.checkpoint(k).message_in(k as u32 + 1, &named, &outputs)
 				.map_err(|e| Error::Refused(e.to_string()))?.digest);
-			inputs.push(json!({"leaf_id": c.row.leaf_id, "checkpoint_value": c.checkpoint_value.to_string(), "checkpoint_sig": hex(cp.as_ref()),
-				"reassignment_sig": hex(re.as_ref())}));
+			let mut input = json!({"leaf_id": c.row.leaf_id, "checkpoint_value": c.checkpoint_value.to_string(),
+				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())});
+			if !c.coin.release_nodes().is_empty() {
+				let d = arca_covenant::Delegation::for_fill(&c.coin.leaf, &policy, &outputs, &takers)
+					.map_err(|e| Error::Refused(format!("the delegation: {}", e)))?;
+				input["delegation_sig"] = json!(hex(sign(&key, &d.message().digest).as_ref()));
+			}
+			inputs.push(input);
 		}
 		let leaf_json = |asset: AssetId, value: u64, l: &NewLeaf| json!({
 			"asset": asset.to_string(), "value": value.to_string(), "owner": hex(&l.owner.serialize()), "owner_nonce": hex(&l.owner_nonce),
