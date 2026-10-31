@@ -22,7 +22,7 @@
 #   STOP_OPERATOR, START_OPERATOR, KILL_OPERATOR, KILL_SIGNER
 #                     the operator's own service commands
 #   CHAIN_PRODUCE, CHAIN_BURY, CHAIN_ADVANCE   regtest hooks (optional)
-set -euo pipefail
+set -Eeuo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 : "${ARCA:?}" "${OPERATOR_URL:?}" "${OPERATOR_KEY:?}" "${NODE_URL:?}" "${ASSET:?}" "${FUND:?}"
 [ -n "${NODE_COOKIE:-}" ] || : "${NODE_USER:?name the node RPC login: NODE_COOKIE, or NODE_USER and NODE_PASSWORD_FILE}" "${NODE_PASSWORD_FILE:?}"
@@ -49,6 +49,9 @@ SCENARIO=setup
 source "$HERE/lib.sh"
 source "$HERE/load.sh"
 source "$HERE/scenarios.sh"
+# Whatever stops the run says where: a command that fails with errexit on
+# (not one `try` runs, nor one inside a command substitution) names itself.
+trap 'rc=$?; [[ $- == *e* ]] && printf "%s STOP: %s line %s: \"%s\" exited %s\n" "$(date -u +%H:%M:%S)" "${BASH_SOURCE[0]##*/}" "$LINENO" "$BASH_COMMAND" "$rc" | tee -a "$RUN/log" >&2' ERR
 
 # Stopping an operator other people use is never this script's to do: it
 # stops only an operator on this machine, one that answers with the key
