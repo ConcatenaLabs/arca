@@ -676,7 +676,8 @@ board's leaf carries the frozen sweep for a token no issuance creates
 Against the sender alone the receiver is then safe: every leaf of the lineage is
 off-chain and has an exit delay of at least the policy's minimum, so when the
 sender's leaf reaches the chain, the receiver publishes the checkpoint and the
-reassignment within that delay. It answers at once: a rollback that disconnects
+reassignment within that delay, or a watchtower holding the receiver's record
+does while the receiver is away. It answers at once: a rollback that disconnects
 its answer does not restart the delay of the leaf it answered. Against the sender
 and the operator together it is not safe, before a round: that is the trust the
 specification calls operator-confirmed.

@@ -12,7 +12,8 @@
 //! is then safe while any one of them acts.
 //!
 //! **The holder's side** ([`Wallet::progress_deposits`], at every `sync`).
-//! For each live coin resting on a batch, the wallet builds one deposit: the
+//! For each live coin resting on a batch, and each coin paid to it out of
+//! round, the wallet builds one deposit: the
 //! coin record, with the authorisations of each batch leaf of its own in it
 //! signed again for a time an hour before that batch's first expiry
 //! ([`DEPOSIT_LEAD`]), so no one can unroll it before the batch could be
@@ -30,9 +31,12 @@
 //! ([`Wallet::tower_deposit`]) and withdrawals ([`Wallet::tower_withdraw`]),
 //! and passes over them ([`Wallet::tower_pass`]). A pass leaves a coin alone
 //! until a batch it rests on is released (the batch's token at `R`, in a
-//! block or the mempool); then it builds whatever is still missing of the
-//! coin's path, from the lowest output the chain holds unspent, exactly as an
-//! exit does, and broadcasts it. Each transaction pays its fee from the
+//! block or the mempool) or, for a coin paid out of round, until a sender
+//! up its lineage takes an earlier coin home (a leaf or checkpoint the coin
+//! descends from in a block or the mempool, which only the coin's checkpoint
+//! and reassignment answer, within that leaf's exit delay); then it builds
+//! whatever is still missing of the coin's path, from the lowest output the
+//! chain holds unspent, exactly as an exit does, and broadcasts it. Each transaction pays its fee from the
 //! reserve the output it spends holds for it, when the node accepts the
 //! batch's asset for fees and the reserve covers the floor; otherwise from a
 //! coin of the watchtower's own. Coins on one branch share its nodes: the
@@ -55,7 +59,7 @@ use std::str::FromStr;
 use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Transaction};
+use elements::{AssetId, OutPoint, Transaction};
 use serde_json::{json, Value};
 
 use arca_covenant::sign::verify_digest;
@@ -120,6 +124,12 @@ fn schedules(record: &CoinRecord, out: &mut Vec<ClockSchedule>) {
 	}
 }
 
+/// Whether `record` is a coin paid out of round (a transfer or a fill): one
+/// with a lineage, whose senders can take an earlier coin home on the chain.
+fn has_lineage(record: &CoinRecord) -> bool {
+	matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_))
+}
+
 /// The latest time of any authorisation `record` carries.
 fn latest_auth(record: &CoinRecord) -> u32 {
 	match record {
@@ -180,12 +190,13 @@ impl Wallet {
 	/// The deposit of the coin `row`: its record, with the authorisations of
 	/// a batch leaf of the wallet's own signed again for an hour before its
 	/// batch's first expiry, and the transactions it rests on. `None` for a
-	/// coin that rests on no batch, which no sweep takes.
+	/// coin that rests on no batch and has no lineage: no sweep takes it, and
+	/// no sender up a lineage can take it back.
 	fn deposit_of(&self, row: &super::store::CoinRow) -> Result<Option<(CoinRecord, Vec<Transaction>)>, Error> {
 		let record = Self::record_of(row)?;
 		let mut sch = vec![];
 		schedules(&record, &mut sch);
-		if sch.is_empty() {
+		if sch.is_empty() && !has_lineage(&record) {
 			return Ok(None);
 		}
 		let bases = self.accepted_bases(&record)?;
@@ -336,8 +347,9 @@ impl Wallet {
 		let record = CoinRecord::from_bytes(&bytes).map_err(|e| Error::Refused(format!("invalid_record: {}", e)))?;
 		let mut sch = vec![];
 		schedules(&record, &mut sch);
-		if sch.is_empty() {
-			return Err(Error::Refused("invalid_record: the coin rests on no batch, and no sweep takes it".into()));
+		if sch.is_empty() && !has_lineage(&record) {
+			return Err(Error::Refused("invalid_record: the coin rests on no batch and has no lineage: no sweep takes it, and no \
+				sender can take it back".into()));
 		}
 		let (owner, _) = record.owner().ok_or_else(|| Error::Refused("invalid_record: the record names no owner".into()))?;
 		let bases = txs_of(&body["bases"])?;
@@ -442,7 +454,12 @@ impl Wallet {
 		let bases = txs_of(&serde_json::from_str::<Value>(&row.bases).map_err(|e| Error::Store(e.to_string()))?)?;
 		let mut sch = vec![];
 		schedules(&record, &mut sch);
-		if row.state == "held" && !self.released(&sch, memo)? {
+		let released = row.state != "held" || self.released(&sch, memo)?;
+		// A coin paid out of round is answered as soon as a sender up its
+		// lineage takes an earlier coin on the chain, released or not; until
+		// an output it descends from moves, nothing of its lineage can be
+		// there, which one look at those outputs tells.
+		if !released && (!has_lineage(&record) || !self.roots_moved(&record, &bases, memo)?) {
 			return Ok(None);
 		}
 		let coin = self.tower_coin(&record, &bases)?;
@@ -450,6 +467,13 @@ impl Wallet {
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
 		let leaf = coin.output().txout();
+		let seen = if released { vec![] } else {
+			let seen = self.lineage_seen(&coin, &here)?;
+			if seen.is_empty() && here.at(&coin.output()).is_none() {
+				return Ok(None);
+			}
+			seen
+		};
 		if let Some(at) = path.iter().zip(&here.at).find(|(o, _)| **o == leaf).and_then(|(_, a)| *a) {
 			if self.chain.finality(&at.txid)?.in_chain() {
 				let note = format!("its leaf is on the chain at {}, its owner's", at);
@@ -481,9 +505,53 @@ impl Wallet {
 		}
 		let mut all: Vec<Value> = serde_json::from_str::<Value>(&row.txs).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
 		all.extend(steps.iter().cloned());
-		let note = format!("its batch is released: its path broadcast, its leaf at {}", at);
+		let note = if seen.is_empty() {
+			format!("its batch is released: its path broadcast, its leaf at {}", at)
+		} else {
+			format!("a sender up its lineage took an earlier coin on the chain ({}): its path broadcast, its leaf at {}", seen.join("; "), at)
+		};
 		self.store.tower_set(&row.id, "brought", &note, Some(&Value::Array(all).to_string()))?;
 		Ok(Some(json!({"deposit": row.id, "leaf_id": row.leaf_id, "state": "brought", "leaf": at.to_string(), "broadcast": steps})))
+	}
+
+	/// Whether an output `record` descends from (a batch output or a board,
+	/// read from the deposit's transactions) is spent, in a block or the
+	/// mempool, or cannot be named: only then can anything of its lineage be
+	/// on the chain.
+	fn roots_moved(&self, record: &CoinRecord, bases: &[Transaction], memo: &mut BTreeMap<Vec<u8>, bool>) -> Result<bool, Error> {
+		let mut outs = vec![];
+		if super::wallet::base_outputs(record, &mut outs).is_err() {
+			return Ok(true);
+		}
+		for o in outs {
+			let Some(tx) = bases.iter().find(|t| t.output.contains(&o)) else { return Ok(true) };
+			let txid = tx.txid();
+			for (i, _) in tx.output.iter().enumerate().filter(|(_, x)| **x == o) {
+				let op = OutPoint::new(txid, i as u32);
+				let key = [b"root".as_slice(), &elements::encode::serialize(&op)].concat();
+				let spent = match memo.get(&key) {
+					Some(b) => *b,
+					None => {
+						let b = !self.chain.unspent(&op)?;
+						memo.insert(key, b);
+						b
+					},
+				};
+				if spent {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
+
+	/// What of `coin`'s lineage is on the chain (`here`): a leaf or
+	/// checkpoint it descends from, unspent in a block or the mempool. Each
+	/// means a sender has started to take an earlier coin home, which only
+	/// the checkpoint and reassignment answer, within that leaf's exit delay.
+	fn lineage_seen(&self, coin: &arca_covenant::ValidCoin, here: &Here) -> Result<Vec<String>, Error> {
+		Ok(coin.lineage().into_iter().filter(|o| here.at(&o.output).is_some())
+			.map(|o| format!("a {} it descends from", o.kind)).collect())
 	}
 }
 
