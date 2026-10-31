@@ -124,6 +124,15 @@ as_user() { runuser -u "$USER_" -- "$@"; }
 SEQCLI=("$OPT/sequentia/bin/sequentia-cli" -conf="$ETC/sequentia.conf" -datadir="$LIB/sequentia")
 BTCCLI=("$OPT/core/bin/bitcoin-cli" -conf="$ETC/bitcoin.conf" -datadir="$LIB/bitcoin")
 seq_cli() { as_user "${SEQCLI[@]}" "$@" </dev/null; }
+# The node's fee rates, keyed by asset id. The node keys an asset by its label
+# when it knows one (USDX, tSEQ on the public testnet), so an id alone would
+# miss every labelled asset; dumpassetlabels maps the labels back.
+node_rates() {
+  local r l
+  r=$(seq_cli getfeeexchangerates 2>/dev/null) || r='{}'
+  l=$(seq_cli dumpassetlabels 2>/dev/null) || l='{}'
+  jq -c --argjson l "$l" 'with_entries(.key = ($l[.key] // .key))' <<<"$r" 2>/dev/null || echo '{}'
+}
 btc_cli() { as_user "${BTCCLI[@]}" "$@" </dev/null; }
 seqln() { as_user "$OPT/seqln/cli/lightning-cli" --lightning-dir="$LIB/seqln" "$@" </dev/null; }
 cln() { as_user "$OPT/cln/usr/bin/lightning-cli" --lightning-dir="$LIB/cln" "$@" </dev/null; }
@@ -507,7 +516,7 @@ EOF
 write_arcad_toml() {
 ark_url="http://127.0.0.1:$CAPTAIND_PORT"; [ -n "$DOMAIN" ] && ark_url="https://$DOMAIN"
 assets_toml=""; fee_assets=""
-rates=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}')
+rates=$(node_rates)
 for id in "${ASSET_IDS[@]}"; do
   assets_toml+="
 [[assets]]
@@ -994,7 +1003,7 @@ if [ -n "$PRICE_FEED_URL" ]; then
   # restart the node takes no fee at all until its first publish (the feed and
   # the registry read first): up to a few minutes.
   for ((i = 0; i < 360; i++)); do
-    r=$(seq_cli getfeeexchangerates 2>/dev/null || echo '{}'); missing=""
+    r=$(node_rates); missing=""
     for id in "${ASSET_IDS[@]}"; do jq -e --arg a "$id" 'has($a)' <<<"$r" >/dev/null || missing+=" ${id:0:12}…"; done
     [ -z "$missing" ] && break; sleep 1
   done
@@ -1195,7 +1204,7 @@ connect() {
     have=$(seqln listpeerchannels "$pid" | jq --arg a "$id" '[.channels[] | select((.channel_asset // .asset) == $a and (.state | test("CLOSING|ONCHAIN|CLOSED") | not))] | length')
     if [ "$have" -gt 0 ]; then say "${id:0:12}…: a channel is open already"; continue; fi
     amt=$(channel_atoms "$id"); [ "$amt" -gt 0 ] || { say "${id:0:12}…: no channel size set"; continue; }
-    jq -e --arg a "$id" 'has($a)' <<<"$(seq_cli getfeeexchangerates)" >/dev/null \
+    jq -e --arg a "$id" 'has($a)' <<<"$(node_rates)" >/dev/null \
       || die "${id:0:12}…: this node takes no fee in it, and a channel in an asset is opened with a fee in that asset: run the price server (PRICE_FEED_URL) or set its rate (sequentia-cli setfeeexchangerates)"
     r=$(seqln -k fundchannel id="$pid" amount="$amt" asset="$id" push_msat="$((amt / 2 * 1000))" announce=false 2>&1) \
       || die "${id:0:12}…: SeqLN did not open the channel: $(jq -r '.message // empty' <<<"$r" 2>/dev/null || true) ${r:0:300}"
