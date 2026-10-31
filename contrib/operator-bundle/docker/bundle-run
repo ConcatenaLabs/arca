@@ -98,6 +98,7 @@ seqln)
   ;;
 cln)
   until_up "the Bitcoin node" btc_cli getblockchaininfo
+  until_up "the fee proxy" bash -c "exec 3<>/dev/tcp/127.0.0.1/$FEE_PROXY_PORT"
   run_as "$OPT/cln/usr/bin/lightningd" --lightning-dir="$LIB/cln"
   ;;
 arca-signer)
