@@ -25,6 +25,7 @@ pub mod chain;
 pub mod channels;
 pub mod coins;
 pub mod cosign;
+pub mod delegations;
 pub mod fees;
 pub mod forfeits;
 pub mod http;

@@ -2398,7 +2398,13 @@ impl Watcher {
 	/// released it, and with `reclaim_early` unrolls toward them through
 	/// nodes all of whose owners have.
 	async fn reclaims(&self, now: MedianTime) -> Result<(), WatcherError> {
-		for (round_id, vout) in self.store.batches_with_releases().await? {
+		let mut batches = self.store.batches_with_releases().await?;
+		for b in self.store.batches_with_delegations().await? {
+			if !batches.contains(&b) {
+				batches.push(b);
+			}
+		}
+		for (round_id, vout) in batches {
 			let round = match self.store.round(round_id).await? {
 				Some(r) if r.state == RoundState::Final => r,
 				_ => continue,
@@ -2425,6 +2431,9 @@ impl Watcher {
 		};
 		// Each leaf's release of its lowest node, by leaf index.
 		let mut released: HashMap<usize, crate::store::ReleaseRow> = HashMap::new();
+		// On a node with RECLAIM-D one of whose leaves moved out of round:
+		// every slot's consent, by leaf index, once each has one.
+		let mut consents: HashMap<usize, crate::delegations::Consent> = HashMap::new();
 		for node in &tree.levels()[0] {
 			let rows = self.store.releases(&node.policy.children_hash()).await?;
 			for i in node.leaves.clone() {
@@ -2432,15 +2441,27 @@ impl Watcher {
 					released.insert(i, r.clone());
 				}
 			}
+			if b.delegated_reclaim && node.policy.delegated() && !node.leaves.clone().all(|i| released.contains_key(&i)) {
+				let start = node.leaves.start;
+				let slots: Option<Vec<([u8; 32], elements::secp256k1_zkp::XOnlyPublicKey)>> = node.leaves.clone()
+					.map(|i| Some((leaves.get(i)?.leaf_id, *node.policy.owners().get(i - start)?))).collect();
+				let Some(slots) = slots else { continue };
+				if let Some(cs) = crate::delegations::node_consents(&self.store, &slots, node.policy.children_hash()).await? {
+					for (i, c) in node.leaves.clone().zip(cs) {
+						consents.insert(i, c);
+					}
+				}
+			}
 		}
-		if released.is_empty() {
+		if released.is_empty() && consents.is_empty() {
 			return Ok(());
 		}
+		let leaf_ids: Vec<[u8; 32]> = leaves.iter().map(|l| l.leaf_id).collect();
 		let seen = self.store.tree_sightings(round.round_id, b.vout).await?;
 		let depth = tree.levels().len();
 		for level in (0..depth).rev() {
 			for (k, node) in tree.levels()[level].iter().enumerate() {
-				if !node.leaves.clone().all(|i| released.contains_key(&i)) {
+				if !node.leaves.clone().all(|i| released.contains_key(&i) || consents.contains_key(&i)) {
 					continue;
 				}
 				let mut candidates: Vec<OutPoint> = seen.iter().filter(|s| s.kind == TreeScriptKind::Node && s.level as usize == level && s.idx as usize == k)
@@ -2453,7 +2474,13 @@ impl Watcher {
 						continue;
 					}
 					if level == 0 {
-						self.reclaim_node(node, op, &released).await?;
+						let ids = &leaf_ids[node.leaves.clone()];
+						if node.leaves.clone().all(|i| released.contains_key(&i)) {
+							self.reclaim_node(node, op, &released, ids).await?;
+						} else {
+							let cs: Vec<&crate::delegations::Consent> = node.leaves.clone().map(|i| &consents[&i]).collect();
+							self.reclaim_node_delegated(node, op, &cs, ids).await?;
+						}
 					} else if self.config.reclaim_early && !expired {
 						self.unroll_released(node, level, depth, op, &leaves, &released).await?;
 					}
@@ -2498,7 +2525,7 @@ impl Watcher {
 	/// Reclaims the lowest node `node`, on the chain at `op`, with every
 	/// owner's release and an atom of each connector asset they name.
 	async fn reclaim_node(&self, node: &arca_covenant::tree::TreeNode, op: OutPoint,
-		released: &HashMap<usize, crate::store::ReleaseRow>) -> Result<(), WatcherError>
+		released: &HashMap<usize, crate::store::ReleaseRow>, leaf_ids: &[[u8; 32]]) -> Result<(), WatcherError>
 	{
 		// The releases in owner order: the node's owners are its leaves'.
 		let rows: Vec<&crate::store::ReleaseRow> = node.leaves.clone().map(|i| &released[&i]).collect();
@@ -2546,8 +2573,62 @@ impl Watcher {
 		let u = ks.finish(below);
 		let mut wallet: Vec<(usize, WalletCoin)> = atoms.into_iter().enumerate().map(|(i, a)| (i + 1, a)).collect();
 		wallet.extend(pay.fee_coin.map(|c| (n - 1, c)));
+		self.store.insert_reclaimed_leaves(&txid.to_byte_array(), leaf_ids).await?;
 		self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "reclaim", node.policy.children_hash().to_vec(),
 			format!("a lowest node of {} owner(s), every one of whom released it", owners)).await?;
+		Ok(())
+	}
+
+	/// Reclaims the lowest node `node`, on the chain at `op`, by RECLAIM-D:
+	/// `consents` holds each owner's, in owner order, and the reclaim takes an
+	/// atom of each connector asset their releases name.
+	async fn reclaim_node_delegated(&self, node: &arca_covenant::tree::TreeNode, op: OutPoint,
+		consents: &[&crate::delegations::Consent], leaf_ids: &[[u8; 32]]) -> Result<(), WatcherError>
+	{
+		let mut rounds = vec![];
+		for c in consents {
+			c.rounds(&mut rounds);
+		}
+		let mut atoms: Vec<WalletCoin> = vec![];
+		for r in rounds {
+			match self.connector_atom(r).await? {
+				Some(a) => atoms.push(a),
+				None => return Ok(()),
+			}
+		}
+		let conns: Vec<(OutPoint, elements::TxOut)> = atoms.iter().map(|a| (
+			OutPoint::new(txid_of(&a.txid), a.vout),
+			sequentia_ext::explicit_txout(AssetAmount::new(AssetId::from_byte_array(a.asset), a.value), Script::from(a.script_pubkey.clone())),
+		)).collect();
+		let back = self.to_wallet().await?;
+		let owners = node.policy.owners().len();
+		let steps: usize = consents.iter().map(|c| c.steps()).sum();
+		let asset = node.policy.children()[0].asset;
+		let chain = self.params.chain;
+		let wallet_inputs: Vec<usize> = (1..=conns.len()).collect();
+		let items = |ks: &KeySpend, sig: Signature| -> Result<Vec<Vec<u8>>, String> {
+			let trees = consents.iter().map(|c| c.tree(&ks.prevouts)).collect::<Result<Vec<_>, _>>()?;
+			let prefix = node.policy.release_prefix().ok_or("a node without RECLAIM")?;
+			arca_covenant::node::reclaim_delegated_items(&sig, &prefix, &chain.delegation_prefix(), &trees).map_err(|e| e.to_string())
+		};
+		let pay = self.payout(asset, node.value, &wallet_inputs, |outs, fee| {
+			let ks = node.policy.reclaim_delegated_tx(op, node.value, &conns, outs, back.clone(), fee).map_err(|e| e.to_string())?;
+			let t = ks.clone().finish(items(&ks, dummy_sig())?).tx;
+			Ok((ks, t))
+		}).await?;
+		let ks = pay.made;
+		let txid = ks.tx.txid();
+		self.wallet.take(&atoms.iter().collect::<Vec<_>>(), &txid).await?;
+		let sig = self.operator_sig(&ks.tx, &ks.prevouts, 0, &ks.script).await?;
+		let below = items(&ks, sig).map_err(WatcherError::Build)?;
+		let n = ks.tx.input.len();
+		let u = ks.finish(below);
+		let mut wallet: Vec<(usize, WalletCoin)> = atoms.into_iter().enumerate().map(|(i, a)| (i + 1, a)).collect();
+		wallet.extend(pay.fee_coin.map(|c| (n - 1, c)));
+		self.store.insert_reclaimed_leaves(&txid.to_byte_array(), leaf_ids).await?;
+		self.publish(Ready { tx: u.tx, wallet, fee: Some(pay.fee) }, "reclaim", node.policy.children_hash().to_vec(),
+			format!("a lowest node of {} owner(s) by RECLAIM-D, released by the current holders of its coins in {} step(s)", owners, steps))
+			.await?;
 		Ok(())
 	}
 }

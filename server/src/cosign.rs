@@ -94,6 +94,12 @@ pub struct InputRequest {
 	pub checkpoint_sig: Signature,
 	/// The owner's signature over the reassignment.
 	pub reassignment_sig: Signature,
+	/// The owner's delegation of the coin's release to the outputs' owner
+	/// keys ([`crate::delegations`]), for a coin resting on a lowest node
+	/// with RECLAIM-D. Not part of the request's hash: a request posted with
+	/// it, or without it, is the same transfer. Without it the node the coin
+	/// rests on comes back only at its batch's expiry.
+	pub delegation_sig: Option<Signature>,
 }
 
 /// One new leaf.
@@ -619,6 +625,20 @@ impl Cosigner {
 			}
 			messages.push((cp, re));
 		}
+		// Each delegation, against the outputs as the server builds them;
+		// one for a coin that rests on no lowest node with RECLAIM-D is of no
+		// use and is not kept.
+		let policies: Vec<arca_covenant::LeafPolicy> = req.outputs.iter().map(|o| o.leaf.policy(s, chain)).collect();
+		let mut delegations = vec![];
+		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+			let Some(d) = &i.delegation_sig else { continue };
+			if crate::delegations::check(&c.coin, chain, &outputs, &policies, d).is_err() {
+				return Err(CosignError::BadSignature { input: k, which: "delegation" });
+			}
+			if !c.coin.release_nodes().is_empty() {
+				delegations.push((c.coin.id, *d));
+			}
+		}
 
 		// The new coins' ids, from the reassignment.
 		let parts: Vec<(LeafId, [u8; 32])> = checked.iter().enumerate()
@@ -743,6 +763,12 @@ impl Cosigner {
 					return Err(e);
 				}
 			},
+		}
+
+		// The delegations, kept with the transfer recorded; one given again
+		// with a repeated request stays as it was.
+		for (id, d) in &delegations {
+			self.store.insert_delegation(&id.0, &transfer, &sig_bytes(d)).await?;
 		}
 
 		// Nothing of it is signed while the signer holds anything else under
@@ -1350,7 +1376,7 @@ mod test {
 	fn an_htlc_leaf_s_terms_and_place_are_in_the_request_hash() {
 		let input = InputRequest {
 			leaf_id: LeafId([1; 32]), checkpoint_value: 900, checkpoint_sig: Signature::from_slice(&[2; 64]).unwrap(),
-			reassignment_sig: Signature::from_slice(&[3; 64]).unwrap(),
+			reassignment_sig: Signature::from_slice(&[3; 64]).unwrap(), delegation_sig: None,
 		};
 		let t = HtlcTerms {
 			direction: HtlcDirection::Send, payment_hash: [9; 32], timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),

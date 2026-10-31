@@ -215,7 +215,7 @@ impl FillRequest {
 			let checkpoint_value = u64_of(take(8)?);
 			let checkpoint_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
 			let reassignment_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
-			inputs.push(InputRequest { leaf_id, checkpoint_value, checkpoint_sig, reassignment_sig });
+			inputs.push(InputRequest { leaf_id, checkpoint_value, checkpoint_sig, reassignment_sig, delegation_sig: None });
 		}
 		let m = take(1)?[0] as usize;
 		let mut outputs = Vec::with_capacity(m);

@@ -676,6 +676,8 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 			.map(|(a, f)| (AssetId::from_byte_array(a).to_string(), api::PoolFlowInfo {
 				locked: f.locked.to_string(), released: f.released.to_string(), reclaimable: f.reclaimable.to_string(),
 				transferred: f.transferred.to_string(),
+				in_flight: f.in_flight.to_string(),
+				in_flight_cap: app.params.in_flight_cap(&AssetId::from_byte_array(a)).map(|c| c.to_string()),
 				drawn_last_hour: f.drawn_last_hour.to_string(), reclaimed_last_hour: f.reclaimed_last_hour.to_string(),
 				swept_last_hour: f.swept_last_hour.to_string(),
 				net_drawn_last_hour: (f.drawn_last_hour as i128 - f.reclaimed_last_hour as i128 - f.swept_last_hour as i128).to_string(),
@@ -700,6 +702,11 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let owed = app.store.owed_totals().await.map_err(|e| log::warn!("what is owed for swept coins: {}", e)).ok();
 	let owed_of = |a: &AssetId| owed.as_ref().and_then(|o| o.get(&a.into_inner().to_byte_array()).copied());
 	let p = &app.params;
+	let in_flight = if p.assets.ids().iter().any(|a| p.in_flight_cap(a).is_some()) {
+		app.store.in_flight().await.map_err(|e| log::warn!("what is in flight: {}", e)).ok()
+	} else {
+		None
+	};
 	Json(api::Info {
 		operator: hex(&p.operator.serialize()),
 		genesis_hash: p.chain.genesis_hash().to_string(),
@@ -740,6 +747,9 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			// coins, which their holders' claims will draw on.
 			fundable: fundable.as_ref().map(|f| f.get(a).copied().unwrap_or(0).saturating_sub(owed_of(a).map_or(0, |o| o.0)).to_string()),
 			owed: owed_of(a).filter(|o| o.1 > 0).map(|(total, coins)| api::OwedInfo { total: total.to_string(), coins }),
+			in_flight_cap: p.in_flight_cap(a).map(|c| c.to_string()),
+			in_flight: p.in_flight_cap(a).and(in_flight.as_ref())
+				.map(|f| f.get(&a.into_inner().to_byte_array()).copied().unwrap_or(0).to_string()),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -874,6 +884,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			checkpoint_value: amount(&i.checkpoint_value)?,
 			checkpoint_sig: sig(&i.checkpoint_sig)?,
 			reassignment_sig: sig(&i.reassignment_sig)?,
+			delegation_sig: i.delegation_sig.as_deref().map(sig).transpose()?,
 		});
 	}
 	let mut outputs = Vec::with_capacity(outs.len());
@@ -1351,6 +1362,7 @@ async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Socket
 		genesis_hash: t.params.chain.genesis_hash().to_string(),
 		schedule: hex(&t.params.schedule.encode()),
 		burn: t.params.burn,
+		delegated_reclaim: t.params.delegated_reclaim,
 		radix: t.params.radix as u32,
 		reserve: match t.params.reserve {
 			arca_covenant::ReserveRule::FeeRate { floor_per_kvb, multiple } => api::TreeReserve::FeeRate(api::FeeRateReserve {
@@ -1455,7 +1467,9 @@ async fn release_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 	let mut releases = Vec::with_capacity(req.releases.len());
 	for r in &req.releases {
 		let connector = r.connector_asset.as_deref().map(asset).transpose()?;
-		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, connector, signature: sig(&r.signature)? });
+		let node = r.node.as_deref().map(|h| unhex(h).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())
+			.ok_or_else(|| Refusal::malformed(format!("node {:?}: 32 bytes in hex", h)))).transpose()?;
+		releases.push(ReleaseRequest { leaf_id: leaf_id(&r.leaf_id)?, connector, signature: sig(&r.signature)?, node });
 	}
 	let done = app.forfeits.release_leaves(&id, &releases).await?;
 	Ok(Json(api::Released { participation_id: hex(&id), released: done.iter().map(|l| l.to_string()).collect() }))
