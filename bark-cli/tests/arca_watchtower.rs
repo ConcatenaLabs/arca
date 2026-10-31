@@ -24,6 +24,7 @@
 mod common;
 
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use elements::Script;
@@ -392,4 +393,155 @@ async fn the_operator_brings_live_coins_on_chain_at_release() {
 	println!("A's coin on return: {} {} | {}", coin["state"], coin["kept_safe_note"], coin["note"]);
 	assert_eq!(coin["kept_safe"], true);
 	assert_eq!(a.ok(&["balance"])["arca"][&x]["kept_safe"], va.to_string());
+}
+
+/// A copy of `from`'s wallet directory as `to`: the wallet as a backup
+/// taken now would restore it.
+fn copy_wallet(from: &Arca, to: &Arca) {
+	fn copy(a: &std::path::Path, b: &std::path::Path) {
+		std::fs::create_dir_all(b).unwrap();
+		for e in std::fs::read_dir(a).unwrap() {
+			let e = e.unwrap();
+			let p = b.join(e.file_name());
+			if e.file_type().unwrap().is_dir() {
+				copy(&e.path(), &p);
+			} else {
+				std::fs::copy(e.path(), p).unwrap();
+			}
+		}
+	}
+	copy(&from.dir, &to.dir);
+}
+
+/// A sender takes home, on the chain, a coin it has already paid on (from a
+/// copy of its wallet made before it paid), while the receiver is away and
+/// the operator is down. The receiver's watchtower sees the earlier coin's
+/// leaf reach the chain, its batch not released, and answers within that
+/// leaf's exit delay: it publishes the checkpoint and the reassignment the
+/// receiver deposited, paying what the reserves cannot from a coin of its
+/// own. The sender's claim then fails, and the receiver, back, finds its
+/// coin on the chain under its own key and takes it home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.watcher.unroll_at_release = false;
+		c.watcher.enabled = false;
+	}).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x.to_string();
+	let s = Arca::new("wt lineage S");
+	let s_old = Arca::new("wt lineage S old");
+	let rc = Arca::new("wt lineage R");
+	for w in [&s, &rc] {
+		w.ok(&create_args(&url, &node));
+	}
+	let board_s = board(&mut r, &s, "2000000").await;
+	s.ok(&["participate", "--leaf", &board_s, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	let (ls, vs, _) = new_leaf(&s.ok(&["sync"]));
+	println!("S's batch leaf {} = {}", ls, vs);
+	// The copy S keeps of its wallet before it pays: it still holds `ls`.
+	copy_wallet(&s, &s_old);
+
+	// R names the watchtower, which holds a coin of its own for fees.
+	let mut t = Tower::new("wt lineage T", &url, &node);
+	r.pay_to(script(&t.wallet.ok(&["address"])), r.x, 1_000_000);
+	r.produce().await;
+	r.bury().await;
+	rc.ok(&["watchtowers", &t.url]);
+	let req = rc.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	s.ok(&["send", &req, "--amount", "600000", "--asset", &x]);
+	let m = rc.ok(&["mailbox"]);
+	let coin = m["accepted"][0]["leaf_id"].as_str().unwrap_or_else(|| panic!("R accepts the payment: {}", m)).to_string();
+	let sync = rc.ok(&["sync"]);
+	println!("R's coin {}; its sync's deposits: {}", coin, sync["deposits"]);
+	assert_eq!(t.deposit_of(&coin).expect("T holds R's deposit")["state"], "held");
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	assert_eq!(t.deposit_of(&coin).unwrap()["state"], "held", "nothing while the lineage is off the chain");
+
+	// R is away and the operator stops. S takes its old coin home from the copy.
+	r.server.stop();
+	// The watchtower is down a while, and returns once S's exit is out.
+	t.stop();
+	let e = s_old.ok(&["exit", &ls]);
+	println!("S takes its old coin home: {}", e);
+	assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+	r.produce().await;
+	// Meanwhile the node comes to value X at a tenth of what it did: the
+	// reserves the transfer left for its checkpoint and reassignment no
+	// longer pay the floor, and the watchtower adds a coin of its own to each.
+	let before: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	let mut rates: serde_json::Map<String, Value> = serde_json::from_value(r.rt.client().call::<Value>("getfeeexchangerates", &[]).unwrap()).unwrap();
+	rates.insert(x.clone(), serde_json::json!(10_000_000));
+	r.rt.client().call::<Value>("setfeeexchangerates", &[Value::Object(rates)]).unwrap();
+	t.start();
+	let start = Instant::now();
+	let mut brought = Value::Null;
+	loop {
+		let d = t.deposit_of(&coin).unwrap();
+		if d["state"] == "brought" {
+			brought = d.clone();
+		}
+		if d["state"] == "on_chain" {
+			break;
+		}
+		assert!(start.elapsed() < Duration::from_secs(90), "the watchtower did not answer: {}", d);
+		r.produce().await;
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+	let d = t.deposit_of(&coin).unwrap();
+	println!("T answered: {} | then {}", brought["note"], d["note"]);
+	assert!(brought["note"].as_str().unwrap_or("").contains("a sender up its lineage took an earlier coin on the chain"), "{}", brought);
+	let steps = d["broadcast"].as_array().unwrap();
+	assert_eq!(steps.len(), 2, "the checkpoint and the reassignment: {}", d["broadcast"]);
+	for st in steps {
+		println!("T's step {}: {} vB, fee {}, paid by {}", st["txid"], st["vsize"], st["fee"], st["paid_by"]);
+		assert_eq!(st["paid_by"], "a coin of the watchtower's", "{}", st);
+	}
+
+	// S's leaf is spent by the watchtower's checkpoint: once its exit delay
+	// runs out there is nothing left for S to claim.
+	let leaf_at = e["leaf"].as_str().unwrap().trim_start_matches("[elements]").to_string();
+	let (lt, lv) = leaf_at.split_once(':').unwrap();
+	let cp = r.rt.client().raw_transaction(&elements::Txid::from_str(steps[0]["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert!(cp.input.iter().any(|i| i.previous_output.txid.to_string() == lt && i.previous_output.vout.to_string() == lv),
+		"the checkpoint spends S's leaf {}", leaf_at);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 2 * 512));
+	r.produce().await;
+	let unspent: Value = r.rt.client().call("gettxout", &[serde_json::json!(lt), serde_json::json!(lv.parse::<u32>().unwrap())]).unwrap();
+	assert!(unspent.is_null(), "S's leaf is spent: {}", unspent);
+	let (ok, v) = s_old.run(&["exit", &ls]);
+	println!("S's claim after the delay: ok {} | {}", ok, v);
+	assert!(!(ok && v["state"] == "claimed"), "S cannot claim the coin it paid on: {}", v);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[before]).unwrap();
+
+	// R returns: its coin is on the chain under its key; it takes it home.
+	r.restart_server().await;
+	r.synced().await;
+	let s1 = rc.ok(&["sync"]);
+	println!("R's sync on return: {}", s1["recheck"]["changes"]);
+	let c = rc.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned().unwrap();
+	println!("R's coin on return: {} {} | {}", c["state"], c["kept_safe_note"], c["note"]);
+	assert_eq!(c["kept_safe"], true, "{}", c);
+	let mut claimed = Value::Null;
+	for _ in 0..6 {
+		r.produce().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 512));
+		let e = rc.ok(&["exit", &coin]);
+		if e["state"] == "claimed" {
+			claimed = e;
+			break;
+		}
+	}
+	println!("R's claim: {}", claimed);
+	assert_eq!(claimed["state"], "claimed", "R takes its coin home");
+	r.produce().await;
+	let claim = elements::Txid::from_str(claimed["claim"]["txid"].as_str().unwrap()).unwrap();
+	let tx = r.rt.client().raw_transaction(&claim).unwrap();
+	let paid = tx.output[0].value.explicit().unwrap();
+	println!("R's claim {} pays {} of X", claim, paid);
+	assert!(paid > 590_000, "R keeps the coin, less its claim's fee: {}", paid);
 }
