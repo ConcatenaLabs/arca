@@ -1412,7 +1412,10 @@ Coins resting on boards alone count for nothing, since the forfeit of a board
 pays the operator back at once. A participation that would take an asset past
 its cap waits for a later round, saying so in plain words in its status
 (`This refresh waits for a later round: ...`), and holds up no other
-participation, nor any other asset's round. Three kinds run whatever the cap:
+participation, nor any other asset's round. The cap holds refreshes back so
+that the pool keeps what holders moving coins out of the Ark need, so an
+offboard (a stake, a withdrawal) runs whatever the cap, though what it gives
+up counts in flight. Three kinds of refresh run whatever the cap too:
 one with a coin within six days of its first expiry (a wallet asks for a
 refresh by itself from five days before, and takes the coin on the chain
 from four), so the cap never sends a coin home; one whose coins rest only on
