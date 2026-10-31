@@ -36,6 +36,7 @@ start; the Linux paths are the ones tested.
 | | `arca-signer` | Holds the operator key and signs for arcad on a Unix socket |
 | | `arcad` | The Arca operator's server: boards, transfers, rounds, the watcher |
 | | SeqLN (`lightningd`) | The Sequentia gateway: one channel per served asset, with the hold-invoice plugin |
+| | price server | The node's fee rates, from a price feed: an asset is accepted for fees only with a rate |
 | Bitcoin | `bitcoind` (Bitcoin Core) | testnet4, with a transaction index |
 | | fee proxy | The node's RPC with fee estimates from the live mempool (testnet4's own estimates often say a sat or two while its mempool queues at tens) |
 | | `captaind`, `watchmand` | Bark's server and watchman: the Bitcoin ark |
@@ -91,6 +92,14 @@ Every path reads the same settings, described line by line in
   the explorer.
 - `ARCA_FEE_ASSETS`: the assets a round's fee is paid in, each accepted for
   fees by the node. Empty: those of the served assets the node accepts.
+- `PRICE_FEED_URL`: where the node's fee rates come from. A node takes fees
+  only in the assets it has a rate for, and a gateway opens a channel in an
+  asset with a fee in that asset, so each asset served over Lightning needs a
+  rate. The bundle runs the price server that comes with Sequentia Core, which
+  reads the feed and the asset registry and gives the node a rate for every
+  asset the feed prices: on the public testnet its own feed, with nothing to
+  set. `none` turns it off; then set the rates yourself
+  (`sequentia-cli setfeeexchangerates`).
 - `DOMAIN`, `CONTACT_NAME`, `CONTACT_EMAIL`: the public route and who runs it.
   Without a domain the operator answers only on this machine.
 - `BACKUP_DIR` (native path): where the database's write-ahead log is
@@ -290,7 +299,8 @@ payments run both ways from the start:
     $B connect
 
 It reads the peer's gateways from its `GET /v1/info`, refuses a peer on
-another chain, and opens only the channels not open yet.
+another chain, opens only the channels not open yet, and refuses an asset
+the node has no fee rate for (see `PRICE_FEED_URL`).
 
 **Check:** after the funding transactions confirm, `$B status` lists each
 channel `CHANNELD_NORMAL` and each asset's Lightning leg `up`.

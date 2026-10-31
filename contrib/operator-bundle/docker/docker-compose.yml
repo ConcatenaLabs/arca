@@ -91,6 +91,8 @@ services:
   bitcoind: { <<: *daemon, command: bitcoind, stop_grace_period: 10m }
   feeproxy: { <<: *daemon, command: feeproxy }
   sequentiad: { <<: *daemon, command: sequentiad, stop_grace_period: 10m }
+  # The node's fee rates, from the public price feed (PRICE_FEED_URL).
+  priceserver: { <<: *daemon, command: priceserver }
   seqln: { <<: *daemon, command: seqln }
   cln: { <<: *daemon, command: cln }
   arca-signer: { <<: *daemon, command: arca-signer }
