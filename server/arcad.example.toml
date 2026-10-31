@@ -60,7 +60,10 @@ cookie_file = "/var/lib/sequentia/.cookie"
 # or: rpc_user = "...", rpc_password = "..."
 
 [finality]
-# Certified, and the anchor buried this many Bitcoin blocks.
+# Certified, and the anchor buried this many Bitcoin blocks. 0 makes a coin
+# final once its block is certified (the public testnet's setting); a Bitcoin
+# reorganisation of the anchored block still takes it out of the chain.
+# Published in `info`, and the wallets that use the operator follow it.
 anchor_depth = 2
 # "required" on every chain with a committee.
 certification = "required"

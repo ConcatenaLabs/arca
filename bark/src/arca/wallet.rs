@@ -52,7 +52,18 @@ struct Pins {
 	keepers: String,
 	tip_height: u64,
 	tip_hash: String,
+	/// The anchor depth the operator publishes, empty when it publishes none.
+	anchor_depth: String,
 }
+
+/// How the note of a coin that is being redone starts: it was live, and a
+/// round or board it rests on left the chain, as a Bitcoin reorganisation of
+/// the block its block anchors to does ([`Wallet::recheck`]).
+pub const REDOING: &str = "being redone after a Bitcoin reorganisation; ";
+
+/// The store's key for the anchor depth the operator last published, empty
+/// when it published none.
+const ANCHOR_DEPTH_META: &str = "anchor_depth";
 
 /// How many unused on-chain scripts past the last one in use the wallet looks at.
 const GAP: u32 = 20;
@@ -712,7 +723,9 @@ impl Wallet {
 		}
 		let keepers = Self::keepers_of(&info)?.to_string();
 		let tip = chain.tip()?;
-		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string() })
+		let anchor_depth = info["finality"]["anchor_depth"].as_u64().map(|d| d.to_string()).unwrap_or_default();
+		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string(),
+			anchor_depth })
 	}
 
 	/// Writes the pins in one transaction, the genesis last. A store that holds
@@ -728,7 +741,7 @@ impl Wallet {
 			("account", cfg.account.to_string()), ("exit_delay_units", cfg.exit_delay_units.to_string()),
 			("min_exit_delay_units", cfg.min_exit_delay_units.to_string()), ("max_exit_delay_units", cfg.max_exit_delay_units.to_string()),
 			("chain_name", pins.chain_name), ("operator", pins.operator),
-			("keepers", pins.keepers),
+			("keepers", pins.keepers), (ANCHOR_DEPTH_META, pins.anchor_depth),
 			("birthday", pins.tip_height.to_string()), ("tip_height", pins.tip_height.to_string()), ("tip_hash", pins.tip_hash),
 			("genesis", pins.genesis),
 		];
@@ -795,6 +808,9 @@ impl Wallet {
 		let coin_type = if get("chain_name")? == "sequentia" { 0 } else { 1 };
 		let keys = Keys::new(mnemonic, cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
+		// The operator's anchor depth as last read, until its `info` is read
+		// again ([`Self::server_info`]).
+		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
@@ -1033,7 +1049,22 @@ impl Wallet {
 			},
 		}
 		self.witness_record(&info["signer_record"], true)?;
+		self.follow_anchor_depth(&info)?;
 		Ok(info)
+	}
+
+	/// Judges finality from now on as the operator does, by the anchor depth
+	/// its `info` publishes ([`ChainSource::follow_anchor_depth`]), and keeps
+	/// it for the next time the wallet opens.
+	fn follow_anchor_depth(&self, info: &Value) -> Result<(), Error> {
+		let published = info["finality"]["anchor_depth"].as_u64();
+		let chain_name = self.store.meta("chain_name")?.unwrap_or_default();
+		self.chain.follow_anchor_depth(published, &chain_name);
+		let kept = published.map(|d| d.to_string()).unwrap_or_default();
+		if self.store.meta(ANCHOR_DEPTH_META)?.unwrap_or_default() != kept {
+			self.store.set_meta(ANCHOR_DEPTH_META, &kept)?;
+		}
+		Ok(())
 	}
 
 	/// The keepers `info` names, checked, as the wallet pins them:
@@ -2799,7 +2830,31 @@ impl Wallet {
 	/// date. `policy` checks the coin as of its expiry once that has passed
 	/// ([`Self::followed_policy`]): what the chain holds of it is looked at
 	/// past its expiry as before it.
+	///
+	/// A coin that was live, and waits again because a round or board it
+	/// rests on left the chain (a Bitcoin reorganisation of the block its
+	/// block anchors to takes every Sequentia block above it out), is being
+	/// redone, not lost: its note starts [`REDOING`] until it is live again,
+	/// and `coins` says so (`redoing`).
 	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
+		let checked = self.recheck_one_at(c, record, policy, now)?;
+		let Checked::Holds("pending", note) = checked else { return Ok(checked) };
+		let note = note.strip_prefix(REDOING).map(str::to_string).unwrap_or(note);
+		let was = c.state == "live" || (c.state == "pending" && c.note.starts_with(REDOING));
+		let out = was && match self.base_txs(record) {
+			Ok(txs) => {
+				let mut out = false;
+				for t in &txs {
+					out |= !self.chain.finality(&t.txid())?.in_chain();
+				}
+				out
+			},
+			Err(_) => false,
+		};
+		Ok(Checked::Holds("pending", if out { format!("{}{}", REDOING, note) } else { note }))
+	}
+
+	fn recheck_one_at(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
 		let txs = match self.base_txs(record) {
 			Ok(t) => t,
 			Err(e @ (Error::Refused(_) | Error::Missing(_) | Error::Parse(_))) => return Ok(Checked::Holds("pending", format!("re-check: {}", e))),
@@ -2949,6 +3004,9 @@ impl Wallet {
 			"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
 			"standing": Self::standing(c), "note": c.note, "expiry": expiry, "exit_deadline": deadline, "rests_on_board": on_board,
 			"spent_by": c.spent_by, "batch_profile": profile,
+			// Live once, and waiting again for a round or board a Bitcoin
+			// reorganisation took out of the chain: still the wallet's.
+			"redoing": c.state == "pending" && c.note.starts_with(REDOING),
 			// Reassignments since a round, as validation counts them: the operator co-signs no
 			// out-of-round spend past its `depth_limit`, and a refresh starts the count again.
 			"hops": record.as_ref().map(record_hops),
@@ -3220,6 +3278,9 @@ impl Wallet {
 			"genesis_hash": self.genesis.genesis_hash().to_string(),
 			"chain": self.store.meta("chain_name")?,
 			"operator": self.operator.to_string(),
+			// The Bitcoin blocks that must bury a certified block's anchor for
+			// the wallet to call a coin in it final: the operator's.
+			"anchor_depth": self.chain.anchor_depth(),
 			"mailbox_key": self.keys.mailbox()?.x_only_public_key().0.to_string(),
 			// Where every coin of a supervised asset lands, and stays frozen
 			// while its issuer freezes the holder.
@@ -3779,7 +3840,7 @@ mod tests {
 			let s = store();
 			let cfg = Config::spec_delays("https://example.org/arca", "http://127.0.0.1:1/");
 			let pins = Pins { genesis: "00".repeat(32), chain_name: "elementsregtest".into(), operator: key(7).x_only_public_key().0.to_string(),
-				keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32) };
+				keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32), anchor_depth: String::new() };
 			Wallet::write_pins(&s, &cfg, pins).unwrap();
 			s
 		};
@@ -3803,7 +3864,7 @@ mod tests {
 		let s = Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
 		let cfg = Config::spec_delays("https://example.org/arca", "http://127.0.0.1:1/");
 		let pins = || Pins { genesis: "00".repeat(32), chain_name: "elementsregtest".into(), operator: key(7).x_only_public_key().0.to_string(),
-			keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32) };
+			keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32), anchor_depth: String::new() };
 		// The join stops as it writes the operator.
 		s.conn_for_tests().execute_batch("CREATE TEMP TRIGGER stop_at_operator BEFORE INSERT ON meta WHEN NEW.key = 'operator' \
 			BEGIN SELECT RAISE(ABORT, 'stopped'); END;").unwrap();
