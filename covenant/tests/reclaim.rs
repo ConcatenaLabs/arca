@@ -34,6 +34,7 @@ mod common;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::Keypair;
 use elements::{AssetId, OutPoint, Transaction, TxOut};
+use elements::hashes::Hash;
 
 use arca_covenant::node::connector_index;
 use arca_covenant::script::sha256;
@@ -369,5 +370,223 @@ fn an_offboards_release_names_the_round_that_pays_it() {
 	c.net.refuse("O0/neg the reclaim with another round's M", &reclaim(&c, &b, &[&other_atom], &rel, &s), "Invalid Schnorr signature");
 	let rel = with_index(&[(r, sg)], &[&atom]);
 	c.net.pass("O0/the reclaim of a one-owner node with the offboard round's M", &reclaim(&c, &b, &[&atom], &rel, &s));
+	c.net.print();
+}
+
+// ---------------------------------------------------------------------------
+// 5. RECLAIM-D: the current holders of coins paid out of round release the node
+// ---------------------------------------------------------------------------
+
+/// A batch of `n` leaves with RECLAIM-D, as [`old_batch`], and its tree.
+fn delegated_batch(c: &mut Arca, s: &Keypair, label: &str, n: usize) -> (Old, Tree) {
+	let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();
+	let preimages: Vec<[u8; 32]> = (0..n).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
+	let specs: Vec<LeafSpec> = owners.iter().zip(&preimages).enumerate()
+		.map(|(i, (o, p))| spec(o, &format!("{} leaf {}", label, i), LEAF, sha256(p))).collect();
+	let (issuer, sched) = c.schedule(s);
+	let tree = c.tree_delegated(&sched, &specs);
+	let (round, _) = round_tx(&c.net, &issuer, &[], &tree.batch_output(), &sched);
+	c.net.pass(&format!("{}: the batch's round, RECLAIM-D on its lowest node", label), &round);
+	let policy = c.policy(s);
+	let valid = (0..n).map(|i| tree.record(i).validate(&round, &policy, &xonly(&owners[i]), &specs[i].owner_nonce).unwrap()).collect();
+	(Old { owners, valid, preimages, round }, tree)
+}
+
+/// The reclaim of `old`'s lowest node by RECLAIM-D with `items` below it
+/// (built for the operator's signature `s` by `items`), the atoms at 1...
+fn reclaim_d(c: &Arca, old: &Old, atoms: &[&Coin], s: &Keypair, items: impl Fn(&Signature) -> Vec<Vec<u8>>) -> Transaction {
+	let lowest = old.valid[0].branch.nodes.last().unwrap();
+	let node = OutPoint::new(old.round.txid(), 0);
+	let connectors: Vec<(OutPoint, TxOut)> = atoms.iter().map(|a| (a.outpoint, a.txout.clone())).collect();
+	let ks = lowest.reclaim_delegated_tx(node, &connectors, &[ExplicitOutput::new(c.net.x, lowest.value - 4_000, op_true_spk())],
+		op_true_spk(), &FeeSource::Reserve).unwrap();
+	let op = sig(s, &ks.sighash(c.net.genesis).unwrap());
+	let mut u = ks.finish(items(&op));
+	for i in 1..u.tx.input.len() {
+		u.tx.input[i].witness.script_witness = op_true_witness();
+	}
+	u.tx
+}
+
+fn rel(key: &Keypair, r: &Release) -> ReleaseTree {
+	let sg = sig(key, &r.message().digest);
+	r.verify(&sg).unwrap();
+	ReleaseTree::Release { key: xonly(key), sig: sg, connector_input: 1 }
+}
+
+fn del(key: &Keypair, d: &Delegation, to: Vec<ReleaseTree>) -> ReleaseTree {
+	assert_eq!(d.from, xonly(key));
+	assert_eq!(d.to, to.iter().map(ReleaseTree::key).collect::<Vec<_>>(), "a delegation names its successors in order");
+	let sg = sig(key, &d.message().digest);
+	d.verify(&sg).unwrap();
+	ReleaseTree::Delegation { key: xonly(key), sig: sg, to }
+}
+
+/// A0 pays B with change, and B pays C with change: A0's coin moved twice.
+/// A1 keeps its leaf. A2 and A3 swap into X2 and X3. Each sender signs a
+/// delegation to every output's key at its reassignment. The six holders
+/// refresh into one new round, each signs its release of the old node naming
+/// that round's `M`, and the node is reclaimed by RECLAIM-D at once.
+#[test]
+fn the_holders_of_coins_paid_out_of_round_release_the_node() {
+	use common::chain::{base, record_for, sign_plan, Party};
+	let mut c = Arca::start();
+	let s = keypair("reclaim-d operator");
+	let (old, tree) = delegated_batch(&mut c, &s, "D0", 4);
+	let lowest = old.valid[0].branch.nodes.last().unwrap().clone();
+	assert!(lowest.reclaim.as_ref().unwrap().delegated.is_some(), "the lowest node carries RECLAIM-D");
+	let (chain, sx) = (c.net.chain, xonly(&s));
+	let policy = c.policy(&s).receipt();
+	let rounds = vec![old.round.clone()];
+	let t = mt(c.net.mtp());
+	let bases: Vec<CoinRecord> = (0..4).map(|i| base(&tree, i, &old.owners[i], old.preimages[i], t)).collect();
+	let coins: Vec<ValidCoin> = bases.iter().map(|b| b.resolve(&rounds, &policy).unwrap()).collect();
+	let x = c.net.x;
+	let out = |p: &Party, v: u64| ExplicitOutput::new(x, v, p.leaf.policy(sx, chain).script_pubkey());
+
+	// Hop 1: A0 pays B, keeps A0c.
+	let (b, a0c) = (Party::new("RD B", delay()), Party::new("RD A0 change", delay()));
+	let cp1 = coins[0].value - MARGIN;
+	let plan1 = TransferPlan { inputs: vec![(coins[0].clone(), cp1)], outputs: vec![out(&b, 7_000_000), out(&a0c, cp1 - 7_000_000 - MARGIN)] };
+	let p1 = sign_plan(&plan1, &[&old.owners[0]], &s);
+	let d1 = Delegation::for_reassignment(&coins[0], &plan1.outputs, &[b.leaf, a0c.leaf]).unwrap();
+	assert_eq!(Delegation::for_reassignment(&coins[0], &plan1.outputs, &[a0c.leaf, b.leaf]).unwrap_err(),
+		SpendError::Delegation("an output is not the leaf named for it"));
+	assert_eq!(Delegation::for_reassignment(&coins[0], &plan1.outputs, &[b.leaf]).unwrap_err(),
+		SpendError::Delegation("the outputs and their leaves differ in number"));
+	let b_rec = record_for(&plan1, &[&bases[0]], &p1, 0, b.leaf);
+	let a0c_rec = record_for(&plan1, &[&bases[0]], &p1, 1, a0c.leaf);
+	let b_coin = b_rec.validate(&rounds, &policy, &b.leaf.owner, &b.leaf.owner_nonce).unwrap();
+	let a0c_coin = a0c_rec.validate(&rounds, &policy, &a0c.leaf.owner, &a0c.leaf.owner_nonce).unwrap();
+
+	// Hop 2: B pays C, keeps Bc.
+	let (cc, bc) = (Party::new("RD C", delay()), Party::new("RD B change", delay()));
+	let cp2 = b_coin.value - MARGIN;
+	let plan2 = TransferPlan { inputs: vec![(b_coin.clone(), cp2)], outputs: vec![out(&cc, 5_000_000), out(&bc, cp2 - 5_000_000 - MARGIN)] };
+	let p2 = sign_plan(&plan2, &[&b.key], &s);
+	let d2 = Delegation::for_reassignment(&b_coin, &plan2.outputs, &[cc.leaf, bc.leaf]).unwrap();
+	let c_rec = record_for(&plan2, &[&b_rec], &p2, 0, cc.leaf);
+	let bc_rec = record_for(&plan2, &[&b_rec], &p2, 1, bc.leaf);
+	let c_coin = c_rec.validate(&rounds, &policy, &cc.leaf.owner, &cc.leaf.owner_nonce).unwrap();
+	let bc_coin = bc_rec.validate(&rounds, &policy, &bc.leaf.owner, &bc.leaf.owner_nonce).unwrap();
+	assert_eq!(c_coin.hops, 2);
+
+	// The swap: A2 and A3 into X2 and X3.
+	let (x2, x3) = (Party::new("RD X2", delay()), Party::new("RD X3", delay()));
+	let (cpa, cpb) = (coins[2].value - MARGIN, coins[3].value - MARGIN);
+	let plan3 = TransferPlan { inputs: vec![(coins[2].clone(), cpa), (coins[3].clone(), cpb)],
+		outputs: vec![out(&x2, cpb - MARGIN), out(&x3, cpa - MARGIN)] };
+	let p3 = sign_plan(&plan3, &[&old.owners[2], &old.owners[3]], &s);
+	let d3 = Delegation::for_reassignment(&coins[2], &plan3.outputs, &[x2.leaf, x3.leaf]).unwrap();
+	let d4 = Delegation::for_reassignment(&coins[3], &plan3.outputs, &[x2.leaf, x3.leaf]).unwrap();
+	let x2_rec = record_for(&plan3, &[&bases[2], &bases[3]], &p3, 0, x2.leaf);
+	let x3_rec = record_for(&plan3, &[&bases[2], &bases[3]], &p3, 1, x3.leaf);
+	let x2_coin = x2_rec.validate(&rounds, &policy, &x2.leaf.owner, &x2.leaf.owner_nonce).unwrap();
+	let x3_coin = x3_rec.validate(&rounds, &policy, &x3.leaf.owner, &x3.leaf.owner_nonce).unwrap();
+
+	// Every holder rests on the one node, and names it.
+	for coin in [&c_coin, &bc_coin, &a0c_coin, &coins[1], &x2_coin, &x3_coin] {
+		assert_eq!(coin.release_nodes(), vec![(chain, lowest.children_hash())]);
+	}
+
+	// The refresh: the six holders' new leaves in round N.
+	let new_keys: Vec<Keypair> = (0..6).map(|i| keypair(&format!("RD new key {}", i))).collect();
+	let (n, cn, n_new) = new_round(&mut c, &s, "RD N", &new_keys);
+	let (o, co, o_new) = new_round(&mut c, &s, "RD O", &new_keys[..1]);
+	let release = |coin: &ValidCoin, i: usize| -> Release {
+		let mut r = Release::for_holder(coin, &n_new[i], &n, cn).unwrap();
+		assert_eq!(r.len(), 1);
+		r.remove(0)
+	};
+	assert_eq!(Release::for_holder(&c_coin, &n_new[0], &o, co).unwrap_err(), SpendError::NotTheRound);
+	assert_eq!(Release::for_holder(&c_coin, &o_new[0], &n, cn).unwrap_err(), SpendError::NotTheRound);
+	let (r_c, r_bc, r_a0c, r_a1, r_x2, r_x3) =
+		(release(&c_coin, 0), release(&bc_coin, 1), release(&a0c_coin, 2), release(&coins[1], 3), release(&x2_coin, 4), release(&x3_coin, 5));
+	assert_eq!(r_a1, Release::for_refresh(&old.valid[1], &n_new[3], &n, cn).unwrap(), "a batch leaf's holder is its owner");
+	assert_eq!(r_c.owner, cc.leaf.owner);
+
+	let tb = del(&b.key, &d2, vec![rel(&cc.key, &r_c), rel(&bc.key, &r_bc)]);
+	let t0 = del(&old.owners[0], &d1, vec![tb.clone(), rel(&a0c.key, &r_a0c)]);
+	let t1 = rel(&old.owners[1], &r_a1);
+	let swap = vec![rel(&x2.key, &r_x2), rel(&x3.key, &r_x3)];
+	let t2 = del(&old.owners[2], &d3, swap.clone());
+	let t3 = del(&old.owners[3], &d4, swap.clone());
+	let good = vec![t0.clone(), t1.clone(), t2.clone(), t3.clone()];
+	let atom = issue_m(&mut c, "RD: the issuance of N's connector asset M", &n, cn, &s);
+	let items = |trees: Vec<ReleaseTree>| {
+		let lowest = lowest.clone();
+		move |op: &Signature| lowest.reclaim_delegated_items(chain, op, &trees).unwrap()
+	};
+	let raw = |trees: Vec<ReleaseTree>| {
+		let prefix = lowest.reclaim.as_ref().unwrap().prefix.clone();
+		move |op: &Signature| node::reclaim_delegated_items(op, &prefix, &chain.delegation_prefix(), &trees).unwrap()
+	};
+
+	// A forged delegation: B's signature over A0's delegation, and A0's own
+	// delegation with a stranger in A0c's place.
+	let ReleaseTree::Delegation { to: t0_to, .. } = &t0 else { unreachable!() };
+	let forged = ReleaseTree::Delegation { key: xonly(&old.owners[0]), sig: sig(&b.key, &d1.message().digest), to: t0_to.clone() };
+	c.net.refuse("RD/neg a forged delegation (B's signature in A0's place)",
+		&reclaim_d(&c, &old, &[&atom], &s, items(vec![forged, t1.clone(), t2.clone(), t3.clone()])), "Invalid Schnorr signature");
+	let z = keypair("RD stranger");
+	let z_rel = Release { owner: xonly(&z), ..r_a0c };
+	let swapped = ReleaseTree::Delegation { key: xonly(&old.owners[0]), sig: sig(&old.owners[0], &d1.message().digest),
+		to: vec![tb.clone(), rel(&z, &z_rel)] };
+	c.net.refuse("RD/neg A0's delegation with a stranger in A0c's place",
+		&reclaim_d(&c, &old, &[&atom], &s, items(vec![swapped, t1.clone(), t2.clone(), t3.clone()])), "Invalid Schnorr signature");
+
+	// A release before the holder's new coin exists: C names a round that is
+	// not in the chain, whose M no input can hold; and no atom at all.
+	let early_r = Release { connector: connector_asset(elements::Txid::all_zeros(), 1), ..r_c };
+	let early = del(&old.owners[0], &d1, vec![del(&b.key, &d2, vec![rel(&cc.key, &early_r), rel(&bc.key, &r_bc)]), rel(&a0c.key, &r_a0c)]);
+	c.net.refuse("RD/neg C's release names a round not in the chain",
+		&reclaim_d(&c, &old, &[&atom], &s, items(vec![early, t1.clone(), t2.clone(), t3.clone()])), "Invalid Schnorr signature");
+	c.net.refuse("RD/neg no atom of M", &reclaim_d(&c, &old, &[], &s, items(good.clone())), "Introspection index out of bounds");
+
+	// Two releases for one slot: A0's tree twice, A1's none; three trees for four.
+	c.net.refuse("RD/neg slot 0's tree in slots 0 and 1",
+		&reclaim_d(&c, &old, &[&atom], &s, raw(vec![t0.clone(), t0.clone(), t2.clone(), t3.clone()])), "OP_EQUALVERIFY");
+	c.net.refuse("RD/neg three trees for four owners",
+		&reclaim_d(&c, &old, &[&atom], &s, raw(vec![t0.clone(), t1.clone(), t2.clone()])), "OP_EQUALVERIFY");
+	assert!(matches!(lowest.reclaim_delegated_items(chain, &sig(&s, &[0; 32]), &good[..3]), Err(Error::ReclaimSignatures { given: 3, needed: 4 })));
+	// One successor short: B's delegation names C and Bc, only C is given.
+	let ReleaseTree::Delegation { sig: tb_sig, to: tb_to, .. } = &tb else { unreachable!() };
+	let short = ReleaseTree::Delegation { key: xonly(&old.owners[0]), sig: sig(&old.owners[0], &d1.message().digest),
+		to: vec![ReleaseTree::Delegation { key: xonly(&b.key), sig: *tb_sig, to: tb_to[..1].to_vec() }, rel(&a0c.key, &r_a0c)] };
+	c.net.refuse("RD/neg B's successors one short",
+		&reclaim_d(&c, &old, &[&atom], &s, items(vec![short, t1.clone(), t2.clone(), t3.clone()])), "Invalid Schnorr signature");
+	// The compact RECLAIM does not take the holders' releases.
+	{
+		let node = OutPoint::new(old.round.txid(), 0);
+		let ks = lowest.reclaim_tx(node, &[(atom.outpoint, atom.txout.clone())],
+			&[ExplicitOutput::new(x, lowest.value - 4_000, op_true_spk())], op_true_spk(), &FeeSource::Reserve).unwrap();
+		let op = sig(&s, &ks.sighash(c.net.genesis).unwrap());
+		let sigs: Vec<(Signature, u32)> = [(&cc.key, &r_c), (&old.owners[1], &r_a1), (&x2.key, &r_x2), (&x3.key, &r_x3)]
+			.iter().map(|(k, r)| (sig(k, &Release { owner: xonly(k), ..**r }.message().digest), 1)).collect();
+		let mut u = ks.finish(node::reclaim_items(&op, &sigs, 4).unwrap());
+		u.tx.input[1].witness.script_witness = op_true_witness();
+		c.net.refuse("RD/neg the compact RECLAIM with the holders' releases", &u.tx, "Invalid Schnorr signature");
+	}
+
+	// A release by a key that has delegated (B after paying C; A0 after
+	// paying B) is a valid spend: the chain cannot know of the delegation.
+	// The operator's signature is what refuses it; here it is only tested.
+	let r_b = Release { owner: xonly(&b.key), ..r_c };
+	let r_a0 = Release { owner: xonly(&old.owners[0]), ..r_c };
+	for (name, t0x) in [
+		("RD/consensus takes B's release after B delegated", del(&old.owners[0], &d1, vec![rel(&b.key, &r_b), rel(&a0c.key, &r_a0c)])),
+		("RD/consensus takes A0's release after A0 delegated", rel(&old.owners[0], &r_a0)),
+	] {
+		let tx = reclaim_d(&c, &old, &[&atom], &s, items(vec![t0x, t1.clone(), t2.clone(), t3.clone()]));
+		let r = c.net.rt.client().test_mempool_accept(&[&tx]).unwrap().remove(0);
+		assert!(r.allowed, "{}: {:?}", name, r.reject_reason);
+		println!("{:<64} testmempoolaccept: allowed ({} vB); the operator refuses it", name, tx.vsize());
+	}
+
+	let tx = reclaim_d(&c, &old, &[&atom], &s, items(good.clone()));
+	println!("RD: the reclaim by RECLAIM-D, {} vB, {} steps of {}", tx.vsize(),
+		good.iter().map(ReleaseTree::steps).sum::<usize>(), node::RECLAIM_STEPS);
+	c.net.pass("RD/pos the node reclaimed by its coins' current holders", &tx);
+	assert!(!c.unspent(&OutPoint::new(old.round.txid(), 0)));
 	c.net.print();
 }

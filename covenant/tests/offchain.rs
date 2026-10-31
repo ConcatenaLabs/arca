@@ -107,7 +107,7 @@ impl Ctx {
 	/// A tree of one leaf per spec, reserves at four times the node's floor.
 	fn tree(&self, sched: &ClockSchedule, leaves: &[LeafSpec]) -> Tree {
 		Tree::build(TreeParams {
-			asset: self.net.x, chain: self.net.chain, schedule: sched.clone(), burn: false, radix: 4,
+			asset: self.net.x, chain: self.net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
 			reserve: ReserveRule::FeeRate { floor_per_kvb: self.floor_per_kvb, multiple: 4 }, min_leaf: 1,
 		}, leaves).unwrap()
 	}

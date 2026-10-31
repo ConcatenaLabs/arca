@@ -266,10 +266,11 @@ def block_reason(mempool_reason):
     """What a block refused by a node checking scripts inline (-par=1) reports
     for a transaction the mempool refused with `mempool_reason`: the same
     script failure, or bad-txns-nonfinal for a lock not yet reached. A
-    script failure is the same error under another label: the mempool's
-    reads mempool-script-verify-flag-failed (policy), a block's
-    mandatory-script-verify-flag-failed (consensus), so the part both share
-    is compared."""
+    script failure is the same error, under the mempool's label
+    mempool-script-verify-flag-failed and a block's
+    mandatory-script-verify-flag-failed (or the mempool's label again, where
+    the block's flags include one relay policy also sets), so the part both
+    share is compared."""
     if mempool_reason in ("non-final", "non-BIP68-final"):
         return "bad-txns-nonfinal"
     if mempool_reason.startswith(SCRIPT_FAILURE_POLICY):

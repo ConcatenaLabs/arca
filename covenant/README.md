@@ -33,7 +33,7 @@ sequentia-contracts (`accumulator_programs`).
 
 | Module | Output | Leaves |
 |---|---|---|
-| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep; RECLAIM on a lowest node, each owner's release naming its own round's connector asset, read from an input |
+| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep; RECLAIM on a lowest node, each owner's release naming its own round's connector asset, read from an input; on a lowest node built with it, RECLAIM-D, which takes each owner's slot released by the current holders of the coins resting on it, through the delegations their senders signed (`ReleaseTree`, 32 steps) |
 | `sweep` | The sweep path of every output above a leaf | The token check (`T` at `R` in input `k`), the notice `W` on every output but the batch output, burn-only for an issuer-operated batch |
 | `clock` | `R` and the clock chain from a published schedule `(T, S, W, E_0 … E_K)` | ROLL, RELEASE; `R` is `<W> CSV DROP <S> CHECKSIG` |
 | `leaf` | The leaf (`vtxo-1`; `vtxo-2` when `v2` is set) | The rebindable collaborative path for 1 to 4 committed outputs, and the exit; for `vtxo-2`, `arca/collab-2` and its data leaf in place of the tapscript path, the same exit |
@@ -67,14 +67,16 @@ feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
 the board and its record, `spend` the transactions that spend a leaf off the
 tree (forfeits, exits, the offboard's unlock and reclaim), `release` the
-release an owner signs for the lowest node above a coin it gave up,
+release an owner signs for the lowest node above a coin it gave up, and
+the delegation a coin's key signs when the coin moves out of round,
 `transfer` the out-of-round transfer and the coin record a receiver validates,
 and `clock` and `sweep` the operator's release or roll of the token and the
 sweep of an expired batch; all described below.
 
-`message` holds the three messages `OP_CHECKSIGFROMSTACK` verifies (the
+`message` holds the four messages `OP_CHECKSIGFROMSTACK` verifies (the
 rebindable message bound to the spent coin and the chain, the unroll
-authorisation, the release bound to the round of the owner's new leaf), `sign` the Elements taproot signature hash and BIP340
+authorisation, the release bound to the round of the owner's new leaf, the
+delegation of a coin's release to the keys of the outputs it moved into), `sign` the Elements taproot signature hash and BIP340
 signing, `checks` the five client checks (`check_round` returns the check that
 failed; `check_reissue` is the fifth's clause on the batch's profile: a round
 whose input reissues the batch's asset passes only when every sweep path above
@@ -113,7 +115,8 @@ nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
 clock schedule
 `(T, S, W, E_0 … E_K)` (`R` is rebuilt from `W` and `S`), whether its sweeps
-are burn-only, and the path from the batch output down to the leaf. Each level
+are burn-only, whether its lowest node carries RECLAIM-D, and the path from
+the batch output down to the leaf. Each level
 of the path holds the index of the child on the leaf's path, the node's reserve
 and its other children; above the lowest node it holds the owner's proof in the
 node's member tree, and at the lowest node the other owners, whose keys that
@@ -434,6 +437,57 @@ let k = node::connector_index(&ks.prevouts, r.connector).unwrap();    // the inp
 let tx = ks.finish(node::reclaim_items(&sig_over(ks.sighash(genesis)?), &releases_in_owner_order, owners)?);
 ```
 
+**Release delegation.** A batch leaf paid on out of round can be released
+only by whoever holds the coins it became, and its owner no longer does. A
+batch built with `delegated_reclaim` puts RECLAIM-D beside RECLAIM on every
+lowest node, at `[UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]]` (UNROLL's control
+block stays 65 bytes, SWEEP's is 97, the two reclaims' 129). When a coin moves
+into a reassignment, its key signs a delegation to the owner keys of every
+output, in output order: `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖
+K_m)` (`Delegation::for_reassignment`, which refuses outputs that are not the
+leaves named for them). RECLAIM-D then takes, for each owner of the node, a
+tree (`ReleaseTree`): the owner's own release, or its delegation and a tree
+for each key it names, every leaf of every tree a release over the node's
+`P ‖ M`, `M` the connector asset of the round of that holder's new coin, read
+from an input as RECLAIM reads it. A holder signs its releases with
+`Release::for_holder`, one for each lowest node with RECLAIM-D its coin rests
+on (`ValidCoin::release_nodes`), once it holds its new leaf's preimage and
+that round is final. So the node is released only when every coin resting on
+it has a successor in a round in the chain, and returns at the next round
+after its holders refresh, however many times its coins moved.
+
+A delegation names every output, so no co-receiver (a payer's change, a
+swap's other side) can release a slot without the others; and it adds no one
+a coin must trust, since the coin's senders, with the operator, could already
+spend the coins it came from twice. The chain cannot know whether a key has
+delegated: a release by a key that already did confirms as its holder's
+would, so the operator, whose signature every reclaim needs, refuses a
+release from any key whose coin has moved on. The script checks every key is
+32 bytes: `OP_CHECKSIGFROMSTACK` passes any signature for a key of another
+length, so two keys of 33 and 31 bytes over the 64 a delegation signed would
+release a node nobody under it released. The leaf runs 32 steps, one per
+release or delegation, summed over every owner's tree; a node whose trees
+need more waits for its batch's expiry. A record reader that does not know
+RECLAIM-D refuses such a batch's leaves (the record's flag), so an operator
+builds batches with it only for wallets that read it. Measured on the node:
+the leaf is 1,868 bytes at four owners; a reclaim with a coin paid twice, a
+swap and a direct release (12 steps) is 1,170 vB, four direct releases through
+RECLAIM-D 951 vB, the same through RECLAIM 481 vB, and six owners using all 32
+steps 1,691 vB.
+
+```rust
+let d = Delegation::for_reassignment(&my_coin, &plan.outputs, &leaves)?;  // the sender, at the transfer
+let sig = sign_digest(&my_key, &d.message().digest, &aux);
+d.verify(&sig)?;                                                       // the operator's check
+let rs = Release::for_holder(&coin, &new_valid, &round, c)?;           // the holder, after its refresh
+let trees = vec![ReleaseTree::Delegation { key: a0, sig: d0, to: vec![
+	ReleaseTree::Release { key: b, sig: rb, connector_input: 1 },
+	ReleaseTree::Release { key: a0_change, sig: rc, connector_input: 1 },
+]}, /* one per owner */];
+let ks = lowest.reclaim_delegated_tx(node_coin, &[(m_coin, m_txout)], &outputs, m_back_to, &FeeSource::Reserve)?;
+let tx = ks.finish(lowest.reclaim_delegated_items(chain, &sig_over(ks.sighash(genesis)?), &trees)?);
+```
+
 **The board.** The owner brings its own coins into Arca with a board
 (`board-1`): it pays them to a board output (`BoardRecord::tx`) and keeps a
 `BoardRecord`: the key, the two nonces of the salt (one given by the operator)
@@ -480,7 +534,9 @@ soon as the preimage fails to arrive.
 
 A transfer is two linked transactions. Each input coin moves, by its
 collaborative path, into a checkpoint output, and the reassignment moves the
-checkpoints into the new leaves (1 to 4 committed outputs). For each input, its
+checkpoints into the new leaves (1 to 4 committed outputs). Where the coin
+rests on a batch with RECLAIM-D, its key also signs a delegation of its
+release to the outputs' owner keys ([Release delegation](#off-chain-transactions)). For each input, its
 owner and the operator sign two pairs in advance: the checkpoint pair, over the
 checkpoint output, and the reassignment pair, over the outputs. A reassignment
 may take several coins of several owners in several assets, the in-tree swap:
@@ -964,7 +1020,23 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   refuses another operator's offboard, a round that does not pay it and an
   output that is not the connector, and the one-owner node is reclaimed with
   that round's `M` and not another's. Every negative case is refused by the
-  mempool and in a block, for its reason.
+  mempool and in a block, for its reason. RECLAIM-D on a batch built with it:
+  owner 0's coin paid twice with change, owner 1's kept, owners 2 and 3
+  swapped, each sender's delegation from `Delegation::for_reassignment` (which
+  refuses its outputs' leaves out of order or short), the six holders
+  refreshed into one round and their releases from `Release::for_holder`
+  (which refuses another round); the node reclaimed with one atom of `M`, and
+  refused with a delegation signed by another key, with a stranger in a
+  successor's place, with a release naming a round not in the chain, without
+  an atom, with one owner's tree in two slots, with three trees for four
+  owners, with a successor missing, and through the compact RECLAIM. A
+  release by a key that has delegated is accepted by `testmempoolaccept`: the
+  chain cannot tell it from its holder's, and the operator refuses it.
+- `tests/reclaim_d_vectors.rs`: RECLAIM-D against `regtest/vectors/reclaim_d.json`
+  (the leaf, its step, the node's scriptPubKey and control blocks, the
+  release and delegation prefixes, messages and signatures, and the items
+  below the leaf for a coin paid twice, a swap and a direct release), byte for
+  byte.
 - `tests/issuer.rs`: what a transaction issues and burns of an asset (a bare
   `OP_RETURN` alone counts as a burn), and a fee coin that burns the margin
   its inputs leave while its own change goes back.

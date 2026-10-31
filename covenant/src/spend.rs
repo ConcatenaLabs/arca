@@ -78,6 +78,8 @@ pub enum SpendError {
 	Connector(u32),
 	#[error("the leaf given up and the round are under different operators")]
 	OtherOperator,
+	#[error("the delegation does not fit the reassignment: {0}")]
+	Delegation(&'static str),
 	#[error(transparent)]
 	Offboard(#[from] crate::offboard::OffboardError),
 	#[error("the board is not the coin the forfeit gives up")]

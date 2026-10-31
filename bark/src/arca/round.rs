@@ -422,7 +422,7 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 		asset: AssetId::from_str(&s("asset")?).map_err(|e| Error::Parse(e.to_string()))?,
 		chain: Chain::new(elements::BlockHash::from_str(&s("genesis_hash")?).map_err(|e| Error::Parse(e.to_string()))?),
 		schedule: ClockSchedule::decode(&unhex(&s("schedule")?)?).map_err(|e| Error::Refused(format!("the published schedule: {}", e)))?,
-		burn: t["burn"].as_bool().unwrap_or(false),
+		burn: t["burn"].as_bool().unwrap_or(false), delegated_reclaim: false,
 		radix: t["radix"].as_u64().unwrap_or(0) as usize,
 		reserve,
 		min_leaf: amount(&t["min_leaf"], "min_leaf")?,

@@ -35,7 +35,7 @@ fn plain(key: &elements::secp256k1_zkp::Keypair) -> Script {
 
 fn tree_in(c: &Arca, asset: elements::AssetId, sched: &ClockSchedule, leaves: &[LeafSpec]) -> Tree {
 	Tree::build(TreeParams {
-		asset, chain: c.net.chain, schedule: sched.clone(), burn: false, radix: 4,
+		asset, chain: c.net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
 		reserve: ReserveRule::FeeRate { floor_per_kvb: c.floor_per_kvb, multiple: 4 }, min_leaf: 1,
 	}, leaves).unwrap()
 }

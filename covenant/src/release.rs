@@ -39,12 +39,44 @@
 //! out-of-round reassignment: the release key is the key the coin was built
 //! with, so its sender and the operator could otherwise void the receiver's
 //! chain.
+//!
+//! # Delegation
+//!
+//! A coin that moves out of round passes the right to release its place in
+//! its batch to the coins it moved into. Its key signs a [`Delegation`] to
+//! the owner keys of every output of the reassignment, in output order:
+//!
+//! ```text
+//! SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)
+//! ```
+//!
+//! On a lowest node built with RECLAIM-D ([`crate::node`]), the release of
+//! an owner's slot is then a tree ([`crate::node::ReleaseTree`]): the owner's
+//! own release, or its delegation and, for each key it names, a tree in turn.
+//! Every leaf of the tree is a release by the key of a coin still resting on
+//! the slot, bound like any release to the round of that holder's new coin
+//! ([`Release::for_holder`]). Naming every output means no co-receiver (a
+//! payer's change, a swap's other side) can release the slot without the
+//! others, so a delegation adds no one a coin must trust: its senders, with
+//! the operator, could already spend the coins it came from twice.
+//!
+//! What a delegation authorises: nothing alone. It makes the releases of the
+//! keys it names, all of them, stand for the signer's release, on every node
+//! the signer's coin rests on, on this chain. The signer's key is one coin's
+//! own, so it names a slot only through that coin. The chain cannot know
+//! whether a key has delegated, so a release by a key that did is accepted
+//! by RECLAIM-D as its holder's: the operator refuses one, and refuses the
+//! release of any coin that has moved on.
 
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Transaction};
 
 use crate::accumulator::ValidAccumulatorLeaf;
+use crate::leaf::LeafPolicy;
+use crate::node::MAX_DELEGATES;
+use crate::script::ExplicitOutput;
+use crate::transfer::{NewLeaf, ValidCoin};
 use crate::forfeit::{connector_asset, ConnectorPolicy};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::OffboardPolicy;
@@ -133,6 +165,93 @@ impl Release {
 			Ok(())
 		} else {
 			Err(SpendError::Signature("owner"))
+		}
+	}
+}
+
+impl Release {
+	/// The releases a coin's holder signs once it has refreshed the coin
+	/// into `new`, a leaf it validated against `round` (whose connector
+	/// output is `c`): one for each lowest node with RECLAIM-D that the coin
+	/// rests on ([`ValidCoin::release_nodes`]), each naming the round's
+	/// connector asset and signed by the coin's own key. For a coin that is
+	/// itself a batch leaf this is [`Release::for_refresh`]'s release when its
+	/// node carries RECLAIM-D. Refuses a `round` other than the one `new` was
+	/// validated against, an output `c` that is not the operator's connector
+	/// and a coin under another operator.
+	pub fn for_holder(coin: &ValidCoin, new: &ValidLeaf, round: &Transaction, c: u32) -> Result<Vec<Release>, SpendError> {
+		if round.txid() != new.round_txid {
+			return Err(SpendError::NotTheRound);
+		}
+		if coin.leaf.operator != new.branch.leaf.operator {
+			return Err(SpendError::OtherOperator);
+		}
+		ConnectorPolicy { operator: coin.leaf.operator }.check(round, c)?;
+		let connector = connector_asset(round.txid(), c);
+		Ok(coin.release_nodes().into_iter().map(|(chain, node_hash)| Release {
+			chain, node_hash, owner: coin.leaf.owner, connector,
+		}).collect())
+	}
+}
+
+/// A coin's key's delegation of its release to the owner keys of a
+/// reassignment's outputs: see the [module documentation](self).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Delegation {
+	pub chain: Chain,
+	/// The coin's owner key, which signs.
+	pub from: XOnlyPublicKey,
+	/// The owner keys of every output of the reassignment, in output order.
+	pub to: Vec<XOnlyPublicKey>,
+}
+
+impl Delegation {
+	/// `from`'s delegation to `to`: 1 to 4 keys.
+	pub fn new(chain: Chain, from: XOnlyPublicKey, to: Vec<XOnlyPublicKey>) -> Result<Delegation, crate::Error> {
+		if to.is_empty() || to.len() > MAX_DELEGATES {
+			return Err(crate::Error::OutputCount(to.len()));
+		}
+		Ok(Delegation { chain, from, to })
+	}
+
+	/// The delegation of `coin`, a coin the wallet holds and is giving, into
+	/// a reassignment of `outputs`, each the leaf `leaves` names at its index
+	/// (under `coin`'s operator and chain). Refuses outputs and leaves that
+	/// differ in number, and an output that is not its leaf's script, asset
+	/// and all: the keys must be the outputs' own, or the delegation would
+	/// leave the slot to keys that hold nothing.
+	pub fn for_reassignment(coin: &ValidCoin, outputs: &[ExplicitOutput], leaves: &[NewLeaf]) -> Result<Delegation, SpendError> {
+		let (operator, chain) = (coin.leaf.operator, coin.leaf.chain);
+		let policies: Vec<LeafPolicy> = leaves.iter().map(|l| l.policy(operator, chain)).collect();
+		Delegation::for_outputs(coin.leaf.owner, chain, outputs, &policies)
+	}
+
+	/// [`Delegation::for_reassignment`] from the outputs' leaf policies, for
+	/// the operator's check of a delegation handed to it with a reassignment.
+	pub fn for_outputs(from: XOnlyPublicKey, chain: Chain, outputs: &[ExplicitOutput], leaves: &[LeafPolicy]) -> Result<Delegation, SpendError> {
+		if outputs.len() != leaves.len() {
+			return Err(SpendError::Delegation("the outputs and their leaves differ in number"));
+		}
+		if outputs.iter().zip(leaves).any(|(o, l)| o.script_pubkey != l.script_pubkey() || l.chain != chain) {
+			return Err(SpendError::Delegation("an output is not the leaf named for it"));
+		}
+		Delegation::new(chain, from, leaves.iter().map(|l| l.owner).collect())
+			.map_err(|_| SpendError::Delegation("a reassignment has 1 to 4 outputs"))
+	}
+
+	/// What the coin's key signs:
+	/// `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`.
+	pub fn message(&self) -> CsfsMessage {
+		self.chain.delegation_message(&self.to).expect("1 to 4 keys")
+	}
+
+	/// The check of a delegation handed to the operator: `sig` is `from`'s
+	/// signature over [`Delegation::message`].
+	pub fn verify(&self, sig: &Signature) -> Result<(), SpendError> {
+		if verify_digest(sig, &self.message().digest, &self.from) {
+			Ok(())
+		} else {
+			Err(SpendError::Signature("delegation"))
 		}
 	}
 }

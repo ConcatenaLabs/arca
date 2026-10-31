@@ -638,7 +638,7 @@ pub struct AccumulatorParams {
 impl AccumulatorParams {
 	fn as_tree(&self) -> TreeParams {
 		TreeParams {
-			asset: self.asset, chain: self.chain, schedule: self.schedule.clone(), burn: self.burn, radix: MIN_RADIX,
+			asset: self.asset, chain: self.chain, schedule: self.schedule.clone(), burn: self.burn, delegated_reclaim: false, radix: MIN_RADIX,
 			reserve: self.reserve, min_leaf: self.min_leaf,
 		}
 	}

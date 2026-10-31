@@ -175,7 +175,7 @@ fn a_degenerate_layout_is_refused() {
 	let record = LeafRecord {
 		template: Template::Vtxo1, owner: xonly(&a), owner_nonce, operator_nonce: label32("lineage e4 operator nonce"),
 		exit_delay: delay(), asset: c.net.x, value: LEAF, unlock_hash: sha256(&preimage), entry_reserve: 0,
-		chain: c.net.chain, schedule: sched.clone(), burn: false,
+		chain: c.net.chain, schedule: sched.clone(), burn: false, delegated: false,
 		upper: (0..15).map(|_| UpperLevel { index: 0, reserve: 0, siblings: vec![], member: proof.clone() }).collect(),
 		lowest: LowestLevel { index: 0, reserve: 0, siblings: vec![], owners: vec![] },
 		htlc: None,

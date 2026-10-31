@@ -235,6 +235,7 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 	add("notice".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, x.schedule.operator,
 		RelativeTime::from_units(x.schedule.notice.units() + 1).unwrap(), x.schedule.expiries().to_vec()).unwrap());
 	add("burn".into(), &|x| x.burn = !x.burn);
+	add("delegated".into(), &|x| x.delegated = !x.delegated);
 	if r.channel.is_some() {
 		add("channel capacity + 1".into(), &|x| x.channel.as_mut().unwrap().capacity += 1);
 		add("channel window + 1".into(), &|x| {

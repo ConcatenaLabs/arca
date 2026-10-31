@@ -83,7 +83,7 @@ pub fn batches(chain: Chain, x: AssetId, y: AssetId, s: Keypair, sched1: ClockSc
 			landing: None,
 			channel: None,
 		}).collect();
-		let tree = Tree::build(TreeParams { asset, chain, schedule: sched, burn: false, radix: 4, reserve, min_leaf: 1 }, &leaves).unwrap();
+		let tree = Tree::build(TreeParams { asset, chain, schedule: sched, burn: false, delegated_reclaim: false, radix: 4, reserve, min_leaf: 1 }, &leaves).unwrap();
 		(tree, preimages)
 	};
 	let (batch1, preimages1) = build("batch 1", x, sched1, 5, 2, &a, 10_000_000);

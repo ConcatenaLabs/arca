@@ -61,6 +61,7 @@ fn the_builder_rebuilds_every_record_vector() {
 			RelativeTime::from_units(inp["notice_units"].as_u64().unwrap() as u16).unwrap(), expiries).unwrap();
 		let params = TreeParams {
 			asset, chain: Chain::new(genesis), schedule, burn: inp["burn"].as_bool().unwrap(),
+			delegated_reclaim: inp.get("delegated_reclaim").is_some_and(|d| d == true),
 			radix: inp["radix"].as_u64().unwrap() as usize,
 			reserve: ReserveRule::Fixed { node: inp["node_reserve"].as_u64().unwrap(), entry: inp["entry_reserve"].as_u64().unwrap() },
 			min_leaf: 1,
@@ -176,7 +177,7 @@ impl Fx {
 		let w = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
 		let schedule = ClockSchedule::new(token, xonly(&self.s), w, vec![e(28), e(56), e(84)]).unwrap();
 		let params = TreeParams {
-			asset: self.x, chain: Chain::new(self.genesis), schedule, burn: false, radix,
+			asset: self.x, chain: Chain::new(self.genesis), schedule, burn: false, delegated_reclaim: false, radix,
 			reserve: ReserveRule::FeeRate { floor_per_kvb: 100, multiple: 4 }, min_leaf: 100,
 		};
 		let owners: Vec<Keypair> = (0..n).map(|i| keypair(&format!("{} owner {}", label, i))).collect();

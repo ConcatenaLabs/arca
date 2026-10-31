@@ -74,7 +74,8 @@ byte order.
     [32]  operator key S
     [32]  token T
     u16   notice W, 512-second units
-    u8    flags: bit 0, the sweeps are burn-only; other bits zero
+    u8    flags: bit 0, the sweeps are burn-only; bit 1, the lowest node
+          carries RECLAIM-D; other bits zero
     u8    expiry count, 1 to 64, then each expiry E_k as u32
     u8    level count, 1 to 16, then each level from the batch output down:
             u8    child count k, 1 to 6
@@ -316,8 +317,14 @@ class Batch:
                 unroll = hgate_unroll(mlevels[-1][0], len(mlevels) - 1, tuples, timed=True)
                 reclaim = None
                 if lowest:
-                    reclaim = reclaim_script(release_prefix(p["genesis"], tuples), [leaves[o]["owner"] for o in owners], S)
-                tap, _ = node_taptree3(unroll, sweep(is_root), reclaim)
+                    prefix = release_prefix(p["genesis"], tuples)
+                    reclaim = reclaim_script(prefix, [leaves[o]["owner"] for o in owners], S)
+                if lowest and p.get("delegated"):
+                    reclaim_d = reclaim_delegated_leaf(prefix, delegate_prefix(p["genesis"]),
+                                                       [leaves[o]["owner"] for o in owners], S)
+                    tap, _ = node_taptree_delegated(unroll, sweep(is_root), reclaim, reclaim_d)
+                else:
+                    tap, _ = node_taptree3(unroll, sweep(is_root), reclaim)
                 nodes.append({"tap": tap, "prog": bytes(tap.scriptPubKey)[2:], "kids": kids, "owners": owners,
                               "first": kids[0]["first"], "mlevels": mlevels, "lo": lo, "hi": hi,
                               "value": sum(k["value"] for k in kids) + p["node_reserve"]})
@@ -368,7 +375,7 @@ class Batch:
             "asset": p["asset"], "value": lf["value"], "unlock_hash": lf["unlock_hash"],
             "entry_reserve": p["entry_reserve"],
             "genesis": p["genesis"], "operator": p["operator"], "token": p["token"], "notice": p["notice"],
-            "burn": p["burn"], "expiries": list(p["expiries"]),
+            "burn": p["burn"], "delegated": bool(p.get("delegated")), "expiries": list(p["expiries"]),
             "path": levels,
         }
 
@@ -396,7 +403,7 @@ def encode(rec):
         b += le64(c["capacity"]) + le16(c["window"])
     b += rec["asset"] + le64(rec["value"]) + rec["unlock_hash"] + le64(rec["entry_reserve"])
     b += rec["genesis"] + rec["operator"] + rec["token"] + le16(rec["notice"])
-    b += bytes([1 if rec["burn"] else 0])
+    b += bytes([(1 if rec["burn"] else 0) | (2 if rec.get("delegated") else 0)])
     b += bytes([len(rec["expiries"])]) + b"".join(le32(e) for e in rec["expiries"])
     b += bytes([len(rec["path"])])
     for n, lv in enumerate(rec["path"]):
@@ -432,6 +439,8 @@ def to_json(rec):
         "notice_units": rec["notice"], "burn": rec["burn"], "expiries": rec["expiries"],
         "path": path,
     }
+    if rec.get("delegated"):
+        o["reclaim_delegated"] = True
     if name == "htlc":
         h = rec["htlc"]
         o["htlc"] = {"direction": h["direction"], "payment_hash": h["payment_hash"].hex(), "timeout": h["timeout"],
@@ -500,14 +509,14 @@ def txout(asset, value, spk):
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
                  expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
-                 v2=None):
+                 v2=None, delegated=False):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
     token = issued_asset(issuer_txid, 0)
     p = {"genesis": GENESIS, "asset": ASSET, "operator": OPERATOR, "token": token, "notice": NOTICE,
          "expiries": [CREATED + d * DAY for d in expiries], "burn": burn, "radix": radix,
-         "node_reserve": node_reserve, "entry_reserve": entry_reserve}
+         "node_reserve": node_reserve, "entry_reserve": entry_reserve, "delegated": delegated}
     leaves = []
     for i in range(n):
         leaves.append({
@@ -575,6 +584,7 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
         "name": name,
         "inputs": {
             "radix": radix, "burn": burn, "node_reserve": node_reserve, "entry_reserve": entry_reserve,
+            **({"delegated_reclaim": True} if delegated else {}),
             "token_issuer": {"txid": display(issuer_txid), "vout": 0, "contract_hash": bytes(32).hex()},
             "token": display(token), "notice_units": NOTICE, "expiries": p["expiries"],
             "leaves": [dict({"owner": lf["owner"].hex(), "owner_nonce": lf["owner_nonce"].hex(),
@@ -631,7 +641,7 @@ def invalid_vectors(valid_binary, valid_json):
         ("a value of zero", put(VALUE, le64(0)), "value"),
         ("a value above the largest money range", put(VALUE, le64(400_000_000 * 100_000_000 + 1)), "value"),
         ("a notice of zero", put(NOTICE_AT, le16(0)), "time"),
-        ("flag bit 1 set", put(FLAGS, b"\x02"), "flag"),
+        ("flag bit 2 set", put(FLAGS, b"\x04"), "flag"),
         ("no expiries", put(EXP, b"\x00"), "count"),
         ("an expiry that is a height", put(EXP + 1, le32(499_999_999)), "time"),
         ("no levels", put(LEVELS, b"\x00"), "count"),
@@ -811,6 +821,7 @@ def generate():
         batch_vector("five leaves of a supervised asset, every one landing-1", 5, 4, landing=[0, 1, 2, 3, 4]),
         batch_vector("five leaves, two of them channel-1", 5, 4, channel={1: 4_000_000, 4: 0}),
         batch_vector("five leaves, two of them vtxo-2", 5, 4, v2=[1, 2]),
+        batch_vector("seventeen leaves, RECLAIM-D on every lowest node", 17, 4, delegated=True),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])

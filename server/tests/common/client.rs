@@ -407,7 +407,7 @@ fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 		asset: s("asset").parse().unwrap(),
 		chain: Chain::new(s("genesis_hash").parse().unwrap()),
 		schedule: ClockSchedule::decode(&unhex(&s("schedule"))).map_err(|e| e.to_string())?,
-		burn: t["burn"].as_bool().unwrap(),
+		burn: t["burn"].as_bool().unwrap(), delegated_reclaim: false,
 		radix: t["radix"].as_u64().unwrap() as usize,
 		reserve,
 		min_leaf: num(&t["min_leaf"]),

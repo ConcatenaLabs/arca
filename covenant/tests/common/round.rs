@@ -47,7 +47,15 @@ impl Arca {
 	/// The tree of `leaves` in X at radix 4, reserves at four times the floor.
 	pub fn tree(&self, sched: &ClockSchedule, leaves: &[LeafSpec]) -> Tree {
 		Tree::build(TreeParams {
-			asset: self.net.x, chain: self.net.chain, schedule: sched.clone(), burn: false, radix: 4,
+			asset: self.net.x, chain: self.net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
+			reserve: ReserveRule::FeeRate { floor_per_kvb: self.floor_per_kvb, multiple: 4 }, min_leaf: 1,
+		}, leaves).unwrap()
+	}
+
+	/// [`Arca::tree`] with RECLAIM-D on every lowest node.
+	pub fn tree_delegated(&self, sched: &ClockSchedule, leaves: &[LeafSpec]) -> Tree {
+		Tree::build(TreeParams {
+			asset: self.net.x, chain: self.net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: true, radix: 4,
 			reserve: ReserveRule::FeeRate { floor_per_kvb: self.floor_per_kvb, multiple: 4 }, min_leaf: 1,
 		}, leaves).unwrap()
 	}

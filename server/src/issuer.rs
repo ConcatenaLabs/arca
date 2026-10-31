@@ -436,7 +436,7 @@ impl WireBatch {
 			});
 		}
 		let params = TreeParams {
-			asset, chain, schedule, burn: true, radix: self.radix as usize, reserve, min_leaf: amount(&self.min_leaf, "min_leaf")?,
+			asset, chain, schedule, burn: true, delegated_reclaim: false, radix: self.radix as usize, reserve, min_leaf: amount(&self.min_leaf, "min_leaf")?,
 		};
 		Tree::build(params, &leaves).map_err(|e| format!("the batch at output {} does not build: {}", self.vout, e))
 	}
