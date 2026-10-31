@@ -60,6 +60,13 @@
 //! others, so a delegation adds no one a coin must trust: its senders, with
 //! the operator, could already spend the coins it came from twice.
 //!
+//! An in-tree fill of a resting order delegates the same way, into the
+//! fill's outputs ([`Delegation::for_fill`]): each taker coin when the
+//! taker signs, and the order's coin once its maker, away at the fill, holds
+//! a coin the fill made ([`Delegation::for_filled_order`]). The paid
+//! `htlc-1` leaf of a Lightning payment out of the tree is released by its
+//! sender's key once the payment is paid ([`Release::for_paid_send`]).
+//!
 //! What a delegation authorises: nothing alone. It makes the releases of the
 //! keys it names, all of them, stand for the signer's release, on every node
 //! the signer's coin rests on, on this chain. The signer's key is one coin's
@@ -76,7 +83,10 @@ use crate::accumulator::ValidAccumulatorLeaf;
 use crate::leaf::LeafPolicy;
 use crate::node::MAX_DELEGATES;
 use crate::script::ExplicitOutput;
-use crate::transfer::{NewLeaf, ValidCoin};
+use crate::htlc::HtlcDirection;
+use crate::order::OrderPolicy;
+use crate::script::sha256;
+use crate::transfer::{NewLeaf, ValidCoin, ValidOrigin};
 use crate::forfeit::{connector_asset, ConnectorPolicy};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::OffboardPolicy;
@@ -214,6 +224,32 @@ impl Release {
 	}
 }
 
+impl Release {
+	/// The releases the sender of a Lightning payment out of the tree signs
+	/// once the payment is paid: `coin` is its `htlc-1` leaf (direction
+	/// send), `preimage` the payment's, which the leaf's hash must be the
+	/// hash of. One release for each lowest node with RECLAIM-D the leaf
+	/// rests on, naming the connector asset of `round`, a round the wallet
+	/// holds (whose connector output is `c`). The leaf is the operator's once
+	/// paid, so its sender holds nothing it gives up; it must not sign before
+	/// the payment is decided, since the release ends its refund. Refuses a
+	/// coin that is not a send's `htlc-1` leaf, a preimage of another hash,
+	/// an output `c` that is not the operator's connector, and a round of
+	/// another operator.
+	pub fn for_paid_send(coin: &ValidCoin, preimage: &[u8; 32], round: &Transaction, c: u32) -> Result<Vec<Release>, SpendError> {
+		let htlc = coin.leaf.htlc.filter(|h| h.direction == HtlcDirection::Send)
+			.ok_or(SpendError::Release("the coin is not the htlc-1 leaf of a payment out of the tree"))?;
+		if sha256(preimage) != htlc.payment_hash {
+			return Err(SpendError::Release("the preimage is not the payment's"));
+		}
+		ConnectorPolicy { operator: coin.leaf.operator }.check(round, c)?;
+		let connector = connector_asset(round.txid(), c);
+		Ok(coin.release_nodes().into_iter().map(|(chain, node_hash)| Release {
+			chain, node_hash, owner: coin.leaf.owner, connector,
+		}).collect())
+	}
+}
+
 /// A coin's key's delegation of its release to the owner keys of a
 /// reassignment's outputs: see the [module documentation](self).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -259,6 +295,43 @@ impl Delegation {
 			.map_err(|_| SpendError::Delegation("a reassignment has 1 to 4 outputs"))
 	}
 
+	/// The delegation of the coin whose leaf is `from` into an in-tree fill
+	/// of the order whose coin's policy is `order`: a taker's coin given up
+	/// in the fill, or the order's coin itself. The fill's `outputs` are the maker's credit, for
+	/// a partial fill the order resting again, then the taker's leaves
+	/// `takers` (as [`crate::order`] lays them out), so `outputs` holds one
+	/// or two more than `takers`. Refuses another count, an order under
+	/// another operator or chain than the coin, an order whose credit keys
+	/// are used up, and an output that is not the leaf named for it.
+	pub fn for_fill(from: &LeafPolicy, order: &OrderPolicy, outputs: &[ExplicitOutput], takers: &[NewLeaf]) -> Result<Delegation, SpendError> {
+		let partial = match outputs.len().checked_sub(takers.len()) {
+			Some(1) => false,
+			Some(2) => true,
+			_ => return Err(SpendError::Delegation("a fill's outputs are the maker's one or two, then the taker's leaves")),
+		};
+		if order.operator != from.operator || order.chain != from.chain {
+			return Err(SpendError::OtherOperator);
+		}
+		let mut leaves = order.fill_leaves(partial).ok_or(SpendError::Delegation("the order's credit keys are used up"))?;
+		leaves.extend(takers.iter().map(|l| l.policy(order.operator, order.chain)));
+		Delegation::for_outputs(from.owner, from.chain, outputs, &leaves)
+	}
+
+	/// The maker's delegation of its order's coin into a fill that spent it,
+	/// signed once the fill is done: `made` is a coin of the fill the wallet
+	/// holds and validated (its credit, or the order resting again), and
+	/// `takers` the taker's leaves the operator names. The fill's outputs
+	/// and the order's coin come from `made`'s record, so the delegation
+	/// names the keys of exactly the outputs the operator signed, or is
+	/// refused ([`Delegation::for_fill`]). Signed by the order coin's key.
+	pub fn for_filled_order(made: &ValidCoin, takers: &[NewLeaf]) -> Result<Delegation, SpendError> {
+		let ValidOrigin::Fill { order, outputs, .. } = &made.origin else {
+			return Err(SpendError::Delegation("the coin is not one a fill made"));
+		};
+		let op = order.leaf.order_policy().ok_or(SpendError::Delegation("the fill's order coin is not an order"))?;
+		Delegation::for_fill(&order.leaf, &op, outputs, takers)
+	}
+
 	/// What the coin's key signs:
 	/// `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`.
 	pub fn message(&self) -> CsfsMessage {
@@ -273,5 +346,101 @@ impl Delegation {
 		} else {
 			Err(SpendError::Signature("delegation"))
 		}
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+	use elements::hashes::Hash;
+	use elements::secp256k1_zkp::{Keypair, SecretKey};
+	use elements::BlockHash;
+
+	use crate::order::{OrderTerms, SeqdexOrder, SeqdexVersion};
+	use crate::RelativeTime;
+
+	fn x(label: &str) -> XOnlyPublicKey {
+		Keypair::from_secret_key(crate::taptree::secp(), &SecretKey::from_slice(&sha256(label.as_bytes())).unwrap()).x_only_public_key().0
+	}
+
+	fn order() -> OrderPolicy {
+		OrderPolicy {
+			landed: SeqdexOrder {
+				terms: OrderTerms { asset_a: AssetId::from_slice(&[1; 32]).unwrap(), asset_b: AssetId::from_slice(&[2; 32]).unwrap(),
+					rate_num: 3, rate_den: 2, min_lot: 1_000 },
+				maker: sha256(b"maker"),
+				expiry: 1_800_000_000,
+				refund_key: x("refund"),
+				version: SeqdexVersion::V2,
+			},
+			owner: x("maker"),
+			operator: x("operator"),
+			salt: [9; 32],
+			chain: Chain::new(BlockHash::from_byte_array([7; 32])),
+			exit_delay: RelativeTime::from_units(254).unwrap(),
+			credits: [x("c0").serialize(), x("c1").serialize(), x("c2").serialize(), x("c3").serialize()],
+		}
+	}
+
+	fn taker(label: &str) -> NewLeaf {
+		NewLeaf { enclave: None, v2: false, owner: x(label), owner_nonce: sha256(label.as_bytes()), creator_nonce: [5; 32],
+			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, landing: None }
+	}
+
+	/// A fill of 10,000 of 50,000: the credit, the order resting again, the
+	/// taker's leaf and its change.
+	fn fill(o: &OrderPolicy, takers: &[NewLeaf]) -> Vec<ExplicitOutput> {
+		let plan = o.plan(50_000, 10_000).unwrap();
+		let mut out = vec![plan.credit.clone(), plan.rest.clone().unwrap()];
+		out.extend(takers.iter().map(|l| ExplicitOutput::new(o.terms().asset_a, 1_000, l.policy(o.operator, o.chain).script_pubkey())));
+		out
+	}
+
+	#[test]
+	fn a_fills_delegation_names_the_credit_the_rest_and_the_takers_leaves() {
+		let o = order();
+		let takers = [taker("got"), taker("change")];
+		let outputs = fill(&o, &takers);
+		// The maker's, from the order's coin: the rest's key is the coin's own.
+		let d = Delegation::for_fill(&o.leaf(), &o, &outputs, &takers).unwrap();
+		assert_eq!(d.from, o.owner);
+		assert_eq!(d.to, vec![x("c0"), o.owner, x("got"), x("change")]);
+		// A taker's coin's names the same keys.
+		let mut coin = o.leaf();
+		coin.owner = x("taker's coin");
+		coin.order = None;
+		let t = Delegation::for_fill(&coin, &o, &outputs, &takers).unwrap();
+		assert_eq!((t.from, &t.to), (x("taker's coin"), &d.to));
+		assert_eq!(t.message(), Chain::new(BlockHash::from_byte_array([7; 32])).delegation_message(&d.to).unwrap());
+		// A whole fill: the credit, then the taker's.
+		let whole = o.plan(50_000, 50_000).unwrap();
+		let outs = vec![whole.credit.clone(), outputs[2].clone()];
+		let w = Delegation::for_fill(&o.leaf(), &o, &outs, &takers[..1]).unwrap();
+		assert_eq!(w.to, vec![x("c0"), x("got")]);
+	}
+
+	#[test]
+	fn a_fills_delegation_refuses_outputs_that_are_not_the_fills() {
+		let o = order();
+		let takers = [taker("got"), taker("change")];
+		let outputs = fill(&o, &takers);
+		let err = |r: Result<Delegation, SpendError>| r.unwrap_err().to_string();
+		// Another taker leaf than the output holds.
+		let other = [taker("got"), taker("someone else")];
+		assert!(err(Delegation::for_fill(&o.leaf(), &o, &outputs, &other)).contains("not the leaf named"));
+		// A credit under the next key (the fill read as one fill later).
+		assert!(err(Delegation::for_fill(&o.leaf(), &o.next(), &outputs, &takers)).contains("not the leaf named"));
+		// A whole fill's leaves for a partial fill's outputs.
+		assert!(err(Delegation::for_fill(&o.leaf(), &o, &outputs[1..], &takers)).contains("not the leaf named"));
+		// Too few or too many outputs for the taker's leaves.
+		assert!(err(Delegation::for_fill(&o.leaf(), &o, &outputs[2..], &takers)).contains("the maker's one or two"));
+		assert!(err(Delegation::for_fill(&o.leaf(), &o, &outputs, &takers[..0])).contains("the maker's one or two"));
+		// An order under another operator.
+		let mut s = o;
+		s.operator = x("another operator");
+		assert_eq!(Delegation::for_fill(&o.leaf(), &s, &outputs, &takers).unwrap_err(), SpendError::OtherOperator);
+		// An order whose credit keys are used up.
+		let spent = o.next().next().next().next();
+		assert!(err(Delegation::for_fill(&o.leaf(), &spent, &outputs, &takers)).contains("used up"));
 	}
 }
