@@ -7,6 +7,12 @@
 //! request a connection, and passes over its deposits every `interval`
 //! seconds ([`bark::arca::Wallet::tower_pass`]). Requests wait while a pass
 //! runs: the wallet is one, and the store is its.
+//!
+//! Every answer allows any origin (`Access-Control-Allow-Origin: *`), and a
+//! preflight (`OPTIONS`) is answered at once: wallets in browsers deposit
+//! with watchtowers on other origins than the page's, their operator's and
+//! other operators'. Nothing it takes or answers is private: a deposit is
+//! sealed, and a withdrawal is signed.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,11 +45,21 @@ fn refusal(e: &Error) -> (u16, Value) {
 	}
 }
 
+/// The headers that let a page on any origin call the watchtower.
+const CORS: &str = "Access-Control-Allow-Origin: *\r\n";
+
+/// The answer to a preflight: the calls a page may make, for ten minutes.
+fn preflight(s: &mut TcpStream) {
+	let head = format!("HTTP/1.1 204 No Content\r\n{}Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+		Access-Control-Allow-Headers: Content-Type\r\nAccess-Control-Max-Age: 600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", CORS);
+	let _ = s.write_all(head.as_bytes()).and_then(|_| s.flush());
+}
+
 fn respond(s: &mut TcpStream, status: u16, body: &Value) {
 	let text = body.to_string();
 	let reason = match status { 200 => "OK", 404 => "Not Found", 413 => "Payload Too Large", 422 => "Unprocessable Entity", _ => "Error" };
-	let head = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", status, reason,
-		text.len());
+	let head = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", status, reason,
+		text.len(), CORS);
 	let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(text.as_bytes())).and_then(|_| s.flush());
 }
 
@@ -69,6 +85,9 @@ fn handle(mut s: TcpStream, tx: mpsc::Sender<Request>) {
 	let mut lines = head.split("\r\n");
 	let first: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
 	let path = first.get(1).copied().unwrap_or("").split('?').next().unwrap_or("").to_string();
+	if first.first().is_some_and(|m| m.eq_ignore_ascii_case("OPTIONS")) {
+		return preflight(&mut s);
+	}
 	let length: usize = lines.filter_map(|l| l.split_once(':')).find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
 		.and_then(|(_, v)| v.trim().parse().ok()).unwrap_or(0);
 	if length > MAX_DEPOSIT_BYTES {

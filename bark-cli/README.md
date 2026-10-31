@@ -1227,7 +1227,8 @@ Any wallet can be a watchtower for other wallets' coins:
 against the operator (it checks every deposit as a receiver checks a coin,
 against that operator's key), takes deposits over HTTP (`POST /v1/deposit`,
 `POST /v1/withdraw`, `GET /v1/info`; the segment after `/v1/` names the
-call, so it serves behind any path a proxy gives it) and passes over them
+call, so it serves behind any path a proxy gives it; every answer allows any
+origin, so a wallet in a browser deposits with it from any page) and passes over them
 every `--interval` seconds. It leaves a coin alone until a batch it rests on
 is released (the batch's token at `R`, in a block or the mempool) or, for a
 coin paid out of round, until a leaf or checkpoint it descends from appears
