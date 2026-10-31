@@ -58,7 +58,7 @@ prints at its end) and `verbatim` (what each wallet said, word for word).
 | `OPERATOR_URL`, `OPERATOR_KEY` | The operator under test, on this machine, and its operator key | required |
 | `NODE_URL`, and `NODE_COOKIE` or `NODE_USER` with `NODE_PASSWORD_FILE` | The Sequentia node's RPC, with `-txindex` and `-validateanchor`: its cookie file (a bundle's is under its data directory), or a login whose password is read from the file, never an argument | required |
 | `ASSET`, `ASSET_B` | The asset the wallets hold; the second asset of `down-swap` | required; `ASSET_B` for `down-swap` |
-| `FUND` | A command run as `$FUND ADDRESS ASSET ATOMS` that pays test coins to the address on the chain. Write it to name the node wallet it pays from, and never a treasury's, a reserve's or a service's | required |
+| `FUND` | A command run as `$FUND ADDRESS ASSET ATOMS` that pays test coins to the address on the chain and prints the payment's txid (`sendtoaddress` does), which a board then waits on to confirm (`FUND_BLOCKS`, default 30 blocks). Write it to name the node wallet it pays from, and never a treasury's, a reserve's or a service's | required |
 | `NAME` | The bundle's name, which its service units carry | `arca-bundle` |
 | `STOP_OPERATOR`, `START_OPERATOR` | Stopping and starting the operator as its service manager does | `systemctl stop\|start $NAME-arcad.service $NAME-arca-signer.service` |
 | `KILL_OPERATOR`, `KILL_SIGNER` | The failure no service manager announces | `systemctl kill -s KILL …` on both units, on the signer's |
