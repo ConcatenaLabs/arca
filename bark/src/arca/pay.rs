@@ -129,6 +129,32 @@ fn asset_of(v: &Value, what: &str) -> Result<AssetId, Error> {
 /// is posted to, and, for a payment to a receive request, when that request
 /// lapses (`until`), which the server checks too: it records no payment to a
 /// request past its lapse.
+/// The signatures another owner made for its input `input` of a transfer
+/// the wallet completes (a swap's other side).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Theirs {
+	pub input: usize,
+	pub checkpoint: Signature,
+	pub reassignment: Signature,
+	pub delegation: Option<Signature>,
+}
+
+/// The delegation of `coin`'s release to the owner keys of every output of
+/// a reassignment of `outputs`, each the leaf `leaves` names, signed with
+/// `key`: for a coin resting on a lowest node with RECLAIM-D, so that the
+/// node comes back once the outputs' holders refresh and release it. `None`
+/// for any other coin. Every output is named, so no co-receiver (the change,
+/// a swap's other side) can release the node alone.
+pub(crate) fn delegation_sig(key: &elements::secp256k1_zkp::Keypair, coin: &ValidCoin, outputs: &[ExplicitOutput], leaves: &[NewLeaf])
+	-> Result<Option<Signature>, Error>
+{
+	if coin.release_nodes().is_empty() {
+		return Ok(None);
+	}
+	let d = arca_covenant::Delegation::for_reassignment(coin, outputs, leaves).map_err(|e| Error::Refused(format!("the delegation: {}", e)))?;
+	Ok(Some(sign(key, &d.message().digest)))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Out {
 	pub asset: AssetId,
@@ -751,7 +777,7 @@ impl Wallet {
 	/// Signs `mine` (the wallet's inputs among `inputs` at their index), asks
 	/// the server to co-sign the whole transfer, and takes the answer. `theirs`
 	/// carries the signatures of inputs another owner signed, by index.
-	fn transfer(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)]) -> Result<Value, Error> {
+	fn transfer(&mut self, inputs: &[In], outs: &[Out], theirs: &[Theirs]) -> Result<Value, Error> {
 		self.transfer_with(inputs, outs, theirs, None)
 	}
 
@@ -767,7 +793,7 @@ impl Wallet {
 		self.transfer_with(inputs, outs, &[], Some(json!({"payment_hash": hash, "preimage": hex(preimage)})))
 	}
 
-	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[(usize, Signature, Signature)], extra: Option<Value>)
+	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[Theirs], extra: Option<Value>)
 		-> Result<Value, Error>
 	{
 		// Nothing is signed for the operator without a witness of its
@@ -777,21 +803,26 @@ impl Wallet {
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
+		let leaves: Vec<NewLeaf> = outs.iter().map(|o| o.leaf).collect();
 		let mut ins = vec![];
 		let mut mine = vec![];
 		for (k, i) in inputs.iter().enumerate() {
-			let (cp, re) = match theirs.iter().find(|(j, _, _)| *j == k) {
-				Some((_, cp, re)) => (*cp, *re),
+			let (cp, re, d) = match theirs.iter().find(|t| t.input == k) {
+				Some(t) => (t.checkpoint, t.reassignment, t.delegation),
 				None => {
 					let key = self.coin_key(&i.row.owner_nonce)?;
 					mine.push(i.row.leaf_id.clone());
 					let cp = sign(&key, &plan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 					let re = sign(&key, &plan.reassignment_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
-					(cp, re)
+					(cp, re, delegation_sig(&key, &i.coin, &plan.outputs, &leaves)?)
 				},
 			};
-			ins.push(json!({"leaf_id": i.coin.id.to_string(), "checkpoint_value": i.checkpoint_value.to_string(),
-				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
+			let mut j = json!({"leaf_id": i.coin.id.to_string(), "checkpoint_value": i.checkpoint_value.to_string(),
+				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())});
+			if let Some(d) = d {
+				j["delegation_sig"] = json!(hex(d.as_ref()));
+			}
+			ins.push(j);
 		}
 		let mut body = json!({"inputs": ins, "outputs": outs.iter().map(|o| { let mut j = o.json(); j["mailbox"] = json!(hex(&o.mailbox.serialize())); j }).collect::<Vec<_>>()});
 		for (k, v) in extra.as_ref().and_then(|e| e.as_object()).into_iter().flatten() {
@@ -1857,12 +1888,17 @@ impl Wallet {
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
+		let leaves: Vec<NewLeaf> = outs.iter().map(|o| o.leaf).collect();
 		let mut sigs = vec![];
 		for (k, i) in inputs.iter().enumerate().skip(n) {
 			let key = self.coin_key(&i.row.owner_nonce)?;
 			let cp = sign(&key, &plan.checkpoint_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
 			let re = sign(&key, &plan.reassignment_message(k).map_err(|e| Error::Refused(e.to_string()))?.digest);
-			sigs.push(json!({"input": k, "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())}));
+			let mut j = json!({"input": k, "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())});
+			if let Some(d) = delegation_sig(&key, &i.coin, &plan.outputs, &leaves)? {
+				j["delegation_sig"] = json!(hex(d.as_ref()));
+			}
+			sigs.push(j);
 		}
 		let accept = json!({
 			"kind": ACCEPT_KIND.name, "swap": id,
@@ -1969,7 +2005,11 @@ impl Wallet {
 			}
 			let cp = Signature::from_slice(&unhex(s["checkpoint_sig"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?;
 			let re = Signature::from_slice(&unhex(s["reassignment_sig"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?;
-			theirs.push((k, cp, re));
+			let delegation = match s["delegation_sig"].as_str() {
+				Some(d) => Some(Signature::from_slice(&unhex(d)?).map_err(|e| Error::Parse(e.to_string()))?),
+				None => None,
+			};
+			theirs.push(Theirs { input: k, checkpoint: cp, reassignment: re, delegation });
 		}
 		if theirs.len() != inputs.len() - n {
 			return Err(Error::Refused("the acceptance does not sign every one of the taker's inputs".into()));

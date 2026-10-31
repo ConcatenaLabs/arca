@@ -422,7 +422,7 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 		asset: AssetId::from_str(&s("asset")?).map_err(|e| Error::Parse(e.to_string()))?,
 		chain: Chain::new(elements::BlockHash::from_str(&s("genesis_hash")?).map_err(|e| Error::Parse(e.to_string()))?),
 		schedule: ClockSchedule::decode(&unhex(&s("schedule")?)?).map_err(|e| Error::Refused(format!("the published schedule: {}", e)))?,
-		burn: t["burn"].as_bool().unwrap_or(false), delegated_reclaim: false,
+		burn: t["burn"].as_bool().unwrap_or(false), delegated_reclaim: t["delegated_reclaim"].as_bool().unwrap_or(false),
 		radix: t["radix"].as_u64().unwrap_or(0) as usize,
 		reserve,
 		min_leaf: amount(&t["min_leaf"], "min_leaf")?,
@@ -1451,6 +1451,16 @@ impl Wallet {
 						(None, None) => unreachable!("refused above"),
 					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
+				}
+			} else if let (CoinRecord::Transfer(_) | CoinRecord::Fill(_), Some(NewValid::Tree(v))) = (&record, new) {
+				// A coin a reassignment made, resting on lowest nodes with
+				// RECLAIM-D: its holder releases each of them for this round,
+				// so that a node whose coins moved out of round comes back
+				// once every coin it became is refreshed.
+				let rels = Release::for_holder(old, v, &round, c).map_err(|e| Error::Refused(format!("the releases of {}: {}", l, e)))?;
+				for rel in rels {
+					releases.push(json!({"leaf_id": l, "node": hex(&rel.node_hash),
+						"signature": hex(sign(&key, &rel.message().digest).as_ref())}));
 				}
 			}
 		}

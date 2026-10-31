@@ -234,6 +234,11 @@ max_margin_multiple = 25
 # reference unit at the asset's rate) is the most the operator puts on its own
 # side of a channel-1 leaf of the asset (README, "Channel leaves"); no channel
 # leaf of the asset is made when absent.
+#
+# in_flight_cap (or in_flight_cap_value) is the most of the asset the
+# operator fronts for refreshes whose old coins have not come back yet; a
+# refresh beyond it waits for a later round (README, "Rounds"). No cap when
+# absent; "0" fronts nothing, for an asset whose pool is empty.
 [[assets]]
 asset = "<asset id>"
 min_leaf = "1000"
@@ -245,6 +250,7 @@ min_leaf = "1000"
 # lightning_base = "0"
 # min_leaf_value = "100000"
 # channel_capacity = "1000000"
+# in_flight_cap = "500000000"
 # [assets.rate]
 # source = "file"
 # path = "/var/lib/arca/rates/<asset id>.json"
@@ -301,10 +307,17 @@ forfeit_window_seconds = 600
 # refreshes again and releases, the watcher unrolls and reclaims it, and its
 # value is back in the pool long before the batch expires. 0 puts every leaf
 # of an asset in one batch.
+#
+# delegated_reclaim puts RECLAIM-D beside RECLAIM on every tree's lowest
+# nodes, so a node whose coins were paid on out of round comes back once their
+# current holders refresh and release it (README, "Reclaim"). A wallet that
+# does not read the leaf record's RECLAIM-D flag refuses such a batch's
+# leaves: set it only once every wallet your holders use reads it.
 [batches]
 # accumulator_exit_rate_ppm = 10000
 holder_batches = 8
 holder_window_seconds = 259200
+delegated_reclaim = false
 
 # The Lightning gateway beside each asset's own node.
 [lightning]

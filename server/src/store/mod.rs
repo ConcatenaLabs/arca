@@ -17,7 +17,8 @@
 //! `schema/V27__resting_orders.sql`, `schema/V28__issuer_operated.sql`,
 //! `schema/V29__fill_requests.sql`, `schema/V30__order_landings.sql`,
 //! `schema/V31__supervised.sql`, `schema/V32__channels.sql`,
-//! `schema/V33__accumulator_batches.sql`, `schema/V34__owed.sql`),
+//! `schema/V33__accumulator_batches.sql`, `schema/V34__owed.sql`,
+//! `schema/V35__release_delegation.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -49,6 +50,7 @@ mod boards;
 mod chain;
 mod channels;
 mod coins;
+mod delegations;
 mod distributions;
 mod lightning;
 mod mailbox;
@@ -69,6 +71,7 @@ pub use boards::{BoardRow, BoardState};
 pub use channels::{Begun, ChannelNoteRow, ChannelSeen, ChannelStateRow, NewChannelState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
+pub use delegations::{DelegationRow, HolderReleaseRow, SpentBy};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
 pub use mailbox::MailboxMessage;
@@ -129,6 +132,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(32, include_str!("../../schema/V32__channels.sql")),
 	(33, include_str!("../../schema/V33__accumulator_batches.sql")),
 	(34, include_str!("../../schema/V34__owed.sql")),
+	(35, include_str!("../../schema/V35__release_delegation.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

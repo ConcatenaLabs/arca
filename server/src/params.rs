@@ -94,6 +94,11 @@ pub struct AssetParams {
 	/// issuer's tree: its leaves are `enclave-1`, and its policy server
 	/// co-signs beside the operator ([`crate::restricted`]).
 	pub restricted: Option<crate::restricted::Restricted>,
+	/// The most of the asset the operator fronts for refreshes whose old
+	/// coins have not come back yet (`in_flight`, [`crate::store::PoolFlow`]):
+	/// a refresh that would take it past the cap waits for a later round.
+	/// No cap when `None`.
+	pub in_flight_cap: Option<Amount>,
 }
 
 /// What the operator serves of a supervised asset beside the rest.
@@ -486,6 +491,14 @@ impl Params {
 		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
 		a.channel_capacity.atoms(self.rates.last(asset)).ok_or_else(|| format!("asset {}'s channel capacity is a value in the \
 			reference unit, and the operator has no rate for it yet", asset))
+	}
+
+	/// The asset's in-flight cap in its atoms ([`AssetParams::in_flight_cap`]):
+	/// `None` for no cap; a cap set as a value with no rate yet counts as 0,
+	/// so nothing is fronted on a guess.
+	pub fn in_flight_cap(&self, asset: &AssetId) -> Option<u64> {
+		let a = self.assets.get(asset)?;
+		a.in_flight_cap.map(|c| c.atoms(self.rates.last(asset)).unwrap_or(0))
 	}
 
 	/// Why a new `channel-1` leaf of `asset`, `value` and `channel` is

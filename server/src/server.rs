@@ -132,6 +132,12 @@ pub struct BatchesSection {
 	/// count as one that moves its coins soon; three days when absent.
 	#[serde(default)]
 	pub holder_window_seconds: Option<u32>,
+	/// Whether new batches carry RECLAIM-D on their lowest nodes
+	/// ([`RoundConfig::delegated_reclaim`]); off when absent. Set it only
+	/// once every wallet the operator's holders use reads the leaf record's
+	/// RECLAIM-D flag: one that does not refuses such a batch's leaves.
+	#[serde(default)]
+	pub delegated_reclaim: bool,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -676,6 +682,15 @@ pub struct AssetSection {
 	pub channel_capacity: Option<String>,
 	#[serde(default)]
 	pub channel_capacity_value: Option<String>,
+	/// The most of the asset the operator fronts for refreshes whose old
+	/// coins have not come back yet, in its atoms, or (`_value`) as a value in
+	/// atoms of the reference unit, converted at the asset's rate; decimal
+	/// strings. A refresh beyond it waits for a later round. No cap when
+	/// absent; `"0"` fronts nothing, for an asset whose pool is empty.
+	#[serde(default)]
+	pub in_flight_cap: Option<String>,
+	#[serde(default)]
+	pub in_flight_cap_value: Option<String>,
 	/// The restricted profile ([`crate::restricted`]): the asset is a
 	/// restricted asset its issuer serves in this tree, and its policy server
 	/// co-signs beside the operator.
@@ -715,7 +730,7 @@ impl AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
 			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None, supervised: None,
-			channel_capacity: None, channel_capacity_value: None, restricted: None,
+			channel_capacity: None, channel_capacity_value: None, in_flight_cap: None, in_flight_cap_value: None, restricted: None,
 		}
 	}
 }
@@ -1434,7 +1449,12 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			},
 		};
 		let channel_capacity = amount("channel_capacity", &a.channel_capacity, &a.channel_capacity_value)?;
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, restricted: None }));
+		let in_flight_cap = match (&a.in_flight_cap, &a.in_flight_cap_value) {
+			(None, None) => None,
+			_ => Some(amount("in_flight_cap", &a.in_flight_cap, &a.in_flight_cap_value)?),
+		};
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, restricted: None,
+			in_flight_cap }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1681,6 +1701,7 @@ impl Server {
 				accumulator_exit_rate_ppm: config.batches.accumulator_exit_rate_ppm,
 				holder_batches: config.batches.holder_batches.unwrap_or(RoundConfig::default().holder_batches),
 				holder_window: config.batches.holder_window_seconds.unwrap_or(RoundConfig::default().holder_window),
+				delegated_reclaim: config.batches.delegated_reclaim,
 				..RoundConfig::default()
 			});
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());

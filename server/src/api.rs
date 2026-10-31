@@ -31,11 +31,11 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
-	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_participating", "not_synced", "on_chain", "open_reassignment",
+	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "on_chain", "open_reassignment",
 	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
@@ -105,9 +105,18 @@ pub struct PoolFlowInfo {
 	/// Of `released`, the batches every leaf of which is released: the watcher reclaims them
 	/// on its next passes.
 	pub reclaimable: String,
-	/// Of `locked`, the leaves paid on out of round: back only at their batch's expiry, since a
-	/// release comes from a leaf's owner and theirs has moved on to another coin.
+	/// Of `locked`, the leaves paid on out of round, not reclaimed yet: their owner has moved on
+	/// to another coin, so on a batch with RECLAIM-D they come back once every coin they became is
+	/// refreshed and its holder released them, and otherwise at their batch's expiry.
 	pub transferred: String,
+	/// What the operator fronted for refreshes and offboards whose old coins have not come back
+	/// yet (reclaimed or swept): the capital the asset's refreshes hold.
+	#[serde(default)]
+	pub in_flight: String,
+	/// The most it fronts so ([`in_flight`](Self::in_flight)): a refresh beyond it waits for a
+	/// later round. Absent when the operator sets no cap.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub in_flight_cap: Option<String>,
 	/// What the rounds of the last hour took out of the pool (their batches and offboards).
 	pub drawn_last_hour: String,
 	/// What reclaims paid back in the last hour.
@@ -440,6 +449,14 @@ pub struct AssetInfo {
 	/// nothing is owed. `fundable` leaves it out.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub owed: Option<OwedInfo>,
+	/// The most of the asset the operator fronts for refreshes whose old
+	/// coins have not come back yet, and what it fronts now (`in_flight`):
+	/// a refresh beyond the cap waits for a later round. Absent when the
+	/// operator sets no cap.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub in_flight_cap: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub in_flight: Option<String>,
 }
 
 /// What the operator owes in an asset for swept coins.
@@ -815,6 +832,11 @@ pub struct TransferInput {
 	/// The owner's signatures over the checkpoint and the reassignment.
 	pub checkpoint_sig: String,
 	pub reassignment_sig: String,
+	/// For a coin resting on a lowest node with RECLAIM-D: the owner's
+	/// delegation of its release to the owner keys of every output, in
+	/// output order, `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub delegation_sig: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1949,6 +1971,11 @@ pub struct PublishedTree {
 	/// canonical encoding.
 	pub schedule: String,
 	pub burn: bool,
+	/// Whether its lowest nodes carry RECLAIM-D beside RECLAIM; absent when
+	/// they do not. A reader that does not know it rebuilds other scripts
+	/// and refuses the batch.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub delegated_reclaim: bool,
 	pub radix: u32,
 	pub reserve: TreeReserve,
 	pub min_leaf: String,
@@ -2219,6 +2246,11 @@ pub struct ReleaseLeaves {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseSignature {
 	pub leaf_id: String,
+	/// For a coin a reassignment made, resting on lowest nodes with
+	/// RECLAIM-D: the children hash `H` of the node this release is of (one
+	/// release for each such node). Absent for a batch leaf's own lowest node.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub node: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub connector_asset: Option<String>,
 	pub signature: String,

@@ -142,6 +142,9 @@ pub struct ReleaseRequest {
 	pub leaf_id: LeafId,
 	pub connector: Option<AssetId>,
 	pub signature: Signature,
+	/// The lowest node released, for a coin a reassignment made
+	/// ([`crate::delegations`]); a batch leaf's own when `None`.
+	pub node: Option<[u8; 32]>,
 }
 
 /// Why a forfeit or a release was refused, or could not be handled.
@@ -177,6 +180,10 @@ pub enum ForfeitError {
 	BadRelease(LeafId),
 	#[error("coin {leaf}'s release names the connector asset {named}; the participation's round's is {round}")]
 	WrongRound { leaf: LeafId, named: AssetId, round: AssetId },
+	#[error("coin {0} moved into a reassignment: its release is its delegation's, and the operator takes no release by its key")]
+	Delegated(LeafId),
+	#[error("coin {0} rests on no lowest node with RECLAIM-D whose children hash is the one named")]
+	NotOnNode(LeafId),
 	#[error(transparent)]
 	Cosign(CosignError),
 	#[error("the signer: {0}")]
@@ -214,6 +221,8 @@ impl ForfeitError {
 			NoLowestNode(_) => "no_lowest_node",
 			BadRelease(_) => "bad_signature",
 			WrongRound { .. } => "wrong_round",
+			Delegated(_) => "delegated",
+			NotOnNode(_) => "not_on_node",
 			Cosign(e) => e.code(),
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
@@ -545,9 +554,40 @@ impl Forfeits {
 			if round.state != RoundState::Final {
 				return Err(ForfeitError::RoundNotFinal(Txid::from_byte_array(round.txid)));
 			}
+			// A coin a reassignment spent releases only through its
+			// delegation: a release by its key would stand for coins it no
+			// longer holds ([`crate::delegations`]).
+			if !matches!(self.store.spent_by(&r.leaf_id.0).await?, crate::store::SpentBy::Other) {
+				return Err(ForfeitError::Delegated(r.leaf_id));
+			}
+			// The release names the connector asset of the participation's
+			// round, so it is void if that round leaves the chain.
+			let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
 			let row = self.store.leaf(&r.leaf_id.0).await?.ok_or_else(|| ForfeitError::Internal("a coin given up vanished".into()))?;
 			let record = match CoinRecord::from_bytes(&row.record) {
 				Ok(CoinRecord::Leaf { record, .. }) => record,
+				// A coin a reassignment made: its holder releases each lowest
+				// node with RECLAIM-D it rests on, one at a time.
+				Ok(CoinRecord::Transfer(_)) | Ok(CoinRecord::Fill(_)) => {
+					let node = r.node.ok_or(ForfeitError::NoLowestNode(r.leaf_id))?;
+					if let Some(named) = r.connector.filter(|n| *n != m) {
+						return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named, round: m });
+					}
+					let now = self.now().await?;
+					let policy = WalletPolicy { horizon: 0, ..self.params.taken_policy(now) };
+					let checked = coins::resolve(&self.store, &policy, &r.leaf_id).await?;
+					let Some((chain, _)) = checked.coin.release_nodes().into_iter().find(|(_, h)| *h == node) else {
+						return Err(ForfeitError::NotOnNode(r.leaf_id));
+					};
+					let release = Release { chain, node_hash: node, owner: checked.coin.leaf.owner, connector: m };
+					if release.verify(&r.signature).is_err() {
+						return Err(ForfeitError::BadRelease(r.leaf_id));
+					}
+					self.store.insert_release(&r.leaf_id.0, id, round.round_id, &node, &m.into_inner().to_byte_array(),
+						r.signature.as_ref()).await?;
+					done.push(r.leaf_id);
+					continue;
+				},
 				Ok(_) => return Err(ForfeitError::NoLowestNode(r.leaf_id)),
 				Err(e) => return Err(ForfeitError::Internal(e.to_string())),
 			};
@@ -556,11 +596,11 @@ impl Forfeits {
 			if lowest.reclaim.is_none() {
 				return Err(ForfeitError::NoLowestNode(r.leaf_id));
 			}
-			// The release names the connector asset of the participation's
-			// round, so it is void if that round leaves the chain.
-			let m = connector_asset(Txid::from_byte_array(round.txid), round.connector_vout);
 			if let Some(named) = r.connector.filter(|n| *n != m) {
 				return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named, round: m });
+			}
+			if r.node.is_some_and(|n| n != lowest.children_hash()) {
+				return Err(ForfeitError::NotOnNode(r.leaf_id));
 			}
 			let release = Release { chain: self.params.chain, node_hash: lowest.children_hash(), owner: record.owner, connector: m };
 			if release.verify(&r.signature).is_err() {

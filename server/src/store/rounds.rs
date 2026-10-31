@@ -97,6 +97,8 @@ pub struct BatchRow {
 	pub min_leaf: u64,
 	/// A tree, or an accumulator batch (whose radix is 0).
 	pub kind: arca_covenant::BatchKind,
+	/// Whether its lowest nodes carry RECLAIM-D beside RECLAIM.
+	pub delegated_reclaim: bool,
 }
 
 /// A batch to record, with its leaves in tree order and the scripts of its
@@ -252,7 +254,7 @@ fn round_row(r: &tokio_postgres::Row) -> Result<RoundRow, StoreError> {
 }
 
 const BATCH_COLUMNS: &str = "round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn, radix,
-	reserve_kind, reserve_a, reserve_b, min_leaf, kind";
+	reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim";
 
 fn batch_kind(s: &str) -> Result<arca_covenant::BatchKind, StoreError> {
 	arca_covenant::BatchKind::parse(s).ok_or_else(|| StoreError::Corrupt(format!("batch kind {}", s)))
@@ -296,6 +298,7 @@ fn batch_row(r: &tokio_postgres::Row) -> Result<BatchRow, StoreError> {
 		},
 		min_leaf: u64_of(r.get(14), "min leaf")?,
 		kind: batch_kind(r.get(15))?,
+		delegated_reclaim: r.get(16),
 	})
 }
 
@@ -378,11 +381,11 @@ impl Store {
 			};
 			t.execute(
 				"INSERT INTO batch (round_id, vout, asset, value, token, token_vout, issuer_txid, issuer_vout, schedule, burn,
-				 radix, reserve_kind, reserve_a, reserve_b, min_leaf, kind)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+				 radix, reserve_kind, reserve_a, reserve_b, min_leaf, kind, delegated_reclaim)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
 				&[&round_id, &(x.vout as i32), &&x.asset[..], &i64_of(x.value)?, &&x.token[..], &(x.token_vout as i32),
 					&&x.issuer.0[..], &(x.issuer.1 as i32), &x.schedule, &x.burn, &(x.radix as i16), &kind, &i64_of(a)?,
-					&i64_of(bb)?, &i64_of(x.min_leaf)?, &x.kind.as_str()],
+					&i64_of(bb)?, &i64_of(x.min_leaf)?, &x.kind.as_str(), &x.delegated_reclaim],
 			).await?;
 			for sc in &b.scripts {
 				t.execute(

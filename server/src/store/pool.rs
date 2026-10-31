@@ -18,8 +18,10 @@ pub struct PoolFlow {
 	/// unrolls and reclaims them on its next passes.
 	pub reclaimable: u64,
 	/// Of `locked`, the leaves paid on out of round (given up in a
-	/// transfer): no release of their lowest node can come from their owner,
-	/// so they come back only at their batch's expiry.
+	/// transfer), not reclaimed yet: no release of their lowest node can come
+	/// from their owner, so they come back by RECLAIM-D once every coin they
+	/// became is refreshed and released ([`crate::delegations`]), or else at
+	/// their batch's expiry.
 	pub transferred: u64,
 	/// What the batches of the rounds built in the last hour, and their
 	/// offboards, took out of the pool.
@@ -28,7 +30,53 @@ pub struct PoolFlow {
 	pub reclaimed_last_hour: u64,
 	/// What sweeps of expired batches paid back in the last hour.
 	pub swept_last_hour: u64,
+	/// What the operator fronted for refreshes and offboards whose old coins
+	/// have not come back: each coin given up in a round broadcast or final,
+	/// while a batch leaf of its asset it rests on (its own, or one up its
+	/// lineage of reassignments) is in a batch neither reclaimed there nor
+	/// swept. A coin resting on boards alone is not counted: its forfeit
+	/// pays the operator back at once.
+	pub in_flight: u64,
 }
+
+/// The common part of [`Store::in_flight`] and [`Store::in_flight_slots`]:
+/// each coin given up in a round broadcast or final, its lineage up through
+/// reassignments, and what has come back.
+const IN_FLIGHT_WITH: &str = "
+	WITH RECURSIVE given AS (
+	   SELECT pi.leaf_id, pi.asset, pi.value FROM participation_input pi
+	   JOIN participation p USING (participation_id) JOIN round r ON r.round_id = p.round_id
+	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('broadcast', 'final')),
+	 parent AS (
+	   SELECT o.leaf_id AS child, ti.leaf_id AS parent FROM transfer_output o JOIN transfer_input ti USING (transfer_id)
+	   UNION ALL
+	   SELECT o.leaf_id, f.order_leaf FROM transfer_output o JOIN order_fill f USING (transfer_id)),
+	 up (root, leaf_id) AS (
+	   SELECT leaf_id, leaf_id FROM given
+	   UNION
+	   SELECT u.root, p.parent FROM up u JOIN parent p ON p.child = u.leaf_id),
+	 swept AS (
+	   SELECT b.round_id, b.vout FROM batch b JOIN watcher_tx w ON w.subject = b.token JOIN nursery_tx n USING (txid)
+	   WHERE w.kind = 'sweep' AND n.state = 'final'),
+	 back AS (
+	   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'
+	   UNION
+	   SELECT nr.leaf_id FROM node_release nr JOIN watcher_tx w ON w.kind = 'reclaim' AND w.subject = nr.node_hash
+	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost'),
+	 held AS (
+	   SELECT u.root, bl.leaf_id, bl.record FROM up u JOIN given g ON g.leaf_id = u.root
+	   JOIN batch_leaf bl ON bl.leaf_id = u.leaf_id JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
+	   JOIN round r ON r.round_id = b.round_id
+	   WHERE b.asset = g.asset AND r.state IN ('broadcast', 'final') AND b.kind = 'tree'
+	     AND (bl.round_id, bl.vout) NOT IN (SELECT round_id, vout FROM swept)
+	     AND bl.leaf_id NOT IN (SELECT leaf_id FROM back))";
+
+/// The value in flight, by asset.
+const IN_FLIGHT: &str = "SELECT g.asset, sum(g.value)::BIGINT FROM given g WHERE EXISTS (SELECT 1 FROM held h WHERE h.root = g.leaf_id)
+	GROUP BY 1";
+
+/// The leaf records of the batch leaves that hold value in flight.
+const IN_FLIGHT_SLOTS: &str = "SELECT DISTINCT leaf_id, record FROM held";
 
 impl Store {
 	/// Each asset's pool flow, by asset: see [`PoolFlow`]. One read-only
@@ -44,25 +92,32 @@ impl Store {
 			 reclaimed_node AS (
 			   SELECT DISTINCT w.subject AS node_hash, w.txid FROM watcher_tx w JOIN nursery_tx n USING (txid)
 			   WHERE w.kind = 'reclaim' AND n.state <> 'lost'),
+			 reclaimed_leaves AS (
+			   SELECT rl.leaf_id, rl.txid FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'),
 			 leaves AS (
 			   SELECT bl.round_id, bl.vout, bl.value,
 			          EXISTS (SELECT 1 FROM node_release nr WHERE nr.leaf_id = bl.leaf_id AND NOT nr.retired) AS released,
-			          EXISTS (SELECT 1 FROM node_release nr JOIN reclaimed_node k USING (node_hash)
-			                  WHERE nr.leaf_id = bl.leaf_id) AS reclaimed,
+			          (EXISTS (SELECT 1 FROM node_release nr JOIN reclaimed_node k USING (node_hash)
+			                  WHERE nr.leaf_id = bl.leaf_id)
+			           OR EXISTS (SELECT 1 FROM reclaimed_leaves k WHERE k.leaf_id = bl.leaf_id)) AS reclaimed,
 			          EXISTS (SELECT 1 FROM transfer_input ti WHERE ti.leaf_id = bl.leaf_id) AS transferred
 			   FROM batch_leaf bl JOIN live USING (round_id, vout)),
 			 per_batch AS (
 			   SELECT l.round_id, l.vout,
 			          coalesce(sum(l.value) FILTER (WHERE l.released AND NOT l.reclaimed), 0) AS released,
-			          coalesce(sum(l.value) FILTER (WHERE l.transferred), 0) AS transferred,
+			          coalesce(sum(l.value) FILTER (WHERE l.transferred AND NOT l.reclaimed), 0) AS transferred,
 			          bool_and(l.released) AS all_released
 			   FROM leaves l GROUP BY 1, 2),
 			 back AS (
 			   SELECT x.round_id, x.vout, sum(c.value) AS v
-			   FROM (SELECT DISTINCT b.round_id, b.vout, b.asset, k.txid FROM live b
+			   FROM (SELECT b.round_id, b.vout, b.asset, k.txid FROM live b
 			         JOIN batch_leaf bl USING (round_id, vout)
 			         JOIN node_release nr ON nr.leaf_id = bl.leaf_id
-			         JOIN reclaimed_node k ON k.node_hash = nr.node_hash) x
+			         JOIN reclaimed_node k ON k.node_hash = nr.node_hash
+			         UNION
+			         SELECT b.round_id, b.vout, b.asset, k.txid FROM live b
+			         JOIN batch_leaf bl USING (round_id, vout)
+			         JOIN reclaimed_leaves k ON k.leaf_id = bl.leaf_id) x
 			   JOIN wallet_coin c ON c.txid = x.txid AND c.asset = x.asset
 			   GROUP BY 1, 2),
 			 locked AS (
@@ -98,9 +153,30 @@ impl Store {
 			let n = |i: usize| r.get::<_, i64>(i).max(0) as u64;
 			out.insert(array32(r.get(0), "asset")?, PoolFlow {
 				locked: n(1), released: n(2), reclaimable: n(3), drawn_last_hour: n(4), reclaimed_last_hour: n(5), swept_last_hour: n(6),
-				transferred: n(7),
+				transferred: n(7), in_flight: 0,
 			});
 		}
+		for (asset, v) in self.in_flight().await? {
+			out.entry(asset).or_default().in_flight = v;
+		}
 		Ok(out)
+	}
+
+	/// What is in flight of each asset ([`PoolFlow::in_flight`]), by asset.
+	/// One read-only statement.
+	pub async fn in_flight(&self) -> Result<BTreeMap<[u8; 32], u64>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("{} {}", IN_FLIGHT_WITH, IN_FLIGHT), &[]).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "asset")?, r.get::<_, i64>(1).max(0) as u64))).collect()
+	}
+
+	/// The leaf records of the batch leaves (of trees) whose value is in
+	/// flight: each given up, or paid on and some coin it became given up,
+	/// in a round broadcast or final, its batch neither reclaimed there nor
+	/// swept. Their lowest nodes are the ones that hold fronted value.
+	pub async fn in_flight_slots(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(&format!("{} {}", IN_FLIGHT_WITH, IN_FLIGHT_SLOTS), &[]).await?;
+		Ok(rows.iter().map(|r| r.get(1)).collect())
 	}
 }

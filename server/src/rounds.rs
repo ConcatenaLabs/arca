@@ -294,7 +294,29 @@ pub struct RoundConfig {
 	/// How young a coin given up must be, in seconds since its batch's round,
 	/// for its holder to count as one that moves its coins soon.
 	pub holder_window: u32,
+	/// Whether a tree's lowest nodes carry RECLAIM-D beside RECLAIM, so that
+	/// a node whose coins were paid on out of round comes back once their
+	/// current holders refresh and release it ([`crate::delegations`]). A
+	/// wallet that does not read the leaf record's flag refuses such a
+	/// batch's leaves, so it is set only once every wallet its holders use
+	/// reads it.
+	pub delegated_reclaim: bool,
 }
+
+/// The lowest nodes of the batch leaves a coin rests on: its own, or each up
+/// its lineage of reassignments.
+fn lowest_nodes(record: &CoinRecord) -> Vec<[u8; 32]> {
+	match record {
+		CoinRecord::Leaf { record, .. } => record.branch().ok().and_then(|b| b.nodes.last().map(|n| n.children_hash())).into_iter().collect(),
+		_ => record.parents().into_iter().flat_map(lowest_nodes).collect(),
+	}
+}
+
+/// How close to its first expiry a coin given up must be for its refresh to
+/// run whatever the in-flight cap ([`Rounds::within_cap`]): six days, a day
+/// beyond the five before expiry from which a wallet asks for a refresh by
+/// itself and the four from which it takes the coin on the chain instead.
+pub const CAP_EXEMPT: u32 = 6 * 86_400;
 
 impl Default for RoundConfig {
 	/// The specification's: radix 4, a 36-hour notice, three steps of 28
@@ -309,6 +331,7 @@ impl Default for RoundConfig {
 			accumulator_exit_rate_ppm: None,
 			holder_batches: 8,
 			holder_window: 3 * 86_400,
+			delegated_reclaim: false,
 		}
 	}
 }
@@ -1049,6 +1072,7 @@ impl Rounds {
 				},
 			}
 		}
+		let chosen = self.within_cap(chosen, now).await?;
 		let chosen = self.fundable_fills(chosen, now).await?;
 		let (mut chosen, ties) = self.tie_reruns(chosen).await?;
 		loop {
@@ -1283,6 +1307,7 @@ impl Rounds {
 		}
 		// What the wallet can fund: a participation whose outputs do not fit
 		// waits, saying why, and delays no other.
+		let chosen = self.within_cap(chosen, now).await?;
 		let chosen = self.fundable(chosen, now).await?;
 		// A re-run spends a coin that keeps it apart from every lost round of
 		// its participation's; one with no such coin is never taken.
@@ -1415,8 +1440,9 @@ impl Rounds {
 	/// Records why `row` waits: a round with it would pay `need` of `asset`,
 	/// and the wallet can spend `have`.
 	async fn wait(&self, row: &ParticipationRow, asset: AssetId, need: u64, have: u64) -> Result<(), RoundError> {
-		let why = format!("the operator's wallet cannot fund it in a round now: the round would pay {} of asset {}, and the wallet \
-			can spend {} of it; it runs once the wallet can", need, asset, have);
+		let why = format!("This refresh waits for a later round: the operator has too little of this asset free to refresh it with \
+			right now. Nothing is lost meanwhile. (The operator's wallet cannot fund it in a round now: the round would pay {} of asset \
+			{}, and the wallet can spend {} of it; it runs once the wallet can.)", need, asset, have);
 		if row.waiting.as_deref() != Some(why.as_str()) {
 			log::warn!("participation {} waits: {}", crate::signer::hex(&row.id), why);
 		}
@@ -1448,7 +1474,7 @@ impl Rounds {
 			let schedule = ClockSchedule::new(AssetId::from_byte_array([0xee; 32]), self.params.operator, self.config.notice, expiries.clone())
 				.map_err(|e| RoundError::Internal(e.to_string()))?;
 			let params = TreeParams {
-				asset, chain: self.params.chain, schedule, burn: false, delegated_reclaim: false, radix: self.config.radix, reserve,
+				asset, chain: self.params.chain, schedule, burn: false, delegated_reclaim: self.config.delegated_reclaim, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
 			let kind = if plan.own { BatchKind::Tree } else { self.kind_of(&asset, &specs) };
@@ -1510,6 +1536,80 @@ impl Rounds {
 			}
 		}
 		Ok(taken)
+	}
+
+	/// The participations of `chosen` within each asset's in-flight cap
+	/// ([`crate::params::AssetParams::in_flight_cap`]), in order: what the
+	/// operator has fronted for refreshes whose old coins have not come back
+	/// ([`Store::in_flight`]), with what the ones taken before it give up, plus
+	/// what it gives up, must stay within the cap of every asset it gives up
+	/// coins in. One that would not waits for a later round, saying so in
+	/// plain words, and delays no other, whatever asset that is: a cap of 0
+	/// (an asset whose pool is empty) holds up none of a round's other
+	/// assets. Coins resting on boards alone count for nothing, as the
+	/// operator's forfeit of them pays it back at once. A participation with a
+	/// coin within [`CAP_EXEMPT`] of its first expiry is never held by the
+	/// cap: its holder would otherwise take it on the chain. Nor is one whose
+	/// coins rest only on lowest nodes that already hold fronted value: it
+	/// opens nothing new, and those nodes come back only once it runs, so
+	/// holding it would keep the cap full for ever. One larger than a cap
+	/// above 0 runs once nothing of the asset is in flight.
+	async fn within_cap(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
+		let caps: BTreeMap<AssetId, u64> = self.params.assets.ids().into_iter()
+			.filter_map(|a| self.params.in_flight_cap(&a).map(|c| (a, c))).collect();
+		if caps.is_empty() || chosen.is_empty() {
+			return Ok(chosen);
+		}
+		let mut flight: BTreeMap<AssetId, u64> = self.store.in_flight().await?.into_iter()
+			.map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
+		// The lowest nodes already holding fronted value: a refresh of a coin
+		// resting on them alone opens nothing new, and the node comes back
+		// only once it runs.
+		let mut open: HashSet<[u8; 32]> = HashSet::new();
+		for rec in self.store.in_flight_slots().await? {
+			if let Some(h) = arca_covenant::LeafRecord::from_bytes(&rec).ok().and_then(|r| r.branch().ok())
+				.and_then(|b| b.nodes.last().map(|n| n.children_hash()))
+			{
+				open.insert(h);
+			}
+		}
+		let mut out = Vec::with_capacity(chosen.len());
+		for row in chosen {
+			let mut adds: BTreeMap<AssetId, u64> = BTreeMap::new();
+			let mut near = false;
+			let mut completes = true;
+			for i in row.inputs.iter().filter(|i| !i.returned) {
+				let asset = AssetId::from_byte_array(i.asset);
+				if !caps.contains_key(&asset) {
+					continue;
+				}
+				let Some(l) = self.store.leaf(&i.leaf_id).await? else { continue };
+				let Ok(record) = CoinRecord::from_bytes(&l.record) else { continue };
+				let Some(expiry) = crate::cosign::first_expiry(&record) else { continue };
+				near |= expiry < now.to_consensus_u32().saturating_add(CAP_EXEMPT);
+				completes &= lowest_nodes(&record).iter().all(|h| open.contains(h));
+				*adds.entry(asset).or_default() += i.value;
+			}
+			let completes = completes && !adds.is_empty();
+			// One refresh larger than a cap above 0 runs when nothing else is
+			// in flight, or it would wait for ever.
+			let over = adds.iter().find(|(a, v)| {
+				let f = flight.get(*a).copied().unwrap_or(0);
+				f.saturating_add(**v) > caps[*a] && !(f == 0 && caps[*a] > 0)
+			}).map(|(a, _)| *a);
+			if let Some(a) = over.filter(|_| !near && !completes) {
+				let why = format!("This refresh waits for a later round: the operator is refreshing as much of this asset as it takes on \
+					at once, and takes more as earlier refreshes come back. Nothing is lost meanwhile. (Asset {}: {} of a cap of {} \
+					in flight.)", a, flight.get(&a).copied().unwrap_or(0), caps[&a]);
+				self.wait_for(&row, &why).await?;
+				continue;
+			}
+			for (a, v) in adds {
+				*flight.entry(a).or_default() += v;
+			}
+			out.push(row);
+		}
+		Ok(out)
 	}
 
 	/// Records why `row` waits.
@@ -1639,7 +1739,7 @@ impl Rounds {
 			Some(f) => ReserveRule::FeeRate { floor_per_kvb: f, multiple: fees::MULTIPLE },
 			None => ReserveRule::Fixed { node: 1, entry: 1 },
 		})).collect();
-		let (radix, notice, chain) = (self.config.radix, self.config.notice, p.chain);
+		let (radix, notice, chain, delegated_reclaim) = (self.config.radix, self.config.notice, p.chain, self.config.delegated_reclaim);
 
 		// The transaction: the wallet issues the tokens, the trees are built
 		// on them.
@@ -1715,7 +1815,7 @@ impl Rounds {
 				let specs: Vec<LeafSpec> = leaves.iter().map(|l| l.spec).collect();
 				// An issuer-operated asset's batch is burn-only.
 				let params = TreeParams {
-					asset: *asset, chain, schedule, burn: Some(*asset) == minted, delegated_reclaim: false, radix, reserve: reserves[asset],
+					asset: *asset, chain, schedule, burn: Some(*asset) == minted, delegated_reclaim, radix, reserve: reserves[asset],
 					min_leaf: Self::tree_min_leaf(&p, asset, &specs),
 				};
 				let tree = Batch::build(kinds[bi], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
@@ -1880,6 +1980,7 @@ impl Rounds {
 					},
 					min_leaf: tp.min_leaf,
 					kind: batch.kind(),
+					delegated_reclaim: tp.delegated_reclaim,
 				},
 				leaves: new_leaves,
 				scripts,
@@ -2951,7 +3052,7 @@ impl Rounds {
 			asset: AssetId::from_byte_array(b.asset),
 			chain: self.params.chain,
 			schedule,
-			burn: b.burn, delegated_reclaim: false,
+			burn: b.burn, delegated_reclaim: b.delegated_reclaim,
 			radix: b.radix as usize,
 			reserve: match b.reserve {
 				StoredReserve::FeeRate { floor_per_kvb, multiple } => ReserveRule::FeeRate { floor_per_kvb, multiple },
