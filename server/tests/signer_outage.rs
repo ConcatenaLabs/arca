@@ -34,7 +34,7 @@ async fn a_release_the_signer_cannot_sign_holds_no_coin_of_the_wallet() {
 	let board = Coin { held, bases: vec![tx] };
 	let key = keypair("SO");
 	let got = refresh(&mut r, &[(&board, &key)]).await;
-	let token = got[0].new_valid.branch.nodes[0].sweep.token.into_inner().to_byte_array().to_vec();
+	let token = got[0].new_valid.branch.nodes[0].sweep.unwrap().token.into_inner().to_byte_array().to_vec();
 	drive(&r, "the board's forfeit claimed", 12, |l| claimed(l) == 1).await;
 	settle(&r).await;
 	let e0 = match &got[0].new.held.record {

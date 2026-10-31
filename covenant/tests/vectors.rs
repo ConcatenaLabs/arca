@@ -124,7 +124,7 @@ impl Ctx {
 		let members: Vec<XOnlyPublicKey> = p["members"].as_array().unwrap().iter().map(key).collect();
 		assert_eq!(members[0], self.x("S"), "the operator leads the member list");
 		let reclaim = if p["kind"].as_str().unwrap().starts_with("lowest") { Some(self.chain) } else { None };
-		let node = NodePolicy::new(children, members[0], members[1..].to_vec(), self.sweep_of(p, burn), reclaim)
+		let node = NodePolicy::new(children, members[0], members[1..].to_vec(), Some(self.sweep_of(p, burn)), reclaim)
 			.unwrap();
 		let m = node.members();
 		assert_eq!(m.root(), h32(&p["member_root"]));
@@ -176,7 +176,7 @@ impl Ctx {
 			asset: asset(&p["asset"]),
 			value: p["value"].as_u64().unwrap(),
 			leaf_program: h32(&p["leaf_program"]),
-			sweep: self.sweep_of(p, burn),
+			sweep: Some(self.sweep_of(p, burn)),
 		}
 	}
 
@@ -203,7 +203,7 @@ impl Ctx {
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
 			chain: self.chain,
-			sweep: self.sweep_of(p, false),
+			sweep: Some(self.sweep_of(p, false)),
 			v2: false,
 		};
 		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
@@ -259,7 +259,7 @@ impl Ctx {
 	/// The Rust output for a vector output, with its leaves by name.
 	fn built(&self, name: &str) -> (TapOutput, BTreeMap<&'static str, Script>) {
 		let node_leaves = |n: &NodePolicy| {
-			let mut m = BTreeMap::from([("unroll", n.unroll_script()), ("sweep", n.sweep_script())]);
+			let mut m = BTreeMap::from([("unroll", n.unroll_script()), ("sweep", n.sweep_script().unwrap())]);
 			if let Some(r) = n.reclaim_script() {
 				m.insert("reclaim", r);
 			}
@@ -282,7 +282,7 @@ impl Ctx {
 			},
 			"entry" | "entry_burn" => {
 				let e = self.entry(name, name.ends_with("burn"));
-				(e.taproot(), BTreeMap::from([("unlock", e.unlock_script()), ("sweep", e.sweep_script())]))
+				(e.taproot(), BTreeMap::from([("unlock", e.unlock_script()), ("sweep", e.sweep_script().unwrap())]))
 			},
 			"lowest_node" | "inner_node" | "batch_output" => node_leaves(&self.node(name, false)),
 			"lowest_node_burn" | "batch_output_burn" => node_leaves(&self.node(name, true)),
@@ -300,7 +300,7 @@ impl Ctx {
 			},
 			"checkpoint" => {
 				let c = self.checkpoint();
-				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("sweep", c.sweep_script())]))
+				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("sweep", c.sweep_script().unwrap())]))
 			},
 			"htlc" | "htlc_receive" => {
 				let h = self.htlc(name);
@@ -408,10 +408,10 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			(n, "sweep") if n.contains("node") || n.starts_with("batch") => {
 				let node = ctx.node(n, n.ends_with("burn"));
-				node.sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32)
+				node.sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap()
 			},
-			("entry", "sweep") => ctx.entry("entry", false).sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32),
-			("checkpoint", "sweep") => ctx.checkpoint().sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32),
+			("entry", "sweep") => ctx.entry("entry", false).sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
+			("checkpoint", "sweep") => ctx.checkpoint().sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
 			("entry", "unlock") => ctx.entry("entry", false).unlock_witness(&h32(&s["preimage"])),
 			(n, "reclaim") => {
 				let node = ctx.node(n, false);

@@ -1856,7 +1856,9 @@ impl Rounds {
 				};
 				let tree = Batch::build(kinds[bi], params.clone(), &specs).map_err(|e| format!("the batch of asset {}: {}", asset, e))?;
 				outputs.push(tree.batch_output());
-				outputs.push(ExplicitOutput::new(*token, 1, tree.clock0_script_pubkey()));
+				if let Some(clock0) = tree.clock0_script_pubkey() {
+					outputs.push(ExplicitOutput::new(*token, 1, clock0));
+				}
 				trees.push((tree, params));
 			}
 			for o in &offboards {

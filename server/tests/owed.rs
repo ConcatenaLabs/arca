@@ -149,7 +149,7 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 	// parent block of its own.
 	let now = mtp(&r).to_consensus_u32();
 	advance_mtp(&r, expiry.saturating_sub(now) + HOUR).await;
-	let token = done[0].new_valid.branch.nodes[0].sweep.token.into_inner().to_byte_array().to_vec();
+	let token = done[0].new_valid.branch.nodes[0].sweep.unwrap().token.into_inner().to_byte_array().to_vec();
 	drive(&r, "the release at the batch's expiry", 4, |l| common::flow::has(l, "release", &token)).await;
 	settle(&r).await;
 	advance_mtp(&r, 37 * HOUR).await;

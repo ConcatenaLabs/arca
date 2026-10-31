@@ -76,17 +76,17 @@ impl Batch {
 		let preimages: Vec<[u8; 32]> = (0..16).map(|i| label32(&format!("{} preimage {}", label, i))).collect();
 		let entries: Vec<EntryPolicy> = (0..16).map(|i| EntryPolicy {
 			unlock_hash: sha256(&preimages[i]), asset: net.x, value: LEAF, leaf_program: leaves[i].program(),
-			sweep: schedule.sweep(true, burn),
+			sweep: Some(schedule.sweep(true, burn)),
 		}).collect();
 		let entry_value = LEAF + ENTRY_RESERVE;
 		let lowest: Vec<NodePolicy> = (0..4).map(|j| {
 			let children = (0..4).map(|i| Child::new(net.x, entry_value, entries[4 * j + i].taproot().program())).collect();
 			let ow = (0..4).map(|i| xonly(&owners[4 * j + i])).collect();
-			NodePolicy::new(children, xonly(s), ow, schedule.sweep(true, burn), Some(net.chain)).unwrap()
+			NodePolicy::new(children, xonly(s), ow, Some(schedule.sweep(true, burn)), Some(net.chain)).unwrap()
 		}).collect();
 		let lowest_value = 4 * entry_value + NODE_RESERVE;
 		let children = lowest.iter().map(|n| Child::new(net.x, lowest_value, n.taproot().program())).collect();
-		let root = NodePolicy::new(children, xonly(s), owners.iter().map(xonly).collect(), schedule.sweep(false, burn), None).unwrap();
+		let root = NodePolicy::new(children, xonly(s), owners.iter().map(xonly).collect(), Some(schedule.sweep(false, burn)), None).unwrap();
 		Batch { owners, leaves, preimages, entries, lowest, root, schedule }
 	}
 
@@ -97,7 +97,7 @@ impl Batch {
 	/// The sweep paths above leaf `i`: the batch output's, its lowest node's
 	/// and its entry's.
 	fn sweeps_above(&self, i: usize) -> Vec<Sweep> {
-		vec![*self.root.sweep(), *self.lowest[i / 4].sweep(), self.entries[i].sweep]
+		vec![*self.root.sweep().unwrap(), *self.lowest[i / 4].sweep().unwrap(), self.entries[i].sweep.unwrap()]
 	}
 }
 
@@ -232,7 +232,7 @@ fn checkpoint_chain(net: &mut Net, external: bool) {
 	// Every collaborative signature is made now, before the round exists.
 	let margin = if external { 0 } else { FEE };
 	let cp = CheckpointPolicy { owner: xonly(a), operator: xonly(&s_key), salt: label32(&format!("{} checkpoint", tag)),
-		chain: net.chain, sweep: sched.sweep(true, false), v2: false };
+		chain: net.chain, sweep: Some(sched.sweep(true, false)), v2: false };
 	let v_cp = LEAF - margin;
 	let cp_out = ExplicitOutput::new(net.x, v_cp, cp.script_pubkey());
 	let m1 = leaf.collab_message(net.x, LEAF, std::slice::from_ref(&cp_out)).unwrap();
@@ -327,7 +327,7 @@ fn forfeit(net: &mut Net) {
 		let new = net.leaf(&a, &s_key, &format!("forfeit new leaf {}", label));
 		let preimage = label32(&format!("forfeit preimage {}", label));
 		let entry = EntryPolicy { unlock_hash: sha256(&preimage), asset: net.x, value: LEAF, leaf_program: new.program(),
-			sweep: sched.sweep(true, false) };
+			sweep: Some(sched.sweep(true, false)) };
 		let f = ForfeitPolicy {
 			unlock_hash: sha256(&preimage), owner: xonly(&a), operator: xonly(&s_key), refund_delay: delay(),
 			leaf_id: LeafId(label32(&format!("forfeit old leaf id {}", label))), connector: m,
@@ -674,15 +674,15 @@ fn entry_sweep(net: &mut Net) {
 		if with_token {
 			// Built by the library.
 			let to = [ExplicitOutput::new(net.x, value - 3_000, op_true_spk())];
-			return built_sweep(net, &s_key, &sched, &[e.sweepable(coin.outpoint, value)], token, &to);
+			return built_sweep(net, &s_key, &sched, &[e.sweepable(coin.outpoint, value).unwrap()], token, &to);
 		}
 		// Without the token, an ordinary coin of X stands at input 1.
 		let t_in = if with_token { token.clone() } else { net.purse.iter().find(|c| c.txout.asset.explicit() == Some(net.x)).unwrap().clone() };
 		let back = if with_token { explicit(sched.token, 1, sched.r().script_pubkey()) } else { explicit(net.x, t_in.txout.value.explicit().unwrap(), op_true_spk()) };
 		let mut s = spend(0).coin(coin, w).coin(&t_in, if with_token { w } else { 0xffff_ffff })
 			.outputs(vec![explicit(net.x, value - 3_000, op_true_spk()), back, fee(net.x, 3_000)]);
-		let sg = s.sign(&s_key, 0, &e.sweep_script(), net.genesis);
-		s.witness(0, e.sweep_witness(&sg, 1));
+		let sg = s.sign(&s_key, 0, &e.sweep_script().unwrap(), net.genesis);
+		s.witness(0, e.sweep_witness(&sg, 1).unwrap());
 		s.witness(1, op_true_witness());
 		s.tx
 	};
@@ -773,8 +773,8 @@ fn burn(net: &mut Net) {
 		s = s.coin(token, w).coin(&fc, 0xffff_fffe).outputs(outs)
 			.outputs(vec![explicit(net.policy, fc.txout.value.explicit().unwrap() - 5_000, op_true_spk()), fee(net.policy, 5_000)]);
 		for (i, (n, _, _)) in nodes.iter().enumerate() {
-			let sg = s.sign(key, i, &n.sweep_script(), net.genesis);
-			s.witness(i, n.sweep_witness(&sg, k as u32));
+			let sg = s.sign(key, i, &n.sweep_script().unwrap(), net.genesis);
+			s.witness(i, n.sweep_witness(&sg, k as u32).unwrap());
 		}
 		r_sign(net, &s_key, sched, &mut s, k);
 		s.witness(k + 1, op_true_witness());
@@ -783,7 +783,7 @@ fn burn(net: &mut Net) {
 	let v = b.value();
 	let t_back = explicit(sched.token, 1, sched.r().script_pubkey());
 	let batch_node = (&b.root, &r.batch, 0xffff_fffe);
-	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v)], &at_r, &[]);
+	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v).unwrap()], &at_r, &[]);
 	net.refuse("burn/neg the batch output burned at the release (no notice)", &tx, "non-BIP68-final");
 	net.wait_csv(&rl, delay());
 	net.wait_csv(&rl2, delay());
@@ -798,7 +798,7 @@ fn burn(net: &mut Net) {
 		let tx = burn_tx(net, &sched, &[batch_node], &at_r, outs, key);
 		net.refuse(name, &tx, expect);
 	}
-	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v)], &at_r, &[]);
+	let tx = built_sweep(net, &s_key, &sched, &[b.root.sweepable(r.batch.outpoint, v).unwrap()], &at_r, &[]);
 	let bt = net.pass("burn/the batch output burned after the notice, behind the token", &tx);
 	let gone: Value = net.rpc("gettxout", json!([bt.to_string(), 0]));
 	assert!(gone.is_null(), "the OP_RETURN output never enters the UTXO set");
@@ -817,7 +817,7 @@ fn burn(net: &mut Net) {
 	// A node relays several bare OP_RETURN burns in one transaction; one whose
 	// relay policy still counts each against the one-OP_RETURN limit refuses
 	// it (multi-op-return), and a producer mines it.
-	let swept2 = [b2.lowest[0].sweepable(lowest2[0].outpoint, lv), b2.lowest[1].sweepable(lowest2[1].outpoint, lv)];
+	let swept2 = [b2.lowest[0].sweepable(lowest2[0].outpoint, lv).unwrap(), b2.lowest[1].sweepable(lowest2[1].outpoint, lv).unwrap()];
 	let tx = built_sweep(net, &s_key, &sched2, &swept2, &at_r2, &[]);
 	assert_eq!(tx.output[2], t_back2, "the token goes back to R after the burns");
 	let bt2 = net.pass_or_mine("burn/two lowest nodes burned in one transaction", &tx, "multi-op-return");
@@ -826,7 +826,7 @@ fn burn(net: &mut Net) {
 	}
 	// The next node: the token, back at R, waits W again.
 	let at_r2 = coin_of(bt2, 2, &tx);
-	let n2 = [b2.lowest[2].sweepable(lowest2[2].outpoint, lv)];
+	let n2 = [b2.lowest[2].sweepable(lowest2[2].outpoint, lv).unwrap()];
 	let tx = built_sweep(net, &s_key, &sched2, &n2, &at_r2, &[]);
 	net.refuse("burn/neg the next node before the token has waited W again", &tx, "non-BIP68-final");
 	net.wait_csv(&bt2, delay());
@@ -865,7 +865,7 @@ fn issuer_round(net: &mut Net, name: &str, entropy: [u8; 32], token: &Coin, issu
 	let t = tree.params().schedule.token;
 	let total = issuer.txout.value.explicit().unwrap();
 	let mut s = spend(0).coin(token, 0xffff_ffff).coin(issuer, 0xffff_ffff).outputs(vec![
-		token.txout.clone(), batch.txout(), explicit(t, 1, tree.clock0_script_pubkey()),
+		token.txout.clone(), batch.txout(), explicit(t, 1, tree.clock0_script_pubkey().unwrap()),
 		explicit(net.x, total - 3_000, op_true_spk()), fee(net.x, 3_000),
 	]);
 	s.tx.input[0].asset_issuance = limiter::reissuance(entropy, batch.value);
@@ -959,7 +959,7 @@ fn issuer_operated(net: &mut Net) {
 	let at_r = coin_of(rl, 0, &tx);
 	let batch_coin = coin_of(rtx, 1, &round);
 	let root = tree.root();
-	let swept = [root.policy.sweepable(batch_coin.outpoint, v)];
+	let swept = [root.policy.sweepable(batch_coin.outpoint, v).unwrap()];
 	let tx = built_sweep(net, &s_key, &sched, &swept, &at_r, &[]);
 	net.refuse("issuer/neg the batch burned before its notice", &tx, "non-BIP68-final");
 	net.wait_csv(&rl, delay());
@@ -978,8 +978,8 @@ fn issuer_operated(net: &mut Net) {
 		let f = if extra.is_some() { 3 } else { 2 };
 		s = s.coin(&fc, 0xffff_fffe).outputs(outs)
 			.outputs(vec![explicit(net.policy, fc.txout.value.explicit().unwrap() - 5_000, op_true_spk()), fee(net.policy, 5_000)]);
-		let sg = s.sign(&s_key, 0, &root.policy.sweep_script(), net.genesis);
-		s.witness(0, root.policy.sweep_witness(&sg, k));
+		let sg = s.sign(&s_key, 0, &root.policy.sweep_script().unwrap(), net.genesis);
+		s.witness(0, root.policy.sweep_witness(&sg, k).unwrap());
 		r_sign(net, &s_key, &sched, &mut s, 1);
 		if extra.is_some() {
 			s.witness(2, op_true_witness());
@@ -1070,7 +1070,7 @@ fn built_tree(net: &mut Net, n: usize, exits: [usize; 3], sizes: &mut Vec<(Strin
 	let batch = tree.batch_output();
 	let total = issuer.txout.value.explicit().unwrap();
 	let mut s = spend(0).coin(&issuer, 0xffff_ffff).outputs(vec![
-		batch.txout(), explicit(sched.token, 1, tree.clock0_script_pubkey()),
+		batch.txout(), explicit(sched.token, 1, tree.clock0_script_pubkey().unwrap()),
 		explicit(net.x, total - batch.value - 2_000, op_true_spk()), fee(net.x, 2_000),
 	]);
 	s.tx.input[0].asset_issuance = AssetIssuance {
@@ -1278,12 +1278,12 @@ fn probes_turned_around(net: &mut Net) {
 	let entries: Vec<(LeafPolicy, EntryPolicy)> = specs.iter().map(|sp| {
 		let leaf = LeafPolicy { enclave: None, owner: sp.owner, operator: xonly(&s_key), salt: sp.salt(), chain: net.chain, exit_delay: delay(), htlc: None, order: None, landing: None, channel: None , v2: false};
 		let entry = EntryPolicy { unlock_hash: sp.unlock_hash, asset: net.x, value: LEAF, leaf_program: leaf.program(),
-			sweep: sched.sweep(true, false) };
+			sweep: Some(sched.sweep(true, false)) };
 		(leaf, entry)
 	}).collect();
 	let children: Vec<Child> = entries.iter().map(|(_, e)| Child::new(net.x, LEAF + ENTRY_RESERVE, e.taproot().program())).collect();
 	let node = NodePolicy::new(children.clone(), xonly(&s_key), specs.iter().map(|sp| sp.owner).collect(),
-		sched.sweep(false, false), Some(net.chain)).unwrap();
+		Some(sched.sweep(false, false)), Some(net.chain)).unwrap();
 	let batch = ExplicitOutput::new(net.x, 4 * (LEAF + ENTRY_RESERVE) + NODE_RESERVE, node.script_pubkey());
 	let (round_txid, round) = plain_round(net, "probe B turned around / round with key A on leaves 0 and 1", &issuer, &sched, &batch);
 	let policy = WalletPolicy::new(net.chain, xonly(&s_key), mt(net.mtp()));

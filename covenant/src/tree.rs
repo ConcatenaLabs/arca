@@ -28,7 +28,10 @@
 //!    list admits only 32-byte keys, by its type.
 //! 6. The batch output's sweep has no notice (the token's wait at `R` is the
 //!    notice); every other node's and every entry's waits `W` from its own
-//!    confirmation. The lowest nodes carry RECLAIM.
+//!    confirmation. The lowest nodes carry RECLAIM. A batch without a sweep
+//!    ([`ClockSchedule::never`]) has no token and no clock: no node and no
+//!    entry carries a sweep leaf, and the round pays no token
+//!    ([`Tree::clock0_script_pubkey`] is `None`).
 //! 7. No leaf script appears twice, so no node or leaf script is funded twice.
 //!    Each leaf's salt is `SHA256("Arca/salt" ‖ owner_nonce ‖ operator_nonce)`
 //!    ([`crate::leaf::leaf_salt`]): the owner's wallet picks its nonce at
@@ -280,7 +283,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 	let min = params.min_leaf.max(1);
 
 	// The leaves and their entries.
-	let entry_sweep = params.schedule.sweep(true, params.burn);
+	let entry_sweep = params.schedule.sweep_path(true, params.burn);
 	let mut tree_leaves: Vec<TreeLeaf> = Vec::with_capacity(n);
 	let mut seen = std::collections::HashMap::with_capacity(n);
 	let mut nonces = std::collections::HashMap::with_capacity(n);
@@ -390,7 +393,7 @@ impl Tree {
 		for level in 0..depth {
 			let lowest = level == 0;
 			let is_root = level + 1 == depth;
-			let sweep = params.schedule.sweep(!is_root, params.burn);
+			let sweep = params.schedule.sweep_path(!is_root, params.burn);
 			let groups = spread(below.len(), r);
 			let mut nodes = Vec::with_capacity(groups.len());
 			for range in groups {
@@ -463,9 +466,10 @@ impl Tree {
 		self.root().output()
 	}
 
-	/// The script the round pays the token's atom to: the first clock.
-	pub fn clock0_script_pubkey(&self) -> Script {
-		self.params.schedule.clock0_script_pubkey()
+	/// The script the round pays the token's atom to: the first clock;
+	/// `None` for a batch without a sweep, whose round pays no token.
+	pub fn clock0_script_pubkey(&self) -> Option<Script> {
+		self.params.schedule.expires().then(|| self.params.schedule.clock0_script_pubkey())
 	}
 
 	/// The nodes on leaf `leaf`'s path, from the batch output down, each with
@@ -513,7 +517,8 @@ impl Tree {
 			entry_reserve: l.entry_reserve,
 			chain: self.params.chain,
 			schedule: self.params.schedule.clone(),
-			burn: self.params.burn,
+			// Burn-only names the sweeps; a batch without a sweep has none.
+			burn: self.params.burn && self.params.schedule.expires(),
 			delegated: self.params.delegated_reclaim,
 			upper,
 			lowest: LowestLevel {

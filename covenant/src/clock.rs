@@ -17,6 +17,11 @@
 //! is the `E` of whichever clock holds `T`; a release starts the notice `W` at
 //! `R`, and every sweep spends `T` from `R`.
 //!
+//! A batch without a sweep has no token and no clock: its schedule is
+//! [`ClockSchedule::never`], which names only the operator `S`. Its token is
+//! an asset id no issuance creates and is never paid, and no output of the
+//! batch carries a sweep leaf ([`ClockSchedule::sweep_path`]).
+//!
 //! The operator moves the token with [`ClockSchedule::release_tx`] at a
 //! clock's expiry, or [`ClockSchedule::roll_tx`] to extend the batch, and reads
 //! where it rests from the script of the output holding it
@@ -38,6 +43,16 @@ use crate::Error;
 
 /// The most steps a schedule may have.
 pub const MAX_STEPS: usize = 64;
+
+/// The tag whose hash is the token of a batch without a sweep: an asset id
+/// no issuance creates, which no script of the batch names.
+pub const NO_SWEEP_TOKEN_TAG: &[u8] = b"Arca/no-sweep";
+
+/// The token a schedule of a batch without a sweep carries:
+/// `SHA256(NO_SWEEP_TOKEN_TAG)`.
+pub fn no_sweep_token() -> AssetId {
+	AssetId::from_byte_array(sha256(NO_SWEEP_TOKEN_TAG))
+}
 
 /// The published schedule of a batch's clock: `(T, S, W, E_0 … E_K)`, from
 /// which `R` and every clock are rebuilt.
@@ -100,7 +115,35 @@ impl ClockSchedule {
 		if expiries.len() > MAX_STEPS {
 			return Err(Error::TooManySteps);
 		}
-		Ok(ClockSchedule { token, operator, notice, expiries })
+		let s = ClockSchedule { token, operator, notice, expiries };
+		if token == no_sweep_token() && s != ClockSchedule::never(operator) {
+			return Err(Error::NoSweepSchedule);
+		}
+		Ok(s)
+	}
+
+	/// The schedule of a batch without a sweep, run by `operator`: no token
+	/// is issued, no clock is paid and no output carries a sweep leaf. It
+	/// expires never ([`MedianTime::MAX`]); its token is [`no_sweep_token`]
+	/// and its notice one unit, neither of which any script names.
+	pub fn never(operator: XOnlyPublicKey) -> ClockSchedule {
+		ClockSchedule {
+			token: no_sweep_token(),
+			operator,
+			notice: RelativeTime::from_units(1).expect("one unit"),
+			expiries: vec![MedianTime::MAX],
+		}
+	}
+
+	/// Whether the batch expires: false for [`ClockSchedule::never`]'s.
+	pub fn expires(&self) -> bool {
+		self.token != no_sweep_token()
+	}
+
+	/// The sweep path an output of this batch carries, as
+	/// [`ClockSchedule::sweep`], or `None` for a batch without a sweep.
+	pub fn sweep_path(&self, with_notice: bool, burn: bool) -> Option<Sweep> {
+		self.expires().then(|| self.sweep(with_notice, burn))
 	}
 
 	pub fn expiries(&self) -> &[MedianTime] {

@@ -6,6 +6,12 @@
 //! | Inner node | UNROLL, SWEEP with notice | 65 bytes each |
 //! | Lowest node | UNROLL, then SWEEP with notice and RECLAIM one level down | 65, 97, 97 |
 //!
+//! A node of a batch without a sweep (the sweep `None`) has no SWEEP leaf:
+//! the batch output and an inner node are `[UNROLL]` (33-byte control block),
+//! a lowest node `[UNROLL, RECLAIM]` (65, 65), or `[UNROLL, [RECLAIM,
+//! RECLAIM-D]]` (65, 97, 97). Nothing then takes a node but its unroll into
+//! its pinned children and, for a lowest node, its owners' releases.
+//!
 //! UNROLL lets a member create the node's children at outputs `0..r-1`, with
 //! nothing else in the transaction constrained, so a fee output and further
 //! inputs may be added. It is gated ([`crate::gate`]) and takes a timed
@@ -115,7 +121,7 @@ pub struct NodePolicy {
 	children: Vec<Child>,
 	operator: XOnlyPublicKey,
 	owners: Vec<XOnlyPublicKey>,
-	sweep: Sweep,
+	sweep: Option<Sweep>,
 	reclaim: Option<Chain>,
 	delegated: bool,
 }
@@ -123,13 +129,14 @@ pub struct NodePolicy {
 impl NodePolicy {
 	/// A node with `children` at outputs `0..r-1`, gated to the operator and
 	/// `owners` (every owner under the node, in leaf order), with `sweep` as
-	/// its sweep path. A lowest node passes the chain its owners' releases are
-	/// bound to in `reclaim`, which adds the RECLAIM leaf.
+	/// its sweep path (`None` in a batch without a sweep). A lowest node
+	/// passes the chain its owners' releases are bound to in `reclaim`, which
+	/// adds the RECLAIM leaf.
 	pub fn new(
 		children: Vec<Child>,
 		operator: XOnlyPublicKey,
 		owners: Vec<XOnlyPublicKey>,
-		sweep: Sweep,
+		sweep: Option<Sweep>,
 		reclaim: Option<Chain>,
 	) -> Result<NodePolicy, Error> {
 		if children.is_empty() || children.len() > MAX_CHILDREN {
@@ -172,8 +179,9 @@ impl NodePolicy {
 		&self.owners
 	}
 
-	pub fn sweep(&self) -> &Sweep {
-		&self.sweep
+	/// The node's sweep path; `None` in a batch without a sweep.
+	pub fn sweep(&self) -> Option<&Sweep> {
+		self.sweep.as_ref()
 	}
 
 	pub fn reclaim_chain(&self) -> Option<Chain> {
@@ -194,8 +202,9 @@ impl NodePolicy {
 		unroll_script(&self.members().commitment(), &self.children)
 	}
 
-	pub fn sweep_script(&self) -> Script {
-		self.sweep.script()
+	/// The SWEEP leaf, when the node has one.
+	pub fn sweep_script(&self) -> Option<Script> {
+		self.sweep.map(|s| s.script())
 	}
 
 	/// The fixed part of every release of this node, for a lowest node:
@@ -226,7 +235,7 @@ impl NodePolicy {
 
 	/// The node's output: `[UNROLL, SWEEP]`, `[UNROLL, [SWEEP, RECLAIM]]` for
 	/// a lowest node, `[UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]]` for one with
-	/// RECLAIM-D.
+	/// RECLAIM-D; without a sweep, the same with SWEEP left out.
 	pub fn taproot(&self) -> TapOutput {
 		node_taproot_delegated(self.unroll_script(), self.sweep_script(), self.reclaim_script(), self.reclaim_delegated_script())
 	}
@@ -257,9 +266,10 @@ impl NodePolicy {
 	}
 
 	/// The full SWEEP witness: the operator's signature over the sweep, and
-	/// the index of the input that carries the token at `R`.
-	pub fn sweep_witness(&self, sig: &Signature, k: u32) -> Vec<Vec<u8>> {
-		self.taproot().witness(&self.sweep_script(), Sweep::witness_items(sig, k))
+	/// the index of the input that carries the token at `R`; `None` for a
+	/// node without a sweep.
+	pub fn sweep_witness(&self, sig: &Signature, k: u32) -> Option<Vec<Vec<u8>>> {
+		Some(self.taproot().witness(&self.sweep_script()?, Sweep::witness_items(sig, k)))
 	}
 
 	/// The full RECLAIM witness: the operator's signature over the reclaim,
@@ -512,19 +522,23 @@ pub fn reclaim_delegated_script(prefix: &[u8], dprefix: &[u8], owners: &[XOnlyPu
 
 /// A node's output: `[UNROLL, SWEEP]`, `[UNROLL, [SWEEP, RECLAIM]]` for a
 /// lowest node, and `[UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]]` for one with
-/// RECLAIM-D.
-pub fn node_taproot_delegated(unroll: Script, sweep: Script, reclaim: Option<Script>, reclaim_d: Option<Script>) -> TapOutput {
-	match (reclaim, reclaim_d) {
-		(Some(rc), Some(rd)) => TapOutput::new(vec![(1, unroll), (2, sweep), (3, rc), (3, rd)]),
-		(reclaim, _) => node_taproot(unroll, sweep, reclaim),
+/// RECLAIM-D. Without a sweep (`sweep` `None`): `[UNROLL]`, `[UNROLL,
+/// RECLAIM]` and `[UNROLL, [RECLAIM, RECLAIM-D]]`.
+pub fn node_taproot_delegated(unroll: Script, sweep: Option<Script>, reclaim: Option<Script>, reclaim_d: Option<Script>) -> TapOutput {
+	match (sweep, reclaim, reclaim_d) {
+		(Some(sweep), Some(rc), Some(rd)) => TapOutput::new(vec![(1, unroll), (2, sweep), (3, rc), (3, rd)]),
+		(None, Some(rc), Some(rd)) => TapOutput::new(vec![(1, unroll), (2, rc), (2, rd)]),
+		(sweep, reclaim, _) => node_taproot(unroll, sweep, reclaim),
 	}
 }
 
 /// A node's output: `[UNROLL, SWEEP]`, or `[UNROLL, [SWEEP, RECLAIM]]` for a
-/// lowest node.
-pub fn node_taproot(unroll: Script, sweep: Script, reclaim: Option<Script>) -> TapOutput {
-	match reclaim {
-		None => TapOutput::new(vec![(1, unroll), (1, sweep)]),
-		Some(rc) => TapOutput::new(vec![(1, unroll), (2, sweep), (2, rc)]),
+/// lowest node; without a sweep, `[UNROLL]` or `[UNROLL, RECLAIM]`.
+pub fn node_taproot(unroll: Script, sweep: Option<Script>, reclaim: Option<Script>) -> TapOutput {
+	match (sweep, reclaim) {
+		(Some(sweep), None) => TapOutput::new(vec![(1, unroll), (1, sweep)]),
+		(Some(sweep), Some(rc)) => TapOutput::new(vec![(1, unroll), (2, sweep), (2, rc)]),
+		(None, None) => TapOutput::new(vec![(0, unroll)]),
+		(None, Some(rc)) => TapOutput::new(vec![(1, unroll), (1, rc)]),
 	}
 }

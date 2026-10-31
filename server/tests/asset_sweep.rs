@@ -53,7 +53,7 @@ async fn a_batch_is_released_and_swept_in_its_own_asset() {
 	let pairs: Vec<(&Coin, &elements::secp256k1_zkp::Keypair)> = boards.iter().zip(&keys).collect();
 	let got = refresh(&mut r, &pairs).await;
 	let round = got[0].round.clone();
-	let schedule = got[0].new_valid.branch.nodes[0].sweep;
+	let schedule = got[0].new_valid.branch.nodes[0].sweep.unwrap();
 	assert_eq!(round.output[got[0].new_valid.batch_vout as usize].asset.explicit(), Some(y), "a batch of Y");
 	drive(&r, "the two boards", 12, |l| claimed(l) == 2).await;
 	settle(&r).await;

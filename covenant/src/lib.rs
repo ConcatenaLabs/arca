@@ -153,7 +153,7 @@ pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTer
 pub use checkpoint::CheckpointPolicy;
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, Claim, ClaimError, Distribution};
-pub use clock::{Clock, ClockSchedule, TokenPlace};
+pub use clock::{no_sweep_token, Clock, ClockSchedule, TokenPlace};
 pub use entry::EntryPolicy;
 pub use fill::{FillError, FillOrder, FillPlan, Filled, RefundLock, Take, TakeLeaf};
 pub use forfeit::{batch_claim_tx, connector_asset, ClaimTx, ConnectorPolicy, Forfeit, ForfeitPolicy};
@@ -203,6 +203,10 @@ pub enum Error {
 	ReclaimSteps(usize),
 	#[error("the clock schedule is empty")]
 	EmptySchedule,
+	#[error("a schedule naming the no-sweep token is the never schedule, with nothing else in it")]
+	NoSweepSchedule,
+	#[error("a batch without a sweep has no token, clock or sweep")]
+	NoSweep,
 	#[error("the clock schedule runs backwards: expiry {index} is earlier than the one before it")]
 	ScheduleBackwards { index: usize },
 	#[error("a clock schedule has at most {max} steps", max = clock::MAX_STEPS)]

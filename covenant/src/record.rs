@@ -165,6 +165,9 @@ use crate::{EntryPolicy, LeafPolicy};
 
 /// The record format this crate writes and reads.
 pub const RECORD_VERSION: u8 = 2;
+/// The format of a record of a batch without a sweep: version 2 without the
+/// token, the notice, the burn flag and the expiries.
+pub const RECORD_VERSION_NO_SWEEP: u8 = 3;
 
 /// The length of an order leaf's terms (`order-2`, `order-3`) in the binary
 /// form.
@@ -564,6 +567,10 @@ pub enum RecordError {
 	BatchOutputRepeated(usize),
 	#[error("the output is not the batch output the record rebuilds")]
 	BatchOutputMismatch,
+	#[error("an accumulator batch always expires: a record of one without a sweep is refused")]
+	NoSweepAccumulator,
+	#[error("the batch has a sweep, and this wallet accepts only batches that never expire")]
+	SweepRefused,
 	#[error("the board transaction pays no output equal to the leaf the record rebuilds")]
 	BoardOutputMissing,
 	#[error("the board transaction pays the leaf the record rebuilds {0} times")]
@@ -587,6 +594,7 @@ impl RecordError {
 				DecodeError::Count(_) | DecodeError::NonCanonical => "count",
 				DecodeError::Time(_) => "time",
 				DecodeError::Policy(_) => "count",
+				DecodeError::NoSweepToken => "sweep",
 			},
 			Version(_) => "version",
 			Template(_) => "template",
@@ -609,6 +617,8 @@ impl RecordError {
 			Hex(_) => "hex",
 			Key(_) => "key",
 			BatchOutputMissing | BatchOutputRepeated(_) | BatchOutputMismatch => "batch_output",
+			NoSweepAccumulator => "template",
+			SweepRefused => "policy",
 			BoardOutputMissing | BoardOutputRepeated(_) => "board_output",
 			Round(_) => "round",
 		}
@@ -713,6 +723,9 @@ impl LeafRecord {
 	/// Checks the record's shape: counts, indices and value bounds. Every
 	/// other method that reads the path runs this first.
 	pub fn check(&self) -> Result<(), RecordError> {
+		if self.burn && !self.schedule.expires() {
+			return Err(RecordError::Template("burn-only sweeps in a batch without a sweep".into()));
+		}
 		match (self.template, &self.channel) {
 			(Template::Channel1, None) => return Err(RecordError::Template("channel-1 without its terms".into())),
 			(Template::Channel1, Some(c)) if self.htlc.is_none() && self.order.is_none() && self.landing.is_none() => {
@@ -788,7 +801,7 @@ impl LeafRecord {
 			asset: self.asset,
 			value: self.value,
 			leaf_program: leaf.program(),
-			sweep: self.schedule.sweep(true, self.burn),
+			sweep: self.schedule.sweep_path(true, self.burn),
 		};
 		let entry_value = sum(self.value, self.entry_reserve)?;
 		let entry_tap = entry.taproot();
@@ -809,7 +822,7 @@ impl LeafRecord {
 			.then(|| reclaim_delegated_script(&prefix, &self.chain.delegation_prefix(), &owners, &operator));
 		let node = BranchNode::new(
 			children, l.index as usize, l.reserve, operator, members.commitment(),
-			members.proof(1 + l.index as usize), self.schedule.sweep(level != 0, self.burn),
+			members.proof(1 + l.index as usize), self.schedule.sweep_path(level != 0, self.burn),
 			Some(Reclaim { owners, prefix, script: reclaim, delegated }),
 		)?;
 		child = Child::new(self.asset, node.value, node.program());
@@ -820,7 +833,7 @@ impl LeafRecord {
 			let children = self.children(level, &u.siblings, u.index, child)?;
 			let node = BranchNode::new(
 				children, u.index as usize, u.reserve, operator, u.member.commitment(&self.owner),
-				u.member.clone(), self.schedule.sweep(level != 0, self.burn), None,
+				u.member.clone(), self.schedule.sweep_path(level != 0, self.burn), None,
 			)?;
 			child = Child::new(self.asset, node.value, node.program());
 			nodes.push(node);
@@ -883,9 +896,14 @@ impl LeafRecord {
 			[i] => i as u32,
 			_ => return Err(RecordError::BatchOutputRepeated(found.len())),
 		};
-		let sweeps = branch.sweeps();
-		check_round(round, &self.schedule, &sweeps[0], &sweeps[1..])?;
-		check_reissue(round, self.asset, &sweeps[0], &sweeps[1..])?;
+		// A batch without a sweep has no token or clock to check, and no
+		// path that takes a coin at expiry, so a reissuance of its asset
+		// gives the operator nothing to take back by script.
+		if self.schedule.expires() {
+			let sweeps = branch.sweeps();
+			check_round(round, &self.schedule, &sweeps[0], &sweeps[1..])?;
+			check_reissue(round, self.asset, &sweeps[0], &sweeps[1..])?;
+		}
 		Ok(ValidLeaf { leaf_id: branch.leaf_id(), round_txid: round.txid(), batch_vout, branch })
 	}
 
@@ -925,7 +943,9 @@ impl LeafRecord {
 	pub fn to_bytes(&self) -> Result<Vec<u8>, RecordError> {
 		self.check()?;
 		let mut w = Vec::with_capacity(256 + 160 * self.levels());
-		w.extend([RECORD_VERSION, self.template.id(), self.template.version()]);
+		let expires = self.schedule.expires();
+		let version = if expires { RECORD_VERSION } else { RECORD_VERSION_NO_SWEEP };
+		w.extend([version, self.template.id(), self.template.version()]);
 		w.extend(self.owner.serialize());
 		w.extend(self.owner_nonce);
 		w.extend(self.operator_nonce);
@@ -950,12 +970,16 @@ impl LeafRecord {
 		w.extend(self.entry_reserve.to_le_bytes());
 		w.extend(self.chain.genesis_bytes());
 		w.extend(self.schedule.operator.serialize());
-		w.extend(asset_bytes(self.schedule.token));
-		w.extend(self.schedule.notice.units().to_le_bytes());
-		w.push(self.burn as u8 | (self.delegated as u8) << 1);
-		w.push(self.schedule.expiries().len() as u8);
-		for e in self.schedule.expiries() {
-			w.extend(e.to_consensus_u32().to_le_bytes());
+		if expires {
+			w.extend(asset_bytes(self.schedule.token));
+			w.extend(self.schedule.notice.units().to_le_bytes());
+			w.push(self.burn as u8 | (self.delegated as u8) << 1);
+			w.push(self.schedule.expiries().len() as u8);
+			for e in self.schedule.expiries() {
+				w.extend(e.to_consensus_u32().to_le_bytes());
+			}
+		} else {
+			w.push((self.delegated as u8) << 1);
 		}
 		w.push(self.levels() as u8);
 		let siblings = |w: &mut Vec<u8>, index: u8, reserve: u64, siblings: &[Sibling]| {
@@ -985,7 +1009,7 @@ impl LeafRecord {
 	pub fn from_bytes(data: &[u8]) -> Result<LeafRecord, RecordError> {
 		let mut r = Reader::new(data);
 		let version = r.u8()?;
-		if version != RECORD_VERSION {
+		if version != RECORD_VERSION && version != RECORD_VERSION_NO_SWEEP {
 			return Err(RecordError::Version(version as u64));
 		}
 		let template_id = r.u8()?;
@@ -1030,21 +1054,34 @@ impl LeafRecord {
 		let entry_reserve = r.u64()?;
 		let chain = r.chain()?;
 		let operator = r.key()?;
-		let token = r.asset()?;
-		let notice = r.relative_time()?;
-		let flags = r.u8()?;
-		if flags & !3 != 0 {
-			return Err(DecodeError::Flag(flags).into());
-		}
-		let steps = r.u8()? as usize;
-		if steps == 0 || steps > MAX_STEPS {
-			return Err(DecodeError::Count(steps as u64).into());
-		}
-		let mut expiries = Vec::with_capacity(steps);
-		for _ in 0..steps {
-			expiries.push(r.median_time()?);
-		}
-		let schedule = ClockSchedule::new_unchecked(token, operator, notice, expiries).map_err(RecordError::Schedule)?;
+		let (schedule, flags) = if version == RECORD_VERSION_NO_SWEEP {
+			// No token, notice or expiries; no sweep to be burn-only.
+			let flags = r.u8()?;
+			if flags & !2 != 0 {
+				return Err(DecodeError::Flag(flags).into());
+			}
+			(ClockSchedule::never(operator), flags)
+		} else {
+			let token = r.asset()?;
+			// The no-sweep token is written as format version 3 alone.
+			if token == crate::clock::no_sweep_token() {
+				return Err(DecodeError::NoSweepToken.into());
+			}
+			let notice = r.relative_time()?;
+			let flags = r.u8()?;
+			if flags & !3 != 0 {
+				return Err(DecodeError::Flag(flags).into());
+			}
+			let steps = r.u8()? as usize;
+			if steps == 0 || steps > MAX_STEPS {
+				return Err(DecodeError::Count(steps as u64).into());
+			}
+			let mut expiries = Vec::with_capacity(steps);
+			for _ in 0..steps {
+				expiries.push(r.median_time()?);
+			}
+			(ClockSchedule::new_unchecked(token, operator, notice, expiries).map_err(RecordError::Schedule)?, flags)
+		};
 		let levels = r.u8()? as usize;
 		if levels == 0 || levels > MAX_LEVELS {
 			return Err(RecordError::Levels(levels));
@@ -1129,6 +1166,12 @@ pub enum Recheck {
 /// holds, and the receipt of a coin out of round, asks only that the first
 /// expiry lie past the exit deadline ([`WalletPolicy::receipt`]): a leaf
 /// accepted from a round passes it for most of its batch's life.
+///
+/// A leaf of a batch without a sweep never expires: it passes the notice
+/// and expiry bounds whatever they are. A wallet that accepts only such
+/// batches, as every wallet on a chain whose operators build no other kind,
+/// takes [`WalletPolicy::no_sweep`], which has no horizon and refuses a
+/// record of a batch with a sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalletPolicy {
 	/// The wallet's own chain.
@@ -1152,6 +1195,9 @@ pub struct WalletPolicy {
 	/// The least each node on the path and the entry hold back for the fee of
 	/// the transaction that spends them.
 	pub min_reserve: ReserveFloor,
+	/// Refuse a batch with a sweep: only batches that never expire are
+	/// accepted, so `min_notice` and `horizon` are not read.
+	pub refuse_sweep: bool,
 }
 
 /// The least a reserve on a leaf's path holds, in the batch asset's atoms.
@@ -1202,7 +1248,19 @@ impl WalletPolicy {
 			max_exit_delay: RelativeTime::from_seconds_ceil(Self::DEFAULT_MAX_EXIT_SECONDS).expect("48 hours is a relative time"),
 			max_levels: Self::DEFAULT_MAX_LEVELS,
 			min_reserve: ReserveFloor::Atoms(1),
+			refuse_sweep: false,
 		}
+	}
+
+	/// The policy for a wallet on `chain` served by `operator`, at `now`,
+	/// that accepts only batches without a sweep: no first-expiry horizon,
+	/// since nothing expires, and a record of a batch with a sweep refused
+	/// ([`RecordError::SweepRefused`]). Every other bound is
+	/// [`WalletPolicy::new`]'s; `now` still bounds the times of the unroll
+	/// authorisations a coin received out of round carries. Its receipt
+	/// policy is itself.
+	pub fn no_sweep(chain: Chain, operator: XOnlyPublicKey, now: MedianTime) -> WalletPolicy {
+		WalletPolicy { horizon: 0, refuse_sweep: true, ..WalletPolicy::new(chain, operator, now) }
 	}
 
 	/// The same policy for a leaf or a coin the wallet already holds or
@@ -1232,6 +1290,13 @@ impl WalletPolicy {
 		}
 		if schedule.operator != self.operator {
 			return Err(RecordError::WrongOperator);
+		}
+		if !schedule.expires() {
+			// Nothing expires: no notice to wait and no horizon to meet.
+			return if self.exit_delay_ok(exit_delay) { Ok(()) } else { Err(self.exit_delay_error(exit_delay)) };
+		}
+		if self.refuse_sweep {
+			return Err(RecordError::SweepRefused);
 		}
 		let notice = schedule.notice.units();
 		if notice < self.min_notice.units() {
@@ -1329,7 +1394,8 @@ pub struct BranchNode {
 	pub gate: GateCommitment,
 	/// The owner's proof in its member tree.
 	pub proof: MemberProof,
-	pub sweep: Sweep,
+	/// Its sweep path; `None` in a batch without a sweep.
+	pub sweep: Option<Sweep>,
 	/// RECLAIM, on the lowest node.
 	pub reclaim: Option<Reclaim>,
 	unroll: Script,
@@ -1345,12 +1411,12 @@ impl BranchNode {
 		operator: XOnlyPublicKey,
 		gate: GateCommitment,
 		proof: MemberProof,
-		sweep: Sweep,
+		sweep: Option<Sweep>,
 		reclaim: Option<Reclaim>,
 	) -> Result<BranchNode, RecordError> {
 		let value = children.iter().try_fold(reserve, |acc, c| sum(acc, c.value))?;
 		let unroll = unroll_script(&gate, &children);
-		let taproot = node_taproot_delegated(unroll.clone(), sweep.script(), reclaim.as_ref().map(|r| r.script.clone()),
+		let taproot = node_taproot_delegated(unroll.clone(), sweep.map(|s| s.script()), reclaim.as_ref().map(|r| r.script.clone()),
 			reclaim.as_ref().and_then(|r| r.delegated.clone()));
 		Ok(BranchNode { children, index, reserve, value, operator, gate, proof, sweep, reclaim, unroll, taproot })
 	}
@@ -1364,8 +1430,9 @@ impl BranchNode {
 		&self.unroll
 	}
 
-	pub fn sweep_script(&self) -> Script {
-		self.sweep.script()
+	/// The SWEEP leaf, when the node has one.
+	pub fn sweep_script(&self) -> Option<Script> {
+		self.sweep.map(|s| s.script())
 	}
 
 	pub fn taproot(&self) -> &TapOutput {
@@ -1504,8 +1571,8 @@ impl Branch {
 	}
 
 	/// The sweep path of every output above the leaf: each node's, then the
-	/// entry's.
+	/// entry's; empty for a batch without a sweep.
 	pub fn sweeps(&self) -> Vec<Sweep> {
-		self.nodes.iter().map(|n| n.sweep).chain([self.entry.sweep]).collect()
+		self.nodes.iter().map(|n| n.sweep).chain([self.entry.sweep]).flatten().collect()
 	}
 }

@@ -684,8 +684,12 @@ def burn_sweep(T_id, R_prog, s_x, W=None):
 def entry_taptree(h, asset_id, value, leaf_prog, sweep):
     """Hash-locked entry: unlock = a preimage of h moves the whole entry into
     output 0 = (asset, value, the owner's leaf); sweep = the batch's sweep with
-    notice. Witness for unlock: <preimage>."""
+    notice, or None for a batch without a sweep. Witness for unlock: <preimage>."""
     unlock = CScript(hash_gate(h) + unroll_body([(asset_id, value, leaf_prog)]))
+    if sweep is None:
+        # A batch without a sweep (T26): the unlock is the entry's one leaf.
+        tap = taproot_construct(NUMS, [("unlock", unlock)])
+        return tap, {"unlock": unlock}
     tap = taproot_construct(NUMS, [("unlock", unlock), ("sweep", sweep)])
     return tap, {"unlock": unlock, "sweep": sweep}
 
@@ -732,8 +736,12 @@ def connector_taptree(s_x):
 
 def checkpoint_taptree(a_x, s_x, salt, ctag, sweep):
     """Checkpoint output: the leaf's collaborative path with the checkpoint's
-    own salt, and the sweep with notice of its batch."""
+    own salt, and the sweep with notice of its batch; for a coin of a batch
+    without a sweep (sweep None), the collaborative path alone."""
     collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
+    if sweep is None:
+        tap = taproot_construct(NUMS, [("collab", collab)])
+        return tap, {"collab": collab}
     tap = taproot_construct(NUMS, [("collab", collab), ("sweep", sweep)])
     return tap, {"collab": collab, "sweep": sweep}
 
@@ -768,7 +776,15 @@ def htlc_taptree(a_x, s_x, salt, ctag, h, timeout, exit_delay, operator_delay, r
 
 
 def node_taptree3(unroll, sweep, reclaim=None):
-    """A tree node: [UNROLL, SWEEP], or for a lowest node [UNROLL, [SWEEP, RECLAIM]]."""
+    """A tree node: [UNROLL, SWEEP], or for a lowest node [UNROLL, [SWEEP, RECLAIM]].
+    A node of a batch without a sweep (sweep None): [UNROLL], or for a lowest
+    node [UNROLL, RECLAIM]."""
+    if sweep is None:
+        if reclaim is None:
+            tap = taproot_construct(NUMS, [("unroll", unroll)])
+            return tap, {"unroll": unroll}
+        tap = taproot_construct(NUMS, [("unroll", unroll), ("reclaim", reclaim)])
+        return tap, {"unroll": unroll, "reclaim": reclaim}
     if reclaim is None:
         tap = taproot_construct(NUMS, [("unroll", unroll), ("sweep", sweep)])
         return tap, {"unroll": unroll, "sweep": sweep}
@@ -779,7 +795,11 @@ def node_taptree3(unroll, sweep, reclaim=None):
 def node_taptree_delegated(unroll, sweep, reclaim, reclaim_d):
     """A lowest node with RECLAIM-D: [UNROLL, [SWEEP, [RECLAIM, RECLAIM-D]]].
     UNROLL keeps its 65-byte control block; SWEEP's is 97 bytes, RECLAIM's and
-    RECLAIM-D's 129."""
+    RECLAIM-D's 129. Without a sweep (sweep None): [UNROLL, [RECLAIM,
+    RECLAIM-D]], RECLAIM's and RECLAIM-D's control blocks 97 bytes."""
+    if sweep is None:
+        tap = taproot_construct(NUMS, [("unroll", unroll), [("reclaim", reclaim), ("reclaim_d", reclaim_d)]])
+        return tap, {"unroll": unroll, "reclaim": reclaim, "reclaim_d": reclaim_d}
     tap = taproot_construct(NUMS, [("unroll", unroll), [("sweep", sweep),
                                                        [("reclaim", reclaim), ("reclaim_d", reclaim_d)]]])
     return tap, {"unroll": unroll, "sweep": sweep, "reclaim": reclaim, "reclaim_d": reclaim_d}

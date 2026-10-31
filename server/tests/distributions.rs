@@ -227,7 +227,7 @@ async fn a_distribution_pays_its_holders_and_what_nobody_takes_up_goes_back_to_i
 	// the watcher pays back the four claims nobody took up.
 	let now = mtp(&r).to_consensus_u32();
 	advance_mtp(&r, expiry.saturating_sub(now) + HOUR).await;
-	let token = new0.branch.nodes[0].sweep.token.into_inner().to_byte_array().to_vec();
+	let token = new0.branch.nodes[0].sweep.unwrap().token.into_inner().to_byte_array().to_vec();
 	drive(&r, "the release at the claim batch's expiry", 4, |l| common::flow::has(l, "release", &token)).await;
 	settle(&r).await;
 	advance_mtp(&r, 37 * HOUR).await;

@@ -742,7 +742,7 @@ impl Wallet {
 		};
 		let terms = HtlcTerms { direction: HtlcDirection::Receive, payment_hash: [0; 32], timeout, operator_delay: units };
 		let leaf = probe_leaf(Some(terms))?.policy(self.operator, self.genesis);
-		let sweep = Sweep { token: asset, r_program: [0; 32], operator: self.operator, notice: None, burn: false };
+		let sweep = Some(Sweep { token: asset, r_program: [0; 32], operator: self.operator, notice: None, burn: false });
 		let coin = ValidCoin { id: LeafId([0; 32]), leaf, asset, value, sweep, expiry: timeout, hops: 0,
 			origin: ValidOrigin::Transfer { inputs: vec![], outputs: vec![], index: 0 } };
 		let m = super::pay::Margins::of(info, asset)?;

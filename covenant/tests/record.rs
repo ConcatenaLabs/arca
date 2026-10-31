@@ -23,6 +23,7 @@ use elements::hex::FromHex;
 use elements::{AssetId, BlockHash, ContractHash, OutPoint, Transaction, Txid};
 use serde_json::Value;
 
+use arca_covenant::no_sweep_token;
 use arca_covenant::record::{LeafRecord, Sibling};
 use arca_covenant::script::sha256;
 use arca_covenant::{Chain, ClockSchedule, MedianTime, MemberProof, RecordError, RelativeTime, ReserveFloor, WalletPolicy};
@@ -94,13 +95,21 @@ fn golden_vectors_regenerate() {
 		let name = b["name"].as_str().unwrap();
 		let round = round_of(b);
 
-		// The token is the asset the round's first input issues.
-		let issuer = &b["inputs"]["token_issuer"];
-		let outpoint = OutPoint::new(Txid::from_str(issuer["txid"].as_str().unwrap()).unwrap(),
-			issuer["vout"].as_u64().unwrap() as u32);
-		assert_eq!(round.input[0].previous_output, outpoint, "{}", name);
-		let token = AssetId::new_issuance(outpoint, ContractHash::from_byte_array([0; 32]));
-		assert_eq!(token.to_string(), b["inputs"]["token"].as_str().unwrap(), "{}: the token", name);
+		// The token is the asset the round's first input issues; a batch
+		// without a sweep has none, and its round issues nothing.
+		let no_sweep = b["inputs"]["no_sweep"] == Value::Bool(true);
+		let token = if no_sweep {
+			assert!(round.input.iter().all(|i| i.asset_issuance.is_null()), "{}: the round issues nothing", name);
+			no_sweep_token()
+		} else {
+			let issuer = &b["inputs"]["token_issuer"];
+			let outpoint = OutPoint::new(Txid::from_str(issuer["txid"].as_str().unwrap()).unwrap(),
+				issuer["vout"].as_u64().unwrap() as u32);
+			assert_eq!(round.input[0].previous_output, outpoint, "{}", name);
+			let token = AssetId::new_issuance(outpoint, ContractHash::from_byte_array([0; 32]));
+			assert_eq!(token.to_string(), b["inputs"]["token"].as_str().unwrap(), "{}: the token", name);
+			token
+		};
 
 		let batch_spk = hexbytes(&b["batch_output"]["script_pubkey"]);
 		let batch_value = b["batch_output"]["value"].as_u64().unwrap();
@@ -132,7 +141,13 @@ fn golden_vectors_regenerate() {
 			let position: Vec<u8> = r["position"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect();
 			assert_eq!(rec.position(), position, "{}: position", ctx);
 			assert_eq!(rec.leaf_id().unwrap().to_string(), r["leaf_id"].as_str().unwrap(), "{}: leaf id", ctx);
-			assert_eq!(rec.schedule.clock0_script_pubkey().as_bytes().to_vec(), hexbytes(&b["clock0_script_pubkey"]));
+			if no_sweep {
+				assert_eq!(rec.schedule, ClockSchedule::never(rec.operator()), "{}: the never schedule", ctx);
+				assert_eq!(binary[0], arca_covenant::record::RECORD_VERSION_NO_SWEEP, "{}: format version 3", ctx);
+				assert!(branch.sweeps().is_empty(), "{}: no sweep on the path", ctx);
+			} else {
+				assert_eq!(rec.schedule.clock0_script_pubkey().as_bytes().to_vec(), hexbytes(&b["clock0_script_pubkey"]));
+			}
 
 			// And the record validates against the round that funds it, for its
 			// owner and the nonce that owner picked, under a wallet whose floor
@@ -227,13 +242,21 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 	add("unlock hash".into(), &|x| x.unlock_hash = flip(x.unlock_hash));
 	add("entry reserve".into(), &|x| x.entry_reserve += 1);
 	add("genesis hash".into(), &|x| x.chain = arca_covenant::Chain::new(BlockHash::from_byte_array(flip(x.chain.genesis_bytes()))));
-	add("operator".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, other_key("operator"),
-		x.schedule.notice, x.schedule.expiries().to_vec()).unwrap());
-	add("token".into(), &|x| x.schedule = ClockSchedule::new_unchecked(
-		AssetId::from_byte_array(flip(x.schedule.token.into_inner().to_byte_array())), x.schedule.operator,
-		x.schedule.notice, x.schedule.expiries().to_vec()).unwrap());
-	add("notice".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, x.schedule.operator,
-		RelativeTime::from_units(x.schedule.notice.units() + 1).unwrap(), x.schedule.expiries().to_vec()).unwrap());
+	if r.schedule.expires() {
+		add("operator".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, other_key("operator"),
+			x.schedule.notice, x.schedule.expiries().to_vec()).unwrap());
+		add("token".into(), &|x| x.schedule = ClockSchedule::new_unchecked(
+			AssetId::from_byte_array(flip(x.schedule.token.into_inner().to_byte_array())), x.schedule.operator,
+			x.schedule.notice, x.schedule.expiries().to_vec()).unwrap());
+		add("notice".into(), &|x| x.schedule = ClockSchedule::new_unchecked(x.schedule.token, x.schedule.operator,
+			RelativeTime::from_units(x.schedule.notice.units() + 1).unwrap(), x.schedule.expiries().to_vec()).unwrap());
+	} else {
+		// A batch without a sweep: its schedule is the never schedule of its
+		// operator, and a schedule with a clock is a batch with a sweep.
+		add("operator".into(), &|x| x.schedule = ClockSchedule::never(other_key("operator")));
+		add("a sweep added".into(), &|x| x.schedule = ClockSchedule::new(AssetId::from_byte_array(sha256(b"a token")),
+			x.schedule.operator, RelativeTime::from_units(253).unwrap(), vec![MedianTime::from_consensus(CREATED + 28 * 86_400).unwrap()]).unwrap());
+	}
 	add("burn".into(), &|x| x.burn = !x.burn);
 	add("delegated".into(), &|x| x.delegated = !x.delegated);
 	if r.channel.is_some() {
@@ -254,20 +277,22 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 			x.template = arca_covenant::Template::Landing1;
 		});
 	}
-	for k in 0..r.schedule.expiries().len() {
-		add(format!("expiry {} later", k), &|x| x.schedule = schedule_with(&x.schedule, |e| {
-			e[k] = MedianTime::from_consensus(e[k].to_consensus_u32() + 1).unwrap()
+	if r.schedule.expires() {
+		for k in 0..r.schedule.expiries().len() {
+			add(format!("expiry {} later", k), &|x| x.schedule = schedule_with(&x.schedule, |e| {
+				e[k] = MedianTime::from_consensus(e[k].to_consensus_u32() + 1).unwrap()
+			}));
+			add(format!("expiry {} earlier", k), &|x| x.schedule = schedule_with(&x.schedule, |e| {
+				e[k] = MedianTime::from_consensus(e[k].to_consensus_u32() - 1).unwrap()
+			}));
+		}
+		add("an expiry added".into(), &|x| x.schedule = schedule_with(&x.schedule, |e| {
+			let last = *e.last().unwrap();
+			e.push(MedianTime::from_consensus(last.to_consensus_u32() + 86_400).unwrap())
 		}));
-		add(format!("expiry {} earlier", k), &|x| x.schedule = schedule_with(&x.schedule, |e| {
-			e[k] = MedianTime::from_consensus(e[k].to_consensus_u32() - 1).unwrap()
-		}));
-	}
-	add("an expiry added".into(), &|x| x.schedule = schedule_with(&x.schedule, |e| {
-		let last = *e.last().unwrap();
-		e.push(MedianTime::from_consensus(last.to_consensus_u32() + 86_400).unwrap())
-	}));
-	if r.schedule.expiries().len() > 1 {
-		add("the last expiry removed".into(), &|x| x.schedule = schedule_with(&x.schedule, |e| { e.pop(); }));
+		if r.schedule.expiries().len() > 1 {
+			add("the last expiry removed".into(), &|x| x.schedule = schedule_with(&x.schedule, |e| { e.pop(); }));
+		}
 	}
 	let extra = Sibling { value: 1_000, program: sha256(b"an extra child") };
 	for l in 0..r.upper.len() {

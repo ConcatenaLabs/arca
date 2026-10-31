@@ -33,15 +33,15 @@ sequentia-contracts (`accumulator_programs`).
 
 | Module | Output | Leaves |
 |---|---|---|
-| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep; RECLAIM on a lowest node, each owner's release naming its own round's connector asset, read from an input; on a lowest node built with it, RECLAIM-D, which takes each owner's slot released by the current holders of the coins resting on it, through the delegations their senders signed (`ReleaseTree`, 32 steps) |
+| `node` | A tree node: the batch output, an inner node, a lowest node | UNROLL behind the membership gate with a timed authorisation; the sweep, except in a batch without one; RECLAIM on a lowest node, each owner's release naming its own round's connector asset, read from an input; on a lowest node built with it, RECLAIM-D, which takes each owner's slot released by the current holders of the coins resting on it, through the delegations their senders signed (`ReleaseTree`, 32 steps) |
 | `sweep` | The sweep path of every output above a leaf | The token check (`T` at `R` in input `k`), the notice `W` on every output but the batch output, burn-only for an issuer-operated batch |
-| `clock` | `R` and the clock chain from a published schedule `(T, S, W, E_0 … E_K)` | ROLL, RELEASE; `R` is `<W> CSV DROP <S> CHECKSIG` |
+| `clock` | `R` and the clock chain from a published schedule `(T, S, W, E_0 … E_K)`; the schedule of a batch without a sweep (`ClockSchedule::never`), which names only `S` | ROLL, RELEASE; `R` is `<W> CSV DROP <S> CHECKSIG` |
 | `leaf` | The leaf (`vtxo-1`; `vtxo-2` when `v2` is set) | The rebindable collaborative path for 1 to 4 committed outputs, and the exit; for `vtxo-2`, `arca/collab-2` and its data leaf in place of the tapscript path, the same exit |
 | `collab` | `vtxo-2`'s collaborative path, for a leaf and for the checkpoint a `vtxo-2` coin moves into (`Collab2`) | `[[arca/collab-2, data], exit]` (or `sweep`): both keys sign `SHA256(K ‖ k ‖ n ‖ I ‖ m ‖ O)`, `K` the salt's own constant, `k` the coin's input index, `I` the `n` inputs the signers name by asset, amount and script (`utxo_hash`, never the outpoint), `O` the `m` outputs committed to by their whole `output_hash`; `n` 1 to 16, `m` 1 to 4, `k < n`. So a pair fits one index of one shape of transaction: it never spends a second coin of its script in the same transaction, two pairs over the same outputs made for coins spent alone never fit one transaction, and a swap leg moves only beside the other leg. What follows `K` is 70 bytes, which the bond slashes as any collaborative message. The spend carries no annex, which the digest does not cover. The pruned program is one constant (`COLLAB_PROGRAM`, 1,158 bytes) for every spend; a spend is 556 vB where `vtxo-1`'s is 280, its exit 219 vB as `vtxo-1`'s |
-| `entry` | The hash-locked entry | Unlock into the owner's leaf with the preimage; the sweep with notice |
+| `entry` | The hash-locked entry | Unlock into the owner's leaf with the preimage; the sweep with notice, except in a batch without one |
 | `forfeit` | The forfeit output, bound to the leaf given up and to its round | The operator's claim with the preimage and the round's connector asset; the owner's refund after the delay |
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
-| `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice |
+| `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice, except for a coin of a batch without one |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
 | `landing` | `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays output 0 to P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
 | `enclave` | `enclave-1`: the leaf of a restricted asset (an OpenAMP asset, whose every move needs its issuer's policy key), held only in its holders' enclaves | The leaf's collaborative path, its script pushing `K ‖ D` (`D = HASH160(Q)`, `Q` the holder's enclave program), so a pair made for one holder spends only a leaf that exits to that holder's enclave; the exit, which after the delay pays output 0 `OP_1 <Q>` explicitly in the leaf's asset, holding exactly its value (130 bytes with a 36-hour delay), the fee from a coin attached (`enclave_exit_tx`); where the asset elected clawback, the enclave's own claw leaf `<Ki> CHECKSIGVERIFY <Kp> CHECKSIG`, at once (`claw_tx`). The owner key is the holder's enclave key for the owner nonce (`enclave_key`: `lift_x(H) + t·G`, `t = SHA256(T ‖ T ‖ H ‖ n)`, `T = SHA256("Arca/enclave-key")`). `Enclave` builds the holder's enclave as openampd does; `policy_cosign_digest` is what the policy key signs beside the operator |
@@ -120,7 +120,9 @@ the batch output down to the leaf. Each level
 of the path holds the index of the child on the leaf's path, the node's reserve
 and its other children; above the lowest node it holds the owner's proof in the
 node's member tree, and at the lowest node the other owners, whose keys that
-node's RECLAIM names.
+node's RECLAIM names. A record of a batch without a sweep is format version 3:
+the same fields without the token, the notice, the burn flag and the expiries
+([Batches without a sweep](#batches-without-a-sweep)).
 
 ```rust
 use arca_covenant::{LeafRecord, WalletPolicy};
@@ -174,6 +176,13 @@ output equal to the batch output it rebuilds (asset, value and script), so the
 leaf is where the record says, and runs the five client checks on the token and
 its clock, every sweep below the batch output carrying the notice. A wallet
 accepts a leaf only after that, and only once the round is final.
+
+A leaf of a batch without a sweep never expires, so it meets every notice and
+horizon. `WalletPolicy::no_sweep(chain, operator, now)` is the policy of a
+wallet that accepts only such batches: no first-expiry horizon, every other
+bound `new`'s, and a record of a batch with a sweep refused
+(`RecordError::SweepRefused`). The Arca wallet on the main chain (`sequentia`)
+takes it; on any other chain it takes `new`, which accepts both kinds.
 
 The 27-day horizon is for accepting a leaf from a round. A leaf the wallet
 already holds, and a coin it receives out of round, need only a first expiry
@@ -241,7 +250,7 @@ let tree = Tree::build(TreeParams {
 	min_leaf: floor_per_kvb,
 }, &leaves)?;
 let batch = tree.batch_output();                  // the round pays this
-let clock0 = tree.clock0_script_pubkey();         // and the token's atom here
+let clock0 = tree.clock0_script_pubkey();         // and the token's atom here (None without a sweep)
 let records = tree.records();                     // one per leaf, for its owner
 ```
 
@@ -328,12 +337,42 @@ let fee = FeeSource::Coin { outpoint, coin, fee: atoms, change };
 let release = schedule.release_tx(0, token_at_clock0, &fee)?;   // at or after E_0
 let sig = sig_over(release.sighash(genesis)?);
 let release = release.finish(Clock::witness_items(&sig));
-let swept = [root.sweepable(batch_outpoint, batch_value)];      // after W at R
+let swept = [root.sweepable(batch_outpoint, batch_value).unwrap()];   // after W at R
 let to = [ExplicitOutput::new(asset, batch_value - fee_atoms, operator_script)];
 let sw = sweep_tx(&schedule, token_at_r, &swept, &to, &FeeSource::Reserve)?;
 let sigs = (0..sw.leaves.len()).map(|i| Ok(sig_over(sw.sighash(i, genesis)?))).collect::<Result<Vec<_>, Error>>()?;
 let tx = sw.finish(&sigs)?;
 ```
+
+### Batches without a sweep
+
+A batch built with `ClockSchedule::never(S)` has no token and no clock, and no
+output above its leaves carries a sweep leaf. Its round issues nothing and pays
+no token (`Tree::clock0_script_pubkey` is `None`). The batch output and an
+inner node are `[UNROLL]`, a lowest node `[UNROLL, RECLAIM]` or `[UNROLL,
+[RECLAIM, RECLAIM-D]]`, an entry `[unlock]`, and the checkpoint of one of its
+coins `[collab]` (`[arca/collab-2, data]` for a `vtxo-2` coin); the leaf is the
+leaf of any batch. A sweep path is `None` wherever it would have been
+(`NodePolicy::sweep`, `EntryPolicy::sweep`, `CheckpointPolicy::sweep`,
+`ValidCoin::sweep`), and a coin of the batch, or one paid on from it, never
+expires (`ValidCoin::expiry` is `transfer::NEVER`, as for a board).
+
+Nothing then takes a holder's coin: a node can only be unrolled into its pinned
+children, a lowest node taken back only with its owners' releases, and an entry
+only opened into its owner's leaf. The operator recovers what it fronted as it
+does for a board: by RECLAIM or RECLAIM-D where every owner under a lowest node
+has moved on, and otherwise by unrolling the node with its own authorisation
+(it is a member of every node), claiming the forfeits of the owners who gave
+their coins up and opening an absent owner's entry, so that coin lands on the
+chain as its owner's leaf. A refresh into such a batch takes every forfeit
+before its round is broadcast: a leaf whose owner never hands over its forfeit
+would otherwise hold the operator's value for good. A forfeit names the
+connector asset `M` of its round, which the round's txid fixes, so the wallet
+validates its new leaf against the built transaction and signs
+(`Forfeit::for_refresh`, `Release::for_refresh`) before it is broadcast.
+
+An accumulator batch keeps its expiry: `Accumulator::build` refuses the never
+schedule, and an accumulator record without a sweep is refused.
 
 ## Off-chain transactions
 
@@ -801,6 +840,9 @@ owner nonce; 2 a taker's leaf, as a reassignment's leaf).
 
 ## Offline refresh
 
+A coin of a batch without a sweep never expires, so it needs no plan; a plan
+names no batch, and an operator takes none for such a coin.
+
 A holder who will be away past a coin's expiry pre-signs a plan (`plan`):
 step `i` gives up the holder's coin `L(i-1)` for a new leaf `L(i)` the
 operator puts in a later round, and `L(0)` is the coin the plan starts from.
@@ -1045,6 +1087,14 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   holder's, and the step run again under the same leaf makes it good; and the
   spends consensus accepts with either half alone, or with a copy of the new
   leaf the operator funds, each pay the holder output 0.
+- `tests/no_sweep.rs`: on an anchored regtest chain, a batch without a sweep:
+  its records (format version 3) and the wallet policy that refuses a batch
+  with a sweep; a refresh into another such batch whose forfeits and releases
+  are signed against the built round before it is broadcast; the operator's
+  recovery by unrolling with its own authorisation, RECLAIM-D, a forfeit's
+  claim and a dormant owner's entry opened into its own leaf, which only that
+  owner takes home; and each removed sweep (batch output, lowest nodes, an
+  entry, a checkpoint) refused in a block with `Witness program hash mismatch`.
 - `tests/reclaim.rs`: on an anchored regtest chain, the reclaim of a lowest
   node whose owners refreshed into new rounds, each release built with
   `Release::for_refresh`. The reclaim with an atom of `M` confirms; without it,

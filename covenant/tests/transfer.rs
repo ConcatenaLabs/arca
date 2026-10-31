@@ -45,7 +45,7 @@ fn schedule(s: &elements::secp256k1_zkp::Keypair, issuer: OutPoint, delay: Relat
 fn round(tree: &arca_covenant::Tree, issuer: OutPoint) -> Transaction {
 	let x = tree.params().asset;
 	let mut r = Spend::new(0).input(issuer, explicit(x, 10_000_000_000, op_true().script_pubkey()), 0xffff_ffff)
-		.outputs(vec![tree.batch_output().txout(), explicit(tree.params().schedule.token, 1, tree.clock0_script_pubkey()), fee(x, 2_000)]).tx;
+		.outputs(vec![tree.batch_output().txout(), explicit(tree.params().schedule.token, 1, tree.clock0_script_pubkey().unwrap()), fee(x, 2_000)]).tx;
 	r.input[0].asset_issuance = AssetIssuance {
 		asset_blinding_nonce: elements::secp256k1_zkp::ZERO_TWEAK, asset_entropy: [0; 32],
 		amount: elements::confidential::Value::Explicit(1), inflation_keys: elements::confidential::Value::Null, denomination: 0,

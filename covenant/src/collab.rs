@@ -126,11 +126,24 @@ impl Collab2 {
 	/// The output whose other leaf is `other` (the leaf's exit, or the
 	/// checkpoint's sweep): `TapBranch(TapBranch(F, D), other)`.
 	pub fn taproot(&self, other: Script) -> TapOutput {
-		TapOutput::with_nodes(vec![
-			(2, TapNode::Simplicity(collab_cmr())),
-			(2, TapNode::Hidden(self.data_leaf())),
-			(1, TapNode::Tapscript(other)),
-		])
+		self.taproot_of(Some(other))
+	}
+
+	/// The output with `other` beside the path, or, for the checkpoint of a
+	/// coin of a batch without a sweep (`None`), the path alone:
+	/// `TapBranch(F, D)`.
+	pub fn taproot_of(&self, other: Option<Script>) -> TapOutput {
+		match other {
+			Some(other) => TapOutput::with_nodes(vec![
+				(2, TapNode::Simplicity(collab_cmr())),
+				(2, TapNode::Hidden(self.data_leaf())),
+				(1, TapNode::Tapscript(other)),
+			]),
+			None => TapOutput::with_nodes(vec![
+				(1, TapNode::Simplicity(collab_cmr())),
+				(1, TapNode::Hidden(self.data_leaf())),
+			]),
+		}
 	}
 
 	/// The bytes both keys sign the digest of, for the coin at input
@@ -176,7 +189,12 @@ impl Collab2 {
 	/// leaf is `other`: the Simplicity witness, the pruned program, the root
 	/// and the control block.
 	pub fn witness(&self, other: Script, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
-		let tap = self.taproot(other);
+		self.witness_of(Some(other), pair, n, m)
+	}
+
+	/// [`Collab2::witness`] from the output [`Collab2::taproot_of`] builds.
+	pub fn witness_of(&self, other: Option<Script>, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
+		let tap = self.taproot_of(other);
 		let cb = tap.control_block_at(&Script::from(collab_cmr().to_vec()), simplicity_version())
 			.expect("the program is a leaf of this output");
 		vec![self.witness_bytes(pair, n, m), unhex(COLLAB_PROGRAM), collab_cmr().to_vec(), cb]
@@ -257,7 +275,7 @@ mod test {
 		assert!(l.message_in(0, &vec![coin; 17], &outs).is_err(), "at most 16 named inputs");
 		let cp = CheckpointPolicy {
 			owner: l.owner, operator: l.operator, salt: [4; 32], chain: l.chain,
-			sweep: crate::transfer::board_sweep(l.operator, l.exit_delay), v2: true,
+			sweep: Some(crate::transfer::board_sweep(l.operator, l.exit_delay)), v2: true,
 		};
 		assert!(cp.names_inputs() && l.names_inputs() && !leaf(false).names_inputs());
 		let b = Policy::Checkpoint(cp).encode();

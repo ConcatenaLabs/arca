@@ -33,15 +33,15 @@ fn policies() -> Vec<Policy> {
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
 		Policy::Leaf(leaf),
-		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), sch.sweep(false, false), None).unwrap()),
-		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), sch.sweep(true, true), Some(chain())).unwrap()),
-		Policy::Node(NodePolicy::new(children[..1].to_vec(), s, (0..300).map(|_| a).collect(), sch.sweep(true, false), Some(chain())).unwrap()),
-		Policy::Entry(EntryPolicy { unlock_hash: label32("h"), asset: asset("X"), value: 77, leaf_program: leaf.program(), sweep: sch.sweep(true, false) }),
+		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), Some(sch.sweep(false, false)), None).unwrap()),
+		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), Some(sch.sweep(true, true)), Some(chain())).unwrap()),
+		Policy::Node(NodePolicy::new(children[..1].to_vec(), s, (0..300).map(|_| a).collect(), Some(sch.sweep(true, false)), Some(chain())).unwrap()),
+		Policy::Entry(EntryPolicy { unlock_hash: label32("h"), asset: asset("X"), value: 77, leaf_program: leaf.program(), sweep: Some(sch.sweep(true, false)) }),
 		Policy::Forfeit(ForfeitPolicy {
 			unlock_hash: label32("h"), owner: a, operator: s, refund_delay: sch.notice,
 			leaf_id: LeafId(label32("leaf id")), connector: asset("connector"),
 		}),
-		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: sch.sweep(true, false), v2: false }),
+		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: false }),
 		Policy::Leaf(LeafPolicy {
 			htlc: Some(HtlcTerms {
 				direction: HtlcDirection::Receive, payment_hash: label32("p"),
@@ -58,7 +58,7 @@ fn policies() -> Vec<Policy> {
 			..leaf
 		}),
 		Policy::Leaf(LeafPolicy { v2: true, ..leaf }),
-		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp2"), chain: chain(), sweep: sch.sweep(true, false), v2: true }),
+		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp2"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: true }),
 		Policy::Offboard(OffboardPolicy {
 			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
 			operator: s, reclaim_delay: sch.notice,
@@ -176,7 +176,7 @@ fn witness_readers() {
 	let sch = schedule();
 	let owners: Vec<XOnlyPublicKey> = (0..4).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000, label32(&format!("c{}", i)))).collect::<Vec<_>>();
-	let node = NodePolicy::new(children, xonly(&s), owners.clone(), sch.sweep(true, false), Some(chain())).unwrap();
+	let node = NodePolicy::new(children, xonly(&s), owners.clone(), Some(sch.sweep(true, false)), Some(chain())).unwrap();
 	let t = MedianTime::from_consensus(1_791_000_000).unwrap();
 	let signer = keypair("o2");
 	let auth = node.unroll_authorisation(t);

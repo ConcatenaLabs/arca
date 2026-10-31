@@ -191,7 +191,7 @@ async fn a_batch_made_before_the_change_is_swept_at_its_expiry() {
 	let got = refresh(&mut r, &pairs).await;
 	drive(&r, "the two boards given up", 12, |l| claimed(l) == 2).await;
 	settle(&r).await;
-	let schedule = got[0].new_valid.branch.nodes[0].sweep;
+	let schedule = got[0].new_valid.branch.nodes[0].sweep.unwrap();
 	let e0 = match &got[0].new.held.record {
 		arca_covenant::CoinRecord::Leaf { record, .. } => record.schedule.expiries()[0].to_consensus_u32(),
 		_ => unreachable!(),

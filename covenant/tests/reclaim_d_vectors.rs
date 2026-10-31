@@ -75,7 +75,7 @@ fn reclaim_d_matches_the_regtest_suites_vectors() {
 
 	let unroll = Script::from(hex(&v["scripts"]["unroll"]));
 	let sweep = Script::from(hex(&v["scripts"]["sweep"]));
-	let tap = node::node_taproot_delegated(unroll.clone(), sweep.clone(), Some(reclaim.clone()), Some(reclaim_d.clone()));
+	let tap = node::node_taproot_delegated(unroll.clone(), Some(sweep.clone()), Some(reclaim.clone()), Some(reclaim_d.clone()));
 	same("scriptPubKey", tap.script_pubkey().as_bytes(), &v["script_pubkey"]);
 	for (name, s) in [("unroll", &unroll), ("sweep", &sweep), ("reclaim", &reclaim), ("reclaim_d", &reclaim_d)] {
 		same(name, &tap.control_block(s).unwrap(), &v["control_blocks"][name]);
