@@ -148,6 +148,9 @@ pub enum CosignError {
 	UnknownLeaf(LeafId),
 	#[error("leaf {0} is {1}, not live: a board is live once its transaction is final")]
 	NotLive(LeafId, &'static str),
+	#[error("leaf {0} is a claim leaf whose distribution's deadline {1} has passed: it lapses to its payer, and the operator co-signs no \
+		take-up of it")]
+	Lapsed(LeafId, u32),
 	#[error("leaf {0} is already spent: the server co-signs one spend of a leaf")]
 	DoubleSpend(LeafId),
 	#[error("leaf {0} rests on a board that is not credited: its transaction is not final")]
@@ -225,6 +228,7 @@ impl CosignError {
 			Malformed(_) => "malformed",
 			UnknownLeaf(_) => "unknown_leaf",
 			NotLive(..) => "not_live",
+			Lapsed(..) => "lapsed",
 			DoubleSpend(_) => "double_spend",
 			BoardNotFinal(_) => "board_not_final",
 			RoundNotFinal(_) => "round_not_final",
@@ -282,6 +286,7 @@ impl From<CoinError> for CosignError {
 			CoinError::PastBoardDate { leaf, expiry, .. } => CosignError::PastBoardDate { leaf, expiry },
 			CoinError::Channel(id) => CosignError::Template(format!("coin {} is a channel-1 coin: it pays by its channel's states, and \
 				is given up only in a round", id)),
+			CoinError::Lapsed { leaf, deadline } => CosignError::Lapsed(leaf, deadline),
 			CoinError::Store(e) => e.into(),
 			CoinError::Internal(m) => CosignError::Internal(m),
 		}

@@ -546,6 +546,7 @@ impl Receives {
 					exit_delay_units: r.new.exit_delay_units, operator_nonce: [0; 32], htlc: Some(terms), order: None,
 					landing: None,
 					channel: None,
+					claim: None,
 				},
 				leaf_id: None,
 			}],

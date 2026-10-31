@@ -4,7 +4,8 @@
 //! A distribution is a participation of the payer's. It gives up the payer's
 //! coins, all in one asset, each attested by its owner key over the
 //! distribution's id ([`arca_covenant::Distribution::id`]), and wants one
-//! `vtxo-1` leaf per claim, owned by the claim key of the key the payer names
+//! leaf per claim (`claim-1` for a distribution with a deadline, `vtxo-1`
+//! otherwise), owned by the claim key of the key the payer names
 //! and the nonce it draws ([`arca_covenant::claim_key`]), which the server
 //! derives itself: a distribution names keys, never claim keys, so it can take
 //! no key a wallet uses for its own leaves. It runs in the asset's ordinary
@@ -38,8 +39,23 @@
 //! transfer, as it does with every round leaf. Signatures that verify under
 //! the claim key are the proof that whoever hands them over holds it.
 //!
-//! The leaves no holder took up are paid back to the payer's return script by
-//! the watcher once the sweep that took them is final ([`crate::watcher`]).
+//! A distribution that names a deadline ([`arca_covenant::DistributionLapse`])
+//! wants `claim-1` leaves, whose lapse pays the payer's return script once
+//! the deadline has passed ([`arca_covenant::claim`]). The server takes one
+//! whose deadline is [`MIN_LAPSE_WINDOW`] to [`MAX_LAPSE_WINDOW`] ahead and
+//! whose allowance is below every claim and, where the node takes the asset
+//! for fees, at least the fee of a lapse at the node's floor
+//! ([`arca_covenant::claim::lapse_allowance`] at one times the floor). It
+//! co-signs no take-up of a `claim-1` leaf from the deadline on
+//! ([`crate::coins::check`]), and its watcher brings each leaf nobody took up
+//! on the chain after the deadline and lapses it, the fee from the allowance
+//! ([`crate::watcher`]): nothing of the operator's pays it back, unless the
+//! node no longer takes the asset for fees, when a coin of the operator's
+//! pays the lapse's fee.
+//!
+//! The `vtxo-1` claim leaves of a distribution without a deadline, which no
+//! holder took up, are paid back to the payer's return script by the watcher
+//! once the sweep that took them is final ([`crate::watcher`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,6 +79,13 @@ use crate::store::{
 /// 1,024 leaves, which its claims share with nothing else they could not fit
 /// beside.
 pub const MAX_CLAIMS: usize = 1024;
+
+/// The least time from a distribution's acceptance to its deadline: a week
+/// for its holders to take their claims up.
+pub const MIN_LAPSE_WINDOW: u32 = 7 * 86_400;
+
+/// The most time from a distribution's acceptance to its deadline.
+pub const MAX_LAPSE_WINDOW: u32 = 400 * 86_400;
 
 /// What a payer submits: the distribution, and for each coin it gives up, in
 /// order, its owner's signature over the distribution's id.
@@ -142,6 +165,25 @@ impl Participations {
 			return Err(ParticipationError::Assets(format!("a fee in asset {}: a distribution pays its fee in its own asset, {}", a, asset)));
 		}
 		p.fresh_rate(&asset).map_err(ParticipationError::Rate)?;
+
+		// The lapse: a deadline that leaves the holders their window, and an
+		// allowance below every claim that pays a lapse's fee where the node
+		// takes the asset.
+		if let Some(l) = &d.lapse {
+			let t = l.deadline.to_consensus_u32();
+			let n = now.to_consensus_u32();
+			if t < n.saturating_add(MIN_LAPSE_WINDOW) || t > n.saturating_add(MAX_LAPSE_WINDOW) {
+				return Err(ParticipationError::OutOfBounds(format!("a deadline of {}; the operator takes one {} to {} days ahead, so the \
+					holders have their time to take their claims up", t, MIN_LAPSE_WINDOW / 86_400, MAX_LAPSE_WINDOW / 86_400)));
+			}
+			if let Some(floor) = self.floor(asset).await? {
+				let least = arca_covenant::claim::lapse_allowance(Some(floor), 1);
+				if l.allowance < least {
+					return Err(ParticipationError::Fee(format!("a lapse allowance of {} of asset {}; a lapse at the node's floor takes {}: \
+						the allowance pays the fee of each unclaimed leaf's lapse", l.allowance, asset, least)));
+				}
+			}
+		}
 
 		// Each claim: its value within the bounds, its exit delay within the
 		// operator's, its claim key derived here, not the operator's, owning
@@ -269,7 +311,7 @@ impl Participations {
 				asset: asset.into_inner().to_byte_array(),
 				value: c.value,
 				kind: WantedKind::Leaf {
-					template: Template::Vtxo1.to_string(),
+					template: if d.lapse.is_some() { Template::Claim1 } else { Template::Vtxo1 }.to_string(),
 					owner_key: owner.serialize(),
 					owner_nonce: c.nonce,
 					exit_delay_units: d.exit_delay.units(),
@@ -278,6 +320,7 @@ impl Participations {
 					order: None,
 					landing: None,
 					channel: None,
+					claim: d.claim_lapse(),
 				},
 				leaf_id: None,
 			}).collect(),
@@ -316,6 +359,13 @@ impl Participations {
 		}
 		if claim.participation_state != ParticipationState::Released {
 			return Err(ParticipationError::ClaimNotReleased(*leaf));
+		}
+		// A claim-1 leaf is the payer's again from its deadline: nobody takes
+		// it up then.
+		if let Some(l) = &claim.lapse {
+			if self.now().await?.to_consensus_u32() >= l.deadline.to_consensus_u32() {
+				return Err(ParticipationError::ClaimLapsed(*leaf, l.deadline.to_consensus_u32()));
+			}
 		}
 		let p = self.store.participation(&claim.participation_id).await?
 			.ok_or_else(|| ParticipationError::Internal("a claim's participation is not recorded".into()))?;

@@ -758,6 +758,7 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 					exit_delay_units: s.exit_delay_units, operator_nonce: s.operator_nonce, htlc: None, order: None,
 					landing: None,
 					channel: None,
+					claim: None,
 				},
 				leaf_id: None,
 			}],

@@ -79,6 +79,27 @@ pub(crate) fn channel_of(b: &[u8]) -> Result<arca_covenant::Channel, StoreError>
 	})
 }
 
+/// A claim-1 leaf's lapse as the store keeps it: the deadline (u32 LE), the
+/// allowance (u64 LE), then the return script.
+pub(crate) fn claim_bytes(l: &arca_covenant::Lapse) -> Vec<u8> {
+	let mut b = l.deadline.to_consensus_u32().to_le_bytes().to_vec();
+	b.extend(l.allowance.to_le_bytes());
+	b.extend(l.return_script.as_bytes());
+	b
+}
+
+pub(crate) fn claim_of(b: &[u8]) -> Result<arca_covenant::Lapse, StoreError> {
+	if b.len() <= 12 {
+		return Err(StoreError::Corrupt(format!("a lapse of {} bytes", b.len())));
+	}
+	Ok(arca_covenant::Lapse {
+		deadline: arca_covenant::MedianTime::from_consensus(u32::from_le_bytes(b[..4].try_into().expect("4 bytes")))
+			.map_err(|e| StoreError::Corrupt(format!("a lapse's deadline: {}", e)))?,
+		allowance: u64::from_le_bytes(b[4..12].try_into().expect("8 bytes")),
+		return_script: elements::Script::from(b[12..].to_vec()),
+	})
+}
+
 pub(crate) fn landing_of(b: &[u8]) -> Result<arca_covenant::Landing, StoreError> {
 	if b.len() != 28 {
 		return Err(StoreError::Corrupt(format!("a landing of {} bytes", b.len())));
@@ -104,6 +125,8 @@ pub enum WantedKind {
 		landing: Option<arca_covenant::Landing>,
 		/// `channel-1`'s terms, for a channel leaf.
 		channel: Option<arca_covenant::Channel>,
+		/// `claim-1`'s lapse, for a distribution's claim leaf that lapses.
+		claim: Option<arca_covenant::Lapse>,
 	},
 	/// An offboard's on-chain output: the destination script, the margin the
 	/// round's output holds for its unlock, the operator's reclaim delay.
@@ -340,7 +363,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	}
 	for r in c.query(
 		"SELECT kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, leaf_id,
-		        script, margin, reclaim_delay_units, htlc, order_terms, landing, channel
+		        script, margin, reclaim_delay_units, htlc, order_terms, landing, channel, claim
 		 FROM participation_output WHERE participation_id = $1 ORDER BY idx",
 		&[&&id[..]],
 	).await? {
@@ -370,6 +393,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 				},
 				landing: r.get::<_, Option<Vec<u8>>>(14).map(|b| landing_of(&b)).transpose()?,
 				channel: r.get::<_, Option<Vec<u8>>>(15).map(|b| channel_of(&b)).transpose()?,
+				claim: r.get::<_, Option<Vec<u8>>>(16).map(|b| claim_of(&b)).transpose()?,
 			},
 			"offboard" => WantedKind::Offboard {
 				script: r.get(9),
@@ -1345,7 +1369,7 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 	}
 	for (k, o) in p.outputs.iter().enumerate() {
 		let r = match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce, order, landing, channel } => {
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, htlc, operator_nonce, order, landing, channel, claim } => {
 				if t.query_opt("SELECT 1 FROM leaf WHERE owner_key = $1 AND state NOT IN ('lost', 'expired')", &[&&owner_key[..]]).await?.is_some() {
 					return Err(StoreError::KeyReused);
 				}
@@ -1367,13 +1391,14 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 				});
 				let landing = landing.map(|l| landing_bytes(&l));
 				let channel = channel.map(|c| channel_bytes(&c));
+				let claim = claim.as_ref().map(claim_bytes);
 				t.execute(
 					"INSERT INTO participation_output
 					 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc,
-					  order_terms, landing, channel)
-					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+					  order_terms, landing, channel, claim)
+					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 					&[&&p.id[..], &(k as i16), &&o.asset[..], &i64_of(o.value)?, template, &&owner_key[..], &&owner_nonce[..],
-						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing, &channel],
+						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing, &channel, &claim],
 				).await
 			},
 			WantedKind::Offboard { script, margin, reclaim_delay_units } => t.execute(

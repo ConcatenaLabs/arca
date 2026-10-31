@@ -1176,21 +1176,26 @@ also be named by its wallet's OpenAMP account key, the key at `m/5/0` that an
 OpenAMP account and a SeqPal ID are (`arca openamp-key` shows it), which is
 how an application that knows its holders only by that account pays them.
 Each holder
-gets an ordinary leaf, owned by a key of its own that the wallet derives from
+gets a leaf (`claim-1`), owned by a key of its own that the wallet derives from
 the key named and a nonce it draws, so one address can be paid by any number
-of distributions and the address key itself signs nothing of the tree.
+of distributions and the address key itself signs nothing of the tree. The
+leaf lapses at the distribution's deadline, 30 days ahead or `--days N`.
 
 The coins given up hold exactly the claims and the operator's fee (its
 refresh fee of each coin given up, its fixed part per claim leaf, and its
 offboard's fixed part once): where no live coin holds that much, the wallet
 first pays itself one out of round. `sync` hands over the forfeits once the
 round is final, as for a refresh, and the claims open. A holder takes its
-claim up through the operator until the deadline, three days before the
-claim batch's first expiry. What no holder has taken up when the operator
-sweeps the expired batch goes back to `--return`, by default a new on-chain
-address of the wallet's, once that sweep is final. The operator pays that
-return out of its own coins: a payer relies on it for the return, and
-`arca distributions` shows each claim's state and each payment back.
+claim up through the operator until the deadline (or, in a batch that
+expires, its exit deadline three days before the batch's first expiry, when
+that comes first). What no holder has taken up by then goes back to
+`--return`, by default a new on-chain address of the wallet's: each such
+leaf lapses there by its own script, which the operator's watcher brings on
+the chain and spends, the fee from an allowance the wallet sets at four times
+a lapse's fee at its node's floor. Nobody signs the lapse and it pays nowhere
+else, so the payer relies on no one for it. `arca distributions` shows the
+deadline, each claim's state (`lapsing`, then `lapsed` with its transaction)
+and each payment back.
 
 A holder needs no prior contact. `arca claims` asks the operator for the
 claims under the wallet's OpenAMP account key and its on-chain receive keys
@@ -1201,14 +1206,19 @@ refresh: rebuilt from the published tree, validated against its round, final,
 under its own key, with the preimage that opens its entry. Then it signs the
 leaf's unroll authorisations with that key, hands them to the operator, keeps
 the leaf as a coin, and pays it out of round to a fresh leaf of its own. A
-wallet restored from its mnemonic finds its claims the same way. A claim the
-operator does not take up is still the wallet's coin, refreshed or taken home
-as any.
+wallet restored from its mnemonic finds its claims the same way. `arca
+claims` shows each claim's deadline; `arca claim` takes up only a claim at
+least an hour before it, and `sync` pays on, before the deadline, a claim
+the wallet holds but did not get to pay on. A claim not taken up by its
+deadline went back to its payer by the distribution's terms: `arca claims`
+shows it `lapsing` or `lapsed`, and a held claim coin left unpaid is marked
+`lapsed`, never lost, and counted in nothing the wallet holds.
 
     arca address                                        # its key, for a payer
     arca openamp-key                                    # or its OpenAMP account key
     arca distribute holders.txt --asset X --quote       # the fee, the coins given up
-    arca distribute holders.txt --asset X --shown 0     # one round pays them all
+    arca distribute holders.txt --asset X --shown 0     # one round pays them all, lapsing in 30 days
+    arca distribute holders.txt --asset X --shown 0 --days 90   # or in 90
     arca sync                                           # the forfeits, once final
     arca distributions                                  # each claim, the deadline, the return
     arca claims                                         # on a holder's wallet
@@ -1927,6 +1937,14 @@ wallet made later from an unclaimed holder's mnemonic finds its claim
 returned. Each refusal (a key named twice, a claim below the smallest leaf,
 a P2WPKH address in place of a key, a fee that changed since it was shown) is
 asserted by its reason.
+
+`tests/arca_claims_lapse.rs` pays three holders with `arca distribute --days
+8`: one takes its claim up, `arca claims` showing its deadline; past the
+deadline another's `arca claim` takes nothing and says the claim went back to
+its payer, nothing of the wallet's lost, and the operator's watcher lapses
+the two unclaimed leaves to the payer's return address, which `arca
+distributions` shows `lapsed`, with no return from the operator's coins,
+while the holder that took its claim up keeps its coin.
 
 `tests/arca_offline_refresh.rs` runs the same way: a holder pre-signs a plan
 of two steps with `arca plan` and its wallet stays closed across two expiries.

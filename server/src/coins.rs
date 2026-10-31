@@ -79,6 +79,12 @@ pub enum CoinError {
 	/// collaborative spend would move the operator's side too.
 	#[error("leaf {0} is a channel-1 coin: it is given up in a round's participation, and paid from by its channel's states alone")]
 	Channel(LeafId),
+	/// A `claim-1` leaf past its distribution's deadline: it is its payer's
+	/// again ([`arca_covenant::claim`]), and the operator co-signs no spend
+	/// of it.
+	#[error("leaf {leaf} is a claim leaf whose distribution's deadline {deadline} has passed: it lapses to its payer, and the operator \
+		co-signs no take-up of it")]
+	Lapsed { leaf: LeafId, deadline: u32 },
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
@@ -266,6 +272,12 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 	let recorded = repeat && matches!(dates, BoardDates::WithinUnlessRecorded(_));
 	let policy = if recorded { WalletPolicy { horizon: 0, ..*policy } } else { *policy };
 	let Checked { record, coin, bases: found, board_expiry } = resolve(store, &policy, id).await?;
+	// A claim-1 leaf is its payer's again from its distribution's deadline.
+	if let Some(l) = record.lapse() {
+		if !repeat && policy.now.to_consensus_u32() >= l.deadline.to_consensus_u32() {
+			return Err(CoinError::Lapsed { leaf: *id, deadline: l.deadline.to_consensus_u32() });
+		}
+	}
 	let horizon = match dates {
 		BoardDates::Within(h) => Some(h),
 		BoardDates::WithinUnlessRecorded(_) if repeat => None,

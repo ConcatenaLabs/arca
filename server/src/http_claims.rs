@@ -20,6 +20,9 @@ pub fn claim_state(c: &ClaimRow) -> &'static str {
 	if c.returned_in.is_some() {
 		return "returned";
 	}
+	if c.lapsed_in.is_some() {
+		return "lapsed";
+	}
 	match c.participation_state {
 		ParticipationState::Pending | ParticipationState::Issued => return "pending",
 		ParticipationState::Released => {},
@@ -36,8 +39,27 @@ pub fn claim_state(c: &ClaimRow) -> &'static str {
 	}
 }
 
-/// The round of `leaf` and the first expiry of its batch.
-async fn placed(app: &App, leaf: &BatchLeafRow) -> Result<(String, u32), Refusal> {
+/// A claim leaf's state now: [`claim_state`], `lapsing` for an open claim-1
+/// leaf whose deadline has passed at `now`.
+pub fn claim_state_at(c: &ClaimRow, now: u32) -> &'static str {
+	match claim_state(c) {
+		"open" if c.lapse.as_ref().is_some_and(|l| now >= l.deadline.to_consensus_u32()) => "lapsing",
+		s => s,
+	}
+}
+
+/// The take-up deadline of a claim placed in a batch whose first expiry is
+/// `expiry` (none without a sweep), lapsing at `lapse`: the earlier.
+fn take_up_deadline(expiry: Option<u32>, lapse: Option<u32>) -> Option<u32> {
+	match (expiry.map(deadline_of), lapse) {
+		(Some(a), Some(b)) => Some(a.min(b)),
+		(a, b) => a.or(b),
+	}
+}
+
+/// The round of `leaf` and the first expiry of its batch (`None` for a
+/// batch without a sweep, which never expires).
+async fn placed(app: &App, leaf: &BatchLeafRow) -> Result<(String, Option<u32>), Refusal> {
 	let round = app.store.round(leaf.round_id).await?
 		.ok_or_else(|| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("round {} is not recorded", leaf.round_id)))?;
 	let batch = app.store.batches(leaf.round_id).await?.into_iter().find(|b| b.vout == leaf.vout)
@@ -45,7 +67,7 @@ async fn placed(app: &App, leaf: &BatchLeafRow) -> Result<(String, u32), Refusal
 			leaf.vout)))?;
 	let schedule = <arca_covenant::ClockSchedule as arca_covenant::encode::Encoding>::decode(&batch.schedule)
 		.map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
-	Ok((txid_hex(&round.txid), schedule.expiries()[0].to_consensus_u32()))
+	Ok((txid_hex(&round.txid), schedule.expiries().first().map(|e| e.to_consensus_u32())))
 }
 
 /// The claim leaves' exit deadline, by which the operator takes a claim up:
@@ -81,7 +103,14 @@ pub(super) async fn distribute(State(app): State<Arc<App>>, body: Result<Bytes, 
 		fees,
 		not_before: req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 			.transpose()?,
-		lapse: None,
+		lapse: match (req.deadline, &req.lapse_allowance) {
+			(Some(t), Some(a)) => Some(arca_covenant::DistributionLapse {
+				deadline: MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("deadline: {}", e)))?,
+				allowance: amount(a)?,
+			}),
+			(None, None) => None,
+			_ => return Err(Refusal::malformed("a deadline and a lapse allowance come together")),
+		},
 	};
 	let status = app.participations.distribute(&DistributionRequest { distribution, attestations }).await?;
 	Ok(Json(participation_status(&status)))
@@ -96,6 +125,8 @@ pub(super) async fn distribution_status(State(app): State<Arc<App>>, body: Resul
 		format!("no distribution {} is known", hex(&id))))?;
 	let p = app.store.participation(&id).await?.ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "unknown_participation",
 		format!("no distribution {} is known", hex(&id))))?;
+	let now = app.store.tip_block().await?.map(|b| b.median_time as u32).unwrap_or(0);
+	let lapse = d.claims.first().and_then(|c| c.lapse.clone());
 	let mut at = None;
 	for c in &d.claims {
 		if let Some(l) = c.leaf_id {
@@ -125,16 +156,19 @@ pub(super) async fn distribution_status(State(app): State<Arc<App>>, body: Resul
 		asset: AssetId::from_byte_array(d.claims.first().map(|c| c.asset).unwrap_or_default()).to_string(),
 		return_script: hex(&d.return_script),
 		round: at.as_ref().map(|(r, _)| r.clone()),
-		expiry: at.as_ref().map(|(_, e)| *e),
-		deadline: at.as_ref().map(|(_, e)| deadline_of(*e)),
+		expiry: at.as_ref().and_then(|(_, e)| *e),
+		deadline: take_up_deadline(at.as_ref().and_then(|(_, e)| *e), lapse.as_ref().map(|l| l.deadline.to_consensus_u32())),
+		lapse_deadline: lapse.as_ref().map(|l| l.deadline.to_consensus_u32()),
+		lapse_allowance: lapse.as_ref().map(|l| l.allowance.to_string()),
 		claims: d.claims.iter().map(|c| api::ClaimStatus {
 			index: c.idx,
 			key: hex(&c.named_key),
 			owner: hex(&c.owner_key),
 			value: c.value.to_string(),
 			leaf_id: c.leaf_id.map(|l| LeafId(l).to_string()),
-			state: claim_state(c).into(),
+			state: claim_state_at(c, now).into(),
 			returned_in: c.returned_in.map(|t| txid_hex(&t)),
+			lapsed_in: c.lapsed_in.map(|t| txid_hex(&t)),
 		}).collect(),
 		returns,
 		returned: returned.to_string(),
@@ -155,6 +189,7 @@ pub(super) async fn claims(State(app): State<Arc<App>>, ConnectInfo(peer): Conne
 		keys.push(authenticate(&app, "claims", &a, &[]).await?.serialize());
 	}
 	let rows = app.store.claims_named(&keys, CLAIMS_PAGE).await?;
+	let now = app.store.tip_block().await?.map(|b| b.median_time as u32).unwrap_or(0);
 	let mut out = Vec::with_capacity(rows.len());
 	for c in rows {
 		let mut found = api::ClaimFound {
@@ -166,8 +201,9 @@ pub(super) async fn claims(State(app): State<Arc<App>>, ConnectInfo(peer): Conne
 			asset: AssetId::from_byte_array(c.asset).to_string(),
 			value: c.value.to_string(),
 			exit_delay_units: c.exit_delay_units,
-			state: claim_state(&c).into(),
+			state: claim_state_at(&c, now).into(),
 			leaf_id: None, round: None, batch_vout: None, leaf_index: None, record: None, preimage: None, expiry: None, deadline: None,
+			lapse_deadline: c.lapse.as_ref().map(|l| l.deadline.to_consensus_u32()),
 		};
 		// Where the leaf is, its record and the preimage that opens its entry,
 		// once the distribution is released: until then the leaf is not
@@ -185,8 +221,8 @@ pub(super) async fn claims(State(app): State<Arc<App>>, ConnectInfo(peer): Conne
 				found.leaf_index = Some(row.idx);
 				found.record = Some(hex(&row.record));
 				found.preimage = p.map(|p| hex(&p.preimage));
-				found.expiry = Some(expiry);
-				found.deadline = Some(deadline_of(expiry));
+				found.expiry = expiry;
+				found.deadline = take_up_deadline(expiry, c.lapse.as_ref().map(|l| l.deadline.to_consensus_u32()));
 			}
 		}
 		out.push(found);

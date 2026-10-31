@@ -1678,7 +1678,8 @@ impl Rounds {
 	/// The leaf `o` of `row` wants, as the tree builder takes it.
 	fn spec(row: &ParticipationRow, o: &crate::store::ParticipationOutput) -> Result<LeafSpec, RoundError> {
 		match &o.kind {
-			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel } => Ok(LeafSpec { claim: None,
+			WantedKind::Leaf { template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc, order, landing, channel, claim } => Ok(LeafSpec {
+				claim: claim.clone(),
 				template: template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: o.value,
@@ -3111,17 +3112,17 @@ impl Rounds {
 			// An htlc-1, order-2, landing-1 or channel-1 leaf's terms, from the
 			// record the builder gave it: a tree leaf record, or an
 			// accumulator record (which carries no channel).
-			let (htlc, order, landing, channel) = match b.kind {
+			let (htlc, order, landing, channel, claim) = match b.kind {
 				BatchKind::Tree => {
 					let r = arca_covenant::LeafRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
-					(r.htlc, r.order, r.landing, r.channel)
+					(r.htlc, r.order, r.landing, r.channel, r.claim)
 				},
 				BatchKind::Accumulator => {
 					let r = AccumulatorRecord::from_bytes(&l.record).map_err(|e| RoundError::Internal(e.to_string()))?;
-					(r.htlc, r.order, r.landing, None)
+					(r.htlc, r.order, r.landing, None, None)
 				},
 			};
-			specs.push(LeafSpec { claim: None,
+			specs.push(LeafSpec { claim,
 				template: l.template.parse::<Template>().map_err(|e| RoundError::Internal(e.to_string()))?,
 				owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&l.owner_key).map_err(|e| RoundError::Internal(e.to_string()))?,
 				value: l.value,
